@@ -1095,19 +1095,35 @@ def run_drill(config: Config, runtime: Runtime) -> tuple[int, dict[str, Any]]:
     evidence["evidence_object"] = f"gs://{config.bucket_name}/{object_name}"
 
     storage_written = False
+    evidence["evidence_write"] = {"completed": True}
     try:
         runtime.storage.write_evidence(object_name, evidence)
         storage_written = True
     except Exception:
-        evidence["outcome"] = "failure"
-        evidence["stage"] = "evidence_write"
-        evidence["failure_code"] = "evidence_bucket_write_failed"
+        evidence["evidence_write"] = {
+            "completed": False,
+            "failure_code": "evidence_bucket_write_failed",
+        }
+        # Preserve the causal failure when the drill had already failed. A
+        # secondary evidence-channel failure must not erase the only useful
+        # diagnosis. Evidence persistence remains a top-level failure when the
+        # restore itself otherwise succeeded.
+        if evidence["outcome"] == "success":
+            evidence["outcome"] = "failure"
+            evidence["stage"] = "evidence_write"
+            evidence["failure_code"] = "evidence_bucket_write_failed"
+    evidence["logging_write"] = {"completed": True}
     try:
         runtime.logger.write(evidence)
     except Exception:
-        evidence["outcome"] = "failure"
-        evidence["stage"] = "evidence_write"
-        evidence["failure_code"] = "evidence_logging_write_failed"
+        evidence["logging_write"] = {
+            "completed": False,
+            "failure_code": "evidence_logging_write_failed",
+        }
+        if evidence["outcome"] == "success":
+            evidence["outcome"] = "failure"
+            evidence["stage"] = "evidence_write"
+            evidence["failure_code"] = "evidence_logging_write_failed"
         if storage_written:
             failure_object = object_name.removesuffix(".json") + "-failure.json"
             evidence["evidence_failure_object"] = (

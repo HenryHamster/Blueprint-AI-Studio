@@ -731,6 +731,30 @@ class DrillLifecycleTests(unittest.TestCase):
         self.assertEqual(evidence["failure_code"], "evidence_bucket_write_failed")
         self.assertEqual(logger.writes[0]["outcome"], "failure")
         self.assertEqual(logger.writes[0]["stage"], "evidence_write")
+        self.assertEqual(
+            evidence["evidence_write"]["failure_code"],
+            "evidence_bucket_write_failed",
+        )
+
+    def test_bucket_evidence_failure_preserves_primary_drill_failure(self):
+        sql = FakeSql(fail_stage="archive_import")
+        storage = FakeStorage(fail_writes=True)
+        logger = FakeLogger()
+        rt, *_ = runtime(sql=sql, storage=storage, logger=logger)
+
+        exit_code, evidence = verifier.run_drill(config(), rt)
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(evidence["stage"], "archive_import")
+        self.assertEqual(evidence["failure_code"], "operation_failed")
+        self.assertEqual(
+            evidence["evidence_write"],
+            {
+                "completed": False,
+                "failure_code": "evidence_bucket_write_failed",
+            },
+        )
+        self.assertEqual(logger.writes[0]["failure_code"], "operation_failed")
 
     def test_logging_failure_adds_failure_supplement_to_bucket(self):
         storage = FakeStorage()
@@ -744,6 +768,27 @@ class DrillLifecycleTests(unittest.TestCase):
         self.assertEqual(len(storage.writes), 2)
         self.assertTrue(storage.writes[1][0].endswith("-failure.json"))
         self.assertEqual(storage.writes[1][1]["outcome"], "failure")
+
+    def test_logging_failure_preserves_primary_drill_failure(self):
+        sql = FakeSql(fail_stage="archive_import")
+        storage = FakeStorage()
+        logger = FakeLogger(fail_writes=True)
+        rt, *_ = runtime(sql=sql, storage=storage, logger=logger)
+
+        exit_code, evidence = verifier.run_drill(config(), rt)
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(evidence["stage"], "archive_import")
+        self.assertEqual(evidence["failure_code"], "operation_failed")
+        self.assertEqual(
+            evidence["logging_write"],
+            {
+                "completed": False,
+                "failure_code": "evidence_logging_write_failed",
+            },
+        )
+        self.assertEqual(len(storage.writes), 2)
+        self.assertTrue(storage.writes[1][0].endswith("-failure.json"))
 
     def test_cleanup_failure_overrides_success_and_expiry_label_remains(self):
         sql = FakeSql(cleanup_fails=True)
