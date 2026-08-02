@@ -47,6 +47,41 @@ from app.review_pipeline import _spawn_pipeline_task
 from testing.conftest import TestingSessionLocal
 
 
+def _mock_open_pr_execution_fence(
+    mocker, project_id, *pr_numbers: int
+) -> dict[int, dict]:
+    """Provide the real warm-claim fence with immutable live PR targets."""
+    targets = {
+        int(pr_number): {
+            "project_id": str(project_id),
+            "pr_number": int(pr_number),
+            "base_sha": f"base-{pr_number}",
+            "head_sha": f"head-{pr_number}",
+        }
+        for pr_number in pr_numbers
+    }
+    mocker.patch(
+        "app.review_claim_fence.get_github_token_for_task",
+        new_callable=mocker.AsyncMock,
+        return_value=("test-token", "test-owner", "test-repo"),
+    )
+
+    async def _get_pull_request(_token, _owner, _repo, pr_number, **_kwargs):
+        target = targets[int(pr_number)]
+        return {
+            "state": "open",
+            "merged": False,
+            "base": {"sha": target["base_sha"], "ref": "main"},
+            "head": {"sha": target["head_sha"], "ref": f"test-pr-{pr_number}"},
+        }
+
+    mocker.patch(
+        "app.review_claim_fence.get_pull_request",
+        new=mocker.AsyncMock(side_effect=_get_pull_request),
+    )
+    return targets
+
+
 @pytest.mark.asyncio
 async def test_warm_vm_full_flow_spawn_heartbeat_next_role_claim(
     client: AsyncClient, db_session, mocker
@@ -75,10 +110,16 @@ async def test_warm_vm_full_flow_spawn_heartbeat_next_role_claim(
         _runtime_config["warm_continuity_enabled"] = True
 
         # ── Step 1: seed Project + IN_PROGRESS source task with a vm_id ─────────
-        project = Project(name="Warm-VM Integration", user_id="test-user-123")
+        project = Project(
+            name="Warm-VM Integration",
+            user_id="test-user-123",
+            github_owner="test-owner",
+            github_repo="test-repo",
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
+        targets = _mock_open_pr_execution_fence(mocker, project.id, 6543)
 
         source_vm_id = "agent-vm-warm-int-001"
         source_task = Task(
@@ -110,6 +151,7 @@ async def test_warm_vm_full_flow_spawn_heartbeat_next_role_claim(
             pr_number=6543,
             branch="feat/warm-int",
             base_branch="main",
+            review_target=targets[6543],
         )
         assert was_created is True and spawned is not None
         assert spawned.status == TaskStatus.QUEUED
@@ -120,6 +162,10 @@ async def test_warm_vm_full_flow_spawn_heartbeat_next_role_claim(
         ctx = spawned.context or {}
         assert ctx.get("warm_target_vm_id") == source_vm_id
         assert str(ctx.get("warm_target_pr")) == "6543"
+        # PostgreSQL's JSONB text accessor coerces the production integer pin;
+        # SQLite's JSON extraction does not. Normalize this cross-dialect
+        # integration fixture before exercising the endpoint's text predicate.
+        spawned.context = {**ctx, "warm_target_pr": "6543"}
 
         # Commit so the next-role endpoint (which opens its own session through
         # the dependency override) sees the QUEUED row.
@@ -432,10 +478,16 @@ async def test_warm_vm_next_role_skips_when_heartbeat_missing(
     try:
         _runtime_config["warm_continuity_enabled"] = True
 
-        project = Project(name="Warm-VM No-Heartbeat", user_id="test-user-123")
+        project = Project(
+            name="Warm-VM No-Heartbeat",
+            user_id="test-user-123",
+            github_owner="test-owner",
+            github_repo="test-repo",
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
+        targets = _mock_open_pr_execution_fence(mocker, project.id, 7777)
 
         source_vm_id = "agent-vm-warm-no-hb"
         source_task = Task(
@@ -456,6 +508,7 @@ async def test_warm_vm_next_role_skips_when_heartbeat_missing(
                 "warm_target_vm_id": source_vm_id,
                 "warm_target_pr": "7777",
                 "warm_handoff_deadline": deadline,
+                "review_loop": {"fix_target": targets[7777]},
             },
         )
         db_session.add(pinned)
@@ -847,13 +900,33 @@ async def test_warm_vm_next_role_chain_continuity_blocked_when_paused(
     mocker.patch(
         "app.routers.agent.broadcast_to_project", new_callable=mocker.AsyncMock
     )
+    mocker.patch(
+        "app.review_claim_fence.get_github_token_for_task",
+        new_callable=mocker.AsyncMock,
+        return_value=("token", "test-owner", "test-repo"),
+    )
+    mocker.patch(
+        "app.review_claim_fence.get_pull_request",
+        new_callable=mocker.AsyncMock,
+        return_value={
+            "state": "open",
+            "merged": False,
+            "base": {"sha": "base-8123"},
+            "head": {"sha": "head-8123"},
+        },
+    )
 
     prior_warm_continuity = _runtime_config.get("warm_continuity_enabled")
     prior_heartbeat = dict(_shared_state.vm_last_heartbeat)
     try:
         _runtime_config["warm_continuity_enabled"] = True
 
-        project = Project(name="Warm-VM Paused Chain", user_id="test-user-123")
+        project = Project(
+            name="Warm-VM Paused Chain",
+            user_id="test-user-123",
+            github_owner="test-owner",
+            github_repo="test-repo",
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
@@ -2465,10 +2538,16 @@ async def test_lane_warm_resume_receipt_set_at_claim_not_spawn(
         _runtime_config["warm_continuity_enabled"] = True
         _runtime_config["improvement_lanes_enabled"] = True
 
-        project = Project(name="Lane Receipt Test", user_id="test-user-lane-receipt")
+        project = Project(
+            name="Lane Receipt Test",
+            user_id="test-user-lane-receipt",
+            github_owner="test-owner",
+            github_repo="test-repo",
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
+        targets = _mock_open_pr_execution_fence(mocker, project.id, 8001)
 
         vm_id = "agent-vm-lane-receipt-001"
         checkpoint_sha = "aabbccdd11223344aabbccdd11223344aabbccdd"
@@ -2501,6 +2580,7 @@ async def test_lane_warm_resume_receipt_set_at_claim_not_spawn(
                 "warm_target_pr": "8001",
                 "is_lane_phase": True,
                 "lane_checkpoint_sha": checkpoint_sha,
+                "review_loop": {"fix_target": targets[8001]},
                 # No LANE_PILOT_WARM_RESUME_RECEIPT_KEY — not yet claimed warm.
             },
         )
@@ -2762,10 +2842,16 @@ async def test_warm_claim_checkpoint_receipt_gated_on_substrate_flag(
     prior_lanes_enabled = _runtime_config.get("improvement_lanes_enabled")
     try:
         # Create a project and a task with lane context.
-        project = Project(name="Lane Receipt Gating Test", user_id="test-user")
+        project = Project(
+            name="Lane Receipt Gating Test",
+            user_id="test-user",
+            github_owner="test-owner",
+            github_repo="test-repo",
+        )
         db_session.add(project)
         await db_session.commit()
         await db_session.refresh(project)
+        targets = _mock_open_pr_execution_fence(mocker, project.id, 999, 1000)
 
         vm_id = "agent-vm-lane-receipt-test"
         lane_id = str(uuid.uuid4())
@@ -2788,6 +2874,7 @@ async def test_warm_claim_checkpoint_receipt_gated_on_substrate_flag(
                 "is_lane_phase": True,
                 "lane_checkpoint_sha": checkpoint_sha,
                 "improvement_lane_id": lane_id,
+                "review_loop": {"fix_target": targets[999]},
             },
         )
         db_session.add(task)
@@ -2847,6 +2934,7 @@ async def test_warm_claim_checkpoint_receipt_gated_on_substrate_flag(
                 "is_lane_phase": True,
                 "lane_checkpoint_sha": checkpoint_sha,
                 "improvement_lane_id": lane_id,
+                "review_loop": {"fix_target": targets[1000]},
             },
         )
         db_session.add(task2)

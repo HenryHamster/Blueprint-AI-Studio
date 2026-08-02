@@ -1356,25 +1356,6 @@ function enrichStatusPayload(taskId: string, payload: Record<string, unknown>): 
   // ourselves (the same VM ran the prior role and is now running this one).
   // On cold roles there is no prior, so we send null.
   telemetry.prior_role_vm_id = isWarmStart ? (process.env.VM_INSTANCE_ID || null) : null;
-  // Reviewer findings telemetry: when a fresh-reviewer pass ran and wrote
-  // reviewer_findings into the self-review JSON, surface counts so the backend
-  // can store them in task.context for catch-rate measurement (e.g. whether
-  // reviewer-flagged categories were later confirmed by the human reviewer).
-  // Best-effort: missing file or parse errors are silently ignored.
-  if (isTerminalStatus(payload.status)) {
-    const srPath = `/tmp/self_review_${taskId}.json`;
-    try {
-      const srRaw = fs.readFileSync(srPath, 'utf-8');
-      const srData = JSON.parse(srRaw) as Record<string, unknown>;
-      if (Array.isArray(srData.reviewer_findings) && srData.reviewer_findings.length > 0) {
-        const findings = srData.reviewer_findings as Array<Record<string, unknown>>;
-        telemetry.reviewer_findings_count = findings.length;
-        telemetry.reviewer_critical_count = findings.filter(
-          f => typeof f.severity === 'string' && f.severity === 'CRITICAL'
-        ).length;
-      }
-    } catch { /* self-review file absent or unparseable — omit telemetry fields */ }
-  }
   // Final flush of any buffered fix-loop events before the terminal status
   // post lands — heartbeats are best-effort, so this is the safety net that
   // guarantees the per-task fix_loop_history is at least eventually accurate.

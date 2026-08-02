@@ -27,7 +27,6 @@ import {
 } from '../index.js';
 import { captureTestBaseline, testFixLoop } from '../utils/test-fix-loop.js';
 import { runCodeChangeTask } from './code-change.js';
-import { runFreshReviewerPass, sensitivePathsFromMetadata } from './standard.js';
 import { writeFetchHelper, buildFetchGuidance, PLAN_FETCH_VERBS } from './strategic-helpers.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import type { BuildConfig } from '../index.js';
@@ -51,7 +50,6 @@ import {
 import { resolveBuildConfig } from '../build-config.js';
 import {
   REVIEW_CLAUDEMD_PROMPT_HEADER, REVIEW_CLAUDEMD_PROMPT_FOOTER,
-  REVIEW_HISTORY_INTRO,
   REVIEW_QA_FOCUS_HINT, REVIEW_MIGRATE_FOCUS_HINT,
   REVIEW_SMALL_SCOPE_PREAMBLE, REVIEW_LARGE_SCOPE_PREAMBLE,
   REVIEW_FIX_RESPONSES_HEADER, REVIEW_FIX_RESPONSES_INSTRUCTIONS,
@@ -72,12 +70,9 @@ import { repairStructuredOutput } from './structured-output-repair.js';
 import { providerAutoInjectsClaudeMd } from '../providers/runners.js';
 
 // ── Extracted helper modules ──────────────────────────────────────────────────
-import { annotateResolvedIssues, fmtAnnotatedIssue } from './review-fix-issue-dedup.js';
-export { ISSUE_SIMILARITY_THRESHOLD, annotateResolvedIssues } from './review-fix-issue-dedup.js';
-export type { AnnotatedIssue, AnnotatedEntry } from './review-fix-issue-dedup.js';
-import type { DriftSignal } from './review-fix-history.js';
-import { computeMaxFixIterations, REVIEW_FEEDBACK_HISTORY_CHARS, formatTrajectorySection, formatDriftSection } from './review-fix-history.js';
-export { computeMaxFixIterations, REVIEW_FEEDBACK_HISTORY_CHARS, formatTrajectorySection, formatDriftSection, verifyStepsOk } from './review-fix-history.js';
+import type { DriftSignal, ReviewHistoryEntry } from './review-fix-history.js';
+import { computeMaxFixIterations, formatTrajectorySection, formatDriftSection } from './review-fix-history.js';
+export { computeMaxFixIterations, formatTrajectorySection, formatDriftSection, verifyStepsOk } from './review-fix-history.js';
 import { detectMigrationConflict, buildMigrationConflictGuidance, extractReservedMigrationRevision } from './review-fix-migration.js';
 import { resolveMigrationLayout } from './specialized.js';
 import { downloadViewportShots } from '../utils/viewport-shot-download.js';
@@ -430,6 +425,49 @@ function validatedCachedReviewVerdict(
   }
 }
 
+type OpenLedgerIssue = {
+  issue_id?: string;
+  severity?: string;
+  description?: string;
+  file?: string;
+  line?: number;
+};
+
+function authoritativeOpenLedgerIssues(
+  reviewLoop: Record<string, unknown> | undefined,
+): OpenLedgerIssue[] | undefined {
+  const ledger = reviewLoop?.issue_ledger as Record<string, unknown> | undefined;
+  if (!ledger || !Array.isArray(ledger.open)) return undefined;
+  return ledger.open.filter(
+    (item): item is OpenLedgerIssue => Boolean(item) && typeof item === 'object',
+  );
+}
+
+function fmtIssueLocation(issue: { file?: string; line?: number }): string {
+  if (issue.file && typeof issue.line === 'number') return ` [${issue.file}:${issue.line}]`;
+  if (issue.file) return ` [${issue.file}]`;
+  return '';
+}
+
+function formatAuthoritativeLedgerSection(
+  reviewLoop: Record<string, unknown> | undefined,
+  role: 'review' | 'fix',
+): string {
+  const open = authoritativeOpenLedgerIssues(reviewLoop) ?? [];
+  if (open.length === 0) return '';
+  const rows = open.map(issue => {
+    const issueId = issue.issue_id ? ` [${issue.issue_id}]` : '';
+    const severity = (issue.severity || 'major').toUpperCase();
+    return `- [${severity}]${issueId}${fmtIssueLocation(issue)} ${issue.description || '(missing description)'}`;
+  });
+  const roleInstruction = role === 'review'
+    ? `Re-raise an unresolved blocker with its exact BP-... id, or record an explicit supported disposition.`
+    : `Address every blocker below. If one is wrong or needs qualification, provide a concrete structured response so the next exact-head reviewer can verify it; fix agents cannot close blockers.`;
+  return `## Authoritative open blockers\n` +
+    `This is the complete binding blocker set derived by the backend. The compact trajectory is historical context only; ` +
+    `do not infer closure from omission or wording changes. ${roleInstruction}\n${rows.join('\n')}\n\n`;
+}
+
 export async function handleReview(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
@@ -445,7 +483,7 @@ export async function handleReview(
   const taskContext = task.context as Record<string, unknown> | undefined;
   const reviewLoop = taskContext?.review_loop as Record<string, unknown> | undefined;
   const iteration = (reviewLoop?.iteration as number | undefined) || 1;
-  const reviewHistory = (reviewLoop?.review_history as Array<{ iteration: number; feedback: string; issues?: Array<{severity: string; description: string; file?: string; line?: number}> }> | undefined) || [];
+  const reviewHistory = (reviewLoop?.review_history as ReviewHistoryEntry[] | undefined) || [];
   const taskScope = (taskContext?.scope as string | undefined) || 'medium';
   const origTaskType = strVal(payload.original_task_type || '');
   // A follow-up reviewer may be given the exact head SHA the prior review
@@ -685,19 +723,11 @@ export async function handleReview(
     [];
   const reviewProjectCtxSection = reviewProjectCtx ? formatProjectContext(reviewProjectCtx, 'review', taskScope, reviewDirectionId, reviewRelatedFiles.length) + '\n\n' : '';
 
-  // Build prior review history section (for iterations > 1)
-  const annotatedReviewHistory = annotateResolvedIssues(reviewHistory);
-  const reviewHistorySection = annotatedReviewHistory.length > 0 && iteration > 1
-    ? `${REVIEW_HISTORY_INTRO}\n${annotatedReviewHistory.map(e => {
-        if (e.issues && e.issues.length > 0) {
-          const critical = e.issues.filter(i => i.severity === 'critical').map(i => fmtAnnotatedIssue('CRITICAL', i));
-          const major = e.issues.filter(i => i.severity === 'major').map(i => fmtAnnotatedIssue('MAJOR', i));
-          const minor = e.issues.filter(i => i.severity === 'minor').map(i => fmtAnnotatedIssue('MINOR', i));
-          return `- Iteration ${e.iteration}:\n` + [...critical, ...major, ...minor].join('\n');
-        }
-        return `- Iteration ${e.iteration}: ` + e.feedback.slice(0, REVIEW_FEEDBACK_HISTORY_CHARS);
-      }).join('\n')}\n\n`
-    : '';
+  // Keep only the compact trajectory plus the complete backend-owned blocker
+  // ledger. Repeating every historical issue/feedback blob duplicated the same
+  // evidence and made each low-tier review progressively more expensive.
+  const reviewTrajectorySection = formatTrajectorySection(reviewHistory);
+  const authoritativeLedgerSection = formatAuthoritativeLedgerSection(reviewLoop, 'review');
 
   // Build iteration preamble with graduated budget guidance
   const reviewMaxIterations = computeMaxFixIterations(task);
@@ -852,9 +882,10 @@ export async function handleReview(
   const viewportScreenshotsForPrompt = deltaBaseSha ? '' : viewportScreenshotSection;
   const reviewScopeBudgetForPrompt = deltaBaseSha ? '' : reviewScopeBudgetSection;
 
-  const reviewPrompt = `${reviewStrategicFramingForPrompt}${reviewStrategicFramingForPrompt ? '\n\n' : ''}${reviewClaudeMdPrefix}${reviewPlaybookForPrompt}${reviewProjectCtxForPrompt}${reviewHistorySection}${fixResponsesSection}${buildReviewMasterPreamble(prNumber, branch, baseBranch)}
+  const reviewPrompt = `${reviewStrategicFramingForPrompt}${reviewStrategicFramingForPrompt ? '\n\n' : ''}${reviewClaudeMdPrefix}${reviewPlaybookForPrompt}${reviewProjectCtxForPrompt}${fixResponsesSection}${buildReviewMasterPreamble(prNumber, branch, baseBranch)}
 
 ${reviewIterationContext}${deltaReviewSection}
+${reviewTrajectorySection}${authoritativeLedgerSection}
 ${rollupGuidance}
 ${originalPrompt ? `The original task was: ${originalPrompt}\n\n` : ''}${prTitle ? `PR title: ${prTitle}\n` : ''}${prBody ? `PR description:\n${prBody}\n\n` : ''}${changedFilesLabel}
 ${changedFiles}${diffShortstat ? `\nDiff volume: ${diffShortstat}\n` : ''}
@@ -891,7 +922,8 @@ ${reviewScopeBudgetForPrompt}${reviewScopePreamble}${taskTypeFocusHint}${reviewC
     ['claude_md', reviewClaudeMdPrefix],
     ['playbook', reviewPlaybookForPrompt],
     ['project_context', reviewProjectCtxForPrompt],
-    ['review_history', reviewHistorySection],
+    ['review_trajectory', reviewTrajectorySection],
+    ['authoritative_ledger', authoritativeLedgerSection],
     ['fix_responses', fixResponsesSection],
     ['review_preamble', buildReviewMasterPreamble(prNumber, branch, baseBranch)],
     ['pr_context', `${reviewIterationContext}${deltaReviewSection}${rollupGuidance}${originalPrompt ? `The original task was: ${originalPrompt}\n\n` : ''}${prTitle ? `PR title: ${prTitle}\n` : ''}${prBody ? `PR description:\n${prBody}\n\n` : ''}${changedFilesLabel}\n${changedFiles}${diffShortstat ? `\nDiff volume: ${diffShortstat}\n` : ''}`],
@@ -1045,21 +1077,18 @@ export async function handleFix(
   writeMessagesHelper(taskId);
   const disallowedToolsFix = configureAgentPermissions('fix');
   const fixBuildConfig = resolveBuildConfig(task);
-  type FixIssue = { severity: string; description: string; file?: string; line?: number };
   const fixTaskContext = (task.context as Record<string, unknown> | undefined) || {};
   const fixReviewLoop = fixTaskContext.review_loop as Record<string, unknown> | undefined;
-  const fixReviewHistory = (fixReviewLoop?.review_history as Array<{
-    iteration: number;
-    feedback: string;
-    issues?: Array<{ severity: string; description: string; file?: string; line?: number }>;
-  }> | undefined) || [];
-  const latestReviewIssueFiles = (fixTaskContext.surviving_issues as FixIssue[] | undefined)
-    ?.map(issue => issue.file)
-    .filter((file): file is string => typeof file === 'string' && file.length > 0)
+  const fixReviewHistory = (fixReviewLoop?.review_history as ReviewHistoryEntry[] | undefined) || [];
+  // The backend ledger is binding whenever present, including an explicitly
+  // empty open set. Review history is retained only as a legacy fallback for
+  // tasks created before authoritative ledgers were persisted.
+  const fixIssues = authoritativeOpenLedgerIssues(fixReviewLoop)
     ?? fixReviewHistory[fixReviewHistory.length - 1]?.issues
-      ?.map(issue => issue.file)
-      .filter((file): file is string => typeof file === 'string' && file.length > 0)
     ?? [];
+  const latestReviewIssueFiles = fixIssues
+    .map(issue => issue.file)
+    .filter((file): file is string => typeof file === 'string' && file.length > 0);
   const existingFixRelatedFiles = (
     (fixTaskContext.related_files as string[] | undefined) ||
     (payload.related_files as string[] | undefined) ||
@@ -1139,16 +1168,6 @@ export async function handleFix(
   const reviewLoop = fixReviewLoop;
   const fixReason = reviewLoop?.fix_reason as string | undefined;
   const taskContext = fixTaskContext;
-  // Challenge-reconciliation: when the backend has resolved a second-opinion
-  // challenge, it passes only the challenge-surviving issues (issues the
-  // challenger confirmed or didn't reject) so the fix agent doesn't address
-  // issues the challenge invalidated. Falls back to the raw review-history
-  // issues when absent (no challenge, or pre-challenge tasks).
-  const survivingIssues: FixIssue[] | undefined = Array.isArray(payload.surviving_issues)
-    ? payload.surviving_issues as FixIssue[]
-    : Array.isArray(taskContext.surviving_issues)
-      ? taskContext.surviving_issues as FixIssue[]
-      : undefined;
   const ciFailureLogs = [
     strVal(taskContext.ci_failure_logs),
     strVal(taskContext._ci_failure_logs),
@@ -1171,7 +1190,7 @@ export async function handleFix(
     iterationHeader += includeOriginalScope
       ? 'Convergence mode: you are at or past 50% of the iteration budget. Make only the minimal changes needed to address the specific issues listed below. You may modify files from the original task scope when fixing a flagged issue requires updating a related definition or consumer, but do NOT introduce new files outside the original scope, do NOT refactor or clean up adjacent code, and defer any non-blocking improvements to follow-up tasks. Scope creep at this stage commonly exhausts the remaining budget and forces the PR to close unmerged.\n'
       : 'Convergence mode: you are at or past 50% of the iteration budget. Make only the minimal changes needed to address the specific issues listed below. Do NOT touch files that are not mentioned in the review feedback, do NOT refactor or clean up adjacent code, and defer any non-blocking improvements to follow-up tasks. Scope creep at this stage commonly exhausts the remaining budget and forces the PR to close unmerged.\n';
-    const latestIssues = survivingIssues ?? reviewHistory[reviewHistory.length - 1]?.issues ?? [];
+    const latestIssues = fixIssues;
     const issueFiles = latestIssues.map(i => i.file).filter((f): f is string => typeof f === 'string' && f.length > 0);
     const originalScopeFiles = includeOriginalScope
       ? [
@@ -1198,33 +1217,17 @@ export async function handleFix(
     }
   }
   const originalPromptSection = originalPrompt ? `## Original Task Goal\n${originalPrompt}\n\n` : '';
-  // Trajectory + drift sections — render before the existing "Previous review
-  // iterations" block so the agent reads the iteration arc (verdicts, files
-  // per iteration, drift) before diving into per-iteration issue lists.
+  // Compact trajectory + drift context; the binding issue set is rendered once
+  // from the authoritative ledger below.
   const trajectorySection = formatTrajectorySection(reviewHistory);
   const driftSignal = (reviewLoop?.drift_signal as DriftSignal | undefined);
   const driftSection = formatDriftSection(driftSignal);
-  let basePrompt = originalPromptSection + trajectorySection + driftSection + iterationHeader + prompt;
-  if (reviewHistory.length > 0) {
-    const annotatedHistory = annotateResolvedIssues(reviewHistory);
-    const historyLines = annotatedHistory
-      .map(e => {
-        const issues = e.issues;
-        if (issues && issues.length > 0) {
-          const critical = issues.filter(i => i.severity === 'critical').map(i => fmtAnnotatedIssue('CRITICAL', i));
-          const major = issues.filter(i => i.severity === 'major').map(i => fmtAnnotatedIssue('MAJOR', i));
-          const minor = issues.filter(i => i.severity === 'minor').map(i => fmtAnnotatedIssue('MINOR', i));
-          return `- Iteration ${e.iteration}:\n${[...critical, ...major, ...minor].join('\n')}`;
-        } else {
-          return `- Iteration ${e.iteration}: ${e.feedback.slice(0, REVIEW_FEEDBACK_HISTORY_CHARS)}`;
-        }
-      })
-      .join('\n');
-    basePrompt = `${originalPromptSection}${trajectorySection}${driftSection}${iterationHeader}Previous review iterations (issues marked "(likely resolved ...)" were not re-flagged in the following iteration — treat as historical context, focus on the current feedback):\n${historyLines}\n\nCurrent review feedback to address:\n${prompt}`;
-  }
+  const authoritativeLedgerSection = formatAuthoritativeLedgerSection(reviewLoop, 'fix');
+  let basePrompt = originalPromptSection + trajectorySection + driftSection +
+    iterationHeader + authoritativeLedgerSection + `Current review feedback to address:\n${prompt}`;
 
   // Surface self-review blind-spots (truncated_files_read, incomplete_review,
-  // reviewer_findings, and author-flagged blind_spots) propagated from the
+  // and author-flagged blind_spots) propagated from the
   // original create task. Empty string when no _self_review_outcome was
   // attached (e.g. CI-failure-driven fixes).
   const fixSelfReviewOutcome = taskContext._self_review_outcome as Record<string, unknown> | undefined;
@@ -1271,7 +1274,7 @@ export async function handleFix(
   if (fixProjectId) writeFetchHelper(taskId, fixProjectId, WORKSPACE, { verbs: PLAN_FETCH_VERBS });
   const fixFetchGuidance = fixProjectId ? buildFetchGuidance(PLAN_FETCH_VERBS) : '';
   const parallelFixFlag = fixProjectMetaEarly?.enable_parallel_fix === true;
-  const latestIssuesForFanOut = survivingIssues ?? reviewHistory[reviewHistory.length - 1]?.issues ?? [];
+  const latestIssuesForFanOut = fixIssues;
   const reviewIssueFilesForFanOut = latestIssuesForFanOut
     .map(i => i.file)
     .filter((f): f is string => typeof f === 'string' && f.length > 0);
@@ -1598,7 +1601,7 @@ If you do neither for a CRITICAL/MAJOR issue, the reviewer will re-raise it on t
 Write structured responses to /tmp/fix_responses_${taskId}.json as a JSON array of these objects:
 
   {
-    "issue_id": "<sha1 of the issue's normalized description (lowercased, whitespace-collapsed)>",
+    "issue_id": "<copy the exact BP-... id shown with the reviewer issue>",
     "issue_summary": "<first 80 chars of the issue text>",
     "source_iteration": <int — which review iteration raised this issue>,
     "response_type": "disputed" | "partial" | "alternative",
@@ -1608,6 +1611,8 @@ Write structured responses to /tmp/fix_responses_${taskId}.json as a JSON array 
       "<another concrete check>"
     ]
   }
+
+Copy the BP-... issue id exactly. Do not hash, recompute, or invent an id.
 
 Verify steps must be MECHANICAL — runnable commands, greppable assertions, references to specific files/lines.  "I tested it" / "I'm confident" / "trust me" are rejected at parse time.  If you cannot produce mechanical verify steps, you cannot dispute — either fix the issue or accept the flag.
 
@@ -1752,24 +1757,4 @@ Maximum 5 responses per iteration.  Skip writing the file entirely if every issu
     mergeVerify: conflictResolutionOccurred || fixReason === 'merge_conflict',
   });
 
-  // Fresh reviewer pass: read-only second session to catch issues the fix
-  // agent missed. Enabled per-project via project_metadata.enable_fresh_reviewer.
-  const fixProjectMeta = task.project_metadata as Record<string, unknown> | undefined;
-  const freshReviewerEnabled =
-    fixProjectMeta?.enable_fresh_reviewer === true;
-  if (freshReviewerEnabled) {
-    const fixTaskTitle = strVal(task.title) || originalPrompt.slice(0, 80) || 'Fix task';
-    await runFreshReviewerPass(
-      taskId,
-      fixTaskTitle,
-      originalPrompt || prompt,
-      fixRelatedFiles,
-      ws,
-      statusRef,
-      model,
-      task.project_context as Record<string, unknown> | undefined,
-      undefined, undefined, undefined, undefined,
-      sensitivePathsFromMetadata(task.project_metadata as Record<string, unknown> | undefined),
-    );
-  }
 }

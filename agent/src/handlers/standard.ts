@@ -60,9 +60,7 @@ import {
 import { resolveBuildConfig } from '../build-config.js';
 import { extractReservedMigrationRevision, buildReservedRevisionGuidance } from './review-fix-migration.js';
 import { resolveMigrationLayout } from './specialized.js';
-import { SCOPE_OVERFLOW_THRESHOLDS, MEDIUM_ANALYSIS_PLAN_FILE_LIMIT, DEFAULT_CLONE_DEPTH, ANALYSIS_CONTEXT_CHAR_CAP } from '../constants.js';
-import { prepareWorkspaceForRole } from '../workspacePrep.js';
-import { writeGitTokenFile, ensureGitCredentialHelperScript } from '../git-credential.js';
+import { SCOPE_OVERFLOW_THRESHOLDS, MEDIUM_ANALYSIS_PLAN_FILE_LIMIT, ANALYSIS_CONTEXT_CHAR_CAP } from '../constants.js';
 import { runCodeChangeTask } from './code-change.js';
 import { consumeAndCommitArtifacts, hydrateComputeResultArtifacts } from './artifact-consume.js';
 import { writeArtifactsHelper, COMPUTE_ARTIFACT_GUIDANCE } from './artifacts-helper.js';
@@ -70,22 +68,14 @@ import { isBlueprintSelfRepo } from '../prompts/code-change-helpers.js';
 import { writeDiagnosticsAfterEditHook } from '../prompts/diagnostics-after-edit-hook.js';
 import { formatExecutionEvidenceForSrPrompt, formatHighFpRateLoosenHintForSrPrompt, formatSrCoFailurePairsForSrPrompt, formatSeverityCalibrationHintForSrPrompt, formatPrecisionRecallQuadrantHintForSrPrompt } from '../prompts/self-review.js';
 import {
-  runFreshReviewerPass,
-  loneCheckerCategoriesForTask,
-  sensitivePathsFromMetadata,
   getRegressingCategories,
   getThinningCategories,
   VIEWPORT_INFRA_SKIP_GUIDANCE,
-} from './fresh-reviewer.js';
+} from './self-review-support.js';
 
 export {
-  runFreshReviewerPass,
-  loneCheckerCategoriesForTask,
-  sensitivePathsFromMetadata,
-  pickFreshReviewerEffort,
   extractSelfReviewJson,
-  SR_SKIP_REASONS,
-} from './fresh-reviewer.js';
+} from './self-review-support.js';
 
 // ── Standard Handler Helper ───────────────────────────────────────────────
 
@@ -1090,101 +1080,6 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     ciFailureSelectors: rawCiSelectors.length > 0 ? rawCiSelectors : undefined,
   });
 
-  // Fresh reviewer pass: read-only second session to catch what the implementing
-  // session missed. Enabled per-project via project_metadata.enable_fresh_reviewer.
-  // Skipped for auto-remediation tasks (their job IS to fix what a reviewer would flag).
-  const projectMeta = task.project_metadata as Record<string, unknown> | undefined;
-  const freshReviewerEnabled =
-    projectMeta?.enable_fresh_reviewer === true;
-  let freshReviewerAlreadyRan = false;
-  if (freshReviewerEnabled && !isAutoRemediation) {
-    freshReviewerAlreadyRan = true;
-    const reviewerRelatedFiles = (
-      (payload.related_files as string[] | undefined) ||
-      ((task.context as Record<string, unknown> | undefined)?.related_files as string[] | undefined) ||
-      []
-    );
-    await runFreshReviewerPass(
-      taskId,
-      taskTitle,
-      rawPrompt,
-      reviewerRelatedFiles,
-      ws,
-      statusRef,
-      model,
-      task.project_context as Record<string, unknown> | undefined,
-      // Self-merge: persist the enabled-path reviewer output into THIS task's
-      // backend _self_review_outcome (originalTaskId = taskId). No recovery flavor.
-      undefined, undefined, undefined, taskId,
-      sensitivePathsFromMetadata(projectMeta),
-    );
-  }
-
-  // Auto-trigger fresh-reviewer when lone-checker categories overlap this task's
-  // risk surface. SR is the sole corroborator for these categories, so a PASS is
-  // uncorroborated. Fires regardless of enable_fresh_reviewer.
-  if (!isAutoRemediation && !freshReviewerAlreadyRan) {
-    const loneCheckerRelatedFiles = (
-      (payload.related_files as string[] | undefined) ||
-      ((task.context as Record<string, unknown> | undefined)?.related_files as string[] | undefined) ||
-      []
-    );
-    const loneCheckerCats = loneCheckerCategoriesForTask(
-      task.project_context as Record<string, unknown> | undefined,
-      loneCheckerRelatedFiles,
-      buildConfig,
-    );
-    if (loneCheckerCats.length > 0) {
-      sendLog(ws, `[FreshReview] Lone-checker categories detected (${loneCheckerCats.join(', ')}) — auto-triggering fresh-reviewer pass.\n`);
-      freshReviewerAlreadyRan = true;
-      await runFreshReviewerPass(
-        taskId, taskTitle, rawPrompt, loneCheckerRelatedFiles, ws, statusRef, model,
-        task.project_context as Record<string, unknown> | undefined,
-        // Self-merge: persist lone-checker recovery output into THIS task's
-        // backend _self_review_outcome (originalTaskId = taskId).
-        false, true, undefined, taskId,
-        sensitivePathsFromMetadata(projectMeta),
-      );
-    }
-  }
-
-  // Auto-trigger fresh-reviewer recovery when SR admits incomplete_review and
-  // the normal fresh-reviewer path hasn't already run. Fires regardless of
-  // project_metadata.enable_fresh_reviewer. Skipped for auto-remediation tasks
-  // (same exclusion as the normal path).
-  if (!isAutoRemediation && !freshReviewerAlreadyRan) {
-    const srRecoveryPath = `/tmp/self_review_${taskId}.json`;
-    let srRecovery: Record<string, unknown> = {};
-    try {
-      const raw = await fs.promises.readFile(srRecoveryPath, 'utf-8');
-      if (raw) srRecovery = JSON.parse(raw) as Record<string, unknown>;
-    } catch { /* may not exist */ }
-    const srCategories = Array.isArray(srRecovery.categories) ? srRecovery.categories as string[] : [];
-    const existingFindings = srRecovery.reviewer_findings;
-    const hasExistingFindings = Array.isArray(existingFindings) && existingFindings.length > 0;
-    if (srCategories.includes('incomplete_review') && !hasExistingFindings) {
-      sendLog(ws, '[FreshReview] SR reports incomplete_review — auto-triggering recovery pass.\n');
-      const recoveryRelatedFiles = (
-        (payload.related_files as string[] | undefined) ||
-        ((task.context as Record<string, unknown> | undefined)?.related_files as string[] | undefined) ||
-        []
-      );
-      await runFreshReviewerPass(
-        taskId,
-        taskTitle,
-        rawPrompt,
-        recoveryRelatedFiles,
-        ws,
-        statusRef,
-        model,
-        task.project_context as Record<string, unknown> | undefined,
-        // Self-merge: persist incomplete-SR recovery output into THIS task's
-        // backend _self_review_outcome (originalTaskId = taskId).
-        true, undefined, undefined, taskId,
-        sensitivePathsFromMetadata(projectMeta),
-      );
-    }
-  }
 }
 
 // ── Handler: Create (default — make changes, push, open PR) ─────────────────
@@ -1256,54 +1151,6 @@ export async function handleCreate(
     ((task.context as Record<string, unknown> | undefined)?.related_files as string[] | undefined) ||
     []
   );
-
-  // Operator-requested fresh-reviewer: clone the original PR branch, run the pass, and return.
-  const operatorReviewFor = taskCtx?.operator_requested_review_for as string | undefined;
-  if (operatorReviewFor) {
-    const prBranch = validateBranchName(strVal(payload.branch), 'branch');
-    const prBaseBranch = validateBranchName(resolveBaseBranch(payload, task), 'base_branch');
-    const cleanRepoUrl = `https://github.com/${owner}/${repo}.git`;
-
-    // Check the branch still exists before cloning — auto-delete-on-merge removes
-    // the head branch as soon as the PR is merged, making clone fatal. This is a
-    // permanent state (not a transient error), so short-circuit cleanly.
-    // Write the token to the credential-helper file and pass the helper via -c
-    // so git ls-remote can authenticate without embedding the token in the URL.
-    writeGitTokenFile(ghToken);
-    const lsHelperPath = ensureGitCredentialHelperScript();
-    let branchExists = false;
-    try {
-      const lsOut = execFileSync('git', ['-c', `credential.https://github.com.helper=${lsHelperPath}`, 'ls-remote', '--heads', cleanRepoUrl, prBranch], { timeout: 30000 });
-      branchExists = lsOut.toString().trim().length > 0;
-    } catch {
-      // ls-remote itself failed (auth error, network, etc.) — let the clone attempt
-      // proceed and fail loudly so non-branch errors still surface.
-      branchExists = true;
-    }
-    if (!branchExists) {
-      const skipMsg = `PR head branch '${prBranch}' no longer exists on ${owner}/${repo} — likely merged and auto-deleted. Skipping review (nothing to review).`;
-      sendLog(ws, `[FreshReview] ${skipMsg}\n`);
-      await persistAndPostStatus(taskId, {
-        task_id: taskId,
-        status: 'COMPLETED',
-        artifact_type: 'ERROR_LOG',
-        logs: skipMsg,
-        failure_category: 'PR_BRANCH_DELETED',
-      });
-      return;
-    }
-
-    sendLog(ws, `[FreshReview] Operator-requested pass — cloning ${owner}/${repo} branch ${prBranch}\n`);
-    await prepareWorkspaceForRole({ workspace: WORKSPACE, repoUrl: cleanRepoUrl, githubToken: ghToken, branch: prBranch, baseBranch: prBaseBranch, depth: DEFAULT_CLONE_DEPTH });
-    try { git(['fetch', 'origin', `+refs/heads/${prBaseBranch}:refs/remotes/origin/${prBaseBranch}`, '--depth', String(DEFAULT_CLONE_DEPTH)]); } catch { /* ok */ }
-    try {
-      const mergeBase = git(['merge-base', 'HEAD', `origin/${prBaseBranch}`]).trim();
-      if (mergeBase) await fs.promises.writeFile(`/tmp/base_commit_${taskId}`, mergeBase);
-    } catch { /* ok */ }
-    const title = strVal(task.title) || 'Operator-requested fresh review';
-    await runFreshReviewerPass(taskId, title, rawPrompt || '', relatedFiles, ws, statusRef, model, task.project_context as Record<string, unknown> | undefined, false, false, true, operatorReviewFor, sensitivePathsFromMetadata(task.project_metadata as Record<string, unknown> | undefined));
-    return;
-  }
 
   const createScope = taskCtx?.scope as string | undefined;
   const isMediumOrLargeScope = createScope === 'medium' || createScope === 'large';

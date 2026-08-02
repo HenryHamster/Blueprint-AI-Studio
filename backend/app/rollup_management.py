@@ -40,6 +40,7 @@ from app.review_pipeline import (
     _load_pipeline_liveness_lookups,
     _task_is_actively_ci_waiting,
 )
+from app.review_policy_merge import attempt_policy_bound_merge
 from app.rollup_branch_cleanup import (  # noqa: F401 — re-exported for callers/tests
     _branch_task_id_prefix,
     _classify_prs_authoritative,
@@ -53,7 +54,6 @@ from app.rollup_migration_validation import (  # noqa: F401 - re-exported for ca
     _plan_rollup_migration_reconciliation,
     _touches_alembic_versions,
     _validate_rollup_migration_chain,
-    pr_touches_migrations,
 )
 from app.rollup_pr_verification import (  # noqa: F401 — re-exported for callers/tests
     MAX_REVIEW_RESPAWNS,
@@ -631,25 +631,6 @@ def _ctx_has_genuine_rejection_marker(ctx: dict | None) -> bool:
     return ctx.get("failure_detail") in _GENUINE_REJECTION_CTX_MARKERS
 
 
-def _ctx_review_was_approved(ctx: dict | None) -> bool:
-    """True when the DB shows this PR was approved before the close.
-
-    Reads the parent's ``review_loop.review_approved`` flag and the legacy
-    ``verdict == 'APPROVE'`` / ``blueprint_review_verdict == 'APPROVE'`` forms.
-    An approved-then-closed-unmerged PR is, by definition, not a rejection — the
-    change was signed off and the close means the work landed (or was de-scoped)
-    elsewhere.
-    """
-    if not ctx:
-        return False
-    review_loop = ctx.get("review_loop") or {}
-    if review_loop.get("review_approved") is True:
-        return True
-    if review_loop.get("verdict") == "APPROVE":
-        return True
-    return ctx.get("blueprint_review_verdict") == "APPROVE"
-
-
 def _ctx_has_supersession_signal(task: "Task") -> bool:
     """True when context / status message marks this PR as superseded or
     de-scoped by a sibling/parent rollup (a recognized cleanup signal)."""
@@ -690,9 +671,12 @@ async def _pr_closed_is_non_rejection(
       1. No genuine-rejection DB marker (pr_rejected / review_cap_exhausted).
       2. No GitHub review with state == CHANGES_REQUESTED.
       3. At least one positive cleanup/supersession signal:
-           • the PR was approved before the close, or
            • a supersession / de-scope marker, or
            • the PR is Blueprint-bot-authored (housekeeping close).
+
+    Approval is deliberately not a cleanup signal. A human-authored PR can be
+    approved and later closed because the work was abandoned or invalidated;
+    only explicit supersession/de-scope evidence can downgrade that close.
 
     GUARDRAIL: any CHANGES_REQUESTED review, or any genuine-rejection marker, or
     the absence of every cleanup signal → returns False so the caller keeps the
@@ -761,8 +745,6 @@ async def _pr_closed_is_non_rejection(
         )
 
     # (3) Require at least one positive cleanup/supersession signal.
-    if _ctx_review_was_approved(ctx):
-        return True
     if _ctx_has_supersession_signal(task):
         return True
     return _pr_author_is_blueprint_bot(pr_data)
@@ -3944,6 +3926,21 @@ async def _check_and_trigger_rollup(
                         )
                         return
 
+                    _rollup_checked_head = str(
+                        (pr_detail.get("head") or {}).get("sha") or ""
+                    )
+                    _rollup_checked_base = str(
+                        (pr_detail.get("base") or {}).get("sha") or ""
+                    )
+                    if not _rollup_checked_head or not _rollup_checked_base:
+                        parent.latest_status_message = (
+                            f"Rollup PR #{rollup_pr_number} merge held — could not "
+                            "bind the attempt to an immutable base/head"
+                        )[:500]
+                        session.add(parent)
+                        await session.commit()
+                        return
+
                     # Release lock around the actual merge call (slowest of all).
                     pre_actual_merge_snapshot = await _release_parent_lock(parent, session)
                     # NOTE: A pre-merge "is the PR behind base?" check used to live
@@ -3956,14 +3953,41 @@ async def _check_and_trigger_rollup(
                     # post-merge at the `_ms == "behind"` branch below — GitHub's
                     # mergeable_state distinguishes real behind from
                     # head-ahead-of-base. Removed 2026-05-26 (PR #6096 incident).
-                    merge_result = await merge_pull_request(
-                        gh_token,
-                        owner,
-                        repo,
-                        rollup_pr_number,
-                        project_id=str(parent.project_id),
-                        expected_head_sha=(pr_detail.get("head") or {}).get("sha"),
+                    async def _submit_small_rollup_merge(
+                        expected_head_sha: str,
+                    ) -> dict:
+                        return await merge_pull_request(
+                            gh_token,
+                            owner,
+                            repo,
+                            rollup_pr_number,
+                            project_id=str(parent.project_id),
+                            expected_head_sha=expected_head_sha,
+                        )
+
+                    _rollup_authority, merge_result = await attempt_policy_bound_merge(
+                        parent,
+                        session,
+                        merge_call=_submit_small_rollup_merge,
+                        gh_token=gh_token,
+                        owner=owner,
+                        repo=repo,
+                        pr_number=rollup_pr_number,
+                        branch=staging_branch,
+                        base_branch=target_branch,
+                        checked_head_sha=_rollup_checked_head,
+                        checked_base_sha=_rollup_checked_base,
+                        review_not_required_reason=(
+                            "small intermediate rollup (<=100 changed lines): "
+                            "downstream rollup receives full review"
+                        ),
                     )
+                    _rollup_merge_held = merge_result is None
+                    if merge_result is None:
+                        merge_result = {
+                            "merged": False,
+                            "message": "held by authoritative review gate",
+                        }
                     parent = await _relock_parent(
                         session,
                         parent_id_local,
@@ -3975,6 +3999,10 @@ async def _check_and_trigger_rollup(
                         # next sweep will pick up the merged state.
                         return
                     parent_ctx = parent.context or {}
+                    if _rollup_merge_held:
+                        session.add(parent)
+                        await session.commit()
+                        return
                     if merge_result.get("merged"):
                         (_landed, _terminal_rollup_merge) = (
                             await _classify_merged_rollup_landing(
@@ -4396,6 +4424,7 @@ async def _check_and_trigger_rollup(
                                 _repoll_merged = False
                                 _repoll_success_ri: int | None = None
                                 _repoll_merge_fail_msg: str | None = None
+                                _repoll_authority_held = False
 
                                 # Release the FOR UPDATE lock before I/O to honour
                                 # the release-lock-around-GitHub-I/O invariant
@@ -4435,14 +4464,66 @@ async def _check_and_trigger_rollup(
                                     if _ms_rp == "clean":
                                         # Resolved — retry merge inline so the
                                         # task doesn't wait for the next sweep.
-                                        _rp_merge = await merge_pull_request(
-                                            gh_token,
-                                            owner,
-                                            repo,
-                                            rollup_pr_number,
-                                            project_id=str(parent.project_id),
+                                        _rp_head = str(
+                                            (_rp_detail.get("head") or {}).get("sha")
+                                            or ""
                                         )
-                                        if _rp_merge.get("merged"):
+                                        _rp_base = str(
+                                            (_rp_detail.get("base") or {}).get("sha")
+                                            or ""
+                                        )
+                                        _validated_base = str(
+                                            (pr_detail.get("base") or {}).get("sha")
+                                            or ""
+                                        )
+                                        if (
+                                            not _rp_head
+                                            or not _rp_base
+                                            or _rp_base != _validated_base
+                                        ):
+                                            _repoll_merge_fail_msg = (
+                                                "live base/head no longer matches the "
+                                                "validated rollup target"
+                                            )
+                                            break
+                                        async def _submit_repoll_merge(
+                                            expected_head_sha: str,
+                                        ) -> dict:
+                                            return await merge_pull_request(
+                                                gh_token,
+                                                owner,
+                                                repo,
+                                                rollup_pr_number,
+                                                project_id=project_id_str,
+                                                expected_head_sha=expected_head_sha,
+                                            )
+
+                                        _rp_authority, _rp_merge = (
+                                            await attempt_policy_bound_merge(
+                                                parent,
+                                                session,
+                                                merge_call=_submit_repoll_merge,
+                                                gh_token=gh_token,
+                                                owner=owner,
+                                                repo=repo,
+                                                pr_number=rollup_pr_number,
+                                                branch=staging_branch,
+                                                base_branch=target_branch,
+                                                checked_head_sha=_rp_head,
+                                                checked_base_sha=_rp_base,
+                                                review_not_required_reason=(
+                                                    "small intermediate rollup "
+                                                    "(<=100 changed lines): downstream "
+                                                    "rollup receives full review"
+                                                ),
+                                            )
+                                        )
+                                        if _rp_merge is None:
+                                            _repoll_authority_held = True
+                                            _repoll_merge_fail_msg = (
+                                                "held by authoritative review gate"
+                                            )
+                                        elif _rp_merge.get("merged"):
                                             _repoll_merged = True
                                             _repoll_success_ri = _ri
                                         else:
@@ -4478,6 +4559,11 @@ async def _check_and_trigger_rollup(
                                 if parent is None:
                                     return
                                 parent_ctx = parent.context or {}
+
+                                if _repoll_authority_held:
+                                    session.add(parent)
+                                    await session.commit()
+                                    return
 
                                 if _repoll_merged:
                                     (
@@ -4562,53 +4648,6 @@ async def _check_and_trigger_rollup(
                             # Re-poll resolved to dirty; skip deferral and fall through
                             # to the conflict-fix spawn path below.
                             if _ms != "dirty":
-                                # For blocked/unstable, ask GitHub to auto-merge once gates
-                                # clear — mirrors the task_lifecycle auto-merge fallback so a
-                                # passing rollup PR lands without waiting on the reaper's
-                                # 15-minute stale-parent sweep. Deferral counters below still
-                                # run so a genuinely stuck PR still escalates to approval.
-                                if _ms_key in ("blocked", "unstable"):
-                                    # Migration-carrying rollup PRs must NOT be handed to
-                                    # GitHub native auto-merge: the target branch can advance
-                                    # while checks are pending, so the eventual merge could land
-                                    # against a different migration chain than the one Blueprint
-                                    # validated. Skip delegation and fall through to the
-                                    # deferral / re-validation path so _validate_rollup_migration_chain
-                                    # re-runs against the live target_branch on the next sweep.
-                                    if await pr_touches_migrations(
-                                        gh_token, owner, repo, rollup_pr_number
-                                    ):
-                                        logger.info(
-                                            f"[ROLLUP] PR #{rollup_pr_number} mergeable_state={_ms_key} "
-                                            f"touches Alembic migrations — skipping GitHub auto-merge; "
-                                            f"deferring for re-validation against {target_branch}"
-                                        )
-                                    else:
-                                        try:
-                                            from app.github import enable_auto_merge
-
-                                            am_result = await enable_auto_merge(
-                                                gh_token,
-                                                owner,
-                                                repo,
-                                                rollup_pr_number,
-                                                project_id=str(parent.project_id),
-                                            )
-                                            if am_result.get("enabled"):
-                                                logger.info(
-                                                    f"[ROLLUP] PR #{rollup_pr_number} mergeable_state={_ms_key} "
-                                                    f"— enabled GitHub auto-merge"
-                                                )
-                                            else:
-                                                logger.info(
-                                                    f"[ROLLUP] PR #{rollup_pr_number} auto-merge enablement "
-                                                    f"declined: {am_result.get('message')}"
-                                                )
-                                        except Exception as _am_exc:
-                                            logger.warning(
-                                                f"[ROLLUP] Auto-merge enablement failed for PR "
-                                                f"#{rollup_pr_number}: {_am_exc}"
-                                            )
                                 prev_state = parent_ctx.get("_merge_deferred_state")
                                 deferred_count = (
                                     (parent_ctx.get("_merge_deferred_count", 0) + 1)
@@ -4729,13 +4768,76 @@ async def _check_and_trigger_rollup(
                                         parent, session, context_dirty=True
                                     )
                                     try:
-                                        _esc_result = await merge_pull_request(
+                                        _esc_detail = await get_pull_request(
                                             gh_token,
                                             owner,
                                             repo,
                                             rollup_pr_number,
-                                            project_id=str(parent.project_id),
+                                            project_id=project_id_str,
                                         )
+                                        _esc_head = str(
+                                            (_esc_detail.get("head") or {}).get("sha")
+                                            or ""
+                                        )
+                                        _esc_base = str(
+                                            (_esc_detail.get("base") or {}).get("sha")
+                                            or ""
+                                        )
+                                        _validated_base = str(
+                                            (pr_detail.get("base") or {}).get("sha")
+                                            or ""
+                                        )
+                                        if (
+                                            _esc_head
+                                            and _esc_base
+                                            and _esc_base == _validated_base
+                                        ):
+                                            async def _submit_escalation_merge(
+                                                expected_head_sha: str,
+                                            ) -> dict:
+                                                return await merge_pull_request(
+                                                    gh_token,
+                                                    owner,
+                                                    repo,
+                                                    rollup_pr_number,
+                                                    project_id=project_id_str,
+                                                    expected_head_sha=expected_head_sha,
+                                                )
+
+                                            _esc_authority, _esc_result = (
+                                                await attempt_policy_bound_merge(
+                                                    parent,
+                                                    session,
+                                                    merge_call=_submit_escalation_merge,
+                                                    gh_token=gh_token,
+                                                    owner=owner,
+                                                    repo=repo,
+                                                    pr_number=rollup_pr_number,
+                                                    branch=staging_branch,
+                                                    base_branch=target_branch,
+                                                    checked_head_sha=_esc_head,
+                                                    checked_base_sha=_esc_base,
+                                                    review_not_required_reason=(
+                                                        "small intermediate rollup "
+                                                        "(<=100 changed lines): "
+                                                        "downstream rollup receives "
+                                                        "full review"
+                                                    ),
+                                                )
+                                            )
+                                            if _esc_result is None:
+                                                _esc_result = {
+                                                    "merged": False,
+                                                    "authority_held": True,
+                                                    "message": (
+                                                        "held by authoritative review gate"
+                                                    ),
+                                                }
+                                        else:
+                                            _esc_result = {
+                                                "merged": False,
+                                                "message": "live base/head changed since validation",
+                                            }
                                     except Exception as _esc_exc:
                                         logger.warning(
                                             f"[ROLLUP] PR #{rollup_pr_number} "
@@ -4752,6 +4854,10 @@ async def _check_and_trigger_rollup(
                                     if parent is None:
                                         return
                                     parent_ctx = parent.context or {}
+                                    if _esc_result.get("authority_held"):
+                                        session.add(parent)
+                                        await session.commit()
+                                        return
                                     if _esc_result.get("merged"):
                                         (
                                             _esc_landed,

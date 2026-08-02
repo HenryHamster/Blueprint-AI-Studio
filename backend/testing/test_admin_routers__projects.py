@@ -1195,7 +1195,6 @@ class TestUpdateProjectOwnerOnlyFields:
         project.github_repo = "preserve-repo"
         project.build_config = {
             "env_vars": {"TOKEN": "secret"},
-            "enable_fresh_reviewer": True,
             "enable_parallel_review": True,
             "enable_parallel_fix": False,
             "task_branch_namespace": "agents",
@@ -1226,7 +1225,6 @@ class TestUpdateProjectOwnerOnlyFields:
         build_config = resp.json().get("build_config") or {}
         assert build_config.get("language") == "typescript"
         assert build_config.get("env_vars", {}).get("TOKEN") == "secret"
-        assert build_config.get("enable_fresh_reviewer") is True
         assert build_config.get("enable_parallel_review") is True
         assert build_config.get("enable_parallel_fix") is False
         assert build_config.get("task_branch_namespace") == "agents"
@@ -1240,7 +1238,6 @@ class TestUpdateProjectOwnerOnlyFields:
         assert (project.build_config or {}).get("env_vars", {}).get("TOKEN") == (
             "secret"
         )
-        assert (project.build_config or {}).get("enable_fresh_reviewer") is True
         assert (project.build_config or {}).get("enable_parallel_review") is True
         assert (project.build_config or {}).get("enable_parallel_fix") is False
         assert (project.build_config or {}).get("task_branch_namespace") == "agents"
@@ -1364,7 +1361,6 @@ class TestApplyOperatorBuildConfigOverrides:
             "git_user_email": "bot@example.com",
             "git_user_name": "Bot",
             "env_vars": {"TOKEN": "secret"},
-            "enable_fresh_reviewer": True,
             "enable_parallel_review": True,
             "enable_parallel_fix": False,
             "task_branch_namespace": "agents",
@@ -1385,7 +1381,6 @@ class TestApplyOperatorBuildConfigOverrides:
         assert merged["git_user_email"] == "bot@example.com"
         assert merged["git_user_name"] == "Bot"
         assert merged["env_vars"] == {"TOKEN": "secret"}
-        assert merged["enable_fresh_reviewer"] is True
         assert merged["enable_parallel_review"] is True
         assert merged["enable_parallel_fix"] is False
         assert merged["task_branch_namespace"] == "agents"

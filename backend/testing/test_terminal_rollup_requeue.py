@@ -562,9 +562,17 @@ def test_attempt_reset_preserves_chain_metadata_only():
         {
             "review_history": [{"verdict": "APPROVE"}],
             "_ci_backstop_first_defer_at": "old",
-            "skip_rereview_minor_only": True,
             "future_unknown_attempt_latch": True,
-            "issue_ledger": {"contested": [{"file": "app.py"}]},
+            "issue_ledger": {
+                "open": [
+                    {
+                        "issue_id": "BP-example",
+                        "severity": "major",
+                        "description": "binding blocker",
+                        "file": "app.py",
+                    }
+                ]
+            },
             "fix_agent_responses": [{"issue": "chain evidence"}],
             "iteration_reset_at": "2026-07-17T10:00:00",
             "iteration_reset_by": "operator@example.test",
@@ -581,7 +589,16 @@ def test_attempt_reset_preserves_chain_metadata_only():
         "iteration": 3,
         "original_task_id": "chain-root",
         "fix_reason": "preserve this chain reason",
-        "issue_ledger": {"contested": [{"file": "app.py"}]},
+        "issue_ledger": {
+            "open": [
+                {
+                    "issue_id": "BP-example",
+                    "severity": "major",
+                    "description": "binding blocker",
+                    "file": "app.py",
+                }
+            ]
+        },
         "fix_agent_responses": [{"issue": "chain evidence"}],
         "iteration_reset_at": "2026-07-17T10:00:00",
         "iteration_reset_by": "operator@example.test",

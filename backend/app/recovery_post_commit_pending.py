@@ -2,16 +2,16 @@
 
 Extracted from ``app.recovery_post_commit`` so the post-commit-pending sweep
 cluster is independent of the orphan-recovery, stranded-sidecar, lane-baseline,
-and bootstrap sweeps.  Holds:
+and bootstrap sweeps. Holds:
 
-* ``_claim_and_bump_total_attempts`` — isolated claim-time attempt accounting
-* ``_build_post_commit_abandoned_context`` — pure context-dict builder
 * ``_sweep_post_commit_pending`` — main pending-marker sweep (runs every 60s)
 * ``_recover_childless_evaluating_without_marker`` — marker-less childless guard
 
-All four names are re-exported from ``app.recovery_post_commit`` (and in turn
-from ``app.recovery_sweeps`` and ``app.services``) via back-compat re-imports so
-existing call sites and test patch targets keep resolving unchanged.
+Atomic claim ownership and abandoned-context helpers live in
+``app.recovery_post_commit_claim`` and are imported here because the sweep is
+their sole runtime caller. Public recovery names are re-exported from
+``app.recovery_post_commit`` (and in turn from ``app.recovery_sweeps`` and
+``app.services``) so existing call sites and test patch targets keep resolving.
 
 ``_post_commit_retry_is_transient`` and ``_AWAITING_SIDECAR_KEYS`` stay in
 ``app.recovery_post_commit`` (shared with other sweeps); they are imported
@@ -30,6 +30,12 @@ from sqlmodel import select
 from app import services
 from app.database import resolve_dialect_name
 from app.models import Task, TaskStatus
+from app.recovery_post_commit_claim import (
+    _build_post_commit_abandoned_context,
+    _claim_and_bump_total_attempts,
+    _post_commit_claim_is_current,
+)
+from app.review_execution_ownership import POST_COMMIT_CONTINUATION_STATUSES
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -46,94 +52,6 @@ logger = logging.getLogger(__name__)
 # legitimate post-commit (240s per-call budget, retried at the 60s sweep cadence
 # — a healthy marker clears in minutes, never 90 min).
 POST_COMMIT_MAX_PENDING_AGE_S = 90 * 60
-
-
-async def _claim_and_bump_total_attempts(task_id, pending_meta) -> dict | None:
-    """Try to claim the task row and advance total_attempts atomically.
-
-    Opens an isolated session, dialect-gates SET LOCAL lock_timeout, and issues
-    SELECT ... FOR UPDATE SKIP LOCKED on the task row. Returns None if the row
-    is held by another writer (caller should defer this marker without doing any
-    work — zero lock_timeout burned, zero DB connections wasted). Returns a dict
-    with the bumped ``total_attempts`` value when the lock is acquired; the commit
-    releases the row lock in milliseconds so _process_post_commit's own
-    skip_locked attempt succeeds immediately after.
-
-    Write-ahead durability: the claim-commit advances total_attempts BEFORE work
-    starts. A hard kill after this commit but before _process_post_commit means
-    the next sweep sees total_attempts already incremented — correct; the ceiling
-    fires in bounded cycles regardless of whether the work ran.
-    """
-    async with services.AsyncSessionLocal() as claim_session:
-        if resolve_dialect_name(claim_session) == "postgresql":
-            await claim_session.execute(text("SET LOCAL lock_timeout = '5s'"))
-        locked = (
-            (
-                await claim_session.execute(
-                    select(Task)
-                    .where(Task.id == task_id)
-                    .with_for_update(skip_locked=True)
-                )
-            )
-            .scalars()
-            .first()
-        )
-        if locked is None:
-            return None  # Row held by peer — defer this cycle
-
-        new_ctx = dict(locked.context or {})
-        new_meta = dict(new_ctx.get("_post_commit_pending_meta") or pending_meta)
-        # Seed from on-disk value; fall back to attempts for pre-rework markers
-        # that have no total_attempts field yet.
-        _current_ta = int(
-            new_meta.get("total_attempts") or new_meta.get("attempts", 0) or 0
-        )
-        new_ta = _current_ta + 1
-        new_meta["total_attempts"] = new_ta
-        new_ctx["_post_commit_pending_meta"] = new_meta
-        locked.context = new_ctx
-        from sqlalchemy.orm.attributes import flag_modified
-
-        flag_modified(locked, "context")
-        claim_session.add(locked)
-        await claim_session.commit()
-        return {"total_attempts": new_ta}
-
-
-def _build_post_commit_abandoned_context(
-    ctx: dict,
-    *,
-    after_attempts: int | None = None,
-    after_total_attempts: int | None = None,
-    after_pending_age_s: int | None = None,
-    reason: str | None = None,
-    last_reason: str | None = None,
-) -> dict:
-    """Build context dict with _post_commit_abandoned marker.
-
-    Returns a new context dict with:
-    - _post_commit_abandoned key set with provided fields (always includes "at")
-    - _post_commit_pending_meta key removed
-
-    Does not touch any session or database.
-    """
-    new_ctx = dict(ctx or {})
-    abandoned = {"at": _utcnow().isoformat()}
-
-    if after_attempts is not None:
-        abandoned["after_attempts"] = after_attempts
-    if after_total_attempts is not None:
-        abandoned["after_total_attempts"] = after_total_attempts
-    if after_pending_age_s is not None:
-        abandoned["after_pending_age_s"] = after_pending_age_s
-    if reason is not None:
-        abandoned["reason"] = reason
-    if last_reason is not None:
-        abandoned["last_reason"] = last_reason
-
-    new_ctx["_post_commit_abandoned"] = abandoned
-    new_ctx.pop("_post_commit_pending_meta", None)
-    return new_ctx
 
 
 async def _sweep_post_commit_pending():
@@ -221,13 +139,7 @@ async def _sweep_post_commit_pending():
                         select(Task)
                         .where(
                             Task.post_commit_pending.is_(True),
-                            Task.status.in_(
-                                [
-                                    TaskStatus.COMPLETED,
-                                    TaskStatus.FAILED,
-                                    TaskStatus.EVALUATING,
-                                ]
-                            ),
+                            Task.status.in_(POST_COMMIT_CONTINUATION_STATUSES),
                             Task.archived.is_(False),
                         )
                         .limit(50)
@@ -494,32 +406,6 @@ async def _sweep_post_commit_pending():
                     await session.commit()
                     continue
 
-                if not payload_dump:
-                    # Older pending flag that didn't store the payload — we
-                    # can't reconstruct. Mark abandoned.
-                    logger.warning(
-                        f"[POST_COMMIT SWEEP] Task {str(task.id)[:8]} has no saved payload — cannot retry"
-                    )
-                    task.context = _build_post_commit_abandoned_context(
-                        ctx, reason="no_saved_payload"
-                    )
-                    task.post_commit_pending = False
-                    task.post_commit_failed = True
-                    from sqlalchemy.orm.attributes import flag_modified
-
-                    flag_modified(task, "context")
-                    session.add(task)
-                    await session.commit()
-                    continue
-
-                try:
-                    _payload = AgentStatusPayload(**payload_dump)
-                except Exception as e:
-                    logger.warning(
-                        f"[POST_COMMIT SWEEP] Task {str(task.id)[:8]} payload reconstruct failed: {e}"
-                    )
-                    continue
-
                 # Claim-time attempt accounting: advance total_attempts BEFORE
                 # doing any work. This decouples the ceiling from the contended
                 # row — if the row is held by a dead connection or a peer, we
@@ -531,7 +417,14 @@ async def _sweep_post_commit_pending():
                 _task_id_short = str(task.id)[:8]
                 try:
                     claimed = await _claim_and_bump_total_attempts(
-                        task.id, pending_meta
+                        task.id,
+                        pending_meta,
+                        expected_status=task.status,
+                        expected_generation_token=str(
+                            pending_meta.get("generation_token")
+                            or pending_meta.get("at")
+                            or ""
+                        ),
                     )
                 except Exception as claim_exc:
                     logger.warning(
@@ -555,6 +448,47 @@ async def _sweep_post_commit_pending():
                 # is claimed, bumped to MAX_TOTAL_ATTEMPTS, and terminalized here
                 # without invoking _process_post_commit.
                 total_attempts = claimed["total_attempts"]
+                claim_token = claimed["claim_token"]
+                payload_dump = claimed.get("payload")
+                attempts = claimed["attempts"]
+                pending_meta = {
+                    **pending_meta,
+                    "generation_token": claimed.get("generation_token"),
+                    "claim_token": claim_token,
+                    "reason": claimed.get("reason"),
+                    "payload": payload_dump,
+                    "attempts": attempts,
+                    "total_attempts": total_attempts,
+                }
+                if not payload_dump:
+                    logger.warning(
+                        f"[POST_COMMIT SWEEP] Task {_task_id_short} has no saved "
+                        "payload — abandoning the claimed generation"
+                    )
+                    async with services.AsyncSessionLocal() as abandon_session:
+                        refreshed = await abandon_session.get(Task, task.id)
+                        if refreshed and _post_commit_claim_is_current(
+                            refreshed, claim_token
+                        ):
+                            refreshed.context = _build_post_commit_abandoned_context(
+                                refreshed.context, reason="no_saved_payload"
+                            )
+                            refreshed.post_commit_pending = False
+                            refreshed.post_commit_failed = True
+                            from sqlalchemy.orm.attributes import flag_modified
+
+                            flag_modified(refreshed, "context")
+                            abandon_session.add(refreshed)
+                            await abandon_session.commit()
+                    continue
+                try:
+                    _payload = AgentStatusPayload(**payload_dump)
+                except Exception as e:
+                    logger.warning(
+                        f"[POST_COMMIT SWEEP] Task {_task_id_short} claimed payload "
+                        f"reconstruct failed: {e}"
+                    )
+                    continue
                 if total_attempts >= services.MAX_TOTAL_ATTEMPTS:
                     _cap_label = "total_attempts"
                     logger.warning(
@@ -564,7 +498,9 @@ async def _sweep_post_commit_pending():
                     )
                     async with services.AsyncSessionLocal() as ceiling_session:
                         refreshed = await ceiling_session.get(Task, task.id)
-                        if refreshed and refreshed.post_commit_pending:
+                        if refreshed and _post_commit_claim_is_current(
+                            refreshed, claim_token
+                        ):
                             refreshed.context = _build_post_commit_abandoned_context(
                                 refreshed.context,
                                 after_attempts=attempts,
@@ -592,7 +528,12 @@ async def _sweep_post_commit_pending():
                     # falls into the except below, which bumps the attempt counter
                     # exactly as a genuine failure would (next sweep retries).
                     await services._bounded(
-                        _process_post_commit(task.id, _payload),
+                        _process_post_commit(
+                            task.id,
+                            _payload,
+                            _expected_post_commit_claim_token=claim_token,
+                            _expected_post_commit_status=task.status,
+                        ),
                         services._POST_COMMIT_CALL_TIMEOUT_S,
                         what=f"post-commit {_task_id_short}",
                     )
@@ -600,7 +541,9 @@ async def _sweep_post_commit_pending():
                     # have mutated context in other ways we want to keep).
                     async with services.AsyncSessionLocal() as clear_session:
                         refreshed = await clear_session.get(Task, task.id)
-                        if refreshed:
+                        if refreshed and _post_commit_claim_is_current(
+                            refreshed, claim_token
+                        ):
                             refreshed.post_commit_pending = False
                             new_ctx = dict(refreshed.context or {})
                             new_ctx.pop("_post_commit_pending_meta", None)
@@ -652,7 +595,9 @@ async def _sweep_post_commit_pending():
                                     text("SET LOCAL lock_timeout = '5s'")
                                 )
                             refreshed = await bump_session.get(Task, task.id)
-                            if refreshed:
+                            if refreshed and _post_commit_claim_is_current(
+                                refreshed, claim_token
+                            ):
                                 new_ctx = dict(refreshed.context or {})
                                 new_pending = dict(
                                     new_ctx.get("_post_commit_pending_meta")

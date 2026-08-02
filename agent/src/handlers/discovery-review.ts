@@ -3,12 +3,12 @@ import {
   DEFAULT_TOOL_GUIDANCE,
   WORKSPACE,
   buildContextPrefix,
-  buildFileTree,
   buildPromptSizeTelemetry,
   computePromptFingerprint,
   configureAgentPermissions,
   git,
   persistAndPostStatus,
+  preparePacketOnlyWorkspace,
   prepareWorkspaceForRole,
   providerAutoInjectsClaudeMd,
   readClaudeMd,
@@ -80,6 +80,8 @@ interface DiscoveryReviewValidationContext {
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const GIT_SHA_PATTERN = /^[0-9a-f]{7,40}$/i;
+const DISCOVERY_REVIEW_SNAPSHOT_PROMPT_CHARS = 8_000;
+const DISCOVERY_REVIEW_SNAPSHOT_CONTRACT_CHARS = 12_000;
 const DISCOVERY_RESULT_KEYS = [
   'cycle_id',
   'reviewed_revision',
@@ -117,6 +119,35 @@ function hasExactKeys(
 function isNullablePositiveInteger(value: unknown): value is number | null {
   return value === null
     || (typeof value === 'number' && Number.isInteger(value) && value > 0);
+}
+
+function compactJsonSize(value: unknown): number | null {
+  try {
+    return JSON.stringify(value ?? {}).length;
+  } catch {
+    return null;
+  }
+}
+
+function boundedSnapshotJson(value: unknown): string {
+  try {
+    const rendered = JSON.stringify(value ?? {}, null, 2);
+    if (rendered.length <= DISCOVERY_REVIEW_SNAPSHOT_PROMPT_CHARS) {
+      return rendered;
+    }
+    const compact = JSON.stringify(value ?? {});
+    return JSON.stringify({
+      snapshot_truncated: true,
+      excerpt: compact.slice(0, DISCOVERY_REVIEW_SNAPSHOT_PROMPT_CHARS),
+      local_guard: true,
+    }, null, 2);
+  } catch {
+    return JSON.stringify({
+      snapshot_truncated: true,
+      local_guard: true,
+      error: 'snapshot was not JSON serializable',
+    }, null, 2);
+  }
 }
 
 /**
@@ -226,6 +257,17 @@ export function validateDiscoveryReviewShape(
       detail: 'next_bet must be an object or null',
     };
   }
+  if (raw.next_bet !== null) {
+    const nextBetSize = compactJsonSize(raw.next_bet);
+    if (nextBetSize === null
+        || nextBetSize > DISCOVERY_REVIEW_SNAPSHOT_PROMPT_CHARS) {
+      return {
+        ok: false,
+        reason: 'parsed_object_schema_mismatch',
+        detail: 'next_bet exceeds the bounded decision contract',
+      };
+    }
+  }
   if (typeof raw.recommended_phase !== 'string'
       || !(DISCOVERY_PHASES as readonly string[]).includes(raw.recommended_phase)) {
     return {
@@ -293,6 +335,25 @@ function reviewContractError(payload: Record<string, unknown>): string | null {
   if (!Array.isArray(payload.evidence_packet)) {
     return 'evidence_packet must be an array';
   }
+  for (const key of ['intent_snapshot', 'bet_snapshot'] as const) {
+    if (!isPlainObject(payload[key])) {
+      return `${key} must be an object`;
+    }
+    const size = compactJsonSize(payload[key]);
+    if (size === null || size > DISCOVERY_REVIEW_SNAPSHOT_CONTRACT_CHARS) {
+      return `${key} exceeds the bounded discovery review contract`;
+    }
+  }
+  if (payload.confirmation_proposal !== undefined
+      && payload.confirmation_proposal !== null) {
+    if (!isPlainObject(payload.confirmation_proposal)) {
+      return 'confirmation_proposal must be an object or null';
+    }
+    const size = compactJsonSize(payload.confirmation_proposal);
+    if (size === null || size > DISCOVERY_REVIEW_SNAPSHOT_CONTRACT_CHARS) {
+      return 'confirmation_proposal exceeds the bounded discovery review contract';
+    }
+  }
   const candidateSha = strVal(payload.candidate_sha).trim();
   if (candidateSha && !GIT_SHA_PATTERN.test(candidateSha)) {
     return 'candidate_sha must be a 7-40 character hexadecimal git commit';
@@ -311,6 +372,9 @@ export function buildDiscoveryReviewPrompt(
     ? payload.evidence_packet
     : [];
   const packetJson = JSON.stringify(packet, null, 2);
+  const reviewRound = typeof payload.review_round === 'number'
+    ? payload.review_round
+    : 1;
   const candidateStatement = resolvedCandidateSha
     ? (
       `The workspace is detached at the exact pinned candidate commit ` +
@@ -342,29 +406,29 @@ ${candidateStatement}
 - outcome_kind: \`${strVal(payload.outcome_kind)}\`
 - packet_checksum: \`${strVal(payload.packet_checksum)}\`
 - mechanism_fingerprint: \`${strVal(payload.mechanism_fingerprint) || '(none)'}\`
-- review_round: ${String(payload.review_round ?? 1)}
+- review_round: ${reviewRound}
 - prior_review_task_id: \`${strVal(payload.prior_review_task_id) || '(none)'}\`
 
 ${payload.review_round === 2 ? `Canonical proposal to confirm or reject:
 \`\`\`json
-${JSON.stringify(payload.confirmation_proposal ?? {}, null, 2)}
+${boundedSnapshotJson(payload.confirmation_proposal ?? {})}
 \`\`\`
 
 Independently judge that proposal against the frozen evidence. If it is
 supported, reproduce its verdict, next_bet, recommended_phase, and
 recommended_limits exactly in your output. If it is not supported, emit the
-different decision you believe the evidence warrants; disagreement will be
-sent for adjudication.
+different decision you believe the evidence warrants; disagreement will fail
+closed and be sent to the operator for adjudication.
 
 ` : ''}
 Intent snapshot:
 \`\`\`json
-${JSON.stringify(payload.intent_snapshot ?? {}, null, 2)}
+${boundedSnapshotJson(payload.intent_snapshot ?? {})}
 \`\`\`
 
 Bet snapshot:
 \`\`\`json
-${JSON.stringify(payload.bet_snapshot ?? {}, null, 2)}
+${boundedSnapshotJson(payload.bet_snapshot ?? {})}
 \`\`\`
 
 Evidence packet (the only IDs allowed in evidence_citations):
@@ -376,8 +440,6 @@ Server evidence manifest:
 \`\`\`json
 ${JSON.stringify(payload.evidence_packet_manifest ?? {}, null, 2)}
 \`\`\`
-
-${buildFileTree(null)}
 
 ## Review method
 
@@ -452,7 +514,10 @@ async function failDiscoveryReview(
   });
 }
 
-function discoveryReviewWorkspaceError(expectedHeadSha: string): string | null {
+function discoveryReviewWorkspaceError(
+  expectedHeadSha: string | null,
+): string | null {
+  if (expectedHeadSha === null) return null;
   try {
     const actualHeadSha = git(['rev-parse', 'HEAD']).trim().toLowerCase();
     if (actualHeadSha !== expectedHeadSha) {
@@ -498,28 +563,32 @@ export async function handleDiscoveryReview(
   const cycleId = strVal(payload.cycle_id);
   const expectedRevision = payload.expected_revision as number;
   const candidateSha = strVal(payload.candidate_sha).trim() || null;
-  const baseBranch = validateBranchName(
-    resolveBaseBranch(payload, task),
-    'base_branch',
-  );
 
   statusRef.value = `Preparing frozen discovery review ${cycleId.slice(0, 8)}...`;
-  const cloneUrl =
-    `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
-  await prepareWorkspaceForRole({
-    workspace: WORKSPACE,
-    repoUrl: cloneUrl,
-    githubToken: ghToken,
-    branch: baseBranch,
-    baseBranch,
-    depth: candidateSha ? 0 : 1,
-    allowLaneResume: false,
-  });
+  if (candidateSha) {
+    const baseBranch = validateBranchName(
+      resolveBaseBranch(payload, task),
+      'base_branch',
+    );
+    const cloneUrl =
+      `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
+    await prepareWorkspaceForRole({
+      workspace: WORKSPACE,
+      repoUrl: cloneUrl,
+      githubToken: ghToken,
+      branch: baseBranch,
+      baseBranch,
+      depth: 1,
+      allowLaneResume: false,
+    });
+  } else {
+    preparePacketOnlyWorkspace(WORKSPACE);
+  }
 
   let resolvedCandidateSha: string | null = null;
   if (candidateSha) {
     try {
-      git(['fetch', '--no-tags', 'origin', candidateSha]);
+      git(['fetch', '--depth=1', '--no-tags', 'origin', candidateSha]);
       git(['checkout', '--detach', candidateSha]);
       resolvedCandidateSha = git(['rev-parse', 'HEAD']).toLowerCase();
       if (!/^[0-9a-f]{40}$/.test(resolvedCandidateSha)
@@ -538,7 +607,9 @@ export async function handleDiscoveryReview(
       return;
     }
   }
-  const reviewHeadSha = git(['rev-parse', 'HEAD']).trim().toLowerCase();
+  const reviewHeadSha = candidateSha
+    ? git(['rev-parse', 'HEAD']).trim().toLowerCase()
+    : null;
 
   const disallowedTools = configureAgentPermissions('discovery_review');
   const prompt = buildDiscoveryReviewPrompt(payload, task, resolvedCandidateSha);
@@ -645,7 +716,7 @@ export async function handleDiscoveryReview(
         ? 'claude_code_failed'
         : 'discovery_review_unparseable',
       `Discovery review produced no valid binding verdict after one structured-output repair. ` +
-        `${failedRun.lastResultText || failedRun.allOutput.slice(-20_000)}`,
+        (failedRun.lastResultText || failedRun.allOutput.slice(-20_000)),
       ws,
     );
     return;

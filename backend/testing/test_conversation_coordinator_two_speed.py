@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlmodel import select
@@ -225,6 +226,121 @@ async def test_client_claim_id_reconciles_response_loss_exactly(db_session):
         claim_idempotency_key="different-key",
     )
     assert conflicting is None
+
+
+@pytest.mark.asyncio
+async def test_expired_exact_claim_rebinds_to_replacement_client_identity(db_session):
+    project, message, task = await _project_with_input(db_session)
+    project_id = project.id
+    message_id = message.id
+    task_id = task.id
+    newer = ProjectMessage(
+        project_id=project_id,
+        sequence=2,
+        surface=MessageSurface.CONVERSATION,
+        from_type="user",
+        content="newer input",
+        status="open",
+        handling_state=MessageHandlingState.PENDING,
+    )
+    db_session.add(newer)
+    await db_session.flush()
+    newer_id = newer.id
+    await db_session.commit()
+    old_client_claim_id = uuid.uuid4()
+    old_incarnation_id = uuid.uuid4()
+    first = await claim_operator_messages(
+        db_session,
+        project_id=project_id,
+        session_id="session",
+        task_id=task_id,
+        worker_generation=1,
+        incarnation_id=old_incarnation_id,
+        message_ids=[message_id],
+        lease_seconds=45,
+        public_reply_owner=ConversationPublicReplyOwner.FAST,
+        canonical_conversation_only=True,
+        client_claim_id=old_client_claim_id,
+        claim_idempotency_key="old-fast-turn",
+    )
+    assert first is not None
+    claimed_row = await db_session.get(ProjectMessage, message_id)
+    assert claimed_row is not None
+    claimed_row.conversation_claim_expires_at = datetime.now(timezone.utc).replace(
+        tzinfo=None
+    ) - timedelta(seconds=1)
+    db_session.add(claimed_row)
+    await db_session.commit()
+
+    replacement_client_claim_id = uuid.uuid4()
+    replacement_incarnation_id = uuid.uuid4()
+    expanded = await claim_operator_messages(
+        db_session,
+        project_id=project_id,
+        session_id="session",
+        task_id=task_id,
+        worker_generation=1,
+        incarnation_id=replacement_incarnation_id,
+        message_ids=[message_id, newer_id],
+        lease_seconds=45,
+        public_reply_owner=ConversationPublicReplyOwner.FAST,
+        canonical_conversation_only=True,
+        client_claim_id=replacement_client_claim_id,
+        claim_idempotency_key="replacement-fast-turn",
+    )
+    assert expanded is None
+    await db_session.rollback()
+
+    replacement = await claim_operator_messages(
+        db_session,
+        project_id=project_id,
+        session_id="session",
+        task_id=task_id,
+        worker_generation=1,
+        incarnation_id=replacement_incarnation_id,
+        message_ids=[message_id],
+        lease_seconds=45,
+        public_reply_owner=ConversationPublicReplyOwner.FAST,
+        canonical_conversation_only=True,
+        client_claim_id=replacement_client_claim_id,
+        claim_idempotency_key="replacement-fast-turn",
+    )
+
+    assert replacement is not None
+    assert replacement.claim_id == replacement_client_claim_id
+    assert replacement.attempt == 2
+    assert [row.id for row in replacement.rows] == [message_id]
+    assert replacement.rows[0].conversation_claim_incarnation == replacement_incarnation_id
+    assert (
+        replacement.rows[0].context["_conversation_claim_idempotency_key"]
+        == "replacement-fast-turn"
+    )
+    untouched_newer = await db_session.get(ProjectMessage, newer_id)
+    assert untouched_newer is not None
+    assert untouched_newer.handling_state == MessageHandlingState.PENDING
+    assert untouched_newer.conversation_claim_id is None
+    await db_session.commit()
+
+    # If the replacement's successful response is lost, its stable request
+    # must replay the newly rebound identity instead of waiting out another
+    # lease interval.
+    replay = await claim_operator_messages(
+        db_session,
+        project_id=project_id,
+        session_id="session",
+        task_id=task_id,
+        worker_generation=1,
+        incarnation_id=replacement_incarnation_id,
+        message_ids=[message_id],
+        lease_seconds=45,
+        public_reply_owner=ConversationPublicReplyOwner.FAST,
+        canonical_conversation_only=True,
+        client_claim_id=replacement_client_claim_id,
+        claim_idempotency_key="replacement-fast-turn",
+    )
+    assert replay is not None
+    assert replay.claim_id == replacement_client_claim_id
+    assert replay.attempt == 2
 
 
 @pytest.mark.asyncio

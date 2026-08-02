@@ -9,8 +9,8 @@
 // This module is the single source of truth. `DigestData` is the UNION of every
 // field either consumer reads, with per-field types chosen so the same object is
 // assignable to BOTH consumers' (and their child sections') prop contracts:
-//   - review sub-objects (self_review_*, review_accuracy, first_*_rate,
-//     fresh_reviewer_effectiveness) use the STRICTER (required-sample_size) shape
+//   - review sub-objects (self_review_*, review_accuracy, first_*_rate) use the
+//     STRICTER (required-sample_size) shape
 //     CatchUpReviewQualitySection demands, plus the dashboard's extra optional
 //     fields — strict objects are assignable to the dashboard's looser props.
 //   - `self_review_prediction_accuracy_trends` uses the richer
@@ -968,14 +968,6 @@ export interface DigestData<DP = unknown> {
     total_approvals: number;
     precision: number | null;
     recall: number | null;
-  } | null;
-  fresh_reviewer_effectiveness?: {
-    fresh_reviewer_sample_size: number;
-    fresh_reviewer_first_attempt_approval_rate: number | null;
-    baseline_first_attempt_approval_rate: number | null;
-    per_category_hit_rate: Record<string, number>;
-    reviewer_finding_added_value: Record<string, number>;
-    prediction_sample_size: number;
   } | null;
   edges_trend?: EdgesTrend | null;
   sr_false_attestation_trends?: {

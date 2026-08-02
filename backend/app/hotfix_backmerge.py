@@ -665,6 +665,32 @@ async def open_backmerge_pr(
         )
         return {"status": "blocked", "error": "pr_missing_number"}
 
+    # Snapshot the exact PR target that the validation below is about to
+    # inspect.  GitHub's create/reuse response is a full PR resource, so both
+    # sides are backend-observed rather than inferred from branch names.
+    initial_head = pr.get("head") or {}
+    initial_base = pr.get("base") or {}
+    initial_head_sha = str(initial_head.get("sha") or "").strip()
+    initial_base_sha = str(initial_base.get("sha") or "").strip()
+    if (
+        not initial_head_sha
+        or not initial_base_sha
+        or initial_head.get("ref") != promotion_target
+        or initial_base.get("ref") != integration_branch
+    ):
+        logger.warning(
+            "[BACKMERGE] project %s: PR #%s target could not be verified "
+            "before validation (head=%s@%s base=%s@%s) — leaving open for "
+            "the next sweep",
+            project_id,
+            pr_number,
+            initial_head.get("ref"),
+            initial_head_sha[:8] or "missing",
+            initial_base.get("ref"),
+            initial_base_sha[:8] or "missing",
+        )
+        return {"status": "deferred", "error": "pr_target_unverified", "pr_url": pr_url}
+
     # 3b. Combined Alembic migration-chain guard — runs BEFORE the merge.
     #     A hotfix migration that landed on the promotion target plus a feature
     #     migration added on the integration branch since the last promotion can
@@ -760,6 +786,63 @@ async def open_backmerge_pr(
             exc,
         )
 
+    # Serialize the final submission to this repository/base and PR with the
+    # same canonical advisory-lock order used by review/fix publication.  The
+    # live re-read happens inside both locks immediately before the expected-
+    # head PUT.  A push to the source branch or an advance of the integration
+    # base while validation was running therefore defers for fresh evidence.
+    from app.task_locking import acquire_merge_submission_locks
+
+    await acquire_merge_submission_locks(
+        session,
+        project_id=project_id,
+        repo_identity=f"{owner}/{repo}",
+        base_branch=integration_branch,
+        pr_number=int(pr_number),
+    )
+    try:
+        fresh_pr = await github.get_pull_request(
+            token, owner, repo, pr_number, project_id=str(project_id)
+        )
+    except Exception as exc:  # noqa: BLE001 — transient read, retry next sweep
+        logger.warning(
+            "[BACKMERGE] project %s: could not re-read PR #%s target after "
+            "validation (%s) — leaving open for the next sweep",
+            project_id,
+            pr_number,
+            exc,
+        )
+        return {"status": "retry", "error": "pr_target_unavailable", "pr_url": pr_url}
+
+    fresh_head = fresh_pr.get("head") or {}
+    fresh_base = fresh_pr.get("base") or {}
+    fresh_head_sha = str(fresh_head.get("sha") or "").strip()
+    fresh_base_sha = str(fresh_base.get("sha") or "").strip()
+    target_changed = (
+        fresh_pr.get("state") != "open"
+        or fresh_head.get("ref") != promotion_target
+        or fresh_base.get("ref") != integration_branch
+        or fresh_head_sha != initial_head_sha
+        or fresh_base_sha != initial_base_sha
+    )
+    if target_changed:
+        logger.info(
+            "[BACKMERGE] project %s: PR #%s target changed during validation "
+            "(%s@%s/%s@%s -> %s@%s/%s@%s, state=%s) — deferring",
+            project_id,
+            pr_number,
+            initial_base.get("ref"),
+            initial_base_sha[:8] or "missing",
+            initial_head.get("ref"),
+            initial_head_sha[:8] or "missing",
+            fresh_base.get("ref"),
+            fresh_base_sha[:8] or "missing",
+            fresh_head.get("ref"),
+            fresh_head_sha[:8] or "missing",
+            fresh_pr.get("state"),
+        )
+        return {"status": "deferred", "error": "pr_target_changed", "pr_url": pr_url}
+
     # 4. Merge the PR — merge_method="merge" preserves the main commit history.
     #    merge_pull_request does NOT raise on 405/409; it returns merged=False.
     try:
@@ -770,6 +853,7 @@ async def open_backmerge_pr(
             pr_number,
             merge_method="merge",
             project_id=str(project_id),
+            expected_head_sha=initial_head_sha,
         )
     except Exception as exc:  # noqa: BLE001 — a 5xx raises HTTPException; treat as blocked
         # A RATE-LIMITED merge (503, raised by github_pulls._raise_merge_pr_retryable)

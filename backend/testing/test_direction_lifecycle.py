@@ -2254,15 +2254,16 @@ def test_detect_already_fixed_deadlock_stops_at_legacy_entry():
 
 
 @pytest.mark.asyncio
-async def test_already_fixed_deadlock_auto_completes_via_apply_post_spawn(db_session):
-    """#10113 superseded: an already-fixed-deadlocked direction completes terminally
+async def test_already_fixed_deadlock_auto_retires_via_apply_post_spawn(db_session):
+    """#10113 superseded: an already-fixed-deadlocked direction retires terminally
     via apply_post_spawn_state instead of the old alert-only no-op.
 
     Three prior cycles whose spawned tasks all resolved SCOPE_EMPTY (work already on
     HEAD) make the direction genuinely exhausted. When a fresh no-findings cycle is
     applied and the direction is neither code-failing nor externally frozen, it is
-    routed to terminal status='completed' with an exhaustion reason and an INFO
-    'Direction auto-completed' alert.
+    routed to non-success terminal status='retired' with an exhaustion reason and
+    an INFO 'Direction auto-retired' alert. Exhaustion must not masquerade as
+    evidence that the direction achieved its declared outcome.
     """
     from app.models import Alert
     from app.research_direction_state import apply_post_spawn_state
@@ -2324,9 +2325,10 @@ async def test_already_fixed_deadlock_auto_completes_via_apply_post_spawn(db_ses
     await db_session.refresh(project)
 
     d = project.directions[0]
-    assert d["status"] == "completed", (
-        f"already-fixed-deadlocked direction should be terminally completed, got {d['status']!r}"
+    assert d["status"] == "retired", (
+        f"already-fixed-deadlocked direction should be terminally retired, got {d['status']!r}"
     )
+    assert d.get("retirement_outcome") == "exhausted"
     assert d.get("auto_completed") is True, "auto_completed must be set"
     assert d.get("completed_at") is not None, "completed_at must be stamped"
     assert "exhausted" in (d.get("auto_completed_reason") or ""), (
@@ -2336,12 +2338,12 @@ async def test_already_fixed_deadlock_auto_completes_via_apply_post_spawn(db_ses
     result = await db_session.execute(
         select(Alert).where(
             Alert.project_id == project.id,
-            Alert.title == "Direction auto-completed",
+            Alert.title == "Direction auto-retired",
             Alert.dismissed_at.is_(None),
         )
     )
     assert result.scalars().first() is not None, (
-        "expected a 'Direction auto-completed' alert"
+        "expected a 'Direction auto-retired' alert"
     )
 
 
@@ -2595,7 +2597,7 @@ async def _make_gap_project(db_session, direction: dict, problem_model: dict) ->
 
 @pytest.mark.asyncio
 async def test_code_failure_auto_retire_reconciles_gap(db_session, mocker):
-    """The code-failure auto-retire ladder must prune the now-completed direction
+    """The code-failure auto-retire ladder must prune the terminal direction
     out of its gap's active_moves and archive it in past_moves — the same terminal
     invariant the zombie/strategic retires preserve."""
     mocker.patch(
@@ -2648,7 +2650,8 @@ async def test_code_failure_auto_retire_reconciles_gap(db_session, mocker):
     await db_session.refresh(project)
 
     d = project.directions[0]
-    assert d["status"] == "completed", "code-failure ladder should auto-retire"
+    assert d["status"] == "retired", "code-failure ladder should auto-retire"
+    assert d["retirement_outcome"] == "failed"
     assert d.get("auto_completed") is True
     assert "code-failure" in (d.get("auto_completed_reason") or "").lower()
 
@@ -2973,7 +2976,7 @@ async def test_lifetime_burn_manual_hold_auto_retires_after_bound(db_session, mo
     lifecycle tick rather than accumulating another manual hold.
 
     Verifies:
-    - status=completed, auto_completed=True
+    - status=retired, retirement_outcome=failed, auto_completed=True
     - auto_completed_reason mentions 'lifetime burn'
     - needs_manual_intervention NOT set (cleared on retirement)
     - completed_at is set
@@ -3030,9 +3033,10 @@ async def test_lifetime_burn_manual_hold_auto_retires_after_bound(db_session, mo
     await db_session.refresh(project)
 
     d = project.directions[0]
-    assert d["status"] == "completed", (
+    assert d["status"] == "retired", (
         "direction should be auto-retired after hitting _MAX_LIFETIME_BURN_PAUSE_CYCLES"
     )
+    assert d["retirement_outcome"] == "failed"
     assert d.get("auto_completed") is True
     assert "lifetime burn" in (d.get("auto_completed_reason") or "").lower(), (
         f"auto_completed_reason should mention 'lifetime burn', got: {d.get('auto_completed_reason')!r}"
@@ -3125,9 +3129,10 @@ async def test_lifetime_burn_retire_stale_gap_id(db_session, mocker):
     await db_session.refresh(project_stale)
 
     d_stale = project_stale.directions[0]
-    assert d_stale["status"] == "completed", (
+    assert d_stale["status"] == "retired", (
         "direction should be auto-retired even with stale gap_id"
     )
+    assert d_stale["retirement_outcome"] == "failed"
     real_gap = next(
         g for g in project_stale.problem_model["gaps"] if g["id"] == "g-real-gap"
     )
@@ -3183,9 +3188,10 @@ async def test_lifetime_burn_retire_stale_gap_id(db_session, mocker):
     await db_session.refresh(project_no_gap)
 
     d_no_gap = project_no_gap.directions[0]
-    assert d_no_gap["status"] == "completed", (
+    assert d_no_gap["status"] == "retired", (
         "direction should be auto-retired even without any gap_id"
     )
+    assert d_no_gap["retirement_outcome"] == "failed"
     gap_no_id = project_no_gap.problem_model["gaps"][0]
     assert "d-lb-no-gap-id" not in gap_no_id["active_moves"], (
         "retired direction must be removed from active_moves when gap_id is absent"
@@ -3555,7 +3561,7 @@ async def test_churn_family_recommendation_full_path(db_session, mocker):
 @pytest.mark.asyncio
 async def test_lifecycle_auto_retire_records_retired_memory_before_prune(db_session, mocker):
     """Lifecycle auto-retire must write _recently_retired_directions to project.vision
-    on the same tick that marks the direction completed, before the next prune pass
+    on the same tick that marks the direction retired, before the next prune pass
     removes it from project.directions.
 
     Uses the code-failure retire path (code_failure_pause_count already at
@@ -3563,7 +3569,7 @@ async def test_lifecycle_auto_retire_records_retired_memory_before_prune(db_sess
     path without hand-setting the terminal counter. (The churn-family ladder no
     longer auto-retires — it records a reviewable recommendation — so a still
     terminal ladder is used here to exercise the retired-memory write.) A second
-    lifecycle tick then prunes the completed direction, confirming the memory
+    lifecycle tick then prunes the retired direction, confirming the memory
     survives.
     """
     mocker.patch(
@@ -3629,7 +3635,8 @@ async def test_lifecycle_auto_retire_records_retired_memory_before_prune(db_sess
     await db_session.refresh(project)
 
     d = project.directions[0]
-    assert d["status"] == "completed", "direction must be auto-retired by lifecycle tick"
+    assert d["status"] == "retired", "direction must be auto-retired by lifecycle tick"
+    assert d["retirement_outcome"] == "failed"
     assert d.get("auto_completed") is True
 
     # The retired memory must be written to vision on the SAME tick as the retire.
@@ -4717,7 +4724,7 @@ def test_keep_decision_reactivates_and_resets_churn_ladder():
     assert d.get("auto_recovered_at")
 
 
-def test_retire_decision_completes_and_clears_recommendation():
+def test_retire_decision_stops_and_clears_recommendation():
     """apply_churn_retirement_retire confirms the terminal outcome and clears the
     recommendation + manual-hold flags."""
     from app.direction_lifecycle import apply_churn_retirement_retire
@@ -4737,7 +4744,8 @@ def test_retire_decision_completes_and_clears_recommendation():
         "added_at": "2026-01-01T00:00:00",
     }
     apply_churn_retirement_retire(d, reason="Retired by explicit decision")
-    assert d["status"] == "completed"
+    assert d["status"] == "retired"
+    assert d["retirement_outcome"] == "stopped"
     assert d["auto_completed"] is True
     assert d["auto_completed_reason"] == "Retired by explicit decision"
     assert d["completed_at"]

@@ -49,7 +49,6 @@ class TaskType(str, Enum):
     repo_bootstrap = "repo_bootstrap"
     salvage_bundle = "salvage_bundle"
     capability_proof_trial = "capability_proof_trial"
-    criterion_coverage_trial = "criterion_coverage_trial"
     walkthrough_e2e = "walkthrough_e2e"
     memory_consolidation = "memory_consolidation"
 
@@ -761,49 +760,14 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         run_shape="single_agent",
     ),
     TaskCapability(
-        TaskType.criterion_coverage_trial,
-        "Criterion Coverage Trial",
-        "read_only",
-        default_category="ops",
-        # No LLM provider runs — the handler runs a bounded, targeted test suite
-        # (a merged task's declared named_test covering tests) and reports a
-        # pass/fail verdict; it never selects a model/account.
-        user_launchable=False,
-        provider_configurable=False,
-        # Not operator/strategist-spawnable and not a plan child: it is enrolled
-        # programmatically by the acceptance earn loop (via
-        # ``acceptance_criteria.enroll_criterion_coverage_trial`` from the reaper's
-        # step-21a backfill sweep), never authored by an agent or operator.
-        description=(
-            "Acceptance earn-loop execution trial: run ONLY a merged task's "
-            "declared ``named_test`` covering tests as a targeted runner job, "
-            "decoupled from the merge gate. A green run mints machine-verified "
-            "``covered`` criterion evidence (``executed_named_test``); a red run "
-            "records nothing and NEVER demotes existing evidence. Operators can "
-            "pause it with ``acceptance_earn_execution_trials_enabled``."
-        ),
-        # A single targeted agent run produces the verdict; it needs a code
-        # checkout to run the tests, but opens no PR — its durable product is the
-        # ingested covered-tier evidence, so output_kind is ``none`` and there is
-        # no forward merge gate (``evaluation="none"``). The ingestion completion
-        # handler consumes the reported result.
-        output_kind="none",
-        requires_code=True,
-        evaluation_strategy="metric",
-        cost_ceiling_usd=2.0,
-        completion_handler="criterion_coverage_trial",
-        evaluation="none",
-        run_shape="single_agent",
-    ),
-    TaskCapability(
         TaskType.walkthrough_e2e,
         "Walkthrough E2E",
         "read_only",
         default_category="ops",
         user_launchable=False,
         description=(
-            "Qualifier-spawned live-stack walkthrough that writes SHA-pinned "
-            "CriterionEvidence for operator-tools acceptance criteria."
+            "Opt-in qualifier live-stack walkthrough whose SHA-pinned report "
+            "and CriterionEvidence directly gate that qualification attempt."
         ),
         run_shape="single_agent",
         output_kind="verdict",
@@ -969,13 +933,6 @@ STRATEGIST_CONTEXTUAL_TASK_TYPES: frozenset[str] = frozenset(
     for capability in TASK_CAPABILITIES
     if capability.strategist_dispatch == "requires_context"
 )
-# Temporary compatibility export for callers that still import the historical
-# spawn_fix allowlist. spawn_fix itself is only an alias for unified spawn_task.
-STRATEGIST_ONE_TIME_SPAWNABLE_TYPES: frozenset[str] = frozenset(
-    task_type
-    for task_type in STRATEGIST_SPAWNABLE_TASK_TYPES
-    if TASK_CAPABILITY_BY_VALUE[task_type].agent_mode == "write"
-)
 # Map of task-type value -> declared completion-handler logical name, derived
 # from the registry. This REPLACES the hand-maintained if/elif completion
 # cascade in task_lifecycle._process_post_commit: that module binds each
@@ -1092,7 +1049,6 @@ AUTONOMOUS_SPAWN_SERVICING_TASK_TYPES: frozenset[str] = frozenset(
         TaskType.discovery_review.value,
         TaskType.salvage_bundle.value,
         TaskType.capability_proof_trial.value,
-        TaskType.criterion_coverage_trial.value,
         TaskType.walkthrough_e2e.value,
         TaskType.memory_consolidation.value,
     }

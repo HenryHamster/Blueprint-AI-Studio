@@ -324,6 +324,21 @@ async def run_infra_recovery_and_hold_maintenance(
         _resurrecting_keys: set[str] = set()
         for _t in _infra_failed:
             _ctx = _t.context or {}
+            _payload = _t.first_payload
+            # PR review/fix failures must be re-driven from current GitHub state
+            # through canonical review admission. A generic FAILED -> QUEUED
+            # flip can resurrect a stale review target or writer and wastes an
+            # agent even though the claim fence would ultimately reject it.
+            if (
+                _payload.get("type") in {"review", "fix"}
+                and _payload.get("pr_number")
+            ):
+                logger.info(
+                    "[REAPER] Skipping generic resurrection of PR %s task %s",
+                    _payload.get("type"),
+                    _t.id,
+                )
+                continue
             # Only resurrect infra-class failures, and only once per task.
             _fail_cat = _ctx.get("failure_category", "")
             if _fail_cat not in INFRA_CLASSES:

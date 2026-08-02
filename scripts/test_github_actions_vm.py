@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -265,9 +267,111 @@ class AssetSecurityTests(unittest.TestCase):
         self.assertIn("shard: [1, 2, 3, 4]", workflow)
         self.assertIn("--shard=${{ matrix.shard }}/4", viewport)
         self.assertIn(
+            'bash scripts/run_viewport_with_retry.sh 3m "$container_name"', viewport
+        )
+        self.assertIn('exit "$viewport_status"', viewport)
+        self.assertIn(
             "viewport-failure-screenshots-shard-${{ matrix.shard }}",
             workflow,
         )
+
+    def test_viewport_retry_distinguishes_timeout_from_child_exit(self):
+        bash = None
+        if os.name == "nt":
+            git_bash = Path(r"C:\Program Files\Git\bin\bash.exe")
+            if git_bash.exists():
+                bash = str(git_bash)
+        else:
+            bash = shutil.which("bash")
+        if bash is None:
+            self.skipTest("bash is required for the viewport retry lifecycle test")
+
+        helper = Path(__file__).parent / "run_viewport_with_retry.sh"
+
+        def bash_path(path: Path) -> str:
+            rendered = path.resolve().as_posix()
+            if os.name == "nt" and len(rendered) >= 3 and rendered[1:3] == ":/":
+                return f"/{rendered[0].lower()}{rendered[2:]}"
+            return rendered
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            fake_bin = temp / "bin"
+            fake_bin.mkdir()
+            docker_log = temp / "docker.log"
+            attempt_log = temp / "attempt.log"
+            fake_docker = fake_bin / "docker"
+            fake_docker.write_text(
+                '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$DOCKER_LOG"\n',
+                encoding="utf-8",
+            )
+            fake_docker.chmod(0o755)
+
+            env = os.environ.copy()
+            env.update(
+                {
+                    "BLUEPRINT_VIEWPORT_KILL_AFTER": "0.1s",
+                    "ATTEMPT_LOG": bash_path(attempt_log),
+                    "DOCKER_LOG": bash_path(docker_log),
+                    "PATH": f"{bash_path(fake_bin)}:{env.get('PATH', '')}",
+                    "RUNNER_TEMP": bash_path(temp),
+                }
+            )
+
+            def run(command: str) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [
+                        bash,
+                        bash_path(helper),
+                        "0.1s",
+                        "blueprint-viewport-test",
+                        "/usr/bin/bash",
+                        "-c",
+                        command,
+                    ],
+                    check=False,
+                    capture_output=True,
+                    env=env,
+                    text=True,
+                    timeout=10,
+                )
+
+            genuine_124 = run("exit 124")
+            self.assertEqual(genuine_124.returncode, 124, genuine_124.stderr)
+            self.assertFalse(docker_log.exists())
+
+            genuine_137 = run("exit 137")
+            self.assertEqual(genuine_137.returncode, 137, genuine_137.stderr)
+            self.assertFalse(docker_log.exists())
+
+            normal_failure = run("exit 42")
+            self.assertEqual(normal_failure.returncode, 42, normal_failure.stderr)
+            self.assertFalse(docker_log.exists())
+
+            responsive_timeout = run('echo attempt >> "$ATTEMPT_LOG"; sleep 2')
+            self.assertEqual(responsive_timeout.returncode, 124)
+            self.assertIn("timed out; retrying once", responsive_timeout.stderr)
+            self.assertEqual(docker_log.read_text(encoding="utf-8").count("rm -f"), 1)
+            self.assertEqual(attempt_log.read_text(encoding="utf-8").count("attempt"), 2)
+
+            docker_log.unlink()
+            attempt_log.unlink()
+            timeout_then_success = run(
+                'if [[ ! -e "$ATTEMPT_LOG" ]]; then touch "$ATTEMPT_LOG"; sleep 2; fi'
+            )
+            self.assertEqual(timeout_then_success.returncode, 0, timeout_then_success.stderr)
+            self.assertIn("timed out; retrying once", timeout_then_success.stderr)
+            self.assertEqual(docker_log.read_text(encoding="utf-8").count("rm -f"), 1)
+
+            docker_log.unlink()
+            attempt_log.unlink()
+            hard_timeout = run(
+                'echo attempt >> "$ATTEMPT_LOG"; trap \'\' TERM; sleep 2'
+            )
+            self.assertIn(hard_timeout.returncode, (124, 137))
+            self.assertIn("timed out; retrying once", hard_timeout.stderr)
+            self.assertEqual(docker_log.read_text(encoding="utf-8").count("rm -f"), 1)
+            self.assertEqual(attempt_log.read_text(encoding="utf-8").count("attempt"), 2)
 
     def test_backend_scrubs_cross_run_postgres_leftovers(self):
         workflow = (

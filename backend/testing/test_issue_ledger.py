@@ -1,470 +1,578 @@
-"""Unit tests for app.issue_ledger.
+"""Tests for the single authoritative review-blocker ledger."""
 
-Covers:
-  1. _region_anchor — symbol precedence, line-window derivation, empty fallback.
-  2. _region_key — returns None when no file.
-  3. build_issue_ledger — state machine:
-       DEMANDED → APPLIED → CONTESTED (incident-replay shape)
-       DEMANDED → APPLIED → RE_DEMANDED (high-overlap, NOT CONTESTED)
-       APPROVE transitions all DEMANDED → APPLIED
-       Non-review-iteration entries (no issues, fix tasks) are skipped
-       Line-drift: two issues at nearby lines → same region
-       Symbol anchors: symbol takes precedence over line window
-       Multiple iterations with no contestation → empty ledger
-       No file → region is invisible to ledger
-  4. format_contested_regions_for_fix / _for_review — non-empty when contested,
-       empty when no contested regions.
-"""
+from __future__ import annotations
 
-import pytest
+import hashlib
 
+from app.context_bounds import REVIEW_HISTORY_MAX_ENTRIES
 from app.issue_ledger import (
-    ISSUE_LEDGER_MAX_CONTESTED,
     _jaccard,
     _region_anchor,
     _region_key,
     build_issue_ledger,
-    format_contested_regions_for_fix,
-    format_contested_regions_for_review,
+    ensure_issue_ids,
+    issue_ledger_complete_for_history,
 )
-
-
-# ── Helpers ────────────────────────────────────────────────────────────────────
-
-
-def _rc_entry(iteration: int, issues: list) -> dict:
-    """Build a minimal REQUEST_CHANGES review_history entry."""
-    return {"iteration": iteration, "verdict": "REQUEST_CHANGES", "issues": issues}
-
-
-def _approve_entry(iteration: int) -> dict:
-    return {"iteration": iteration, "verdict": "APPROVE", "issues": []}
 
 
 def _issue(
     description: str,
     *,
-    severity: str = "CRITICAL",
-    file: str = "backend/app/foo.py",
-    line: int | None = 10,
-    symbol: str | None = None,
+    issue_id: str | None = None,
+    severity: str = "MAJOR",
+    file: str | None = "app.py",
+    line: int | None = 41,
 ) -> dict:
-    out: dict = {"description": description, "severity": severity, "file": file}
+    issue: dict = {"severity": severity, "description": description}
+    if issue_id is not None:
+        issue["issue_id"] = issue_id
+    if file is not None:
+        issue["file"] = file
     if line is not None:
-        out["line"] = line
-    if symbol is not None:
-        out["symbol"] = symbol
-    return out
+        issue["line"] = line
+    return issue
 
 
-# ── _region_anchor ─────────────────────────────────────────────────────────────
+def _review(
+    iteration: int,
+    head: str,
+    issues: list[dict] | None = None,
+    *,
+    verdict: str = "REQUEST_CHANGES",
+    resolutions: list[dict] | None = None,
+    base: str = "base-1",
+    verified: bool = True,
+) -> dict:
+    entry = {
+        "iteration": iteration,
+        "verdict": verdict,
+        "reviewed_head_sha": head,
+        "reviewed_base_sha": base,
+        "issues": issues or [],
+    }
+    if verified and head and base:
+        entry["target_verified_by_backend"] = True
+        entry["review_task_id"] = f"review-{iteration}"
+    if resolutions is not None:
+        entry["resolutions"] = resolutions
+    return entry
 
 
-class TestRegionAnchor:
-    def test_symbol_takes_precedence_over_line(self):
-        issue = {"symbol": "process_user", "line": 42}
-        assert _region_anchor(issue) == "sym:process_user"
-
-    def test_symbol_empty_falls_back_to_line(self):
-        issue = {"symbol": "", "line": 42}
-        # 42 // 40 == 1
-        assert _region_anchor(issue) == "win:1"
-
-    def test_symbol_whitespace_falls_back_to_line(self):
-        issue = {"symbol": "   ", "line": 0}
-        assert _region_anchor(issue) == "win:0"
-
-    def test_line_zero_gives_block_zero(self):
-        assert _region_anchor({"line": 0}) == "win:0"
-
-    def test_line_39_gives_block_zero(self):
-        assert _region_anchor({"line": 39}) == "win:0"
-
-    def test_line_40_gives_block_one(self):
-        assert _region_anchor({"line": 40}) == "win:1"
-
-    def test_line_79_gives_block_one(self):
-        assert _region_anchor({"line": 79}) == "win:1"
-
-    def test_line_80_gives_block_two(self):
-        assert _region_anchor({"line": 80}) == "win:2"
-
-    def test_no_symbol_no_line_gives_empty(self):
-        assert _region_anchor({}) == ""
-
-    def test_invalid_line_gives_empty(self):
-        assert _region_anchor({"line": "not-a-number"}) == ""
-
-    def test_none_line_gives_empty(self):
-        assert _region_anchor({"line": None}) == ""
+def _backend_id(issue: dict, *, head: str, iteration: int, ordinal: int = 0) -> str:
+    without_supplied_id = {k: v for k, v in issue.items() if k != "issue_id"}
+    padded = [{} for _ in range(ordinal)] + [without_supplied_id]
+    return ensure_issue_ids(
+        padded,
+        reviewed_head_sha=head,
+        iteration=iteration,
+    )[-1]["issue_id"]
 
 
-# ── _region_key ────────────────────────────────────────────────────────────────
+def test_jaccard_and_region_helpers_are_conservative() -> None:
+    assert _jaccard("missing null guard", "null guard is missing") == 1.0
+    assert _jaccard("missing null guard", "unrelated race condition") == 0.0
+    assert _region_anchor({"symbol": "handle", "line": 999}) == "sym:handle"
+    assert _region_anchor({"line": 79}) == "win:1"
+    assert _region_key({"file": "app.py", "line": 80}) == ("app.py", "win:2")
+    assert _region_key({"description": "global invariant"}) is None
 
 
-class TestRegionKey:
-    def test_returns_none_when_no_file(self):
-        assert _region_key({"description": "x"}) is None
+def test_issue_ids_use_stable_sha256_prefix_and_preserve_for_propagation() -> None:
+    issue = _issue("null dereference in handler")
+    normalized = ensure_issue_ids([issue], reviewed_head_sha="head-1", iteration=1)
+    seed = "head-1|1|0|app.py|win:1|MAJOR|dereference handler null"
+    expected = f"BP-{hashlib.sha256(seed.encode('utf-8')).hexdigest()[:12]}"
+    assert normalized[0]["issue_id"] == expected
+    assert issue.get("issue_id") is None
 
-    def test_returns_none_when_file_empty(self):
-        assert _region_key({"file": "", "line": 5}) is None
-
-    def test_returns_none_when_file_whitespace(self):
-        assert _region_key({"file": "  ", "line": 5}) is None
-
-    def test_returns_tuple_with_file_and_anchor(self):
-        key = _region_key({"file": "app/foo.py", "line": 10})
-        assert key == ("app/foo.py", "win:0")
-
-    def test_symbol_anchor_in_key(self):
-        key = _region_key({"file": "app/foo.py", "symbol": "my_func"})
-        assert key == ("app/foo.py", "sym:my_func")
-
-    def test_line_drift_same_block(self):
-        # Lines 5 and 35 are both in block 0 → same region key
-        key_a = _region_key({"file": "f.py", "line": 5})
-        key_b = _region_key({"file": "f.py", "line": 35})
-        assert key_a == key_b
-
-    def test_line_drift_different_block(self):
-        # Lines 5 and 45 are in blocks 0 and 1 → different region keys
-        key_a = _region_key({"file": "f.py", "line": 5})
-        key_b = _region_key({"file": "f.py", "line": 45})
-        assert key_a != key_b
-
-    def test_different_files_different_keys(self):
-        key_a = _region_key({"file": "a.py", "line": 10})
-        key_b = _region_key({"file": "b.py", "line": 10})
-        assert key_a != key_b
+    explicit = ensure_issue_ids(
+        [_issue("anything", issue_id="BP-existing")],
+        reviewed_head_sha="head-2",
+        iteration=2,
+    )
+    assert explicit[0]["issue_id"] == "BP-existing"
 
 
-# ── Jaccard helper ─────────────────────────────────────────────────────────────
+def test_empty_history_has_empty_authoritative_state() -> None:
+    assert build_issue_ledger([]) == {"open": [], "resolved": []}
+    assert build_issue_ledger(None) == {"open": [], "resolved": []}
 
 
-class TestJaccard:
-    def test_identical_strings_return_one(self):
-        assert _jaccard("replace old constants", "replace old constants") == pytest.approx(
-            1.0
+def test_same_head_approve_cannot_close_prior_blocker() -> None:
+    ledger = build_issue_ledger(
+        [
+            _review(1, "head-1", [_issue("null dereference", issue_id="BP-null")]),
+            _review(2, "head-1", verdict="APPROVE"),
+        ]
+    )
+    assert [row["description"] for row in ledger["open"]] == ["null dereference"]
+    assert ledger["resolved"] == []
+
+
+def test_approve_with_new_blocking_issue_keeps_it_open() -> None:
+    ledger = build_issue_ledger(
+        [
+            _review(
+                1,
+                "head-1",
+                [_issue("reviewer-listed blocker", issue_id="BP-new")],
+                verdict="APPROVE",
+            )
+        ]
+    )
+    assert [row["description"] for row in ledger["open"]] == [
+        "reviewer-listed blocker"
+    ]
+
+
+def test_changed_head_approve_closes_omitted_prior_but_opens_listed_blocker() -> None:
+    old = _issue("prior blocker", issue_id="BP-old")
+    new = _issue("new blocker", issue_id="BP-new", file="worker.py")
+    old_id = _backend_id(old, head="head-1", iteration=1)
+    new_id = _backend_id(new, head="head-2", iteration=2)
+    ledger = build_issue_ledger(
+        [
+            _review(1, "head-1", [old]),
+            _review(
+                2,
+                "head-2",
+                [new],
+                verdict="APPROVE",
+            ),
+        ]
+    )
+    assert [row["issue_id"] for row in ledger["open"]] == [new_id]
+    assert [row["issue_id"] for row in ledger["resolved"]] == [old_id]
+
+
+def test_same_head_request_changes_omission_keeps_old_and_adds_new() -> None:
+    ledger = build_issue_ledger(
+        [
+            _review(1, "head-1", [_issue("null dereference", issue_id="BP-a")]),
+            _review(
+                2,
+                "head-1",
+                [_issue("lost update race", issue_id="BP-b", file="worker.py")],
+            ),
+        ]
+    )
+    assert [row["description"] for row in ledger["open"]] == [
+        "null dereference",
+        "lost update race",
+    ]
+    assert ledger["resolved"] == []
+
+
+def test_changed_exact_head_omission_closes_fixed_blocker() -> None:
+    blocker = _issue("null dereference", issue_id="BP-a")
+    blocker_id = _backend_id(blocker, head="head-1", iteration=1)
+    ledger = build_issue_ledger(
+        [
+            _review(1, "head-1", [blocker]),
+            _review(2, "head-2", verdict="APPROVE"),
+        ]
+    )
+    assert ledger["open"] == []
+    assert ledger["resolved"] == [
+        {
+            "issue_id": blocker_id,
+            "disposition": "fixed",
+            "reason": "absent from review of a changed exact PR head",
+            "resolved_iteration": 2,
+            "resolved_head_sha": "head-2",
+        }
+    ]
+
+
+def test_explicit_id_reraise_preserves_original_demand_fields() -> None:
+    original = _issue("missing null guard before handler dereference")
+    original_id = _backend_id(original, head="head-1", iteration=1)
+    ledger = build_issue_ledger(
+        [
+            _review(
+                1,
+                "head-1",
+                [
+                        original
+                ],
+            ),
+            _review(
+                2,
+                "head-2",
+                [
+                    _issue(
+                            "handler has a missing null guard before dereference",
+                            issue_id=original_id,
+                    )
+                ],
+            ),
+        ]
+    )
+    assert [row["issue_id"] for row in ledger["open"]] == [original_id]
+    assert (
+        ledger["open"][0]["description"]
+        == "missing null guard before handler dereference"
+    )
+    assert ledger["resolved"] == []
+
+
+def test_wrong_reused_id_cannot_erase_unrelated_open_blocker() -> None:
+    original = _issue("missing null guard")
+    original_id = _backend_id(original, head="head-1", iteration=1)
+    ledger = build_issue_ledger(
+        [
+            _review(
+                1,
+                "head-1",
+                [original],
+            ),
+            _review(
+                2,
+                "head-1",
+                [
+                    _issue(
+                        "lost update race in worker queue",
+                        issue_id=original_id,
+                        file="worker.py",
+                    )
+                ],
+            ),
+        ]
+    )
+    assert len(ledger["open"]) == 2
+    assert ledger["open"][0]["issue_id"] == original_id
+    assert ledger["open"][0]["description"] == "missing null guard"
+    assert ledger["open"][1]["issue_id"].startswith("BP-")
+    assert ledger["open"][1]["issue_id"] != original_id
+    assert ledger["open"][1]["description"] == "lost update race in worker queue"
+
+
+def test_duplicate_id_for_distinct_current_findings_is_split_fail_closed() -> None:
+    ledger = build_issue_ledger(
+        [
+            _review(
+                1,
+                "head-1",
+                [
+                    _issue("missing null guard", issue_id="BP-a"),
+                    _issue(
+                        "lost update race in worker queue",
+                        issue_id="BP-a",
+                        file="worker.py",
+                    ),
+                ],
+            )
+        ]
+    )
+    assert len(ledger["open"]) == 2
+    assert len({row["issue_id"] for row in ledger["open"]}) == 2
+    assert {row["description"] for row in ledger["open"]} == {
+        "missing null guard",
+        "lost update race in worker queue",
+    }
+
+
+def test_changed_head_closes_old_blocker_while_new_blocker_remains() -> None:
+    ledger = build_issue_ledger(
+        [
+            _review(1, "head-1", [_issue("null dereference", issue_id="BP-a")]),
+            _review(
+                2,
+                "head-2",
+                [_issue("lost update race", issue_id="BP-b", file="worker.py")],
+            ),
+        ]
+    )
+    assert [row["description"] for row in ledger["open"]] == ["lost update race"]
+    assert len(ledger["resolved"]) == 1
+
+
+def test_same_head_explicit_refuted_or_adjudicated_resolution_closes_with_reason() -> None:
+    blocker = _issue("null dereference")
+    blocker_id = _backend_id(blocker, head="head-1", iteration=1)
+    for disposition in ("refuted", "adjudicated"):
+        ledger = build_issue_ledger(
+            [
+                    _review(1, "head-1", [blocker]),
+                _review(
+                    2,
+                    "head-1",
+                    verdict="APPROVE",
+                    resolutions=[
+                        {
+                            "issue_id": blocker_id,
+                            "disposition": disposition,
+                            "reason": "concrete evidence",
+                        }
+                    ],
+                ),
+            ]
         )
-
-    def test_disjoint_strings_return_zero(self):
-        assert _jaccard("alpha beta gamma", "delta epsilon zeta") == pytest.approx(0.0)
-
-    def test_empty_string_returns_zero(self):
-        assert _jaccard("", "something") == pytest.approx(0.0)
-
-    def test_short_tokens_ignored(self):
-        # Tokens < 3 chars are filtered out
-        assert _jaccard("a b c", "a b c") == pytest.approx(0.0)
-
-    def test_partial_overlap(self):
-        # "replace constants" ↔ "add constants back" → shared: "constants"; total unique: replace, constants, back → 1/3
-        j = _jaccard("replace constants", "add constants back")
-        assert 0.0 < j < 1.0
+        assert ledger["open"] == []
+        assert ledger["resolved"][0]["disposition"] == disposition
 
 
-# ── build_issue_ledger ─────────────────────────────────────────────────────────
+def test_same_head_fixed_or_reasonless_refutation_cannot_close() -> None:
+    blocker = _issue("null dereference")
+    blocker_id = _backend_id(blocker, head="head-1", iteration=1)
+    for resolution in (
+        {"issue_id": blocker_id, "disposition": "fixed", "reason": "claimed"},
+        {"issue_id": blocker_id, "disposition": "refuted", "reason": ""},
+    ):
+        ledger = build_issue_ledger(
+            [
+                _review(1, "head-1", [blocker]),
+                _review(
+                    2,
+                    "head-1",
+                    verdict="APPROVE",
+                    resolutions=[resolution],
+                ),
+            ]
+        )
+        assert [row["issue_id"] for row in ledger["open"]] == [blocker_id]
+        assert ledger["resolved"] == []
 
 
-class TestBuildIssueLedger:
-    def test_empty_history_returns_empty_ledger(self):
-        ledger = build_issue_ledger([])
-        assert ledger["contested"] == []
-        assert ledger["total_regions"] == 0
-
-    def test_none_history_returns_empty_ledger(self):
-        ledger = build_issue_ledger(None)
-        assert ledger["contested"] == []
-
-    def test_single_demand_no_contestation(self):
-        history = [_rc_entry(0, [_issue("replace frozenset with list")])]
-        ledger = build_issue_ledger(history)
-        assert ledger["contested"] == []
-        assert ledger["total_regions"] == 1
-
-    def test_demand_then_apply_no_contestation(self):
-        """Region demanded in iter 0, absent in iter 1 → APPLIED, no contest."""
-        history = [
-            _rc_entry(0, [_issue("replace frozenset with list")]),
-            _rc_entry(1, [_issue("unrelated issue", file="other.py")]),
+def test_missing_sha_provenance_never_proves_omission_fixed() -> None:
+    ledger = build_issue_ledger(
+        [
+            _review(1, "", [_issue("null dereference", issue_id="BP-a")]),
+            _review(2, "", verdict="APPROVE"),
         ]
-        ledger = build_issue_ledger(history)
-        assert ledger["contested"] == []
+    )
+    assert [row["description"] for row in ledger["open"]] == ["null dereference"]
 
-    def test_incident_replay_contested(self):
-        """Incident shape: iter 4 demanded 'replace old constants' → applied;
-        iter 9 demands 'add them back' → CONTESTED (low Jaccard)."""
-        history = [
-            _rc_entry(
-                4,
-                [_issue("replace old constants", file="backend/app/task_evaluators.py", line=42)],
+
+def test_unmarked_invented_full_target_cannot_close_verified_blocker() -> None:
+    blocker = _issue("null dereference")
+    ledger = build_issue_ledger(
+        [
+            _review(1, "head-1", [blocker]),
+            _review(2, "invented-head", verdict="APPROVE", verified=False),
+            _review(3, "head-1", verdict="APPROVE"),
+        ]
+    )
+    assert [row["description"] for row in ledger["open"]] == ["null dereference"]
+    assert ledger["resolved"] == []
+
+
+def test_unmarked_reasoned_resolution_cannot_close_verified_blocker() -> None:
+    blocker = _issue("null dereference")
+    blocker_id = _backend_id(blocker, head="head-1", iteration=1)
+    ledger = build_issue_ledger(
+        [
+            _review(1, "head-1", [blocker]),
+            _review(
+                2,
+                "head-1",
+                verdict="APPROVE",
+                verified=False,
+                resolutions=[
+                    {
+                        "issue_id": blocker_id,
+                        "disposition": "refuted",
+                        "reason": "invented legacy adjudication",
+                    }
+                ],
             ),
-            # iter 5-8: the region is absent → APPLIED
-            _rc_entry(5, [_issue("unrelated issue A", file="other.py")]),
-            _rc_entry(6, [_issue("unrelated issue B", file="other.py")]),
-            # iter 9: different demand on same region
-            _rc_entry(
-                9,
-                [_issue("add them back", file="backend/app/task_evaluators.py", line=42)],
+        ]
+    )
+    assert [row["issue_id"] for row in ledger["open"]] == [blocker_id]
+
+
+def test_verified_reasoned_resolution_can_reconcile_legacy_unmarked_blocker() -> None:
+    blocker = _issue("legacy null dereference")
+    blocker_id = _backend_id(blocker, head="legacy-head", iteration=1)
+    for disposition in ("fixed", "refuted", "adjudicated"):
+        ledger = build_issue_ledger(
+            [
+                _review(1, "legacy-head", [blocker], verified=False),
+                _review(
+                    2,
+                    "current-head",
+                    verdict="APPROVE",
+                    resolutions=[
+                        {
+                            "issue_id": blocker_id,
+                            "disposition": disposition,
+                            "reason": "exact review supplied concrete reconciliation",
+                        }
+                    ],
+                ),
+            ]
+        )
+        assert ledger["open"] == []
+        assert ledger["resolved"][0]["disposition"] == disposition
+
+
+def test_fileless_global_blocker_is_authoritative() -> None:
+    ledger = build_issue_ledger(
+        [
+            _review(
+                1,
+                "head-1",
+                [_issue("global transaction invariant is broken", file=None, line=None)],
+            )
+        ]
+    )
+    assert len(ledger["open"]) == 1
+    assert ledger["open"][0]["description"] == "global transaction invariant is broken"
+    assert "file" not in ledger["open"][0]
+
+
+def test_same_region_paraphrase_carries_original_identity() -> None:
+    original = _issue("missing null guard before handler dereference")
+    original_id = _backend_id(original, head="head-1", iteration=1)
+    ledger = build_issue_ledger(
+        [
+            _review(
+                1,
+                "head-1",
+                [original],
+            ),
+            _review(
+                2,
+                "head-1",
+                [_issue("handler has missing null guard before dereference")],
             ),
         ]
-        ledger = build_issue_ledger(history)
-        assert len(ledger["contested"]) == 1
-        c = ledger["contested"][0]
-        assert c["file"] == "backend/app/task_evaluators.py"
-        assert "replace old constants" in c["demanded_description"]
-        assert "add them back" in c["reappeared_description"]
-        assert c["demanded_iteration"] == 4
-        assert c["reappeared_iteration"] == 9
+    )
+    assert len(ledger["open"]) == 1
+    assert ledger["open"][0]["issue_id"] == original_id
 
-    def test_high_overlap_is_re_demanded_not_contested(self):
-        """Reappeared demand with high Jaccard to original → RE_DEMANDED, not CONTESTED."""
-        # "replace old constants list" and "replace old constants set" share ~4/5 tokens
-        history = [
-            _rc_entry(0, [_issue("replace old constants list", line=10)]),
-            _rc_entry(1, [_issue("unrelated", file="other.py")]),
-            _rc_entry(2, [_issue("replace old constants set", line=10)]),
+
+def test_open_blockers_are_never_truncated() -> None:
+    blockers = [
+        _issue(
+            f"unique blocker number {index}",
+            issue_id=f"BP-{index:02d}",
+            file=f"module_{index}.py",
+        )
+        for index in range(35)
+    ]
+    ledger = build_issue_ledger(
+        [
+            _review(1, "head-1", blockers),
+            _review(2, "head-1", verdict="APPROVE"),
         ]
-        ledger = build_issue_ledger(history)
-        # High overlap → RE_DEMANDED, not CONTESTED
-        assert ledger["contested"] == []
+    )
+    assert len(ledger["open"]) == 35
+    assert len({row["issue_id"] for row in ledger["open"]}) == 35
+    assert ledger["open"][30]["description"] == "unique blocker number 30"
+    assert ledger["open"][-1]["description"] == "unique blocker number 34"
 
-    def test_approve_transitions_demanded_to_applied(self):
-        """APPROVE marks all DEMANDED → APPLIED; reappearance after APPROVE is detected."""
-        history = [
-            _rc_entry(0, [_issue("remove unused import", line=5)]),
-            _approve_entry(1),
-            # reappears with different demand on same region
-            _rc_entry(2, [_issue("add missing import here", line=5)]),
-        ]
-        ledger = build_issue_ledger(history)
-        assert len(ledger["contested"]) == 1
-        c = ledger["contested"][0]
-        assert "remove unused import" in c["demanded_description"]
-        assert "add missing import here" in c["reappeared_description"]
 
-    def test_non_review_entries_are_skipped(self):
-        """Entries without verdict or with non-RC/APPROVE verdicts are ignored."""
-        history = [
-            {"iteration": 0, "feedback": "fix this"},  # no verdict
-            {"iteration": 0, "verdict": "APPROVE", "issues": []},
-        ]
-        ledger = build_issue_ledger(history)
-        assert ledger["contested"] == []
-
-    def test_minor_issues_are_not_tracked(self):
-        """MINOR severity issues are invisible to the ledger."""
-        history = [
-            _rc_entry(0, [_issue("fix indentation", severity="MINOR", line=5)]),
-            # all MINOR — no CRITICAL/MAJOR in iter 1 either
-            _rc_entry(1, [_issue("unrelated spacing", severity="MINOR", file="other.py")]),
-            _rc_entry(2, [_issue("reorder imports", severity="MINOR", line=5)]),
-        ]
-        ledger = build_issue_ledger(history)
-        assert ledger["contested"] == []
-        assert ledger["total_regions"] == 0
-
-    def test_issues_without_file_are_not_tracked(self):
-        """Issues with no file are not trackable as regions."""
-        history = [
+def test_nonblocking_and_malformed_rows_are_ignored_safely() -> None:
+    ledger = build_issue_ledger(
+        [
+            None,
+            "bad",
             {
-                "iteration": 0,
-                "verdict": "REQUEST_CHANGES",
-                "issues": [{"description": "fix missing test", "severity": "CRITICAL"}],
+                "verdict": "PENDING",
+                "issues": [_issue("nonblocking note", severity="MINOR")],
             },
-            _rc_entry(1, []),
+            {
+                "iteration": "not-an-int",
+                "verdict": "REQUEST_CHANGES",
+                "reviewed_head_sha": "head-1",
+                "issues": [None, "bad", _issue("minor note", severity="MINOR")],
+                "resolutions": [None, "bad"],
+            },
+        ]
+    )
+    assert ledger == {"open": [], "resolved": []}
+
+
+def test_structured_blockers_survive_unrecognized_or_missing_verdicts() -> None:
+    ledger = build_issue_ledger(
+        [
+            {
+                "iteration": 1,
+                "verdict": "COMMENT",
+                "reviewed_head_sha": "head-1",
+                "issues": [_issue("comment-listed major blocker")],
+            },
             {
                 "iteration": 2,
-                "verdict": "REQUEST_CHANGES",
-                "issues": [{"description": "add the test back", "severity": "CRITICAL"}],
+                "verdict": "NOT_A_VERDICT",
+                "reviewed_head_sha": "head-1",
+                "issues": [
+                    _issue("malformed-verdict critical blocker", severity="CRITICAL")
+                ],
+            },
+            {
+                "iteration": 3,
+                "reviewed_head_sha": "head-1",
+                "issues": [_issue("missing-verdict major blocker")],
             },
         ]
-        ledger = build_issue_ledger(history)
-        assert ledger["contested"] == []
-        assert ledger["total_regions"] == 0
+    )
 
-    def test_line_drift_within_window_same_region(self):
-        """Lines 5 and 30 both in block 0 → same region → APPLIED → detected."""
-        history = [
-            _rc_entry(0, [_issue("remove unused import", line=5)]),
-            _rc_entry(1, [_issue("unrelated", file="other.py")]),
-            _rc_entry(2, [_issue("reorder differently", line=30)]),  # same block
-        ]
-        ledger = build_issue_ledger(history)
-        assert len(ledger["contested"]) == 1
-
-    def test_line_drift_across_window_different_region(self):
-        """Lines 5 and 50 are in different blocks → different regions → no contest."""
-        history = [
-            _rc_entry(0, [_issue("remove unused import", line=5)]),
-            _rc_entry(1, [_issue("unrelated", file="other.py")]),
-            _rc_entry(2, [_issue("add import here", line=50)]),  # block 1
-        ]
-        ledger = build_issue_ledger(history)
-        assert ledger["contested"] == []
-
-    def test_symbol_anchor_takes_precedence_over_line_window(self):
-        """Same symbol on different lines → same region; different symbol → different region."""
-        history = [
-            _rc_entry(
-                0, [_issue("remove frozenset", line=10, symbol="MY_CONSTANTS")]
-            ),
-            _rc_entry(1, [_issue("unrelated", file="other.py")]),
-            # Same file, same symbol, different line → same region
-            _rc_entry(
-                2, [_issue("add frozenset back", line=999, symbol="MY_CONSTANTS")]
-            ),
-        ]
-        ledger = build_issue_ledger(history)
-        assert len(ledger["contested"]) == 1
-
-    def test_contested_capped_at_max(self):
-        """Never more than ISSUE_LEDGER_MAX_CONTESTED contested regions."""
-        issues_iter0 = [
-            _issue(f"demand {i}", file=f"file_{i}.py", line=10)
-            for i in range(ISSUE_LEDGER_MAX_CONTESTED + 5)
-        ]
-        issues_iter2 = [
-            _issue(f"reverse {i}", file=f"file_{i}.py", line=10)
-            for i in range(ISSUE_LEDGER_MAX_CONTESTED + 5)
-        ]
-        history = [
-            _rc_entry(0, issues_iter0),
-            _rc_entry(1, []),  # all APPLIED
-            _rc_entry(2, issues_iter2),
-        ]
-        ledger = build_issue_ledger(history)
-        assert len(ledger["contested"]) == ISSUE_LEDGER_MAX_CONTESTED
-
-    def test_multiple_demands_only_contested_on_prior_applied(self):
-        """A region that was DEMANDED and remains DEMANDED across two entries
-        is NOT contested — it was never APPLIED."""
-        history = [
-            _rc_entry(0, [_issue("remove deprecated call", line=10)]),
-            _rc_entry(1, [_issue("add new call instead", line=10)]),  # still demanded, never applied
-        ]
-        ledger = build_issue_ledger(history)
-        assert ledger["contested"] == []
-
-    def test_total_regions_counts_unique_keys(self):
-        """total_regions counts unique (file, anchor) pairs across the whole history."""
-        history = [
-            _rc_entry(
-                0,
-                [
-                    _issue("issue A", file="a.py", line=5),
-                    _issue("issue B", file="b.py", line=5),
-                ],
-            ),
-            _rc_entry(
-                1,
-                [
-                    _issue("issue C", file="a.py", line=5),  # same region as A
-                    _issue("issue D", file="c.py", line=5),
-                ],
-            ),
-        ]
-        ledger = build_issue_ledger(history)
-        # a.py:win:0, b.py:win:0, c.py:win:0 → 3 unique regions
-        assert ledger["total_regions"] == 3
-
-    def test_contested_structure_fields(self):
-        """Contested dicts have all expected fields."""
-        history = [
-            _rc_entry(3, [_issue("old way", line=20)]),
-            _rc_entry(4, [_issue("unrelated", file="other.py")]),
-            _rc_entry(7, [_issue("new way completely different", line=20)]),
-        ]
-        ledger = build_issue_ledger(history)
-        assert len(ledger["contested"]) == 1
-        c = ledger["contested"][0]
-        assert "file" in c
-        assert "anchor" in c
-        assert "demanded_iteration" in c
-        assert "demanded_description" in c
-        assert "reappeared_iteration" in c
-        assert "reappeared_description" in c
-        assert c["demanded_iteration"] == 3
-        assert c["reappeared_iteration"] == 7
-
-    def test_malformed_entries_skipped(self):
-        """Non-dict entries and missing keys don't crash the ledger builder."""
-        history = [
-            None,
-            "not a dict",
-            _rc_entry(0, [_issue("valid issue")]),
-            {},  # missing verdict
-            _rc_entry(1, [None, "invalid", _issue("another valid issue", file="b.py")]),
-        ]
-        ledger = build_issue_ledger(history)
-        # Should not raise; contested may be empty depending on overlap
-        assert isinstance(ledger["contested"], list)
+    assert {row["description"] for row in ledger["open"]} == {
+        "comment-listed major blocker",
+        "malformed-verdict critical blocker",
+        "missing-verdict major blocker",
+    }
+    assert ledger["resolved"] == []
 
 
-# ── Prompt formatting ──────────────────────────────────────────────────────────
-
-
-class TestFormatContestedRegions:
-    def _make_contested(self, n: int = 1) -> list:
-        return [
+def test_invalid_verdict_cannot_resolve_or_omit_existing_blocker() -> None:
+    original = _issue("binding blocker", issue_id="BP-binding")
+    ledger = build_issue_ledger(
+        [
+            _review(1, "head-1", [original]),
             {
-                "file": f"app/foo_{i}.py",
-                "anchor": f"sym:func_{i}",
-                "demanded_iteration": i,
-                "demanded_description": f"remove thing {i}",
-                "reappeared_iteration": i + 5,
-                "reappeared_description": f"add thing {i} back",
-            }
-            for i in range(n)
+                "iteration": 2,
+                "verdict": "COMMENT",
+                "reviewed_head_sha": "head-2",
+                "issues": [],
+                "resolutions": [
+                    {
+                        "issue_id": "BP-binding",
+                        "disposition": "fixed",
+                        "reason": "unsupported verdict cannot prove this",
+                    }
+                ],
+            },
         ]
+    )
 
-    def test_fix_prefix_empty_when_no_contested(self):
-        assert format_contested_regions_for_fix([], "main") == ""
+    assert [row["description"] for row in ledger["open"]] == ["binding blocker"]
+    assert ledger["resolved"] == []
 
-    def test_review_appendix_empty_when_no_contested(self):
-        assert format_contested_regions_for_review([], "main") == ""
 
-    def test_fix_prefix_contains_contested_marker(self):
-        result = format_contested_regions_for_fix(self._make_contested(), "main")
-        assert "CONTESTED" in result
+def test_durable_seed_survives_many_sequential_history_compactions() -> None:
+    history: list[dict] = []
+    ledger: dict | None = None
+    for iteration in range(1, REVIEW_HISTORY_MAX_ENTRIES + 26):
+        history = (
+            history
+            + [_review(iteration, f"head-{iteration}", verdict="APPROVE")]
+        )[-REVIEW_HISTORY_MAX_ENTRIES:]
+        ledger = build_issue_ledger(
+            history,
+            **({"seed_ledger": ledger} if ledger is not None else {}),
+            stamp_complete=True,
+        )
+        assert issue_ledger_complete_for_history(ledger, history) is True
 
-    def test_fix_prefix_contains_file_and_descriptions(self):
-        contested = self._make_contested(1)
-        result = format_contested_regions_for_fix(contested, "main")
-        assert "app/foo_0.py" in result
-        assert "remove thing 0" in result
-        assert "add thing 0 back" in result
 
-    def test_fix_prefix_contains_base_branch_in_git_command(self):
-        result = format_contested_regions_for_fix(self._make_contested(), "automain")
-        assert "origin/automain" in result
+def test_discontinuous_capped_history_cannot_extend_stale_seed_proof() -> None:
+    first = _review(1, "head-1", verdict="APPROVE")
+    seed = build_issue_ledger([first], stamp_complete=True)
+    discontinuous_history = [
+        _review(iteration, f"head-{iteration}", verdict="APPROVE")
+        for iteration in range(100, 100 + REVIEW_HISTORY_MAX_ENTRIES)
+    ]
 
-    def test_review_appendix_contains_contested_marker(self):
-        result = format_contested_regions_for_review(self._make_contested(), "main")
-        assert "CONTESTED" in result
+    rebuilt = build_issue_ledger(
+        discontinuous_history,
+        seed_ledger=seed,
+        stamp_complete=True,
+    )
 
-    def test_review_appendix_mentions_reconcile(self):
-        result = format_contested_regions_for_review(self._make_contested(), "main")
-        assert "reconcile" in result.lower() or "reconcil" in result.lower()
-
-    def test_review_appendix_contains_base_hint(self):
-        result = format_contested_regions_for_review(self._make_contested(), "main")
-        assert "git diff" in result
-        assert "origin/main" in result
-
-    def test_fix_prefix_contains_iteration_numbers(self):
-        contested = [
-            {
-                "file": "app/foo.py",
-                "anchor": "sym:bar",
-                "demanded_iteration": 4,
-                "demanded_description": "replace old constants",
-                "reappeared_iteration": 9,
-                "reappeared_description": "add them back",
-            }
-        ]
-        result = format_contested_regions_for_fix(contested, "main")
-        assert "iter 4" in result
-        assert "iter 9" in result
-        assert "replace old constants" in result
-        assert "add them back" in result
+    assert rebuilt["complete"] is False
+    assert issue_ledger_complete_for_history(
+        rebuilt, discontinuous_history
+    ) is False

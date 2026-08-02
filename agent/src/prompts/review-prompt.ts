@@ -24,7 +24,6 @@ export type ReviewPromptFingerprintOptions = {
 export const REVIEW_CLAUDEMD_PROMPT_HEADER = '## Codebase Instructions\n';
 export const REVIEW_CLAUDEMD_PROMPT_FOOTER = '\n\nCheck that the changes respect the File Restrictions listed above. Changes to restricted files should result in REQUEST_CHANGES.\n\n';
 
-export const REVIEW_HISTORY_INTRO = 'Issues from previous iterations (verify each was addressed — issues marked "(likely resolved ...)" were not re-flagged in the following iteration and are historical context, not active blockers):';
 export const REVIEW_ITERATION_PRIOR_NOTE = '\nPrevious iterations have already addressed some issues. Focus on what remains unresolved.';
 
 // Delta-focus guidance for iteration ≥2. Round 1 keeps the full-PR-diff,
@@ -231,18 +230,20 @@ export function buildReviewVerdictInstructions(taskId: string, opts?: { repairCo
   return `${opening}
 
 **APPROVE** — the change is ready to merge as-is. Use this when the code is correct, the tests cover the behavior, and nothing blocks shipping. Optional polish notes belong in \`feedback\` as non-blocking observations; they do NOT disqualify APPROVE.
-{"verdict": "APPROVE", "feedback": "What you verified and why it's ready to merge. Include any non-blocking polish notes here."}
+{"verdict": "APPROVE", "feedback": "What you verified and why it's ready to merge. Include any non-blocking polish notes here.", "resolutions": [{"issue_id": "BP-...", "disposition": "fixed|refuted|adjudicated", "reason": "Concrete evidence for closing this prior blocker."}]}
 
 **REQUEST_CHANGES** — block only on a concrete, substantiated CODE defect: a logic/correctness bug, a security hole, a missing test for new behavior, a broken invariant, a design flaw, or a merge conflict in the diff. Build/type-check/test pass is CI's job, not yours — do not block on it. Uncertainty rooted in something you could NOT verify in your sandbox (a command you couldn't run, a tool that was missing, an API that 401'd) is NOT grounds to block: judge the code on its merits and trust CI for build/test pass. If your concern is a real, substantiated defect, list it; if it is only a "couldn't confirm", do not REQUEST_CHANGES.
-{"verdict": "REQUEST_CHANGES", "feedback": "What needs fixing and why it blocks merge.", "issues": [{"severity": "critical|major|minor", "description": "...", "file": "path/to/file.py", "line": 42}], "requires_rereview": false}
+{"verdict": "REQUEST_CHANGES", "feedback": "What needs fixing and why it blocks merge.", "issues": [{"issue_id": "BP-...", "severity": "critical|major|minor", "description": "...", "file": "path/to/file.py", "line": 42}], "resolutions": [{"issue_id": "BP-...", "disposition": "fixed|refuted|adjudicated", "reason": "Concrete evidence for closing this prior blocker."}]}
 
-Every REQUEST_CHANGES verdict MUST include the boolean \`requires_rereview\`. Explicitly choose:
-- \`true\` — an independent follow-up review is required after the fixer responds. Use this whenever the correctness of the resulting repair still needs independent judgment.
-- \`false\` — you are comfortable delegating closure of this specific repair to the fixer's self-check and the normal CI/merge gates. This is not mechanical proof that the repair is correct; it is your judgment that an independent follow-up review is unnecessary.
+Every pushed repair receives an exact-SHA delta review, so there is no reviewer-waiver field.
 
-Do not choose \`true\` merely because the issue is labeled critical or major, or because re-review feels safer by default. A localized, fully specified repair with a focused regression test that directly exercises acceptance is normally \`false\`. Choose \`true\` when the repair itself will still require independent design or behavioral judgment—for example, when multiple valid implementations could preserve different invariants or the change crosses a security, data-integrity, migration, or external-contract boundary.
+For every prior issue id, do exactly one of the following:
+- Re-raise it in \`issues\` when it remains a blocker.
+- Record \`fixed\` only when the reviewed head changed and the delta proves the repair.
+- Record \`refuted\` when concrete evidence proves the original finding was wrong.
+- Record \`adjudicated\` only when an explicit higher-authority decision supersedes it; cite that decision.
 
-\`APPROVE\` ignores \`requires_rereview\`; omit it from APPROVE verdicts.
+Never claim \`fixed\` on the same reviewed head. Never omit an unresolved prior issue and assume APPROVE erases it; the backend ledger will keep it blocking.
 
 **Exhaustiveness — list every blocking change this PR needs, not just the most prominent one.** When you choose REQUEST_CHANGES, the \`issues\` array must enumerate every blocker you can identify in this pass. The fix agent will address each item; if you surface them one-per-iteration, the PR burns N review-fix cycles for what could have converged in one. Concretely:
 - Before finalizing your verdict, re-scan the diff and the touched call sites for additional blockers in adjacent files / sister call sites / invariants the touched functions used to enforce. A single conceptual change often spans multiple files — flag every place that needs to change, not just the first one you noticed.
@@ -252,6 +253,7 @@ Do not choose \`true\` merely because the issue is labeled critical or major, or
 Do NOT emit "COMMENT", "NEUTRAL", "ADVISORY", or any other verdict — they are not accepted and will be normalized to REQUEST_CHANGES. There is no informational-only path: if the change is acceptable → APPROVE (put observations in \`feedback\`); if anything needs changing → REQUEST_CHANGES.
 
 For each issue in the \`issues\` array:
+- \`issue_id\`: when re-raising a prior blocker, copy its exact BP-... id; omit this field for a genuinely new finding. Never hash, recompute, or invent an id.
 - \`file\`: repo-relative path to the file where the issue is located (optional — omit if not tied to a specific file)
 - \`line\`: line number in the file (optional — omit if not applicable)
 - Issues without \`file\`/\`line\` are still valid and will be included in the review body summary
@@ -317,7 +319,6 @@ export function buildReviewPromptFingerprintContent(
   const sections: string[] = [
     REVIEW_CLAUDEMD_PROMPT_HEADER,
     REVIEW_CLAUDEMD_PROMPT_FOOTER,
-    REVIEW_HISTORY_INTRO,
     buildReviewIterationPreamble(2, 0, true, true),
     REVIEW_QA_FOCUS_HINT,
     REVIEW_MIGRATE_FOCUS_HINT,

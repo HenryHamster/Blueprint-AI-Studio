@@ -323,21 +323,13 @@
                 "Use this operation for bounded implementation, research, plan, design, and compute work under an existing strategic outcome.",
                 "Parallelize independent implementation with multiple tasks under one direction; do not create file-, PR-, or phase-sharded directions.",
                 "type=fix additionally requires pr_number and branch.",
-                "Spawned tasks are watched by default; set watch=false to opt out.",
+                "Write/plan/design tasks and standalone research are watched by default. Direction-linked research is filtered through discovery review; set watch=true only when its raw completion itself needs Resident attention.",
                 "Exceptional project bursts return a durable deferred request instead of HTTP 429.",
                 "For compute_experiment, set preview_only=true to validate and inspect the normalized launch without dispatching.",
                 "Omit accelerator for a CPU-only job. Preview reports the selected resource and estimated billable cost.",
                 "Use success_criteria for simple all-required (AND) measurement contracts; success_criterion remains supported."
             ]
         }
-    },
-    {
-        "op": "spawn_fix",
-        "alias": null,
-        "description": "Deprecated compatibility alias for spawn-task.",
-        "cli": false,
-        "prompt": false,
-        "internal_reason": "Deprecated compatibility alias; use spawn-task."
     },
     {
         "op": "cancel_task",
@@ -369,7 +361,7 @@
     {
         "op": "watch_task",
         "alias": "watch-task",
-        "description": "Register a durable one-shot notification for a same-project task reaching a terminal state.",
+        "description": "Register a durable one-shot notification for a same-project task reaching an actionable boundary. Knowledge work fires at terminal; write work waits for landing, failure, blocker, approval, or no-PR completion.",
         "cli": true,
         "prompt": true,
         "internal_reason": null
@@ -521,9 +513,26 @@
     {
         "op": "request_qualification",
         "alias": "request-qualification",
-        "description": "Request a fresh release-qualification run directly, without going through set_problem_model.",
+        "description": "Request a fresh release qualification at a stable checkpoint, with only explicitly selected product probes.",
         "cli": true,
         "prompt": true,
-        "internal_reason": null
+        "internal_reason": null,
+        "input": {
+            "kind": "json",
+            "fields": [
+                "reason",
+                "probes"
+            ],
+            "example": {
+                "reason": "The candidate is stable and the remaining release claims are ready for judgment.",
+                "probes": [
+                    "walkthrough_e2e"
+                ]
+            },
+            "notes": [
+                "Qualification is expensive; request it only at a meaningful stable checkpoint.",
+                "Omit probes for ordinary code/release judgment. Request walkthrough_e2e only when the release claim requires live product behavior."
+            ]
+        }
     }
 ]

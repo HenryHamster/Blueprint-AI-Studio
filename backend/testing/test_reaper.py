@@ -4175,8 +4175,8 @@ def _install_dep_unblock_compat(mocker, blocked_id_str: str):
         def __call__(self):
             call_count["n"] += 1
             inner = real_asl()
-            # All calls in reaper_post_orphan_sweep are dep-unblock or
-            # safeguard sessions — always return the proxy.
+            # All calls in reaper_post_orphan_sweep are dependency-unblock
+            # sessions — always return the proxy.
             return _DepSessionProxy(inner)
 
     mocker.patch("app.reaper_post_orphan_sweep.AsyncSessionLocal", _SmartASL())
@@ -4368,8 +4368,8 @@ async def test_dep_unblocking_skipped_when_task_is_retried_not_failed(
     assert retrying.attempt_count == 1
     assert waiting.depends_on == [str(retrying.id)]
     # No dep-unblock session should open — the tracker only counts
-    # reaper_post_orphan_sweep.AsyncSessionLocal calls (dep-unblock + safeguard),
-    # neither of which fires for a retried (non-terminal) task.
+    # reaper_post_orphan_sweep.AsyncSessionLocal dependency-unblock calls,
+    # which do not fire for a retried (non-terminal) task.
     assert call_tracker["n"] == 0
 
 

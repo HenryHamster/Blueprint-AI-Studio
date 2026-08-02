@@ -1468,7 +1468,7 @@ def test_promote_recover_cut_discloses_staged_activation_consequences(monkeypatc
                     "phase": "build",
                     "in_flight_task_count": 3,
                     "qualification_state": {
-                        "state": "promotion_in_flight",
+                        "state": "promotion_check_wait",
                         "promotion_pr_number": 456,
                     },
                 },
@@ -1499,7 +1499,7 @@ def test_promote_recover_cut_discloses_staged_activation_consequences(monkeypatc
     assert "Ship staged change A" in prompt
     assert "Ship staged change B" in prompt
     assert "3 in-flight tasks will NOT be stopped" in prompt
-    assert "Promotion PR #456 is open and auto-merging" in prompt
+    assert "Promotion PR #456 is open and waiting for required checks" in prompt
     assert not any(method == "POST" and "version-cut" in path for method, path, _ in calls)
 
 

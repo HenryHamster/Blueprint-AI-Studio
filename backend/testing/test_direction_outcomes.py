@@ -6005,6 +6005,7 @@ async def test_generalized_health_non_code_portfolio(db_session: AsyncSession):
         research_task.id,
         project.id,
         status=TaskStatus.COMPLETED,
+        context={"research_surviving_findings": 1},
         payloads=[{"type": "research"}],
         title="research",
     )

@@ -470,10 +470,6 @@ VM-scoped liveness for warm-VM continuity.
 
 Warm-VM handoff endpoint that either claims a pinned task or exits with no work.
 
-### `POST /api/agent/tasks/{original_task_id}/reviewer-merge`
-
-Internal helper used by review workflows to merge approved changes.
-
 ### `GET /api/agent/projects/{project_id}/directions/{direction_id}`
 
 Fetch a single direction for agent-side strategic work.
@@ -616,10 +612,12 @@ truncated). Notable behaviors:
 - `spawn_task` durably dispatches `research`, `web_research`, `design`, `plan`,
   `compute_experiment`, `create`, `refactor`, or `qa` directly. `fix` is also
   accepted when `pr_number` and `branch` are supplied. Direction association is
-  optional. The request is idempotent, automatically watches the child unless
-  `watch: false`, and returns HTTP 202 with a durable deferred receipt only when
-  the project-wide abuse circuit breaker is reached. `spawn_fix` remains an
-  unadvertised compatibility alias for one release.
+  optional. The request is idempotent and automatically watches children unless
+  `watch: false` or the work is direction-linked research. That research enters a bounded
+  discovery cycle instead, so its cheap review filters routine completion before
+  Resident attention; callers may set `watch: true` for an exceptional raw-result
+  interrupt. The endpoint returns HTTP 202 with a durable deferred receipt only when
+  the project-wide abuse circuit breaker is reached.
 - `cancel_task` requires a reason plus exactly one of `target_task_id` or
   `request_id`. A task can be cancelled only in its early lifecycle; a durable
   spawn request can be cancelled only while deferred, which prevents later
@@ -1110,13 +1108,11 @@ branch-routing endpoints. The remaining config endpoints:
 | GET | `/api/admin/projects/{project_id}/sr-unhandled-edges-retrospectives` | Tasks with agent-flagged unhandled edge cases. |
 | GET | `/api/admin/projects/{project_id}/sr-alert-drilldown` | Tasks in the current SR alert window that missed the given categories. |
 | GET | `/api/admin/projects/{project_id}/sr-blind-spots` | Aggregate `blind_spots` from recent self-review outcomes. |
-| GET | `/api/admin/projects/{project_id}/sr-reviewer-disagreements` | Categories where SR passed but the fresh-reviewer flagged an issue. |
-| GET | `/api/admin/projects/{project_id}/sr-reviewer-disagreements/tasks` | Paginated task rows behind a reviewer-disagreement badge. |
 | GET | `/api/admin/projects/{project_id}/sr-recent-misses` | Most recent tasks where SR missed a human-caught category. |
 | GET | `/api/admin/projects/{project_id}/direction-sr-breakdown` | Per-direction SR catch-rate breakdown. |
-| GET | `/api/admin/projects/{project_id}/sr_catch_rate/health` | Persisted SR catch-rate snapshot for ops/audit/CI. |
 | POST | `/api/admin/projects/{project_id}/sr-investigation` | Spawn an operator-triggered SR investigation task for a category. |
 | GET | `/api/admin/projects/{project_id}/sr-investigation-task-ids` | Map of category → task_id for open SR investigations. |
+| GET | `/api/admin/projects/{project_id}/sr_catch_rate/health` | Persisted SR catch-rate snapshot for ops/audit/CI. |
 | GET | `/api/admin/projects/{project_id}/prompt-fingerprint-analytics` | Group recent code-change outcomes by prompt fingerprint. |
 | GET | `/api/admin/projects/{project_id}/research-actionability` | Actionability grade distribution + merge outcome by grade tier. |
 | GET | `/api/admin/projects/{project_id}/findings-by-source` | Findings (across directions) whose `source_refs` cite a given ref. |

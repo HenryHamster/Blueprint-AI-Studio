@@ -47,6 +47,23 @@ resource "google_kms_crypto_key_iam_member" "recovery_cloud_sql_decrypter" {
   depends_on = [time_sleep.service_agent_propagation]
 }
 
+# Service identities can exist without their standard project grants after
+# project bootstrap or IAM drift. Manage these bindings explicitly so private
+# Cloud SQL creation does not depend on an implicit, out-of-band grant.
+resource "google_project_iam_member" "recovery_cloud_sql_service_agent" {
+  count   = local.recovery_enabled ? 1 : 0
+  project = var.recovery_project_id
+  role    = "roles/cloudsql.serviceAgent"
+  member  = "serviceAccount:${google_project_service_identity.cloud_sql[0].email}"
+}
+
+resource "google_project_iam_member" "recovery_service_networking_service_agent" {
+  count   = local.restore_verifier_prerequisites_enabled ? 1 : 0
+  project = var.recovery_project_id
+  role    = "roles/servicenetworking.serviceAgent"
+  member  = "serviceAccount:${google_project_service_identity.service_networking[0].email}"
+}
+
 # The explicit recovery administrator is the only application-level principal
 # granted both archive reads and KMS decrypt. A personal deployment may use one
 # Google user; larger deployments should use a separately managed group.

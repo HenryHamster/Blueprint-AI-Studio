@@ -2466,17 +2466,11 @@ def _cut_confirmation_prompt(pid: str) -> str:
     else:
         lines.append("- No tasks are currently in flight.")
 
-    if qual_state_name == "promotion_in_flight":
+    if qual_state_name == "promotion_check_wait":
         pr_label = f" #{promotion_pr_number}" if promotion_pr_number else ""
         lines.append(
-            f"- Promotion PR{pr_label} is open and auto-merging - this cut will be rejected until it "
-            "lands or is canceled."
-        )
-    elif qual_state_name == "promotion_check_wait":
-        pr_label = f" #{promotion_pr_number}" if promotion_pr_number else ""
-        lines.append(
-            f"- Migration-carrying promotion PR{pr_label} is open and waiting for required checks - "
-            "Blueprint retries the merge automatically; this cut will be rejected until it lands or is canceled."
+            f"- Promotion PR{pr_label} is open and waiting for required checks - "
+            "Blueprint revalidates the exact target and retries the merge; this cut will be rejected until it lands or is canceled."
         )
 
     lines.append("Proceed?")

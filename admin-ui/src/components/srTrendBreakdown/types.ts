@@ -15,10 +15,6 @@ export interface SrCategoryTrend {
   weighted_miss_rate?: number | null;
   false_positive_rate?: number | null;
   precision?: number | null;
-  sr_alone_hit_count?: number | null;
-  reviewer_save_hit_count?: number | null;
-  sr_alone_hit_rate?: number | null;
-  reviewer_save_rate?: number | null;
   trend?: 'increasing' | 'decreasing' | 'stable';
   trend_significant?: boolean | null;
   rate_history?: number[];
@@ -60,12 +56,6 @@ export interface SrCheckResultEntry {
   passed: boolean;
   issue?: string | null;
   origin?: string | null;
-}
-
-export interface SrReviewerFinding {
-  category: string;
-  severity?: string | null;
-  description: string;
 }
 
 export interface SrSeverityBucket {
@@ -110,14 +100,6 @@ export const SR_CANONICAL_CATEGORIES: { id: string; label: string }[] = [
   { id: 'cross-system-contract', label: 'Cross-System Contract' },
 ];
 
-export interface ReviewerHallucinationRate {
-  current_rate?: number | null;
-  previous_rate?: number | null;
-  current_sample?: number | null;
-  previous_sample?: number | null;
-  delta?: number | null;
-}
-
 export interface SrTrendData {
   computed_at?: string | null;
   is_stale?: boolean | null;
@@ -142,26 +124,6 @@ export interface SrTrendData {
   by_severity?: Record<string, SrSeverityBucket> | null;
   by_direction?: Record<string, Record<string, DirectionSrCatStat>> | null;
   co_failure_pairs?: SrCoFailurePair[] | null;
-  reviewer_hallucination_rate?: ReviewerHallucinationRate | null;
-}
-
-export interface FreshReviewerMetricEntry {
-  current: number | null;
-  previous: number | null;
-  delta?: number | null;
-  trend?: 'improving' | 'regressing' | 'stable' | null;
-}
-
-export interface FreshReviewerTrend {
-  computed_at?: string | null;
-  bucket_mode?: 'cycle' | 'calendar' | null;
-  current_cycle_id?: string | null;
-  previous_cycle_id?: string | null;
-  current_sample_size?: number | null;
-  previous_sample_size?: number | null;
-  per_category_hit_rate?: Record<string, FreshReviewerMetricEntry> | null;
-  added_value?: Record<string, { current: number; previous: number; trend?: string | null }> | null;
-  approval_rate_lift?: FreshReviewerMetricEntry | null;
 }
 
 export interface EdgesTrendStats {
@@ -195,10 +157,6 @@ export interface DirectionSrCatStat {
   weighted_miss_rate?: number | null;
   false_positive_rate?: number | null;
   precision?: number | null;
-  sr_alone_hit_count?: number | null;
-  reviewer_save_hit_count?: number | null;
-  sr_alone_hit_rate?: number | null;
-  reviewer_save_rate?: number | null;
   examples?: Array<{ desc: string; severity: string }>;
 }
 
@@ -224,51 +182,6 @@ export interface SrMissedTask {
   caught_categories: string[];
   pr_url?: string | null;
   sr_check_results?: Record<string, SrCheckResultEntry>;
-  reviewer_findings?: SrReviewerFinding[];
-}
-
-export interface SrDisagreementExample {
-  severity: string;
-  description: string;
-  task_id: string;
-  task_type?: string | null;
-}
-
-export interface SrReviewerDisagreement {
-  category: string;
-  task_type: string;
-  count: number;
-  severity_breakdown?: Record<string, number> | null;
-  max_severity?: string | null;
-  examples?: SrDisagreementExample[] | null;
-  false_positive_count?: number | null;
-  true_positive_count?: number | null;
-  false_positive_rate?: number | null;
-}
-
-export interface SrReviewerDisagreementsData {
-  window_days: number;
-  total_entries: number;
-  disagreements: SrReviewerDisagreement[];
-}
-
-export interface SrReviewerDisagreementTask {
-  task_id: string;
-  title: string;
-  task_type: string;
-  scope: string | null;
-  created_at: string;
-  pr_url: string | null;
-  category: string;
-  severity: string;
-  description: string;
-}
-
-export interface SrReviewerDisagreementTasksResult {
-  items: SrReviewerDisagreementTask[];
-  total: number;
-  page: number;
-  page_size: number;
 }
 
 export interface SrScopeDriftVsExpansion {

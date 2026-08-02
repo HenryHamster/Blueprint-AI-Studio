@@ -104,11 +104,11 @@ class TestSetVersionPhase:
         assert resp.json()["phase"] == "build"
 
     @pytest.mark.asyncio
-    async def test_set_phase_rejects_promotion_in_flight(
+    async def test_set_phase_rejects_promotion_check_wait(
         self, client: AsyncClient, db_session
     ):
-        """A phase flip while a promotion PR is open and auto-merging is rejected
-        with a 409 — flipping back to build would clear the in-flight indication
+        """A phase flip while a managed promotion PR is open is rejected with a
+        409 — flipping back to build would clear the pending indication
         without cancelling anything, leaving the operator levers disagreeing."""
         from datetime import timedelta
         from app.time_utils import _utcnow
@@ -120,7 +120,6 @@ class TestSetVersionPhase:
             "promotion_pending": {
                 "pr_number": 8642,
                 "pr_url": "https://example/pr/8642",
-                "auto_merge_enabled": True,
                 "enabled_at": (_utcnow() - timedelta(minutes=15)).isoformat(),
             },
         }
@@ -132,9 +131,9 @@ class TestSetVersionPhase:
             json={"phase": "build"},
         )
         assert resp.status_code == 409
-        assert "promotion PR is open and auto-merging" in resp.text
-        # The 409 surfaces the in-flight age derived from enabled_at.
-        assert "in flight ~" in resp.text
+        assert "managed promotion PR is open" in resp.text
+        # The 409 surfaces the managed-wait age derived from enabled_at.
+        assert "waiting ~" in resp.text
 
         # Phase unchanged — the flip was refused before any mutation.
         await db_session.refresh(version)
@@ -145,8 +144,8 @@ class TestSetVersionPhase:
         self, client: AsyncClient, db_session
     ):
         """A phase flip while a migration-carrying promotion PR is held in
-        managed check-wait is ALSO rejected with a 409, with copy distinct from
-        native auto-merge (waiting for required checks, auto-retry)."""
+        managed check-wait is ALSO rejected with a 409 that explains the
+        required-check wait and Blueprint's exact-target retry."""
         project = await _make_project(db_session)
         version = await _make_open_version(db_session, project.id, phase="stabilize")
         version.last_qualification = {
@@ -154,8 +153,6 @@ class TestSetVersionPhase:
             "promotion_pending": {
                 "pr_number": 8643,
                 "pr_url": "https://example/pr/8643",
-                "auto_merge_enabled": False,
-                "migration_carrying": True,
                 "managed_check_wait": True,
             },
         }
@@ -167,8 +164,9 @@ class TestSetVersionPhase:
             json={"phase": "build"},
         )
         assert resp.status_code == 409
-        assert "waiting for required checks" in resp.text
-        assert "retry the merge automatically" in resp.text
+        assert "will wait for required checks" in resp.text
+        assert "revalidate the exact base/head pair" in resp.text
+        assert "retry the merge" in resp.text
         assert "#8643" in resp.text
 
         await db_session.refresh(version)
@@ -187,8 +185,6 @@ class TestSetVersionPhase:
             "promotion_pending": {
                 "pr_number": 8644,
                 "pr_url": "https://example/pr/8644",
-                "auto_merge_enabled": False,
-                "migration_carrying": True,
                 "managed_check_wait": True,
             },
         }
@@ -200,7 +196,8 @@ class TestSetVersionPhase:
             json={"reason": "operator cut attempt"},
         )
         assert resp.status_code == 409
-        assert "waiting for required checks" in resp.text
+        assert "will wait for required checks" in resp.text
+        assert "revalidate the exact base/head pair" in resp.text
         assert "#8644" in resp.text
 
         # The version was NOT abandoned — still the same open version.
@@ -289,14 +286,13 @@ class TestSetVersionPhase:
         assert resp.status_code == 200
         assert resp.json()["phase"] == "stabilize"
 
-        # Verify that promotion_in_flight check is enforced (evidence of
+        # Verify that promotion_check_wait check is enforced (evidence of
         # precondition re-checking against the state).
         version.last_qualification = {
             "status": "pending",
             "promotion_pending": {
                 "pr_number": 5555,
                 "pr_url": "https://example/pr/5555",
-                "auto_merge_enabled": True,
             },
         }
         db_session.add(version)
@@ -306,9 +302,9 @@ class TestSetVersionPhase:
             f"/api/admin/projects/{project.id}/version-phase",
             json={"phase": "build"},
         )
-        # The promotion_in_flight guard is re-checked against the locked row.
+        # The promotion_check_wait guard is re-checked against the locked row.
         assert resp.status_code == 409
-        assert "promotion PR is open and auto-merging" in resp.text
+        assert "managed promotion PR is open" in resp.text
         assert "5555" in resp.text
 
     @pytest.mark.asyncio
@@ -328,7 +324,6 @@ class TestSetVersionPhase:
             "promotion_pending": {
                 "pr_number": 7777,
                 "pr_url": "https://example/pr/7777",
-                "auto_merge_enabled": True,
             },
         }
         db_session.add(version)
@@ -370,7 +365,6 @@ class TestSetVersionPhase:
             "promotion_pending": {
                 "pr_number": 8888,
                 "pr_url": "https://example/pr/8888",
-                "auto_merge_enabled": True,
             },
         }
         db_session.add(version)
@@ -865,7 +859,7 @@ class TestCutVersion:
         assert resp.status_code == 422
 
     @pytest.mark.asyncio
-    async def test_version_cut_rejects_promotion_in_flight(
+    async def test_version_cut_rejects_promotion_check_wait(
         self, client: AsyncClient, db_session
     ):
         """A version with an open promotion PR is rejected before any state
@@ -880,7 +874,6 @@ class TestCutVersion:
             "promotion_pending": {
                 "pr_number": 7357,
                 "pr_url": "https://example/pr/7357",
-                "auto_merge_enabled": True,
                 "enabled_at": (_utcnow() - timedelta(hours=2)).isoformat(),
             },
         }
@@ -892,9 +885,9 @@ class TestCutVersion:
             json={"reason": "too early"},
         )
         assert resp.status_code == 409
-        assert "promotion PR is open and auto-merging" in resp.text
-        # The version-cut 409 carries the in-flight age via the widened exception.
-        assert "in flight ~" in resp.text
+        assert "managed promotion PR is open" in resp.text
+        # The version-cut 409 carries the managed-wait age via the exception.
+        assert "waiting ~" in resp.text
 
         await db_session.refresh(version)
         assert version.status == "open"
@@ -2176,7 +2169,7 @@ class TestVersionLifecyclePolicyProvenance:
     async def test_promotion_pending_state_exposed_in_current_version(
         self, client: AsyncClient, db_session
     ):
-        """The lifecycle payload surfaces promotion-in-flight as a distinct
+        """The lifecycle payload surfaces managed promotion wait as a distinct
         qualification_state, not a generic pending status."""
         project = await _make_project(db_session)
         version = ReleaseVersion(
@@ -2189,7 +2182,6 @@ class TestVersionLifecyclePolicyProvenance:
                 "promotion_pending": {
                     "pr_number": 7357,
                     "pr_url": "https://example/pr/7357",
-                    "auto_merge_enabled": True,
                 },
             },
         )
@@ -2222,11 +2214,11 @@ class TestVersionLifecyclePolicyProvenance:
 
         assert resp.status_code == 200, resp.text
         current = resp.json()["current_version"]
-        assert current["qualification_state"]["state"] == "promotion_in_flight"
+        assert current["qualification_state"]["state"] == "promotion_check_wait"
         assert current["qualification_state"]["promotion_pr_number"] == 7357
-        assert (
-            "auto-merge is armed" in current["qualification_state"]["summary"].lower()
-        )
+        assert "revalidate the exact base/head pair" in current[
+            "qualification_state"
+        ]["summary"].lower()
 
 
 class TestVersionLifecycleArtifactServingState:

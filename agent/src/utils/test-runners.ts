@@ -102,7 +102,6 @@ export interface BuildConfig {
   env_vars?: Record<string, string>;
   git_user_name?: string;
   git_user_email?: string;
-  enable_fresh_reviewer?: boolean;
   enable_parallel_review?: boolean;
   /** Project-specific migration layout (alembic versions dir, models dir,
    *  schema-revision file/constant). Unset → Blueprint defaults. */

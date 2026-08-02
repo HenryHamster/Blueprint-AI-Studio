@@ -42,7 +42,7 @@ from app.models import (
 from app.max_plan_pool import filter_user_task_context
 from app.payload_schemas import validate_task_payload
 from app.task_capabilities import BACKEND_MANAGED_TASK_TYPES
-from app.research_completion import resolve_research_findings_for_surface
+from app.findings_index import resolve_research_findings_for_surface
 from app.schemas import DeployPayload
 from app.shared_state import backfill_branch_columns, limiter
 from app.broadcast import manager, broadcast_to_project, _sanitize_log
@@ -418,13 +418,10 @@ async def get_project_tasks(
 
     # Group artifacts by task_id
     artifacts_by_task = {}
-    research_map = {}
     for a in artifacts:
         if a.task_id not in artifacts_by_task:
             artifacts_by_task[a.task_id] = []
         artifacts_by_task[a.task_id].append(a)
-        if a.artifact_type == ArtifactType.RESEARCH_FINDINGS and a.logs:
-            research_map[a.task_id] = a.logs[:100000]
 
     # Combine
     result = []
@@ -445,9 +442,7 @@ async def get_project_tasks(
             "parent_task_id": str(t.parent_task_id) if t.parent_task_id else None,
             "context": filter_user_task_context(t.context),
             "artifacts": artifacts_by_task.get(t.id, []),
-            "research_findings": resolve_research_findings_for_surface(
-                t.plan_output, research_map.get(t.id)
-            )
+            "research_findings": resolve_research_findings_for_surface(t)
             if (t.first_payload).get("type") == "research"
             else None,
             "duration_seconds": duration_seconds,

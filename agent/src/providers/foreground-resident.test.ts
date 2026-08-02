@@ -55,6 +55,18 @@ describe('Fast Resident foreground profile', () => {
     expect(buildClaudeForegroundLaunch).toBeTypeOf('function');
   });
 
+  it('routes effort through the compatible provider environment instead of a CLI flag', () => {
+    const profile = createForegroundResidentProfile({ PATH: process.env.PATH });
+    try {
+      const launch = buildClaudeForegroundLaunch(profile, '/tmp/strict-mcp.json', 'haiku', 'low');
+      expect(launch.args).not.toContain('--effort');
+      expect(launch.env.CLAUDE_CODE_EFFORT_LEVEL).toBe('low');
+    } finally {
+      fs.rmSync(profile.cwd, { recursive: true, force: true });
+      if (profile.env.HOME) fs.rmSync(profile.env.HOME, { recursive: true, force: true });
+    }
+  });
+
   it('requires an exact deployment qualification attestation', () => {
     expect(configuredClaudeForegroundAdapter({}).validation).toBe('unvalidated');
     expect(configuredClaudeForegroundAdapter({

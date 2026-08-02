@@ -1357,7 +1357,7 @@ class TestMonitoringWindowEdgeCases:
         """When rollback is recommended but no rollback target exists,
         should_rollback still returns the recommendation — the caller
         must check revision equality."""
-        from app.shared_state import deploy_monitoring
+        from app.shared_state import deploy_monitoring, external_health
         from app.time_utils import _utcnow
 
         deploy_monitoring["task_results"] = [
@@ -1369,6 +1369,11 @@ class TestMonitoringWindowEdgeCases:
         ]
         deploy_monitoring["pre_deploy_failure_rate"] = 0.0
         deploy_monitoring["window_start"] = _utcnow() - timedelta(minutes=20)
+        # Shards do not necessarily collect the causation tests that reset this
+        # process-global state.  The edge case under test assumes healthy
+        # dependencies; make that premise explicit instead of depending on
+        # collection order.
+        external_health["failed_deps"] = []
         do_rollback, _reason, response = should_rollback()
         assert do_rollback
         assert response == "ROLLBACK"
@@ -2097,7 +2102,16 @@ async def test_rollup_scan_blocked_gates_off_alerts_and_merges(rollup_db, mocker
     mocker.patch(
         "app.github.get_pull_request",
         new_callable=AsyncMock,
-        return_value={"additions": 5, "deletions": 5},
+        return_value={
+            "additions": 5,
+            "deletions": 5,
+            "state": "open",
+            "merged": False,
+            "mergeable": True,
+            "mergeable_state": "clean",
+            "base": {"sha": "basebeef", "ref": "research/parent12"},
+            "head": {"sha": "abc123", "ref": "research/rollup-stg"},
+        },
     )
     mocker.patch(
         "app.security.scan_pr_for_injection",
@@ -2434,7 +2448,14 @@ def _patch_deferred_counter_mocks(mocker, mergeable_state_holder):
             "state": "open",
             "merged": False,
             "mergeable_state": mergeable_state_holder["state"],
-            "head": {"sha": "abc123"},
+            "base": {
+                "sha": "basebeef",
+                "ref": "research/parent-xyz",
+            },
+            "head": {
+                "sha": "abc123",
+                "ref": "research/rollup-stg",
+            },
         }
 
     mocker.patch(
@@ -2780,96 +2801,6 @@ async def test_rollup_merge_unrecognized_state_escalates(rollup_db, mocker):
 
 
 @pytest.mark.asyncio
-async def test_rollup_auto_merge_blocked_calls_enable_auto_merge(rollup_db, mocker):
-    """When the rollup auto-merge path hits mergeable_state=blocked, call
-    enable_auto_merge so GitHub lands the PR once required checks pass —
-    mirroring the task_lifecycle auto-merge fallback. The deferral counter
-    path still runs so a genuinely stuck PR escalates normally."""
-    state = {"state": "blocked"}
-    _patch_deferred_counter_mocks(mocker, state)
-    mocker.patch(
-        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
-    )
-    mocker.patch(
-        "app.rollup_management._dispatch_rollup_approval_alert", new_callable=AsyncMock
-    )
-    mock_enable = mocker.patch(
-        "app.github.enable_auto_merge",
-        new_callable=AsyncMock,
-        return_value={"enabled": True, "message": "Auto-merge enabled at 2026-04-17"},
-    )
-
-    _, parent, child = await _make_rollup_parent_with_completed_child(
-        rollup_db, target_branch="research/parent-xyz"
-    )
-
-    await _check_and_trigger_rollup(child, rollup_db)
-    await rollup_db.refresh(parent)
-
-    mock_enable.assert_awaited_once()
-    call_kwargs = mock_enable.await_args.kwargs
-    call_args = mock_enable.await_args.args
-    # Accept either positional or keyword call style — the important thing is PR #777
-    pr_number_arg = (
-        call_kwargs.get("pr_number") if "pr_number" in call_kwargs else call_args[3]
-    )
-    assert pr_number_arg == 777
-    # Deferral counter path still ran in parallel
-    assert (parent.context or {}).get("_merge_deferred_count") == 1
-    assert (parent.context or {}).get("_merge_deferred_state") == "blocked"
-
-
-@pytest.mark.parametrize("mergeable_state", ["blocked", "unstable"])
-@pytest.mark.asyncio
-async def test_rollup_auto_merge_skips_github_for_migration_pr(
-    rollup_db, mocker, mergeable_state
-):
-    """A migration-carrying rollup PR must NOT be delegated to GitHub native
-    auto-merge: the target branch can advance while checks are pending, so the
-    merge could land against a different migration chain than the one validated.
-    Skip enable_auto_merge and fall through to the deferral / re-validation path
-    (the deferral counter must still increment so a stuck PR escalates)."""
-    state = {"state": mergeable_state}
-    _patch_deferred_counter_mocks(mocker, state)
-    # Override the empty get_pr_files mock so pr_touches_migrations returns True.
-    mocker.patch(
-        "app.github.get_pr_files",
-        new_callable=AsyncMock,
-        return_value=[{"filename": "backend/alembic/versions/0140_add_widget.py"}],
-    )
-    # With a migration file present, the pre-merge combined-chain guard would
-    # otherwise fetch the (unmocked) diff and defer before the post-merge-failure
-    # branch. Force "ok" so flow reaches the auto-merge fallback we're testing.
-    mocker.patch(
-        "app.rollup_management._validate_rollup_migration_chain",
-        new=AsyncMock(return_value=("ok", None)),
-    )
-    mocker.patch(
-        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
-    )
-    mocker.patch(
-        "app.rollup_management._dispatch_rollup_approval_alert", new_callable=AsyncMock
-    )
-    mock_enable = mocker.patch(
-        "app.github.enable_auto_merge",
-        new_callable=AsyncMock,
-        return_value={"enabled": True},
-    )
-
-    _, parent, child = await _make_rollup_parent_with_completed_child(
-        rollup_db, target_branch="research/parent-xyz"
-    )
-
-    await _check_and_trigger_rollup(child, rollup_db)
-    await rollup_db.refresh(parent)
-
-    mock_enable.assert_not_awaited()
-    # Deferral / re-validation path still runs so a stuck PR still escalates.
-    assert (parent.context or {}).get("_merge_deferred_count") == 1
-    assert (parent.context or {}).get("_merge_deferred_state") == mergeable_state
-
-
-@pytest.mark.asyncio
 async def test_rollup_per_state_alert_does_not_refire_on_flap(rollup_db, mocker):
     """A PR that flaps blocked↔unstable between sweeps resets the per-state
     counter each flip, but per-state alerts must only fire once per state
@@ -2892,12 +2823,6 @@ async def test_rollup_per_state_alert_does_not_refire_on_flap(rollup_db, mocker)
     mocker.patch(
         "app.rollup_management._dispatch_rollup_approval_alert", new_callable=AsyncMock
     )
-    mocker.patch(
-        "app.github.enable_auto_merge",
-        new_callable=AsyncMock,
-        return_value={"enabled": False},
-    )
-
     _, parent, child = await _make_rollup_parent_with_completed_child(
         rollup_db, target_branch="research/parent-xyz"
     )
@@ -2951,7 +2876,15 @@ async def test_rollup_merge_success_clears_transient_counter_state(rollup_db, mo
             "state": "open",
             "merged": False,
             "mergeable_state": "clean",
-            "head": {"sha": "abc123"},
+            "mergeable": True,
+            "base": {
+                "sha": "basebeef",
+                "ref": "research/parent-xyz",
+            },
+            "head": {
+                "sha": "abc123",
+                "ref": "research/rollup-stg",
+            },
         },
     )
     mocker.patch(
@@ -3182,7 +3115,8 @@ async def test_rollup_auto_merge_on_distinct_promotion_target_alerts_without_pr_
             "state": "open",
             "merged": False,
             "mergeable_state": "clean",
-            "head": {"sha": "abc123"},
+            "head": {"sha": "abc123", "ref": "research/rollup-stg"},
+            "base": {"sha": "release-base-777", "ref": "release/main"},
         },
     )
     mocker.patch(
@@ -3249,7 +3183,8 @@ async def test_rollup_auto_merge_on_single_branch_sets_pr_merged(rollup_db, mock
             "state": "open",
             "merged": False,
             "mergeable_state": "clean",
-            "head": {"sha": "abc123"},
+            "head": {"sha": "abc123", "ref": "research/rollup-stg"},
+            "base": {"sha": "release-base-777", "ref": "release/main"},
         },
     )
     mocker.patch(
@@ -3305,6 +3240,14 @@ def _patch_refetch_failure_mocks(mocker, *, merge_msg="merge_msg-from-failed-att
         "deletions": 5,
         "state": "open",
         "merged": False,
+        "base": {
+            "sha": "basebeef",
+            "ref": "research/parent-xyz",
+        },
+        "head": {
+            "sha": "abc123",
+            "ref": "research/rollup-stg",
+        },
     }
     merge_attempted = {"v": False}
 
@@ -3397,27 +3340,39 @@ async def test_rollup_refetch_success_clears_failure_counter(rollup_db, mocker):
     refetch succeeds on a later sweep, the counter must reset so a future
     transient failure starts from zero."""
     _patch_common_rollup_mocks(mocker)
-    mocker.patch(
-        "app.github.get_pull_request",
-        new_callable=AsyncMock,
-        return_value={
+    merge_attempted = {"value": False}
+
+    async def _pr_detail(*_args, **_kwargs):
+        state = "dirty" if merge_attempted["value"] else "clean"
+        merge_attempted["value"] = False
+        return {
             "additions": 5,
             "deletions": 5,
             "state": "open",
             "merged": False,
-            "mergeable_state": "dirty",
-        },
-    )
+            "mergeable": True,
+            "mergeable_state": state,
+            "base": {
+                "sha": "basebeef",
+                "ref": "research/parent-xyz",
+            },
+            "head": {
+                "sha": "abc123",
+                "ref": "research/rollup-stg",
+            },
+        }
+
+    async def _merge(*_args, **_kwargs):
+        merge_attempted["value"] = True
+        return {"merged": False, "message": "real conflict"}
+
+    mocker.patch("app.github.get_pull_request", new=AsyncMock(side_effect=_pr_detail))
     mocker.patch(
         "app.security.scan_pr_for_injection",
         new_callable=AsyncMock,
         return_value={"blocked": False, "findings": [], "summary": "ok", "report": ""},
     )
-    mocker.patch(
-        "app.github.merge_pull_request",
-        new_callable=AsyncMock,
-        return_value={"merged": False, "message": "real conflict"},
-    )
+    mocker.patch("app.github.merge_pull_request", new=AsyncMock(side_effect=_merge))
     mocker.patch("app.github.get_pr_files", new_callable=AsyncMock, return_value=[])
     mock_spawn = mocker.patch(
         "app.rollup_management._spawn_pipeline_task",
@@ -3457,28 +3412,46 @@ def _patch_behind_branch_mocks(mocker, update_branch_result):
     mocker.patch(
         "app.github.get_branch_sha", new_callable=AsyncMock, return_value="deadbeef"
     )
-    mocker.patch(
-        "app.github.get_pull_request",
-        new_callable=AsyncMock,
-        return_value={
+    merge_attempted = {"value": False}
+
+    async def _pr_detail(*_args, **_kwargs):
+        # The authoritative final GET must observe a currently safe exact
+        # target.  Only the refetch after GitHub rejects the merge reports the
+        # newly-computed behind state that this helper is designed to exercise.
+        mergeable_state = "behind" if merge_attempted["value"] else "clean"
+        merge_attempted["value"] = False
+        return {
             "additions": 5,
             "deletions": 5,
             "state": "open",
             "merged": False,
-            "mergeable_state": "behind",
-            "head": {"sha": "abc123"},
-        },
+            "mergeable_state": mergeable_state,
+            "base": {
+                "sha": "basebeef",
+                "ref": "research/parent-xyz",
+            },
+            "head": {
+                "sha": "abc123",
+                "ref": "research/rollup-stg",
+            },
+        }
+
+    async def _merge(*_args, **_kwargs):
+        merge_attempted["value"] = True
+        return {"merged": False, "message": "merge blocked"}
+
+    mocker.patch("app.github.get_pull_request", new=AsyncMock(side_effect=_pr_detail))
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new_callable=AsyncMock,
+        return_value=False,
     )
     mocker.patch(
         "app.security.scan_pr_for_injection",
         new_callable=AsyncMock,
         return_value={"blocked": False, "findings": [], "summary": "ok", "report": ""},
     )
-    mocker.patch(
-        "app.github.merge_pull_request",
-        new_callable=AsyncMock,
-        return_value={"merged": False, "message": "merge blocked"},
-    )
+    mocker.patch("app.github.merge_pull_request", new=AsyncMock(side_effect=_merge))
     if callable(update_branch_result):
         mocker.patch(
             "app.github.update_branch_with_sha_retry",
@@ -3638,7 +3611,15 @@ async def test_rollup_clean_pr_skips_update_branch_despite_sha_mismatch(
             "state": "open",
             "merged": False,
             "mergeable_state": "clean",
-            "head": {"sha": "abc123"},
+            "mergeable": True,
+            "base": {
+                "sha": "basebeef",
+                "ref": "research/parent-xyz",
+            },
+            "head": {
+                "sha": "abc123",
+                "ref": "research/rollup-stg",
+            },
         },
     )
     mocker.patch(
@@ -3785,7 +3766,9 @@ def _patch_merge_queue_merged_mocks(mocker, sibling_details):
         "state": "open",
         "merged": False,
         "mergeable_state": "clean",
-        "head": {"sha": "abc123"},
+        "mergeable": True,
+        "base": {"sha": "basebeef", "ref": _MQ_TARGET},
+        "head": {"sha": "abc123", "ref": "research/rollup-stg"},
     }
 
     async def _pr_get(*args, **_kwargs):
@@ -3970,27 +3953,33 @@ async def test_rollup_dirty_within_merge_queue_window_defers_fix_spawn(
     from app.time_utils import _utcnow
 
     _patch_common_rollup_mocks(mocker)
-    mocker.patch(
-        "app.github.get_pull_request",
-        new_callable=AsyncMock,
-        return_value={
+    merge_attempted = {"value": False}
+
+    async def _pr_detail(*_args, **_kwargs):
+        state = "dirty" if merge_attempted["value"] else "clean"
+        merge_attempted["value"] = False
+        return {
             "additions": 5,
             "deletions": 5,
             "state": "open",
             "merged": False,
-            "mergeable_state": "dirty",
-        },
-    )
+            "mergeable": True,
+            "mergeable_state": state,
+            "base": {"sha": "basebeef", "ref": _MQ_TARGET},
+            "head": {"sha": "abc123", "ref": "research/rollup-stg"},
+        }
+
+    async def _merge(*_args, **_kwargs):
+        merge_attempted["value"] = True
+        return {"merged": False, "message": "real conflict"}
+
+    mocker.patch("app.github.get_pull_request", new=AsyncMock(side_effect=_pr_detail))
     mocker.patch(
         "app.security.scan_pr_for_injection",
         new_callable=AsyncMock,
         return_value={"blocked": False, "findings": [], "summary": "ok", "report": ""},
     )
-    mocker.patch(
-        "app.github.merge_pull_request",
-        new_callable=AsyncMock,
-        return_value={"merged": False, "message": "real conflict"},
-    )
+    mocker.patch("app.github.merge_pull_request", new=AsyncMock(side_effect=_merge))
     mock_spawn = mocker.patch(
         "app.rollup_management._spawn_pipeline_task",
         new=AsyncMock(return_value=(MagicMock(id="fix-1"), None)),
@@ -4025,27 +4014,33 @@ async def test_rollup_dirty_with_stale_merge_queue_marker_spawns_fix(rollup_db, 
     from app.time_utils import _utcnow
 
     _patch_common_rollup_mocks(mocker)
-    mocker.patch(
-        "app.github.get_pull_request",
-        new_callable=AsyncMock,
-        return_value={
+    merge_attempted = {"value": False}
+
+    async def _pr_detail(*_args, **_kwargs):
+        state = "dirty" if merge_attempted["value"] else "clean"
+        merge_attempted["value"] = False
+        return {
             "additions": 5,
             "deletions": 5,
             "state": "open",
             "merged": False,
-            "mergeable_state": "dirty",
-        },
-    )
+            "mergeable": True,
+            "mergeable_state": state,
+            "base": {"sha": "basebeef", "ref": _MQ_TARGET},
+            "head": {"sha": "abc123", "ref": "research/rollup-stg"},
+        }
+
+    async def _merge(*_args, **_kwargs):
+        merge_attempted["value"] = True
+        return {"merged": False, "message": "real conflict"}
+
+    mocker.patch("app.github.get_pull_request", new=AsyncMock(side_effect=_pr_detail))
     mocker.patch(
         "app.security.scan_pr_for_injection",
         new_callable=AsyncMock,
         return_value={"blocked": False, "findings": [], "summary": "ok", "report": ""},
     )
-    mocker.patch(
-        "app.github.merge_pull_request",
-        new_callable=AsyncMock,
-        return_value={"merged": False, "message": "real conflict"},
-    )
+    mocker.patch("app.github.merge_pull_request", new=AsyncMock(side_effect=_merge))
     mocker.patch("app.github.get_pr_files", new_callable=AsyncMock, return_value=[])
     mock_spawn = mocker.patch(
         "app.rollup_management._spawn_pipeline_task",

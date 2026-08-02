@@ -195,8 +195,7 @@ async def _evaluate_lone_checker_alert(
     message = (
         f"{len(lone_cats)} categories have entered lone-checker state "
         f"(SR is the only reviewer, catch-rate unmeasurable): {cats_str}. "
-        f"Fresh-reviewer is auto-enabled for tasks whose risk surface overlaps "
-        f"these categories. Operator action: arrange human review coverage or "
+        f"Operator action: arrange independent review coverage or "
         f"adjust category scope to exit lone-checker state."
     )
     session.add(
@@ -1029,23 +1028,6 @@ async def compute_pipeline_health_summary(
         if sft:
             sr_false_attestation_trends = sft
 
-    # Fresh-reviewer cycle-over-cycle trend from compute_fresh_reviewer_trend.
-    fresh_reviewer_trend: Optional[Dict[str, Any]] = None
-    if project:
-        fr_trends = _sr_data.get("fresh_reviewer_trend") or {}
-        if fr_trends:
-            fresh_reviewer_trend = {
-                "computed_at": fr_trends.get("computed_at"),
-                "bucket_mode": fr_trends.get("bucket_mode"),
-                "current_cycle_id": fr_trends.get("current_cycle_id"),
-                "previous_cycle_id": fr_trends.get("previous_cycle_id"),
-                "current_sample_size": fr_trends.get("current_sample_size"),
-                "previous_sample_size": fr_trends.get("previous_sample_size"),
-                "per_category_hit_rate": fr_trends.get("per_category_hit_rate") or {},
-                "added_value": fr_trends.get("added_value") or {},
-                "approval_rate_lift": fr_trends.get("approval_rate_lift") or {},
-            }
-
     # Edges-considered cycle-over-cycle trend from compute_edges_trend.
     edges_trend: Optional[Dict[str, Any]] = None
     if project:
@@ -1186,7 +1168,6 @@ async def compute_pipeline_health_summary(
         "self_review_prediction_accuracy_trends": self_review_prediction_accuracy_trends,
         "sr_regression_risk_test_signal_trends": sr_regression_risk_test_signal_trends,
         "sr_false_attestation_trends": sr_false_attestation_trends,
-        "fresh_reviewer_trend": fresh_reviewer_trend,
         "edges_trend": edges_trend,
         "edges_considered_metrics": edges_considered_metrics,
         "review_accuracy": review_accuracy,

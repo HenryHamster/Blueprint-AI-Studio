@@ -7,8 +7,7 @@ the independent cleanup operations that consume the loop's output:
 2. Old-VM deletion (IDs captured before the reap overwrite)
 3. Rollup checks for failed tasks with parents
 4. Terminal-dependency unblocking for QUEUED dependents
-5. Safeguard merge-gate release for reaped security_audit tasks
-6. Dead-PR closing for exhausted fix tasks
+5. Dead-PR closing for exhausted fix tasks
 """
 
 import contextlib
@@ -190,7 +189,7 @@ async def run_post_orphan_sweep(
 
     # Re-fetch post_reap_tasks: per-iteration rollbacks inside the rollup loop
     # above expire every ORM object regardless of expire_on_commit, including
-    # the post_reap_tasks list that the safeguard and dead-PR loops below read
+    # the post_reap_tasks list that the dead-PR loop below reads
     # directly. A sync attribute access on an expired AsyncSession object raises
     # MissingGreenlet on asyncpg. Re-fetch once so the downstream loops get
     # fresh (non-expired) objects without needing their own per-loop re-fetches.
@@ -243,41 +242,6 @@ async def run_post_orphan_sweep(
                     f"[PIPELINE] Failed to unblock dependents of {task.id}: {e}",
                     exc_info=True,
                 )
-
-    # C5: release the cross-cutting safeguard merge gate when a
-    # reaper-terminated safeguard task FAILS. The gate is otherwise
-    # released only on the security_audit COMPLETED branch, so a
-    # reaped safeguard (orphan-timeout, retries exhausted) would
-    # leave orig.requires_approval=True forever — a permanent
-    # strand that services.py then 2h-timeout-FAILs into a healthy
-    # parent. Each release runs in its OWN session (mirrors the
-    # dependent-unblock loop above and reaper Step 9
-    # sweep_stuck_qualifications) so a failure here cannot poison
-    # the shared reaper session. _maybe_release_safeguard_gate
-    # no-ops for non-safeguard tasks; findings=None → release
-    # (a reaped safeguard produced no blocker).
-    for task in post_reap_tasks:
-        progress_cb()
-        if task.status != TaskStatus.FAILED:
-            continue
-        _t_payload = task.first_payload if task.payloads else {}
-        if _t_payload.get("type") != "security_audit":
-            continue
-        try:
-            from app.task_completion import (
-                _maybe_release_safeguard_gate,
-            )
-
-            async with AsyncSessionLocal() as _sg_session:
-                _sg_task = await _sg_session.get(Task, task.id)
-                if _sg_task is not None:
-                    await _maybe_release_safeguard_gate(_sg_task, None, _sg_session)
-        except Exception as _sg_exc:  # noqa: BLE001
-            logger.warning(
-                f"[SAFEGUARD] Failed to release gate on reaped "
-                f"safeguard {task.id}: {_sg_exc}",
-                exc_info=True,
-            )
 
     # Close open PRs owned by terminally-failed fix tasks. When a
     # fix exhausts retries, its PR stays OPEN on GitHub, and

@@ -38,7 +38,7 @@ def _resolve(**kwargs):
         automain_ci_state=None,
         blocker=None,
         in_flight=False,
-        promotion_in_flight=False,
+        promotion_check_wait=False,
     )
     defaults.update(kwargs)
     return resolve_qualification_trigger(**defaults)
@@ -59,10 +59,10 @@ class TestT0HoldGuards:
         assert not d.fire
         assert d.reason == "in_flight"
 
-    def test_promotion_in_flight_blocks(self):
-        d = _resolve(promotion_in_flight=True)
+    def test_promotion_check_wait_blocks(self):
+        d = _resolve(promotion_check_wait=True)
         assert not d.fire
-        assert d.reason == "promotion_in_flight"
+        assert d.reason == "promotion_check_wait"
 
     def test_wrong_phase_takes_priority_over_everything(self):
         # Even if everything else would fire, wrong phase wins.
@@ -457,7 +457,7 @@ class TestExplainQualificationTrigger:
             automain_ci_state=None,
             blocker=None,
             in_flight=False,
-            promotion_in_flight=False,
+            promotion_check_wait=False,
             last_attempt=None,
             knob="observe",
             evaluated_at="2026-07-10T00:00:00",
@@ -738,7 +738,7 @@ class TestExplainNewStates:
             automain_ci_state=None,
             blocker=None,
             in_flight=False,
-            promotion_in_flight=False,
+            promotion_check_wait=False,
             last_attempt=None,
             knob="on",
             evaluated_at="2026-07-16T00:00:00",

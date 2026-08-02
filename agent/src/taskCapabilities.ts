@@ -47,7 +47,6 @@ export const AGENT_TASK_TYPE_IDS = [
   'repo_bootstrap',
   'salvage_bundle',
   'capability_proof_trial',
-  'criterion_coverage_trial',
   'memory_consolidation',
 ] as const;
 

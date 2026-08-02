@@ -3,13 +3,24 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { expectNoOverflowAt, expectNoTextTruncationAt } from '../test/viewport';
 
-vi.mock('../api/projectTools', async () => {
-  const actual = await vi.importActual<typeof import('../api/projectTools')>('../api/projectTools');
-  return {
-    ...actual,
-    fetchProjectTools: vi.fn(),
-  };
-});
+vi.mock('../api/projectTools', () => ({
+  ConflictError: class ConflictError extends Error {},
+  ToolArtifactConflictError: class ToolArtifactConflictError extends Error {},
+  ToolArtifactRequestError: class ToolArtifactRequestError extends Error {},
+  buildToolAssetUrl: vi.fn(),
+  createProjectTool: vi.fn(),
+  createResidentToolArtifactRef: vi.fn(),
+  deleteProjectTool: vi.fn(),
+  fetchAssetToken: vi.fn(),
+  fetchComputeImageStatus: vi.fn(),
+  fetchProjectToolManifest: vi.fn(),
+  fetchProjectTools: vi.fn(),
+  fetchToolContent: vi.fn(),
+  fetchToolKinds: vi.fn(),
+  saveToolContent: vi.fn(),
+  seedProjectTools: vi.fn(),
+  updateProjectTool: vi.fn(),
+}));
 
 import { fetchProjectTools } from '../api/projectTools';
 import { WhiteboardRailSection } from './WhiteboardRailSection';

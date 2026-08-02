@@ -425,9 +425,9 @@ def test_blocker_labels_have_emitters():
     replaced by the per-category goal-verification gate (which blocks as
     ``criterion_coverage_incomplete``) but the label outlived the emitter.
 
-    The emitters are the ``blocker = "..."`` assignments in ``release_scoring``
-    (``compute_composite`` is the sole producer of the hard-blocker codes these
-    labels render).  This is the REVERSE direction of
+    The emitters are the ``blocker = "..."`` assignments in
+    ``release_scoring`` plus the explicit ``{"blocker": "..."}`` product-probe
+    verdicts in ``release_qualifier``. This is the REVERSE direction of
     ``test_every_compute_composite_blocker_code_is_classified`` in
     test_release_scoring.py, which pins emitter → classification; together they
     keep the vocabulary and the gates in lockstep in both directions.
@@ -435,9 +435,13 @@ def test_blocker_labels_have_emitters():
     import re
     from pathlib import Path
 
-    src = Path(rs.__file__).read_text()
-    emitted = set(re.findall(r'blocker = "([a-z_]+)"', src))
-    assert emitted, "expected to find blocker assignments in release_scoring"
+    scoring_src = Path(rs.__file__).read_text()
+    qualifier_src = Path(rq.__file__).read_text()
+    emitted = set(re.findall(r'blocker = "([a-z0-9_]+)"', scoring_src))
+    emitted.update(
+        re.findall(r'"blocker"\s*:\s*"([a-z0-9_]+)"', qualifier_src)
+    )
+    assert emitted, "expected to find blocker emitters in release code"
 
     dead = sorted(set(rq._BLOCKER_LABELS) - emitted)
     assert not dead, (

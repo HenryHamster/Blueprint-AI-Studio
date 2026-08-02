@@ -1,8 +1,8 @@
-"""Durable, one-shot task watches for the Strategic Resident.
+"""Durable, semantic task watches for the Strategic Resident.
 
 The Resident heartbeat already observes a project-wide work-state revision.
 These helpers add the missing identity/agenda layer: which exact task Strategic
-was waiting on, why it mattered, and whether its terminal receipt was handled.
+was waiting on, why it mattered, and whether its actionable receipt was handled.
 They deliberately do not park or advance either task's lifecycle.
 """
 
@@ -22,6 +22,8 @@ from app.models import (
     TaskStatus,
     _utcnow,
 )
+from app.landed_signal import has_landed_signal
+from app.task_capabilities import WRITE_TASK_TYPES
 
 WATCH_PENDING = "pending"
 WATCH_FIRED = "fired"
@@ -70,12 +72,55 @@ def _status_value(value: TaskStatus | str | None) -> str | None:
     return value.value if isinstance(value, TaskStatus) else str(value)
 
 
-def _is_terminal(value: TaskStatus | str | None) -> bool:
-    return _status_value(value) in {
-        TaskStatus.COMPLETED.value,
-        TaskStatus.FAILED.value,
-        TaskStatus.CANCELLED.value,
-    }
+def _watch_condition(target: Task) -> str:
+    """Return the semantic completion boundary for *target*.
+
+    Read-only/knowledge work is useful when the agent itself terminates.  A
+    write task, however, commonly reaches ``COMPLETED`` before its PR has made
+    it through review/fix and onto the integration branch.  Waking Strategic at
+    that earlier boundary is both misleading and expensive, so write-task
+    watches wait for a real landing (or an actionable failure/blocker).
+    """
+
+    task_type = str((target.first_payload or {}).get("type") or "")
+    return "landed" if task_type in WRITE_TASK_TYPES else "terminal"
+
+
+def _task_pr_number(target: Task) -> int | str | None:
+    ctx = target.context or {}
+    review_loop = ctx.get("review_loop")
+    if isinstance(review_loop, dict) and review_loop.get("pr_number") is not None:
+        return review_loop.get("pr_number")
+    for source in (ctx, target.first_payload or {}):
+        for key in ("rollup_pr_number", "pr_number"):
+            if source.get(key) is not None:
+                return source.get(key)
+    return None
+
+
+def _watch_outcome(target: Task) -> str | None:
+    """Return an actionable outcome, or ``None`` while the watch should wait."""
+
+    status = _status_value(target.status)
+    if target.requires_approval:
+        return "requires_approval"
+    if status == TaskStatus.BLOCKED.value:
+        return "blocked"
+    if status == TaskStatus.FAILED.value:
+        return "failed"
+    if status == TaskStatus.CANCELLED.value:
+        return "cancelled"
+    if _watch_condition(target) == "terminal":
+        return "completed" if status == TaskStatus.COMPLETED.value else None
+    if has_landed_signal(target):
+        return "landed"
+    # A write task that completed without ever opening a PR is a meaningful
+    # no-delivery/no-op result.  Do not wait forever for a landing that cannot
+    # happen; surface it so Strategic can decide whether the scope was already
+    # satisfied or needs another attempt.
+    if status == TaskStatus.COMPLETED.value and _task_pr_number(target) is None:
+        return "completed_without_pr"
+    return None
 
 
 async def _build_task_receipt(
@@ -83,6 +128,7 @@ async def _build_task_receipt(
     *,
     watch: StrategicWatch,
     target: Task,
+    outcome: str,
 ) -> dict[str, Any]:
     doc_ids = (
         (
@@ -100,14 +146,23 @@ async def _build_task_receipt(
         .all()
     )
     payload = target.first_payload or {}
+    ctx = target.context or {}
+    blocker = ctx.get("blocker") if isinstance(ctx.get("blocker"), dict) else None
     return {
         "watch_id": str(watch.id),
         "target_kind": "task",
         "target_task_id": str(target.id),
         "title": str(target.title or "Untitled Task")[:500],
         "task_type": str(payload.get("type") or "")[:64],
+        "condition": _watch_condition(target),
+        "outcome": outcome,
         "terminal_status": _status_value(target.status),
         "latest_status_message": str(target.latest_status_message or "")[:2000],
+        "pr_number": _task_pr_number(target),
+        "landed_on_integration": has_landed_signal(target),
+        "merge_commit_sha": str(ctx.get("merge_commit_sha") or "")[:64] or None,
+        "requires_approval": bool(target.requires_approval),
+        "blocker": blocker,
         "knowledge_document_ids": [str(doc_id) for doc_id in doc_ids],
         "purpose": str(watch.purpose or "")[:1000],
         "fired_at": (watch.fired_at or _utcnow()).isoformat(),
@@ -128,6 +183,7 @@ def serialize_watch(watch: StrategicWatch) -> dict[str, Any]:
         "target_task_id": str(watch.target_task_id),
         "purpose": str(watch.purpose or "")[:1000],
         "state": watch.state,
+        "condition": (watch.receipt or {}).get("condition"),
         "terminal_status": watch.terminal_status,
         "receipt": dict(watch.receipt or {}),
         "deadline_at": watch.deadline_at.isoformat() if watch.deadline_at else None,
@@ -149,7 +205,7 @@ async def register_task_watch(
     strategic_session_id: str | None = None,
     deadline_at: datetime | None = None,
 ) -> tuple[StrategicWatch, bool]:
-    """Register one idempotent terminal watch for a same-project task."""
+    """Register one idempotent semantic watch for a same-project task."""
 
     target = await session.get(Task, target_task_id)
     if target is None or target.project_id != project_id:
@@ -176,8 +232,10 @@ async def register_task_watch(
         target_task_id=target_task_id,
         purpose=(purpose or "")[:1000],
         deadline_at=deadline_at,
+        receipt={"condition": _watch_condition(target)},
     )
-    if _is_terminal(target.status):
+    outcome = _watch_outcome(target)
+    if outcome is not None:
         watch.state = WATCH_FIRED
         watch.terminal_status = _status_value(target.status)
         watch.fired_at = now
@@ -185,6 +243,7 @@ async def register_task_watch(
             session,
             watch=watch,
             target=target,
+            outcome=outcome,
         )
     session.add(watch)
     await session.flush()
@@ -198,7 +257,7 @@ async def resolve_project_task_watches(
     now: datetime | None = None,
     limit: int = WATCH_RECEIPT_LIMIT,
 ) -> list[StrategicWatch]:
-    """Resolve terminal/expired watches and return unacknowledged receipts.
+    """Resolve actionable/expired watches and return unacknowledged receipts.
 
     The caller commits. Repeated calls are safe: only ``pending`` rows can
     transition, while fired/expired rows remain visible until acknowledgement.
@@ -220,11 +279,13 @@ async def resolve_project_task_watches(
                         StrategicWatch.deadline_at <= now,
                         Task.status.in_(
                             (
+                                TaskStatus.BLOCKED,
                                 TaskStatus.COMPLETED,
                                 TaskStatus.FAILED,
                                 TaskStatus.CANCELLED,
                             )
                         ),
+                        Task.requires_approval.is_(True),
                     ),
                 )
                 .order_by(StrategicWatch.created_at.asc())
@@ -248,6 +309,12 @@ async def resolve_project_task_watches(
                 "fired_at": now.isoformat(),
             }
         else:
+            outcome = _watch_outcome(target)
+            if outcome is None:
+                # A write task may be agent-terminal while its PR is still in
+                # review/fix/merge.  Keep the durable watch pending until the
+                # landed signal (or a blocker/deadline) arrives.
+                continue
             watch.state = WATCH_FIRED
             watch.terminal_status = _status_value(target.status)
             watch.fired_at = now
@@ -255,6 +322,7 @@ async def resolve_project_task_watches(
                 session,
                 watch=watch,
                 target=target,
+                outcome=outcome,
             )
         session.add(watch)
     if pending_rows:

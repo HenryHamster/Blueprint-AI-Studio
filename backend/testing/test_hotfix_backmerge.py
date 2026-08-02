@@ -128,9 +128,26 @@ def _patch_github(
         create_kwargs["side_effect"] = create_side_effect
     else:
         create_kwargs["return_value"] = create_return
-    create_mock = mocker.patch(
-        "app.github.create_pull_request", new=AsyncMock(**create_kwargs)
-    )
+    if create_side_effect is None and isinstance(create_return, dict):
+        async def _create_with_target(*args, **kwargs):
+            result = dict(create_return)
+            if not result.get("empty_diff"):
+                result.setdefault(
+                    "head", {"ref": kwargs["head"], "sha": "deadbeef"}
+                )
+                result.setdefault(
+                    "base", {"ref": kwargs["base"], "sha": "basebeef"}
+                )
+            return result
+
+        create_mock = mocker.patch(
+            "app.github.create_pull_request",
+            new=AsyncMock(side_effect=_create_with_target),
+        )
+    else:
+        create_mock = mocker.patch(
+            "app.github.create_pull_request", new=AsyncMock(**create_kwargs)
+        )
     merge_kwargs: dict = {}
     if merge_side_effect is not None:
         merge_kwargs["side_effect"] = merge_side_effect
@@ -141,11 +158,24 @@ def _patch_github(
     )
     # Safe defaults for the step-6/7 lookups so the blocked path never makes a
     # real network call. Tests that exercise conflict / CI-failure override these.
+    async def _get_created_pr_target(*args, **kwargs):
+        create_call = create_mock.call_args
+        return {
+            "state": "open",
+            "mergeable_state": "clean",
+            "head": {
+                "ref": create_call.kwargs["head"],
+                "sha": "deadbeef",
+            },
+            "base": {
+                "ref": create_call.kwargs["base"],
+                "sha": "basebeef",
+            },
+        }
+
     mocker.patch(
         "app.github.get_pull_request",
-        new=AsyncMock(
-            return_value={"mergeable_state": "clean", "head": {"sha": "deadbeef"}}
-        ),
+        new=AsyncMock(side_effect=_get_created_pr_target),
     )
     mocker.patch(
         "app.github.get_check_runs_cached",
@@ -180,6 +210,16 @@ async def test_open_backmerge_pr_success(db_session, mocker):
         create_return={"number": 12, "html_url": "http://pr/12"},
         merge_return={"merged": True, "message": "Merged"},
     )
+    lock_mock = mocker.patch(
+        "app.task_locking.acquire_merge_submission_locks",
+        new=AsyncMock(return_value=None),
+    )
+    from app import github as github_mod
+
+    calls = mocker.Mock()
+    calls.attach_mock(github_mod.get_pull_request, "get_pr")
+    calls.attach_mock(lock_mock, "lock")
+    calls.attach_mock(merge_mock, "merge")
 
     result = await hb.open_backmerge_pr(
         db_session,
@@ -199,11 +239,51 @@ async def test_open_backmerge_pr_success(db_session, mocker):
 
     # Merge uses merge_method="merge" to preserve the hotfix history.
     assert merge_mock.call_args.kwargs["merge_method"] == "merge"
+    assert merge_mock.call_args.kwargs["expected_head_sha"] == "deadbeef"
     assert merge_mock.call_args.args[3] == 12  # pr_number
+    lock_mock.assert_awaited_once_with(
+        db_session,
+        project_id=project.id,
+        repo_identity="acme/widget",
+        base_branch="automain",
+        pr_number=12,
+    )
+    assert [call[0] for call in calls.mock_calls][-3:] == ["lock", "get_pr", "merge"]
 
     # A clean back-merge raises no Alert and spawns no task.
     assert await _alerts_for(db_session, project.id) == []
     assert await _tasks_for(db_session, project.id) == []
+
+
+@pytest.mark.parametrize("changed_side", ["head", "base"])
+async def test_open_backmerge_pr_defers_when_target_changes_during_validation(
+    db_session, mocker, changed_side
+):
+    """A changed source or target invalidates the guard evidence; never merge it."""
+    project = await _make_project(db_session)
+    _create_mock, merge_mock = _patch_github(
+        mocker,
+        create_return={"number": 13, "html_url": "http://pr/13"},
+        merge_return={"merged": True},
+    )
+    fresh_head_sha = "head-new" if changed_side == "head" else "deadbeef"
+    fresh_base_sha = "base-new" if changed_side == "base" else "basebeef"
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "open",
+                "head": {"ref": "main", "sha": fresh_head_sha},
+                "base": {"ref": "automain", "sha": fresh_base_sha},
+            }
+        ),
+    )
+
+    result = await hb.open_backmerge_pr(db_session, project.id, periodic=True)
+
+    assert result["status"] == "deferred"
+    assert result["error"] == "pr_target_changed"
+    merge_mock.assert_not_awaited()
 
 
 async def test_open_backmerge_pr_success_no_hotfix_metadata(db_session, mocker):
@@ -257,8 +337,10 @@ async def test_open_backmerge_pr_already_merged_pr_is_merged_not_blocked(
             return_value={
                 "merged": True,
                 "merged_at": "2026-07-12T00:00:00Z",
+                "state": "open",
                 "mergeable_state": "unknown",
-                "head": {"sha": "deadbeef"},
+                "head": {"ref": "main", "sha": "deadbeef"},
+                "base": {"ref": "automain", "sha": "basebeef"},
             }
         ),
     )
@@ -291,8 +373,10 @@ async def test_open_backmerge_pr_merged_at_only_also_counts_as_merged(
         new=AsyncMock(
             return_value={
                 "merged_at": "2026-07-12T00:00:00Z",
+                "state": "open",
                 "mergeable_state": "clean",
-                "head": {"sha": "deadbeef"},
+                "head": {"ref": "main", "sha": "deadbeef"},
+                "base": {"ref": "automain", "sha": "basebeef"},
             }
         ),
     )
@@ -321,8 +405,10 @@ async def test_open_backmerge_pr_unmerged_dirty_pr_still_classified_conflict(
             return_value={
                 "merged": False,
                 "merged_at": None,
+                "state": "open",
                 "mergeable_state": "dirty",
-                "head": {"sha": "deadbeef"},
+                "head": {"ref": "main", "sha": "deadbeef"},
+                "base": {"ref": "automain", "sha": "basebeef"},
             }
         ),
     )
@@ -464,7 +550,15 @@ async def test_open_backmerge_pr_dirty_pr_detected_as_conflict_spawns_resolver(
     # The PR's authoritative state says it's dirty (has conflicts).
     mocker.patch(
         "app.github.get_pull_request",
-        new=AsyncMock(return_value={"number": 77, "mergeable_state": "dirty"}),
+        new=AsyncMock(
+            return_value={
+                "number": 77,
+                "state": "open",
+                "mergeable_state": "dirty",
+                "head": {"ref": "main", "sha": "deadbeef"},
+                "base": {"ref": "automain", "sha": "basebeef"},
+            }
+        ),
     )
 
     result = await hb.open_backmerge_pr(db_session, project.id, periodic=True)
@@ -497,8 +591,10 @@ async def test_open_backmerge_pr_blocked_when_not_dirty(db_session, mocker):
         new=AsyncMock(
             return_value={
                 "number": 78,
+                "state": "open",
                 "mergeable_state": "blocked",
-                "head": {"sha": "abc123"},
+                "head": {"ref": "main", "sha": "deadbeef"},
+                "base": {"ref": "automain", "sha": "basebeef"},
             }
         ),
     )
@@ -535,8 +631,10 @@ async def test_open_backmerge_pr_ci_red_spawns_ci_fix_task(db_session, mocker):
         new=AsyncMock(
             return_value={
                 "number": 91,
+                "state": "open",
                 "mergeable_state": "blocked",  # not "dirty" → not a conflict
-                "head": {"sha": "cafe123"},
+                "head": {"ref": "main", "sha": "deadbeef"},
+                "base": {"ref": "automain", "sha": "basebeef"},
             }
         ),
     )
@@ -590,8 +688,10 @@ async def test_open_backmerge_pr_ci_red_no_duplicate_remediation(db_session, moc
         new=AsyncMock(
             return_value={
                 "number": 92,
+                "state": "open",
                 "mergeable_state": "blocked",
-                "head": {"sha": "beef456"},
+                "head": {"ref": "main", "sha": "deadbeef"},
+                "base": {"ref": "automain", "sha": "basebeef"},
             }
         ),
     )
@@ -3297,10 +3397,27 @@ async def test_open_backmerge_pr_no_duplicate_when_prior_resolver_pr_still_open(
     await _add_pr_artifact(
         db_session, resolver.id, "https://github.com/acme/widget/pull/7478"
     )
-    # The resolution PR is still open on GitHub.
+    # The resolution PR is still open on GitHub.  Keep the back-merge PR's
+    # exact target identity available too: the final merge boundary re-reads
+    # PR #7476 after validation, while resolver dedup independently reads
+    # PR #7478.
+    async def _get_backmerge_or_resolver_pr(
+        _token, _owner, _repo, pr_number, *, project_id=None
+    ):
+        if int(pr_number) == 7478:
+            return {"number": 7478, "state": "open", "merged": False}
+        assert int(pr_number) == 7476
+        return {
+            "number": 7476,
+            "state": "open",
+            "mergeable_state": "clean",
+            "head": {"ref": "main", "sha": "deadbeef"},
+            "base": {"ref": "automain", "sha": "basebeef"},
+        }
+
     mocker.patch(
         "app.github.get_pull_request",
-        new=AsyncMock(return_value={"number": 7478, "state": "open", "merged": False}),
+        new=AsyncMock(side_effect=_get_backmerge_or_resolver_pr),
     )
 
     # Cycle 2 (600s later): the back-merge PR is still dirty → conflict again.

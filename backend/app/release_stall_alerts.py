@@ -7,6 +7,7 @@ from datetime import datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.release_artifacts import summarize_required_artifact_gap
 from app import pause_clock, release_version
@@ -33,25 +34,12 @@ _BUILD_STALL_MERGED_TASKS = 40
 _STABILIZE_STALL_AGE_DAYS = 14
 _STABILIZE_STALL_MERGED_TASKS = 40
 
-# How long a managed_check_wait promotion PR may be pending before a stall alert
-# fires.  Migration-carrying PRs skip GitHub native auto-merge; the reconciler
-# polls CI instead.  A much shorter threshold (20 min) is appropriate because a
-# green-but-unmerged migration promotion is a hard operator-visible blocker.
-_MANAGED_CHECK_WAIT_STALL_SECONDS = 20 * 60
-_MANAGED_CHECK_WAIT_REALERT_INTERVAL_SECONDS = 20 * 60
-_MANAGED_CHECK_WAIT_STALL_CRITICAL_SECONDS = 2 * 3600
-
-# How long a promotion PR may await auto-merge before the stall alert fires.
-_AUTO_MERGE_STALL_SECONDS = 4 * 3600
-
-# Audit C9: the auto-merge stall alert must NOT fire only once and then go
-# permanently silent — a version stranded in promotion_pending was becoming
-# operator-invisible after the first alert.  Instead it re-fires on this cadence
-# (so a still-stuck promotion stays on the operator's radar) and escalates in
-# severity (WARNING → ERROR, the highest AlertSeverity) once the stall exceeds
-# _AUTO_MERGE_STALL_CRITICAL_SECONDS.
-_AUTO_MERGE_REALERT_INTERVAL_SECONDS = 4 * 3600
-_AUTO_MERGE_STALL_CRITICAL_SECONDS = 24 * 3600
+# A managed promotion PR includes ordinary CI, whose supported full gate can
+# legitimately take 45-60+ minutes. Alert only after four hours, re-alert on the
+# same cadence, and escalate at the promotion_pending 24-hour backstop.
+_MANAGED_CHECK_WAIT_STALL_SECONDS = 4 * 3600
+_MANAGED_CHECK_WAIT_REALERT_INTERVAL_SECONDS = 4 * 3600
+_MANAGED_CHECK_WAIT_STALL_CRITICAL_SECONDS = 24 * 3600
 
 
 def _release_qualifier_module():
@@ -532,171 +520,11 @@ async def _resolve_promotion_deploy_failed_alert(
     return len(open_alerts)
 
 
-async def _check_version_auto_merge_stall(
-    session: AsyncSession,
-    version: release_version.ReleaseVersion,
-) -> bool:
-    """Alert when a promotion PR awaiting auto-merge has been pending too long.
-
-    Audit C9: this alert is PERIODIC/ESCALATING, not single-fire.  A version
-    stranded in ``promotion_pending`` was previously becoming operator-invisible
-    after the first alert (the old code bailed once ``alerted_at`` was set).  Now
-    it re-fires every ``_AUTO_MERGE_REALERT_INTERVAL_SECONDS`` for as long as the
-    promotion stays stuck, escalating in severity (WARNING → ERROR, the highest
-    ``AlertSeverity``) once the stall exceeds
-    ``_AUTO_MERGE_STALL_CRITICAL_SECONDS`` — so a wedged promotion stays on the
-    operator's radar.  (The promotion_pending wall-clock deadline in
-    ``release_reconciliation`` independently force-fails the sub-state, but this
-    alert keeps the situation visible in the meantime and on any project where
-    that deadline has not yet elapsed.)
-    """
-    if version.status != "open":
-        return False
-
-    qual = version.last_qualification or {}
-    if qual.get("status") != "pending":
-        return False
-
-    pending = qual.get("promotion_pending")
-    if not pending:
-        return False
-
-    # managed_check_wait promotions are handled by _check_version_managed_check_wait_stall
-    # which uses a much shorter threshold appropriate for migration-carrying PRs.
-    if pending.get("managed_check_wait"):
-        return False
-
-    enabled_at_str = pending.get("enabled_at")
-    if not enabled_at_str:
-        return False
-
-    try:
-        enabled_at = datetime.fromisoformat(enabled_at_str)
-    except (ValueError, TypeError):
-        return False
-
-    rq = _release_qualifier_module()
-    now = _utcnow()
-    # PAUSE-AWARE stall age: while the pipeline is PAUSED the promotion PR's
-    # auto-merge cannot progress, so counting pause time toward the stall
-    # threshold fires escalating WARNING→ERROR "promotion stalled" alerts for a
-    # pause the operator started. This mirrors the promotion_pending 24h backstop
-    # (which is likewise pause-aware) so the alert and the force-fail agree on
-    # what "stalled" means. The open pause window is excluded (enabled_at is armed
-    # at several sites with no stampable baseline; deploy_state=None → raw).
-    _deploy_state = await session.get(DeploymentState, 1)
-    age_seconds = pause_clock.active_elapsed_seconds(
-        _deploy_state, enabled_at, pending.get("pause_baseline")
-    )
-    if age_seconds < rq._AUTO_MERGE_STALL_SECONDS:
-        return False
-
-    # Re-alert gate: fire on the first stall and then once per re-alert interval
-    # thereafter (replaces the old fire-exactly-once ``alerted_at`` guard).  The
-    # interval is measured from the LAST alert, falling back to ``alerted_at``
-    # (written by the pre-C9 single-fire path) so an in-flight stall upgrades
-    # cleanly to the periodic cadence.
-    last_alerted_str = pending.get("last_alerted_at") or pending.get("alerted_at")
-    if last_alerted_str:
-        try:
-            last_alerted = datetime.fromisoformat(last_alerted_str)
-        except (ValueError, TypeError):
-            last_alerted = None
-        if (
-            last_alerted is not None
-            and (now - last_alerted).total_seconds()
-            < _AUTO_MERGE_REALERT_INTERVAL_SECONDS
-        ):
-            return False
-
-    pr_number = pending.get("pr_number")
-    pr_url = pending.get("pr_url") or ""
-    auto_merge_enabled = bool(pending.get("auto_merge_enabled"))
-    age_hours = int(age_seconds // 3600)
-
-    critical = age_seconds >= _AUTO_MERGE_STALL_CRITICAL_SECONDS
-    # ERROR is the highest available AlertSeverity (no CRITICAL tier exists).
-    severity = AlertSeverity.ERROR if critical else AlertSeverity.WARNING
-    severity_note = (
-        " This has now exceeded "
-        f"{_AUTO_MERGE_STALL_CRITICAL_SECONDS // 3600}h — manual intervention "
-        "is likely required (the promotion_pending backstop will force-fail it "
-        "back to stabilize)."
-        if critical
-        else ""
-    )
-
-    session.add(
-        Alert(
-            project_id=version.project_id,
-            event_type="release.promotion_auto_merge_stalled",
-            severity=severity,
-            title=(f"Release v{version.version_number} promotion auto-merge stalled"),
-            message=(
-                f"Release v{version.version_number} passed qualification but "
-                f"promotion PR #{pr_number} has not merged after {age_hours}h "
-                f"(auto-merge "
-                f"{'enabled' if auto_merge_enabled else 'NOT confirmed enabled'}"
-                f"). Check the PR: {pr_url}{severity_note}"
-            ),
-        )
-    )
-    try:
-        await rq.post_version_auto_merge_stall_message(
-            session,
-            version.project_id,
-            version_number=version.version_number,
-            version_id=str(version.id),
-            pr_number=pr_number,
-            pr_url=pr_url,
-            auto_merge_enabled=auto_merge_enabled,
-            age_hours=age_hours,
-        )
-    except Exception as exc:  # noqa: BLE001 — messaging must never break the sweep
-        logger.warning(
-            "[RELEASE_QUALIFIER] failed to post auto-merge-stall message for v%d (non-fatal): %s",
-            version.version_number,
-            exc,
-        )
-
-    new_qual = dict(qual)
-    new_pending = dict(pending)
-    now_iso = now.isoformat()
-    # Keep ``alerted_at`` as the FIRST-fire anchor for backward compatibility;
-    # ``last_alerted_at`` drives the re-alert cadence and ``alert_count`` records
-    # the escalation history.
-    new_pending.setdefault("alerted_at", now_iso)
-    new_pending["last_alerted_at"] = now_iso
-    new_pending["alert_count"] = int(new_pending.get("alert_count") or 0) + 1
-    new_qual["promotion_pending"] = new_pending
-    version.last_qualification = new_qual
-    session.add(version)
-
-    logger.warning(
-        "[RELEASE_QUALIFIER] auto-merge stall alert (%s, #%d) for v%d: PR #%s "
-        "pending %dh (auto-merge %s)",
-        "ERROR" if critical else "WARNING",
-        new_pending["alert_count"],
-        version.version_number,
-        pr_number,
-        age_hours,
-        "enabled" if auto_merge_enabled else "NOT confirmed enabled",
-    )
-    return True
-
-
 async def _check_version_managed_check_wait_stall(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
 ) -> bool:
-    """Alert when a managed_check_wait promotion PR has been pending too long.
-
-    Migration-carrying PRs skip GitHub native auto-merge and instead wait for
-    CI to go green before the reconciler merges them directly.  A green-but-stuck
-    promotion in this sub-state is a hard operator-visible blocker, so we fire
-    much earlier than the native auto-merge stall alert (20 min vs 4 h) and
-    re-fire on the same cadence until resolved.
-    """
+    """Alert when Blueprint's managed promotion PR has been pending too long."""
     if version.status != "open":
         return False
 
@@ -704,21 +532,34 @@ async def _check_version_managed_check_wait_stall(
     if qual.get("status") != "pending":
         return False
 
-    pending = qual.get("promotion_pending")
-    if not pending or not pending.get("managed_check_wait"):
-        return False
+    from app.release_promotion_pending import (
+        _PROMOTION_PENDING_MANAGED,
+        _canonicalize_promotion_pending,
+        _parse_promotion_pending_time,
+    )
 
-    enabled_at_str = pending.get("enabled_at")
-    if not enabled_at_str:
+    pending, pending_kind, pending_was_normalized = _canonicalize_promotion_pending(
+        qual.get("promotion_pending"),
+        qualification=qual,
+        version=version,
+    )
+    if pending is None or pending_kind != _PROMOTION_PENDING_MANAGED:
         return False
-
-    try:
-        enabled_at = datetime.fromisoformat(enabled_at_str)
-    except (ValueError, TypeError):
+    enabled_at = _parse_promotion_pending_time(pending.get("enabled_at"))
+    if enabled_at is None:  # canonicalizer is total; defensive only.
         return False
+    if pending_was_normalized:
+        qual = dict(qual)
+        qual["promotion_pending"] = pending
+        version.last_qualification = qual
+        flag_modified(version, "last_qualification")
+        session.add(version)
 
     now = _utcnow()
-    age_seconds = (now - enabled_at).total_seconds()
+    deploy_state = await session.get(DeploymentState, 1)
+    age_seconds = pause_clock.active_elapsed_seconds(
+        deploy_state, enabled_at, pending.get("pause_baseline")
+    )
     if age_seconds < _MANAGED_CHECK_WAIT_STALL_SECONDS:
         return False
 
@@ -737,7 +578,7 @@ async def _check_version_managed_check_wait_stall(
 
     pr_number = pending.get("pr_number")
     pr_url = pending.get("pr_url") or ""
-    age_minutes = int(age_seconds // 60)
+    age_hours = int(age_seconds // 3600)
     ci_state = pending.get("ci_state", "unknown")
 
     critical = age_seconds >= _MANAGED_CHECK_WAIT_STALL_CRITICAL_SECONDS
@@ -755,13 +596,14 @@ async def _check_version_managed_check_wait_stall(
             event_type="release.managed_check_wait_stalled",
             severity=severity,
             title=(
-                f"Release v{version.version_number} managed_check_wait promotion stalled"
+                f"Release v{version.version_number} promotion check wait stalled"
             ),
             message=(
-                f"Release v{version.version_number} migration-carrying promotion PR "
-                f"#{pr_number} has been in managed_check_wait for {age_minutes}m "
-                f"(CI state: {ci_state}). The reconciler merges this PR once CI is "
-                f"green — check the PR for stuck or failing checks: {pr_url}{severity_note}"
+                f"Release v{version.version_number} promotion PR #{pr_number} has "
+                f"waited {age_hours}h for required checks (CI state: {ci_state}). "
+                "Blueprint will revalidate the exact base/head and retry the merge "
+                f"once checks pass. Check for stuck or failing checks: {pr_url}"
+                f"{severity_note}"
             ),
         )
     )
@@ -778,12 +620,12 @@ async def _check_version_managed_check_wait_stall(
 
     logger.warning(
         "[RELEASE_QUALIFIER] managed_check_wait stall alert (%s, #%d) for v%d: "
-        "PR #%s pending %dm (ci_state=%s)",
+        "PR #%s pending %dh (ci_state=%s)",
         "ERROR" if critical else "WARNING",
         new_pending["mcw_alert_count"],
         version.version_number,
         pr_number,
-        age_minutes,
+        age_hours,
         ci_state,
     )
     return True

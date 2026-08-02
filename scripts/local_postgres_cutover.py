@@ -535,11 +535,13 @@ _INDEXES_SQL = """
 SELECT COALESCE(jsonb_agg(jsonb_build_object(
   'schema', x.schemaname, 'table', x.tablename, 'name', x.indexname,
   'definition', x.indexdef, 'owner', pg_get_userbyid(i.relowner),
-  'acl', COALESCE(i.relacl::text[], ARRAY[]::text[])
+  'acl', COALESCE(i.relacl::text[], ARRAY[]::text[]),
+  'valid', state.indisvalid, 'ready', state.indisready, 'live', state.indislive
 ) ORDER BY x.tablename, x.indexname), '[]'::jsonb)::text
 FROM pg_indexes x
 JOIN pg_namespace n ON n.nspname=x.schemaname
 JOIN pg_class i ON i.relnamespace=n.oid AND i.relname=x.indexname
+JOIN pg_index state ON state.indexrelid=i.oid
 WHERE x.schemaname = 'public';
 """
 
@@ -731,6 +733,33 @@ def snapshot_database(client: DockerPsql, *, label: str, instance: str) -> dict[
     ]
     if unvalidated_constraints:
         raise CutoverError("database_snapshot", "unvalidated_constraints_present")
+    required_index_fields = {
+        "schema",
+        "table",
+        "name",
+        "definition",
+        "owner",
+        "acl",
+        "valid",
+        "ready",
+        "live",
+    }
+    for index in indexes:
+        if (
+            not isinstance(index, dict)
+            or not required_index_fields.issubset(index)
+            or not isinstance(index.get("definition"), str)
+            or not all(
+                isinstance(index.get(field), bool)
+                for field in ("valid", "ready", "live")
+            )
+        ):
+            raise CutoverError("database_snapshot", "invalid_index_inventory")
+    if any(
+        not index["valid"] or not index["ready"] or not index["live"]
+        for index in indexes
+    ):
+        raise CutoverError("database_snapshot", "unhealthy_indexes_present")
     for key in ("orphan_tasks", "orphan_parent_tasks", "orphan_artifacts"):
         if critical.get(key) != 0:
             raise CutoverError("database_snapshot", f"critical_{key}")
@@ -801,6 +830,15 @@ def validate_snapshot(value: Mapping[str, Any], *, label: str) -> None:
         raise CutoverError("evidence", f"invalid_{label}_alembic_revision")
     if value.get("unvalidated_constraints") != []:
         raise CutoverError("evidence", f"{label}_unvalidated_constraints")
+    for field in ("public_constraints", "public_indexes"):
+        inventory = value.get(field)
+        if not isinstance(inventory, list) or any(
+            not isinstance(item, dict)
+            or "definition" not in item
+            or not isinstance(item["definition"], str)
+            for item in inventory
+        ):
+            raise CutoverError("evidence", f"invalid_{label}_{field}")
     critical = value.get("critical_aggregates")
     if not isinstance(critical, dict) or any(
         critical.get(key) != 0
@@ -837,14 +875,220 @@ def _normalize_role_bound(value: Any, role: str) -> Any:
     return value
 
 
-def compare_snapshots(
+_TEXT_ARRAY_BODY_RE = r"[^\[\]]*"
+_WRAPPED_TEXT_ARRAY_RE = re.compile(
+    rf"\(ARRAY\[(?P<body>{_TEXT_ARRAY_BODY_RE})\]\)::text\[\]"
+)
+_CAST_TEXT_ARRAY_RE = re.compile(
+    rf"ARRAY\[(?P<body>{_TEXT_ARRAY_BODY_RE})\]::text\[\]"
+)
+_TEXT_ARRAY_RE = re.compile(rf"ARRAY\[(?P<body>{_TEXT_ARRAY_BODY_RE})\]")
+_TEXT_ARRAY_ELEMENT_RE = re.compile(
+    r"(?:"
+    r"\((?P<parenthesized>'(?:''|[^'])*')::character varying\)::text"
+    r"|(?P<varchar>'(?:''|[^'])*')::character varying(?:::text)?"
+    r"|(?P<text>'(?:''|[^'])*')::text"
+    r")"
+)
+
+
+def _canonical_text_literal_array(match: re.Match[str]) -> str:
+    """Canonicalize only an array made entirely of cast string literals."""
+
+    body = match.group("body")
+    allows_bare_varchar = match.re in {
+        _WRAPPED_TEXT_ARRAY_RE,
+        _CAST_TEXT_ARRAY_RE,
+    }
+    literals: list[str] = []
+    position = 0
+    while position < len(body):
+        element = _TEXT_ARRAY_ELEMENT_RE.match(body, position)
+        if element is None:
+            return match.group(0)
+        if (
+            element.group("varchar") is not None
+            and not allows_bare_varchar
+            and not element.group(0).endswith("::text")
+        ):
+            return match.group(0)
+        literal = next(value for value in element.groups() if value is not None)
+        literals.append(f"{literal}::text")
+        position = element.end()
+        if position == len(body):
+            break
+        separator = re.match(r",\s*", body[position:])
+        if separator is None:
+            return match.group(0)
+        position += separator.end()
+    if not literals:
+        return match.group(0)
+    return "ARRAY[" + ", ".join(literals) + "]"
+
+
+def _normalize_pg15_definition(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    # PostgreSQL 15.17 emits ``(ARRAY[varchar literals])::text[]`` while
+    # 15.18 emits ``ARRAY[(varchar literal)::text]``.  The rewrite is allowed
+    # only when every array element is an explicitly cast SQL string literal.
+    result: list[str] = []
+    position = 0
+    while position < len(value):
+        character = value[position]
+        if character in {"'", '"'}:
+            quote = character
+            end = position + 1
+            closed = False
+            while end < len(value):
+                if value[end] == quote:
+                    if end + 1 < len(value) and value[end + 1] == quote:
+                        end += 2
+                        continue
+                    end += 1
+                    closed = True
+                    break
+                end += 1
+            if not closed:
+                return value
+            result.append(value[position:end])
+            position = end
+            continue
+        if value.startswith("--", position):
+            end = value.find("\n", position + 2)
+            if end < 0:
+                result.append(value[position:])
+                break
+            result.append(value[position:end])
+            position = end
+            continue
+        if value.startswith("/*", position):
+            end = position + 2
+            depth = 1
+            while end < len(value) and depth:
+                if value.startswith("/*", end):
+                    depth += 1
+                    end += 2
+                elif value.startswith("*/", end):
+                    depth -= 1
+                    end += 2
+                else:
+                    end += 1
+            if depth:
+                return value
+            result.append(value[position:end])
+            position = end
+            continue
+        if character == "$":
+            tag = re.match(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$", value[position:])
+            if tag is not None:
+                delimiter = tag.group(0)
+                end = value.find(delimiter, position + len(delimiter))
+                if end < 0:
+                    return value
+                end += len(delimiter)
+                result.append(value[position:end])
+                position = end
+                continue
+        candidates: list[re.Match[str]] = []
+        if character == "(":
+            wrapped = _WRAPPED_TEXT_ARRAY_RE.match(value, position)
+            if wrapped is not None:
+                candidates.append(wrapped)
+        if value.startswith("ARRAY[", position) and (
+            position == 0
+            or not (value[position - 1].isalnum() or value[position - 1] in {"_", "$"})
+        ):
+            cast_array = _CAST_TEXT_ARRAY_RE.match(value, position)
+            if cast_array is not None:
+                candidates.append(cast_array)
+            array = _TEXT_ARRAY_RE.match(value, position)
+            if array is not None:
+                candidates.append(array)
+        if candidates:
+            match = max(candidates, key=lambda candidate: candidate.end())
+            replacement = _canonical_text_literal_array(match)
+            result.append(replacement)
+            position = match.end()
+            continue
+        result.append(character)
+        position += 1
+    return "".join(result)
+
+
+def _normalize_column_ordinals(value: Any) -> Any:
+    """Densify ordinals while retaining exact surviving-column order."""
+
+    if not isinstance(value, list):
+        return value
+    normalized: list[dict[str, Any]] = []
+    prior_table: tuple[str, str] | None = None
+    prior_ordinal = 0
+    dense_ordinal = 0
+    identities: set[tuple[str, str, str]] = set()
+    for item in value:
+        if not isinstance(item, dict):
+            return value
+        schema = item.get("schema")
+        table = item.get("table")
+        name = item.get("name")
+        ordinal = item.get("ordinal")
+        if (
+            not all(isinstance(part, str) for part in (schema, table, name))
+            or not isinstance(ordinal, int)
+            or isinstance(ordinal, bool)
+            or ordinal < 1
+        ):
+            return value
+        table_key = (schema, table)
+        identity = (schema, table, name)
+        if identity in identities or (prior_table is not None and table_key < prior_table):
+            return value
+        if table_key != prior_table:
+            prior_table = table_key
+            prior_ordinal = 0
+            dense_ordinal = 0
+        if ordinal <= prior_ordinal:
+            return value
+        identities.add(identity)
+        prior_ordinal = ordinal
+        dense_ordinal += 1
+        normalized_item = dict(item)
+        normalized_item["ordinal"] = dense_ordinal
+        normalized.append(normalized_item)
+    return normalized
+
+
+def _normalize_comparison_field(field: str, value: Any, role: str) -> Any:
+    normalized = _normalize_role_bound(value, role)
+    if field == "public_columns":
+        return _normalize_column_ordinals(normalized)
+    if field in {"public_constraints", "public_indexes"} and isinstance(
+        normalized, list
+    ):
+        result: list[Any] = []
+        for item in normalized:
+            if (
+                not isinstance(item, dict)
+                or "definition" not in item
+                or not isinstance(item["definition"], str)
+            ):
+                return normalized
+            normalized_item = dict(item)
+            normalized_item["definition"] = _normalize_pg15_definition(item["definition"])
+            result.append(normalized_item)
+        return result
+    return normalized
+
+
+def snapshot_mismatches(
     source: Mapping[str, Any],
     target: Mapping[str, Any],
     *,
     source_owner: str = "postgres",
     target_owner: str = "blueprint",
     compare_sequences: bool = True,
-) -> None:
+) -> list[str]:
     validate_snapshot(source, label="source")
     validate_snapshot(target, label="target")
     source_owner = _safe_cli_name(source_owner, "source_owner")
@@ -854,12 +1098,29 @@ def compare_snapshots(
         if compare_sequences
         else tuple(field for field in _COMPARISON_FIELDS if field != "sequences")
     )
-    mismatches = [
+    return [
         field
         for field in comparison_fields
-        if _normalize_role_bound(source[field], source_owner)
-        != _normalize_role_bound(target[field], target_owner)
+        if _normalize_comparison_field(field, source[field], source_owner)
+        != _normalize_comparison_field(field, target[field], target_owner)
     ]
+
+
+def compare_snapshots(
+    source: Mapping[str, Any],
+    target: Mapping[str, Any],
+    *,
+    source_owner: str = "postgres",
+    target_owner: str = "blueprint",
+    compare_sequences: bool = True,
+) -> None:
+    mismatches = snapshot_mismatches(
+        source,
+        target,
+        source_owner=source_owner,
+        target_owner=target_owner,
+        compare_sequences=compare_sequences,
+    )
     if mismatches:
         raise CutoverError("comparison", "mismatch_" + "_".join(mismatches))
 

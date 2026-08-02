@@ -38,21 +38,12 @@ export type {
   DirectionSrCatStat,
   EdgesTrend,
   EdgesTrendStats,
-  FreshReviewerMetricEntry,
-  FreshReviewerTrend,
-  ReviewerHallucinationRate,
   SrCategoryTrend,
   SrCheckResultEntry,
   SrCoFailurePair,
-  SrDisagreementExample,
   SrInvestigationSignal,
   SrMissExample,
   SrMissedTask,
-  SrReviewerDisagreement,
-  SrReviewerDisagreementsData,
-  SrReviewerDisagreementTask,
-  SrReviewerDisagreementTasksResult,
-  SrReviewerFinding,
   SrScopeDriftVsExpansion,
   SrSeverityBucket,
   SrTaskTypeCategoryStats,
@@ -73,7 +64,6 @@ export {
 export {
   DirectionSrBreakdownPanel,
   EdgesTrendBreakdown,
-  SrReviewerDisagreementsPanel,
 } from './srTrendBreakdown/panels';
 export { SrMissedRetrospective, SrUnhandledEdgesRetrospective } from './srTrendBreakdown/retrospectives';
 
@@ -576,11 +566,6 @@ function CategoryRow({
   );
 
   if (variant === 'card') {
-    const srAlone = c.sr_alone_hit_rate;
-    const reviewerSave = c.reviewer_save_rate;
-    const combined = c.current_hit_rate;
-    const showSplit = srAlone != null || reviewerSave != null;
-
     const rowBody = (
       <>
         <span className="text-neutral-300 truncate flex-1" title={cat}>{cat}</span>
@@ -715,16 +700,6 @@ function CategoryRow({
           )}
           {investigateButton}
         </div>
-        {showSplit && (
-          <div className="flex items-center gap-2 text-xs text-neutral-500 ml-5 mt-0.5">
-            <span className="font-mono">
-              SR alone {srAlone != null ? `${Math.round(srAlone * 100)}%` : '–'} ·{' '}
-              reviewer-save {reviewerSave != null ? `${Math.round(reviewerSave * 100)}%` : '–'} ·{' '}
-              combined {combined != null ? `${Math.round(combined * 100)}%` : '–'} ·{' '}
-              miss {miss != null ? `${Math.round(miss * 100)}%` : '–'}
-            </span>
-          </div>
-        )}
         {open && hasExamples && <ExampleList examples={examples} />}
       </div>
     );

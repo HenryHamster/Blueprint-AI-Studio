@@ -21,6 +21,7 @@ from app.models import Project, ProjectMember, Task, TaskStatus
 from app.task_locking import (
     DESIGN_DOC_MAX_BYTES,
     DesignDocSizeLimitExceeded,
+    acquire_merge_submission_locks,
     acquire_pr_spawn_lock,
     lock_project_or_429,
     project_lock,
@@ -650,7 +651,7 @@ async def test_acquire_pr_spawn_lock_is_noop_on_sqlite(db_session):
     if db_session.bind.dialect.name == "postgresql":
         pytest.skip("This test only verifies the SQLite no-op fallback")
     # Should not raise
-    await acquire_pr_spawn_lock(db_session, 12345)
+    await acquire_pr_spawn_lock(db_session, "project-a", 12345)
     # Sanity: subsequent queries on the same session still work
     result = await db_session.execute(select(Project).limit(1))
     result.scalars().all()
@@ -679,7 +680,9 @@ async def test_acquire_pr_spawn_lock_serializes_concurrent_holders(db_session):
 
     async def hold_lock_first():
         async with Session() as session:
-            await acquire_pr_spawn_lock(session, pr_number)
+            await acquire_pr_spawn_lock(
+                session, "project-a", pr_number, repo_identity="owner/repo-a"
+            )
             first_acquired.set()
             # Hold the lock briefly so the second caller's acquire is forced
             # to wait. 200ms is enough to detect serialization vs
@@ -691,7 +694,9 @@ async def test_acquire_pr_spawn_lock_serializes_concurrent_holders(db_session):
     async def acquire_second():
         await first_acquired.wait()
         async with Session() as session:
-            await acquire_pr_spawn_lock(session, pr_number)
+            await acquire_pr_spawn_lock(
+                session, "project-a", pr_number, repo_identity="owner/repo-a"
+            )
             second_acquired_at.append(asyncio.get_event_loop().time())
             await session.commit()
 
@@ -725,7 +730,9 @@ async def test_acquire_pr_spawn_lock_different_prs_dont_block(db_session):
 
     async def hold_a():
         async with Session() as session:
-            await acquire_pr_spawn_lock(session, 99100)
+            await acquire_pr_spawn_lock(
+                session, "project-a", 99100, repo_identity="owner/repo-a"
+            )
             pr_a_acquired.set()
             await asyncio.sleep(0.3)
             await session.commit()
@@ -737,12 +744,136 @@ async def test_acquire_pr_spawn_lock_different_prs_dont_block(db_session):
         # the 0.3s hold — so a spurious dependency surfaces as a timeout.
         async with Session() as session:
             await asyncio.wait_for(
-                acquire_pr_spawn_lock(session, 99101),
+                acquire_pr_spawn_lock(
+                    session,
+                    "project-a",
+                    99101,
+                    repo_identity="owner/repo-a",
+                ),
                 timeout=0.1,
             )
             await session.commit()
 
     await asyncio.gather(hold_a(), acquire_b())
+
+
+@pytest.mark.skipif(not USE_POSTGRES, reason="advisory locks require PostgreSQL")
+@pytest.mark.asyncio
+async def test_acquire_pr_spawn_lock_same_number_different_projects_do_not_block(
+    db_session,
+):
+    """Repository identity prevents unrelated PR #N rows from serializing."""
+    Session = sessionmaker(
+        bind=db_session.bind,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    first_acquired = asyncio.Event()
+
+    async def hold_first():
+        async with Session() as session:
+            await acquire_pr_spawn_lock(
+                session, "project-a", 99102, repo_identity="owner/repo-a"
+            )
+            first_acquired.set()
+            await asyncio.sleep(0.3)
+            await session.commit()
+
+    async def acquire_other_project():
+        await first_acquired.wait()
+        async with Session() as session:
+            await asyncio.wait_for(
+                acquire_pr_spawn_lock(
+                    session,
+                    "project-b",
+                    99102,
+                    repo_identity="other/repo-b",
+                ),
+                timeout=0.1,
+            )
+            await session.commit()
+
+    await asyncio.gather(hold_first(), acquire_other_project())
+
+
+@pytest.mark.skipif(not USE_POSTGRES, reason="advisory locks require PostgreSQL")
+@pytest.mark.asyncio
+async def test_pr_lock_serializes_duplicate_projects_for_same_repository(db_session):
+    """Duplicate Blueprint projects cannot race the same GitHub PR."""
+    Session = sessionmaker(
+        bind=db_session.bind,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    first_acquired = asyncio.Event()
+    first_released_at: list[float] = []
+    second_acquired_at: list[float] = []
+
+    async def hold_first():
+        async with Session() as session:
+            await acquire_pr_spawn_lock(
+                session, "project-a", 99103, repo_identity="owner/shared"
+            )
+            first_acquired.set()
+            await asyncio.sleep(0.2)
+            first_released_at.append(asyncio.get_event_loop().time())
+            await session.commit()
+
+    async def acquire_duplicate_project():
+        await first_acquired.wait()
+        async with Session() as session:
+            await acquire_pr_spawn_lock(
+                session, "project-b", 99103, repo_identity="OWNER/SHARED"
+            )
+            second_acquired_at.append(asyncio.get_event_loop().time())
+            await session.commit()
+
+    await asyncio.gather(hold_first(), acquire_duplicate_project())
+    assert second_acquired_at[0] >= first_released_at[0] - 0.005
+
+
+@pytest.mark.skipif(not USE_POSTGRES, reason="advisory locks require PostgreSQL")
+@pytest.mark.asyncio
+async def test_base_merge_lock_serializes_duplicate_projects_same_repo_base(db_session):
+    """Same GitHub repo/base serializes even across duplicate project rows."""
+    Session = sessionmaker(
+        bind=db_session.bind,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    first_acquired = asyncio.Event()
+    first_released_at: list[float] = []
+    second_acquired_at: list[float] = []
+
+    async def hold_first():
+        async with Session() as session:
+            await acquire_merge_submission_locks(
+                session,
+                project_id="project-a",
+                repo_identity="owner/shared",
+                base_branch="automain",
+                pr_number=99104,
+            )
+            first_acquired.set()
+            await asyncio.sleep(0.2)
+            first_released_at.append(asyncio.get_event_loop().time())
+            await session.commit()
+
+    async def acquire_duplicate_project():
+        await first_acquired.wait()
+        async with Session() as session:
+            await acquire_merge_submission_locks(
+                session,
+                project_id="project-b",
+                repo_identity="OWNER/SHARED",
+                base_branch="automain",
+                pr_number=99105,
+            )
+            second_acquired_at.append(asyncio.get_event_loop().time())
+            await session.commit()
+
+    await asyncio.gather(hold_first(), acquire_duplicate_project())
+    assert second_acquired_at[0] >= first_released_at[0] - 0.005
 
 
 # ── with_design_doc_locked ──────────────────────────────────────────────────
@@ -832,6 +963,40 @@ async def test_with_directions_locked_whole_array_overwrite(db_session):
     await db_session.refresh(project)
 
     assert project.directions == [{"id": "d-9"}]
+
+
+@pytest.mark.asyncio
+async def test_with_directions_locked_survives_follow_on_project_projection(db_session):
+    """A later projected lock must not restore the pre-mutation directions blob.
+
+    SQLite's test session deliberately disables autoflush. This pins the
+    transaction invariant directly: the canonical directions helper flushes
+    its authoritative blob before a populate_existing vision lock can refresh
+    another Project projection into the shared identity-mapped instance.
+    """
+    project = Project(
+        name="dir-lock-follow-on-projection",
+        user_id="user",
+        directions=[{"id": "d-1", "status": "paused"}],
+        vision={"purpose": "initial"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+
+    def _retire(directions: list) -> None:
+        directions[0]["status"] = "retired"
+
+    await with_directions_locked(db_session, project.id, _retire)
+    await with_vision_locked(
+        db_session,
+        project.id,
+        lambda vision: vision.update({"purpose": "updated"}),
+    )
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    assert project.directions == [{"id": "d-1", "status": "retired"}]
+    assert project.vision == {"purpose": "updated"}
 
 
 @pytest.mark.skipif(not USE_POSTGRES, reason="row-lock concurrency requires PostgreSQL")
@@ -1872,7 +2037,6 @@ def test_reserved_design_doc_keys_contains_cochange_and_audit_keys():
         "repo_overview",
         "review_effectiveness",
         "playbook_deleted_keys",
-        "sr_reviewer_disagreements",
         "sr_catch_rate_trends_alert",
         "sr_catch_rate_floor_alert",
         "sr_quadrant_alert",
@@ -1890,7 +2054,6 @@ def test_reserved_design_doc_keys_contains_cochange_and_audit_keys():
 
 _ROLLING_CUTOVER_KEYS = (
     "lane_baselines",
-    "fresh_reviewer_trend",
     "edges_trend",
     "sr_false_attestation_trends",
     "sr_regression_risk_test_signal_trends",

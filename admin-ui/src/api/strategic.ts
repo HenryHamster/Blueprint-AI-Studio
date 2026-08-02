@@ -624,10 +624,6 @@ export interface DirectionSrCatStat {
   hit_rate?: number | null;
   miss_rate: number | null;
   examples?: Array<{ desc: string; severity: string }>;
-  sr_alone_hit_count?: number | null;
-  reviewer_save_hit_count?: number | null;
-  sr_alone_hit_rate?: number | null;
-  reviewer_save_rate?: number | null;
 }
 
 export interface DirectionSrEntry {
@@ -709,10 +705,6 @@ export interface SrCategoryTrend {
   weighted_miss_rate?: number | null;
   false_positive_rate?: number | null;
   precision?: number | null;
-  sr_alone_hit_count?: number | null;
-  reviewer_save_hit_count?: number | null;
-  sr_alone_hit_rate?: number | null;
-  reviewer_save_rate?: number | null;
   trend?: 'increasing' | 'decreasing' | 'stable';
   rate_history?: number[];
   prompt_version_changed?: boolean | null;
@@ -751,31 +743,6 @@ export interface SrFalsePositiveCategoryStat {
   tp_count: number;
 }
 
-export interface SrReviewerDisagreementCategory {
-  category: string;
-  sample_size: number;
-  reviewer_overrode_sr_count: number;
-  sr_overrode_reviewer_count: number;
-}
-
-/**
- * Response envelope for the `sr-reviewer-disagreements` endpoint.
- *
- * `total_entries` is the legacy field (= number of returned entries, i.e. the
- * truncated page slice) and is always emitted for backward compatibility. The
- * additive `total_distinct_categories` / `returned_entries` fields report the
- * true distinct-category total for the window independently from the truncated
- * `disagreements` list; they are optional so a frontend can still render
- * sensibly against an older backend during a mixed deploy.
- */
-export interface SrReviewerDisagreementsEnvelope {
-  window_days: number;
-  total_entries: number;
-  total_distinct_categories?: number;
-  returned_entries?: number;
-  disagreements: import('../components/SrTrendBreakdown').SrReviewerDisagreement[];
-}
-
 export interface PromptFingerprintEntry {
   fingerprint: string;
   sample_size: number;
@@ -787,12 +754,9 @@ export interface PromptFingerprintEntry {
   sr_sample_size: number;
   sr_catch_rate: number | null;
   sr_catch_sample_size: number;
-  reviewer_rescue_rate: number | null;
-  reviewer_rescue_sample_size: number;
   sr_false_positive_rate: number | null;
   sr_false_positive_sample_size: number;
   sr_false_positive_rate_by_category: SrFalsePositiveCategoryStat[];
-  sr_reviewer_disagreement_top_categories: SrReviewerDisagreementCategory[];
   sr_catch_rate_delta_vs_project_mean: number | null;
 }
 

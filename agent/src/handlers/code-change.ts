@@ -114,15 +114,6 @@ export interface CodeChangeTaskOpts {
    *  minimum a status field; completed siblings expose their files list so
    *  the guard can check whether all relatedFiles are already covered. */
   siblingTasks?: Array<{ status: string; files?: string[]; title?: string; id?: string }>;
-  /**
-   * Called when SR has categories=["incomplete_review"] and no reviewer_findings yet.
-   * Implementations run a fresh-reviewer pass with incompleteSrRecovery=true so
-   * check_results are stamped with origin="reviewer_recovery_after_incomplete_sr".
-   * Only invoked from the PR-URL fallback path so the recovery findings are captured
-   * in the COMPLETED status payload. Guard callers with freshReviewerAlreadyRan when
-   * they also run a fresh-reviewer pass unconditionally to avoid double-firing.
-   */
-  incompleteReviewRecoveryFn?: () => Promise<void>;
 }
 
 /** Read Claude's self-review JSON and ensure prompt_version is stamped.
@@ -207,26 +198,6 @@ function writeFixSRContext(taskId: string, baseCommit: string, prNumber: number,
       { mode: 0o644 },
     );
   } catch { /* non-fatal */ }
-}
-
-/**
- * Fires incompleteReviewRecoveryFn when the SR carries incomplete_review in
- * categories and no reviewer_findings have been set yet. No-op when recoveryFn
- * is undefined or when conditions are not met. Exported for unit testing.
- */
-export async function maybeRunIncompleteReviewRecovery(
-  taskId: string,
-  ws: WebSocket | null,
-  recoveryFn: (() => Promise<void>) | undefined,
-): Promise<void> {
-  if (!recoveryFn) return;
-  const sr = readSelfReviewOutcome(taskId);
-  const cats = Array.isArray(sr?.categories) ? sr.categories as string[] : [];
-  const hasFindings = Array.isArray(sr?.reviewer_findings) && (sr.reviewer_findings as unknown[]).length > 0;
-  if (cats.includes('incomplete_review') && !hasFindings) {
-    sendLog(ws, '[FreshReview] SR reports incomplete_review — auto-triggering recovery pass.\n');
-    await recoveryFn();
-  }
 }
 
 function workspaceHasChanges(baseCommit: string): boolean {
@@ -347,9 +318,6 @@ async function inspectTerminalMarkers(
       sendLog(ws, `[wrapper] /tmp/pr_url_${taskId} contains malformed PR URL: ${JSON.stringify(prUrl)}. Treating as task-did-not-ship.\n`);
       return 'unshipped';
     }
-    // Run incomplete-review recovery before reading the SR for the status post so
-    // any fresh-reviewer findings are included in the COMPLETED payload.
-    await maybeRunIncompleteReviewRecovery(taskId, ws, opts.incompleteReviewRecoveryFn);
     sendLog(ws, `[wrapper] PR URL marker present (${prUrl}) but no ./done marker${note}. Posting COMPLETED on Claude's behalf.\n`);
     // Capture the diff so review-pipeline scope analysis, direction credit,
     // and rollup management get real changed_files instead of an empty list.

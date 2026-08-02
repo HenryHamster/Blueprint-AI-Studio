@@ -9,7 +9,10 @@ from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
-from app.ci_merge_helpers import _pr_number_match
+from app.ci_merge_helpers import (
+    _pr_number_match,
+    revoke_review_authority_for_active_fix,
+)
 from app.models import Task, TaskStatus
 
 logger = logging.getLogger(__name__)
@@ -125,6 +128,14 @@ async def spawn_migration_guard_fix_task(
             loop["migration_guard_fix_spawned"] = str(fix_task_id)
             # Compatibility with existing CI-monitor skip/backstop paths.
             loop["ci_fix_spawned"] = str(fix_task_id)
+            revoked_loop = revoke_review_authority_for_active_fix(
+                task,
+                fix_task_id,
+                review_loop=loop,
+                context_snapshot=source_context,
+            )
+            loop.clear()
+            loop.update(revoked_loop)
         elif state == MIGRATION_GUARD_STATE_FIX_SUPPRESSED:
             loop["migration_guard_fix_suppressed"] = True
         task.context = {
@@ -203,6 +214,9 @@ async def spawn_migration_guard_fix_task(
             f"active -> {existing_fix.id}"
         )[:500]
         session.add(task)
+        # This branch bypasses _spawn_pipeline_task, so make the same active-fix
+        # authority transition durable before handing control back to callers.
+        await session.commit()
         return existing_fix, False
 
     fix_prompt = build_migration_guard_fix_prompt(

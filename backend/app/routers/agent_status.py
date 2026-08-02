@@ -977,6 +977,12 @@ async def _persist_post_commit_pending(factory, task_id, reason: str, payload_du
                         # POST_COMMIT_MAX_PENDING_AGE_S backstop.
                         "first_pending_at": prior_meta.get("first_pending_at")
                         or _utcnow().isoformat(),
+                        # One durable continuation generation may be retried
+                        # many times, but a later agent completion gets a new
+                        # token. Recovery claims use it to reject ABA reuse of
+                        # the same status + pending bit.
+                        "generation_token": prior_meta.get("generation_token")
+                        or uuid.uuid4().hex,
                         "reason": reason,
                         "payload": payload_dump,
                         "attempts": int(prior_meta.get("attempts", 0)) + 1,
@@ -1265,6 +1271,7 @@ async def update_agent_status(
 
     if locked_resident_project is not None:
         from app.strategic_resident_session import (
+            resident_worker_matches_ended_identity,
             resident_worker_incarnation_is_current,
         )
 
@@ -1275,16 +1282,58 @@ async def update_agent_status(
             )
         except (TypeError, ValueError):
             worker_generation = -1
-        if not resident_worker_incarnation_is_current(
+        pending_meta = (task.context or {}).get("_post_commit_pending_meta")
+        stored_ended_payload: AgentStatusPayload | None = None
+        if (
+            isinstance(pending_meta, dict)
+            and pending_meta.get("reason") == "resident_session_ended"
+            and isinstance(pending_meta.get("payload"), dict)
+        ):
+            try:
+                stored_ended_payload = AgentStatusPayload.model_validate(
+                    pending_meta["payload"]
+                )
+            except Exception:
+                stored_ended_payload = None
+        active_incarnation = resident_worker_incarnation_is_current(
             locked_resident_project.vision,
             task_id=task.id,
             worker_generation=worker_generation,
             incarnation_id=payload.resident_incarnation_id,
-        ):
+        )
+        # The cap/lapse heartbeat atomically ends the exact Resident task and
+        # write-aheads post_commit_pending before the process can send its
+        # ordinary terminal callback.  That callback has no ongoing mutation
+        # authority, but it may drive the already-authorized terminal pipeline
+        # when every ended identity fence still matches.  Require BOTH the
+        # server-owned terminal+pending state and a terminal payload; all other
+        # ended/stale callbacks remain 409-fenced.
+        ended_terminal_retry = (
+            task.status == TaskStatus.COMPLETED
+            and task.post_commit_pending
+            and payload.status == task.status
+            and stored_ended_payload is not None
+            and stored_ended_payload.task_id == task.id
+            and stored_ended_payload.status == task.status
+            and resident_worker_matches_ended_identity(
+                locked_resident_project.vision,
+                task_id=task.id,
+                worker_generation=worker_generation,
+                incarnation_id=payload.resident_incarnation_id,
+            )
+        )
+        if not active_incarnation and not ended_terminal_retry:
             raise HTTPException(
                 status_code=409,
                 detail="Resident process incarnation superseded",
             )
+        if ended_terminal_retry:
+            # The process no longer holds mutation authority.  Use only the
+            # payload atomically authorized by the ending heartbeat; the final
+            # callback is a wake signal, not an opportunity to change terminal
+            # semantics or attach new artifacts/PR metadata.
+            assert stored_ended_payload is not None
+            payload = stored_ended_payload
 
     # F11: this handler holds a row lock until the early commit below, but it
     # also performs several SELECTs while preparing artifacts/retry metadata.
@@ -1337,6 +1386,10 @@ async def update_agent_status(
                 )
                 await session.refresh(task)
                 task.post_commit_pending = False
+                completed_ctx = dict(task.context or {})
+                completed_ctx.pop("_post_commit_pending_meta", None)
+                task.context = completed_ctx
+                flag_modified(task, "context")
                 session.add(task)
                 await session.commit()
                 return result
@@ -4356,6 +4409,7 @@ async def update_agent_status(
                 **(task.context or {}),
                 "_post_commit_pending_meta": {
                     "at": _utcnow().isoformat(),
+                    "generation_token": uuid.uuid4().hex,
                     "reason": "inline_running",
                     "payload": _payload_dump,
                     "attempts": 0,

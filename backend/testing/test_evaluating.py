@@ -1605,6 +1605,35 @@ async def test_rollup_concurrent_terminal_events_respawn_at_most_once(eval_db, m
 # These tests pin the honest-reason and one-shot recovery behaviours.
 
 
+def test_ci_backstop_review_gate_excludes_legacy_verdict_mirrors():
+    from app.recovery_evaluating_ci_backstop import _review_gate_is_approved
+
+    assert _review_gate_is_approved({"review_approved": True}) is True
+    assert _review_gate_is_approved({"review_approved": False}) is False
+    assert _review_gate_is_approved({"verdict": "APPROVE"}) is False
+    assert _review_gate_is_approved({"review_approved": "true"}) is False
+    assert (
+        _review_gate_is_approved(
+            {
+                "review_not_required": True,
+                "review_policy_reason": "small non-code task",
+                "review_history": [],
+            }
+        )
+        is True
+    )
+    assert (
+        _review_gate_is_approved(
+            {
+                "review_not_required": True,
+                "review_policy_reason": "stale bypass marker",
+                "review_history": [{"verdict": "REQUEST_CHANGES"}],
+            }
+        )
+        is False
+    )
+
+
 @pytest.mark.asyncio
 async def test_backstop_reason_names_review_when_ci_passed(eval_db, mocker):
     """When CI has passed but review_approved is absent AND recovery was

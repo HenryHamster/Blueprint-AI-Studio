@@ -8,13 +8,11 @@ import {
   SrUnhandledEdgesRetrospective,
   DirectionSrBreakdownPanel,
   EdgesTrendBreakdown,
-  SrReviewerDisagreementsPanel,
   MissRateSparkline,
   computeTargetHealth,
   type SrTrendData,
   type DirectionSrEntry,
   type EdgesTrend,
-  type SrReviewerDisagreementsData,
   type SrUnhandledEdgesTask,
 } from './SrTrendBreakdown';
 
@@ -236,7 +234,7 @@ describe('SrTrendBreakdown CategoryRow chevron', () => {
 });
 
 describe('SrMissedRetrospective drilldown', () => {
-  it('expands to show SR/reviewer drilldown and keeps the PR link from triggering row click', async () => {
+  it('expands to show self-review evidence and keeps the PR link from triggering row click', async () => {
     const user = userEvent.setup();
     const onTaskClick = vi.fn();
     render(
@@ -244,38 +242,36 @@ describe('SrMissedRetrospective drilldown', () => {
         tasks={[
           {
             task_id: 't1',
-            title: 'Task with reviewer findings',
+            title: 'Task with self-review evidence',
             task_type: 'create',
             scope: 'small',
             created_at: new Date().toISOString(),
             missed_categories: ['correctness'],
             caught_categories: [],
             pr_url: 'https://example.com/pr/1',
-            sr_check_results: { correctness: { passed: true, issue: 'sr note', origin: 'reviewer' } },
-            reviewer_findings: [{ category: 'correctness', severity: 'HIGH', description: 'bad edge' }],
+            sr_check_results: { correctness: { passed: true, issue: 'sr note', origin: 'author' } },
           },
         ]}
         onTaskClick={onTaskClick}
       />,
     );
 
-    await user.click(screen.getByRole('button', { name: /expand task with reviewer findings/i }));
-    expect(screen.getByText('SR')).toBeInTheDocument();
-    expect(screen.getByText('Reviewer')).toBeInTheDocument();
-    expect(screen.getByText('origin: reviewer')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /expand task with self-review evidence/i }));
+    expect(screen.getByText('Self-review evidence')).toBeInTheDocument();
+    expect(screen.getByText('origin: author')).toBeInTheDocument();
 
     await user.click(screen.getByRole('link', { name: 'PR' }));
     expect(onTaskClick).not.toHaveBeenCalled();
   });
 
-  it('falls back to the rejection category label when reviewer findings are missing', async () => {
+  it('falls back to the rejection category label when self-review evidence is missing', async () => {
     const user = userEvent.setup();
     render(
       <SrMissedRetrospective
         tasks={[
           {
             task_id: 't2',
-            title: 'Task without reviewer findings',
+            title: 'Task without self-review evidence',
             created_at: new Date().toISOString(),
             missed_categories: ['correctness'],
             caught_categories: [],
@@ -284,37 +280,32 @@ describe('SrMissedRetrospective drilldown', () => {
       />,
     );
 
-    await user.click(screen.getByRole('button', { name: /expand task without reviewer findings/i }));
+    await user.click(screen.getByRole('button', { name: /expand task without self-review evidence/i }));
     expect(screen.getAllByText('correctness').length).toBeGreaterThanOrEqual(2);
   });
 
-  it('shows mixed SR origin tags for missed categories', async () => {
+  it('shows self-review origin tags for missed categories', async () => {
     const user = userEvent.setup();
     render(
       <SrMissedRetrospective
         tasks={[
           {
             task_id: 't3',
-            title: 'Task with mixed origins',
+            title: 'Task with recorded origins',
             created_at: new Date().toISOString(),
             missed_categories: ['correctness', 'performance'],
             caught_categories: [],
             sr_check_results: {
-              correctness: { passed: true, origin: 'reviewer' },
+              correctness: { passed: true, origin: 'author' },
               performance: { passed: true, origin: 'author' },
             },
-            reviewer_findings: [
-              { category: 'correctness', severity: 'HIGH', description: 'issue' },
-              { category: 'performance', severity: 'LOW', description: 'issue' },
-            ],
           },
         ]}
       />,
     );
 
-    await user.click(screen.getByRole('button', { name: /expand task with mixed origins/i }));
-    expect(screen.getByText('origin: reviewer')).toBeInTheDocument();
-    expect(screen.getByText('origin: author')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /expand task with recorded origins/i }));
+    expect(screen.getAllByText('origin: author')).toHaveLength(2);
   });
 
   it('re-syncs the visible list when selectedCategory prop changes', () => {
@@ -1362,181 +1353,6 @@ describe('SrTrendBreakdown reasoning engagement', () => {
     const engEl = screen.getByTitle(/Reasoning thinning/i);
     expect(engEl).toHaveTextContent('eng:30%');
     expect(engEl.className).toContain('amber'); // shows thinning via local logic
-  });
-});
-
-describe('SrReviewerDisagreementsPanel severity stratification', () => {
-  function makeData(disagreements: SrReviewerDisagreementsData['disagreements']): SrReviewerDisagreementsData {
-    return { window_days: 7, total_entries: disagreements.length, disagreements };
-  }
-
-  it('returns null when disagreements array is empty', () => {
-    const { container } = render(<SrReviewerDisagreementsPanel data={makeData([])} />);
-    expect(container.firstChild).toBeNull();
-  });
-
-  it('applies red styling for CRITICAL max_severity badge', () => {
-    const { container } = render(
-      <SrReviewerDisagreementsPanel data={makeData([
-        { category: 'correctness', task_type: 'create', count: 5, max_severity: 'CRITICAL', severity_breakdown: { CRITICAL: 5 } },
-      ])} />,
-    );
-    const badge = container.querySelector('[data-testid="sr-reviewer-disagreements"] span:first-child');
-    expect(badge?.className).toContain('text-red-400');
-  });
-
-  it('applies orange styling for HIGH max_severity badge', () => {
-    const { container } = render(
-      <SrReviewerDisagreementsPanel data={makeData([
-        { category: 'correctness', task_type: 'create', count: 3, max_severity: 'HIGH', severity_breakdown: { HIGH: 3 } },
-      ])} />,
-    );
-    const badge = container.querySelector('[data-testid="sr-reviewer-disagreements"] span:first-child');
-    expect(badge?.className).toContain('text-orange-400');
-  });
-
-  it('applies amber styling for MEDIUM max_severity badge', () => {
-    const { container } = render(
-      <SrReviewerDisagreementsPanel data={makeData([
-        { category: 'style-conventions', task_type: 'fix', count: 2, max_severity: 'MEDIUM', severity_breakdown: { MEDIUM: 2 } },
-      ])} />,
-    );
-    const badge = container.querySelector('[data-testid="sr-reviewer-disagreements"] span:first-child');
-    expect(badge?.className).toContain('text-amber-400');
-  });
-
-  it('shows severity detail counts inline for CRITICAL badge', () => {
-    render(
-      <SrReviewerDisagreementsPanel data={makeData([
-        { category: 'correctness', task_type: 'create', count: 8, max_severity: 'CRITICAL', severity_breakdown: { CRITICAL: 3, HIGH: 5 } },
-      ])} />,
-    );
-    expect(screen.getByText(/3 CRITICAL/)).toBeInTheDocument();
-    expect(screen.getByText(/5 HIGH/)).toBeInTheDocument();
-  });
-
-  it('shows severity detail counts inline for HIGH badge', () => {
-    render(
-      <SrReviewerDisagreementsPanel data={makeData([
-        { category: 'error-handling', task_type: 'fix', count: 4, max_severity: 'HIGH', severity_breakdown: { HIGH: 4 } },
-      ])} />,
-    );
-    expect(screen.getByText(/4 HIGH/)).toBeInTheDocument();
-  });
-
-  it('does not show severity detail counts for MEDIUM badge', () => {
-    render(
-      <SrReviewerDisagreementsPanel data={makeData([
-        { category: 'style-conventions', task_type: 'fix', count: 2, max_severity: 'MEDIUM', severity_breakdown: { MEDIUM: 2 } },
-      ])} />,
-    );
-    expect(screen.queryByText(/MEDIUM/)).not.toBeInTheDocument();
-  });
-
-  it('does not show severity detail counts for LOW badge', () => {
-    render(
-      <SrReviewerDisagreementsPanel data={makeData([
-        { category: 'documentation', task_type: 'create', count: 1, max_severity: 'LOW', severity_breakdown: { LOW: 1 } },
-      ])} />,
-    );
-    expect(screen.queryByText(/LOW/)).not.toBeInTheDocument();
-  });
-
-  it('backward compat: renders badge without severity_breakdown (old data shape)', () => {
-    render(
-      <SrReviewerDisagreementsPanel data={makeData([
-        { category: 'correctness', task_type: 'create', count: 12 },
-      ])} />,
-    );
-    expect(screen.getByText('×12')).toBeInTheDocument();
-    expect(screen.getByText('correctness')).toBeInTheDocument();
-  });
-
-  it('sorts CRITICAL badges before HIGH, HIGH before MEDIUM, then by count descending', () => {
-    const { container } = render(
-      <SrReviewerDisagreementsPanel data={makeData([
-        { category: 'performance', task_type: 'fix', count: 10, max_severity: 'MEDIUM' },
-        { category: 'correctness', task_type: 'create', count: 3, max_severity: 'CRITICAL', severity_breakdown: { CRITICAL: 3 } },
-        { category: 'error-handling', task_type: 'fix', count: 7, max_severity: 'HIGH', severity_breakdown: { HIGH: 7 } },
-        { category: 'security', task_type: 'create', count: 2, max_severity: 'CRITICAL', severity_breakdown: { CRITICAL: 2 } },
-      ])} />,
-    );
-    const badges = container.querySelectorAll('[data-testid="sr-reviewer-disagreements"] > div > span');
-    // First two should be CRITICAL (count 3 before 2), third HIGH, fourth MEDIUM
-    expect(badges[0].textContent).toContain('correctness');
-    expect(badges[1].textContent).toContain('security');
-    expect(badges[2].textContent).toContain('error-handling');
-    expect(badges[3].textContent).toContain('performance');
-  });
-
-  it('title attribute encodes max_severity when present', () => {
-    const { container } = render(
-      <SrReviewerDisagreementsPanel data={makeData([
-        { category: 'correctness', task_type: 'create', count: 5, max_severity: 'CRITICAL', severity_breakdown: { CRITICAL: 5 } },
-      ])} />,
-    );
-    const badge = container.querySelector('[title*="max: CRITICAL"]');
-    expect(badge).not.toBeNull();
-  });
-});
-
-describe('SrReviewerDisagreementsPanel drill-through', () => {
-  function makeDrillData(): SrReviewerDisagreementsData {
-    return {
-      window_days: 7, total_entries: 1,
-      disagreements: [{
-        category: 'correctness', task_type: 'create', count: 3,
-        max_severity: 'CRITICAL',
-        examples: [
-          { severity: 'HIGH', description: 'missed null check', task_id: 'task-abc' },
-          { severity: 'CRITICAL', description: 'logic bug', task_id: 'task-def' },
-        ],
-      }],
-    };
-  }
-
-  it('clicking a badge with examples expands the drill-through panel', async () => {
-    const user = userEvent.setup();
-    render(<SrReviewerDisagreementsPanel data={makeDrillData()} />);
-    expect(screen.queryByTestId('sr-disagreement-examples')).not.toBeInTheDocument();
-    await user.click(screen.getByText('correctness').parentElement!);
-    expect(screen.getByTestId('sr-disagreement-examples')).toBeInTheDocument();
-  });
-
-  it('clicking the expanded badge again collapses the panel', async () => {
-    const user = userEvent.setup();
-    render(<SrReviewerDisagreementsPanel data={makeDrillData()} />);
-    const badge = screen.getByText('correctness').parentElement!;
-    await user.click(badge);
-    await user.click(badge);
-    expect(screen.queryByTestId('sr-disagreement-examples')).not.toBeInTheDocument();
-  });
-
-  it('clicking an example row invokes onSelectTask with the example task_id', async () => {
-    const onSelectTask = vi.fn();
-    const user = userEvent.setup();
-    render(<SrReviewerDisagreementsPanel data={makeDrillData()} onSelectTask={onSelectTask} />);
-    await user.click(screen.getByText('correctness').parentElement!);
-    await user.click(screen.getByText('missed null check'));
-    expect(onSelectTask).toHaveBeenCalledWith('task-abc');
-  });
-
-  it('examples in the expanded panel are sorted CRITICAL before HIGH', async () => {
-    const user = userEvent.setup();
-    render(<SrReviewerDisagreementsPanel data={makeDrillData()} />);
-    await user.click(screen.getByText('correctness').parentElement!);
-    const text = screen.getByTestId('sr-disagreement-examples').textContent ?? '';
-    expect(text.indexOf('logic bug')).toBeLessThan(text.indexOf('missed null check'));
-  });
-
-  it('applies red fp color (>50%) and amber fp color (>30%) in the badge', () => {
-    const data = makeDrillData();
-    data.disagreements[0].false_positive_rate = 0.6;
-    const { container, rerender } = render(<SrReviewerDisagreementsPanel data={data} />);
-    expect(container.querySelector('[title="false-positive rate"]')?.className).toContain('text-red-400');
-    data.disagreements[0].false_positive_rate = 0.4;
-    rerender(<SrReviewerDisagreementsPanel data={{ ...data, disagreements: [...data.disagreements] }} />);
-    expect(container.querySelector('[title="false-positive rate"]')?.className).toContain('text-amber-400');
   });
 });
 

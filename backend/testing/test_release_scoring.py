@@ -1102,8 +1102,25 @@ class TestBlockerExecutionSite:
         # entry (and its operator-facing label) outlived the emitter.
         import re
 
-        src = (Path(rs.__file__)).read_text()
-        emitted = set(re.findall(r'blocker = "([a-z_]+)"', src))
+        assignment_pattern = re.compile(
+            r"""\bblocker\s*=\s*["']([a-z0-9_]+)["']"""
+        )
+        mapping_pattern = re.compile(
+            r"""["']blocker["']\s*:\s*["']([a-z0-9_]+)["']"""
+        )
+        # The explicitly requested walkthrough gate is composed by the
+        # qualifier after base scoring, so the reverse vocabulary check must
+        # include both execution sites.
+        sources = [
+            Path(rs.__file__).read_text(),
+            Path(rs.__file__).with_name("release_qualifier.py").read_text(),
+        ]
+        emitted = {
+            code
+            for source in sources
+            for pattern in (assignment_pattern, mapping_pattern)
+            for code in pattern.findall(source)
+        }
         assert emitted, "expected to find blocker assignments in release_scoring"
 
         dead = sorted(set(rs.BLOCKER_EXECUTION_SITE) - emitted)

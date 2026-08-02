@@ -12,7 +12,6 @@ from app.discovery_admission import (
     authorize_discovery_task_execution,
     consume_discovery_admission,
     DiscoveryCycleUnavailable,
-    discovery_admission_mode_from_runtime,
     ensure_discovery_cycle_for_research,
     release_discovery_admission,
     reserve_discovery_admission,
@@ -70,6 +69,12 @@ async def test_research_bootstrap_creates_one_frozen_bounded_cycle(db_session):
         "text": "Build paired constructor and evaluator levels",
         "category": "product",
         "completion_criteria": "A user can play and compare both generated levels.",
+        "context": {
+            "success_evidence": "A blinded evaluator prefers the paired levels.",
+            "retirement_condition": "Retire if paired levels do not improve preference.",
+            "implementation_constraints": "Use the existing level runtime.",
+            "mutable_strategic_note": "Do not promote this to review truth.",
+        },
     }
 
     first = await ensure_discovery_cycle_for_research(
@@ -79,6 +84,7 @@ async def test_research_bootstrap_creates_one_frozen_bounded_cycle(db_session):
         direction=direction,
         now=_utcnow(),
     )
+    direction["context"]["success_evidence"] = "A later Strategic rewrite."
     replay = await ensure_discovery_cycle_for_research(
         db_session,
         project=project,
@@ -97,6 +103,12 @@ async def test_research_bootstrap_creates_one_frozen_bounded_cycle(db_session):
     assert first.bet_snapshot["direction"]["completion_criteria"] == (
         direction["completion_criteria"]
     )
+    assert first.bet_snapshot["direction"]["context"] == {
+        "success_evidence": "A blinded evaluator prefers the paired levels.",
+        "retirement_condition": "Retire if paired levels do not improve preference.",
+        "implementation_constraints": "Use the existing level runtime.",
+    }
+    assert "mutable_strategic_note" not in first.bet_snapshot["direction"]["context"]
     assert first.task_credit_limit == 8
     assert first.attempt_credit_limit == 4
     assert first.concurrency_limit == 2
@@ -128,27 +140,7 @@ async def test_terminal_policy_halts_new_direction_root_until_resolved(db_sessio
             project=project,
             direction_key="unsafe-expansion",
             direction={"id": "unsafe-expansion", "text": "Expand the mechanism"},
-            runtime_config={"discovery_admission_mode": "enforced"},
-        )
-
-
-@pytest.mark.asyncio
-async def test_shadow_mode_observes_without_suppressing_a_second_root(db_session):
-    project, cycle = await _project_and_cycle(
-        db_session,
-        direction_key="shadow-direction",
-        state="reviewing",
     )
-
-    observed = await ensure_discovery_cycle_for_research(
-        db_session,
-        project=project,
-        direction_key="shadow-direction",
-        direction={"id": "shadow-direction", "text": "Keep observing"},
-        runtime_config={"discovery_admission_mode": "shadow"},
-    )
-
-    assert observed is None
 
 
 @pytest.mark.asyncio
@@ -167,7 +159,6 @@ async def test_enforced_mode_halts_capped_renew_without_live_successor(db_sessio
             project=project,
             direction_key=cycle.direction_key,
             direction={"id": cycle.direction_key, "text": "Try yet again"},
-            runtime_config={"discovery_admission_mode": "enforced"},
         )
 
 
@@ -183,13 +174,11 @@ async def test_reservation_is_idempotent_and_settles_counters_once(db_session):
         db_session,
         cycle_id=cycle.id,
         admission_key="task:one",
-        mode="enforced",
     )
     duplicate = await reserve_discovery_admission(
         db_session,
         cycle_id=cycle.id,
         admission_key="task:one",
-        mode="enforced",
     )
 
     assert first.allowed is True
@@ -252,47 +241,22 @@ async def test_release_is_idempotent_and_does_not_consume(db_session):
 
 
 @pytest.mark.asyncio
-async def test_enforced_limit_denies_without_mutation_while_shadow_records(db_session):
+async def test_limit_denies_without_mutating_admission_ledger(db_session):
     _, cycle = await _project_and_cycle(db_session, task_credit_limit=1)
     await reserve_discovery_admission(
         db_session,
         cycle_id=cycle.id,
         admission_key="task:first",
-        mode="enforced",
     )
 
     denied = await reserve_discovery_admission(
         db_session,
         cycle_id=cycle.id,
         admission_key="task:denied",
-        mode="enforced",
     )
     assert denied.allowed is False
     assert denied.reason == "logical_task_credit_limit"
     assert cycle.reserved_task_credits == 1
-
-    observed = await reserve_discovery_admission(
-        db_session,
-        cycle_id=cycle.id,
-        admission_key="task:observed",
-        mode="shadow",
-    )
-    assert observed.allowed is True
-    assert observed.shadow_violation is True
-    assert observed.reason == "logical_task_credit_limit"
-    assert cycle.reserved_task_credits == 2
-    ledger = (
-        await db_session.execute(
-            select(DiscoveryAdmission).where(
-                DiscoveryAdmission.id == observed.admission_id
-            )
-        )
-    ).scalar_one()
-    assert ledger.admission_metadata["shadow_violation"] is True
-    assert (
-        ledger.admission_metadata["shadow_reason"]
-        == "logical_task_credit_limit"
-    )
 
 
 @pytest.mark.asyncio
@@ -303,14 +267,12 @@ async def test_attempt_credit_is_accounted_separately(db_session):
         cycle_id=cycle.id,
         admission_key="attempt:one",
         admission_kind="attempt",
-        mode="enforced",
     )
     denied = await reserve_discovery_admission(
         db_session,
         cycle_id=cycle.id,
         admission_key="attempt:two",
         admission_kind="attempt",
-        mode="enforced",
     )
     assert admitted.allowed is True
     assert denied.allowed is False
@@ -341,7 +303,6 @@ async def test_same_row_fresh_attempts_charge_once_per_execution_incarnation(
     initial = await authorize_discovery_task_execution(
         db_session,
         task=task,
-        mode="enforced",
     )
     assert initial.allowed is True
     assert cycle.consumed_task_credits == 1
@@ -352,12 +313,10 @@ async def test_same_row_fresh_attempts_charge_once_per_execution_incarnation(
     first_retry = await authorize_discovery_task_execution(
         db_session,
         task=task,
-        mode="enforced",
     )
     duplicate_fence = await authorize_discovery_task_execution(
         db_session,
         task=task,
-        mode="enforced",
     )
 
     assert first_retry.allowed is True
@@ -387,7 +346,6 @@ async def test_same_row_fresh_attempts_charge_once_per_execution_incarnation(
     second_retry = await authorize_discovery_task_execution(
         db_session,
         task=task,
-        mode="enforced",
     )
     assert second_retry.allowed is True
     assert cycle.consumed_attempt_credits == 2
@@ -398,7 +356,6 @@ async def test_same_row_fresh_attempts_charge_once_per_execution_incarnation(
     denied = await authorize_discovery_task_execution(
         db_session,
         task=task,
-        mode="enforced",
     )
     assert denied.allowed is False
     assert denied.reason == "attempt_credit_limit"
@@ -434,12 +391,10 @@ async def test_replacement_clone_charges_attempt_not_logical_task(db_session):
     admitted = await authorize_discovery_task_execution(
         db_session,
         task=retry,
-        mode="enforced",
     )
     duplicate = await authorize_discovery_task_execution(
         db_session,
         task=retry,
-        mode="enforced",
     )
 
     assert admitted.allowed is True
@@ -478,7 +433,6 @@ async def test_closed_cycle_denies_fresh_retry_despite_prior_logical_admission(
         await authorize_discovery_task_execution(
             db_session,
             task=task,
-            mode="enforced",
         )
     ).allowed
 
@@ -490,7 +444,6 @@ async def test_closed_cycle_denies_fresh_retry_despite_prior_logical_admission(
     denied = await authorize_discovery_task_execution(
         db_session,
         task=task,
-        mode="enforced",
     )
     assert denied.allowed is False
     assert denied.reason == "cycle_not_admitting"
@@ -517,7 +470,6 @@ async def test_new_reservations_respect_cycle_state_and_deadline(
         db_session,
         cycle_id=cycle.id,
         admission_key=f"blocked:{reason}",
-        mode="enforced",
     )
     assert decision.allowed is False
     assert decision.reason == reason
@@ -548,7 +500,6 @@ async def test_concurrency_backlogs_at_reservation_and_defers_at_execution(db_se
         cycle_id=cycle.id,
         admission_key="task:next",
         task_id=queued.id,
-        mode="enforced",
     )
     assert admitted.allowed is True
     assert admitted.reason == "reserved"
@@ -556,7 +507,6 @@ async def test_concurrency_backlogs_at_reservation_and_defers_at_execution(db_se
     dispatch = await authorize_discovery_task_execution(
         db_session,
         task=queued,
-        mode="enforced",
     )
     assert dispatch.allowed is False
     assert dispatch.reason == "concurrency_limit"
@@ -568,7 +518,6 @@ async def test_concurrency_backlogs_at_reservation_and_defers_at_execution(db_se
     dispatch_after_slot_opens = await authorize_discovery_task_execution(
         db_session,
         task=queued,
-        mode="enforced",
     )
     assert dispatch_after_slot_opens.allowed is True
     assert cycle.reserved_task_credits == 0
@@ -595,7 +544,6 @@ async def test_admitted_task_can_drain_after_cycle_closes_or_expires(db_session)
         cycle_id=cycle.id,
         admission_key="task:drain",
         task_id=task.id,
-        mode="enforced",
     )
     cycle.state = "admission_closed"
     cycle.deadline_at = _utcnow() - timedelta(minutes=1)
@@ -606,26 +554,16 @@ async def test_admitted_task_can_drain_after_cycle_closes_or_expires(db_session)
         db_session,
         cycle_id=cycle.id,
         task_id=task.id,
-        mode="enforced",
     )
     missing = await validate_discovery_dispatch_authority(
         db_session,
         cycle_id=cycle.id,
         task_id=unadmitted.id,
-        mode="enforced",
-    )
-    shadow_missing = await validate_discovery_dispatch_authority(
-        db_session,
-        cycle_id=cycle.id,
-        task_id=unadmitted.id,
-        mode="shadow",
     )
     assert admitted.allowed is True
     assert admitted.reason == "authority_valid"
     assert missing.allowed is False
     assert missing.reason == "admission_missing"
-    assert shadow_missing.allowed is True
-    assert shadow_missing.shadow_violation is True
     assert (cycle.reserved_task_credits, cycle.revision) == before
 
 
@@ -645,14 +583,12 @@ async def test_retry_attempt_admission_grants_dispatch_authority(db_session):
         admission_key="attempt:retry",
         admission_kind="attempt",
         task_id=retry.id,
-        mode="enforced",
     )
 
     decision = await validate_discovery_dispatch_authority(
         db_session,
         cycle_id=cycle.id,
         task_id=retry.id,
-        mode="enforced",
     )
 
     assert decision.allowed is True
@@ -731,7 +667,6 @@ async def test_execution_backstop_stamps_and_admits_unstamped_grandchild(db_sess
     decision = await authorize_discovery_task_execution(
         db_session,
         task=grandchild,
-        mode="enforced",
     )
 
     assert decision.allowed is True
@@ -776,7 +711,6 @@ async def test_execution_backstop_terminally_denies_unadmitted_closed_descendant
     decision = await authorize_discovery_task_execution(
         db_session,
         task=grandchild,
-        mode="enforced",
     )
 
     assert grandchild.discovery_cycle_id == cycle.id
@@ -786,7 +720,7 @@ async def test_execution_backstop_terminally_denies_unadmitted_closed_descendant
 
 
 @pytest.mark.asyncio
-async def test_review_freeze_is_invariant_even_in_shadow_mode(db_session):
+async def test_review_freeze_is_always_enforced(db_session):
     project, cycle = await _project_and_cycle(db_session, state="reviewed")
     task = Task(
         project_id=project.id,
@@ -799,19 +733,8 @@ async def test_review_freeze_is_invariant_even_in_shadow_mode(db_session):
     decision = await authorize_discovery_task_execution(
         db_session,
         task=task,
-        mode="shadow",
     )
 
     assert decision.allowed is False
     assert decision.reason == "cycle_review_frozen"
     assert decision.terminal_denial is True
-
-
-def test_runtime_mode_defaults_to_shadow_and_supports_enforcement():
-    assert discovery_admission_mode_from_runtime({}) == "shadow"
-    assert (
-        discovery_admission_mode_from_runtime(
-            {"discovery_admission_mode": "enforced"}
-        )
-        == "enforced"
-    )

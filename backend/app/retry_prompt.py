@@ -274,6 +274,11 @@ def _build_scope_overflow_details(ctx: dict, task_scope: str) -> str:
 def _append_approve_to_review_history(
     review_loop: dict,
     changed_files: "list[str] | None" = None,
+    *,
+    reviewed_head_sha: str = "",
+    reviewed_base_sha: str = "",
+    delta_base_sha: str = "",
+    resolutions: "list[dict] | None" = None,
 ) -> list:
     """Append an APPROVE entry to ``review_history`` so the trajectory section
     shown to fix agents includes approved iterations alongside REQUEST_CHANGES
@@ -300,6 +305,16 @@ def _append_approve_to_review_history(
         and history[-1].get("iteration") == iteration
         and history[-1].get("verdict") == "APPROVE"
     ):
+        enriched = dict(history[-1])
+        if reviewed_head_sha:
+            enriched["reviewed_head_sha"] = reviewed_head_sha
+        if reviewed_base_sha:
+            enriched["reviewed_base_sha"] = reviewed_base_sha
+        if delta_base_sha:
+            enriched["delta_base_sha"] = delta_base_sha
+        if resolutions:
+            enriched["resolutions"] = list(resolutions)[:30]
+        history[-1] = enriched
         return bound_review_history(history)
     history.append(
         {
@@ -307,6 +322,18 @@ def _append_approve_to_review_history(
             "feedback": "",
             "verdict": "APPROVE",
             "changed_files": list(changed_files or [])[:30],
+            **(
+                {"reviewed_head_sha": reviewed_head_sha}
+                if reviewed_head_sha
+                else {}
+            ),
+            **(
+                {"reviewed_base_sha": reviewed_base_sha}
+                if reviewed_base_sha
+                else {}
+            ),
+            **({"delta_base_sha": delta_base_sha} if delta_base_sha else {}),
+            **({"resolutions": list(resolutions or [])[:30]} if resolutions else {}),
         }
     )
     return bound_review_history(history)

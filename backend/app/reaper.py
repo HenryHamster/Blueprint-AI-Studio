@@ -2582,15 +2582,6 @@ async def reaper_service():
                                             )
                                         )
                                         _qsession.add(_qtask)
-                                        # Snapshot the branch scalar into a plain
-                                        # local BEFORE commit: _qsession.commit()
-                                        # expires _qtask, so the post-commit
-                                        # `_qtask.first_payload` read would lazy-load
-                                        # from async context and raise MissingGreenlet
-                                        # on asyncpg.
-                                        _qtask_payload_type = (
-                                            _qtask.first_payload or {}
-                                        ).get("type")
                                         await _qsession.commit()
                                         logger.exception(
                                             "[REAPER] Task %s quarantined after %d "
@@ -2599,24 +2590,6 @@ async def reaper_service():
                                             _streak,
                                         )
                                         del _orphan_reap_crash_streaks[_reap_key]
-                                        # C5: a quarantined (FAILED) safeguard must
-                                        # also release its cross-cutting merge gate,
-                                        # else orig.requires_approval is stranded
-                                        # forever. Runs on the same freshly-committed
-                                        # _qsession; no-ops for non-safeguard tasks.
-                                        if _qtask_payload_type == "security_audit":
-                                            from app.task_completion import (
-                                                _maybe_release_safeguard_gate,
-                                            )
-
-                                            # Re-load the just-committed row so the
-                                            # gate helper reads live (non-expired) ORM
-                                            # state (it accesses _qtask.context)
-                                            # instead of lazy-loading post-commit.
-                                            await _qsession.refresh(_qtask)
-                                            await _maybe_release_safeguard_gate(
-                                                _qtask, None, _qsession
-                                            )
                             except Exception:
                                 logger.exception(
                                     "[REAPER] Failed to quarantine task %s", task_id

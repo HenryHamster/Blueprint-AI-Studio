@@ -36,6 +36,7 @@ from app.routers.agent_strategic_messages import (
     _RESIDENT_POLL_RATE_LIMIT_PER_MINUTE,
     _RESIDENT_POLL_REPLACEMENT_OVERLAP,
     _resident_poll_rate_limit_key,
+    WorkdayArtifactBatchLimit,
     agent_poll_messages,
     router as _messages_router,
 )
@@ -1177,6 +1178,218 @@ async def test_resident_poll_uses_authenticated_session_scope(
     assert response.status_code == 200, response.text
     assert [row["id"] for row in response.json()["messages"]] == [str(own.id)]
     assert response.json()["claim_required"] is True
+
+
+@pytest.mark.asyncio
+async def test_resident_poll_returns_stale_fast_claim_group_atomically_across_page_cap(
+    client: AsyncClient, db_session
+):
+    project, task = await _make_resident_poll_worker(db_session)
+    older = await _add_message(
+        db_session,
+        project,
+        from_type="user",
+        status="open",
+        message_type=MessageType.NOTE,
+        surface=MessageSurface.CONVERSATION,
+        content="older unclaimed input",
+        sequence=1,
+        resident_session_id="resident-session",
+        created_at=_BASE,
+    )
+    claim_id = uuid.uuid4()
+    stale_rows = []
+    for offset in range(20):
+        stale_rows.append(
+            await _add_message(
+                db_session,
+                project,
+                from_type="user",
+                status="open",
+                message_type=MessageType.NOTE,
+                surface=MessageSurface.CONVERSATION,
+                content=f"stale claimed input {offset}",
+                sequence=offset + 2,
+                resident_session_id="resident-session",
+                created_at=_BASE + timedelta(seconds=offset + 1),
+                handling_state=MessageHandlingState.CLAIMED,
+                handled_by_task_id=task.id,
+                conversation_claim_id=claim_id,
+                conversation_claim_generation=1,
+                conversation_claim_incarnation=uuid.uuid4(),
+                conversation_claim_expires_at=_BASE - timedelta(minutes=1),
+                conversation_claim_attempt=1,
+                context={
+                    "_conversation_public_reply_owner": "fast",
+                    "_conversation_claim_idempotency_key": "stale-fast-turn",
+                },
+            )
+        )
+    newer = await _add_message(
+        db_session,
+        project,
+        from_type="user",
+        status="open",
+        message_type=MessageType.NOTE,
+        surface=MessageSurface.CONVERSATION,
+        content="newer unclaimed input",
+        sequence=22,
+        resident_session_id="resident-session",
+        created_at=_BASE + timedelta(minutes=1),
+    )
+
+    response = await client.get(
+        f"/api/agent/projects/{project.id}/messages?limit=20",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    expected_ids = [str(row.id) for row in stale_rows]
+    assert [row["id"] for row in body["messages"]] == expected_ids
+    assert body["fast_message_ids"] == expected_ids
+    assert body["fast_claim_groups"] == [
+        {
+            "idempotency_key": "stale-fast-turn",
+            "message_ids": expected_ids,
+            "member_count": 20,
+            "complete": True,
+            "artifacts_degraded": False,
+        }
+    ]
+    await db_session.refresh(older)
+    await db_session.refresh(newer)
+    assert older.status == "open"
+    assert newer.status == "open"
+    assert older.conversation_claim_id is None
+    assert newer.conversation_claim_id is None
+
+
+@pytest.mark.asyncio
+async def test_resident_poll_leaves_expired_ordinary_claim_group_to_workday(
+    client: AsyncClient, db_session
+):
+    project, task = await _make_resident_poll_worker(db_session)
+    old_claim_id = uuid.uuid4()
+    old_incarnation = uuid.uuid4()
+    claim_fields = {
+        "from_type": "user",
+        "status": "open",
+        "message_type": MessageType.NOTE,
+        "resident_session_id": "resident-session",
+        "handling_state": MessageHandlingState.CLAIMED,
+        "handled_by_task_id": task.id,
+        "conversation_claim_id": old_claim_id,
+        "conversation_claim_generation": 1,
+        "conversation_claim_incarnation": old_incarnation,
+        "conversation_claim_expires_at": _BASE - timedelta(minutes=1),
+        "conversation_claim_attempt": 1,
+        "context": {},
+    }
+    conversation_row = await _add_message(
+        db_session,
+        project,
+        surface=MessageSurface.CONVERSATION,
+        content="ordinary conversation input",
+        sequence=1,
+        created_at=_BASE,
+        **claim_fields,
+    )
+    activity_row = await _add_message(
+        db_session,
+        project,
+        surface=MessageSurface.ACTIVITY,
+        content="ordinary activity input",
+        sequence=2,
+        created_at=_BASE + timedelta(seconds=1),
+        **claim_fields,
+    )
+
+    response = await client.get(
+        f"/api/agent/projects/{project.id}/messages?limit=20",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    expected_ids = [str(conversation_row.id), str(activity_row.id)]
+    assert [row["id"] for row in body["messages"]] == expected_ids
+    assert body["fast_message_ids"] == []
+    assert body["fast_claim_groups"] == []
+
+    replacement_incarnation = str(uuid.uuid4())
+    reclaimed = await client.post(
+        f"/api/agent/projects/{project.id}/messages/claim",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+        json={
+            "task_id": str(task.id),
+            "session_id": "resident-session",
+            "worker_generation": 2,
+            "incarnation_id": replacement_incarnation,
+            "message_ids": expected_ids,
+            "lease_seconds": 45,
+        },
+    )
+    assert reclaimed.status_code == 200, reclaimed.text
+    assert reclaimed.json()["claim_id"] == str(old_claim_id)
+    assert reclaimed.json()["message_ids"] == expected_ids
+
+
+@pytest.mark.asyncio
+async def test_stale_fast_claim_group_degrades_artifacts_without_losing_membership(
+    client: AsyncClient, db_session, monkeypatch
+):
+    project, task = await _make_resident_poll_worker(db_session)
+    claim_id = uuid.uuid4()
+    stale_rows = []
+    for offset in range(2):
+        stale_rows.append(
+            await _add_message(
+                db_session,
+                project,
+                from_type="user",
+                status="open",
+                message_type=MessageType.NOTE,
+                surface=MessageSurface.CONVERSATION,
+                content=f"claimed artifact input {offset}",
+                sequence=offset + 1,
+                resident_session_id="resident-session",
+                created_at=_BASE + timedelta(seconds=offset),
+                handling_state=MessageHandlingState.CLAIMED,
+                handled_by_task_id=task.id,
+                conversation_claim_id=claim_id,
+                conversation_claim_generation=1,
+                conversation_claim_incarnation=uuid.uuid4(),
+                conversation_claim_expires_at=_BASE - timedelta(minutes=1),
+                conversation_claim_attempt=1,
+                context={
+                    "_conversation_public_reply_owner": "fast",
+                    "_conversation_claim_idempotency_key": "stale-artifact-turn",
+                    "attachments": [{"type": "image", "url": "https://expired"}],
+                },
+            )
+        )
+
+    async def _exceed_artifact_budget(*args, **kwargs):
+        raise WorkdayArtifactBatchLimit(stale_rows[1].id)
+
+    monkeypatch.setattr(
+        "app.routers.agent_strategic_messages._materialize_workday_artifact_attachments",
+        _exceed_artifact_budget,
+    )
+    response = await client.get(
+        f"/api/agent/projects/{project.id}/messages?limit=20",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    expected_ids = [str(row.id) for row in stale_rows]
+    assert [row["id"] for row in body["messages"]] == expected_ids
+    assert body["fast_message_ids"] == expected_ids
+    assert body["fast_claim_groups"][0]["complete"] is True
+    assert body["fast_claim_groups"][0]["artifacts_degraded"] is True
+    for row in body["messages"]:
+        assert "System recovery notice" in row["content"]
+        assert row["context"]["_artifact_delivery_deferred"] is True
+        assert "attachments" not in row["context"]
 
 
 @pytest.mark.asyncio

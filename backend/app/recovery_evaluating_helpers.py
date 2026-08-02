@@ -789,6 +789,10 @@ async def _verify_ci_before_backstop(
             _repo,
             session,
             source="ci_backstop_verify",
+            checked_head_sha=_head_sha,
+            checked_base_sha=(
+                ((_pr_data or {}).get("base") or {}).get("sha") or ""
+            ),
         )
     except Exception as e:
         logger.warning(

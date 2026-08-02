@@ -61,7 +61,8 @@ def _mock_clean_premerge_deps(mocker, *, head_sha, base_tip_sha):
     # tip-fetch (the removed block called it; the new flow does not).
     mock_tip = create_autospec(_real_get_branch_sha, return_value=base_tip_sha)
     mocker.patch("app.github.get_branch_sha", new=mock_tip)
-    # get_pull_request fires twice on the resume + diff-size path. head_sha
+    # get_pull_request fires on the resume, diff-size, and final exact-target
+    # paths. head_sha
     # differs from base_tip_sha -- i.e. the PR has commits ahead of base,
     # the normal happy-path state for any PR with work in it.
     mocker.patch(
@@ -74,7 +75,22 @@ def _mock_clean_premerge_deps(mocker, *, head_sha, base_tip_sha):
                 "deletions": 5,
                 "merged": False,
                 "state": "open",
-                "head": {"sha": head_sha},
+                "mergeable_state": "clean",
+                "base": {
+                    "sha": base_tip_sha,
+                    "ref": "research/conflict-base",
+                },
+                "head": {"sha": head_sha, "ref": "research/conflict-stg"},
+            },
+            {
+                "merged": False,
+                "state": "open",
+                "mergeable_state": "clean",
+                "base": {
+                    "sha": base_tip_sha,
+                    "ref": "research/conflict-base",
+                },
+                "head": {"sha": head_sha, "ref": "research/conflict-stg"},
             },
         ],
     )
@@ -214,12 +230,6 @@ async def test_failed_merge_with_clean_state_does_not_trigger_update_branch(
         new_callable=AsyncMock,
         return_value=(None, None),
     )
-    mocker.patch(
-        "app.github.enable_auto_merge",
-        new_callable=AsyncMock,
-        return_value={"enabled": True},
-    )
-
     from app.rollup_management import _check_and_trigger_rollup
 
     project = await _make_project(cleanup_db)

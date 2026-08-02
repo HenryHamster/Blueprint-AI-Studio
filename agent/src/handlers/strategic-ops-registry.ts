@@ -145,11 +145,23 @@ const INPUTS = {
       'Use this operation for bounded implementation, research, plan, design, and compute work under an existing strategic outcome.',
       'Parallelize independent implementation with multiple tasks under one direction; do not create file-, PR-, or phase-sharded directions.',
       'type=fix additionally requires pr_number and branch.',
-      'Spawned tasks are watched by default; set watch=false to opt out.',
+      'Write/plan/design tasks and standalone research are watched by default. Direction-linked research is filtered through discovery review; set watch=true only when its raw completion itself needs Resident attention.',
       'Exceptional project bursts return a durable deferred request instead of HTTP 429.',
       'For compute_experiment, set preview_only=true to validate and inspect the normalized launch without dispatching.',
       'Omit accelerator for a CPU-only job. Preview reports the selected resource and estimated billable cost.',
       'Use success_criteria for simple all-required (AND) measurement contracts; success_criterion remains supported.',
+    ],
+  },
+  request_qualification: {
+    kind: 'json' as const,
+    fields: ['reason', 'probes'],
+    example: {
+      reason: 'The candidate is stable and the remaining release claims are ready for judgment.',
+      probes: ['walkthrough_e2e'],
+    },
+    notes: [
+      'Qualification is expensive; request it only at a meaningful stable checkpoint.',
+      'Omit probes for ordinary code/release judgment. Request walkthrough_e2e only when the release claim requires live product behavior.',
     ],
   },
   cancel_task: {
@@ -169,7 +181,7 @@ const INPUTS = {
 } satisfies Record<string, StrategicOpInputContract>;
 
 function inputFor(op: string): StrategicOpInputContract {
-  return INPUTS[op as keyof typeof INPUTS] ?? jsonInput();
+  return (INPUTS as Record<string, StrategicOpInputContract>)[op] ?? jsonInput();
 }
 
 /**
@@ -215,13 +227,10 @@ export const STRATEGIC_OPS_REGISTRY: readonly StrategicOpEntry[] = [
     description: 'Resolve an addressed operator message (available to all agent types).' },
   { op: 'spawn_task', alias: 'spawn-task', cli: true, prompt: true, internalReason: null,
     description: 'Durably dispatch bounded implementation, research, plan, design, or compute work under a strategic outcome.', input: inputFor('spawn_task') },
-  { op: 'spawn_fix', alias: null, cli: false, prompt: false,
-    internalReason: 'Deprecated compatibility alias; use spawn-task.',
-    description: 'Deprecated compatibility alias for spawn-task.' },
   { op: 'cancel_task', alias: 'cancel-task', cli: true, prompt: true, internalReason: null,
     description: 'Cancel a spawned QUEUED/PROVISIONING task or deferred spawn request.', input: inputFor('cancel_task') },
   { op: 'watch_task', alias: 'watch-task', cli: true, prompt: true, internalReason: null,
-    description: 'Register a durable one-shot notification for a same-project task reaching a terminal state.' },
+    description: 'Register a durable one-shot notification for a same-project task reaching an actionable boundary. Knowledge work fires at terminal; write work waits for landing, failure, blocker, approval, or no-PR completion.' },
   { op: 'ack_watch', alias: 'ack-watch', cli: true, prompt: true, internalReason: null,
     description: 'Acknowledge a fired task watch after reporting, acting, or deciding no action is needed.' },
   { op: 'cancel_watch', alias: 'cancel-watch', cli: true, prompt: true, internalReason: null,
@@ -270,7 +279,8 @@ export const STRATEGIC_OPS_REGISTRY: readonly StrategicOpEntry[] = [
   { op: 'dismiss_knowledge', alias: 'dismiss-knowledge', cli: true, prompt: true, internalReason: null,
     description: 'Mark a knowledge document as dismissed — not actionable, with an optional reason.' },
   { op: 'request_qualification', alias: 'request-qualification', cli: true, prompt: true, internalReason: null,
-    description: 'Request a fresh release-qualification run directly, without going through set_problem_model.' },
+    description: 'Request a fresh release qualification at a stable checkpoint, with only explicitly selected product probes.',
+    input: INPUTS.request_qualification },
 ];
 
 /** Registry entries surfaced on the `./strategic` CLI, in canonical order. */

@@ -111,10 +111,6 @@ runtime_config: Dict = {
     # Ships "observe" as a deliberate gradual-rollout posture so operators can
     # measure the initiative/servicing split before switching the tighter gate on.
     "autonomous_spawn_budget_mode": "observe",
-    # Discovery-cycle admission is initially record-only. Operators can graduate
-    # it to ``enforced`` after shadow telemetry confirms that cycle lineage and
-    # credit accounting are complete across every spawn path.
-    "discovery_admission_mode": "shadow",
     # Tighter cross-project cap on INITIATIVE-category spawns (net-new research/
     # create, excluding review/fix servicing churn). Only binds when
     # autonomous_spawn_budget_mode == "enforce"; pending its dedicated rollout.
@@ -472,13 +468,6 @@ runtime_config: Dict = {
         "SECURITY_AUDIT_QUALITY_GRADER_ENABLED", "false"
     ).lower()
     in ("1", "true", "yes"),
-    # Graduated rollout mode for the safeguard merge-gate challenge.
-    #   "off"     — no challenge; gate held unconditionally on any
-    #               critical/high finding. Preserves pre-v9 behavior exactly.
-    #   "observe" — (default) shadow/observe mode: the challenge is spawned and its verdict
-    #               is recorded on the safeguard task as
-    #               ``safeguard_observe_verdict``, but the gate is NEVER released
-    #               by the verdict. Lets operators measure the false-positive rate
     # Per-finding second-opinion challenge for high-stakes research-finding
     # verdicts. When True, a single borderline/absent verdict (a reproduce-on-HEAD
     # 'absent' hard-drop or a low-actionability decay) is independently re-examined
@@ -912,17 +901,6 @@ runtime_config: Dict = {
     # keeping the small-scope fast-path enabled.
     "auto_approve_medium_max_lines": 30,
     "auto_approve_medium_max_files": 2,
-    # Cross-cutting safeguard gate: automatically spawns a security_audit task and
-    # blocks merge (requires_approval) for PRs that span multiple top-level modules
-    # or are large-scope. Thresholds are operator-adjustable.
-    #   enabled:                False disables the gate entirely.
-    #   medium_module_threshold: minimum number of top-level modules (backend/agent/
-    #                            admin-ui) a medium-scope PR must span to be gated.
-    #   overflow_line_threshold: a PR with scope_overflow_warned=True is also gated
-    #                            when its diff exceeds this many lines.
-    "cross_cutting_gate_enabled": True,
-    "cross_cutting_gate_medium_module_threshold": 3,
-    "cross_cutting_gate_overflow_line_threshold": 100,
     # How long a NEEDS_MANUAL_INTERVENTION regression case must observe its
     # underlying signal back below threshold before the dispatcher watchdog
     # auto-closes it as 'recovered_unattended'. 24h gives an unrelated PR or
@@ -1250,29 +1228,6 @@ runtime_config: Dict = {
     "promotion_enabled": False,
     # Ordinary post-promotion deployment smoke only; never a qualifier child.
     "smoketest_enabled": False,
-    # walkthrough_e2e_enabled gates the qualifier-spawned ``walkthrough_e2e``
-    # child task (the live-stack Playwright walkthrough evidence lane).
-    # Defaults True: the walkthrough_e2e lane is armed fleet-wide, producing
-    # SHA-pinned CriterionEvidence for the click-to-talk acceptance criterion.
-    # Failure is evidence-only (never cascades a fix).  Operator-tunable via
-    # runtime_config_json; persisted across restarts.
-    "walkthrough_e2e_enabled": True,
-    # Per-project walkthrough_e2e enablement overrides ({project_id: bool}).
-    # An EMPTY map (the default) means every project falls back to the fleet-wide
-    # ``walkthrough_e2e_enabled`` above.  A per-project entry can HOLD the
-    # walkthrough evidence lane for one project without touching the fleet default.
-    # Mirrors ``promotion_enabled_by_project``.
-    "walkthrough_e2e_enabled_by_project": {},
-    # acceptance_earn_execution_trials_enabled gates the acceptance earn-loop's
-    # execution-trial lane: when ON, the reaper step-21a backfill enrolls a bounded
-    # ``criterion_coverage_trial`` that actually RUNS a merged task's declared
-    # named_test covering tests and, on green, mints the machine-verified
-    # ``covered`` evidence tier (instead of only the lower-confidence ``backfilled``
-    # tier). Ships DARK (default False): the lane spawns real targeted test runs,
-    # so it is armed fleet-wide only once proven. When off, the backfill is
-    # byte-for-byte identical to the backfilled-only behaviour. Operator-tunable
-    # via PATCH /api/admin/settings (runtime_config_json); persisted across restarts.
-    "acceptance_earn_execution_trials_enabled": False,
     # env_preflight_enabled gates the boot-prerequisite hard gate (Slice 3).
     # Armed True: a new candidate must declare its required boot-time env vars;
     # missing or absent declarations block promotion.  This gate was built to
@@ -2067,14 +2022,6 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     )
                     if raw_mode in {"off", "observe", "enforce"}:
                         _set("autonomous_spawn_budget_mode", raw_mode)
-                if "discovery_admission_mode" in config_json:
-                    raw_mode = (
-                        str(config_json["discovery_admission_mode"] or "")
-                        .strip()
-                        .lower()
-                    )
-                    if raw_mode in {"shadow", "enforced"}:
-                        _set("discovery_admission_mode", raw_mode)
                 if "max_global_autonomous_initiative_tasks_per_hour" in config_json:
                     try:
                         raw_cap = int(
@@ -2164,7 +2111,7 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "strategic_local_hold_timeout_seconds",
                     "strategic_session_idle_tick_seconds",
                     "strategic_session_turn_timeout_seconds",
-                    "strategic_session_min_tick_seconds",
+                    "strategic_session_exploration_interval_seconds",
                     "strategic_session_max_ops_per_turn",
                     "strategic_session_autonomous_turn_timeout_seconds",
                     "strategic_session_max_unattended_seconds",
@@ -2312,11 +2259,6 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     _set(
                         "capability_proof_execution_trials_enabled",
                         bool(config_json["capability_proof_execution_trials_enabled"]),
-                    )
-                if "acceptance_earn_execution_trials_enabled" in config_json:
-                    _set(
-                        "acceptance_earn_execution_trials_enabled",
-                        bool(config_json["acceptance_earn_execution_trials_enabled"]),
                     )
                 for _cap_grad_float_key in (
                     "capability_proof_gate_auto_graduation_observe_threshold",
@@ -2823,42 +2765,6 @@ def resolve_project_promotion_enabled(project_id) -> bool:
     if sid in per_project:
         return per_project[sid]
     return bool(runtime_config.get("promotion_enabled"))
-
-
-def walkthrough_e2e_enabled_by_project_map() -> Dict[str, bool]:
-    """Per-project walkthrough_e2e overrides, as ``{project_id: bool}``.
-
-    Read from the durable ``walkthrough_e2e_enabled_by_project`` runtime-config
-    value. Normalizes to trimmed, non-empty string project-id keys mapping to
-    bools, silently dropping malformed entries. An EMPTY map (the default) means
-    every project falls back to the fleet-wide ``walkthrough_e2e_enabled``.
-    Parallel to :func:`promotion_enabled_by_project_map`.
-    """
-    raw = runtime_config.get("walkthrough_e2e_enabled_by_project") or {}
-    if not isinstance(raw, dict):
-        return {}
-    out: Dict[str, bool] = {}
-    for key, value in raw.items():
-        sid = str(key).strip()
-        if not sid:
-            continue
-        out[sid] = bool(value)
-    return out
-
-
-def resolve_project_walkthrough_e2e_enabled(project_id) -> bool:
-    """A project's EFFECTIVE walkthrough_e2e gate.
-
-    Returns the project's explicit per-project value from
-    ``walkthrough_e2e_enabled_by_project`` when one is set, otherwise falls back
-    to the fleet-wide ``walkthrough_e2e_enabled`` default (True).  Mirrors
-    :func:`resolve_project_promotion_enabled` for the walkthrough evidence lane.
-    """
-    per_project = walkthrough_e2e_enabled_by_project_map()
-    sid = str(project_id)
-    if sid in per_project:
-        return per_project[sid]
-    return bool(runtime_config.get("walkthrough_e2e_enabled"))
 
 
 def resolve_project_concurrency_cap(project_id) -> int | None:

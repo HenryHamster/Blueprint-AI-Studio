@@ -194,16 +194,6 @@ describe('SrCatchRateCard', () => {
     expect(screen.getByText('n=10 findings')).toBeInTheDocument();
   });
 
-  it('renders the author / +reviewer line when SR-alone rate is present', () => {
-    const trends = trendsWithFindings(10, {
-      overall_sr_alone_hit_rate: 0.6,
-    });
-    render(<SrCatchRateCard rate={0.82} trends={trends} loading={false} />);
-    expect(screen.getByText('author 60%')).toBeInTheDocument();
-    // reviewer lift = 82% - 60% = 22pp
-    expect(screen.getByText('/ +reviewer 22pp')).toBeInTheDocument();
-  });
-
   it('shows the stale badge when trend data is stale', () => {
     render(<SrCatchRateCard rate={0.82} trends={trendsWithFindings(10, { is_stale: true })} loading={false} />);
     expect(screen.getByText('stale')).toBeInTheDocument();

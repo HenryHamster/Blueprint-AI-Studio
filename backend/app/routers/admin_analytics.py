@@ -42,7 +42,6 @@ from app.shared_state import (
     get_project_promotion_target,
 )
 from app.review_heuristics import (
-    LANE_ARBITRATION,
     LANE_CI,
     LANE_CONFLICT,
     LANE_REVIEW_CONVERGENCE,
@@ -183,7 +182,6 @@ _TASK_COST_WINDOW_MS: Dict[str, int] = {
 _LANE_DIAG_LANES = (
     LANE_CONFLICT,
     LANE_CI,
-    LANE_ARBITRATION,
     LANE_REVIEW_CONVERGENCE,
 )
 _LANE_DIAG_FIX_TYPES = {"create", "fix"}

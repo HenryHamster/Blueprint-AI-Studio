@@ -22,6 +22,7 @@ from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 from app.context_bounds import bound_review_history, warn_if_context_oversized
+from app.ci_merge_helpers import revoke_review_authority_for_active_fix
 from app.database import resolve_dialect_name
 from app.github import post_pipeline_merge_summary_comment as post_merge_summary_comment  # noqa: F401
 from app.models import Task, TaskHistory, TaskStatus
@@ -39,15 +40,11 @@ from app.spawn_calibration import (
     _compute_scope_overflow_warning,
 )
 
-# Issue-ledger: derives per-region DEMANDED/APPLIED/CONTESTED state from
-# review_history. Side-effect-free; re-exported here so callers importing from
-# app.review_pipeline keep working.
+# Authoritative issue ledger. Side-effect-free; re-exported here so callers
+# importing from app.review_pipeline keep working.
 from app.issue_ledger import (  # noqa: F401
-    CONTESTED_JACCARD_THRESHOLD,
-    ISSUE_LEDGER_MAX_CONTESTED,
     build_issue_ledger,
-    format_contested_regions_for_fix,
-    format_contested_regions_for_review,
+    ensure_issue_ids,
 )
 
 # Pure, side-effect-free review-loop heuristics live in review_heuristics; they
@@ -56,8 +53,6 @@ from app.issue_ledger import (  # noqa: F401
 from app.review_heuristics import (  # noqa: F401
     EARLY_NONCONVERGENCE_ESCALATE_AT,
     ISSUE_CHURN_WINDOW,
-    LANE_ARBITRATION,
-    LANE_CAP_ARBITRATION_DEFAULT,
     LANE_CAP_CI_DEFAULT,
     LANE_CAP_CONFLICT_DEFAULT,
     LANE_CAP_NON_REVIEW_DEFAULT,
@@ -104,8 +99,6 @@ from app.review_policy import (  # noqa: F401
     should_auto_approve_diff,
     should_auto_approve_small_diff,
     should_skip_initial_review,
-    should_skip_re_review,
-    should_skip_rereview,
 )
 
 # Review<->fix outer-loop convergence machinery (scope-pressure / narrow-focus
@@ -370,7 +363,7 @@ def _genuine_blocking_issue_exists(issues: "list | None") -> bool:
     CLEARING phrase such as "no remaining blocking correctness issue" read as a
     concrete defect via the bare ``correctness`` cue, latching the fix loop to the
     iteration cap). The structured issues are authoritative; CI-green is the
-    independent safety gate, and trunk APPROVEs still pass the second-opinion gate.
+    independent safety gate.
     Pure / side-effect-free — unit-testable.
     """
     for issue in issues or []:
@@ -1049,154 +1042,6 @@ async def _post_repeat_fingerprint_blocker_message(
     session.add(pm)
 
 
-# ---------------------------------------------------------------------------
-# Cross-cutting safeguard gate
-# ---------------------------------------------------------------------------
-
-TOP_LEVEL_MODULES = frozenset({"backend", "agent", "admin-ui"})
-
-
-def _is_cross_cutting_pr(source_task: Task) -> tuple[bool, str]:
-    """Return (True, reason) when the PR qualifies for a cross-cutting safeguard gate.
-
-    Three conditions, any one of which triggers the gate:
-    (a) scope=large — large PRs always get a safeguard review.
-    (b) scope=medium AND changed files span >= cross_cutting_gate_medium_module_threshold
-        distinct top-level modules (backend / agent / admin-ui).
-    (c) scope_overflow_warned=True AND diff lines exceed
-        cross_cutting_gate_overflow_line_threshold.
-    """
-    if not _runtime_config.get("cross_cutting_gate_enabled", True):
-        return (False, "gate disabled")
-    ctx = source_task.context or {}
-    scope = ctx.get("scope", "medium")
-    if scope == "large":
-        return (True, "scope=large")
-    if scope == "medium":
-        changed = ctx.get("_pr_changed_files") or []
-        mods = len(
-            {f.split("/")[0] for f in changed if f.split("/")[0] in TOP_LEVEL_MODULES}
-        )
-        threshold = int(
-            _runtime_config.get("cross_cutting_gate_medium_module_threshold", 3)
-        )
-        if mods >= threshold:
-            return (True, f"scope=medium,{mods}_modules")
-    if (ctx.get("review_loop") or {}).get("scope_overflow_warned"):
-        lines = _diff_lines_changed(ctx.get("_pr_diff_summary"))
-        overflow_threshold = int(
-            _runtime_config.get("cross_cutting_gate_overflow_line_threshold", 100)
-        )
-        if lines and lines > overflow_threshold:
-            return (True, f"overflow+{lines}_lines")
-    return (False, "not cross-cutting")
-
-
-async def maybe_spawn_cross_cutting_safeguard(
-    orig: Task, pr_number: int, branch: str, base_branch: str, session: AsyncSession
-) -> bool:
-    """Spawn a security_audit safeguard task if the PR is cross-cutting.
-
-    Sets orig.requires_approval=True and stores the safeguard task ID in
-    orig.context so the orchestrator and completion handlers can coordinate.
-    Returns True if a safeguard was spawned, False otherwise.
-    Idempotent: no-ops if orig.context already has a safeguard_task_id.
-    """
-    from sqlalchemy.orm.attributes import flag_modified
-
-    ctx = orig.context or {}
-    if ctx.get("safeguard_task_id"):
-        return False
-    # C5 invariant: the safeguard gate is a *merge-approval* gate — it sets
-    # orig.requires_approval=True and relies on the safeguard's completion to
-    # release it. With require_approval_gates OFF the operator has opted out of
-    # manual merge gating, so spawning the safeguard would (a) burn a VM that
-    # gates nothing actionable and (b) set requires_approval, which services.py's
-    # 2h approval-gate timeout would then use to FAIL the otherwise-healthy
-    # parent (discarding merged siblings) if the safeguard ever FAILED/reaped.
-    # Early-return so no VM is wasted and no flag is set. (Gates the spawn
-    # *and* the requires_approval set in one place — the invariant the whole
-    # cluster turns on.)
-    if not _runtime_config.get("require_approval_gates", True):
-        logger.info(
-            f"[PIPELINE] Cross-cutting safeguard skipped for orig {orig.id} "
-            f"(require_approval_gates off — no merge gate to enforce)"
-        )
-        return False
-    is_cross, reason = _is_cross_cutting_pr(orig)
-    if not is_cross:
-        return False
-
-    safeguard_id = uuid.uuid4()
-    changed = ctx.get("_pr_changed_files") or []
-    files_str = ", ".join(changed[:15]) or "all changed files"
-    payload_data = validate_internal_payload(
-        {
-            "type": "security_audit",
-            "prompt": (
-                f"Cross-cutting safeguard review for PR #{pr_number} ({reason}). "
-                "Assess: (1) security vulnerabilities introduced by cross-module changes, "
-                "(2) interface breakage across module boundaries, "
-                "(3) test coverage for cross-module interactions. "
-                f"Changed files: {files_str}. Return findings as a JSON array."
-            ),
-            "base_branch": base_branch,
-        },
-        "review_pipeline:cross_cutting_safeguard",
-    )
-    safeguard = Task(
-        id=safeguard_id,
-        project_id=orig.project_id,
-        title=f"Cross-cutting safeguard: PR #{pr_number}",
-        description=f"Security/QA safeguard ({reason})",
-        parent_task_id=orig.id,
-        payloads=[payload_data],
-        context={
-            "safeguard_for_task_id": str(orig.id),
-            "safeguard_pr_number": pr_number,
-            "safeguard_base_branch": base_branch,
-        },
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-        status=TaskStatus.QUEUED,
-        created_by="ORCHESTRATOR",
-    )
-    session.add(safeguard)
-    orig.requires_approval = True
-    orig.context = {
-        **ctx,
-        "safeguard_task_id": str(safeguard_id),
-        "safeguard_reason": reason,
-        "safeguard_pr_number": pr_number,
-    }
-    flag_modified(orig, "context")
-    orig.latest_status_message = (
-        f"Merge gated — awaiting cross-cutting safeguard for PR #{pr_number} ({reason})"
-    )
-    session.add(orig)
-    session.add(
-        TaskHistory(
-            task_id=safeguard_id,
-            action="SPAWNED",
-            details={
-                "spawned_by": "CROSS_CUTTING_GATE",
-                "pr_number": pr_number,
-                "reason": reason,
-            },
-        )
-    )
-    await session.commit()
-    logger.info(
-        f"[PIPELINE] Cross-cutting safeguard {safeguard_id} spawned "
-        f"for PR #{pr_number} ({reason}) — merge gated on orig {orig.id}"
-    )
-    await broadcast_to_project(
-        str(orig.project_id),
-        "task_updated",
-        {"task_id": str(safeguard_id), "status": TaskStatus.QUEUED},
-    )
-    return True
-
-
 async def _emit_scope_overflow_pr_signal(session, signal: dict) -> None:
     """Emit the deferred scope-overflow PR signal (label + comment) POST-commit.
 
@@ -1331,16 +1176,12 @@ async def _spawn_verify_tests_task(
     )
 
     # Carry strategic context (direction_id, scope, …) but drop the parking
-    # task's review_loop, second-opinion state, and transient
-    # underscore-internal flags.
-    from app.task_completion import REVIEW_SECOND_OPINION_TASK_LOCAL_KEYS
-
+    # task's review_loop and transient underscore-internal flags.
     source_ctx = source_task.context or {}
     propagated_ctx = {
         k: v
         for k, v in source_ctx.items()
         if k != "review_loop"
-        and k not in REVIEW_SECOND_OPINION_TASK_LOCAL_KEYS
         and (not k.startswith("_") or k in _PROPAGATE_UNDERSCORE_KEYS)
     }
     propagated_ctx["review_loop"] = {
@@ -1892,10 +1733,12 @@ async def _spawn_pipeline_task(
     current_feedback: str = "",
     fix_reason: str = "",
     current_issues: list | None = None,
+    current_resolutions: list | None = None,
     ci_failure_logs: str = "",
     investigated_files: list[str] | None = None,
-    rereview_waived: bool = False,
     reviewed_head_sha: str = "",
+    reviewed_base_sha: str = "",
+    target_verified_by_backend: bool = False,
     delta_base_sha: str = "",
     review_target: dict[str, str | int] | None = None,
     suppress_warm_handoff: bool = False,
@@ -1949,7 +1792,7 @@ async def _spawn_pipeline_task(
     # peer is already spawning for this PR — deferring is not just safe, it is
     # the correct outcome.
     try:
-        await acquire_pr_spawn_lock(session, pr_number)
+        await acquire_pr_spawn_lock(session, source_task.project_id, pr_number)
     except DBAPIError as _spawn_lock_exc:
         if not _is_lock_timeout_error(_spawn_lock_exc):
             raise
@@ -1985,6 +1828,12 @@ async def _spawn_pipeline_task(
             session.add(_reloaded_source)
             await session.commit()
         return (None, False)
+
+    from app.review_repository_scope import repository_project_ids
+
+    _repository_project_ids = await repository_project_ids(
+        session, source_task.project_id
+    )
 
     # Collect VMs to delete when tasks are superseded or churn-halted.
     # VMs are deleted after the session commits to avoid holding the
@@ -2211,7 +2060,7 @@ async def _spawn_pipeline_task(
         (
             await session.execute(
                 select(Task).where(
-                    Task.project_id == source_task.project_id,
+                    Task.project_id.in_(_repository_project_ids),
                     # Shared with _get_active_pipeline_task_by_key / verify_tests
                     # dedup so cross-type liveness can never diverge from key-level
                     # dedup. Includes BLOCKED — a same-PR fix parked on a
@@ -2241,7 +2090,11 @@ async def _spawn_pipeline_task(
         t_orig = t_payload.get("original_task_id") or ""
         if t_payload.get("pr_number") != pr_number or t_type not in ("review", "fix"):
             continue
-        same_chain = is_rollup_source or t_orig == resolved_original_id
+        same_chain = (
+            is_rollup_source
+            or t_orig == resolved_original_id
+            or t.project_id != source_task.project_id
+        )
         same_target_review = (
             task_type == "review"
             and t_type == "review"
@@ -2387,6 +2240,16 @@ async def _spawn_pipeline_task(
             )
             _set_spawn_reason(source_task, SPAWN_REASON_DEDUP)
             session.add(source_task)
+            if task_type == "fix":
+                revoke_review_authority_for_active_fix(source_task, t.id)
+                session.add(source_task)
+                if orig_task is not None and orig_task.id != source_task.id:
+                    revoke_review_authority_for_active_fix(orig_task, t.id)
+                    session.add(orig_task)
+                # The active-fix row and revoked merge authority must become
+                # visible together.  Returning an existing fix without this
+                # commit would leave caller-specific legacy bypasses live.
+                await session.commit()
             return (t, False)
 
         if task_type == "fix" and t_type == "review":
@@ -2969,7 +2832,6 @@ async def _spawn_pipeline_task(
     lane_counts: dict[str, int] = {
         LANE_CONFLICT: 0,
         LANE_CI: 0,
-        LANE_ARBITRATION: 0,
         LANE_REVIEW_CONVERGENCE: 0,
     }
     for _lt in pr_pipeline_tasks:
@@ -2981,20 +2843,13 @@ async def _spawn_pipeline_task(
         LANE_CONFLICT,
         _counts_toward_cap,
     )
-    non_review_total = (
-        lane_counts[LANE_CONFLICT]
-        + lane_counts[LANE_CI]
-        + lane_counts[LANE_ARBITRATION]
-    )
+    non_review_total = lane_counts[LANE_CONFLICT] + lane_counts[LANE_CI]
 
     # Runtime-config-tunable sub-caps.
     _lane_cap_conflict = _runtime_config.get(
         "review_lane_cap_conflict", LANE_CAP_CONFLICT_DEFAULT
     )
     _lane_cap_ci = _runtime_config.get("review_lane_cap_ci", LANE_CAP_CI_DEFAULT)
-    _lane_cap_arbitration = _runtime_config.get(
-        "review_lane_cap_arbitration", LANE_CAP_ARBITRATION_DEFAULT
-    )
     _lane_cap_non_review = _runtime_config.get(
         "review_lane_cap_non_review", LANE_CAP_NON_REVIEW_DEFAULT
     )
@@ -3003,7 +2858,6 @@ async def _spawn_pipeline_task(
         return (
             f"conflict={lane_counts[LANE_CONFLICT]}/{_lane_cap_conflict}, "
             f"ci={lane_counts[LANE_CI]}/{_lane_cap_ci}, "
-            f"arbitration={lane_counts[LANE_ARBITRATION]}/{_lane_cap_arbitration}, "
             f"non_review={non_review_total}/{_lane_cap_non_review}, "
             f"review_convergence={lane_counts[LANE_REVIEW_CONVERGENCE]}"
         )
@@ -3092,16 +2946,10 @@ async def _spawn_pipeline_task(
     # Block a spawn when its lane's sub-cap is exhausted or non-review lanes
     # collectively hit the collective ceiling. These fire before the global cap
     # so mechanical churn never starves review-convergence work.
-    # Arbitration exhaustion → standoff escalation (mirrors the is_standoff
-    # path). Conflict/CI exhaustion routes to _handle_cap_exhaustion which
-    # uses _pr_is_preservable_on_cap to preserve rollup work.
+    # Conflict/CI exhaustion routes to _handle_cap_exhaustion, which uses
+    # _pr_is_preservable_on_cap to preserve rollup work.
     _lane_exhausted: str | None = None
     if (
-        _spawn_lane == LANE_ARBITRATION
-        and lane_counts[LANE_ARBITRATION] >= _lane_cap_arbitration
-    ):
-        _lane_exhausted = LANE_ARBITRATION
-    elif (
         _spawn_lane == LANE_CONFLICT
         and lane_counts[LANE_CONFLICT] >= _lane_cap_conflict
     ):
@@ -3116,112 +2964,30 @@ async def _spawn_pipeline_task(
 
     if _lane_exhausted is not None:
         _detail = _lane_breakdown_detail()
-        if _lane_exhausted == LANE_ARBITRATION:
-            # Arbitration lane exhausted → treat as standoff escalation.
-            logger.warning(
-                f"[PIPELINE] PR #{pr_number} arbitration lane exhausted "
-                f"({lane_counts[LANE_ARBITRATION]}/{_lane_cap_arbitration} iterations). "
-                f"Lane breakdown: {_detail}"
-            )
-            try:
-                _ae_orig = await session.get(Task, uuid.UUID(resolved_original_id))
-                if _ae_orig:
-                    if _runtime_config.get("require_approval_gates", True):
-                        _ae_orig.requires_approval = True
-                    _ae_orig.latest_status_message = (
-                        f"Arbitration lane cap reached ({lane_counts[LANE_ARBITRATION]} "
-                        f"second-opinion iterations) — review-fix loop escalated for "
-                        f"manual resolution on PR #{pr_number}. {_detail}"
-                    )
-                    _set_review_loop_terminal_outcome(
-                        _ae_orig,
-                        kind="standoff",
-                        reason="arbitration_lane_exhausted",
-                        pr_number=pr_number,
-                        iterations=pr_iterations,
-                        detail=_detail,
-                    )
-                    session.add(_ae_orig)
-                    await session.commit()
-                    # Durable operator alert — fires regardless of
-                    # approval-gate state (mirrors the existing standoff path).
-                    try:
-                        from app.alert_dispatch import (
-                            _maybe_create_escalation_alert,
-                        )
-
-                        await _maybe_create_escalation_alert(
-                            _ae_orig,
-                            session,
-                            pr_number=pr_number,
-                            reason="arbitration_lane_exhausted",
-                            iteration=pr_iterations,
-                        )
-                    except Exception as _alert_err:  # noqa: BLE001
-                        logger.warning(
-                            f"[PIPELINE] Failed to create escalation alert for "
-                            f"arbitration-lane exhaustion on PR #{pr_number}: {_alert_err}",
-                            exc_info=True,
-                        )
-                    try:
-                        import asyncio as _asyncio
-                        from app.notification_dispatch import (
-                            dispatch_external_notification,
-                        )
-
-                        _asyncio.ensure_future(  # noqa: RUF006
-                            dispatch_external_notification(
-                                _ae_orig.project_id,
-                                "APPROVAL_NEEDED",
-                                {
-                                    "task_id": str(_ae_orig.id),
-                                    "task_title": _ae_orig.title
-                                    or str(_ae_orig.id)[:8],
-                                    "pr_number": pr_number,
-                                    "iteration": pr_iterations,
-                                    "reason": "Arbitration lane cap reached — manual review required",
-                                },
-                            )
-                        )
-                    except Exception as _ne:  # noqa: BLE001
-                        logger.warning(
-                            f"[NOTIFY] APPROVAL_NEEDED dispatch setup failed "
-                            f"(arbitration-lane): {_ne}"
-                        )
-            except Exception as _ae_err:  # noqa: BLE001
-                logger.warning(
-                    f"[PIPELINE] Failed to mark arbitration-lane exhaustion on "
-                    f"{resolved_original_id[:8]}: {_ae_err}",
-                    exc_info=True,
-                )
-            _set_spawn_reason(source_task, SPAWN_REASON_STUCK)
-            session.add(source_task)
-            return (None, False)
-        else:
-            # Conflict or CI lane exhausted (or non-review collective cap) →
-            # route to _handle_cap_exhaustion. For rollup PRs,
-            # _pr_is_preservable_on_cap returns True → preserve work.
-            _scope_label = (
-                f"{_lane_exhausted}-lane"
-                if _lane_exhausted in (LANE_CONFLICT, LANE_CI)
-                else "non-review-collective"
-            )
-            logger.warning(
-                f"[PIPELINE] PR #{pr_number} {_scope_label} lane cap exhausted. "
-                f"Lane breakdown: {_detail}"
-            )
-            await _handle_cap_exhaustion(
-                source_task,
-                resolved_original_id,
-                pr_number,
-                pr_iterations,
-                session,
-                scope=_scope_label,
-                lane_counts=lane_counts,
-            )
-            _set_spawn_reason(source_task, SPAWN_REASON_CAP)
-            session.add(source_task)
-            return (None, False)
+        # Conflict or CI lane exhausted (or non-review collective cap) →
+        # route to _handle_cap_exhaustion. For rollup PRs,
+        # _pr_is_preservable_on_cap returns True → preserve work.
+        _scope_label = (
+            f"{_lane_exhausted}-lane"
+            if _lane_exhausted in (LANE_CONFLICT, LANE_CI)
+            else "non-review-collective"
+        )
+        logger.warning(
+            f"[PIPELINE] PR #{pr_number} {_scope_label} lane cap exhausted. "
+            f"Lane breakdown: {_detail}"
+        )
+        await _handle_cap_exhaustion(
+            source_task,
+            resolved_original_id,
+            pr_number,
+            pr_iterations,
+            session,
+            scope=_scope_label,
+            lane_counts=lane_counts,
+        )
+        _set_spawn_reason(source_task, SPAWN_REASON_CAP)
+        session.add(source_task)
+        return (None, False)
 
     # Track review-fix iteration count to prevent infinite loops (per-chain).
     # Rollup PRs use the same elevated cap as the global check above — without
@@ -3231,6 +2997,25 @@ async def _spawn_pipeline_task(
     # fixable issues (duplicate vi.mock keys) because the per-chain cap had
     # not been bumped in step with the global cap.
     source_loop = (source_task.context or {}).get("review_loop", {})
+    if task_type == "fix" and not reviewed_head_sha:
+        # CI, conflict, and migration-guard fixes are commonly spawned after
+        # approval, from a parked source task rather than directly from the
+        # review verdict. Preserve that source's pre-fix head centrally so the
+        # mandatory follow-up can remain a cheap exact-SHA delta review instead
+        # of silently expanding to a full-PR review. Explicit verdict provenance
+        # wins; older source rows fall back through their live head and pinned
+        # immutable review target.
+        source_review_target = source_loop.get("review_target")
+        reviewed_head_sha = str(
+            source_loop.get("reviewed_head_sha")
+            or source_loop.get("head_sha")
+            or (
+                source_review_target.get("head_sha")
+                if isinstance(source_review_target, dict)
+                else ""
+            )
+            or ""
+        )
     cached_verdict_json = ""
     cached_review_task_id = ""
     if task_type == "review" and requested_review_target is not None:
@@ -3361,21 +3146,6 @@ async def _spawn_pipeline_task(
     ) or {}
     orig_hotfix = bool(_orig_payload.get("hotfix"))
 
-    # Cross-cutting safeguard gate: on the first review spawn for a PR that spans
-    # multiple top-level modules, is large-scope, or has an overflow warning on a
-    # large diff, spawn a security_audit safeguard task and block auto-merge until
-    # it completes. Skip for rollup reviews — those are already aggregated.
-    if task_type == "review" and iteration == 1 and orig is not None and not is_rollup:
-        try:
-            await maybe_spawn_cross_cutting_safeguard(
-                orig, pr_number, branch, base_branch, session
-            )
-        except Exception as _sg_err:  # noqa: BLE001
-            logger.warning(
-                f"[PIPELINE] Cross-cutting safeguard spawn failed for PR #{pr_number}: {_sg_err}",
-                exc_info=True,
-            )
-
     # Apply per-task-type model/effort defaults from settings
     type_model = _runtime_config.get("task_type_models", {}).get(task_type) or None
     type_effort = _runtime_config.get("task_type_efforts", {}).get(task_type) or None
@@ -3477,6 +3247,11 @@ async def _spawn_pipeline_task(
         or ((orig.context or {}).get("_pr_changed_files") if orig else None)
         or []
     )
+    _normalized_current_issues = ensure_issue_ids(
+        current_issues,
+        reviewed_head_sha=reviewed_head_sha,
+        iteration=iteration - 1,
+    )
     new_review_entry: dict[str, object] = {
         "iteration": iteration - 1,
         "feedback": current_feedback,
@@ -3485,9 +3260,39 @@ async def _spawn_pipeline_task(
         # in task_lifecycle.py so the trajectory shows them too.
         "verdict": "REQUEST_CHANGES",
         "changed_files": list(_source_changed_files)[:30],
+        **(
+            {"reviewed_head_sha": reviewed_head_sha}
+            if reviewed_head_sha
+            else {}
+        ),
+        **(
+            {"reviewed_base_sha": reviewed_base_sha}
+            if reviewed_base_sha
+            else {}
+        ),
+        **(
+            {
+                "target_verified_by_backend": True,
+                "review_task_id": str(source_task.id),
+            }
+            if target_verified_by_backend
+            and reviewed_head_sha
+            and reviewed_base_sha
+            else {}
+        ),
+        **(
+            {"delta_base_sha": source_loop.get("delta_base_sha")}
+            if source_loop.get("delta_base_sha")
+            else {}
+        ),
+        **(
+            {"resolutions": list(current_resolutions or [])[:30]}
+            if current_resolutions
+            else {}
+        ),
     }
-    if current_issues:
-        new_review_entry["issues"] = current_issues
+    if _normalized_current_issues:
+        new_review_entry["issues"] = _normalized_current_issues
     # Bound each entry's freeform feedback so the persisted row can never be fat,
     # no matter how large the underlying agent log is. Applied to the whole list —
     # the freshly built entry AND any carried-forward prior entries — BEFORE the
@@ -3496,9 +3301,12 @@ async def _spawn_pipeline_task(
     # rather than the legacy _cap_review_history_feedback so the truncation marker is
     # present on truncated entries; the bound_review_history call at the persistence
     # chokepoint below becomes a no-op because the list is already bounded here.
+    has_current_review_result = task_type == "fix" and bool(
+        current_feedback or _normalized_current_issues or current_resolutions
+    )
     new_review_history = bound_review_history(
         [*prev_review_history, new_review_entry]
-        if task_type == "fix" and current_feedback
+        if has_current_review_result
         else prev_review_history
     )
 
@@ -3589,9 +3397,8 @@ async def _spawn_pipeline_task(
         standoff_detail = ""
         if curr_critical_major and prev_critical_major:
             prior_responses = list(source_loop.get("fix_agent_responses") or [])
-            # Match by issue_id (sha1 of normalized description) when present;
-            # fall back to substring match on issue_summary so rationale
-            # written before issue_id became standard still counts.
+            # Collect copied stable BP issue ids when present; retain the
+            # issue-summary fallback so older structured responses still count.
             standoff_issue_ids: set[str] = set()
             for r in prior_responses:
                 if not isinstance(r, dict):
@@ -3604,9 +3411,8 @@ async def _spawn_pipeline_task(
             # but the reviewer rejected — standoff.
             re_raised_with_response = 0
             for desc in curr_critical_major:
-                # issue_id sha1 matching deferred until backend hashes
-                # consistently; for now any rationale present + same issue
-                # description re-appearing is treated as a standoff signal.
+                # Standoff currently requires at least one structured response
+                # carrying an id plus the same normalized description recurring.
                 if standoff_issue_ids and desc in prev_critical_major:
                     re_raised_with_response += 1
             if re_raised_with_response > 0 and standoff_issue_ids:
@@ -3842,34 +3648,22 @@ async def _spawn_pipeline_task(
                 )
                 fix_prompt = early_prefix + (fix_prompt or "")
 
-    # Contested-region detection: derive the issue ledger from review_history and
-    # inject guidance when the same code region has been demanded, fixed, then
-    # demanded *differently* — the oscillation shape the stuck/churn detectors miss.
-    # Fix prompt: prepend a contested-region prefix (topmost, before churn/mid-budget
-    # prefixes that were prepended above, so the most actionable signal reads first).
-    # Review prompt: append — mirrors the overflow_instruction pattern below.
-    # Ledger is serialized into review_loop regardless of task_type so the full
-    # history of contested regions is visible to reviewers and fix agents alike.
+    # Advance the durable complete ledger from only the newly observed review
+    # row. Replaying the bounded 50-row history would lose blockers whose demand
+    # row was compacted before a later omission; the prior ledger is the compact
+    # carry-forward state for every unresolved demand.
     _issue_ledger: dict = {}
-    if new_review_history:
-        _issue_ledger = build_issue_ledger(new_review_history)
-        _contested = _issue_ledger.get("contested") or []
-        if _contested:  # noqa: SIM102
-            if task_type == "fix":
-                contested_fix_prefix = format_contested_regions_for_fix(
-                    _contested, base_branch
-                )
-                if contested_fix_prefix:
-                    logger.info(
-                        f"[PIPELINE] Contested regions detected for PR #{pr_number}: "
-                        f"{len(_contested)} region(s). Injecting fix-prompt prefix."
-                    )
-                    payload_data["prompt"] = contested_fix_prefix + (
-                        payload_data.get("prompt") or ""
-                    )
-                    fix_prompt = contested_fix_prefix + (fix_prompt or "")
-            # Review-prompt injection happens after validate_internal_payload
-            # (same placement as overflow_instruction — see below).
+    if source_loop.get("issue_ledger") is not None:
+        _issue_ledger = build_issue_ledger(
+            new_review_history,
+            seed_ledger=source_loop.get("issue_ledger"),
+            stamp_complete=True,
+        )
+    elif new_review_history:
+        _issue_ledger = build_issue_ledger(
+            new_review_history,
+            stamp_complete=True,
+        )
 
     # Graduated scope-budget pressure cap: a medium- or large-scope fix cycle's
     # remaining iterations are scaled down by how close the PR is to its
@@ -3944,19 +3738,13 @@ async def _spawn_pipeline_task(
     propagated_scope = source_ctx.get("scope", source_loop.get("scope", "medium"))
     # Carry strategic context (direction_id, related_files, parent_context, scope, …)
     # from source task so fix/review agents see the same direction/intent the create
-    # task had. Skip underscore-prefixed internal flags (per-task transient state),
-    # the second-opinion key family (task-local: an inherited reconciliation
-    # record clobbers the next review's verdict with iteration-1's — see
-    # REVIEW_SECOND_OPINION_TASK_LOCAL_KEYS), and override review_loop below;
-    # exceptions in _PROPAGATE_UNDERSCORE_KEYS carry cross-iteration capability
-    # classifiers (e.g. rollup tags).
-    from app.task_completion import REVIEW_SECOND_OPINION_TASK_LOCAL_KEYS
-
+    # task had. Skip underscore-prefixed internal flags (per-task transient state)
+    # and override review_loop below; exceptions in _PROPAGATE_UNDERSCORE_KEYS
+    # carry cross-iteration capability classifiers (e.g. rollup tags).
     propagated_ctx = {
         k: v
         for k, v in source_ctx.items()
         if k != "review_loop"
-        and k not in REVIEW_SECOND_OPINION_TASK_LOCAL_KEYS
         and (not k.startswith("_") or k in _PROPAGATE_UNDERSCORE_KEYS)
     }
     propagated_ctx["scope"] = propagated_scope
@@ -4054,23 +3842,6 @@ async def _spawn_pipeline_task(
                 (payload_data.get("original_prompt") or "").strip()
                 + "\n\n"
                 + overflow_instruction
-            ).strip()
-    # Contested-region review-prompt injection: append after overflow_instruction
-    # so the reviewer sees both when scope overflow is also present.
-    if task_type == "review" and _issue_ledger.get("contested"):
-        contested_review_appendix = format_contested_regions_for_review(
-            _issue_ledger["contested"], base_branch
-        )
-        if contested_review_appendix:
-            logger.info(
-                f"[PIPELINE] Contested regions detected for PR #{pr_number}: "
-                f"{len(_issue_ledger['contested'])} region(s). "
-                f"Appending review-prompt guidance."
-            )
-            payload_data["original_prompt"] = (
-                (payload_data.get("original_prompt") or "").strip()
-                + "\n\n"
-                + contested_review_appendix
             ).strip()
     # Persist the scope-budget hard cap (either newly triggered this spawn or
     # carried forward from a prior spawn) so _max_review_iterations enforces
@@ -4202,11 +3973,6 @@ async def _spawn_pipeline_task(
         ),
         **({"fix_reason": fix_reason} if fix_reason else {}),
         **(
-            {"rereview_waived": True}
-            if task_type == "fix" and rereview_waived
-            else {}
-        ),
-        **(
             {"reviewed_head_sha": reviewed_head_sha}
             if task_type == "fix" and reviewed_head_sha
             else {}
@@ -4229,10 +3995,13 @@ async def _spawn_pipeline_task(
             if accumulated_responses
             else {}
         ),
-        # Issue ledger: carries contested regions across iterations so each fix/review
-        # agent sees the full oscillation history without re-deriving from history.
-        # Only written when the ledger has at least one contested region.
-        **({"issue_ledger": _issue_ledger} if _issue_ledger.get("contested") else {}),
+        # Binding blocker state. Open is complete and never capped; resolved is
+        # bounded historical explanation.
+        **(
+            {"issue_ledger": _issue_ledger}
+            if _issue_ledger.get("open") or _issue_ledger.get("resolved")
+            else {}
+        ),
         # Reviewer-model pin: first review stamps the resolved model; subsequent
         # reviews and fix tasks carry it forward so all reviews on the chain use
         # the same model (prevents reviewer personality drift mid-chain).
@@ -4502,6 +4271,16 @@ async def _spawn_pipeline_task(
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
     )
+    if task_type == "fix":
+        # Commit the active child and authority revocation atomically.  Every
+        # fix origin (review rejection, CI, conflict, migration, recovery) uses
+        # this helper, so no caller can accidentally preserve an old APPROVE or
+        # no-review exemption while code is changing.
+        revoke_review_authority_for_active_fix(source_task, new_task.id)
+        session.add(source_task)
+        if orig_task is not None and orig_task.id != source_task.id:
+            revoke_review_authority_for_active_fix(orig_task, new_task.id)
+            session.add(orig_task)
     session.add(new_task)
     if lane_fix_to_activate is not None:
         await activate_lane_for_fix(
@@ -4559,7 +4338,26 @@ async def _spawn_pipeline_task(
                 f"idempotent spawn already active → {str(existing.id)[:8]}"
             )
             _set_spawn_reason(reloaded_source, SPAWN_REASON_DEDUP)
+            if task_type == "fix":
+                revoke_review_authority_for_active_fix(
+                    reloaded_source, existing.id
+                )
             session.add(reloaded_source)
+            if task_type == "fix":
+                try:
+                    _reloaded_orig_id = uuid.UUID(resolved_original_id)
+                except (TypeError, ValueError):
+                    _reloaded_orig_id = None
+                if (
+                    _reloaded_orig_id is not None
+                    and _reloaded_orig_id != reloaded_source.id
+                ):
+                    _reloaded_orig = await session.get(Task, _reloaded_orig_id)
+                    if _reloaded_orig is not None:
+                        revoke_review_authority_for_active_fix(
+                            _reloaded_orig, existing.id
+                        )
+                        session.add(_reloaded_orig)
             await session.commit()
         return (existing, False)
     except DBAPIError as _spawn_db_exc:

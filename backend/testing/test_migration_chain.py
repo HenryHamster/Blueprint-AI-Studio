@@ -1298,8 +1298,8 @@ def test_backfill_0707_chains_from_0702_and_declares_kv_keys():
         )
 
 
-def test_strategic_memory_0718_is_the_expected_schema_head():
-    """Strategic Memory follows main's hot-sweep migration as one linear chain."""
+def test_index_repair_0720_is_the_expected_schema_head():
+    """Index repair follows constraint validation as one linear chain."""
     versions_dir = Path(__file__).resolve().parents[1] / "alembic" / "versions"
     operability = (
         versions_dir / "0708_pipeline_operability_foundation.py"
@@ -1332,6 +1332,12 @@ def test_strategic_memory_0718_is_the_expected_schema_head():
     timezone_columns = (
         versions_dir / "0718_strategic_memory_timezone_columns.py"
     ).read_text()
+    constraint_validation = (
+        versions_dir / "0719_validate_task_context_size_constraint.py"
+    ).read_text()
+    index_repair = (
+        versions_dir / "0720_repair_direction_status_staged_index.py"
+    ).read_text()
     assert parse_revision_identifiers(operability) == ("0708", "0707")
     assert parse_revision_identifiers(claims) == ("0709", "0708")
     assert parse_revision_identifiers(incarnation) == ("0710", "0709")
@@ -1343,10 +1349,12 @@ def test_strategic_memory_0718_is_the_expected_schema_head():
     assert parse_revision_identifiers(source_control) == ("0716", "0715")
     assert parse_revision_identifiers(semantic_ledger) == ("0717", "0716")
     assert parse_revision_identifiers(timezone_columns) == ("0718", "0717")
+    assert parse_revision_identifiers(constraint_validation) == ("0719", "0718")
+    assert parse_revision_identifiers(index_repair) == ("0720", "0719")
 
     from app.main import EXPECTED_SCHEMA_REVISION
 
-    assert EXPECTED_SCHEMA_REVISION == "0718", (
-        f"Expected EXPECTED_SCHEMA_REVISION == '0718', got {EXPECTED_SCHEMA_REVISION!r}. "
+    assert EXPECTED_SCHEMA_REVISION == "0720", (
+        f"Expected EXPECTED_SCHEMA_REVISION == '0720', got {EXPECTED_SCHEMA_REVISION!r}. "
         "Bump EXPECTED_SCHEMA_REVISION in backend/app/main.py."
     )

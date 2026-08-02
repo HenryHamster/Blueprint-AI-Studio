@@ -122,24 +122,6 @@ describe('sr-pr-section.js renderer', () => {
     expect(out).toContain('Self-review skipped — reason: unknown');
   });
 
-  it('renders reviewer_findings counts by severity (omits zero buckets)', () => {
-    const out = runScript({
-      verdict: 'pass',
-      fixes_applied: false,
-      reviewer_findings: [
-        { category: 'correctness', severity: 'CRITICAL', description: 'bad' },
-        { category: 'security', severity: 'HIGH', description: 'worse' },
-        { category: 'style-conventions', severity: 'HIGH', description: 'meh' },
-      ],
-    });
-    expect(out).toContain('**Fresh-reviewer findings (high severity):**');
-    expect(out).toContain('[CRITICAL] correctness: bad');
-    expect(out).toContain('[HIGH] security: worse');
-    expect(out).toContain('[HIGH] style-conventions: meh');
-    expect(out).not.toContain('MEDIUM:');
-    expect(out).not.toContain('LOW:');
-  });
-
   it('renders edges_considered count for handled edges', () => {
     const out = runScript({
       verdict: 'pass',
@@ -183,37 +165,6 @@ describe('sr-pr-section.js renderer', () => {
     expect(out).not.toContain('edge4');
   });
 
-  it('lists CRITICAL/HIGH severity findings with truncated description', () => {
-    const out = runScript({
-      verdict: 'pass',
-      fixes_applied: false,
-      reviewer_findings: [
-        { category: 'correctness', severity: 'CRITICAL', description: 'Off-by-one error in loop boundary affects all array processing' },
-        { category: 'security', severity: 'HIGH', description: 'Unvalidated user input could lead to injection attack' },
-      ],
-    });
-    expect(out).toContain('Fresh-reviewer findings (high severity):');
-    expect(out).toContain('[CRITICAL] correctness:');
-    expect(out).toContain('[HIGH] security:');
-  });
-
-  it('caps high-severity findings list with +N more when exceeding', () => {
-    const out = runScript({
-      verdict: 'pass',
-      fixes_applied: false,
-      reviewer_findings: [
-        { category: 'correctness', severity: 'CRITICAL', description: 'Issue 1' },
-        { category: 'security', severity: 'CRITICAL', description: 'Issue 2' },
-        { category: 'performance', severity: 'HIGH', description: 'Issue 3' },
-        { category: 'type-safety', severity: 'HIGH', description: 'Issue 4' },
-      ],
-    });
-    expect(out).toContain('Fresh-reviewer findings (high severity):');
-    expect(out).toContain('+1 more');
-    expect(out).toContain('correctness');
-    expect(out).toContain('Issue 3');
-  });
-
   it('shows files not re-verified when incomplete_review and truncated_files_read present', () => {
     const out = runScript({
       verdict: 'pass',
@@ -224,45 +175,6 @@ describe('sr-pr-section.js renderer', () => {
     expect(out).toContain('Files not re-verified:');
     expect(out).toContain('agent/src/foo.ts');
     expect(out).toContain('backend/app/bar.py');
-  });
-
-  it('summarizes lower-severity findings as counts in "Other reviewer findings"', () => {
-    const out = runScript({
-      verdict: 'pass',
-      fixes_applied: false,
-      reviewer_findings: [
-        { category: 'documentation', severity: 'MEDIUM', description: 'Missing doc' },
-        { category: 'style-conventions', severity: 'LOW', description: 'Formatting' },
-        { category: 'style-conventions', severity: 'LOW', description: 'Spacing' },
-      ],
-    });
-    expect(out).toContain('**Other reviewer findings:** MEDIUM: 1, LOW: 2');
-  });
-
-  it('prioritizes high-severity findings and unhandled edges over other content', () => {
-    const out = runScript({
-      verdict: 'fail',
-      fixes_applied: false,
-      edges_considered: [
-        { case: 'unhandled edge', handled: false, blind_spot: 'critical issue' },
-      ],
-      reviewer_findings: [
-        { category: 'correctness', severity: 'CRITICAL', description: 'Critical bug' },
-      ],
-      check_results: {
-        security: { passed: false },
-        performance: { passed: false },
-      },
-    });
-    // Unhandled edge should appear before failing categories
-    const unhandledIdx = out.indexOf('Unhandled edges');
-    const criticalIdx = out.indexOf('Fresh-reviewer findings');
-    const failIdx = out.indexOf('Failing categories');
-    expect(unhandledIdx).toBeGreaterThan(-1);
-    expect(criticalIdx).toBeGreaterThan(-1);
-    expect(failIdx).toBeGreaterThan(-1);
-    expect(unhandledIdx).toBeLessThan(criticalIdx);
-    expect(criticalIdx).toBeLessThan(failIdx);
   });
 
   it('clamps output to 1500 chars and preserves closing marker', () => {
@@ -291,78 +203,4 @@ describe('sr-pr-section.js renderer', () => {
     expect(out).toBe('');
   });
 
-  it('renders fp_rate_hint when present in reviewer_findings', () => {
-    const out = runScript({
-      verdict: 'pass',
-      fixes_applied: false,
-      reviewer_findings: [
-        {
-          category: 'correctness',
-          severity: 'CRITICAL',
-          description: 'Off-by-one error',
-          fp_rate_hint: '(FP rate 55% in this project, n=20)',
-        },
-      ],
-    });
-    expect(out).toContain('[CRITICAL] correctness: Off-by-one error (FP rate 55% in this project, n=20)');
-  });
-
-  it('renders finding without fp_rate_hint when hint is absent (backward compat)', () => {
-    const out = runScript({
-      verdict: 'pass',
-      fixes_applied: false,
-      reviewer_findings: [
-        {
-          category: 'security',
-          severity: 'HIGH',
-          description: 'Missing validation',
-        },
-      ],
-    });
-    expect(out).toContain('[HIGH] security: Missing validation');
-    expect(out).not.toContain('FP rate');
-  });
-
-  it('includes fp_rate_hint only for findings with sufficient sample size', () => {
-    const out = runScript({
-      verdict: 'pass',
-      fixes_applied: false,
-      reviewer_findings: [
-        {
-          category: 'style-conventions',
-          severity: 'HIGH',
-          description: 'Inconsistent formatting',
-          fp_rate_hint: '(FP rate 50% in this project, n=5)',
-        },
-        {
-          category: 'type-safety',
-          severity: 'CRITICAL',
-          description: 'Unsafe cast',
-          fp_rate_hint: '(FP rate 65% in this project, n=15)',
-        },
-      ],
-    });
-    // Both hints should be present since we're not filtering them here;
-    // filtering happens when augmenting in the agent handler
-    expect(out).toContain('(FP rate 50% in this project, n=5)');
-    expect(out).toContain('(FP rate 65% in this project, n=15)');
-  });
-
-  it('truncates description but preserves fp_rate_hint', () => {
-    const out = runScript({
-      verdict: 'pass',
-      fixes_applied: false,
-      reviewer_findings: [
-        {
-          category: 'correctness',
-          severity: 'CRITICAL',
-          description: 'This is a very long description that will be truncated by the 80-character limit in the renderer',
-          fp_rate_hint: '(FP rate 72% in this project, n=25)',
-        },
-      ],
-    });
-    expect(out).toContain('(FP rate 72% in this project, n=25)');
-    // Description should be truncated to 80 chars
-    expect(out).toMatch(/This is a very long description that will be truncated by the 80-c/);
-  });
 });

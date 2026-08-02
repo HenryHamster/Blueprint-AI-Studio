@@ -40,15 +40,14 @@ def _release_qualifier():
 
 
 # Statuses from ``promote()`` where the hotfix bypass ACTUALLY took effect: the
-# candidate merged outright (``promoted``) or a promotion PR was opened with
-# auto-merge / a managed-check wait armed (``pending_auto_merge`` /
-# ``pending_managed_check_wait`` — the CI-gated primary flow). Each skipped the
+# candidate merged outright (``promoted``) or a promotion PR was opened under
+# ``pending_managed_check_wait`` (the CI-gated primary flow). Each skipped the
 # audit/scoring gate and is owed normal-gate re-qualification, so the audit
 # trail (completion-debt backfill + operator Alert) MUST be recorded for every
 # one of them, not only the already-merged ``promoted`` case. A
 # ``promotion_failed`` / no-op result deployed nothing, so it owes nothing.
 _HOTFIX_PROMOTE_ATTEMPTED_STATUSES: frozenset[str] = frozenset(
-    {"promoted", "pending_auto_merge", "pending_managed_check_wait"}
+    {"promoted", "pending_managed_check_wait"}
 )
 
 
@@ -92,7 +91,7 @@ async def _hotfix_promote_locked(
     from app.qualification_state_resolver import resolve_newest_qualification_verdict
     _latest_verdict = await resolve_newest_qualification_verdict(session, version)
     _rq = _release_qualifier()
-    _promo = _rq._promotion_in_flight_result(version, latest_verdict=_latest_verdict)
+    _promo = _rq._promotion_pending_result(version, latest_verdict=_latest_verdict)
     if _promo is not None:
         return _promo
     now = _utcnow()
@@ -208,10 +207,9 @@ async def _record_hotfix_audit_trail(
     """Durable, append-only audit trail for a hotfix promote that took effect.
 
     Recorded for every status in ``_HOTFIX_PROMOTE_ATTEMPTED_STATUSES`` — the
-    already-merged ``promoted`` case AND the CI-gated ``pending_auto_merge`` /
-    ``pending_managed_check_wait`` cases where the promotion PR is open with
-    auto-merge armed but not yet landed. All three bypassed the audit gate and
-    are equally owed re-qualification.
+    already-merged ``promoted`` case and the CI-gated
+    ``pending_managed_check_wait`` case where the promotion PR is open but not
+    yet landed. Both bypassed the audit gate and are equally owed re-qualification.
 
     Reuses existing primitives (design §2.3 prefers this over a new table):
 

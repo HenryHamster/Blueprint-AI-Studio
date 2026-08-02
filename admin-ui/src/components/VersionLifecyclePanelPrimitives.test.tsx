@@ -661,17 +661,6 @@ describe('CutConsequences', () => {
     expect(host.textContent).toContain('In-flight task count unavailable');
   });
 
-  test('renders promotion_in_flight warning', () => {
-    const promoCv: CurrentVersion = {
-      ...cv,
-      qualification_state: { state: 'promotion_in_flight', promotion_pr_number: 42, promotion_age_seconds: 180 },
-    } as CurrentVersion;
-    const staged: StagedDirection[] = [];
-    const host = render(<CutConsequences cv={promoCv} staged={staged} />);
-    expect(host.textContent).toContain('#42');
-    expect(host.textContent).toContain('auto-merging');
-  });
-
   test('renders promotion_check_wait warning', () => {
     const waitCv: CurrentVersion = {
       ...cv,
@@ -679,7 +668,8 @@ describe('CutConsequences', () => {
     } as CurrentVersion;
     const host = render(<CutConsequences cv={waitCv} staged={[]} />);
     expect(host.textContent).toContain('#43');
-    expect(host.textContent).toContain('waiting for required checks');
+    expect(host.textContent).toContain('exact-head check wait');
+    expect(host.textContent).toContain('merges only the checked head');
   });
 });
 
@@ -984,27 +974,27 @@ describe('formatPromotionFreshnessContext', () => {
   test('returns detail text for normal case', () => {
     const state: QualificationState = { promotion_age_seconds: 120 } as QualificationState;
     const result = formatPromotionFreshnessContext(state);
-    expect(result?.detailText).toContain('in flight ~');
-    expect(result?.toneClassName).toBe('text-emerald-300');
+    expect(result?.detailText).toContain('waiting ~');
+    expect(result?.toneClassName).toBe('text-blue-300');
   });
 
   test('adds timeout cap when timeout_seconds present', () => {
     const state: QualificationState = { promotion_age_seconds: 300, promotion_timeout_seconds: 3600 } as QualificationState;
     const result = formatPromotionFreshnessContext(state);
-    expect(result?.detailText).toContain('auto-timeout cap');
+    expect(result?.detailText).toContain('timeout cap');
   });
 
-  test('returns past-auto-timeout tone', () => {
+  test('returns past-timeout tone', () => {
     const state: QualificationState = { promotion_age_seconds: 5000, promotion_past_timeout: true } as QualificationState;
     const result = formatPromotionFreshnessContext(state);
-    expect(result?.detailText).toContain('past auto-timeout');
+    expect(result?.detailText).toContain('past timeout');
     expect(result?.toneClassName).toBe('text-red-400');
   });
 
-  test('returns nearing-auto-timeout tone', () => {
+  test('returns nearing-timeout tone', () => {
     const state: QualificationState = { promotion_age_seconds: 3000, promotion_nearing_timeout: true } as QualificationState;
     const result = formatPromotionFreshnessContext(state);
-    expect(result?.detailText).toContain('nearing auto-timeout');
+    expect(result?.detailText).toContain('nearing timeout');
     expect(result?.toneClassName).toBe('text-amber-400');
   });
 });

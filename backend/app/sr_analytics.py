@@ -2,7 +2,7 @@
 
 Thin re-export shim. Logic lives in focused submodules:
   - sr_analytics_catch_rate: SR catch-rate analytics helpers and trend tracking
-  - sr_reviewer_trends: fresh-reviewer and edges-considered cycle trends
+  - sr_edges_trends: author edges-considered cycle trends
   - sr_signal_trends: regression-risk, false-attestation, and alert drilldown
 
 ``app.playbook_learning`` re-exports these names for backward compatibility.
@@ -15,8 +15,6 @@ from app.playbook_learning import (  # noqa: F401
 )
 from app.sr_analytics_catch_rate import (  # noqa: F401
     _compute_edges_stats,
-    _partition_edges_by_origin,
-    _reviewer_caught_author_miss,
     _stats_for_tasks,
     compute_direction_sr_breakdown_for_endpoint,
     compute_sr_catch_rate_by_direction,
@@ -29,7 +27,6 @@ from app.sr_analytics_common import (  # noqa: F401
     _EXAMPLE_MAX_PER_CAT,
     _EXECUTION_EVIDENCE_CATEGORIES,
     _FLOOR_MIN_CONSECUTIVE_WINDOWS,
-    _HALLUCINATION_RATE_MIN_FINDINGS,
     _MIN_DIRECTION_SR_SAMPLE,
     _MIN_SR_FINDINGS,
     _MIN_SR_SAMPLE,
@@ -65,12 +62,7 @@ from app.sr_analytics_common import (  # noqa: F401
     _sr_skip_stats,
     _task_prompt_fingerprint,
 )
-from app.sr_reviewer_trends import (  # noqa: F401
-    _FR_CODE_CHANGE_TYPES,
-    compute_edges_trend,
-    compute_fresh_reviewer_trend,
-    compute_sr_reviewer_disagreements,
-)
+from app.sr_edges_trends import compute_edges_trend  # noqa: F401
 from app.sr_signal_trends import (  # noqa: F401
     _FALSE_ATTESTATION_ALERT_TITLE_PREFIX,
     _FALSE_ATTESTATION_RATE_THRESHOLD,

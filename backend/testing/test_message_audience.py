@@ -62,11 +62,11 @@ def test_route_event_routine_maps_to_strategist_internal():
     assert route_event("discovery.review_completed") == STRATEGIST_INTERNAL
 
 
-def test_discovery_review_attention_events_reach_operator():
-    assert route_event("discovery.review_blocked") == OPERATOR_ACTION_NEEDED
+def test_discovery_review_attention_routes_through_resident_first():
+    assert route_event("discovery.review_blocked") == STRATEGIST_INTERNAL
     assert route_event("discovery.operator_question") == OPERATOR_ACTION_NEEDED
     assert "discovery.review_completed" in get_non_operator_event_types()
-    assert "discovery.review_blocked" in get_operator_event_types()
+    assert "discovery.review_blocked" in get_non_operator_event_types()
     assert "discovery.operator_question" in get_operator_event_types()
 
 
@@ -265,8 +265,9 @@ def test_route_event_already_registered_reused_types_retain_audience():
     assert route_event("self_improvement.payload_too_large") == STRATEGIST_INTERNAL
     # cost.ceiling_reached is operator-facing (reused on cost_ceiling.py)
     assert route_event("cost.ceiling_reached") == OPERATOR_ACTION_NEEDED
-    # research.direction_auto_completed is internal (reused on direction_lifecycle.py)
+    # Both successful completion and non-successful retirement are internal.
     assert route_event("research.direction_auto_completed") == STRATEGIST_INTERNAL
+    assert route_event("research.direction_auto_retired") == STRATEGIST_INTERNAL
 
 
 def test_new_internal_event_types_appear_in_non_operator_filter():

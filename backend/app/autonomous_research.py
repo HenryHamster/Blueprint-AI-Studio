@@ -84,6 +84,7 @@ from app.resource_envelope import (
     resolve_project_spend_window_days,
 )
 from app.autonomous_spawn_budget import (
+    autonomous_spawn_task_clause,
     build_autonomous_spawn_budget_guard,
     classify_autonomous_spawn_budget_category,
     compute_autonomous_spawn_budget_snapshot,
@@ -2110,7 +2111,7 @@ async def _spawn_research_task_inner(
                 select(func.count())
                 .select_from(Task)
                 .where(
-                    Task.created_by == "ORCHESTRATOR",
+                    autonomous_spawn_task_clause(),
                     Task.created_at >= one_hour_ago,
                 )
             )
@@ -2951,7 +2952,6 @@ async def _spawn_research_task_inner(
         from app.discovery_admission import (
             consume_discovery_admission,
             DiscoveryCycleUnavailable,
-            discovery_admission_mode_from_runtime,
             ensure_discovery_cycle_for_research,
             reserve_discovery_admission,
         )
@@ -3048,7 +3048,6 @@ async def _spawn_research_task_inner(
                         session,
                         cycle_id=_discovery_cycle_id,
                         admission_key=_discovery_admission_key,
-                        mode=discovery_admission_mode_from_runtime(_runtime_config),
                         metadata={"source": "autonomous_research"},
                     )
                     if not _discovery_decision.allowed:
@@ -3284,7 +3283,7 @@ async def _spawn_periodic_task(
                 select(func.count())
                 .select_from(Task)
                 .where(
-                    Task.created_by == "ORCHESTRATOR",
+                    autonomous_spawn_task_clause(),
                     Task.created_at >= one_hour_ago,
                 )
             )

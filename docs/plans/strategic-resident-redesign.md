@@ -57,7 +57,10 @@ Chat/Workday session plans.
 - Raw interactive and background histories remain separate and bounded.
 - Rapid operator messages coalesce; interactive work preempts background work at
   safe boundaries.
-- Unchanged cadence checks make zero model calls.
+- Unchanged cadence checks make zero model calls. The current Workday Resident's
+  separate unchanged-state exploration fallback is explicitly configurable as
+  `strategic_session_exploration_interval_seconds` and defaults to four hours;
+  first-turn, operator, watch, follow-up, and semantic-state wakes remain immediate.
 - Warm provider processes are optional latency optimizations and are valid only for
   the exact checkpoint lineage, provider, model, and instruction set.
 - Code editing, large review, open-ended debugging, and repeated CI repair remain

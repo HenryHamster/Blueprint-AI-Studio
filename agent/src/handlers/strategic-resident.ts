@@ -46,7 +46,9 @@ import {
   buildSurfaceCatalog, nextFocus, classifyTickOutcome, openFoundLeads, parseTickVerdict,
   classifyOperatorDecisionReview, mergePendingOperatorDecisionReview,
   retainPendingOperatorDecisionReview, advancePendingOperatorDecisionReview, MAX_REVIEW_ATTEMPTS,
-  shouldRunAutonomousTurn, EXAM_RECORDS_CAP, FOCUS_LIST_SIZE,
+  shouldRunAutonomousTurn, actionableFiredWatchRevision, wakeBarrierRevision,
+  hasPendingOwnedWork,
+  EXAM_RECORDS_CAP, FOCUS_LIST_SIZE,
   serializeLedger, restoreLedger, refreshSurfaceCatalog,
   compactionThreshold, formatDirectionGroundingText, buildCompactionCheckpoint,
   decisionsRegisterText, DECISIONS_REGISTER_CAP, isSettledDecisionVerdict, admitDecisionEntry,
@@ -58,7 +60,8 @@ import {
   type CompactionCheckpointContext, type DecisionsRegisterEntry,
   type PendingOperatorDecisionReview,
   type CheckpointGrounding, type CheckpointStateResponse,
-  type StrategicWatchReceipt, type ResidentActivityUpdate,
+  type StrategicWatchReceipt, type ResidentWakeBarrierReceipt,
+  type ResidentActivityUpdate,
 } from './strategic-resident-lib.js';
 import {
   formatResidentRepoSnapshot,
@@ -209,7 +212,40 @@ export function selectTypedFastClaimMessages(
     messages: ResidentInboundMessage[];
   } | null,
 ): ResidentInboundMessage[] | null {
-  if (!pending) return messages;
+  if (!pending) {
+    // A previous Resident incarnation can leave an expired, exact Fast claim
+    // in front of newer unclaimed input.  The coordinator intentionally
+    // forbids appending the newer rows to that immutable logical turn.  Polls
+    // retain the claim idempotency marker in the internal message context, so
+    // recover the oldest marked turn by itself; the newer rows remain open and
+    // are picked up immediately after its atomic completion.
+    const oldestClaimKey = messages.find(message => (
+      typeof message.context?._conversation_claim_idempotency_key === 'string'
+      && message.context._conversation_claim_idempotency_key.trim().length > 0
+    ))?.context?._conversation_claim_idempotency_key;
+    if (typeof oldestClaimKey === 'string') {
+      const claimedMessages = messages.filter(message => (
+        message.context?._conversation_claim_idempotency_key === oldestClaimKey
+      ));
+      const groupContext = claimedMessages[0]?.context;
+      const expectedCount = groupContext?._conversation_claim_member_count;
+      const expectedIds = groupContext?._conversation_claim_message_ids;
+      if (groupContext?._conversation_claim_group_complete === false) return null;
+      if (
+        typeof expectedCount === 'number'
+        && (!Number.isInteger(expectedCount) || expectedCount !== claimedMessages.length)
+      ) return null;
+      if (Array.isArray(expectedIds)) {
+        const visibleIds = new Set(claimedMessages.map(message => message.id));
+        if (
+          expectedIds.length !== claimedMessages.length
+          || expectedIds.some(id => typeof id !== 'string' || !visibleIds.has(id))
+        ) return null;
+      }
+      return claimedMessages;
+    }
+    return messages;
+  }
   const pageById = new Map(messages.map(message => [
     typeof message.id === 'string' ? message.id.trim() : '',
     message,
@@ -1053,7 +1089,8 @@ export async function handleStrategicResident(
   // child sharing the Resident's *conversation authority*, not a second
   // Workday/coding session or a UI mode toggle.
   let foregroundTyped: ForegroundTypedController | null = null;
-  let typedFastLease: { leaseId: string; generation: number } | null = null;
+  type TypedFastLeaseIdentity = { leaseId: string; generation: number };
+  let typedFastLease: TypedFastLeaseIdentity | null = null;
   let typedFastDispatching = false;
   const typedFastConfig = typedFastRuntimeConfig({
     enabled: payload.typed_fast_enabled === true,
@@ -1069,7 +1106,16 @@ export async function handleStrategicResident(
       ? payload.typed_fast_qualification
       : undefined,
   });
+  // Once Fast owns the public conversation, Workday is an on-demand research
+  // lane rather than a second autonomous mind. It still handles explicit Fast
+  // consultations and the ordinary fallback path, but it must not burn turns
+  // merely because the project clock moved while nobody asked it to do
+  // anything. Workday-only sessions retain their autonomous behavior.
+  const workdayOnDemand = typedFastConfig.activated;
   let typedFastReady = typedFastConfig.activated;
+  let typedFastProvisioning = false;
+  let typedFastProvisionAttempt: Promise<boolean> | null = null;
+  let typedFastProvisionRetryAt = 0;
   let typedFastFailureCount = 0;
   let typedFastCircuitOpenUntil = 0;
   let typedFastTranscriptSequence = 0;
@@ -1100,7 +1146,7 @@ export async function handleStrategicResident(
   // Keep private requests serialized, but never make the foreground input loop
   // await them: newer operator input must remain immediately dispatchable.
   let privateWorkdayChain: Promise<void> = Promise.resolve();
-  let privateWorkdayBusy = false;
+  let pendingPrivateWorkdayJobs = 0;
   let nextTypedConsultationPollAt = 0;
   let cursor = initialCursor(task, payload);
   // Bounded set of message ids already handled — with `created_at >= since` poll
@@ -1253,15 +1299,20 @@ export async function handleStrategicResident(
   };
   // An operator turn just completed → run an autonomous turn to act on it.
   let operatorTurnJustCompleted = false;
-  // Pacing state for shouldRunAutonomousTurn: 0 = never run (floor fires first).
+  // Pacing state for shouldRunAutonomousTurn: 0 = never run (first turn fires immediately).
   let lastAutonomousTurnAt = 0;
   let lastAutonomousWorkStateRev: string | null = null;
+  let lastAutonomousFiredWatchRev = '';
   // Latest work_state_rev observed on a heartbeat (undefined until the backend
-  // that populates it lands — absence degrades to floor-tick pacing).
+  // that populates it lands — absence degrades to sparse exploration pacing).
   let currentWorkStateRev: string | null = null;
+  let currentWorkStateSummary: Record<string, unknown> | null = null;
   // Exact task-completion receipts returned by the heartbeat. They remain in
   // autonomous prompts until the backend observes an explicit ack-watch.
   let firedStrategicWatches: StrategicWatchReceipt[] = [];
+  // Exact server-authored outcome barriers. A completed autonomous turn sends
+  // their ids back as handled; interrupted turns deliberately leave them open.
+  let firedResidentBarriers: ResidentWakeBarrierReceipt[] = [];
   // Pacing for the "watching" ephemeral status line emitted while gated-idle so
   // deliberate quiet looks different from a dark/crashed session.
   let lastWatchingEmitAt = 0;
@@ -1882,15 +1933,56 @@ export async function handleStrategicResident(
           (Array.isArray(resp.fast_message_ids) ? resp.fast_message_ids : [])
             .filter((id): id is string => typeof id === 'string' && id.length > 0),
         );
+        const fastClaimGroupByMessageId = new Map<string, {
+          idempotencyKey: string;
+          messageIds: string[];
+          memberCount: number;
+          complete: boolean;
+          artifactsDegraded: boolean;
+        }>();
+        for (const group of Array.isArray(resp.fast_claim_groups) ? resp.fast_claim_groups : []) {
+          const idempotencyKey = typeof group.idempotency_key === 'string'
+            ? group.idempotency_key.trim()
+            : '';
+          const messageIds = Array.isArray(group.message_ids)
+            ? group.message_ids.filter((id): id is string => typeof id === 'string' && id.length > 0)
+            : [];
+          const memberCount = typeof group.member_count === 'number'
+            ? group.member_count
+            : messageIds.length;
+          if (!idempotencyKey || messageIds.length === 0) continue;
+          for (const messageId of messageIds) {
+            fastClaimGroupByMessageId.set(messageId, {
+              idempotencyKey,
+              messageIds,
+              memberCount,
+              complete: group.complete === true,
+              artifactsDegraded: group.artifacts_degraded === true,
+            });
+          }
+        }
         // The backend alone decides canonical Fast membership. Carry the
         // additive projection through the legacy batch admission so a mixed
         // page can split safely instead of causing a broad typed claim.
         const raw = (Array.isArray(resp.messages) ? resp.messages : []).map(message => {
           const id = typeof message.id === 'string' ? message.id : '';
           if (!fastIds.has(id)) return message;
+          const claimGroup = fastClaimGroupByMessageId.get(id);
           return {
             ...message,
-            context: { ...(message.context ?? {}), _typed_fast_eligible: true },
+            context: {
+              ...(message.context ?? {}),
+              _typed_fast_eligible: true,
+              // Always overwrite the free-form operator context with the
+              // server-owned poll projection, including the false case.
+              _server_artifact_delivery_deferred: claimGroup?.artifactsDegraded === true,
+              ...(claimGroup ? {
+                _conversation_claim_idempotency_key: claimGroup.idempotencyKey,
+                _conversation_claim_message_ids: claimGroup.messageIds,
+                _conversation_claim_member_count: claimGroup.memberCount,
+                _conversation_claim_group_complete: claimGroup.complete,
+              } : {}),
+            },
           };
         });
         const admission = admitMessageBatchPage(
@@ -2114,7 +2206,10 @@ export async function handleStrategicResident(
     return 'continue';
   };
 
-  const applyHeartbeatResponse = (resp: SessionHeartbeatResponse): void => {
+  const applyHeartbeatResponse = (
+    resp: SessionHeartbeatResponse,
+    heartbeatTypedFastLease: TypedFastLeaseIdentity | null = null,
+  ): void => {
     if (resp.resident_incarnation_id === residentProcessIncarnation) {
       conversationIncarnationSupported = true;
     }
@@ -2134,14 +2229,21 @@ export async function handleStrategicResident(
       );
       reconcileCallLifecycle();
     }
-    if (typedFastLease !== null && Object.prototype.hasOwnProperty.call(resp, 'typed_fast')) {
+    const heartbeatStillOwnsCurrentFastLease = heartbeatTypedFastLease !== null
+      && typedFastLease !== null
+      && heartbeatTypedFastLease.leaseId === typedFastLease.leaseId
+      && heartbeatTypedFastLease.generation === typedFastLease.generation;
+    if (
+      heartbeatStillOwnsCurrentFastLease
+      && Object.prototype.hasOwnProperty.call(resp, 'typed_fast')
+    ) {
       const typedLease = (resp as SessionHeartbeatResponse & { typed_fast?: unknown }).typed_fast;
       const active = typedLease !== null
         && typeof typedLease === 'object'
         && !Array.isArray(typedLease)
         && (typedLease as Record<string, unknown>).status === 'active'
-        && (typedLease as Record<string, unknown>).lease_id === typedFastLease.leaseId
-        && Number((typedLease as Record<string, unknown>).generation) === typedFastLease.generation;
+        && (typedLease as Record<string, unknown>).lease_id === heartbeatTypedFastLease.leaseId
+        && Number((typedLease as Record<string, unknown>).generation) === heartbeatTypedFastLease.generation;
       if (!active) {
         foregroundTyped?.close();
         foregroundTyped = null;
@@ -2154,9 +2256,21 @@ export async function handleStrategicResident(
     if (typeof resp.work_state_rev === 'string') {
       currentWorkStateRev = resp.work_state_rev;
     }
+    if (
+      resp.work_state_summary !== null
+      && typeof resp.work_state_summary === 'object'
+      && !Array.isArray(resp.work_state_summary)
+    ) {
+      currentWorkStateSummary = resp.work_state_summary;
+    }
     if (Array.isArray(resp.fired_watches)) {
       firedStrategicWatches = resp.fired_watches.filter(
         (watch): watch is StrategicWatchReceipt => typeof watch.id === 'string',
+      );
+    }
+    if (Array.isArray(resp.fired_barriers)) {
+      firedResidentBarriers = resp.fired_barriers.filter(
+        (barrier): barrier is ResidentWakeBarrierReceipt => typeof barrier.id === 'string',
       );
     }
     if (Array.isArray(resp.active_direction_ids)) {
@@ -2242,9 +2356,13 @@ export async function handleStrategicResident(
         };
       }
     }
-    if (typedFastLease !== null) {
-      body.typed_fast_lease_id = typedFastLease.leaseId;
-      body.typed_fast_generation = typedFastLease.generation;
+    // Fence the response against the exact lease identity represented by this
+    // request. A heartbeat sent before acquisition must not revoke a lease that
+    // finishes warming while the request is in flight.
+    const heartbeatTypedFastLease = typedFastLease === null ? null : { ...typedFastLease };
+    if (heartbeatTypedFastLease !== null) {
+      body.typed_fast_lease_id = heartbeatTypedFastLease.leaseId;
+      body.typed_fast_generation = heartbeatTypedFastLease.generation;
       body.typed_fast_ttl_seconds = 300;
     }
     if (handledIds && handledIds.length > 0) {
@@ -2269,7 +2387,7 @@ export async function handleStrategicResident(
         HEARTBEAT_API_MAX_RETRIES,
         HEARTBEAT_API_TIMEOUT,
       ) as SessionHeartbeatResponse;
-      applyHeartbeatResponse(resp);
+      applyHeartbeatResponse(resp, heartbeatTypedFastLease);
       return resp;
     } catch (e) {
       const msg = String(e);
@@ -2284,10 +2402,10 @@ export async function handleStrategicResident(
     }
   };
 
-  const releaseTypedFastLease = async (reason: string): Promise<void> => {
-    const lease = typedFastLease;
-    typedFastLease = null;
-    if (!lease) return;
+  const releaseExactTypedFastLease = async (
+    lease: TypedFastLeaseIdentity,
+    reason: string,
+  ): Promise<void> => {
     try {
       await apiPost(
         `/api/agent/projects/${projectId}/strategic-session/typed-fast-lease/release`,
@@ -2307,6 +2425,122 @@ export async function handleStrategicResident(
       // failure cannot hold capacity indefinitely; never block parent cleanup.
       sendLog(ws, `[resident] typed Fast slot release deferred: ${sanitize(String(error))}\n`);
     }
+  };
+
+  const releaseTypedFastLease = async (reason: string): Promise<void> => {
+    const lease = typedFastLease;
+    if (!lease) return;
+    typedFastLease = null;
+    await releaseExactTypedFastLease(lease, reason);
+  };
+
+  /**
+   * Provision (or re-provision) the restricted Fast child. Capacity and warm-up
+   * failures are transient in a pooled runner, so they must not permanently
+   * demote the Resident until its next process restart.
+   */
+  const ensureTypedFastReady = async (): Promise<boolean> => {
+    if (!typedFastConfig.activated) return false;
+    if (typedFastReady && foregroundTyped !== null && typedFastLease !== null) {
+      if (foregroundTyped.isAlive()) return true;
+      typedFastReady = false;
+      foregroundTyped.close();
+      foregroundTyped = null;
+      await releaseTypedFastLease('foreground_process_gone');
+    }
+    // Provisioning is kicked off beside the main Resident loop.  Never await
+    // the same provider probe from message admission: that would make a hung
+    // foreground CLI prevent both polling and liveness heartbeats.
+    if (typedFastProvisioning) return false;
+    if (Date.now() < typedFastProvisionRetryAt) return false;
+
+    // Bound retry pressure when the provider/account pool is temporarily full.
+    typedFastProvisionRetryAt = Date.now() + 5_000;
+    typedFastProvisioning = true;
+    typedFastReady = false;
+    let warmingController: ForegroundTypedController | null = null;
+    let acquiredLease: TypedFastLeaseIdentity | null = null;
+    try {
+      const leaseResponse = await apiPost(
+        `/api/agent/projects/${projectId}/strategic-session/typed-fast-lease/acquire`,
+        {
+          task_id: taskId,
+          worker_generation: workerGeneration,
+          resident_incarnation_id: residentProcessIncarnation,
+        },
+        HEARTBEAT_API_MAX_RETRIES,
+        HEARTBEAT_API_TIMEOUT,
+      ) as { acquired?: unknown; reason?: unknown; lease?: unknown };
+      const lease = leaseResponse.lease;
+      if (
+        leaseResponse.acquired !== true
+        || lease === null
+        || typeof lease !== 'object'
+        || Array.isArray(lease)
+        || typeof (lease as Record<string, unknown>).lease_id !== 'string'
+        || !Number.isInteger((lease as Record<string, unknown>).generation)
+      ) {
+        const reason = typeof leaseResponse.reason === 'string'
+          ? leaseResponse.reason : 'lease was not admitted';
+        throw new Error(`typed Fast capacity unavailable: ${reason}`);
+      }
+      acquiredLease = {
+        leaseId: (lease as Record<string, unknown>).lease_id as string,
+        generation: (lease as Record<string, unknown>).generation as number,
+      };
+      typedFastLease = acquiredLease;
+      warmingController = new ForegroundTypedController({
+        adapter: typedFastConfig.adapter,
+        model: typedFastConfig.model,
+        effort: typedFastConfig.effort,
+      });
+      foregroundTyped = warmingController;
+      await warmingController.ensureReady();
+      const warmingStillCurrent = foregroundTyped === warmingController
+        && typedFastLease?.leaseId === acquiredLease.leaseId
+        && typedFastLease.generation === acquiredLease.generation;
+      if (!warmingStillCurrent) {
+        warmingController.close();
+        await releaseExactTypedFastLease(acquiredLease, 'readiness_superseded');
+        return false;
+      }
+      typedFastReady = true;
+      typedFastProvisionRetryAt = 0;
+      sendLog(
+        ws,
+        `[resident] typed Fast foreground passed readiness probe (${typedFastConfig.model}/${typedFastConfig.effort})\n`,
+      );
+      return true;
+    } catch (error) {
+      typedFastReady = false;
+      warmingController?.close();
+      if (foregroundTyped === warmingController) foregroundTyped = null;
+      const failedLease = acquiredLease;
+      if (
+        failedLease !== null
+        && typedFastLease?.leaseId === failedLease.leaseId
+        && typedFastLease.generation === failedLease.generation
+      ) {
+        typedFastLease = null;
+        await releaseExactTypedFastLease(failedLease, 'readiness_failed');
+      }
+      sendLog(
+        ws,
+        `[resident] typed Fast unavailable before admission: ${sanitize(String(error))}; retrying while preserving operator input\n`,
+      );
+      return false;
+    } finally {
+      typedFastProvisioning = false;
+    }
+  };
+
+  const kickTypedFastProvisioning = (): void => {
+    if (typedFastProvisionAttempt !== null) return;
+    const attempt = ensureTypedFastReady();
+    typedFastProvisionAttempt = attempt;
+    void attempt.finally(() => {
+      if (typedFastProvisionAttempt === attempt) typedFastProvisionAttempt = null;
+    });
   };
 
   /** Keep Fast lifecycle independent from the persistent Workday subprocess. */
@@ -2804,6 +3038,7 @@ export async function handleStrategicResident(
   const schedulePrivateWorkdayRequest = (
     request: { request_id: string; prompt: string; receipt: CallTurnReceipt },
   ): void => {
+    pendingPrivateWorkdayJobs += 1;
     privateWorkdayChain = privateWorkdayChain
       .catch(() => undefined)
       .then(async () => {
@@ -2818,6 +3053,9 @@ export async function handleStrategicResident(
       })
       .catch((error: unknown) => {
         sendLog(ws, `[resident] private call Workday request failed: ${sanitize(String(error))}\n`);
+      })
+      .finally(() => {
+        pendingPrivateWorkdayJobs = Math.max(0, pendingPrivateWorkdayJobs - 1);
       });
   };
 
@@ -2937,7 +3175,7 @@ export async function handleStrategicResident(
   };
 
   const scheduleTypedConsultation = (packet: ClaimedTypedConsultation): void => {
-    privateWorkdayBusy = true;
+    pendingPrivateWorkdayJobs += 1;
     privateWorkdayChain = privateWorkdayChain
       .catch(() => undefined)
       .then(async () => {
@@ -2999,13 +3237,13 @@ export async function handleStrategicResident(
         }
       })
       .finally(() => {
-        privateWorkdayBusy = false;
+        pendingPrivateWorkdayJobs = Math.max(0, pendingPrivateWorkdayJobs - 1);
       });
   };
 
   const maybeClaimTypedConsultation = async (): Promise<boolean> => {
     if (
-      privateWorkdayBusy
+      pendingPrivateWorkdayJobs > 0
       || callCoordinator.suppressOrdinaryWorkday()
       || Date.now() < nextTypedConsultationPollAt
     ) return false;
@@ -3317,7 +3555,12 @@ export async function handleStrategicResident(
   // Ticks at the fast message-poll cadence so an operator message pre-empts the
   // autonomous turn promptly; the liveness heartbeat inside stays paced to
   // cfg.idleTickMs.
-  const watchTurn = async (turnPromise: Promise<ResidentTurnResult>): Promise<WatchOutcome> => {
+  const watchTurn = async (
+    turnPromise: Promise<ResidentTurnResult>,
+    handleMessagesInForeground?: (
+      messages: ResidentInboundMessage[],
+    ) => Promise<boolean>,
+  ): Promise<WatchOutcome> => {
     const doneSignal: Promise<typeof TURN_DONE> = turnPromise.then(() => TURN_DONE);
     for (;;) {
       const raced = await Promise.race([doneSignal, sleep(cfg.messagePollMs).then(() => 'tick' as const)]);
@@ -3331,7 +3574,16 @@ export async function handleStrategicResident(
         if (!authorityHeld) return { kind: 'suspend' };
       }
       const newMsgs = await pollMessages();
-      if (newMsgs.length > 0) return { kind: 'message', messages: newMsgs };
+      if (newMsgs.length > 0) {
+        // A pure canonical Fast page can complete through the restricted
+        // foreground child while Workday keeps thinking.  Only input that Fast
+        // could not safely own is allowed to pre-empt the Workday turn.
+        if (
+          handleMessagesInForeground
+          && await handleMessagesInForeground(newMsgs)
+        ) continue;
+        return { kind: 'message', messages: newMsgs };
+      }
     }
   };
 
@@ -3343,6 +3595,9 @@ export async function handleStrategicResident(
   // could be superseded despite the runner continuing to report progress.
   const watchOperatorTurn = async (
     turnPromise: Promise<ResidentTurnResult>,
+    handleMessagesInForeground?: (
+      messages: ResidentInboundMessage[],
+    ) => Promise<boolean>,
   ): Promise<'done' | 'stop'> => {
     const doneSignal: Promise<'done'> = turnPromise.then(() => 'done' as const);
     for (;;) {
@@ -3358,6 +3613,27 @@ export async function handleStrategicResident(
           return 'stop';
         }
         if (hb?.stop_requested || !authorityHeld) return 'stop';
+      }
+      const newMsgs = await pollMessages();
+      if (newMsgs.length > 0) {
+        const partition = partitionTypedFastMessages(newMsgs);
+        const pureFastPage = partition.fast.length > 0
+          && partition.workday.length === 0;
+        if (
+          pureFastPage
+          && handleMessagesInForeground
+          && await handleMessagesInForeground(newMsgs)
+        ) continue;
+        if (pureFastPage) {
+          // A Fast claim became ambiguous while another public Workday claim
+          // was active. Stop the parent rather than let either lane race the
+          // other's durable ownership.
+          stopReason = 'foreground_fast_claim_deferred';
+          return 'stop';
+        }
+        // An ordinary/legacy row may wait for the current public reply, but its
+        // cursor admission must be rolled back so the next loop can see it.
+        rollbackPendingOperatorAdmission();
       }
     }
   };
@@ -3430,6 +3706,16 @@ export async function handleStrategicResident(
     status?: 'abandoned' | 'already_abandoned' | 'already_completed';
     legacy_fallback_admissible?: boolean;
   };
+  type ConversationClaimSnapshot = {
+    id: string;
+    messageIds: string[];
+    incarnation: string | null;
+  };
+  type TypedFastTurnOutcome =
+    | 'completed'
+    | 'deferred'
+    | 'not_available'
+    | 'displaced_workday_claim_lost';
 
   const clearTypedConversationClaim = (): void => {
     activeConversationClaimId = null;
@@ -3444,7 +3730,45 @@ export async function handleStrategicResident(
     clearTypedConversationClaim();
   };
 
-  const watchTypedFastTurn = async <T>(turnPromise: Promise<T>): Promise<'done' | 'lost'> => {
+  const renewConversationClaimSnapshot = async (
+    claim: ConversationClaimSnapshot,
+  ): Promise<boolean> => {
+    try {
+      const renewed = await apiPost(
+        `/api/agent/projects/${projectId}/messages/claim`,
+        {
+          task_id: taskId,
+          session_id: sessionId,
+          worker_generation: workerGeneration,
+          resident_incarnation_id: residentProcessIncarnation,
+          ...(claim.incarnation === null
+            ? {}
+            : { incarnation_id: claim.incarnation }),
+          message_ids: claim.messageIds,
+          lease_seconds: CONVERSATION_CLAIM_LEASE_SECONDS,
+        },
+      ) as ConversationClaimResponse;
+      const renewedIds = Array.isArray(renewed.message_ids)
+        ? renewed.message_ids.filter(
+          (value): value is string => typeof value === 'string',
+        )
+        : [];
+      return renewed.claim_id === claim.id
+        && [...renewedIds].sort().join('\n')
+          === [...claim.messageIds].sort().join('\n');
+    } catch (error) {
+      sendLog(
+        ws,
+        `[resident] displaced Workday claim renewal failed: ${sanitize(String(error))}\n`,
+      );
+      return false;
+    }
+  };
+
+  const watchTypedFastTurn = async <T>(
+    turnPromise: Promise<T>,
+    displacedWorkdayClaim: ConversationClaimSnapshot | null = null,
+  ): Promise<'done' | 'fast_lost' | 'displaced_lost'> => {
     const done = turnPromise.then(() => 'done' as const);
     for (;;) {
       const raced = await Promise.race([
@@ -3458,7 +3782,11 @@ export async function handleStrategicResident(
         || hb?.stop_requested
         || !authorityHeld
         || !residentIncarnationHeld
-      ) return 'lost';
+      ) return 'fast_lost';
+      if (
+        displacedWorkdayClaim !== null
+        && !await renewConversationClaimSnapshot(displacedWorkdayClaim)
+      ) return 'displaced_lost';
     }
   };
 
@@ -3521,11 +3849,21 @@ export async function handleStrategicResident(
    */
   const tryHandleTypedFastTurn = async (
     msgs: ResidentInboundMessage[],
-  ): Promise<'completed' | 'deferred' | 'not_available'> => {
+    displacedWorkdayClaim: ConversationClaimSnapshot | null = null,
+  ): Promise<TypedFastTurnOutcome> => {
     if (typedFastDispatching || callCoordinator.suppressOrdinaryWorkday()) return 'not_available';
+    // Preserve a stable pending request without re-hitting claim/abandon while
+    // its retry circuit is open.  This check must precede unresolved-claim
+    // reconciliation because that path uses the same coordinator budget.
+    if (Date.now() < typedFastCircuitOpenUntil) return 'not_available';
     const unresolved = await reconcileUnresolvedTypedFastClaim();
     if (unresolved === 'completed') return 'completed';
-    if (unresolved === 'pending') return 'deferred';
+    if (unresolved === 'pending') {
+      typedFastFailureCount += 1;
+      typedFastCircuitOpenUntil = Date.now()
+        + typedFastFailureBackoffMs(typedFastFailureCount);
+      return 'deferred';
+    }
     // The typed endpoint is intentionally narrower than legacy polling. Never
     // let an internal packet or a mixed legacy page become a Fast public turn.
     if (msgs.some(message => (
@@ -3543,16 +3881,31 @@ export async function handleStrategicResident(
     if (selectedMessages === null) {
       // We still cannot reconstruct the old exact input, so do not replace it
       // with a new claim or let legacy Workday race it.
+      typedFastFailureCount += 1;
+      typedFastCircuitOpenUntil = Date.now()
+        + typedFastFailureBackoffMs(typedFastFailureCount);
       return 'deferred';
     }
     const messageIds = selectedMessages
       .map(message => typeof message.id === 'string' ? message.id.trim() : '')
       .filter(Boolean);
     if (messageIds.length !== selectedMessages.length || messageIds.length === 0) return 'deferred';
-    if (
-      !pendingClaimRequest
-      && (!typedFastReady || Date.now() < typedFastCircuitOpenUntil)
-    ) return 'not_available';
+    if (!pendingClaimRequest) {
+      if (Date.now() < typedFastCircuitOpenUntil) return 'not_available';
+      if (
+        !typedFastReady || foregroundTyped === null || typedFastLease === null
+        || !foregroundTyped.isAlive()
+      ) {
+        if (foregroundTyped !== null && !foregroundTyped.isAlive()) {
+          typedFastReady = false;
+          foregroundTyped.close();
+          foregroundTyped = null;
+          await releaseTypedFastLease('foreground_process_gone');
+        }
+        kickTypedFastProvisioning();
+        return 'not_available';
+      }
+    }
     const claimRequest = pendingClaimRequest ?? {
       clientClaimId: randomUUID(),
       idempotencyKey: `typed-fast-claim:${randomUUID()}`,
@@ -3633,6 +3986,9 @@ export async function handleStrategicResident(
       const attachmentBlocks = await materializeContentBlocks(
         combineOperatorMessages(attachmentOnlyMessages),
       );
+      const artifactDeliveryDeferred = selectedMessages.some(message => (
+        message.context?._server_artifact_delivery_deferred === true
+      ));
       const promptText = [
         buildFastResidentContextFrame(verified, typedFastTranscriptSequence),
         '',
@@ -3641,6 +3997,9 @@ export async function handleStrategicResident(
         attachmentBlocks.length > 0
           ? 'The model input following this text contains the active turn attachments.'
           : 'There are no separate attachment blocks for this turn.',
+        ...(artifactDeliveryDeferred ? [
+          'Recovery notice: attachments from this interrupted turn exceeded the safe delivery limit and were not included. Ask the operator to resend the relevant artifact if it is needed to answer accurately.',
+        ] : []),
         '',
         'You MUST use mcp__call__complete_turn exactly once with the natural public reply.',
         'If fresh investigation is genuinely necessary, also use mcp__call__request_workday with a concise private request, but still complete this turn naturally (for example, say what you are checking). Do not emit a competing public answer in plain text.',
@@ -3655,22 +4014,30 @@ export async function handleStrategicResident(
         ? promptText
         : promptBlocks;
       let turnPromise = foregroundTyped.dispatch(receipt, prompt);
-      let watch = await watchTypedFastTurn(turnPromise);
-      if (watch === 'lost') {
+      let watch = await watchTypedFastTurn(turnPromise, displacedWorkdayClaim);
+      if (watch !== 'done') {
         foregroundTyped.interrupt();
         await turnPromise;
-        throw new Error('Fast Resident lost its exact conversation claim');
+        throw new Error(
+          watch === 'displaced_lost'
+            ? 'DISPLACED_WORKDAY_CLAIM_LOST'
+            : 'Fast Resident lost its exact conversation claim',
+        );
       }
       let turn = await turnPromise;
       if (turn.result.processGone) {
         foregroundTyped.replaceAfterCrash();
         typedFastTranscriptSequence = 0;
         turnPromise = foregroundTyped.dispatch(receipt, prompt);
-        watch = await watchTypedFastTurn(turnPromise);
-        if (watch === 'lost') {
+        watch = await watchTypedFastTurn(turnPromise, displacedWorkdayClaim);
+        if (watch !== 'done') {
           foregroundTyped.interrupt();
           await turnPromise;
-          throw new Error('Fast Resident lost its exact conversation claim during replacement');
+          throw new Error(
+            watch === 'displaced_lost'
+              ? 'DISPLACED_WORKDAY_CLAIM_LOST'
+              : 'Fast Resident lost its exact conversation claim during replacement',
+          );
         }
         turn = await turnPromise;
       }
@@ -3698,6 +4065,8 @@ export async function handleStrategicResident(
       markTypedFastCompleted(messageIds);
       return 'completed';
     } catch (error) {
+      const displacedWorkdayClaimLost = error instanceof Error
+        && error.message === 'DISPLACED_WORKDAY_CLAIM_LOST';
       sendLog(ws, `[resident] typed Fast turn deferred: ${sanitize(String(error))}\n`);
       typedFastFailureCount += 1;
       typedFastCircuitOpenUntil = Date.now()
@@ -3709,7 +4078,9 @@ export async function handleStrategicResident(
           );
           if (disposition === 'completed') {
             markTypedFastCompleted(claimRequest.messageIds);
-            return 'completed';
+            return displacedWorkdayClaimLost
+              ? 'displaced_workday_claim_lost'
+              : 'completed';
           }
           claimReleased = disposition === 'fallback';
         } catch (abandonError) {
@@ -3721,7 +4092,9 @@ export async function handleStrategicResident(
       }
       if (claimReleased) {
         clearTypedConversationClaim();
-        return 'not_available';
+        return displacedWorkdayClaimLost
+          ? 'displaced_workday_claim_lost'
+          : 'not_available';
       }
       return 'deferred';
     } finally {
@@ -3744,7 +4117,7 @@ export async function handleStrategicResident(
   ): Promise<'stop' | 'continue'> => {
     const partition = partitionTypedFastMessages(msgs);
     const fastMessages = partition.fast;
-    let workdayMessages = partition.workday;
+    const workdayMessages = partition.workday;
     // Fast is the typed public-reply owner.  Do not silently fall through to
     // the ordinary Workday reply path if it is unavailable or needs research:
     // that would reintroduce two competing conversational owners.
@@ -3777,21 +4150,59 @@ export async function handleStrategicResident(
       } else {
         rollbackPendingOperatorAdmission();
         setResidentActivity('waiting', 'Fast Resident turn remains pending');
+        // Claim conflicts and transient coordinator locks are retryable, but a
+        // pending stable claim request must not bypass the circuit deadline and
+        // hot-loop the claim endpoint.  The live failure that motivated this
+        // fence reached the endpoint's 120/minute limit before any model turn.
+        const retryDelayMs = Math.max(
+          cfg.messagePollMs,
+          Math.min(
+            cfg.idleTickMs,
+            Math.max(0, typedFastCircuitOpenUntil - Date.now()),
+          ),
+        );
+        await sleep(retryDelayMs);
+        if (livenessHeartbeatDue()) {
+          const hb = await livenessHeartbeat();
+          if (hb?.stop_requested || !authorityHeld) return 'stop';
+        }
         return 'continue';
       }
     }
     if (typedOutcome === 'not_available' && fastMessages.length > 0) {
-      // Typed Fast was disabled/circuit-open before it acquired a claim, or the
-      // Coordinator confirmed release. Preserve the original canonical order
-      // for the legacy Workday responder; never silently drop Fast-eligible
-      // text, images, or whiteboard attachments.
-      workdayMessages = [...msgs];
+      // Fast is the sole public owner for canonical conversation.  Falling
+      // through to the broad Workday process here lets a greeting become a
+      // project-tool/autonomy turn — exactly the split-brain behavior the
+      // two-speed architecture exists to prevent.  Preserve the input and
+      // pause ordinary Workday until the restricted child can claim it.
+      rollbackPendingOperatorAdmission();
+      setResidentActivity(
+        'waiting',
+        'Fast Resident unavailable; operator message preserved for retry',
+      );
+      const retryDeadline = Math.max(
+        typedFastProvisionRetryAt,
+        typedFastCircuitOpenUntil,
+      );
+      const retryDelayMs = Math.max(
+        cfg.messagePollMs,
+        Math.min(
+          cfg.idleTickMs,
+          Math.max(0, retryDeadline - Date.now()),
+        ),
+      );
+      await sleep(retryDelayMs);
+      if (livenessHeartbeatDue()) {
+        const hb = await livenessHeartbeat();
+        if (hb?.stop_requested || !authorityHeld) return 'stop';
+      }
+      return 'continue';
     }
     // A private consultation shares the long-lived Workday session, so a
     // legacy-only batch cannot start a competing runTurn.  Crucially this is
     // after the Fast subset was dispatched above: private research may defer
     // only legacy Workday work, never a new typed Fast reply.
-    if (workdayMessages.length > 0 && privateWorkdayBusy) {
+    if (workdayMessages.length > 0 && pendingPrivateWorkdayJobs > 0) {
       rollbackPendingOperatorAdmission();
       setResidentActivity('waiting', 'Private Workday research is running');
       return 'continue';
@@ -3912,7 +4323,10 @@ export async function handleStrategicResident(
         }, cfg.operatorAckThresholdMs);
       }
       const turnPromise = runTurn(operatorBlocks, true, pickupLagMs, repoSnapshot);
-      const watch = await watchOperatorTurn(turnPromise);
+      const watch = await watchOperatorTurn(
+        turnPromise,
+        handlePureFastMessagesDuringWorkday,
+      );
       if (watch === 'stop') {
         session.interrupt();
         const settledBeforeDeadline = await Promise.race([
@@ -4061,63 +4475,81 @@ export async function handleStrategicResident(
     return 'continue';
   };
 
+  /**
+   * Complete a pure typed-conversation page without interrupting Workday.
+   * Mixed/legacy pages still return false and take the existing serialized
+   * Workday path.  A failed or deferred Fast attempt also returns false so the
+   * caller pre-empts Workday; handleOperatorTurn then retries fail-closed and
+   * never hands canonical public input to the broad tool-capable process.
+   */
+  const handlePureFastMessagesDuringWorkday = async (
+    messages: ResidentInboundMessage[],
+  ): Promise<boolean> => {
+    const partition = partitionTypedFastMessages(messages);
+    if (
+      partition.fast.length === 0
+      || partition.workday.length > 0
+    ) return false;
+    // A legacy Workday reply can already own a distinct durable input claim.
+    // Fast temporarily uses the single heartbeat claim slot while it completes
+    // the newer canonical row, then restores Workday's exact claim. If Fast
+    // becomes ambiguous, the caller stops the parent instead of racing owners.
+    const displacedWorkdayClaim = activeConversationClaimId === null
+      ? null
+      : {
+          id: activeConversationClaimId,
+          messageIds: [...activeConversationClaimMessageIds],
+          incarnation: activeConversationClaimIncarnation,
+        };
+    const outcome = await tryHandleTypedFastTurn(
+      partition.fast,
+      displacedWorkdayClaim,
+    );
+    if (outcome !== 'completed') {
+      rollbackPendingOperatorAdmission();
+      setResidentActivity(
+        'waiting',
+        outcome === 'deferred'
+          ? 'Fast Resident turn remains pending'
+          : 'Fast Resident unavailable; operator message preserved for retry',
+      );
+      // No Fast claim was admitted, so the existing Workday claim remains the
+      // only owner and can keep streaming while provisioning is retried.
+      if (outcome === 'not_available' && displacedWorkdayClaim !== null) {
+        activeConversationClaimId = displacedWorkdayClaim.id;
+        activeConversationClaimMessageIds = displacedWorkdayClaim.messageIds;
+        activeConversationClaimIncarnation = displacedWorkdayClaim.incarnation;
+        setResidentActivity(
+          'working',
+          'Workday reply continues while Fast Resident waits for capacity',
+        );
+        return true;
+      }
+      return false;
+    }
+    if (displacedWorkdayClaim !== null) {
+      activeConversationClaimId = displacedWorkdayClaim.id;
+      activeConversationClaimMessageIds = displacedWorkdayClaim.messageIds;
+      activeConversationClaimIncarnation = displacedWorkdayClaim.incarnation;
+    }
+    pendingOperatorAdmission = null;
+    setResidentActivity(
+      'working',
+      'Fast Resident replied; Workday continues in background',
+    );
+    return true;
+  };
+
   // ── Two-speed loop ──────────────────────────────────────────────────────────
   // Do not start provider work or public-call dispatch until this exact process
   // has won the backend incarnation CAS. A transport failure retries quickly;
   // it is never treated as proof of authority.
   applyHeartbeatResponse(initialAuthorityAdmission);
   lastLivenessHeartbeatAt = Date.now();
-  if (typedFastReady) {
-    let warmingController: ForegroundTypedController | null = null;
-    try {
-      const leaseResponse = await apiPost(
-        `/api/agent/projects/${projectId}/strategic-session/typed-fast-lease/acquire`,
-        {
-          task_id: taskId,
-          worker_generation: workerGeneration,
-          resident_incarnation_id: residentProcessIncarnation,
-        },
-        HEARTBEAT_API_MAX_RETRIES,
-        HEARTBEAT_API_TIMEOUT,
-      ) as { acquired?: unknown; reason?: unknown; lease?: unknown };
-      const lease = leaseResponse.lease;
-      if (
-        leaseResponse.acquired !== true
-        || lease === null
-        || typeof lease !== 'object'
-        || Array.isArray(lease)
-        || typeof (lease as Record<string, unknown>).lease_id !== 'string'
-        || !Number.isInteger((lease as Record<string, unknown>).generation)
-      ) {
-        const reason = typeof leaseResponse.reason === 'string'
-          ? leaseResponse.reason : 'lease was not admitted';
-        throw new Error(`typed Fast capacity unavailable: ${reason}`);
-      }
-      typedFastLease = {
-        leaseId: (lease as Record<string, unknown>).lease_id as string,
-        generation: (lease as Record<string, unknown>).generation as number,
-      };
-      warmingController = new ForegroundTypedController({
-        adapter: typedFastConfig.adapter,
-        model: typedFastConfig.model,
-        effort: typedFastConfig.effort,
-      });
-      foregroundTyped = warmingController;
-      await warmingController.ensureReady();
-      sendLog(
-        ws,
-        `[resident] typed Fast foreground passed readiness probe (${typedFastConfig.model}/${typedFastConfig.effort})\n`,
-      );
-    } catch (error) {
-      typedFastReady = false;
-      warmingController?.close();
-      foregroundTyped = null;
-      await releaseTypedFastLease('readiness_failed');
-      sendLog(
-        ws,
-        `[resident] typed Fast unavailable before admission: ${sanitize(String(error))}; using normal Resident replies\n`,
-      );
-    }
+  if (typedFastConfig.activated) {
+    // Fast warm-up is opportunistic.  A provider readiness probe must not hold
+    // the persistent Resident before its first message poll or heartbeat.
+    kickTypedFastProvisioning();
   } else {
     sendLog(ws, `[resident] typed Fast inactive: ${sanitize(typedFastConfig.reason)}\n`);
   }
@@ -4249,6 +4681,23 @@ export async function handleStrategicResident(
         continue;
       }
 
+      // The private consultation chain and the ordinary loop share the same
+      // persistent Workday subprocess. Keep Fast responsive in its independent
+      // foreground child, but never start a continuation, legacy reply, compact,
+      // or autonomous turn until the current private Workday turn has settled.
+      // Without this gate the next loop iteration can call runTurn() while the
+      // consultation still owns ResidentSession.sendTurn(), terminating the
+      // entire session with "sendTurn called while a turn is already active".
+      if (pendingPrivateWorkdayJobs > 0) {
+        setResidentActivity('working', 'Workday is investigating a Fast consultation');
+        if (livenessHeartbeatDue()) {
+          const hb = await livenessHeartbeat();
+          if (hb?.stop_requested) break;
+        }
+        await sleep(cfg.messagePollMs);
+        continue;
+      }
+
       // A completed private investigation is delivered by Fast through a
       // distinct server-created continuation receipt. It never reuses the
       // original input claim or the native Workday reply capability.
@@ -4265,10 +4714,17 @@ export async function handleStrategicResident(
       // and folds any re-arm (authority_held:true — set when a new operator
       // message re-engages) so the NEXT iteration reopens the autonomous path.
       // We never self-prompt or mutate strategic state on a lapsed lease.
-      if (callCoordinator.suppressAutonomy() || !autonomousActive(cfg.autonomousEnabled, authorityHeld)) {
+      if (
+        callCoordinator.suppressAutonomy()
+        || workdayOnDemand
+        || !autonomousActive(cfg.autonomousEnabled, authorityHeld)
+      ) {
+        const waitingReason = workdayOnDemand
+          ? 'Workday is ready when Fast needs deeper research'
+          : 'Waiting in chat-only mode';
         setResidentActivity(
           'waiting',
-          'Waiting in chat-only mode',
+          waitingReason,
           new Date(Date.now() + cfg.messagePollMs).toISOString(),
         );
         // Poll operator messages at the fast cadence (the fast path at the top of
@@ -4282,24 +4738,36 @@ export async function handleStrategicResident(
         continue;
       }
 
-      // 2. Autonomous path: state-gated so ticks fire on real signals rather than
-      // loop speed. Run when the world moved (heartbeat work_state_rev differs
-      // from the rev at the last turn), the agent declared more work
-      // (AGENDA-CONTINUE), an operator turn just completed, or the floor tick
-      // elapsed. Otherwise wait like passive mode — no self-prompt against
-      // unchanged state.
+      // 2. Autonomous path: state-gated so turns fire on real signals rather
+      // than loop speed. A pending task/watch frontier suppresses unchanged-state
+      // exploration: heartbeats wait cheaply until a blocker, failure, drained barrier,
+      // exact watch receipt, or operator decision makes another turn actionable.
+      const currentFiredWatchRev = [
+        actionableFiredWatchRevision(
+          firedStrategicWatches,
+          currentWorkStateSummary,
+        ),
+        wakeBarrierRevision(firedResidentBarriers),
+      ].join('#');
+      const ownedWorkPending = hasPendingOwnedWork(currentWorkStateSummary);
       if (!shouldRunAutonomousTurn({
         currentWorkStateRev,
         lastTurnWorkStateRev: lastAutonomousWorkStateRev,
         previousTurnAgendaContinue,
+        followupTurnPending: correctiveNextTick || operatorDecisionReview !== null,
         operatorTurnJustCompleted,
+        currentFiredWatchRev,
+        lastTurnFiredWatchRev: lastAutonomousFiredWatchRev,
+        ownedWorkPending,
         msSinceLastAutonomousTurn: lastAutonomousTurnAt === 0
           ? Number.POSITIVE_INFINITY : Date.now() - lastAutonomousTurnAt,
-        floorTickMs: cfg.minTickMs,
+        explorationIntervalMs: cfg.explorationIntervalMs,
       })) {
-        const nextReviewAt = lastAutonomousTurnAt === 0
+        const nextReviewAt = ownedWorkPending
+          ? null
+          : lastAutonomousTurnAt === 0
           ? new Date().toISOString()
-          : new Date(lastAutonomousTurnAt + cfg.minTickMs).toISOString();
+          : new Date(lastAutonomousTurnAt + cfg.explorationIntervalMs).toISOString();
         setResidentActivity(
           'waiting',
           'Watching for task, project, or operator movement',
@@ -4314,12 +4782,14 @@ export async function handleStrategicResident(
           if (msSinceWatching >= cfg.idleTickMs * 2) {
             const rawInFlight = hb?.work_state_summary?.in_flight;
             const inFlight = typeof rawInFlight === 'number' ? rawInFlight : null;
-            const msUntilFloor = lastAutonomousTurnAt === 0
+            const msUntilExploration = lastAutonomousTurnAt === 0
               ? 0
-              : Math.max(0, cfg.minTickMs - (Date.now() - lastAutonomousTurnAt));
-            const nextReview = msUntilFloor < 60_000
+              : Math.max(0, cfg.explorationIntervalMs - (Date.now() - lastAutonomousTurnAt));
+            const nextReview = ownedWorkPending
+              ? 'on an actionable state change'
+              : msUntilExploration < 60_000
               ? 'soon'
-              : `~${Math.round(msUntilFloor / 60_000)}min`;
+              : `~${Math.round(msUntilExploration / 60_000)}min`;
             const taskNote = inFlight !== null ? `${inFlight} task${inFlight === 1 ? '' : 's'} in flight; ` : '';
             streamer.status(`watching — ${taskNote}next review ${nextReview} or on state change`);
             lastWatchingEmitAt = Date.now();
@@ -4385,12 +4855,16 @@ export async function handleStrategicResident(
           decisionsRegisterText(decisionsReg),
           reviewForTurn ?? false,
           firedStrategicWatches,
+          firedResidentBarriers,
         ),
         false,
         null,
         repoSnapshot,
       );
-      const watch = await watchTurn(turnPromise);
+      const watch = await watchTurn(
+        turnPromise,
+        handlePureFastMessagesDuringWorkday,
+      );
       let r: ResidentTurnResult;
       if (watch.kind !== 'done') {
         session.interrupt();
@@ -4579,15 +5053,34 @@ export async function handleStrategicResident(
         r.appliedStrategicOp
           ? 'Strategic progress recorded; watching for movement'
           : 'Review complete; watching for movement',
-        new Date(lastAutonomousTurnAt + cfg.minTickMs).toISOString(),
+        hasPendingOwnedWork(currentWorkStateSummary)
+          ? null
+          : new Date(lastAutonomousTurnAt + cfg.explorationIntervalMs).toISOString(),
       );
-      const hb = await heartbeat(r.appliedStrategicOp && authorityHeld);
+      const consumedBarrierIds = turnInterrupted
+        ? undefined
+        : firedResidentBarriers.map((barrier) => barrier.id);
+      const hb = await heartbeat(
+        r.appliedStrategicOp && authorityHeld,
+        consumedBarrierIds,
+      );
       // Record the pacing baseline AFTER the post-turn heartbeat so the loop's own
       // writes are already folded into the rev we compare against next iteration.
       // Recording it pre-turn would leave lastAutonomousWorkStateRev behind the
       // heartbeat's updated currentWorkStateRev, causing the gate to fire again on
       // the loop's own applied ops (self-echo).
       lastAutonomousWorkStateRev = currentWorkStateRev;
+      // An interrupted turn did not consume an exact watch agenda receipt; keep
+      // its prior baseline so the receipt immediately re-arms after preemption.
+      if (!turnInterrupted) {
+        lastAutonomousFiredWatchRev = [
+          actionableFiredWatchRevision(
+            firedStrategicWatches,
+            currentWorkStateSummary,
+          ),
+          wakeBarrierRevision(firedResidentBarriers),
+        ].join('#');
+      }
       if (hb?.stop_requested || watch.kind === 'stop') break;
 
       // Authority lapsed mid-turn ⇒ fall through to passive mode next iteration.
@@ -4639,8 +5132,17 @@ export async function handleStrategicResident(
     const foregroundToClose: ForegroundCallController | null = foregroundCall;
     (foregroundToClose as ForegroundCallController | null)?.close();
     foregroundCall = null;
-    const typedForegroundToClose: ForegroundTypedController | null = foregroundTyped;
-    typedForegroundToClose?.close();
+    let typedForegroundToClose: ForegroundTypedController | null = foregroundTyped;
+    (typedForegroundToClose as ForegroundTypedController | null)?.close();
+    // The attempt may still be waiting for lease acquisition and can assign a
+    // controller after the first snapshot above.  Its provider probe is
+    // bounded; join it during teardown, then close/release the final state so a
+    // quick stop cannot leak a pooled slot or restricted child.
+    if (typedFastProvisionAttempt !== null) {
+      await typedFastProvisionAttempt;
+    }
+    typedForegroundToClose = foregroundTyped;
+    (typedForegroundToClose as ForegroundTypedController | null)?.close();
     foregroundTyped = null;
     await releaseTypedFastLease('parent_shutdown');
     callWakeGate.close();

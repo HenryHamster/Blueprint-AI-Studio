@@ -561,6 +561,7 @@ def _create_session(work_root: Path, session_id: str) -> tuple[Path, Path, Path]
             os.close(descriptor)
         if os.name != "nt":
             os.chown(data_dir, _POSTGRES_UID, _POSTGRES_GID)
+            os.chown(password_file, _POSTGRES_UID, _POSTGRES_GID)
         return session_dir, data_dir, password_file
     except Exception:
         if session_dir.exists() and not session_dir.is_symlink():
@@ -687,6 +688,8 @@ def _start_target(
             f"type=bind,src={data_dir},dst=/var/lib/postgresql/data",
             "--mount",
             f"type=bind,src={password_file},dst=/run/secrets/postgres_password,readonly",
+            "--user",
+            f"{_POSTGRES_UID}:{_POSTGRES_GID}",
             "--env",
             "POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password",
             "--env",
@@ -761,6 +764,7 @@ def _assert_target_isolation(
         raise RehearsalError("target", "container_disappeared")
     _assert_owned_container(payload, session_id)
     host = payload.get("HostConfig") or {}
+    config = payload.get("Config") or {}
     mounts = payload.get("Mounts") or []
     destinations = {
         str(item.get("Destination")): item
@@ -771,6 +775,7 @@ def _assert_target_isolation(
     password_mount = destinations.get("/run/secrets/postgres_password") or {}
     if (
         payload.get("Image") != image_id
+        or config.get("User") != f"{_POSTGRES_UID}:{_POSTGRES_GID}"
         or host.get("NetworkMode") != "none"
         or bool(host.get("PortBindings"))
         or set(destinations)
@@ -789,6 +794,24 @@ def _validate_expected_revision(snapshot: Mapping[str, Any], expected: str) -> N
         raise RehearsalError("verification", "alembic_revision_mismatch")
 
 
+def _verification_summary(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    try:
+        revisions = snapshot["alembic_revisions"]
+        critical = snapshot["critical_aggregates"]
+        row_counts = snapshot["row_counts"]
+    except KeyError as exc:
+        raise RehearsalError("verification", "incomplete_target_snapshot") from exc
+    if not isinstance(revisions, list) or not isinstance(critical, dict) or not isinstance(
+        row_counts, dict
+    ):
+        raise RehearsalError("verification", "invalid_target_snapshot_summary")
+    return {
+        "alembic_revisions": revisions,
+        "critical_aggregates": critical,
+        "row_counts": row_counts,
+    }
+
+
 def _artifact_manifest(
     args: argparse.Namespace,
     archive: Mapping[str, Any],
@@ -805,6 +828,7 @@ def _artifact_manifest(
             "project_id": args.source_project_id,
             "instance": args.source_instance,
             "database": args.source_database,
+            "owner": args.source_user,
             "identity": dict(source_identity),
         },
         "consistency": {
@@ -828,6 +852,252 @@ def _artifact_manifest(
             "stderr_bytes": archive["stderr_bytes"],
         },
     }
+
+
+def _read_root_json(path_value: str, label: str) -> tuple[dict[str, Any], Path, str]:
+    descriptor, path, info = cutover._open_held_regular(path_value, label)
+    try:
+        if os.name != "nt" and (
+            info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o600
+        ):
+            raise RehearsalError("filesystem", f"unsafe_{label}")
+        raw = b""
+        while chunk := os.read(descriptor, 1024 * 1024):
+            raw += chunk
+            if len(raw) > cutover._MAX_EVIDENCE_BYTES:
+                raise RehearsalError("evidence", f"{label}_too_large")
+    finally:
+        os.close(descriptor)
+    try:
+        value = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RehearsalError("evidence", f"invalid_{label}_json") from exc
+    if not isinstance(value, dict):
+        raise RehearsalError("evidence", f"invalid_{label}_shape")
+    return value, path, hashlib.sha256(raw).hexdigest()
+
+
+def _validate_replay_outputs(args: argparse.Namespace, permanent: Path) -> None:
+    permanent_resolved = _resolved(permanent)
+    seen: set[Path] = set()
+    for field in ("snapshot_output", "diagnostic_output"):
+        path = _absolute_path(getattr(args, field), field)
+        resolved = _resolved(path)
+        if resolved in seen:
+            raise RehearsalError("filesystem", "duplicate_evidence_output")
+        seen.add(resolved)
+        if _contains(permanent_resolved, resolved):
+            raise RehearsalError("filesystem", "evidence_overlaps_permanent_data")
+        if path.exists() or path.is_symlink():
+            raise RehearsalError("filesystem", "evidence_output_exists")
+        try:
+            parent_info = path.parent.lstat()
+        except FileNotFoundError as exc:
+            raise RehearsalError("filesystem", "evidence_parent_missing") from exc
+        if (
+            not stat.S_ISDIR(parent_info.st_mode)
+            or stat.S_IMODE(parent_info.st_mode) != 0o700
+            or (os.name != "nt" and parent_info.st_uid != 0)
+        ):
+            raise RehearsalError("filesystem", "unsafe_evidence_parent")
+        _validate_root_owned_ancestry(path.parent)
+
+
+def _validate_root_owned_ancestry(path: Path) -> None:
+    if os.name == "nt":
+        return
+    current = path
+    while True:
+        try:
+            info = current.lstat()
+        except OSError as exc:
+            raise RehearsalError("filesystem", "evidence_ancestor_missing") from exc
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != 0
+            or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise RehearsalError("filesystem", "unsafe_evidence_ancestry")
+        if current.parent == current:
+            return
+        current = current.parent
+
+
+def _create_replay_json(path_value: str, payload: Mapping[str, Any]) -> Path:
+    path = Path(path_value)
+    _validate_root_owned_ancestry(path.parent)
+    return _create_json(path_value, payload)
+
+
+def _validate_replay_inputs(
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any], str, str, int, dict[str, Any], str]:
+    manifest, _manifest_path, manifest_sha = _read_root_json(
+        args.manifest, "rehearsal_manifest"
+    )
+    source, source_path, source_sha = _read_root_json(
+        args.source_snapshot, "source_snapshot"
+    )
+    cutover.validate_snapshot(source, label="source")
+    artifact = manifest.get("artifact")
+    pg_dump = manifest.get("pg_dump")
+    consistency = manifest.get("consistency")
+    manifest_source = manifest.get("source")
+    if (
+        manifest.get("schema_version") != SCHEMA_VERSION
+        or manifest.get("kind") != MANIFEST_KIND
+        or manifest.get("purpose") != "precutover_restore_rehearsal_only"
+        or manifest.get("final_cutover_eligible") is not False
+        or not isinstance(artifact, dict)
+        or not isinstance(pg_dump, dict)
+        or not isinstance(consistency, dict)
+        or not isinstance(manifest_source, dict)
+        or artifact.get("format") != "postgres-custom"
+        or consistency.get("method")
+        != "single_exported_serializable_deferrable_snapshot"
+        or consistency.get("production_write_fence_required") is not False
+        or pg_dump.get("major_version") != 15
+        or not isinstance(pg_dump.get("client_version"), str)
+        or not re.fullmatch(
+            r"pg_dump \(PostgreSQL\) 15(?:\.[0-9]+){0,2}(?: .*)?",
+            pg_dump["client_version"],
+        )
+        or pg_dump.get("serializable_deferrable_snapshot_export") is not True
+        or pg_dump.get("no_owner") is not True
+        or pg_dump.get("no_acl") is not True
+        or not isinstance(pg_dump.get("stderr_sha256"), str)
+        or not _SHA256_RE.fullmatch(pg_dump["stderr_sha256"])
+        or not isinstance(pg_dump.get("stderr_bytes"), int)
+        or pg_dump["stderr_bytes"] < 0
+        or manifest_source.get("instance") != source.get("instance")
+        or manifest_source.get("database") != source.get("database")
+        or (
+            manifest_source.get("owner") is not None
+            and manifest_source.get("owner") != args.source_owner
+        )
+        or manifest.get("source_snapshot_sha256") != source_sha
+        or _resolved(Path(str(manifest.get("artifact_path", ""))))
+        != _resolved(Path(args.artifact))
+        or _resolved(source_path) != _resolved(Path(args.source_snapshot))
+    ):
+        raise RehearsalError("evidence", "manifest_binding_mismatch")
+    artifact_sha = artifact.get("sha256")
+    artifact_size = artifact.get("size_bytes")
+    if (
+        not isinstance(artifact_sha, str)
+        or not _SHA256_RE.fullmatch(artifact_sha)
+        or not isinstance(artifact_size, int)
+        or artifact_size <= 0
+    ):
+        raise RehearsalError("evidence", "invalid_artifact_binding")
+    return source, source_sha, artifact_sha, artifact_size, manifest, manifest_sha
+
+
+def _canonical_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    ).hexdigest()
+
+
+def _open_validated_replay_artifact(
+    path_value: str, expected_sha256: str, expected_size: int
+) -> tuple[int, Path]:
+    descriptor, path, info = cutover._open_held_regular(
+        path_value, "rehearsal_artifact"
+    )
+    try:
+        if os.name != "nt" and (
+            info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o600
+        ):
+            raise RehearsalError("filesystem", "unsafe_rehearsal_artifact")
+        if info.st_size != expected_size:
+            raise RehearsalError("evidence", "artifact_size_mismatch")
+        digest = hashlib.sha256()
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+        if digest.hexdigest() != expected_sha256:
+            raise RehearsalError("evidence", "artifact_digest_mismatch")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        return descriptor, path
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+_DIFF_KEYS = {
+    "public_columns": ("schema", "table", "name"),
+    "public_constraints": ("schema", "table", "name"),
+    "public_indexes": ("schema", "table", "name"),
+}
+
+
+def _metadata_diff(
+    source: Mapping[str, Any],
+    target: Mapping[str, Any],
+    *,
+    source_owner: str,
+    target_owner: str,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for field, key_fields in _DIFF_KEYS.items():
+        source_items = cutover._normalize_comparison_field(
+            field, source[field], source_owner
+        )
+        target_items = cutover._normalize_comparison_field(
+            field, target[field], target_owner
+        )
+
+        def keyed(items: Any, label: str) -> dict[tuple[Any, ...], dict[str, Any]]:
+            if not isinstance(items, list):
+                raise RehearsalError("diagnostic", f"invalid_{label}_inventory")
+            result_by_key: dict[tuple[Any, ...], dict[str, Any]] = {}
+            for item in items:
+                if not isinstance(item, dict):
+                    raise RehearsalError("diagnostic", f"invalid_{label}_item")
+                identity = tuple(item.get(key) for key in key_fields)
+                if any(value is None for value in identity) or identity in result_by_key:
+                    raise RehearsalError("diagnostic", f"ambiguous_{label}_identity")
+                result_by_key[identity] = item
+            return result_by_key
+
+        source_by_key = keyed(source_items, f"source_{field}")
+        target_by_key = keyed(target_items, f"target_{field}")
+        changes: list[dict[str, Any]] = []
+        for identity in sorted(set(source_by_key) | set(target_by_key), key=repr):
+            before = source_by_key.get(identity)
+            after = target_by_key.get(identity)
+            if before == after:
+                continue
+            before_mapping = before if isinstance(before, dict) else {}
+            after_mapping = after if isinstance(after, dict) else {}
+            changes.append(
+                {
+                    "identity": dict(zip(key_fields, identity)),
+                    "status": (
+                        "missing_from_source"
+                        if before is None
+                        else "missing_from_target"
+                        if after is None
+                        else "changed"
+                    ),
+                    "changed_properties": sorted(
+                        key
+                        for key in set(before_mapping) | set(after_mapping)
+                        if key not in before_mapping
+                        or key not in after_mapping
+                        or before_mapping[key] != after_mapping[key]
+                    ),
+                    "source_sha256": None if before is None else _canonical_sha256(before),
+                    "target_sha256": None if after is None else _canonical_sha256(after),
+                }
+            )
+        result[field] = {
+            "source_sha256": _canonical_sha256(source_items),
+            "target_sha256": _canonical_sha256(target_items),
+            "change_count": len(changes),
+            "changes": changes,
+        }
+    return result
 
 
 def run_rehearsal(
@@ -980,6 +1250,10 @@ def run_rehearsal(
             instance="disposable-rehearsal",
         )
         _validate_expected_revision(snapshot, expected_revision)
+        # Persist the target evidence before comparison.  A strict comparison
+        # failure must remain diagnosable after the disposable target is
+        # removed in ``finally``.
+        snapshot_path = _create_json(args.snapshot_output, snapshot)
         cutover.compare_snapshots(
             source_snapshot,
             snapshot,
@@ -991,7 +1265,6 @@ def run_rehearsal(
             # column maximum. Exact equality remains mandatory for cutover.
             compare_sequences=False,
         )
-        snapshot_path = _create_json(args.snapshot_output, snapshot)
     finally:
         if keeper is not None:
             try:
@@ -1036,11 +1309,7 @@ def run_rehearsal(
         "source_snapshot_sha256": cutover._file_sha256(source_snapshot_path),
         "expected_alembic_revision": expected_revision,
         "restore": restored,
-        "verification": {
-            "alembic_revisions": snapshot["alembic_revisions"],
-            "critical_integrity": snapshot["critical_integrity"],
-            "table_counts": snapshot["table_counts"],
-        },
+        "verification": _verification_summary(snapshot),
         "isolation": {
             "permanent_container_used": False,
             "permanent_data_directory_used": False,
@@ -1052,6 +1321,172 @@ def run_rehearsal(
     }
     _create_json(args.result_output, result)
     return result
+
+
+def run_artifact_replay(
+    args: argparse.Namespace,
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> dict[str, Any]:
+    """Restore preserved rehearsal evidence without touching the live source."""
+
+    if os.name != "nt" and os.geteuid() != 0:
+        raise RehearsalError("configuration", "root_required")
+    args.docker_binary = _trusted_binary(args.docker_binary, "docker_binary")
+    image_id = _inspect_image(args.docker_binary, args.postgres_image_id, run=run)
+    work_root, permanent = validate_isolated_roots(
+        args.work_root, args.permanent_data_dir
+    )
+    _validate_replay_outputs(args, permanent)
+    source_owner = _safe_name(args.source_owner, "source_owner")
+    target_owner = "blueprint"
+    args.source_owner = source_owner
+    source, source_sha, artifact_sha, artifact_size, _manifest, manifest_sha = (
+        _validate_replay_inputs(args)
+    )
+    expected_revision = _safe_name(
+        args.expected_alembic_revision, "expected_revision"
+    )
+    _validate_expected_revision(source, expected_revision)
+
+    artifact_fd, artifact_path = _open_validated_replay_artifact(
+        args.artifact, artifact_sha, artifact_size
+    )
+
+    session_id = uuid.uuid4().hex
+    target_name = f"{_SESSION_PREFIX}{session_id}-target"
+    session_dir: Path | None = None
+    data_dir: Path | None = None
+    password_file: Path | None = None
+    cleanup_errors: list[Exception] = []
+    restored: dict[str, Any] | None = None
+    snapshot: dict[str, Any] | None = None
+    snapshot_path: Path | None = None
+    try:
+        session_dir, data_dir, password_file = _create_session(
+            work_root, session_id
+        )
+        _start_target(
+            args.docker_binary,
+            target_name,
+            session_id,
+            image_id,
+            data_dir,
+            password_file,
+            run=run,
+        )
+        _wait_healthy(
+            args.docker_binary,
+            target_name,
+            session_id,
+            timeout_seconds=args.target_start_timeout_seconds,
+            run=run,
+        )
+        _assert_target_isolation(
+            args.docker_binary,
+            target_name,
+            session_id,
+            image_id,
+            data_dir,
+            password_file,
+            run=run,
+        )
+        target = cutover.DockerPsql(
+            container=target_name,
+            database="blueprint",
+            user="blueprint",
+            docker_binary=args.docker_binary,
+            run=run,
+        )
+        cutover.target_public_schema_empty(target)
+        restored = cutover.stream_restore(
+            target,
+            artifact_fd,
+            app_name="blueprint-cutover-rehearsal-replay",
+            timeout_seconds=args.restore_timeout_seconds,
+        )
+        snapshot = cutover.snapshot_database(
+            target,
+            label="precutover-disposable-replay-target",
+            instance="disposable-rehearsal-replay",
+        )
+        _validate_expected_revision(snapshot, expected_revision)
+        snapshot_path = _create_replay_json(args.snapshot_output, snapshot)
+        mismatches = cutover.snapshot_mismatches(
+            source,
+            snapshot,
+            source_owner=source_owner,
+            target_owner=target_owner,
+            compare_sequences=False,
+        )
+        metadata_diff = _metadata_diff(
+            source,
+            snapshot,
+            source_owner=source_owner,
+            target_owner=target_owner,
+        )
+        provenance = {
+            "server_version_num": target.query_text("SHOW server_version_num;"),
+            "server_version": target.query_text("SHOW server_version;"),
+            "server_encoding": target.query_text("SHOW server_encoding;"),
+            "lc_collate": target.query_text("SHOW lc_collate;"),
+            "lc_ctype": target.query_text("SHOW lc_ctype;"),
+        }
+    finally:
+        try:
+            os.close(artifact_fd)
+        except OSError as exc:
+            cleanup_errors.append(exc)
+        try:
+            _remove_owned_container(
+                args.docker_binary, target_name, session_id, run=run
+            )
+        except Exception as exc:
+            cleanup_errors.append(exc)
+        if not cleanup_errors and session_dir is not None:
+            try:
+                _remove_session_dir(session_dir, work_root, session_id)
+            except Exception as exc:
+                cleanup_errors.append(exc)
+        if cleanup_errors:
+            raise RehearsalError("cleanup", "incomplete_cleanup") from cleanup_errors[0]
+
+    if restored is None or snapshot is None or snapshot_path is None:
+        raise RehearsalError("replay", "incomplete_result")
+    diagnostic = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "postgres-precutover-rehearsal-replay-diagnostic",
+        "outcome": "match" if not mismatches else "mismatch",
+        "completed_at": cutover._utcnow(),
+        "diagnostic_only": True,
+        "final_cutover_eligible": False,
+        "session_id": session_id,
+        "postgres_image_id": image_id,
+        "artifact": {
+            "path": str(artifact_path),
+            "sha256": artifact_sha,
+            "size_bytes": artifact_size,
+        },
+        "rehearsal_manifest_sha256": manifest_sha,
+        "source_snapshot_sha256": source_sha,
+        "source_snapshot_path": str(Path(args.source_snapshot)),
+        "target_snapshot_sha256": cutover._file_sha256(snapshot_path),
+        "target_snapshot_path": str(snapshot_path),
+        "comparison_owners": {
+            "source": source_owner,
+            "target": target_owner,
+        },
+        "mismatched_fields": mismatches,
+        "metadata_diff": metadata_diff,
+        "target_provenance": provenance,
+        "restore": restored,
+        "cleanup": {
+            "disposable_container_removed": True,
+            "disposable_data_directory_removed": True,
+        },
+    }
+    _create_replay_json(args.diagnostic_output, diagnostic)
+    return diagnostic
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1084,9 +1519,38 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def build_replay_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Replay a preserved pre-cutover artifact into an isolated target"
+    )
+    parser.add_argument("--postgres-image-id", required=True)
+    parser.add_argument("--docker-binary", default="/usr/bin/docker")
+    parser.add_argument("--work-root", required=True)
+    parser.add_argument("--permanent-data-dir", required=True)
+    parser.add_argument("--artifact", required=True)
+    parser.add_argument("--manifest", required=True)
+    parser.add_argument("--source-snapshot", required=True)
+    parser.add_argument("--source-owner", required=True)
+    parser.add_argument("--snapshot-output", required=True)
+    parser.add_argument("--diagnostic-output", required=True)
+    parser.add_argument("--expected-alembic-revision", required=True)
+    parser.add_argument("--restore-timeout-seconds", type=int, default=7200)
+    parser.add_argument("--target-start-timeout-seconds", type=int, default=180)
+    return parser
+
+
 def main(argv: list[str] | None = None) -> int:
     try:
-        args = build_parser().parse_args(argv)
+        selected = list(sys.argv[1:] if argv is None else argv)
+        if selected[:1] == ["replay"]:
+            args = build_replay_parser().parse_args(selected[1:])
+            result = run_artifact_replay(args)
+            print(
+                "pre-cutover artifact replay completed "
+                f"({result['outcome']}): {args.diagnostic_output}"
+            )
+            return 0
+        args = build_parser().parse_args(selected)
         run_rehearsal(args)
         print(f"pre-cutover restore rehearsal succeeded: {args.result_output}")
         return 0

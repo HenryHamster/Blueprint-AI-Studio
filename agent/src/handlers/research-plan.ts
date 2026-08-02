@@ -53,7 +53,7 @@ import { resolveMigrationLayout } from './specialized.js';
 import { setPromptSizeTelemetry, buildPromptSizeTelemetry } from '../telemetry.js';
 
 export const PR_INELIGIBLE_TASK_TYPES = [
-  'capability_proof_trial', 'compute_experiment', 'criterion_coverage_trial',
+  'capability_proof_trial', 'compute_experiment',
   'debug', 'design', 'design_doc_update', 'discovery_review',
   'investigate', 'memo', 'memory_consolidation', 'perf', 'plan',
   'release_audit', 'release_audit_challenge', 'release_merge_grade',

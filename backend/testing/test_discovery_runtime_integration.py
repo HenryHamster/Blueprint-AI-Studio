@@ -205,7 +205,7 @@ async def test_strategic_spawn_reserves_once_and_propagates_cycle(db_session):
 
 
 @pytest.mark.asyncio
-async def test_enforced_closed_cycle_rejects_new_strategic_intent(db_session):
+async def test_closed_cycle_rejects_new_strategic_intent(db_session):
     project, cycle, owner = await _cycle_owner(
         db_session,
         state="admission_closed",
@@ -223,7 +223,6 @@ async def test_enforced_closed_cycle_rejects_new_strategic_intent(db_session):
             specification=_spec(),
             idempotency_key="too-late",
             direction_id="direction-a",
-            discovery_admission_mode="enforced",
         )
 
     assert (

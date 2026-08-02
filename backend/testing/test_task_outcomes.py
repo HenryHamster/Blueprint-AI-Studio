@@ -200,6 +200,7 @@ def test_research_actionable_findings_is_success():
             {"title": "fix: do the thing", "actionability_grade": "HIGH"},
             {"title": "fix: another", "actionability_grade": "MEDIUM"},
         ],
+        context={"research_findings_finalized": True},
     )
     assert evaluate_task_outcome(task) == TaskOutcome("success", KIND_RESEARCH_QUALITY)
     assert is_successful_outcome(task) is True
@@ -235,8 +236,8 @@ def test_research_surviving_findings_recorded_is_success():
 
 def test_research_zero_survivors_is_neutral_despite_titled_findings():
     # Core fix: every titled finding was rejected at ingestion (stale dup /
-    # citation absent on HEAD / low actionability). plan_output still holds the
-    # raw findings for admin visibility, but the cycle produced no work — neutral.
+    # citation absent on HEAD / low actionability). The raw pre-gate plan is not
+    # an outcome signal; the cycle produced no work and remains neutral.
     task = _make_task(
         "research",
         plan_output=[
@@ -249,9 +250,17 @@ def test_research_zero_survivors_is_neutral_despite_titled_findings():
     assert is_successful_outcome(task) is False
 
 
-def test_research_missing_survivor_count_falls_back_to_titled_findings():
-    # Legacy tasks (dispatch predates the survivor signal) keep the old heuristic.
+def test_research_unfinalized_legacy_findings_fail_closed_to_neutral():
     task = _make_task("research", plan_output=[{"title": "fix: legacy"}], context={})
+    assert evaluate_task_outcome(task) == TaskOutcome("neutral", KIND_RESEARCH_QUALITY)
+
+
+def test_research_finalized_findings_supply_legacy_compatible_success():
+    task = _make_task(
+        "research",
+        plan_output=[{"title": "fix: accepted"}],
+        context={"research_findings_finalized": True},
+    )
     assert evaluate_task_outcome(task) == TaskOutcome("success", KIND_RESEARCH_QUALITY)
 
 

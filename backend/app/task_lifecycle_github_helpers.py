@@ -4,8 +4,6 @@ Extracted from ``task_lifecycle.py`` to isolate a cohesive cluster of
 GitHub-facing helpers that are independent of the ``_process_post_commit``
 state machine:
 
-- :func:`_merge_with_retry` — exponential-backoff wrapper around PR merge
-  (transient 5xx retry).
 - :func:`_comment_with_retry` — exponential-backoff wrapper around PR comments.
 - :func:`_pick_merge_method` — merge-vs-squash picker for a task's auto-merge.
 - :func:`_get_approval_gate_file_lists` — approval-gate infra/critical file
@@ -43,50 +41,6 @@ def _get_approval_gate_file_lists(project: Project) -> tuple[set, set]:
     if critical and not infra:
         infra = set(critical)
     return infra, critical
-
-
-async def _merge_with_retry(
-    merge_pull_request_fn,
-    gh_token: str,
-    owner: str,
-    repo: str,
-    pr_number: int,
-    project_id: str,
-    max_attempts: int = 3,
-    merge_method: str = "squash",
-) -> dict:
-    """Call merge_pull_request with exponential backoff for transient 5xx errors.
-
-    Returns the merge result dict on success/conflict (same semantics as
-    merge_pull_request).  Only retries on raised exceptions — non-200 merge
-    results (405/409) are returned as-is without retrying.
-
-    ``merge_method`` defaults to ``"squash"`` (the orchestrator's normal mode);
-    callers pass ``"merge"`` for PRs whose ancestry must be preserved on the
-    target branch (e.g. back-merge conflict resolutions — see
-    :func:`_pick_merge_method`).
-    """
-    last_exc = None
-    for attempt in range(max_attempts):
-        try:
-            return await merge_pull_request_fn(
-                gh_token,
-                owner,
-                repo,
-                pr_number,
-                merge_method=merge_method,
-                project_id=project_id,
-            )
-        except Exception as exc:  # noqa: PERF203 — per-attempt try is required for the retry loop
-            last_exc = exc
-            if attempt < max_attempts - 1:
-                backoff = (2**attempt) * (1 + _random.random())  # ~1-2s, ~2-4s
-                logger.warning(
-                    f"[PIPELINE] Merge attempt {attempt + 1} for PR #{pr_number} raised {type(exc).__name__}, "
-                    f"retrying in {backoff:.1f}s: {exc!r}"
-                )
-                await asyncio.sleep(backoff)
-    raise last_exc  # type: ignore[misc]
 
 
 def _pick_merge_method(task: Task) -> str:

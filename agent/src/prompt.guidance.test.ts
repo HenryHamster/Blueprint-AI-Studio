@@ -174,17 +174,15 @@ describe('formatSelfReviewBlindSpots', () => {
     expect(out).toContain('- only-uncertainty');
   });
 
-  it('coexists with truncated_files_read and reviewer_findings sections', () => {
+  it('coexists with truncated_files_read sections', () => {
     const outcome = {
       verdict: 'PASS',
       truncated_files_read: ['a.ts'],
-      reviewer_findings: [{ category: 'correctness', severity: 'HIGH', description: 'oops' }],
       blind_spots: ['author-uncertainty'],
     };
     const out = formatSelfReviewBlindSpots(outcome, ['a.ts', 'b.ts']);
     expect(out).toContain('Files the self-review verified');
     expect(out).toContain('Files NOT verified by self-review');
-    expect(out).toContain('Fresh-reviewer findings');
     expect(out).toContain('Author-flagged uncertainty');
     expect(out).toContain('- author-uncertainty');
   });
@@ -475,11 +473,11 @@ describe('cross-cutting guidance-block fingerprints — structural invariants fo
 
 // ── SELF_REVIEW_PROMPT_VERSION — version lock ─────────────────────────────────
 // Pin the version so trend data correctly attributes the regime change when
-// create/fix/docs/deps focus blocks were added. If this test fails, bump the
-// version in prompt.ts and reset this assertion to the new value.
+// the former independent-review inputs were consolidated into author self-review.
+// If this test fails, bump the version in prompt.ts and reset this assertion.
 describe('SELF_REVIEW_PROMPT_VERSION — regime version lock', () => {
-  it('is "8" (current pinned version)', () => {
-    expect(SELF_REVIEW_PROMPT_VERSION).toBe('8');
+  it('is "9" (current pinned version)', () => {
+    expect(SELF_REVIEW_PROMPT_VERSION).toBe('9');
   });
 
   it('is a non-empty string (used as prompt_version field in self-review JSON)', () => {

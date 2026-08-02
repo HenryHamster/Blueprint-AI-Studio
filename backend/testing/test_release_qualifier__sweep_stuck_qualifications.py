@@ -7,6 +7,51 @@ Split from test_release_qualifier.py."""
 from _release_qualifier_testhelpers import *  # noqa: F403
 
 
+def _patch_exact_promotion_pr(
+    mocker,
+    *,
+    pr_number: int,
+    candidate: str | None = None,
+    merge_sha: str | None = None,
+    merged: bool = False,
+    discover: bool = False,
+    base_ref: str = "main",
+):
+    """Patch one deterministic release PR with an exact head/base identity.
+
+    ``candidate=None`` derives the SHA from ``create_branch`` after the normal
+    promotion flow cuts the release branch.  Crash-recovery fixtures that make
+    the PR discoverable before branch creation must pass ``candidate``.
+    """
+    mocker.patch(
+        "app.github.get_pull_requests_for_head_branch",
+        new=AsyncMock(return_value=([{"number": pr_number}] if discover else [])),
+    )
+
+    async def _get_pull_request(_token, _owner, _repo, number, **_kwargs):
+        from app import github as _github
+
+        resolved_candidate = candidate
+        if resolved_candidate is None:
+            branch_call = _github.create_branch.call_args
+            assert branch_call is not None, "candidate must be known before PR lookup"
+            resolved_candidate = branch_call.args[4]
+        return {
+            "number": number,
+            "state": "closed" if merged else "open",
+            "merged": merged,
+            "html_url": f"http://pr/{number}",
+            "head": {"ref": "release-v1", "sha": resolved_candidate},
+            "base": {"ref": base_ref, "sha": "base0001"},
+            "merge_commit_sha": merge_sha if merged else None,
+        }
+
+    return mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(side_effect=_get_pull_request),
+    )
+
+
 @pytest.mark.asyncio
 async def test_auto_stale_skips_when_head_unchanged(db_session, mocker):
     """When automain HEAD equals the not_promoted candidate SHA, the auto-stale
@@ -2033,10 +2078,149 @@ async def test_resolved_qualification_triggers_strategic_review(
 
 
 @pytest.mark.asyncio
+async def test_resolved_qualification_wakes_active_resident_without_spawn(
+    db_session, mocker
+):
+    """A live Resident consumes the exact durable barrier receipt itself."""
+    from app.models import ProjectMessage
+
+    project, version = await _make_project_and_version(db_session)
+    project.vision = {
+        **(project.vision or {}),
+        "_resident_strategic_session": {
+            "session_id": "ss-qualification-test",
+            "status": "active",
+            "stop_requested": False,
+        },
+    }
+    db_session.add(project)
+    await db_session.commit()
+    spawn_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+
+    await rq._maybe_trigger_strategic_after_qualification(
+        version.id,
+        {"status": "not_promoted", "candidate_sha": "a" * 40},
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    spawn_mock.assert_not_awaited()
+    receipt = (
+        await db_session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.project_id == project.id,
+                ProjectMessage.idempotency_key
+                == f"release:{version.id}:qualification:not_promoted:{'a' * 40}",
+            )
+        )
+    ).scalar_one()
+    assert receipt.context["event_type"] == "release.qualification_resolved"
+    assert receipt.context["receipt_kind"] == "qualification_barrier"
+    assert receipt.context["qualification_status"] == "not_promoted"
+
+
+@pytest.mark.asyncio
+async def test_promoted_qualification_defers_to_single_serving_receipt(
+    db_session, mocker
+):
+    """A promotion does not spend one Resident turn before serving resolves."""
+    from app.models import ProjectMessage
+
+    project, version = await _make_project_and_version(db_session)
+    project.vision = {
+        **(project.vision or {}),
+        "_resident_strategic_session": {
+            "session_id": "ss-promotion-test",
+            "status": "active",
+            "stop_requested": False,
+        },
+    }
+    db_session.add(project)
+    await db_session.commit()
+    spawn_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+
+    await rq._maybe_trigger_strategic_after_qualification(
+        version.id,
+        {"status": "promoted", "candidate_sha": "c" * 40},
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    spawn_mock.assert_not_awaited()
+    receipts = (
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert receipts == []
+
+
+@pytest.mark.asyncio
+async def test_resolved_qualification_is_inert_while_project_paused(db_session, mocker):
+    """Pause records the outcome but blocks every new agent spawn."""
+    from app.models import ProjectMessage
+
+    project, version = await _make_project_and_version(db_session)
+    project.paused = True
+    db_session.add(project)
+    await db_session.commit()
+    spawn_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+
+    await rq._maybe_trigger_strategic_after_qualification(
+        version.id,
+        {"status": "not_promoted", "candidate_sha": "b" * 40},
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    spawn_mock.assert_not_awaited()
+    receipt = (
+        await db_session.execute(
+            select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+        )
+    ).scalar_one()
+    assert receipt.context["qualification_status"] == "not_promoted"
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_does_not_spawn_or_call_github_while_paused(
+    db_session, mocker
+):
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    project.paused = True
+    db_session.add(project)
+    await db_session.commit()
+    resolver = mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("token", "acme", "widget")),
+    )
+    spawn = mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(side_effect=AssertionError("paused qualification spawned work")),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+
+    assert result == {"status": "project_paused"}
+    resolver.assert_not_awaited()
+    spawn.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "result",
     [
-        {"status": "pending_auto_merge"},  # promotion still in flight
+        {"status": "pending_managed_check_wait"},  # promotion still pending
         {"status": "audit_rate_limit_respawned", "respawn_count": 1},  # transient
         {"status": "wrong_phase"},  # no-op
         None,  # read-only no-op finalize
@@ -2440,22 +2624,31 @@ async def test_sweep_finalize_crash_loop_force_finalizes_and_alerts(db_session, 
 
 
 @pytest.mark.asyncio
-async def test_promote_idempotent_when_candidate_already_on_main(db_session, mocker):
-    """R4-C1: a retried promote() whose candidate_sha is ALREADY reachable from
-    main (a prior attempt landed the merge but crashed before the DB commit)
-    records SUCCESS without re-merging — it must NOT open a second PR, re-merge,
-    or record a promotion_failed.  This is the crash-between-merge-and-commit
-    divergence fix."""
+async def test_promote_idempotent_when_exact_receipt_already_landed(
+    db_session, mocker
+):
+    """R4-C1: a retry with an exact merged release-PR receipt records success
+    without opening or merging a second PR."""
     _project, version = await _make_project_and_version(db_session)
-    candidate = "alr3ady0" * 5  # already merged to main by a prior attempt
+    candidate = "alr3ady0" * 5
+    merge_sha = "receipt1" * 5
 
     mocker.patch(
         "app.github.get_repo_installation_token",
         new=AsyncMock(return_value="gh-token"),
     )
-    # The idempotency pre-check sees the candidate is already on main.
+    # The exact receipt's immutable merge commit is reachable from main.
     ancestor_mock = mocker.patch(
-        "app.github.is_ancestor_of", new=AsyncMock(return_value=True)
+        "app.github.is_ancestor_of",
+        new=AsyncMock(side_effect=lambda *_args, **_kwargs: True),
+    )
+    _patch_exact_promotion_pr(
+        mocker,
+        pr_number=1,
+        candidate=candidate,
+        merge_sha=merge_sha,
+        merged=True,
+        discover=True,
     )
     # These must NOT be called — the promotion already landed.
     branch_mock = mocker.patch("app.github.create_branch", new=_create_branch_mock())
@@ -2497,6 +2690,7 @@ async def test_promote_idempotent_when_candidate_already_on_main(db_session, moc
 
     await db_session.refresh(version)
     assert version.status == "promoted"
+    assert version.promoted_sha == merge_sha
     assert version.last_qualification["status"] == "promoted"
     # The record is flagged as an already-landed idempotent retry.
     assert version.last_qualification.get("already_landed") is True
@@ -2511,9 +2705,8 @@ async def test_promote_open_pr_already_merged_recorded_as_success(db_session, mo
     """R4-H1: on a retry the release PR is still open, merge_pull_request runs
     again, GitHub returns 405 (already merged) → {"merged": False}.  Without the
     post-merge disambiguation this would be misclassified as merge_blocked.
-    Round 7 concern 3: promote() disambiguates via the PR's OWN merged boolean
-    (get_pull_request_merge_state) — the PR reports merged=True, so promote()
-    records SUCCESS instead."""
+    The exact PR resource then reports the expected head/base pair, merged=True,
+    and its immutable merge commit, so promote() records SUCCESS instead."""
     _project, version = await _make_project_and_version(db_session)
     candidate = "0penpr00" * 5
     merge_sha = "realmerg" * 5
@@ -2523,15 +2716,12 @@ async def test_promote_open_pr_already_merged_recorded_as_success(db_session, mo
         new=AsyncMock(return_value="gh-token"),
     )
 
-    # is_ancestor_of: False — only the idempotency PRE-check consults it.  The
-    # merged=False disambiguation no longer needs the (lagging) ancestry API:
-    # the authoritative PR-state check below settles it.
-    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
-    # Round 7 concern 3: the PR's own resource reports merged=True.
-    pr_state_mock = mocker.patch(
-        "app.github.get_pull_request_merge_state",
-        new=AsyncMock(return_value=True),
-    )
+    merge_mock = None
+
+    async def _is_ancestor(_token, _owner, _repo, ancestor, _target, **_kwargs):
+        return ancestor == merge_sha
+
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(side_effect=_is_ancestor))
     mocker.patch(
         "app.github.get_branch_sha",
         new=_branch_sha_mock(main=merge_sha),
@@ -2547,6 +2737,27 @@ async def test_promote_open_pr_already_merged_recorded_as_success(db_session, mo
         new=AsyncMock(
             return_value={"merged": False, "message": "Pull Request is not mergeable"}
         ),
+    )
+
+    async def _get_pull_request(_token, _owner, _repo, number, **_kwargs):
+        merged_now = bool(merge_mock.call_count)
+        return {
+            "number": number,
+            "state": "closed" if merged_now else "open",
+            "merged": merged_now,
+            "html_url": f"http://pr/{number}",
+            "head": {"ref": "release-v1", "sha": candidate},
+            "base": {"ref": "main", "sha": "base0001"},
+            "merge_commit_sha": merge_sha if merged_now else None,
+        }
+
+    mocker.patch(
+        "app.github.get_pull_requests_for_head_branch",
+        new=AsyncMock(return_value=[]),
+    )
+    exact_pr_mock = mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(side_effect=_get_pull_request),
     )
     delete_mock = mocker.patch(
         "app.github.delete_branch", new=AsyncMock(return_value=True)
@@ -2569,13 +2780,13 @@ async def test_promote_open_pr_already_merged_recorded_as_success(db_session, mo
     assert result["status"] == "promoted"
     assert result["status"] != "promotion_failed"
     merge_mock.assert_awaited()  # the merge WAS attempted
-    pr_state_mock.assert_awaited()  # the PR's own merge state WAS consulted
+    assert exact_pr_mock.await_count >= 3  # evidence pair plus exact receipt
     delete_mock.assert_awaited()  # branch cleaned up
 
     await db_session.refresh(version)
     assert version.status == "promoted"
     assert version.last_qualification["status"] == "promoted"
-    # The post-merge re-resolve of main HEAD becomes promoted_sha.
+    # The exact PR receipt's merge commit becomes promoted_sha.
     assert version.promoted_sha == merge_sha
     assert version.last_qualification.get("already_landed") is True
 
@@ -2598,12 +2809,8 @@ async def test_promote_pr_creation_fails_on_retry_but_candidate_merged(
         "app.github.get_repo_installation_token",
         new=AsyncMock(return_value="gh-token"),
     )
-    # Pre-check False (proceed), post-PR-failure re-check True (already merged).
-    ancestry_calls = {"n": 0}
-
-    async def _ancestor(token, owner, repo, anc, desc, project_id=None):
-        ancestry_calls["n"] += 1
-        return ancestry_calls["n"] >= 2
+    async def _ancestor(_token, _owner, _repo, ancestor, _target, **_kwargs):
+        return ancestor == merge_sha
 
     mocker.patch("app.github.is_ancestor_of", new=AsyncMock(side_effect=_ancestor))
     mocker.patch(
@@ -2611,6 +2818,24 @@ async def test_promote_pr_creation_fails_on_retry_but_candidate_merged(
         new=_branch_sha_mock(main=merge_sha),
     )
     mocker.patch("app.github.create_branch", new=_create_branch_mock())
+    mocker.patch(
+        "app.github.get_pull_requests_for_head_branch",
+        new=AsyncMock(side_effect=[[], [{"number": 8}]]),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "number": 8,
+                "state": "closed",
+                "merged": True,
+                "html_url": "http://pr/8",
+                "head": {"ref": "release-v1", "sha": candidate},
+                "base": {"ref": "main", "sha": "base0001"},
+                "merge_commit_sha": merge_sha,
+            }
+        ),
+    )
     # PR creation raises — the prior attempt's PR is already merged + closed.
     create_mock = mocker.patch(
         "app.github.create_pull_request",
@@ -2622,7 +2847,7 @@ async def test_promote_pr_creation_fails_on_retry_but_candidate_merged(
     )
     merge_mock = mocker.patch(
         "app.github.merge_pull_request",
-        new=AsyncMock(return_value={"merged": True}),
+        new=AsyncMock(return_value={"merged": True, "sha": merge_sha}),
     )
     delete_mock = mocker.patch(
         "app.github.delete_branch", new=AsyncMock(return_value=True)
@@ -2678,12 +2903,15 @@ async def test_promote_indeterminate_ancestry_does_not_false_succeed(
     branch_mock = mocker.patch("app.github.create_branch", new=_create_branch_mock())
     merge_mock = mocker.patch(
         "app.github.merge_pull_request",
-        new=AsyncMock(return_value={"merged": True, "message": "Merged"}),
+        new=AsyncMock(
+            return_value={"merged": True, "sha": merge_sha, "message": "Merged"}
+        ),
     )
     mocker.patch(
         "app.github.create_pull_request",
         new=AsyncMock(return_value={"number": 2, "html_url": "http://pr/2"}),
     )
+    _patch_exact_promotion_pr(mocker, pr_number=2, candidate=candidate)
     mocker.patch("app.github.delete_branch", new=AsyncMock(return_value=True))
     mocker.patch(
         "app.github.create_tag",
@@ -2716,18 +2944,13 @@ async def test_promote_genuine_merge_block_still_fails(db_session, mocker):
     )
     # is_ancestor_of False — only the idempotency pre-check consults it.
     mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
-    # Round 7 concern 3: the PR's own resource reports merged=False — a genuine,
-    # authoritative not-merged.  The merged=False result is a real failure.
-    mocker.patch(
-        "app.github.get_pull_request_merge_state",
-        new=AsyncMock(return_value=False),
-    )
     mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
     mocker.patch("app.github.create_branch", new=_create_branch_mock())
     mocker.patch(
         "app.github.create_pull_request",
         new=AsyncMock(return_value={"number": 4, "html_url": "http://pr/4"}),
     )
+    _patch_exact_promotion_pr(mocker, pr_number=4, candidate=candidate)
     mocker.patch(
         "app.github.merge_pull_request",
         new=AsyncMock(
@@ -2755,24 +2978,13 @@ async def test_promote_genuine_merge_block_still_fails(db_session, mocker):
 
 
 # ===========================================================================
-# No-CI repo promotion: managed_check_wait instead of native auto-merge
+# No-CI repo promotion uses the same managed_check_wait path
 # ===========================================================================
 
 
 @pytest.mark.asyncio
-async def test_promote_no_ci_repo_does_not_wait_on_native_automerge(db_session, mocker):
-    """promote() on a no-CI repo must NOT hand the PR to GitHub native auto-merge.
-
-    When the promotion PR does not merge immediately (GitHub 405 / merged=False,
-    no conflict), the normal path enables GitHub native auto-merge and waits for
-    CI checks to trigger it.  On a no-CI repo no checks will ever run, so native
-    auto-merge never fires and the version strands indefinitely.
-
-    The fix: when ``requires_ci_checks(project)`` is False, promote() must enter
-    ``managed_check_wait`` (same retryable sub-state as migration-carrying PRs)
-    instead of calling ``enable_auto_merge``.  The reconciler sweep will then
-    retry the merge directly without waiting for non-existent checks.
-    """
+async def test_promote_no_ci_repo_enters_managed_check_wait(db_session, mocker):
+    """A not-yet-merged no-CI promotion is retained for managed retry."""
     # Build a no-CI project (build_config.requires_ci_checks=False).
     project = Project(
         name="NoCiRepo",
@@ -2798,10 +3010,6 @@ async def test_promote_no_ci_repo_does_not_wait_on_native_automerge(db_session, 
         new=AsyncMock(return_value="gh-token"),
     )
     mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
-    mocker.patch(
-        "app.github.get_pull_request_merge_state",
-        new=AsyncMock(return_value=False),
-    )
     mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
     mocker.patch("app.github.create_branch", new=_create_branch_mock())
     mocker.patch(
@@ -2813,19 +3021,9 @@ async def test_promote_no_ci_repo_does_not_wait_on_native_automerge(db_session, 
         "app.github.merge_pull_request",
         new=AsyncMock(return_value={"merged": False, "conflict": False}),
     )
-    auto_merge_mock = mocker.patch(
-        "app.github.enable_auto_merge",
-        new=AsyncMock(return_value={"enabled": True}),
-    )
     delete_branch_mock = mocker.patch(
         "app.github.delete_branch", new=AsyncMock(return_value=True)
     )
-    # No migrations touched — migration guard is not the trigger.
-    mocker.patch(
-        "app.rollup_migration_validation.pr_touches_migrations",
-        new=AsyncMock(return_value=False),
-    )
-
     result = await rq.promote(
         db_session,
         version,
@@ -2835,12 +3033,10 @@ async def test_promote_no_ci_repo_does_not_wait_on_native_automerge(db_session, 
     )
     await db_session.commit()
 
-    # Must NOT call enable_auto_merge — checks will never run.
-    auto_merge_mock.assert_not_called()
     # Release branch kept — the reconciler needs it.
     delete_branch_mock.assert_not_awaited()
 
-    # Result is a retryable managed_check_wait, NOT pending_auto_merge.
+    # Result is the one retryable managed_check_wait.
     assert result["status"] == "pending_managed_check_wait"
     assert result["managed_check_wait"] is True
     assert result["pr_number"] == 55
@@ -2851,8 +3047,6 @@ async def test_promote_no_ci_repo_does_not_wait_on_native_automerge(db_session, 
     assert version.last_qualification["status"] == "pending"
     pending = version.last_qualification["promotion_pending"]
     assert pending["managed_check_wait"] is True
-    assert pending["auto_merge_enabled"] is False
-    assert pending["why_not_native_automerge"] == "no_ci_repo"
     assert pending["pr_number"] == 55
     # No terminal failure.
     assert "error" not in version.last_qualification
@@ -2869,6 +3063,7 @@ async def test_promote_deletes_release_branch_after_merge(db_session, mocker):
     release-v{N} branch so dangling release branches do not accumulate on the
     repo forever."""
     _project, version = await _make_project_and_version(db_session)
+    candidate = "ca0d" * 10
     merge_sha = "delbr000" * 5
 
     mocker.patch(
@@ -2885,9 +3080,12 @@ async def test_promote_deletes_release_branch_after_merge(db_session, mocker):
         "app.github.create_pull_request",
         new=AsyncMock(return_value={"number": 6, "html_url": "http://pr/6"}),
     )
+    _patch_exact_promotion_pr(mocker, pr_number=6, candidate=candidate)
     mocker.patch(
         "app.github.merge_pull_request",
-        new=AsyncMock(return_value={"merged": True, "message": "Merged"}),
+        new=AsyncMock(
+            return_value={"merged": True, "sha": merge_sha, "message": "Merged"}
+        ),
     )
     delete_mock = mocker.patch(
         "app.github.delete_branch", new=AsyncMock(return_value=True)
@@ -2898,7 +3096,7 @@ async def test_promote_deletes_release_branch_after_merge(db_session, mocker):
     )
 
     result = await rq.promote(
-        db_session, version, "ca0d" * 10, composite={"confidence": 0.9}
+        db_session, version, candidate, composite={"confidence": 0.9}
     )
     await db_session.commit()
 
@@ -2915,6 +3113,7 @@ async def test_promote_branch_delete_failure_does_not_abort_promotion(
     """R4-H2: a delete_branch failure is non-fatal — the promotion still
     succeeds (the merge already landed; a dangling branch is cosmetic)."""
     _project, version = await _make_project_and_version(db_session)
+    candidate = "beef" * 10
     merge_sha = "keptbr00" * 5
 
     from fastapi import HTTPException
@@ -2933,9 +3132,12 @@ async def test_promote_branch_delete_failure_does_not_abort_promotion(
         "app.github.create_pull_request",
         new=AsyncMock(return_value={"number": 10, "html_url": "http://pr/10"}),
     )
+    _patch_exact_promotion_pr(mocker, pr_number=10, candidate=candidate)
     mocker.patch(
         "app.github.merge_pull_request",
-        new=AsyncMock(return_value={"merged": True, "message": "Merged"}),
+        new=AsyncMock(
+            return_value={"merged": True, "sha": merge_sha, "message": "Merged"}
+        ),
     )
     # delete_branch raises — must not abort the promotion.
     mocker.patch(
@@ -2948,7 +3150,7 @@ async def test_promote_branch_delete_failure_does_not_abort_promotion(
     )
 
     result = await rq.promote(
-        db_session, version, "beef" * 10, composite={"confidence": 0.95}
+        db_session, version, candidate, composite={"confidence": 0.95}
     )
     await db_session.commit()
 
@@ -2991,6 +3193,7 @@ async def test_promote_bails_if_version_already_promoted_under_relock(
         "app.github.create_pull_request",
         new=AsyncMock(return_value={"number": 11, "html_url": "http://pr/11"}),
     )
+    _patch_exact_promotion_pr(mocker, pr_number=11, candidate=candidate)
 
     # Simulate a concurrent finalize winning the race: while promote()'s merge
     # I/O "runs", another path flips the version to promoted in the DB.  We
@@ -3007,7 +3210,7 @@ async def test_promote_bails_if_version_already_promoted_under_relock(
             .values(status="promoted", promoted_sha="wonrace0" * 5)
         )
         await db_session.commit()
-        return {"merged": True, "message": "Merged"}
+        return {"merged": True, "sha": merge_sha, "message": "Merged"}
 
     mocker.patch(
         "app.github.merge_pull_request",
@@ -3510,7 +3713,7 @@ class TestGetPullRequestMergeState:
 
 
 # ===========================================================================
-# Round 7 — promote(): merged=False disambiguation via the PR's own state
+# Round 7 — promote(): merged=False disambiguation via an exact PR receipt
 # (concern 3 — an already-merged PR must never be recorded as merge_blocked)
 # ===========================================================================
 
@@ -3519,10 +3722,9 @@ class TestGetPullRequestMergeState:
 async def test_promote_merged_false_but_pr_state_merged_is_success(db_session, mocker):
     """Concern 3: merge_pull_request returns {"merged": False} (GitHub's merge
     endpoint returns 405 once a PR is already merged), AND the eventually-
-    consistent compare/ancestry API still lags (is_ancestor_of → False).  The
-    PR's OWN merged boolean is True, so promote() records SUCCESS — a genuinely
-    successful promotion is NOT misclassified as merge_blocked just because the
-    ancestry API has not caught up yet."""
+    PR then exposes an exact merged receipt for the expected head/base/candidate
+    and immutable merge commit.  promote() records SUCCESS rather than
+    misclassifying a genuinely landed promotion as merge_blocked."""
     _project, version = await _make_project_and_version(db_session)
     candidate = "pr5tate0" * 5
     merge_sha = "pr5merg0" * 5
@@ -3535,15 +3737,10 @@ async def test_promote_merged_false_but_pr_state_merged_is_success(db_session, m
         "app.github.get_branch_sha",
         new=_branch_sha_mock(main=merge_sha),
     )
-    # is_ancestor_of: False on BOTH the pre-check and any later call — the
-    # compare API is lagging right after the merge.  Without the PR-state
-    # check this candidate would be misrecorded as merge_blocked.
-    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
-    # The PR resource itself reports merged=True — the authoritative signal.
-    pr_state_mock = mocker.patch(
-        "app.github.get_pull_request_merge_state",
-        new=AsyncMock(return_value=True),
-    )
+    async def _is_ancestor(_token, _owner, _repo, ancestor, _target, **_kwargs):
+        return ancestor == merge_sha
+
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(side_effect=_is_ancestor))
     mocker.patch("app.github.create_branch", new=_create_branch_mock())
     mocker.patch(
         "app.github.create_pull_request",
@@ -3553,6 +3750,26 @@ async def test_promote_merged_false_but_pr_state_merged_is_success(db_session, m
     merge_mock = mocker.patch(
         "app.github.merge_pull_request",
         new=AsyncMock(return_value={"merged": False, "message": "not mergeable"}),
+    )
+
+    async def _get_pull_request(_token, _owner, _repo, number, **_kwargs):
+        merged_now = bool(merge_mock.call_count)
+        return {
+            "number": number,
+            "state": "closed" if merged_now else "open",
+            "merged": merged_now,
+            "html_url": f"http://pr/{number}",
+            "head": {"ref": "release-v1", "sha": candidate},
+            "base": {"ref": "main", "sha": "base0001"},
+            "merge_commit_sha": merge_sha if merged_now else None,
+        }
+
+    mocker.patch(
+        "app.github.get_pull_requests_for_head_branch",
+        new=AsyncMock(return_value=[]),
+    )
+    exact_pr_mock = mocker.patch(
+        "app.github.get_pull_request", new=AsyncMock(side_effect=_get_pull_request)
     )
     delete_mock = mocker.patch(
         "app.github.delete_branch", new=AsyncMock(return_value=True)
@@ -3571,18 +3788,18 @@ async def test_promote_merged_false_but_pr_state_merged_is_success(db_session, m
     )
     await db_session.commit()
 
-    # Recorded as a SUCCESS — NOT merge_blocked — purely on the PR-state signal.
+    # Recorded as a SUCCESS — NOT merge_blocked — on the exact receipt.
     assert result["status"] == "promoted"
     assert result["status"] != "promotion_failed"
     merge_mock.assert_awaited()  # the merge WAS attempted
-    pr_state_mock.assert_awaited()  # the PR's own merge state WAS consulted
+    assert exact_pr_mock.await_count >= 3
     delete_mock.assert_awaited()  # branch cleaned up
 
     await db_session.refresh(version)
     assert version.status == "promoted"
     assert version.last_qualification["status"] == "promoted"
     assert version.last_qualification.get("already_landed") is True
-    # The post-merge re-resolve of main HEAD becomes promoted_sha.
+    # The immutable receipt merge commit becomes promoted_sha.
     assert version.promoted_sha == merge_sha
 
 
@@ -3591,10 +3808,8 @@ async def test_promote_merged_false_and_pr_state_not_merged_is_failure(
     db_session, mocker
 ):
     """Concern 3 boundary: merge_pull_request returns {"merged": False} AND the
-    PR's own state reports merged=False — the PR genuinely did not merge (a real
-    checks/reviews block).  This is recorded as merge_blocked.  The authoritative
-    PR-state False is trusted directly; the lagging ancestry API is NOT consulted
-    to second-guess a definitive 'not merged'."""
+    exact PR remains open and the merge reports a real conflict.  This is
+    recorded as merge_blocked."""
     _project, version = await _make_project_and_version(db_session)
     candidate = "n0tm3rg0" * 5
 
@@ -3604,18 +3819,14 @@ async def test_promote_merged_false_and_pr_state_not_merged_is_failure(
     )
     mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
     # Pre-check ancestry False so promote() proceeds to the merge step.
-    ancestor_mock = mocker.patch(
-        "app.github.is_ancestor_of", new=AsyncMock(return_value=False)
-    )
-    # The PR resource itself reports merged=False — authoritative not-merged.
-    pr_state_mock = mocker.patch(
-        "app.github.get_pull_request_merge_state",
-        new=AsyncMock(return_value=False),
-    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
     mocker.patch("app.github.create_branch", new=_create_branch_mock())
     mocker.patch(
         "app.github.create_pull_request",
         new=AsyncMock(return_value={"number": 32, "html_url": "http://pr/32"}),
+    )
+    exact_pr_mock = _patch_exact_promotion_pr(
+        mocker, pr_number=32, candidate=candidate
     )
     mocker.patch(
         "app.github.merge_pull_request",
@@ -3637,11 +3848,7 @@ async def test_promote_merged_false_and_pr_state_not_merged_is_failure(
     # A genuine merge block (conflict=True) — recorded as a failure, not papered over.
     assert result["status"] == "promotion_failed"
     assert result["error"] == "merge_blocked"
-    pr_state_mock.assert_awaited()
-    # The ancestry API was consulted ONLY for the pre-check (call #1); the
-    # merged=False path trusted the authoritative PR-state and did NOT make a
-    # second ancestry call to second-guess it.
-    assert ancestor_mock.await_count == 1
+    assert exact_pr_mock.await_count >= 3
 
     await db_session.refresh(version)
     assert version.status == "open"
@@ -3650,13 +3857,14 @@ async def test_promote_merged_false_and_pr_state_not_merged_is_failure(
 
 
 @pytest.mark.asyncio
-async def test_promote_merged_false_pr_state_indeterminate_falls_back_to_ancestry(
+async def test_promote_merged_false_without_exact_receipt_defers_despite_ancestry(
     db_session, mocker
 ):
-    """Concern 3 fallback: merge_pull_request returns {"merged": False} and the
-    PR-state query is indeterminate (API error → None).  promote() falls back to
-    the candidate-on-main ancestry check; with the candidate on main it records
-    SUCCESS."""
+    """Candidate ancestry cannot turn merged=False into promotion success.
+
+    Without an exact merged PR receipt the promotion remains in the canonical
+    managed waiter even when the candidate is reachable from main.
+    """
     _project, version = await _make_project_and_version(db_session)
     candidate = "fa11bck0" * 5
     merge_sha = "fa11mrg0" * 5
@@ -3678,16 +3886,12 @@ async def test_promote_merged_false_pr_state_indeterminate_falls_back_to_ancestr
         return ancestry_calls["n"] >= 2
 
     mocker.patch("app.github.is_ancestor_of", new=AsyncMock(side_effect=_ancestor))
-    # PR-state query is indeterminate — None — so promote() must fall back.
-    pr_state_mock = mocker.patch(
-        "app.github.get_pull_request_merge_state",
-        new=AsyncMock(return_value=None),
-    )
     mocker.patch("app.github.create_branch", new=_create_branch_mock())
     mocker.patch(
         "app.github.create_pull_request",
         new=AsyncMock(return_value={"number": 33, "html_url": "http://pr/33"}),
     )
+    _patch_exact_promotion_pr(mocker, pr_number=33, candidate=candidate)
     mocker.patch(
         "app.github.merge_pull_request",
         new=AsyncMock(return_value={"merged": False, "message": "not mergeable"}),
@@ -3703,16 +3907,16 @@ async def test_promote_merged_false_pr_state_indeterminate_falls_back_to_ancestr
     )
     await db_session.commit()
 
-    # PR-state was indeterminate → ancestry fallback → candidate on main →
-    # SUCCESS.
-    assert result["status"] == "promoted"
-    pr_state_mock.assert_awaited()
-    # The fallback ancestry check ran (pre-check + post-merge fallback).
+    assert result["status"] == "pending_managed_check_wait"
+    assert result["managed_check_wait"] is True
+    # Ancestry corroboration ran, but could not supply promotion authority.
     assert ancestry_calls["n"] >= 2
 
     await db_session.refresh(version)
-    assert version.status == "promoted"
-    assert version.last_qualification.get("already_landed") is True
+    assert version.status == "open"
+    pending = version.last_qualification["promotion_pending"]
+    assert pending["managed_check_wait"] is True
+    assert pending["pr_number"] == 33
 
 
 # ===========================================================================
@@ -3807,12 +4011,11 @@ async def test_maybe_finalize_takes_no_caller_session(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_promote_pending_ci_enables_auto_merge_no_failure(db_session, mocker):
+async def test_promote_pending_ci_enters_managed_check_wait_no_failure(db_session, mocker):
     """When merge_pull_request returns merged=False with no conflict flag
     (GitHub 405 — required checks still pending), promote() must NOT record a
-    failure verdict.  Instead it enables GitHub auto-merge so the PR merges
-    automatically once the checks pass.  last_qualification stays "pending"
-    so the reaper can confirm success when auto-merge lands."""
+    failure verdict. Instead Blueprint retains the PR in managed_check_wait and
+    retries after checks pass. last_qualification stays "pending"."""
     _project, version = await _make_project_and_version(db_session)
     candidate = "p3nd1ng0" * 5
 
@@ -3822,10 +4025,6 @@ async def test_promote_pending_ci_enables_auto_merge_no_failure(db_session, mock
     )
     mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
     # PR not yet merged (pending CI, not a conflict).
-    mocker.patch(
-        "app.github.get_pull_request_merge_state",
-        new=AsyncMock(return_value=False),
-    )
     mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
     mocker.patch("app.github.create_branch", new=_create_branch_mock())
     mocker.patch(
@@ -3838,10 +4037,6 @@ async def test_promote_pending_ci_enables_auto_merge_no_failure(db_session, mock
         new=AsyncMock(
             return_value={"merged": False, "message": "required checks pending"}
         ),
-    )
-    am_mock = mocker.patch(
-        "app.github.enable_auto_merge",
-        new=AsyncMock(return_value={"enabled": True, "message": "auto-merge enabled"}),
     )
     mocker.patch("app.github.delete_branch", new=AsyncMock(return_value=True))
 
@@ -3854,10 +4049,9 @@ async def test_promote_pending_ci_enables_auto_merge_no_failure(db_session, mock
     )
     await db_session.commit()
 
-    # Pending CI → auto-merge enabled, NOT a promotion failure.
-    assert result["status"] == "pending_auto_merge"
-    assert result["auto_merge_enabled"] is True
-    am_mock.assert_awaited_once()
+    # Pending CI → managed retry, NOT a promotion failure.
+    assert result["status"] == "pending_managed_check_wait"
+    assert result["managed_check_wait"] is True
 
     # No failure recorded — status is not promotion_failed.
     await db_session.refresh(version)
@@ -3865,12 +4059,12 @@ async def test_promote_pending_ci_enables_auto_merge_no_failure(db_session, mock
     assert lq.get("status") != "promotion_failed"
     assert "error" not in lq
 
-    # Durable promotion_pending sub-state is now written so the reaper can
+    # Durable promotion_pending sub-state is now written so the reconciler can
     # distinguish this version (qualification PASSED) from a hung qualifier child.
     pending = lq.get("promotion_pending") or {}
     assert pending.get("pr_number") == 99
     assert pending.get("pr_url") == "http://pr/99"
-    assert pending.get("auto_merge_enabled") is True
+    assert pending.get("managed_check_wait") is True
     assert "enabled_at" in pending
 
     # The spawn-time "pending" record carried NO confidence (the composite is
@@ -3881,93 +4075,6 @@ async def test_promote_pending_ci_enables_auto_merge_no_failure(db_session, mock
     assert lq.get("sub_scores") == {"ci": 1.0}
     # The merge must NOT clobber the "pending" status the substate relies on.
     assert lq.get("status") == "pending"
-
-
-@pytest.mark.asyncio
-async def test_promote_pending_ci_migration_pr_skips_auto_merge(db_session, mocker):
-    """A migration-carrying promotion PR that returns pending-CI (GitHub 405,
-    no conflict) must NOT be handed to GitHub native auto-merge — that would
-    reopen the dual-head TOCTOU window (the promotion target can advance while
-    checks are pending, so the eventual native merge could land against a
-    different migration chain than the one Blueprint validated). Instead, promote()
-    persists a durable managed_check_wait sub-state and keeps the branch open so
-    the reconciler can re-validate the Alembic guard and retry the merge once CI
-    passes."""
-    _project, version = await _make_project_and_version(db_session)
-    candidate = "m1grat10" * 5
-
-    mocker.patch(
-        "app.github.get_repo_installation_token",
-        new=AsyncMock(return_value="gh-token"),
-    )
-    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
-    mocker.patch(
-        "app.github.get_pull_request_merge_state",
-        new=AsyncMock(return_value=False),
-    )
-    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
-    mocker.patch("app.github.create_branch", new=_create_branch_mock())
-    mocker.patch(
-        "app.github.create_pull_request",
-        new=AsyncMock(return_value={"number": 99, "html_url": "http://pr/99"}),
-    )
-    # 405-style: not merged, no conflict flag — pending required checks.
-    mocker.patch(
-        "app.github.merge_pull_request",
-        new=AsyncMock(
-            return_value={"merged": False, "message": "required checks pending"}
-        ),
-    )
-    am_mock = mocker.patch(
-        "app.github.enable_auto_merge",
-        new=AsyncMock(return_value={"enabled": True, "message": "auto-merge enabled"}),
-    )
-    delete_branch_mock = mocker.patch(
-        "app.github.delete_branch", new=AsyncMock(return_value=True)
-    )
-    # The pre-merge guard passes (validates clean against the target AT check
-    # time) so execution reaches the pending-CI auto-merge fallback; the new
-    # exclusion then diverts a migration-carrying PR away from native auto-merge.
-    # promote() consumes the 3-way verdict directly, so mock the chain (not the
-    # bool wrapper) to an "ok" verdict.
-    mocker.patch(
-        "app.rollup_migration_validation._validate_rollup_migration_chain",
-        new=AsyncMock(return_value=("ok", None)),
-    )
-    # PR touches an Alembic migration → pr_touches_migrations returns True.
-    mocker.patch(
-        "app.github.get_pr_files",
-        new=AsyncMock(
-            return_value=[{"filename": "backend/alembic/versions/0042_feature.py"}]
-        ),
-    )
-
-    result = await rq.promote(
-        db_session,
-        version,
-        candidate,
-        composite={"confidence": 0.9},
-        base_record={"candidate_sha": candidate},
-    )
-    await db_session.commit()
-
-    # Native auto-merge was NEVER delegated.
-    am_mock.assert_not_called()
-    # managed_check_wait hold recorded — reconciler owns the retry.
-    assert result["status"] == "pending_managed_check_wait"
-    assert result["managed_check_wait"] is True
-    assert result["pr_number"] == 99
-
-    await db_session.refresh(version)
-    # Version stays open so the managed_check_wait reconciler can retry.
-    assert version.status == "open"
-    assert version.last_qualification["status"] == "pending"
-    pending = version.last_qualification["promotion_pending"]
-    assert pending["managed_check_wait"] is True
-    assert pending["migration_carrying"] is True
-    assert pending["pr_number"] == 99
-    # The release branch was NOT deleted — it must stay for the reconciler.
-    delete_branch_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -4058,6 +4165,7 @@ async def test_promote_does_not_commit_caller_unrelated_transaction(db_session, 
         "app.github.create_pull_request",
         new=AsyncMock(return_value={"number": 50, "html_url": "http://pr/50"}),
     )
+    _patch_exact_promotion_pr(mocker, pr_number=50)
     mocker.patch(
         "app.github.create_tag",
         new=AsyncMock(return_value={"ref": "refs/tags/v1"}),
@@ -4100,7 +4208,7 @@ async def test_promote_does_not_commit_caller_unrelated_transaction(db_session, 
                 "promote()'s intermediate commit leaked the caller's "
                 "unrelated transaction"
             )
-            return {"merged": True, "message": "Merged"}
+            return {"merged": True, "sha": "caller00" * 5, "message": "Merged"}
 
         mocker.patch(
             "app.github.merge_pull_request",
@@ -4263,9 +4371,9 @@ async def test_overlapping_promote_does_not_double_promote(db_session, mocker):
     lock) BEFORE its GitHub I/O, with ``last_qualification.status`` still
     'pending'.  So a concurrent caller that fires mid-merge genuinely passes the
     pending guard and enters its own promote() — the pending guard is NOT what
-    serializes this.  The real safety net is the idempotency machinery
-    (``_candidate_already_on_main``) plus the ``status != "open"`` re-check in
-    ``_record_promotion_success`` / ``_record_promotion_failure``.
+    serializes this.  The real safety net is the exact merged-PR receipt plus
+    the ``status != "open"`` re-check in ``_record_promotion_success`` /
+    ``_record_promotion_failure``.
 
     This mirrors the mid-merge-callback pattern of
     ``test_promote_does_not_commit_caller_unrelated_transaction``: the merge
@@ -4361,26 +4469,49 @@ async def test_overlapping_promote_does_not_double_promote(db_session, mocker):
         "app.github.get_branch_sha",
         new=_branch_sha_mock(main=merge_sha),
     )
-    # is_ancestor_of is the idempotency primitive.  It is False before the first
-    # promotion's merge lands and True after — so the SECOND finalize, launched
-    # mid-merge once the first merge has been marked landed, sees the candidate
-    # already on main and routes straight to the idempotent-success path
-    # WITHOUT a second merge.
+    # The exact release PR is open before the first merge lands and exposes an
+    # immutable merged receipt afterwards.  The SECOND finalize, launched from
+    # inside the merge hook, discovers that receipt and does not submit another
+    # merge.
     merge_landed = {"done": False}
 
     async def _is_ancestor(token, owner, repo, anc, desc, project_id=None):
         return merge_landed["done"]
 
     mocker.patch("app.github.is_ancestor_of", new=AsyncMock(side_effect=_is_ancestor))
-    mocker.patch(
-        "app.github.get_pull_request_merge_state",
-        new=AsyncMock(return_value=False),
-    )
     mocker.patch("app.github.delete_branch", new=AsyncMock(return_value=True))
-    mocker.patch("app.github.create_branch", new=_create_branch_mock())
+    create_branch_mock = mocker.patch(
+        "app.github.create_branch", new=_create_branch_mock()
+    )
     mocker.patch(
         "app.github.create_pull_request",
         new=AsyncMock(return_value={"number": 70, "html_url": "http://pr/70"}),
+    )
+
+    async def _find_release_pr(*_args, **_kwargs):
+        return [{"number": 70}] if merge_landed["done"] else []
+
+    async def _get_release_pr(_token, _owner, _repo, number, **_kwargs):
+        branch_call = create_branch_mock.call_args
+        assert branch_call is not None
+        candidate = branch_call.args[4]
+        return {
+            "number": number,
+            "state": "closed" if merge_landed["done"] else "open",
+            "merged": merge_landed["done"],
+            "html_url": f"http://pr/{number}",
+            "head": {"ref": "release-v1", "sha": candidate},
+            "base": {"ref": "main", "sha": "base0001"},
+            "merge_commit_sha": merge_sha if merge_landed["done"] else None,
+        }
+
+    mocker.patch(
+        "app.github.get_pull_requests_for_head_branch",
+        new=AsyncMock(side_effect=_find_release_pr),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(side_effect=_get_release_pr),
     )
     mocker.patch(
         "app.github.create_tag",
@@ -4397,16 +4528,15 @@ async def test_overlapping_promote_does_not_double_promote(db_session, mocker):
         # dedicated session (a real second connection from the test engine, NOT
         # the shared test session) so it is a true concurrent promote and not a
         # reentrant commit on this transaction.  The merge hook is THIS
-        # function, so we mark merge_landed BEFORE the reentrant call: the inner
-        # finalize's idempotency pre-check (is_ancestor_of) then sees the
-        # candidate already on main and takes the no-merge idempotent-success
-        # path — which is what avoids a recursive merge.
+        # function, so we expose the exact receipt BEFORE the reentrant call.
+        # The inner finalize resolves that receipt and takes the no-merge
+        # idempotent-success path, avoiding a recursive merge.
         if not merge_landed["done"]:
             merge_landed["done"] = True
             second_result["value"] = await rq.maybe_finalize_qualification(
                 smoke_task, session_factory=_dedicated_factory
             )
-        return {"merged": True, "message": "Merged"}
+        return {"merged": True, "sha": merge_sha, "message": "Merged"}
 
     merge_mock = mocker.patch(
         "app.github.merge_pull_request",
@@ -4431,7 +4561,7 @@ async def test_overlapping_promote_does_not_double_promote(db_session, mocker):
     assert second_result["value"]["status"] == "promoted"
 
     # merge_pull_request was called EXACTLY once despite the genuine overlap —
-    # the second promote() took the candidate-already-on-main idempotent path.
+    # the second promote() took the exact-receipt idempotent path.
     assert merge_mock.await_count == 1
 
     # Exactly ONE v2 ReleaseVersion row — no duplicate from the overlapping
@@ -4488,19 +4618,13 @@ async def test_record_promotion_failure_does_not_overwrite_promoted_version(
     # is_ancestor_of False — the idempotency pre-check does not short-circuit;
     # this promote() proceeds to open + merge the PR (and the merge fails).
     mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
-    # The PR's own merge state reports False — so the merged=False result is
-    # treated as a genuine merge block, routing promote() to
-    # _record_promotion_failure (NOT the already-merged success path).
-    mocker.patch(
-        "app.github.get_pull_request_merge_state",
-        new=AsyncMock(return_value=False),
-    )
     mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
     mocker.patch("app.github.create_branch", new=_create_branch_mock())
     mocker.patch(
         "app.github.create_pull_request",
         new=AsyncMock(return_value={"number": 80, "html_url": "http://pr/80"}),
     )
+    _patch_exact_promotion_pr(mocker, pr_number=80, candidate=candidate)
     mocker.patch("app.github.delete_branch", new=AsyncMock(return_value=True))
 
     # The merge hook: a PARALLEL promotion lands first (direct SQL UPDATE flips
@@ -4572,24 +4696,20 @@ async def test_record_promotion_failure_still_records_on_open_version(
     back to stabilize — the guard converts only the already-promoted race, not
     real failures."""
     _project, version = await _make_project_and_version(db_session)
+    candidate = "0p3nfa1l" * 5
 
     mocker.patch(
         "app.github.get_repo_installation_token",
         new=AsyncMock(return_value="gh-token"),
     )
     mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
-    # The PR's own resource reports merged=False — a genuine, authoritative
-    # not-merged.  The version is never raced, so it stays 'open'.
-    mocker.patch(
-        "app.github.get_pull_request_merge_state",
-        new=AsyncMock(return_value=False),
-    )
     mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
     mocker.patch("app.github.create_branch", new=_create_branch_mock())
     mocker.patch(
         "app.github.create_pull_request",
         new=AsyncMock(return_value={"number": 81, "html_url": "http://pr/81"}),
     )
+    _patch_exact_promotion_pr(mocker, pr_number=81, candidate=candidate)
     mocker.patch(
         "app.github.merge_pull_request",
         new=AsyncMock(
@@ -4605,9 +4725,9 @@ async def test_record_promotion_failure_still_records_on_open_version(
     result = await rq.promote(
         db_session,
         version,
-        "0p3nfa1l" * 5,
+        candidate,
         composite={"confidence": 0.9},
-        base_record={"candidate_sha": "0p3nfa1l" * 5},
+        base_record={"candidate_sha": candidate},
     )
     await db_session.commit()
 
@@ -4753,19 +4873,15 @@ async def test_promote_pr_missing_number_cleans_up_release_branch(db_session, mo
 
 @pytest.mark.asyncio
 async def test_promote_idempotent_success_records_meaningful_pr_url(db_session, mocker):
-    """Concern 5: the idempotency-success path (candidate already on main) has
-    no live PR of its own.  Rather than recording a bare "" pr_url, it carries
-    forward a pr_url the caller threaded through base_record when present, and
-    otherwise records an explicit human-readable label — never a blank string
-    that reads like 'there was no PR'."""
+    """Exact-receipt and exact-empty-diff successes both record useful provenance."""
     _project, version = await _make_project_and_version(db_session)
     candidate = "1d3mp0t0" * 5
+    merge_sha = "urlmerge" * 5
 
     mocker.patch(
         "app.github.get_repo_installation_token",
         new=AsyncMock(return_value="gh-token"),
     )
-    # The idempotency pre-check sees the candidate already on main.
     mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=True))
     mocker.patch("app.github.delete_branch", new=AsyncMock(return_value=True))
     mocker.patch(
@@ -4773,8 +4889,16 @@ async def test_promote_idempotent_success_records_meaningful_pr_url(db_session, 
         new=AsyncMock(return_value={"ref": "refs/tags/v1"}),
     )
 
-    # Case A: a prior promotion attempt's PR url is carried in base_record —
-    # the idempotent-success record reuses that real url.
+    _patch_exact_promotion_pr(
+        mocker,
+        pr_number=91,
+        candidate=candidate,
+        merge_sha=merge_sha,
+        merged=True,
+        discover=True,
+    )
+
+    # Case A: an exact merged receipt records the authoritative PR URL.
     result_a = await rq.promote(
         db_session,
         version,
@@ -4785,10 +4909,19 @@ async def test_promote_idempotent_success_records_meaningful_pr_url(db_session, 
     await db_session.commit()
     assert result_a["status"] == "promoted"
     await db_session.refresh(version)
-    assert version.last_qualification["pr_url"] == "http://pr/prior"
+    assert version.last_qualification["pr_url"] == "http://pr/91"
+    assert version.promoted_sha == merge_sha
 
-    # Case B: no carried pr_url — the record gets an explicit label, not "".
+    # Case B: an exact empty diff records an explicit label, not a blank URL.
     _project_b, version_b = await _make_project_and_version(db_session)
+    mocker.patch(
+        "app.github.get_pull_requests_for_head_branch",
+        new=AsyncMock(return_value=[]),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(main=candidate),
+    )
     result_b = await rq.promote(
         db_session,
         version_b,
@@ -4800,9 +4933,8 @@ async def test_promote_idempotent_success_records_meaningful_pr_url(db_session, 
     assert result_b["status"] == "promoted"
     await db_session.refresh(version_b)
     recorded = version_b.last_qualification["pr_url"]
-    # Not a bare empty string — an explicit, human-readable label.
     assert recorded != ""
-    assert "already merged" in recorded.lower()
+    assert "empty diff" in recorded.lower()
 
 
 class TestFmtSubScores:

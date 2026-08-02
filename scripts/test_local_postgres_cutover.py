@@ -42,7 +42,22 @@ class FakeSnapshotClient:
                 }
             ]
         if sql == cutover._INDEXES_SQL:
-            return [{"schema": "public", "table": "task", "name": "task_pkey", "definition": "CREATE UNIQUE INDEX task_pkey ON public.task USING btree (id)"}]
+            return [
+                {
+                    "schema": "public",
+                    "table": "task",
+                    "name": "task_pkey",
+                    "definition": (
+                        "CREATE UNIQUE INDEX task_pkey "
+                        "ON public.task USING btree (id)"
+                    ),
+                    "owner": "postgres",
+                    "acl": [],
+                    "valid": True,
+                    "ready": True,
+                    "live": True,
+                }
+            ]
         if sql == cutover._TRIGGERS_SQL:
             return []
         if sql == cutover._VIEWS_SQL:
@@ -305,7 +320,42 @@ class CutoverTests(unittest.TestCase):
         self.assertEqual(value["unvalidated_constraints"], [])
         self.assertEqual(value["public_constraints"][0]["definition"], "PRIMARY KEY (id)")
         self.assertEqual(value["public_indexes"][0]["name"], "task_pkey")
+        self.assertTrue(value["public_indexes"][0]["valid"])
         self.assertEqual(value["critical_aggregates"]["orphan_tasks"], 0)
+
+    def test_snapshot_rejects_unhealthy_or_malformed_index_state(self):
+        missing = object()
+
+        class UnhealthyIndexClient(FakeSnapshotClient):
+            def __init__(self, field, field_value):
+                self.field = field
+                self.field_value = field_value
+
+            def query_json(self, sql: str):
+                value = super().query_json(sql)
+                if sql == cutover._INDEXES_SQL:
+                    if self.field_value is missing:
+                        value[0].pop(self.field)
+                    else:
+                        value[0][self.field] = self.field_value
+                return value
+
+        cases = (
+            ("valid", False, "unhealthy_indexes_present"),
+            ("ready", False, "unhealthy_indexes_present"),
+            ("live", False, "unhealthy_indexes_present"),
+            ("valid", None, "invalid_index_inventory"),
+            ("ready", "false", "invalid_index_inventory"),
+            ("live", missing, "invalid_index_inventory"),
+        )
+        for field, field_value, expected_error in cases:
+            with self.subTest(field=field, field_value=field_value):
+                with self.assertRaisesRegex(cutover.CutoverError, expected_error):
+                    cutover.snapshot_database(
+                        UnhealthyIndexClient(field, field_value),
+                        label="source-frozen",
+                        instance="blueprint-cloudsql-1234",
+                    )
 
     def test_target_must_be_exactly_empty(self):
         client = mock.Mock()
@@ -439,15 +489,157 @@ class CutoverTests(unittest.TestCase):
         with self.assertRaisesRegex(cutover.CutoverError, "mismatch_public_constraints"):
             cutover.compare_snapshots(source, target)
 
+    def test_compare_densifies_only_column_ordinal_holes(self):
+        source = snapshot()
+        target = json.loads(json.dumps(source))
+        source["public_columns"] = [
+            {"schema": "public", "table": "task", "name": "id", "ordinal": 1},
+            {
+                "schema": "public",
+                "table": "task",
+                "name": "status",
+                "ordinal": 3,
+            },
+        ]
+        target["public_columns"] = json.loads(json.dumps(source["public_columns"]))
+        target["public_columns"][1]["ordinal"] = 2
+
+        cutover.compare_snapshots(source, target, target_owner="postgres")
+
+        target["public_columns"].reverse()
+        with self.assertRaisesRegex(cutover.CutoverError, "mismatch_public_columns"):
+            cutover.compare_snapshots(source, target, target_owner="postgres")
+
+    def test_compare_preserves_nonordinal_column_differences(self):
+        source = snapshot()
+        target = json.loads(json.dumps(source))
+        source["public_columns"][0]["ordinal"] = 2
+        source["public_columns"][0]["data_type"] = "uuid"
+        target["public_columns"][0]["ordinal"] = 1
+        target["public_columns"][0]["data_type"] = "text"
+
+        with self.assertRaisesRegex(cutover.CutoverError, "mismatch_public_columns"):
+            cutover.compare_snapshots(source, target, target_owner="postgres")
+
+    def test_compare_normalizes_pg15_text_array_constraint_deparse(self):
+        source = snapshot()
+        target = json.loads(json.dumps(source))
+        source["public_constraints"][0]["definition"] = (
+            "CHECK (status::text = ANY (ARRAY['queued'::character varying, "
+            "'running'::character varying]::text[]))"
+        )
+        target["public_constraints"][0]["definition"] = (
+            "CHECK (status::text = ANY (ARRAY['queued'::character varying::text, "
+            "'running'::character varying::text]))"
+        )
+
+        cutover.compare_snapshots(source, target, target_owner="postgres")
+
+    def test_compare_normalizes_pg15_text_array_index_deparse(self):
+        source = snapshot()
+        target = json.loads(json.dumps(source))
+        source["public_indexes"][0]["definition"] = (
+            "CREATE INDEX task_pkey ON public.task USING btree (status) "
+            "WHERE ((status)::text = ANY ((ARRAY['QUEUED'::character varying, "
+            "'IN_PROGRESS'::character varying])::text[]))"
+        )
+        target["public_indexes"][0]["definition"] = (
+            "CREATE INDEX task_pkey ON public.task USING btree (status) "
+            "WHERE ((status)::text = ANY (ARRAY[('QUEUED'::character varying)::text, "
+            "('IN_PROGRESS'::character varying)::text]))"
+        )
+
+        cutover.compare_snapshots(source, target, target_owner="postgres")
+
+    def test_compare_pg15_deparse_normalization_rejects_semantic_changes(self):
+        source = snapshot()
+        target = json.loads(json.dumps(source))
+        source["public_constraints"][0]["definition"] = (
+            "CHECK (status::text = ANY (ARRAY['queued'::character varying, "
+            "'running'::character varying]::text[]))"
+        )
+        target["public_constraints"][0]["definition"] = (
+            "CHECK (status::text = ANY (ARRAY['queued'::character varying::text, "
+            "'failed'::character varying::text]))"
+        )
+
+        with self.assertRaisesRegex(cutover.CutoverError, "mismatch_public_constraints"):
+            cutover.compare_snapshots(source, target, target_owner="postgres")
+
+        target["public_constraints"][0]["definition"] = (
+            "CHECK (status::text = ANY (ARRAY[lower('queued')::text, "
+            "'running'::character varying::text]))"
+        )
+        with self.assertRaisesRegex(cutover.CutoverError, "mismatch_public_constraints"):
+            cutover.compare_snapshots(source, target, target_owner="postgres")
+
+    def test_compare_does_not_change_an_uncast_varchar_array_type(self):
+        source = snapshot()
+        target = json.loads(json.dumps(source))
+        source["public_constraints"][0]["definition"] = (
+            "CHECK (pg_typeof(ARRAY['a'::character varying]) = "
+            "'character varying[]'::regtype)"
+        )
+        target["public_constraints"][0]["definition"] = (
+            "CHECK (pg_typeof(ARRAY['a'::text]) = 'character varying[]'::regtype)"
+        )
+
+        with self.assertRaisesRegex(cutover.CutoverError, "mismatch_public_constraints"):
+            cutover.compare_snapshots(source, target, target_owner="postgres")
+
+    def test_compare_pg15_deparse_normalization_ignores_quoted_sql_text(self):
+        source = snapshot()
+        target = json.loads(json.dumps(source))
+        source["public_constraints"][0]["definition"] = (
+            'CHECK ("ARRAY[\'queued\'::character varying]" IS NOT NULL)'
+        )
+        target["public_constraints"][0]["definition"] = (
+            'CHECK ("ARRAY[\'queued\'::text]" IS NOT NULL)'
+        )
+
+        with self.assertRaisesRegex(cutover.CutoverError, "mismatch_public_constraints"):
+            cutover.compare_snapshots(source, target, target_owner="postgres")
+
+        source["public_constraints"][0]["definition"] = (
+            "CHECK ('ARRAY[''queued''::character varying]' IS NOT NULL)"
+        )
+        target["public_constraints"][0]["definition"] = (
+            "CHECK ('ARRAY[''queued''::text]' IS NOT NULL)"
+        )
+        with self.assertRaisesRegex(cutover.CutoverError, "mismatch_public_constraints"):
+            cutover.compare_snapshots(source, target, target_owner="postgres")
+
+    def test_compare_rejects_malformed_definition_inventory(self):
+        source = snapshot()
+        target = json.loads(json.dumps(source))
+        del source["public_constraints"][0]["definition"]
+        target["public_constraints"][0]["definition"] = None
+
+        with self.assertRaisesRegex(
+            cutover.CutoverError, "invalid_source_public_constraints"
+        ):
+            cutover.compare_snapshots(source, target, target_owner="postgres")
+
+        source = snapshot()
+        target = json.loads(json.dumps(source))
+        source["public_indexes"][0]["definition"] = None
+        target["public_indexes"][0]["definition"] = 7
+        with self.assertRaisesRegex(cutover.CutoverError, "invalid_source_public_indexes"):
+            cutover.compare_snapshots(source, target, target_owner="postgres")
+
     def test_compare_normalizes_database_and_cutover_owner(self):
         source = snapshot()
         target = json.loads(json.dumps(source))
         source["database"] = "postgres"
         target["database"] = "blueprint"
-        target["public_views"][0]["owner"] = "blueprint"
-        target["public_routines"][0]["owner"] = "blueprint"
-        target["public_types"][0]["owner"] = "blueprint"
-        target["extensions"][0]["owner"] = "blueprint"
+        for field in (
+            "public_indexes",
+            "public_views",
+            "public_routines",
+            "public_types",
+            "extensions",
+        ):
+            target[field][0]["owner"] = "blueprint"
         cutover.compare_snapshots(
             source,
             target,
@@ -461,12 +653,18 @@ class CutoverTests(unittest.TestCase):
         source["public_views"][0]["definition"] = "SELECT 'postgres'"
         target["public_views"][0]["definition"] = "SELECT 'blueprint'"
         with self.assertRaisesRegex(cutover.CutoverError, "mismatch_public_views"):
-            cutover.compare_snapshots(source, target)
+            cutover.compare_snapshots(source, target, target_owner="postgres")
 
     def test_compare_normalizes_only_acl_principal_and_grantor(self):
         source = snapshot()
         target = json.loads(json.dumps(source))
-        for field in ("public_views", "public_routines", "public_types", "extensions"):
+        for field in (
+            "public_indexes",
+            "public_views",
+            "public_routines",
+            "public_types",
+            "extensions",
+        ):
             for item in target[field]:
                 item["owner"] = "blueprint"
         source["public_views"][0]["acl"] = ["postgres=r/postgres"]

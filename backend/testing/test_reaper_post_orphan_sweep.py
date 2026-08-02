@@ -104,7 +104,7 @@ async def _make_task(
 
 
 def _noop_asl():
-    """A no-op AsyncSessionLocal context manager for dep-unblock / safeguard loops."""
+    """A no-op AsyncSessionLocal context manager for dependency-unblock loops."""
 
     class _NullCtx:
         async def __aenter__(self):
@@ -149,7 +149,7 @@ async def _run_sweep(
 ):
     """Run run_post_orphan_sweep with shared defaults for sweep tests.
 
-    Patches AsyncSessionLocal (dep-unblock / safeguard gate) to a no-op so tests
+    Patches AsyncSessionLocal dependency-unblock access to a no-op so tests
     don't need JSONB-compatible dep queries against SQLite.
     """
     mocker.patch(
@@ -590,7 +590,7 @@ async def test_expired_attribute_after_rollback_raises_under_fidelity_mode(
     landed = AsyncMock()
     # Must NOT raise even under fidelity mode: the production code re-batches
     # and re-assigns task before landed_cb, then re-fetches post_reap_tasks
-    # after the rollup loop so the safeguard and dead-PR loops get fresh objects.
+    # after the rollup loop so the dead-PR loop gets fresh objects.
     await run_post_orphan_sweep(
         sweep_db,
         orphaned_tasks=[child1, child2],

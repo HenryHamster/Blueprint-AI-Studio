@@ -40,8 +40,7 @@ This change should make the following operator experience ordinary:
 
 These decisions are not open during implementation:
 
-- `spawn_fix` is not a permanent product concept. It becomes a compatibility
-  alias for unified `spawn_task` and is then retired.
+- `spawn_fix` is retired and removed. `spawn_task` is the only dispatch contract.
 - Spawn limits are abuse circuit breakers, not ordinary work quotas.
 - Accepted spawn intent is durable before admission is evaluated.
 - Exceptional spawn bursts are deferred and auto-drained FIFO; normal work is
@@ -113,10 +112,10 @@ global autonomy/concurrency/cost protection rather than replacing it.
 
 ### `docs/plans/strategic-resident-redesign.md`
 
-The resident control plane, message batching, cooperative autonomous-turn
-preemption, durable replies, and existing unattended cap remain foundational.
-This PR changes the cap default and adds compact durable activity, not another
-resident architecture.
+That document is historical and explicitly retired. This work retains the
+supported Chat/Workday `/strategic-session` path, including its durable replies,
+cooperative turn preemption, and bounded unattended cadence. It does not revive
+the retired shadow-turn or parallel Resident control-plane architecture.
 
 ## 5. Target architecture
 
@@ -213,9 +212,8 @@ Direction association is optional and independent of code-versus-research
 classification. When a direction is supplied, existing criterion/evidence
 wiring remains intact.
 
-`spawn_fix` routes internally through the same normalizer, request record,
-admission logic, and task builder. It returns the unified response with a
-deprecation marker and is no longer advertised.
+There is no second dispatch lane or compatibility execution path for
+`spawn_fix`.
 
 ### 5.4 Usage attempt state
 
@@ -624,7 +622,7 @@ Owns:
 - idempotency;
 - abuse deferral and FIFO draining;
 - default watch creation for dispatched Strategic tasks;
-- `spawn_fix` compatibility alias;
+- no second compatibility dispatch lane;
 - compact request visibility/cancellation.
 
 Primary files:
@@ -874,7 +872,7 @@ Primary suites:
 - idempotent spawn replay does not create a second watch;
 - `watch=false` suppresses the default watch;
 - permanent validation failures are not retryable;
-- legacy `spawn_fix` routes through the unified service and warns;
+- `spawn_fix` is absent from the operation registry and never creates work;
 - only explicit transient failures are retried with the same key.
 
 Primary suites:
@@ -1083,7 +1081,6 @@ All new readers tolerate absent fields. Rollout order:
 
 Compatibility retained for one release:
 
-- `spawn_fix` alias;
 - raw positional Strategic JSON;
 - nested `update_direction` wrapper;
 - `set_problem_model` alias;
@@ -1091,8 +1088,9 @@ Compatibility retained for one release:
 - exact legacy generated-command decoder;
 - existing provenance tags `strategic_direct` and `strategic_direct_fix`.
 
-Do not delete aliases in this PR unless repository deployment guarantees all
-running agents are on the new image before the backend changes serve traffic.
+Do not delete the remaining aliases in this PR unless repository deployment
+guarantees all running agents are on the new image before the backend changes
+serve traffic. `spawn_fix` is already retired and removed.
 
 ## 12. Observability
 

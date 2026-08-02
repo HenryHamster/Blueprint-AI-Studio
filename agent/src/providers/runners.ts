@@ -77,6 +77,7 @@ function _commandExists(command: string): boolean {
 
 const CLAUDE_PARTIAL_MESSAGES_FLAG = '--include-partial-messages';
 const CLAUDE_RESIDENT_REQUIRED_FLAGS = new Set([
+  '--input-format',
   '--append-system-prompt',
   '--mcp-config',
   '--strict-mcp-config',

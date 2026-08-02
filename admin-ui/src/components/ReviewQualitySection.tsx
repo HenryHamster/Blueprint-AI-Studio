@@ -20,10 +20,6 @@ export type SrTrendWithFixIterations = SrTrendData & {
   previous_overall_hit_rate?: number | null;
   overall_trend_verdict?: 'improving' | 'declining' | 'stable' | null;
   overall_trend_significant?: boolean | null;
-  overall_sr_alone_hit_rate?: number | null;
-  previous_overall_sr_alone_hit_rate?: number | null;
-  overall_sr_alone_trend_verdict?: 'improving' | 'declining' | 'stable' | null;
-  overall_sr_alone_trend_significant?: boolean | null;
 };
 
 // ---------- FixIterationBreakdown ----------
@@ -124,14 +120,6 @@ interface ReviewQualityDigest {
     violation_count: number;
     sample_size: number;
     by_task_type: Record<string, { rate: number; violation_count: number; sample_size: number }>;
-  } | null;
-  fresh_reviewer_effectiveness?: {
-    fresh_reviewer_sample_size: number;
-    fresh_reviewer_first_attempt_approval_rate: number | null;
-    baseline_first_attempt_approval_rate: number | null;
-    per_category_hit_rate: Record<string, number>;
-    reviewer_finding_added_value: Record<string, number>;
-    prediction_sample_size: number;
   } | null;
   sr_false_attestation_trends?: {
     computed_at?: string | null;
@@ -241,7 +229,6 @@ export function ReviewQualitySection({
       digest?.self_review_prediction_accuracy_trends == null &&
       digest?.self_review_skip_rate == null &&
       digest?.sr_disallowed_blind_spot_rate == null &&
-      digest?.fresh_reviewer_effectiveness == null &&
       digest?.sr_false_attestation_trends == null
     )
   ) {
@@ -443,46 +430,6 @@ export function ReviewQualitySection({
             </div>
           );
         })()}
-        {digest?.self_review_prediction_accuracy_trends?.reviewer_hallucination_rate != null && (() => {
-          const hall = digest?.self_review_prediction_accuracy_trends?.reviewer_hallucination_rate;
-          if (!hall) return null;
-          const curr = hall.current_rate;
-          const prev = hall.previous_rate;
-          const sample = hall.current_sample ?? 0;
-          const hasSample = sample >= 5;
-          const color = !hasSample ? 'text-neutral-500' : curr == null ? 'text-neutral-500' : curr <= 0.05 ? 'text-emerald-400' : curr <= 0.15 ? 'text-amber-400' : 'text-red-400';
-          const tooltip = [
-            'Reviewer hallucination rate: share of fresh-reviewer findings that reference non-existent files/lines',
-            hasSample ? `Current: ${Math.round((curr ?? 0) * 100)}% (n=${sample})` : `Insufficient sample (n=${sample})`,
-            prev != null ? `Previous: ${Math.round(prev * 100)}%` : null,
-            hall.delta != null ? `Δ vs previous cycle: ${hall.delta >= 0 ? '+' : ''}${Math.round(hall.delta * 100)}pp` : null,
-          ].filter(Boolean).join('\n');
-          return (
-            <div
-              className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[140px]"
-              title={tooltip}
-              data-testid="reviewer-hallucination-rate-tile"
-            >
-              <p className="text-ui-xs text-neutral-500 uppercase tracking-wide mb-0.5">Reviewer Hallucination</p>
-              {hasSample && curr != null ? (
-                <>
-                  <p className={`text-xl font-bold font-mono ${color}`}>
-                    {Math.round(curr * 100)}%
-                  </p>
-                  {prev != null && hall.delta != null && (
-                    <p className={`text-ui-xs mt-0.5 ${hall.delta > 0.005 ? 'text-red-400' : hall.delta < -0.005 ? 'text-emerald-400' : 'text-neutral-600'}`}>
-                      {hall.delta >= 0 ? '+' : ''}
-                      {Math.round(hall.delta * 100)}pp
-                    </p>
-                  )}
-                  <p className="text-ui-xs text-neutral-600 mt-0.5">n={sample}</p>
-                </>
-              ) : (
-                <p className="text-ui-xs text-neutral-500 mt-2">insufficient sample</p>
-              )}
-            </div>
-          );
-        })()}
         {digest?.sr_disallowed_blind_spot_rate != null && (() => {
           const dbs = digest?.sr_disallowed_blind_spot_rate;
           if (!dbs) return null;
@@ -568,31 +515,6 @@ export function ReviewQualitySection({
         />
         <FixIterationBreakdown trends={digest?.self_review_prediction_accuracy_trends} />
         <EdgesTrendBreakdown trend={digest?.edges_trend} />
-        {digest?.fresh_reviewer_effectiveness != null && (() => {
-          const fre = digest.fresh_reviewer_effectiveness;
-          const n = fre.fresh_reviewer_sample_size;
-          const freRate = fre.fresh_reviewer_first_attempt_approval_rate;
-          const baseRate = fre.baseline_first_attempt_approval_rate;
-          const lift = freRate != null && baseRate != null ? freRate - baseRate : null;
-          const freColor = freRate != null ? (freRate >= 0.8 ? 'text-emerald-400' : freRate >= 0.5 ? 'text-amber-400' : 'text-red-400') : 'text-neutral-300';
-          const liftColor = lift == null ? 'text-neutral-400' : lift >= 0.05 ? 'text-emerald-400' : lift >= 0 ? 'text-amber-400' : 'text-red-400';
-          return (
-            <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[130px]">
-              <p className="text-ui-xs text-neutral-500 uppercase tracking-wide mb-0.5">FR Approval Lift</p>
-              {n < 5 ? (
-                <p className="text-xs text-neutral-500">n={n} — too small</p>
-              ) : (
-                <>
-                  <p className={`text-xl font-bold font-mono ${freColor}`}>{freRate != null ? `${Math.round(freRate * 100)}%` : '--'}</p>
-                  {lift != null && (
-                    <p className={`text-ui-xs mt-0.5 ${liftColor}`}>{lift >= 0 ? '+' : ''}{Math.round(lift * 100)}pp vs baseline</p>
-                  )}
-                  <p className="text-ui-xs text-neutral-600 mt-0.5">n={n}</p>
-                </>
-              )}
-            </div>
-          );
-        })()}
       </div>
       {selectedProjectId && (() => {
         const cats = Object.entries(

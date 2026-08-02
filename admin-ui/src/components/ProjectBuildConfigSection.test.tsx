@@ -28,7 +28,6 @@ const buildConfig: BuildConfig = {
   ],
   git_user_email: 'blueprint-agent@automated.dev',
   git_user_name: 'Blueprint Agent',
-  enable_fresh_reviewer: false,
 };
 
 describe('ProjectBuildConfigSection — staging prefix error handling', () => {

@@ -64,7 +64,6 @@ from app.task_capabilities import (
 from app.database import AsyncSessionLocal
 from app.discovery_admission import (
     authorize_discovery_task_execution,
-    discovery_admission_mode_from_runtime,
 )
 from app.models import (
     DeploymentState,
@@ -3411,9 +3410,6 @@ async def orchestrator_worker():
                             await authorize_discovery_task_execution(
                                 session,
                                 task=task,
-                                mode=discovery_admission_mode_from_runtime(
-                                    _runtime_config
-                                ),
                             )
                         )
                         if not _discovery_authority.allowed:
@@ -3447,13 +3443,6 @@ async def orchestrator_worker():
                                     _discovery_authority.reason,
                                 )
                             continue
-                        if _discovery_authority.shadow_violation:
-                            logger.warning(
-                                "[ORCHESTRATOR][discovery-admission-shadow] "
-                                "Task %s would be denied: %s",
-                                task.id,
-                                _discovery_authority.reason,
-                            )
                         # vm_instance_id read via __dict__ after the strategic
                         # path call. _hold_strategic_local_runner_task's
                         # no-change branch calls session.rollback(), which
@@ -4485,9 +4474,6 @@ async def orchestrator_worker():
                             await authorize_discovery_task_execution(
                                 session,
                                 task=task,
-                                mode=discovery_admission_mode_from_runtime(
-                                    _runtime_config
-                                ),
                             )
                         )
                         if not _discovery_claim.allowed:

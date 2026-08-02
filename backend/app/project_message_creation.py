@@ -75,7 +75,6 @@ CONVERSATION_EVENT_TYPES = frozenset(
         "direction_outcome_stalled",
         "direction_staged_activated",
         "promotion_readiness_reached",
-        "release_auto_merge_stalled",
         "strategic_steering_deferred",
         "strategic_steering_acted",
         "capability_trial_stalled",

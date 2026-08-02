@@ -105,7 +105,7 @@ def resolve_qualification_trigger(
     automain_ci_state: str | None,
     blocker: str | None,
     in_flight: bool,
-    promotion_in_flight: bool,
+    promotion_check_wait: bool,
     consecutive_infra_errors: int = 0,
 ) -> TriggerDecision:
     """Return a fire/hold decision for the open version.
@@ -151,8 +151,8 @@ def resolve_qualification_trigger(
         The blocker code from the last_qualification record, or None.
     in_flight:
         True when a qualification is currently pending/in_progress.
-    promotion_in_flight:
-        True when a promotion PR is open and auto-merging.
+    promotion_check_wait:
+        True when Blueprint owns a managed promotion check/merge wait.
     consecutive_infra_errors:
         The per-candidate infra-failure streak from
         ``last_qualification["consecutive_infra_errors"]`` (reset when the
@@ -177,11 +177,11 @@ def resolve_qualification_trigger(
             reason="in_flight",
             blocking=["a qualification is already pending or in progress"],
         )
-    if promotion_in_flight:
+    if promotion_check_wait:
         return TriggerDecision(
             fire=False,
             trigger="none",
-            reason="promotion_in_flight",
+            reason="promotion_check_wait",
             blocking=["a promotion PR is in flight — qualification locked"],
         )
 
@@ -442,7 +442,7 @@ def explain_qualification_trigger(
     automain_ci_state: str | None,
     blocker: str | None,
     in_flight: bool,
-    promotion_in_flight: bool,
+    promotion_check_wait: bool,
     last_attempt: dict[str, Any] | None,
     knob: str,
     evaluated_at: str,
@@ -490,7 +490,7 @@ def explain_qualification_trigger(
         automain_ci_state=automain_ci_state,
         blocker=blocker,
         in_flight=in_flight,
-        promotion_in_flight=promotion_in_flight,
+        promotion_check_wait=promotion_check_wait,
         consecutive_infra_errors=consecutive_infra_errors,
     )
 
@@ -514,7 +514,7 @@ def explain_qualification_trigger(
     reason_to_next: dict[str, str] = {
         "wrong_phase": "operator_or_strategist_only",
         "in_flight": "in_flight",
-        "promotion_in_flight": "operator_or_strategist_only",
+        "promotion_check_wait": "operator_or_strategist_only",
         # A not-met grade is frozen against its candidate sha — the realistic
         # unblock is new work landing (which re-grades), not the stale verdict
         # spontaneously flipping.

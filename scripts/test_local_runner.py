@@ -88,6 +88,7 @@ def _healthy_llm_clis():
         "claude": {
             "present": True, "executable_found": True, "healthy": True,
             "version": "claude 1.0.0", "reason": None,
+            "resident_ready": True, "missing_resident_flags": [],
         },
         "codex": {
             "present": True, "executable_found": True, "healthy": True,
@@ -248,6 +249,23 @@ class TestLlmCliBackendProbe(unittest.TestCase):
         self.assertIsNone(body["cli_inventory"]["codex"])
         self.assertTrue(body["llm_clis"]["claude"]["healthy"])
         self.assertIsNotNone(body["cli_inventory"]["claude"])
+
+    def test_hybrid_requires_resident_capability_proof_from_every_backend(self):
+        legacy_image_health = _healthy_llm_clis()
+        legacy_image_health["claude"].pop("resident_ready")
+        legacy_image_health["claude"].pop("missing_resident_flags")
+
+        body = self._hybrid_heartbeat(
+            host_health=_healthy_llm_clis(),
+            image_health=legacy_image_health,
+        )
+
+        self.assertTrue(body["llm_clis"]["claude"]["healthy"])
+        self.assertFalse(body["llm_clis"]["claude"]["resident_ready"])
+        self.assertEqual(
+            body["llm_clis"]["claude"]["capability_probe_reason"],
+            "missing_or_unverified_on_selectable_backend",
+        )
 
     def test_same_tag_new_image_id_invalidates_cached_probe(self):
         identities = iter(("sha256:old", "sha256:new"))
@@ -413,11 +431,78 @@ class TestManagedCliMaintenance(unittest.TestCase):
         with patch.object(local_runner.shutil, "which", return_value="/tools/npm"), \
              patch.object(iso, "probe_llm_clis", return_value=inventory), \
              patch.object(local_runner, "_npm_latest_version", return_value="1.0.0"), \
+             patch.object(local_runner, "_cli_meets_capability_policy", return_value=True), \
              patch.object(local_runner, "_install_managed_cli", return_value=True) as install:
             local_runner._maintain_host_llm_clis_once(now=1000)
 
         install.assert_called_once_with(
             "codex", "/tools/npm", "@openai/codex", "0.144.1"
+        )
+
+    def test_current_claude_without_resident_flags_is_repaired(self):
+        inventory = _healthy_llm_clis()
+        inventory["claude"]["version"] = "2.1.220"
+
+        def which(name, path=None):
+            if name == "npm":
+                return "/tools/npm"
+            if name == "claude":
+                return "/operator/bin/claude"
+            return None
+
+        missing_flags_help = subprocess.CompletedProcess(
+            ["claude", "--help"],
+            0,
+            stdout="--mcp-config --strict-mcp-config --allowedTools",
+            stderr="",
+        )
+        with patch.object(local_runner.shutil, "which", side_effect=which), \
+             patch.object(iso, "probe_llm_clis", return_value=inventory), \
+             patch.object(local_runner, "_npm_latest_version", return_value="2.1.220"), \
+             patch.object(local_runner.subprocess, "run", return_value=missing_flags_help), \
+             patch.object(local_runner, "_install_managed_cli", return_value=True) as install:
+            local_runner._maintain_host_llm_clis_once(now=1500)
+
+        install.assert_called_once_with(
+            "claude", "/tools/npm", "@anthropic-ai/claude-code", "2.1.220"
+        )
+
+    def test_claude_stage_without_resident_flags_is_not_activated(self):
+        def which(name, path=None):
+            if path:
+                candidate = os.path.join(path, name)
+                return candidate if os.path.isfile(candidate) else None
+            return "/tools/npm" if name == "npm" else None
+
+        def staged_without_required_flags(args, **kwargs):
+            if "install" in args:
+                staging = args[args.index("--prefix") + 1]
+                bin_dir = os.path.join(staging, "node_modules", ".bin")
+                os.makedirs(bin_dir, exist_ok=True)
+                Path(os.path.join(bin_dir, "claude")).write_text("shim")
+                return subprocess.CompletedProcess(args, 0, stdout="installed", stderr="")
+            if "--version" in args:
+                return subprocess.CompletedProcess(args, 0, stdout="2.1.220", stderr="")
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                stdout="--mcp-config --strict-mcp-config --allowedTools",
+                stderr="",
+            )
+
+        with patch.object(local_runner.shutil, "which", side_effect=which), \
+             patch.object(local_runner.subprocess, "run", side_effect=staged_without_required_flags):
+            self.assertFalse(
+                local_runner._install_managed_cli(
+                    "claude", "/tools/npm", "@anthropic-ai/claude-code", "latest"
+                )
+            )
+
+        self.assertEqual(
+            local_runner._read_json(
+                os.path.join(self.tmp.name, "claude", "active.json")
+            ),
+            {},
         )
 
     def test_install_failure_is_backed_off_and_does_not_log_subprocess_output(self):
@@ -443,6 +528,41 @@ class TestManagedCliMaintenance(unittest.TestCase):
         self.assertEqual(state["next_retry_at"], 2060)
         self.assertNotIn(secret, stdout.getvalue())
         self.assertIn("keeping the previous CLI", stdout.getvalue())
+
+    def test_changed_capability_policy_bypasses_stale_backoff_once(self):
+        local_runner._atomic_json(
+            local_runner._cli_backoff_path("claude"),
+            {
+                "failures": 3,
+                "next_retry_at": 9_999,
+                "policy_fingerprint": "old-policy",
+            },
+        )
+        current = local_runner._cli_policy_fingerprint(
+            "claude", "@anthropic-ai/claude-code", "latest"
+        )
+
+        self.assertFalse(
+            local_runner._cli_in_backoff(
+                "claude", 2_000, policy_fingerprint=current
+            )
+        )
+        local_runner._record_cli_install_result(
+            "claude",
+            succeeded=False,
+            now=2_000,
+            policy_fingerprint=current,
+        )
+        state = local_runner._read_json(
+            local_runner._cli_backoff_path("claude")
+        )
+        self.assertEqual(state["failures"], 1)
+        self.assertEqual(state["next_retry_at"], 2_060)
+        self.assertTrue(
+            local_runner._cli_in_backoff(
+                "claude", 2_001, policy_fingerprint=current
+            )
+        )
 
     def test_install_view_and_verification_receive_secret_free_environment(self):
         secrets = {

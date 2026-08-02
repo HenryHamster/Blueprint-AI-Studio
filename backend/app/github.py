@@ -1346,7 +1346,6 @@ from app.github_pulls import (  # noqa: F401
     get_pull_request_commits,
     merge_pull_request,
     get_pull_request_merge_state,
-    enable_auto_merge,
     update_branch,
     update_branch_with_sha_retry,
     close_pull_request,

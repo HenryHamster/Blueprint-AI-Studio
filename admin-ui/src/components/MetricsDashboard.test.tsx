@@ -18,7 +18,7 @@ const { apiFetch } = vi.hoisted(() => ({
         window_start: '2026-04-17T12:00:00Z',
         project_id: 'project-1',
         max_tasks: 5000,
-        relay_counts_by_lane: { LANE_CI: 3, LANE_CONFLICT: 1, LANE_REVIEW_CONVERGENCE: 2, LANE_ARBITRATION: 0 },
+        relay_counts_by_lane: { LANE_CI: 3, LANE_CONFLICT: 1, LANE_REVIEW_CONVERGENCE: 2 },
         lane_iteration_distribution: {},
         per_pr_phase_breakdown: [],
         lane_waste: {

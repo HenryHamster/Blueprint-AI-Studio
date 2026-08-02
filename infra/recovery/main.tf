@@ -41,12 +41,17 @@ resource "terraform_data" "recovery_configuration" {
       condition     = var.retention_period_seconds >= 7776000 && var.archive_expiry_days >= 90
       error_message = "Recovery archives require at least 90 days of retention and expiry."
     }
+    precondition {
+      condition     = can(regex("^[0-9A-F]{6}-[0-9A-F]{6}-[0-9A-F]{6}$", var.recovery_billing_account_id))
+      error_message = "recovery_billing_account_id is required so the isolated recovery project has its own cost alert."
+    }
   }
 }
 
 resource "google_project_service" "required" {
   for_each = local.recovery_enabled ? toset([
     "cloudresourcemanager.googleapis.com",
+    "billingbudgets.googleapis.com",
     "iam.googleapis.com",
     "cloudkms.googleapis.com",
     "cloudscheduler.googleapis.com",
@@ -60,18 +65,108 @@ resource "google_project_service" "required" {
   disable_on_destroy = false
 }
 
+# The restore verifier has heavier networking/build prerequisites than the
+# archive writer. Keep them behind a separate switch so operators can create
+# and validate the recovery network and image repository before enabling a
+# job that is allowed to create temporary Cloud SQL instances.
+resource "google_project_service" "restore_verifier_prerequisite" {
+  for_each = local.recovery_enabled && var.enable_restore_verifier_prerequisites ? toset([
+    "artifactregistry.googleapis.com",
+    "compute.googleapis.com",
+    "dns.googleapis.com",
+    "servicenetworking.googleapis.com",
+  ]) : toset([])
+
+  project            = var.recovery_project_id
+  service            = each.value
+  disable_on_destroy = false
+}
+
 resource "terraform_data" "restore_verifier_configuration" {
   count = local.recovery_enabled && var.enable_restore_verifier ? 1 : 0
 
   lifecycle {
     precondition {
       condition = (
+        var.enable_restore_verifier_prerequisites &&
+        var.enable_restore_janitor &&
         var.restore_verifier_image != "" &&
+        startswith(
+          var.restore_verifier_image,
+          "${var.recovery_region}-docker.pkg.dev/${var.recovery_project_id}/${var.restore_verifier_artifact_repository}/restore-verifier@sha256:",
+        ) &&
         var.restore_verifier_private_network != "" &&
         var.restore_verifier_private_subnetwork != "" &&
         var.restore_verifier_expected_revision != ""
       )
-      error_message = "restore verifier image, network, subnetwork, and expected revision are required."
+      error_message = "restore verifier prerequisites, janitor, recovery-project image, network, subnetwork, and expected revision are required."
+    }
+    precondition {
+      condition = (
+        (
+          var.restore_verifier_expected_archive_name == "" &&
+          var.restore_verifier_expected_archive_generation == "" &&
+          var.restore_verifier_expected_manifest_generation == "" &&
+          var.restore_verifier_expected_archive_sha256 == "" &&
+          var.restore_verifier_expected_archive_size_bytes == 0
+        ) ||
+        (
+          var.restore_verifier_expected_archive_name != "" &&
+          var.restore_verifier_expected_archive_generation != "" &&
+          var.restore_verifier_expected_manifest_generation != "" &&
+          var.restore_verifier_expected_archive_sha256 != "" &&
+          var.restore_verifier_expected_archive_size_bytes > 0
+        )
+      )
+      error_message = "the exact archive name, both generations, SHA-256, and byte size must be supplied together or all omitted."
+    }
+    precondition {
+      condition = (
+        !var.enable_restore_drill_schedule ||
+        (
+          var.restore_verifier_expected_archive_name == "" &&
+          var.restore_verifier_expected_archive_generation == "" &&
+          var.restore_verifier_expected_manifest_generation == "" &&
+          var.restore_verifier_expected_archive_sha256 == "" &&
+          var.restore_verifier_expected_archive_size_bytes == 0
+        )
+      )
+      error_message = "recurring restore drills must select fresh archives and cannot retain a one-shot exact archive pin."
+    }
+  }
+}
+
+resource "terraform_data" "restore_janitor_configuration" {
+  count = local.recovery_enabled && var.enable_restore_janitor ? 1 : 0
+
+  lifecycle {
+    precondition {
+      condition = (
+        var.enable_restore_verifier_prerequisites &&
+        var.restore_verifier_image != "" &&
+        startswith(
+          var.restore_verifier_image,
+          "${var.recovery_region}-docker.pkg.dev/${var.recovery_project_id}/${var.restore_verifier_artifact_repository}/restore-verifier@sha256:",
+        ) &&
+        var.restore_verifier_private_network != "" &&
+        var.restore_verifier_private_subnetwork != "" &&
+        var.restore_verifier_expected_revision != ""
+      )
+      error_message = "restore janitor requires managed prerequisites, the recovery-project verifier image, network, subnetwork, and expected revision."
+    }
+  }
+}
+
+resource "terraform_data" "restore_verifier_prerequisite_configuration" {
+  count = local.recovery_enabled && var.enable_restore_verifier_prerequisites ? 1 : 0
+
+  lifecycle {
+    precondition {
+      condition = (
+        var.restore_verifier_private_network != "" &&
+        var.restore_verifier_private_subnetwork != ""
+      )
+      error_message = "restore verifier network and subnetwork names are required when prerequisites are enabled."
     }
   }
 }
@@ -83,6 +178,24 @@ resource "google_project_service_identity" "cloud_sql" {
   service  = "sqladmin.googleapis.com"
 
   depends_on = [google_project_service.required]
+}
+
+resource "google_project_service_identity" "cloud_run" {
+  provider = google-beta
+  count    = local.restore_verifier_prerequisites_enabled ? 1 : 0
+  project  = var.recovery_project_id
+  service  = "run.googleapis.com"
+
+  depends_on = [google_project_service.required]
+}
+
+resource "google_project_service_identity" "service_networking" {
+  provider = google-beta
+  count    = local.restore_verifier_prerequisites_enabled ? 1 : 0
+  project  = var.recovery_project_id
+  service  = "servicenetworking.googleapis.com"
+
+  depends_on = [google_project_service.restore_verifier_prerequisite]
 }
 
 # Google can return newly created managed service-agent addresses before those

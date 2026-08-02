@@ -21,6 +21,7 @@ from typing import Any, Optional
 import urllib.parse
 
 import httpx
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.url_security import _resolve_safe_external_url
@@ -91,7 +92,6 @@ HIGH_SIGNAL_NOTE_EVENT_TYPES: frozenset[str] = frozenset(
         "release_build_stalled",  # post_version_build_stalled_message
         "release_stabilize_stalled",  # post_version_stabilize_stalled_message
         "release_ci_unresolved_stall",  # post_version_ci_unresolved_stall_message
-        "release_auto_merge_stalled",  # post_version_auto_merge_stall_message
         "strategic_steering_deferred",  # post_strategic_steering_deferred_message
         "strategic_steering_acted",  # post_strategic_steering_acted_message
         "capability_trial_ambiguous_lift_escalation",  # raise_ambiguous_lift_escalation_notice
@@ -726,6 +726,7 @@ async def post_event_message(
     summary: str,
     context: Optional[dict[str, Any]] = None,
     task_id: Optional[uuid.UUID] = None,
+    idempotency_key: str | None = None,
 ) -> Optional[ProjectMessage]:
     """Core helper — creates a system ProjectMessage with the given event_type in context.
 
@@ -752,6 +753,18 @@ async def post_event_message(
             event_type,
         )
         return None
+    normalized_idempotency_key = (idempotency_key or "").strip()[:200] or None
+    if normalized_idempotency_key is not None:
+        existing = await session.scalar(
+            select(ProjectMessage)
+            .where(
+                ProjectMessage.project_id == project_id,
+                ProjectMessage.idempotency_key == normalized_idempotency_key,
+            )
+            .limit(1)
+        )
+        if existing is not None:
+            return existing
     # Stamp the resolved audience via the shared helper so the message carries
     # a fail-closed audience classification consistent with every other
     # operator-reaching emitter. ``stamp_message_audience`` sets event_type
@@ -767,6 +780,7 @@ async def post_event_message(
         from_task_id=task_id,
         content=summary,
         context=ctx,
+        idempotency_key=normalized_idempotency_key,
     )
     session.add(msg)
     return msg
@@ -2931,65 +2945,6 @@ async def post_version_stabilize_stalled_message(
                 "version_id": version_id,
                 "age_days": age_days,
                 "tasks_merged": tasks_merged,
-                "summary": summary,
-            },
-        )
-    )
-    return msg
-
-
-async def post_version_auto_merge_stall_message(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    *,
-    version_number: int,
-    version_id: str,
-    pr_number: int | None,
-    pr_url: str,
-    auto_merge_enabled: bool,
-    age_hours: int,
-) -> ProjectMessage:
-    """Post a stall alert when a promotion PR awaiting auto-merge has not landed.
-
-    Called when a version passed qualification and enabled auto-merge on its
-    promotion PR, but the PR has not merged within the expected window.  This
-    catches: auto-merge not confirmed enabled, a required check going red, or a
-    required check that never reports (GitHub's "N of N checks expected" state).
-
-    Does NOT commit — the caller owns the transaction.
-    """
-    pr_label = f"#{pr_number}" if pr_number else "(unknown)"
-    am_state = "enabled" if auto_merge_enabled else "NOT confirmed enabled"
-    summary = (
-        f"v{version_number} promotion PR {pr_label} has been awaiting auto-merge "
-        f"for {age_hours}h (auto-merge {am_state}). "
-        f"Check the PR for failed or missing required checks: {pr_url}"
-    )
-    msg = await post_event_message(
-        session,
-        project_id,
-        event_type="release_auto_merge_stalled",
-        summary=summary,
-        context={
-            "version_number": version_number,
-            "version_id": version_id,
-            "pr_number": pr_number,
-            "pr_url": pr_url,
-            "auto_merge_enabled": auto_merge_enabled,
-            "age_hours": age_hours,
-        },
-    )
-    asyncio.ensure_future(
-        dispatch_external_notification(
-            project_id,
-            "RELEASE_VERSION_AUTO_MERGE_STALLED",
-            {
-                "version_number": version_number,
-                "version_id": version_id,
-                "pr_number": pr_number,
-                "pr_url": pr_url,
-                "auto_merge_enabled": auto_merge_enabled,
-                "age_hours": age_hours,
                 "summary": summary,
             },
         )

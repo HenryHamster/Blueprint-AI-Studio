@@ -136,7 +136,7 @@ import * as indexMod from '../index.js';
 import * as testLoopMod from '../utils/test-fix-loop.js';
 import { expectCalledWith, expectLastCalledWith } from '../utils/typed-mock-call.js';
 import {
-  handleReview, handleFix, REVIEW_FEEDBACK_HISTORY_CHARS,
+  handleReview, handleFix,
   detectMediumScopeSubsystemHint, pushForceWithLeaseRetrying,
   buildBlueprintPrFooter, formatLaneResumeSection,
 } from './review-fix.js';
@@ -209,63 +209,38 @@ beforeEach(() => {
   });
 });
 
-// ── Review history text truncation: reviewer and fixer must align ───────────
-describe('review history feedback truncation — reviewer sees at least as much as fixer', () => {
-  const longFeedback = 'x'.repeat(3000);
+// ── Authoritative blocker prompt ────────────────────────────────────────────
+describe('authoritative blocker prompt', () => {
   const histWithStructured = [{
     iteration: 1,
-    feedback: longFeedback,
+    feedback: 'historical detail that must not be duplicated into the prompt',
     issues: [{ severity: 'major', description: 'real problem', file: 'a.ts', line: 10 }],
   }];
-  const histNoStructured = [{ iteration: 1, feedback: longFeedback }];
 
-  it('reviewer truncates fallback feedback at the shared constant (no structured issues)', async () => {
+  it('reviewer receives role-appropriate authoritative-ledger instructions', async () => {
     await handleReview(
-      'task-trunc-review',
-      { pr_number: 5, branch: 'feat/y', base_branch: 'main', original_prompt: '' },
-      { context: { scope: 'medium', review_loop: { iteration: 2, review_history: histNoStructured } } },
+      'task-authoritative-review',
+      { pr_number: 61, branch: 'feat/z', base_branch: 'main', original_prompt: '' },
+      {
+        context: {
+          scope: 'medium',
+          review_loop: {
+            iteration: 2,
+            review_history: histWithStructured,
+            issue_ledger: {
+              open: [{ issue_id: 'BP-review', severity: 'major', description: 'verify the null guard' }],
+            },
+          },
+        },
+      },
       'gh-token', 'owner', 'repo', null, statusRef(),
     );
     const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
-    const iterMatch = prompt.match(/- Iteration 1: (x+)/);
-    expect(iterMatch?.[1]?.length).toBe(REVIEW_FEEDBACK_HISTORY_CHARS);
-  });
-
-  it('fixer truncates fallback feedback at the same constant (no structured issues)', async () => {
-    await handleFix(
-      'task-trunc-fix',
-      { branch: 'feat/y', base_branch: 'main', pr_number: 5, prompt: 'address review' },
-      { context: { scope: 'small', review_loop: { iteration: 2, review_history: histNoStructured } } },
-      'gh-token', 'owner', 'repo', null, statusRef(),
-    );
-    const prompt = capturedFixPrompt();
-    const iterMatch = prompt.match(/- Iteration 1: (x+)/);
-    expect(iterMatch?.[1]?.length).toBe(REVIEW_FEEDBACK_HISTORY_CHARS);
-  });
-
-  it('reviewer prefers structured issues over raw feedback (no truncation applied)', async () => {
-    await handleReview(
-      'task-structured-review',
-      { pr_number: 6, branch: 'feat/z', base_branch: 'main', original_prompt: '' },
-      { context: { scope: 'medium', review_loop: { iteration: 2, review_history: histWithStructured } } },
-      'gh-token', 'owner', 'repo', null, statusRef(),
-    );
-    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
-    expect(prompt).toContain('[MAJOR] [a.ts:10] real problem');
-    // fallback text must NOT appear when structured issues exist
-    expect(prompt).not.toMatch(/- Iteration 1: x+/);
-  });
-
-  it('fixer prefers structured issues over raw feedback (no truncation applied)', async () => {
-    await handleFix(
-      'task-structured-fix',
-      { branch: 'feat/z', base_branch: 'main', pr_number: 6, prompt: 'address review' },
-      { context: { scope: 'small', review_loop: { iteration: 2, review_history: histWithStructured } } },
-      'gh-token', 'owner', 'repo', null, statusRef(),
-    );
-    const prompt = capturedFixPrompt();
-    expect(prompt).toContain('[MAJOR] [a.ts:10] real problem');
-    expect(prompt).not.toMatch(/- Iteration 1: x+/);
+    expect(prompt).toContain('[MAJOR] [BP-review] verify the null guard');
+    expect(prompt).toContain('Re-raise an unresolved blocker with its exact BP-... id');
+    expect(prompt).not.toContain('fix agents cannot close blockers');
+    expect(prompt).not.toContain('historical detail that must not be duplicated');
+    expect(prompt).not.toContain('[MAJOR] [a.ts:10] real problem');
   });
 });
 
@@ -338,7 +313,7 @@ describe('handleFix — operator steering (strategic_intent)', () => {
     expect(prompt).toContain('## Operator Steering');
     expect(prompt).toContain('**Current focus:** Thread operator steering into tactical prompts.');
     expect(prompt).toContain('**Purpose:** Build an autonomous coding studio.');
-    expect(prompt).toContain('[MAJOR] [a.ts:10] real problem');
+    expect(prompt).toContain('Current review feedback to address:\naddress review');
   });
 
   it('prepends ## Operator Steering alongside the existing review context', async () => {
@@ -358,8 +333,8 @@ describe('handleFix — operator steering (strategic_intent)', () => {
     expect(prompt).toContain('## Operator Steering');
     expect(prompt).toContain('**Current focus:** Thread operator steering into tactical prompts.');
     expect(prompt).toContain('**Purpose:** Build an autonomous coding studio.');
-    // The steering section is additive — existing review context still present.
-    expect(prompt).toContain('[MAJOR] [a.ts:10] real problem');
+    // The steering section is additive — current review feedback remains present.
+    expect(prompt).toContain('Current review feedback to address:\naddress review');
   });
 
   it('omits ## Operator Steering when strategic_intent is absent', async () => {
@@ -371,7 +346,7 @@ describe('handleFix — operator steering (strategic_intent)', () => {
     );
     const prompt = capturedFixPrompt();
     expect(prompt).not.toContain('## Operator Steering');
-    expect(prompt).toContain('[MAJOR] [a.ts:10] real problem');
+    expect(prompt).toContain('Current review feedback to address:\naddress review');
   });
 });
 
@@ -404,8 +379,8 @@ describe('handleFix — repo overview (repo_overview)', () => {
     expect(prompt).toContain('**Directory layout:** backend/ agent/ admin-ui/');
     expect(prompt).toContain('**First steps:** pip install && npm install');
     expect(prompt).toContain('**Bootstrapped:** 2026-01-15T10:00:00Z');
-    // existing review context still present
-    expect(prompt).toContain('[MAJOR] [a.ts:5] fix this');
+    // Current review feedback remains present.
+    expect(prompt).toContain('Current review feedback to address:\naddress review');
   });
 
   it('omits ## Repo Overview from the fix prompt when repo_overview is absent', async () => {
@@ -453,8 +428,8 @@ describe('handleFix — provenance / stale-premise notice', () => {
     expect(prompt).toContain('2 broken/missing citation(s)');
     expect(prompt).toContain('app/foo.py:5');
     expect(prompt).toContain('REPRODUCE-FIRST');
-    // Additive — existing review context still present.
-    expect(prompt).toContain('[MAJOR] [a.ts:10] real problem');
+    // Additive — current review feedback remains present.
+    expect(prompt).toContain('Current review feedback to address:\naddress review');
   });
 
   it('omits the stale-premise notice when _provenance_warnings is absent', async () => {
@@ -506,8 +481,8 @@ describe('handleFix — lane resume section', () => {
     expect(prompt).toContain('- backend/app/foo.py');
     expect(prompt).toContain('Open issues carried into this fix:');
     expect(prompt).toContain('Known risks / deferred items:');
-    // Additive — existing review context still present.
-    expect(prompt).toContain('[MAJOR] [a.ts:10] real problem');
+    // Additive — current review feedback remains present.
+    expect(prompt).toContain('Current review feedback to address:\naddress review');
   });
 
   it('omits the ## Lane Resume section when context.lane_resume is absent', async () => {
@@ -1707,59 +1682,6 @@ describe('handleFix — runCodeChangeTask delegation', () => {
       ),
     ).rejects.toThrow(/Fix task missing prompt/);
     expect(vi.mocked(runCodeChangeTask)).not.toHaveBeenCalled();
-  });
-
-  it('does NOT run fresh-reviewer pass when only is_self_repo is true and enable_fresh_reviewer is unset', async () => {
-    vi.mocked(indexMod.git).mockReturnValue(Array.from({ length: 25 }, (_, i) => `+line ${i}`).join('\n'));
-    vi.mocked(indexMod.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '{"reviewer_findings":[]}' });
-
-    await handleFix(
-      'task-fix-self-repo',
-      basePayload,
-      {
-        context: { scope: 'small' },
-        project_metadata: { is_self_repo: true },
-      },
-      'gh-token', 'owner', 'repo', null, statusRef(),
-    );
-
-    const reviewerCall = vi.mocked(indexMod.runClaudeCode).mock.calls.find(
-      call => typeof call[0] === 'string' && call[0].includes('You are reviewing a PR'),
-    );
-    expect(reviewerCall).toBeUndefined();
-  });
-
-  it('forwards project_context into the fresh-reviewer calibration block when enabled', async () => {
-    vi.mocked(indexMod.git).mockReturnValue(Array.from({ length: 25 }, (_, i) => `+line ${i}`).join('\n'));
-    vi.mocked(indexMod.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '{"reviewer_findings":[]}' });
-
-    await handleFix(
-      'task-fix-reviewer-calibration',
-      basePayload,
-      {
-        context: { scope: 'small' },
-        project_context: {
-          self_review_catch_rate: {
-            categories: {
-              security: {
-                miss_rate: 0.5,
-                weighted_miss_rate: 0.8,
-                examples: [{ severity: 'HIGH', desc: 'missing auth guard' }],
-              },
-            },
-          },
-        },
-        project_metadata: { enable_fresh_reviewer: true },
-      },
-      'gh-token', 'owner', 'repo', null, statusRef(),
-    );
-
-    const reviewerPrompt = vi.mocked(indexMod.runClaudeCode).mock.calls.find(
-      call => typeof call[0] === 'string' && call[0].includes('Calibration from prior self-review misses:'),
-    )?.[0];
-    if (typeof reviewerPrompt !== 'string') throw new Error('expected reviewer prompt');
-    expect(reviewerPrompt).toContain('- security: 50% missed (80% severity-weighted)');
-    expect(reviewerPrompt).toContain('missing auth guard');
   });
 
   it('rebases onto base branch before delegating to runCodeChangeTask', async () => {
@@ -3277,7 +3199,6 @@ describe('handleReview — exact-SHA delta execution', () => {
       verdict: 'REQUEST_CHANGES',
       feedback: 'Needs a narrow fix.',
       issues: [{ severity: 'major', description: 'Bug', file: 'src/a.ts', line: 1 }],
-      requires_rereview: true,
       reviewed_base_sha: 'a'.repeat(40),
       reviewed_head_sha: 'b'.repeat(40),
     }));
@@ -3499,6 +3420,60 @@ describe('handleFix — fix-task SR focus block', () => {
     );
     const prompt = capturedFixPrompt();
     expect(prompt).not.toContain('Repeating-issues verification');
+  });
+
+  it('renders the backend authoritative ledger without inferring closure from history', async () => {
+    const reviewHistory = [
+      {
+        iteration: 1,
+        feedback: 'null dereference',
+        reviewed_head_sha: 'head-1',
+        issues: [{ issue_id: 'BP-null', severity: 'major', description: 'null dereference in handler' }],
+      },
+    ];
+    await handleFix(
+      'task-fix-authoritative-history',
+      { branch: 'feature/x', base_branch: 'main', pr_number: 203, prompt: 'finish the fix' },
+      {
+        context: {
+          scope: 'small',
+          review_loop: {
+            iteration: 2,
+            review_history: reviewHistory,
+            issue_ledger: {
+              open: [
+                { issue_id: 'BP-null', severity: 'major', description: 'null dereference in handler', file: 'src/handler.ts', line: 42 },
+                { issue_id: 'BP-race', severity: 'critical', description: 'race loses the update' },
+              ],
+            },
+          },
+        },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    const prompt = capturedFixPrompt();
+    expect(prompt).toContain('## Authoritative open blockers');
+    expect(prompt).toContain('[MAJOR] [BP-null] [src/handler.ts:42] null dereference in handler');
+    expect(prompt).toContain('[CRITICAL] [BP-race] race loses the update');
+    expect(prompt).toContain('historical context only');
+    expect(prompt).toContain('Address every blocker below');
+    expect(prompt).toContain('fix agents cannot close blockers');
+    expect(prompt).not.toContain('Re-raise an unresolved blocker');
+    expect(prompt).not.toContain('(fixed in iteration');
+    expect(prompt).not.toContain('likely resolved');
+  });
+
+  it('requires exact BP issue ids in structured fix responses', async () => {
+    await handleFix(
+      'task-fix-response-id',
+      { branch: 'feature/x', base_branch: 'main', pr_number: 204, prompt: 'fix issue [BP-deadbeef1234]' },
+      { context: { scope: 'small', review_loop: { iteration: 1 } } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    const prompt = capturedFixPrompt();
+    expect(prompt).toContain('copy the exact BP-... id shown with the reviewer issue');
+    expect(prompt).toContain('Do not hash, recompute, or invent an id');
+    expect(prompt).not.toContain('sha1 of the issue');
   });
 });
 
@@ -3917,20 +3892,20 @@ describe('mid-run ./fetch provisioning for review/fix', () => {
   });
 });
 
-// ── handleFix: surviving_issues from challenge reconciliation ─────────────────
-describe('handleFix — surviving_issues from challenge reconciliation', () => {
+// ── handleFix: authoritative issue source ─────────────────────────────────────
+describe('handleFix — authoritative issue source', () => {
   // Use a medium-scope iteration in convergence mode (iteration * 2 >= maxIterations).
   // For medium scope, maxIterations = 12. With iteration = 7: 7*2=14 >= 12 ✓ and 7 < 12 ✓.
   // Convergence mode uses latestIssues for file-scope guidance and CRITICAL/MAJOR counts —
   // the primary observable place where survivingIssues influences the prompt text.
   const rawHistoryIssue = { severity: 'major', description: 'Old issue from raw history', file: 'src/old.ts', line: 5 };
-  const survivingIssue = { severity: 'critical', description: 'Surviving issue after challenge', file: 'src/new.ts', line: 22 };
-  const rejectedIssue = { severity: 'major', description: 'Rejected issue not in surviving set', file: 'src/rejected.ts', line: 9 };
+  const authoritativeIssue = { issue_id: 'BP-new', severity: 'critical', description: 'Binding open blocker', file: 'src/new.ts', line: 22 };
+  const staleHistoryIssue = { severity: 'major', description: 'Resolved issue retained in history', file: 'src/resolved.ts', line: 9 };
 
   const reviewHistory = [{
     iteration: 1,
     feedback: 'primary review feedback',
-    issues: [rawHistoryIssue, rejectedIssue],
+    issues: [rawHistoryIssue, staleHistoryIssue],
   }];
 
   // Convergence-mode context: iteration 7 of 12 (7*2=14 >= 12).
@@ -3941,49 +3916,34 @@ describe('handleFix — surviving_issues from challenge reconciliation', () => {
     },
   };
 
-  it('handleFix uses surviving_issues from payload instead of raw history issues when present', async () => {
+  it('handleFix uses the authoritative open ledger instead of stale history or payload compatibility fields', async () => {
     await handleFix(
-      'task-surviving-payload',
+      'task-authoritative-ledger',
       {
         branch: 'feat/challenge',
         base_branch: 'main',
         pr_number: 77,
-        prompt: 'Fix the surviving issues after challenge reconciliation',
-        surviving_issues: [survivingIssue],
+        prompt: 'Fix the authoritative blockers',
       },
-      convergenceContext,
-      'gh-token', 'owner', 'repo', null, statusRef(),
-    );
-    const prompt = capturedFixPrompt();
-    // In convergence mode, survivingIssues drives the CRITICAL/MAJOR count guidance.
-    // survivingIssue has severity 'critical' → "Address exactly 1 CRITICAL and 0 MAJOR".
-    expect(prompt).toContain('Address exactly 1 CRITICAL and 0 MAJOR');
-    // The surviving file should be in the allowed-files list.
-    expect(prompt).toContain('src/new.ts');
-    // The rejected file should NOT be in the allowed-files list (it came from raw history).
-    expect(prompt).not.toContain('Files you may modify: src/rejected.ts');
-  });
-
-  it('handleFix uses surviving_issues from taskContext instead of raw history when payload has none', async () => {
-    await handleFix(
-      'task-surviving-context',
-      { branch: 'feat/challenge', base_branch: 'main', pr_number: 78, prompt: 'Fix surviving issues' },
       {
         context: {
           scope: 'medium',
-          review_loop: { iteration: 7, review_history: reviewHistory },
-          surviving_issues: [survivingIssue],
+          review_loop: {
+            iteration: 7,
+            review_history: reviewHistory,
+            issue_ledger: { open: [authoritativeIssue] },
+          },
         },
       },
       'gh-token', 'owner', 'repo', null, statusRef(),
     );
     const prompt = capturedFixPrompt();
-    // taskContext surviving_issues (1 critical) takes precedence over raw history (0 critical, 2 major).
     expect(prompt).toContain('Address exactly 1 CRITICAL and 0 MAJOR');
     expect(prompt).toContain('src/new.ts');
+    expect(prompt).not.toContain('Files you may modify: src/resolved.ts');
   });
 
-  it('handleFix falls back to latest review-history issues when surviving_issues is absent', async () => {
+  it('handleFix falls back to latest review-history issues when no authoritative ledger exists', async () => {
     await handleFix(
       'task-no-surviving',
       { branch: 'feat/challenge', base_branch: 'main', pr_number: 79, prompt: 'Fix review issues' },
@@ -3991,11 +3951,9 @@ describe('handleFix — surviving_issues from challenge reconciliation', () => {
       'gh-token', 'owner', 'repo', null, statusRef(),
     );
     const prompt = capturedFixPrompt();
-    // Falls back to raw history issues: rawHistoryIssue and rejectedIssue, both 'major' → 0 CRITICAL, 2 MAJOR.
     expect(prompt).toContain('Address exactly 0 CRITICAL and 2 MAJOR');
-    // Both history files appear in allowed-files.
     expect(prompt).toContain('src/old.ts');
-    expect(prompt).toContain('src/rejected.ts');
+    expect(prompt).toContain('src/resolved.ts');
   });
 });
 

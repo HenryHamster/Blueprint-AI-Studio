@@ -1083,10 +1083,8 @@ async def test_requeue_propagates_pr_artifacts_to_retry_context(requeue_db, mock
         requeue_db,
         child_payloads=[
             {
-                "type": "fix",
-                "prompt": "fix the bug",
-                "pr_number": 42,
-                "branch": "fix/bug",
+                "type": "create",
+                "prompt": "implement the change",
             }
         ],
         child_context={

@@ -1,8 +1,8 @@
 import type { Task } from '../types/task';
 
 /**
- * Side-car tasks (second-opinion challengers, forward-quality/adversarial
- * graders, safeguard challenges, per-finding challenges) are spawned with
+ * Side-car tasks (forward-quality/adversarial graders and per-finding
+ * challenges) are spawned with
  * parent_task_id=null ON PURPOSE — they must not participate in the primary
  * task's rollup-child accounting (backend app/task_evaluators.py). The link to
  * the task they grade/challenge lives in context under a per-kind
@@ -11,14 +11,11 @@ import type { Task } from '../types/task';
  * entangling them in real parent/child rollups.
  */
 export type SidecarKind =
-  | 'second-opinion'
   | 'grader'
   | 'finding-challenge';
 
 /** Back-reference context keys written ON THE SIDE-CAR (backend task_evaluators.py). */
 export const SIDECAR_BACKREF_KEYS: Record<string, SidecarKind> = {
-  // REVIEW_SECOND_OPINION_SOURCE_KEY — challenger of a review verdict
-  review_second_opinion_for_task_id: 'second-opinion',
   // QUALITY_GRADER_SOURCE_KEY — forward-quality grade OR adversarial finding gate
   // (the adversarial side-car reuses the same back-reference key and is
   // distinguished by context.adversarial_grader on the side-car itself)
@@ -88,21 +85,6 @@ export function deriveSidecarBadge(sidecar: Task, primary: Task): SidecarBadge |
   const pctx = (primary.context ?? {}) as Record<string, unknown>;
 
   switch (backref.kind) {
-    case 'second-opinion': {
-      // REVIEW_SECOND_OPINION_RECONCILIATION_KEY (backend task_completion.py)
-      const rec = pctx['review_second_opinion'] as { state?: unknown } | undefined;
-      const state = typeof rec?.state === 'string' ? rec.state : null;
-      if (state === 'challenged_confirmed') {
-        return badge(backref.kind, 'challenged ✓', 'positive', 'Second-opinion challenge confirmed the primary review verdict');
-      }
-      if (state === 'challenged_revised') {
-        return badge(backref.kind, 'challenged ~', 'mixed', 'Second-opinion challenge kept the verdict direction but revised the surviving issue set');
-      }
-      if (state === 'challenged_rejected') {
-        return badge(backref.kind, 'challenged ✗', 'negative', 'Second-opinion challenge overturned the primary review verdict');
-      }
-      return unresolved(backref.kind, 'challenge', sidecar);
-    }
     case 'grader': {
       const isAdversarial = sidecar.context?.adversarial_grader === true;
       if (isAdversarial) {

@@ -4318,7 +4318,7 @@ async def test_qualification_in_flight_false_when_all_three_terminal(db_session)
 @pytest.mark.asyncio
 async def test_promote_success_creates_release_tag(db_session, mocker):
     """A successful promotion creates a git tag v{version_number} on the REAL
-    merged commit (re-resolved main HEAD) via github.create_tag."""
+    merge-response commit via github.create_tag."""
     _project, version = await _make_project_and_version(db_session)
 
     merge_sha = "tagmerge" * 5
@@ -4341,7 +4341,9 @@ async def test_promote_success_creates_release_tag(db_session, mocker):
     )
     mocker.patch(
         "app.github.merge_pull_request",
-        new=AsyncMock(return_value={"merged": True, "message": "Merged"}),
+        new=AsyncMock(
+            return_value={"merged": True, "sha": merge_sha, "message": "Merged"}
+        ),
     )
     tag_mock = mocker.patch(
         "app.github.create_tag",
@@ -4393,7 +4395,9 @@ async def test_promote_success_tag_failure_does_not_abort_promotion(db_session, 
     )
     mocker.patch(
         "app.github.merge_pull_request",
-        new=AsyncMock(return_value={"merged": True, "message": "Merged"}),
+        new=AsyncMock(
+            return_value={"merged": True, "sha": merge_sha, "message": "Merged"}
+        ),
     )
     # Simulate a tag creation failure (e.g. GitHub 500, network error, etc.)
     from fastapi import HTTPException as _HTTPException
@@ -4552,7 +4556,7 @@ async def test_stall_alerts_preserve_concurrently_committed_last_qualification(
     committed concurrently between sweep start and the stall check.
 
     The loop used to ``merge(load=False)`` the sweep-START snapshot of the version
-    into the alert session, so ``_check_version_auto_merge_stall`` rebuilt the
+    into the alert session, so the promotion stall checker rebuilt the
     promotion-pending verdict from that STALE snapshot and wrote it back — erasing
     a ``last_qualification`` another writer had committed in the interim.  The fix
     re-``SELECT``s the row fresh inside the stall-check transaction, so the alert
@@ -4562,7 +4566,7 @@ async def test_stall_alerts_preserve_concurrently_committed_last_qualification(
     carries the STALE verdict (PR #111), a different writer commits a fresh verdict
     (PR #222) to the row, and the stall loop then runs on its own dedicated session
     (fresh identity map, as in production).  The concurrently committed PR #222 must
-    survive with the auto-merge-stall alert layered on top of it — never reverting
+    survive with the managed-wait alert layered on top of it — never reverting
     to #111.
     """
     from contextlib import asynccontextmanager
@@ -4575,13 +4579,13 @@ async def test_stall_alerts_preserve_concurrently_committed_last_qualification(
     from app import shared_state
 
     # promotion-readiness check short-circuits when promotion is enabled; keep it
-    # disabled so the stall loop exercises the auto-merge-stall path deterministically.
+    # disabled so the stall loop exercises the managed-wait path deterministically.
     shared_state.runtime_config["promotion_enabled"] = False
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
 
     # A stall-eligible promotion_pending anchored >4h ago (past
-    # _AUTO_MERGE_STALL_SECONDS) with no prior alert, so _check_version_auto_merge_stall
+    # the managed-wait threshold) with no prior alert, so the stall checker
     # fires. This is the SWEEP-START snapshot (PR #111) carried in open_versions.
     enabled_at = (
         datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=5)
@@ -4591,6 +4595,7 @@ async def test_stall_alerts_preserve_concurrently_committed_last_qualification(
         "promotion_pending": {
             "pr_number": 111,
             "pr_url": "http://pr/111",
+            "managed_check_wait": True,
             "enabled_at": enabled_at,
         },
     }
@@ -4610,6 +4615,7 @@ async def test_stall_alerts_preserve_concurrently_committed_last_qualification(
         "promotion_pending": {
             "pr_number": 222,
             "pr_url": "http://pr/222",
+            "managed_check_wait": True,
             "enabled_at": enabled_at,
         },
     }
@@ -4637,7 +4643,7 @@ async def test_stall_alerts_preserve_concurrently_committed_last_qualification(
         open_versions, session_factory=_dedicated_factory
     )
 
-    # The concurrently committed verdict SURVIVES: the auto-merge-stall alert was
+    # The concurrently committed verdict SURVIVES: the managed-wait alert was
     # layered onto the CURRENT row (PR #222), not the stale snapshot (PR #111).
     await db_session.refresh(version)
     pending = version.last_qualification["promotion_pending"]
@@ -4647,8 +4653,8 @@ async def test_stall_alerts_preserve_concurrently_committed_last_qualification(
     )
     # And the alert genuinely fired (so the assertion above is not vacuous).
     assert version.last_qualification["status"] == "pending"
-    assert "last_alerted_at" in pending
-    assert pending["alert_count"] == 1
+    assert "mcw_last_alerted_at" in pending
+    assert pending["mcw_alert_count"] == 1
 
 
 @pytest.mark.asyncio

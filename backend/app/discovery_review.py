@@ -1,9 +1,9 @@
 """Durable review boundary for bounded discovery cycles.
 
-The Resident is deliberately not part of this state machine.  A normal
-``discovery_review`` task judges a quiescent cycle from a server-built evidence
-packet; a durable ProjectMessage merely makes the resulting decision available
-to the next strategic session, whenever that session happens to be online.
+A normal ``discovery_review`` task judges a quiescent cycle from a server-built
+evidence packet. Routine continuation stays within the cheap review loop;
+consequential or blocked outcomes become durable semantic receipts that wake the
+supported Resident session for strategic judgment.
 
 All mutating helpers operate on the caller's transaction and never commit.
 """
@@ -12,20 +12,27 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-import hashlib
 import json
 import logging
 from typing import Any, Mapping
 import uuid
 
-from sqlalchemy import func
 from sqlmodel import select
 
+from app.direction_contract import DIRECTION_CONTRACT_FIELDS
+from app.discovery_review_packet import (
+    DISCOVERY_REVIEW_BLOCKED_GRACE as _BLOCKED_GRACE,
+    DISCOVERY_REVIEW_DECISION_SNAPSHOT_CHARS as _DECISION_SNAPSHOT_CHARS,
+    DISCOVERY_REVIEW_MAX_PACKET_ITEMS as _MAX_PACKET_ITEMS,
+    _canonical_json,
+    _checksum,
+    _enum_value,
+    build_discovery_review_packet as _build_review_packet,
+)
 from app.models import (
-    Artifact,
     DiscoveryAdmission,
     DiscoveryCycle,
-    DiscoveryEvidenceItem,
+    Project,
     ProjectMessage,
     StrategicSpawnRequest,
     Task,
@@ -39,14 +46,12 @@ from app.time_utils import _utcnow
 logger = logging.getLogger(__name__)
 
 DISCOVERY_REVIEW_TASK_TYPE = "discovery_review"
-DISCOVERY_REVIEW_PACKET_VERSION = 1
-DISCOVERY_REVIEW_MAX_TASKS = 120
-DISCOVERY_REVIEW_MAX_ARTIFACTS = 80
-DISCOVERY_REVIEW_MAX_PACKET_ITEMS = 200
-DISCOVERY_REVIEW_METADATA_EXCERPT_CHARS = 4_000
 DISCOVERY_REVIEW_SWEEP_LIMIT = 40
-DISCOVERY_REVIEW_BLOCKED_GRACE = timedelta(hours=2)
 MAX_AUTONOMOUS_DISCOVERY_GENERATIONS = 3
+# Routine evidence synthesis belongs on the strong lower tier. Only a
+# consequential proposal earns one independent frontier confirmation.
+DISCOVERY_REVIEW_ROUTINE_EFFORT = "medium"
+DISCOVERY_REVIEW_CONFIRMATION_EFFORT = "max"
 
 _ACTIVE_COHORT_STATUSES = frozenset(
     {
@@ -81,8 +86,11 @@ _VALID_VERDICTS = frozenset(
 )
 _VALID_PHASES = frozenset({"probe", "demonstrate", "productize", "release"})
 _AUTONOMOUS_CONTINUATION_VERDICTS = frozenset({"renew", "inconclusive"})
-_CONSEQUENTIAL_VERDICTS = frozenset(
+_CONSEQUENTIAL_CONTINUATION_VERDICTS = frozenset(
     {"pivot", "expand", "branch", "fallback_pending"}
+)
+_CONFIRMATION_VERDICTS = frozenset(
+    {*_CONSEQUENTIAL_CONTINUATION_VERDICTS, "park", "stop"}
 )
 _RECOMMENDED_LIMIT_KEYS = frozenset(
     {"task_credit_limit", "attempt_credit_limit", "concurrency_limit"}
@@ -100,6 +108,35 @@ class DiscoveryReviewSpawnResult:
 
 class DiscoveryReviewResultError(ValueError):
     """The review output cannot authoritatively transition its cycle."""
+
+
+def _authoritative_successor_bet(
+    current_bet: Mapping[str, Any],
+    proposed_bet: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Carry a cycle's frozen direction proof contract into its successor."""
+
+    successor_bet = dict(proposed_bet)
+    current_direction = current_bet.get("direction")
+    if not isinstance(current_direction, Mapping):
+        return successor_bet
+    current_context = current_direction.get("context")
+    if not isinstance(current_context, Mapping):
+        return successor_bet
+    proof_contract = {
+        field: current_context[field]
+        for field in DIRECTION_CONTRACT_FIELDS
+        if field in current_context
+    }
+    if not proof_contract:
+        return successor_bet
+
+    # A next bet may change the mechanism within a direction. It cannot rewrite
+    # the purpose and proof boundary against which that mechanism is reviewed.
+    frozen_direction = dict(current_direction)
+    frozen_direction["context"] = proof_contract
+    successor_bet["direction"] = frozen_direction
+    return successor_bet
 
 
 async def resolve_discovery_cycle(
@@ -147,9 +184,14 @@ async def resolve_discovery_cycle(
                 else None
             )
             if (
-                isinstance(prior_resolution, Mapping)
+                predecessor is not None
+                and isinstance(prior_resolution, Mapping)
                 and prior_resolution.get("action") == "continue"
-                and dict(live_successor.bet_snapshot or {}) == dict(next_bet or {})
+                and dict(live_successor.bet_snapshot or {})
+                == _authoritative_successor_bet(
+                    dict(predecessor.bet_snapshot or {}),
+                    dict(next_bet or {}),
+                )
             ):
                 return live_successor
     cycle = (
@@ -183,6 +225,10 @@ async def resolve_discovery_cycle(
     if not isinstance(next_bet, Mapping) or not next_bet:
         raise ValueError("continue requires a non-empty next_bet")
     cycle.state = "superseded"
+    successor_bet = _authoritative_successor_bet(
+        dict(cycle.bet_snapshot or {}),
+        next_bet,
+    )
     successor = DiscoveryCycle(
         project_id=cycle.project_id,
         direction_key=cycle.direction_key,
@@ -190,8 +236,8 @@ async def resolve_discovery_cycle(
         outcome_kind=cycle.outcome_kind,
         phase=cycle.phase,
         intent_snapshot=dict(cycle.intent_snapshot or {}),
-        bet_snapshot=dict(next_bet),
-        mechanism_fingerprint=_checksum(dict(next_bet)),
+        bet_snapshot=successor_bet,
+        mechanism_fingerprint=_checksum(successor_bet),
         task_credit_limit=cycle.task_credit_limit,
         attempt_credit_limit=cycle.attempt_credit_limit,
         concurrency_limit=cycle.concurrency_limit,
@@ -201,520 +247,6 @@ async def resolve_discovery_cycle(
     session.add(successor)
     await session.flush()
     return successor
-
-
-def _enum_value(value: Any) -> Any:
-    return value.value if hasattr(value, "value") else value
-
-
-def _json_default(value: Any) -> str:
-    if isinstance(value, (datetime, uuid.UUID)):
-        return value.isoformat() if isinstance(value, datetime) else str(value)
-    return str(_enum_value(value))
-
-
-def _canonical_json(value: Any) -> str:
-    return json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        default=_json_default,
-    )
-
-
-def _checksum(value: Any) -> str:
-    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
-
-
-def _bounded_json_excerpt(value: Any) -> tuple[str, bool]:
-    rendered = _canonical_json(value)
-    if len(rendered) <= DISCOVERY_REVIEW_METADATA_EXCERPT_CHARS:
-        return rendered, False
-    return rendered[:DISCOVERY_REVIEW_METADATA_EXCERPT_CHARS], True
-
-
-def _task_snapshot(task: Task) -> dict[str, Any]:
-    plan_excerpt, plan_truncated = _bounded_json_excerpt(task.plan_output)
-    context = task.context or {}
-    context_projection = {
-        key: context.get(key)
-        for key in (
-            "direction_id",
-            "research_task_id",
-            "acceptance_verdict",
-            "acceptance_evidence_result",
-            "failure_category",
-            "failure_class",
-            "pr_merged",
-            "landed_on_integration",
-            "rollup_pr_number",
-            "capacity_degraded",
-            "_research_surviving_findings",
-        )
-        if key in context
-    }
-    return {
-        "id": str(task.id),
-        "type": str(task.first_payload.get("type") or ""),
-        "title": task.title,
-        "description": task.description,
-        "status": str(_enum_value(task.status)),
-        "attempt_count": int(task.attempt_count or 0),
-        "parent_task_id": str(task.parent_task_id) if task.parent_task_id else None,
-        "created_by": task.created_by,
-        "latest_status_message": (task.latest_status_message or "")[:1_000],
-        "context": context_projection,
-        "plan_output_excerpt": plan_excerpt,
-        "plan_output_truncated": plan_truncated,
-    }
-
-
-def _artifact_snapshot(artifact: Artifact) -> dict[str, Any]:
-    logs_excerpt, logs_truncated = _bounded_json_excerpt(artifact.logs)
-    return {
-        "id": str(artifact.id),
-        "task_id": str(artifact.task_id),
-        "artifact_type": str(_enum_value(artifact.artifact_type)),
-        "logical_key": artifact.logical_key,
-        "commit_hash": artifact.commit_hash,
-        "repo_url": artifact.repo_url,
-        "pr_url": artifact.pr_url,
-        "storage_uri": artifact.storage_uri,
-        "iteration": artifact.iteration,
-        "created_at": artifact.created_at,
-        "logs_excerpt": logs_excerpt,
-        "logs_truncated": logs_truncated,
-    }
-
-
-async def _get_or_add_evidence(
-    session,
-    *,
-    cycle: DiscoveryCycle,
-    dedupe_key: str,
-    semantic_role: str,
-    source_kind: str,
-    source_id: str,
-    source_uri: str | None,
-    content_type: str,
-    head_sha: str | None,
-    snapshot: Mapping[str, Any],
-) -> DiscoveryEvidenceItem:
-    existing = (
-        await session.execute(
-            select(DiscoveryEvidenceItem).where(
-                DiscoveryEvidenceItem.cycle_id == cycle.id,
-                DiscoveryEvidenceItem.dedupe_key == dedupe_key,
-            )
-        )
-    ).scalar_one_or_none()
-    if existing is not None:
-        return existing
-
-    item = DiscoveryEvidenceItem(
-        cycle_id=cycle.id,
-        semantic_role=semantic_role,
-        source_kind=source_kind,
-        source_id=source_id,
-        source_uri=source_uri,
-        checksum=_checksum(snapshot),
-        content_type=content_type,
-        head_sha=head_sha,
-        mechanism_fingerprint=cycle.mechanism_fingerprint,
-        evidence_metadata={
-            "packet_version": DISCOVERY_REVIEW_PACKET_VERSION,
-            # Round-trip through the canonical encoder so UUID/datetime/Enum
-            # values become JSON-safe before reaching the JSONB bind processor.
-            "snapshot": json.loads(_canonical_json(snapshot)),
-        },
-        dedupe_key=dedupe_key,
-    )
-    session.add(item)
-    await session.flush()
-    return item
-
-
-def _evidence_projection(
-    item: DiscoveryEvidenceItem,
-    *,
-    artifact_id: str | None = None,
-) -> dict[str, Any]:
-    projection: dict[str, Any] = {
-        "evidence_id": str(item.id),
-        "semantic_role": item.semantic_role,
-        "source_kind": item.source_kind,
-        "checksum": item.checksum,
-        "source_id": item.source_id,
-        "source_uri": item.source_uri,
-        "content_type": item.content_type,
-        "head_sha": item.head_sha,
-        "mechanism_fingerprint": item.mechanism_fingerprint,
-        "evidence_metadata": item.evidence_metadata or {},
-    }
-    if artifact_id is not None:
-        projection["artifact_id"] = artifact_id
-    return projection
-
-
-async def build_discovery_review_packet(
-    session,
-    cycle: DiscoveryCycle,
-    *,
-    now: datetime | None = None,
-) -> tuple[
-    list[dict[str, Any]],
-    str,
-    list[dict[str, Any]],
-    dict[str, Any],
-]:
-    """Build and ledger a bounded, cycle-isolated evidence packet.
-
-    The caller must hold the cycle row lock.  Quiescence is checked separately
-    over the full task set; the bounds here limit only what is sent to the model.
-    """
-
-    now = now or _utcnow()
-    task_scope = [
-        Task.discovery_cycle_id == cycle.id,
-        (
-            Task.id != cycle.review_task_id
-            if cycle.review_task_id is not None
-            else True
-        ),
-    ]
-    total_tasks = int(
-        (
-            await session.execute(
-                select(func.count(Task.id)).where(*task_scope)
-            )
-        ).scalar_one()
-        or 0
-    )
-    task_packet_limit = min(
-        DISCOVERY_REVIEW_MAX_TASKS,
-        max(0, DISCOVERY_REVIEW_MAX_PACKET_ITEMS - 1),
-    )
-
-    # Reserve slots for the source and one representative of every outcome
-    # state before filling chronologically. This prevents a large successful
-    # cohort from pushing the source or rarer failures out of the bounded packet.
-    tasks: list[Task] = []
-    selected_task_ids: set[uuid.UUID] = set()
-
-    async def add_task(task: Task | None) -> None:
-        if task is None or task.id in selected_task_ids:
-            return
-        if len(tasks) >= task_packet_limit:
-            return
-        tasks.append(task)
-        selected_task_ids.add(task.id)
-
-    if cycle.source_research_task_id is not None:
-        await add_task(
-            (
-                await session.execute(
-                    select(Task).where(
-                        *task_scope,
-                        Task.id == cycle.source_research_task_id,
-                    )
-                )
-            ).scalar_one_or_none()
-        )
-    for status in (
-        TaskStatus.COMPLETED,
-        TaskStatus.FAILED,
-        TaskStatus.CANCELLED,
-        TaskStatus.PARKED,
-        TaskStatus.BLOCKED,
-    ):
-        await add_task(
-            (
-                await session.execute(
-                    select(Task)
-                    .where(*task_scope, Task.status == status)
-                    .order_by(Task.created_at.asc(), Task.id.asc())
-                    .limit(1)
-                )
-            ).scalar_one_or_none()
-        )
-
-    remaining_slots = task_packet_limit - len(tasks)
-    if remaining_slots:
-        filler = list(
-            (
-                await session.execute(
-                    select(Task)
-                    .where(
-                        *task_scope,
-                        (
-                            Task.id.notin_(selected_task_ids)
-                            if selected_task_ids
-                            else True
-                        ),
-                    )
-                    .order_by(Task.created_at.asc(), Task.id.asc())
-                    .limit(remaining_slots)
-                )
-            )
-            .scalars()
-            .all()
-        )
-        for task in filler:
-            await add_task(task)
-
-    total_artifacts = int(
-        (
-            await session.execute(
-                select(func.count(Artifact.id))
-                .select_from(Artifact)
-                .join(Task, Artifact.task_id == Task.id)
-                .where(*task_scope)
-            )
-        ).scalar_one()
-        or 0
-    )
-    artifact_packet_limit = min(
-        DISCOVERY_REVIEW_MAX_ARTIFACTS,
-        max(0, DISCOVERY_REVIEW_MAX_PACKET_ITEMS - 1 - len(tasks)),
-    )
-    artifacts = list(
-        (
-            await session.execute(
-                select(Artifact)
-                .join(Task, Artifact.task_id == Task.id)
-                .where(*task_scope)
-                .order_by(Artifact.created_at.asc(), Artifact.id.asc())
-                .limit(artifact_packet_limit)
-            )
-        )
-        .scalars()
-        .all()
-    )
-
-    task_evidence: list[DiscoveryEvidenceItem] = []
-    for task in tasks:
-        snapshot = _task_snapshot(task)
-        role = (
-            "source_research"
-            if task.id == cycle.source_research_task_id
-            else "cohort_task"
-        )
-        task_evidence.append(
-            await _get_or_add_evidence(
-                session,
-                cycle=cycle,
-                dedupe_key=f"task:{task.id}:terminal:v1",
-                semantic_role=role,
-                source_kind="task",
-                source_id=str(task.id),
-                source_uri=None,
-                content_type="application/vnd.blueprint.task+json",
-                head_sha=cycle.candidate_sha,
-                snapshot=snapshot,
-            )
-        )
-
-    artifact_prerequisites: list[dict[str, Any]] = []
-    artifact_evidence: list[DiscoveryEvidenceItem] = []
-    for artifact in artifacts:
-        snapshot = _artifact_snapshot(artifact)
-        artifact_evidence.append(
-            await _get_or_add_evidence(
-                session,
-                cycle=cycle,
-                dedupe_key=f"artifact:{artifact.id}:v1",
-                semantic_role="outcome_artifact",
-                source_kind="artifact",
-                source_id=str(artifact.id),
-                source_uri=artifact.storage_uri or artifact.pr_url,
-                content_type=f"application/vnd.blueprint.artifact.{str(_enum_value(artifact.artifact_type)).lower()}+json",
-                head_sha=artifact.commit_hash or cycle.candidate_sha,
-                snapshot=snapshot,
-            )
-        )
-        if artifact.storage_uri:
-            artifact_prerequisites.append(
-                {
-                    "artifact_id": str(artifact.id),
-                    "artifact_type": str(_enum_value(artifact.artifact_type)),
-                    "logical_key": artifact.logical_key,
-                    "source_task_id": str(artifact.task_id),
-                    "storage_uri": artifact.storage_uri,
-                }
-            )
-
-    overdue_blocked_ids = [
-        str(task.id)
-        for task in tasks
-        if task.status == TaskStatus.BLOCKED
-        and cycle.deadline_at is not None
-        and now >= cycle.deadline_at + DISCOVERY_REVIEW_BLOCKED_GRACE
-    ]
-    overdue_blocked_count = 0
-    if (
-        cycle.deadline_at is not None
-        and now >= cycle.deadline_at + DISCOVERY_REVIEW_BLOCKED_GRACE
-    ):
-        overdue_blocked_count = int(
-            (
-                await session.execute(
-                    select(func.count(Task.id)).where(
-                        *task_scope,
-                        Task.status == TaskStatus.BLOCKED,
-                    )
-                )
-            ).scalar_one()
-            or 0
-        )
-    overdue_spawn_request_count = 0
-    if (
-        cycle.deadline_at is not None
-        and now >= cycle.deadline_at + DISCOVERY_REVIEW_BLOCKED_GRACE
-    ):
-        overdue_spawn_request_count = int(
-            (
-                await session.execute(
-                    select(func.count(StrategicSpawnRequest.id)).where(
-                        StrategicSpawnRequest.discovery_cycle_id == cycle.id,
-                        StrategicSpawnRequest.state.in_({"accepted", "deferred"}),
-                        StrategicSpawnRequest.task_id.is_(None),
-                    )
-                )
-            ).scalar_one()
-            or 0
-        )
-    omitted_tasks = max(0, total_tasks - len(tasks))
-    omitted_artifacts = max(0, total_artifacts - len(artifacts))
-    required_evidence_omitted = bool(
-        omitted_tasks or omitted_artifacts or overdue_spawn_request_count
-    )
-    manifest: dict[str, Any] = {
-        "version": DISCOVERY_REVIEW_PACKET_VERSION,
-        "tasks": {
-            "total": total_tasks,
-            "included": len(tasks),
-            "omitted": omitted_tasks,
-        },
-        "artifacts": {
-            "total": total_artifacts,
-            "included": len(artifacts),
-            "omitted": omitted_artifacts,
-        },
-        "overdue_blocked": {
-            "count": overdue_blocked_count,
-            "included_task_ids": overdue_blocked_ids,
-        },
-        "overdue_spawn_requests": {"count": overdue_spawn_request_count},
-        "required_evidence_omitted": required_evidence_omitted,
-        "incomplete": bool(required_evidence_omitted or overdue_blocked_count),
-        "incomplete_reasons": [
-            reason
-            for condition, reason in (
-                (bool(omitted_tasks), "task_limit"),
-                (bool(omitted_artifacts), "artifact_limit"),
-                (bool(overdue_blocked_count), "overdue_blocked_tasks"),
-                (
-                    bool(overdue_spawn_request_count),
-                    "overdue_deferred_spawn_requests",
-                ),
-            )
-            if condition
-        ],
-    }
-    pre_manifest_ledger_total = int(
-        (
-            await session.execute(
-                select(func.count(DiscoveryEvidenceItem.id)).where(
-                    DiscoveryEvidenceItem.cycle_id == cycle.id
-                )
-            )
-        ).scalar_one()
-        or 0
-    )
-    manifest["ledger"] = {
-        "total": pre_manifest_ledger_total + 1,
-        "included": min(
-            pre_manifest_ledger_total + 1,
-            DISCOVERY_REVIEW_MAX_PACKET_ITEMS,
-        ),
-        "omitted": max(
-            0,
-            pre_manifest_ledger_total + 1 - DISCOVERY_REVIEW_MAX_PACKET_ITEMS,
-        ),
-    }
-    if manifest["ledger"]["omitted"]:
-        manifest["incomplete"] = True
-        manifest["required_evidence_omitted"] = True
-        manifest["incomplete_reasons"].append("ledger_packet_limit")
-    manifest_item = await _get_or_add_evidence(
-        session,
-        cycle=cycle,
-        dedupe_key="packet-manifest:v1",
-        semantic_role="packet_manifest",
-        source_kind="server_ledger",
-        source_id=str(cycle.id),
-        source_uri=None,
-        content_type="application/vnd.blueprint.discovery-review-manifest+json",
-        head_sha=cycle.candidate_sha,
-        snapshot=manifest,
-    )
-
-    # Re-read the ledger as the packet authority so evidence captured before
-    # this boundary (for example an experiment or experiential observation)
-    # is not lost merely because it was not represented by a legacy Artifact
-    # row. Stable creation order plus the hard bound keeps prompt size fixed.
-    priority_items = [manifest_item, *task_evidence, *artifact_evidence]
-    priority_ids = {item.id for item in priority_items}
-    remaining_packet_slots = max(
-        0, DISCOVERY_REVIEW_MAX_PACKET_ITEMS - len(priority_items)
-    )
-    ledger_items = priority_items[:DISCOVERY_REVIEW_MAX_PACKET_ITEMS]
-    if remaining_packet_slots:
-        ledger_items.extend(
-            list(
-                (
-                    await session.execute(
-                        select(DiscoveryEvidenceItem)
-                        .where(
-                            DiscoveryEvidenceItem.cycle_id == cycle.id,
-                            DiscoveryEvidenceItem.id.notin_(priority_ids),
-                        )
-                        .order_by(
-                            DiscoveryEvidenceItem.created_at.asc(),
-                            DiscoveryEvidenceItem.id.asc(),
-                        )
-                        .limit(remaining_packet_slots)
-                    )
-                )
-                .scalars()
-                .all()
-            )
-        )
-    artifact_ids = {str(artifact.id) for artifact in artifacts}
-    packet = [
-        _evidence_projection(
-            item,
-            artifact_id=(
-                item.source_id
-                if item.source_kind == "artifact"
-                and item.source_id in artifact_ids
-                else None
-            ),
-        )
-        for item in ledger_items
-    ]
-    allowed_artifact_ids = {
-        str(entry["artifact_id"])
-        for entry in packet
-        if entry.get("artifact_id")
-    }
-    artifact_prerequisites = [
-        pointer
-        for pointer in artifact_prerequisites
-        if pointer["artifact_id"] in allowed_artifact_ids
-    ]
-    return packet, _checksum(packet), artifact_prerequisites, manifest
 
 
 async def _cycle_is_quiescent(
@@ -761,7 +293,7 @@ async def _cycle_is_quiescent(
     ).scalar_one_or_none()
     if blocked is not None and (
         cycle.deadline_at is None
-        or now < cycle.deadline_at + DISCOVERY_REVIEW_BLOCKED_GRACE
+        or now < cycle.deadline_at + _BLOCKED_GRACE
     ):
         return False, "cohort_blocked_in_grace"
     pending_request = (
@@ -777,7 +309,7 @@ async def _cycle_is_quiescent(
     ).scalar_one_or_none()
     if pending_request is not None and (
         cycle.deadline_at is None
-        or now < cycle.deadline_at + DISCOVERY_REVIEW_BLOCKED_GRACE
+        or now < cycle.deadline_at + _BLOCKED_GRACE
     ):
         return False, "spawn_requests_in_grace"
     return True, "quiescent"
@@ -793,7 +325,7 @@ async def _cancel_overdue_spawn_requests(
 
     if (
         cycle.deadline_at is None
-        or now < cycle.deadline_at + DISCOVERY_REVIEW_BLOCKED_GRACE
+        or now < cycle.deadline_at + _BLOCKED_GRACE
     ):
         return 0
     requests = (
@@ -859,6 +391,53 @@ async def maybe_close_and_spawn_discovery_review(
         return DiscoveryReviewSpawnResult(
             parsed_cycle_id, None, False, False, "cycle_missing"
         )
+    project = await session.get(Project, cycle.project_id)
+    stored_review = cycle.review_result or {}
+    deferred_confirmation = (
+        stored_review.get("confirmation_deferred") == "project_paused"
+        if isinstance(stored_review, Mapping)
+        else False
+    )
+    if deferred_confirmation:
+        if project is not None and project.paused:
+            return DiscoveryReviewSpawnResult(
+                cycle.id,
+                cycle.review_task_id,
+                False,
+                True,
+                "project_paused",
+            )
+        first_result = stored_review.get("first_review")
+        prior_task = (
+            await session.get(Task, cycle.review_task_id)
+            if cycle.review_task_id is not None
+            else None
+        )
+        if not isinstance(first_result, Mapping) or prior_task is None:
+            cycle.state = "review_blocked"
+            cycle.review_result = {
+                **dict(stored_review),
+                "error": "deferred confirmation lost its first review task",
+            }
+            cycle.updated_at = _utcnow()
+            session.add(cycle)
+            return DiscoveryReviewSpawnResult(
+                cycle.id, None, False, False, "deferred_confirmation_invalid"
+            )
+        confirmation = await _spawn_confirmation_review(
+            session,
+            cycle=cycle,
+            prior_task=prior_task,
+            first_result=first_result,
+            now=now or _utcnow(),
+        )
+        return DiscoveryReviewSpawnResult(
+            cycle.id,
+            confirmation.id,
+            True,
+            True,
+            "confirmation_spawned",
+        )
     if cycle.review_task_id is not None:
         return DiscoveryReviewSpawnResult(
             cycle.id, cycle.review_task_id, False, True, "review_exists"
@@ -887,9 +466,22 @@ async def maybe_close_and_spawn_discovery_review(
         session.add(cycle)
         return DiscoveryReviewSpawnResult(cycle.id, None, False, False, reason)
 
-    packet, packet_checksum, artifact_prerequisites, packet_manifest = (
-        await build_discovery_review_packet(session, cycle, now=now)
-    )
+    if project is not None and project.paused:
+        cycle.state = "review_pending"
+        cycle.updated_at = now
+        session.add(cycle)
+        return DiscoveryReviewSpawnResult(
+            cycle.id, None, False, True, "project_paused"
+        )
+
+    (
+        packet,
+        packet_checksum,
+        artifact_prerequisites,
+        packet_manifest,
+        bounded_intent,
+        bounded_bet,
+    ) = await _build_review_packet(session, cycle, now=now)
     await _cancel_overdue_spawn_requests(session, cycle=cycle, now=now)
     review_revision = int(cycle.revision or 0) + 1
     task = Task(
@@ -907,8 +499,8 @@ async def maybe_close_and_spawn_discovery_review(
                 "cycle_id": str(cycle.id),
                 "expected_revision": review_revision,
                 "direction_key": cycle.direction_key,
-                "intent_snapshot": cycle.intent_snapshot or {},
-                "bet_snapshot": cycle.bet_snapshot or {},
+                "intent_snapshot": bounded_intent,
+                "bet_snapshot": bounded_bet,
                 "outcome_kind": cycle.outcome_kind,
                 "phase": cycle.phase,
                 "evidence_packet": packet,
@@ -918,6 +510,10 @@ async def maybe_close_and_spawn_discovery_review(
                 "mechanism_fingerprint": cycle.mechanism_fingerprint,
                 "review_round": 1,
                 "prior_review_task_id": None,
+                # Payload routing wins over the task's broad ``strategic``
+                # category, preventing every ordinary cycle review from paying
+                # the max-tier strategic overhead.
+                "effort": DISCOVERY_REVIEW_ROUTINE_EFFORT,
             }
         ],
         context={
@@ -1006,6 +602,12 @@ def parse_discovery_review_result(raw: str | Mapping[str, Any]) -> dict[str, Any
     next_bet = result.get("next_bet")
     if next_bet is not None and not isinstance(next_bet, dict):
         raise DiscoveryReviewResultError("next_bet must be an object or null")
+    if (
+        next_bet is not None
+        and len(_canonical_json(next_bet))
+        > _DECISION_SNAPSHOT_CHARS
+    ):
+        raise DiscoveryReviewResultError("next_bet exceeds the decision size limit")
     recommended_phase = result.get("recommended_phase")
     if recommended_phase is not None and recommended_phase not in _VALID_PHASES:
         raise DiscoveryReviewResultError("recommended_phase is invalid")
@@ -1038,7 +640,7 @@ def parse_discovery_review_result(raw: str | Mapping[str, Any]) -> dict[str, Any
     evidence_ids = result.get("evidence_citations")
     if (
         not isinstance(evidence_ids, list)
-        or len(evidence_ids) > DISCOVERY_REVIEW_MAX_PACKET_ITEMS
+        or len(evidence_ids) > _MAX_PACKET_ITEMS
     ):
         raise DiscoveryReviewResultError(
             "evidence_citations must be a bounded list"
@@ -1070,11 +672,13 @@ async def _emit_review_event(
     event_type: str,
     summary: str,
     extra: Mapping[str, Any] | None = None,
+    wake_resident: bool = False,
 ) -> ProjectMessage | None:
     context = {
         "cycle_id": str(cycle.id),
         "review_task_id": str(task_id),
         "direction_key": cycle.direction_key,
+        **({"resident_wake_barrier": True} if wake_resident else {}),
         **dict(extra or {}),
     }
     return await post_event_message(
@@ -1084,6 +688,7 @@ async def _emit_review_event(
         summary=summary,
         context=context,
         task_id=task_id,
+        idempotency_key=f"discovery-review:{task_id}:{event_type}",
     )
 
 
@@ -1097,10 +702,14 @@ async def _create_successor_cycle(
     """Apply a safe continuation verdict without requiring Resident uptime."""
 
     limits = dict(result["recommended_limits"])
-    next_bet = (
+    proposed_bet = (
         dict(result["next_bet"])
         if isinstance(result.get("next_bet"), Mapping)
         else dict(cycle.bet_snapshot or {})
+    )
+    next_bet = _authoritative_successor_bet(
+        dict(cycle.bet_snapshot or {}),
+        proposed_bet,
     )
     successor = DiscoveryCycle(
         project_id=cycle.project_id,
@@ -1142,6 +751,56 @@ def _decision_proposal(result: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _decision_consequence_reasons(
+    cycle: DiscoveryCycle,
+    result: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Derive consequence from effective state changes, not model labels."""
+
+    # ask_operator already fails directly into Resident judgment; paying for a
+    # frontier confirmation first would add cost without making it less human.
+    if result.get("verdict") == "ask_operator":
+        return ()
+
+    reasons: list[str] = []
+    if result.get("verdict") in _CONFIRMATION_VERDICTS:
+        reasons.append("verdict")
+
+    current_bet = dict(cycle.bet_snapshot or {})
+    proposed_bet = result.get("next_bet")
+    effective_bet = (
+        dict(proposed_bet)
+        if isinstance(proposed_bet, Mapping)
+        else current_bet
+    )
+    if _canonical_json(effective_bet) != _canonical_json(current_bet):
+        reasons.append("next_bet")
+
+    effective_phase = result.get("recommended_phase") or cycle.phase
+    if effective_phase != cycle.phase:
+        reasons.append("phase")
+
+    recommended_limits = result.get("recommended_limits")
+    if isinstance(recommended_limits, Mapping):
+        for key in sorted(_RECOMMENDED_LIMIT_KEYS):
+            current_value = int(getattr(cycle, key))
+            proposed_value = recommended_limits.get(key)
+            effective_value = (
+                proposed_value if proposed_value is not None else current_value
+            )
+            if effective_value != current_value:
+                reasons.append(key)
+
+    return tuple(reasons)
+
+
+def _decision_requires_confirmation(
+    cycle: DiscoveryCycle,
+    result: Mapping[str, Any],
+) -> bool:
+    return bool(_decision_consequence_reasons(cycle, result))
+
+
 async def _spawn_confirmation_review(
     session,
     *,
@@ -1163,6 +822,9 @@ async def _spawn_confirmation_review(
             # frozen evidence. It can reproduce it exactly to confirm or emit a
             # different decision to reject/escalate.
             "confirmation_proposal": _decision_proposal(first_result),
+            # This is the cycle's only frontier adjudication. Round two cannot
+            # recursively create another confirmation task.
+            "effort": DISCOVERY_REVIEW_CONFIRMATION_EFFORT,
         }
     )
     context = dict(prior_task.context or {})
@@ -1197,9 +859,13 @@ async def _spawn_confirmation_review(
     )
     await session.flush()
     cycle.review_task_id = task.id
+    cycle.state = "reviewing"
     cycle.review_result = {
         "first_review": dict(first_result),
         "confirmation_task_id": str(task.id),
+        "confirmation_reasons": list(
+            _decision_consequence_reasons(cycle, first_result)
+        ),
     }
     cycle.revision = next_revision
     cycle.updated_at = now
@@ -1217,6 +883,27 @@ def _continuation_block_reason(
     if not isinstance(next_bet, Mapping) or not next_bet:
         return "next_bet_required_for_autonomous_continuation"
     return None
+
+
+def _validate_monotone_recommended_limits(
+    cycle: DiscoveryCycle,
+    result: Mapping[str, Any],
+) -> None:
+    recommended = result.get("recommended_limits")
+    if not isinstance(recommended, Mapping):
+        return
+    current = {
+        "task_credit_limit": int(cycle.task_credit_limit),
+        "attempt_credit_limit": int(cycle.attempt_credit_limit),
+        "concurrency_limit": int(cycle.concurrency_limit),
+    }
+    for key, current_value in current.items():
+        proposed = recommended.get(key)
+        if proposed is not None and proposed > current_value:
+            raise DiscoveryReviewResultError(
+                f"recommended_limits.{key} cannot increase autonomously "
+                f"from {current_value} to {proposed}"
+            )
 
 
 async def complete_discovery_review(
@@ -1256,6 +943,7 @@ async def complete_discovery_review(
         result = parse_discovery_review_result(raw_result)
         if stale_reason:
             raise DiscoveryReviewResultError(stale_reason)
+        _validate_monotone_recommended_limits(cycle, result)
         if result["cycle_id"] != str(cycle.id):
             raise DiscoveryReviewResultError(
                 "review cycle_id does not match the task cycle"
@@ -1333,11 +1021,43 @@ async def complete_discovery_review(
                     f"Discovery review blocked for {cycle.direction_key}: {str(exc)[:240]}"
                 ),
                 extra={"reason": str(exc)[:500]},
+                wake_resident=True,
             )
         raise
 
     verdict = result["verdict"]
-    if review_round == 1 and verdict in _CONSEQUENTIAL_VERDICTS:
+    consequence_reasons = _decision_consequence_reasons(cycle, result)
+    if review_round == 1 and _decision_requires_confirmation(cycle, result):
+        project = await session.get(Project, cycle.project_id)
+        if project is not None and project.paused:
+            cycle.state = "review_pending"
+            cycle.review_result = {
+                "first_review": dict(result),
+                "prior_review_task_id": str(task.id),
+                "confirmation_deferred": "project_paused",
+                "confirmation_reasons": list(consequence_reasons),
+            }
+            cycle.revision = int(cycle.revision or 0) + 1
+            cycle.updated_at = _utcnow()
+            session.add(cycle)
+            await _emit_review_event(
+                session,
+                cycle=cycle,
+                task_id=task.id,
+                event_type="discovery.review_completed",
+                summary=(
+                    f"Discovery review for {cycle.direction_key}: {verdict}; "
+                    "confirmation deferred while the project is paused."
+                ),
+                extra={
+                    "verdict": verdict,
+                    "confidence": result["confidence"],
+                    "review_result": result,
+                    "confirmation_reasons": list(consequence_reasons),
+                    "policy_status": "confirmation_deferred_project_paused",
+                },
+            )
+            return cycle
         confirmation = await _spawn_confirmation_review(
             session,
             cycle=cycle,
@@ -1359,6 +1079,7 @@ async def complete_discovery_review(
                 "confidence": result["confidence"],
                 "review_result": result,
                 "confirmation_task_id": str(confirmation.id),
+                "confirmation_reasons": list(consequence_reasons),
                 "policy_status": "confirmation_queued",
             },
         )
@@ -1386,16 +1107,17 @@ async def complete_discovery_review(
                 session,
                 cycle=cycle,
                 task_id=task.id,
-                event_type="discovery.operator_question",
+                event_type="discovery.review_completed",
                 summary=(
                     f"Discovery reviews disagree for {cycle.direction_key}: "
-                    "their proposed decisions differ."
+                    "Resident adjudication is required."
                 ),
                 extra={
                     "first_review": dict(first_result),
                     "confirmation_review": result,
-                    "policy_status": "operator_required_review_disagreement",
+                    "policy_status": "resident_adjudication_required",
                 },
+                wake_resident=True,
             )
             return cycle
 
@@ -1404,6 +1126,7 @@ async def complete_discovery_review(
         {
             "first_review": dict(first_result),
             "confirmation_review": result,
+            "confirmation_reasons": list(consequence_reasons),
         }
         if first_result is not None
         else result
@@ -1418,7 +1141,10 @@ async def complete_discovery_review(
     successor: DiscoveryCycle | None = None
     continuation_requested = (
         verdict in _AUTONOMOUS_CONTINUATION_VERDICTS
-        or (review_round == 2 and verdict in _CONSEQUENTIAL_VERDICTS)
+        or (
+            review_round == 2
+            and verdict in _CONSEQUENTIAL_CONTINUATION_VERDICTS
+        )
     )
     continuation_block_reason = (
         _continuation_block_reason(cycle, result)
@@ -1433,17 +1159,11 @@ async def complete_discovery_review(
             now=cycle.reviewed_at,
         )
 
-    event_type = "discovery.review_completed"
-    if (
-        verdict in {"ask_operator", "stop", "park"}
-        or continuation_block_reason is not None
-    ):
-        event_type = "discovery.operator_question"
     await _emit_review_event(
         session,
         cycle=cycle,
         task_id=task.id,
-        event_type=event_type,
+        event_type="discovery.review_completed",
         summary=(
             f"Discovery review for {cycle.direction_key}: {verdict} "
             f"({result['decision_summary'][:240]})"
@@ -1459,13 +1179,18 @@ async def complete_discovery_review(
                 else (
                     continuation_block_reason
                     or (
-                        "operator_notified"
+                        "resident_review_required"
                         if verdict in {"ask_operator", "stop", "park"}
                         else "halted"
                     )
                 )
             ),
         },
+        wake_resident=(
+            (review_round == 2 and bool(consequence_reasons))
+            or verdict == "ask_operator"
+            or continuation_block_reason is not None
+        ),
     )
     return cycle
 
@@ -1509,6 +1234,7 @@ async def block_failed_discovery_review(
         event_type="discovery.review_blocked",
         summary=f"Discovery review blocked for {cycle.direction_key}: {reason[:240]}",
         extra={"reason": reason[:500]},
+        wake_resident=True,
     )
     return True
 

@@ -1472,6 +1472,7 @@ async def sweep_stranded_lanes(session, now: datetime, *, runtime_config) -> int
                         Task.project_id,
                         Task.parent_task_id,
                         Task.priority,
+                        Task.post_commit_pending,
                         raiseload=True,
                     )
                 )
@@ -1529,10 +1530,26 @@ async def sweep_stranded_lanes(session, now: datetime, *, runtime_config) -> int
             stranded = True
         else:
             task = tasks_by_id.get(lane.current_task_id)
-            if task is None or task.status in _LANE_TERMINAL_TASK_STATUSES:
+            if task is None:
                 stranded = True
+            elif task.status in _LANE_TERMINAL_TASK_STATUSES:
+                # A terminal row with a write-ahead continuation marker still
+                # owns its review/fix handoff. The post-commit sweeper must
+                # finish or clear that marker before lane recovery may replace
+                # it with another writer.
+                stranded = not task.post_commit_pending
         if not stranded:
             continue
+
+        payload = (task.first_payload or {}) if task is not None else {}
+        task_ctx = dict((task.context if task is not None else None) or {})
+        pr_number = payload.get("pr_number")
+        branch = payload.get("branch")
+        base_branch = payload.get("base_branch")
+        original_task_id = payload.get("original_task_id") or (
+            str(task.id) if task is not None else None
+        )
+        recovery_task_id = uuid.uuid4()
 
         # Bounded recovery: increment the requeue counter via the shared
         # primitive, then either create a checkpoint-recovery task (rebinding
@@ -1542,19 +1559,70 @@ async def sweep_stranded_lanes(session, now: datetime, *, runtime_config) -> int
         # deterministically rather than parked into a dead state with no
         # resume path.
         try:
+            from app.models import _LANE_MAX_PHASE_REQUEUES
+
+            admitted_fix_target: dict | None = None
+            budget_can_requeue = (
+                (lane.phase_requeues or 0) + 1 <= _LANE_MAX_PHASE_REQUEUES
+            )
+            if task is not None and pr_number is not None and budget_can_requeue:
+                from app.fix_admission import (
+                    FixAdmissionDenial,
+                    prepare_direct_fix_admission,
+                )
+                from app.github import get_pull_request
+                from app.github_token_resolver import get_github_token_for_task
+
+                gh_token, owner, repo = await get_github_token_for_task(
+                    task.id, session
+                )
+
+                async def _fetch_lane_pr() -> dict:
+                    return await get_pull_request(
+                        gh_token, owner, repo, int(pr_number)
+                    )
+
+                admission = await prepare_direct_fix_admission(
+                    session,
+                    project_id=task.project_id,
+                    pr_number=int(pr_number),
+                    fix_task_id=recovery_task_id,
+                    fetch_live_pr=_fetch_lane_pr,
+                )
+                if not admission.allowed:
+                    if admission.denial is not FixAdmissionDenial.TERMINAL:
+                        # Missing credentials/live state and an existing owner
+                        # are deferrals, not evidence that the lane should die.
+                        # Commit the read-only admission transaction to release
+                        # its PR/task locks without consuming recovery budget.
+                        await session.commit()
+                        logger.info(
+                            "[WARM-POOL] deferred stranded-lane fix for PR #%s "
+                            "(%s): %s",
+                            pr_number,
+                            admission.denial.value if admission.denial else "unknown",
+                            admission.reason,
+                        )
+                        continue
+                    await cas_transition(
+                        session,
+                        lane.id,
+                        ImprovementLaneStatus.ACTIVE,
+                        ImprovementLaneStatus.KILLED,
+                    )
+                    transitioned += 1
+                    await session.commit()
+                    logger.info(
+                        "[WARM-POOL] skipped stranded-lane fix for terminal PR #%s: %s",
+                        pr_number,
+                        admission.reason,
+                    )
+                    continue
+                admitted_fix_target = dict(admission.fix_target or {})
             lane_locked, should_requeue = await mark_checkpoint_missing(
                 session, lane.id, reason="stranded_terminal_task"
             )
             if should_requeue:
-                payload = (task.first_payload or {}) if task is not None else {}
-                task_ctx = dict((task.context if task is not None else None) or {})
-                pr_number = payload.get("pr_number")
-                branch = payload.get("branch")
-                base_branch = payload.get("base_branch")
-                original_task_id = payload.get("original_task_id") or (
-                    str(task.id) if task is not None else None
-                )
-
                 if task is not None and pr_number is not None:
                     # Dispatch context available: create a recovery task and
                     # rebind the lane to it (stays ACTIVE), mirroring the
@@ -1579,6 +1647,9 @@ async def sweep_stranded_lanes(session, now: datetime, *, runtime_config) -> int
                     ):
                         if task_ctx.get(key) is not None:
                             recovery_ctx[key] = task_ctx[key]
+                    recovery_loop = dict(recovery_ctx.get("review_loop") or {})
+                    recovery_loop["fix_target"] = admitted_fix_target or {}
+                    recovery_ctx["review_loop"] = recovery_loop
                     # Always stamp the lane id — the stranded task's context may
                     # have been cleared, which would leave get_chain_lane() unable
                     # to find the lane when the recovery task completes.
@@ -1613,6 +1684,7 @@ async def sweep_stranded_lanes(session, now: datetime, *, runtime_config) -> int
                         is_rollup=False,
                     )
                     recovery_task = Task(
+                        id=recovery_task_id,
                         project_id=task.project_id,
                         title=f"Lane checkpoint recovery PR #{pr_number}",
                         description=recovery_prompt,
@@ -1664,8 +1736,6 @@ async def sweep_stranded_lanes(session, now: datetime, *, runtime_config) -> int
                         f"lane '{lane_title}' stranded — checkpoint recovery task spawned "
                         f"(phase_requeues={lane_locked.phase_requeues}; pr=#{pr_number})",
                     )
-                    from app.models import _LANE_MAX_PHASE_REQUEUES
-
                     if lane_locked.phase_requeues == _LANE_MAX_PHASE_REQUEUES - 1:
                         await emit_lane_event_message(
                             session,
@@ -1761,6 +1831,9 @@ async def sweep_stranded_lanes(session, now: datetime, *, runtime_config) -> int
                     f"exhausted (phase_requeues={lane_locked.phase_requeues})",
                 )
             transitioned += 1
+            # The fix row and every authority revocation become visible together;
+            # this also releases the scoped PR admission lock before other lanes.
+            await session.commit()
         except LaneCASError as exc:
             # Concurrent maintainer/sweep tick already transitioned this lane —
             # the loser no-ops rather than double-killing.  Log the loop-scoped

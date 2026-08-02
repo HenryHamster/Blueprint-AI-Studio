@@ -2,6 +2,7 @@ import logging
 import os
 import asyncio
 import hashlib
+import json
 import time
 import uuid
 from pathlib import Path
@@ -44,6 +45,32 @@ from app.schemas import AgentStatusPayload
 from app.routers.agent_status import _is_task_llm_auth_hard_disable
 from app.task_capabilities import TaskType, task_type_catalog
 from app.time_utils import _utcnow
+
+
+def _mock_open_pr_execution_fence(mocker, project_id, pr_number: int) -> dict:
+    """Let a PR claim traverse the real fence without external GitHub I/O."""
+    target = {
+        "project_id": str(project_id),
+        "pr_number": pr_number,
+        "base_sha": f"base-{pr_number}",
+        "head_sha": f"head-{pr_number}",
+    }
+    mocker.patch(
+        "app.review_claim_fence.get_github_token_for_task",
+        new=AsyncMock(return_value=("test-token", "test-owner", "test-repo")),
+    )
+    mocker.patch(
+        "app.review_claim_fence.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "base": {"sha": target["base_sha"]},
+                "head": {"sha": target["head_sha"]},
+            }
+        ),
+    )
+    return target
 
 
 def _resolve_sr_recent_miss_examples_contract_fixture() -> Path:
@@ -2979,8 +3006,7 @@ async def test_agent_claim_project_metadata_empty_build_config(
 async def test_agent_claim_surfaces_approval_gate_config(
     client: AsyncClient, db_session
 ):
-    """A project's approval_gate_config is surfaced in project_metadata so the
-    agent's fresh-reviewer can derive per-project sensitive paths."""
+    """A project's approval gate is surfaced for task-level policy checks."""
     project = Project(
         name="Approval Gate Test",
         user_id="test-user-123",
@@ -7654,7 +7680,7 @@ async def test_claim_omits_recent_findings_evidence_when_absent_or_non_list(
 @pytest.mark.smoketest
 @pytest.mark.asyncio
 async def test_claim_does_not_inject_direction_context_for_review_task(
-    client: AsyncClient, db_session
+    client: AsyncClient, db_session, mocker
 ):
     """Claim endpoint does NOT inject direction_context for review tasks (only create/fix/refactor)."""
     from sqlalchemy.orm.attributes import flag_modified
@@ -7674,6 +7700,7 @@ async def test_claim_does_not_inject_direction_context_for_review_task(
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    _mock_open_pr_execution_fence(mocker, project.id, 42)
 
     task = Task(
         project_id=project.id,
@@ -8812,7 +8839,7 @@ async def test_claim_injects_cochange_files_for_create_task(
 
 @pytest.mark.asyncio
 async def test_claim_does_not_inject_cochange_files_for_review_task(
-    client: AsyncClient, db_session
+    client: AsyncClient, db_session, mocker
 ):
     """Claim endpoint does NOT inject cochange_files for review tasks."""
     cochange_index = {
@@ -8825,6 +8852,7 @@ async def test_claim_does_not_inject_cochange_files_for_review_task(
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    _mock_open_pr_execution_fence(mocker, project.id, 99)
 
     # Seeded on purpose: the exclusion below must be earned by the task-type
     # gate, not granted for free by an index the reader never finds.
@@ -9280,7 +9308,7 @@ async def test_claim_injects_module_feedback_warnings_for_create_task(
 
 @pytest.mark.asyncio
 async def test_claim_does_not_inject_module_feedback_warnings_for_review_task(
-    client: AsyncClient, db_session
+    client: AsyncClient, db_session, mocker
 ):
     """Claim endpoint does NOT inject module_feedback_warnings for review tasks."""
     from sqlalchemy.orm.attributes import flag_modified
@@ -9301,6 +9329,7 @@ async def test_claim_does_not_inject_module_feedback_warnings_for_review_task(
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    _mock_open_pr_execution_fence(mocker, project.id, 42)
 
     task = Task(
         project_id=project.id,
@@ -9457,111 +9486,6 @@ async def test_claim_injects_self_review_catch_rate_for_qa(
 
 
 @pytest.mark.asyncio
-async def test_claim_injects_self_review_catch_rate_failure_mode_fields(
-    client: AsyncClient, db_session
-):
-    """Claim endpoint forwards trend, below_floor, engagement_thinning, and miss_mode_breakdown.
-
-    These fields drive the agent-side failure-mode hint
-    (self-review.ts:formatFailureModeHintForSrPrompt) and the thinning
-    reasoning gate (standard.ts:getThinningCategories). If _cat_entry drops
-    them at the backend->agent boundary, the hint never renders.
-    """
-    from sqlalchemy.orm.attributes import flag_modified
-
-    design_doc = {
-        "sr_catch_rate_trends": {
-            "categories": {
-                "security": {
-                    "miss_rate": 0.30,
-                    "trend": "decreasing",
-                    "below_floor": True,
-                    "engagement_thinning": True,
-                    "miss_mode_breakdown": {
-                        "reading_gap": 5,
-                        "judgment_gap": 1,
-                        "coverage_gap": 0,
-                        "dominant_mode": "reading_gap",
-                    },
-                },
-                "correctness": {
-                    "miss_rate": 0.10,
-                    # No regression signals — fields should be omitted.
-                },
-            },
-            "by_task_type": {
-                "create": {
-                    "security": {
-                        "miss_rate": 0.25,
-                        "trend": "stable",
-                        "below_floor": False,
-                        "miss_mode_breakdown": {
-                            "reading_gap": 0,
-                            "judgment_gap": 3,
-                            "coverage_gap": 1,
-                            "dominant_mode": "judgment_gap",
-                        },
-                    },
-                },
-            },
-        },
-    }
-    project = Project(
-        name="SR Failure Mode Test",
-        user_id="test-user-123",
-        design_doc=design_doc,
-    )
-    flag_modified(project, "design_doc")
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    task = Task(
-        project_id=project.id,
-        payloads=[{"type": "create", "prompt": "Add feature"}],
-        vm_instance_id="agent-vm-sr-failure-mode",
-        context={"related_files": ["backend/app/foo.py"]},
-    )
-    db_session.add(task)
-    await db_session.commit()
-    await db_session.refresh(task)
-
-    token = create_agent_token(str(task.id), "agent-vm-sr-failure-mode")
-    with patch('app.routers.agent._refresh_sr_catch_rate', AsyncMock()):
-        resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
-    assert resp.status_code == 200
-    project_ctx = resp.json().get("project_context", {})
-    sr = project_ctx.get("self_review_catch_rate")
-    assert sr is not None, (
-        f"expected self_review_catch_rate in project_context, got {list(project_ctx.keys())}"
-    )
-
-    sec = sr["categories"]["security"]
-    assert sec["trend"] == "decreasing"
-    assert sec["below_floor"] is True
-    assert sec["engagement_thinning"] is True
-    assert sec["miss_mode_breakdown"] == {
-        "reading_gap": 5,
-        "judgment_gap": 1,
-        "coverage_gap": 0,
-        "dominant_mode": "reading_gap",
-    }
-
-    # Category without regression signals: fields must be absent.
-    corr = sr["categories"]["correctness"]
-    assert "trend" not in corr
-    assert "below_floor" not in corr
-    assert "engagement_thinning" not in corr
-    assert "miss_mode_breakdown" not in corr
-
-    # for_task_type passthrough preserves the same fields.
-    type_sec = sr["for_task_type"]["security"]
-    assert type_sec["trend"] == "stable"
-    assert type_sec["below_floor"] is False
-    assert type_sec["miss_mode_breakdown"]["dominant_mode"] == "judgment_gap"
-
-
-@pytest.mark.asyncio
 async def test_claim_injects_architecture_context_for_create_task(
     client: AsyncClient, db_session
 ):
@@ -9627,7 +9551,7 @@ async def test_claim_injects_architecture_context_for_create_task(
 
 @pytest.mark.asyncio
 async def test_claim_does_not_inject_architecture_context_for_review_task(
-    client: AsyncClient, db_session
+    client: AsyncClient, db_session, mocker
 ):
     """Claim endpoint does NOT inject architecture_context for review tasks."""
     from sqlalchemy.orm.attributes import flag_modified
@@ -9649,6 +9573,7 @@ async def test_claim_does_not_inject_architecture_context_for_review_task(
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    _mock_open_pr_execution_fence(mocker, project.id, 99)
 
     task = Task(
         project_id=project.id,
@@ -11441,6 +11366,124 @@ async def test_post_commit_lock_on_retry_returns_pending_not_500(
     assert task.post_commit_pending is True, (
         "post_commit_pending must stay set on contention — the sweep owns the retry"
     )
+
+
+@pytest.mark.asyncio
+async def test_exact_ended_resident_terminal_retry_drives_post_commit(
+    client: AsyncClient, db_session, mocker
+):
+    """Cap/lapse ends the session before the agent's final status callback.
+
+    The exact ended generation/incarnation may consume the server-owned pending
+    marker, while the ordinary Resident authority fence remains closed.
+    """
+    from app.strategic_resident_session import RESIDENT_SESSION_KEY
+
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    process_post_commit = mocker.patch(
+        "app.routers.agent_status._process_post_commit",
+        new_callable=AsyncMock,
+        return_value={"status": "accepted"},
+    )
+
+    project = Project(name="Ended Resident Retry", user_id="test-user-resident")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task_id = uuid.uuid4()
+    incarnation_id = uuid.uuid4()
+    session_id = "ended-resident-session"
+    generation = 4
+    task = Task(
+        id=task_id,
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "resident_session": True}],
+        vm_instance_id="runner:ended-resident",
+        status=TaskStatus.COMPLETED,
+        post_commit_pending=True,
+        context={
+            "_resident_session": True,
+            "strategic_session_id": session_id,
+            "_resident_worker_generation": generation,
+            "_post_commit_pending_meta": {
+                "reason": "resident_session_ended",
+                "attempts": 0,
+                "payload": {
+                    "task_id": str(task_id),
+                    "resident_incarnation_id": str(incarnation_id),
+                    "status": "COMPLETED",
+                    "artifact_type": "RESEARCH_FINDINGS",
+                    "logs": "Canonical server-authored Resident completion",
+                },
+            },
+        },
+    )
+    project.vision = {
+        RESIDENT_SESSION_KEY: {
+            "status": "ended",
+            "stop_requested": True,
+            "session_id": session_id,
+            "task_id": str(task_id),
+            "worker_generation": generation,
+            "worker_incarnation_id": str(incarnation_id),
+        }
+    }
+    db_session.add(project)
+    db_session.add(task)
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    rejected = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": str(task.id),
+            "resident_incarnation_id": str(uuid.uuid4()),
+            "status": "COMPLETED",
+        },
+        headers={"x-agent-token": token},
+    )
+    assert rejected.status_code == 409
+    process_post_commit.assert_not_awaited()
+    await db_session.refresh(task)
+    assert task.post_commit_pending is True
+
+    conflicting = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": str(task.id),
+            "resident_incarnation_id": str(incarnation_id),
+            "status": "FAILED",
+        },
+        headers={"x-agent-token": token},
+    )
+    assert conflicting.status_code == 409
+    process_post_commit.assert_not_awaited()
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    assert task.post_commit_pending is True
+
+    response = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": str(task.id),
+            "resident_incarnation_id": str(incarnation_id),
+            "status": "COMPLETED",
+            "logs": "Tampered callback content must not reach post-commit",
+        },
+        headers={"x-agent-token": token},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "accepted"
+    process_post_commit.assert_awaited_once()
+    processed_payload = process_post_commit.await_args.args[1]
+    assert processed_payload.status == TaskStatus.COMPLETED
+    assert processed_payload.logs == "Canonical server-authored Resident completion"
+    await db_session.refresh(task)
+    assert task.post_commit_pending is False
+    assert "_post_commit_pending_meta" not in (task.context or {})
 
 
 @pytest.mark.asyncio
@@ -17761,7 +17804,7 @@ async def test_next_role_returns_204_when_no_warm_pinned_task(
 
 @pytest.mark.asyncio
 async def test_next_role_claims_warm_pinned_queued_task(
-    client: AsyncClient, db_session
+    client: AsyncClient, db_session, mocker
 ):
     """next-role atomically claims a QUEUED task whose context.warm_target_vm_id matches."""
     from datetime import timedelta
@@ -17770,6 +17813,7 @@ async def test_next_role_claims_warm_pinned_queued_task(
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    fix_target = _mock_open_pr_execution_fence(mocker, project.id, 1234)
 
     prior_task = Task(
         project_id=project.id,
@@ -17789,6 +17833,7 @@ async def test_next_role_claims_warm_pinned_queued_task(
             "warm_target_vm_id": "agent-vm-warm-claim",
             "warm_target_pr": "1234",
             "warm_handoff_deadline": deadline,
+            "review_loop": {"fix_target": fix_target},
         },
     )
     db_session.add(pinned_task)
@@ -18356,6 +18401,7 @@ async def test_next_role_token_mint_failure_rolls_back(
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    fix_target = _mock_open_pr_execution_fence(mocker, project.id, 2222)
 
     prior_task = Task(
         project_id=project.id,
@@ -18374,6 +18420,7 @@ async def test_next_role_token_mint_failure_rolls_back(
             "warm_target_vm_id": "agent-vm-mint-fail",
             "warm_target_pr": "2222",
             "warm_handoff_deadline": deadline,
+            "review_loop": {"fix_target": fix_target},
         },
     )
     db_session.add(pinned_task)
@@ -18493,6 +18540,7 @@ async def test_next_role_broadcasts_on_claim(client: AsyncClient, db_session, mo
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    fix_target = _mock_open_pr_execution_fence(mocker, project.id, 7777)
 
     prior_task = Task(
         project_id=project.id,
@@ -18511,6 +18559,7 @@ async def test_next_role_broadcasts_on_claim(client: AsyncClient, db_session, mo
             "warm_target_vm_id": "agent-vm-broadcast",
             "warm_target_pr": "7777",
             "warm_handoff_deadline": deadline,
+            "review_loop": {"fix_target": fix_target},
         },
     )
     db_session.add(pinned_task)
@@ -18831,7 +18880,7 @@ async def test_active_task_jwt_unaffected_by_freshness_check(
 
 @pytest.mark.asyncio
 async def test_next_role_claim_writes_warm_claim_origin(
-    client: AsyncClient, db_session
+    client: AsyncClient, db_session, mocker
 ):
     """The next-role warm-claim writes warm_claim_origin='next_role_endpoint' so
     post-mortems can distinguish server-side seeding from agent-reported values.
@@ -18842,6 +18891,7 @@ async def test_next_role_claim_writes_warm_claim_origin(
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    fix_target = _mock_open_pr_execution_fence(mocker, project.id, 4321)
 
     prior_task = Task(
         project_id=project.id,
@@ -18863,6 +18913,7 @@ async def test_next_role_claim_writes_warm_claim_origin(
             "warm_target_vm_id": "agent-vm-h3",
             "warm_target_pr": "4321",
             "warm_handoff_deadline": deadline,
+            "review_loop": {"fix_target": fix_target},
             "_timing": {"warm_start": False, "preexisting": "kept"},
         },
     )
@@ -19296,13 +19347,14 @@ async def test_claim_omits_sr_blind_spot_themes_when_empty(
 
 @pytest.mark.asyncio
 async def test_claim_does_not_inject_sr_blind_spot_themes_for_review_task(
-    client: AsyncClient, db_session
+    client: AsyncClient, db_session, mocker
 ):
     """Field is NOT injected for non-(create/fix/refactor/migrate) task types."""
     project = Project(name="SR BlindSpots Review", user_id="test-user-123")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    _mock_open_pr_execution_fence(mocker, project.id, 99)
     await _seed_blind_spot_tasks(db_session, project.id)
 
     task = Task(
@@ -19622,7 +19674,7 @@ async def test_claim_omits_sr_recent_miss_examples_when_no_examples(
 
 @pytest.mark.asyncio
 async def test_claim_does_not_inject_sr_recent_miss_examples_for_review_task(
-    client: AsyncClient, db_session
+    client: AsyncClient, db_session, mocker
 ):
     """Field is NOT injected for review task types."""
     from sqlalchemy.orm.attributes import flag_modified
@@ -19646,6 +19698,7 @@ async def test_claim_does_not_inject_sr_recent_miss_examples_for_review_task(
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    _mock_open_pr_execution_fence(mocker, project.id, 42)
     flag_modified(project, "design_doc")
     await db_session.commit()
 
@@ -21352,14 +21405,25 @@ async def test_hotfix_backmerge_runs_for_hotfix_merge_to_main(db_session, mocker
         "app.github.get_repo_installation_token",
         new=AsyncMock(return_value="gh-token"),
     )
+    exact_backmerge_target = {
+        "state": "open",
+        "merged": False,
+        "head": {"ref": "main", "sha": "hotfix-main-head-4242"},
+        "base": {"ref": "automain", "sha": "hotfix-automain-base-4242"},
+    }
     create_pr = mocker.patch(
         "app.github.create_pull_request",
         new=AsyncMock(
             return_value={
                 "number": 4242,
                 "html_url": "https://github.com/acme/widget/pull/4242",
+                **exact_backmerge_target,
             }
         ),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(return_value=exact_backmerge_target),
     )
     merge_pr = mocker.patch(
         "app.github.merge_pull_request",
@@ -21460,6 +21524,8 @@ async def test_hotfix_backmerge_trigger_commits_conflict_alert_and_task(
     # carries the PR coordinates and points back at the hotfix task.
     pr_number = 7777
     branch = "blueprint/rollup-hotfix"
+    head_sha = "hotfix-head"
+    base_sha = "hotfix-base"
     review_task = Task(
         project_id=project.id,
         title="Review of hotfix rollup PR",
@@ -21473,6 +21539,12 @@ async def test_hotfix_backmerge_trigger_commits_conflict_alert_and_task(
                 "branch": branch,
                 "base_branch": "main",
                 "original_task_id": str(orig_task.id),
+                "review_target": {
+                    "project_id": str(project.id),
+                    "pr_number": pr_number,
+                    "base_sha": base_sha,
+                    "head_sha": head_sha,
+                },
             }
         },
     )
@@ -21486,12 +21558,20 @@ async def test_hotfix_backmerge_trigger_commits_conflict_alert_and_task(
         "app.routers.agent.get_github_token_for_task",
         new=AsyncMock(return_value=("gh-token", "acme", "widget")),
     )
-    # PR head ref matches `branch` (no branch-mismatch abort); no head sha so the
-    # CI gate short-circuits (ci_status stays None) and the merge proceeds.
+    # PR identity matches the assigned review target so the backend can stamp
+    # the review verdict as exact-target authority before the merge proceeds.
     mocker.patch(
         "app.github.get_pull_request",
         new=AsyncMock(
-            return_value={"state": "open", "merged": False, "head": {"ref": branch}}
+            return_value={
+                "state": "open",
+                "merged": False,
+                "draft": False,
+                "mergeable": True,
+                "mergeable_state": "clean",
+                "head": {"ref": branch, "sha": head_sha},
+                "base": {"ref": "main", "sha": base_sha},
+            }
         ),
     )
     merge_pr = mocker.patch(
@@ -21500,6 +21580,21 @@ async def test_hotfix_backmerge_trigger_commits_conflict_alert_and_task(
     )
     mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
     mocker.patch("app.github.get_pr_files", new=AsyncMock(return_value=[]))
+    mocker.patch(
+        "app.github.submit_pr_review",
+        new=AsyncMock(return_value={"id": 1}),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={
+                "status": "completed",
+                "conclusion": "success",
+                "failed_logs": "",
+                "details": [],
+            }
+        ),
+    )
 
     # open_backmerge_pr mocked to REPLICATE its real conflict path: session.add
     # an ERROR Alert + a high-priority conflict-resolution Task, then flush() —
@@ -21540,7 +21635,15 @@ async def test_hotfix_backmerge_trigger_commits_conflict_alert_and_task(
     payload = AgentStatusPayload(
         task_id=review_task.id,
         status=TaskStatus.COMPLETED,
-        verdict_json='{"verdict": "APPROVE", "feedback": "ok", "issues": []}',
+        verdict_json=json.dumps(
+            {
+                "verdict": "APPROVE",
+                "feedback": "ok",
+                "issues": [],
+                "reviewed_head_sha": head_sha,
+                "reviewed_base_sha": base_sha,
+            }
+        ),
     )
     _factory = _process_post_commit_factory(db_session)
     await _process_post_commit(review_task.id, payload, _session_factory=_factory)
@@ -23580,7 +23683,7 @@ async def test_refresh_token_downgrades_bootstrap_to_short_ttl(
 
 @pytest.mark.asyncio
 async def test_warm_handoff_issues_short_ttl_for_refresh_capable_vm(
-    client: AsyncClient, db_session
+    client: AsyncClient, db_session, mocker
 ):
     """The warm-handoff path mints the short TTL when the VM has already
     proven it can refresh (a prior role on the VM recorded
@@ -23591,6 +23694,7 @@ async def test_warm_handoff_issues_short_ttl_for_refresh_capable_vm(
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    fix_target = _mock_open_pr_execution_fence(mocker, project.id, 4242)
 
     vm_id = "agent-vm-warm-confirmed"
     prior_task = Task(
@@ -23612,6 +23716,7 @@ async def test_warm_handoff_issues_short_ttl_for_refresh_capable_vm(
             "warm_target_vm_id": vm_id,
             "warm_target_pr": "4242",
             "warm_handoff_deadline": deadline,
+            "review_loop": {"fix_target": fix_target},
         },
     )
     db_session.add(pinned_task)
@@ -23645,7 +23750,7 @@ async def test_warm_handoff_issues_short_ttl_for_refresh_capable_vm(
 
 @pytest.mark.asyncio
 async def test_warm_handoff_keeps_bootstrap_ttl_for_unconfirmed_vm(
-    client: AsyncClient, db_session
+    client: AsyncClient, db_session, mocker
 ):
     """Deploy-survival regression guard: a VM that has NEVER refreshed (e.g.
     an old image that cannot call /refresh-token) must keep receiving the long
@@ -23656,6 +23761,7 @@ async def test_warm_handoff_keeps_bootstrap_ttl_for_unconfirmed_vm(
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    fix_target = _mock_open_pr_execution_fence(mocker, project.id, 5252)
 
     vm_id = "agent-vm-warm-unconfirmed"
     prior_task = Task(
@@ -23677,6 +23783,7 @@ async def test_warm_handoff_keeps_bootstrap_ttl_for_unconfirmed_vm(
             "warm_target_vm_id": vm_id,
             "warm_target_pr": "5252",
             "warm_handoff_deadline": deadline,
+            "review_loop": {"fix_target": fix_target},
         },
     )
     db_session.add(pinned_task)
@@ -25058,300 +25165,6 @@ async def test_agent_status_park_logs_sanitized_as_reason(
     assert "ghp_***" in task.park_reason, (
         "sanitized park_reason must contain the redaction marker"
     )
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# POST /api/agent/tasks/{original_task_id}/reviewer-merge — self-merge path
-#
-# Automatic fresh-reviewer passes (enabled / lone-checker / incomplete-SR
-# recovery) run AFTER the primary code-change session posted its terminal
-# status. They self-merge their reviewer output back into the SAME task's
-# durable _self_review_outcome (token sub == original_task_id). See
-# agent/src/handlers/{standard,fresh-reviewer}.ts and
-# merge_operator_reviewer_findings in app/routers/agent.py.
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-async def _make_reviewer_merge_project(db_session) -> Project:
-    project = Project(name="Reviewer Merge Test", user_id="test-user-rm")
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-    return project
-
-
-@pytest.mark.asyncio
-async def test_reviewer_merge_self_merge_persists_recovery_origin(client, db_session):
-    """A task self-merging its automatic fresh-reviewer output is authorized and
-    persists the supplied recovery origin onto _self_review_outcome and the
-    per-category check_results origin tags."""
-    project = await _make_reviewer_merge_project(db_session)
-    task = Task(
-        project_id=project.id,
-        payloads=[{"prompt": "do work"}],
-        status=TaskStatus.COMPLETED,
-        vm_instance_id="agent-vm-self-merge",
-        context={
-            "_self_review_outcome": {"check_results": {"correctness": {"passed": True}}}
-        },
-    )
-    db_session.add(task)
-    await db_session.commit()
-    await db_session.refresh(task)
-
-    # Token subject == the task itself → self-merge authorization.
-    token = create_agent_token(str(task.id), "agent-vm-self-merge")
-    resp = await client.post(
-        f"/api/agent/tasks/{task.id}/reviewer-merge",
-        headers={"x-agent-token": token},
-        json={
-            "reviewer_findings": [
-                {
-                    "category": "correctness",
-                    "description": "missed null check",
-                    "severity": "HIGH",
-                }
-            ],
-            "reviewer_edges_considered": [{"case": "empty list", "handled": False}],
-            "reviewer_recovery_origin": "lone_checker_recovery",
-        },
-    )
-    assert resp.status_code == 200
-    assert resp.json()["finding_count"] == 1
-
-    db_session.expire_all()
-    await db_session.refresh(task)
-    sr = task.context["_self_review_outcome"]
-    assert len(sr["reviewer_findings"]) == 1
-    # Supplied recovery origin is stamped (not the operator default).
-    assert sr["reviewer_recovery_origin"] == "lone_checker_recovery"
-    assert sr["reviewer_edges_considered"] == [{"case": "empty list", "handled": False}]
-    # The previously-passing self-attestation is overridden and tagged with the
-    # same recovery origin.
-    assert sr["check_results"]["correctness"]["passed"] is False
-    assert sr["check_results"]["correctness"]["origin"] == "lone_checker_recovery"
-
-
-@pytest.mark.asyncio
-async def test_reviewer_merge_self_merge_no_origin_uses_plain_reviewer(
-    client, db_session
-):
-    """A self-merge that supplies NO recovery origin (enabled path) tags findings
-    with a plain reviewer origin and leaves reviewer_recovery_origin unset — the
-    operator default must NOT leak into the self-merge path."""
-    project = await _make_reviewer_merge_project(db_session)
-    task = Task(
-        project_id=project.id,
-        payloads=[{"prompt": "do work"}],
-        status=TaskStatus.COMPLETED,
-        vm_instance_id="agent-vm-self-enabled",
-        context={
-            "_self_review_outcome": {"check_results": {"security": {"passed": True}}}
-        },
-    )
-    db_session.add(task)
-    await db_session.commit()
-    await db_session.refresh(task)
-
-    token = create_agent_token(str(task.id), "agent-vm-self-enabled")
-    resp = await client.post(
-        f"/api/agent/tasks/{task.id}/reviewer-merge",
-        headers={"x-agent-token": token},
-        json={
-            "reviewer_findings": [
-                {
-                    "category": "security",
-                    "description": "unvalidated input",
-                    "severity": "MEDIUM",
-                }
-            ]
-        },
-    )
-    assert resp.status_code == 200
-
-    db_session.expire_all()
-    await db_session.refresh(task)
-    sr = task.context["_self_review_outcome"]
-    # No recovery origin recorded for the plain enabled path.
-    assert "reviewer_recovery_origin" not in sr
-    # A category that previously PASSED self-review → reviewer_disagreement.
-    assert sr["check_results"]["security"]["passed"] is False
-    assert sr["check_results"]["security"]["origin"] == "reviewer_disagreement"
-
-
-@pytest.mark.asyncio
-async def test_reviewer_merge_operator_path_no_origin_defaults_to_operator(
-    client, db_session
-):
-    """The legacy operator-requested request shape (no reviewer_recovery_origin
-    field) is byte-for-byte unchanged: it still defaults to
-    operator_requested_recovery."""
-    project = await _make_reviewer_merge_project(db_session)
-    original = Task(
-        project_id=project.id,
-        payloads=[{"prompt": "do work"}],
-        status=TaskStatus.COMPLETED,
-        vm_instance_id="agent-vm-orig",
-        context={
-            "_self_review_outcome": {"check_results": {"correctness": {"passed": True}}}
-        },
-    )
-    db_session.add(original)
-    await db_session.commit()
-    await db_session.refresh(original)
-
-    reviewer = Task(
-        project_id=project.id,
-        payloads=[{"prompt": "review"}],
-        status=TaskStatus.IN_PROGRESS,
-        vm_instance_id="agent-vm-op-rev",
-        context={"operator_requested_review_for": str(original.id)},
-    )
-    db_session.add(reviewer)
-    await db_session.commit()
-    await db_session.refresh(reviewer)
-
-    token = create_agent_token(str(reviewer.id), "agent-vm-op-rev")
-    resp = await client.post(
-        f"/api/agent/tasks/{original.id}/reviewer-merge",
-        headers={"x-agent-token": token},
-        json={
-            "reviewer_findings": [
-                {
-                    "category": "correctness",
-                    "description": "missed edge case",
-                    "severity": "HIGH",
-                }
-            ]
-        },
-    )
-    assert resp.status_code == 200
-
-    db_session.expire_all()
-    await db_session.refresh(original)
-    sr = original.context["_self_review_outcome"]
-    assert sr["reviewer_recovery_origin"] == "operator_requested_recovery"
-    assert sr["check_results"]["correctness"]["origin"] == "operator_requested_recovery"
-
-
-@pytest.mark.asyncio
-async def test_reviewer_merge_unrelated_task_still_403(client, db_session):
-    """A requesting task that is neither the target itself nor an operator-scoped
-    reviewer for it is rejected with 403."""
-    project = await _make_reviewer_merge_project(db_session)
-    original = Task(
-        project_id=project.id,
-        payloads=[{"prompt": "do work"}],
-        status=TaskStatus.COMPLETED,
-        vm_instance_id="agent-vm-target",
-    )
-    db_session.add(original)
-    await db_session.commit()
-    await db_session.refresh(original)
-
-    other = Task(
-        project_id=project.id,
-        payloads=[{"prompt": "unrelated"}],
-        status=TaskStatus.IN_PROGRESS,
-        vm_instance_id="agent-vm-unrelated",
-        context={"operator_requested_review_for": str(uuid.uuid4())},
-    )
-    db_session.add(other)
-    await db_session.commit()
-    await db_session.refresh(other)
-
-    token = create_agent_token(str(other.id), "agent-vm-unrelated")
-    resp = await client.post(
-        f"/api/agent/tasks/{original.id}/reviewer-merge",
-        headers={"x-agent-token": token},
-        json={
-            "reviewer_findings": [],
-            "reviewer_recovery_origin": "lone_checker_recovery",
-        },
-    )
-    assert resp.status_code == 403
-
-
-@pytest.mark.asyncio
-async def test_reviewer_merge_findings_list_too_long(client, db_session):
-    """reviewer_findings with more than 100 items must return HTTP 422."""
-    project = await _make_reviewer_merge_project(db_session)
-    task = Task(
-        project_id=project.id,
-        payloads=[{"prompt": "do work"}],
-        status=TaskStatus.COMPLETED,
-        vm_instance_id="agent-vm-bounds-1",
-    )
-    db_session.add(task)
-    await db_session.commit()
-    await db_session.refresh(task)
-
-    token = create_agent_token(str(task.id), "agent-vm-bounds-1")
-    oversized = [
-        {"category": "correctness", "description": f"finding {i}"} for i in range(101)
-    ]
-    resp = await client.post(
-        f"/api/agent/tasks/{task.id}/reviewer-merge",
-        headers={"x-agent-token": token},
-        json={"reviewer_findings": oversized},
-    )
-    assert resp.status_code == 422
-
-
-@pytest.mark.asyncio
-async def test_reviewer_merge_edges_list_too_long(client, db_session):
-    """reviewer_edges_considered with more than 50 items must return HTTP 422."""
-    project = await _make_reviewer_merge_project(db_session)
-    task = Task(
-        project_id=project.id,
-        payloads=[{"prompt": "do work"}],
-        status=TaskStatus.COMPLETED,
-        vm_instance_id="agent-vm-bounds-2",
-    )
-    db_session.add(task)
-    await db_session.commit()
-    await db_session.refresh(task)
-
-    token = create_agent_token(str(task.id), "agent-vm-bounds-2")
-    oversized_edges = [{"case": f"edge {i}"} for i in range(51)]
-    resp = await client.post(
-        f"/api/agent/tasks/{task.id}/reviewer-merge",
-        headers={"x-agent-token": token},
-        json={"reviewer_findings": [], "reviewer_edges_considered": oversized_edges},
-    )
-    assert resp.status_code == 422
-
-
-@pytest.mark.asyncio
-async def test_reviewer_merge_finding_description_too_long(client, db_session):
-    """A single finding whose description exceeds 2000 characters must return HTTP 422."""
-    project = await _make_reviewer_merge_project(db_session)
-    task = Task(
-        project_id=project.id,
-        payloads=[{"prompt": "do work"}],
-        status=TaskStatus.COMPLETED,
-        vm_instance_id="agent-vm-bounds-3",
-    )
-    db_session.add(task)
-    await db_session.commit()
-    await db_session.refresh(task)
-
-    token = create_agent_token(str(task.id), "agent-vm-bounds-3")
-    resp = await client.post(
-        f"/api/agent/tasks/{task.id}/reviewer-merge",
-        headers={"x-agent-token": token},
-        json={
-            "reviewer_findings": [
-                {"category": "correctness", "description": "x" * 2001}
-            ]
-        },
-    )
-    assert resp.status_code == 422
-
-
-# ---------------------------------------------------------------------------
-# POST /api/agent/build-config-discovery tests
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio

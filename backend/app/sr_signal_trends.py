@@ -543,30 +543,6 @@ def get_sr_alert_drilldown_tasks(
             continue
         caught_in_target = human_cats & target_cats & sr_failed
         payload = t.first_payload or {}
-        findings_list = ctx["_self_review_outcome"].get("reviewer_findings") or []
-        findings_by_cat = {
-            f["category"]: f
-            for f in findings_list
-            if isinstance(f, dict) and "category" in f
-        }
-        missed_category_findings: dict[str, Any] = {}
-        for cat in missed_in_target:
-            finding = findings_by_cat.get(cat)
-            if finding:
-                desc = finding.get("description") or ""
-                missed_category_findings[cat] = {
-                    "severity": finding.get("severity"),
-                    "description": desc[:140],
-                    "has_more": len(desc) > 140,
-                    "full_description": desc if len(desc) > 140 else None,
-                }
-            else:
-                missed_category_findings[cat] = {
-                    "severity": None,
-                    "description": "no description recorded",
-                    "has_more": False,
-                    "full_description": None,
-                }
         results.append(
             {
                 "task_id": str(t.id),
@@ -577,7 +553,6 @@ def get_sr_alert_drilldown_tasks(
                 "missed_categories": sorted(missed_in_target),
                 "caught_categories": sorted(caught_in_target),
                 "sr_verdict": ctx["_self_review_outcome"].get("verdict"),
-                "missed_category_findings": missed_category_findings,
             }
         )
 

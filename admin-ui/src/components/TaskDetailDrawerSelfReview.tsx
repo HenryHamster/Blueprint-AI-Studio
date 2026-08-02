@@ -1,7 +1,6 @@
 import { useState } from 'react';
 import { ChevronDown, ChevronRight } from 'lucide-react';
 import type { Task } from './TaskCard';
-import { apiFetch } from '../api';
 
 interface SelfReviewCheckResult {
   passed: boolean;
@@ -9,12 +8,6 @@ interface SelfReviewCheckResult {
   reasoning?: string;
   severity?: string;
   evidence?: string;
-}
-
-interface ReviewerFinding {
-  category: string;
-  severity: 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW';
-  description: string;
 }
 
 interface EdgeConsidered {
@@ -29,7 +22,6 @@ interface SelfReviewOutcome {
   fixes_applied?: boolean;
   check_results?: Record<string, SelfReviewCheckResult>;
   blind_spots?: string[];
-  reviewer_findings?: ReviewerFinding[];
   edges_considered?: EdgeConsidered[];
   fix_iteration?: number;
   _filtered_blind_spots_count?: number;
@@ -41,27 +33,6 @@ const DISALLOWED_BLIND_SPOT_LABELS = [
   'docker pytest',
   'viewport tests',
 ];
-
-function getSeverityColor(severity: string): string {
-  switch (severity) {
-    case 'CRITICAL': return 'bg-red-950/40 border-red-800/40 text-red-400';
-    case 'HIGH': return 'bg-orange-950/40 border-orange-800/40 text-orange-400';
-    case 'MEDIUM': return 'bg-amber-950/40 border-amber-800/40 text-amber-400';
-    case 'LOW': return 'bg-yellow-950/40 border-yellow-800/40 text-yellow-400';
-    default: return 'bg-neutral-800 border-neutral-700 text-neutral-400';
-  }
-}
-
-function getSRPredictionBadge(category: string, checkResults: Record<string, SelfReviewCheckResult>): { icon: string; label: string; color: string } | null {
-  if (!checkResults || !(category in checkResults)) {
-    return { icon: '–', label: 'no SR signal', color: 'bg-neutral-900/40 border-neutral-700/40 text-neutral-500' };
-  }
-  const result = checkResults[category];
-  if (!result.passed) {
-    return { icon: '✓', label: 'caught by SR', color: 'bg-emerald-950/40 border-emerald-800/40 text-emerald-400' };
-  }
-  return { icon: '✗', label: 'missed by SR', color: 'bg-red-950/40 border-red-800/40 text-red-400' };
-}
 
 function CheckResultReasoningDisplay({ result }: { result: SelfReviewCheckResult }) {
   const [expanded, setExpanded] = useState(false);
@@ -103,34 +74,10 @@ export function SelfReviewPanel({ task }: { task: Task }) {
   const outcome = ctx?._self_review_outcome as SelfReviewOutcome | undefined;
   const humanCategories = ctx?._first_attempt_rejection_categories as Record<string, unknown> | undefined;
   const [open, setOpen] = useState(false);
-  const [requestingFreshReview, setRequestingFreshReview] = useState(false);
-  const [freshReviewResult, setFreshReviewResult] = useState<'success' | 'cooldown' | string | null>(null);
-
-  const handleRequestFreshReview = async () => {
-    setRequestingFreshReview(true);
-    setFreshReviewResult(null);
-    try {
-      const res = await apiFetch(`/api/admin/tasks/${task.id}/request-fresh-reviewer`, { method: 'POST' });
-      if (res.ok) {
-        setFreshReviewResult('success');
-      } else if (res.status === 429) {
-        setFreshReviewResult('cooldown');
-      } else {
-        const data = await res.json().catch(() => ({}));
-        setFreshReviewResult((data as { detail?: string }).detail ?? `Error ${res.status}`);
-      }
-    } catch {
-      setFreshReviewResult('Request failed');
-    } finally {
-      setRequestingFreshReview(false);
-    }
-  };
-
   if (!outcome) return null;
 
   const verdict = outcome.verdict ?? 'unknown';
   const checkResults = outcome.check_results ?? {};
-  const reviewerFindings = outcome.reviewer_findings ?? [];
   const isSoftFallback = verdict === 'unknown' && Object.keys(checkResults).length === 0;
 
   const verdictColor = verdict === 'pass' ? 'text-emerald-400' : verdict === 'fail' ? 'text-red-400' : 'text-neutral-400';
@@ -287,34 +234,6 @@ export function SelfReviewPanel({ task }: { task: Task }) {
                 </div>
               )}
 
-              {reviewerFindings.length > 0 && (
-                <div className="border-t border-neutral-700/50 pt-3">
-                  <p className="text-xs text-neutral-400 font-medium mb-1.5">Fresh-reviewer findings</p>
-                  <div className="space-y-2">
-                    {reviewerFindings.sort((a, b) => {
-                      const severityOrder: Record<string, number> = { CRITICAL: 0, HIGH: 1, MEDIUM: 2, LOW: 3 };
-                      return (severityOrder[a.severity] ?? 4) - (severityOrder[b.severity] ?? 4);
-                    }).map((finding, i) => {
-                      const srBadge = getSRPredictionBadge(finding.category, checkResults);
-                      return (
-                        <div key={i} className={`text-xs rounded border px-2 py-1.5 ${getSeverityColor(finding.severity)}`}>
-                          <div className="flex items-center gap-2 mb-0.5 flex-wrap">
-                            <span className="font-semibold uppercase text-ui-xs tracking-wide">{finding.severity}</span>
-                            <span className="font-mono text-ui-sm">{finding.category}</span>
-                            {srBadge && (
-                              <span className={`text-ui-xs font-semibold px-1.5 py-0.5 rounded border inline-block ml-auto ${srBadge.color}`}>
-                                {srBadge.icon} {srBadge.label}
-                              </span>
-                            )}
-                          </div>
-                          <p className="text-neutral-200 break-words">{finding.description}</p>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-              )}
-
               {humanCats && allCategories.length > 0 && (
                 <div>
                   <p className="text-xs text-neutral-400 font-medium mb-1.5">Agent vs. Human review categories</p>
@@ -353,28 +272,6 @@ export function SelfReviewPanel({ task }: { task: Task }) {
                 </div>
               )}
 
-              {task.status === 'COMPLETED' && (
-                <div className="border-t border-neutral-700/50 pt-3">
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <button
-                      onClick={handleRequestFreshReview}
-                      disabled={requestingFreshReview || freshReviewResult === 'success'}
-                      className="text-xs px-2.5 py-1.5 rounded border border-blue-700/50 bg-blue-950/30 text-blue-400 hover:bg-blue-950/50 hover:border-blue-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                    >
-                      {requestingFreshReview ? 'Requesting…' : 'Request fresh review'}
-                    </button>
-                    {freshReviewResult === 'success' && (
-                      <span className="text-xs text-emerald-400">Queued — findings will appear here when complete.</span>
-                    )}
-                    {freshReviewResult === 'cooldown' && (
-                      <span className="text-xs text-amber-400">Cooldown active — a fresh-reviewer pass was recently run.</span>
-                    )}
-                    {freshReviewResult && freshReviewResult !== 'success' && freshReviewResult !== 'cooldown' && (
-                      <span className="text-xs text-red-400">{freshReviewResult}</span>
-                    )}
-                  </div>
-                </div>
-              )}
             </>
           )}
         </div>

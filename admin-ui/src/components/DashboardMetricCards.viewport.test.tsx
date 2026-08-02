@@ -32,9 +32,6 @@ const trends = {
   categories: { correctness: { current_reviewer_finding_count: 64 } },
   previous_overall_hit_rate: 0.61,
   overall_trend_verdict: 'declining',
-  overall_sr_alone_hit_rate: 0.55,
-  previous_overall_sr_alone_hit_rate: 0.7,
-  overall_sr_alone_trend_verdict: 'declining',
   is_stale: true,
 } as unknown as SrTrendWithFixIterations;
 

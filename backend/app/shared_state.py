@@ -56,7 +56,6 @@ from app.runtime_config_state import (  # noqa: F401
     _seed_promotion_policy,
     promotion_enabled_by_project_map,
     resolve_project_promotion_enabled,
-    resolve_project_walkthrough_e2e_enabled,
     resolve_retry_budget,
     runtime_config,
     runtime_config_lock,

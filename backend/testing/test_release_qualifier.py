@@ -11,9 +11,8 @@
 """Domain slice: run_qualification — walkthrough_e2e evidence-child spawn.
 
 Split from test_release_qualifier.py. Covers run_qualification's optional
-walkthrough_e2e child: exactly one QUEUED evidence-only child pinned to the
-candidate SHA + attempt id when walkthrough_e2e_enabled, and no child at all
-when it is False."""
+walkthrough_e2e child: exactly one QUEUED decision-bearing child pinned to the
+candidate SHA + attempt id when explicitly requested, and no child by default."""
 from _release_qualifier_testhelpers import *  # noqa: F403
 
 
@@ -21,18 +20,17 @@ from _release_qualifier_testhelpers import *  # noqa: F403
 async def test_run_qualification_spawns_walkthrough_e2e_when_enabled(
     db_session, mocker
 ):
-    """With walkthrough_e2e_enabled=True, run_qualification spawns exactly ONE
+    """An explicit walkthrough probe request spawns exactly ONE
     QUEUED walkthrough_e2e child pinned to the candidate SHA + the qualification
     attempt id, and a same-attempt re-drive does NOT spawn a duplicate.
 
-    The walkthrough child is evidence-only: it is flagged
-    ``qualifier_walkthrough_e2e`` (so a failed run cascades no fix task) and is
-    NOT a required child for the in-flight / finalize gate."""
+    The walkthrough child is flagged ``qualifier_walkthrough_e2e`` (so a failed
+    run cascades no fix task) and is a required child for this attempt's
+    in-flight/finalize gate."""
     from app import shared_state
 
     shared_state.runtime_config["smoketest_enabled"] = False
     shared_state.runtime_config["env_preflight_enabled"] = False
-    shared_state.runtime_config["walkthrough_e2e_enabled"] = True
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
 
@@ -50,35 +48,42 @@ async def test_run_qualification_spawns_walkthrough_e2e_when_enabled(
         new=AsyncMock(return_value={"conclusion": "success"}),
     )
 
-    result = await rq.run_qualification(db_session, project.id, version)
+    result = await rq.run_qualification(
+        db_session,
+        project.id,
+        version,
+        requested_probes=["walkthrough_e2e"],
+    )
     await db_session.commit()
 
     assert result["status"] == "spawned"
-    assert result["walkthrough_e2e_enabled"] is True
+    assert result["requested_probes"] == ["walkthrough_e2e"]
     walk_task_id = result["walkthrough_e2e_task_id"]
     assert walk_task_id is not None
 
     await db_session.refresh(version)
     attempt_id = version.last_qualification["qualification_attempt_id"]
-    assert version.last_qualification["walkthrough_e2e_enabled"] is True
+    assert version.last_qualification["requested_probes"] == ["walkthrough_e2e"]
     assert version.last_qualification["walkthrough_e2e_task_id"] == walk_task_id
 
     # Exactly one walkthrough_e2e task, QUEUED, pinned to the candidate SHA and
     # the qualification attempt id.
     from sqlmodel import select as _sqlmodel_select
 
-    walk_tasks = (
+    project_tasks = (
         (
             await db_session.execute(
-                _sqlmodel_select(Task).where(
-                    Task.project_id == project.id,
-                    Task.context["qualifier_walkthrough_e2e"].astext == "true",
-                )
+                _sqlmodel_select(Task).where(Task.project_id == project.id)
             )
         )
         .scalars()
         .all()
     )
+    walk_tasks = [
+        task
+        for task in project_tasks
+        if (task.context or {}).get("qualifier_walkthrough_e2e") is True
+    ]
     assert len(walk_tasks) == 1
     walk = walk_tasks[0]
     assert str(walk.id) == walk_task_id
@@ -88,7 +93,7 @@ async def test_run_qualification_spawns_walkthrough_e2e_when_enabled(
     assert walk.first_payload["candidate_sha"] == candidate
     assert walk.first_payload["qualification_attempt_id"] == attempt_id
     assert walk.first_payload["base_branch"] == "automain"
-    # Evidence-only marker mirrors the smoketest's qualifier_smoketest flag.
+    # Qualifier marker prevents ordinary task-fix cascades.
     assert walk.context["qualifier_walkthrough_e2e"] is True
     assert walk.context["candidate_sha"] == candidate
     assert walk.context["qualification_attempt_id"] == attempt_id
@@ -99,13 +104,12 @@ async def test_run_qualification_spawns_walkthrough_e2e_when_enabled(
 async def test_run_qualification_skips_walkthrough_e2e_when_disabled(
     db_session, mocker
 ):
-    """With walkthrough_e2e_enabled=False, no walkthrough_e2e child is spawned
+    """Without an explicit probe request, no walkthrough_e2e child is spawned
     and last_qualification records a None walkthrough_e2e_task_id."""
     from app import shared_state
 
     shared_state.runtime_config["smoketest_enabled"] = False
     shared_state.runtime_config["env_preflight_enabled"] = False
-    shared_state.runtime_config["walkthrough_e2e_enabled"] = False
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
 
@@ -127,28 +131,215 @@ async def test_run_qualification_skips_walkthrough_e2e_when_disabled(
     await db_session.commit()
 
     assert result["status"] == "spawned"
-    assert result["walkthrough_e2e_enabled"] is False
+    assert result["requested_probes"] == []
     assert result["walkthrough_e2e_task_id"] is None
 
     await db_session.refresh(version)
-    assert version.last_qualification["walkthrough_e2e_enabled"] is False
+    assert version.last_qualification["requested_probes"] == []
     assert version.last_qualification["walkthrough_e2e_task_id"] is None
 
     from sqlmodel import select as _sqlmodel_select
 
-    walk_tasks = (
+    project_tasks = (
         (
             await db_session.execute(
-                _sqlmodel_select(Task).where(
-                    Task.project_id == project.id,
-                    Task.context["qualifier_walkthrough_e2e"].astext == "true",
-                )
+                _sqlmodel_select(Task).where(Task.project_id == project.id)
             )
         )
         .scalars()
         .all()
     )
+    walk_tasks = [
+        task
+        for task in project_tasks
+        if (task.context or {}).get("qualifier_walkthrough_e2e") is True
+    ]
     assert walk_tasks == []
+
+
+def test_walkthrough_probe_contract_is_strict_and_cache_safe():
+    with pytest.raises(ValueError, match="unsupported"):
+        rq._normalize_qualification_probes(["made_up_probe"])
+    with pytest.raises(ValueError, match="duplicate"):
+        rq._normalize_qualification_probes(
+            ["walkthrough_e2e", "walkthrough_e2e"]
+        )
+    with pytest.raises(ValueError, match="collection"):
+        rq._normalize_qualification_probes("walkthrough_e2e")
+
+    candidate = "a" * 40
+    assert not rq._qualification_probe_contract_is_reusable(
+        {"candidate_sha": candidate, "requested_probes": []},
+        frozenset({"walkthrough_e2e"}),
+    )
+    assert not rq._qualification_probe_contract_is_reusable(
+        {
+            "candidate_sha": candidate,
+            "requested_probes": ["walkthrough_e2e"],
+            "walkthrough_e2e_result": {
+                "status": "passed",
+                "candidate_sha": candidate,
+            },
+        },
+        frozenset({"walkthrough_e2e"}),
+    )
+    assert not rq._qualification_probe_contract_is_reusable(
+        {
+            "candidate_sha": candidate,
+            "requested_probes": ["walkthrough_e2e"],
+            "walkthrough_e2e_result": {
+                "status": "passed",
+                "candidate_sha": candidate,
+                "exercised_engine_sha": "b" * 40,
+            },
+        },
+        frozenset({"walkthrough_e2e"}),
+    )
+    assert rq._qualification_probe_contract_is_reusable(
+        {
+            "candidate_sha": candidate,
+            "requested_probes": ["walkthrough_e2e"],
+            "walkthrough_e2e_result": {
+                "status": "passed",
+                "candidate_sha": candidate,
+                "exercised_engine_sha": candidate,
+            },
+        },
+        frozenset({"walkthrough_e2e"}),
+    )
+
+
+def test_walkthrough_report_requires_exact_exercised_sha_and_classifies_failure():
+    candidate = "b" * 40
+    full_results = [
+        {"criterion_key": "c-dfdc9d82", "passed": True},
+        {"criterion_key": "c-f52fd975", "passed": True},
+        {"criterion_key": "c-workday-session-lifecycle", "passed": True},
+        {"criterion_key": "c-5214996f", "passed": True},
+    ]
+    missing_engine = rq._evaluate_walkthrough_e2e_report(
+        {
+            "git_sha": candidate,
+            "results": full_results,
+        },
+        candidate,
+    )
+    assert missing_engine == {
+        "status": "invalid",
+        "reason": "exercised_engine_sha_mismatch",
+        "candidate_sha": candidate,
+        "exercised_engine_sha": None,
+    }
+
+    failed = rq._evaluate_walkthrough_e2e_report(
+        {
+            "git_sha": candidate,
+            "exercised_engine_sha": candidate,
+            "results": [
+                {"criterion_key": "c-dfdc9d82", "passed": True},
+                {"criterion_key": "c-f52fd975", "passed": False},
+                {
+                    "criterion_key": "c-workday-session-lifecycle",
+                    "passed": True,
+                },
+                {"criterion_key": "c-5214996f", "passed": False},
+            ],
+        },
+        candidate,
+    )
+    assert failed["status"] == "failed"
+    assert failed["failed_criterion_keys"] == ["c-f52fd975", "c-5214996f"]
+    assert rq._walkthrough_e2e_canonical_evidence_keys(failed["results"]) == {
+        "c-dfdc9d82",
+        "c-f52fd975",
+        "c-5214996f",
+    }
+    decision = rq._apply_walkthrough_decision(
+        {"promote": True, "blocker": None, "sub_scores": {"audit": 1.0}},
+        failed,
+    )
+    assert decision["promote"] is False
+    assert decision["blocker"] == "walkthrough_e2e_failed"
+    assert decision["sub_scores"]["walkthrough_e2e"] == 0.0
+
+
+def test_walkthrough_report_rejects_subset_duplicate_and_malformed_rows():
+    candidate = "c" * 40
+    full_results = [
+        {"criterion_key": "c-dfdc9d82", "passed": True},
+        {"criterion_key": "c-f52fd975", "passed": True},
+        {"criterion_key": "c-workday-session-lifecycle", "passed": True},
+        {"criterion_key": "c-5214996f", "passed": True},
+    ]
+
+    def evaluate(results):
+        return rq._evaluate_walkthrough_e2e_report(
+            {
+                "git_sha": candidate,
+                "exercised_engine_sha": candidate,
+                "results": results,
+            },
+            candidate,
+        )
+
+    subset = evaluate(full_results[:-1])
+    assert subset["status"] == "invalid"
+    assert subset["reason"] == "result_schema_mismatch"
+    assert subset["missing_criterion_keys"] == ["c-5214996f"]
+
+    duplicate = evaluate(
+        [*full_results[:-1], {"criterion_key": "c-dfdc9d82", "passed": True}]
+    )
+    assert duplicate["status"] == "invalid"
+    assert duplicate["reason"] == "result_key_duplicate"
+
+    malformed = evaluate(
+        [
+            full_results[0],
+            {"criterion_key": "c-f52fd975", "passed": 1},
+            *full_results[2:],
+        ]
+    )
+    assert malformed["status"] == "invalid"
+    assert malformed["reason"] == "result_entry_invalid"
+
+
+@pytest.mark.asyncio
+async def test_requested_walkthrough_is_a_required_terminal_child():
+    import uuid
+    from types import SimpleNamespace
+
+    attempt_id = uuid.uuid4()
+    audit_id = uuid.uuid4()
+    walkthrough_id = uuid.uuid4()
+    version = SimpleNamespace(
+        version_number=1,
+        last_qualification={
+            "status": "pending",
+            "qualification_attempt_id": str(attempt_id),
+            "audit_task_id": str(audit_id),
+            "requested_probes": ["walkthrough_e2e"],
+            "walkthrough_e2e_task_id": str(walkthrough_id),
+        },
+    )
+    tasks = {
+        audit_id: SimpleNamespace(
+            id=audit_id,
+            status=TaskStatus.COMPLETED,
+            context={"qualification_attempt_id": str(attempt_id)},
+        ),
+        walkthrough_id: SimpleNamespace(
+            id=walkthrough_id,
+            status=TaskStatus.QUEUED,
+            context={"qualification_attempt_id": str(attempt_id)},
+        ),
+    }
+    session = MagicMock()
+    session.get = AsyncMock(side_effect=lambda _model, task_id: tasks.get(task_id))
+
+    assert not await rq._required_children_terminal(session, version)
+    tasks[walkthrough_id].status = TaskStatus.COMPLETED
+    assert await rq._required_children_terminal(session, version)
 
 
 @pytest.mark.asyncio
@@ -183,7 +374,6 @@ async def test_walkthrough_e2e_lane_records_registered_criterion_evidence(
 
     shared_state.runtime_config["smoketest_enabled"] = False
     shared_state.runtime_config["env_preflight_enabled"] = False
-    shared_state.runtime_config["walkthrough_e2e_enabled"] = True
 
     # PROPERTY 1: project + open version; register the three emitted keys as ACTIVE criteria.
     project, version = await _make_project_and_version(db_session, phase="stabilize")
@@ -233,11 +423,16 @@ async def test_walkthrough_e2e_lane_records_registered_criterion_evidence(
     )
 
     # PROPERTY 2: run_qualification spawns exactly one QUEUED walkthrough_e2e child.
-    result = await rq.run_qualification(db_session, project.id, version)
+    result = await rq.run_qualification(
+        db_session,
+        project.id,
+        version,
+        requested_probes=["walkthrough_e2e"],
+    )
     await db_session.commit()
 
     assert result["status"] == "spawned"
-    assert result["walkthrough_e2e_enabled"] is True
+    assert result["requested_probes"] == ["walkthrough_e2e"]
     walk_task_id = result["walkthrough_e2e_task_id"]
     assert walk_task_id is not None
 
@@ -245,18 +440,20 @@ async def test_walkthrough_e2e_lane_records_registered_criterion_evidence(
     attempt_id = version.last_qualification["qualification_attempt_id"]
     assert version.last_qualification["candidate_sha"] == candidate
 
-    walk_tasks = (
+    project_tasks = (
         (
             await db_session.execute(
-                _sel(Task).where(
-                    Task.project_id == project.id,
-                    Task.context["qualifier_walkthrough_e2e"].astext == "true",
-                )
+                _sel(Task).where(Task.project_id == project.id)
             )
         )
         .scalars()
         .all()
     )
+    walk_tasks = [
+        task
+        for task in project_tasks
+        if (task.context or {}).get("qualifier_walkthrough_e2e") is True
+    ]
     assert len(walk_tasks) == 1
     walk = walk_tasks[0]
     assert str(walk.id) == walk_task_id

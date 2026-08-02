@@ -468,12 +468,14 @@ async def test_fix_task_receives_project_context(client: AsyncClient, db_session
 
 
 async def _make_task(db_session, project, status, requires_approval=False):
-    """Helper: create a task belonging to a project with test user as member."""
+    """Create a generic task belonging to a project with the test user as member."""
     task = Task(
         project_id=project.id,
         title="Test task",
         status=status,
-        payloads=[{"type": "fix", "prompt": "do something"}],
+        # These tests exercise generic bulk mutations. A fix task now requires
+        # an exact live PR target and has its own admission-focused coverage.
+        payloads=[{"type": "create", "prompt": "do something"}],
         requires_approval=requires_approval,
     )
     db_session.add(task)

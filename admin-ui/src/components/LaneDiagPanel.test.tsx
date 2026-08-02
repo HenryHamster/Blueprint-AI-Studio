@@ -18,7 +18,6 @@ const mockLaneDiagResponse = {
     LANE_CI: 3,
     LANE_CONFLICT: 1,
     LANE_REVIEW_CONVERGENCE: 2,
-    LANE_ARBITRATION: 0,
   },
   lane_iteration_distribution: {},
   per_pr_phase_breakdown: [
@@ -228,8 +227,6 @@ describe('LaneDiagPanel', () => {
     expect(screen.getByText('LANE_CI')).toBeInTheDocument();
     expect(screen.getByText('LANE_CONFLICT')).toBeInTheDocument();
     expect(screen.getByText('LANE_REVIEW_CONVERGENCE')).toBeInTheDocument();
-    // LANE_ARBITRATION has count 0 so it should not be shown
-    expect(screen.queryByText('LANE_ARBITRATION')).not.toBeInTheDocument();
   });
 
   it('renders per-PR phase breakdown sorted by total_seconds desc', async () => {

@@ -63,7 +63,6 @@ def test_precision_equals_one_minus_fpr_from_cat_fp_stats():
                 "check_results": {
                     cat: {"passed": False} for cat in sr_failed_cats
                 },
-                "reviewer_findings": [],
             },
             "_first_attempt_rejection_categories": {c: 1 for c in human_cats},
         })

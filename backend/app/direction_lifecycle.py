@@ -14,6 +14,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.models import Project, Task, TaskStatus
+from app.direction_terminal_guard import mark_auto_direction_terminal
 from app.payload_schemas import validate_internal_payload
 from app.shared_state import (
     runtime_config as _runtime_config,
@@ -370,18 +371,20 @@ def apply_churn_retirement_retire(
     """RETIRE decision on a churn-retirement-recommended direction.
 
     Confirms the terminal outcome the recommendation was proposing: marks the
-    direction ``completed``/``auto_completed`` with a reason attributing the
-    retirement to an explicit keep/retire decision, and clears the recommendation
+    direction retired with the explicit ``stopped`` outcome and a reason
+    attributing the retirement to an explicit keep/retire decision, then clears the recommendation
     fields plus the manual-hold flags the recommendation set (retirement
     supersedes them — mirrors :func:`_retire_lifetime_burn`). Gap reconciliation
     and retired-direction memory are the caller's responsibility (they need the
     problem_model / vision, which live outside the direction dict).
     """
     now = now_iso or _utcnow().isoformat()
-    direction["status"] = "completed"
-    direction["auto_completed"] = True
-    direction["auto_completed_reason"] = reason
-    direction["completed_at"] = now
+    mark_auto_direction_terminal(
+        direction,
+        outcome="stopped",
+        reason=reason,
+        completed_at=now,
+    )
     for key in _CHURN_RETIREMENT_RECOMMENDATION_KEYS:
         direction.pop(key, None)
     direction.pop("needs_manual_intervention", None)
@@ -854,20 +857,23 @@ async def _process_direction_lifecycle_locked(
 
         Single source of truth for the lifetime-burn retire side effects so the
         active-directions retire ladder and the auto-recovery extend-pause path
-        produce a functionally identical retirement: mark the direction
-        completed, clear the manual-hold flags, post the milestone + Alert, and
+        produce a functionally identical retirement: mark the direction with the
+        explicit ``failed`` outcome, clear the manual-hold flags, post the milestone + Alert, and
         reconcile any gap the direction was staffing. Callers set
         ``directions_modified = True`` and ``continue`` past the
         active_directions append.
         """
-        d["status"] = "completed"
-        d["auto_completed"] = True
-        d["auto_completed_reason"] = (
+        _reason = (
             f"Auto-retired: direction tripped lifetime burn backstop "
             f"{lb_pause_count} times with no recovery. "
             f"Slot freed for new directions."
         )
-        d["completed_at"] = _utcnow().isoformat()
+        mark_auto_direction_terminal(
+            d,
+            outcome="failed",
+            reason=_reason,
+            completed_at=_utcnow().isoformat(),
+        )
         # Clear the manual-hold flags — retirement supersedes them.
         d.pop("needs_manual_intervention", None)
         d.pop("needs_manual_intervention_at", None)
@@ -880,7 +886,7 @@ async def _process_direction_lifecycle_locked(
         session.add(
             Alert(
                 project_id=project.id,
-                event_type="research.direction_auto_completed",
+                event_type="research.direction_auto_retired",
                 severity=AlertSeverity.INFO,
                 title="Direction auto-retired (lifetime burn)",
                 message=(
@@ -1796,13 +1802,16 @@ async def _process_direction_lifecycle_locked(
             MAX_AUTO_PAUSE_CYCLES = _MAX_AUTO_PAUSE_CYCLES
             code_pause_count = d.get("code_failure_pause_count", 0)
             if code_pause_count >= MAX_AUTO_PAUSE_CYCLES:
-                d["status"] = "completed"
-                d["auto_completed"] = True
-                d["auto_completed_reason"] = (
+                _reason = (
                     f"Auto-retired: direction hit {code_pause_count} code-failure "
                     f"auto-pauses without producing results. Slot freed for new directions."
                 )
-                d["completed_at"] = _utcnow().isoformat()
+                mark_auto_direction_terminal(
+                    d,
+                    outcome="failed",
+                    reason=_reason,
+                    completed_at=_utcnow().isoformat(),
+                )
                 logger.info(
                     f"[AUTONOMOUS] Auto-retired direction {did} after "
                     f"{code_pause_count} code-failure auto-pause cycles: {d.get('text', '')[:60]}"
@@ -1811,7 +1820,7 @@ async def _process_direction_lifecycle_locked(
 
                 alert = Alert(
                     project_id=project.id,
-                    event_type="research.direction_auto_completed",
+                    event_type="research.direction_auto_retired",
                     severity=AlertSeverity.INFO,
                     title="Direction auto-retired",
                     message=(

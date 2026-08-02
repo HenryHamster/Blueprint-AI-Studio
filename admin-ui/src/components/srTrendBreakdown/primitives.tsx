@@ -1,18 +1,12 @@
 /* eslint-disable react-refresh/only-export-components */
 import { Check, Minus, TrendingDown, TrendingUp } from 'lucide-react';
 import type { SrCatchRateHealthResponse } from '../../api';
-import type { SrCategoryTrend, SrMissExample, SrReviewerFinding, SrSeverityBucket } from './types';
+import type { SrCategoryTrend, SrMissExample, SrSeverityBucket } from './types';
 
 export function severityColor(sev: SrMissExample['severity']): string {
   if (sev === 'CRITICAL') return 'text-red-400';
   if (sev === 'MAJOR') return 'text-amber-400';
   return 'text-neutral-400';
-}
-
-export function reviewerSeverityColor(severity?: SrReviewerFinding['severity']): string {
-  if (severity === 'CRITICAL' || severity === 'HIGH') return severityColor('CRITICAL');
-  if (severity === 'MAJOR' || severity === 'MEDIUM') return severityColor('MAJOR');
-  return severityColor('MINOR');
 }
 
 export function ExampleList({ examples, indent }: { examples: SrMissExample[]; indent?: boolean }) {

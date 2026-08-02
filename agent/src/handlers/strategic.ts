@@ -1472,7 +1472,8 @@ ${proposedCriteriaBlock}
    If the Thinker did NOT emit \`version_phase_decision\`, SKIP — do not fabricate one, and do not add the field. Absence means "no phase change this cycle."
 
    Likewise, if the Thinker's analysis includes a \`qualify_request\` field (look in Section 6 and throughout the analysis), edit \`/tmp/problem_model_${taskId}.json\` IN PLACE to add it as a top-level sibling key too:
-   \`{"qualify_request": {"reason": "..."}, ...rest_of_problem_model}\`
+   \`{"qualify_request": {"reason": "...", "probes": ["walkthrough_e2e"]}, ...rest_of_problem_model}\`
+   Qualification is an expensive stable-checkpoint decision. Omit \`probes\` for ordinary code/release judgment; include \`walkthrough_e2e\` only when the release claim materially depends on live product behavior that code, CI, and existing evidence cannot establish. Never add a probe merely because a qualification is running.
    If the Thinker did NOT emit \`qualify_request\`, SKIP — do not fabricate one, and do not add the field. Absence means "do not qualify this cycle."
 
    Likewise, if \`new_version_goal\` is already present as a top-level key in \`/tmp/problem_model_${taskId}.json\` (pre-merged from the Thinker's Section 7 output file before this executor pass), it is already set — the \`cat\` in step 1 will carry it through automatically. Do NOT overwrite or re-add it. If it is absent from the file, the Thinker did not set a version goal this cycle; do NOT fabricate one.

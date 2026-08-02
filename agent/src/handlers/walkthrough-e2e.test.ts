@@ -68,8 +68,13 @@ vi.mock('ws', () => ({
 // Preload the handlers barrel so audits.ts (source of resolveCandidateSha) binds
 // against the mocked ../index.js in this module's context (mirrors specialized.test.ts).
 import './index.js';
-import { handleWalkthroughE2e, prepareRunnerIsolation } from './walkthrough-e2e.js';
+import {
+  handleWalkthroughE2e,
+  prepareRunnerIsolation,
+  WALKTHROUGH_V26_RESULT_KEYS,
+} from './walkthrough-e2e.js';
 import { apiPost, persistAndPostStatus, readHandlerOutput, sendLog } from '../index.js';
+import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { execFileSync } from 'child_process';
 import { existsSync, readFileSync } from 'fs';
 
@@ -95,7 +100,12 @@ const STACK = {
 const VALID_RESULT = {
   git_sha: CANDIDATE_SHA,
   run_timestamp: '2026-07-22T00:00:00Z',
-  results: [{ criterion_key: 'c-dfdc9d82', passed: true, notes: 'ok' }],
+  results: [
+    { criterion_key: 'c-dfdc9d82', passed: true, notes: 'runner ok' },
+    { criterion_key: 'c-f52fd975', passed: true, notes: 'tools ok' },
+    { criterion_key: 'c-workday-session-lifecycle', passed: true, notes: 'workday ok' },
+    { criterion_key: 'c-5214996f', passed: true, notes: 'meta ok' },
+  ],
 };
 
 /** Find the execFileSync invocation that launched the walkthrough harness. */
@@ -114,7 +124,7 @@ function lastStatus(): Record<string, unknown> {
   return calls[calls.length - 1][1];
 }
 
-/** All three criterion keys the harness emits, one entry per flow. */
+/** All four raw result rows the v26 harness emits. */
 const ALL_CRITERIA_RESULT = {
   git_sha: CANDIDATE_SHA,
   run_timestamp: '2026-07-22T00:00:00Z',
@@ -122,6 +132,7 @@ const ALL_CRITERIA_RESULT = {
     { criterion_key: 'c-dfdc9d82', passed: true, notes: 'runner enrolled and heartbeat confirmed' },
     { criterion_key: 'c-f52fd975', passed: true, notes: 'tools lifecycle completed end-to-end' },
     { criterion_key: 'c-workday-session-lifecycle', passed: true, notes: 'workday session lifecycle complete' },
+    { criterion_key: 'c-5214996f', passed: true, notes: 'all substantive walkthrough gates passed' },
   ],
 };
 
@@ -147,16 +158,41 @@ describe('handleWalkthroughE2e — candidate-SHA stack targeting', () => {
     expect(env.WALKTHROUGH_BACKEND_URL).not.toBe(DEPLOYED_URL);
     expect(env.WALKTHROUGH_FRONTEND_URL).toBe(STACK.frontendUrl);
     expect(env.WALKTHROUGH_ADMIN_TOKEN).toBe(STACK.adminToken);
+    expect(env.WALKTHROUGH_PROJECT_ID).toBe('proj-1');
+    expect(env.GIT_SHA).toBe(CANDIDATE_SHA);
+    expect(env.WALKTHROUGH_RESULT_FILE).toContain(TASK_ID);
 
     // Evidence POST carries the SHA the candidate stack actually served.
     expect(evidencePosted()).toBe(true);
     const evidenceCalls = vi.mocked(apiPost).mock.calls.filter((c) => c[0].includes('walkthrough-e2e-evidence'));
+    expect(evidenceCalls[0][0]).toContain('/projects/proj-1/');
     const body = evidenceCalls[0][1] as Record<string, unknown>;
     expect(body.candidate_sha).toBe(CANDIDATE_SHA);
     expect(body.exercised_engine_sha).toBe(CANDIDATE_SHA);
 
-    // COMPLETED and torn down.
-    expect(lastStatus().status).toBe('COMPLETED');
+    // Exact-SHA targeting stays shallow: the base clone is depth 1 and the
+    // pinned object is fetched explicitly at depth 1 before detached checkout.
+    expect(prepareWorkspaceForRole).toHaveBeenCalledWith(
+      expect.objectContaining({ depth: 1 }),
+    );
+    expect(execFileSync).toHaveBeenCalledWith(
+      'git',
+      ['fetch', '--depth', '1', 'origin', CANDIDATE_SHA],
+      expect.objectContaining({ cwd: '/tmp/workspace' }),
+    );
+    expect(execFileSync).toHaveBeenCalledWith(
+      'git',
+      ['checkout', '--detach', CANDIDATE_SHA],
+      expect.objectContaining({ cwd: '/tmp/workspace' }),
+    );
+
+    // COMPLETED with a durable candidate-SHA report, then torn down.
+    const completed = lastStatus();
+    expect(completed.status).toBe('COMPLETED');
+    expect(completed.artifact_type).toBe('WALKTHROUGH_E2E_REPORT');
+    expect(completed.logs).toBe(
+      JSON.stringify({ ...VALID_RESULT, exercised_engine_sha: CANDIDATE_SHA }),
+    );
     expect(teardownMock).toHaveBeenCalled();
   });
 
@@ -192,7 +228,7 @@ describe('handleWalkthroughE2e — flow-to-criterion mapping', () => {
     process.env.ADMIN_API_KEY = 'agent-vm-admin-key';
   });
 
-  it('all three criterion keys from harness results appear in the evidence POST body', async () => {
+  it('all four frozen raw criterion rows appear in the evidence POST body', async () => {
     bootMock.mockResolvedValue(STACK);
     vi.mocked(readHandlerOutput).mockReturnValue(ALL_CRITERIA_RESULT);
 
@@ -207,10 +243,7 @@ describe('handleWalkthroughE2e — flow-to-criterion mapping', () => {
       results: Array<{ criterion_key: string; passed: boolean; notes: string | null }>;
     };
     const postedKeys = body.results.map((r) => r.criterion_key);
-    expect(postedKeys).toContain('c-dfdc9d82');
-    expect(postedKeys).toContain('c-f52fd975');
-    expect(postedKeys).toContain('c-workday-session-lifecycle');
-    expect(postedKeys).toHaveLength(3);
+    expect(postedKeys).toEqual([...WALKTHROUGH_V26_RESULT_KEYS]);
   });
 
   it('absent notes field is normalised to null in the evidence body', async () => {
@@ -221,6 +254,8 @@ describe('handleWalkthroughE2e — flow-to-criterion mapping', () => {
       results: [
         { criterion_key: 'c-dfdc9d82', passed: true },                                // no notes
         { criterion_key: 'c-f52fd975', passed: false, notes: 'step 7e failed' },     // string notes
+        { criterion_key: 'c-workday-session-lifecycle', passed: true, notes: 'ok' },
+        { criterion_key: 'c-5214996f', passed: false, notes: 'substantive gate failed' },
       ],
     };
     vi.mocked(readHandlerOutput).mockReturnValue(resultMixedNotes);
@@ -285,6 +320,44 @@ describe('handleWalkthroughE2e — error paths', () => {
     process.env.ADMIN_API_KEY = 'agent-vm-admin-key';
   });
 
+  it.each([
+    {
+      field: 'project_id',
+      payload: { candidate_sha: CANDIDATE_SHA },
+      task: {},
+    },
+    {
+      field: 'candidate_sha',
+      payload: { project_id: 'proj-1' },
+      task: {},
+    },
+  ])('rejects a dispatch missing required $field before cloning', async ({ field, payload, task }) => {
+    await expect(
+      handleWalkthroughE2e(TASK_ID, payload, task, GH_TOKEN, OWNER, REPO, WS, { value: '' }),
+    ).rejects.toThrow(field);
+
+    expect(prepareWorkspaceForRole).not.toHaveBeenCalled();
+  });
+
+  it('classifies an exact-SHA checkout failure as clone_failed before booting a stack', async () => {
+    vi.mocked(execFileSync).mockImplementation((cmd, args) => {
+      if (cmd === 'git' && Array.isArray(args) && args.includes('checkout')) {
+        throw new Error('fatal: reference is not a tree');
+      }
+      return Buffer.from('');
+    });
+
+    await handleWalkthroughE2e(TASK_ID, PAYLOAD, TASK, GH_TOKEN, OWNER, REPO, WS, { value: '' });
+
+    expect(harnessCall()).toBeUndefined();
+    expect(evidencePosted()).toBe(false);
+    expect(bootMock).not.toHaveBeenCalled();
+    expect(lastStatus()).toEqual(expect.objectContaining({
+      status: 'FAILED',
+      failure_category: 'clone_failed',
+    }));
+  });
+
   it('harness exits non-zero AND result file absent: FAILED with walkthrough_harness_failed', async () => {
     bootMock.mockResolvedValue(STACK);
     // Make only the walkthrough harness invocation throw; git commands succeed.
@@ -319,6 +392,38 @@ describe('handleWalkthroughE2e — error paths', () => {
     expect(status.status).toBe('FAILED');
     expect(status.failure_category).toBe('walkthrough_result_unparseable');
     expect(teardownMock).toHaveBeenCalled();
+  });
+
+  it('rejects a parseable but truncated result subset before posting evidence', async () => {
+    bootMock.mockResolvedValue(STACK);
+    vi.mocked(readHandlerOutput).mockReturnValue({
+      ...VALID_RESULT,
+      results: VALID_RESULT.results.slice(0, 3),
+    });
+
+    await handleWalkthroughE2e(TASK_ID, PAYLOAD, TASK, GH_TOKEN, OWNER, REPO, WS, { value: '' });
+
+    expect(evidencePosted()).toBe(false);
+    expect(lastStatus().status).toBe('FAILED');
+    expect(lastStatus().failure_category).toBe('walkthrough_result_unparseable');
+    expect(teardownMock).toHaveBeenCalled();
+  });
+
+  it('rejects duplicate or non-boolean raw rows before posting evidence', async () => {
+    bootMock.mockResolvedValue(STACK);
+    vi.mocked(readHandlerOutput).mockReturnValue({
+      ...VALID_RESULT,
+      results: [
+        ...VALID_RESULT.results.slice(0, 3),
+        { criterion_key: 'c-workday-session-lifecycle', passed: 'true' },
+      ],
+    });
+
+    await handleWalkthroughE2e(TASK_ID, PAYLOAD, TASK, GH_TOKEN, OWNER, REPO, WS, { value: '' });
+
+    expect(evidencePosted()).toBe(false);
+    expect(lastStatus().status).toBe('FAILED');
+    expect(lastStatus().failure_category).toBe('walkthrough_result_unparseable');
   });
 
   it('evidence POST throws: task still COMPLETED (evidence failure is non-fatal)', async () => {

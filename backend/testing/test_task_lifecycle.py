@@ -5,8 +5,7 @@ Covers the critical functions:
   1. _has_active_strategic_task — active strategic task guard
   2. _increment_research_spawn_count — vision spawn counter management
   3. _requeue_parent_task — failed child retry with context injection
-  4. _merge_with_retry — PR merge with exponential backoff
-  5. _process_post_commit — task not found guard and rollup triggering
+  4. _process_post_commit — task not found guard and rollup triggering
 """
 
 import ast
@@ -52,7 +51,6 @@ from app.task_lifecycle import (
     _increment_research_spawn_count,
     _mark_dependents_warm_claimable,
     _requeue_parent_task,
-    _merge_with_retry,
     _comment_with_retry,
     _process_post_commit,
     _record_parent_failure,
@@ -133,7 +131,7 @@ def _default_no_migration_pr(mocker):
     non-staging small-scope auto-approve) now run
     ``enforce_premerge_migration_guard`` before merging, which calls
     ``github.get_pr_files``. Existing merge-reaching tests only mock
-    ``_merge_with_retry`` / ``merge_pull_request``; without this default an
+    ``merge_pull_request``; without this default an
     unmocked ``get_pr_files`` would make the guard DEFER and falsely hold the
     merge. A PR that touches only a non-migration file passes the guard cleanly.
     Tests that exercise the guard re-patch ``app.github.get_pr_files`` to
@@ -191,6 +189,26 @@ async def _make_task(
     await session.commit()
     await session.refresh(task)
     return task
+
+
+def _open_pull_request(
+    *,
+    head_sha: str = "abc123",
+    head_ref: str = "blueprint/task-abc123",
+    base_sha: str = "base123",
+    base_ref: str = "main",
+    mergeable_state: str = "clean",
+) -> dict:
+    """Exact open PR snapshot accepted by the policy-bound merge authority."""
+    return {
+        "state": "open",
+        "merged": False,
+        "draft": False,
+        "mergeable": True,
+        "mergeable_state": mergeable_state,
+        "head": {"sha": head_sha, "ref": head_ref},
+        "base": {"sha": base_sha, "ref": base_ref},
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3317,95 +3335,12 @@ def test_derive_failure_stage_integration():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# _merge_with_retry
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-@pytest.mark.asyncio
-async def test_merge_with_retry_succeeds_on_first_attempt():
-    """Returns the merge result immediately when the first call succeeds."""
-    mock_merge = AsyncMock(return_value={"merged": True, "sha": "abc123"})
-    result = await _merge_with_retry(
-        mock_merge, "gh_token", "owner", "repo", 42, "proj-id"
-    )
-    assert result == {"merged": True, "sha": "abc123"}
-    assert mock_merge.await_count == 1
-
-
-@pytest.mark.asyncio
-async def test_merge_with_retry_retries_on_exception_and_returns_success(mocker):
-    """Retries after a transient exception and returns the successful result."""
-    mocker.patch("asyncio.sleep", new=AsyncMock())
-    call_count = 0
-
-    async def _flaky_merge(*args, **kwargs):
-        nonlocal call_count
-        call_count += 1
-        if call_count < 2:
-            raise ConnectionError("transient network error")
-        return {"merged": True}
-
-    result = await _merge_with_retry(_flaky_merge, "token", "owner", "repo", 10, "proj")
-    assert result == {"merged": True}
-    assert call_count == 2
-
-
-@pytest.mark.asyncio
-async def test_merge_with_retry_raises_last_exception_after_max_attempts(mocker):
-    """Raises the last exception after exhausting all retry attempts."""
-    mocker.patch("asyncio.sleep", new=AsyncMock())
-
-    async def _always_fails(*args, **kwargs):
-        raise RuntimeError("persistent error")
-
-    with pytest.raises(RuntimeError, match="persistent error"):
-        await _merge_with_retry(
-            _always_fails, "token", "owner", "repo", 99, "proj", max_attempts=3
-        )
-
-
-@pytest.mark.asyncio
-async def test_merge_with_retry_returns_non_merged_without_retry():
-    """A non-exception non-merged result (e.g., conflict) is returned on the first call."""
-    call_count = 0
-
-    async def _conflict_merge(*args, **kwargs):
-        nonlocal call_count
-        call_count += 1
-        return {"merged": False, "message": "Merge conflict detected"}
-
-    result = await _merge_with_retry(
-        _conflict_merge, "token", "owner", "repo", 5, "proj"
-    )
-    assert result == {"merged": False, "message": "Merge conflict detected"}
-    assert call_count == 1
-
-
-@pytest.mark.asyncio
-async def test_merge_with_retry_respects_max_attempts_parameter(mocker):
-    """custom max_attempts controls how many times the merge is attempted."""
-    mocker.patch("asyncio.sleep", new=AsyncMock())
-    call_count = 0
-
-    async def _always_fails(*args, **kwargs):
-        nonlocal call_count
-        call_count += 1
-        raise ValueError("fail each time")
-
-    with pytest.raises(ValueError):
-        await _merge_with_retry(
-            _always_fails, "token", "owner", "repo", 1, "proj", max_attempts=2
-        )
-    assert call_count == 2
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # GitHub-helper extraction seam (task_lifecycle_github_helpers.py)
 # ══════════════════════════════════════════════════════════════════════════════
 
 
 def test_github_helpers_seam_no_circular_import():
-    """The extracted GitHub-retry helpers live in their own sibling module and
+    """The extracted GitHub helpers live in their own sibling module and
     are re-exported by task_lifecycle, so existing import paths are unchanged
     and the new module imports cleanly without a cycle."""
     import importlib
@@ -3414,7 +3349,6 @@ def test_github_helpers_seam_no_circular_import():
     lifecycle = importlib.import_module("app.task_lifecycle")
 
     for name in (
-        "_merge_with_retry",
         "_comment_with_retry",
         "_pick_merge_method",
         "_get_approval_gate_file_lists",
@@ -4294,7 +4228,7 @@ async def test_approve_branch_does_not_propagate_warm_target(tl_db, mocker):
     mocker.patch(
         "app.github.get_pull_request",
         new_callable=AsyncMock,
-        return_value={"head": {"sha": "abc123", "ref": "feat/x"}},
+        return_value=_open_pull_request(head_ref="feat/x"),
     )
     # Simulate CI failure so the APPROVE-CI-failure spawn fires.
     mocker.patch(
@@ -4307,6 +4241,7 @@ async def test_approve_branch_does_not_propagate_warm_target(tl_db, mocker):
         },
     )
     mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+    mocker.patch("app.github.submit_pr_review", new_callable=AsyncMock)
 
     # _process_post_commit's APPROVE branch is reached when:
     #   - task.status == COMPLETED
@@ -4351,6 +4286,12 @@ async def test_approve_branch_does_not_propagate_warm_target(tl_db, mocker):
                 "base_branch": "main",
                 "original_task_id": str(original.id),
                 "iteration": 1,
+                "review_target": {
+                    "project_id": str(project.id),
+                    "pr_number": 5050,
+                    "base_sha": "base123",
+                    "head_sha": "abc123",
+                },
             },
         },
     )
@@ -4363,7 +4304,11 @@ async def test_approve_branch_does_not_propagate_warm_target(tl_db, mocker):
         status=TaskStatus.COMPLETED,
         pr_url="https://github.com/o/r/pull/5050",
         artifact_type=ArtifactType.PULL_REQUEST,
-        verdict_json='{"verdict": "APPROVE", "issues": []}',
+        verdict_json=(
+            '{"verdict": "APPROVE", "issues": [], '
+            '"reviewed_head_sha": "abc123", '
+            '"reviewed_base_sha": "base123"}'
+        ),
     )
 
     try:  # noqa: SIM105
@@ -4389,7 +4334,15 @@ async def test_approve_branch_does_not_propagate_warm_target(tl_db, mocker):
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-async def _run_request_changes_branch(tl_db, mocker, *, verdict_json, ci_check_runs):
+async def _run_request_changes_branch(
+    tl_db,
+    mocker,
+    *,
+    verdict_json,
+    ci_check_runs,
+    original_context=None,
+    review_history=None,
+):
     """Drive _process_post_commit through the review-verdict handling.
 
     ``ci_check_runs`` is the value (or side_effect callable) for the
@@ -4399,7 +4352,7 @@ async def _run_request_changes_branch(tl_db, mocker, *, verdict_json, ci_check_r
     A verification-only REQUEST_CHANGES on authoritatively-green CI no longer
     halts the loop — it FLIPS the verdict to APPROVE before the verdict branch,
     so the PR merges through the normal approve path. The APPROVE merge cluster
-    is therefore mocked here (``_merge_with_retry`` etc.) so callers can assert
+    is therefore mocked here (``merge_pull_request`` etc.) so callers can assert
     the merge was attempted. The still-blocks scenarios never reach that path.
 
     Returns ``(captured_spawn_kwargs, merge_mock, review_task)`` so callers can
@@ -4418,7 +4371,7 @@ async def _run_request_changes_branch(tl_db, mocker, *, verdict_json, ci_check_r
     # still-blocks scenarios, which take the REQUEST_CHANGES fix-spawn branch
     # and never call these.
     merge_mock = mocker.patch(
-        "app.task_lifecycle._merge_with_retry",
+        "app.github.merge_pull_request",
         new_callable=AsyncMock,
         return_value={"merged": True},
     )
@@ -4437,6 +4390,7 @@ async def _run_request_changes_branch(tl_db, mocker, *, verdict_json, ci_check_r
         new_callable=AsyncMock,
         return_value={
             "head": {"sha": "deadbeef", "ref": "feat/x"},
+            "base": {"sha": "base-sha", "ref": "main"},
             "state": "open",
             "merged": False,
         },
@@ -4485,7 +4439,7 @@ async def _run_request_changes_branch(tl_db, mocker, *, verdict_json, ci_check_r
         payloads=[{"type": "create", "prompt": "X", "base_branch": "main"}],
         status=TaskStatus.EVALUATING,
         created_by="ORCHESTRATOR",
-        context={},
+        context=original_context or {},
     )
     session.add(original)
     await session.commit()
@@ -4511,6 +4465,13 @@ async def _run_request_changes_branch(tl_db, mocker, *, verdict_json, ci_check_r
                 "base_branch": "main",
                 "original_task_id": str(original.id),
                 "iteration": 1,
+                "review_history": list(review_history or []),
+                "review_target": {
+                    "project_id": str(project.id),
+                    "pr_number": 6060,
+                    "base_sha": "base-sha",
+                    "head_sha": "deadbeef",
+                },
             },
         },
     )
@@ -4545,6 +4506,8 @@ _VERIFICATION_ONLY_VERDICT = json.dumps(
                 "severity": "major",
             },
         ],
+        "reviewed_head_sha": "deadbeef",
+        "reviewed_base_sha": "base-sha",
     }
 )
 
@@ -4562,6 +4525,8 @@ _CONCRETE_DEFECT_VERDICT = json.dumps(
                 "severity": "critical",
             },
         ],
+        "reviewed_head_sha": "deadbeef",
+        "reviewed_base_sha": "base-sha",
     }
 )
 
@@ -4595,6 +4560,7 @@ async def test_request_changes_verification_only_ci_green_is_approved_and_merges
     assert merge_mock.await_count >= 1, (
         "Verification-only + green CI must merge the PR via the approve path"
     )
+    assert merge_mock.await_args.kwargs["expected_head_sha"] == "deadbeef"
     assert (review_task.context or {}).get("verification_only_downgrade") is True
 
 
@@ -4614,6 +4580,107 @@ async def test_request_changes_concrete_defect_ci_green_still_blocks(tl_db, mock
     )
     assert captured, "Concrete-defect REQUEST_CHANGES must still spawn a fix"
     merge_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_same_head_request_changes_revokes_ci_wait_parent_before_fix(
+    tl_db, mocker
+):
+    """A parked parent's older approval/bypass cannot outlive a new blocker."""
+    old_approval = {
+        "iteration": 0,
+        "verdict": "APPROVE",
+        "feedback": "Earlier reviewer approved this exact head.",
+        "issues": [],
+        "reviewed_head_sha": "deadbeef",
+        "reviewed_base_sha": "base-sha",
+    }
+    prior_child_blocker = {
+        "iteration": 0,
+        "verdict": "REQUEST_CHANGES",
+        "feedback": "Earlier child review found an authorization defect.",
+        "issues": [
+            {
+                "description": "Authorization bypass in the admin endpoint",
+                "severity": "major",
+                "file": "app/admin.py",
+                "line": 40,
+            }
+        ],
+        "reviewed_head_sha": "deadbeef",
+        "reviewed_base_sha": "base-sha",
+    }
+    captured, merge_mock, review_task = await _run_request_changes_branch(
+        tl_db,
+        mocker,
+        verdict_json=_CONCRETE_DEFECT_VERDICT,
+        ci_check_runs={
+            "status": "completed",
+            "conclusion": "success",
+            "failed_logs": "",
+            "details": [],
+        },
+        review_history=[prior_child_blocker],
+        original_context={
+            "review_loop": {
+                "pr_number": 6060,
+                "branch": "feat/x",
+                "base_branch": "main",
+                "ci_waiting": True,
+                "ci_passed": True,
+                "review_approved": True,
+                "review_not_required": True,
+                "review_policy_reason": "small diff",
+                "verdict": "APPROVE",
+                "review_history": [old_approval],
+                "review_target": {
+                    "project_id": "stale-project",
+                    "pr_number": 6060,
+                    "base_sha": "base-sha",
+                    "head_sha": "deadbeef",
+                },
+                "head_sha": "deadbeef",
+                "base_sha": "base-sha",
+            }
+        },
+    )
+
+    assert captured, "The fix may spawn only after durable parent revocation"
+    merge_mock.assert_not_awaited()
+    session, _factory = tl_db
+    original_id = uuid.UUID(review_task.first_payload["original_task_id"])
+    original = await session.get(Task, original_id)
+    await session.refresh(original)
+    parent_loop = (original.context or {})["review_loop"]
+    assert parent_loop["review_approved"] is False
+    assert "review_not_required" not in parent_loop
+    assert "review_policy_reason" not in parent_loop
+    assert "verdict" not in parent_loop
+    assert parent_loop["ci_passed"] is True
+    assert parent_loop["ci_waiting"] is True
+    assert parent_loop["review_history"][-1]["verdict"] == "REQUEST_CHANGES"
+    assert parent_loop["review_history"][-1]["review_task_id"] == str(
+        review_task.id
+    )
+    assert parent_loop["issue_ledger"]["open"]
+    assert any(
+        "SQL injection" in issue["description"]
+        for issue in parent_loop["issue_ledger"]["open"]
+    )
+    assert any(
+        "Authorization bypass" in issue["description"]
+        for issue in parent_loop["issue_ledger"]["open"]
+    )
+    assert any(
+        "Authorization bypass" in issue["description"]
+        for issue in parent_loop["review_history"][-1]["issues"]
+    )
+    assert parent_loop["review_target"] == {
+        "project_id": str(original.project_id),
+        "pr_number": 6060,
+        "base_sha": "base-sha",
+        "head_sha": "deadbeef",
+    }
 
 
 @pytest.mark.asyncio
@@ -4686,6 +4753,8 @@ _EMPTY_ISSUES_VERDICT = json.dumps(
             "in this pass."
         ),
         "issues": [],
+        "reviewed_head_sha": "deadbeef",
+        "reviewed_base_sha": "base-sha",
     }
 )
 
@@ -4697,6 +4766,8 @@ _MINOR_ONLY_VERDICT = json.dumps(
             {"description": "Rename this variable for clarity", "severity": "minor"},
             {"description": "Add a docstring to the helper", "severity": "minor"},
         ],
+        "reviewed_head_sha": "deadbeef",
+        "reviewed_base_sha": "base-sha",
     }
 )
 
@@ -4905,10 +4976,15 @@ async def test_scan_transient_retry_success(tl_db, mocker):
         new_callable=AsyncMock,
         return_value=("gh-token", "owner", "repo"),
     )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value=_open_pull_request(base_ref="research/cycle-1"),
+    )
     mocker.patch("app.security.scan_pr_for_injection", side_effect=_scan_side_effect)
     # Merge succeeds
     mocker.patch(
-        "app.task_lifecycle._merge_with_retry",
+        "app.github.merge_pull_request",
         new_callable=AsyncMock,
         return_value={"merged": True},
     )
@@ -4961,6 +5037,19 @@ async def test_scan_transient_retry_exhausted(tl_db, mocker):
     mocker.patch(
         "app.security.scan_pr_for_injection",
         side_effect=TimeoutError("connection timed out"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "state": "open",
+            "merged": False,
+            "draft": False,
+            "mergeable": True,
+            "mergeable_state": "clean",
+            "head": {"sha": "abc123", "ref": "blueprint/task-abc123"},
+            "base": {"sha": "base123", "ref": "research/cycle-1"},
+        },
     )
 
     payload = AgentStatusPayload(
@@ -5091,6 +5180,13 @@ async def test_residual_remediation_case_merged_on_merge(tl_db, mocker):
                 "pr_number": 99,
                 "branch": "blueprint/task-remfp",
                 "base_branch": "main",
+                "iteration": 1,
+                "review_target": {
+                    "project_id": str(project.id),
+                    "pr_number": 99,
+                    "base_sha": "base123",
+                    "head_sha": "abc123",
+                },
             },
         },
     )
@@ -5100,22 +5196,22 @@ async def test_residual_remediation_case_merged_on_merge(tl_db, mocker):
         new_callable=AsyncMock,
         return_value=("gh-token", "owner", "repo"),
     )
-    # get_pull_request: used for PR state check (early-exit guard) and head-branch validation.
-    # Return empty head.sha so CI gate is skipped; ref matches branch so no branch-mismatch abort.
+    # Every approval and merge is bound to the same immutable PR target.
     mocker.patch(
         "app.github.get_pull_request",
         new_callable=AsyncMock,
-        return_value={
-            "head": {"ref": "blueprint/task-remfp", "sha": ""},
-            "state": "open",
-            "merged": False,
-        },
+        return_value=_open_pull_request(head_ref="blueprint/task-remfp"),
     )
     mocker.patch(
         "app.github.submit_pr_review", new_callable=AsyncMock, return_value={"id": 1}
     )
     mocker.patch(
-        "app.task_lifecycle._merge_with_retry",
+        "app.github.get_check_runs_cached",
+        new_callable=AsyncMock,
+        return_value={"status": "completed", "conclusion": "success"},
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
         new_callable=AsyncMock,
         return_value={"merged": True},
     )
@@ -5130,7 +5226,11 @@ async def test_residual_remediation_case_merged_on_merge(tl_db, mocker):
     payload = AgentStatusPayload(
         task_id=review_task.id,
         status=TaskStatus.COMPLETED,
-        verdict_json='{"verdict": "APPROVE", "feedback": "LGTM"}',
+        verdict_json=(
+            '{"verdict": "APPROVE", "feedback": "LGTM", '
+            '"reviewed_head_sha": "abc123", '
+            '"reviewed_base_sha": "base123"}'
+        ),
         pr_url="https://github.com/owner/repo/pull/99",
         branch="blueprint/task-remfp",
         artifact_type=ArtifactType.PULL_REQUEST,
@@ -5220,6 +5320,12 @@ async def _setup_approve_merge(session, project, *, base_branch="main"):
                 "base_branch": base_branch,
                 "original_task_id": str(original.id),
                 "iteration": 1,
+                "review_target": {
+                    "project_id": str(project.id),
+                    "pr_number": 5151,
+                    "base_sha": "base123",
+                    "head_sha": "abc123",
+                },
             },
         },
     )
@@ -5236,7 +5342,11 @@ def payload_for(review_task):
         status=TaskStatus.COMPLETED,
         pr_url="https://github.com/owner/repo/pull/5151",
         artifact_type=ArtifactType.PULL_REQUEST,
-        verdict_json='{"verdict": "APPROVE", "issues": []}',
+        verdict_json=(
+            '{"verdict": "APPROVE", "issues": [], '
+            '"reviewed_head_sha": "abc123", '
+            '"reviewed_base_sha": "base123"}'
+        ),
     )
 
 
@@ -5252,6 +5362,7 @@ def _patch_approve_merge_env(mocker):
         new_callable=AsyncMock,
         return_value={
             "head": {"sha": "abc123", "ref": "feat/x"},
+            "base": {"sha": "base123", "ref": "main"},
             "state": "open",
             "merged": False,
         },
@@ -5267,6 +5378,67 @@ def _patch_approve_merge_env(mocker):
     mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
     mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
     mocker.patch("app.task_lifecycle.asyncio.sleep", new_callable=AsyncMock)
+
+
+@pytest.mark.asyncio
+async def test_rollup_approve_handoff_copies_exact_authoritative_proof(tl_db, mocker):
+    """The parked parent receives history, ledger, and the exact approved target."""
+    session, factory = tl_db
+    project = await _make_project(session)
+    original, review_task = await _setup_approve_merge(session, project)
+    original.context = {
+        "rollup_pr_number": 5151,
+        "review_loop": {
+            "ci_waiting": True,
+            "ci_passed": False,
+            "review_approved": False,
+            "review_not_required": True,
+            "review_policy_reason": "legacy bypass must be superseded",
+            "pr_number": 5151,
+            "branch": "feat/x",
+            "base_branch": "main",
+            "original_task_id": str(original.id),
+        },
+    }
+    session.add(original)
+    await session.commit()
+
+    _patch_approve_merge_env(mocker)
+    merge_gate = mocker.patch(
+        "app.ci_completion._attempt_merge_with_retry_and_escalation",
+        new_callable=AsyncMock,
+    )
+
+    result = await _process_post_commit(
+        review_task.id,
+        payload_for(review_task),
+        _session_factory=factory,
+    )
+
+    assert result == {"status": "accepted"}
+    merge_gate.assert_not_awaited()
+    await session.refresh(original)
+    loop = (original.context or {})["review_loop"]
+    assert loop["review_approved"] is True
+    assert loop["review_target"] == {
+        "project_id": str(project.id),
+        "pr_number": 5151,
+        "base_sha": "base123",
+        "head_sha": "abc123",
+    }
+    assert loop["head_sha"] == "abc123"
+    assert loop["base_sha"] == "base123"
+    assert loop["review_history"][-1]["verdict"] == "APPROVE"
+    assert loop["review_history"][-1]["reviewed_head_sha"] == "abc123"
+    assert loop["review_history"][-1]["reviewed_base_sha"] == "base123"
+    ledger = loop["issue_ledger"]
+    assert ledger["open"] == []
+    assert ledger["resolved"] == []
+    assert ledger["schema_version"] == 1
+    assert ledger["complete"] is True
+    assert ledger["through_entry_key"]
+    assert "review_not_required" not in loop
+    assert "review_policy_reason" not in loop
 
 
 @pytest.mark.asyncio
@@ -5287,7 +5459,7 @@ async def test_process_post_commit_review_approve_merge_held_on_dual_head(
         return_value=(fake_fix, True),
     )
     merge_mock = mocker.patch(
-        "app.task_lifecycle._merge_with_retry",
+        "app.github.merge_pull_request",
         new_callable=AsyncMock,
         return_value={"merged": True},
     )
@@ -5305,7 +5477,9 @@ async def test_process_post_commit_review_approve_merge_held_on_dual_head(
     rl = (review_task.context or {}).get("review_loop", {})
     assert rl.get("ci_waiting") is False
     assert rl.get("ci_passed") is False
-    assert rl.get("review_approved") is True
+    # Any code-changing fix invalidates the approval that preceded it.  The
+    # replacement head must complete a new exact-target review before merge.
+    assert rl.get("review_approved") is False
     assert rl.get("migration_guard_state") == "fix_spawned"
     assert rl.get("migration_guard_fix_spawned") == str(fake_fix.id)
     assert rl.get("ci_fix_spawned") == str(fake_fix.id)
@@ -5337,7 +5511,7 @@ async def test_process_post_commit_review_approve_guard_defer_preserves_ci_wait(
         return_value=(None, False),
     )
     merge_mock = mocker.patch(
-        "app.task_lifecycle._merge_with_retry",
+        "app.github.merge_pull_request",
         new_callable=AsyncMock,
         return_value={"merged": True},
     )
@@ -5371,7 +5545,7 @@ async def test_process_post_commit_review_approve_merge_proceeds_when_guard_ok(
     # autouse _default_no_migration_pr fixture already returns a non-migration
     # file from get_pr_files, so the guard returns ok.
     merge_mock = mocker.patch(
-        "app.task_lifecycle._merge_with_retry",
+        "app.github.merge_pull_request",
         new_callable=AsyncMock,
         return_value={"merged": True},
     )
@@ -5418,6 +5592,13 @@ async def test_small_scope_auto_approve_merge_held_on_dual_head(tl_db, mocker):
         new_callable=AsyncMock,
         return_value=("tok", "owner", "repo"),
     )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value=_open_pull_request(
+            head_ref="blueprint/task-aa", base_ref="main"
+        ),
+    )
     # Force the auto_approve_small gate open.
     mocker.patch("app.direction_metrics._compute_acceptance_rate", return_value=0.9)
     mocker.patch(
@@ -5442,7 +5623,7 @@ async def test_small_scope_auto_approve_merge_held_on_dual_head(tl_db, mocker):
         return_value=(fake_fix, True),
     )
     merge_mock = mocker.patch(
-        "app.task_lifecycle._merge_with_retry",
+        "app.github.merge_pull_request",
         new_callable=AsyncMock,
         return_value={"merged": True},
     )
@@ -5509,6 +5690,13 @@ async def test_small_scope_auto_approve_merge_blocked_by_guard_skips_auto_merge(
         new_callable=AsyncMock,
         return_value=("tok", "owner", "repo"),
     )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value=_open_pull_request(
+            head_ref="blueprint/task-aa", base_ref="main"
+        ),
+    )
     mocker.patch("app.direction_metrics._compute_acceptance_rate", return_value=0.9)
     mocker.patch(
         "app.review_policy.should_auto_approve_diff",
@@ -5525,14 +5713,9 @@ async def test_small_scope_auto_approve_merge_blocked_by_guard_skips_auto_merge(
         },
     )
     merge_mock = mocker.patch(
-        "app.task_lifecycle._merge_with_retry",
+        "app.github.merge_pull_request",
         new_callable=AsyncMock,
         return_value={"merged": True},
-    )
-    enable_auto_merge_mock = mocker.patch(
-        "app.github.enable_auto_merge",
-        new_callable=AsyncMock,
-        return_value={"enabled": True},
     )
     mocker.patch(
         "app.rollup_migration_validation.enforce_premerge_migration_guard",
@@ -5557,7 +5740,6 @@ async def test_small_scope_auto_approve_merge_blocked_by_guard_skips_auto_merge(
 
     assert result == {"status": "accepted"}
     merge_mock.assert_not_called()
-    enable_auto_merge_mock.assert_not_called()
     spawn_mock.assert_awaited_once()
     assert spawn_mock.await_args.kwargs.get("fix_reason") == "migration_guard"
     await session.refresh(task)
@@ -5602,6 +5784,13 @@ async def test_small_scope_auto_approve_guard_defer_preserves_ci_wait(
         new_callable=AsyncMock,
         return_value=("tok", "owner", "repo"),
     )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value=_open_pull_request(
+            head_ref="blueprint/task-aa", base_ref="main"
+        ),
+    )
     mocker.patch("app.direction_metrics._compute_acceptance_rate", return_value=0.9)
     mocker.patch(
         "app.review_policy.should_auto_approve_diff",
@@ -5625,14 +5814,9 @@ async def test_small_scope_auto_approve_guard_defer_preserves_ci_wait(
         ),
     )
     merge_mock = mocker.patch(
-        "app.task_lifecycle._merge_with_retry",
+        "app.github.merge_pull_request",
         new_callable=AsyncMock,
         return_value={"merged": True},
-    )
-    enable_auto_merge_mock = mocker.patch(
-        "app.github.enable_auto_merge",
-        new_callable=AsyncMock,
-        return_value={"enabled": True},
     )
     spawn_mock = mocker.patch(
         "app.review_pipeline._spawn_pipeline_task",
@@ -5651,7 +5835,6 @@ async def test_small_scope_auto_approve_guard_defer_preserves_ci_wait(
 
     assert result == {"status": "accepted"}
     merge_mock.assert_not_called()
-    enable_auto_merge_mock.assert_not_called()
     spawn_mock.assert_not_called()
     await session.refresh(task)
     assert task.status == TaskStatus.EVALUATING
@@ -5694,6 +5877,13 @@ async def test_small_scope_auto_approve_auto_finalizes_reserved_migration(
         new_callable=AsyncMock,
         return_value=("tok", "owner", "repo"),
     )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value=_open_pull_request(
+            head_ref="blueprint/task-aa", base_ref="main"
+        ),
+    )
     mocker.patch("app.direction_metrics._compute_acceptance_rate", return_value=0.9)
     mocker.patch(
         "app.review_policy.should_auto_approve_diff",
@@ -5710,7 +5900,7 @@ async def test_small_scope_auto_approve_auto_finalizes_reserved_migration(
         },
     )
     merge_mock = mocker.patch(
-        "app.task_lifecycle._merge_with_retry",
+        "app.github.merge_pull_request",
         new_callable=AsyncMock,
         return_value={"merged": True},
     )
@@ -5746,7 +5936,10 @@ async def test_small_scope_auto_approve_auto_finalizes_reserved_migration(
     await session.refresh(task)
     assert task.status == TaskStatus.EVALUATING
     review_loop = (task.context or {}).get("review_loop", {})
-    assert review_loop.get("review_approved") is True
+    # Finalization rewrites the PR head, so the pre-rewrite small-diff bypass
+    # cannot remain merge authority for the new bytes.
+    assert review_loop.get("review_approved") is False
+    assert review_loop.get("authoritative_review_required") is True
     assert review_loop.get("ci_waiting") is True
     assert review_loop.get("ci_passed") is False
     assert review_loop.get("head_sha") == ""
@@ -5791,6 +5984,13 @@ async def test_small_scope_intermediate_merge_skips_guard(tl_db, mocker):
         return_value=("tok", "owner", "repo"),
     )
     mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value=_open_pull_request(
+            head_ref="blueprint/task-bb", base_ref="research/cycle-1"
+        ),
+    )
+    mocker.patch(
         "app.security.scan_pr_for_injection",
         new_callable=AsyncMock,
         return_value={
@@ -5809,7 +6009,7 @@ async def test_small_scope_intermediate_merge_skips_guard(tl_db, mocker):
         return_value=[{"filename": "README.md"}],
     )
     merge_mock = mocker.patch(
-        "app.task_lifecycle._merge_with_retry",
+        "app.github.merge_pull_request",
         new_callable=AsyncMock,
         return_value={"merged": True},
     )
@@ -6767,24 +6967,47 @@ async def test_fix_completion_preserves_agent_stamped_fix_iteration(tl_db, mocke
 
 
 @pytest.mark.asyncio
-async def test_fix_completion_skip_rereview_resets_review_wait_respawn_count(
-    tl_db, mocker
+@pytest.mark.parametrize(
+    "fix_reason",
+    ["code_review", "ci_failure", "merge_conflict", "migration_guard"],
+)
+async def test_fix_completion_all_reasons_spawn_exact_head_delta_rereview(
+    tl_db, mocker, fix_reason
 ):
-    """When a ci_failure fix task completes (skip_rereview path), the
-    review_wait_respawn_count from a prior backstop episode must be cleared
-    before the task enters CI-wait.  This ensures each fix→review→CI-pass
-    cycle gets its own full respawn budget."""
+    """Every pushed fix gets a bounded review of its exact pre-fix delta."""
     mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
     mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
     mocker.patch("app.task_lifecycle.broadcast_to_project", new_callable=AsyncMock)
-    # Mock pause_clock to avoid DB dependency for the baseline query.
     mocker.patch(
-        "app.pause_clock.current_baseline", new_callable=AsyncMock, return_value=0
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
     )
-    # The skip_rereview path does NOT call _spawn_pipeline_task — it transitions
-    # directly to CI-wait.  Verify this by checking the mock is never called.
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "merged": False,
+            "state": "open",
+            "base": {"sha": "live-base"},
+            "head": {"sha": "live-head"},
+        },
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={
+            "blocked": False,
+            "findings": [],
+            "summary": "clean",
+            "report": "",
+        },
+    )
+    spawned_review = mocker.Mock(id=uuid.uuid4())
     spawn_mock = mocker.patch(
-        "app.task_lifecycle._spawn_pipeline_task", new_callable=AsyncMock
+        "app.task_lifecycle._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(spawned_review, True),
     )
 
     session, factory = tl_db
@@ -6800,10 +7023,9 @@ async def test_fix_completion_skip_rereview_resets_review_wait_respawn_count(
                 "pr_number": 42,
                 "branch": "blueprint/test-branch",
                 "base_branch": "main",
-                "fix_reason": "ci_failure",
+                "fix_reason": fix_reason,
                 "iteration": 2,
-                # Simulate a prior backstop episode that consumed the respawn:
-                "review_wait_respawn_count": 1,
+                "reviewed_head_sha": "pre-fix-head",
             },
         },
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
@@ -6813,18 +7035,17 @@ async def test_fix_completion_skip_rereview_resets_review_wait_respawn_count(
     await _process_post_commit(task.id, payload, _session_factory=factory)
     await session.refresh(task)
 
-    # The skip_rereview path should have cleared review_wait_respawn_count
-    # from the CI-wait loop before setting ci_waiting=True.
-    review_loop = (task.context or {}).get("review_loop", {})
-    assert review_loop.get("ci_waiting") is True, (
-        "fix task must enter CI-wait on skip_rereview"
-    )
-    assert review_loop.get("review_wait_respawn_count") is None, (
-        "review_wait_respawn_count must be cleared for the new episode, "
-        f"got {review_loop.get('review_wait_respawn_count')!r}"
-    )
-    # verify the skip_rereview path did not call _spawn_pipeline_task
-    spawn_mock.assert_not_called()
+    spawn_mock.assert_awaited_once()
+    spawn_args = spawn_mock.await_args.args
+    spawn_kwargs = spawn_mock.await_args.kwargs
+    assert spawn_args[1] == "review"
+    assert spawn_kwargs["delta_base_sha"] == "pre-fix-head"
+    assert spawn_kwargs["review_target"] == {
+        "project_id": str(project.id),
+        "pr_number": 42,
+        "base_sha": "live-base",
+        "head_sha": "live-head",
+    }
 
 
 @pytest.mark.asyncio
@@ -6918,32 +7139,16 @@ async def test_fix_completion_spawn_failure_creates_alert(tl_db, mocker):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Auto-merge failure → mergeable_state='dirty' → fix task gets a prompt
+# Exact-target merge authority
 # ══════════════════════════════════════════════════════════════════════════════
 
 
 @pytest.mark.asyncio
-async def test_auto_merge_dirty_spawns_fix_with_prompt(tl_db, mocker):
-    """When auto-merge fails and mergeable_state='dirty', the spawned fix task
-    must carry a non-empty fix_prompt with rebase guidance.
-
-    Regression guard for the bug where spawn_kwargs lacked 'fix_prompt',
-    causing the agent to throw 'Fatal error: Fix task missing prompt'.
-    """
+async def test_dirty_target_is_held_before_merge_submission(tl_db, mocker):
+    """A live dirty target is rejected before the expected-head merge PUT."""
     mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
     mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
-
-    captured_kwargs: list[dict] = []
-
-    async def _capture_spawn(*args, **kwargs):
-        captured_kwargs.append(kwargs)
-        mock_task = mocker.MagicMock()
-        mock_task.id = uuid.uuid4()
-        mock_task.first_payload = {"type": "fix"}
-        mock_task.status = TaskStatus.QUEUED
-        return (mock_task, True)
-
-    mocker.patch("app.task_lifecycle._spawn_pipeline_task", side_effect=_capture_spawn)
+    mocker.patch("app.task_lifecycle._spawn_pipeline_task", new_callable=AsyncMock)
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -6959,20 +7164,19 @@ async def test_auto_merge_dirty_spawns_fix_with_prompt(tl_db, mocker):
             "report": "",
         },
     )
-    # Merge fails
-    mocker.patch(
-        "app.task_lifecycle._merge_with_retry",
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
         new_callable=AsyncMock,
-        return_value={"merged": False, "message": "merge conflict"},
+        return_value={"merged": True},
     )
-    # GitHub reports mergeable_state='dirty'
     mocker.patch(
         "app.github.get_pull_request",
         new_callable=AsyncMock,
-        return_value={
-            "mergeable_state": "dirty",
-            "head": {"sha": "abc123", "ref": "blueprint/task-deadbeef"},
-        },
+        return_value=_open_pull_request(
+            head_ref="blueprint/task-deadbeef",
+            base_ref="research/cycle-1",
+            mergeable_state="dirty",
+        ),
     )
 
     session, factory = tl_db
@@ -6984,7 +7188,6 @@ async def test_auto_merge_dirty_spawns_fix_with_prompt(tl_db, mocker):
         status=TaskStatus.IN_PROGRESS,
         context={"scope": "small"},
     )
-    # intermediate branch so is_intermediate=True and the auto-merge path fires
     task.payloads = [
         {
             "type": "create",
@@ -7005,42 +7208,29 @@ async def test_auto_merge_dirty_spawns_fix_with_prompt(tl_db, mocker):
 
     await _process_post_commit(task.id, payload, _session_factory=factory)
 
-    fix_spawns = [
-        kw for kw in captured_kwargs if kw.get("fix_reason") == "merge_conflict"
-    ]
-    assert fix_spawns, "Expected a merge_conflict fix task to be spawned"
-    fix_kw = fix_spawns[0]
-    fix_prompt = fix_kw.get("fix_prompt", "")
-    assert fix_prompt, (
-        "fix_prompt must be non-empty (was missing, causing Fatal error in agent)"
-    )
-    assert "rebase" in fix_prompt.lower(), "fix_prompt must contain rebase guidance"
-    assert "77" in fix_prompt, "fix_prompt must reference the PR number"
-    assert "research/cycle-1" in fix_prompt, "fix_prompt must reference the base branch"
+    merge_mock.assert_not_called()
+    await session.refresh(task)
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("ci_waiting") is True
+    assert review_loop.get("authoritative_review_required") is True
 
 
 @pytest.mark.asyncio
 async def test_is_intermediate_honors_custom_staging_prefix(tl_db, mocker):
     """A small-scope create task whose base branch matches a NON-default
     configured staging prefix must be classified as intermediate (is_intermediate
-    =True), routing through the auto-merge path. Regression guard for the bug
+    =True), routing through the policy-bound merge path. Regression guard for the bug
     where the small-diff path hardcoded 'research/'/'plan/' instead of the
     per-project staging_branch_prefixes.
     """
     mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
     mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
 
-    captured_kwargs: list[dict] = []
-
-    async def _capture_spawn(*args, **kwargs):
-        captured_kwargs.append(kwargs)
-        mock_task = mocker.MagicMock()
-        mock_task.id = uuid.uuid4()
-        mock_task.first_payload = {"type": "fix"}
-        mock_task.status = TaskStatus.QUEUED
-        return (mock_task, True)
-
-    mocker.patch("app.task_lifecycle._spawn_pipeline_task", side_effect=_capture_spawn)
+    spawn_mock = mocker.patch(
+        "app.task_lifecycle._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(None, False),
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -7056,20 +7246,17 @@ async def test_is_intermediate_honors_custom_staging_prefix(tl_db, mocker):
             "report": "",
         },
     )
-    # Merge fails with a dirty state so the intermediate path spawns a
-    # merge_conflict fix — observable proof the intermediate branch was taken.
-    mocker.patch(
-        "app.task_lifecycle._merge_with_retry",
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
         new_callable=AsyncMock,
-        return_value={"merged": False, "message": "merge conflict"},
+        return_value={"merged": True},
     )
     mocker.patch(
         "app.github.get_pull_request",
         new_callable=AsyncMock,
-        return_value={
-            "mergeable_state": "dirty",
-            "head": {"sha": "abc123", "ref": "blueprint/task-deadbeef"},
-        },
+        return_value=_open_pull_request(
+            head_ref="blueprint/task-deadbeef", base_ref="feature/cycle-1"
+        ),
     )
 
     session, factory = tl_db
@@ -7105,23 +7292,16 @@ async def test_is_intermediate_honors_custom_staging_prefix(tl_db, mocker):
 
     await _process_post_commit(task.id, payload, _session_factory=factory)
 
-    fix_spawns = [
-        kw for kw in captured_kwargs if kw.get("fix_reason") == "merge_conflict"
-    ]
-    assert fix_spawns, (
-        "Expected the intermediate auto-merge path to fire for a custom-prefix "
-        "base branch (is_intermediate must honor staging_branch_prefixes)"
-    )
-    assert "feature/cycle-1" in fix_spawns[0].get("fix_prompt", "")
+    merge_mock.assert_awaited_once()
+    spawn_mock.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_auto_merge_clean_state_enables_auto_merge_not_review(tl_db, mocker):
-    """When auto-merge fails but mergeable_state='clean', no recovery task should be
-    spawned. The PR is in good shape — re-enable auto-merge and park in CI-wait.
-    """
+async def test_auto_merge_clean_state_defers_under_blueprint_not_review(tl_db, mocker):
+    """A clean-but-unmerged PR parks for Blueprint's next exact-target retry."""
     mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
     mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
+    mocker.patch("app.review_merge_authority.asyncio.sleep", new_callable=AsyncMock)
 
     spawn_calls: list = []
 
@@ -7150,7 +7330,7 @@ async def test_auto_merge_clean_state_enables_auto_merge_not_review(tl_db, mocke
         },
     )
     mocker.patch(
-        "app.task_lifecycle._merge_with_retry",
+        "app.github.merge_pull_request",
         new_callable=AsyncMock,
         return_value={"merged": False, "message": "not mergeable"},
     )
@@ -7159,16 +7339,10 @@ async def test_auto_merge_clean_state_enables_auto_merge_not_review(tl_db, mocke
         new_callable=AsyncMock,
         return_value={
             "mergeable_state": "clean",
+            "base": {"sha": "base123", "ref": "research/cycle-1"},
             "head": {"sha": "abc123", "ref": "blueprint/task-deadbeef"},
         },
     )
-    enable_auto_merge_mock = mocker.patch(
-        "app.github.enable_auto_merge",
-        new_callable=AsyncMock,
-        return_value={"enabled": True},
-    )
-    # The pre-auto-merge migration guard calls get_pr_files; a non-migration
-    # file keeps the GitHub-auto-merge fast path (pr_touches_migrations=False).
     mocker.patch(
         "app.github.get_pr_files",
         new_callable=AsyncMock,
@@ -7207,7 +7381,6 @@ async def test_auto_merge_clean_state_enables_auto_merge_not_review(tl_db, mocke
     assert not spawn_calls, (
         "No review or fix task should be spawned when mergeable_state='clean'"
     )
-    enable_auto_merge_mock.assert_called_once()
 
     # Parked task must be able to satisfy the merge gate on the next CI signal.
     # The small/medium-intermediate path explicitly skips review, so no review
@@ -7230,118 +7403,6 @@ async def test_auto_merge_clean_state_enables_auto_merge_not_review(tl_db, mocke
     )
     assert _review_approved(parked_loop), (
         "_review_approved must return True so handle_ci_completion can merge"
-    )
-
-
-@pytest.mark.parametrize("mergeable_state", ["clean", "blocked", "unstable"])
-@pytest.mark.asyncio
-async def test_auto_merge_migration_pr_skips_github_auto_merge(
-    tl_db, mocker, mergeable_state
-):
-    """A migration-carrying PR must NOT be delegated to GitHub native auto-merge.
-
-    For clean/blocked/unstable states the non-migration path arms
-    enable_auto_merge. A PR that touches alembic/versions must instead park in
-    CI-wait so handle_ci_completion re-runs the pre-merge Alembic guard against
-    the live target branch — otherwise the merge could land against a different
-    migration chain than the one Blueprint validated.
-    """
-    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
-    mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
-
-    spawn_calls: list = []
-
-    async def _capture_spawn(*args, **kwargs):
-        spawn_calls.append((args, kwargs))
-        mock_task = mocker.MagicMock()
-        mock_task.id = uuid.uuid4()
-        mock_task.first_payload = {"type": "review"}
-        mock_task.status = TaskStatus.QUEUED
-        return (mock_task, True)
-
-    mocker.patch("app.task_lifecycle._spawn_pipeline_task", side_effect=_capture_spawn)
-    mocker.patch(
-        "app.routers.agent.get_github_token_for_task",
-        new_callable=AsyncMock,
-        return_value=("gh-token", "owner", "repo"),
-    )
-    mocker.patch(
-        "app.security.scan_pr_for_injection",
-        new_callable=AsyncMock,
-        return_value={
-            "blocked": False,
-            "findings": [],
-            "summary": "clean",
-            "report": "",
-        },
-    )
-    mocker.patch(
-        "app.task_lifecycle._merge_with_retry",
-        new_callable=AsyncMock,
-        return_value={"merged": False, "message": "not mergeable"},
-    )
-    mocker.patch(
-        "app.github.get_pull_request",
-        new_callable=AsyncMock,
-        return_value={
-            "mergeable_state": mergeable_state,
-            "head": {"sha": "abc123", "ref": "blueprint/task-deadbeef"},
-        },
-    )
-    enable_auto_merge_mock = mocker.patch(
-        "app.github.enable_auto_merge",
-        new_callable=AsyncMock,
-        return_value={"enabled": True},
-    )
-    # A migration file makes pr_touches_migrations return True → no delegation.
-    mocker.patch(
-        "app.github.get_pr_files",
-        new_callable=AsyncMock,
-        return_value=[
-            {"filename": "backend/alembic/versions/0140_add_widget.py"},
-        ],
-    )
-
-    session, factory = tl_db
-    project = await _make_project(session)
-    task = await _make_task(
-        session,
-        project.id,
-        task_type="create",
-        status=TaskStatus.IN_PROGRESS,
-        context={"scope": "small"},
-    )
-    task.payloads = [
-        {
-            "type": "create",
-            "prompt": "implement feature Y",
-            "base_branch": "research/cycle-1",
-        }
-    ]
-    session.add(task)
-    await session.commit()
-    await session.refresh(task)
-
-    payload = AgentStatusPayload(
-        task_id=task.id,
-        status=TaskStatus.COMPLETED,
-        pr_url="https://github.com/owner/repo/pull/91",
-        artifact_type=ArtifactType.PULL_REQUEST,
-    )
-
-    await _process_post_commit(task.id, payload, _session_factory=factory)
-
-    enable_auto_merge_mock.assert_not_called()
-    assert not spawn_calls, (
-        "Migration PR must park in CI-wait, not spawn a recovery task"
-    )
-
-    await session.refresh(task)
-    assert task.status == TaskStatus.EVALUATING
-    parked_loop = (task.context or {}).get("review_loop", {})
-    assert parked_loop.get("ci_waiting") is True, (
-        "migration PR must park with ci_waiting=True so handle_ci_completion "
-        "re-enters and re-runs the pre-merge Alembic guard"
     )
 
 
@@ -7940,102 +8001,6 @@ async def test_strategic_backstop_skips_advanced_cycle(
         mark.assert_not_awaited()
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Cluster C5 — FAILED safeguard releases the cross-cutting merge gate.
-# Pre-fix: the gate was released ONLY on the security_audit COMPLETED branch
-# (_handle_security_audit_completion), so a FAILED/reaped safeguard left
-# orig.requires_approval=True forever — a permanent strand that the services.py
-# 2h approval-gate timeout then turns into a FAILED parent (discarding merged
-# siblings). _process_post_commit's FAILED branch must now release the gate.
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-@pytest.mark.asyncio
-async def test_post_commit_failed_safeguard_releases_merge_gate(tl_db, mocker):
-    """A safeguard (security_audit) task that FAILS must clear the merge gate on
-    its orig — proving the FAILED post-commit path wires in
-    _maybe_release_safeguard_gate. This test FAILS against the pre-fix code,
-    where the orig stayed requires_approval=True forever."""
-    session, factory = tl_db
-
-    project = await _make_project(session)
-    # The gated original task — EVALUATING, merge held on the safeguard.
-    orig = await _make_task(
-        session,
-        project.id,
-        task_type="create",
-        status=TaskStatus.EVALUATING,
-        context={"review_loop": {"review_approved": True}},
-    )
-    orig.requires_approval = True
-    session.add(orig)
-    await session.commit()
-    await session.refresh(orig)
-
-    # The safeguard task, reported FAILED by the agent.
-    safeguard = await _make_task(
-        session,
-        project.id,
-        task_type="security_audit",
-        status=TaskStatus.FAILED,
-        parent_task_id=orig.id,
-        context={
-            "safeguard_for_task_id": str(orig.id),
-            "safeguard_pr_number": 4242,
-        },
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-    )
-
-    payload = AgentStatusPayload(task_id=safeguard.id, status=TaskStatus.FAILED)
-    await _process_post_commit(safeguard.id, payload, _session_factory=factory)
-
-    # Re-fetch the orig from a fresh session to assert the gate was released.
-    async with factory() as verify_session:
-        refetched_orig = (
-            (await verify_session.execute(select(Task).where(Task.id == orig.id)))
-            .scalars()
-            .first()
-        )
-
-    assert refetched_orig is not None
-    assert refetched_orig.requires_approval is False, (
-        "FAILED safeguard must release the merge gate, not strand it forever"
-    )
-    # EVALUATING orig is re-armed for the CI loop (ci_waiting handoff).
-    assert (refetched_orig.context or {}).get("review_loop", {}).get(
-        "ci_waiting"
-    ) is True
-
-
-@pytest.mark.asyncio
-async def test_post_commit_failed_non_safeguard_does_not_touch_gate(tl_db, mocker):
-    """Control: a FAILED non-safeguard task must not invoke the gate release
-    (no orig context → no-op). Guards against over-broad wiring."""
-    session, factory = tl_db
-
-    project = await _make_project(session)
-    # A normal create task that fails — carries no safeguard_for_task_id.
-    task = await _make_task(
-        session,
-        project.id,
-        task_type="create",
-        status=TaskStatus.FAILED,
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-    )
-
-    # If the release helper were called for a non-safeguard task it would no-op,
-    # but assert it's never even invoked for a non-security_audit type.
-    spy = mocker.patch(
-        "app.task_completion._maybe_release_safeguard_gate",
-        new_callable=AsyncMock,
-    )
-
-    payload = AgentStatusPayload(task_id=task.id, status=TaskStatus.FAILED)
-    await _process_post_commit(task.id, payload, _session_factory=factory)
-
-    spy.assert_not_awaited()
-
-
 # ── QP6: main-branch auto-approve gate uses the strict tested helper ──────────
 #
 # Before QP6 the live main-branch auto-approve path in _process_post_commit was
@@ -8047,7 +8012,7 @@ async def test_post_commit_failed_non_safeguard_does_not_touch_gate(tl_db, mocke
 # pins the gap: a `docs`-type small PR with favorable direction history that the
 # weak copy auto-merged (skipping review) must now be REJECTED by the gate and
 # routed to the review pipeline. It fails against pre-fix code (which auto-merged
-# the docs PR via _merge_with_retry instead of spawning review).
+# the docs PR via the direct merge helper instead of spawning review).
 
 
 @pytest.mark.asyncio
@@ -8088,15 +8053,14 @@ async def test_main_branch_non_rollup_skips_review_auto_merges(
         "app.github.get_pull_request",
         new_callable=AsyncMock,
         return_value={
-            "merged": False,
-            "state": "open",
+            **_open_pull_request(head_ref="blueprint/task-docs", base_ref="main"),
             "additions": 5,
             "deletions": 1,
             "changed_files": 1,
         },
     )
     merge_spy = mocker.patch(
-        "app.task_lifecycle._merge_with_retry",
+        "app.github.merge_pull_request",
         new_callable=AsyncMock,
         return_value={"merged": True},
     )
@@ -8408,13 +8372,9 @@ async def _make_audit_source_and_grader(session, *, verdict_passed: bool):
 
 
 def _quiet_audit_completion_io(mocker):
-    """Silence the GitHub / broadcast / safeguard IO the audit handler performs."""
+    """Silence the GitHub and broadcast IO the audit handler performs."""
     mocker.patch(
         "app.task_completion.broadcast_to_project", new=AsyncMock(return_value=None)
-    )
-    mocker.patch(
-        "app.task_completion._maybe_release_safeguard_gate",
-        new=AsyncMock(return_value=None),
     )
     mocker.patch(
         "app.task_completion.get_github_token_for_task",
@@ -9452,10 +9412,6 @@ async def test_sweep_stranded_multi_lane_non_first_sidecar(tl_db, mocker):
     mocker.patch("app.recovery_sweeps.services.AsyncSessionLocal", Session)
     mocker.patch("app.task_lifecycle.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch(
-        "app.task_completion._maybe_release_safeguard_gate",
-        new=AsyncMock(return_value=None),
-    )
-    mocker.patch(
         "app.task_completion.broadcast_to_project", new=AsyncMock(return_value=None)
     )
 
@@ -9543,10 +9499,6 @@ async def test_sweep_stranded_multi_terminal_lanes_both_verdicts_applied(tl_db, 
     mocker.patch("app.task_lifecycle.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch(
         "app.research_completion._handle_research_completion",
-        new=AsyncMock(return_value=None),
-    )
-    mocker.patch(
-        "app.task_completion._maybe_release_safeguard_gate",
         new=AsyncMock(return_value=None),
     )
     mocker.patch(
@@ -9858,7 +9810,10 @@ async def _run_stale_head_branch(
     *,
     reviewed_head_sha: str,
     live_head_sha: str,
-    prior_discard_count: int = 0,
+    reviewed_base_sha: str = "base-sha-1",
+    live_base_sha: str = "base-sha-1",
+    review_history: list[dict] | None = None,
+    current_issues: list[dict] | None = None,
 ):
     """Drive _process_post_commit through a REQUEST_CHANGES verdict that carries
     ``reviewed_head_sha``.  Returns (captured_spawn_calls, review_task) where
@@ -9867,7 +9822,6 @@ async def _run_stale_head_branch(
 
     ``reviewed_head_sha`` is the SHA baked into the verdict JSON.
     ``live_head_sha``     is the SHA that get_pull_request returns as the live PR head.
-    ``prior_discard_count`` seeds ``stale_head_consecutive_discards`` on the review task context.
     """
     captured_spawn_calls: list[tuple] = []
 
@@ -9877,7 +9831,7 @@ async def _run_stale_head_branch(
 
     mocker.patch("app.task_lifecycle._spawn_pipeline_task", side_effect=_capture_spawn)
     mocker.patch(
-        "app.task_lifecycle._merge_with_retry",
+        "app.github.merge_pull_request",
         new_callable=AsyncMock,
         return_value={"merged": True},
     )
@@ -9895,6 +9849,7 @@ async def _run_stale_head_branch(
         new_callable=AsyncMock,
         return_value={
             "head": {"sha": live_head_sha, "ref": "feat/x"},
+            "base": {"sha": live_base_sha, "ref": "main"},
             "state": "open",
             "merged": False,
         },
@@ -9939,11 +9894,19 @@ async def _run_stale_head_branch(
             "base_branch": "main",
             "original_task_id": str(original.id),
             "iteration": 1,
+            "review_target": {
+                "project_id": str(project.id),
+                "pr_number": 7070,
+                "base_sha": reviewed_base_sha,
+                "head_sha": reviewed_head_sha,
+            },
+            **(
+                {"review_history": review_history}
+                if review_history is not None
+                else {}
+            ),
         },
     }
-    if prior_discard_count:
-        ctx["stale_head_consecutive_discards"] = prior_discard_count
-
     review_task = Task(
         project_id=project.id,
         payloads=[
@@ -9967,8 +9930,10 @@ async def _run_stale_head_branch(
         {
             "verdict": "REQUEST_CHANGES",
             "feedback": "Found a real bug.",
-            "issues": [{"description": "Real bug", "severity": "major"}],
+            "issues": current_issues
+            or [{"description": "Real bug", "severity": "major"}],
             "reviewed_head_sha": reviewed_head_sha,
+            "reviewed_base_sha": reviewed_base_sha,
         }
     )
 
@@ -9989,8 +9954,7 @@ async def _run_stale_head_branch(
 async def test_stale_head_verdict_discards_fix_and_respawns_review(tl_db, mocker):
     """When the verdict carries a reviewed_head_sha that differs from the live PR head,
     the pipeline must NOT spawn a fix (stale guidance), must spawn a fresh REVIEW,
-    must set _review_stale_head=True on the task context, and must increment
-    stale_head_consecutive_discards to 1.  This is the first discard path."""
+    and must set _review_stale_head=True without any discard-count escape hatch."""
     calls, review_task = await _run_stale_head_branch(
         tl_db,
         mocker,
@@ -10008,51 +9972,103 @@ async def test_stale_head_verdict_discards_fix_and_respawns_review(tl_db, mocker
     # Context flags.
     ctx = review_task.context or {}
     assert ctx.get("_review_stale_head") is True, "_review_stale_head must be set"
-    assert ctx.get("stale_head_consecutive_discards") == 1, (
-        "stale_head_consecutive_discards must be 1"
-    )
+    assert not any(call[0][1] == "fix" for call in calls)
 
 
 @pytest.mark.asyncio
-async def test_stale_head_second_consecutive_accepts_verdict_with_annotation(
+async def test_same_head_fix_receives_prior_and_current_authoritative_blockers(
     tl_db, mocker
 ):
-    """On the 2nd consecutive stale-head discard (stale_head_consecutive_discards already 2),
-    the verdict is accepted (a fix IS spawned) and the feedback is annotated with
-    the head-mismatch note instead of discarding."""
+    """Omitting A while raising B on the same head must hand both to the fixer."""
+    head = "a" * 40
     calls, _review_task = await _run_stale_head_branch(
         tl_db,
         mocker,
-        reviewed_head_sha="oldsha0000000",
-        live_head_sha="newsha1111111",
-        prior_discard_count=2,
+        reviewed_head_sha=head,
+        live_head_sha=head,
+        review_history=[
+            {
+                "iteration": 0,
+                "verdict": "REQUEST_CHANGES",
+                "reviewed_head_sha": head,
+                "reviewed_base_sha": "base-sha-1",
+                "target_verified_by_backend": True,
+                "review_task_id": "prior-same-head-review",
+                "issues": [
+                    {
+                        "issue_id": "BP-prior",
+                        "description": "prior null-check blocker",
+                        "severity": "major",
+                    }
+                ],
+            }
+        ],
+        current_issues=[
+            {
+                "issue_id": "BP-current",
+                "description": "new lost-update race",
+                "severity": "major",
+            }
+        ],
     )
 
-    # A fix must have been spawned (verdict accepted despite stale head).
-    fix_calls = [c for c in calls if c[0][1] == "fix"]
-    assert fix_calls, (
-        "2nd consecutive stale-head discard must accept verdict and spawn a fix"
-    )
-
-    # No review respawn (the verdict was accepted, not discarded).
-    review_respawn_calls = [c for c in calls if c[0][1] == "review"]
-    assert not review_respawn_calls, "2nd consecutive discard must not respawn a review"
+    fix_calls = [call for call in calls if call[0][1] == "fix"]
+    assert len(fix_calls) == 1
+    assert [
+        issue["description"] for issue in fix_calls[0][1]["current_issues"]
+    ] == ["prior null-check blocker", "new lost-update race"]
 
 
 @pytest.mark.asyncio
-async def test_stale_head_discard_counter_idempotent_on_replay(tl_db, mocker):
-    """Post-commit replay of a first stale-head discard must NOT double-increment
-    stale_head_consecutive_discards and must NOT spawn a second fresh review.
+async def test_changed_head_fix_receives_only_still_open_blockers(tl_db, mocker):
+    """A later exact-head review may close omitted A while newly raised B stays open."""
+    old_head = "a" * 40
+    new_head = "b" * 40
+    calls, _review_task = await _run_stale_head_branch(
+        tl_db,
+        mocker,
+        reviewed_head_sha=new_head,
+        live_head_sha=new_head,
+        review_history=[
+            {
+                "iteration": 0,
+                "verdict": "REQUEST_CHANGES",
+                "reviewed_head_sha": old_head,
+                "reviewed_base_sha": "base-sha-1",
+                "target_verified_by_backend": True,
+                "review_task_id": "prior-old-head-review",
+                "issues": [
+                    {
+                        "issue_id": "BP-prior",
+                        "description": "prior null-check blocker",
+                        "severity": "major",
+                    }
+                ],
+            }
+        ],
+        current_issues=[
+            {
+                "issue_id": "BP-current",
+                "description": "new lost-update race",
+                "severity": "major",
+            }
+        ],
+    )
 
-    Simulates replay by seeding the task context with _review_stale_head=True and
-    stale_head_consecutive_discards=1 (the state written by the first run before it
-    crashed), then re-running _process_post_commit with the same stale verdict.
-    The counter must stay at 1 and no spawn must occur.
+    fix_calls = [call for call in calls if call[0][1] == "fix"]
+    assert len(fix_calls) == 1
+    assert [
+        issue["description"] for issue in fix_calls[0][1]["current_issues"]
+    ] == ["new lost-update race"]
 
-    Approach: run _run_stale_head_branch with prior_discard_count=0 (fresh) so
-    the first discard sets the counter to 1 and _review_stale_head=True, then
-    manually call _process_post_commit on the SAME task (now carrying those
-    fields) and confirm no second spawn and the counter stays at 1."""
+
+@pytest.mark.asyncio
+async def test_stale_head_respawn_idempotent_on_replay(tl_db, mocker):
+    """A replay keeps the stale verdict discarded without spawning duplicate work.
+
+    The task-local stale marker and review spawn idempotency bound retries; no
+    counter is allowed to make an old-head verdict authoritative.
+    """
     import json as _json
     from app.task_lifecycle import _process_post_commit
 
@@ -10064,14 +10080,10 @@ async def test_stale_head_discard_counter_idempotent_on_replay(tl_db, mocker):
         mocker,
         reviewed_head_sha="stalehd000000",
         live_head_sha="livehd1111111",
-        prior_discard_count=0,
     )
-    # Confirm the first run set _review_stale_head and count=1.
+    # Confirm the first run marked the stale verdict and spawned its replacement.
     ctx1 = review_task1.context or {}
     assert ctx1.get("_review_stale_head") is True, "first run must set _review_stale_head"
-    assert ctx1.get("stale_head_consecutive_discards") == 1, (
-        "first run must set stale_head_consecutive_discards to 1"
-    )
     assert len(calls1) == 1 and calls1[0][0][1] == "review", (
         "first run must spawn exactly one fresh review"
     )
@@ -10092,6 +10104,7 @@ async def test_stale_head_discard_counter_idempotent_on_replay(tl_db, mocker):
             "feedback": "Found a real bug.",
             "issues": [{"description": "Real bug", "severity": "major"}],
             "reviewed_head_sha": "stalehd000000",
+            "reviewed_base_sha": "base-sha-1",
         }
     )
     payload = AgentStatusPayload(
@@ -10105,19 +10118,15 @@ async def test_stale_head_discard_counter_idempotent_on_replay(tl_db, mocker):
     await session.refresh(review_task1)
 
     ctx_replay = review_task1.context or {}
-    assert ctx_replay.get("stale_head_consecutive_discards") == 1, (
-        f"replay must NOT increment stale_head_consecutive_discards "
-        f"(got {ctx_replay.get('stale_head_consecutive_discards')})"
-    )
+    assert ctx_replay.get("_review_stale_head") is True
     assert not spawn_calls_replay, (
         f"replay must NOT spawn a second fresh review (got {len(spawn_calls_replay)} calls)"
     )
 
 
 @pytest.mark.asyncio
-async def test_stale_head_backward_compat_no_reviewed_head_sha(tl_db, mocker):
-    """Old verdicts without reviewed_head_sha must behave exactly as before:
-    REQUEST_CHANGES spawns a fix without any stale-head guard firing."""
+async def test_missing_review_provenance_respawns_exact_target_review(tl_db, mocker):
+    """A REQUEST_CHANGES verdict without both SHAs cannot authorize a fix."""
     captured_spawn_calls: list[tuple] = []
 
     async def _capture_spawn(*args, **kwargs):
@@ -10126,7 +10135,7 @@ async def test_stale_head_backward_compat_no_reviewed_head_sha(tl_db, mocker):
 
     mocker.patch("app.task_lifecycle._spawn_pipeline_task", side_effect=_capture_spawn)
     mocker.patch(
-        "app.task_lifecycle._merge_with_retry",
+        "app.github.merge_pull_request",
         new_callable=AsyncMock,
         return_value={"merged": True},
     )
@@ -10144,6 +10153,7 @@ async def test_stale_head_backward_compat_no_reviewed_head_sha(tl_db, mocker):
         new_callable=AsyncMock,
         return_value={
             "head": {"sha": "anylivesha", "ref": "feat/x"},
+            "base": {"sha": "livebasesha", "ref": "main"},
             "state": "open",
             "merged": False,
         },
@@ -10228,12 +10238,19 @@ async def test_stale_head_backward_compat_no_reviewed_head_sha(tl_db, mocker):
     await _process_post_commit(review_task.id, payload, _session_factory=factory)
     await session.refresh(review_task)
 
-    # Must behave as before: a fix spawned, no stale-head flag.
+    # Missing provenance is discarded just like a mismatched target. The
+    # replacement review is pinned to the exact live base/head; no fix runs.
     fix_calls = [c for c in captured_spawn_calls if c[0][1] == "fix"]
-    assert fix_calls, "Old verdict without reviewed_head_sha must still spawn a fix"
-    assert not (review_task.context or {}).get("_review_stale_head"), (
-        "_review_stale_head must not be set when reviewed_head_sha is absent"
-    )
+    review_calls = [c for c in captured_spawn_calls if c[0][1] == "review"]
+    assert not fix_calls
+    assert len(review_calls) == 1
+    assert review_calls[0][1]["review_target"] == {
+        "project_id": str(project.id),
+        "pr_number": 7071,
+        "base_sha": "livebasesha",
+        "head_sha": "anylivesha",
+    }
+    assert (review_task.context or {}).get("_review_stale_head") is True
 
 
 @pytest.mark.asyncio

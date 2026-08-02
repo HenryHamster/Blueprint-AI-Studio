@@ -2,8 +2,9 @@
 
 The caller holds the project lock. That makes idempotency, burst admission,
 task creation, and the request state transition one transaction instead of a
-read-then-create race. Ordinary work dispatches immediately; only the
-project-wide abuse circuit breaker defers accepted intent.
+read-then-create race. Ordinary work dispatches immediately; only the existing
+autonomous spawn backstops or project-wide abuse circuit breaker defer accepted
+intent.
 """
 
 from __future__ import annotations
@@ -16,11 +17,18 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
-from sqlalchemy import func
+from sqlalchemy import func, update
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
-from app.models import Project, StrategicSpawnRequest, Task, TaskStatus, _utcnow
+from app.models import (
+    DiscoveryCycle,
+    Project,
+    StrategicSpawnRequest,
+    Task,
+    TaskStatus,
+    _utcnow,
+)
 from app.strategic_watches import register_task_watch
 from app.task_locking import project_lock
 
@@ -28,6 +36,16 @@ DEFAULT_BURST_CAP = 100
 DEFAULT_BURST_WINDOW_MINUTES = 60
 MAX_DRAIN_PER_PASS = 10
 MAX_PROJECTS_PER_SWEEP = 20
+BUDGET_RECHECK_MINUTES = 5
+PROJECT_FAIRNESS_YIELD_SECONDS = 1
+ACTIVE_STRATEGIC_WORK_STATUSES = (
+    TaskStatus.QUEUED,
+    TaskStatus.PROVISIONING,
+    TaskStatus.IN_PROGRESS,
+    TaskStatus.EVALUATING,
+    TaskStatus.BLOCKED,
+    TaskStatus.PARKED,
+)
 
 logger = logging.getLogger("blueprint")
 
@@ -45,6 +63,41 @@ def stable_specification_hash(specification: dict[str, Any]) -> str:
 
 def default_idempotency_key(specification_hash: str) -> str:
     return f"spec:{specification_hash}"
+
+
+def stable_work_specification_hash(specification: dict[str, Any]) -> str:
+    """Hash executable work while excluding Resident-generation bookkeeping.
+
+    A new Resident task/session must be able to recognize work already active
+    under the same direction.  Watch presentation and the originating
+    Strategic task id do not change that work; payload, acceptance contract,
+    priority and the remaining context do.
+    """
+
+    task_spec = dict(specification.get("task") or {})
+    raw_context = task_spec.get("context")
+    context = dict(raw_context) if isinstance(raw_context, dict) else {}
+    context.pop("parent_strategic_task_id", None)
+    task_spec["context"] = context
+    task_spec.pop("watch", None)
+    task_spec.pop("watch_purpose", None)
+    return stable_specification_hash({"task": task_spec})
+
+
+def strategic_work_idempotency_key(
+    *,
+    project_id: uuid.UUID,
+    direction_id: str | None,
+    request_key: str,
+) -> str:
+    """Return the global active-Task identity for one logical work unit."""
+
+    identity = json.dumps(
+        [str(project_id), str(direction_id or "-"), request_key],
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return f"strategic-direct:{hashlib.sha256(identity).hexdigest()}"
 
 
 def _discovery_admission_key(
@@ -67,6 +120,8 @@ def _task_from_specification(
     project_id: uuid.UUID,
     specification: dict[str, Any],
     discovery_cycle_id: uuid.UUID | None = None,
+    active_task_idempotency_key: str | None = None,
+    work_specification_hash: str | None = None,
 ) -> Task:
     task_spec = specification.get("task")
     if not isinstance(task_spec, dict):
@@ -75,8 +130,12 @@ def _task_from_specification(
     if not isinstance(payloads, list) or not payloads:
         raise ValueError("spawn request task specification requires payloads")
     context = task_spec.get("context")
-    if not isinstance(context, dict):
-        context = {}
+    context = {} if not isinstance(context, dict) else dict(context)
+    if active_task_idempotency_key:
+        context["_strategic_work_key"] = active_task_idempotency_key
+    if work_specification_hash:
+        context["_strategic_work_specification_hash"] = work_specification_hash
+    raw_priority = task_spec.get("priority")
     return Task(
         project_id=project_id,
         discovery_cycle_id=discovery_cycle_id,
@@ -85,9 +144,10 @@ def _task_from_specification(
         payloads=payloads,
         context=context,
         status=TaskStatus.QUEUED,
-        priority=int(task_spec.get("priority") or 100),
+        priority=int(raw_priority if raw_priority is not None else 50),
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         created_by="STRATEGIC_AGENT",
+        idempotency_key=active_task_idempotency_key,
         criterion_ids=list(task_spec.get("criterion_ids") or []),
         **(
             {"requires_approval": bool(task_spec["requires_approval"])}
@@ -102,6 +162,37 @@ async def _dispatch_request(
     *,
     request: StrategicSpawnRequest,
 ) -> tuple[Task, str | None]:
+    admission_key: str | None = None
+    if request.discovery_cycle_id is not None:
+        from app.discovery_admission import reserve_discovery_admission
+
+        # Immediate submission may have enriched the request policy snapshot
+        # after the initial reservation flush. Persist only this row before the
+        # authoritative refresh below so those local fields are not discarded.
+        await session.flush([request])
+        cycle_id = request.discovery_cycle_id
+        # Discovery review takes these locks in cycle -> request order before it
+        # releases reservations and cancels overdue intent. Match that order and
+        # refresh the request under lock so a drain which selected the row just
+        # before review cannot dispatch from its stale in-memory state.
+        await session.execute(
+            select(DiscoveryCycle)
+            .where(DiscoveryCycle.id == cycle_id)
+            .with_for_update()
+        )
+        locked_request = (
+            await session.execute(
+                select(StrategicSpawnRequest)
+                .where(StrategicSpawnRequest.id == request.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if locked_request is None:
+            raise ValueError("strategic spawn request disappeared during dispatch")
+        if locked_request.discovery_cycle_id != cycle_id:
+            raise ValueError("strategic spawn request changed discovery cycle")
+        request = locked_request
     if request.task_id is not None:
         existing = await session.get(Task, request.task_id)
         if existing is not None:
@@ -110,11 +201,42 @@ async def _dispatch_request(
                 request=request,
                 task=existing,
             )
+    if request.state not in {"accepted", "deferred"}:
+        raise ValueError(
+            f"strategic spawn request is no longer dispatchable ({request.state})"
+        )
+    if request.discovery_cycle_id is not None:
+        admission_key = _discovery_admission_key(
+            request.parent_task_id,
+            request.idempotency_key,
+        )
+        # Revalidate the durable reservation before inserting a Task. The cycle
+        # lock remains held through the eventual request/admission transition,
+        # so review cannot release or finalize the envelope between this check
+        # and consumption.
+        decision = await reserve_discovery_admission(
+            session,
+            cycle_id=request.discovery_cycle_id,
+            admission_key=admission_key,
+            spawn_request_id=request.id,
+        )
+        if not decision.allowed:
+            raise ValueError(
+                f"discovery admission denied during dispatch: {decision.reason}"
+            )
 
     task = _task_from_specification(
         project_id=request.project_id,
         specification=dict(request.specification or {}),
         discovery_cycle_id=request.discovery_cycle_id,
+        active_task_idempotency_key=str(
+            (request.policy_snapshot or {}).get("active_task_idempotency_key") or ""
+        )
+        or None,
+        work_specification_hash=str(
+            (request.policy_snapshot or {}).get("work_specification_hash") or ""
+        )
+        or None,
     )
     session.add(task)
     await session.flush()
@@ -124,12 +246,10 @@ async def _dispatch_request(
             reserve_discovery_admission,
         )
 
-        admission_key = _discovery_admission_key(
-            request.parent_task_id,
-            request.idempotency_key,
-        )
-        # Bind the already-reserved request credit to its eventual Task. This
-        # idempotent re-reservation never charges the deferred drain twice.
+        assert admission_key is not None
+        # The cycle and request locks make this binding/consume pair
+        # infallible with respect to concurrent review: review cannot release
+        # or finalize either row until this transaction commits.
         decision = await reserve_discovery_admission(
             session,
             cycle_id=request.discovery_cycle_id,
@@ -139,7 +259,7 @@ async def _dispatch_request(
         )
         if not decision.allowed:
             raise ValueError(
-                f"discovery admission denied during dispatch: {decision.reason}"
+                f"discovery admission denied while binding task: {decision.reason}"
             )
         if not await consume_discovery_admission(
             session,
@@ -147,6 +267,11 @@ async def _dispatch_request(
             admission_key=admission_key,
         ):
             raise RuntimeError("discovery admission could not be consumed")
+        if request.task_type in {"research", "web_research"}:
+            cycle = await session.get(DiscoveryCycle, request.discovery_cycle_id)
+            if cycle is not None and cycle.source_research_task_id is None:
+                cycle.source_research_task_id = task.id
+                session.add(cycle)
 
     request.task_id = task.id
     request.state = "dispatched"
@@ -155,18 +280,7 @@ async def _dispatch_request(
     request.dispatched_at = _utcnow()
     session.add(request)
 
-    task_spec = dict((request.specification or {}).get("task") or {})
-    if bool(task_spec.get("watch", True)) and request.parent_task_id is not None:
-        await register_task_watch(
-            session,
-            project_id=request.project_id,
-            created_by_task_id=request.parent_task_id,
-            target_task_id=task.id,
-            purpose=str(
-                task_spec.get("watch_purpose")
-                or f"Report when Strategic child {task.title} reaches terminal state"
-            ),
-        )
+    await _register_request_watch(session, request=request, task=task)
 
     if request.parent_task_id is not None:
         parent = await session.get(Task, request.parent_task_id)
@@ -183,6 +297,90 @@ async def _dispatch_request(
         request=request,
         task=task,
     )
+
+
+async def _register_request_watch(
+    session,
+    *,
+    request: StrategicSpawnRequest,
+    task: Task,
+) -> None:
+    task_spec = dict((request.specification or {}).get("task") or {})
+    if not bool(task_spec.get("watch", True)) or request.parent_task_id is None:
+        return
+    await register_task_watch(
+        session,
+        project_id=request.project_id,
+        created_by_task_id=request.parent_task_id,
+        target_task_id=task.id,
+        purpose=str(
+            task_spec.get("watch_purpose")
+            or f"Report when Strategic child {task.title} reaches terminal state"
+        ),
+    )
+
+
+async def _active_task_for_work_key(session, work_key: str) -> Task | None:
+    return (
+        await session.execute(
+            select(Task).where(
+                Task.idempotency_key == work_key,
+                Task.status.in_(ACTIVE_STRATEGIC_WORK_STATUSES),
+            )
+        )
+    ).scalar_one_or_none()
+
+
+async def _budget_guard_for_request(
+    session,
+    *,
+    task_type: str,
+    specification: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Apply the existing autonomous backstop to a direct Strategic root."""
+
+    from app.autonomous_spawn_budget import (
+        autonomous_spawn_budget_config_from_runtime,
+        classify_autonomous_spawn_budget_category,
+    )
+    from app.shared_state import runtime_config
+    from app.strategic_spawning import _strategic_spawn_budget_guard
+
+    task_spec = dict(specification.get("task") or {})
+    payloads = task_spec.get("payloads") or []
+    first_payload = payloads[0] if payloads and isinstance(payloads[0], dict) else {}
+    context = task_spec.get("context")
+    if not isinstance(context, dict):
+        context = {}
+    try:
+        config = autonomous_spawn_budget_config_from_runtime(runtime_config)
+    except ValueError:
+        # Keep classification available so the canonical guard can apply its
+        # own established malformed-config fail posture.
+        config = None
+    category = classify_autonomous_spawn_budget_category(
+        task_type=task_type,
+        config=config,
+        payload=first_payload,
+        context=context,
+    )
+    return await _strategic_spawn_budget_guard(session, category)
+
+
+def _defer_for_budget(
+    request: StrategicSpawnRequest,
+    *,
+    guard: dict[str, Any],
+    now,
+) -> None:
+    request.state = "deferred"
+    request.admission_reason = str(guard.get("guard") or "spawn_budget")[:255]
+    request.not_before = now + timedelta(minutes=BUDGET_RECHECK_MINUTES)
+    request.policy_snapshot = {
+        **(request.policy_snapshot or {}),
+        "budget_guard": guard,
+        "budget_recheck_minutes": BUDGET_RECHECK_MINUTES,
+    }
 
 
 async def _link_request_debt(
@@ -262,6 +460,38 @@ async def _next_admission_time(
     return (oldest or _utcnow()) + timedelta(minutes=window_minutes)
 
 
+async def _advance_due_requests_until_burst_room(
+    session,
+    *,
+    project_id: uuid.UUID,
+    since,
+    window_minutes: int,
+    now,
+) -> None:
+    """Move an ineligible due queue to its first real dispatch opportunity."""
+
+    next_time = await _next_admission_time(
+        session,
+        project_id=project_id,
+        since=since,
+        window_minutes=window_minutes,
+    )
+    # The oldest dispatch can sit exactly on the inclusive window boundary.
+    # Keep it out of the next sweep rather than repeatedly spending a global
+    # project candidate on a row which still has no room.
+    next_time = max(next_time, now + timedelta(seconds=1))
+    await session.execute(
+        update(StrategicSpawnRequest)
+        .where(
+            StrategicSpawnRequest.project_id == project_id,
+            StrategicSpawnRequest.state == "deferred",
+            StrategicSpawnRequest.not_before <= now,
+        )
+        .values(not_before=next_time, updated_at=now)
+        .execution_options(synchronize_session="fetch")
+    )
+
+
 async def submit_strategic_spawn(
     session,
     *,
@@ -271,16 +501,22 @@ async def submit_strategic_spawn(
     specification: dict[str, Any],
     idempotency_key: str | None,
     direction_id: str | None,
+    discovery_cycle_id: uuid.UUID | None = None,
     burst_cap: int = DEFAULT_BURST_CAP,
     burst_window_minutes: int = DEFAULT_BURST_WINDOW_MINUTES,
-    discovery_admission_mode: str = "shadow",
 ) -> SpawnSubmission:
     """Persist one intent and immediately dispatch unless the abuse guard trips."""
 
     specification_hash = stable_specification_hash(specification)
+    work_specification_hash = stable_work_specification_hash(specification)
     normalized_key = (
         str(idempotency_key or "").strip()[:128]
-        or default_idempotency_key(specification_hash)
+        or default_idempotency_key(work_specification_hash)
+    )
+    active_task_idempotency_key = strategic_work_idempotency_key(
+        project_id=project_id,
+        direction_id=direction_id,
+        request_key=normalized_key,
     )
     existing = (
         await session.execute(
@@ -318,6 +554,59 @@ async def submit_strategic_spawn(
             await session.commit()
         return SpawnSubmission(existing, existing_task, True, linked_debt_id)
 
+    project = await session.get(Project, project_id)
+    if project is None:
+        raise ValueError("project not found")
+    if project.paused:
+        raise ValueError("project is paused; strategic spawning is disabled")
+
+    # The request row is intentionally parent-scoped for exact API replay, but
+    # executable work is scoped to project + direction + logical request key.
+    # That keeps a replacement Resident generation from duplicating work which
+    # is still queued/running/parked, while the partial Task index releases the
+    # key after terminal completion so a later retry remains possible.
+    active_task = await _active_task_for_work_key(
+        session, active_task_idempotency_key
+    )
+    if active_task is not None:
+        active_work_hash = str(
+            (active_task.context or {}).get("_strategic_work_specification_hash")
+            or ""
+        )
+        if active_work_hash != work_specification_hash:
+            raise ValueError(
+                "idempotency_key already identifies different active work in "
+                "this direction"
+            )
+        request = StrategicSpawnRequest(
+            project_id=project_id,
+            parent_task_id=parent_task_id,
+            idempotency_key=normalized_key,
+            task_type=task_type,
+            specification=specification,
+            specification_hash=specification_hash,
+            direction_id=direction_id,
+            discovery_cycle_id=active_task.discovery_cycle_id,
+            state="dispatched",
+            admission_reason="active_work_deduplicated",
+            policy_snapshot={
+                "kind": "active_work_deduplication",
+                "active_task_idempotency_key": active_task_idempotency_key,
+                "work_specification_hash": work_specification_hash,
+            },
+            task_id=active_task.id,
+        )
+        session.add(request)
+        await session.flush()
+        await _register_request_watch(session, request=request, task=active_task)
+        linked_debt_id = await _link_request_debt(
+            session,
+            request=request,
+            task=active_task,
+        )
+        await session.commit()
+        return SpawnSubmission(request, active_task, True, linked_debt_id)
+
     now = _utcnow()
     cap = max(1, int(burst_cap))
     window = max(1, int(burst_window_minutes))
@@ -334,6 +623,8 @@ async def submit_strategic_spawn(
             "kind": "abuse_circuit_breaker",
             "burst_cap": cap,
             "window_minutes": window,
+            "active_task_idempotency_key": active_task_idempotency_key,
+            "work_specification_hash": work_specification_hash,
         },
     )
     session.add(request)
@@ -343,10 +634,12 @@ async def submit_strategic_spawn(
         resolve_discovery_cycle_lineage,
     )
 
-    request.discovery_cycle_id = await resolve_discovery_cycle_lineage(
-        session,
-        parent_task_id=parent_task_id,
-    )
+    request.discovery_cycle_id = discovery_cycle_id
+    if request.discovery_cycle_id is None:
+        request.discovery_cycle_id = await resolve_discovery_cycle_lineage(
+            session,
+            parent_task_id=parent_task_id,
+        )
     if request.discovery_cycle_id is not None:
         decision = await reserve_discovery_admission(
             session,
@@ -355,7 +648,6 @@ async def submit_strategic_spawn(
                 parent_task_id,
                 normalized_key,
             ),
-            mode=discovery_admission_mode,
             spawn_request_id=request.id,
             metadata={"source": "strategic_spawn_request"},
         )
@@ -364,11 +656,20 @@ async def submit_strategic_spawn(
             raise ValueError(f"discovery admission denied: {decision.reason}")
         request.policy_snapshot = {
             **(request.policy_snapshot or {}),
-            "discovery_admission_mode": discovery_admission_mode,
             "discovery_admission_reason": decision.reason,
-            "discovery_shadow_violation": decision.shadow_violation,
         }
         session.add(request)
+
+    budget_guard = await _budget_guard_for_request(
+        session,
+        task_type=task_type,
+        specification=specification,
+    )
+    if budget_guard is not None:
+        _defer_for_budget(request, guard=budget_guard, now=now)
+        session.add(request)
+        await session.commit()
+        return SpawnSubmission(request, None, False)
 
     since = now - timedelta(minutes=window)
     recent_count = await _recent_dispatch_count(
@@ -407,6 +708,10 @@ async def drain_deferred_spawn_requests(
     The caller must hold the project lock and commits after this function.
     """
 
+    project = await session.get(Project, project_id)
+    if project is None or project.paused:
+        return []
+
     now = _utcnow()
     cap = max(1, int(burst_cap))
     window = max(1, int(burst_window_minutes))
@@ -417,8 +722,16 @@ async def drain_deferred_spawn_requests(
         since=since,
     )
     if room <= 0:
+        await _advance_due_requests_until_burst_room(
+            session,
+            project_id=project_id,
+            since=since,
+            window_minutes=window,
+            now=now,
+        )
         return []
-    rows = (
+    row_limit = max(1, min(int(limit), room, MAX_DRAIN_PER_PASS))
+    candidates = (
         (
             await session.execute(
                 select(StrategicSpawnRequest)
@@ -427,16 +740,62 @@ async def drain_deferred_spawn_requests(
                     StrategicSpawnRequest.state == "deferred",
                     StrategicSpawnRequest.not_before <= now,
                 )
-                .order_by(StrategicSpawnRequest.created_at.asc())
-                .limit(max(1, min(int(limit), room, MAX_DRAIN_PER_PASS)))
+                .order_by(
+                    StrategicSpawnRequest.created_at.asc(),
+                    StrategicSpawnRequest.id.asc(),
+                )
+                .limit(row_limit + 1)
             )
         )
         .scalars()
         .all()
     )
+    rows = candidates[:row_limit]
+    has_more_due = len(candidates) > row_limit
+    drained: list[StrategicSpawnRequest] = []
     for request in rows:
+        budget_guard = await _budget_guard_for_request(
+            session,
+            task_type=request.task_type,
+            specification=dict(request.specification or {}),
+        )
+        if budget_guard is not None:
+            _defer_for_budget(request, guard=budget_guard, now=now)
+            session.add(request)
+            continue
         await _dispatch_request(session, request=request)
-    return rows
+        drained.append(request)
+    if has_more_due:
+        if len(drained) >= room:
+            # This project filled its last burst slot during the current pass.
+            await _advance_due_requests_until_burst_room(
+                session,
+                project_id=project_id,
+                since=since,
+                window_minutes=window,
+                now=now,
+            )
+        else:
+            # The queue hit the bounded per-project pass before its burst
+            # window filled. Move only the untouched due tail behind every
+            # project already waiting at this sweep boundary. ``not_before`` is
+            # durable, so max_projects=1 remains fair across leader restarts
+            # without adding a cursor/config subsystem.
+            await session.execute(
+                update(StrategicSpawnRequest)
+                .where(
+                    StrategicSpawnRequest.project_id == project_id,
+                    StrategicSpawnRequest.state == "deferred",
+                    StrategicSpawnRequest.not_before <= now,
+                )
+                .values(
+                    not_before=now
+                    + timedelta(seconds=PROJECT_FAIRNESS_YIELD_SECONDS),
+                    updated_at=now,
+                )
+                .execution_options(synchronize_session="fetch")
+            )
+    return drained
 
 
 async def drain_due_strategic_spawn_requests(
@@ -454,30 +813,44 @@ async def drain_due_strategic_spawn_requests(
     """
 
     now = _utcnow()
-    project_ids = (
-        (
+    oldest_due_at = func.min(StrategicSpawnRequest.not_before).label("oldest_due_at")
+    oldest_created_at = func.min(StrategicSpawnRequest.created_at).label(
+        "oldest_created_at"
+    )
+    project_ids = [
+        row[0]
+        for row in (
             await session.execute(
-                select(StrategicSpawnRequest.project_id)
+                select(
+                    StrategicSpawnRequest.project_id,
+                    oldest_due_at,
+                    oldest_created_at,
+                )
+                .join(Project, Project.id == StrategicSpawnRequest.project_id)
                 .where(
                     StrategicSpawnRequest.state == "deferred",
                     StrategicSpawnRequest.not_before <= now,
+                    Project.paused.is_(False),
                 )
-                .distinct()
+                .group_by(StrategicSpawnRequest.project_id)
+                .order_by(
+                    oldest_due_at.asc(),
+                    oldest_created_at.asc(),
+                    StrategicSpawnRequest.project_id.asc(),
+                )
                 .limit(max(1, min(int(max_projects), MAX_PROJECTS_PER_SWEEP)))
             )
-        )
-        .scalars()
-        .all()
-    )
+        ).all()
+    ]
     drained: list[StrategicSpawnRequest] = []
     for project_id in project_ids:
         async with project_lock(
             session,
             project_id,
             skip_locked=True,
-            load_columns=[Project.id],
+            load_columns=[Project.id, Project.paused],
         ) as locked_project:
-            if locked_project is None:
+            if locked_project is None or locked_project.paused:
                 continue
             drained.extend(
                 await drain_deferred_spawn_requests(

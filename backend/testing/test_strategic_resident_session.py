@@ -931,6 +931,36 @@ async def test_mode_changed_ensure_leaves_existing_session_untouched_and_manual_
     assert [row.id for row in tasks] == [task_id]
 
 
+async def test_explicit_runner_change_rejects_active_session(db_session):
+    project = await _make_project(db_session)
+    await _make_task(db_session, project)
+    first_runner = await _make_runner(db_session, project)
+    second_runner = await _make_runner(db_session, project)
+
+    started = await start_resident_session(
+        db_session,
+        project,
+        operator_user_id=TEST_USER_ID,
+        runner_id=str(first_runner.id),
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await start_resident_session(
+            db_session,
+            project,
+            operator_user_id=TEST_USER_ID,
+            runner_id=str(second_runner.id),
+        )
+
+    assert exc.value.status_code == 409
+    assert "stop the current session" in str(exc.value.detail)
+    refreshed = await db_session.get(Project, project.id)
+    blob = read_resident_session(dict(refreshed.vision or {}))
+    assert blob is not None
+    assert blob["session_id"] == started["session_id"]
+    assert blob["runner_id"] == str(first_runner.id)
+
+
 async def test_start_adopts_task_and_liveness_heartbeat_preserves_lease(db_session, monkeypatch):
     monkeypatch.setenv("CALL_FOREGROUND_QUALIFICATION", "claude-warm-stream-json:phase0-v1")
     project = await _make_project(db_session)
@@ -1604,6 +1634,51 @@ async def test_reload_ensure_replaces_retry_after_task_heartbeat_goes_stale(db_s
 
 
 @pytest.mark.asyncio
+async def test_explicit_runner_replaces_a_genuinely_stale_active_worker(db_session):
+    project = await _make_project(db_session)
+    old_task = await _make_task(db_session, project)
+    first_runner = await _make_runner(db_session, project)
+    second_runner = await _make_runner(db_session, project)
+    started = await start_resident_session(
+        db_session,
+        project,
+        operator_user_id=TEST_USER_ID,
+        runner_id=str(first_runner.id),
+    )
+    stale_at = _utcnow() - timedelta(
+        seconds=resident_session_module._RESIDENT_WORKER_HEARTBEAT_STALE_SECONDS + 1
+    )
+
+    old_task = await db_session.get(Task, old_task.id)
+    old_task.status = TaskStatus.QUEUED
+    old_task.last_heartbeat = stale_at
+    project = await db_session.get(Project, project.id)
+    vision = dict(project.vision or {})
+    blob = dict(vision[RESIDENT_SESSION_KEY])
+    blob["started_at"] = (_utcnow() - timedelta(minutes=10)).isoformat()
+    blob.pop("worker_heartbeat_at", None)
+    vision[RESIDENT_SESSION_KEY] = blob
+    project.vision = vision
+    flag_modified(project, "vision")
+    db_session.add_all([project, old_task])
+    await db_session.commit()
+
+    replaced = await start_resident_session(
+        db_session,
+        project,
+        operator_user_id=TEST_USER_ID,
+        runner_id=str(second_runner.id),
+    )
+
+    assert replaced["session_id"] == started["session_id"]
+    assert replaced["worker_generation"] == started["worker_generation"] + 1
+    assert replaced["task_id"] != started["task_id"]
+    assert replaced["runner_id"] == str(second_runner.id)
+    await db_session.refresh(old_task)
+    assert old_task.status == TaskStatus.CANCELLED
+
+
+@pytest.mark.asyncio
 async def test_reload_ensure_replaces_worker_after_task_corroboration_grace(
     db_session,
 ):
@@ -1895,6 +1970,18 @@ async def test_unattended_cap_persists_message_handoff(db_session, monkeypatch):
     assert capped["authority_held"] is False
     assert capped["stop_requested"] is True
     assert capped["status"] == "ended"
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    assert task.latest_status_message == (
+        "Resident strategic session ended after reaching the idle limit"
+    )
+    assert task.post_commit_pending is True
+    assert task.context["_post_commit_pending_meta"]["reason"] == (
+        "resident_session_ended"
+    )
+    assert task.context["_post_commit_pending_meta"]["payload"]["status"] == (
+        TaskStatus.COMPLETED
+    )
     await db_session.refresh(pending)
     assert pending.status == "open"
     assert pending.resident_session_id is None
@@ -1962,6 +2049,9 @@ async def test_unattended_cap_handoff_is_atomic_with_cap_end(
 
     assert capped["authority_held"] is False
     assert capped["status"] == "ended"
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    assert task.post_commit_pending is True
     # Message must be released even though rearm raised
     await db_session.refresh(pending)
     assert pending.resident_session_id is None, (
@@ -1970,6 +2060,121 @@ async def test_unattended_cap_handoff_is_atomic_with_cap_end(
     )
     assert pending.handling_state == MessageHandlingState.PENDING
     assert pending.handled_by_task_id is None
+
+
+@pytest.mark.asyncio
+async def test_stale_continuation_lease_atomically_terminalizes_resident_task(
+    db_session, monkeypatch
+):
+    project = await _make_project(db_session)
+    task = await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    started = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    monkeypatch.setitem(
+        runtime_config, STRATEGIC_SESSION_MAX_UNATTENDED_SETTING, 86_400
+    )
+    monkeypatch.setitem(runtime_config, "strategic_continuation_ttl_seconds", 60)
+
+    project = await db_session.get(Project, project.id)
+    vision = dict(project.vision or {})
+    marker = dict(vision[STRATEGIC_LOCAL_CONTINUATION_KEY])
+    marker["last_seen_at"] = (_utcnow() - timedelta(minutes=5)).isoformat()
+    marker["updated_at"] = marker["last_seen_at"]
+    vision[STRATEGIC_LOCAL_CONTINUATION_KEY] = marker
+    project.vision = vision
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    project = await db_session.get(Project, project.id)
+    lapsed = await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=started["session_id"],
+        task_id=started["task_id"],
+        progress=False,
+    )
+
+    assert lapsed["authority_held"] is False
+    assert lapsed["stop_requested"] is True
+    assert lapsed["status"] == "ended"
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    assert task.post_commit_pending is True
+    assert task.latest_status_message == (
+        "Resident strategic session ended after its continuation lease lapsed"
+    )
+    pending = task.context["_post_commit_pending_meta"]
+    assert pending["reason"] == "resident_session_ended"
+    assert pending["payload"]["status"] == TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_cap_never_terminalizes_cross_project_resident_task_pointer(
+    db_session, monkeypatch
+):
+    project = await _make_project(db_session)
+    await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    started = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    foreign_project = Project(
+        name="Foreign resident project", user_id=TEST_USER_ID
+    )
+    db_session.add(foreign_project)
+    await db_session.commit()
+    await db_session.refresh(foreign_project)
+    foreign_task = Task(
+        project_id=foreign_project.id,
+        payloads=[{"type": "strategic_review", "resident_session": True}],
+        status=TaskStatus.IN_PROGRESS,
+        context={
+            "_resident_session": True,
+            "strategic_session_id": started["session_id"],
+            "_resident_worker_generation": 1,
+        },
+    )
+    db_session.add(foreign_task)
+    await db_session.commit()
+    await db_session.refresh(foreign_task)
+
+    monkeypatch.setitem(runtime_config, STRATEGIC_SESSION_MAX_UNATTENDED_SETTING, 60)
+    project = await db_session.get(Project, project.id)
+    vision = dict(project.vision or {})
+    blob = dict(vision[RESIDENT_SESSION_KEY])
+    blob["task_id"] = str(foreign_task.id)
+    blob["worker_incarnation_id"] = str(
+        legacy_resident_worker_incarnation(foreign_task.id, 1)
+    )
+    blob["worker_incarnation_expires_at"] = (
+        _utcnow() + timedelta(minutes=5)
+    ).isoformat()
+    blob["last_operator_interaction_at"] = (
+        _utcnow() - timedelta(hours=2)
+    ).isoformat()
+    vision[RESIDENT_SESSION_KEY] = blob
+    project.vision = vision
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    project = await db_session.get(Project, project.id)
+    ended = await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=started["session_id"],
+        task_id=str(foreign_task.id),
+        progress=False,
+    )
+
+    assert ended["status"] == "ended"
+    await db_session.refresh(foreign_task)
+    assert foreign_task.status == TaskStatus.IN_PROGRESS
+    assert foreign_task.post_commit_pending is False
 
 
 @pytest.mark.asyncio
@@ -2474,13 +2679,12 @@ def test_resident_reaper_uses_own_heartbeat_window():
 
 @pytest.mark.asyncio
 async def test_heartbeat_handled_ids_only_affect_own_session(db_session, monkeypatch):
-    """handled_message_ids in renew_resident_session_lease must ONLY mark messages
-    as 'handled' when their resident_session_id matches the active session.
+    """Handled ids affect own-session messages and exact server wake barriers.
 
     Legacy / cadence messages (resident_session_id IS NULL) and messages pinned
     to a different session must remain untouched even when their IDs appear in
-    handled_message_ids.  This is the invariant enforced at
-    strategic_resident_session.py::L3425 (WHERE resident_session_id == session_id).
+    handled_message_ids. A NULL-session strategist-internal wake barrier is the
+    only project-scoped exception.
     """
     project = await _make_project(db_session)
     task = await _make_task(db_session, project)
@@ -2525,13 +2729,49 @@ async def test_heartbeat_handled_ids_only_affect_own_session(db_session, monkeyp
         status="open",
         resident_session_id="ss-other-entirely",
     )
-    db_session.add_all([own_msg, null_session_msg, other_session_msg])
+    wake_barrier = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.NOTE,
+        from_type="system",
+        content="Promoted v7 is serving the expected SHA.",
+        status="open",
+        resident_session_id=None,
+        context={
+            "audience": "strategist-internal",
+            "event_type": "release.serving_confirmed",
+            "resident_wake_barrier": True,
+            "served_sha": "abc123",
+        },
+    )
+    db_session.add_all(
+        [own_msg, null_session_msg, other_session_msg, wake_barrier]
+    )
     await db_session.commit()
-    for m in (own_msg, null_session_msg, other_session_msg):
+    for m in (own_msg, null_session_msg, other_session_msg, wake_barrier):
         await db_session.refresh(m)
 
     project = await db_session.get(Project, project.id)
-    await renew_resident_session_lease(
+    initial = await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=session_id,
+        task_id=started["task_id"],
+        progress=False,
+    )
+    assert initial["fired_barriers"] == [
+        {
+            "id": str(wake_barrier.id),
+            "event_type": "release.serving_confirmed",
+            "summary": "Promoted v7 is serving the expected SHA.",
+            "created_at": wake_barrier.created_at.isoformat(),
+            "task_id": None,
+            "context": {
+                "event_type": "release.serving_confirmed",
+                "served_sha": "abc123",
+            },
+        }
+    ]
+    acknowledged = await renew_resident_session_lease(
         db_session,
         project,
         session_id=session_id,
@@ -2541,12 +2781,28 @@ async def test_heartbeat_handled_ids_only_affect_own_session(db_session, monkeyp
             str(own_msg.id),
             str(null_session_msg.id),
             str(other_session_msg.id),
+            str(wake_barrier.id),
         ],
     )
+    assert acknowledged["fired_barriers"] == []
+    assert acknowledged["work_state_summary"]["pending_barriers"] == 0
+
+    followup = await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=session_id,
+        task_id=started["task_id"],
+        progress=False,
+    )
+    assert followup["fired_barriers"] == []
+    assert followup["work_state_summary"]["pending_barriers"] == 0
+    assert followup["work_state_rev"] == acknowledged["work_state_rev"]
+    assert acknowledged["work_state_rev"] == initial["work_state_rev"]
 
     await db_session.refresh(own_msg)
     await db_session.refresh(null_session_msg)
     await db_session.refresh(other_session_msg)
+    await db_session.refresh(wake_barrier)
 
     assert own_msg.status == "handled", (
         "Own-session message must be marked handled by the heartbeat"
@@ -2557,6 +2813,7 @@ async def test_heartbeat_handled_ids_only_affect_own_session(db_session, monkeyp
     assert other_session_msg.status == "open", (
         "Message from a different session must NOT be marked handled"
     )
+    assert wake_barrier.status == "handled"
 
 
 # ---------------------------------------------------------------------------

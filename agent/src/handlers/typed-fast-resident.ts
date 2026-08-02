@@ -56,6 +56,12 @@ export interface ForegroundTypedControllerOptions {
   allowUnvalidatedAdapter?: boolean;
 }
 
+// A private READY probe exists only to prove that the restricted child can
+// complete a provider turn.  It must never consume the normal 90-second Fast
+// turn budget: provisioning runs beside the Resident loop, and a wedged CLI
+// should be replaced quickly while operator input remains unclaimed.
+const TYPED_FAST_READINESS_TIMEOUT_MS = 15_000;
+
 function nonEmpty(value: unknown, name: string, max = MAX_TYPED_REPLY_CHARS): string {
   if (typeof value !== 'string' || !value.trim() || value.length > max) {
     throw new Error(`invalid typed Fast ${name}`);
@@ -190,9 +196,25 @@ export class ForegroundTypedController {
     this.ensureStarted();
     const session = this.session;
     if (!session) throw new Error('Fast Resident failed to start');
-    const result = await session.sendTurn(
-      'Private startup health probe. Do not call any tools. Reply with READY only.',
-    );
+    let watchdog: NodeJS.Timeout | null = null;
+    const readinessTimeout = new Promise<never>((_resolve, reject) => {
+      watchdog = setTimeout(() => {
+        if (this.session === session) this.closeSessionOnly();
+        reject(new Error('Fast Resident readiness probe exceeded its controller deadline'));
+      }, TYPED_FAST_READINESS_TIMEOUT_MS);
+    });
+    let result: Awaited<ReturnType<ResidentSession['sendTurn']>>;
+    try {
+      result = await Promise.race([
+        session.sendTurn(
+          'Private startup health probe. Do not call any tools. Reply with READY only.',
+          { hardTimeoutMs: TYPED_FAST_READINESS_TIMEOUT_MS },
+        ),
+        readinessTimeout,
+      ]);
+    } finally {
+      if (watchdog !== null) clearTimeout(watchdog);
+    }
     if (
       result.processGone || result.timedOut || result.hardTimedOut
       || result.interrupted || result.providerFailed

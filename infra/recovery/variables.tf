@@ -82,6 +82,41 @@ variable "enable_restore_verifier" {
   default     = false
 }
 
+variable "recovery_billing_account_id" {
+  description = "Billing account ID used only to create the recovery project's dedicated monthly budget alert."
+  type        = string
+  default     = ""
+}
+
+variable "recovery_monthly_budget_usd" {
+  description = "Monthly USD alert budget scoped only to the recovery project."
+  type        = number
+  default     = 20
+
+  validation {
+    condition     = var.recovery_monthly_budget_usd >= 5 && var.recovery_monthly_budget_usd <= 100 && floor(var.recovery_monthly_budget_usd) == var.recovery_monthly_budget_usd
+    error_message = "recovery_monthly_budget_usd must be a whole-dollar amount between 5 and 100."
+  }
+}
+
+variable "enable_restore_janitor" {
+  description = "Keep the recovery janitor job and 30-minute schedule active independently of recurring full restore drills."
+  type        = bool
+  default     = false
+}
+
+variable "enable_restore_drill_schedule" {
+  description = "Enable recurring full restore drills only after a manual exact-generation drill and cleanup proof succeed."
+  type        = bool
+  default     = false
+}
+
+variable "enable_restore_verifier_prerequisites" {
+  description = "Create the dedicated recovery VPC, private-services connection, and immutable verifier image repository before enabling restore jobs."
+  type        = bool
+  default     = false
+}
+
 variable "restore_verifier_image" {
   description = "Immutable restore-verifier container image, including an @sha256 digest."
   type        = string
@@ -105,10 +140,93 @@ variable "restore_verifier_private_subnetwork" {
   default     = ""
 }
 
+variable "restore_verifier_subnetwork_cidr" {
+  description = "CIDR for Cloud Run Direct VPC egress used only by the recovery restore verifier."
+  type        = string
+  default     = "10.73.0.0/24"
+
+  validation {
+    condition     = can(cidrnetmask(var.restore_verifier_subnetwork_cidr))
+    error_message = "restore_verifier_subnetwork_cidr must be a valid IPv4 CIDR."
+  }
+}
+
+variable "restore_verifier_private_service_prefix_length" {
+  description = "Prefix length of the Google-managed private-services range used by temporary recovery Cloud SQL instances."
+  type        = number
+  default     = 24
+
+  validation {
+    condition     = var.restore_verifier_private_service_prefix_length >= 16 && var.restore_verifier_private_service_prefix_length <= 24
+    error_message = "restore_verifier_private_service_prefix_length must be between 16 and 24."
+  }
+}
+
+variable "restore_verifier_artifact_repository" {
+  description = "Recovery-project Artifact Registry repository for immutable restore-verifier images."
+  type        = string
+  default     = "blueprint-recovery"
+
+  validation {
+    condition     = can(regex("^[a-z][a-z0-9-]{3,62}$", var.restore_verifier_artifact_repository))
+    error_message = "restore_verifier_artifact_repository must be a valid Artifact Registry repository ID."
+  }
+}
+
 variable "restore_verifier_expected_revision" {
   description = "Exact Alembic revision required by successful restore drills."
   type        = string
   default     = ""
+}
+
+variable "restore_verifier_expected_archive_name" {
+  description = "Optional exact archive object name required by a manual pre-cutover drill."
+  type        = string
+  default     = ""
+}
+
+variable "restore_verifier_expected_archive_generation" {
+  description = "Optional immutable GCS generation of the exact archive required by a manual pre-cutover drill."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.restore_verifier_expected_archive_generation == "" || can(regex("^[0-9]+$", var.restore_verifier_expected_archive_generation))
+    error_message = "restore_verifier_expected_archive_generation must be empty or numeric."
+  }
+}
+
+variable "restore_verifier_expected_manifest_generation" {
+  description = "Optional immutable GCS generation of the exact completion manifest required by a manual pre-cutover drill."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.restore_verifier_expected_manifest_generation == "" || can(regex("^[0-9]+$", var.restore_verifier_expected_manifest_generation))
+    error_message = "restore_verifier_expected_manifest_generation must be empty or numeric."
+  }
+}
+
+variable "restore_verifier_expected_archive_sha256" {
+  description = "Optional SHA-256 of the exact archive required by a manual pre-cutover drill."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.restore_verifier_expected_archive_sha256 == "" || can(regex("^[0-9a-f]{64}$", var.restore_verifier_expected_archive_sha256))
+    error_message = "restore_verifier_expected_archive_sha256 must be empty or a lowercase SHA-256 digest."
+  }
+}
+
+variable "restore_verifier_expected_archive_size_bytes" {
+  description = "Optional byte size of the exact archive required by a manual pre-cutover drill; zero disables exact pinning."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.restore_verifier_expected_archive_size_bytes >= 0 && floor(var.restore_verifier_expected_archive_size_bytes) == var.restore_verifier_expected_archive_size_bytes
+    error_message = "restore_verifier_expected_archive_size_bytes must be a non-negative integer."
+  }
 }
 
 variable "restore_drill_schedule" {

@@ -277,7 +277,6 @@ export const TASK_TYPES_WITHOUT_HINT: ReadonlySet<string> = new Set([
   'repo_bootstrap',          // Uses specialized.ts bespoke prompt assembly (external-repo first-cycle bootstrap)
   'salvage_bundle',          // Uses standard.ts handleSalvageBundle bespoke prompt assembly (consolidated fix batch)
   'capability_proof_trial',  // Uses capability-proof-trial.ts; runs the targeted covering tests directly, no Claude prompt
-  'criterion_coverage_trial', // Uses criterion-coverage-trial.ts; runs discovered covering tests directly, no Claude prompt
   'memory_consolidation',     // Uses memory-consolidation.ts bespoke receipt-only prompt
   'walkthrough_e2e',        // Uses specialized.ts bespoke prompt assembly (live-stack walkthrough harness)
 ]);
@@ -1336,7 +1335,7 @@ export function writeSkillHelpers(
 // across the agent → backend (schemas.SelfReviewOutcome) → frontend
 // (SrTrendData.prompt_version) chain is consistent and string-safe
 // for frontend operations like `.slice(...)`.
-export const SELF_REVIEW_PROMPT_VERSION = "8";
+export const SELF_REVIEW_PROMPT_VERSION = "9";
 
 // Human-readable examples of disallowed blind_spot entries — mirrored in
 // backend/app/sr_blind_spots.py DISALLOWED_BLIND_SPOT_EXAMPLES for contract-test parity.
@@ -1462,7 +1461,6 @@ Categories:
 
 **Optional:** \`truncated_files_read\` = subset re-read. \`["incomplete_review"]\` when diff truncated.
 
-**Fresh-reviewer pass:** May add \`reviewer_findings\` (overrides passing). Auto-fires for \`"incomplete_review"\`.
 `;
 
 /** Config-driven ./check description for a project that supplied a build_config

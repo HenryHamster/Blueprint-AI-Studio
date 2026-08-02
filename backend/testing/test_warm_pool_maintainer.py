@@ -3419,7 +3419,7 @@ async def test_sweep_stranded_lane_no_context_kills_and_clears_reservation(
 
 @pytest.mark.asyncio
 async def test_sweep_stranded_lanes_creates_recovery_task_when_context_available(
-    db_session, lanes_on
+    db_session, lanes_on, mocker
 ):
     """Acceptance proof: a stranded ACTIVE lane whose terminal task carries PR
     dispatch context (pr_number / branch / base_branch) is re-dispatched with a
@@ -3441,6 +3441,22 @@ async def test_sweep_stranded_lanes_creates_recovery_task_when_context_available
         current_task_id=cancelled.id,
         phase_requeues=0,
         name="stranded-with-context",
+    )
+
+    mocker.patch(
+        "app.github_token_resolver.get_github_token_for_task",
+        new=AsyncMock(return_value=("token", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "base": {"sha": "base-a"},
+                "head": {"sha": "head-a"},
+            }
+        ),
     )
 
     transitioned = await sweep_stranded_lanes(
@@ -3470,6 +3486,142 @@ async def test_sweep_stranded_lanes_creates_recovery_task_when_context_available
         db_session, _utcnow(), runtime_config=_runtime_config
     )
     assert second == 0, "live-task lane is not stranded — re-run is a no-op"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "denial"),
+    [
+        ("lookup_failure", "retryable"),
+        ("unknown_live_state", "retryable"),
+        ("existing_owner", "occupied"),
+    ],
+)
+async def test_sweep_stranded_lane_defers_nonterminal_fix_denial(
+    db_session, lanes_on, mocker, case, denial
+):
+    from app.fix_admission import FixAdmissionDecision, FixAdmissionDenial
+
+    project = await _make_project(db_session, name=f"Strand defer {case}")
+    failed = await _make_task_with_pr(
+        db_session, project, TaskStatus.FAILED, pr_number=100
+    )
+    lane = await _make_lane(
+        db_session,
+        project,
+        status=ImprovementLaneStatus.ACTIVE,
+        current_task_id=failed.id,
+        phase_requeues=0,
+        name=f"stranded-{case}",
+    )
+    mocker.patch(
+        "app.github_token_resolver.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    denial_kind = FixAdmissionDenial(denial)
+    mocker.patch(
+        "app.fix_admission.prepare_direct_fix_admission",
+        new_callable=AsyncMock,
+        return_value=FixAdmissionDecision(
+            False,
+            f"{case} admission",
+            denial=denial_kind,
+        ),
+    )
+
+    transitioned = await sweep_stranded_lanes(
+        db_session, _utcnow(), runtime_config=_runtime_config
+    )
+
+    assert transitioned == 0
+    await db_session.refresh(lane)
+    assert lane.status == ImprovementLaneStatus.ACTIVE.value
+    assert lane.current_task_id == failed.id
+    assert lane.phase_requeues == 0
+
+
+@pytest.mark.asyncio
+async def test_sweep_stranded_lane_kills_only_terminal_fix_denial(
+    db_session, lanes_on, mocker
+):
+    from app.fix_admission import FixAdmissionDecision, FixAdmissionDenial
+
+    project = await _make_project(db_session, name="Strand terminal denial")
+    failed = await _make_task_with_pr(
+        db_session, project, TaskStatus.FAILED, pr_number=101
+    )
+    lane = await _make_lane(
+        db_session,
+        project,
+        status=ImprovementLaneStatus.ACTIVE,
+        current_task_id=failed.id,
+        phase_requeues=0,
+        name="stranded-terminal",
+    )
+    mocker.patch(
+        "app.github_token_resolver.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.fix_admission.prepare_direct_fix_admission",
+        new_callable=AsyncMock,
+        return_value=FixAdmissionDecision(
+            False,
+            "PR is no longer open",
+            denial=FixAdmissionDenial.TERMINAL,
+        ),
+    )
+
+    transitioned = await sweep_stranded_lanes(
+        db_session, _utcnow(), runtime_config=_runtime_config
+    )
+
+    assert transitioned == 1
+    await db_session.refresh(lane)
+    assert lane.status == ImprovementLaneStatus.KILLED.value
+
+
+@pytest.mark.asyncio
+async def test_sweep_stranded_lane_preserves_pending_terminal_owner(
+    db_session, lanes_on, mocker
+):
+    project = await _make_project(db_session, name="Strand pending owner")
+    completed = await _make_task_with_pr(
+        db_session, project, TaskStatus.COMPLETED, pr_number=102
+    )
+    completed.post_commit_pending = True
+    db_session.add(completed)
+    await db_session.commit()
+    lane = await _make_lane(
+        db_session,
+        project,
+        status=ImprovementLaneStatus.ACTIVE,
+        current_task_id=completed.id,
+        phase_requeues=0,
+        name="stranded-pending",
+    )
+    token_mock = mocker.patch(
+        "app.github_token_resolver.get_github_token_for_task",
+        new_callable=AsyncMock,
+    )
+    admission_mock = mocker.patch(
+        "app.fix_admission.prepare_direct_fix_admission",
+        new_callable=AsyncMock,
+    )
+
+    transitioned = await sweep_stranded_lanes(
+        db_session, _utcnow(), runtime_config=_runtime_config
+    )
+
+    assert transitioned == 0
+    token_mock.assert_not_awaited()
+    admission_mock.assert_not_awaited()
+    await db_session.refresh(lane)
+    assert lane.status == ImprovementLaneStatus.ACTIVE.value
+    assert lane.current_task_id == completed.id
+    assert lane.phase_requeues == 0
 
 
 @pytest.mark.asyncio

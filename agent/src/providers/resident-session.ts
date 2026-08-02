@@ -284,7 +284,11 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
   // / --disallowedTools, so we only add the input side.
   // Keep resident launch compatible with the installed Claude binary just like
   // the ordinary one-shot runner path.
-  const capabilities = probeClaudeCapabilities(base.command, base.env);
+  const childEnv = { ...base.env, ...opts.env };
+  const capabilities = probeClaudeCapabilities(base.command, childEnv);
+  if (!capabilities || !capabilities.has('--input-format')) {
+    throw new Error('resident streaming requires verified Claude --input-format support');
+  }
   const compatibleBaseArgs = opts.foregroundLaunch
     ? [...base.args]
     : stripUnsupportedClaudeOptionalArgs(base.args, capabilities);
@@ -322,7 +326,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
 
   const child = spawn(base.command, args, {
     cwd: opts.foregroundLaunch?.cwd ?? workspace,
-    env: { ...base.env, ...opts.env },
+    env: childEnv,
     detached: true,
     stdio: ['pipe', 'pipe', 'pipe'],
   });

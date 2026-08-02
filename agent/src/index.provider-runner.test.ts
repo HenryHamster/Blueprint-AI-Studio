@@ -699,6 +699,7 @@ describe('provider runner prompt transport', () => {
       .mockReturnValueOnce([
         'Usage: claude [options]',
         '  --model <model>',
+        '  --input-format <format>',
         '  --append-system-prompt <prompt>',
         '  --mcp-config <path>',
         '  --strict-mcp-config',
@@ -709,6 +710,7 @@ describe('provider runner prompt transport', () => {
 
     expect(capabilities).toEqual(new Set([
       '--model',
+      '--input-format',
       '--append-system-prompt',
       '--mcp-config',
       '--strict-mcp-config',
@@ -725,8 +727,8 @@ describe('provider runner prompt transport', () => {
       if (args?.[0] === '--help') {
         const probePath = (options as { env?: NodeJS.ProcessEnv } | undefined)?.env?.PATH;
         return probePath === '/modern/bin'
-          ? '--append-system-prompt --mcp-config --strict-mcp-config --allowedTools'
-          : '--mcp-config --strict-mcp-config --allowedTools';
+          ? '--input-format --append-system-prompt --mcp-config --strict-mcp-config --allowedTools'
+          : '--input-format --mcp-config --strict-mcp-config --allowedTools';
       }
       return '';
     });

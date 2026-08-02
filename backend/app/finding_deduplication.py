@@ -547,7 +547,7 @@ def extract_recent_terminal_finding_history(
     """Return recent terminal findings suitable for cross-cycle dedup.
 
     The history is bounded and conservative:
-      * only tasks with persisted ``plan_output`` findings are considered;
+      * research tasks contribute only their finalized surviving findings;
       * completed tasks whose rollup parent was already marked stranded are
         excluded as ghost merges;
       * FAILED/CANCELLED tasks keep the existing retry semantics, so transient
@@ -555,6 +555,11 @@ def extract_recent_terminal_finding_history(
       * the returned findings are capped so a busy project cannot balloon the
         terminal-history seed.
     """
+    # Imported lazily because findings_index reuses this module's canonical
+    # finding_hash. Keeping the truth seam out of module initialization avoids
+    # a findings_index <-> finding_deduplication import cycle.
+    from app.findings_index import finalized_research_findings
+
     now = now or _utcnow()
     terminal_tasks = sorted(
         recent_tasks,
@@ -589,16 +594,22 @@ def extract_recent_terminal_finding_history(
                 t, now
             ):
                 continue
-        if not isinstance(t.plan_output, list) or not t.plan_output:
+        task_type = _normalize_task_type((t.first_payload or {}).get("type"))
+        if task_type == "research":
+            task_findings = finalized_research_findings(t)
+        else:
+            task_findings = (
+                [finding for finding in t.plan_output if isinstance(finding, dict)]
+                if isinstance(t.plan_output, list)
+                else []
+            )
+        if not task_findings:
             continue
         task_count += 1
         task_dir_id = _optional_str(ctx.get("direction_id"))
-        task_type = _normalize_task_type((t.first_payload or {}).get("type"))
-        for finding in t.plan_output:
+        for finding in task_findings:
             if len(findings) >= finding_cap:
                 break
-            if not isinstance(finding, dict):
-                continue
             title = finding.get("title")
             if not title:
                 continue

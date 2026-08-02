@@ -266,40 +266,86 @@ def _patch_promote_github_defaults(mocker, *, already_on_main: bool = False):
 
     promote() makes several GitHub calls beyond branch/PR/merge:
 
-      * ``github.is_ancestor_of`` — the idempotency ancestry check (R4-C1/H1).
-        Defaults to ``already_on_main=False`` (candidate NOT yet on main) so a
-        normal-flow test proceeds to actually open + merge the PR.  Pass
-        ``already_on_main=True`` to exercise the already-landed idempotent
-        path.
-      * ``github.get_pull_request_merge_state`` — Round 7 concern 3: the
-        authoritative PR-state check promote() runs to disambiguate a
-        ``merge_pull_request`` ``{"merged": False}`` result.  Defaulted CONSISTENT
-        with ``already_on_main`` (an already-landed candidate's PR is merged;
-        a not-landed candidate's PR is not) so a test that does not specifically
-        exercise the merged=False disambiguation behaves coherently.
+      * ``github.is_ancestor_of`` — receipt-merge reachability plus candidate
+        ancestry corroboration.  Candidate ancestry alone is never promotion
+        authority.  ``already_on_main=True`` also exposes a deterministic exact
+        merged-PR receipt for compatibility with older fixture call sites.
       * ``github.delete_branch`` — the best-effort release-branch cleanup
         (R4-H2).  Defaulted to a no-op success so a test that does not
         specifically assert on branch deletion does not make a real network
         call.
 
-    Returns ``(is_ancestor_mock, delete_branch_mock, pr_state_mock)`` so a test
-    can assert on any of them when it cares.  A test that specifically exercises
-    one of these paths should patch that helper itself (this default patch is
-    only for the helpers a given test treats as incidental).
+    Returns ``(is_ancestor_mock, delete_branch_mock)`` so a test can assert on
+    either when it cares. A test that specifically exercises exact receipt
+    identity should patch the full PR resource itself.
     """
+    receipt_sha = "receipt0" * 5
+
+    async def _is_ancestor(_token, _owner, _repo, ancestor, _descendant, **_kwargs):
+        # Exact receipt reachability is independent from whether the candidate
+        # was already present before this promote() attempt.
+        if ancestor == receipt_sha:
+            return True
+        return already_on_main
+
     is_ancestor_mock = mocker.patch(
         "app.github.is_ancestor_of",
-        new=AsyncMock(return_value=already_on_main),
+        new=AsyncMock(side_effect=_is_ancestor),
     )
     delete_branch_mock = mocker.patch(
         "app.github.delete_branch",
         new=AsyncMock(return_value=True),
     )
-    pr_state_mock = mocker.patch(
-        "app.github.get_pull_request_merge_state",
-        new=AsyncMock(return_value=already_on_main),
+    mocker.patch(
+        "app.github.get_pull_requests_for_head_branch",
+        new=AsyncMock(
+            return_value=([{"number": 9001}] if already_on_main else [])
+        ),
     )
-    return is_ancestor_mock, delete_branch_mock, pr_state_mock
+
+    async def _get_pull_request(_token, _owner, _repo, number, **_kwargs):
+        from app import github as _github
+
+        create_branch_call = getattr(_github.create_branch, "call_args", None)
+        create_pr_call = getattr(_github.create_pull_request, "call_args", None)
+        if create_branch_call is not None:
+            head_ref = create_branch_call.args[3]
+            candidate_sha = create_branch_call.args[4]
+        else:
+            head_ref = "release-v1"
+            ancestry_call = is_ancestor_mock.call_args
+            candidate_sha = ancestry_call.args[3] if ancestry_call is not None else "c" * 40
+        base_ref = (
+            create_pr_call.kwargs.get("base", "main")
+            if create_pr_call is not None
+            else "main"
+        )
+        merge_mock = _github.merge_pull_request
+        merge_called = bool(getattr(merge_mock, "call_count", 0))
+        merge_return = getattr(merge_mock, "return_value", None)
+        merged_now = bool(
+            already_on_main
+            or (
+                merge_called
+                and isinstance(merge_return, dict)
+                and merge_return.get("merged") is True
+            )
+        )
+        return {
+            "number": number,
+            "state": "closed" if merged_now else "open",
+            "merged": merged_now,
+            "html_url": f"http://pr/{number}",
+            "head": {"ref": head_ref, "sha": candidate_sha},
+            "base": {"ref": base_ref, "sha": "base0001"},
+            "merge_commit_sha": receipt_sha if merged_now else None,
+        }
+
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(side_effect=_get_pull_request),
+    )
+    return is_ancestor_mock, delete_branch_mock
 
 
 @pytest.fixture(autouse=True)
@@ -407,29 +453,6 @@ def _qualifier_ci_resolves_green(mocker, monkeypatch):
         "app.release_qualifier.run_migration_apply_gate",
         new=AsyncMock(return_value=("ok", None)),
     )
-
-
-@pytest.fixture(autouse=True)
-def _default_walkthrough_e2e_disabled():
-    """Force ``walkthrough_e2e_enabled=False`` as the per-test default for every
-    release-qualifier slice that imports this preamble.
-
-    ``walkthrough_e2e_enabled`` defaults to ``True`` in the production
-    ``runtime_config_state.py`` (the lane is armed fleet-wide), so
-    ``run_qualification`` would otherwise spawn an extra ``walkthrough_e2e``
-    evidence child during every qualification run.  The overwhelming majority of
-    qualifier tests assert on the exact set of spawned children
-    (e.g. ``["release_audit", "smoketest"]``) and do not exercise the
-    walkthrough lane, so an unexpected walkthrough child breaks them.  Forcing
-    the flag ``False`` module-wide keeps those assertions stable; the two tests
-    that DO exercise the walkthrough lane set ``walkthrough_e2e_enabled = True``
-    in their own body, which overrides this default (fixture setup runs before
-    the test body).
-    """
-    from app import shared_state
-
-    shared_state.runtime_config["walkthrough_e2e_enabled"] = False
-    yield
 
 
 # ===========================================================================
@@ -1989,7 +2012,6 @@ __all__ = [
     '_create_branch_mock',
     '_patch_promote_github_defaults',
     '_qualifier_ci_resolves_green',
-    '_default_walkthrough_e2e_disabled',
     '_audit_tasks',
     '_promotion_failed_record',
     '_seed_qualification_children',

@@ -23,7 +23,10 @@ from app.models import (
 from app.auth import get_current_user
 from app.admin import _user_project_ids
 from app.failure_classification import classify_failure, classify_failure_taxonomy
-from app.research_completion import resolve_research_findings_for_surface
+from app.findings_index import (
+    FINALIZED_RESEARCH_FINDINGS_KEY,
+    resolve_research_findings_for_surface_from_state,
+)
 from app.sr_review_quality_metrics import _stash_projected_task_fields
 
 logger = logging.getLogger(__name__)
@@ -69,7 +72,7 @@ async def get_activity(
     # Project only payloads[0] SQL-side instead of loading the whole payloads
     # JSONB array (which grows per attempt and is TOAST-able / multi-MB per
     # row). plan_output is dropped entirely here and fetched narrowly below
-    # only for the handful of tasks that carry a RESEARCH_FINDINGS artifact.
+    # only for completed research tasks that can carry a finalized snapshot.
     # context stays loaded: classify_failure()/classify_failure_taxonomy() read
     # the full dict for FAILED rows. SQLite (tests without --postgres) can't
     # return a parsed dict from payloads[0], so it falls back to loading the
@@ -122,9 +125,6 @@ async def get_activity(
 
     # Fetch relevant artifacts in one query
     artifact_map: Dict[str, Dict[str, Any]] = {}  # task_id -> artifact info
-    research_artifact_map: Dict[
-        str, Dict[str, Any]
-    ] = {}  # task_id -> research artifact
     error_log_map: Dict[str, str] = {}  # task_id -> truncated error logs
     investigation_report_map: Dict[str, str] = {}  # task_id -> summary text
 
@@ -137,7 +137,6 @@ async def get_activity(
                     [
                         ArtifactType.PULL_REQUEST,
                         ArtifactType.ERROR_LOG,
-                        ArtifactType.RESEARCH_FINDINGS,
                         ArtifactType.INVESTIGATION_REPORT,
                     ]
                 ),
@@ -159,20 +158,21 @@ async def get_activity(
                 and tid not in error_log_map
             ):
                 error_log_map[tid] = a.logs[:300]
-            elif a.artifact_type == ArtifactType.RESEARCH_FINDINGS:
-                research_artifact_map[tid] = {
-                    "artifact_created_at": a.created_at,
-                    "artifact_logs": a.logs[:100000] if a.logs else None,
-                }
             elif a.artifact_type == ArtifactType.INVESTIGATION_REPORT and a.logs:
                 investigation_report_map[tid] = a.logs[:2000]
 
-    # Fetch plan_output (JSONB, potentially large research-finding arrays) only
-    # for the tasks that actually emit a RESEARCH_FINDINGS event, instead of
-    # loading it for every terminal row in the feed.
+    # Fetch plan_output only for completed research rows. The finalized-state
+    # seam below rejects pre-gate/unmarked output, so the activity feed cannot
+    # turn submission-time agent output into an accepted finding event.
     plan_output_map: Dict[str, Any] = {}  # task_id -> plan_output
-    if research_artifact_map:
-        research_uuids = [uuid.UUID(tid) for tid in research_artifact_map]
+    research_uuids = [
+        t.id
+        for t in recent_tasks
+        if t.status == TaskStatus.COMPLETED
+        and (t.first_payload or {}).get("type") == "research"
+        and (t.context or {}).get(FINALIZED_RESEARCH_FINDINGS_KEY) is True
+    ]
+    if research_uuids:
         plan_output_result = await session.execute(
             select(Task.id, Task.plan_output).where(Task.id.in_(research_uuids))
         )
@@ -260,15 +260,19 @@ async def get_activity(
                 }
             )
 
-        # --- 3: Research findings events (one per task) ---
-        if tid in research_artifact_map:
-            ra = research_artifact_map[tid]
-            ra_ts = ra["artifact_created_at"]
+        # --- 3: Finalized research findings events (one per task) ---
+        finalized_findings = resolve_research_findings_for_surface_from_state(
+            plan_output_map.get(tid),
+            t.context,
+            status=t.status,
+            task_type=task_type,
+        )
+        if finalized_findings:
             events.append(
                 {
                     "id": f"research-{tid}",
                     "type": "RESEARCH_FINDINGS",
-                    "timestamp": ra_ts.isoformat() if ra_ts else None,
+                    "timestamp": completed_at.isoformat() if completed_at else None,
                     "title": f"Research findings: {t.title or tid}",
                     "task_id": tid,
                     "task_type": task_type,
@@ -276,12 +280,7 @@ async def get_activity(
                     "repo_url": None,
                     "commit_hash": None,
                     "error_summary": None,
-                    "finding_count": len(
-                        resolve_research_findings_for_surface(
-                            plan_output_map.get(tid), ra.get("artifact_logs")
-                        )
-                        or []
-                    ),
+                    "finding_count": len(finalized_findings),
                     "investigation_summary": investigation_report_map.get(tid),
                     "deploy_sha": None,
                     "deploy_status": None,

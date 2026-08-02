@@ -4,7 +4,7 @@ Extracted from release_qualifier.py.  This module owns the ~1 200-line cluster
 of 8 functions that handle the automain → main promotion step:
 
   _candidate_already_on_main   — idempotency pre-check (is candidate on main?)
-  _promotion_pr_landed         — disambiguate merged=False results
+  _resolve_exact_promotion_receipt — recover only exact landed PR outcomes
   _idempotent_pr_url           — resolve the pr_url on idempotent success paths
   _relock_version_for_promotion_write — re-acquire the FOR UPDATE lock safely
   promote                      — the main entry point; creates branch, opens PR,
@@ -416,6 +416,23 @@ async def _record_qualification_verdict(
         if "completion_debt" in base_record:
             sub_scores = dict(sub_scores)
             sub_scores["completion_debt"] = base_record["completion_debt"]
+        # Preserve the opt-in product-probe contract and its bounded verdict in
+        # immutable history without a schema migration. Raw per-criterion rows
+        # already live in CriterionEvidence; the verdict needs only the compact
+        # decision/provenance summary.
+        if "requested_probes" in base_record:
+            sub_scores = dict(sub_scores)
+            sub_scores["requested_probes"] = list(
+                base_record.get("requested_probes") or []
+            )
+        walkthrough_result = base_record.get("walkthrough_e2e_result")
+        if isinstance(walkthrough_result, dict):
+            sub_scores = dict(sub_scores)
+            sub_scores["walkthrough_e2e_result"] = {
+                key: value
+                for key, value in walkthrough_result.items()
+                if key != "results"
+            }
         # Carry the observe-mode debt-enforce preview into the immutable verdict
         # row so verdict history can show what enforce would have done at this
         # attempt without re-deriving it from mutable last_qualification state.
@@ -594,88 +611,175 @@ async def _candidate_already_on_main(
     return ancestry
 
 
-async def _promotion_pr_landed(
+async def _resolve_exact_promotion_receipt(
     token: str,
     owner: str,
     repo: str,
-    pr_number: int,
     candidate_sha: str,
     version: release_version.ReleaseVersion,
     *,
     project: Project | None = None,
-) -> bool:
-    """Return True iff promotion PR ``pr_number`` has in fact already merged.
+    pr_number: int | None = None,
+) -> dict[str, Any] | None:
+    """Resolve a promotion to the exact PR outcome that carried its candidate.
 
-    Concern 3 — ``github.merge_pull_request`` returns ``{"merged": False}`` for
-    BOTH a genuine merge block (failing checks / required reviews / conflict)
-    AND an already-merged PR (GitHub's merge endpoint returns 405 once a PR has
-    already been merged).  ``promote()`` must NOT record an already-merged PR as
-    a ``merge_blocked`` failure — that permanently diverges the DB from GitHub.
+    Ancestry proves only that a candidate is somewhere below the current target;
+    it cannot identify which merge landed it or which later commit should be
+    tagged.  A valid receipt therefore requires the deterministic release-vN PR,
+    ``merged=True``, exact head/base refs, exact candidate head, and GitHub's
+    non-empty ``merge_commit_sha``.  Crash recovery may search closed PRs for the
+    deterministic head branch when the PR number was not persisted.
 
-    This disambiguates with TWO signals, strongest first:
-
-      1. **The PR's own ``merged`` boolean** (``get_pull_request_merge_state``).
-         This is a property of the PR resource itself; GitHub flips it to
-         ``true`` synchronously the moment a merge completes.  It is therefore
-         the AUTHORITATIVE answer and — crucially — is NOT subject to the
-         eventual-consistency lag the ``GET /compare`` ancestry API can exhibit
-         immediately after a merge.  A genuinely-successful promotion that the
-         ancestry API would still report as ``diverged`` for a few seconds is
-         correctly seen as merged here, so a real success is never misrecorded
-         as ``merge_blocked``.
-
-      2. **Ancestry fallback** (``_candidate_already_on_main``).  Used ONLY when
-         the PR-state query is indeterminate (API error, PR not found).  Better
-         than nothing: a crash-retry against a PR that merged-then-was-GC'd may
-         no longer be queryable, but the candidate is still on ``main``.
-
-    Returns ``True`` only on a positive merge signal from either tier; ``False``
-    when both are negative or indeterminate — so a genuine merge block (the PR
-    is open + unmerged, the candidate is not on main) is still correctly
-    reported as not-landed and recorded as the failure it is.
+    The sole no-PR success is an exact empty diff: the promotion target itself is
+    the candidate commit.  A positive ancestry result without either receipt is
+    logged only as corroboration and remains deferred.
     """
-    try:
-        pr_merged = await github.get_pull_request_merge_state(
-            token, owner, repo, pr_number, project_id=str(version.project_id)
+
+    if not candidate_sha:
+        return None
+    _integration_branch, promotion_target = _lts_branch_names(project)
+    release_branch = f"release-v{version.version_number}"
+
+    candidate_pr_numbers: list[int] = []
+    if pr_number is not None:
+        candidate_pr_numbers.append(int(pr_number))
+    else:
+        try:
+            listed = await github.get_pull_requests_for_head_branch(
+                token,
+                owner,
+                repo,
+                release_branch,
+                base=promotion_target,
+            )
+        except Exception as exc:  # noqa: BLE001 — receipt absence defers
+            logger.warning(
+                "[RELEASE_QUALIFIER] exact promotion receipt search failed for "
+                "v%d candidate %s: %s",
+                version.version_number,
+                candidate_sha[:8],
+                exc,
+            )
+            listed = []
+        candidate_pr_numbers.extend(
+            sorted(
+                {
+                    int(item["number"])
+                    for item in listed
+                    if isinstance(item, dict) and item.get("number")
+                },
+                reverse=True,
+            )
         )
-    except Exception as exc:  # noqa: BLE001 — a state check must not abort promotion
+
+    for number in candidate_pr_numbers:
+        try:
+            pr = await github.get_pull_request(
+                token,
+                owner,
+                repo,
+                number,
+                project_id=str(version.project_id),
+            )
+        except Exception as exc:  # noqa: BLE001 — retry on a later sweep
+            logger.warning(
+                "[RELEASE_QUALIFIER] exact promotion receipt fetch failed for "
+                "PR #%s (v%d): %s",
+                number,
+                version.version_number,
+                exc,
+            )
+            continue
+        head = pr.get("head") or {}
+        base = pr.get("base") or {}
+        merge_sha = str(pr.get("merge_commit_sha") or "").strip()
+        if (
+            pr.get("merged") is True
+            and head.get("ref") == release_branch
+            and head.get("sha") == candidate_sha
+            and base.get("ref") == promotion_target
+            and merge_sha
+        ):
+            try:
+                merge_reachable = await github.is_ancestor_of(
+                    token,
+                    owner,
+                    repo,
+                    merge_sha,
+                    promotion_target,
+                    project_id=str(version.project_id),
+                )
+            except Exception as exc:  # noqa: BLE001 — recovery must defer
+                logger.warning(
+                    "[RELEASE_QUALIFIER] exact promotion receipt PR #%s could "
+                    "not prove merge commit %s reachable from %s: %s",
+                    number,
+                    merge_sha[:8],
+                    promotion_target,
+                    exc,
+                )
+                merge_reachable = None
+            if merge_reachable is True:
+                return {
+                    "pr_number": number,
+                    "pr_url": pr.get("html_url") or "",
+                    "merge_commit_sha": merge_sha,
+                    "empty_diff": False,
+                }
+            logger.warning(
+                "[RELEASE_QUALIFIER] exact promotion receipt PR #%s names merge "
+                "commit %s but reachability from %s is %r — deferring recovery",
+                number,
+                merge_sha[:8],
+                promotion_target,
+                merge_reachable,
+            )
+
+    try:
+        target_sha = await github.get_branch_sha(
+            token,
+            owner,
+            repo,
+            promotion_target,
+            project_id=str(version.project_id),
+            live=True,
+        )
+    except Exception as exc:  # noqa: BLE001 — receipt absence defers
         logger.warning(
-            "[RELEASE_QUALIFIER] promote: PR-state merge check raised for "
-            "PR #%s (v%d) (%s) — falling back to the ancestry check",
-            pr_number,
+            "[RELEASE_QUALIFIER] exact empty-diff check failed for v%d: %s",
             version.version_number,
             exc,
         )
-        pr_merged = None
+        target_sha = None
+    if target_sha == candidate_sha:
+        return {
+            "pr_number": None,
+            "pr_url": "(empty diff — promotion target already equals candidate)",
+            "merge_commit_sha": candidate_sha,
+            "empty_diff": True,
+        }
 
-    if pr_merged is True:
-        logger.info(
-            "[RELEASE_QUALIFIER] promote: PR #%s for v%d reports merged=True on "
-            "its own resource — the promotion landed",
-            pr_number,
-            version.version_number,
+    try:
+        ancestry = await github.is_ancestor_of(
+            token,
+            owner,
+            repo,
+            candidate_sha,
+            promotion_target,
+            project_id=str(version.project_id),
         )
-        return True
-    if pr_merged is False:
-        # The PR resource itself says it is NOT merged — this is authoritative.
-        # A merged=False merge result on a definitively-unmerged PR is a real
-        # merge block; do not consult the lagging ancestry API to second-guess
-        # it.
-        return False
-
-    # pr_merged is None — the PR state could not be determined.  Fall back to
-    # the ancestry check (eventually-consistent, but the best remaining signal).
-    logger.warning(
-        "[RELEASE_QUALIFIER] promote: PR #%s for v%d merge state "
-        "indeterminate — falling back to the candidate-on-main ancestry check",
-        pr_number,
-        version.version_number,
-    )
-    if not candidate_sha:
-        return False
-    return await _candidate_already_on_main(
-        token, owner, repo, candidate_sha, version, project=project
-    )
+    except Exception:  # noqa: BLE001 — corroboration only
+        ancestry = None
+    if ancestry is True:
+        logger.warning(
+            "[RELEASE_QUALIFIER] candidate %s for v%d is reachable from %s but "
+            "has no exact promotion receipt — deferring instead of attributing "
+            "the moving target tip",
+            candidate_sha[:8],
+            version.version_number,
+            promotion_target,
+        )
+    return None
 
 
 def _idempotent_pr_url(base_record: dict[str, Any] | None) -> str:
@@ -791,6 +895,48 @@ async def _relock_version_for_promotion_write(
     return relocked
 
 
+async def _enter_managed_check_wait(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+    base_record: dict[str, Any],
+    *,
+    pr_number: int,
+    pr_url: str,
+    reason: str,
+) -> dict[str, Any]:
+    """Persist the one canonical deferred promotion-PR ownership state."""
+
+    logger.info(
+        "[RELEASE_QUALIFIER] promote: PR #%s for v%d entering "
+        "managed_check_wait (%s)",
+        pr_number,
+        version.version_number,
+        reason,
+    )
+    locked = await _relock_version_for_promotion_write(
+        session, version, lock_released=True
+    )
+    if locked is not None and locked.status == "open":
+        q = dict(locked.last_qualification or {})
+        q.update(base_record)
+        q["status"] = "pending"
+        q["promotion_pending"] = {
+            "pr_number": pr_number,
+            "pr_url": pr_url,
+            "managed_check_wait": True,
+            "enabled_at": _utcnow().isoformat(),
+        }
+        locked.last_qualification = q
+        flag_modified(locked, "last_qualification")
+        session.add(locked)
+    return {
+        "status": "pending_managed_check_wait",
+        "pr_number": pr_number,
+        "pr_url": pr_url,
+        "managed_check_wait": True,
+    }
+
+
 async def promote(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -825,15 +971,13 @@ async def promote(
     release branch is frozen at the scored commit regardless.
 
     **Idempotency (audit R4-C1 / R4-H1).**  A promotion is multi-step; a crash
-    or retry between the merge landing on ``main`` and the DB commit would
-    otherwise re-merge a closed PR or misclassify an already-merged PR (405) as
-    a failure — diverging the DB from GitHub permanently.  ``promote()``
-    therefore runs ONE ancestry check (``_candidate_already_on_main`` →
-    ``github.is_ancestor_of``) (a) at the very start — if ``candidate_sha`` is
-    already reachable from ``main`` the promotion already landed, so route
-    straight to success — and (b) again before recording any non-merged result
-    as a failure, so an open-but-already-merged PR is recorded as the success
-    it actually is.
+    or retry between the merge landing and the DB commit would otherwise
+    re-merge a closed PR or misclassify an already-merged PR (405) as a failure.
+    ``promote()`` therefore resolves the deterministic release PR and accepts
+    success only when its exact head/base/candidate identity, immutable merge
+    commit, and reachability from the configured promotion target are proven.
+    Candidate ancestry by itself is only corroboration and never authorizes a
+    success record or supplies the SHA to tag.
 
     **Lock safety (audit R4-H3).**  ``promote()``'s GitHub I/O (branch create,
     optional delete+recreate, PR create, merge, SHA re-resolve, tag, branch
@@ -945,11 +1089,11 @@ async def promote(
     # only written AFTER that I/O.  Without a marker, a concurrent
     # ``run_qualification`` on a newer HEAD acquires the freed lock DURING the
     # I/O window, sees no ``promotion_pending``, sails past Guard 2b
-    # (``_promotion_in_flight_result``), re-cuts, and CLOBBERS the in-flight
+    # (``_promotion_pending_result``), re-cuts, and CLOBBERS the pending
     # promotion's provenance (the PR #12492 incident).  So stamp a lightweight
     # CLAIM here, carried on the SAME transaction the intermediate commit makes
     # durable: ``summarize_qualification_state`` already classifies ANY
-    # ``promotion_pending`` dict as ``promotion_in_flight`` (a
+    # ``promotion_pending`` dict as ``promotion_check_wait`` (a
     # PROMOTION_BLOCKING_STATE), so from the instant this commits both Guard 2b
     # and the version-cut lever refuse concurrent re-qualification.  promote()'s
     # normal pending/success writers overwrite this claim with the real
@@ -972,10 +1116,10 @@ async def promote(
     # --- Release the ReleaseVersion row lock BEFORE any GitHub I/O ----------
     # Audit R4-H3 + concern 2: the caller-supplied dedicated session holds a
     # FOR UPDATE lock on this version row (taken by _finalize_in_dedicated_session).
-    # Token resolution AND the idempotency ancestry check are both GitHub I/O —
+    # Token resolution AND the exact idempotency receipt check are GitHub I/O —
     # they must NOT run under that row lock, or every concurrent qualifier path
     # stalls behind the network.  So the intermediate commit happens HERE,
-    # before token resolution and before the idempotency check — the lock is
+    # before token resolution and before the receipt check — the lock is
     # released first, then all I/O runs unlocked.  The final state write
     # re-acquires the lock via _relock_version_for_promotion_write.
     #
@@ -1038,19 +1182,24 @@ async def promote(
             )
         token, owner, repo = resolved
 
-    # --- Idempotency pre-check (audit R4-C1 / R4-H1) ------------------------
-    # If candidate_sha is ALREADY reachable from main, a prior promotion
-    # attempt landed the merge but crashed before the DB commit.  Route
-    # straight to the success path (treat as already-landed) — do NOT re-merge
-    # and do NOT record a failure.  This is a read-only GitHub call and now
-    # runs unlocked (the intermediate commit above released the row lock).
-    if candidate_sha and await _candidate_already_on_main(
-        token, owner, repo, candidate_sha, version, project=project
-    ):
+    # --- Exact idempotency receipt (audit R4-C1 / R4-H1) --------------------
+    # A crash after GitHub merged but before the DB commit is successful only
+    # when the deterministic release PR proves the exact candidate/base pair
+    # and supplies its merge commit.  Ancestry alone cannot identify the merge
+    # outcome or distinguish a later adjacent target commit.
+    existing_receipt = await _resolve_exact_promotion_receipt(
+        token,
+        owner,
+        repo,
+        candidate_sha,
+        version,
+        project=project,
+    )
+    if existing_receipt is not None:
         logger.info(
             "[RELEASE_QUALIFIER] promote: candidate %s for v%d is already "
-            "reachable from main — a prior promotion landed; recording success "
-            "without re-merging (idempotent retry)",
+            "bound to an exact promotion receipt — recording success without "
+            "re-merging (idempotent retry)",
             candidate_sha[:8],
             version.version_number,
         )
@@ -1064,14 +1213,14 @@ async def promote(
             version,
             candidate_sha,
             base_record,
-            # Concern 5: this idempotent-success path has no PR object of its
-            # own.  Carry forward a pr_url the caller threaded through
-            # base_record (the original promotion attempt's PR) when present;
-            # otherwise label it explicitly rather than recording a bare "".
-            pr_url=_idempotent_pr_url(base_record),
+            pr_url=(
+                existing_receipt.get("pr_url") or _idempotent_pr_url(base_record)
+            ),
             token=token,
             owner=owner,
             repo=repo,
+            empty_diff=bool(existing_receipt.get("empty_diff")),
+            promoted_sha=existing_receipt["merge_commit_sha"],
             already_landed=True,
         )
 
@@ -1158,14 +1307,20 @@ async def promote(
         # Audit R4-H1: a PR-creation failure on a RETRY is the classic
         # divergence trap — the prior attempt's PR merged then closed, so
         # create_pull_request finds nothing open and raises.  Re-run the
-        # idempotency check before recording a failure: if the candidate is
-        # already on main, this is a successful prior promotion, not a failure.
-        if candidate_sha and await _candidate_already_on_main(
-            token, owner, repo, candidate_sha, version, project=project
-        ):
+        # exact-receipt check before recording a failure.  Reachability alone
+        # cannot bind the candidate to this promotion or identify its merge SHA.
+        retry_receipt = await _resolve_exact_promotion_receipt(
+            token,
+            owner,
+            repo,
+            candidate_sha,
+            version,
+            project=project,
+        )
+        if retry_receipt is not None:
             logger.info(
                 "[RELEASE_QUALIFIER] promote: PR creation failed for v%d but "
-                "candidate %s is already on main — a prior promotion landed; "
+                "candidate %s has an exact prior promotion receipt; "
                 "recording success (idempotent retry)",
                 version.version_number,
                 candidate_sha[:8],
@@ -1178,12 +1333,12 @@ async def promote(
                 version,
                 candidate_sha,
                 base_record,
-                # Concern 5: no live PR object here (creation failed); carry a
-                # caller-threaded pr_url through if present, else label it.
-                pr_url=_idempotent_pr_url(base_record),
+                pr_url=(retry_receipt.get("pr_url") or _idempotent_pr_url(base_record)),
                 token=token,
                 owner=owner,
                 repo=repo,
+                empty_diff=bool(retry_receipt.get("empty_diff")),
+                promoted_sha=retry_receipt["merge_commit_sha"],
                 already_landed=True,
             )
         logger.warning(
@@ -1240,6 +1395,67 @@ async def promote(
             "pr_missing_number",
             pr_url=pr_url,
             lock_released=True,
+        )
+
+    # Bind the migration evidence below to one live, exact PR target.  The
+    # create response is not sufficient: an existing deterministic PR may have
+    # been retargeted or its release branch pushed out of band.
+    try:
+        initial_pr = await github.get_pull_request(
+            token,
+            owner,
+            repo,
+            int(pr_number),
+            project_id=str(version.project_id),
+        )
+    except Exception as exc:  # noqa: BLE001 — defer until exact target is readable
+        logger.warning(
+            "[RELEASE_QUALIFIER] promote: could not read exact target for PR "
+            "#%s (v%d): %s — deferring to managed_check_wait",
+            pr_number,
+            version.version_number,
+            exc,
+        )
+        return await _enter_managed_check_wait(
+            session,
+            version,
+            base_record,
+            pr_number=int(pr_number),
+            pr_url=pr_url,
+            reason="initial_pr_target_unavailable",
+        )
+
+    initial_head = initial_pr.get("head") or {}
+    initial_base = initial_pr.get("base") or {}
+    initial_head_sha = str(initial_head.get("sha") or "").strip()
+    initial_base_sha = str(initial_base.get("sha") or "").strip()
+    initial_target_valid = (
+        initial_pr.get("state") == "open"
+        and initial_head.get("ref") == release_branch
+        and initial_head_sha == candidate_sha
+        and initial_base.get("ref") == promotion_target
+        and bool(initial_base_sha)
+    )
+    if not initial_target_valid:
+        logger.error(
+            "[RELEASE_QUALIFIER] promote: PR #%s target identity is not the "
+            "qualified pair (%s/%s@%s -> %s/%s@%s, state=%s) — merge forbidden",
+            pr_number,
+            promotion_target,
+            release_branch,
+            candidate_sha[:8],
+            initial_base.get("ref"),
+            initial_head.get("ref"),
+            initial_head_sha[:8] or "missing",
+            initial_pr.get("state"),
+        )
+        return await _enter_managed_check_wait(
+            session,
+            version,
+            base_record,
+            pr_number=int(pr_number),
+            pr_url=pr_url,
+            reason="initial_pr_target_mismatch",
         )
 
     # --- Pre-merge Alembic dual-head guard (parity with the rollup, hotfix
@@ -1305,30 +1521,88 @@ async def promote(
             promotion_target,
             hold_reason,
         )
-        locked = await _relock_version_for_promotion_write(
-            session, version, lock_released=True
+        return await _enter_managed_check_wait(
+            session,
+            version,
+            base_record,
+            pr_number=int(pr_number),
+            pr_url=pr_url,
+            reason="migration_guard_deferred",
         )
-        if locked is not None and locked.status == "open":
-            q = dict(locked.last_qualification or {})
-            q.update(base_record)
-            q["status"] = "pending"
-            q["promotion_pending"] = {
-                "pr_number": pr_number,
-                "pr_url": pr_url,
-                "auto_merge_enabled": False,
-                "migration_carrying": True,
-                "managed_check_wait": True,
-                "why_not_native_automerge": "migration_guard_deferred",
-                "enabled_at": _utcnow().isoformat(),
-            }
-            locked.last_qualification = q
-            session.add(locked)
-        return {
-            "status": "pending_managed_check_wait",
-            "pr_number": pr_number,
-            "pr_url": pr_url,
-            "managed_check_wait": True,
-        }
+
+    # The migration validator authorised the initial live base/head pair.
+    # Serialize final submissions to this repository/base and PR with the same
+    # canonical advisory-lock order used by review/fix publication.  The live
+    # re-read MUST happen inside both locks and immediately precede the
+    # expected-head PUT; any movement re-enters managed_check_wait so all
+    # evidence is rerun against the new target.
+    from app.task_locking import acquire_merge_submission_locks
+
+    await acquire_merge_submission_locks(
+        session,
+        project_id=version.project_id,
+        repo_identity=f"{owner}/{repo}",
+        base_branch=promotion_target,
+        pr_number=int(pr_number),
+    )
+    try:
+        fresh_pr = await github.get_pull_request(
+            token,
+            owner,
+            repo,
+            int(pr_number),
+            project_id=str(version.project_id),
+        )
+    except Exception as exc:  # noqa: BLE001 — defer until exact target is readable
+        logger.warning(
+            "[RELEASE_QUALIFIER] promote: final target read failed for PR #%s "
+            "(v%d): %s — deferring",
+            pr_number,
+            version.version_number,
+            exc,
+        )
+        return await _enter_managed_check_wait(
+            session,
+            version,
+            base_record,
+            pr_number=int(pr_number),
+            pr_url=pr_url,
+            reason="final_pr_target_unavailable",
+        )
+    fresh_head = fresh_pr.get("head") or {}
+    fresh_base = fresh_pr.get("base") or {}
+    fresh_head_sha = str(fresh_head.get("sha") or "").strip()
+    fresh_base_sha = str(fresh_base.get("sha") or "").strip()
+    target_unchanged = (
+        fresh_pr.get("state") == "open"
+        and fresh_head.get("ref") == release_branch
+        and fresh_base.get("ref") == promotion_target
+        and fresh_head_sha == candidate_sha == initial_head_sha
+        and fresh_base_sha == initial_base_sha
+    )
+    if not target_unchanged:
+        logger.info(
+            "[RELEASE_QUALIFIER] promote: PR #%s target changed while evidence "
+            "ran (%s@%s/%s@%s -> %s@%s/%s@%s, state=%s) — deferring",
+            pr_number,
+            promotion_target,
+            initial_base_sha[:8],
+            release_branch,
+            initial_head_sha[:8],
+            fresh_base.get("ref"),
+            fresh_base_sha[:8],
+            fresh_head.get("ref"),
+            fresh_head_sha[:8],
+            fresh_pr.get("state"),
+        )
+        return await _enter_managed_check_wait(
+            session,
+            version,
+            base_record,
+            pr_number=int(pr_number),
+            pr_url=pr_url,
+            reason="pr_target_changed_after_evidence",
+        )
 
     # 2. Merge the PR — merge_method="merge" preserves integration history.
     #    merge_pull_request does NOT raise on 405/409; it returns merged=False.
@@ -1340,6 +1614,7 @@ async def promote(
             pr_number,
             merge_method="merge",
             project_id=str(version.project_id),
+            expected_head_sha=candidate_sha,
         )
     except Exception as exc:  # noqa: BLE001 — a 5xx raises HTTPException; treat as failure
         logger.warning(
@@ -1366,15 +1641,16 @@ async def promote(
         # already merged).  Recording an already-merged PR as merge_blocked
         # would permanently diverge the DB from GitHub.
         #
-        # _promotion_pr_landed asks the PR resource itself for its
-        # authoritative ``merged`` boolean — which flips synchronously on a
-        # merge and is NOT subject to the compare API's eventual-consistency
-        # lag that could make a genuinely-successful promotion look like a
-        # merge_blocked failure right after the merge.  It falls back to the
-        # ancestry check only when the PR state is indeterminate.
-        if await _promotion_pr_landed(
-            token, owner, repo, pr_number, candidate_sha, version, project=project
-        ):
+        retry_receipt = await _resolve_exact_promotion_receipt(
+            token,
+            owner,
+            repo,
+            candidate_sha,
+            version,
+            project=project,
+            pr_number=int(pr_number),
+        )
+        if retry_receipt is not None:
             logger.info(
                 "[RELEASE_QUALIFIER] promote: PR #%s for v%d returned "
                 "merged=False but the PR is in fact merged — recording success "
@@ -1385,20 +1661,6 @@ async def promote(
             await _delete_release_branch_best_effort(
                 token, owner, repo, release_branch, version
             )
-            merged_sha_retry: str | None = None
-            try:
-                merged_sha_retry = await github.get_branch_sha(
-                    token, owner, repo, promotion_target, live=True
-                )
-            except Exception:  # noqa: BLE001 — best-effort; degrade to candidate
-                logger.warning(
-                    "[RELEASE_QUALIFIER] promote: could not re-resolve %s "
-                    "HEAD after detecting an already-merged PR #%s for v%d — "
-                    "recording candidate_sha",
-                    promotion_target,
-                    pr_number,
-                    version.version_number,
-                )
             return await _record_promotion_success(
                 session,
                 version,
@@ -1408,7 +1670,7 @@ async def promote(
                 token=token,
                 owner=owner,
                 repo=repo,
-                promoted_sha=merged_sha_retry or candidate_sha,
+                promoted_sha=retry_receipt["merge_commit_sha"],
                 already_landed=True,
             )
 
@@ -1437,186 +1699,52 @@ async def promote(
                 lock_released=True,
             )
 
-        # CI still pending (GitHub 405, no conflict) — arrange for GitHub to
-        # complete the merge once required checks pass.  Don't record a failure
-        # verdict; last_qualification stays "pending" so the reaper re-checks
-        # and _candidate_already_on_main records idempotent success when the
-        # auto-merge lands.
+        # CI still pending (GitHub 405, no conflict). Keep merge authority in
+        # Blueprint. The managed waiter re-checks CI on an exact head, re-runs the
+        # migration guard against an exact base/head pair, and submits the merge
+        # with GitHub's expected-head CAS.
         msg = merge_result.get("message", "merge not completed")
-        # Migration-carrying promotion PRs must NOT be handed to GitHub native
-        # auto-merge: the promotion target can advance while checks are pending
-        # (exactly the hotfix-migration-after-qualification race the pre-merge
-        # guard comment above documents), so the eventual native merge could
-        # land against a different migration chain than the one Blueprint
-        # validated. Parity with the task-PR and rollup auto-merge sites: skip
-        # delegation and hold the version in its existing retryable state so the
-        # next strategic cycle re-qualifies and re-runs the pre-merge guard
-        # against the live promotion target before merging.
-        from app.rollup_migration_validation import pr_touches_migrations
-
-        if await pr_touches_migrations(token, owner, repo, pr_number):
-            # Migration-carrying PR with pending CI: enter managed_check_wait
-            # mode instead of native auto-merge.  The promotion target can
-            # advance while CI is pending (exactly the hotfix-migration-after-
-            # qualification race documented above), so we must NOT delegate to
-            # GitHub native auto-merge — it would merge without re-running the
-            # Alembic dual-head guard.  Instead, persist a durable sub-state
-            # that the reconciler rung in the qualifier sweep will periodically
-            # re-check: once CI is green the reconciler re-runs the pre-merge
-            # Alembic guard and retries the merge itself.  The release branch is
-            # kept open (do NOT delete it) because the reconciler needs it.
-            logger.info(
-                "[RELEASE_QUALIFIER] promote: promotion PR #%s for v%d pending "
-                "CI touches Alembic migrations — entering managed_check_wait "
-                "instead of native auto-merge; reconciler will retry after CI "
-                "passes and re-validates the migration chain against %s",
-                pr_number,
-                version.version_number,
-                promotion_target,
-            )
-            locked = await _relock_version_for_promotion_write(
-                session, version, lock_released=True
-            )
-            if locked is not None and locked.status == "open":
-                q = dict(locked.last_qualification or {})
-                q.update(base_record)
-                q["status"] = "pending"
-                q["promotion_pending"] = {
-                    "pr_number": pr_number,
-                    "pr_url": pr_url,
-                    "auto_merge_enabled": False,
-                    "migration_carrying": True,
-                    "managed_check_wait": True,
-                    "why_not_native_automerge": "migration_carrying",
-                    "enabled_at": _utcnow().isoformat(),
-                }
-                locked.last_qualification = q
-                session.add(locked)
-            return {
-                "status": "pending_managed_check_wait",
-                "pr_number": pr_number,
-                "pr_url": pr_url,
-                "managed_check_wait": True,
-            }
-
-        # No-CI repo guard: if the project declares it has no CI checks, native
-        # auto-merge will never fire (no checks will ever run), so handing the
-        # PR to GitHub native auto-merge leaves the version stranded indefinitely.
-        # Enter managed_check_wait instead so the reconciler retries the merge
-        # directly on the next sweep (which will see no_checks and proceed).
-        from app.ci_resolution import requires_ci_checks
-
-        if not requires_ci_checks(project):
-            logger.info(
-                "[RELEASE_QUALIFIER] promote: promotion PR #%s for v%d pending "
-                "merge on a no-CI repo — entering managed_check_wait instead of "
-                "native auto-merge; reconciler will retry the merge directly",
-                pr_number,
-                version.version_number,
-            )
-            locked = await _relock_version_for_promotion_write(
-                session, version, lock_released=True
-            )
-            if locked is not None and locked.status == "open":
-                q = dict(locked.last_qualification or {})
-                q.update(base_record)
-                q["status"] = "pending"
-                q["promotion_pending"] = {
-                    "pr_number": pr_number,
-                    "pr_url": pr_url,
-                    "auto_merge_enabled": False,
-                    "managed_check_wait": True,
-                    "why_not_native_automerge": "no_ci_repo",
-                    "enabled_at": _utcnow().isoformat(),
-                }
-                locked.last_qualification = q
-                session.add(locked)
-            return {
-                "status": "pending_managed_check_wait",
-                "pr_number": pr_number,
-                "pr_url": pr_url,
-                "managed_check_wait": True,
-            }
-
-        try:
-            am_result = await github.enable_auto_merge(
-                token,
-                owner,
-                repo,
-                pr_number,
-                merge_method="MERGE",
-                project_id=str(version.project_id),
-            )
-        except Exception as exc:  # noqa: BLE001
-            am_result = {"enabled": False, "message": str(exc)[:200]}
-        auto_merge_enabled = bool(am_result.get("enabled"))
         logger.info(
             "[RELEASE_QUALIFIER] promote: PR #%s for v%d pending CI — "
-            "auto-merge %s (%s). Qualification stays pending; reaper confirms "
-            "when auto-merge lands.",
+            "entering managed_check_wait; "
+            "reconciler will re-authorise an exact target before merging (%s)",
             pr_number,
             version.version_number,
-            "enabled" if auto_merge_enabled else "not confirmed",
-            am_result.get("message", ""),
+            msg,
         )
-        # Durably record the promotion sub-state so the reaper's qualification-
-        # timeout backstop can distinguish this version (qualification PASSED,
-        # waiting on the promotion PR's CI) from a version whose qualifier
-        # children never terminated.  Re-lock the version row first because the
-        # intermediate commit above released the lock.
-        locked = await _relock_version_for_promotion_write(
-            session, version, lock_released=True
+        return await _enter_managed_check_wait(
+            session,
+            version,
+            base_record,
+            pr_number=int(pr_number),
+            pr_url=pr_url,
+            reason="required_checks_pending",
         )
-        if locked is not None and locked.status == "open":
-            # The live last_qualification here is the SPAWN-TIME "pending" record
-            # (written before the audit/composite children finished), so it has
-            # NO confidence / sub_scores / threshold.  Merge the finalize-time
-            # base_record (which carries the computed composite) in FIRST, then
-            # graft the promotion_pending sub-state on top.  Without this merge a
-            # later reconcile path — which records the promotion from
-            # base_record stripped of promotion_pending — would announce the
-            # promotion at "confidence 0.00" even though the candidate qualified
-            # at its real composite (the v6 prod regression).  base_record has no
-            # "status" key, so q's "pending" status is preserved.
-            q = dict(locked.last_qualification or {})
-            q.update(base_record)
-            q["status"] = "pending"
-            q["promotion_pending"] = {
-                "pr_number": pr_number,
-                "pr_url": pr_url,
-                "auto_merge_enabled": auto_merge_enabled,
-                "enabled_at": _utcnow().isoformat(),
-            }
-            locked.last_qualification = q
-            session.add(locked)
-        return {
-            "status": "pending_auto_merge",
-            "pr_number": pr_number,
-            "pr_url": pr_url,
-            "auto_merge_enabled": auto_merge_enabled,
-        }
 
-    # 3. Success — resolve the REAL merged commit.  merge_method="merge"
-    #    creates a NEW merge commit on main; candidate_sha is only one of its
-    #    parents, not main HEAD.  github.merge_pull_request does not return the
-    #    merge SHA, so re-resolve main HEAD — that commit IS the merge result.
-    #    A resolution failure here is non-fatal: the merge already landed, so
-    #    degrade to candidate_sha (a known parent) rather than fail a
-    #    successful promotion.
-    merged_sha: str | None = None
-    try:
-        merged_sha = await github.get_branch_sha(
-            token, owner, repo, promotion_target, live=True
+    # 3. Success — GitHub's merge response SHA is the exact commit produced by
+    #    this PR.  Legacy mocks/providers that omit it must produce the same
+    #    exact PR receipt; a moving target tip is never an outcome identifier.
+    merged_sha: str | None = str(merge_result.get("sha") or "").strip() or None
+    if merged_sha is None:
+        success_receipt = await _resolve_exact_promotion_receipt(
+            token,
+            owner,
+            repo,
+            candidate_sha,
+            version,
+            project=project,
+            pr_number=int(pr_number),
         )
-    except Exception as exc:  # noqa: BLE001 — merge already succeeded; SHA read is best-effort
-        logger.warning(
-            "[RELEASE_QUALIFIER] promote: merged PR #%s for v%d but could not "
-            "resolve the new %s HEAD (%s) — recording candidate_sha instead",
-            pr_number,
-            version.version_number,
-            promotion_target,
-            exc,
-        )
+        if success_receipt is None:
+            return await _enter_managed_check_wait(
+                session,
+                version,
+                base_record,
+                pr_number=int(pr_number),
+                pr_url=pr_url,
+                reason="merge_receipt_pending",
+            )
+        merged_sha = success_receipt["merge_commit_sha"]
 
     # 4. Best-effort: delete the release branch now that the merge has landed
     #    (audit R4-H2 — release-v{N} branches must not accumulate forever).

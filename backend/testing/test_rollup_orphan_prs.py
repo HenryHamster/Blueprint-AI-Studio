@@ -3,7 +3,7 @@
 A child task that was CANCELLED (e.g. requeue-replaced after a timeout, or
 SCOPE_EMPTY pre-empted) can leave its PR open. No live task will ever drive it
 to merge, so blocking the parent's rollup on that PR strands the parent in
-EVALUATING forever (incident 2026-05-28: an orphan safeguard PR from a
+EVALUATING forever (incident 2026-05-28: an orphan PR from a
 cancelled, retry-replaced child wedged a research rollup — the cancel path left
 the PR open and it carried 0 CI checks, so the merge gate never fired either).
 

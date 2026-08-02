@@ -301,14 +301,14 @@ async def trigger_qualify(
         session, project_id, open_version
     )
     await session.commit()
-    # Promotion-in-flight: the audit passed and a promotion PR is open and
-    # auto-merging.  Re-qualifying would spawn a fresh heavy qualifier child set
+    # Promotion check-wait: the audit passed and a managed promotion is pending.
+    # Re-qualifying would spawn a fresh heavy qualifier child set
     # and clobber the promotion-pending provenance, so run_qualification refuses
     # (no-op).  Surface that to the operator as a 409, mirroring the version-cut
     # lever, so all the levers over an in-flight promotion agree.
-    if result.get("status") == "promotion_in_flight":
+    if result.get("status") == "promotion_check_wait":
         detail = (
-            "a promotion PR is open and auto-merging — wait for it to land or "
+            "a managed promotion is pending — wait for it to land or "
             "cancel it before re-qualifying"
         )
         pr_number = result.get("promotion_pr_number")
@@ -367,9 +367,9 @@ async def trigger_force_promote(
             status_code=404,
             detail="No open release version found for this project.",
         )
-    if status == "promotion_in_flight":
+    if status == "promotion_check_wait":
         detail = (
-            "a promotion PR is open and auto-merging — wait for it to land or "
+            "a managed promotion is pending — wait for it to land or "
             "cancel it before force-promoting"
         )
         pr_number = result.get("promotion_pr_number")
@@ -573,7 +573,12 @@ async def trigger_rollup(
     """
     from app.routers.agent import get_github_token_for_task
     from app.review_pipeline import _spawn_pipeline_task
-    from app.github import create_pull_request, merge_pull_request, delete_branch
+    from app.github import (
+        create_pull_request,
+        delete_branch,
+        get_pull_request,
+        merge_pull_request,
+    )
     from app.rollup_management import (
         _build_rollup_pr_body,
         _ROLLUP_PR_CREATE_CLAIM_TTL_S,
@@ -870,9 +875,72 @@ async def trigger_rollup(
                 "status": task.status,
                 "merge_blocked_reason": _hold_reason,
             }
-        merge_result = await merge_pull_request(
-            gh_token, owner, repo, rollup_pr_number, allow_changes_requested=True
+        _merge_detail = await get_pull_request(
+            gh_token,
+            owner,
+            repo,
+            rollup_pr_number,
+            project_id=str(task.project_id),
         )
+        _checked_head = str((_merge_detail.get("head") or {}).get("sha") or "")
+        _checked_base = str((_merge_detail.get("base") or {}).get("sha") or "")
+        if not _checked_head or not _checked_base:
+            task.latest_status_message = (
+                "Rollup merge held — could not bind the automatic attempt to "
+                "an immutable base/head"
+            )[:500]
+            session.add(task)
+            await session.commit()
+            return {
+                "rollup_pr_url": rollup_pr_url,
+                "rollup_pr_number": rollup_pr_number,
+                "target": target_branch,
+                "status": task.status,
+                "merge_blocked_reason": "immutable PR target unresolved",
+            }
+        _changed_lines = int(_merge_detail.get("additions") or 0) + int(
+            _merge_detail.get("deletions") or 0
+        )
+
+        async def _submit_operator_rollup_merge(expected_head_sha: str) -> dict:
+            return await merge_pull_request(
+                gh_token,
+                owner,
+                repo,
+                rollup_pr_number,
+                project_id=str(task.project_id),
+                expected_head_sha=expected_head_sha,
+            )
+
+        from app.review_policy_merge import attempt_policy_bound_merge
+
+        _merge_authority, merge_result = await attempt_policy_bound_merge(
+            task,
+            session,
+            merge_call=_submit_operator_rollup_merge,
+            gh_token=gh_token,
+            owner=owner,
+            repo=repo,
+            pr_number=rollup_pr_number,
+            branch=staging_branch,
+            base_branch=target_branch,
+            checked_head_sha=_checked_head,
+            checked_base_sha=_checked_base,
+            review_not_required_reason=(
+                "small operator-triggered intermediate rollup (<=100 changed "
+                "lines): downstream rollup receives full review"
+                if _changed_lines <= 100
+                else None
+            ),
+        )
+        if merge_result is None:
+            return {
+                "rollup_pr_url": rollup_pr_url,
+                "rollup_pr_number": rollup_pr_number,
+                "target": target_branch,
+                "status": task.status,
+                "merge_blocked_reason": "authoritative review gate held merge",
+            }
         if merge_result.get("merged"):
             (
                 record_pr_merged,
@@ -890,7 +958,7 @@ async def trigger_rollup(
                 TaskStatus.COMPLETED if terminal_rollup_merge else TaskStatus.EVALUATING
             )
             task.context = {
-                **ctx,
+                **(task.context or {}),
                 "rollup_pr_number": rollup_pr_number,
                 "rollup_pr_url": rollup_pr_url,
             }

@@ -646,7 +646,7 @@ async def get_version_lifecycle(
                     automain_ci_state=None,
                     blocker=_lq.get("blocker"),
                     in_flight=_lq_status == "pending",
-                    promotion_in_flight=bool(_lq.get("promotion_pending")),
+                    promotion_check_wait=bool(_lq.get("promotion_pending")),
                     last_attempt=_lq if _lq else None,
                     knob=_get_trigger_mode(),
                     evaluated_at=_utcnow().isoformat(),
@@ -1019,11 +1019,10 @@ async def set_version_phase(
             detail="No open release version found for this project.",
         )
 
-    # Refuse a phase flip while a promotion is in flight (audit passed, promotion
-    # PR open and auto-merging).  Flipping back to build here clears the
-    # "promotion in flight" indication in the panel even though nothing was
-    # cancelled — leaving the operator levers disagreeing about the version's
-    # real state.  Mirrors the version-cut lever's 409 refusal on the same
+    # Refuse a phase flip while Blueprint owns a managed promotion. Flipping
+    # back to build here clears the promotion-pending indication even though
+    # nothing was cancelled, leaving the operator levers disagreeing about the
+    # version's real state. Mirrors the version-cut lever's 409 refusal on the same
     # predicate. (Only the operator endpoint guards this — the internal
     # set_version_phase helper stays open for finalize/sweep/promotion flows that
     # legitimately flip phase mid-promotion.)
@@ -1031,18 +1030,18 @@ async def set_version_phase(
     # stale-pending+finalized-verdict is not misclassified as still-blocking.
     _promo_state = await resolve_promotion_blocking_result(session, open_ver)
     if _promo_state is not None:
-        if _promo_state.get("status") == "promotion_check_wait":
+        pr_number = _promo_state.get("promotion_pr_number")
+        if pr_number is not None:
             detail = (
-                "a migration-carrying promotion PR is open and waiting for "
-                "required checks — Blueprint will retry the merge automatically; "
+                "a managed promotion PR is open — Blueprint will wait for required "
+                "checks, revalidate the exact base/head pair, and retry the merge; "
                 "wait for it to land or cancel it before changing the phase"
             )
         else:
             detail = (
-                "a promotion PR is open and auto-merging — wait for it to land or "
-                "cancel it before changing the phase"
+                "a managed promotion is starting — wait for Blueprint to finish "
+                "opening the promotion PR, or cancel it before changing the phase"
             )
-        pr_number = _promo_state.get("promotion_pr_number")
         if pr_number is not None:
             detail += f" (PR #{pr_number}"
             pr_url = _promo_state.get("promotion_pr_url")
@@ -1175,17 +1174,16 @@ async def cut_version(
             idempotency_key=payload.idempotency_key,
         )
     except _release_version.VersionCutBlockedByPromotion as exc:
-        _cut_state = (exc.promotion_freshness or {}).get("state")
-        if _cut_state == "promotion_check_wait":
+        if exc.promotion_pr_number is not None:
             detail = (
-                "a migration-carrying promotion PR is open and waiting for "
-                "required checks — Blueprint will retry the merge automatically; "
+                "a managed promotion PR is open — Blueprint will wait for required "
+                "checks, revalidate the exact base/head pair, and retry the merge; "
                 "wait for it to land or cancel it before cutting"
             )
         else:
             detail = (
-                "a promotion PR is open and auto-merging — wait for it to land or "
-                "cancel it before cutting"
+                "a managed promotion is starting — wait for Blueprint to finish "
+                "opening the promotion PR, or cancel it before cutting"
             )
         if exc.promotion_pr_number is not None:
             detail += f" (PR #{exc.promotion_pr_number}"

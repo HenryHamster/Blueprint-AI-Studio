@@ -969,7 +969,7 @@ async def test_churn_retirement_decision_keep_and_retire_clear_flag(
 
     KEEP reactivates the held-paused direction, resets the churn-family ladder
     counter to 0, and clears the recommendation + manual-hold flags. RETIRE
-    confirms the terminal outcome (completed/auto_completed), clears the
+    confirms the explicit stopped/retired terminal outcome, clears the
     recommendation, and reconciles the freed problem-model gap.
     """
     # ── KEEP ────────────────────────────────────────────────────────────────
@@ -1032,7 +1032,8 @@ async def test_churn_retirement_decision_keep_and_retire_clear_flag(
     assert retire_body["status"] == "retired"
     assert retire_body["decision"] == "RETIRE"
     retired = retire_body["direction"]
-    assert retired["status"] == "completed"
+    assert retired["status"] == "retired"
+    assert retired["retirement_outcome"] == "stopped"
     assert retired["auto_completed"] is True
     assert "decision" in retired["auto_completed_reason"].lower()
     assert retired["completed_at"]
@@ -3603,7 +3604,7 @@ async def test_put_directions_completion_criteria_too_long(client: AsyncClient, 
 
 @pytest.mark.asyncio
 async def test_auto_completion_triggers(db_session, mocker):
-    """Direction auto-completes when saturated with >= 3 total merged PRs and current cycle has findings."""
+    """A saturated direction completes only with challenge-approved success proof."""
     direction_id = "d-autocomp"
     direction = {
         "id": direction_id,
@@ -3612,6 +3613,8 @@ async def test_auto_completion_triggers(db_session, mocker):
         "priority": "medium",
         "paths": [],
         "added_at": "2026-01-01T00:00:00",
+        "context": {"success_evidence": "The target behavior is verified"},
+        "evidence_progress": {"status": "met", "challenge_approved": True},
         "research_history": [
             {
                 "timestamp": "2026-01-01T01:00:00",

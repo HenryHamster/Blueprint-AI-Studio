@@ -12,7 +12,6 @@ from app.sr_analytics_common import (  # noqa: F401
     _EXAMPLE_MAX_PER_CAT,
     _EXECUTION_EVIDENCE_CATEGORIES,
     _FLOOR_MIN_CONSECUTIVE_WINDOWS,
-    _HALLUCINATION_RATE_MIN_FINDINGS,
     _MIN_DIRECTION_SR_SAMPLE,
     _MIN_SR_FINDINGS,
     _MIN_SR_SAMPLE,
@@ -50,8 +49,6 @@ from app.sr_analytics_common import (  # noqa: F401
 )
 from app.sr_analytics_catch_rate import (  # noqa: F401
     _compute_edges_stats,
-    _partition_edges_by_origin,
-    _reviewer_caught_author_miss,
     _stats_for_tasks,
     compute_direction_sr_breakdown_for_endpoint,
     compute_sr_catch_rate_by_direction,

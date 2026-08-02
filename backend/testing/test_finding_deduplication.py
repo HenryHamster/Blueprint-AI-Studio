@@ -257,12 +257,13 @@ def test_build_dedup_state_ancestry_indeterminate_trusts_pr_merged_flag():
 
 
 def test_extract_recent_terminal_finding_history_uses_plan_output_without_hash():
-    """Terminal history must keep persisted findings even when context lacks a hash."""
+    """Final terminal history keeps accepted findings without a child hash."""
     t = _make_task(
         status=TaskStatus.COMPLETED,
-        context={},
+        context={"research_findings_finalized": True},
         created_at=datetime.now(timezone.utc).replace(tzinfo=None),
     )
+    t.payloads = [{"type": "research"}]
     t.plan_output = [
         {
             "title": "Persisted finding",
@@ -276,8 +277,17 @@ def test_extract_recent_terminal_finding_history_uses_plan_output_without_hash()
         {
             "title": "Persisted finding",
             "description": "kept in plan_output",
+            "type": "research",
         }
     ]
+
+
+def test_extract_recent_terminal_history_ignores_unfinalized_research_output():
+    t = _make_task(status=TaskStatus.COMPLETED, context={})
+    t.payloads = [{"type": "research"}]
+    t.plan_output = [{"title": "Rejected raw finding"}]
+
+    assert extract_recent_terminal_finding_history([t], failed_parent_ids=set()) == []
 
 
 def test_build_dedup_state_excludes_infra_failures():

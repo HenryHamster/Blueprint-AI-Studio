@@ -565,6 +565,44 @@ def detect_gpus() -> tuple[tuple[int, ...], tuple[str, ...]]:
 # Known LLM CLI binaries the runner may advertise in the heartbeat.
 _LLM_CLI_NAMES: tuple[str, ...] = ("claude", "codex", "gemini")
 MIN_CODEX_CLI_VERSION: tuple[int, int, int] = (0, 144, 1)
+CLAUDE_RESIDENT_REQUIRED_FLAGS: frozenset[str] = frozenset(
+    {
+        "--input-format",
+        "--append-system-prompt",
+        "--mcp-config",
+        "--strict-mcp-config",
+        "--allowedTools",
+    }
+)
+
+
+def _with_claude_resident_capabilities(
+    info: dict,
+    completed: subprocess.CompletedProcess | None,
+    *,
+    failure_reason: str | None = None,
+) -> dict:
+    enriched = dict(info)
+    if completed is None or completed.returncode != 0:
+        enriched.update(
+            {
+                "resident_ready": False,
+                "missing_resident_flags": sorted(CLAUDE_RESIDENT_REQUIRED_FLAGS),
+                "capability_probe_reason": failure_reason or "help_probe_failed",
+            }
+        )
+        return enriched
+    output = "\n".join((completed.stdout or "", completed.stderr or ""))
+    flags = set(re.findall(r"--[0-9A-Za-z][0-9A-Za-z-]*", output))
+    missing = sorted(CLAUDE_RESIDENT_REQUIRED_FLAGS - flags)
+    enriched.update(
+        {
+            "resident_ready": not missing,
+            "missing_resident_flags": missing,
+            "capability_probe_reason": None if not missing else "missing_required_flags",
+        }
+    )
+    return enriched
 
 
 def _llm_cli_probe_reason(name: str, output: str) -> str:
@@ -651,9 +689,13 @@ def probe_llm_clis(*, env: dict[str, str] | None = None) -> dict[str, dict]:
     """
     result: dict[str, dict] = {}
     for name in _LLM_CLI_NAMES:
-        path = _which(name)
+        path = shutil.which(name, path=(env or {}).get("PATH")) if env else _which(name)
         if path is None:
             result[name] = _unavailable_llm_cli("not_found")
+            if name == "claude":
+                result[name] = _with_claude_resident_capabilities(
+                    result[name], None, failure_reason="not_found"
+                )
             continue
         try:
             ver = subprocess.run(
@@ -664,14 +706,47 @@ def probe_llm_clis(*, env: dict[str, str] | None = None) -> dict[str, dict]:
                 env=env,
             )
             result[name] = _llm_cli_result(name, ver)
+            if name == "claude":
+                if result[name].get("healthy") is not True:
+                    result[name] = _with_claude_resident_capabilities(
+                        result[name], None, failure_reason=result[name].get("reason")
+                    )
+                else:
+                    try:
+                        help_result = subprocess.run(
+                            [path, "--help"],
+                            capture_output=True,
+                            text=True,
+                            timeout=10,
+                            env=env,
+                        )
+                        result[name] = _with_claude_resident_capabilities(
+                            result[name], help_result
+                        )
+                    except subprocess.TimeoutExpired:
+                        result[name] = _with_claude_resident_capabilities(
+                            result[name], None, failure_reason="help_probe_timeout"
+                        )
+                    except (OSError, subprocess.SubprocessError):
+                        result[name] = _with_claude_resident_capabilities(
+                            result[name], None, failure_reason="help_probe_error"
+                        )
         except subprocess.TimeoutExpired:
             result[name] = _unavailable_llm_cli(
                 "version_probe_timeout", executable_found=True
             )
+            if name == "claude":
+                result[name] = _with_claude_resident_capabilities(
+                    result[name], None, failure_reason="version_probe_timeout"
+                )
         except (OSError, subprocess.SubprocessError):
             result[name] = _unavailable_llm_cli(
                 "version_probe_error", executable_found=True
             )
+            if name == "claude":
+                result[name] = _with_claude_resident_capabilities(
+                    result[name], None, failure_reason="version_probe_error"
+                )
     return result
 
 
@@ -725,12 +800,54 @@ def probe_container_llm_clis(
                 result[name] = _unavailable_llm_cli("not_found")
             else:
                 result[name] = _llm_cli_result(name, completed)
+                if name == "claude":
+                    if result[name].get("healthy") is not True:
+                        result[name] = _with_claude_resident_capabilities(
+                            result[name], None, failure_reason=result[name].get("reason")
+                        )
+                    else:
+                        try:
+                            help_result = subprocess.run(
+                                [
+                                    runtime,
+                                    "run",
+                                    "--rm",
+                                    "--entrypoint",
+                                    name,
+                                    image,
+                                    "--help",
+                                ],
+                                capture_output=True,
+                                text=True,
+                                timeout=20,
+                            )
+                            result[name] = _with_claude_resident_capabilities(
+                                result[name], help_result
+                            )
+                        except subprocess.TimeoutExpired:
+                            result[name] = _with_claude_resident_capabilities(
+                                result[name], None,
+                                failure_reason="container_help_probe_timeout",
+                            )
+                        except (OSError, subprocess.SubprocessError):
+                            result[name] = _with_claude_resident_capabilities(
+                                result[name], None,
+                                failure_reason="container_help_probe_error",
+                            )
         except subprocess.TimeoutExpired:
             result[name] = _unavailable_llm_cli(
                 "version_probe_timeout", executable_found=True
             )
+            if name == "claude":
+                result[name] = _with_claude_resident_capabilities(
+                    result[name], None, failure_reason="container_probe_timeout"
+                )
         except (OSError, subprocess.SubprocessError):
             result[name] = _unavailable_llm_cli("container_probe_error")
+            if name == "claude":
+                result[name] = _with_claude_resident_capabilities(
+                    result[name], None, failure_reason="container_probe_error"
+                )
     return result
 
 

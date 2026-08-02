@@ -115,7 +115,6 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "capability_proof_gate_auto_graduation_observe_threshold",
         "capability_proof_gate_auto_graduation_enforce_threshold",
         "capability_proof_execution_trials_enabled",
-        "acceptance_earn_execution_trials_enabled",
         "cloud_run_task_type_allowlist",
         "evergreen_fill_mode",
         "evergreen_fill_interval_minutes",
@@ -140,7 +139,6 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "compute_experiment_spend_threshold_usd",
         "cross_provider_fallback_enabled",
         "daily_cost_ceiling_usd",
-        "discovery_admission_mode",
         "monthly_budget_target_usd",
         "deploy_repo_identity",
         "drift_over_claim_consistency_threshold",
@@ -192,7 +190,6 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "rollup_merge_queue_enabled",
         "env_preflight_enabled",
         "smoketest_enabled",
-        "walkthrough_e2e_enabled_by_project",
         "spend_approval_timeout_hours",
         "strategic_max_interval_minutes",
         "strategic_research_frequency",
@@ -201,7 +198,7 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "strategic_local_hold_timeout_seconds",
         "strategic_session_idle_tick_seconds",
         "strategic_session_turn_timeout_seconds",
-        "strategic_session_min_tick_seconds",
+        "strategic_session_exploration_interval_seconds",
         "strategic_session_max_ops_per_turn",
         "strategic_session_autonomous_turn_timeout_seconds",
         "strategic_session_max_unattended_seconds",
@@ -577,9 +574,6 @@ async def get_settings(
         "autonomous_spawn_budget_mode": str(
             _runtime_config.get("autonomous_spawn_budget_mode", "observe")
         ),
-        "discovery_admission_mode": str(
-            _runtime_config.get("discovery_admission_mode", "shadow")
-        ),
         "max_global_autonomous_initiative_tasks_per_hour": int(
             _runtime_config.get("max_global_autonomous_initiative_tasks_per_hour", 50)
         ),
@@ -641,9 +635,6 @@ async def get_settings(
         "capability_proof_trial_projection": capability_proof_trial_projection,
         "capability_proof_execution_trials_enabled": bool(
             _runtime_config.get("capability_proof_execution_trials_enabled", False)
-        ),
-        "acceptance_earn_execution_trials_enabled": bool(
-            _runtime_config.get("acceptance_earn_execution_trials_enabled", False)
         ),
         "metrics_integrity_sweep_interval_minutes": int(
             _runtime_config.get("metrics_integrity_sweep_interval_minutes", 60)
@@ -793,8 +784,8 @@ async def get_settings(
         "strategic_session_turn_timeout_seconds": _runtime_config.get(
             "strategic_session_turn_timeout_seconds", 120
         ),
-        "strategic_session_min_tick_seconds": _runtime_config.get(
-            "strategic_session_min_tick_seconds", 600
+        "strategic_session_exploration_interval_seconds": _runtime_config.get(
+            "strategic_session_exploration_interval_seconds", 14_400
         ),
         "strategic_session_max_ops_per_turn": _runtime_config.get(
             "strategic_session_max_ops_per_turn", 3
@@ -814,12 +805,6 @@ async def get_settings(
         },
         "env_preflight_enabled": bool(_runtime_config.get("env_preflight_enabled", True)),
         "smoketest_enabled": bool(_runtime_config.get("smoketest_enabled", False)),
-        "walkthrough_e2e_enabled_by_project": {
-            str(k): bool(v)
-            for k, v in (
-                _runtime_config.get("walkthrough_e2e_enabled_by_project") or {}
-            ).items()
-        },
         "merge_grade_block_threshold": float(
             _runtime_config.get("merge_grade_block_threshold", 0.0) or 0.0
         ),
@@ -1210,16 +1195,6 @@ async def _apply_settings(
             _debt_keys_to_resolve.append(
                 "dormant_knob:autonomous_spawn_budget_mode"
             )
-    if "discovery_admission_mode" in payload:
-        val = str(payload["discovery_admission_mode"] or "").strip().lower()
-        if val not in ("shadow", "enforced"):
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "discovery_admission_mode must be one of: shadow, enforced"
-                ),
-            )
-        _runtime_config["discovery_admission_mode"] = val
     if "max_global_autonomous_initiative_tasks_per_hour" in payload:
         try:
             _runtime_config["max_global_autonomous_initiative_tasks_per_hour"] = (
@@ -1443,14 +1418,6 @@ async def _apply_settings(
                 detail="capability_proof_execution_trials_enabled must be a boolean",
             )
         _runtime_config["capability_proof_execution_trials_enabled"] = val
-    if "acceptance_earn_execution_trials_enabled" in payload:
-        val = payload["acceptance_earn_execution_trials_enabled"]
-        if not isinstance(val, bool):
-            raise HTTPException(
-                status_code=400,
-                detail="acceptance_earn_execution_trials_enabled must be a boolean",
-            )
-        _runtime_config["acceptance_earn_execution_trials_enabled"] = val
     for _cap_grad_key, _cap_grad_default in (
         ("capability_proof_gate_auto_graduation_observe_threshold", 0.5),
         ("capability_proof_gate_auto_graduation_enforce_threshold", 0.95),
@@ -1523,29 +1490,6 @@ async def _apply_settings(
         _runtime_config["env_preflight_enabled"] = bool(payload["env_preflight_enabled"])
     if "smoketest_enabled" in payload:
         _runtime_config["smoketest_enabled"] = bool(payload["smoketest_enabled"])
-    if "walkthrough_e2e_enabled_by_project" in payload:
-        raw = payload["walkthrough_e2e_enabled_by_project"]
-        if not isinstance(raw, dict):
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "walkthrough_e2e_enabled_by_project must be a mapping of "
-                    "project-id strings to booleans"
-                ),
-            )
-        cleaned_walkthrough: dict[str, bool] = {}
-        for key, value in raw.items():
-            sid = str(key).strip()
-            if not sid:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        "walkthrough_e2e_enabled_by_project keys must be "
-                        "non-empty project ids"
-                    ),
-                )
-            cleaned_walkthrough[sid] = bool(value)
-        _runtime_config["walkthrough_e2e_enabled_by_project"] = cleaned_walkthrough
     if "no_ci_test_gate_enabled" in payload:
         _runtime_config["no_ci_test_gate_enabled"] = bool(
             payload["no_ci_test_gate_enabled"]
@@ -1780,17 +1724,18 @@ async def _apply_settings(
     # the continuation TTL and local-hold timeout are the safety windows (min 60s
     # so a live session can never be reaped mid-turn; ceiling 7200s / 2h so an
     # operator can NEVER reintroduce a >12h local-pin wall); the idle tick and
-    # turn timeout bound the session loop cadence; the unattended cap bounds total
+    # turn timeout bound the session loop cadence; sparse exploration is a
+    # model-call fallback rather than liveness; the unattended cap bounds total
     # autonomous lifetime (ceiling 8h, still well under a 12h wall).
     for _key, _lo, _hi in (
         ("strategic_continuation_ttl_seconds", 60, 7_200),
         ("strategic_local_hold_timeout_seconds", 60, 7_200),
         ("strategic_session_idle_tick_seconds", 1, 300),
         ("strategic_session_turn_timeout_seconds", 10, 3_600),
-        # Floor-tick cadence: >=60s (never busy-loop) and <=3600s (review at
-        # least hourly). The design default 600s sits well under the 25-min
-        # continuation TTL so the session reviews before the lease can lapse.
-        ("strategic_session_min_tick_seconds", 60, 3_600),
+        # Sparse unchanged-state exploration: 1h..24h. State, watch, operator,
+        # follow-up, and first-turn wakes bypass this interval; the 4h default
+        # prevents routine idleness from becoming an upper-tier model tax.
+        ("strategic_session_exploration_interval_seconds", 3_600, 86_400),
         # Soft per-turn op cap: 1..20. Advisory prompt hint only; the hard
         # per-op spawn/retire gates are unaffected.
         ("strategic_session_max_ops_per_turn", 1, 20),
@@ -3537,9 +3482,6 @@ async def _apply_settings(
                     "autonomous_spawn_budget_mode": str(
                         _runtime_config.get("autonomous_spawn_budget_mode", "observe")
                     ),
-                    "discovery_admission_mode": str(
-                        _runtime_config.get("discovery_admission_mode", "shadow")
-                    ),
                     "max_global_autonomous_initiative_tasks_per_hour": int(
                         _runtime_config.get(
                             "max_global_autonomous_initiative_tasks_per_hour", 50
@@ -3900,13 +3842,6 @@ async def _apply_settings(
                             "capability_proof_execution_trials_enabled", False
                         )
                     ),
-                    # Persist the dark acceptance earn-loop execution-trial flag so
-                    # an operator enable survives a Cloud Run restart.
-                    "acceptance_earn_execution_trials_enabled": bool(
-                        _runtime_config.get(
-                            "acceptance_earn_execution_trials_enabled", False
-                        )
-                    ),
                     "adversarial_spawn_gate_infra_failure_mode": str(
                         _runtime_config.get(
                             "adversarial_spawn_gate_infra_failure_mode", "observe"
@@ -3939,8 +3874,10 @@ async def _apply_settings(
                             "strategic_session_turn_timeout_seconds", 120
                         )
                     ),
-                    "strategic_session_min_tick_seconds": int(
-                        _runtime_config.get("strategic_session_min_tick_seconds", 600)
+                    "strategic_session_exploration_interval_seconds": int(
+                        _runtime_config.get(
+                            "strategic_session_exploration_interval_seconds", 14_400
+                        )
                     ),
                     "strategic_session_max_ops_per_turn": int(
                         _runtime_config.get("strategic_session_max_ops_per_turn", 3)

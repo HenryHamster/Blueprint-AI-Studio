@@ -28,7 +28,6 @@ if (verdict === 'unknown') {
   const cr = sr.check_results || {};
   const fail = Object.entries(cr).filter(function (entry) { return !entry[1].passed; }).map(function (entry) { return entry[0]; });
   const edges = Array.isArray(sr.edges_considered) ? sr.edges_considered : [];
-  const rfind = Array.isArray(sr.reviewer_findings) ? sr.reviewer_findings : [];
   const cats = Array.isArray(sr.categories) ? sr.categories : [];
   const truncFiles = Array.isArray(sr.truncated_files_read) ? sr.truncated_files_read : [];
   const pv = sr.prompt_version || '';
@@ -52,27 +51,6 @@ if (verdict === 'unknown') {
     }
   }
 
-  // High-priority: CRITICAL/HIGH reviewer findings
-  const highSevFindings = rfind.filter(function (f) {
-    const s = (f.severity || '').toUpperCase();
-    return s === 'CRITICAL' || s === 'HIGH';
-  });
-  if (highSevFindings.length > 0) {
-    const MAX_FINDINGS = 3;
-    const findingsToShow = highSevFindings.slice(0, MAX_FINDINGS);
-    lines.push('- **Fresh-reviewer findings (high severity):**');
-    findingsToShow.forEach(function (f) {
-      const sev = (f.severity || '').toUpperCase();
-      const cat = f.category || 'unknown';
-      const desc = (f.description || '').slice(0, 80);
-      const hint = f.fp_rate_hint ? ' ' + f.fp_rate_hint : '';
-      lines.push('  - [' + sev + '] ' + cat + ': ' + desc + hint);
-    });
-    if (highSevFindings.length > MAX_FINDINGS) {
-      lines.push('  - +' + (highSevFindings.length - MAX_FINDINGS) + ' more');
-    }
-  }
-
   // Medium-priority: unverified files when incomplete_review
   if ((cats.includes('incomplete_review') || truncFiles.length > 0) && truncFiles.length > 0) {
     lines.push('- **Files not re-verified:**');
@@ -89,18 +67,6 @@ if (verdict === 'unknown') {
     lines.push('- **Failing categories (' + fail.length + '):** ' + catStr);
   }
 
-  // Summary counts for non-high-severity findings
-  const otherFindings = rfind.filter(function (f) {
-    const s = (f.severity || '').toUpperCase();
-    return s !== 'CRITICAL' && s !== 'HIGH';
-  });
-  if (otherFindings.length > 0) {
-    const c = { MEDIUM: 0, LOW: 0 };
-    otherFindings.forEach(function (f) { const s = (f.severity || '').toUpperCase(); if (Object.prototype.hasOwnProperty.call(c, s)) c[s]++; });
-    const parts = Object.entries(c).filter(function (e) { return e[1] > 0; }).map(function (e) { return e[0] + ': ' + e[1]; });
-    if (parts.length > 0) lines.push('- **Other reviewer findings:** ' + parts.join(', '));
-  }
-
   const handledEdges = edges.filter(function (e) { return e && e.handled !== false; });
   if (handledEdges.length > 0) {
     lines.push('- **Edges considered (handled): ' + handledEdges.length + '**');
@@ -111,7 +77,7 @@ if (verdict === 'unknown') {
 }
 
 if (block.length > MAX_LEN) {
-  // Truncation with priority: unhandled-edges > critical-findings > unverified > everything else
+  // Truncation with priority: unhandled-edges > unverified > everything else
   // For now, simple truncation. In future could implement smarter priority-based truncation.
   block = block.slice(0, MAX_LEN - MC.length - 5) + '…\n' + MC;
 }

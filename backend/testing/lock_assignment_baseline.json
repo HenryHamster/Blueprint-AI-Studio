@@ -18,7 +18,7 @@
     "sr_analytics.py": 0,
     "sr_analytics_catch_rate_impl.py": 0,
     "sr_catch_rate_trends.py": 0,
-    "sr_reviewer_trends.py": 0,
+    "sr_edges_trends.py": 0,
     "sr_signal_trends.py": 0,
     "task_locking.py": 2
   },

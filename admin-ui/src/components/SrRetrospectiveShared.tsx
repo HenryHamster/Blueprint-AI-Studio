@@ -7,12 +7,6 @@ export interface SrCheckResultEntry {
   origin?: string | null;
 }
 
-export interface SrReviewerFinding {
-  category: string;
-  severity?: string | null;
-  description: string;
-}
-
 export interface SrMissedTask {
   task_id: string;
   title: string;
@@ -23,7 +17,6 @@ export interface SrMissedTask {
   caught_categories: string[];
   pr_url?: string | null;
   sr_check_results?: Record<string, SrCheckResultEntry>;
-  reviewer_findings?: SrReviewerFinding[];
 }
 
 const RETROSPECTIVE_DAY_OPTIONS = [7, 14, 30, 90] as const;

@@ -19,10 +19,10 @@ export {
   validateBranchName,
 } from '../index.js';
 export { prepareWorkspaceForRole } from '../workspacePrep.js';
+export { preparePacketOnlyWorkspace } from './discovery-review-workspace.js';
 export {
   DEFAULT_TOOL_GUIDANCE,
   buildContextPrefix,
-  buildFileTree,
   computePromptFingerprint,
   configureAgentPermissions,
   readClaudeMd,

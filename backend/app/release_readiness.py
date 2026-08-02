@@ -438,6 +438,9 @@ def format_qualification_for_api(qual: dict[str, Any]) -> dict[str, Any]:
         # zero-weighted and the 0.0 placeholder should not be shown as an
         # active lane).  None on legacy records that predate this field.
         "smoketest_enabled": qual.get("smoketest_enabled"),
+        "requested_probes": qual.get("requested_probes") or [],
+        "walkthrough_e2e_task_id": qual.get("walkthrough_e2e_task_id"),
+        "walkthrough_e2e_result": qual.get("walkthrough_e2e_result"),
         "audit_reconciliation": _recon_out,
         "audit_leg_proof": _audit_leg_proof,
         "promotion_pr_url": qual.get("promotion_pr_url"),
@@ -488,6 +491,8 @@ def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
     )
     sub_scores = verdict.sub_scores
     if isinstance(sub_scores, dict):
+        requested_probes = sub_scores.get("requested_probes") or []
+        walkthrough_e2e_result = sub_scores.get("walkthrough_e2e_result")
         debt_enforce_confidence_preview = sub_scores.get(
             "debt_enforce_confidence_preview"
         )
@@ -500,9 +505,13 @@ def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
                 "acceptance_aggregate",
                 "debt_enforce_confidence_preview",
                 "debt_enforce_weight_preview",
+                "requested_probes",
+                "walkthrough_e2e_result",
             }
         }
     else:
+        requested_probes = []
+        walkthrough_e2e_result = None
         debt_enforce_confidence_preview = getattr(
             verdict, "debt_enforce_confidence_preview", None
         )
@@ -516,6 +525,8 @@ def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
         "confidence": verdict.confidence,
         "sub_scores": sub_scores,
         "blocker": verdict.blocker,
+        "requested_probes": requested_probes,
+        "walkthrough_e2e_result": walkthrough_e2e_result,
         "audit_missing_reason": verdict.audit_missing_reason,
         "would_promote": verdict.would_promote,
         "promotion_enabled": verdict.promotion_enabled,

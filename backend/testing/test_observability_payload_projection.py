@@ -419,6 +419,7 @@ async def test_research_actionability_walks_cancelled_and_non_code_followons(
         status=TaskStatus.COMPLETED,
         created_at=now - timedelta(hours=2),
         payloads=[{"type": "research"}],
+        context={"research_findings_finalized": True},
         plan_output=[
             {
                 "title": "Finding HIGH",

@@ -1,4 +1,3 @@
-import { useState } from 'react';
 import {
   ExampleList,
   deltaColorClass,
@@ -10,14 +9,11 @@ import type {
   DirectionSrEntry,
   EdgesTrend,
   SrCoFailurePair,
-  SrDisagreementExample,
   SrMissExample,
-  SrReviewerDisagreement,
-  SrReviewerDisagreementsData,
   SrTrendData,
 } from './types';
 
-function frTrendColor(trend: string | null | undefined): string {
+function edgesTrendColor(trend: string | null | undefined): string {
   if (trend === 'improving') return 'text-emerald-400';
   if (trend === 'regressing') return 'text-red-400';
   return 'text-neutral-500';
@@ -45,7 +41,7 @@ export function EdgesTrendBreakdown({ trend }: { trend: EdgesTrend | null | unde
       </div>
       <div className="flex items-center gap-2 text-ui-sm">
         <span className="text-neutral-400 flex-1">tasks with edges</span>
-        <span className={`font-mono tabular-nums ${frTrendColor(trendVal)}`}>
+        <span className={`font-mono tabular-nums ${edgesTrendColor(trendVal)}`}>
           {curr.tasks_with_edges_rate != null ? `${Math.round(curr.tasks_with_edges_rate * 100)}%` : '–'}
         </span>
         {delta != null && (
@@ -241,13 +237,6 @@ export function DirectionSrBreakdownPanel({
                         )}
                         <span className="text-neutral-600 ml-auto">n={stat.sample_count}</span>
                       </div>
-                      {(stat.sr_alone_hit_rate != null || stat.reviewer_save_rate != null) && (
-                        <div className="flex items-center gap-1 text-ui-xs text-neutral-500 font-mono ml-3 mt-0.5">
-                          <span>SR-alone {stat.sr_alone_hit_rate != null ? `${Math.round(stat.sr_alone_hit_rate * 100)}%` : '–'}</span>
-                          <span className="text-neutral-700">·</span>
-                          <span>reviewer-save {stat.reviewer_save_rate != null ? `${Math.round(stat.reviewer_save_rate * 100)}%` : '–'}</span>
-                        </div>
-                      )}
                       {(stat.examples ?? []).length > 0 && (
                         <ExampleList
                           examples={(stat.examples ?? []).map(example => ({
@@ -265,111 +254,6 @@ export function DirectionSrBreakdownPanel({
           </div>
         );
       })}
-    </div>
-  );
-}
-
-const DISAGREEMENT_SEV_ORDER: Record<string, number> = { CRITICAL: 0, HIGH: 1, MEDIUM: 2, LOW: 3 };
-
-function disagreementBadgeClass(maxSev?: string | null): string {
-  if (maxSev === 'CRITICAL') return 'bg-red-500/10 text-red-400 border-red-500/20';
-  if (maxSev === 'HIGH') return 'bg-orange-500/10 text-orange-400 border-orange-500/20';
-  if (maxSev === 'MEDIUM') return 'bg-amber-500/10 text-amber-400 border-amber-500/20';
-  return 'bg-orange-500/10 text-orange-400 border-orange-500/20';
-}
-
-function sortDisagreements(items: SrReviewerDisagreement[]): SrReviewerDisagreement[] {
-  return [...items].sort((a, b) => {
-    const left = DISAGREEMENT_SEV_ORDER[a.max_severity ?? ''] ?? 4;
-    const right = DISAGREEMENT_SEV_ORDER[b.max_severity ?? ''] ?? 4;
-    return left !== right ? left - right : b.count - a.count;
-  });
-}
-
-function exampleSeverityColor(severity: SrDisagreementExample['severity']): string {
-  if (severity === 'CRITICAL') return 'text-red-400';
-  if (severity === 'HIGH') return 'text-orange-400';
-  if (severity === 'MEDIUM' || severity === 'MAJOR') return 'text-amber-400';
-  return 'text-neutral-400';
-}
-
-export function SrReviewerDisagreementsPanel({
-  data,
-  onSelectTask,
-}: {
-  data: SrReviewerDisagreementsData;
-  onSelectTask?: (taskId: string) => void;
-}) {
-  const [expandedKey, setExpandedKey] = useState<string | null>(null);
-  if (!data.disagreements.length) return null;
-  const sorted = sortDisagreements(data.disagreements);
-  return (
-    <div data-testid="sr-reviewer-disagreements" className="flex flex-col gap-1.5">
-      <div className="flex flex-wrap gap-1.5">
-        {sorted.slice(0, 8).map((disagreement, index) => {
-          const severity = disagreement.max_severity;
-          const breakdown = disagreement.severity_breakdown;
-          const showSevDetail = (severity === 'CRITICAL' || severity === 'HIGH') && breakdown;
-          const sevDetail = showSevDetail && breakdown
-            ? (['CRITICAL', 'HIGH'] as const)
-                .filter(key => (breakdown[key] ?? 0) > 0)
-                .map(key => `${breakdown[key]} ${key}`)
-                .join(', ')
-            : null;
-          const key = `${disagreement.category}:${disagreement.task_type}:${index}`;
-          const isExpanded = expandedKey === key;
-          const hasExamples = (disagreement.examples?.length ?? 0) > 0;
-          const fp = disagreement.false_positive_rate;
-          return (
-            // eslint-disable-next-line viewport/min-touch-target -- dense chip list mirrors the existing panel behavior
-            <span
-              key={index}
-              title={`${disagreement.count} task${disagreement.count !== 1 ? 's' : ''} where self-review passed ${disagreement.category} but reviewer flagged it${severity ? ` (max: ${severity})` : ''}${hasExamples ? ' — click to expand' : ''}`}
-              onClick={() => hasExamples ? setExpandedKey(isExpanded ? null : key) : undefined}
-              className={`inline-flex items-center gap-1.5 text-ui-sm font-semibold px-2 py-0.5 rounded border ${disagreementBadgeClass(severity)}${hasExamples ? ' cursor-pointer' : ''}`}
-            >
-              <span className="truncate max-w-[120px]">{disagreement.category}</span>
-              {disagreement.task_type && <span className="opacity-60 font-normal">·</span>}
-              {disagreement.task_type && <span className="opacity-70 font-normal">{disagreement.task_type}</span>}
-              <span className="font-bold shrink-0">×{disagreement.count}</span>
-              {fp != null && (
-                <span className={`font-mono font-normal ${fpRateColorClass(fp)}`} title="false-positive rate">fp:{Math.round(fp * 100)}%</span>
-              )}
-              {sevDetail && <span className="font-normal opacity-80">({sevDetail})</span>}
-              {hasExamples && <span className="opacity-50 font-normal">{isExpanded ? '▲' : '▼'}</span>}
-            </span>
-          );
-        })}
-      </div>
-      {expandedKey !== null && (() => {
-        const index = sorted.slice(0, 8).findIndex((disagreement, itemIndex) => `${disagreement.category}:${disagreement.task_type}:${itemIndex}` === expandedKey);
-        const disagreement = index >= 0 ? sorted[index] : null;
-        if (!disagreement?.examples?.length) return null;
-        const examples = [...disagreement.examples].sort((a, b) => {
-          const order: Record<string, number> = { CRITICAL: 0, HIGH: 1, MEDIUM: 2, MAJOR: 2, LOW: 3, MINOR: 3 };
-          return (order[a.severity] ?? 4) - (order[b.severity] ?? 4);
-        });
-        return (
-          <div
-            data-testid="sr-disagreement-examples"
-            className="mt-0.5 rounded border border-neutral-800/60 bg-neutral-900/60 divide-y divide-neutral-800/40 text-ui-sm"
-          >
-            {examples.map((example, exampleIndex) => (
-              <div
-                key={exampleIndex}
-                onClick={() => onSelectTask && example.task_id ? onSelectTask(example.task_id) : undefined}
-                className={`flex items-start gap-2 px-2.5 py-1.5${onSelectTask && example.task_id ? ' cursor-pointer hover:bg-neutral-800/40' : ''}`}
-              >
-                <span className={`shrink-0 font-bold ${exampleSeverityColor(example.severity)}`}>{example.severity}</span>
-                <span className="text-neutral-300 leading-snug flex-1">{example.description}</span>
-                {example.task_id && onSelectTask && (
-                  <span className="shrink-0 text-neutral-600 font-mono">{example.task_id.slice(0, 8)}</span>
-                )}
-              </div>
-            ))}
-          </div>
-        );
-      })()}
     </div>
   );
 }

@@ -19,6 +19,7 @@ import re
 from sqlalchemy import func
 from sqlalchemy.exc import InvalidRequestError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.database import resolve_dialect_name
@@ -117,15 +118,156 @@ def _is_deterministic_merge_error(normalized_msg: str) -> bool:
     return any(pat in normalized_msg for pat in _DETERMINISTIC_MERGE_ERROR_PATTERNS)
 
 
-def _review_approved(review_loop: dict) -> bool:
-    """True if a review task signed off on this PR.
+def _review_not_required(review_loop: dict) -> bool:
+    """Return whether a recognized no-initial-review policy marker applies.
 
-    Accepts the new ``review_approved`` flag and the legacy ``verdict == "APPROVE"``
-    form so EVALUATING tasks written before the gate split still merge.
+    The marker authorizes only a chain that has never accumulated review
+    history and carries the backend-written policy reason. If history exists
+    (or is malformed), the chain has entered the authoritative review protocol
+    and a stale marker cannot bypass it.
     """
-    if review_loop.get("review_approved"):
-        return True
-    return review_loop.get("verdict") == "APPROVE"
+    history = review_loop.get("review_history")
+    history_is_empty = history is None or (
+        isinstance(history, list) and len(history) == 0
+    )
+    policy_reason = review_loop.get("review_policy_reason")
+    pristine_review_state = bool(
+        review_loop.get("issue_ledger") is None
+        and not any(
+            review_loop.get(key)
+            for key in (
+                "authoritative_review_required",
+                "authoritative_review_task_id",
+                "authoritative_review_target",
+                "review_wait_started",
+                "review_approved",
+            )
+        )
+    )
+    return bool(
+        review_loop.get("review_not_required") is True
+        and history_is_empty
+        and pristine_review_state
+        and isinstance(policy_reason, str)
+        and policy_reason.strip()
+    )
+
+
+async def _fetch_live_review_target(
+    gh_token: str,
+    owner: str,
+    repo: str,
+    pr_number: int,
+    *,
+    project_id: str,
+) -> dict[str, object]:
+    """Fetch the immutable GitHub merge identity used by review authority."""
+    from app.github import get_pull_request
+
+    pr_data = await get_pull_request(
+        gh_token,
+        owner,
+        repo,
+        pr_number,
+        project_id=project_id or None,
+    )
+    return {
+        "project_id": project_id,
+        "pr_number": int(pr_number),
+        "base_sha": str((pr_data.get("base") or {}).get("sha") or ""),
+        "head_sha": str((pr_data.get("head") or {}).get("sha") or ""),
+        "base_ref": str((pr_data.get("base") or {}).get("ref") or ""),
+        "state": str(pr_data.get("state") or ""),
+        "merged": pr_data.get("merged") is True,
+        "draft": pr_data.get("draft") is True,
+        "mergeable": pr_data.get("mergeable"),
+        "mergeable_state": str(pr_data.get("mergeable_state") or ""),
+    }
+
+
+def _live_target_is_merge_submission_safe(
+    target: dict[str, object], *, base_branch: str
+) -> bool:
+    """Reject GitHub states that prove the checked target is not landable.
+
+    GitHub does not expose an atomic compare-and-swap for the base SHA. The
+    same-base advisory lock closes Blueprint-vs-Blueprint movement; external
+    movement still relies on branch protection/up-to-date checks. This helper
+    fails closed on the concrete stale/closed/conflicted states visible in the
+    final GET without pretending an ``unknown`` mergeability value is a CAS.
+    """
+    state = str(target.get("state") or "").lower()
+    mergeable_state = str(target.get("mergeable_state") or "").lower()
+    base_ref = str(target.get("base_ref") or "")
+    return not (
+        target.get("merged") is True
+        or target.get("draft") is True
+        or target.get("mergeable") is False
+        or (state and state != "open")
+        or mergeable_state in {"behind", "dirty", "draft"}
+        or (base_ref and base_ref != base_branch)
+    )
+
+
+def _review_approved(review_loop: dict) -> bool:
+    """Return whether the durable review policy permits the merge path.
+
+    A reviewed chain must carry the explicit ``review_approved=True`` flag.
+    A policy path that deliberately skipped review must instead carry the
+    explicit ``review_not_required=True`` marker.  The old free-standing
+    ``verdict == "APPROVE"`` value is not merge authority: it has neither an
+    authoritative blocker ledger nor immutable target provenance.
+    """
+    return (
+        review_loop.get("review_approved") is True
+        or _review_not_required(review_loop)
+    )
+
+
+def revoke_review_authority_for_active_fix(
+    task: Task,
+    fix_task_id=None,
+    *,
+    review_loop: dict | None = None,
+    context_snapshot: dict | None = None,
+) -> dict:
+    """Make a code-writing fix a durable merge-authority boundary.
+
+    A fix can change the PR head, so neither an older exact-head APPROVE nor an
+    initial-review policy exemption may survive while that fix is active.  The
+    history, ledger, and prior target remain available for cheap delta review;
+    only authority/transient merge-gate state is cleared.  Callers must commit
+    this mutation no later than the transaction that makes ``fix_task_id``
+    active.
+    """
+    context = dict(
+        context_snapshot if context_snapshot is not None else (task.context or {})
+    )
+    loop = dict(
+        review_loop
+        if review_loop is not None
+        else (context.get("review_loop") or {})
+    )
+    loop["review_approved"] = False
+    loop["ci_passed"] = False
+    loop["ci_waiting"] = False
+    if fix_task_id is not None:
+        loop["ci_fix_spawned"] = str(fix_task_id)
+    else:
+        loop.pop("ci_fix_spawned", None)
+    for stale_key in (
+        "verdict",
+        "review_not_required",
+        "review_policy_reason",
+        "authoritative_review_required",
+        "authoritative_review_task_id",
+        "authoritative_review_target",
+        "authoritative_review_target_unresolved_at",
+    ):
+        loop.pop(stale_key, None)
+    task.context = {**context, "review_loop": loop}
+    flag_modified(task, "context")
+    return loop
 
 
 def effective_pr_number(task_or_ctx) -> int | None:

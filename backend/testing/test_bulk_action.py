@@ -93,7 +93,15 @@ async def test_single_admin_requeue_strips_blocked_escalation_context(db_session
     from app.task_blocked import enter_blocked_state, mark_blocker_escalated
 
     project = await _make_project_with_member(db_session)
-    task = await _make_task(db_session, project, status=TaskStatus.IN_PROGRESS)
+    # This regression exercises the generic admin requeue cleanup path.  A
+    # direct fix/review requeue now correctly requires an exact PR admission
+    # target, which is unrelated to the blocked-context behavior under test.
+    task = await _make_task(
+        db_session,
+        project,
+        status=TaskStatus.IN_PROGRESS,
+        task_type="create",
+    )
     enter_blocked_state(task, waiting_on="dep", reason="blocked")
     mark_blocker_escalated(task, detail="deadline elapsed")
     task.context = {
@@ -140,6 +148,7 @@ async def test_bulk_retry_strips_fresh_attempt_context(db_session):
     task = await _make_task(
         db_session,
         project,
+        task_type="create",
         status=TaskStatus.FAILED,
         context={
             "failure_class": "CODE_ERROR",
@@ -382,6 +391,30 @@ async def _make_rollup_approval_task(db_session, project, base_branch, *, hotfix
     return task
 
 
+def _patch_explicit_merge_target(mocker, project, *, base_ref: str):
+    target = {
+        "project_id": str(project.id),
+        "pr_number": 4242,
+        "base_sha": "bulk-base-4242",
+        "head_sha": "bulk-head-4242",
+        "base_ref": base_ref,
+        "state": "open",
+        "merged": False,
+        "draft": False,
+        "mergeable": True,
+        "mergeable_state": "clean",
+    }
+    for patch_target in (
+        "app.review_policy_merge._fetch_live_review_target",
+        "app.review_merge_authority._fetch_live_review_target",
+    ):
+        mocker.patch(
+            patch_target,
+            new_callable=AsyncMock,
+            return_value=dict(target),
+        )
+
+
 @pytest.mark.asyncio
 async def test_bulk_approve_rollup_to_promotion_target_merges_without_pr_merged(
     client: AsyncClient, db_session, mocker
@@ -394,6 +427,7 @@ async def test_bulk_approve_rollup_to_promotion_target_merges_without_pr_merged(
     not gate on _promotion_target_merge_allowed at all."""
     project = await _make_distinct_branch_project_with_member(db_session)
     task = await _make_rollup_approval_task(db_session, project, "main")
+    _patch_explicit_merge_target(mocker, project, base_ref="main")
 
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
@@ -526,6 +560,7 @@ async def test_bulk_approve_rollup_to_integration_branch_merges(
     still merges and sets pr_merged=True."""
     project = await _make_distinct_branch_project_with_member(db_session)
     task = await _make_rollup_approval_task(db_session, project, "automain")
+    _patch_explicit_merge_target(mocker, project, base_ref="automain")
 
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
@@ -567,6 +602,7 @@ async def test_bulk_approve_rollup_hotfix_to_promotion_target_merges(
     ``landed_on_integration``, not ``pr_merged``."""
     project = await _make_distinct_branch_project_with_member(db_session)
     task = await _make_rollup_approval_task(db_session, project, "main", hotfix=True)
+    _patch_explicit_merge_target(mocker, project, base_ref="main")
 
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",

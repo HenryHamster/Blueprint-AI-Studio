@@ -12,8 +12,10 @@ from app.models import Project, ProjectSRAnalytics
 LEGACY_SR_ANALYTICS_KEYS = frozenset(
     {
         "sr_catch_rate_trends",
-        "fresh_reviewer_trend",
         "edges_trend",
+        # Rolling-cutover/rollback vocabulary retained to match migration 0696.
+        # Current runtime consumers ignore these retired Fresh Reviewer fields.
+        "fresh_reviewer_trend",
         "sr_reviewer_disagreements",
         "sr_regression_risk_test_signal_trends",
         "sr_false_attestation_trends",

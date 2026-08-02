@@ -24,10 +24,12 @@ _PROJECT_NUMBER_RE = re.compile(r"^[1-9][0-9]{5,20}$")
 _BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]$")
 _REGION_RE = re.compile(r"^[a-z]+-[a-z0-9]+[0-9]$")
 _NETWORK_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
+_SAFE_API_TOKEN_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
 _REVISION_RE = re.compile(r"^[a-zA-Z0-9_.-]{1,64}$")
 _PREFIX_RE = re.compile(r"^[a-zA-Z0-9_./-]{1,160}$")
 _INSTANCE_RE = re.compile(r"^[a-z][a-z0-9-]{0,96}[a-z0-9]$")
 _OPERATION_RE = re.compile(r"^[a-zA-Z0-9_.-]{1,200}$")
+_ARCHIVE_OBJECT_RE = re.compile(r"^[a-zA-Z0-9_./-]{1,1024}$")
 _PROXY_PORT = 5434
 _DATABASE_NAME = "blueprint"
 _DATABASE_USER = "postgres"
@@ -45,10 +47,32 @@ _REQUIRED_COLUMNS = {
 class DrillError(RuntimeError):
     """A deliberately non-sensitive drill failure."""
 
-    def __init__(self, stage: str, code: str):
+    def __init__(
+        self,
+        stage: str,
+        code: str,
+        *,
+        diagnostic: dict[str, Any] | None = None,
+    ):
         super().__init__(f"{stage}:{code}")
         self.stage = stage
         self.code = code
+        self.diagnostic = dict(diagnostic or {})
+
+
+class AdminApiError(DrillError):
+    """A non-sensitive Cloud SQL Admin API failure classification."""
+
+    def __init__(
+        self,
+        stage: str,
+        code: str,
+        *,
+        definitive_rejection: bool,
+        diagnostic: dict[str, Any] | None = None,
+    ):
+        super().__init__(stage, code, diagnostic=diagnostic)
+        self.definitive_rejection = definitive_rejection
 
 
 def _required(env: dict[str, str], name: str) -> str:
@@ -73,6 +97,15 @@ def _bounded_int(
 
 
 @dataclass(frozen=True)
+class ArchivePin:
+    name: str
+    generation: str
+    manifest_generation: str
+    sha256: str
+    size: int
+
+
+@dataclass(frozen=True)
 class Config:
     recovery_project_id: str
     recovery_project_number: str
@@ -80,6 +113,7 @@ class Config:
     bucket_name: str
     region: str
     private_network: str
+    private_service_range: str
     expected_revision: str
     archive_prefix: str
     evidence_prefix: str
@@ -88,6 +122,7 @@ class Config:
     operation_timeout_seconds: int
     proxy_start_timeout_seconds: int
     proxy_binary: str
+    expected_archive: ArchivePin | None
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "Config":
@@ -98,6 +133,7 @@ class Config:
         bucket = _required(values, "RECOVERY_BUCKET")
         region = _required(values, "RECOVERY_REGION")
         network = _required(values, "RECOVERY_PRIVATE_NETWORK")
+        private_service_range = _required(values, "RECOVERY_PRIVATE_SERVICE_RANGE")
         revision = _required(values, "EXPECTED_ALEMBIC_REVISION")
         archive_prefix = values.get(
             "RECOVERY_ARCHIVE_PREFIX", "local-postgres-exports/"
@@ -108,6 +144,15 @@ class Config:
         proxy_binary = values.get(
             "CLOUD_SQL_PROXY_BINARY", "/usr/local/bin/cloud-sql-proxy"
         ).strip()
+        expected_archive_values = {
+            "name": values.get("EXPECTED_ARCHIVE_NAME", "").strip(),
+            "generation": values.get("EXPECTED_ARCHIVE_GENERATION", "").strip(),
+            "manifest_generation": values.get(
+                "EXPECTED_MANIFEST_GENERATION", ""
+            ).strip(),
+            "sha256": values.get("EXPECTED_ARCHIVE_SHA256", "").strip(),
+            "size": values.get("EXPECTED_ARCHIVE_SIZE_BYTES", "").strip(),
+        }
 
         if (
             not _PROJECT_RE.fullmatch(recovery_project)
@@ -131,6 +176,8 @@ class Config:
             or not _NETWORK_NAME_RE.fullmatch(network_name)
         ):
             raise DrillError("configuration", "network_not_in_recovery_project")
+        if not _NETWORK_NAME_RE.fullmatch(private_service_range):
+            raise DrillError("configuration", "invalid_private_service_range")
         if not _REVISION_RE.fullmatch(revision):
             raise DrillError("configuration", "invalid_expected_revision")
         if (
@@ -142,6 +189,37 @@ class Config:
             raise DrillError("configuration", "invalid_storage_prefix")
         if not Path(proxy_binary).is_absolute():
             raise DrillError("configuration", "proxy_binary_not_absolute")
+        expected_archive: ArchivePin | None = None
+        if any(expected_archive_values.values()):
+            if not all(expected_archive_values.values()):
+                raise DrillError("configuration", "incomplete_expected_archive")
+            expected_name = expected_archive_values["name"]
+            if (
+                not _ARCHIVE_OBJECT_RE.fullmatch(expected_name)
+                or ".." in expected_name.split("/")
+                or not expected_name.startswith(archive_prefix)
+                or not expected_name.endswith(".sql.gz")
+            ):
+                raise DrillError("configuration", "invalid_expected_archive_name")
+            if (
+                not expected_archive_values["generation"].isdigit()
+                or not expected_archive_values["manifest_generation"].isdigit()
+                or not re.fullmatch(
+                    r"[0-9a-f]{64}", expected_archive_values["sha256"]
+                )
+                or not expected_archive_values["size"].isdigit()
+                or int(expected_archive_values["size"]) <= 0
+            ):
+                raise DrillError("configuration", "invalid_expected_archive")
+            expected_archive = ArchivePin(
+                name=expected_name,
+                generation=expected_archive_values["generation"],
+                manifest_generation=expected_archive_values[
+                    "manifest_generation"
+                ],
+                sha256=expected_archive_values["sha256"],
+                size=int(expected_archive_values["size"]),
+            )
 
         return cls(
             recovery_project_id=recovery_project,
@@ -150,6 +228,7 @@ class Config:
             bucket_name=bucket,
             region=region,
             private_network=f"/{normalized_network}",
+            private_service_range=private_service_range,
             expected_revision=revision,
             archive_prefix=archive_prefix,
             evidence_prefix=evidence_prefix,
@@ -180,6 +259,7 @@ class Config:
                 maximum=120,
             ),
             proxy_binary=proxy_binary,
+            expected_archive=expected_archive,
         )
 
 
@@ -211,7 +291,12 @@ class RecoveryStorage:
     def _bucket(self) -> Any:
         bucket = self._client.bucket(self._config.bucket_name)
         if not self._bucket_verified:
-            bucket.reload(timeout=60)
+            try:
+                bucket.reload(timeout=60)
+            except Exception as exc:
+                raise DrillError(
+                    "storage_scope", "bucket_metadata_unavailable"
+                ) from exc
             project_number = str(getattr(bucket, "project_number", "") or "")
             if project_number != self._config.recovery_project_number:
                 raise DrillError("storage_scope", "bucket_not_in_recovery_project")
@@ -227,7 +312,9 @@ class RecoveryStorage:
             created = created.replace(tzinfo=timezone.utc)
         return created.astimezone(timezone.utc)
 
-    def _archive_from_manifest(self, manifest_blob: Any) -> Archive | None:
+    def _archive_from_manifest(
+        self, manifest_blob: Any, expected: ArchivePin | None = None
+    ) -> Archive | None:
         name = str(getattr(manifest_blob, "name", "") or "")
         if not name.endswith(".sql.gz.manifest.json"):
             return None
@@ -239,6 +326,7 @@ class RecoveryStorage:
             payload = json.loads(manifest_blob.download_as_text(timeout=60))
         except Exception:
             return None
+        manifest_generation = str(getattr(manifest_blob, "generation", "") or "")
         archive_name = name.removesuffix(".manifest.json")
         expected_uri = f"gs://{self._config.bucket_name}/{archive_name}"
         if (
@@ -253,22 +341,34 @@ class RecoveryStorage:
             or not re.fullmatch(r"[0-9a-f]{64}", str(payload.get("sha256", "")))
             or not isinstance(payload.get("size_bytes"), int)
             or payload["size_bytes"] <= 0
+            or (
+                expected is not None
+                and (
+                    archive_name != expected.name
+                    or manifest_generation != expected.manifest_generation
+                    or payload["sha256"] != expected.sha256
+                    or payload["size_bytes"] != expected.size
+                )
+            )
         ):
             return None
         bucket = self._bucket()
-        archive_blob = bucket.blob(archive_name)
+        archive_blob = bucket.blob(
+            archive_name,
+            generation=(int(expected.generation) if expected is not None else None),
+        )
         try:
             archive_blob.reload(timeout=60)
         except Exception:
             return None
         generation = str(getattr(archive_blob, "generation", "") or "")
-        manifest_generation = str(getattr(manifest_blob, "generation", "") or "")
         created = self._created(archive_blob)
         if (
             not generation.isdigit()
             or not manifest_generation.isdigit()
             or created is None
             or int(getattr(archive_blob, "size", 0) or 0) != payload["size_bytes"]
+            or (expected is not None and generation != expected.generation)
         ):
             return None
         digest = hashlib.sha256()
@@ -299,25 +399,70 @@ class RecoveryStorage:
         )
 
     def latest_archive(self, now: datetime) -> Archive:
-        self._bucket()
-        candidates: list[Archive] = []
-        for blob in self._client.list_blobs(
-            self._config.bucket_name,
-            prefix=self._config.archive_prefix,
-            timeout=60,
-        ):
-            candidate = self._archive_from_manifest(blob)
-            if candidate is not None:
-                candidates.append(candidate)
-        if not candidates:
-            raise DrillError("archive_selection", "no_usable_archive")
-        archive = max(candidates, key=lambda item: item.created_at)
+        bucket = self._bucket()
+        expected = self._config.expected_archive
+        if expected is not None:
+            manifest_blob = bucket.blob(
+                f"{expected.name}.manifest.json",
+                generation=int(expected.manifest_generation),
+            )
+            try:
+                manifest_blob.reload(timeout=60)
+            except Exception as exc:
+                raise DrillError(
+                    "archive_selection", "expected_archive_not_found"
+                ) from exc
+            archive = self._archive_from_manifest(manifest_blob, expected)
+            if archive is None:
+                raise DrillError("archive_selection", "expected_archive_invalid")
+        else:
+            manifests = [
+                blob
+                for blob in self._client.list_blobs(
+                    self._config.bucket_name,
+                    prefix=self._config.archive_prefix,
+                    timeout=60,
+                )
+                if str(getattr(blob, "name", "") or "").endswith(
+                    ".sql.gz.manifest.json"
+                )
+            ]
+            manifests.sort(
+                key=lambda blob: (
+                    self._created(blob)
+                    or datetime.min.replace(tzinfo=timezone.utc),
+                    str(getattr(blob, "name", "") or ""),
+                ),
+                reverse=True,
+            )
+            archive = (
+                self._archive_from_manifest(manifests[0]) if manifests else None
+            )
+            if archive is None:
+                error_code = (
+                    "newest_archive_invalid" if manifests else "no_usable_archive"
+                )
+                raise DrillError("archive_selection", error_code)
         rpo_seconds = (now - archive.created_at).total_seconds()
         if rpo_seconds < -300:
             raise DrillError("archive_selection", "archive_timestamp_in_future")
         if rpo_seconds > self._config.max_rpo_seconds:
             raise DrillError("archive_selection", "archive_exceeds_rpo")
         return archive
+
+    def assert_import_generation_current(self, archive: Archive) -> None:
+        current = self._bucket().blob(archive.name)
+        try:
+            current.reload(timeout=60)
+        except Exception as exc:
+            raise DrillError(
+                "archive_import", "archive_current_generation_unavailable"
+            ) from exc
+        if (
+            str(getattr(current, "generation", "") or "") != archive.generation
+            or int(getattr(current, "size", 0) or 0) != archive.size
+        ):
+            raise DrillError("archive_import", "archive_generation_changed")
 
     def write_evidence(self, object_name: str, payload: dict[str, Any]) -> None:
         encoded = json.dumps(
@@ -375,17 +520,67 @@ class SqlAdminRest:
         params: dict[str, str] | None = None,
         allow_not_found: bool = False,
     ) -> dict[str, Any] | None:
-        response = self._session.request(
-            method,
-            f"{self._BASE}{path}",
-            json=body,
-            params=params,
-            timeout=self._request_timeout,
-        )
+        try:
+            response = self._session.request(
+                method,
+                f"{self._BASE}{path}",
+                json=body,
+                params=params,
+                timeout=self._request_timeout,
+            )
+        except Exception as exc:
+            raise AdminApiError(
+                stage,
+                "admin_api_transport_failed",
+                definitive_rejection=False,
+            ) from exc
         if allow_not_found and response.status_code == 404:
             return None
         if response.status_code < 200 or response.status_code >= 300:
-            raise DrillError(stage, "admin_api_request_failed")
+            status = int(response.status_code)
+            codes = {
+                400: "admin_api_bad_request",
+                401: "admin_api_unauthorized",
+                403: "admin_api_forbidden",
+                404: "admin_api_not_found",
+                409: "admin_api_conflict",
+                429: "admin_api_rate_limited",
+            }
+            code = codes.get(
+                status,
+                "admin_api_unavailable" if status >= 500 else "admin_api_request_failed",
+            )
+            diagnostic: dict[str, Any] = {"http_status": status}
+            try:
+                error_payload = response.json()
+            except (TypeError, ValueError):
+                error_payload = None
+            if isinstance(error_payload, dict):
+                error = error_payload.get("error")
+                if isinstance(error, dict):
+                    provider_status = error.get("status")
+                    errors = error.get("errors")
+                    provider_reason = (
+                        errors[0].get("reason")
+                        if isinstance(errors, list)
+                        and errors
+                        and isinstance(errors[0], dict)
+                        else None
+                    )
+                    for key, value in (
+                        ("provider_status", provider_status),
+                        ("provider_reason", provider_reason),
+                    ):
+                        if isinstance(value, str) and _SAFE_API_TOKEN_RE.fullmatch(value):
+                            diagnostic[key] = re.sub(
+                                r"(?<=[a-z0-9])(?=[A-Z])", "_", value
+                            ).replace("-", "_").upper()
+            raise AdminApiError(
+                stage,
+                code,
+                definitive_rejection=status in {400, 401, 403, 404, 409, 422},
+                diagnostic=diagnostic,
+            )
         if not response.content:
             return {}
         try:
@@ -445,6 +640,15 @@ class SqlAdminRest:
             f"/projects/{self.project_id}/instances/{name}",
             stage="instance_verify",
         ) or {}
+
+    def get_instance_if_exists(self, name: str) -> dict[str, Any] | None:
+        name = self._part(name, _INSTANCE_RE)
+        return self._request(
+            "GET",
+            f"/projects/{self.project_id}/instances/{name}",
+            stage="cleanup_reconcile",
+            allow_not_found=True,
+        )
 
     def create_database(self, instance: str, database: str) -> str:
         instance = self._part(instance, _INSTANCE_RE)
@@ -556,8 +760,8 @@ def _instance_body(config: Config, name: str, expires_at: datetime) -> dict[str,
             "ipConfiguration": {
                 "ipv4Enabled": False,
                 "privateNetwork": config.private_network,
+                "allocatedIpRange": config.private_service_range,
                 "authorizedNetworks": [],
-                "enablePrivatePathForGoogleCloudServices": True,
             },
             "userLabels": {
                 "blueprint-purpose": "restore-drill",
@@ -566,6 +770,26 @@ def _instance_body(config: Config, name: str, expires_at: datetime) -> dict[str,
             },
         },
     }
+
+
+def _is_owned_cleanup_target(
+    instance: dict[str, Any] | None,
+    config: Config,
+    name: str,
+    expires_at: datetime,
+) -> bool:
+    if not isinstance(instance, dict):
+        return False
+    settings = instance.get("settings")
+    labels = settings.get("userLabels") if isinstance(settings, dict) else None
+    return (
+        instance.get("project") == config.recovery_project_id
+        and instance.get("name") == name
+        and isinstance(labels, dict)
+        and labels.get("blueprint-purpose") == "restore-drill"
+        and labels.get("blueprint-drill") == name.removeprefix("bp-restore-")
+        and labels.get("expires-epoch") == str(int(expires_at.timestamp()))
+    )
 
 
 def _reconcile_drill_instances(
@@ -854,7 +1078,7 @@ def run_drill(config: Config, runtime: Runtime) -> tuple[int, dict[str, Any]]:
         },
     }
     archive: Archive | None = None
-    instance_requested = False
+    instance_request_state = "not_requested"
     proxy = None
     password = ""
     failure: DrillError | None = None
@@ -870,18 +1094,29 @@ def run_drill(config: Config, runtime: Runtime) -> tuple[int, dict[str, Any]]:
         evidence["archive"] = {
             "id": archive.archive_id,
             "created_at": archive.created_at.isoformat(),
+            "manifest_generation": archive.manifest_generation,
+            "sha256": archive.sha256,
             "size_bytes": archive.size,
             "rpo_seconds": rpo_seconds,
+            "selection": (
+                "expected" if config.expected_archive is not None else "newest_usable"
+            ),
         }
 
         evidence["stage"] = "instance_create"
         # Record cleanup intent before the create request: an ambiguous API
         # response can still mean the instance was created server-side.
-        instance_requested = True
+        instance_request_state = "ambiguous"
         evidence["cleanup"]["intent_recorded"] = True
-        operation = runtime.sql.create_instance(
-            drill_id, _instance_body(config, drill_id, expires_at)
-        )
+        try:
+            operation = runtime.sql.create_instance(
+                drill_id, _instance_body(config, drill_id, expires_at)
+            )
+            instance_request_state = "accepted"
+        except AdminApiError as exc:
+            if exc.definitive_rejection:
+                instance_request_state = "rejected"
+            raise
         _wait_operation(runtime, config, operation, stage="instance_create")
 
         evidence["stage"] = "instance_verify"
@@ -901,8 +1136,11 @@ def run_drill(config: Config, runtime: Runtime) -> tuple[int, dict[str, Any]]:
         _wait_operation(runtime, config, operation, stage="database_user")
 
         evidence["stage"] = "archive_import"
+        runtime.storage.assert_import_generation_current(archive)
         operation = runtime.sql.import_archive(drill_id, archive.uri)
         _wait_operation(runtime, config, operation, stage="archive_import")
+        runtime.storage.assert_import_generation_current(archive)
+        evidence["archive"]["generation_stable_during_import"] = True
 
         evidence["stage"] = "proxy_start"
         proxy, _proxy_command = _start_proxy(runtime, config, connection_name)
@@ -947,47 +1185,89 @@ def run_drill(config: Config, runtime: Runtime) -> tuple[int, dict[str, Any]]:
                 "completed": False,
                 "failure_code": proxy_cleanup_failure.code,
             }
-        if instance_requested:
-            evidence["cleanup"]["attempted"] = True
-            try:
-                delete_operation = runtime.sql.delete_instance(drill_id)
-                if delete_operation:
-                    _wait_operation(
-                        runtime, config, delete_operation, stage="cleanup"
+        if instance_request_state == "rejected":
+            evidence["cleanup"].update({"completed": True, "not_required": True})
+        elif instance_request_state in {"ambiguous", "accepted"}:
+            cleanup_target_confirmed = instance_request_state == "accepted"
+            if instance_request_state == "ambiguous":
+                evidence["cleanup"]["ownership_check_attempted"] = True
+                try:
+                    cleanup_target_confirmed = _is_owned_cleanup_target(
+                        runtime.sql.get_instance_if_exists(drill_id),
+                        config,
+                        drill_id,
+                        expires_at,
                     )
-                evidence["cleanup"]["completed"] = True
-            except Exception:
-                cleanup_failure = DrillError("cleanup", "instance_cleanup_failed")
-                evidence["cleanup"]["failure_code"] = cleanup_failure.code
-                if failure is None:
-                    failure = cleanup_failure
-                evidence["outcome"] = "failure"
-                evidence["stage"] = cleanup_failure.stage
-                evidence["failure_code"] = cleanup_failure.code
+                    evidence["cleanup"]["ownership_check_completed"] = True
+                except Exception:
+                    cleanup_target_confirmed = False
+                    evidence["cleanup"]["ownership_check_completed"] = False
+                    evidence["cleanup"][
+                        "ownership_check_failure_code"
+                    ] = "cleanup_reconcile_failed"
+                if not cleanup_target_confirmed:
+                    evidence["cleanup"]["deferred_to_janitor"] = True
+            if not cleanup_target_confirmed:
+                evidence["cleanup"]["completed"] = False
+            else:
+                evidence["cleanup"]["attempted"] = True
+                try:
+                    delete_operation = runtime.sql.delete_instance(drill_id)
+                    if delete_operation:
+                        _wait_operation(
+                            runtime, config, delete_operation, stage="cleanup"
+                        )
+                    evidence["cleanup"]["completed"] = True
+                except Exception:
+                    cleanup_failure = DrillError("cleanup", "instance_cleanup_failed")
+                    evidence["cleanup"]["failure_code"] = cleanup_failure.code
+                    if failure is None:
+                        failure = cleanup_failure
+                    evidence["outcome"] = "failure"
+                    evidence["stage"] = cleanup_failure.stage
+                    evidence["failure_code"] = cleanup_failure.code
 
     if failure is not None:
         evidence["outcome"] = "failure"
         evidence["stage"] = failure.stage
         evidence["failure_code"] = failure.code
+        if failure.diagnostic:
+            evidence["failure_diagnostic"] = failure.diagnostic
         evidence.pop("observed_revision", None)
     evidence["finished_at"] = runtime.now().astimezone(timezone.utc).isoformat()
     object_name = _safe_evidence_name(config, started_at, drill_id)
     evidence["evidence_object"] = f"gs://{config.bucket_name}/{object_name}"
 
     storage_written = False
+    evidence["evidence_write"] = {"completed": True}
     try:
         runtime.storage.write_evidence(object_name, evidence)
         storage_written = True
     except Exception:
-        evidence["outcome"] = "failure"
-        evidence["stage"] = "evidence_write"
-        evidence["failure_code"] = "evidence_bucket_write_failed"
+        evidence["evidence_write"] = {
+            "completed": False,
+            "failure_code": "evidence_bucket_write_failed",
+        }
+        # Preserve the causal failure when the drill had already failed. A
+        # secondary evidence-channel failure must not erase the only useful
+        # diagnosis. Evidence persistence remains a top-level failure when the
+        # restore itself otherwise succeeded.
+        if evidence["outcome"] == "success":
+            evidence["outcome"] = "failure"
+            evidence["stage"] = "evidence_write"
+            evidence["failure_code"] = "evidence_bucket_write_failed"
+    evidence["logging_write"] = {"completed": True}
     try:
         runtime.logger.write(evidence)
     except Exception:
-        evidence["outcome"] = "failure"
-        evidence["stage"] = "evidence_write"
-        evidence["failure_code"] = "evidence_logging_write_failed"
+        evidence["logging_write"] = {
+            "completed": False,
+            "failure_code": "evidence_logging_write_failed",
+        }
+        if evidence["outcome"] == "success":
+            evidence["outcome"] = "failure"
+            evidence["stage"] = "evidence_write"
+            evidence["failure_code"] = "evidence_logging_write_failed"
         if storage_written:
             failure_object = object_name.removesuffix(".json") + "-failure.json"
             evidence["evidence_failure_object"] = (

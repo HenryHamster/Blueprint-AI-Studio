@@ -44,7 +44,6 @@ from app.claim_analytics import stamp_warm_claim_timing
 from app.database import get_session, resolve_dialect_name
 from app.discovery_admission import (
     authorize_discovery_task_execution,
-    discovery_admission_mode_from_runtime,
 )
 from app.models import Task, TaskStatus, _utcnow
 from app.routers.agent import verify_agent_token
@@ -591,6 +590,47 @@ async def _finalize_warm_claim(
     same account because refresh tokens rotate independently of account identity.
     The field remains additive for older agents that ignore it.
     """
+    # Candidate selectors arrive holding the Task row. PR work has a stricter
+    # repo/PR -> Task order shared with merge publication, so release the
+    # selector lock and reacquire it through the centralized execution fence
+    # before doing account selection, workspace handoff, or token minting.
+    from app.review_claim_fence import (
+        _pr_task_identity,
+        lock_pr_task_for_execution,
+    )
+
+    if _pr_task_identity(task) is not None:
+        warm_task_id = task.id
+        await session.commit()
+        pr_fence = await lock_pr_task_for_execution(
+            session,
+            task_id=warm_task_id,
+            claimable_statuses=(TaskStatus.QUEUED,),
+        )
+        if not pr_fence.allowed or pr_fence.task is None:
+            from app.warm_pool import release_pool_vm
+
+            fenced_task = pr_fence.task
+            if fenced_task is not None:
+                clear_warm_dispatch_pin(fenced_task)
+                session.add(fenced_task)
+            await release_pool_vm(
+                session,
+                vm_instance_id,
+                owning_task_id=warm_task_id,
+            )
+            await session.commit()
+            logger.warning(
+                "[NEXT-ROLE][pr-execution-fence] Declining warm claim (%s) "
+                "for task %s on vm %s: %s",
+                origin,
+                warm_task_id,
+                vm_instance_id,
+                pr_fence.reason or "task no longer claimable",
+            )
+            return Response(status_code=204)
+        task = pr_fence.task
+
     # Execution-authority fence (shared with cold dispatch): re-grade this locked
     # QUEUED task's capability-proof requirements against the live gate mode +
     # platform ledger BEFORE it flips to IN_PROGRESS, acquires an account, or
@@ -629,7 +669,6 @@ async def _finalize_warm_claim(
     _discovery_authority = await authorize_discovery_task_execution(
         session,
         task=task,
-        mode=discovery_admission_mode_from_runtime(_shared_state.runtime_config),
     )
     if not _discovery_authority.allowed:
         from app.warm_pool import release_pool_vm
@@ -662,12 +701,6 @@ async def _finalize_warm_claim(
             " (cancelled)" if _discovery_authority.terminal_denial else "",
         )
         return Response(status_code=204)
-    if _discovery_authority.shadow_violation:
-        logger.warning(
-            "[NEXT-ROLE][discovery-admission-shadow] Task %s would be denied: %s",
-            task.id,
-            _discovery_authority.reason,
-        )
     from app.compute import VM_PROVISIONING_MODEL
 
     task.vm_instance_id = vm_instance_id

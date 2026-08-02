@@ -238,13 +238,6 @@
       "audience": "operator-fyi"
     },
     {
-      "name": "release_auto_merge_stalled",
-      "classification": "high_signal",
-      "message_type": "NOTE",
-      "source_fn": "post_version_auto_merge_stall_message",
-      "audience": "operator-fyi"
-    },
-    {
       "name": "strategic_steering_deferred",
       "classification": "high_signal",
       "message_type": "NOTE",

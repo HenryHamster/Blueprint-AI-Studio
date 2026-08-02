@@ -20,7 +20,8 @@ The block:
 ``_handle_ci_waiting_backstop`` returns ``True`` when it handled the row (the
 caller ``continue``s) or ``False`` to fall through to the remaining recovery
 branches unchanged (CI-wait conditions not met). The move is purely structural —
-every commit / notification / classification semantic is preserved byte-for-byte.
+commit / notification ordering remains unchanged; review-gate authority is shared
+with ``ci_merge_helpers`` so legacy verdict mirrors cannot suppress recovery.
 ``services.*`` refs and function-local deferred imports are kept unchanged so
 test patches against ``app.services.<name>``, ``app.orchestrator.*``,
 ``app.failure_classification.*``, ``app.routers.agent_status.*``, etc. still
@@ -32,6 +33,7 @@ import logging
 from datetime import datetime
 
 from app import services
+from app.ci_merge_helpers import _review_approved as _review_gate_is_approved
 from app.models import Task, TaskStatus
 from app.recovery_evaluating_helpers import (
     _chain_has_recoverable_failed_work,
@@ -119,9 +121,7 @@ async def _handle_ci_waiting_backstop(
     # fallback for cases where review status hasn't become
     # terminal yet.
     rl_ci_passed = bool(rl.get("ci_passed"))
-    rl_review_approved = (
-        bool(rl.get("review_approved")) or rl.get("verdict") == "APPROVE"
-    )
+    rl_review_approved = _review_gate_is_approved(rl)
     rl_recovery_attempted = bool(rl.get("review_recovery_attempted"))
     early_recovery_eligible = False
     if rl_ci_passed and not rl_review_approved and not rl_recovery_attempted:
@@ -240,7 +240,7 @@ async def _handle_ci_waiting_backstop(
 
     hours = round(elapsed / 3600, 1)
     ci_passed = bool(rl.get("ci_passed"))
-    review_approved = bool(rl.get("review_approved")) or rl.get("verdict") == "APPROVE"
+    review_approved = _review_gate_is_approved(rl)
     recovery_attempted = bool(rl.get("review_recovery_attempted"))
     review_summary = await _summarize_latest_review_for_chain(task, session)
 

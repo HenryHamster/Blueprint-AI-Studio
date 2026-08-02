@@ -27,6 +27,21 @@ Required environment:
 - `RECOVERY_PRIVATE_NETWORK`, in the recovery project
 - `EXPECTED_ALEMBIC_REVISION`
 
+For a one-shot pre-cutover drill, all five of these must be supplied together:
+
+- `EXPECTED_ARCHIVE_NAME`
+- `EXPECTED_ARCHIVE_GENERATION`
+- `EXPECTED_MANIFEST_GENERATION`
+- `EXPECTED_ARCHIVE_SHA256`
+- `EXPECTED_ARCHIVE_SIZE_BYTES`
+
+That mode directly loads and verifies the named immutable object generations;
+it never substitutes a newer archive. Immediately before and after Cloud SQL's
+unversioned import operation, the verifier also requires that pinned generation
+to remain the current retained object, so any privileged replacement makes the
+drill fail. Scheduled runs omit all five values, hash only the newest completion
+manifest, and fail rather than mask a corrupt newest backup.
+
 Optional bounded settings:
 
 - `MAX_RPO_HOURS` (default 24, maximum 168)
@@ -46,6 +61,17 @@ permission in the production project.
 
 The Job must have direct access to the recovery VPC used for Cloud SQL private
 services access. No public IPv4 address or authorized network is created. The
+Terraform deployment routes all container egress through that VPC without NAT
+and allows only metadata/DNS, restricted Google APIs, and the private Cloud SQL
+proxy port. The image is accepted only from the dedicated recovery-project
+repository by digest; its base image and Python dependency graph are also
+content-pinned. The
 database password is generated in memory, passed only through HTTPS to the
 Admin API and the in-process database driver, cleared before evidence writing,
 and never placed in a process command or log.
+
+After intentionally changing `requirements.txt`, regenerate
+`requirements.lock` for Python 3.12 Linux amd64 with `uv pip compile
+requirements.txt --generate-hashes --python-version 3.12 --python-platform
+x86_64-manylinux_2_28 --no-header --output-file requirements.lock`, then rebuild
+and deploy the resulting image only by repository digest.

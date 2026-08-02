@@ -42,7 +42,6 @@ const ALL_QUAL_STATE_VALUES: QualificationStateValue[] = [
   'promotion_confirmation_timed_out',
   'promotion_deploy_failed',
   'promotion_failed',
-  'promotion_in_flight',
   'protection_blocked_review',
   'qualifying',
   'required_check_failed',

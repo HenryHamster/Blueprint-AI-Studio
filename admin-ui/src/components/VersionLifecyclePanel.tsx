@@ -201,32 +201,20 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
   const readiness = data.promotion_readiness;
   const policySource = data.promotion_policy_source ?? null;
   const policyError = data.promotion_policy_error ?? null;
-  // A promotion in flight (audit passed, promotion PR open and auto-merging)
-  // makes the qualify + phase-flip levers unsafe: re-qualifying clobbers the
-  // promotion-pending record and a phase flip clears the in-flight indication
-  // without cancelling anything. The backend refuses both with a 409; disable
-  // the controls here so the panel presents the same truth, consistent with how
-  // the cut lever already surfaces this state.
-  const promotionInFlight = cv?.qualification_state?.state === 'promotion_in_flight';
-  // Managed migration-carrying promotion PR waiting on required checks. It is
-  // ALSO a promotion-blocking state (the backend refuses qualify / phase-flip /
-  // cut on it), but its copy must be distinct from native auto-merge: Blueprint
-  // is waiting for required checks and retries the merge automatically.
+  // Blueprint keeps authority over every pending promotion PR while required
+  // checks settle, then revalidates the exact base/head target before merging.
+  // Re-qualifying or flipping phase would clobber that durable wait record, so
+  // the backend rejects those actions and the UI locks them pre-emptively.
   const promotionCheckWait = cv?.qualification_state?.state === 'promotion_check_wait';
-  // Either promotion hold locks the qualify + phase-flip levers.
-  const promotionLocked = promotionInFlight || promotionCheckWait;
+  const promotionLocked = promotionCheckWait;
   const promotionFreshness = formatPromotionFreshnessContext(cv?.qualification_state);
   const promotionLockContext = promotionFreshness ? ` (${promotionFreshness.detailText})` : '';
   const phaseLockTitle = promotionCheckWait
-    ? `A migration-carrying promotion PR is open and waiting for required checks${promotionLockContext} — Blueprint retries the merge automatically; wait for it to land or cancel it before changing the phase`
-    : promotionInFlight
-      ? `A promotion PR is open and auto-merging${promotionLockContext} — wait for it to land or cancel it before changing the phase`
-      : undefined;
+    ? `A promotion PR is open in Blueprint's exact-head check wait${promotionLockContext} — Blueprint will merge only the revalidated checked head; wait for it to land or cancel it before changing the phase`
+    : undefined;
   const qualifyLockTitle = promotionCheckWait
-    ? `A migration-carrying promotion PR is open and waiting for required checks${promotionLockContext} — Blueprint retries the merge automatically; wait for it to land or cancel it before re-qualifying`
-    : promotionInFlight
-      ? `A promotion PR is open and auto-merging${promotionLockContext} — wait for it to land or cancel it before re-qualifying`
-      : undefined;
+    ? `A promotion PR is open in Blueprint's exact-head check wait${promotionLockContext} — Blueprint will merge only the revalidated checked head; wait for it to land or cancel it before re-qualifying`
+    : undefined;
   const auditEvidenceState = cv?.audit_evidence_state ?? (cv?.latest_audit ? 'current' : 'none');
   // Admin-only lever: a promoted version latched to deploy_failed (current open
   // version after promotion, or a recent promoted one) can be cleared once the
@@ -370,11 +358,8 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
       inFlight > 0
         ? `${inFlight} in-flight task${inFlight !== 1 ? 's' : ''} will keep running against the new version`
         : null,
-      qualState?.state === 'promotion_in_flight'
-        ? `promotion PR${qualState.promotion_pr_number ? ` #${qualState.promotion_pr_number}` : ''} is open and auto-merging${cutPromotionFreshness ? ` (${cutPromotionFreshness.detailText})` : ''}`
-        : null,
       qualState?.state === 'promotion_check_wait'
-        ? `migration-carrying promotion PR${qualState.promotion_pr_number ? ` #${qualState.promotion_pr_number}` : ''} is open and waiting for required checks${cutPromotionFreshness ? ` (${cutPromotionFreshness.detailText})` : ''} (Blueprint retries automatically)`
+        ? `promotion PR${qualState.promotion_pr_number ? ` #${qualState.promotion_pr_number}` : ''} is open in Blueprint's exact-head check wait${cutPromotionFreshness ? ` (${cutPromotionFreshness.detailText})` : ''} (only the revalidated checked head can merge)`
         : null,
     ].filter(Boolean);
     const msg = consequences.length
@@ -765,20 +750,12 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                     </span>
                   )}
                 </div>
-                {cv.qualification_state.state === 'promotion_in_flight' && promotionFreshness && (
-                  <p
-                    data-testid="promotion-in-flight-freshness"
-                    className={`text-ui-sm ${promotionFreshness.toneClassName}`}
-                  >
-                    Promotion PR{cv.qualification_state.promotion_pr_number ? ` #${cv.qualification_state.promotion_pr_number}` : ''} open & auto-merging ({promotionFreshness.detailText})
-                  </p>
-                )}
                 {cv.qualification_state.state === 'promotion_check_wait' && (
                   <p
                     data-testid="promotion-check-wait-freshness"
                     className={`text-ui-sm ${promotionFreshness?.toneClassName ?? 'text-blue-400'}`}
                   >
-                    Migration-carrying promotion PR{cv.qualification_state.promotion_pr_number ? ` #${cv.qualification_state.promotion_pr_number}` : ''} waiting for required checks{promotionFreshness ? ` (${promotionFreshness.detailText})` : ''} — Blueprint retries the merge automatically
+                    Promotion PR{cv.qualification_state.promotion_pr_number ? ` #${cv.qualification_state.promotion_pr_number}` : ''} in Blueprint&apos;s exact-head check wait{promotionFreshness ? ` (${promotionFreshness.detailText})` : ''} — only the revalidated checked head can merge
                   </p>
                 )}
                 {cv.qualification_state.state === 'promotion_check_wait' && (
@@ -1087,20 +1064,12 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                     {actionLoading === 'qualify' ? '…' : 'Run Qualify'}
                   </button>
                 )}
-                {promotionInFlight && (
-                  <span
-                    data-testid="promotion-in-flight-note"
-                    className={`text-ui-sm italic ${promotionFreshness?.toneClassName ?? 'text-emerald-300'}`}
-                  >
-                    Promotion PR{cv.qualification_state?.promotion_pr_number ? ` #${cv.qualification_state.promotion_pr_number}` : ''} open & auto-merging{promotionLockContext} — qualify & phase locked until it lands or is canceled
-                  </span>
-                )}
                 {promotionCheckWait && (
                   <span
                     data-testid="promotion-check-wait-note"
                     className={`text-ui-sm italic ${promotionFreshness?.toneClassName ?? 'text-blue-300'}`}
                   >
-                    Migration-carrying promotion PR{cv.qualification_state?.promotion_pr_number ? ` #${cv.qualification_state.promotion_pr_number}` : ''} open — waiting for required checks{promotionLockContext}; Blueprint retries the merge automatically. Qualify &amp; phase locked until it lands or is canceled — no fresh qualification needed.
+                    Promotion PR{cv.qualification_state?.promotion_pr_number ? ` #${cv.qualification_state.promotion_pr_number}` : ''} open in Blueprint&apos;s exact-head check wait{promotionLockContext}; Blueprint revalidates the target and merges only the checked head after required checks pass. Qualify &amp; phase locked until it lands or is canceled — no fresh qualification needed.
                   </span>
                 )}
                 {cuttingVersion ? (

@@ -1,50 +1,35 @@
-"""Pure, synchronous issue-ledger derivation for the review→fix loop.
+"""Authoritative blocker ledger for the review -> fix loop.
 
-Side-effect-free: no DB, no async, no logging side-effects. Takes
-review_history (the list of dicts with keys verdict / issues / iteration /
-feedback / changed_files assembled by _spawn_pipeline_task) and returns a
-structured ledger classifying per-region state as DEMANDED, APPLIED,
-RE_DEMANDED, or CONTESTED.
+The ledger is intentionally small in concept: every CRITICAL/MAJOR finding is
+open until a later exact-head review proves a fix, or an explicit reviewer or
+operator disposition refutes/adjudicates it. Omission on an unchanged or
+unproven head is never closure.
 
-The CONTESTED state is the reversal shape: a region was demanded, the fix
-complied (region absent from the next review), then a later review demands
-something *different* on the same region. This is the oscillation mode the
-existing stuck-cycle / standoff / churn detectors miss because they count
-textual repetition, not contradiction.
-
-Incident motivating this module (PR #9244 / task 7f5e1f0a): across 9 stateless
-reviews, one region (a frozenset in task_evaluators.py) was demanded changed one
-way (iter 4: "replace old constants"), the fix complied exactly, then a later
-review (iter 9) demanded the exact reversal ("add them back"). Each verdict was
-locally defensible; the existing detectors count textual repetition, not
-contradiction, so oscillation read as progress until the global cap killed the
-chain.
-
-Re-exported from app.review_pipeline so existing callers keep working.
+This module replaces the older contested-region/Jaccard state machine. That
+second inference layer guessed that omission meant a fix and could therefore
+contradict the binding open set. Region similarity remains only as a
+conservative way to carry one blocker identity across reviewer paraphrases.
 """
 
+import hashlib
 import re
+from typing import Any
 
-# Regex for tokenizing descriptions — same surface as review_heuristics._FEEDBACK_TOKEN_RE.
+from app.context_bounds import REVIEW_HISTORY_MAX_ENTRIES
+from app.issue_ledger_state import (
+    ISSUE_LEDGER_MAX_RESOLVED,
+    ISSUE_LEDGER_SCHEMA_VERSION,
+    _history_entry_key,
+    _seed_open_record,
+    issue_ledger_complete_for_history,
+    normalize_issue_ledger,
+)
+
+
 _FEEDBACK_TOKEN_RE = re.compile(r"[a-z0-9_]+")
-
-# Jaccard similarity boundary between RE_DEMANDED (high — same concern resurfaced)
-# and CONTESTED (low — different demand on the same region, the reversal shape).
-# A previously-applied region reappearing with ≥ this similarity to the original
-# demand is RE_DEMANDED (feeds existing stuck machinery).  Below this → CONTESTED.
-CONTESTED_JACCARD_THRESHOLD = 0.5
-
-# Maximum contested regions serialized into review_loop["issue_ledger"].
-ISSUE_LEDGER_MAX_CONTESTED = 10
-
-# Line-window block size. Two issues on lines X and Y in the same file are treated
-# as the same region when floor(X / LINE_WINDOW_BLOCK) == floor(Y / LINE_WINDOW_BLOCK),
-# giving ±LINE_WINDOW_BLOCK/2 tolerance centred on the block boundary.
+ISSUE_MATCH_JACCARD_THRESHOLD = 0.5
 LINE_WINDOW_BLOCK = 40
-
-
-# ── Token-level Jaccard ────────────────────────────────────────────────────────
-
+ISSUE_RESOLUTION_DISPOSITIONS = frozenset({"fixed", "refuted", "adjudicated"})
 
 def _token_set(text: str) -> set[str]:
     return {t for t in _FEEDBACK_TOKEN_RE.findall(text.lower()) if len(t) >= 3}
@@ -58,256 +43,439 @@ def _jaccard(a: str, b: str) -> float:
     return len(ta & tb) / len(ta | tb)
 
 
-# ── Region fingerprint ─────────────────────────────────────────────────────────
-
-
 def _region_anchor(issue: dict) -> str:
-    """Derive the anchor component of a region fingerprint.
-
-    Preference: symbol > line-window > empty string.  Symbol takes priority
-    because it is stable across edits (a line number shifts when code is
-    inserted/removed above it, but the function name does not).
-    """
+    """Return a stable symbol anchor, then a coarse line-window fallback."""
     symbol = (issue.get("symbol") or "").strip()
     if symbol:
         return f"sym:{symbol}"
     line = issue.get("line")
     if line is not None:
         try:
-            block = int(line) // LINE_WINDOW_BLOCK
-            return f"win:{block}"
+            return f"win:{int(line) // LINE_WINDOW_BLOCK}"
         except (TypeError, ValueError):
             pass
     return ""
 
 
 def _region_key(issue: dict) -> tuple[str, str] | None:
-    """Return (file, anchor) or None when the issue has no file."""
     file_path = (issue.get("file") or "").strip()
     if not file_path:
         return None
     return (file_path, _region_anchor(issue))
 
 
-# ── Ledger builder ─────────────────────────────────────────────────────────────
+def _entry_head_sha(entry: dict) -> str:
+    """Return the immutable PR head a review entry actually examined."""
+    return str(entry.get("reviewed_head_sha") or entry.get("head_sha") or "").strip()
 
 
-def build_issue_ledger(review_history: list) -> dict:
-    """Derive per-region state from review_history and return a ledger dict.
+def _entry_base_sha(entry: dict) -> str:
+    return str(entry.get("reviewed_base_sha") or entry.get("base_sha") or "").strip()
 
-    Returns:
-      {
-        "contested": [
-          {
-            "file": str,
-            "anchor": str,            # "sym:X", "win:N", or ""
-            "demanded_iteration": int,
-            "demanded_description": str,   # description from the APPLIED demand
-            "reappeared_iteration": int,
-            "reappeared_description": str, # description of the contradicting demand
-          },
-          ...
-        ],   # at most ISSUE_LEDGER_MAX_CONTESTED, in discovery order
-        "total_regions": int,          # unique region keys seen across history
-      }
 
-    State machine per region key = (file, anchor):
-      NOT_SEEN
-        → DEMANDED  when issue appears in a REQUEST_CHANGES entry
-      DEMANDED
-        → APPLIED   when region is absent from the next REQUEST_CHANGES entry
-                    (or when an APPROVE entry is seen — the whole batch passed)
-      APPLIED
-        → CONTESTED if the region reappears with Jaccard(applied_desc, new_desc)
-                    < CONTESTED_JACCARD_THRESHOLD   [the reversal shape]
-        → RE_DEMANDED otherwise (same concern resurfaced; feeds stuck machinery)
+def _issue_fingerprint(
+    issue: dict,
+    *,
+    reviewed_head_sha: str = "",
+    iteration: int = 0,
+    ordinal: int = 0,
+) -> str:
+    """Return a deterministic ``BP-<sha256 prefix>`` identity for a finding."""
+    region = _region_key(issue)
+    region_text = "|".join(region) if region is not None else "global"
+    description = " ".join(sorted(_token_set(str(issue.get("description") or ""))))
+    seed = (
+        f"{reviewed_head_sha}|{iteration}|{ordinal}|{region_text}|"
+        f"{str(issue.get('severity') or '').upper()}|{description}"
+    )
+    return f"BP-{hashlib.sha256(seed.encode('utf-8')).hexdigest()[:12]}"
 
-    Only CRITICAL and MAJOR issues are tracked, consistent with stuck-cycle
-    and churn detection elsewhere.
 
-    Description text is a tiebreaker only: when multiple issues in the same
-    entry map to the same (file, anchor), the one whose description has the
-    highest Jaccard similarity to the prior demand is kept.
+def ensure_issue_ids(
+    issues: list | None,
+    *,
+    reviewed_head_sha: str = "",
+    iteration: int = 0,
+) -> list[dict]:
+    """Copy structured issues and fill a deterministic ID when absent.
+
+    Existing IDs are preserved for lossless propagation between lifecycle
+    seams.  Only :func:`build_issue_ledger` decides whether an incoming ID is a
+    compatible reference to an open blocker; it assigns backend-owned IDs to
+    every genuinely new finding.
     """
-    # {key: {"state": "DEMANDED"|"APPLIED", "demanded_iteration": int,
-    #        "demanded_description": str}}
-    state: dict[tuple, dict] = {}
-    contested: list[dict] = []
-    all_region_keys: set[tuple] = set()
-
-    for entry in review_history or []:
-        if not isinstance(entry, dict):
+    normalized: list[dict] = []
+    for ordinal, raw in enumerate(issues or []):
+        if not isinstance(raw, dict):
             continue
-        verdict = (entry.get("verdict") or "").upper()
-        iteration = int(entry.get("iteration") or 0)
-        issues = entry.get("issues") or []
-
-        if verdict == "APPROVE":
-            # All currently DEMANDED regions were addressed — mark APPLIED.
-            for key in list(state):
-                if state[key]["state"] == "DEMANDED":
-                    state[key] = dict(state[key])
-                    state[key]["state"] = "APPLIED"
-            continue
-
-        if verdict != "REQUEST_CHANGES":
-            # Fix tasks, verify_tests, or entries without a verdict — skip.
-            continue
-
-        # ── Collect this entry's CRITICAL/MAJOR regions ───────────────────
-        current_regions: dict[tuple, dict] = {}
-        for issue in issues:
-            if not isinstance(issue, dict):
-                continue
-            if (issue.get("severity") or "").upper() not in ("CRITICAL", "MAJOR"):
-                continue
-            key = _region_key(issue)
-            if key is None:
-                continue
-            desc = (issue.get("description") or "").strip()
-            if not desc:
-                continue
-            all_region_keys.add(key)
-            if key not in current_regions:
-                current_regions[key] = {"iteration": iteration, "description": desc}
-            else:
-                # Tiebreaker: keep the description with higher Jaccard to prior demand.
-                if key in state:
-                    prior_desc = state[key].get("demanded_description", "")
-                    existing = current_regions[key]["description"]
-                    if _jaccard(desc, prior_desc) > _jaccard(existing, prior_desc):
-                        current_regions[key] = {"iteration": iteration, "description": desc}
-
-        # ── State transitions ─────────────────────────────────────────────
-        # Snapshot current state before mutating (avoid dict-change-during-iter).
-        prev_state_snapshot = {k: dict(v) for k, v in state.items()}
-
-        # DEMANDED → APPLIED: region was demanded but absent from this entry.
-        for key, info in prev_state_snapshot.items():
-            if info["state"] == "DEMANDED" and key not in current_regions:
-                state[key]["state"] = "APPLIED"
-
-        # APPLIED → RE_DEMANDED or CONTESTED: previously applied, now reappears.
-        for key, info in prev_state_snapshot.items():
-            if info["state"] == "APPLIED" and key in current_regions:
-                applied_desc = info.get("demanded_description", "")
-                new_desc = current_regions[key]["description"]
-                similarity = _jaccard(applied_desc, new_desc)
-                if (
-                    similarity < CONTESTED_JACCARD_THRESHOLD
-                    and len(contested) < ISSUE_LEDGER_MAX_CONTESTED
-                ):
-                    contested.append(
-                        {
-                            "file": key[0],
-                            "anchor": key[1],
-                            "demanded_iteration": info.get("demanded_iteration", 0),
-                            "demanded_description": applied_desc,
-                            "reappeared_iteration": iteration,
-                            "reappeared_description": new_desc,
-                        }
-                    )
-                # Transition to DEMANDED regardless (both RE_DEMANDED and CONTESTED
-                # are re-demands; distinction is only for prompt context).
-                state[key] = {
-                    "state": "DEMANDED",
-                    "demanded_iteration": iteration,
-                    "demanded_description": new_desc,
-                }
-
-        # Update/add DEMANDED regions from current entry.
-        for key, info in current_regions.items():
-            all_region_keys.add(key)
-            if key in state and state[key]["state"] == "DEMANDED":
-                state[key]["demanded_description"] = info["description"]
-                state[key]["demanded_iteration"] = iteration
-            elif key not in state:
-                state[key] = {
-                    "state": "DEMANDED",
-                    "demanded_iteration": iteration,
-                    "demanded_description": info["description"],
-                }
-            # APPLIED regions reappearing are handled in the transition loop above.
-
-    return {
-        "contested": contested[:ISSUE_LEDGER_MAX_CONTESTED],
-        "total_regions": len(all_region_keys),
-    }
+        issue = dict(raw)
+        issue_id = str(issue.get("issue_id") or "").strip()
+        issue["issue_id"] = issue_id or _issue_fingerprint(
+            issue,
+            reviewed_head_sha=reviewed_head_sha,
+            iteration=iteration,
+            ordinal=ordinal,
+        )
+        normalized.append(issue)
+    return normalized
 
 
-# ── Prompt injection helpers ───────────────────────────────────────────────────
-
-_CONTESTED_FIX_PREFIX_HEADER = (
-    "⚠️ CONTESTED REGIONS DETECTED: The following code regions were demanded "
-    "by a prior review, addressed by the fix (verified absent from a later "
-    "review), and then demanded in a DIFFERENT direction by a subsequent review. "
-    "Both demands are valid constraints — you must implement the UNION of both, "
-    "satisfying each simultaneously. Use the structured-response channel "
-    "(verify_steps / rationale) to explain how each prior demand is still honored "
-    "in your fix.\n\n"
-)
-
-_CONTESTED_FIX_BASE_HINT = (
-    "\nFor each contested file, run:\n"
-    "  git diff $(git merge-base HEAD origin/{base_branch})"
-    "..origin/{base_branch} -- {{file}}\n"
-    "If the base evolved that region since branching, the base version is "
-    "presumptively authoritative — converge to base or implement an explicit union.\n\n"
-)
-
-_CONTESTED_REVIEW_APPENDIX_HEADER = (
-    "CONTESTED REGIONS: The code regions listed below were previously demanded, "
-    "addressed (verified absent from a subsequent review), and are now being "
-    "demanded again — possibly in a different direction. If you raise a demand "
-    "on any of these regions, you MUST explicitly reconcile with the prior "
-    "applied demand: state how the new demand coexists with, supersedes, or "
-    "forms a union with the prior fix. Silent reversal of an applied demand is "
-    "invalid feedback.\n\n"
-)
-
-_CONTESTED_REVIEW_BASE_HINT = (
-    "For each contested file, run:\n"
-    "  git diff $(git merge-base HEAD origin/{base_branch})"
-    "..origin/{base_branch} -- {{file}}\n"
-    "If the base evolved the region since branching, the base version is "
-    "authoritative — demand convergence-to-base or an explicit union.\n\n"
-)
-
-
-def _format_contested_region_line(region: dict) -> str:
-    file_path = region.get("file", "")
-    anchor = region.get("anchor", "")
-    d_iter = region.get("demanded_iteration", 0)
-    d_desc = (region.get("demanded_description") or "").strip()
-    r_iter = region.get("reappeared_iteration", 0)
-    r_desc = (region.get("reappeared_description") or "").strip()
-    anchor_part = f" ({anchor})" if anchor else ""
+def _is_blocking(issue: dict) -> bool:
     return (
-        f"- `{file_path}`{anchor_part}: "
-        f'iter {d_iter} demanded "{d_desc}" → applied; '
-        f'iter {r_iter} now demands "{r_desc}"'
+        str(issue.get("severity") or "").upper() in ("CRITICAL", "MAJOR")
+        and bool(str(issue.get("description") or "").strip())
     )
 
 
-def format_contested_regions_for_fix(contested: list, base_branch: str) -> str:
-    """Build the fix-prompt prefix for contested regions.
+def _same_finding(a: dict, b: dict) -> bool:
+    """Conservatively carry one blocker identity across reviewer paraphrases."""
+    a_region = _region_key(a)
+    b_region = _region_key(b)
+    if a_region is not None and a_region == b_region:
+        return _jaccard(
+            str(a.get("description") or ""), str(b.get("description") or "")
+        ) >= ISSUE_MATCH_JACCARD_THRESHOLD
+    if a_region is None and b_region is None:
+        return _jaccard(
+            str(a.get("description") or ""), str(b.get("description") or "")
+        ) >= 0.75
+    return False
 
-    Prepended to the fix task prompt when contested regions exist in the ledger.
+
+def _fresh_collision_id(
+    issue: dict,
+    *,
+    reviewed_head_sha: str,
+    iteration: int,
+    ordinal: int,
+    unavailable_ids: set[str],
+) -> str:
+    """Generate a deterministic backend ID that does not alias another finding."""
+    attempt = 0
+    while True:
+        candidate = _issue_fingerprint(
+            issue,
+            reviewed_head_sha=reviewed_head_sha,
+            iteration=iteration,
+            # ``ensure_issue_ids`` already used ``ordinal``.  A separate stable
+            # namespace keeps collision repair deterministic without trusting
+            # the reviewer-supplied ID that collided.
+            ordinal=ordinal + ((attempt + 1) * 1_000_000),
+        )
+        if candidate not in unavailable_ids:
+            return candidate
+        attempt += 1
+
+
+def _public_open_record(record: dict) -> dict:
+    issue = record["issue"]
+    return {
+        "issue_id": record["issue_id"],
+        "severity": str(issue.get("severity") or "").lower(),
+        "description": str(issue.get("description") or ""),
+        **({"file": issue.get("file")} if issue.get("file") else {}),
+        **({"line": issue.get("line")} if issue.get("line") is not None else {}),
+        **({"symbol": issue.get("symbol")} if issue.get("symbol") else {}),
+        "demanded_iteration": record["demanded_iteration"],
+        "demanded_head_sha": record["demanded_head_sha"],
+        "demanded_base_sha": record["demanded_base_sha"],
+        "demanded_target_verified": record["demanded_target_verified"],
+        "last_seen_iteration": record["last_seen_iteration"],
+        "last_seen_head_sha": record["last_seen_head_sha"],
+        "last_seen_base_sha": record["last_seen_base_sha"],
+        "last_seen_target_verified": record["last_seen_target_verified"],
+    }
+
+
+def build_issue_ledger(
+    review_history: list | None,
+    *,
+    seed_ledger: dict | None = None,
+    stamp_complete: bool = False,
+) -> dict[str, Any]:
+    """Derive the complete binding open set and bounded resolution history.
+
+    Fail-closed rules:
+
+    * APPROVE on the same head does not close an earlier blocker.
+    * Omission closes a blocker as ``fixed`` only after a different exact head.
+    * Every explicit closure requires a concrete reason from a backend-verified
+      exact-target review.  A verified review may explicitly reconcile a
+      legacy blocker whose original target was not stamped; implicit omission
+      never may.
+    * ``fixed`` requires a changed exact head when the prior demand also has
+      backend-verified SHA provenance.
+    * Structured CRITICAL/MAJOR findings remain binding even when the verdict
+      token is missing or malformed.  An invalid token cannot resolve or omit
+      an existing demand, but it also cannot make an explicitly listed blocker
+      disappear.
+    * The returned ``open`` list is never capped or sliced.
     """
-    if not contested:
-        return ""
-    lines = "\n".join(_format_contested_region_line(r) for r in contested)
-    base_hint = _CONTESTED_FIX_BASE_HINT.format(base_branch=base_branch)
-    return _CONTESTED_FIX_PREFIX_HEADER + lines + "\n" + base_hint
+    normalized_seed = (
+        normalize_issue_ledger(seed_ledger) if seed_ledger is not None else None
+    )
+    if seed_ledger is not None and normalized_seed is None:
+        raise ValueError("malformed durable issue ledger")
+    open_records: dict[str, dict] = {
+        row["issue_id"]: _seed_open_record(row)
+        for row in (normalized_seed or {}).get("open", [])
+    }
+    resolved: list[dict] = list((normalized_seed or {}).get("resolved", []))
+    history = list(review_history or [])
+    seed_is_complete = bool(
+        normalized_seed
+        and normalized_seed.get("schema_version") == ISSUE_LEDGER_SCHEMA_VERSION
+        and normalized_seed.get("complete") is True
+        and normalized_seed.get("through_entry_key")
+    )
+    entries_to_apply = history
+    matching_index: int | None = None
+    if seed_is_complete:
+        through_key = str(normalized_seed.get("through_entry_key") or "")
+        matching_index = next(
+            (
+                index
+                for index in range(len(history) - 1, -1, -1)
+                if _history_entry_key(history[index]) == through_key
+            ),
+            None,
+        )
+        if matching_index is not None:
+            entries_to_apply = history[matching_index + 1 :]
+    # A complete seed only remains a proof when its tail is still present in
+    # the retained history (or no new history was supplied). If the marker is
+    # absent, replaying the retained cap may reconstruct current-looking state
+    # while silently skipping rows between the seed and that window.
+    lineage_complete = bool(
+        (seed_is_complete and (not history or matching_index is not None))
+        or (not seed_is_complete and len(history) < REVIEW_HISTORY_MAX_ENTRIES)
+    )
 
+    for entry in entries_to_apply:
+        if not isinstance(entry, dict):
+            continue
+        verdict = str(entry.get("verdict") or "").upper()
+        verdict_is_authoritative = verdict in ("APPROVE", "REQUEST_CHANGES")
+        try:
+            iteration = int(entry.get("iteration") or 0)
+        except (TypeError, ValueError):
+            iteration = 0
+        head_sha = _entry_head_sha(entry)
+        base_sha = _entry_base_sha(entry)
+        target_verified = bool(
+            entry.get("target_verified_by_backend") is True
+            and str(entry.get("review_task_id") or "").strip()
+            and head_sha
+            and base_sha
+        )
 
-def format_contested_regions_for_review(contested: list, base_branch: str) -> str:
-    """Build the review-prompt appendix for contested regions.
+        # Only a well-formed review verdict may close a demand.  Blockers below
+        # are deliberately ingested regardless of this token, but accepting a
+        # resolution from a COMMENT/malformed row would be the inverse
+        # fail-open bug.
+        for resolution in (
+            (entry.get("resolutions") or [])
+            if verdict_is_authoritative and target_verified
+            else []
+        ):
+            if not isinstance(resolution, dict):
+                continue
+            issue_id = str(resolution.get("issue_id") or "").strip()
+            disposition = str(resolution.get("disposition") or "").lower().strip()
+            reason = str(resolution.get("reason") or "").strip()
+            record = open_records.get(issue_id)
+            if record is None or disposition not in ISSUE_RESOLUTION_DISPOSITIONS:
+                continue
+            if not reason:
+                continue
+            if disposition == "fixed":
+                # For fully proven chains, "fixed" still means the bytes
+                # changed.  A legacy/unmarked blocker can only be retired by a
+                # later exact-target review making an explicit, reasoned
+                # disposition; omission alone remains non-authoritative.
+                if record.get("last_seen_target_verified") and (
+                    not record.get("last_seen_base_sha")
+                    or not record.get("last_seen_head_sha")
+                    or head_sha == record["last_seen_head_sha"]
+                ):
+                    continue
+            open_records.pop(issue_id, None)
+            resolved.append(
+                {
+                    "issue_id": issue_id,
+                    "disposition": disposition,
+                    "reason": reason,
+                    "resolved_iteration": iteration,
+                    "resolved_head_sha": head_sha,
+                }
+            )
 
-    Appended to the review task's original_prompt when contested regions exist.
-    """
-    if not contested:
-        return ""
-    lines = "\n".join(_format_contested_region_line(r) for r in contested)
-    base_hint = _CONTESTED_REVIEW_BASE_HINT.format(base_branch=base_branch)
-    return _CONTESTED_REVIEW_APPENDIX_HEADER + base_hint + lines + "\n"
+        raw_current_issues = [
+            i for i in (entry.get("issues") or []) if isinstance(i, dict)
+        ]
+        supplied_issue_ids = [
+            str(issue.get("issue_id") or "").strip() for issue in raw_current_issues
+        ]
+        # Compute a backend-owned candidate for every finding regardless of an
+        # agent-supplied ID. Supplied IDs are considered separately below and
+        # are accepted only as compatible references to an already-open demand.
+        current_issues: list[dict] = []
+        for ordinal, raw_issue in enumerate(raw_current_issues):
+            issue = dict(raw_issue)
+            issue["issue_id"] = _issue_fingerprint(
+                issue,
+                reviewed_head_sha=head_sha,
+                iteration=iteration,
+                ordinal=ordinal,
+            )
+            current_issues.append(issue)
+        blocking = [
+            (ordinal, issue, supplied_issue_ids[ordinal])
+            for ordinal, issue in enumerate(current_issues)
+            if _is_blocking(issue)
+        ]
+
+        matched_open_ids: set[str] = set()
+        normalized_current: list[dict] = []
+        current_by_id: dict[str, dict] = {}
+        preserve_demanded_fields: set[str] = set()
+        for ordinal, issue, supplied_issue_id in blocking:
+            matched_id: str | None = None
+
+            # A copied BP ID is a reference to the original demand, not
+            # permission to rewrite that demand's description or location.  It
+            # only re-raises the existing blocker when the payload is also a
+            # conservative semantic/region match.  Otherwise keep the old
+            # blocker and give the unrelated newcomer its own backend ID.
+            exact_prior = open_records.get(supplied_issue_id)
+            if (
+                exact_prior is not None
+                and supplied_issue_id not in matched_open_ids
+                and _same_finding(exact_prior["issue"], issue)
+            ):
+                matched_id = supplied_issue_id
+                issue = dict(exact_prior["issue"])
+                preserve_demanded_fields.add(supplied_issue_id)
+
+            if matched_id is None:
+                matched_id = next(
+                    (
+                        issue_id
+                        for issue_id, prior in open_records.items()
+                        if issue_id not in matched_open_ids
+                        and _same_finding(prior["issue"], issue)
+                    ),
+                    None,
+                )
+            if matched_id is not None:
+                issue = {**issue, "issue_id": matched_id}
+                matched_open_ids.add(matched_id)
+
+            issue_id = str(issue["issue_id"])
+            duplicate_current = current_by_id.get(issue_id)
+            if duplicate_current is not None:
+                if _same_finding(duplicate_current, issue):
+                    # Two copies of one finding are one binding blocker.
+                    continue
+                issue_id = _fresh_collision_id(
+                    issue,
+                    reviewed_head_sha=head_sha,
+                    iteration=iteration,
+                    ordinal=ordinal,
+                    unavailable_ids={
+                        *open_records.keys(),
+                        *current_by_id.keys(),
+                    },
+                )
+                issue = {**issue, "issue_id": issue_id}
+            elif issue_id in open_records and issue_id not in matched_open_ids:
+                # A deterministic hash collision must also fail closed.  Keep
+                # both demands rather than overwriting one under a shared key.
+                issue_id = _fresh_collision_id(
+                    issue,
+                    reviewed_head_sha=head_sha,
+                    iteration=iteration,
+                    ordinal=ordinal,
+                    unavailable_ids={
+                        *open_records.keys(),
+                        *current_by_id.keys(),
+                    },
+                )
+                issue = {**issue, "issue_id": issue_id}
+
+            current_by_id[issue_id] = issue
+            normalized_current.append(issue)
+
+        if verdict_is_authoritative and target_verified:
+            for issue_id, prior in list(open_records.items()):
+                if issue_id in matched_open_ids:
+                    continue
+                if (
+                    prior.get("last_seen_target_verified")
+                    and head_sha
+                    and base_sha
+                    and prior["last_seen_head_sha"]
+                    and prior.get("last_seen_base_sha")
+                    and head_sha != prior["last_seen_head_sha"]
+                ):
+                    open_records.pop(issue_id, None)
+                    resolved.append(
+                        {
+                            "issue_id": issue_id,
+                            "disposition": "fixed",
+                            "reason": "absent from review of a changed exact PR head",
+                            "resolved_iteration": iteration,
+                            "resolved_head_sha": head_sha,
+                        }
+                    )
+
+        # Structured blocking findings are authoritative even when the verdict
+        # token says APPROVE. Treating that contradictory payload as empty would
+        # be fail-open and could merge a reviewer-listed CRITICAL/MAJOR defect.
+        if blocking:
+            for issue in normalized_current:
+                issue_id = str(issue["issue_id"])
+                existing = open_records.get(issue_id)
+                if existing is None:
+                    open_records[issue_id] = {
+                        "issue_id": issue_id,
+                        "issue": issue,
+                        "demanded_iteration": iteration,
+                        "demanded_head_sha": head_sha,
+                        "demanded_base_sha": base_sha,
+                        "demanded_target_verified": target_verified,
+                        "last_seen_iteration": iteration,
+                        "last_seen_head_sha": head_sha,
+                        "last_seen_base_sha": base_sha,
+                        "last_seen_target_verified": target_verified,
+                    }
+                else:
+                    if issue_id not in preserve_demanded_fields:
+                        existing["issue"] = issue
+                    existing["last_seen_iteration"] = iteration
+                    if target_verified:
+                        existing["last_seen_head_sha"] = head_sha
+                        existing["last_seen_base_sha"] = base_sha
+                        existing["last_seen_target_verified"] = True
+
+    result = {
+        "open": [_public_open_record(record) for record in open_records.values()],
+        "resolved": resolved[-ISSUE_LEDGER_MAX_RESOLVED:],
+    }
+    tail = next(
+        (entry for entry in reversed(history) if isinstance(entry, dict)),
+        None,
+    )
+    if stamp_complete and tail is not None:
+        result.update(
+            {
+                "schema_version": ISSUE_LEDGER_SCHEMA_VERSION,
+                "complete": lineage_complete,
+                "through_entry_key": _history_entry_key(tail),
+            }
+        )
+    elif stamp_complete and normalized_seed is not None:
+        for key in ("schema_version", "complete", "through_entry_key"):
+            if key in normalized_seed:
+                result[key] = normalized_seed[key]
+    return result

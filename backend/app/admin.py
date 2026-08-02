@@ -3,7 +3,7 @@
 Hosts the operator-facing task endpoints: listing and inspecting tasks
 (including serial-console output and PR file diffs), creating tasks, bulk
 archive/action operations, and the review-control actions (request changes,
-request a fresh reviewer, reset iteration cap, archive/unarchive, patch). All
+reset iteration cap, archive/unarchive, patch). All
 routes require an authenticated user via the router-level ``get_current_user``
 dependency. Task-mutation logic is delegated to ``admin_task_mutations`` and
 shared access checks to ``admin_helpers``.
@@ -31,7 +31,6 @@ from app.inline_llm import (
     resolve_inline_llm_settings,
 )
 from app.shared_state import (
-    derive_task_branch as _derive_task_branch,
     backfill_branch_columns,
     get_project_integration_branch,
     get_project_promotion_target as _get_project_promotion_target_for_task,
@@ -322,7 +321,9 @@ async def get_all_tasks(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    from app.research_completion import resolve_research_findings_for_surface
+    from app.findings_index import (
+        resolve_research_findings_for_surface_from_state,
+    )
 
     limit = min(limit, ADMIN_TASKS_MAX_LIMIT)
 
@@ -457,7 +458,6 @@ async def get_all_tasks(
     artifacts_map: Dict[str, List[Dict[str, Any]]] = {}
     pr_map: Dict[str, str] = {}
     logs_map: Dict[str, str] = {}
-    research_artifact_logs_map: Dict[str, str] = {}
     merge_test_map: Dict[str, Dict[str, Any]] = {}
     commit_map: Dict[str, Dict[str, Any]] = {}
     if task_ids:
@@ -530,7 +530,6 @@ async def get_all_tasks(
                 Artifact.artifact_type.in_(
                     [
                         ArtifactType.ERROR_LOG,
-                        ArtifactType.RESEARCH_FINDINGS,
                         ArtifactType.MERGE_TEST_RESULT,
                     ]
                 ),
@@ -549,8 +548,6 @@ async def get_all_tasks(
                 and _artifact_is_current_attempt(_tasks_by_id[tid], a.created_at)
             ):
                 logs_map[tid] = a.logs[:2000]
-            if a.artifact_type == ArtifactType.RESEARCH_FINDINGS and a.logs and tid not in research_artifact_logs_map:
-                research_artifact_logs_map[tid] = a.logs[:100000]
             if a.artifact_type == ArtifactType.MERGE_TEST_RESULT and a.logs and tid not in merge_test_map:
                 try:
                     parsed = await asyncio.to_thread(json.loads, a.logs[:100000])
@@ -664,8 +661,11 @@ async def get_all_tasks(
             "artifacts": artifacts_map.get(str(t.id), []),
             "pr_url": pr_map.get(str(t.id)),
             "error_logs": logs_map.get(str(t.id)),
-            "research_findings": resolve_research_findings_for_surface(
-                t.plan_output, research_artifact_logs_map.get(str(t.id))
+            "research_findings": resolve_research_findings_for_surface_from_state(
+                t.plan_output,
+                t.context,
+                status=t.status,
+                task_type=task_type,
             )
             if task_type == "research"
             else None,
@@ -857,6 +857,7 @@ async def bulk_archive_tasks(
                 Task.id.in_(valid_uuids),
                 Task.status.in_(TERMINAL_STATUSES),
                 Task.archived.is_(False),
+                Task.post_commit_pending.is_(False),
                 Task.project_id.in_(user_project_ids),
             )
             .with_for_update(skip_locked=True)
@@ -872,6 +873,7 @@ async def bulk_archive_tasks(
             .where(
                 Task.archived.is_(False),
                 Task.status.in_(statuses),
+                Task.post_commit_pending.is_(False),
                 Task.project_id.in_(user_project_ids),
             )
             .limit(5000)
@@ -1014,6 +1016,7 @@ async def _bulk_retry_one_task(
     children rather than spinning a VM here).
     """
     from sqlalchemy.ext.asyncio import async_sessionmaker
+    from app.review_execution_ownership import has_pending_pr_continuation
     from app.routers.agent import _terminated_task_ids
     from app.task_lifecycle import _requeue_parent_task
 
@@ -1023,6 +1026,53 @@ async def _bulk_retry_one_task(
         expire_on_commit=False,
     )
     async with scoped_factory() as scoped_session:
+        admitted_fix_target: dict | None = None
+        preloaded_task = await scoped_session.get(Task, task_id)
+        preloaded_payload = (
+            _task_payload_dict(preloaded_task) if preloaded_task is not None else {}
+        )
+        if preloaded_task is not None and has_pending_pr_continuation(preloaded_task):
+            task_type = str(preloaded_payload.get("type") or "review/fix")
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Cannot retry {task_type} task while its post-commit "
+                    "continuation is pending; wait for recovery or cancel the "
+                    "task first"
+                ),
+            )
+        if preloaded_task is not None and preloaded_payload.get("type") == "fix":
+            from app.fix_admission import prepare_direct_fix_admission
+            from app.github import get_pull_request
+            from app.routers.agent import get_github_token_for_task
+
+            pr_number = preloaded_payload.get("pr_number")
+            if pr_number is None:
+                raise HTTPException(status_code=409, detail="Cannot retry fix without PR")
+            gh_token, owner, repo = await get_github_token_for_task(
+                preloaded_task.id, scoped_session
+            )
+
+            async def _fetch_bulk_retry_pr() -> dict:
+                return await get_pull_request(
+                    gh_token,
+                    owner,
+                    repo,
+                    int(pr_number),
+                    project_id=str(preloaded_task.project_id),
+                )
+
+            admission = await prepare_direct_fix_admission(
+                scoped_session,
+                project_id=preloaded_task.project_id,
+                pr_number=int(pr_number),
+                fix_task_id=preloaded_task.id,
+                fetch_live_pr=_fetch_bulk_retry_pr,
+            )
+            if not admission.allowed:
+                await scoped_session.rollback()
+                raise HTTPException(status_code=409, detail=admission.reason)
+            admitted_fix_target = dict(admission.fix_target or {})
         async with task_lock(
             scoped_session, task_id, skip_locked=False, timeout=10
         ) as task:
@@ -1032,7 +1082,26 @@ async def _bulk_retry_one_task(
                 # "deleted between phases" race; report it.
                 raise HTTPException(status_code=404, detail="Task not found")
 
+            # Revalidate under the definitive row lock: a terminal status
+            # request can set the write-ahead marker after the unlocked preload.
+            if has_pending_pr_continuation(task):
+                task_type = str(_task_payload_dict(task).get("type") or "review/fix")
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Cannot retry {task_type} task while its post-commit "
+                        "continuation is pending; wait for recovery or cancel "
+                        "the task first"
+                    ),
+                )
+
             task.status = TaskStatus.QUEUED
+            task.archived = False
+            if admitted_fix_target is not None:
+                fix_loop = dict((task.context or {}).get("review_loop") or {})
+                fix_loop["fix_target"] = admitted_fix_target
+                task.context = {**(task.context or {}), "review_loop": fix_loop}
+                flag_modified(task, "context")
             # If the task was FAILED/CANCELLED, the SQLAlchemy set event added
             # task.id to _terminated_task_ids, revoking any outstanding JWT.
             # Drop the cache entry so the next provisioned VM can claim.
@@ -1869,7 +1938,7 @@ async def get_task(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    from app.research_completion import resolve_research_findings_for_surface
+    from app.findings_index import resolve_research_findings_for_surface
 
     try:
         tid = uuid.UUID(task_id)
@@ -1890,7 +1959,6 @@ async def get_task(
     artifacts_list = []
     pr_url = None
     error_logs = None
-    research_findings = None
     merge_test_result = None
     commit_hash = None
     repo_url = None
@@ -1916,8 +1984,6 @@ async def get_task(
             and _artifact_is_current_attempt(task, a.created_at)
         ):
             error_logs = a.logs
-        if a.artifact_type == ArtifactType.RESEARCH_FINDINGS and a.logs:
-            research_findings = a.logs[:100000]  # raw logs; resolved below
         if a.artifact_type == ArtifactType.MERGE_TEST_RESULT and a.logs:
             try:
                 parsed = await asyncio.to_thread(json.loads, a.logs[:100000])
@@ -1997,10 +2063,6 @@ async def get_task(
         ).scalar_one_or_none()
 
     task_id_str = str(tid)
-    operator_requested_reviewer_task_ids = select(Task.id).where(
-        Task.project_id == task.project_id,
-        Task.context["operator_requested_review_for"].as_string() == task_id_str,
-    )
     related_messages = (
         await session.execute(
             select(ProjectMessage)
@@ -2008,11 +2070,8 @@ async def get_task(
                 ProjectMessage.project_id == task.project_id,
                 or_(
                     ProjectMessage.from_task_id == tid,
-                    ProjectMessage.from_task_id.in_(operator_requested_reviewer_task_ids),
                     ProjectMessage.context["task_id"].as_string() == task_id_str,
                     ProjectMessage.context["source_task_id"].as_string() == task_id_str,
-                    ProjectMessage.context["operator_requested_review_for"].as_string()
-                    == task_id_str,
                     and_(
                         ProjectMessage.context["_convergence_link"]["kind"].as_string()
                         == "task",
@@ -2052,7 +2111,14 @@ async def get_task(
         "requires_approval": task.requires_approval,
         "parent_task_id": str(task.parent_task_id) if task.parent_task_id else None,
         "depends_on": task.depends_on or [],
-        "plan_output": task.plan_output,
+        # Research plan_output is resumable pre-gate state until the completion
+        # handler stamps it final. Do not expose rejected raw findings through
+        # the generic detail field.
+        "plan_output": (
+            resolve_research_findings_for_surface(task)
+            if task_type == "research"
+            else task.plan_output
+        ),
         "created_at": task.created_at.isoformat() if task.created_at else None,
         "started_at": task.started_at.isoformat() if task.started_at else None,
         "last_heartbeat": task.last_heartbeat.isoformat()
@@ -2098,9 +2164,7 @@ async def get_task(
         "error_logs": error_logs,
         "commit_hash": commit_hash,
         "repo_url": repo_url,
-        "research_findings": resolve_research_findings_for_surface(
-            task.plan_output, research_findings
-        )
+        "research_findings": resolve_research_findings_for_surface(task)
         if task_type == "research"
         else None,
         "evaluation_summary": _build_task_evaluation_summary(
@@ -2823,7 +2887,80 @@ async def create_task_manually(
                 "is_duplicate": True,
             }
 
+    new_task_id = uuid.uuid4()
+    direct_review_loop: dict | None = None
+    if payload.task_type in (TaskType.fix, TaskType.review) and payload.pr_number is not None:
+        from app.branch_cleanup import _get_project_github_token
+        from app.github import get_pull_request
+
+        _direct_gh_token = await _get_project_github_token(project, session)
+
+        async def _fetch_direct_pr() -> dict:
+            return await get_pull_request(
+                _direct_gh_token,
+                github_owner,
+                github_repo,
+                int(payload.pr_number),
+                project_id=str(project.id),
+            )
+
+        if payload.task_type == TaskType.fix:
+            from app.fix_admission import prepare_direct_fix_admission
+
+            admission = await prepare_direct_fix_admission(
+                session,
+                project_id=project.id,
+                pr_number=int(payload.pr_number),
+                fix_task_id=new_task_id,
+                fetch_live_pr=_fetch_direct_pr,
+            )
+            if admission.allowed and admission.fix_target is not None:
+                direct_review_loop = {
+                    "pr_number": int(payload.pr_number),
+                    "branch": str(payload.branch or ""),
+                    "base_branch": resolved_base_branch,
+                    "fix_target": dict(admission.fix_target),
+                }
+        else:
+            from app.review_admission import prepare_direct_review_admission
+
+            admission = await prepare_direct_review_admission(
+                session,
+                project_id=project.id,
+                pr_number=int(payload.pr_number),
+                fetch_live_pr=_fetch_direct_pr,
+            )
+            if admission.existing_task is not None:
+                existing = admission.existing_task
+                await session.commit()
+                return {
+                    "id": str(existing.id),
+                    "project_id": str(existing.project_id),
+                    "title": existing.title,
+                    "status": existing.status,
+                    "vm_instance_id": existing.vm_instance_id,
+                    "is_duplicate": True,
+                }
+            if admission.allowed and admission.review_target is not None:
+                direct_review_loop = {
+                    "pr_number": int(payload.pr_number),
+                    "branch": str(payload.branch or ""),
+                    "base_branch": resolved_base_branch,
+                    "review_target": dict(admission.review_target),
+                    "review_history": [],
+                }
+        if not admission.allowed:
+            await session.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Cannot queue {payload.task_type.value} for PR "
+                    f"#{payload.pr_number}: {admission.reason}"
+                ),
+            )
+
     new_task = Task(
+        id=new_task_id,
         project_id=project.id,
         title=payload.title,
         description=payload.prompt,
@@ -2834,7 +2971,20 @@ async def create_task_manually(
         launched_by_user_id=current_user["user_id"],
         requires_approval=False,
         idempotency_key=scoped_idempotency_key,
-        **({"context": citation_task_context} if citation_task_context else {}),
+        **(
+            {
+                "context": {
+                    **(citation_task_context or {}),
+                    **(
+                        {"review_loop": direct_review_loop}
+                        if direct_review_loop is not None
+                        else {}
+                    ),
+                }
+            }
+            if citation_task_context is not None or direct_review_loop is not None
+            else {}
+        ),
     )
     session.add(new_task)
     try:
@@ -3960,113 +4110,6 @@ async def request_changes(
     raise HTTPException(status_code=500, detail="Failed to spawn task (iteration cap?)")
 
 
-_FRESH_REVIEWER_COOLDOWN_SECS = 3600  # 1 hour
-
-# Maps a task's payload ``type`` to the branch prefix the agent uses when
-# deriving the work branch. Mirrors the agent's branchPrefix wiring
-# (agent/src/handlers/standard.ts: create/qa->task, refactor->refactor,
-# docs->docs, deps->deps; handlers/specialized.ts->migrate). Fix tasks reuse
-# an existing branch carried in the payload, so they never need this fallback.
-# Branch derivation moved to app.shared_state.derive_task_branch so callers
-# outside admin (rollup_management, task_lifecycle) can share the same map
-# without circular imports.
-
-
-@router.post("/tasks/{task_id}/request-fresh-reviewer")
-@limiter.limit("10/minute")
-async def request_fresh_reviewer(
-    request: Request,
-    task_id: uuid.UUID,
-    session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user),
-):
-    """Spawn an operator-requested fresh-reviewer pass against a completed task's PR diff."""
-    task = await _get_user_task_with_role(
-        task_id, current_user["user_id"], session, "member"
-    )
-
-    ctx = dict(task.context or {})
-    last_req = ctx.get("_operator_fresh_reviewer_requested_at")
-    if last_req:
-        elapsed = (
-            datetime.now(timezone.utc) - datetime.fromisoformat(last_req)
-        ).total_seconds()
-        if elapsed < _FRESH_REVIEWER_COOLDOWN_SECS:
-            raise HTTPException(
-                status_code=429,
-                detail="Cooldown active — a fresh-reviewer pass was recently requested",
-            )
-
-    artifact = (
-        (
-            await session.execute(
-                select(Artifact).where(
-                    Artifact.task_id == task_id,
-                    Artifact.artifact_type == ArtifactType.PULL_REQUEST,
-                )
-            )
-        )
-        .scalars()
-        .first()
-    )
-    if not artifact or not artifact.pr_url:
-        raise HTTPException(status_code=400, detail="No PR found for this task")
-
-    pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
-    task_payload = _task_payload_dict(task)
-    review_loop = ctx.get("review_loop") or {}
-    _project = await session.get(Project, task.project_id)
-    branch = (
-        review_loop.get("branch")
-        or task_payload.get("branch")
-        or _derive_task_branch(
-            task_id,
-            task_payload.get("type"),
-            get_project_task_branch_namespace(_project),
-        )
-    )
-    base_branch = task_payload.get("base_branch") or get_project_integration_branch(
-        _project
-    )
-    related_files = task_payload.get("related_files") or ctx.get("related_files") or []
-
-    reviewer_task = Task(
-        project_id=task.project_id,
-        title=f"Operator fresh review: {task.title or str(task_id)[:8]}",
-        description=f"Operator-requested fresh-reviewer pass for task {task_id}",
-        payloads=[
-            {
-                "type": "create",
-                "prompt": f"Operator-requested fresh-reviewer pass for task {task_id}.",
-                "pr_number": pr_number,
-                "branch": branch,
-                "base_branch": base_branch,
-                "related_files": related_files,
-            }
-        ],
-        context={
-            "operator_requested_review_for": str(task_id),
-            "operator_requested_by": str(current_user["user_id"]),
-        },
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-        status=TaskStatus.QUEUED,
-        created_by="USER",
-        launched_by_user_id=current_user["user_id"],
-    )
-    session.add(reviewer_task)
-
-    ctx["_operator_fresh_reviewer_requested_at"] = datetime.now(
-        timezone.utc
-    ).isoformat()
-    task.context = ctx
-    flag_modified(task, "context")
-    session.add(task)
-
-    await session.commit()
-
-    return {"spawned_task_id": str(reviewer_task.id)}
-
-
 @router.post("/tasks/{task_id}/archive")
 async def archive_task(
     task_id: uuid.UUID,
@@ -4080,6 +4123,14 @@ async def archive_task(
         raise HTTPException(
             status_code=400,
             detail=f"Cannot archive task with status '{task.status}'. Only terminal tasks (COMPLETED, FAILED, CANCELLED) can be archived.",
+        )
+    if task.post_commit_pending:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Cannot archive a task while its post-commit continuation is "
+                "pending; wait for recovery or explicitly cancel/clear it first"
+            ),
         )
     task.archived = True
     session.add(task)
@@ -4132,13 +4183,39 @@ async def reset_iteration_cap(
             Task.archived.is_(False),
             _pr_number_match(session, pr_number),
         )
-        .options(load_only(Task.id, Task.archived, Task.payloads, raiseload=True))
+        .options(
+            load_only(
+                Task.id,
+                Task.archived,
+                Task.payloads,
+                Task.post_commit_pending,
+                raiseload=True,
+            )
+        )
     )
+    failed_review_fix_tasks = [
+        candidate
+        for candidate in failed_result.scalars().all()
+        if _task_payload_dict(candidate).get("type") in ("review", "fix")
+    ]
+    pending_failed = next(
+        (
+            candidate
+            for candidate in failed_review_fix_tasks
+            if candidate.post_commit_pending
+        ),
+        None,
+    )
+    if pending_failed is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Cannot reset the iteration cap while failed review/fix task "
+                f"{pending_failed.id} has a pending post-commit continuation"
+            ),
+        )
     archived_count = 0
-    for t in failed_result.scalars().all():
-        fp = _task_payload_dict(t)
-        if fp.get("type") not in ("review", "fix"):
-            continue
+    for t in failed_review_fix_tasks:
         t.archived = True
         session.add(t)
         archived_count += 1

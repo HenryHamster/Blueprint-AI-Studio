@@ -151,6 +151,22 @@ Stored in `runtime_config` (admin UI Settings):
 - `auto_remediation_enabled` — Automatically spawn fix tasks for CI failures
 - `anomaly_detection_enabled` — Monitor for unusual failure patterns
 
+### Discovery Review Cycles
+
+Cycle lineage, credit and concurrency limits, and the review freeze are always
+enforced. There is no shadow admission path.
+
+The first `discovery_review` pass runs at `medium` effort. Routine `renew` or
+`inconclusive` decisions resolve in that cheap pass. A consequential `pivot`,
+`expand`, `branch`, `fallback_pending`, `park`, or `stop` proposal queues one
+independent `max`-effort confirmation. `ask_operator` already identifies a
+decision boundary, so it wakes the supported Resident directly. Matching
+continuation decisions may open a successor cycle, but reviewer-selected task,
+attempt, and concurrency limits may only stay level or decrease; increases
+require Strategic/operator authority. A confirmed halt, blocked review, or
+disagreement also wakes the Resident with an exact internal receipt. The Resident
+does not run a duplicate discovery review.
+
 ---
 
 ## Performance Tuning

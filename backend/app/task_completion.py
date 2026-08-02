@@ -1737,186 +1737,6 @@ async def _ensure_branch(
 # ---------------------------------------------------------------------------
 
 
-async def _maybe_release_safeguard_gate(
-    safeguard_task: Task, findings: list | None, session: AsyncSession
-) -> None:
-    """Release or maintain the cross-cutting merge gate when a safeguard audit terminates.
-
-    No-ops immediately if the task is not a safeguard (no safeguard_for_task_id in context).
-    Releases the gate (clears orig.requires_approval) when no critical/high findings exist.
-    Called on every TERMINAL safeguard path — COMPLETED (with parsed findings) AND
-    FAILED/reaped (findings=None) — so the gate cannot be permanently stranded (cluster C5).
-
-    Re-arm behaviour after clearing the flag:
-      - orig EVALUATING (review approved while safeguard was pending): set
-        review_loop.ci_waiting=True so the orchestrator's CI loop attempts the merge.
-      - orig already COMPLETED (the safeguard outlived orig's lifecycle): clearing
-        the flag alone leaves the open PR stranded forever — nothing re-attempts the
-        merge. Fire the merge directly here, guarded by an idempotency flag
-        (_safeguard_merge_fired) so a re-run / concurrent path cannot double-merge.
-    """
-    from sqlalchemy.orm.attributes import flag_modified
-
-    safeguard_for_id = (safeguard_task.context or {}).get("safeguard_for_task_id")
-    if not safeguard_for_id:
-        return
-    has_blocker = bool(
-        findings and any(f.get("severity") in ("critical", "high") for f in findings)
-    )
-    try:
-        orig = await session.get(Task, uuid.UUID(safeguard_for_id))
-    except Exception:
-        orig = None
-    if orig is None:
-        logger.warning(
-            f"[SAFEGUARD] orig {safeguard_for_id[:8]} not found — gate not updated"
-        )
-        return
-
-    # No challenge lane: critical/high findings conservatively hold the gate.
-    if has_blocker:
-        logger.info(
-            "[SAFEGUARD] Gate maintained on %s — critical/high findings",
-            safeguard_for_id[:8],
-        )
-        return
-    orig.requires_approval = False
-    pr_num = (safeguard_task.context or {}).get("safeguard_pr_number")
-    orig_ctx = dict(orig.context or {})
-    _fire_completed_orig_merge = False
-    if orig.status == TaskStatus.EVALUATING and pr_num:
-        # Review already approved while safeguard was pending; hand off to CI
-        # polling loop. arm_ci_wait co-stamps pr_number + a fresh ci_wait_started
-        # so this re-arm never parks the identity-less {ci_waiting} shape that the
-        # merge poll would skip / that would silently disable the CI-wait timeout.
-        from app.ci_merge_helpers import arm_ci_wait
-
-        _rearm_loop = dict(orig_ctx.get("review_loop") or {})
-        arm_ci_wait(
-            _rearm_loop,
-            pr_number=pr_num,
-            now_iso=_utcnow().isoformat(),
-        )
-        orig_ctx["review_loop"] = _rearm_loop
-        orig.context = orig_ctx
-        flag_modified(orig, "context")
-    elif (
-        orig.status == TaskStatus.COMPLETED
-        and pr_num
-        and not orig_ctx.get("_safeguard_merge_fired")
-    ):
-        # orig already terminalized — clearing the flag re-arms nothing, so the
-        # open PR would strand forever. Mark the idempotency flag now (persisted
-        # with the gate-clear commit) and fire the merge AFTER the commit, below.
-        orig_ctx["_safeguard_merge_fired"] = True
-        orig.context = orig_ctx
-        flag_modified(orig, "context")
-        _fire_completed_orig_merge = True
-    orig.latest_status_message = (
-        f"Cross-cutting safeguard passed — merge gate released (PR #{pr_num})"
-    )
-    session.add(orig)
-    await session.commit()
-    logger.info(f"[SAFEGUARD] Gate released on {safeguard_for_id[:8]} for PR #{pr_num}")
-
-    if _fire_completed_orig_merge:
-        # Best-effort: fire the held merge for the already-COMPLETED orig. The
-        # idempotency flag was committed above, so even if this raises the merge
-        # is never re-attempted from here (avoids a double-merge loop); a manual
-        # re-arm is then the operator's call. Merge only if the PR is still open.
-        from app.github import (
-            get_pull_request,
-            merge_pull_request,
-        )
-
-        try:
-            gh_token, owner, repo = await get_github_token_for_task(orig.id, session)
-            _pr = await get_pull_request(gh_token, owner, repo, int(pr_num))
-            if _pr.get("merged"):
-                logger.info(
-                    f"[SAFEGUARD] PR #{pr_num} already merged — no action (orig "
-                    f"{safeguard_for_id[:8]})"
-                )
-            elif (_pr.get("state") or "open") != "open":
-                logger.info(
-                    f"[SAFEGUARD] PR #{pr_num} not open (state={_pr.get('state')}) "
-                    f"— skipping post-gate merge (orig {safeguard_for_id[:8]})"
-                )
-            else:
-                # Pre-merge Alembic dual-head guard (parity with the CI-completion
-                # and inline task-completion merge paths). The held merge can target
-                # the integration or promotion branch; without this check a PR that
-                # added 'the next' migration while the safeguard ran could land a
-                # duplicate revision / dual head. Only guard integration/promotion
-                # targets; on a block-or-defer verdict skip the merge and leave the
-                # PR open so the guarded retry/resolver flow can handle it.
-                from app.shared_state import (
-                    get_project_promotion_target,
-                )
-
-                _sg_project = (
-                    await session.get(Project, orig.project_id)
-                    if orig.project_id
-                    else None
-                )
-                _sg_base = (_pr.get("base") or {}).get("ref", "")
-                _sg_gated = _sg_base in (
-                    get_project_integration_branch(_sg_project),
-                    get_project_promotion_target(_sg_project),
-                )
-                _sg_ok = True
-                if _sg_gated:
-                    from app.rollup_migration_validation import (
-                        enforce_premerge_migration_guard,
-                    )
-
-                    _sg_ok, _sg_reason = await enforce_premerge_migration_guard(
-                        gh_token,
-                        owner,
-                        repo,
-                        int(pr_num),
-                        _sg_base,
-                        promotion_target=get_project_promotion_target(_sg_project),
-                    )
-                if not _sg_ok:
-                    logger.warning(
-                        f"[SAFEGUARD] Post-gate merge of PR #{pr_num} held — "
-                        f"Alembic dual-head guard: {_sg_reason} (orig "
-                        f"{safeguard_for_id[:8]}) — leaving PR open for the "
-                        f"guarded retry/resolver flow"
-                    )
-                else:
-                    _res = await merge_pull_request(gh_token, owner, repo, int(pr_num))
-                    if _res.get("merged"):
-                        try:
-                            await _finalize_migration_reservation_after_merge(
-                                orig, session
-                            )
-                        except Exception as _mr_exc:  # noqa: BLE001
-                            logger.warning(
-                                "[MIGRATION] Failed to finalize reservation for "
-                                "merged task %s: %r",
-                                orig.id,
-                                _mr_exc,
-                            )
-                        logger.info(
-                            f"[SAFEGUARD] Fired held merge for COMPLETED orig "
-                            f"{safeguard_for_id[:8]} PR #{pr_num} after gate release"
-                        )
-                    else:
-                        logger.warning(
-                            f"[SAFEGUARD] Post-gate merge of PR #{pr_num} (orig "
-                            f"{safeguard_for_id[:8]}) did not merge: "
-                            f"{_res.get('message', 'unknown')}"
-                        )
-        except Exception as _merge_exc:  # noqa: BLE001
-            logger.warning(
-                f"[SAFEGUARD] Post-gate merge attempt for PR #{pr_num} (orig "
-                f"{safeguard_for_id[:8]}) failed: {_merge_exc}",
-                exc_info=True,
-            )
-
-
 # ---------------------------------------------------------------------------
 # Cheap always-on acceptance probes for findings-producing task types
 # (security_audit, perf). Mirrors the topic-responsiveness and grounding
@@ -2063,7 +1883,7 @@ async def _handle_security_audit_completion(
     if _grader_verdict is not None and not _grader_verdict.get("passed", False):
         # FAILED forward-quality gate: fail closed — do NOT spawn fix tasks and
         # do NOT complete clean. Record the verdict for observability +
-        # direction-health accounting, release any safeguard gate, end terminal.
+        # direction-health accounting and end terminal.
         record_failed_gate(
             task,
             EvaluationVerdict(
@@ -2074,7 +1894,6 @@ async def _handle_security_audit_completion(
         )
         session.add(task)
         await session.commit()
-        await _maybe_release_safeguard_gate(task, None, session)
         await broadcast_to_project(
             str(task.project_id),
             "task_updated",
@@ -2105,7 +1924,6 @@ async def _handle_security_audit_completion(
         task.plan_output = {"findings": []}
         session.add(task)
         await session.commit()
-        await _maybe_release_safeguard_gate(task, findings, session)
         return
 
     # Store all findings + acceptance-probe detail for operator visibility.
@@ -2135,7 +1953,6 @@ async def _handle_security_audit_completion(
         )
         session.add(task)
         await session.commit()
-        await _maybe_release_safeguard_gate(task, None, session)
         await broadcast_to_project(
             str(task.project_id),
             "task_updated",
@@ -2159,7 +1976,6 @@ async def _handle_security_audit_completion(
         task.latest_status_message = f"Security audit found {len(findings)} finding(s), none critical/high — no tasks spawned"
         session.add(task)
         await session.commit()
-        await _maybe_release_safeguard_gate(task, findings, session)
         return
 
     # Forward-quality ESCALATION gate (blast-radius-proportional). When enabled
@@ -2345,7 +2161,6 @@ async def _handle_security_audit_completion(
     logger.info(
         f"[SECURITY AUDIT] Created {len(child_tasks)} fix tasks from audit {task.id}"
     )
-    await _maybe_release_safeguard_gate(task, findings, session)
 
 
 async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
@@ -4003,294 +3818,6 @@ async def _handle_capability_proof_trial_completion(
             )
 
 
-def _parse_criterion_coverage_trial_result(task: Task, logs: str) -> dict | None:
-    """Extract a ``criterion_coverage_trial`` agent-reported result dict.
-
-    The agent's bespoke handler reports
-    ``{type, criterion_ids, source_task_id, head_sha, queued_head_sha, test_refs,
-    ran, passed, could_not_run}``. We accept it from either the durable
-    ``task.plan_output`` (a dict) or the raw reported ``logs`` (JSON, optionally
-    wrapped under a ``criterion_coverage_trial_result`` key). Returns the result
-    dict, or ``None`` when nothing parseable is present. Never raises.
-    """
-    po = getattr(task, "plan_output", None)
-    if isinstance(po, dict) and (
-        "ran" in po or po.get("type") == "criterion_coverage_trial"
-    ):
-        return po
-    if isinstance(logs, str) and logs.strip():
-        try:
-            parsed = json.loads(logs)
-        except (ValueError, TypeError):
-            parsed = None
-        if isinstance(parsed, dict):
-            inner = parsed.get("criterion_coverage_trial_result")
-            if isinstance(inner, dict):
-                return inner
-            if "ran" in parsed or parsed.get("type") == "criterion_coverage_trial":
-                return parsed
-    return None
-
-
-async def _handle_criterion_coverage_trial_completion(
-    task: Task, logs: str, session: AsyncSession
-) -> None:
-    """Ingest a ``criterion_coverage_trial``'s executed-test result into the ledger.
-
-    The INGESTION half of the acceptance earn-loop's execution-trial lane (the
-    ENROLL half is :func:`app.acceptance_criteria.enroll_criterion_coverage_trial`).
-    The agent handler runs ONLY a merged task's declared ``named_test`` covering
-    tests as a targeted runner job and reports the result contract:
-
-      ``{type, criterion_ids, source_task_id, head_sha, queued_head_sha,
-        test_refs, ran, passed, could_not_run}``
-
-    On a GREEN result (:func:`ci_resolution.criterion_coverage_trial_is_green` —
-    the tests actually RAN and PASSED and the executed ``head_sha`` matches the
-    enrolled checkout), it mints the machine-verified ``covered`` tier via
-    :func:`acceptance_criteria.record_executed_named_test_evidence`, SHA-pinned to
-    the executed checkout. On RED / skipped / could-not-run / SHA-mismatch it
-    records NOTHING and NEVER demotes existing evidence (fail-closed); the
-    contradiction is stamped on ``task.context`` for visibility only.
-
-    **Receipt validation**: the receipt must name the enrolled ``source_task_id``,
-    the complete enrolled ``test_refs`` set (exact — neither subset nor superset),
-    and ``criterion_ids`` drawn from the enrolled set; when the enrollment bound a
-    ``head_sha`` the reported ``head_sha`` must match it. Any mismatch records no
-    evidence.
-
-    Operator-disableable + fail-open: gated on
-    ``acceptance_earn_execution_trials_enabled`` (default OFF), and any
-    parse/lookup/record error leaves existing coverage untouched, never worse.
-    Non-raising.
-    """
-    try:
-        if not _runtime_config.get("acceptance_earn_execution_trials_enabled", False):
-            logger.info(
-                "[CRIT_TRIAL] flag off — ingestion skipped for task %s", task.id
-            )
-            return
-
-        from app.acceptance_criteria import (
-            get_criteria_by_keys,
-            record_executed_named_test_evidence,
-        )
-        from app.ci_resolution import criterion_coverage_trial_is_green
-        from app.release_version import current_open_version
-
-        result = _parse_criterion_coverage_trial_result(task, logs)
-        if result is None:
-            logger.warning(
-                "[CRIT_TRIAL] no parseable trial result for task %s — ingesting nothing",
-                task.id,
-            )
-            return
-
-        reported_source = (
-            str(result.get("source_task_id")).strip()
-            if result.get("source_task_id")
-            else ""
-        )
-        reported_crit_ids = [
-            c
-            for c in (result.get("criterion_ids") or [])
-            if isinstance(c, str) and c.strip()
-        ]
-        reported_refs = [
-            r
-            for r in (result.get("test_refs") or [])
-            if isinstance(r, str) and r.strip()
-        ]
-
-        # --- Read enrollment contract (task.first_payload, orchestrator-authored) ---
-        enrolled = task.first_payload
-        if not isinstance(enrolled, dict):
-            logger.warning(
-                "[CRIT_TRIAL] no enrollment payload for task %s — ingesting nothing",
-                task.id,
-            )
-            return
-        source_enrolled = (
-            str(enrolled.get("source_task_id")).strip()
-            if enrolled.get("source_task_id")
-            else ""
-        )
-        crit_ids_enrolled = [
-            c
-            for c in (enrolled.get("criterion_ids") or [])
-            if isinstance(c, str) and c.strip()
-        ]
-        refs_enrolled = [
-            r
-            for r in (enrolled.get("test_refs") or [])
-            if isinstance(r, str) and r.strip()
-        ]
-        head_sha_enrolled = (
-            enrolled.get("head_sha")
-            if isinstance(enrolled.get("head_sha"), str)
-            else None
-        )
-        if not source_enrolled or not crit_ids_enrolled:
-            logger.warning(
-                "[CRIT_TRIAL] enrollment for task %s missing source/criteria — "
-                "ingesting nothing",
-                task.id,
-            )
-            return
-
-        async def _record_contradiction(reason: str) -> None:
-            """Persist an auditable rejection without changing coverage state."""
-            ctx = dict(task.context or {})
-            ctx["criterion_coverage_trial_contradiction"] = {
-                "reason": reason,
-                "ran": bool(result.get("ran")),
-                "passed": bool(result.get("passed")),
-                "could_not_run": bool(result.get("could_not_run")),
-                "recorded_at": _utcnow().isoformat(),
-            }
-            task.context = ctx
-            flag_modified(task, "context")
-            await session.commit()
-
-        # (1) source_task_id must match the enrolled contract.
-        if reported_source != source_enrolled:
-            logger.warning(
-                "[CRIT_TRIAL] source_task_id mismatch for task %s — reported=%r "
-                "enrolled=%r — ingesting nothing",
-                task.id,
-                reported_source,
-                source_enrolled,
-            )
-            await _record_contradiction("source_task_mismatch")
-            return
-
-        # (2) test_refs must name exactly the enrolled target set. A subset would
-        #     let a runner omit a hard test then have a green aggregate recorded as
-        #     though the complete covering suite ran.
-        if not reported_refs or set(reported_refs) != set(refs_enrolled):
-            logger.warning(
-                "[CRIT_TRIAL] test_refs mismatch for task %s — reported=%s "
-                "enrolled=%s — ingesting nothing",
-                task.id,
-                sorted(reported_refs),
-                sorted(refs_enrolled),
-            )
-            await _record_contradiction("test_refs_mismatch")
-            return
-
-        # (3) criterion_ids must be drawn from the enrolled set (no fabricating
-        #     coverage for a criterion the trial was never enrolled to cover).
-        cover_keys = [c for c in reported_crit_ids if c in set(crit_ids_enrolled)]
-        if not cover_keys or set(reported_crit_ids) - set(crit_ids_enrolled):
-            logger.warning(
-                "[CRIT_TRIAL] criterion_ids mismatch for task %s — reported=%s "
-                "enrolled=%s — ingesting nothing",
-                task.id,
-                sorted(reported_crit_ids),
-                sorted(crit_ids_enrolled),
-            )
-            await _record_contradiction("criterion_ids_mismatch")
-            return
-
-        # (4) If the enrollment bound a head_sha, the reported executed SHA must
-        #     match it (an empty/missing reported SHA cannot satisfy a bound trial).
-        reported_sha = (
-            result.get("head_sha") if isinstance(result.get("head_sha"), str) else None
-        )
-        if head_sha_enrolled and reported_sha != head_sha_enrolled:
-            logger.warning(
-                "[CRIT_TRIAL] head_sha mismatch for task %s — reported=%s "
-                "enrolled=%s — ingesting nothing",
-                task.id,
-                reported_sha,
-                head_sha_enrolled,
-            )
-            await _record_contradiction("head_sha_mismatch")
-            return
-
-        if not criterion_coverage_trial_is_green(result):
-            # Non-green: NEVER demote (fail-closed). Surface the contradiction only.
-            await _record_contradiction("not_green")
-            logger.info(
-                "[CRIT_TRIAL] non-green trial for source_task=%s (task %s) — "
-                "ran=%s passed=%s could_not_run=%s — no evidence minted",
-                source_enrolled,
-                task.id,
-                bool(result.get("ran")),
-                bool(result.get("passed")),
-                bool(result.get("could_not_run")),
-            )
-            return
-
-        # --- GREEN: mint the SHA-pinned covered tier ---
-        project = await session.get(Project, task.project_id)
-        if project is None:
-            logger.warning(
-                "[CRIT_TRIAL] project %s gone for trial task %s — ingesting nothing",
-                task.project_id,
-                task.id,
-            )
-            return
-        open_version = await current_open_version(session, task.project_id)
-        if open_version is None:
-            logger.info(
-                "[CRIT_TRIAL] no open version for project %s — cannot resolve active "
-                "criteria for task %s",
-                task.project_id,
-                task.id,
-            )
-            return
-        criteria = await get_criteria_by_keys(
-            session,
-            task.project_id,
-            cover_keys,
-            release_version_id=open_version.id,
-        )
-        active = [c for c in criteria if c.status == "active"]
-        if not active:
-            logger.info(
-                "[CRIT_TRIAL] no active criteria among %s for task %s — nothing to mint",
-                cover_keys,
-                task.id,
-            )
-            return
-        # The executed checkout SHA is the pin. criterion_coverage_trial_is_green
-        # already guaranteed reported_sha is a non-empty string matching any bound
-        # enrolled SHA.
-        recorded = await record_executed_named_test_evidence(
-            session,
-            project_id=task.project_id,
-            criteria=active,
-            executed_sha=reported_sha or head_sha_enrolled or "",
-            test_refs=refs_enrolled,
-            source_task_id=source_enrolled,
-        )
-        await session.commit()
-        logger.info(
-            "[CRIT_TRIAL] GREEN trial — minted %d covered row(s) for source_task=%s "
-            "(task %s, sha=%s, criteria=%s)",
-            recorded,
-            source_enrolled,
-            task.id,
-            reported_sha,
-            cover_keys,
-        )
-    except Exception:  # noqa: BLE001 — ingestion must fail open, never raise
-        logger.warning(
-            "[CRIT_TRIAL] ingestion failed for task %s (fail-open — coverage left "
-            "unchanged)",
-            getattr(task, "id", None),
-            exc_info=True,
-        )
-        try:
-            await session.rollback()
-        except Exception:  # noqa: BLE001
-            logger.debug(
-                "[CRIT_TRIAL] rollback after ingestion failure also failed",
-                exc_info=True,
-            )
-
-
 async def _handle_walkthrough_e2e_completion(
     task: Task, logs: str, session: AsyncSession
 ) -> None:
@@ -4313,6 +3840,7 @@ async def _handle_walkthrough_e2e_completion(
     """
     try:
         from app.acceptance_criteria import record_walkthrough_e2e_evidence
+        from app.release_qualifier import _evaluate_walkthrough_e2e_report
         from app.release_version import current_open_version
 
         result: dict | None = None
@@ -4350,8 +3878,47 @@ async def _handle_walkthrough_e2e_completion(
             )
             return
 
+        expected_candidate_sha = str(
+            (task.context or {}).get("candidate_sha")
+            or (task.first_payload or {}).get("candidate_sha")
+            or ""
+        ).strip()
+        probe_result = _evaluate_walkthrough_e2e_report(
+            result, expected_candidate_sha
+        )
+        if probe_result.get("status") == "invalid":
+            task.context = {
+                **(task.context or {}),
+                "qualification_probe_result": {
+                    key: value
+                    for key, value in probe_result.items()
+                    if key != "results"
+                },
+            }
+            flag_modified(task, "context")
+            session.add(task)
+            logger.info(
+                "[WALKTHROUGH_E2E] invalid decision report for task %s: %s",
+                task.id,
+                probe_result.get("reason"),
+            )
+            return
+
+        results = probe_result["results"]
+        candidate_sha = probe_result["candidate_sha"]
+
         project_id = task.project_id
-        open_version = await current_open_version(session, project_id)
+        open_version = None
+        bound_version_id = (task.context or {}).get("release_version_id")
+        if bound_version_id:
+            with contextlib.suppress(ValueError, TypeError, AttributeError):
+                from app.release_version import ReleaseVersion
+
+                open_version = await session.get(
+                    ReleaseVersion, uuid.UUID(str(bound_version_id))
+                )
+        if open_version is None:
+            open_version = await current_open_version(session, project_id)
         if open_version is None:
             logger.info(
                 "[WALKTHROUGH_E2E] no open release version for project %s (task %s) — skipping",
@@ -4361,14 +3928,43 @@ async def _handle_walkthrough_e2e_completion(
             return
 
         exercised_engine_sha = str(result.get("exercised_engine_sha") or "").strip() or None
+        task_id = task.id
+        task_context = dict(task.context or {})
         summary = await record_walkthrough_e2e_evidence(
             session,
             version=open_version,
             candidate_sha=candidate_sha,
             results=results,
-            qualification_attempt_id=None,
+            qualification_attempt_id=(task.context or {}).get(
+                "qualification_attempt_id"
+            )
+            or (task.first_payload or {}).get("qualification_attempt_id"),
             exercised_engine_sha=exercised_engine_sha,
         )
+        # Evidence recording may commit per criterion and expire ORM objects.
+        # Re-fetch before touching task.context so this completion backstop does
+        # not trigger a synchronous lazy-load / MissingGreenlet.
+        refreshed_task = await session.get(Task, task_id)
+        if refreshed_task is None:
+            return
+        task = refreshed_task
+        task.context = {
+            **task_context,
+            "qualification_probe_result": {
+                **{
+                    key: value
+                    for key, value in probe_result.items()
+                    if key != "results"
+                },
+                "ingestion_status": summary.get("status"),
+                "ingestion_recorded": summary.get("recorded"),
+                "ingestion_unmatched_keys": list(
+                    summary.get("unmatched_keys") or []
+                )[:50],
+            },
+        }
+        flag_modified(task, "context")
+        session.add(task)
         logger.info(
             "[WALKTHROUGH_E2E] ingestion for task %s: status=%s recorded=%s",
             task.id,
@@ -4819,31 +4415,6 @@ async def _handle_compute_experiment_completion(
         criterion,
         owns_commit=owns_commit,
     )
-
-
-# ---------------------------------------------------------------------------
-# Review second-opinion reconciliation — context keys for the review pipeline
-# ---------------------------------------------------------------------------
-
-# Context key on the REVIEW task holding the durable reconciliation record of a
-# primary verdict against its independent challenge. Exactly one of
-# four states:
-#   unchallenged          gate off / not high-stakes (recorded inline, never here)
-#   challenged_confirmed  challenge upholds the verdict AND the surviving issues
-#   challenged_revised    same verdict direction, surviving issue set changed
-#   challenged_rejected   challenge overturns the verdict direction
-REVIEW_SECOND_OPINION_RECONCILIATION_KEY = "review_second_opinion"
-
-# The whole second-opinion key family is task-local state on a single review
-# task (or its challenger). None of it may ride the review→fix→review context
-# copy in review_pipeline._spawn_pipeline_task: an inherited reconciliation
-# record fires the single-shot re-entry override on the NEXT review task,
-# clobbering its fresh verdict with iteration-1's verdict + issues — the
-# identical issue set then trips the stuck-cycle detector and falsely parks
-# the chain (PR #9243). Spawn paths that copy context must exclude these.
-REVIEW_SECOND_OPINION_TASK_LOCAL_KEYS = (
-    REVIEW_SECOND_OPINION_RECONCILIATION_KEY,
-)
 
 
 # ---------------------------------------------------------------------------

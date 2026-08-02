@@ -1,7 +1,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { act, renderHook, cleanup, waitFor } from '@testing-library/react';
 import { useStrategicSession } from './useStrategicSession';
-import { startStrategicSession, stopStrategicSession } from '../strategicStateApi';
+import {
+  startStrategicSession, stopStrategicSession, updateStrategicWorkbenchState,
+} from '../strategicStateApi';
 import type {
   StrategicLivenessResponse,
   StrategicSessionStartResponse,
@@ -162,6 +164,150 @@ describe('useStrategicSession liveness fallback', () => {
     await waitFor(() => expect(readModel.refresh).toHaveBeenCalledTimes(1));
 
     rerender();
+    expect(startStrategicSession).toHaveBeenCalledTimes(1);
+  });
+
+  it('lets explicit runner selection own a live Chat to Workday start', async () => {
+    const liveness = makeLiveness();
+    liveness.interaction_mode = 'chat';
+    liveness.resident_session = null;
+    liveness.resident_session_availability = {
+      available: true, state: 'ready', reason: null,
+    };
+    let resolveSave!: (value: Awaited<ReturnType<typeof updateStrategicWorkbenchState>>) => void;
+    vi.mocked(updateStrategicWorkbenchState).mockReturnValue(
+      new Promise(resolve => { resolveSave = resolve; }),
+    );
+    vi.mocked(startStrategicSession).mockResolvedValue(successfulStartResponse());
+    const { result } = renderHook(() =>
+      useStrategicSession({
+        selectedProjectId: 'proj-1',
+        addToast: vi.fn(),
+        strategicReadModel: makeReadModel(null),
+        strategicLiveness: liveness,
+      }),
+    );
+
+    act(() => {
+      result.current.persistStrategicWorkbench({
+        interaction_mode: 'continuous', active_surface: 'strategic',
+      });
+      result.current.handleSelectStrategicRunner('hamsterwheel-runner');
+    });
+    const start = result.current.handleStartStrategicSession();
+    await Promise.resolve();
+    expect(startStrategicSession).not.toHaveBeenCalled();
+
+    resolveSave({
+      workbench: {
+        version: 1,
+        interaction_mode: 'continuous',
+        active_surface: 'strategic',
+        selected_refs: [],
+        preferred_runner_id: 'hamsterwheel-runner',
+      },
+      arming: null,
+    });
+    await act(async () => { await start; });
+
+    expect(startStrategicSession).toHaveBeenCalledTimes(1);
+    expect(startStrategicSession).toHaveBeenCalledWith('proj-1', {
+      runner_id: 'hamsterwheel-runner',
+    });
+  });
+
+  it('does not clear explicit-start ownership against a stale predecessor snapshot', async () => {
+    const stale = makeLiveness();
+    stale.interaction_mode = 'chat';
+    stale.resident_session = {
+      session_id: 'ss-old', worker_generation: 1, status: 'ended',
+      worker_state: 'restart_failed', stop_requested: false,
+    };
+    vi.mocked(updateStrategicWorkbenchState).mockResolvedValue({
+      workbench: {
+        version: 1, interaction_mode: 'continuous', active_surface: 'strategic',
+        selected_refs: [], preferred_runner_id: 'hamsterwheel-runner',
+      },
+      arming: null,
+    });
+    vi.mocked(startStrategicSession).mockResolvedValue({
+      ...successfulStartResponse(),
+      session: {
+        ...successfulStartResponse().session,
+        session_id: 'ss-new', worker_generation: 2,
+      },
+    });
+    const { result, rerender } = renderHook(() =>
+      useStrategicSession({
+        selectedProjectId: 'proj-1', addToast: vi.fn(),
+        strategicReadModel: makeReadModel(null), strategicLiveness: stale,
+      }),
+    );
+
+    act(() => {
+      result.current.persistStrategicWorkbench({ interaction_mode: 'continuous' });
+      result.current.handleSelectStrategicRunner('hamsterwheel-runner');
+    });
+    await act(async () => { await result.current.handleStartStrategicSession(); });
+    rerender();
+    await vi.advanceTimersByTimeAsync(1_000);
+    stale.interaction_mode = 'continuous';
+    stale.resident_session = {
+      session_id: 'ss-new', worker_generation: 2, status: 'active',
+      worker_state: 'ready', stop_requested: false,
+      runner_id: 'hamsterwheel-runner',
+    };
+    rerender();
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(startStrategicSession).toHaveBeenCalledTimes(1);
+  });
+
+  it('reconciles a failed runner save before explicit Start reads the selection', async () => {
+    const liveness = makeLiveness();
+    liveness.interaction_mode = 'chat';
+    liveness.resident_session = null;
+    vi.mocked(updateStrategicWorkbenchState).mockRejectedValue(new Error('save failed'));
+    vi.mocked(startStrategicSession).mockResolvedValue(successfulStartResponse());
+    const { result } = renderHook(() =>
+      useStrategicSession({
+        selectedProjectId: 'proj-1', addToast: vi.fn(),
+        strategicReadModel: makeReadModel(null), strategicLiveness: liveness,
+      }),
+    );
+
+    act(() => result.current.handleSelectStrategicRunner('hidden-failed-runner'));
+    await act(async () => { await result.current.handleStartStrategicSession(); });
+
+    expect(startStrategicSession).toHaveBeenCalledWith('proj-1', {});
+  });
+
+  it('does not turn a rejected explicit Start into an autonomous retry loop', async () => {
+    const liveness = makeLiveness();
+    liveness.interaction_mode = 'chat';
+    liveness.resident_session = null;
+    vi.mocked(updateStrategicWorkbenchState).mockResolvedValue({
+      workbench: {
+        version: 1, interaction_mode: 'continuous', active_surface: 'strategic',
+        selected_refs: [], preferred_runner_id: 'offline-runner',
+      },
+      arming: null,
+    });
+    vi.mocked(startStrategicSession).mockRejectedValue(new Error('runner offline'));
+    const { result } = renderHook(() =>
+      useStrategicSession({
+        selectedProjectId: 'proj-1', addToast: vi.fn(),
+        strategicReadModel: makeReadModel(null), strategicLiveness: liveness,
+      }),
+    );
+
+    act(() => {
+      result.current.persistStrategicWorkbench({ interaction_mode: 'continuous' });
+      result.current.handleSelectStrategicRunner('offline-runner');
+    });
+    await act(async () => { await result.current.handleStartStrategicSession(); });
+    await vi.advanceTimersByTimeAsync(30_000);
+
     expect(startStrategicSession).toHaveBeenCalledTimes(1);
   });
 

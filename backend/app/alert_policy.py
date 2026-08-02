@@ -173,9 +173,6 @@ ALERT_EVENT_POLICIES: dict[str, AlertEventPolicy] = {
     "release.promotion_deploy_failed": AlertEventPolicy(
         "release.promotion_deploy_failed", domain=DOMAIN_RELEASE_LIFECYCLE
     ),
-    "release.promotion_auto_merge_stalled": AlertEventPolicy(
-        "release.promotion_auto_merge_stalled", domain=DOMAIN_RELEASE_LIFECYCLE
-    ),
     "release.managed_check_wait_stalled": AlertEventPolicy(
         "release.managed_check_wait_stalled", domain=DOMAIN_RELEASE_LIFECYCLE
     ),
@@ -206,6 +203,12 @@ ALERT_EVENT_POLICIES: dict[str, AlertEventPolicy] = {
     ),
     "research.direction_auto_completed": AlertEventPolicy(
         "research.direction_auto_completed",
+        domain=DOMAIN_RESEARCH_DIRECTIONS,
+        route=ROUTE_TIMELINE,
+        action_required=False,
+    ),
+    "research.direction_auto_retired": AlertEventPolicy(
+        "research.direction_auto_retired",
         domain=DOMAIN_RESEARCH_DIRECTIONS,
         route=ROUTE_TIMELINE,
         action_required=False,

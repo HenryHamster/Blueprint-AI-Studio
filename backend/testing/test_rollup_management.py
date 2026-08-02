@@ -27,6 +27,20 @@ def _files(*paths: str) -> list[dict]:
     return [{"filename": p, "status": "added"} for p in paths]
 
 
+def _open_rollup_pr_detail(*, mergeable_state: str = "clean") -> dict:
+    """Exact immutable target used by multi-attempt rollup merge fixtures."""
+    return {
+        "additions": 5,
+        "deletions": 2,
+        "merged": False,
+        "state": "open",
+        "mergeable": True,
+        "mergeable_state": mergeable_state,
+        "base": {"sha": "base-sha", "ref": "research/conflict-base"},
+        "head": {"sha": "deadbeef", "ref": "research/conflict-stg"},
+    }
+
+
 def _migration_file(path: str, revision: str, down_revision: str | None) -> dict:
     """Create a pr_files entry for a migration file with per-file patch."""
     down = "None" if down_revision is None else f"'{down_revision}'"
@@ -40,11 +54,11 @@ def _migration_file(path: str, revision: str, down_revision: str | None) -> dict
 def _mock_automerge_deps(mocker, *, pr_files, merge_merged=True):
     """Mock the auto-merge path so control reaches the Alembic guard.
 
-    ``get_pull_request`` is consumed twice before the merge: the resume-time
-    existing-PR validation and the diff-size fetch (small PR → auto-merge,
-    no ``head`` so the branch-tip check is skipped). Returns the merge and
-    spawn mocks so callers can assert whether the merge fired and whether a
-    re-chain fix was routed.
+    Every ``get_pull_request`` call returns the same immutable, currently-safe
+    target.  The auto-merge path consumes it for resume validation, diff size,
+    and the authority boundary's final live-target lookup.  Returns the merge
+    and spawn mocks so callers can assert whether the merge fired and whether
+    a re-chain fix was routed.
     """
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch(
@@ -84,16 +98,22 @@ def _mock_automerge_deps(mocker, *, pr_files, merge_merged=True):
     mocker.patch(
         "app.github.get_pull_request",
         new_callable=AsyncMock,
-        side_effect=[
-            {"merged": False, "state": "open"},
-            {
-                "additions": 10,
-                "deletions": 5,
-                "merged": False,
-                "state": "open",
-                "head": {"sha": "reviewed-rollup-head"},
+        return_value={
+            "additions": 10,
+            "deletions": 5,
+            "merged": False,
+            "state": "open",
+            "mergeable": True,
+            "mergeable_state": "clean",
+            "base": {
+                "sha": "base-sha",
+                "ref": "research/conflict-base",
             },
-        ],
+            "head": {
+                "sha": "reviewed-rollup-head",
+                "ref": "research/conflict-stg",
+            },
+        },
     )
     mock_merge = mocker.patch(
         "app.github.merge_pull_request",
@@ -232,11 +252,6 @@ async def test_rollup_guard_block_skips_auto_merge(cleanup_db, mocker):
             _migration_file("backend/alembic/versions/0124_a.py", "0124", "0123")
         ],
     )
-    enable_auto_merge_mock = mocker.patch(
-        "app.github.enable_auto_merge",
-        new_callable=AsyncMock,
-        return_value={"enabled": True, "message": "ok"},
-    )
     mocker.patch(
         "app.rollup_management._validate_rollup_migration_chain",
         new=AsyncMock(return_value=("block", "dual-head: duplicate revision")),
@@ -251,7 +266,6 @@ async def test_rollup_guard_block_skips_auto_merge(cleanup_db, mocker):
     await _check_and_trigger_rollup(child, cleanup_db)
 
     mock_merge.assert_not_called()
-    enable_auto_merge_mock.assert_not_called()
     mock_spawn.assert_awaited_once()
     await cleanup_db.refresh(parent)
     assert parent.requires_approval is True
@@ -325,94 +339,6 @@ async def test_rollup_size_cap_breach_hold_when_cap_exhausted(cleanup_db, mocker
 
 
 @pytest.mark.asyncio
-async def test_pr_touches_migrations_positive(mocker):
-    """pr_touches_migrations returns True when a PR file is under alembic/versions."""
-    from app.rollup_migration_validation import pr_touches_migrations
-
-    mocker.patch(
-        "app.github.get_pr_files",
-        new_callable=AsyncMock,
-        return_value=_files(
-            "backend/app/models.py",
-            "backend/alembic/versions/0140_add_widget.py",
-        ),
-    )
-    assert await pr_touches_migrations("tok", "owner", "repo", 42) is True
-
-
-@pytest.mark.asyncio
-async def test_pr_touches_migrations_negative(mocker):
-    """pr_touches_migrations returns False when no PR file touches alembic/versions."""
-    from app.rollup_migration_validation import pr_touches_migrations
-
-    mocker.patch(
-        "app.github.get_pr_files",
-        new_callable=AsyncMock,
-        return_value=_files("backend/app/models.py", "admin-ui/src/App.tsx"),
-    )
-    assert await pr_touches_migrations("tok", "owner", "repo", 42) is False
-
-
-@pytest.mark.asyncio
-async def test_pr_touches_migrations_fetch_error_failsafe(mocker):
-    """A files-fetch error is fail-safe True: an unknown file set must NOT be
-    treated as migration-free (the caller would otherwise take the auto-merge
-    fast path that bypasses Blueprint's re-entry guard)."""
-    from app.rollup_migration_validation import pr_touches_migrations
-
-    mocker.patch(
-        "app.github.get_pr_files",
-        new_callable=AsyncMock,
-        side_effect=RuntimeError("502 from GitHub"),
-    )
-    assert await pr_touches_migrations("tok", "owner", "repo", 42) is True
-
-
-@pytest.mark.asyncio
-async def test_rollup_blocked_migration_pr_does_not_delegate_auto_merge(
-    cleanup_db, mocker
-):
-    """A migration-carrying rollup PR in mergeable_state=blocked must not be
-    handed to GitHub native auto-merge; it defers for re-validation instead."""
-    from app.rollup_management import _check_and_trigger_rollup
-
-    _mock_rollup_merge_conflict_deps(mocker, mergeable_state="blocked")
-    mocker.patch(
-        "app.github.get_pr_files",
-        new_callable=AsyncMock,
-        return_value=_files("backend/alembic/versions/0140_add_widget.py"),
-    )
-    # Force the pre-merge combined-chain guard to "ok" so flow reaches the
-    # post-merge-failure auto-merge branch where pr_touches_migrations is checked
-    # (otherwise the migration file makes it defer on the unmocked diff fetch).
-    mocker.patch(
-        "app.rollup_management._validate_rollup_migration_chain",
-        new=AsyncMock(return_value=("ok", None)),
-    )
-    mocker.patch(
-        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
-    )
-    mocker.patch(
-        "app.rollup_management._dispatch_rollup_approval_alert", new_callable=AsyncMock
-    )
-    enable_auto_merge_mock = mocker.patch(
-        "app.github.enable_auto_merge",
-        new_callable=AsyncMock,
-        return_value={"enabled": True},
-    )
-
-    project = await _make_project(cleanup_db)
-    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
-    child = await _make_merged_child(cleanup_db, project.id, parent.id)
-
-    await _check_and_trigger_rollup(child, cleanup_db)
-
-    enable_auto_merge_mock.assert_not_called()
-    await cleanup_db.refresh(parent)
-    assert (parent.context or {}).get("_merge_deferred_state") == "blocked"
-
-
-@pytest.mark.asyncio
 async def test_rollup_not_touching_migrations_unaffected(cleanup_db, mocker):
     """A rollup whose diff does not touch alembic/versions auto-merges; the
     guard returns ok without even fetching the diff."""
@@ -446,6 +372,27 @@ async def test_rollup_auto_merges_for_custom_staging_prefix(cleanup_db, mocker):
     mock_merge, mock_spawn = _mock_automerge_deps(
         mocker,
         pr_files=_files("backend/app/models.py"),
+    )
+    # This test deliberately replaces the default research/* target with a
+    # custom configured prefix.  Keep every live-target read bound to that
+    # exact immutable PR identity so the authority boundary validates the
+    # behavior under test instead of (correctly) rejecting a stale fixture.
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "additions": 10,
+            "deletions": 5,
+            "merged": False,
+            "state": "open",
+            "mergeable": True,
+            "mergeable_state": "clean",
+            "base": {"sha": "base-sha", "ref": "feature/conflict-base"},
+            "head": {
+                "sha": "reviewed-rollup-head",
+                "ref": "feature/conflict-stg",
+            },
+        },
     )
 
     from app.rollup_management import _check_and_trigger_rollup
@@ -548,14 +495,47 @@ async def test_clean_pr_sha_mismatch_skips_update_branch(cleanup_db, mocker):
         "app.github.get_pull_request",
         new_callable=AsyncMock,
         side_effect=[
-            {"merged": False, "state": "open"},
+            {
+                "merged": False,
+                "state": "open",
+                "base": {
+                    "sha": "base-sha",
+                    "ref": "research/conflict-base",
+                },
+                "head": {
+                    "sha": "head-sha-111",
+                    "ref": "research/conflict-stg",
+                },
+            },
             {
                 "additions": 10,
                 "deletions": 5,
                 "merged": False,
                 "state": "open",
-                "head": {"sha": "head-sha-111"},
+                "mergeable": True,
                 "mergeable_state": "clean",
+                "base": {
+                    "sha": "base-sha",
+                    "ref": "research/conflict-base",
+                },
+                "head": {
+                    "sha": "head-sha-111",
+                    "ref": "research/conflict-stg",
+                },
+            },
+            {
+                "merged": False,
+                "state": "open",
+                "mergeable": True,
+                "mergeable_state": "clean",
+                "base": {
+                    "sha": "base-sha",
+                    "ref": "research/conflict-base",
+                },
+                "head": {
+                    "sha": "head-sha-111",
+                    "ref": "research/conflict-stg",
+                },
             },
         ],
     )
@@ -1376,6 +1356,13 @@ async def test_rollup_create_clears_claim_on_marker_commit(cleanup_db, mocker):
             "deletions": 5,
             "merged": False,
             "state": "open",
+            "mergeable": True,
+            "mergeable_state": "clean",
+            "base": {"sha": "base-sha", "ref": "research/dup-base"},
+            "head": {
+                "sha": "reviewed-rollup-head",
+                "ref": "research/dup-stg",
+            },
         },
     )
     mock_create = mocker.patch(
@@ -1620,6 +1607,17 @@ async def test_admin_rollup_merge_to_promotion_target_proceeds_unqualified(
         new_callable=AsyncMock,
         return_value=("tok", "owner", "repo"),
     )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "state": "open",
+            "merged": False,
+            "mergeable_state": "clean",
+            "base": {"sha": "approved-base-4242", "ref": "main"},
+            "head": {"sha": "approved-head-4242", "ref": "rollup/4242"},
+        },
+    )
     mock_merge = mocker.patch(
         "app.github.merge_pull_request",
         new_callable=AsyncMock,
@@ -1683,6 +1681,21 @@ async def test_admin_rollup_hotfix_to_promotion_target_merges(cleanup_db, mocker
     # See sibling test: empty PR-file list → "ok" Alembic guard verdict so the
     # hotfix merge proceeds instead of hitting the fail-safe "defer" refusal.
     mocker.patch("app.github.get_pr_files", new_callable=AsyncMock, return_value=[])
+    # Explicit human approval bypasses model review, not immutable target
+    # verification.  Both the initial bind and final authority GET must observe
+    # the same open, mergeable promotion-target PR.
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "merged": False,
+            "state": "open",
+            "mergeable": True,
+            "mergeable_state": "clean",
+            "base": {"sha": "base-sha", "ref": "main"},
+            "head": {"sha": "hotfix-head", "ref": "hotfix/approved-rollup"},
+        },
+    )
     mocker.patch(
         "app.admin_task_mutations._maybe_spawn_rollup_smoketest", new_callable=AsyncMock
     )
@@ -1945,18 +1958,32 @@ async def test_classify_positive_ancestry_lands_as_before(cleanup_db, mocker):
 
 
 def _stage_gpr_merged_then_sha(mocker, merge_commit_sha="cafef00dbabe1234"):
-    """Patch get_pull_request for the auto_merge_success wrapper: the first two
-    reads (resume validation, diff-size) report an open PR so control reaches the
-    merge; every later read (the ancestry merge_commit_sha fetch and beyond)
-    reports a merged PR carrying the SHA the ancestry gate inspects."""
+    """Patch get_pull_request for the auto_merge_success wrapper: the first
+    three reads (resume validation, diff-size, authority final GET) report the
+    same exact open PR so control reaches the merge; every later read (the
+    ancestry merge_commit_sha fetch and beyond) reports a merged PR carrying
+    the SHA the ancestry gate inspects."""
     calls = {"n": 0}
 
     def _gpr(*_a, **_k):
         calls["n"] += 1
-        if calls["n"] == 1:
-            return {"merged": False, "state": "open"}
-        if calls["n"] == 2:
-            return {"additions": 10, "deletions": 5, "merged": False, "state": "open"}
+        if calls["n"] <= 3:
+            return {
+                "additions": 10,
+                "deletions": 5,
+                "merged": False,
+                "state": "open",
+                "mergeable": True,
+                "mergeable_state": "clean",
+                "base": {
+                    "sha": "base-sha",
+                    "ref": "research/conflict-base",
+                },
+                "head": {
+                    "sha": "reviewed-rollup-head",
+                    "ref": "research/conflict-stg",
+                },
+            }
         return {"merged": True, "merge_commit_sha": merge_commit_sha}
 
     mocker.patch(
@@ -2481,8 +2508,9 @@ def _mock_repoll_resolves_to_dirty(mocker, *, initial_state):
     get_pull_request side_effect:
       1. existing-PR validation (open, not merged)
       2. diff-size fetch (small PR)
-      3. initial state after failed merge (empty or unknown — triggers repoll)
-      4. re-poll result (dirty — should trigger fix spawn, not deferral)
+      3. authority boundary final GET (same exact, currently-safe target)
+      4. initial state after failed merge (empty or unknown — triggers repoll)
+      5. re-poll result (dirty — should trigger fix spawn, not deferral)
     """
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch(
@@ -2519,8 +2547,48 @@ def _mock_repoll_resolves_to_dirty(mocker, *, initial_state):
         "app.github.get_pull_request",
         new_callable=AsyncMock,
         side_effect=[
-            {"merged": False, "state": "open"},
-            {"additions": 10, "deletions": 5, "merged": False, "state": "open"},
+            {
+                "merged": False,
+                "state": "open",
+                "base": {
+                    "sha": "base-sha",
+                    "ref": "research/conflict-base",
+                },
+                "head": {
+                    "sha": "deadbeef",
+                    "ref": "research/conflict-stg",
+                },
+            },
+            {
+                "additions": 10,
+                "deletions": 5,
+                "merged": False,
+                "state": "open",
+                "mergeable": True,
+                "mergeable_state": "clean",
+                "base": {
+                    "sha": "base-sha",
+                    "ref": "research/conflict-base",
+                },
+                "head": {
+                    "sha": "deadbeef",
+                    "ref": "research/conflict-stg",
+                },
+            },
+            {
+                "merged": False,
+                "state": "open",
+                "mergeable": True,
+                "mergeable_state": "clean",
+                "base": {
+                    "sha": "base-sha",
+                    "ref": "research/conflict-base",
+                },
+                "head": {
+                    "sha": "deadbeef",
+                    "ref": "research/conflict-stg",
+                },
+            },
             {"mergeable_state": initial_state, "head": {"sha": "deadbeef"}},
             {"mergeable_state": "dirty", "head": {"sha": "deadbeef"}},
         ],
@@ -2704,14 +2772,17 @@ async def test_repoll_merge_propagates_landed_to_rollup_children(cleanup_db, moc
 
     _mock_repoll_or_escalation_landing_deps(
         mocker,
-        # get_pull_request calls: (1) validation, (2) diff-size, (3) post-merge
-        # state check returns 'empty' → enters repoll loop, (4) repoll 1 returns
-        # 'clean' → inline merge fires.
+        # get_pull_request calls: (1) validation, (2) diff-size, (3) initial
+        # authority GET, (4) post-merge state is empty, (5) repoll resolves
+        # clean, (6) repoll authority GET.  Every read carries the same
+        # immutable base/head; only mergeability advances.
         get_pr_side_effect=[
-            {"merged": False, "state": "open"},
-            {"additions": 5, "deletions": 2, "merged": False, "state": "open"},
-            {"mergeable_state": "empty", "head": {"sha": "deadbeef"}},
-            {"mergeable_state": "clean", "head": {"sha": "deadbeef"}},
+            _open_rollup_pr_detail(),
+            _open_rollup_pr_detail(),
+            _open_rollup_pr_detail(),
+            _open_rollup_pr_detail(mergeable_state="empty"),
+            _open_rollup_pr_detail(),
+            _open_rollup_pr_detail(),
         ],
         # merge_pull_request calls: (1) initial attempt fails, (2) repoll merge succeeds.
         merge_side_effect=[
@@ -2793,16 +2864,19 @@ async def test_escalation_merge_propagates_landed_to_rollup_children(cleanup_db,
 
     _mock_repoll_or_escalation_landing_deps(
         mocker,
-        # get_pull_request calls: (1) validation, (2) diff-size, (3) post-merge
-        # state returns 'empty' → repoll loop, (4-6) all three repoll attempts
-        # still return 'empty' → loop exhausts, falls to deferral/escalation.
+        # get_pull_request calls: (1) validation, (2) diff-size, (3) initial
+        # authority GET, (4) post-merge state is empty, (5-7) three empty
+        # repolls, (8) escalation bind, (9) escalation authority GET.
         get_pr_side_effect=[
-            {"merged": False, "state": "open"},
-            {"additions": 5, "deletions": 2, "merged": False, "state": "open"},
-            {"mergeable_state": "empty", "head": {"sha": "deadbeef"}},
-            {"mergeable_state": "empty", "head": {"sha": "deadbeef"}},
-            {"mergeable_state": "empty", "head": {"sha": "deadbeef"}},
-            {"mergeable_state": "empty", "head": {"sha": "deadbeef"}},
+            _open_rollup_pr_detail(),
+            _open_rollup_pr_detail(),
+            _open_rollup_pr_detail(),
+            _open_rollup_pr_detail(mergeable_state="empty"),
+            _open_rollup_pr_detail(mergeable_state="empty"),
+            _open_rollup_pr_detail(mergeable_state="empty"),
+            _open_rollup_pr_detail(mergeable_state="empty"),
+            _open_rollup_pr_detail(),
+            _open_rollup_pr_detail(),
         ],
         # merge_pull_request calls: (1) initial attempt fails, (2) escalation succeeds.
         merge_side_effect=[

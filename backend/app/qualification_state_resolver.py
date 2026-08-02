@@ -225,7 +225,7 @@ def apply_verdict_substitution(
     same ``candidate_sha``. In that window the verdict is canonical: the
     returned ``effective_qual`` adopts the verdict's terminal status (and drops
     ``promotion_pending``) so downstream ``summarize_qualification_state`` sees
-    the resolved outcome instead of the stale ``promotion_in_flight``, and
+    the resolved outcome instead of the stale ``promotion_check_wait``, and
     ``disagreement`` records both sides for surfacing.
 
     Otherwise the input dict is returned unchanged with ``disagreement=None``.
@@ -386,10 +386,10 @@ async def resolve_promotion_blocking_result(
 
     Shared predicate for all four promotion-blocking operator levers
     (run_qualification, force_promote, abandon_current_version, set_version_phase).
-    Mirrors ``_promotion_in_flight_result`` in ``release_qualifier`` but applies
+    Mirrors ``_promotion_pending_result`` in ``release_qualifier`` but applies
     finalized-verdict substitution via :func:`apply_verdict_substitution` so that
     a stale-pending record with a finalized ``QualificationVerdict`` row is not
-    misclassified as ``promotion_in_flight`` / ``promotion_check_wait``.
+    misclassified as ``promotion_check_wait``.
 
     Returns a dict with ``status``, ``promotion_pr_number``, ``promotion_pr_url``,
     and any freshness keys when the version is genuinely mid-promotion, or ``None``
@@ -415,7 +415,7 @@ async def resolve_promotion_blocking_result(
     qual_state = summarize_qualification_state(effective_qual)
     if qual_state and qual_state.get("state") in PROMOTION_BLOCKING_STATES:
         result: dict[str, Any] = {
-            # "status" mirrors _promotion_in_flight_result's return shape
+            # "status" mirrors _promotion_pending_result's return shape
             # (used by run_qualification / force_promote / set_version_phase).
             # "state" is included so VersionCutBlockedByPromotion.promotion_freshness
             # consumers (the version-cut router) that read .get("state") still work.

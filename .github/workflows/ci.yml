@@ -276,8 +276,9 @@ jobs:
               docker pull "$playwright_image"
           fi
 
-          timeout --signal=TERM --kill-after=30s 10m \
-          docker run --init \
+          set +e
+          bash scripts/run_viewport_with_retry.sh 3m "$container_name" \
+            docker run --init \
             --name "$container_name" \
             --label com.blueprint.ci=viewport \
             --user "$(id -u):$(id -g)" \
@@ -311,6 +312,9 @@ jobs:
               node --version
               npx --no-install vitest run --config vitest.viewport.config.ts --shard=${{ matrix.shard }}/4
             '
+          viewport_status=$?
+          set -e
+          exit "$viewport_status"
 
       - name: Clean viewport container
         if: always()
