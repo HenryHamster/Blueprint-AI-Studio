@@ -1587,18 +1587,49 @@ def _mock_verify_pr_closed_deps(mocker, *, pr_data, reviews, reviews_status="com
 
 
 @pytest.mark.asyncio
-async def test_verify_pr_closed_after_approve_lands_cancelled_no_alert(
+async def test_verify_pr_closed_after_approve_without_cleanup_signal_stays_failed(
     cleanup_db, mocker
 ):
-    """FIX A: a PR closed-unmerged that was previously APPROVED (review_loop.
-    review_approved=True) and has no CHANGES_REQUESTED review is a cleanup /
-    supersession close → CANCELLED with failure_detail=pr_closed_non_rejection,
-    NO failure alert."""
+    """Approval alone does not prove why a human-authored PR was closed.
+
+    Without an explicit supersession/de-scope signal, a closed-unmerged PR must
+    stay FAILED even when the old lifecycle flag and GitHub review say APPROVED.
+    """
     project = await _make_project(cleanup_db)
     task = await _make_task(
         cleanup_db,
         project.id,
         context={"review_loop": {"review_approved": True, "pr_number": 55}},
+    )
+    await _make_artifact(cleanup_db, task.id, "https://github.com/owner/repo/pull/55")
+
+    _, alert_mock = _mock_verify_pr_closed_deps(
+        mocker,
+        pr_data={"merged": False, "state": "closed", "user": {"login": "human"}},
+        reviews=[{"state": "APPROVED"}],
+    )
+
+    result = await _verify_pr_merged(task, cleanup_db)
+
+    assert result is True
+    assert task.status == TaskStatus.FAILED
+    assert task.context.get("failure_detail") != "pr_closed_non_rejection"
+    alert_mock.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_verify_pr_closed_with_explicit_supersession_lands_cancelled(
+    cleanup_db, mocker
+):
+    """An explicit supersession marker remains a valid cleanup signal."""
+    project = await _make_project(cleanup_db)
+    task = await _make_task(
+        cleanup_db,
+        project.id,
+        context={
+            "superseded": True,
+            "review_loop": {"review_approved": True, "pr_number": 55},
+        },
     )
     await _make_artifact(cleanup_db, task.id, "https://github.com/owner/repo/pull/55")
 
@@ -2857,11 +2888,12 @@ async def _make_rollup_parent_with_pr(session, project_id, *, extra_context=None
 def _mock_rollup_merge_conflict_deps(mocker, *, mergeable_state, head_sha="deadbeef"):
     """Common mocks for reaching the mergeable_state state machine.
 
-    get_pull_request is called three times with different semantics — plumb
+    get_pull_request is called four times with different semantics — plumb
     distinct responses via side_effect:
       1. existing-PR validation at resume (line ~725): open, not merged
       2. diff-size fetch (line ~840): small PR
-      3. mergeable_state refetch after failed merge (line ~966)
+      3. exact-target verification immediately before the merge attempt
+      4. mergeable_state refetch after failed merge (line ~966)
     """
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch(
@@ -2899,8 +2931,26 @@ def _mock_rollup_merge_conflict_deps(mocker, *, mergeable_state, head_sha="deadb
         new_callable=AsyncMock,
         side_effect=[
             {"merged": False, "state": "open"},
-            {"additions": 10, "deletions": 5, "merged": False, "state": "open"},
-            {"mergeable_state": mergeable_state, "head": {"sha": head_sha}},
+            {
+                "additions": 10,
+                "deletions": 5,
+                "merged": False,
+                "state": "open",
+                "base": {"sha": "base-sha", "ref": "research/conflict-base"},
+                "head": {"sha": head_sha, "ref": "research/conflict-stg"},
+            },
+            {
+                "merged": False,
+                "state": "open",
+                "mergeable_state": "clean",
+                "base": {"sha": "base-sha", "ref": "research/conflict-base"},
+                "head": {"sha": head_sha, "ref": "research/conflict-stg"},
+            },
+            {
+                "mergeable_state": mergeable_state,
+                "base": {"sha": "base-sha", "ref": "research/conflict-base"},
+                "head": {"sha": head_sha, "ref": "research/conflict-stg"},
+            },
         ],
     )
     # Ensure pr_is_not_behind's ancestor check treats the PR as genuinely
@@ -3075,14 +3125,8 @@ async def test_merge_conflict_blocked_or_unstable_defers_with_counter(
     cleanup_db, mocker, state
 ):
     """mergeable_state in {'blocked','unstable'} → defer without spawning fix,
-    increment per-state + total deferral counters, and enable GitHub auto-merge
-    so the PR lands once gates clear without a full orchestrator sweep."""
+    increment per-state + total counters, and leave the retry to Blueprint."""
     _mock_rollup_merge_conflict_deps(mocker, mergeable_state=state)
-    mock_auto = mocker.patch(
-        "app.github.enable_auto_merge",
-        new_callable=AsyncMock,
-        return_value={"enabled": True},
-    )
     mock_spawn = mocker.patch(
         "app.rollup_management._spawn_pipeline_task",
         new_callable=AsyncMock,
@@ -3103,7 +3147,6 @@ async def test_merge_conflict_blocked_or_unstable_defers_with_counter(
 
     await _check_and_trigger_rollup(child, cleanup_db)
 
-    mock_auto.assert_awaited_once()
     mock_spawn.assert_not_called()
     await cleanup_db.refresh(parent)
     ctx = parent.context or {}
@@ -3123,11 +3166,6 @@ async def test_merge_conflict_deferral_counter_escalates_to_approval(
     dispatch fires exactly once (the approval gate is latched by
     parent.requires_approval, so subsequent sweeps won't re-dispatch)."""
     _mock_rollup_merge_conflict_deps(mocker, mergeable_state="blocked")
-    mocker.patch(
-        "app.github.enable_auto_merge",
-        new_callable=AsyncMock,
-        return_value={"enabled": False, "message": "not eligible"},
-    )
     mock_spawn = mocker.patch(
         "app.rollup_management._spawn_pipeline_task",
         new_callable=AsyncMock,
@@ -3939,18 +3977,82 @@ async def test_merge_conflict_empty_mergeability_repoll_resolves_and_merges(
     # get_pull_request calls:
     #  1. existing-PR validation (resume path)
     #  2. diff-size fetch
-    #  3. post-merge-failure refetch → mergeable_state=None (not yet computed)
-    #  4. re-poll 1 → still empty
-    #  5. re-poll 2 → "clean" (GitHub finished computing)
+    #  3. authority boundary final GET → same exact, currently-safe target
+    #  4. post-merge-failure refetch → mergeable_state=None (not yet computed)
+    #  5. re-poll 1 → still empty
+    #  6. re-poll 2 → "clean" (GitHub finished computing)
+    #  7. retry authority boundary final GET → same exact clean target
     mocker.patch(
         "app.github.get_pull_request",
         new_callable=AsyncMock,
         side_effect=[
-            {"merged": False, "state": "open"},
-            {"additions": 10, "deletions": 5, "merged": False, "state": "open"},
+            {
+                "merged": False,
+                "state": "open",
+                "base": {
+                    "sha": "basebeef",
+                    "ref": "research/conflict-base",
+                },
+                "head": {
+                    "sha": "deadbeef",
+                    "ref": "research/conflict-stg",
+                },
+            },
+            {
+                "additions": 10,
+                "deletions": 5,
+                "merged": False,
+                "state": "open",
+                "base": {
+                    "sha": "basebeef",
+                    "ref": "research/conflict-base",
+                },
+                "head": {
+                    "sha": "deadbeef",
+                    "ref": "research/conflict-stg",
+                },
+            },
+            {
+                "merged": False,
+                "state": "open",
+                "mergeable": True,
+                "mergeable_state": "clean",
+                "base": {
+                    "sha": "basebeef",
+                    "ref": "research/conflict-base",
+                },
+                "head": {
+                    "sha": "deadbeef",
+                    "ref": "research/conflict-stg",
+                },
+            },
             {"mergeable_state": None, "head": {"sha": "deadbeef"}},
             {"mergeable_state": None, "head": {"sha": "deadbeef"}},
-            {"mergeable_state": "clean", "head": {"sha": "deadbeef"}},
+            {
+                "mergeable_state": "clean",
+                "base": {
+                    "sha": "basebeef",
+                    "ref": "research/conflict-base",
+                },
+                "head": {
+                    "sha": "deadbeef",
+                    "ref": "research/conflict-stg",
+                },
+            },
+            {
+                "merged": False,
+                "state": "open",
+                "mergeable": True,
+                "mergeable_state": "clean",
+                "base": {
+                    "sha": "basebeef",
+                    "ref": "research/conflict-base",
+                },
+                "head": {
+                    "sha": "deadbeef",
+                    "ref": "research/conflict-stg",
+                },
+            },
         ],
     )
     # merge_pull_request calls:
@@ -4051,8 +4153,46 @@ async def test_merge_conflict_empty_mergeability_defers_when_repoll_exhausted(
         "app.github.get_pull_request",
         new_callable=AsyncMock,
         side_effect=[
-            {"merged": False, "state": "open"},
-            {"additions": 10, "deletions": 5, "merged": False, "state": "open"},
+            {
+                "merged": False,
+                "state": "open",
+                "base": {
+                    "sha": "basebeef",
+                    "ref": "research/conflict-base",
+                },
+                "head": {
+                    "sha": "deadbeef",
+                    "ref": "research/conflict-stg",
+                },
+            },
+            {
+                "additions": 10,
+                "deletions": 5,
+                "merged": False,
+                "state": "open",
+                "base": {
+                    "sha": "basebeef",
+                    "ref": "research/conflict-base",
+                },
+                "head": {
+                    "sha": "deadbeef",
+                    "ref": "research/conflict-stg",
+                },
+            },
+            {
+                "merged": False,
+                "state": "open",
+                "mergeable": True,
+                "mergeable_state": "clean",
+                "base": {
+                    "sha": "basebeef",
+                    "ref": "research/conflict-base",
+                },
+                "head": {
+                    "sha": "deadbeef",
+                    "ref": "research/conflict-stg",
+                },
+            },
             # Post-merge-failure refetch + 3 re-polls all return empty state.
             {"mergeable_state": None, "head": {"sha": "deadbeef"}},
             {"mergeable_state": None, "head": {"sha": "deadbeef"}},

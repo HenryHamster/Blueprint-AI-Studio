@@ -331,7 +331,6 @@ Primary agent lifecycle surface under `/api/agent/*`.
 - `GET /api/agent/github/issues`
 - `POST /api/agent/github/branches`
 - `POST /api/agent/github/pull-requests`
-- `POST /api/agent/tasks/{original_task_id}/reviewer-merge`
 
 ### `backend/app/routers/agent_warm_continuity.py`
 
@@ -671,7 +670,6 @@ Agent VM endpoints.
 - `POST /api/agent/refresh-token` — JWT renewal
 - `POST /api/agent/artifacts/upload-url` — Signed artifact upload URL
 - `POST /api/agent/viewport/failure-screenshot-upload-url` — Signed viewport screenshot upload URL
-- `POST /api/agent/tasks/{original_task_id}/reviewer-merge` — Reviewer merge helper
 
 ### `routers/agent_status.py`
 

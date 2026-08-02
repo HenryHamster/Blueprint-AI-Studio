@@ -601,7 +601,7 @@ async def test_strategic_decide_churn_retirement_keep(
 async def test_strategic_decide_churn_retirement_retire(
     client: AsyncClient, db_session, mocker
 ):
-    """The strategist decide_churn_retirement RETIRE op completes the direction,
+    """The strategist decide_churn_retirement RETIRE op retires the direction,
     clears the recommendation, reconciles the gap, and records retired memory."""
     from app.auth import create_agent_token
 
@@ -636,7 +636,8 @@ async def test_strategic_decide_churn_retirement_retire(
 
     await db_session.refresh(project)
     d = next(x for x in project.directions if x["id"] == "d-churn-retire")
-    assert d["status"] == "completed"
+    assert d["status"] == "retired"
+    assert d["retirement_outcome"] == "stopped"
     assert d["auto_completed"] is True
     assert not d.get("churn_retirement_recommended")
     gap = next(g for g in project.problem_model["gaps"] if g["id"] == "g-churn-r")

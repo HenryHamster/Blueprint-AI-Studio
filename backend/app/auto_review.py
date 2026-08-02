@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.database import AsyncSessionLocal
-from app.models import Task, TaskStatus
+from app.models import Project, Task, TaskStatus
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -31,6 +31,7 @@ async def _handle_auto_review(
     pr_title: str,
     project_id: uuid.UUID,
     config: dict[str, Any],
+    webhook_pr: dict[str, Any] | None = None,
 ) -> None:
     """Background handler: spawn a review task for a newly opened PR.
 
@@ -47,6 +48,7 @@ async def _handle_auto_review(
                 pr_title=pr_title,
                 project_id=project_id,
                 config=config,
+                webhook_pr=webhook_pr,
                 session=session,
             )
     except Exception as exc:
@@ -70,12 +72,58 @@ async def _handle_auto_review_inner(
     pr_title: str,
     project_id: uuid.UUID,
     config: dict[str, Any],
+    webhook_pr: dict[str, Any] | None = None,
     session: AsyncSession,
 ) -> None:
     """Inner implementation, called with a live session."""
     max_per_hour = config.get("max_per_hour", 5)
     max_concurrent = config.get("max_concurrent", 3)
     now = _utcnow()
+
+    # The webhook is signature-verified event context, but the background job
+    # may run after another synchronize/close/merge. Resolve current GitHub
+    # state inside canonical admission's repo/PR lock so stale events do not
+    # provision needless reviewers.
+    if not isinstance(webhook_pr, dict):
+        logger.warning(
+            "[AUTO-REVIEW] Refusing unbound review for PR #%d on %s/%s",
+            pr_number,
+            owner,
+            repo,
+        )
+        return
+    from app.review_admission import prepare_direct_review_admission
+    from app.branch_cleanup import _get_project_github_token
+    from app.github import get_pull_request
+
+    project = await session.get(Project, project_id)
+    if project is None:
+        logger.warning("[AUTO-REVIEW] Project %s disappeared", project_id)
+        return
+    gh_token = await _get_project_github_token(project, session)
+
+    async def _current_pr_target() -> dict:
+        return await get_pull_request(
+            gh_token,
+            owner,
+            repo,
+            pr_number,
+            project_id=str(project_id),
+        )
+
+    admission = await prepare_direct_review_admission(
+        session,
+        project_id=project_id,
+        pr_number=pr_number,
+        fetch_live_pr=_current_pr_target,
+    )
+    if not admission.allowed:
+        logger.info(
+            "[AUTO-REVIEW] Admission declined for PR #%d: %s",
+            pr_number,
+            admission.reason,
+        )
+        return
 
     # ── Guard: rate limit ──
     one_hour_ago = now - timedelta(hours=1)
@@ -103,36 +151,21 @@ async def _handle_auto_review_inner(
         )
         return
 
-    # ── Guard: duplicate detection (same PR number, active review task) ──
-    active_statuses = [
-        TaskStatus.QUEUED,
-        TaskStatus.PROVISIONING,
-        TaskStatus.IN_PROGRESS,
-        TaskStatus.EVALUATING,
-    ]
+    # ── Guard: concurrent limit ──
+    from app.review_pipeline import _PIPELINE_ACTIVE_STATUSES
+
     active_tasks = (
         (
             await session.execute(
                 select(Task).where(
                     Task.project_id == project_id,
-                    Task.status.in_(active_statuses),
+                    Task.status.in_(_PIPELINE_ACTIVE_STATUSES),
                 )
             )
         )
         .scalars()
         .all()
     )
-    for t in active_tasks:
-        ctx = t.context or {}
-        if ctx.get("auto_review") is True and ctx.get("pr_number") == pr_number:
-            logger.info(
-                "[AUTO-REVIEW] Duplicate: active task %s already covers PR #%d",
-                t.id,
-                pr_number,
-            )
-            return
-
-    # ── Guard: concurrent limit ──
     active_review_count = sum(
         1 for t in active_tasks if (t.context or {}).get("auto_review") is True
     )
@@ -162,6 +195,13 @@ async def _handle_auto_review_inner(
             "pr_number": pr_number,
             "pr_title": pr_title,
             "pr_url": f"https://github.com/{owner}/{repo}/pull/{pr_number}",
+            "review_loop": {
+                "pr_number": pr_number,
+                "branch": branch,
+                "base_branch": base_branch,
+                "review_target": admission.review_target,
+                "target_assigned_by_backend": True,
+            },
         },
         status=TaskStatus.QUEUED,
         created_by="SYSTEM_AUTO_REVIEW",

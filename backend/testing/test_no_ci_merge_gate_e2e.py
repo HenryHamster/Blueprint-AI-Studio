@@ -120,6 +120,8 @@ async def _make_no_ci_project(db_session, *, with_test_cmd: bool):
 
 def _make_parent_task(db_session, project) -> Task:
     """EVALUATING review task holding the ci_loop the gate drives through."""
+    checked_base = "test-no-ci-base-sha"
+    checked_head = "test-no-ci-head-sha"
     loop = {
         "pr_number": PR_NUMBER,
         "branch": BRANCH,
@@ -127,6 +129,26 @@ def _make_parent_task(db_session, project) -> Task:
         "iteration": 1,
         "review_approved": True,
         "ci_waiting": True,
+        "head_sha": checked_head,
+        "base_sha": checked_base,
+        "ci_checked_head_sha": checked_head,
+        "ci_checked_base_sha": checked_base,
+        "review_target": {
+            "project_id": str(project.id),
+            "pr_number": PR_NUMBER,
+            "base_sha": checked_base,
+            "head_sha": checked_head,
+        },
+        "review_history": [
+            {
+                "verdict": "APPROVE",
+                "issues": [],
+                "reviewed_base_sha": checked_base,
+                "reviewed_head_sha": checked_head,
+                "target_verified_by_backend": True,
+                "review_task_id": "test-no-ci-review",
+            }
+        ],
     }
     task = Task(
         project_id=project.id,
@@ -200,6 +222,17 @@ def _patch_github(mocker):
     mocker.patch(
         "app.rollup_size_preflight.preflight_rollup_size_caps",
         AsyncMock(return_value=("ok", None)),
+    )
+    mocker.patch(
+        "app.review_merge_authority._fetch_live_review_target",
+        AsyncMock(
+            side_effect=lambda _token, _owner, _repo, pr_number, *, project_id, **_kwargs: {
+                "project_id": project_id,
+                "pr_number": pr_number,
+                "base_sha": "test-no-ci-base-sha",
+                "head_sha": "test-no-ci-head-sha",
+            }
+        ),
     )
 
 
@@ -1663,6 +1696,14 @@ async def test_no_ci_optin_honest_block_blocks_degraded_fall_open(db_session, mo
 
     # ── Half 2: policy OFF (default) + SAME degraded reason ⇒ merge UNVERIFIED ─
     off_project = await _make_no_ci_project(db_session, with_test_cmd=True)
+    # Half 1 intentionally leaves its PR held and active.  Give the independent
+    # policy-OFF comparison a distinct repository identity so repository-wide
+    # exact-PR execution authority does not correctly treat that held review as
+    # a competing owner of the same acme/widget#4242 chain.
+    off_project.github_repo = "widget-policy-off"
+    db_session.add(off_project)
+    await db_session.commit()
+    await db_session.refresh(off_project)
     off_parent = _make_parent_task(db_session, off_project)
     await db_session.commit()
     await db_session.refresh(off_parent)
@@ -1675,7 +1716,13 @@ async def test_no_ci_optin_honest_block_blocks_degraded_fall_open(db_session, mo
     # Mirror the orchestrator's merge branch: handle_ci_completion merges
     # UNVERIFIED and raises exactly one operator alert, exactly as today.
     acted = await handle_ci_completion(
-        off_parent, ci_result, "ghs_test", "acme", "widget", db_session, source="poll"
+        off_parent,
+        ci_result,
+        "ghs_test",
+        "acme",
+        "widget-policy-off",
+        db_session,
+        source="poll",
     )
     assert acted is True
     merge_mock.assert_called_once()
@@ -1862,6 +1909,12 @@ async def test_block_no_test_unverified_merge_mirrors_orchestrator_decision_tree
 
     # ── Half 2: policy OFF (default) + SAME reason ⇒ merge UNVERIFIED ─────────
     off_project = await _make_no_ci_project(db_session, with_test_cmd=False)
+    # Repository-wide merge ownership is keyed by exact repo/PR.  Keep this
+    # independent half from inheriting half 1's intentionally held PR #4242.
+    off_project.github_repo = "widget-policy-off"
+    db_session.add(off_project)
+    await db_session.commit()
+    await db_session.refresh(off_project)
     off_parent = _make_parent_task(db_session, off_project)
     await db_session.commit()
     await db_session.refresh(off_parent)
@@ -1874,7 +1927,13 @@ async def test_block_no_test_unverified_merge_mirrors_orchestrator_decision_tree
     # Mirror the orchestrator's merge branch: handle_ci_completion merges
     # UNVERIFIED and raises exactly one operator alert, exactly as today.
     acted = await handle_ci_completion(
-        off_parent, ci_result, "ghs_test", "acme", "widget", db_session, source="poll"
+        off_parent,
+        ci_result,
+        "ghs_test",
+        "acme",
+        "widget-policy-off",
+        db_session,
+        source="poll",
     )
     assert acted is True
     merge_mock.assert_called_once()
@@ -2858,6 +2917,8 @@ _STAGING_BASE = "research/rollup-7"
 def _make_parent_task_on_base(db_session, project, base: str) -> Task:
     """Like ``_make_parent_task`` but targets an arbitrary base branch so the
     bypass-path flows can drive a staging-base merge."""
+    checked_base = "test-no-ci-base-sha"
+    checked_head = "test-no-ci-head-sha"
     loop = {
         "pr_number": PR_NUMBER,
         "branch": BRANCH,
@@ -2865,6 +2926,26 @@ def _make_parent_task_on_base(db_session, project, base: str) -> Task:
         "iteration": 1,
         "review_approved": True,
         "ci_waiting": True,
+        "head_sha": checked_head,
+        "base_sha": checked_base,
+        "ci_checked_head_sha": checked_head,
+        "ci_checked_base_sha": checked_base,
+        "review_target": {
+            "project_id": str(project.id),
+            "pr_number": PR_NUMBER,
+            "base_sha": checked_base,
+            "head_sha": checked_head,
+        },
+        "review_history": [
+            {
+                "verdict": "APPROVE",
+                "issues": [],
+                "reviewed_base_sha": checked_base,
+                "reviewed_head_sha": checked_head,
+                "target_verified_by_backend": True,
+                "review_task_id": "test-no-ci-review",
+            }
+        ],
     }
     task = Task(
         project_id=project.id,

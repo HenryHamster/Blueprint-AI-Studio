@@ -77,9 +77,9 @@ async def _project(session) -> Project:
 
 def _pending_marker(sidecar_id) -> dict:
     return {
-        "lane": "review_second_opinion",
+        "lane": "finding_challenge",
         "sidecar_task_id": str(sidecar_id),
-        "verdict_key": "review_second_opinion_reconciliation",
+        "verdict_key": "finding_challenge",
     }
 
 

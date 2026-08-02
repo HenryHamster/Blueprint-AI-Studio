@@ -12,8 +12,9 @@ A PR is merged only when BOTH gates are open on the parking task's review_loop:
 
 Whichever signal arrives first sets its flag and waits; the second flips the
 gate and triggers the merge. ``ci_waiting`` only means "orchestrator should poll
-CI" — it is NOT permission to merge. The legacy ``verdict == "APPROVE"`` form is
-accepted as a fallback so in-flight tasks from before the gate split still merge.
+CI" — it is NOT permission to merge. A legacy scalar
+``verdict == "APPROVE"`` is never merge authority; an exact-target APPROVE in
+durable review history (or an explicit no-review policy marker) is required.
 """
 
 import asyncio
@@ -42,8 +43,10 @@ from app.ci_merge_helpers import (  # noqa: F401
     _pr_number_match,
     _relock_merge_task,
     _review_approved,
+    _review_not_required,
     arm_ci_wait,
     effective_pr_number,
+    revoke_review_authority_for_active_fix,
 )
 from app.models import Task, TaskStatus, _utcnow
 
@@ -156,6 +159,8 @@ async def _attempt_merge_with_retry_and_escalation(
     source: str,
     precomputed_migration_guard: object | None = None,
     precomputed_size_cap: tuple[str, str | None] | None = None,
+    checked_head_sha: str | None = None,
+    checked_base_sha: str | None = None,
 ) -> bool:
     """Both gates are open — try to merge. Mutates ``task`` in place; caller commits.
 
@@ -202,27 +207,18 @@ async def _attempt_merge_with_retry_and_escalation(
     )
     from app.shared_state import runtime_config as _rt_cfg
 
-    # C5 invariant: the approval/safeguard gate is enforced AT the merge call,
-    # not just at the (point-in-time) set sites. Both gate flags can be set
-    # AFTER a task is parked ci_waiting (e.g. a cross-cutting safeguard spawns
-    # while CI is still pending), so the gate must be re-read here — the merge
-    # primitive is the single chokepoint every merge path funnels through
-    # (handle_ci_completion both-gates-met, the rollup gate-handoff, and the
-    # skip-review CI-wait park). With gates ON and requires_approval still set,
-    # do NOT merge: leave the task EVALUATING (caller commits) and return False.
-    # The orchestrator CI-poll loop skips requires_approval rows (added in the
-    # same change) so this does not busy-loop; the merge fires once the
-    # safeguard/operator clears the flag. With gates OFF the flag is advisory
-    # only (the set sites no longer set it), so we proceed.
+    # Approval gates are enforced at the merge call so a task parked in
+    # ci_waiting cannot bypass an approval requirement added while CI was pending.
+    # Leave the task EVALUATING until the operator clears the gate.
     if task.requires_approval and _rt_cfg.get("require_approval_gates", True):
         _gate_pr = (task.context or {}).get("review_loop", {}).get("pr_number")
         logger.info(
             f"[CI] Merge held for PR #{_gate_pr} — task {str(task.id)[:8]} "
-            f"requires_approval (safeguard/approval gate still set); leaving "
+            f"requires_approval (approval gate still set); leaving "
             f"EVALUATING, not merging"
         )
         task.latest_status_message = (
-            f"Merge gated — awaiting approval/safeguard for PR #{_gate_pr}"
+            f"Merge gated — awaiting approval for PR #{_gate_pr}"
         )
         session.add(task)
         return False
@@ -251,6 +247,10 @@ async def _attempt_merge_with_retry_and_escalation(
         or ci_payload.get("base_branch", "")
         or get_project_integration_branch(_merge_project)
     )
+    if not ci_pr_number:
+        task.latest_status_message = "Merge held: missing PR identity"
+        session.add(task)
+        return False
 
     # Pre-merge Alembic dual-head guard (parity with the autonomous rollup and
     # hotfix back-merge paths). Two task PRs can each independently add 'the
@@ -339,6 +339,10 @@ async def _attempt_merge_with_retry_and_escalation(
                     from app.task_completion import _reset_review_loop_pr_head_cache
 
                     review_loop = _reset_review_loop_pr_head_cache(ci_loop)
+                    review_loop = revoke_review_authority_for_active_fix(
+                        task,
+                        review_loop=review_loop,
+                    )
                     # Re-arm the CI wait on the rewritten PR head. arm_ci_wait
                     # co-stamps pr_number + a fresh ci_wait_started so the merge
                     # poll never sees the identity-less {ci_waiting} shape.
@@ -415,6 +419,10 @@ async def _attempt_merge_with_retry_and_escalation(
             return False
         if _sc_verdict == "bumped":
             _sc_loop = _reset_review_loop_pr_head_cache(ci_loop)
+            _sc_loop = revoke_review_authority_for_active_fix(
+                task,
+                review_loop=_sc_loop,
+            )
             arm_ci_wait(_sc_loop, pr_number=ci_pr_number, now_iso=_utcnow().isoformat())
             _sc_loop["ci_passed"] = False
             task.context = {
@@ -516,33 +524,33 @@ async def _attempt_merge_with_retry_and_escalation(
     # operation auto-acquires (audit H6 — no
     # connection held during the GitHub window).
 
-    expected_merge_head_sha = ci_loop.get("head_sha") or None
-    merge_result = await merge_pull_request(
-        gh_token,
-        owner,
-        repo,
-        ci_pr_number,
-        expected_head_sha=expected_merge_head_sha,
+    from app.review_merge_authority import attempt_merge_with_authority
+
+    authority, merge_result = await attempt_merge_with_authority(
+        task,
+        session,
+        merge_call=lambda expected_head: merge_pull_request(
+            gh_token,
+            owner,
+            repo,
+            ci_pr_number,
+            expected_head_sha=expected_head,
+        ),
+        gh_token=gh_token,
+        owner=owner,
+        repo=repo,
+        ci_loop=ci_loop,
+        pr_number=int(ci_pr_number),
+        branch=ci_branch,
+        base_branch=ci_base,
+        original_task_id=ci_orig_id,
+        checked_head_sha=checked_head_sha,
+        checked_base_sha=checked_base_sha,
+        retry_nonterminal=source != "webhook",
     )
-    if (
-        not merge_result.get("merged")
-        and not merge_result.get("conflict")
-        and not merge_result.get("review_veto")
-        and source != "webhook"
-    ):
-        # Retry with backoff (skip in webhook context — would timeout delivery).
-        # Skip retries on conflict: 409 means the diff can't merge until code changes.
-        for attempt in range(3):
-            await asyncio.sleep(5 * (3**attempt))
-            merge_result = await merge_pull_request(
-                gh_token,
-                owner,
-                repo,
-                ci_pr_number,
-                expected_head_sha=expected_merge_head_sha,
-            )
-            if merge_result.get("merged") or merge_result.get("conflict"):
-                break
+    if merge_result is None:
+        return False
+    ci_loop = authority.review_loop
 
     # ── PRE-RELOCK GITHUB I/O ──────────────────────────────────────────────
     # Round 5 W1 (this commit): all GitHub API calls below this point used to
@@ -1359,6 +1367,9 @@ async def _attempt_merge_with_retry_and_escalation(
                 None,
             )
             if existing_fix:
+                ci_loop = revoke_review_authority_for_active_fix(
+                    task, existing_fix.id, review_loop=ci_loop
+                )
                 if not _is_rollup_parent_awaiting_merge(task.context):
                     task.status = TaskStatus.COMPLETED
                 task.latest_status_message = (
@@ -1369,6 +1380,8 @@ async def _attempt_merge_with_retry_and_escalation(
                     f"[CI] PR #{ci_pr_number} behind base escalation — fix already exists → "
                     f"{existing_fix.id} ({source})"
                 )
+                session.add(task)
+                await session.commit()
                 return False
             behind_prompt = (
                 f"PR #{ci_pr_number} is behind `{ci_base}` and GitHub's update_branch API "
@@ -1397,10 +1410,11 @@ async def _attempt_merge_with_retry_and_escalation(
                 suppress_warm_handoff=True,
             )
             if fix_task:
-                ci_loop["ci_waiting"] = False
-                ci_loop["ci_fix_spawned"] = str(fix_task.id)
-                task.context = {**(task.context or {}), "review_loop": ci_loop}
-                flag_modified(task, "context")
+                ci_loop = revoke_review_authority_for_active_fix(
+                    task,
+                    fix_task.id,
+                    review_loop=(task.context or {}).get("review_loop") or ci_loop,
+                )
                 if not _is_rollup_parent_awaiting_merge(task.context):
                     task.status = TaskStatus.COMPLETED
                 task.latest_status_message = (
@@ -1481,12 +1495,17 @@ async def _attempt_merge_with_retry_and_escalation(
                 None,
             )
             if existing_fix:
+                ci_loop = revoke_review_authority_for_active_fix(
+                    task, existing_fix.id, review_loop=ci_loop
+                )
                 if not _is_rollup_parent_awaiting_merge(task.context):
                     task.status = TaskStatus.COMPLETED
                 task.latest_status_message = f"PR #{ci_pr_number} merge conflict, fix already active → {existing_fix.id}"
                 logger.warning(
                     f"[CI] PR #{ci_pr_number} merge conflict, fix already exists → {existing_fix.id} ({source})"
                 )
+                session.add(task)
+                await session.commit()
                 return False
             conflict_prompt = build_merge_conflict_fix_prompt(
                 ci_pr_number, ci_base, merge_error=merge_msg
@@ -1524,11 +1543,11 @@ async def _attempt_merge_with_retry_and_escalation(
                 suppress_warm_handoff=True,
             )
             if fix_task:
-                ci_loop_ctx = dict(ci_loop)
-                ci_loop_ctx["ci_waiting"] = False
-                ci_loop_ctx["ci_fix_spawned"] = str(fix_task.id)
-                task.context = {**(task.context or {}), "review_loop": ci_loop_ctx}
-                flag_modified(task, "context")
+                ci_loop = revoke_review_authority_for_active_fix(
+                    task,
+                    fix_task.id,
+                    review_loop=(task.context or {}).get("review_loop") or ci_loop,
+                )
                 if not _is_rollup_parent_awaiting_merge(task.context):
                     task.status = TaskStatus.COMPLETED
                 task.latest_status_message = (
@@ -1713,11 +1732,26 @@ async def _attempt_merge_with_retry_and_escalation(
                     .scalars()
                     .all()
                 )
-                already_fixing = any(
-                    t.id != task.id and t.first_payload.get("type") == "fix"
-                    for t in active_tasks
+                existing_fix = next(
+                    (
+                        t
+                        for t in active_tasks
+                        if t.id != task.id and t.first_payload.get("type") == "fix"
+                    ),
+                    None,
                 )
-                if not already_fixing:
+                if existing_fix is not None:
+                    ci_loop = revoke_review_authority_for_active_fix(
+                        task, existing_fix.id, review_loop=ci_loop
+                    )
+                    task.latest_status_message = (
+                        f"Merge held on PR #{ci_pr_number}: rebase fix "
+                        f"{existing_fix.id} already active"
+                    )
+                    session.add(task)
+                    await session.commit()
+                    return False
+                else:
                     rebase_prompt = (
                         f"PR #{ci_pr_number} was approved and CI passed, but GitHub rejected the merge: "
                         f"{merge_msg[:300]}\n\n"
@@ -1746,10 +1780,12 @@ async def _attempt_merge_with_retry_and_escalation(
                         suppress_warm_handoff=True,
                     )
                     if fix_task:
-                        ci_loop["ci_waiting"] = (
-                            False  # hand off; fix-completion will re-park
+                        ci_loop = revoke_review_authority_for_active_fix(
+                            task,
+                            fix_task.id,
+                            review_loop=(task.context or {}).get("review_loop")
+                            or ci_loop,
                         )
-                        task.context = {**(task.context or {}), "review_loop": ci_loop}
                         from app.rollup_state import _is_rollup_parent_awaiting_merge
 
                         if not _is_rollup_parent_awaiting_merge(task.context):
@@ -1902,6 +1938,8 @@ async def handle_ci_completion(
     session: AsyncSession,
     *,
     source: str = "poll",
+    checked_head_sha: str | None = None,
+    checked_base_sha: str | None = None,
 ) -> bool:
     """Process CI completion for a ci_waiting task.
 
@@ -1992,10 +2030,45 @@ async def handle_ci_completion(
         # Record the CI gate signal. JSONB columns don't track in-place dict
         # mutations — flag_modified ensures the change is flushed to disk.
         ci_loop["ci_passed"] = True
+        _checked_head_sha = str(
+            checked_head_sha
+            or ci_loop.get("ci_checked_head_sha")
+            or ci_loop.get("head_sha")
+            or ""
+        )
+        _checked_base_sha = str(
+            checked_base_sha or ci_loop.get("ci_checked_base_sha") or ""
+        )
+        if _checked_head_sha:
+            ci_loop["ci_checked_head_sha"] = _checked_head_sha
+        if _checked_base_sha:
+            ci_loop["ci_checked_base_sha"] = _checked_base_sha
         task.context = {**(task.context or {}), "review_loop": ci_loop}
         flag_modified(task, "context")
 
-        if not _review_approved(ci_loop):
+        # A prior authoritative-gate attempt may have failed before it could
+        # resolve or spawn the exact live target. In that state there is no
+        # review task to wait for, so re-enter the merge chokepoint on the next
+        # CI signal instead of parking until the generic one-hour backstop.
+        _authoritative_retry_needed = bool(
+            ci_loop.get("authoritative_review_required") is True
+            and not ci_loop.get("authoritative_review_task_id")
+        )
+        # A legacy scalar APPROVE used to open this gate directly.  It is no
+        # longer authority, but simply parking it here would strand an
+        # in-flight pre-ledger task until the generic orphan backstop.  Route
+        # that one legacy approval shape through the authoritative boundary so
+        # it is replaced immediately by an exact-target review.  Other legacy
+        # verdicts remain closed and follow their normal review/fix lifecycle.
+        _legacy_approval_needs_exact_review = bool(
+            ci_loop.get("verdict") == "APPROVE"
+            and not _review_approved(ci_loop)
+        )
+        if (
+            not _review_approved(ci_loop)
+            and not _authoritative_retry_needed
+            and not _legacy_approval_needs_exact_review
+        ):
             # Review hasn't approved yet — leave parked, just persist the signal.
             # The review task's APPROVE handler will write review_approved on the
             # parent and trigger the gate when it runs.
@@ -2185,8 +2258,8 @@ async def handle_ci_completion(
                                 ci_loop["review_wait_respawn_count"] = (
                                     _respawn_count + 1
                                 )
-                                # Reset the window so the fresh reviewer gets a
-                                # full timeout before we escalate again.
+                                # Reset the window so the replacement review
+                                # task gets a full timeout before escalation.
                                 ci_loop["review_wait_started"] = (
                                     _utcnow().isoformat()
                                 )
@@ -2257,7 +2330,14 @@ async def handle_ci_completion(
 
         # Both gates met — perform the merge
         await _attempt_merge_with_retry_and_escalation(
-            task, gh_token, owner, repo, session, source=source
+            task,
+            gh_token,
+            owner,
+            repo,
+            session,
+            source=source,
+            checked_head_sha=_checked_head_sha,
+            checked_base_sha=_checked_base_sha,
         )
     else:
         # CI failed — spawn fix task
@@ -2475,10 +2555,12 @@ async def handle_ci_completion(
         if fix_task:
             from app.rollup_state import _is_rollup_parent_awaiting_merge
 
-            ci_loop_ctx = dict(ci_loop)
-            ci_loop_ctx["ci_waiting"] = False
-            ci_loop_ctx["ci_fix_spawned"] = str(fix_task.id)
-            task.context = {**(task.context or {}), "review_loop": ci_loop_ctx}
+            ci_loop = revoke_review_authority_for_active_fix(
+                task,
+                fix_task.id,
+                review_loop=(task.context or {}).get("review_loop") or ci_loop,
+            )
+            ci_loop["ci_waiting"] = False
             # Rollup parents stay in EVALUATING — ci_completion will promote them
             # via pr_merged=True once the fix lands and the PR merges.
             # Capture the broadcast status HERE, at the point of decision, rather

@@ -24,10 +24,13 @@ from sqlmodel import select
 from app.context_bounds import bound_deferred_findings
 from app.depends_on_provenance import remember_structural_depends_on
 from app.findings_index import (  # noqa: F401 — re-exported for callers/tests
+    FINALIZED_RESEARCH_FINDINGS_KEY,
     lookup_findings_by_source_ref,
     query_findings_index,
-    _shelve_findings_for_next_cycle,
+    resolve_research_findings_for_surface,
+    resolve_research_findings_for_surface_from_state,
 )
+from app.findings_shelving import _shelve_findings_for_next_cycle  # noqa: F401
 from app.models import (
     Artifact,
     ArtifactType,
@@ -57,6 +60,10 @@ from app.direction_metrics import (  # noqa: F401 — re-exported for callers/te
     _compute_productivity_score,
 )
 from app.direction_outcomes import credit_gate_merged_count
+from app.direction_terminal_guard import (
+    direction_success_evidence_met,
+    mark_auto_direction_terminal,
+)
 from app.failure_classification import (
     CO_DEFERRED_SHELVED,
     EXTERNAL_API,
@@ -153,7 +160,6 @@ from app.shared_state import (
 )
 from app.discovery_admission import (
     consume_discovery_admission,
-    discovery_admission_mode_from_runtime,
     reserve_discovery_admission,
 )
 from app.spawn_calibration import (  # noqa: F401 — re-exported for tests/callers
@@ -894,13 +900,14 @@ async def _delivered_output_present(task: Task, session: AsyncSession) -> bool:
 
 
 def _record_research_survival_signal(task: Task, *, surviving: int) -> None:
-    """Record the honest research success signal on the task at dispatch time.
+    """Record the honest research success signal on the finalized task.
 
-    ``surviving`` is the count of findings that survived ingestion validation +
-    dedup + actionability gating and were routed to work (spawned, or deferred
-    only for capacity/health reasons). Stored on ``task.context`` so the outcome
-    evaluator (``task_outcomes._evaluate_research``) scores the cycle on real
-    surviving work rather than the raw parsed-findings list.
+    ``surviving`` is the count of finalized findings backed by a durable,
+    non-cancelled child route.  Deferred intent is not surviving work: it remains
+    in ``context['deferred_findings']`` and may count only if a later cycle
+    actually admits it. Stored on ``task.context`` so the outcome evaluator
+    (``task_outcomes._evaluate_research``) scores the cycle on real routed work
+    rather than the raw parsed-findings list.
 
     A cycle whose findings were ALL rejected (stale duplicates, citations absent
     on HEAD, low actionability) yields ``surviving == 0``; in that case any
@@ -927,11 +934,10 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
     observed in the 2026-06-10 incident where cycle 10 spawned 2 minutes
     after cycle 9 completed with "no actionable findings").
 
-    Also applies the same auto-completion criteria used by apply_post_spawn_state:
-    if the direction becomes saturated (3+ consecutive unproductive cycles) and has
-    accumulated enough merged PRs (>= 3), it is marked completed so that fully
-    exhausted, proven directions are retired consistently regardless of whether the
-    triggering cycle happened to produce any findings.
+    Also applies the same terminal criteria used by apply_post_spawn_state: a
+    saturated direction completes successfully only when its declared
+    success_evidence has a challenge-approved ``met`` judgment; otherwise genuine
+    exhaustion may retire it as the distinct ``exhausted`` outcome.
     """
     direction_id = (task.context or {}).get("direction_id") or task.first_payload.get(
         "current_direction_id"
@@ -958,13 +964,11 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
             target["possibly_saturated"] = new_consec >= 3
         stamp_direction_refractory(target)
 
-        # Auto-complete the most exhausted directions (those producing zero
-        # findings) rather than looping forever — same criteria as
-        # apply_post_spawn_state:
-        #   * PROVEN route: saturated AND >= 3 verified PRs merged.
-        #   * ADDITIVE exhaustion route: genuinely exhausted (saturated with no
-        #     recent output / deadlocked) with < 3 merges, under the code-failing
-        #     and externally-frozen guardrails.
+        # Resolve saturated zero-finding directions against the same terminal
+        # truth as apply_post_spawn_state.  Only challenge-approved
+        # evidence_progress=met over a declared success_evidence contract is a
+        # successful completion.  Otherwise genuine exhaustion may retire the
+        # direction, but is recorded explicitly as non-successful.
         if target.get("status") == "active" and target.get("possibly_saturated"):
             from app.strategic_completion import (
                 _exhaustion_complete_reason,
@@ -984,37 +988,40 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
                 ) - int(agg.get("total_stranded_prs_merged", 0) or 0),
             )
             total_cycles = len(history) + (agg.get("total_cycles") or 0)
-            # Direction completion falls back to its own proven-merge and
-            # exhaustion logic. The acceptance contract is enforced only at
-            # qualify (the ledger gate in compute_composite), so a direction
-            # retiring while a criterion is unmet still cannot promote an unmet
-            # version — there is no pre-qualification coverage precondition here.
-            if total_merged >= 3:
-                target["status"] = "completed"
-                target["completed_at"] = now_iso
-                target["auto_completed"] = True
-                target["auto_completed_reason"] = (
-                    f"Auto-completed: direction saturated with {total_merged} "
-                    f"verified PRs merged across {total_cycles} cycles"
+            if direction_success_evidence_met(target):
+                reason = (
+                    "Auto-completed: declared success evidence met "
+                    f"after {total_merged} verified PRs merged across "
+                    f"{total_cycles} cycles"
+                )
+                mark_auto_direction_terminal(
+                    target,
+                    outcome="success_evidence_met",
+                    reason=reason,
+                    completed_at=now_iso,
                 )
                 _auto_complete_info.append(
                     {
                         "text": target.get("text", direction_id),
-                        "reason": target["auto_completed_reason"],
+                        "reason": reason,
+                        "outcome": "success_evidence_met",
                         "total_merged": total_merged,
                         "total_cycles": total_cycles,
                     }
                 )
             elif _should_autocomplete_exhausted(target):
                 reason = _exhaustion_complete_reason(target)
-                target["status"] = "completed"
-                target["completed_at"] = now_iso
-                target["auto_completed"] = True
-                target["auto_completed_reason"] = reason
+                mark_auto_direction_terminal(
+                    target,
+                    outcome="exhausted",
+                    reason=reason,
+                    completed_at=now_iso,
+                )
                 _auto_complete_info.append(
                     {
                         "text": target.get("text", direction_id),
                         "reason": reason,
+                        "outcome": "exhausted",
                         "total_merged": total_merged,
                         "total_cycles": total_cycles,
                     }
@@ -1024,12 +1031,12 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
         session, task.project_id, _apply_no_findings_refractory
     )
 
-    # Reconcile problem-model gap staffing when the direction was auto-completed.
+    # Reconcile problem-model gap staffing when the direction became terminal.
     # The no-findings path bypasses _apply_direction_state_updates, so gap
     # reconciliation would otherwise be skipped — leaving the direction in
     # active_moves until the next lifecycle prune removes the completed entry.
     if _auto_complete_info:
-        from app.problem_model import reconcile_gaps_for_retired_directions  # noqa: PLC0415
+        from app.problem_model import reconcile_gaps_for_retired_directions
 
         _reconcile_now = _utcnow().isoformat()
         _retired_id = direction_id
@@ -1050,22 +1057,29 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
             )
 
     for info in _auto_complete_info:
-        from app.models import Alert, AlertSeverity  # noqa: PLC0415
+        from app.models import Alert, AlertSeverity
 
+        _successful = info.get("outcome") == "success_evidence_met"
+        _milestone = "auto-completed" if _successful else "auto-retired"
+        _title = "Direction auto-completed" if _successful else "Direction auto-retired"
         session.add(
             Alert(
                 project_id=task.project_id,
                 severity=AlertSeverity.INFO,
-                event_type="research.direction_auto_completed",
-                title="Direction auto-completed",
+                event_type=(
+                    "research.direction_auto_completed"
+                    if _successful
+                    else "research.direction_auto_retired"
+                ),
+                title=_title,
                 message=(
-                    f"Direction '{info['text'][:80]}' was auto-completed: "
+                    f"Direction '{info['text'][:80]}' reached {_milestone}: "
                     f"{info['reason']}."
                 ),
             )
         )
         try:
-            from app.notification_dispatch import (  # noqa: PLC0415
+            from app.notification_dispatch import (
                 post_direction_milestone_message,
             )
 
@@ -1073,7 +1087,7 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
                 session,
                 task.project_id,
                 direction_text=info["text"],
-                milestone="auto-completed",
+                milestone=_milestone,
                 reason=info["reason"],
                 direction_id=direction_id,
             )
@@ -1258,8 +1272,6 @@ def _is_high_stakes_finding(finding: Dict[str, Any]) -> bool:
     # finding as bodiless even when a non-empty description is also present.
     if not str(finding.get("prompt") or finding.get("description") or "").strip():
         return False
-    if finding.get("already_spawned"):
-        return False
     if finding.get("actionability_grade") == "LOW":
         return False
     # Capability-foundation work is structurally non-adversarial: a finding that
@@ -1359,8 +1371,6 @@ def _research_findings_would_spawn(findings: List[Dict[str, Any]]) -> bool:
         if (f.get("type") or "") in _NON_SPAWNING_FINDING_TYPES:
             continue
         if not str(f.get("prompt") or "").strip():
-            continue
-        if f.get("already_spawned"):
             continue
         if f.get("actionability_grade") == "LOW":
             continue
@@ -1725,6 +1735,17 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         spawn_forward_quality_grader,
     )
 
+    # A post-commit replay may arrive after the survivor set was finalized.
+    # Keep that authoritative snapshot across the handler's pre-gate
+    # ``plan_output`` write below; a replay must never replace accepted findings
+    # with freshly re-parsed raw output.
+    _prior_finalized_findings = (
+        [f for f in task.plan_output if isinstance(f, dict)]
+        if (task.context or {}).get(FINALIZED_RESEARCH_FINDINGS_KEY) is True
+        and isinstance(task.plan_output, list)
+        else None
+    )
+
     # Re-entry signal: the independent grader has returned its verdict.
     _grader_verdict = (task.context or {}).get(QUALITY_GRADER_VERDICT_KEY)
     _adversarial_verdict_raw = (task.context or {}).get(ADVERSARIAL_GATE_VERDICT_KEY)
@@ -1947,6 +1968,11 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         else:
             task.latest_status_message = "Research completed with no actionable findings"
         task.plan_output = []
+        task.context = {
+            **(task.context or {}),
+            FINALIZED_RESEARCH_FINDINGS_KEY: True,
+        }
+        flag_modified(task, "context")
         _record_research_survival_signal(task, surviving=0)
         # Stamp refractory on the direction before committing — this path skips
         # _apply_direction_state_updates, so last_researched_at would otherwise
@@ -4075,11 +4101,6 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             empty_prompt_count += 1
             continue
 
-        # Skip findings already directly dispatched by the research agent (scope=small+risk=low).
-        # These were sent via /api/agent/spawn before research completed; no task needed here.
-        if finding.get("already_spawned"):
-            continue
-
         # Adversarial gate: defer findings that failed the per-finding adversarial
         # challenge. The finding is deferred (not dropped) so it resurfaces in
         # prior_deferred_findings on the next research cycle for a fresh attempt.
@@ -4256,7 +4277,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
 
         # Spawn-time health gate: when pipeline is degraded, cap implementation task creation
         # to avoid queuing tasks that will fail immediately or stall indefinitely.
-        # Metadata findings (already handled above) and already_spawned bypass this check.
+        # Metadata findings were already handled above.
         if _pipeline_degraded and _impl_spawned >= _DEGRADED_SPAWN_CAP:
             _degradation_gate_deferred.append(finding)
             continue
@@ -5475,7 +5496,6 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 session,
                 cycle_id=task.discovery_cycle_id,
                 admission_key=_finding_admission_key,
-                mode=discovery_admission_mode_from_runtime(_runtime_config),
                 metadata={"source": "research_finding"},
             )
             if not _finding_admission.allowed:
@@ -5683,7 +5703,6 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 session,
                 cycle_id=task.discovery_cycle_id,
                 admission_key=_memo_admission_key,
-                mode=discovery_admission_mode_from_runtime(_runtime_config),
                 metadata={"source": "research_memo"},
             )
             if not _memo_admission.allowed:
@@ -5812,7 +5831,6 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 session,
                 cycle_id=task.discovery_cycle_id,
                 admission_key=_salvage_admission_key,
-                mode=discovery_admission_mode_from_runtime(_runtime_config),
                 metadata={"source": "research_salvage"},
             )
             if not _salvage_admission.allowed:
@@ -5998,19 +6016,6 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # can distinguish thin-but-honest results from capacity-truncated ones.
     if _capacity_degradation_reason:
         _mark_capacity_degraded(task, _capacity_degradation_reason)
-    # Honest success signal: count findings that SURVIVED ingestion validation +
-    # dedup + actionability and were routed to work — spawned, or deferred only
-    # for capacity/health reasons (batch cap, pipeline degradation). Findings
-    # dropped as low-actionability / stale-duplicate / broken-citation, or
-    # rejected by the reproduce-on-HEAD gate, did NOT survive and are excluded
-    # (the gate uses `continue`, so they never reach _impl_spawned or either
-    # capacity-deferred list), so a cycle whose findings were all rejected scores
-    # neutral instead of a spurious success.
-    _surviving_findings = (
-        _impl_spawned + len(_batch_cap_deferred) + len(_degradation_gate_deferred)
-    )
-    _record_research_survival_signal(task, surviving=_surviving_findings)
-
     # Evergreen backlog adapter: if this research probe was spawned from the
     # evergreen ledger, transition its row from the probe's outcome. Children
     # still come ONLY from the surviving-finding gates above (_impl_spawned) —
@@ -6025,7 +6030,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 item_id=str(_evergreen_item_id),
                 impl_spawned=_impl_spawned,
                 reproduce_rejected=len(_reproduce_rejected),
-                surviving=_surviving_findings,
+                surviving=_impl_spawned,
             )
         except Exception as _eg_exc:  # noqa: BLE001 — outcome adapter must not block completion
             logger.warning(
@@ -6787,26 +6792,6 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         flag_modified(task, "context")
         session.add(task)
 
-    # Adjust the surviving-findings signal to exclude children cancelled during
-    # prerequisite wiring (escalated-to-parent or co-deferred-shelved). These
-    # tasks were counted in _surviving_findings at spawn time but never actually
-    # ran; leaving them in the signal causes the saturation detector to see
-    # tasks_created>=1 on a cycle that produced no real work, preventing
-    # auto-completion for stuck directions.
-    _prereq_cancelled_count = sum(
-        1
-        for ct in child_tasks
-        if ct.status == TaskStatus.CANCELLED
-        and (
-            (ct.context or {}).get("prerequisite_escalated_to_parent")
-            or (ct.context or {}).get(CO_DEFERRED_SHELVED)
-        )
-    )
-    if _prereq_cancelled_count:
-        _record_research_survival_signal(
-            task, surviving=max(0, _surviving_findings - _prereq_cancelled_count)
-        )
-
     # Chain auto-decomposed siblings: when a finding is split into N sub-tasks
     # by cochange/path clustering, run them serially rather than in parallel.
     # Each sibling's base branch otherwise picks up partial sibling-merged
@@ -6882,6 +6867,53 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         filtered_findings=filtered_findings,
         salvage_count=len(_salvage_candidates),
     )
+
+    # Replace the resumable pre-gate ``plan_output`` with the authoritative
+    # survivor set only after child creation and prerequisite wiring are durable.
+    # A finding is final when it was routed to a real child that remains
+    # non-cancelled.
+    # Everything rejected by adversarial review, staleness/reproduction checks,
+    # deduplication, actionability, malformed-contract, or discovery admission
+    # has no qualifying child and therefore cannot re-enter Strategic through
+    # the findings index.  Capacity-deferred findings remain in the existing
+    # deferred_findings recovery path and become indexable only if a later cycle
+    # actually admits them.
+    if _prior_finalized_findings is None:
+        _final_child_rows = (
+            (
+                await session.execute(
+                    select(Task).where(Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        _surviving_child_hashes = {
+            str((child.context or {}).get("finding_hash"))
+            for child in _final_child_rows
+            if child.status != TaskStatus.CANCELLED
+            and (child.context or {}).get("finding_hash")
+        }
+        _finalized_findings: list[dict] = []
+        _finalized_hashes: set[str] = set()
+        for _, finding, finding_hash in deduplicated:
+            if (
+                finding_hash in _surviving_child_hashes
+                and finding_hash not in _finalized_hashes
+            ):
+                _finalized_findings.append(finding)
+                _finalized_hashes.add(finding_hash)
+    else:
+        _finalized_findings = _prior_finalized_findings
+
+    task.plan_output = _finalized_findings
+    _record_research_survival_signal(task, surviving=len(_finalized_findings))
+    _final_ctx = dict(task.context or {})
+    _final_ctx[FINALIZED_RESEARCH_FINDINGS_KEY] = True
+    task.context = _final_ctx
+    flag_modified(task, "context")
+    session.add(task)
+    await session.commit()
 
     # Persist per-cycle deferred-finding counts on the direction's latest
     # research_history entry so the next research agent can see how many of
@@ -7105,73 +7137,3 @@ async def _record_research_task_failure(task: Task, session: AsyncSession) -> No
             f"[RESEARCH] Recorded failed research task {task.id} on direction "
             f"{direction_id} ({failure_category})"
         )
-
-
-_BOUNDED_CHALLENGE_SURFACE_KEYS: frozenset = frozenset(
-    {
-        "challenged_boundary",
-        "first_verdict",
-        "second_opinion_verdict",
-        "agreement",
-        "reason",
-        "sidecar_task_id",
-    }
-)
-
-
-def resolve_research_findings_for_surface(
-    plan_output: List[Any] | None,
-    artifact_logs: str | None,
-) -> List[Dict[str, Any]] | None:
-    """Return the canonical challenge-enriched finding list for surface rendering.
-
-    Prefers task.plan_output (which carries attached finding_challenge records)
-    over the legacy RESEARCH_FINDINGS artifact log stream (written at agent-
-    submission time, before challenge resolution). Falls back to parsing
-    artifact_logs for tasks that completed before challenge records were added.
-
-    The finding_challenge record on each returned finding is bounded to
-    {challenged_boundary, first_verdict, second_opinion_verdict, agreement,
-    reason, sidecar_task_id} so consumers receive a stable, bounded contract.
-    Findings without a challenge record are returned unchanged.
-
-    Returns None when neither source yields a non-empty list of dicts.
-    """
-
-    def _trim_finding(finding: Dict[str, Any]) -> Dict[str, Any]:
-        challenge = finding.get(_FINDING_CHALLENGE_RECORD_KEY)
-        if not isinstance(challenge, dict):
-            return finding
-        bounded = {
-            k: v for k, v in challenge.items() if k in _BOUNDED_CHALLENGE_SURFACE_KEYS
-        }
-        if bounded == challenge:
-            return finding
-        out = dict(finding)
-        out[_FINDING_CHALLENGE_RECORD_KEY] = bounded
-        return out
-
-    # Prefer plan_output: non-empty list of dicts carries challenge records
-    if isinstance(plan_output, list) and plan_output:
-        findings = [f for f in plan_output if isinstance(f, dict)]
-        if findings:
-            return [_trim_finding(f) for f in findings]
-
-    # Fall back to artifact logs; support both [list] and {"logs": [...]} shapes
-    if artifact_logs:
-        try:
-            parsed = json.loads(artifact_logs[:100000])
-            if isinstance(parsed, list):
-                findings = [f for f in parsed if isinstance(f, dict)]
-                if findings:
-                    return findings
-            elif isinstance(parsed, dict):
-                inner = parsed.get("logs", [])
-                if isinstance(inner, list):
-                    findings = [f for f in inner if isinstance(f, dict)]
-                    if findings:
-                        return findings
-        except (json.JSONDecodeError, AttributeError):
-            pass
-
-    return None

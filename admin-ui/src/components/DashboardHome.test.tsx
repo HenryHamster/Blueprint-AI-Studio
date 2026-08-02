@@ -21,7 +21,6 @@ const { apiFetchMock, fetchQualificationVerdictsMock, fetchTaskMock, fetchFleetU
     improvementLanes: null as Record<string, unknown> | null,
     srUnhandledEdges: null as Record<string, unknown> | null,
     srMissed: null as Record<string, unknown> | null,
-    srDisagreements: null as Record<string, unknown> | null,
     fixLoop: null as Record<string, unknown> | null,
     outerLoop: null as Record<string, unknown> | null,
   },
@@ -159,10 +158,6 @@ vi.mock('./SrTrendBreakdown', async (importOriginal) => {
       capturedProps.srMissed = props;
       return <div data-testid="sr-missed-retrospective">SrMissedRetrospective</div>;
     },
-    SrReviewerDisagreementsPanel: (props: Record<string, unknown>) => {
-      capturedProps.srDisagreements = props;
-      return <div data-testid="sr-reviewer-disagreements">SrReviewerDisagreementsPanel</div>;
-    },
   };
 });
 
@@ -272,8 +267,8 @@ function setupApiMocks({
     if (url.includes('/direction-sr-breakdown')) return Promise.resolve(directionSrBreakdown ? jsonResponse(directionSrBreakdown) : notFoundResponse());
     if (url.includes('/prompt-fingerprint-analytics')) return Promise.resolve(promptFingerprintAnalytics ? jsonResponse(promptFingerprintAnalytics) : notFoundResponse());
     if (url.includes('/health-overview')) return Promise.resolve(jsonResponse(healthOverview ?? { overall_status: 'healthy', success_rate: { current: null, trend: null, window_hours: 24 }, queue_depth: { queued: 0, active: 0, evaluating: 0 }, actionable_issues: [] }));
-    // Unmatched endpoints (sr-blind-spots, sr-reviewer-disagreements,
-    // sr-recent-misses, task-duration-stats, etc.) return 404 so the
+    // Unmatched endpoints (sr-blind-spots, sr-recent-misses,
+    // task-duration-stats, etc.) return 404 so the
     // component leaves the corresponding state slot at its initial null/[] sentinel rather
     // than ingesting an empty {} that would crash truthy-but-shapeless guards in JSX.
     return Promise.resolve(notFoundResponse());
@@ -1139,7 +1134,6 @@ describe('DashboardHome', () => {
         if (url.includes('/api/admin/max-plan-accounts/health')) return Promise.resolve(jsonResponse({ accounts: [] }));
         if (url.includes('/api/admin/projects/') && url.includes('/system-maturity')) return Promise.resolve(jsonResponse([]));
         if (url.includes('/api/admin/projects/') && url.includes('/sr-blind-spots')) return Promise.resolve(notFoundResponse());
-        if (url.includes('/api/admin/projects/') && url.includes('/sr-reviewer-disagreements')) return Promise.resolve(notFoundResponse());
         if (url.includes('/api/admin/projects/') && url.includes('/sr-recent-misses')) return Promise.resolve(notFoundResponse());
         if (url.includes('/api/admin/projects/') && url.includes('/direction-sr-breakdown')) return Promise.resolve(notFoundResponse());
         if (url.includes('/api/admin/projects/') && url.includes('/prompt-fingerprint-analytics')) return Promise.resolve(notFoundResponse());
@@ -1266,35 +1260,18 @@ describe('DashboardHome', () => {
     beforeEach(() => {
       capturedProps.srUnhandledEdges = null;
       capturedProps.srMissed = null;
-      capturedProps.srDisagreements = null;
       capturedProps.fixLoop = null;
     });
 
-    // Populate the SR diagnostics endpoints so the Recent Misses and
-    // Reviewer-Disagreements sections render (and our mocked panels capture
-    // their drill-through callbacks).
-    function setupSrApiMocks(
-      disagreementResponse: {
-        disagreements: Array<{ category: string; count: number; max_severity: string; examples: unknown[] }>;
-        window_days: number;
-        total_entries: number;
-        total_distinct_categories?: number;
-        returned_entries?: number;
-      } = {
-        disagreements: [{ category: 'correctness', count: 3, max_severity: 'HIGH', examples: [] }],
-        window_days: 14,
-        total_entries: 1,
-      },
-    ) {
+    // Populate the SR diagnostics endpoint so the Recent Misses section
+    // renders and our mocked panel captures its drill-through callback.
+    function setupSrApiMocks() {
       apiFetchMock.mockImplementation((url: string) => {
         if (url.includes('/sr-recent-misses')) {
           return Promise.resolve(jsonResponse({
             misses: [{ task_id: 'off-slice-miss', title: 'Off-slice miss', task_type: 'create', missed_categories: ['correctness'] }],
             total: 1,
           }));
-        }
-        if (url.includes('/sr-reviewer-disagreements')) {
-          return Promise.resolve(jsonResponse(disagreementResponse));
         }
         if (url.includes('/api/admin/digest')) return Promise.resolve(jsonResponse(baseDigest));
         if (url.includes('/diagnostics')) return Promise.resolve(jsonResponse(makeDiagnostics()));
@@ -1303,38 +1280,6 @@ describe('DashboardHome', () => {
         return Promise.resolve(notFoundResponse());
       });
     }
-
-    it('shows the true disagreement category total when the backend returns a truncated page slice', async () => {
-      setupSrApiMocks({
-        disagreements: [{ category: 'correctness', count: 3, max_severity: 'HIGH', examples: [] }],
-        window_days: 14,
-        total_entries: 20,
-        total_distinct_categories: 23,
-        returned_entries: 20,
-      });
-
-      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
-
-      const sectionHeading = await screen.findByText('SR ↔ Reviewer Disagreements');
-      const header = sectionHeading.closest('p');
-      expect(header).not.toBeNull();
-      expect(header).toHaveTextContent('top 20 of 23 categories');
-    });
-
-    it('falls back to the legacy disagreement category count when older backend fields are absent', async () => {
-      setupSrApiMocks({
-        disagreements: [{ category: 'correctness', count: 3, max_severity: 'HIGH', examples: [] }],
-        window_days: 14,
-        total_entries: 1,
-      });
-
-      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
-
-      const sectionHeading = await screen.findByText('SR ↔ Reviewer Disagreements');
-      const header = sectionHeading.closest('p');
-      expect(header).not.toBeNull();
-      expect(header).toHaveTextContent('1 category');
-    });
 
     it('Recent SR Misses drill-through fetches an off-slice task by id and navigates', async () => {
       setupSrApiMocks();
@@ -1369,24 +1314,6 @@ describe('DashboardHome', () => {
       (props.onSelectTask as (id: string) => void)('off-slice-edge');
 
       await waitFor(() => expect(fetchTaskMock).toHaveBeenCalledWith('off-slice-edge'));
-      await waitFor(() => expect(onViewTask).toHaveBeenCalledWith(offSliceTask));
-    });
-
-    it('SR ↔ Reviewer Disagreements drill-through fetches an off-slice task by id and navigates', async () => {
-      setupSrApiMocks();
-      const onViewTask = vi.fn();
-      const offSliceTask = makeTask({ id: 'off-slice-disagree', title: 'Off-slice disagreement task' });
-      fetchTaskMock.mockResolvedValue(offSliceTask);
-
-      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={onViewTask} />);
-
-      await waitFor(() => expect(capturedProps.srDisagreements).not.toBeNull());
-      const props = capturedProps.srDisagreements ?? {};
-      expect(typeof props.onSelectTask).toBe('function');
-
-      (props.onSelectTask as (id: string) => void)('off-slice-disagree');
-
-      await waitFor(() => expect(fetchTaskMock).toHaveBeenCalledWith('off-slice-disagree'));
       await waitFor(() => expect(onViewTask).toHaveBeenCalledWith(offSliceTask));
     });
 
@@ -1703,14 +1630,9 @@ describe('DashboardHome', () => {
             sr_sample_size: 65,
             sr_catch_rate: 0.72,
             sr_catch_sample_size: 40,
-            reviewer_rescue_rate: 0.15,
-            reviewer_rescue_sample_size: 30,
             sr_false_positive_rate: 0.08,
             sr_false_positive_sample_size: 25,
             sr_false_positive_rate_by_category: [],
-            sr_reviewer_disagreement_top_categories: [
-              { category: 'correctness', sample_size: 20, reviewer_overrode_sr_count: 3, sr_overrode_reviewer_count: 1 },
-            ],
             sr_catch_rate_delta_vs_project_mean: 0.05,
           },
         ],
@@ -1725,10 +1647,6 @@ describe('DashboardHome', () => {
     expect(screen.getByText(/72%/)).toBeInTheDocument();
     // delta +5pp
     expect(screen.getByText(/\(\+5pp\)/)).toBeInTheDocument();
-    // rescue rate 15%
-    expect(screen.getByText(/15%/)).toBeInTheDocument();
-    // disagreement category badge
-    expect(screen.getByText('correctness')).toBeInTheDocument();
   });
 
   it('does not render prompt fingerprint SR quality section when no data', async () => {

@@ -422,97 +422,86 @@ def _task_is_actively_ci_waiting(task: Task) -> bool:
     return bool(((task.context or {}).get("review_loop") or {}).get("ci_waiting"))
 
 
-async def _cap_exhausted_after_approve(
+def _review_loop_has_authoritative_approval(
+    review_loop: dict | None,
+    *,
+    project_id: uuid.UUID,
+    pr_number: int,
+) -> bool:
+    """Return whether ``review_loop`` proves a clean exact-target approval.
+
+    Approval flags and top-level verdict mirrors are lifecycle hints, not
+    authority.  The durable proof is the final review-history entry, stamped
+    with both immutable SHAs, matching the pinned review target, with no binding
+    blocker left in either the persisted or rebuilt issue ledger.  Missing or
+    contradictory proof fails closed.
+    """
+    if not isinstance(review_loop, dict):
+        return False
+
+    history = review_loop.get("review_history")
+    if not isinstance(history, list) or not history:
+        return False
+    latest = history[-1]
+    if not isinstance(latest, dict):
+        return False
+    if str(latest.get("verdict") or "").upper() != "APPROVE":
+        return False
+
+    approved_head = str(
+        latest.get("reviewed_head_sha") or latest.get("head_sha") or ""
+    ).strip()
+    approved_base = str(
+        latest.get("reviewed_base_sha") or latest.get("base_sha") or ""
+    ).strip()
+    if not approved_head or not approved_base:
+        return False
+
+    target = review_loop.get("review_target")
+    if not isinstance(target, dict):
+        return False
+    try:
+        target_pr = int(target.get("pr_number"))
+    except (TypeError, ValueError):
+        return False
+    if target_pr != pr_number:
+        return False
+    if str(target.get("project_id") or "") != str(project_id):
+        return False
+    if str(target.get("head_sha") or "").strip() != approved_head:
+        return False
+    if str(target.get("base_sha") or "").strip() != approved_base:
+        return False
+
+    persisted_ledger = review_loop.get("issue_ledger")
+    if isinstance(persisted_ledger, dict) and persisted_ledger.get("open"):
+        return False
+
+    from app.issue_ledger import build_issue_ledger
+
+    return not bool(build_issue_ledger(history).get("open"))
+
+
+def _cap_exhausted_after_approve(
     orig: Task,
     source_task: Task,
-    resolved_original_id: str,
     pr_number: int,
-    session: AsyncSession,
 ) -> bool:
-    """FIX D: decide whether the review-fix cap was hit on an ALREADY-APPROVED
-    PR (a benign non-convergence on the merge mechanics, e.g. repeated rebase /
-    CI-flap churn after sign-off) rather than a genuine unresolved review
-    rejection.
+    """Classify cap exhaustion as post-approval only from durable proof.
 
-    Returns True when the last recorded verdict is APPROVE / clean:
-      • the parent (``orig``) or the source task carries
-        ``review_loop.review_approved == True`` (or legacy verdict == APPROVE);
-      • the most recent chain review task recorded
-        ``blueprint_review_verdict == 'APPROVE'``;
-      • the latest iteration has ZERO outstanding CHANGES_REQUESTED issues.
-
-    GUARDRAIL: any outstanding CHANGES_REQUESTED on the latest iteration (a
-    genuine non-convergence) → returns False so the caller keeps today's
-    FAILED + CODE_ERROR path.
+    The parent handoff is preferred, while an exact proof on the source task is
+    accepted for non-rollup chains.  This intentionally performs no broad task
+    scan: a stale review row or legacy verdict mirror cannot authorize a
+    lifecycle outcome for the current PR target.
     """
-    from sqlalchemy import select
-
-    # (1) Outstanding CHANGES_REQUESTED on the latest iteration is a hard veto —
-    # check it FIRST so an approval flag from an earlier round can never override
-    # a later unresolved rejection.
-    for t in (orig, source_task):
-        rl = (t.context or {}).get("review_loop") or {}
-        if rl.get("verdict") == "REJECT" or rl.get("review_changes_requested"):
-            return False
-        history = rl.get("review_history") or []
-        if history:
-            last = history[-1] or {}
-            if (last.get("verdict") or "").upper() in (
-                "REJECT",
-                "CHANGES_REQUESTED",
-            ):
-                return False
-            if last.get("issues"):
-                return False
-
-    # (2) Parent / source approval flag.
-    for t in (orig, source_task):
-        rl = (t.context or {}).get("review_loop") or {}
-        if rl.get("review_approved") is True or rl.get("verdict") == "APPROVE":
-            return True
-        if (t.context or {}).get("blueprint_review_verdict") == "APPROVE":
-            return True
-
-    # (3) Most recent chain review task's recorded verdict.
-    try:
-        review_rows = (
-            (
-                await session.execute(
-                    select(Task)
-                    .where(
-                        Task.project_id == orig.project_id,
-                        Task.status.in_([TaskStatus.COMPLETED, TaskStatus.EVALUATING]),
-                    )
-                    .order_by(Task.completed_at.desc().nullslast())
-                    .limit(200)
-                )
-            )
-            .scalars()
-            .all()
+    return any(
+        _review_loop_has_authoritative_approval(
+            (task.context or {}).get("review_loop"),
+            project_id=orig.project_id,
+            pr_number=pr_number,
         )
-        for rt in review_rows:
-            rp = rt.first_payload or {}
-            if rp.get("type") != "review":
-                continue
-            if rp.get("pr_number") != pr_number:
-                continue
-            r_orig = rp.get("original_task_id") or ""
-            if r_orig and r_orig != resolved_original_id:
-                continue
-            verdict = (rt.context or {}).get("blueprint_review_verdict")
-            if verdict == "APPROVE":
-                return True
-            if verdict in ("REJECT", "CHANGES_REQUESTED"):
-                return False
-            # First matching chain review with a non-APPROVE/non-REJECT verdict
-            # is inconclusive; keep scanning older ones.
-    except Exception as _vq_err:  # noqa: BLE001
-        logger.warning(
-            f"[PIPELINE] Cap-exhaustion verdict lookup failed for PR #{pr_number}: "
-            f"{_vq_err}"
-        )
-
-    return False
+        for task in (orig, source_task)
+    )
 
 
 def _is_backmerge_resolver(orig: Task) -> bool:
@@ -862,18 +851,17 @@ async def _handle_cap_exhaustion(
         return
 
     # ── Decide FIRST, mutate SECOND. ──
-    # Both the after-approve classification (DB reads) and the preservability
-    # check (a real GitHub GET) now run here, with NO advisory lock held and no
-    # lock on ``orig``. `_pr_is_preservable_on_cap` commits its own read txn
-    # before the GET so nothing is left idle-in-transaction across it.
+    # Both the after-approve classification (a pure durable-context read) and
+    # the preservability check (a real GitHub GET) now run here, with NO
+    # advisory lock held and no lock on ``orig``. `_pr_is_preservable_on_cap`
+    # commits its own read txn before the GET so nothing is left
+    # idle-in-transaction across it.
     #
     # Hoisting the two preservability calls into one is behaviour-preserving:
     # the after-approve branch called it with after_approve=True and returned;
     # the fall-through branch called it with after_approve=False. Exactly one of
     # those ran before, and exactly one set of semantics runs now.
-    after_approve = await _cap_exhausted_after_approve(
-        orig, source_task, resolved_original_id, pr_number, session
-    )
+    after_approve = _cap_exhausted_after_approve(orig, source_task, pr_number)
     try:
         preservable = await _pr_is_preservable_on_cap(
             orig, pr_number, session, after_approve=after_approve
@@ -1076,18 +1064,17 @@ async def _handle_cap_exhaustion(
     # mechanics churn after sign-off, not an unresolved review rejection), land
     # CANCELLED with failure_detail='cap_exhausted_after_approve' and record the
     # distinct APPROVED_CAP_PR_CLOSED outcome instead of CODE_ERROR. GUARDRAIL:
-    # _cap_exhausted_after_approve returns False on any outstanding
-    # CHANGES_REQUESTED, preserving today's FAILED + CODE_ERROR path for genuine
-    # non-convergence.
+    # _cap_exhausted_after_approve returns False without exact target proof or
+    # while the authoritative ledger has any open blocker, preserving today's
+    # FAILED + CODE_ERROR path for genuine non-convergence.
     if after_approve:
         from sqlalchemy.orm.attributes import flag_modified
 
         # APPROVED + PRESERVABLE: an approved rollup/back-merge PR is the
         # strongest candidate for preservation — close+CANCEL destroys
         # salvageable, signed-off work. Leave it open for hand-merge and
-        # keep the APPROVED_CAP_PR_CLOSED labeling (approval changes the
-        # label, never whether the PR is destroyed). Non-preservable approved
-        # PRs (empty, non-rollup) keep the close+CANCEL path.  Conflicted
+            # keep the APPROVED_CAP_PR_CLOSED labeling. Non-preservable approved
+            # PRs (empty, non-rollup) keep the close+CANCEL path.  Conflicted
         # (dirty) rollup/back-merge PRs are also preserved here: the conflict
         # is a mechanical, recoverable blocker on an APPROVED PR — a human can
         # resolve it for hand-merge (after_approve=True loosens the dirty guard).

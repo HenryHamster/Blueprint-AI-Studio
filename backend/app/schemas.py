@@ -1198,7 +1198,6 @@ class BuildConfig(BaseModel):
     git_user_name: str | None = None
     git_user_email: str | None = None
     detected_at: str | None = None
-    enable_fresh_reviewer: bool = False
     enable_parallel_review: bool = False
     enable_parallel_fix: bool = False
     # Per-project branch and PR metadata — must be preserved through

@@ -3,7 +3,7 @@
 **Date:** 2026-05-20
 **Scope:** Replace the backend's *mining* of agent self-review free-text with explicit, structured, agent-*declared* flags. Covers the agent helper-script layer, the self-review prompt, a new backend ingestion endpoint + model, the regression dispatcher's detection input, and removal of the blind-spot theme-mining / triage / denylist machinery.
 **Related files:** `agent/src/prompt.ts`, `backend/app/sr_blind_spots.py`, `backend/app/pipeline_regression_dispatcher.py`, `backend/app/routers/agent_status.py`, `backend/app/routers/admin_digest.py`, `backend/app/models.py`, `backend/app/main.py`
-**Status:** Planned. Implementation deferred until after `feature/automain-lts` merges & deploys — this plan rewrites `pipeline_regression_dispatcher.py` and `routers/agent_status.py`, both in that branch's uncommitted working set.
+**Status:** Superseded (2026-08-01) — historical only; do not implement. The dedicated Fresh Reviewer path was retired. Current review authority is the ordinary exact-head review loop plus the backend blocker ledger and self-review diagnostics. Any future agent-declared flag work needs a new plan against that architecture.
 
 ## Summary
 
@@ -11,7 +11,7 @@ Today the orchestrator does not *receive* regression/blind-spot signals — it *
 
 Every layer is an inference on top of an inference. The denylist is the tell: it exists to override the agent — an adversarial posture toward the system's own agents, and a source of perpetual phrasing whack-a-mole (the `suite` vs `test suite` gap that produced the 2026-05-19/20 false-positive cases).
 
-This plan replaces inference with declaration. Agents get an explicit command — `./flag` — to structurally declare a regression. The backend trusts the structured flag and acts on it directly. Blind spots keep their one legitimate job (a per-task aid for the fresh-reviewer) and are no longer mined into anything. Aggregate trend detection — which catches what no single agent can see — is kept unchanged.
+This historical plan proposed replacing inference with declaration. Agents would get an explicit command — `./flag` — to structurally declare a regression. The backend would trust the structured flag and act on it directly. Blind spots would remain task-level context for ordinary review and diagnostics rather than being mined into anything. Aggregate trend detection — which catches what no single agent can see — would remain unchanged.
 
 ## Current Architecture (what is being replaced)
 
@@ -33,11 +33,11 @@ This plan replaces inference with declaration. Agents get an explicit command �
 
 ### Channel 1 — Blind spots: demoted to a per-task reviewer aid
 
-`blind_spots` stays a **free-text** array in the self-review JSON. Free text is fine for its real and only consumer — the fresh-reviewer LLM, which reads it as a focus hint ("here is what the author was unsure about"). Free text was never the problem; *mining* it was.
+`blind_spots` stays a **free-text** array in the self-review JSON. Free text is useful as task-level context for the ordinary review loop and operator diagnostics ("here is what the author was unsure about"). Free text was never the problem; *mining* it was.
 
 - It is **not** aggregated, themed, counted, triaged, or denylisted.
 - It is **not** a regression signal.
-- It is shown on the task in the admin UI and passed to the fresh-reviewer pass. Nothing else reads it.
+- It is shown on the task in the admin UI and may be passed into the ordinary exact-head review context. There is no dedicated reviewer subsystem.
 - No schema change, no migration. The entire mining/triage/denylist stack is deleted (see Removals).
 
 ### Channel 2 — `./flag`: explicit agent-declared flags
@@ -54,7 +54,7 @@ A new agent helper command, generated into the workspace alongside `./done`, `./
 - `--type` is an enum, extensible. **v1 implements `regression`**; future types (e.g. `risk`) can follow without re-architecting.
 - The script POSTs to a new endpoint with the agent's task token (same auth as other agent helper scripts). Follow the established helper-script generation pattern; per `CLAUDE.md`, keep the script body trivial (a single-line JSON build + POST) or use the base64'd-real-file pattern — no multi-line bash heredocs.
 - A *command* (not a self-review field) is deliberate: it decouples flagging from task success — an agent can flag the moment it observes something even if its own task later fails — and it is symmetric with the agent's existing `./` vocabulary.
-- Available to **all task types**, not just code-change. The fresh-reviewer agent can flag too.
+- Available to **all task types**, not just code-change. Ordinary review agents could flag too.
 
 **Backend ingestion.** A new `AgentFlag` record is the structured input. The dispatcher's existing `RegressionRemediationCase` remains the remediation state machine — only the *detection input* changes from mined-themes to explicit flags. An open `AgentFlag(type=regression)` becomes a `RegressionRemediationCase` with `regression_class = "agent_flag:<fingerprint>"`, deduped by a summary/files fingerprint (mirrors the existing residual-case fingerprint approach). Because the signal is high-trust and pre-structured, no recurrence floor is needed — one flag is acted on directly.
 
@@ -109,7 +109,7 @@ A new agent helper command, generated into the workspace alongside `./done`, `./
 
 ## Risks & Open Questions
 
-- **Under-flagging.** Agents may not run `./flag` when they should. Mitigations: clear prompt guidance; the fresh-reviewer can also flag; the aggregate trend signals still catch anything systemic. Net detection is expected to *improve* (a flag is immediate; the old floor needed N recurrences).
+- **Under-flagging.** Agents may not run `./flag` when they should. Proposed mitigations were clear prompt guidance, allowing ordinary reviewers to flag, and retaining aggregate trend signals for systemic failures. Net detection was expected to *improve* (a flag is immediate; the old floor needed N recurrences).
 - **Over-flagging.** Less likely with a deliberate command than with passive free-text. Fingerprint dedup + an optional per-task flag cap contain it.
 - **Loss of a "recurring known-risk → prompt gap" signal.** Theme recurrence could, in principle, hint at a prompt weakness. `sr_catch_rate` already covers self-review quality; if a recurring-risk signal is still wanted, it can be rebuilt later as a clean aggregate over `AgentFlag` rows — structured data, no truncation. Out of scope for v1.
 - **Endpoint auth.** `POST /api/agent/flags` should use the same task-token auth as other agent endpoints; ties into the `task_type`-in-JWT-claims work tracked separately.

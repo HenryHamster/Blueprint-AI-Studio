@@ -233,13 +233,6 @@ export function SrCatchRateCard({ rate, trends, loading, onScrollToReviewQuality
   const verdict = trends?.overall_trend_verdict ?? null;
   const significant = trends?.overall_trend_significant ?? null;
 
-  const srAloneRate = trends?.overall_sr_alone_hit_rate ?? null;
-  const prevSrAloneRate = trends?.previous_overall_sr_alone_hit_rate ?? null;
-  const srAloneDelta = srAloneRate != null && prevSrAloneRate != null ? srAloneRate - prevSrAloneRate : null;
-  const srAloneVerdict = trends?.overall_sr_alone_trend_verdict ?? null;
-  const srAloneSignificant = trends?.overall_sr_alone_trend_significant ?? null;
-  const reviewerLift = srAloneRate != null ? rate - srAloneRate : null;
-
   const pct = Math.round(rate * 100);
   const color = rate >= 0.7 ? 'text-emerald-400' : rate >= 0.4 ? 'text-amber-400' : 'text-red-400';
   const deltaPp = delta != null ? Math.round(delta * 100) : 0;
@@ -250,14 +243,6 @@ export function SrCatchRateCard({ rate, trends, loading, onScrollToReviewQuality
   const deltaIcon = improving ? '↑' : declining ? '↓' : '→';
   // De-emphasize delta when backend reports non-significant change
   const deltaOpacity = (verdict === 'stable' || significant === false) ? 'opacity-50' : '';
-
-  const srAlonePct = srAloneRate != null ? Math.round(srAloneRate * 100) : null;
-  const reviewerLiftPp = reviewerLift != null ? Math.round(reviewerLift * 100) : null;
-  const srAloneDeltaPp = srAloneDelta != null ? Math.round(srAloneDelta * 100) : null;
-  const srAloneImproving = srAloneVerdict === 'improving' || (srAloneVerdict == null && srAloneSignificant !== false && srAloneDelta != null && srAloneDelta > 0.01);
-  const srAloneDeclining = srAloneVerdict === 'declining' || (srAloneVerdict == null && srAloneSignificant !== false && srAloneDelta != null && srAloneDelta < -0.01);
-  const srAloneDeltaColor = srAloneImproving ? 'text-emerald-500' : srAloneDeclining ? 'text-red-500' : 'text-neutral-500';
-  const srAloneDeltaOpacity = (srAloneVerdict === 'stable' || srAloneSignificant === false) ? 'opacity-50' : '';
 
   return (
     <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4 cursor-pointer hover:border-neutral-700/80 transition-colors" onClick={onScrollToReviewQuality}>
@@ -278,26 +263,7 @@ export function SrCatchRateCard({ rate, trends, loading, onScrollToReviewQuality
           </span>
         )}
       </div>
-      {srAlonePct != null ? (
-        <p className="text-ui-sm font-mono mt-0.5" title="author = SR-alone catch rate (excludes reviewer saves); +reviewer = additional coverage from fresh-reviewer pass">
-          <span className={srAloneDeclining ? 'text-red-400' : srAloneImproving ? 'text-emerald-400' : 'text-neutral-400'}>
-            author {srAlonePct}%
-          </span>
-          {srAloneDeltaPp != null && (
-            <span className={`${srAloneDeltaColor} ${srAloneDeltaOpacity} ml-0.5`}>
-              {srAloneDeltaPp >= 0 ? '+' : ''}{srAloneDeltaPp}pp
-            </span>
-          )}
-          {reviewerLiftPp != null && reviewerLiftPp > 0 && (
-            <span className="text-neutral-500"> / +reviewer {reviewerLiftPp}pp</span>
-          )}
-        </p>
-      ) : (
-        <p className="text-ui-sm text-neutral-600 mt-1">n={reviewerFindingCount} findings</p>
-      )}
-      {srAlonePct != null && (
-        <p className="text-ui-sm text-neutral-600">n={reviewerFindingCount} findings</p>
-      )}
+      <p className="text-ui-sm text-neutral-600 mt-1">n={reviewerFindingCount} findings</p>
     </div>
   );
 }

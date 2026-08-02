@@ -3439,10 +3439,10 @@ async def test_dedup_deadlock_auto_completes_exhausted_direction(db_session):
     #10112 superseded: instead of the old auto-pause-and-recover loop, three
     consecutive dedup-zero research cycles on a direction that is not externally
     frozen and not code-failing now:
-    - Set direction status to terminal 'completed' with auto_completed=True and an
+    - Set direction status to terminal 'retired' with auto_completed=True and an
       exhaustion auto_completed_reason
     - Stamp completed_at
-    - Create an INFO 'Direction auto-completed' alert (not the WARNING deadlock alert)
+    - Create an INFO 'Direction auto-retired' alert (not the WARNING deadlock alert)
     - NOT auto-pause (no auto_paused / paused_reason) — the direction is terminal.
     """
     from datetime import datetime, timedelta
@@ -3530,10 +3530,11 @@ async def test_dedup_deadlock_auto_completes_exhausted_direction(db_session):
     await db_session.refresh(project)
 
     d = project.directions[0]
-    assert d["status"] == "completed", (
-        f"dedup-deadlocked exhausted direction should be terminally completed, "
+    assert d["status"] == "retired", (
+        f"dedup-deadlocked exhausted direction should be terminally retired, "
         f"got {d['status']!r}"
     )
+    assert d.get("retirement_outcome") == "exhausted"
     assert d.get("auto_completed") is True, "auto_completed must be set"
     assert d.get("completed_at") is not None, "completed_at must be stamped"
     assert "exhausted" in (d.get("auto_completed_reason") or ""), (
@@ -3541,20 +3542,20 @@ async def test_dedup_deadlock_auto_completes_exhausted_direction(db_session):
     )
     # The superseded auto-pause must NOT have fired.
     assert not d.get("auto_paused"), (
-        "exhausted-completed direction must not be auto-paused"
+        "exhausted-retired direction must not be auto-paused"
     )
-    assert not d.get("paused_reason"), "no paused_reason on a completed direction"
+    assert not d.get("paused_reason"), "no paused_reason on a retired direction"
 
-    # An INFO 'Direction auto-completed' alert is created (not the WARNING deadlock alert).
+    # An INFO 'Direction auto-retired' alert is created (not the WARNING deadlock alert).
     result = await db_session.execute(
         _select(Alert).where(
             Alert.project_id == project.id,
-            Alert.title == "Direction auto-completed",
+            Alert.title == "Direction auto-retired",
             Alert.dismissed_at.is_(None),
         )
     )
     assert result.scalars().first() is not None, (
-        "expected a 'Direction auto-completed' alert"
+        "expected a 'Direction auto-retired' alert"
     )
 
 
@@ -4244,7 +4245,10 @@ class TestQueryFindingsIndex:
 
         task = MagicMock()
         task.id = uuid.uuid4()
-        task.context = {"direction_id": direction_id}
+        task.context = {
+            "direction_id": direction_id,
+            "research_findings_finalized": True,
+        }
         task.created_at = _utcnow() - timedelta(days=days_ago)
         task.plan_output = plan_output
         task.status = status
@@ -5134,11 +5138,13 @@ class TestShelveFindingsForNextCycle:
         async def fake_closing_session():
             yield fake_session
 
-        # _shelve_findings_for_next_cycle was extracted to app.findings_index
-        # (re-exported via rc); patch closing_session where the function now
+        # _shelve_findings_for_next_cycle lives in app.findings_shelving
+        # (re-exported via rc); patch closing_session where the function
         # resolves it. rc._shelve_findings_for_next_cycle is the same object
         # via the facade re-export.
-        monkeypatch.setattr("app.findings_index.closing_session", fake_closing_session)
+        monkeypatch.setattr(
+            "app.findings_shelving.closing_session", fake_closing_session
+        )
 
         findings = [
             {"title": "f1", "description": "d1", "prompt": "p1"},
@@ -5189,7 +5195,9 @@ class TestShelveFindingsForNextCycle:
         async def fake_closing_session():
             yield fake_session
 
-        monkeypatch.setattr("app.findings_index.closing_session", fake_closing_session)
+        monkeypatch.setattr(
+            "app.findings_shelving.closing_session", fake_closing_session
+        )
 
         await rc._shelve_findings_for_next_cycle(
             _uuid.uuid4(),
@@ -5267,10 +5275,12 @@ class TestForwardQualityWouldSpawnPredicate:
         assert not _research_findings_would_spawn(
             [{"type": "improvement", "prompt": "   "}]
         )
-        assert not _research_findings_would_spawn(
+        assert not _research_findings_would_spawn([])
+
+    def test_unrecognized_already_spawned_field_cannot_bypass_quality_gate(self):
+        assert _research_findings_would_spawn(
             [{"type": "improvement", "prompt": "do x", "already_spawned": True}]
         )
-        assert not _research_findings_would_spawn([])
 
 
 class TestParseGraderVerdict:
@@ -7936,6 +7946,12 @@ async def test_batch_cap_deferred_foundation_co_defers_dependent(db_session, moc
     assert by_hash[dependent_hash]["deferred_reason"] == "batch_cap", (
         "the dependent must be co-deferred under the batch_cap reason, not spawned"
     )
+    assert (task.context or {}).get("research_surviving_findings") == 0, (
+        "recoverable deferred intent must not score this completed cycle as success"
+    )
+    assert task.plan_output == [], (
+        "only findings backed by non-cancelled child routes may be finalized"
+    )
 
 
 @_pytest.mark.asyncio
@@ -9334,6 +9350,9 @@ class TestCompletedFoundationSatisfiesPrereqAtSpawn:
                 "finding_hash": "terminal-history-hash",
                 "direction_id": direction["id"],
                 "pr_merged": True,
+                # Cross-cycle dedup reads only findings that survived the
+                # completion gates; raw pre-gate plan_output is not evidence.
+                "research_findings_finalized": True,
             },
             plan_output=[terminal_finding],
         )
@@ -11414,8 +11433,8 @@ class TestIsHighStakesFinding:
     def test_empty_prompt_is_not_high_stakes(self):
         assert not _is_high_stakes_finding(self._f(scope="large", prompt="   "))
 
-    def test_already_spawned_is_not_high_stakes(self):
-        assert not _is_high_stakes_finding(self._f(scope="large", already_spawned=True))
+    def test_unrecognized_already_spawned_field_cannot_bypass_challenge(self):
+        assert _is_high_stakes_finding(self._f(scope="large", already_spawned=True))
 
     def test_low_actionability_is_not_high_stakes(self):
         assert not _is_high_stakes_finding(
@@ -13067,6 +13086,11 @@ async def test_adversarial_gate_refuted_finding_records_challenge_reason(
     ), "deferred record must carry the challenger's reason"
     assert "_adversarial_verdict" not in d, "_adversarial_verdict must be cleared"
     assert "_adversarial_verdict_reason" not in d, "internal key must be cleared"
+    assert (task.context or {}).get("research_findings_finalized") is True
+    assert task.plan_output == [], (
+        "refuted findings may remain in the deferred retry path but must not "
+        "survive into the authoritative findings index"
+    )
 
 
 @_pytest.mark.asyncio
@@ -14324,11 +14348,7 @@ async def test_malformed_stored_adversarial_verdict_fails_closed(db_session, moc
 
 
 class TestResolveResearchFindingsForSurface:
-    """resolve_research_findings_for_surface: canonical challenge-enriched findings
-    for surface rendering — prefers plan_output over artifact logs, trims challenge
-    records to the bounded vocabulary, and falls back gracefully."""
-
-    from app.research_completion import resolve_research_findings_for_surface
+    """User surfaces expose only the finalized challenge-enriched snapshot."""
 
     def _finding(self, title: str = "F1", **kwargs):
         return {"title": title, "description": "desc", **kwargs}
@@ -14346,19 +14366,31 @@ class TestResolveResearchFindingsForSurface:
         base.update(overrides)
         return base
 
+    @staticmethod
+    def _resolve(plan_output, *, finalized=True, status=TaskStatus.COMPLETED):
+        from app.research_completion import (
+            FINALIZED_RESEARCH_FINDINGS_KEY,
+            resolve_research_findings_for_surface_from_state,
+        )
+
+        context = {FINALIZED_RESEARCH_FINDINGS_KEY: True} if finalized else {}
+        return resolve_research_findings_for_surface_from_state(
+            plan_output,
+            context,
+            status=status,
+            task_type="research",
+        )
+
     def test_challenge_enriched_findings_surface_through_serializer(self):
         """A finding in plan_output with a finding_challenge surfaces the bounded
         challenge fields and strips internal-only keys."""
-        from app.research_completion import (
-            _FINDING_CHALLENGE_RECORD_KEY,
-            resolve_research_findings_for_surface,
-        )
+        from app.research_completion import _FINDING_CHALLENGE_RECORD_KEY
 
         challenge = self._challenge()
         finding = self._finding(title="Bug with challenge")
         finding[_FINDING_CHALLENGE_RECORD_KEY] = challenge
 
-        result = resolve_research_findings_for_surface([finding], None)
+        result = self._resolve([finding])
 
         assert result is not None
         assert len(result) == 1
@@ -14379,12 +14411,10 @@ class TestResolveResearchFindingsForSurface:
 
     def test_plan_output_returned_unchanged_when_no_challenge(self):
         """Findings without a challenge record serialize exactly as before."""
-        from app.research_completion import resolve_research_findings_for_surface
-
         finding = self._finding(
             title="No challenge finding", actionability_grade="HIGH"
         )
-        result = resolve_research_findings_for_surface([finding], None)
+        result = self._resolve([finding])
 
         assert result is not None
         assert len(result) == 1
@@ -14392,93 +14422,24 @@ class TestResolveResearchFindingsForSurface:
         assert result[0]["actionability_grade"] == "HIGH"
         assert "finding_challenge" not in result[0]
 
-    def test_plan_output_preferred_over_artifact_logs(self):
-        """When both plan_output and artifact_logs are present, plan_output wins."""
-        from app.research_completion import resolve_research_findings_for_surface
-        import json
+    def test_raw_unfinalized_output_is_not_presented(self):
+        finding = self._finding(title="Rejected before finalization")
+        assert self._resolve([finding], finalized=False) is None
 
-        plan_finding = self._finding(title="From plan_output")
-        artifact_finding = self._finding(title="From artifact_logs")
-        artifact_logs = json.dumps([artifact_finding])
+    def test_non_completed_output_is_not_presented(self):
+        finding = self._finding(title="Still being evaluated")
+        assert self._resolve([finding], status=TaskStatus.EVALUATING) is None
 
-        result = resolve_research_findings_for_surface([plan_finding], artifact_logs)
+    def test_empty_final_snapshot_returns_none(self):
+        assert self._resolve(None) is None
+        assert self._resolve([]) is None
 
-        assert result is not None
-        assert len(result) == 1
-        assert result[0]["title"] == "From plan_output"
-
-    def test_falls_back_to_artifact_logs_when_plan_output_absent(self):
-        """When plan_output is None, artifact_logs (list shape) is parsed."""
-        from app.research_completion import resolve_research_findings_for_surface
-        import json
-
-        artifact_finding = self._finding(title="From artifact list logs")
-        artifact_logs = json.dumps([artifact_finding])
-
-        result = resolve_research_findings_for_surface(None, artifact_logs)
-
-        assert result is not None
-        assert len(result) == 1
-        assert result[0]["title"] == "From artifact list logs"
-
-    def test_falls_back_to_artifact_logs_when_plan_output_empty(self):
-        """When plan_output is an empty list, artifact_logs is used as fallback."""
-        from app.research_completion import resolve_research_findings_for_surface
-        import json
-
-        artifact_finding = self._finding(title="From fallback logs")
-        artifact_logs = json.dumps([artifact_finding])
-
-        result = resolve_research_findings_for_surface([], artifact_logs)
-
-        assert result is not None
-        assert len(result) == 1
-        assert result[0]["title"] == "From fallback logs"
-
-    def test_artifact_logs_legacy_dict_shape_unwrapped(self):
-        """Artifact logs in the legacy {"logs": [...]} dict shape are unwrapped."""
-        from app.research_completion import resolve_research_findings_for_surface
-        import json
-
-        artifact_finding = self._finding(title="Inside dict logs")
-        artifact_logs = json.dumps({"logs": [artifact_finding]})
-
-        result = resolve_research_findings_for_surface(None, artifact_logs)
-
-        assert result is not None
-        assert len(result) == 1
-        assert result[0]["title"] == "Inside dict logs"
-
-    def test_both_absent_returns_none(self):
-        """Returns None when both plan_output and artifact_logs are absent."""
-        from app.research_completion import resolve_research_findings_for_surface
-
-        assert resolve_research_findings_for_surface(None, None) is None
-        assert resolve_research_findings_for_surface([], None) is None
-        assert resolve_research_findings_for_surface(None, "") is None
-
-    def test_malformed_artifact_logs_returns_none(self):
-        """Malformed JSON in artifact logs does not raise — returns None."""
-        from app.research_completion import resolve_research_findings_for_surface
-
-        result = resolve_research_findings_for_surface(None, "not valid json {{{")
-        assert result is None
-
-    def test_activity_pending_count_reflects_canonical_finding_set(self):
-        """The count derived from the helper reflects the canonical (plan_output)
-        finding set, not the stale artifact count, when they differ."""
-        from app.research_completion import resolve_research_findings_for_surface
-        import json
-
-        # plan_output has 3 findings (canonical after challenge resolution)
+    def test_finalized_count_reflects_canonical_finding_set(self):
         plan_findings = [self._finding(title=f"Finding {i}") for i in range(3)]
-        # artifact logs only have 2 (written before challenge resolution)
-        artifact_logs = json.dumps([self._finding(title=f"Old {i}") for i in range(2)])
-
-        result = resolve_research_findings_for_surface(plan_findings, artifact_logs)
+        result = self._resolve(plan_findings)
 
         assert result is not None
-        assert len(result) == 3  # canonical count wins
+        assert len(result) == 3
 
 
 @_pytest.mark.asyncio
@@ -16190,6 +16151,11 @@ async def test_audit_mode_persist_error_does_not_block_spawn(db_session, mocker)
         .all()
     )
     assert len(children) >= 1, "spawn loop must proceed even when audit persist fails"
+    await db_session.refresh(task)
+    assert (task.context or {}).get("research_findings_finalized") is True
+    assert [item.get("title") for item in (task.plan_output or [])] == [
+        finding.get("title")
+    ]
 
 
 class TestStampNoFindingsRefractory:
@@ -16294,123 +16260,40 @@ class TestStampNoFindingsRefractory:
         ]
         return project
 
-    def test_auto_complete_requires_verified_merge_count(self):
-        """Auto-completion must use verified merge count, not raw prs_merged.
-
-        A saturated direction with 3 raw prs_merged but 0 verified_prs_merged
-        must NOT be auto-completed.  Only when the same merges carry a non-zero
-        verified_prs_merged should the direction flip to 'completed'.
-        """
+    def test_merge_count_alone_never_claims_success(self):
         from app.research_completion import _stamp_no_findings_refractory
 
-        # --- case 1: 3 raw merges, all unverified (verified_prs_merged=0) ---
-        # Each entry has prs_merged=1 but verified_prs_merged=0 (degraded).
-        unverified_history = [
-            {"prs_merged": 1, "verified_prs_merged": 0},
-            {"prs_merged": 1, "verified_prs_merged": 0},
-            {"prs_merged": 1, "verified_prs_merged": 0},
-        ]
-        task = self._make_task()
-        project = self._make_saturated_project(history=unverified_history)
-        self._run(project, _stamp_no_findings_refractory(task, self._make_session()))
-        direction = project.directions[0]
-        assert direction.get("status") != "completed", (
-            "Direction with 3 unverified merges must NOT be auto-completed"
-        )
-
-        # --- case 2: same 3 merges, all verified (verified_prs_merged=1) ---
         verified_history = [
-            {"prs_merged": 1, "verified_prs_merged": 1},
-            {"prs_merged": 1, "verified_prs_merged": 1},
-            {"prs_merged": 1, "verified_prs_merged": 1},
+            {"prs_merged": 1, "verified_prs_merged": 1} for _ in range(3)
         ]
-        task2 = self._make_task()
-        project2 = self._make_saturated_project(history=verified_history)
-        self._run(project2, _stamp_no_findings_refractory(task2, self._make_session()))
-        direction2 = project2.directions[0]
-        assert direction2.get("status") == "completed", (
-            "Direction with 3 verified merges must be auto-completed"
-        )
-        assert "verified" in direction2.get("auto_completed_reason", ""), (
-            "auto_completed_reason must reflect the verified count"
-        )
+        task = self._make_task()
+        project = self._make_saturated_project(history=verified_history)
+        self._run(project, _stamp_no_findings_refractory(task, self._make_session()))
 
-    def test_auto_complete_aggregate_path_requires_verified_count(self):
-        """Auto-completion via history_aggregate must use total_verified_prs_merged.
+        direction = project.directions[0]
+        assert direction.get("status") != "completed"
+        assert direction.get("retirement_outcome") != "success_evidence_met"
 
-        When raw total_prs_merged >= 3 but total_verified_prs_merged == 0, the
-        direction must NOT be auto-completed.
-        """
+    def test_challenge_approved_declared_success_evidence_can_complete(self):
         from app.research_completion import _stamp_no_findings_refractory
 
-        # Aggregate path: total raw merges=3, verified=0
-        agg_unverified = {
-            "total_prs_merged": 3,
-            "total_verified_prs_merged": 0,
-            "total_cycles": 5,
+        project = self._make_saturated_project(
+            history=[{"verified_prs_merged": 1} for _ in range(3)]
+        )
+        direction = project.directions[0]
+        direction["context"] = {"success_evidence": "The live probe passes twice."}
+        direction["evidence_progress"] = {
+            "status": "met",
+            "challenge_approved": True,
         }
         task = self._make_task()
-        project = self._make_saturated_project(agg=agg_unverified)
         self._run(project, _stamp_no_findings_refractory(task, self._make_session()))
-        direction = project.directions[0]
-        assert direction.get("status") != "completed", (
-            "Direction with only unverified aggregate merges must NOT be auto-completed"
-        )
 
-        # Aggregate path: total raw merges=3, verified=3
-        agg_verified = {
-            "total_prs_merged": 3,
-            "total_verified_prs_merged": 3,
-            "total_cycles": 5,
-        }
-        task2 = self._make_task()
-        project2 = self._make_saturated_project(agg=agg_verified)
-        self._run(project2, _stamp_no_findings_refractory(task2, self._make_session()))
-        direction2 = project2.directions[0]
-        assert direction2.get("status") == "completed", (
-            "Direction with 3 verified aggregate merges must be auto-completed"
-        )
+        assert direction["status"] == "completed"
+        assert direction["retirement_outcome"] == "success_evidence_met"
+        assert "declared success evidence met" in direction["auto_completed_reason"]
 
-    def test_auto_complete_aggregate_stranded_merges_not_counted(self):
-        """Auto-completion must subtract total_stranded_prs_merged from aggregate verified total.
-
-        When total_verified_prs_merged >= 3 but all are confirmed-stranded (stranded==verified),
-        the effective credit-eligible count is 0 and the direction must NOT be auto-completed.
-        When the non-stranded remainder reaches 3, it should auto-complete.
-        """
-        from app.research_completion import _stamp_no_findings_refractory
-
-        # Case 1: 3 verified, 3 stranded → credit-eligible = 0 → must NOT auto-complete
-        agg_all_stranded = {
-            "total_prs_merged": 3,
-            "total_verified_prs_merged": 3,
-            "total_stranded_prs_merged": 3,
-            "total_cycles": 5,
-        }
-        task = self._make_task()
-        project = self._make_saturated_project(agg=agg_all_stranded)
-        self._run(project, _stamp_no_findings_refractory(task, self._make_session()))
-        direction = project.directions[0]
-        assert direction.get("status") != "completed", (
-            "Direction whose only aggregate merges are confirmed-stranded must NOT be auto-completed"
-        )
-
-        # Case 2: 5 verified, 2 stranded → credit-eligible = 3 → must auto-complete
-        agg_partial_stranded = {
-            "total_prs_merged": 5,
-            "total_verified_prs_merged": 5,
-            "total_stranded_prs_merged": 2,
-            "total_cycles": 5,
-        }
-        task2 = self._make_task()
-        project2 = self._make_saturated_project(agg=agg_partial_stranded)
-        self._run(project2, _stamp_no_findings_refractory(task2, self._make_session()))
-        direction2 = project2.directions[0]
-        assert direction2.get("status") == "completed", (
-            "Direction with 3 credit-eligible aggregate merges (5 verified − 2 stranded) must auto-complete"
-        )
-
-    # ── Additive exhaustion route (terminal COMPLETED regardless of merge count) ──
+    # ── Exhaustion is terminal but explicitly non-successful ──
 
     def _make_exhausted_project(
         self,
@@ -16438,7 +16321,7 @@ class TestStampNoFindingsRefractory:
 
     def test_exhausted_unproductive_direction_auto_completes(self):
         """A saturated, genuinely-exhausted (already-fixed-deadlock) UNPRODUCTIVE
-        direction with < 3 merges auto-completes to terminal status='completed'.
+        direction with < 3 merges retires with outcome='exhausted'.
 
         This is the #10113 root fix: an already-fixed-deadlocked direction (its
         spawned tasks all terminate SCOPE_EMPTY because the work is already on HEAD)
@@ -16459,10 +16342,11 @@ class TestStampNoFindingsRefractory:
         self._run(project, _stamp_no_findings_refractory(task, self._make_session()))
 
         direction = project.directions[0]
-        assert direction.get("status") == "completed", (
+        assert direction.get("status") == "retired", (
             "A genuinely-exhausted already-fixed-deadlocked direction with <3 merges "
-            "must auto-complete to terminal 'completed'"
+            "must retire without claiming success"
         )
+        assert direction.get("retirement_outcome") == "exhausted"
         assert direction.get("auto_completed") is True, "auto_completed must be stamped"
         assert direction.get("completed_at"), "completed_at must be stamped"
         reason = direction.get("auto_completed_reason", "")
@@ -16491,7 +16375,7 @@ class TestStampNoFindingsRefractory:
         self._run(project, _stamp_no_findings_refractory(task, self._make_session()))
 
         direction = project.directions[0]
-        assert direction.get("status") != "completed", (
+        assert direction.get("status") == "active", (
             "A code-failing direction must NOT be auto-completed as exhausted"
         )
 
@@ -16514,7 +16398,7 @@ class TestStampNoFindingsRefractory:
         self._run(project, _stamp_no_findings_refractory(task, self._make_session()))
 
         direction = project.directions[0]
-        assert direction.get("status") != "completed", (
+        assert direction.get("status") == "active", (
             "An externally-frozen (needs_manual_intervention) direction must NOT be "
             "auto-completed as exhausted"
         )
@@ -16532,7 +16416,7 @@ class TestStampNoFindingsRefractory:
         )
         self._run(project2, _stamp_no_findings_refractory(task2, self._make_session()))
         direction2 = project2.directions[0]
-        assert direction2.get("status") != "completed", (
+        assert direction2.get("status") == "active", (
             "A budget-paused (cost_pause_evidence) direction must NOT be auto-completed"
         )
 
@@ -16554,11 +16438,11 @@ class TestStampNoFindingsRefractory:
         direction_id = "d-gap-test"
         gap_id = "g-test-gap"
 
-        # Build a saturated direction that will auto-complete via the verified merge path.
+        # Build an already-fixed exhausted direction. Gap reconciliation applies
+        # to every terminal outcome, not only successful completion.
         history = [
-            {"prs_merged": 1, "verified_prs_merged": 1},
-            {"prs_merged": 1, "verified_prs_merged": 1},
-            {"prs_merged": 1, "verified_prs_merged": 1},
+            {"tasks_created": 1, "scope_empty_noop_count": 1, "prs_merged": 0}
+            for _ in range(3)
         ]
         project = MagicMock()
         project.directions = [
@@ -16606,11 +16490,10 @@ class TestStampNoFindingsRefractory:
                 _stamp_no_findings_refractory(task, session)
             )
 
-        # The direction must have been auto-completed to trigger gap reconciliation.
+        # The direction must have become terminal to trigger gap reconciliation.
         direction = project.directions[0]
-        assert direction.get("status") == "completed", (
-            "Direction must have been auto-completed to trigger gap reconciliation"
-        )
+        assert direction.get("status") == "retired"
+        assert direction.get("retirement_outcome") == "exhausted"
 
         # with_problem_model_locked must have been called.
         assert captured_pm_calls, (
@@ -16629,14 +16512,11 @@ class TestStampNoFindingsRefractory:
 
 
 # --------------------------------------------------------------------------- #
-# Proven-merge success completion (criterion-coverage gate RETIRED — Stage 1).
+# Declared-success completion (criterion-coverage remains a release concern).
 #
-# A saturated direction with >= 3 verified merges auto-completes on the
-# proven-merge route regardless of any owned acceptance criterion: the
-# pre-qualification coverage gate was removed, and the acceptance contract is
-# enforced only at qualify (the ledger gate in compute_composite). These
-# control tests confirm proven-merge completion still fires whether the
-# direction owns a covered criterion or no criteria at all.
+# A saturated direction completes here only when its current declared
+# success_evidence has a challenge-approved `met` judgment. Criterion coverage
+# remains independently enforced at qualification.
 # --------------------------------------------------------------------------- #
 
 
@@ -16646,9 +16526,7 @@ async def _setup_saturated_proven_direction(
     direction_id: str,
     criterion_keys: list[str],
 ):
-    """Create a project whose in-memory direction is saturated + proven (3 verified
-    merges) and about to tip into possibly_saturated, plus the matching Direction
-    ORM row carrying *criterion_keys*. Returns (project, task, direction_dict)."""
+    """Create a saturated direction with approved declared-success evidence."""
     from app.models import Direction
 
     direction = {
@@ -16657,6 +16535,8 @@ async def _setup_saturated_proven_direction(
         "status": "active",
         "history_aggregate": {},
         "consecutive_unproductive_cycles": 2,  # +1 in the call → saturated
+        "context": {"success_evidence": "The declared outcome probe passes."},
+        "evidence_progress": {"status": "met", "challenge_approved": True},
         "research_history": [
             {"prs_merged": 1, "verified_prs_merged": 1},
             {"prs_merged": 1, "verified_prs_merged": 1},
@@ -16737,79 +16617,11 @@ async def _open_version_with_criterion(db_session, project, *, covered: bool):
     return version, criterion
 
 
-@_pytest.mark.asyncio
-async def test_no_findings_proven_direction_with_covered_criterion_completes(
-    db_session,
-):
-    """Site 2: when the owned criterion IS covered, the saturated proven
-    direction still auto-completes exactly as before."""
-    from app.research_completion import _stamp_no_findings_refractory
-
-    direction_id = "d-cov-covered"
-    project, task, _ = await _setup_saturated_proven_direction(
-        db_session, direction_id=direction_id, criterion_keys=["placeholder"]
-    )
-    _version, criterion = await _open_version_with_criterion(
-        db_session, project, covered=True
-    )
-
-    from app.models import Direction
-
-    row = (
-        await db_session.execute(
-            _select(Direction).where(
-                Direction.project_id == project.id,
-                Direction.direction_key == direction_id,
-            )
-        )
-    ).scalar_one()
-    row.criterion_keys = [criterion.criterion_key]
-    db_session.add(row)
-    await db_session.commit()
-
-    await _stamp_no_findings_refractory(task, db_session)
-
-    await db_session.refresh(project)
-    target = next(d for d in project.directions if d.get("id") == direction_id)
-    assert target.get("status") == "completed", (
-        "Direction whose owned criterion is covered must still auto-complete"
-    )
-    assert target.get("auto_completed") is True
-    assert "verified" in (target.get("auto_completed_reason") or "")
-
-
-@_pytest.mark.asyncio
-async def test_no_findings_proven_direction_owning_no_criteria_completes(db_session):
-    """Site 2: a saturated proven direction with an empty criterion_keys set
-    still completes (proven-merge completion is criterion-independent)."""
-    from app.research_completion import _stamp_no_findings_refractory
-
-    direction_id = "d-cov-none"
-    project, task, _ = await _setup_saturated_proven_direction(
-        db_session, direction_id=direction_id, criterion_keys=[]
-    )
-    # An open version with an active criterion exists, but it does not affect
-    # proven-merge completion.
-    await _open_version_with_criterion(db_session, project, covered=False)
-
-    await _stamp_no_findings_refractory(task, db_session)
-
-    await db_session.refresh(project)
-    target = next(d for d in project.directions if d.get("id") == direction_id)
-    assert target.get("status") == "completed", (
-        "Direction owning no criteria must auto-complete unchanged"
-    )
-    assert target.get("auto_completed") is True
-
-
 # --------------------------------------------------------------------------- #
-# Site 1 (apply_post_spawn_state): proven-route completion (gate RETIRED).
+# Site 1 (apply_post_spawn_state): declared-success completion.
 #
-# The proven-merge success completion path inside apply_post_spawn_state
-# auto-completes a saturated direction with >= 3 verified merges regardless of
-# any owned acceptance criterion — the pre-qualification coverage gate is gone.
-# This control test confirms completion still fires through the full post-spawn
-# state pipeline.
+# This control confirms that the same evidence-backed completion rule fires
+# through the full post-spawn state pipeline.
 # --------------------------------------------------------------------------- #
 
 
@@ -17625,9 +17437,9 @@ async def test_genuine_cross_tree_none_base_branch_is_noop(db_session, mocker):
 
 @_pytest.mark.asyncio
 async def test_exhaustion_autocomplete_reconciles_gap_active_moves(db_session):
-    """Auto-completing an exhausted direction reconciles the problem-model gap.
+    """Auto-retiring an exhausted direction reconciles the problem-model gap.
 
-    When apply_post_spawn_state auto-completes a direction (via the dedup-deadlock
+    When apply_post_spawn_state auto-retires a direction (via the dedup-deadlock
     exhaustion path), any gap in project.problem_model whose active_moves contains
     that direction id must have it pruned out (moved to past_moves) after the call.
     This mirrors the invariant enforced by strategic and zombie retirements.
@@ -17732,11 +17544,12 @@ async def test_exhaustion_autocomplete_reconciles_gap_active_moves(db_session):
     )
     await db_session.refresh(project)
 
-    # Direction must be terminally completed.
+    # Direction must be terminally retired without claiming success.
     d = project.directions[0]
-    assert d["status"] == "completed", (
-        f"direction must be auto-completed, got {d['status']!r}"
+    assert d["status"] == "retired", (
+        f"direction must be auto-retired, got {d['status']!r}"
     )
+    assert d.get("retirement_outcome") == "exhausted"
 
     # problem_model gap must have direction pruned from active_moves and moved to past_moves.
     pm = project.problem_model or {}
@@ -18048,21 +17861,37 @@ async def test_criterion_ids_propagated_from_finding_direction(db_session, mocke
 
 
 @_pytest.mark.asyncio
-async def test_apply_post_spawn_state_aggregate_stranded_merges_not_counted(db_session):
-    """apply_post_spawn_state must subtract total_stranded_prs_merged from aggregate total.
+async def test_apply_post_spawn_state_aggregate_stranded_merges_not_counted(
+    db_session, mocker
+):
+    """Aggregate merge context discounts stranded work without becoming success proof.
 
     When stranded merges have been evicted into history_aggregate, the aggregate term
-    in the saturated auto-complete gate must apply the same credit-gate discount as
+    in the saturated completion summary must apply the same credit-gate discount as
     research_completion._stamp_no_findings_refractory and
     strategic_completion._compute_lifetime_burn_metrics.
 
-    Case 1: total_verified=3, total_stranded=3 → credit-eligible=0 → must NOT auto-complete.
-    Case 2: total_verified=5, total_stranded=2 → credit-eligible=3 → must auto-complete.
+    Case 1: total_verified=3, total_stranded=3 and no outcome proof → must NOT complete.
+    Case 2: declared, challenged success evidence is met; the completion reason must
+    report 3 credit-eligible merges (5 verified minus 2 stranded), not all 5.
     """
     from datetime import datetime, timedelta
 
     from app.research_direction_state import apply_post_spawn_state
     from test_autonomous_research import _active_direction, _make_research_task
+
+    mocker.patch(
+        "app.research_direction_state.broadcast_to_project",
+        new_callable=AsyncMock,
+    )
+    # This test exercises direction accounting, not the strategic-memory
+    # ProjectMessage dual-write hook.  ``apply_post_spawn_state`` can flush its
+    # activity message more than once while updating the same direction, so
+    # isolate that orthogonal receipt writer from this two-project fixture.
+    mocker.patch(
+        "app.models._stage_strategic_memory_source_for_flush",
+        return_value=None,
+    )
 
     direction_id = "d-agg-stranded-apply"
 
@@ -18159,7 +17988,8 @@ async def test_apply_post_spawn_state_aggregate_stranded_merges_not_counted(db_s
         "auto-completed via apply_post_spawn_state"
     )
 
-    # Case 2: 5 verified, 2 stranded → credit-eligible = max(0, 5-2) = 3 → auto-complete.
+    # Case 2: declared/challenged success evidence authorizes completion. The
+    # merge count remains contextual and must discount the two stranded merges.
     direction_id2 = "d-agg-stranded-apply2"
     agg_partial_stranded = {
         "total_prs_merged": 5,
@@ -18167,8 +17997,19 @@ async def test_apply_post_spawn_state_aggregate_stranded_merges_not_counted(db_s
         "total_stranded_prs_merged": 2,
         "total_cycles": 5,
     }
+    active_direction2 = _active_direction(
+        direction_id2, "Aggregate partial stranded test direction"
+    )
     direction2 = {
-        **_active_direction(direction_id2, "Aggregate partial stranded test direction"),
+        **active_direction2,
+        "context": {
+            **(active_direction2.get("context") or {}),
+            "success_evidence": "The declared direction outcome is verified",
+        },
+        "evidence_progress": {
+            "status": "met",
+            "challenge_approved": True,
+        },
         "research_history": list(old_history),
         "history_aggregate": agg_partial_stranded,
     }
@@ -18212,8 +18053,10 @@ async def test_apply_post_spawn_state_aggregate_stranded_merges_not_counted(db_s
 
     d2 = project2.directions[0]
     assert d2.get("status") == "completed", (
-        "Direction with 3 credit-eligible aggregate merges (5 verified − 2 stranded) "
-        "must auto-complete via apply_post_spawn_state"
+        "Challenged declared success evidence must complete the direction"
+    )
+    assert "3 verified PRs" in str(d2.get("auto_completed_reason") or ""), (
+        "Completion context must discount the two stranded aggregate merges"
     )
 
 

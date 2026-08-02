@@ -39,7 +39,6 @@ EXTRACTED_SYMBOLS: dict[str, tuple[str, ...]] = {
         # Trend / sample-size threshold constants
         "_MIN_SR_SAMPLE",
         "_MIN_SR_FINDINGS",
-        "_HALLUCINATION_RATE_MIN_FINDINGS",
         "_MIN_DIRECTION_SR_SAMPLE",
         "_TREND_DELTA_THRESHOLD",
         "_TREND_Z_MIN",
@@ -61,8 +60,6 @@ EXTRACTED_SYMBOLS: dict[str, tuple[str, ...]] = {
         "_SR_CODE_CHANGE_TYPES",
         "_EDGE_CATS",
         # Helper functions used inside compute_sr_catch_rate_trends
-        "_partition_edges_by_origin",
-        "_reviewer_caught_author_miss",
         "_compute_edges_stats",
         "_stats_for_tasks",
         "_sr_skip_stats",

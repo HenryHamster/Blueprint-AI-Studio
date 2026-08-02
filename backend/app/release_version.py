@@ -77,7 +77,7 @@ logger = logging.getLogger(__name__)
 _VALID_PHASES = frozenset({"build", "stabilize"})
 _PHASE_REASONING_MAX = 500
 
-# Fraction of the promotion auto-timeout cap past which an in-flight promotion is
+# Fraction of the promotion timeout cap past which a pending promotion is
 # flagged as ``promotion_nearing_timeout`` (so operators/strategist get a warning
 # before the reconciliation sweep force-reverts it to stabilize).
 _PROMOTION_NEARING_TIMEOUT_FRACTION = 0.8
@@ -86,11 +86,10 @@ _PROMOTION_NEARING_TIMEOUT_FRACTION = 0.8
 # mid-promotion" — re-qualifying, cutting, or flipping phase here would clobber
 # the promotion-pending provenance the reconciler relies on, so every operator
 # lever (qualify duplicate-block, phase-flip 409, version-cut 409) refuses on
-# this set.  ``promotion_in_flight`` is native GitHub auto-merge; the
-# ``promotion_check_wait`` member is the managed migration-carrying wait whose
-# merge the reconciler retries after required checks pass.  Exporting one
-# frozenset keeps all guards in agreement by construction.
-PROMOTION_BLOCKING_STATES = frozenset({"promotion_in_flight", "promotion_check_wait"})
+# this set. Every persisted promotion PR and the short pre-PR claim are owned by
+# the same managed check-wait state. Exporting one frozenset keeps all guards in
+# agreement by construction.
+PROMOTION_BLOCKING_STATES = frozenset({"promotion_check_wait"})
 
 # Exhaustive vocabulary of ``state`` values returned by
 # ``summarize_qualification_state``.  Pin this against the function body so
@@ -100,7 +99,6 @@ QUALIFICATION_STATE_VOCAB: frozenset[str] = frozenset(
         "qualifying",
         "audit_crashed",
         "promotion_check_wait",
-        "promotion_in_flight",
         "promotion_failed",
         "required_check_failed",
         "protection_blocked_review",
@@ -126,7 +124,7 @@ _GOAL_MAX = 500
 
 
 class VersionCutBlockedByPromotion(RuntimeError):
-    """Raised when an operator tries to cut a version that is auto-merging."""
+    """Raised when an operator tries to cut a version with a pending promotion."""
 
     def __init__(
         self,
@@ -134,10 +132,10 @@ class VersionCutBlockedByPromotion(RuntimeError):
         promotion_pr_url: str | None = None,
         promotion_freshness: Mapping[str, Any] | None = None,
     ) -> None:
-        super().__init__("promotion PR is open and auto-merging")
+        super().__init__("promotion PR is awaiting managed checks and merge")
         self.promotion_pr_number = promotion_pr_number
         self.promotion_pr_url = promotion_pr_url
-        # Additive freshness context (age / auto-timeout) so the version-cut 409
+        # Additive freshness context (age / timeout) so the version-cut 409
         # can surface elapsed age and near/past-timeout state. ``None`` when the
         # promotion_pending record had no usable ``enabled_at``.
         self.promotion_freshness = (
@@ -650,14 +648,14 @@ def _humanize_seconds(seconds: float) -> str:
     return f"{minutes}m"
 
 
-def _promotion_in_flight_freshness(promo: dict[str, Any]) -> dict[str, Any]:
-    """Derive additive age / auto-timeout context for an in-flight promotion.
+def _promotion_pending_freshness(promo: dict[str, Any]) -> dict[str, Any]:
+    """Derive additive age / timeout context for a pending promotion.
 
-    Reads ``promotion_pending.enabled_at`` (the moment auto-merge was armed) and
+    Reads ``promotion_pending.enabled_at`` (the moment the managed wait began) and
     the SAME configurable cap the reconciliation sweep uses to force-fail a
     stranded ``promotion_pending`` (``_promotion_pending_timeout_seconds``), so
     every consumer of the shared qualification summary agrees by construction on
-    elapsed age and whether the promotion is nearing or past the auto-timeout.
+    elapsed age and whether the promotion is nearing or past its timeout.
 
     Returns ``{}`` (today's timeless behavior) when ``enabled_at`` is missing or
     unparseable — callers fall back to the PR-number-only summary rather than
@@ -693,7 +691,7 @@ def _promotion_in_flight_freshness(promo: dict[str, Any]) -> dict[str, Any]:
 
 
 def format_promotion_freshness(state: Mapping[str, Any] | None) -> str:
-    """Return a short operator-facing age / auto-timeout suffix for 409 details.
+    """Return a short operator-facing age / timeout suffix for 409 details.
 
     Reads the additive freshness keys carried on the shared qualification
     summary (or the version-cut exception). Returns ``""`` when no freshness is
@@ -704,11 +702,11 @@ def format_promotion_freshness(state: Mapping[str, Any] | None) -> str:
     age = state.get("promotion_age_seconds")
     if age is None:
         return ""
-    phrase = f"in flight ~{_humanize_seconds(age)}"
+    phrase = f"waiting ~{_humanize_seconds(age)}"
     if state.get("promotion_past_timeout"):
-        phrase += ", past auto-timeout"
+        phrase += ", past timeout"
     elif state.get("promotion_nearing_timeout"):
-        phrase += ", nearing auto-timeout"
+        phrase += ", nearing timeout"
     return f" — {phrase}"
 
 
@@ -764,7 +762,7 @@ def summarize_qualification_state(
     ``status == "pending"`` collapses two very different situations:
 
     * the qualification **audit is still scoring** the candidate (wait), and
-    * the audit **PASSED and a promotion PR is open** with auto-merge armed —
+    * the audit **PASSED and a managed promotion is pending** —
       ``promote()`` records a ``promotion_pending`` sub-key for this case. It is
       NOT "still auditing": the promotion PR can fail its own CI and bounce the
       version back to stabilize.
@@ -777,7 +775,7 @@ def summarize_qualification_state(
 
     Returns ``{"state", "summary", ...}`` where ``state`` ∈
     ``QUALIFICATION_STATE_VOCAB`` (``qualifying`` | ``audit_crashed`` |
-    ``promotion_check_wait`` | ``promotion_in_flight`` | ``promotion_failed`` |
+    ``promotion_check_wait`` | ``promotion_failed`` |
     ``required_check_failed`` | ``protection_blocked_review`` | ``not_promoted`` |
     ``dry_run`` | ``promoted`` | ``promoted_unconfirmed`` |
     ``promotion_deploy_failed`` | ``promotion_confirmation_timed_out`` |
@@ -811,55 +809,10 @@ def summarize_qualification_state(
         return None
     if status == "pending":
         promo = lq.get("promotion_pending")
-        if isinstance(promo, dict) and promo.get("managed_check_wait"):
-            # Migration-carrying promotion PR held in managed check-wait: the
-            # merge is NOT delegated to native auto-merge (that would skip the
-            # Alembic dual-head guard). Blueprint is waiting for the promotion
-            # target's required status checks and the reconciler retries the
-            # merge itself once they pass — this is NOT "still auditing" and
-            # does NOT need a fresh qualification.
-            freshness = _promotion_in_flight_freshness(promo)
-            summary = (
-                "Audit PASSED; a migration-carrying promotion PR is open. "
-                "Blueprint is WAITING for the promotion target's required status "
-                "checks to pass and will retry the merge AUTOMATICALLY once they "
-                "do — this does NOT need a fresh qualification and is NOT a "
-                "pending audit. The required checks (e.g. CI) can take 45-60+ "
-                "minutes; the reconciler re-validates the Alembic chain and "
-                "merges when CI is green."
-            )
-            if freshness:
-                age_str = _humanize_seconds(freshness["promotion_age_seconds"])
-                cap_str = _humanize_seconds(freshness["promotion_timeout_seconds"])
-                summary += f" Waiting ~{age_str} (auto-timeout cap {cap_str})."
-                if freshness["promotion_past_timeout"]:
-                    summary += (
-                        " It has PASSED the auto-timeout — the reconciliation "
-                        "sweep will force-fail it back to stabilize."
-                    )
-                elif freshness["promotion_nearing_timeout"]:
-                    summary += (
-                        " It is NEARING the auto-timeout that reverts it to stabilize."
-                    )
-            result: dict[str, Any] = {
-                "state": "promotion_check_wait",
-                "summary": summary,
-                "promotion_pr_number": promo.get("pr_number"),
-                "promotion_pr_url": promo.get("pr_url"),
-                "migration_carrying": bool(promo.get("migration_carrying", True)),
-                **freshness,
-            }
-            # Forward any check snapshot / CI classification the reconciler has
-            # persisted (additive — absent on the spawn-time record).
-            if promo.get("check_snapshot") is not None:
-                result["check_snapshot"] = promo.get("check_snapshot")
-            if promo.get("ci_state") is not None:
-                result["ci_state"] = promo.get("ci_state")
-            return result
         if isinstance(promo, dict):
             # A bare CLAIM (``claiming`` with no ``pr_number``) is written
             # under-lock by promote() before its GitHub I/O so a concurrent
-            # re-qualify can't clobber the in-flight promotion — there is NO PR
+            # re-qualify can't clobber the pending promotion — there is NO PR
             # yet.  Report that honestly rather than as "a promotion PR is open".
             _is_claim = bool(promo.get("claiming")) and not promo.get("pr_number")
             if _is_claim:
@@ -871,38 +824,42 @@ def summarize_qualification_state(
                     "is blocked until then."
                 )
             else:
-                armed = promo.get("auto_merge_enabled")
                 summary = (
-                    "Audit PASSED; a promotion PR is open and auto-merge is "
-                    f"{'armed' if armed else 'not confirmed'}. This is NOT 'still "
-                    "auditing' — the audit already cleared. Watch the promotion "
-                    "PR's CI: if it goes red the version bounces back to "
-                    "stabilize and needs a fresh qualify on a synced candidate."
+                    "Audit PASSED; a promotion PR is open. Blueprint is WAITING "
+                    "for the promotion target's required checks and will "
+                    "revalidate the exact base/head pair and retry the merge once "
+                    "they pass. This is NOT 'still auditing' and does not need a "
+                    "fresh qualification."
                 )
-            freshness = _promotion_in_flight_freshness(promo)
-            # Skip the auto-timeout messaging for a bare claim: its GC bound is
-            # the short claim timeout, not the 24h cap _promotion_in_flight_
+            freshness = _promotion_pending_freshness(promo)
+            # Skip timeout messaging for a bare claim: its GC bound is
+            # the short claim timeout, not the 24h promotion-pending
             # freshness reports, so that text would misstate the deadline.
             if freshness and not _is_claim:
                 age_str = _humanize_seconds(freshness["promotion_age_seconds"])
                 cap_str = _humanize_seconds(freshness["promotion_timeout_seconds"])
-                summary += f" In flight ~{age_str} (auto-timeout cap {cap_str})."
+                summary += f" Waiting ~{age_str} (timeout cap {cap_str})."
                 if freshness["promotion_past_timeout"]:
                     summary += (
-                        " It has PASSED the auto-timeout — the reconciliation "
+                        " It has PASSED the timeout — the reconciliation "
                         "sweep will force-fail it back to stabilize."
                     )
                 elif freshness["promotion_nearing_timeout"]:
                     summary += (
-                        " It is NEARING the auto-timeout that reverts it to stabilize."
+                        " It is NEARING the timeout that reverts it to stabilize."
                     )
-            return {
-                "state": "promotion_in_flight",
+            result: dict[str, Any] = {
+                "state": "promotion_check_wait",
                 "summary": summary,
                 "promotion_pr_number": promo.get("pr_number"),
                 "promotion_pr_url": promo.get("pr_url"),
                 **freshness,
             }
+            if promo.get("check_snapshot") is not None:
+                result["check_snapshot"] = promo.get("check_snapshot")
+            if promo.get("ci_state") is not None:
+                result["ci_state"] = promo.get("ci_state")
+            return result
         if _audit_child_crashed(audit_child):
             return {
                 "state": "audit_crashed",

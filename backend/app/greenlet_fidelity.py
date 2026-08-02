@@ -221,9 +221,8 @@ COMMIT_FLOW_ALLOWLIST: frozenset[str] = frozenset({
 # _monitor_evaluating_tasks (broadcast from pre-captured id/project_id/status),
 # orchestrator_runner_dispatch._dispatch_compute_experiment_directly (broadcast/
 # log the blocked task from pre-captured id/project_id), and reaper.reaper_service
-# (snapshot the quarantine payload-type branch scalar + refresh ``_qtask`` before
-# the safeguard-gate helper). The two entries retained above are genuine scanner
-# false positives, not debt.
+# (remove the obsolete post-commit continuation). The two entries retained
+# above are genuine scanner false positives, not debt.
 COMMIT_FLOW_ALLOWLIST_CEILING: int = 2
 
 

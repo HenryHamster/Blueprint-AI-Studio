@@ -77,8 +77,6 @@ def apply_operator_build_config_overrides(
         detected["git_user_name"] = existing["git_user_name"]
     if "env_vars" in existing:
         detected["env_vars"] = existing["env_vars"]
-    if "enable_fresh_reviewer" in existing:
-        detected["enable_fresh_reviewer"] = existing["enable_fresh_reviewer"]
     if "enable_parallel_review" in existing:
         detected["enable_parallel_review"] = existing["enable_parallel_review"]
     if "enable_parallel_fix" in existing:

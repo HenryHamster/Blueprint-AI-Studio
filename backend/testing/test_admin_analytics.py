@@ -382,7 +382,6 @@ class TestLaneDiag:
         assert body["relay_counts_by_lane"] == {
             "conflict": 1,
             "ci": 1,
-            "arbitration": 0,
             "review_convergence": 1,
         }
 
@@ -396,7 +395,6 @@ class TestLaneDiag:
         }
         assert lanes["conflict"]["task_count"] == 1
         assert lanes["ci"]["task_count"] == 1
-        assert lanes["arbitration"]["task_count"] == 0
 
         by_pr = {row["pr_number"]: row for row in body["per_pr_phase_breakdown"]}
         assert list(by_pr.keys()) == ["101", "202"]

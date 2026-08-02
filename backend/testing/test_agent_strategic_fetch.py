@@ -2122,7 +2122,7 @@ async def test_agent_fetch_qualification_surfaces_promotion_failure_context(
     )
     db_session.add(verdict)
 
-    # last_qualification carries promotion_pending sub-record showing in-flight state
+    # last_qualification carries the managed promotion sub-record.
     version.last_qualification = {
         "status": "promotion_failed",
         "candidate_sha": sha,
@@ -2135,7 +2135,7 @@ async def test_agent_fetch_qualification_surfaces_promotion_failure_context(
         "promotion_pending": {
             "pr_number": 42,
             "pr_url": "https://github.com/example/repo/pull/42",
-            "auto_merge_enabled": False,
+            "managed_check_wait": True,
         },
     }
     flag_modified(version, "last_qualification")
@@ -2166,7 +2166,7 @@ async def test_agent_fetch_qualification_surfaces_promotion_failure_context(
     assert promotion_pending is not None
     assert promotion_pending["pr_number"] == 42
     assert promotion_pending["pr_url"] == "https://github.com/example/repo/pull/42"
-    assert promotion_pending["auto_merge_enabled"] is False
+    assert promotion_pending["managed_check_wait"] is True
 
 
 @pytest.mark.asyncio
@@ -2193,8 +2193,7 @@ async def test_agent_fetch_qualification_promotion_context_in_fallback(
         "promotion_pending": {
             "pr_number": 99,
             "pr_url": "https://github.com/example/repo/pull/99",
-            "auto_merge_enabled": True,
-            "migration_carrying": True,
+            "managed_check_wait": True,
         },
     }
     flag_modified(version, "last_qualification")
@@ -2220,8 +2219,7 @@ async def test_agent_fetch_qualification_promotion_context_in_fallback(
     promotion_pending = body.get("promotion_pending")
     assert promotion_pending is not None
     assert promotion_pending["pr_number"] == 99
-    assert promotion_pending["auto_merge_enabled"] is True
-    assert promotion_pending["migration_carrying"] is True
+    assert promotion_pending["managed_check_wait"] is True
 
 
 @pytest.mark.asyncio
@@ -4257,7 +4255,7 @@ async def test_agent_fetch_version_phase_qualification_state_not_in_flight_when_
     """When open version last_qualification.status=pending with promotion_pending
     AND QualificationVerdict.terminal_status=promoted, version-phase returns
     qualification_state_disagreement and qualification_state.state reflects the
-    resolved outcome (not promotion_in_flight)."""
+    resolved outcome (not promotion_check_wait)."""
     from sqlalchemy.orm.attributes import flag_modified
 
     project, task, version = await _make_project_with_version(
@@ -4302,9 +4300,9 @@ async def test_agent_fetch_version_phase_qualification_state_not_in_flight_when_
     assert body["status"] == "success"
 
     current = body["data"]["current_version"]
-    # qualification_state.state must not be promotion_in_flight when verdict is finalized
-    assert current["qualification_state"]["state"] != "promotion_in_flight", (
-        "qualification_state should not show promotion_in_flight when verdict is finalized"
+    # qualification_state.state must not be promotion_check_wait when verdict is finalized
+    assert current["qualification_state"]["state"] != "promotion_check_wait", (
+        "qualification_state should not show promotion_check_wait when verdict is finalized"
     )
     # The disagreement field must be present
     assert "qualification_state_disagreement" in current
@@ -4436,7 +4434,7 @@ async def test_open_version_qualification_state_agrees_across_surfaces(
     # --- (a) Stale-pending window ---------------------------------------------
     # last_qualification is a transient pending+promotion_pending record, but a
     # finalized verdict (terminal_status=promoted) has already resolved. Every
-    # surface must adopt the resolved outcome (NOT promotion_in_flight) and emit an
+    # surface must adopt the resolved outcome (NOT promotion_check_wait) and emit an
     # identical finalized-verdict disagreement.
     p1, t1, v1 = await _make_open_version_project(db_session, vm="agent-vm-xsurf-sp")
     sha1 = "a" * 40
@@ -4472,9 +4470,9 @@ async def test_open_version_qualification_state_agrees_across_surfaces(
     for surface, state in states.items():
         assert state is not None, surface
         # The finalized verdict (terminal_status=promoted) supersedes the stale
-        # promotion_pending: the surface must NOT still read promotion_in_flight.
-        assert state["state"] != "promotion_in_flight", (
-            f"{surface} still reads promotion_in_flight despite a finalized verdict: {state}"
+        # promotion_pending: the surface must NOT still read promotion_check_wait.
+        assert state["state"] != "promotion_check_wait", (
+            f"{surface} still reads promotion_check_wait despite a finalized verdict: {state}"
         )
         assert state["state"].startswith("promoted") or state["state"] == "promotion_confirmation_timed_out", (
             surface,
@@ -4652,7 +4650,7 @@ async def test_pending_attempt_does_not_inherit_prior_finalization_across_surfac
 
     pending_surfaces, pending_agent_qualification = await collect_surfaces()
     for surface, payload in pending_surfaces.items():
-        assert payload["qualification_state"]["state"] == "promotion_in_flight", surface
+        assert payload["qualification_state"]["state"] == "promotion_check_wait", surface
         provenance = payload["qualification_provenance"]
         assert provenance["active_projection"] == {
             "attempt_id": str(active_attempt),

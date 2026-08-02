@@ -147,21 +147,21 @@ function findNode(roots: TreeNode[], id: string): TreeNode | null {
 
 describe('buildForest side-car nesting', () => {
   it('nests a side-car under its primary instead of rendering it top-level', () => {
-    const primary = makeTask({ id: 'review-1', title: 'Review PR', task_type: 'review' });
+    const primary = makeTask({ id: 'research-1', title: 'Research direction', task_type: 'research' });
     const sidecar = makeTask({
-      id: 'challenger-1',
-      title: '[CHALLENGE] second-opinion panel review',
+      id: 'finding-challenge-1',
+      title: '[CHALLENGE] Verify research finding',
       status: 'IN_PROGRESS',
       created_at: '2026-05-01T11:00:00Z',
-      context: { review_second_opinion_for_task_id: 'review-1' },
+      context: { finding_challenge_for_task_id: 'research-1' },
     });
 
     const forest = buildForest([primary, sidecar]);
 
     // The side-car is NOT a top-level root...
-    expect(forest.map(r => r.task.id)).toEqual(['review-1']);
+    expect(forest.map(r => r.task.id)).toEqual(['research-1']);
     // ...it nests under the primary, flagged as a side-car.
-    expect(forest[0].sidecars.map(s => s.task.id)).toEqual(['challenger-1']);
+    expect(forest[0].sidecars.map(s => s.task.id)).toEqual(['finding-challenge-1']);
     expect(forest[0].sidecars[0].isSidecar).toBe(true);
   });
 
@@ -228,31 +228,31 @@ describe('PipelineView side-car rendering', () => {
     const user = userEvent.setup();
     const tasks = [
       makeTask({
-        id: 'review-1',
-        title: 'Review PR #42',
-        task_type: 'review',
+        id: 'research-1',
+        title: 'Research direction',
+        task_type: 'research',
         status: 'COMPLETED',
-        context: { review_second_opinion: { state: 'challenged_confirmed' } },
+        context: { finding_challenge: { agreement: 'agrees' } },
       }),
       makeTask({
-        id: 'challenger-1',
-        title: '[CHALLENGE] second-opinion panel review for PR #42',
+        id: 'finding-challenge-1',
+        title: '[CHALLENGE] Verify research finding',
         status: 'COMPLETED',
         created_at: '2026-05-01T11:00:00Z',
-        context: { review_second_opinion_for_task_id: 'review-1' },
+        context: { finding_challenge_for_task_id: 'research-1' },
       }),
       makeTask({ id: 'sibling', title: 'Sibling root', status: 'IN_PROGRESS' }),
     ];
     render(<PipelineView tasks={tasks} onViewLogs={vi.fn()} />);
     await user.click(screen.getByRole('button', { name: 'Expand all' }));
 
-    // The primary row carries the compact challenge-outcome badge.
-    expect(screen.getByText('challenged ✓')).toBeTruthy();
+    // The primary row carries the compact finding-challenge outcome badge.
+    expect(screen.getByText('2nd opinion ✓')).toBeTruthy();
     // Collapsed by default: the side-car row is not rendered yet.
-    expect(document.querySelector('[data-task-id="challenger-1"]')).toBeNull();
+    expect(document.querySelector('[data-task-id="finding-challenge-1"]')).toBeNull();
 
     await user.click(screen.getByRole('button', { name: /1 side-car/ }));
-    expect(document.querySelector('[data-task-id="challenger-1"]')).not.toBeNull();
+    expect(document.querySelector('[data-task-id="finding-challenge-1"]')).not.toBeNull();
     expect(screen.getByText('↳ side-car')).toBeTruthy();
   });
 });

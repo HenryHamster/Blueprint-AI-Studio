@@ -918,12 +918,13 @@ async def _hydrate_outcome_plan_outputs(
     document) live on ``plan_output``; without it ``evaluate_task_outcome``
     degrades them to ``neutral`` via ``_task_local_attr`` — silent
     under-counting in the digest's ``non_code_outcomes`` block. The window
-    scans deliberately do NOT load that JSONB for every row (research
-    plan_output alone can run ~100KB/row), so hydrate just the rows the walker
-    actually reads it on: terminal, outside a review chain, read-only typed —
-    plus legacy research rows lacking the ``research_surviving_findings``
-    context signal. The re-SELECT populates the unloaded attribute on the
-    already-tracked instances via the identity map.
+    scans deliberately do NOT load that JSONB for every row, so hydrate just
+    the rows the walker actually reads it on: terminal, outside a review chain,
+    read-only typed, and non-research. Research outcomes use the finalized
+    context signal and fail closed for legacy rows; loading their potentially
+    100KB raw pre-gate output would be both wasteful and misleading. The
+    re-SELECT populates the unloaded attribute on the already-tracked instances
+    via the identity map.
     """
     from app.task_outcomes import _READ_ONLY_EVALUATORS  # noqa: PLC0415
 
@@ -943,8 +944,8 @@ async def _hydrate_outcome_plan_outputs(
         t_type = (t.first_payload or {}).get("type")
         if t_type not in _READ_ONLY_EVALUATORS:
             continue
-        if t_type == "research" and "research_surviving_findings" in ctx:
-            continue  # modern research rows carry their signal on context
+        if t_type == "research":
+            continue
         need.append(t.id)
     if not need:
         return

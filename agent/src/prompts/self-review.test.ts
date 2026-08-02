@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { formatSrBlindSpotThemesForSrPrompt, formatExecutionEvidenceForSrPrompt, formatSrRecentMissExamplesForSrPrompt, formatPersistentBlindSpotHintForSrPrompt, formatHighFpRateLoosenHintForSrPrompt, formatSrCoFailurePairsForSrPrompt, formatSeverityCalibrationHintForSrPrompt, formatFailureModeHintForSrPrompt, formatPrecisionRecallQuadrantHintForSrPrompt } from './self-review.js';
+import { formatSrBlindSpotThemesForSrPrompt, formatExecutionEvidenceForSrPrompt, formatSrRecentMissExamplesForSrPrompt, formatHighFpRateLoosenHintForSrPrompt, formatSrCoFailurePairsForSrPrompt, formatSeverityCalibrationHintForSrPrompt, formatPrecisionRecallQuadrantHintForSrPrompt } from './self-review.js';
 
 describe('formatHighFpRateLoosenHintForSrPrompt', () => {
   it('returns empty string for null, undefined, and empty object', () => {
@@ -72,7 +72,6 @@ describe('formatHighFpRateLoosenHintForSrPrompt', () => {
     expect(result).toContain('evidence');
   });
 });
-
 describe('formatPrecisionRecallQuadrantHintForSrPrompt', () => {
   it('returns empty string for null, undefined, and empty object', () => {
     expect(formatPrecisionRecallQuadrantHintForSrPrompt(null)).toBe('');
@@ -174,55 +173,6 @@ describe('formatPrecisionRecallQuadrantHintForSrPrompt', () => {
     expect(result.endsWith('\n\n')).toBe(true);
   });
 });
-
-describe('formatPersistentBlindSpotHintForSrPrompt', () => {
-  it('returns empty string for null', () => {
-    expect(formatPersistentBlindSpotHintForSrPrompt(null)).toBe('');
-  });
-
-  it('returns empty string for undefined', () => {
-    expect(formatPersistentBlindSpotHintForSrPrompt(undefined)).toBe('');
-  });
-
-  it('returns empty string when categories is empty', () => {
-    expect(formatPersistentBlindSpotHintForSrPrompt({ categories: [], hint: 'some hint' })).toBe('');
-  });
-
-  it('returns empty string when hint is null', () => {
-    expect(formatPersistentBlindSpotHintForSrPrompt({
-      categories: [{ category: 'correctness', task_type: 'create', rate: 0.4 }],
-      hint: null,
-    })).toBe('');
-  });
-
-  it('returns formatted block with section heading when categories present', () => {
-    const result = formatPersistentBlindSpotHintForSrPrompt({
-      categories: [{ category: 'correctness', task_type: 'create', rate: 0.4 }],
-      hint: 'Persistent self-review blind spots: correctness (40%). Spend extra attention.',
-    });
-    expect(result).toContain('## Persistent Self-Review Blind Spots');
-    expect(result).toContain('correctness');
-    expect(result).toContain('40%');
-  });
-
-  it('includes the backend hint text verbatim', () => {
-    const hint = 'Persistent self-review blind spots (reviewer-disagreement rate over 2 x 7-day windows): scope-drift (35%). Spend extra attention on these categories.';
-    const result = formatPersistentBlindSpotHintForSrPrompt({
-      categories: [{ category: 'scope-drift', task_type: 'create', rate: 0.35 }],
-      hint,
-    });
-    expect(result).toContain(hint);
-  });
-
-  it('returns non-empty string ending with double newline when populated', () => {
-    const result = formatPersistentBlindSpotHintForSrPrompt({
-      categories: [{ category: 'security', task_type: 'fix', rate: 0.3 }],
-      hint: 'Persistent blind spots: security (30%).',
-    });
-    expect(result.endsWith('\n\n')).toBe(true);
-  });
-});
-
 describe('formatExecutionEvidenceForSrPrompt', () => {
   it('includes all three command-execution category names', () => {
     const result = formatExecutionEvidenceForSrPrompt();
@@ -656,68 +606,5 @@ describe('formatSeverityCalibrationHintForSrPrompt', () => {
       },
     });
     expect(result).toContain('MINOR');
-  });
-});
-
-describe('formatFailureModeHintForSrPrompt', () => {
-  it('returns empty string for null, undefined, and empty object', () => {
-    expect(formatFailureModeHintForSrPrompt(null)).toBe('');
-    expect(formatFailureModeHintForSrPrompt(undefined)).toBe('');
-    expect(formatFailureModeHintForSrPrompt({})).toBe('');
-  });
-
-  it('returns empty string when no categories are regressing', () => {
-    const result = formatFailureModeHintForSrPrompt({
-      correctness: { trend: 'stable', below_floor: false, miss_mode_breakdown: { reading_gap: 3, judgment_gap: 0, coverage_gap: 0, dominant_mode: 'reading_gap' } },
-    });
-    expect(result).toBe('');
-  });
-
-  it('returns empty string when regressing category has no miss_mode_breakdown', () => {
-    const result = formatFailureModeHintForSrPrompt({
-      correctness: { trend: 'decreasing' },
-    });
-    expect(result).toBe('');
-  });
-
-  it('surfaces reading_gap hint for below_floor category', () => {
-    const result = formatFailureModeHintForSrPrompt({
-      correctness: { below_floor: true, miss_mode_breakdown: { reading_gap: 5, judgment_gap: 1, coverage_gap: 0, dominant_mode: 'reading_gap' } },
-    });
-    expect(result).toContain('correctness');
-    expect(result).toContain('reading_gap');
-    expect(result).toContain('re-read all changed files');
-  });
-
-  it('surfaces judgment_gap hint for decreasing trend category', () => {
-    const result = formatFailureModeHintForSrPrompt({
-      security: { trend: 'decreasing', miss_mode_breakdown: { reading_gap: 0, judgment_gap: 4, coverage_gap: 1, dominant_mode: 'judgment_gap' } },
-    });
-    expect(result).toContain('security');
-    expect(result).toContain('judgment_gap');
-    expect(result).toContain('calibration');
-  });
-
-  it('surfaces coverage_gap hint when dominant mode is coverage_gap', () => {
-    const result = formatFailureModeHintForSrPrompt({
-      'test-coverage': { below_floor: true, miss_mode_breakdown: { reading_gap: 0, judgment_gap: 0, coverage_gap: 3, dominant_mode: 'coverage_gap' } },
-    });
-    expect(result).toContain('test-coverage');
-    expect(result).toContain('coverage_gap');
-    expect(result).toContain('score this category');
-  });
-
-  it('skips categories with null dominant_mode', () => {
-    const result = formatFailureModeHintForSrPrompt({
-      correctness: { below_floor: true, miss_mode_breakdown: { reading_gap: 0, judgment_gap: 0, coverage_gap: 0, dominant_mode: null } },
-    });
-    expect(result).toBe('');
-  });
-
-  it('ends with double newline when populated', () => {
-    const result = formatFailureModeHintForSrPrompt({
-      correctness: { below_floor: true, miss_mode_breakdown: { reading_gap: 3, judgment_gap: 0, coverage_gap: 0, dominant_mode: 'reading_gap' } },
-    });
-    expect(result.endsWith('\n\n')).toBe(true);
   });
 });

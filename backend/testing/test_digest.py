@@ -7768,7 +7768,10 @@ async def test_research_actionability_grade_distribution(
         project_id=project.id,
         status=TaskStatus.COMPLETED,
         payloads=[{"type": "research"}],
-        context={"_actionability_structural_downgrades": 2},
+        context={
+            "_actionability_structural_downgrades": 2,
+            "research_findings_finalized": True,
+        },
         plan_output=[
             {
                 "title": "Finding A",
@@ -7849,6 +7852,7 @@ async def test_research_actionability_excludes_non_research_plan_output(
             project_id=project.id,
             status=TaskStatus.COMPLETED,
             payloads=[{"type": "research"}],
+            context={"research_findings_finalized": True},
             plan_output=[
                 {
                     "title": "Real finding",
@@ -7926,7 +7930,11 @@ async def test_research_actionability_research_task_does_not_self_attribute(
         project_id=project.id,
         status=TaskStatus.COMPLETED,
         payloads=[{"type": "research"}],
-        context={"direction_id": "dir-self", "pr_merged": True},
+        context={
+            "direction_id": "dir-self",
+            "pr_merged": True,
+            "research_findings_finalized": True,
+        },
         plan_output=[
             {
                 "title": "Self-attribution probe",
@@ -7978,6 +7986,7 @@ async def test_research_actionability_merge_requires_pr_merged_flag(
         status=TaskStatus.COMPLETED,
         payloads=[{"type": "research"}],
         created_at=research_at,
+        context={"research_findings_finalized": True},
         plan_output=[
             {
                 "title": "Merged path",
@@ -8098,6 +8107,7 @@ async def test_research_actionability_grade_merge_rate_and_calibration(
             status=TaskStatus.COMPLETED,
             payloads=[{"type": "research"}],
             created_at=research_at,
+            context={"research_findings_finalized": True},
             plan_output=plan_output,
         )
     )
@@ -8160,6 +8170,7 @@ async def test_research_actionability_calibration_null_when_no_findings(
             project_id=project.id,
             status=TaskStatus.COMPLETED,
             payloads=[{"type": "research"}],
+            context={"research_findings_finalized": True},
             plan_output=[
                 {
                     "title": "M1",
@@ -8222,6 +8233,7 @@ async def test_research_actionability_cycle_history_chronological(
             status=TaskStatus.COMPLETED,
             payloads=[{"type": "research"}],
             created_at=research_old_at,
+            context={"research_findings_finalized": True},
             plan_output=[
                 {
                     "title": "Old HIGH",
@@ -8249,6 +8261,7 @@ async def test_research_actionability_cycle_history_chronological(
             status=TaskStatus.COMPLETED,
             payloads=[{"type": "research"}],
             created_at=research_new_at,
+            context={"research_findings_finalized": True},
             plan_output=[
                 {
                     "title": "New LOW",
@@ -8314,6 +8327,7 @@ async def test_research_actionability_cycle_history_null_rate_for_zero_findings(
             status=TaskStatus.COMPLETED,
             payloads=[{"type": "research"}],
             created_at=cyc_at + _td(minutes=10),
+            context={"research_findings_finalized": True},
             plan_output=[
                 {
                     "title": "M-only",

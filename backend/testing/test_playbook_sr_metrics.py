@@ -559,139 +559,6 @@ async def test_compute_sr_catch_rate_trends_per_category_hit_and_miss(
 
 
 @pytest.mark.asyncio
-async def test_compute_sr_catch_rate_trends_splits_sr_and_reviewer_hits(
-    db_session: AsyncSession,
-):
-    """Origin tags split combined hits into SR-alone vs reviewer-save counts."""
-    from app.playbook_learning import compute_sr_catch_rate_trends
-
-    project = await _make_project(db_session)
-    tasks = []
-    current_specs = [
-        (["test-coverage"], None),
-        (["test-coverage"], {"test-coverage": {"origin": "reviewer"}}),
-        (
-            ["test-coverage"],
-            {"test-coverage": {"origin": "reviewer_recovery_after_incomplete_sr"}},
-        ),
-        ([], None),
-        ([], None),
-    ]
-    for failed_cats, overrides in current_specs:
-        t = _make_sr_task(
-            project.id,
-            age_days=2,
-            human_cats={"test-coverage": 1},
-            sr_failed_cats=failed_cats,
-            check_result_overrides=overrides,
-        )
-        db_session.add(t)
-        tasks.append(t)
-    for i in range(5):
-        t = _make_sr_task(
-            project.id,
-            age_days=20,
-            human_cats={"test-coverage": 1},
-            sr_failed_cats=["test-coverage"],
-        )
-        db_session.add(t)
-        tasks.append(t)
-    await db_session.flush()
-
-    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
-
-    assert result is not None
-    cat = result["categories"]["test-coverage"]
-    assert cat["current_hit_rate"] == round(3 / 5, 3)
-    assert cat["sr_alone_hit_count"] == 1
-    assert cat["reviewer_save_hit_count"] == 2
-    assert cat["sr_alone_hit_rate"] == round(1 / 5, 3)
-    assert cat["reviewer_save_rate"] == round(2 / 5, 3)
-    assert cat["current_hit_rate"] == round(
-        cat["sr_alone_hit_rate"] + cat["reviewer_save_rate"], 3
-    )
-
-
-@pytest.mark.asyncio
-async def test_compute_sr_catch_rate_trends_split_excludes_false_positives(
-    db_session: AsyncSession,
-):
-    """Bucket counts only count true positives — FP sr_failed entries (cat not in
-    human_cats for the same task) must not inflate sr_alone/reviewer_save so
-    the split rates always sum to current_hit_rate."""
-    from app.playbook_learning import compute_sr_catch_rate_trends
-
-    project = await _make_project(db_session)
-    tasks = []
-    # Current window: 5 tasks where human flagged test-coverage (3 hits, 2 misses)
-    # plus 2 tasks where humans flagged "correctness" but SR (incorrectly) flagged
-    # test-coverage. The 2 extra entries are FPs for test-coverage and must not
-    # add to its sr_alone/reviewer_save buckets (the bug being fixed).
-    current_specs = [
-        # human={test-coverage}, sr_failed=[test-coverage] (TP hits)
-        ({"test-coverage": 1}, ["test-coverage"], None),
-        (
-            {"test-coverage": 1},
-            ["test-coverage"],
-            {"test-coverage": {"origin": "reviewer"}},
-        ),
-        (
-            {"test-coverage": 1},
-            ["test-coverage"],
-            {"test-coverage": {"origin": "reviewer_recovery_after_incomplete_sr"}},
-        ),
-        # human={test-coverage}, sr_failed=[] (TP misses)
-        ({"test-coverage": 1}, [], None),
-        ({"test-coverage": 1}, [], None),
-        # human={correctness}, sr_failed=[test-coverage] (FP for test-coverage)
-        ({"correctness": 1}, ["test-coverage"], None),
-        (
-            {"correctness": 1},
-            ["test-coverage"],
-            {"test-coverage": {"origin": "reviewer"}},
-        ),
-    ]
-    for human, failed_cats, overrides in current_specs:
-        t = _make_sr_task(
-            project.id,
-            age_days=2,
-            human_cats=human,
-            sr_failed_cats=failed_cats,
-            check_result_overrides=overrides,
-        )
-        db_session.add(t)
-        tasks.append(t)
-    for i in range(5):
-        t = _make_sr_task(
-            project.id,
-            age_days=20,
-            human_cats={"test-coverage": 1},
-            sr_failed_cats=["test-coverage"],
-        )
-        db_session.add(t)
-        tasks.append(t)
-    await db_session.flush()
-
-    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
-
-    assert result is not None
-    cat = result["categories"]["test-coverage"]
-    # Combined hit_rate counts only TPs (3/5 — the 2 FP entries don't enter
-    # human_count or hit_count).
-    assert cat["current_hit_rate"] == round(3 / 5, 3)
-    # Buckets must also count only TPs — not the 2 FP entries.
-    assert cat["sr_alone_hit_count"] == 1
-    assert cat["reviewer_save_hit_count"] == 2
-    assert cat["sr_alone_hit_rate"] == round(1 / 5, 3)
-    assert cat["reviewer_save_rate"] == round(2 / 5, 3)
-    # Invariant: split rates sum to combined rate. With the buggy code the FP
-    # entries would inflate either bucket and break this equality.
-    assert round(cat["sr_alone_hit_rate"] + cat["reviewer_save_rate"], 3) == round(
-        cat["current_hit_rate"], 3
-    )
-
-
-@pytest.mark.asyncio
 async def test_compute_sr_catch_rate_trends_trend_classification(
     db_session: AsyncSession,
 ):
@@ -1976,231 +1843,6 @@ async def test_compute_sr_catch_rate_trends_by_direction_significance_gates_tren
     assert entry_large["trend"] == "decreasing", (
         "n=30, delta=-0.2: z >= 1.28, significant → decreasing"
     )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Tests for reviewer_hallucination_rate in compute_sr_catch_rate_trends
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def _make_sr_task_with_rff(
-    project_id,
-    *,
-    age_days: float,
-    total_reviewer_findings: int,
-    filtered_count: int,
-) -> Task:
-    """Build a Task carrying reviewer_findings_filtered in its SR outcome."""
-    ctx: dict = {
-        "_self_review_outcome": {
-            "check_results": {"correctness": {"passed": True}},
-            "reviewer_findings_filtered": {
-                "total_reviewer_findings": total_reviewer_findings,
-                "filtered_count": filtered_count,
-                "sampled_phantom_paths": [],
-            },
-        },
-        "_first_attempt_rejection_categories": {"correctness": 1},
-    }
-    task = Task(
-        project_id=project_id,
-        title="RFF task",
-        payloads=[{"type": "create", "prompt": "do something"}],
-        status=TaskStatus.COMPLETED,
-        context=ctx,
-    )
-    task.created_at = _utcnow() - timedelta(days=age_days)
-    return task
-
-
-@pytest.mark.asyncio
-async def test_reviewer_hallucination_rate_omitted_below_floor(
-    db_session: AsyncSession,
-):
-    """reviewer_hallucination_rate is absent when total findings < floor (10)."""
-    from app.playbook_learning import compute_sr_catch_rate_trends
-
-    project = await _make_project(db_session)
-    tasks = []
-    # Current window: 5 tasks, each with only 1 total finding → sum=5, below floor of 10
-    for _ in range(5):
-        t = _make_sr_task_with_rff(
-            project.id, age_days=2, total_reviewer_findings=1, filtered_count=0
-        )
-        db_session.add(t)
-        tasks.append(t)
-    for _ in range(5):
-        t = _make_sr_task_with_rff(
-            project.id, age_days=20, total_reviewer_findings=1, filtered_count=0
-        )
-        db_session.add(t)
-        tasks.append(t)
-    await db_session.flush()
-
-    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
-    assert result is not None
-    # Neither window meets the floor (5 < 10), so the key should be absent
-    assert "reviewer_hallucination_rate" not in result
-
-
-@pytest.mark.asyncio
-async def test_reviewer_hallucination_rate_correct_computation(
-    db_session: AsyncSession,
-):
-    """reviewer_hallucination_rate current_rate = filtered/total across current window tasks."""
-    from app.playbook_learning import compute_sr_catch_rate_trends
-
-    project = await _make_project(db_session)
-    tasks = []
-    # Current window: 5 tasks, 4 findings each → total=20, filtered=5 → rate=0.25
-    for _ in range(5):
-        t = _make_sr_task_with_rff(
-            project.id, age_days=2, total_reviewer_findings=4, filtered_count=1
-        )
-        db_session.add(t)
-        tasks.append(t)
-    # Previous window: 5 tasks, 4 findings each → total=20, filtered=0 → rate=0.0
-    for _ in range(5):
-        t = _make_sr_task_with_rff(
-            project.id, age_days=20, total_reviewer_findings=4, filtered_count=0
-        )
-        db_session.add(t)
-        tasks.append(t)
-    await db_session.flush()
-
-    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
-    assert result is not None
-    assert "reviewer_hallucination_rate" in result
-    rhr = result["reviewer_hallucination_rate"]
-    assert rhr["current_rate"] == pytest.approx(0.25, abs=0.001)
-    assert rhr["previous_rate"] == pytest.approx(0.0, abs=0.001)
-    assert rhr["current_sample"] == 20
-    assert rhr["previous_sample"] == 20
-    assert rhr["delta"] == pytest.approx(0.25, abs=0.001)
-
-
-@pytest.mark.asyncio
-async def test_reviewer_hallucination_rate_delta_direction(
-    db_session: AsyncSession,
-):
-    """delta is positive when current_rate > previous_rate (worsening)."""
-    from app.playbook_learning import compute_sr_catch_rate_trends
-
-    project = await _make_project(db_session)
-    tasks = []
-    # Current window: higher hallucination rate (6/20 = 0.3)
-    for _ in range(5):
-        t = _make_sr_task_with_rff(
-            project.id, age_days=2, total_reviewer_findings=4, filtered_count=1
-        )
-        db_session.add(t)
-        tasks.append(t)
-    # Previous window: lower hallucination rate (2/20 = 0.1)
-    for _ in range(5):
-        t = _make_sr_task_with_rff(
-            project.id, age_days=20, total_reviewer_findings=4, filtered_count=0
-        )
-        db_session.add(t)
-        tasks.append(t)
-    # Add 2 more current and 2 more previous with extra filtered
-    t_extra_curr = _make_sr_task_with_rff(
-        project.id, age_days=3, total_reviewer_findings=0, filtered_count=0
-    )
-    t_extra_prev = _make_sr_task_with_rff(
-        project.id, age_days=21, total_reviewer_findings=0, filtered_count=0
-    )
-    db_session.add(t_extra_curr)
-    db_session.add(t_extra_prev)
-    tasks.extend([t_extra_curr, t_extra_prev])
-    await db_session.flush()
-
-    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
-    assert result is not None
-    if "reviewer_hallucination_rate" in result:
-        rhr = result["reviewer_hallucination_rate"]
-        # delta should be current_rate - previous_rate
-        if rhr["delta"] is not None:
-            assert (
-                abs(rhr["delta"] - (rhr["current_rate"] - rhr["previous_rate"])) < 0.001
-            )
-
-
-@pytest.mark.asyncio
-async def test_reviewer_hallucination_rate_persists_to_dedicated_store(
-    db_session: AsyncSession,
-):
-    """reviewer_hallucination_rate is persisted in project.design_doc['sr_catch_rate_trends']."""
-    from app.playbook_learning import compute_sr_catch_rate_trends
-
-    project = await _make_project(db_session)
-    tasks = []
-    for _ in range(5):
-        t = _make_sr_task_with_rff(
-            project.id, age_days=2, total_reviewer_findings=4, filtered_count=2
-        )
-        db_session.add(t)
-        tasks.append(t)
-    for _ in range(5):
-        t = _make_sr_task_with_rff(
-            project.id, age_days=20, total_reviewer_findings=4, filtered_count=1
-        )
-        db_session.add(t)
-        tasks.append(t)
-    await db_session.flush()
-
-    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
-    assert result is not None
-    assert "reviewer_hallucination_rate" in result
-    stored = (await _read_sr_analytics(db_session, project)).get(
-        "sr_catch_rate_trends", {}
-    )
-    assert "reviewer_hallucination_rate" in stored
-
-
-@pytest.mark.asyncio
-async def test_reviewer_hallucination_rate_tasks_without_field_ignored(
-    db_session: AsyncSession,
-):
-    """Tasks without reviewer_findings_filtered contribute nothing to the rate."""
-    from app.playbook_learning import compute_sr_catch_rate_trends
-
-    project = await _make_project(db_session)
-    tasks = []
-    # Mix tasks with and without the field; only those with field count
-    for _ in range(3):
-        t = _make_sr_task_with_rff(
-            project.id, age_days=2, total_reviewer_findings=5, filtered_count=1
-        )
-        db_session.add(t)
-        tasks.append(t)
-    # 2 tasks without the field (old-style)
-    for _ in range(2):
-        t = _make_sr_task(
-            project.id, age_days=2, human_cats={"correctness": 1}, sr_failed_cats=[]
-        )
-        db_session.add(t)
-        tasks.append(t)
-    for _ in range(5):
-        t = _make_sr_task(
-            project.id, age_days=20, human_cats={"correctness": 1}, sr_failed_cats=[]
-        )
-        db_session.add(t)
-        tasks.append(t)
-    await db_session.flush()
-
-    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
-    assert result is not None
-    # Previous window has no tasks with reviewer_findings_filtered, so no rate for it.
-    # Current window total = 3*5 = 15 >= 10, so current_rate should be present.
-    if "reviewer_hallucination_rate" in result:
-        rhr = result["reviewer_hallucination_rate"]
-        assert rhr["current_sample"] == 15  # only the 3 tasks with rff contribute
-        assert rhr["previous_rate"] is None  # previous window below floor
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Tests for reasoning engagement in compute_sr_catch_rate_trends
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 def _make_sr_task_with_pass_reasoning(
@@ -4210,64 +3852,6 @@ async def test_sr_passes_do_not_affect_false_positive_metric(db_session: AsyncSe
 
 
 @pytest.mark.asyncio
-async def test_previous_fp_rate_uses_reviewer_findings_for_consistency(
-    db_session: AsyncSession,
-):
-    """previous_fp_rate uses _compute_cat_fp_stats so reviewer_findings in the prior
-    window count as confirmations — preventing phantom sr_false_positive signals after
-    a fresh-reviewer wave raises many reviewer_findings in the previous cycle."""
-    from app.playbook_learning import compute_sr_catch_rate_trends
-
-    project = await _make_project(db_session)
-    tasks = []
-
-    def _task_with_reviewer_confirmation(age_days):
-        task = Task(
-            project_id=project.id,
-            title="SR task",
-            payloads=[{"type": "create", "prompt": "do something"}],
-            status=TaskStatus.COMPLETED,
-            context={
-                "_self_review_outcome": {
-                    "check_results": {"correctness": {"passed": False, "issue": "x"}},
-                    "reviewer_findings": [
-                        {"category": "correctness", "severity": "HIGH"}
-                    ],
-                },
-                "_first_attempt_rejection_categories": {"test-coverage": 1},
-            },
-        )
-        task.created_at = _utcnow() - timedelta(days=age_days)
-        return task
-
-    for _ in range(5):
-        t = _task_with_reviewer_confirmation(age_days=2)
-        db_session.add(t)
-        tasks.append(t)
-    for _ in range(5):
-        t = _task_with_reviewer_confirmation(age_days=20)
-        db_session.add(t)
-        tasks.append(t)
-    await db_session.flush()
-
-    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
-
-    assert result is not None
-    cat = result["categories"]["correctness"]
-    assert cat["false_positive_rate"] == 0.0, (
-        "reviewer_findings confirmed SR failure in current window → not a FP"
-    )
-    assert cat["previous_fp_rate"] == 0.0, (
-        "reviewer_findings confirmed SR failure in previous window → previous_fp_rate must be 0.0"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Tests for loosen-hint data pipeline: fp_count + tp_count >= 10 threshold
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
 async def test_compute_sr_catch_rate_trends_stores_loosen_hint_threshold_fields(
     db_session: AsyncSession,
 ):
@@ -5375,173 +4959,6 @@ async def test_regression_alert_dedup_tied_to_cycle_id(db_session: AsyncSession)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tests for reviewer_recovery_after_incomplete_sr_count tracking
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def _make_recovery_task(
-    project_id,
-    *,
-    use_top_level_origin: bool = True,
-    use_check_results_origin: bool = False,
-) -> Task:
-    """Build a Task whose _self_review_outcome marks a recovery pass."""
-    sro: dict = {}
-    if use_top_level_origin:
-        sro["reviewer_recovery_origin"] = "reviewer_recovery_after_incomplete_sr"
-    if use_check_results_origin:
-        sro["check_results"] = {
-            "correctness": {
-                "passed": False,
-                "origin": "reviewer_recovery_after_incomplete_sr",
-            },
-        }
-    return Task(
-        project_id=project_id,
-        title="Recovery task",
-        payloads=[{"type": "create", "prompt": "do something"}],
-        status=TaskStatus.COMPLETED,
-        context={"_self_review_outcome": sro},
-    )
-
-
-def _count_recovery_tasks(tasks: list) -> int:
-    """Mirror the counting expression used in agent.py for reviewer_recovery_after_incomplete_sr_count."""
-    return sum(
-        1
-        for t in tasks
-        if (
-            (t.context or {})
-            .get("_self_review_outcome", {})
-            .get("reviewer_recovery_origin")
-            == "reviewer_recovery_after_incomplete_sr"
-        )
-        or any(
-            isinstance(v, dict)
-            and v.get("origin") == "reviewer_recovery_after_incomplete_sr"
-            for v in (
-                (t.context or {}).get("_self_review_outcome", {}).get("check_results")
-                or {}
-            ).values()
-        )
-    )
-
-
-def test_reviewer_recovery_count_via_top_level_origin():
-    """Tasks with reviewer_recovery_origin on _self_review_outcome are counted."""
-    project_id = uuid.uuid4()
-    tasks = [
-        _make_recovery_task(project_id, use_top_level_origin=True),
-        _make_recovery_task(project_id, use_top_level_origin=True),
-        Task(  # no recovery fields
-            project_id=project_id,
-            title="Normal task",
-            payloads=[{"type": "create", "prompt": "x"}],
-            status=TaskStatus.COMPLETED,
-            context={
-                "_self_review_outcome": {
-                    "check_results": {"correctness": {"passed": True}}
-                }
-            },
-        ),
-    ]
-    assert _count_recovery_tasks(tasks) == 2
-
-
-def test_reviewer_recovery_count_via_check_results_origin():
-    """Tasks with origin on a check_results entry (no top-level field) are counted."""
-    project_id = uuid.uuid4()
-    tasks = [
-        _make_recovery_task(
-            project_id, use_top_level_origin=False, use_check_results_origin=True
-        ),
-        Task(
-            project_id=project_id,
-            title="Normal task",
-            payloads=[{"type": "create", "prompt": "x"}],
-            status=TaskStatus.COMPLETED,
-            context={
-                "_self_review_outcome": {
-                    "check_results": {"correctness": {"passed": False}}
-                }
-            },
-        ),
-    ]
-    assert _count_recovery_tasks(tasks) == 1
-
-
-def test_reviewer_recovery_count_is_zero_when_no_recovery_tasks():
-    """Returns 0 when no tasks have recovery markers."""
-    project_id = uuid.uuid4()
-    tasks = [
-        Task(
-            project_id=project_id,
-            title="Task A",
-            payloads=[{"type": "create", "prompt": "x"}],
-            status=TaskStatus.COMPLETED,
-            context={"_self_review_outcome": {"check_results": {}}},
-        ),
-        Task(
-            project_id=project_id,
-            title="Task B",
-            payloads=[{"type": "fix", "prompt": "y"}],
-            status=TaskStatus.COMPLETED,
-            context={},
-        ),
-    ]
-    assert _count_recovery_tasks(tasks) == 0
-
-
-@pytest.mark.asyncio
-async def test_reviewer_recovery_count_written_to_design_doc(db_session: AsyncSession):
-    """Verifies the count is written to project.design_doc['sr_catch_rate_trends']."""
-    from sqlalchemy.orm.attributes import flag_modified
-
-    project = await _make_project(db_session)
-    # Simulate: sr_catch_rate_trends already exists from compute_sr_catch_rate_trends
-    doc = dict(project.design_doc or {})
-    doc["sr_catch_rate_trends"] = {
-        "computed_at": "2026-01-01T00:00:00",
-        "categories": {},
-    }
-    project.design_doc = doc
-    flag_modified(project, "design_doc")
-    db_session.add(project)
-    await db_session.flush()
-
-    tasks = [
-        _make_recovery_task(project.id, use_top_level_origin=True),
-        _make_recovery_task(project.id, use_top_level_origin=True),
-        Task(
-            project_id=project.id,
-            title="Normal task",
-            payloads=[{"type": "create", "prompt": "x"}],
-            status=TaskStatus.COMPLETED,
-            context={"_self_review_outcome": {"check_results": {}}},
-        ),
-    ]
-    recovery_count = _count_recovery_tasks(tasks)
-    assert recovery_count == 2
-
-    # Apply the same update logic as agent.py
-    _proj = await db_session.get(Project, project.id)
-    assert _proj is not None
-    _doc = dict(_proj.design_doc or {})
-    _trends = dict(_doc.get("sr_catch_rate_trends") or {})
-    _trends["reviewer_recovery_after_incomplete_sr_count"] = recovery_count
-    _doc["sr_catch_rate_trends"] = _trends
-    _proj.design_doc = _doc
-    flag_modified(_proj, "design_doc")
-    db_session.add(_proj)
-    await db_session.flush()
-
-    refreshed = await db_session.get(Project, project.id)
-    assert refreshed is not None
-    trends = (refreshed.design_doc or {}).get("sr_catch_rate_trends", {})
-    assert trends.get("reviewer_recovery_after_incomplete_sr_count") == 2
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Tests for sr_skip_rate / sr_skip_reason_distribution
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -5567,50 +4984,6 @@ def _make_skip_task(
         context={"_self_review_outcome": outcome},
     )
     task.created_at = _utcnow() - timedelta(days=age_days)
-    return task
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Tests for compute_fresh_reviewer_trend
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def _make_fr_task(
-    project_id,
-    *,
-    age_days: float,
-    reviewer_findings=None,
-    human_cats=None,
-    all_iteration_cats=None,
-    sr_failed_cats=None,
-    first_attempt_succeeded: bool = True,
-    task_type: str = "create",
-    cycle_id=None,
-) -> Task:
-    """Build a Task for fresh-reviewer trend tests."""
-    check_results = {cat: {"passed": False} for cat in (sr_failed_cats or [])}
-    ctx: dict = {"_first_attempt_succeeded": first_attempt_succeeded}
-    if reviewer_findings is not None:
-        ctx["_self_review_outcome"] = {
-            "check_results": check_results,
-            "reviewer_findings": reviewer_findings,
-        }
-    else:
-        ctx["_self_review_outcome"] = {"check_results": check_results}
-    if human_cats is not None:
-        ctx["_first_attempt_rejection_categories"] = human_cats
-    if all_iteration_cats is not None:
-        ctx["_all_iterations_rejection_categories"] = all_iteration_cats
-    task = Task(
-        project_id=project_id,
-        title="FR task",
-        payloads=[{"type": task_type, "prompt": "do something"}],
-        status=TaskStatus.COMPLETED,
-        context=ctx,
-    )
-    task.created_at = _utcnow() - timedelta(days=age_days)
-    if cycle_id:
-        task.strategic_cycle_id = cycle_id
     return task
 
 
@@ -5763,594 +5136,25 @@ async def test_compute_sr_catch_rate_trends_all_fields_always_present(
     assert "edges_considered_stats" not in result
 
 
-@pytest.mark.asyncio
-async def test_compute_fresh_reviewer_trend_returns_none_below_sample_size(
-    db_session: AsyncSession,
-):
-    """Returns None when either window has fewer than _MIN_SR_SAMPLE tasks with reviewer_findings."""
-    from app.playbook_learning import compute_fresh_reviewer_trend
-
-    project = await _make_project(db_session)
-    tasks = []
-    for _ in range(3):
-        t = _make_fr_task(
-            project.id, age_days=2, reviewer_findings=[{"category": "correctness"}]
-        )
-        db_session.add(t)
-        tasks.append(t)
-    for _ in range(3):
-        t = _make_fr_task(
-            project.id, age_days=20, reviewer_findings=[{"category": "correctness"}]
-        )
-        db_session.add(t)
-        tasks.append(t)
-    await db_session.flush()
-
-    result = await compute_fresh_reviewer_trend(project.id, db_session, tasks)
-
-    assert result is None
-
-
-@pytest.mark.asyncio
-async def test_compute_fresh_reviewer_trend_per_category_hit_rate(
-    db_session: AsyncSession,
-):
-    """per_category_hit_rate reflects confirmed / flagged per category."""
-    from app.playbook_learning import compute_fresh_reviewer_trend
-
-    project = await _make_project(db_session)
-    tasks = []
-    # Current: 5 flag correctness, 3 confirmed + 2 not
-    for i in range(5):
-        confirmed = i < 3
-        t = _make_fr_task(
-            project.id,
-            age_days=2,
-            reviewer_findings=[{"category": "correctness"}],
-            human_cats=["correctness"] if confirmed else [],
-        )
-        db_session.add(t)
-        tasks.append(t)
-    # Previous: 5 flag correctness, all confirmed
-    for _ in range(5):
-        t = _make_fr_task(
-            project.id,
-            age_days=20,
-            reviewer_findings=[{"category": "correctness"}],
-            human_cats=["correctness"],
-        )
-        db_session.add(t)
-        tasks.append(t)
-    await db_session.flush()
-
-    result = await compute_fresh_reviewer_trend(project.id, db_session, tasks)
-
-    assert result is not None
-    cat = result["per_category_hit_rate"]["correctness"]
-    assert cat["current"] == round(3 / 5, 3)
-    assert cat["previous"] == 1.0
-    assert cat["trend"] == "regressing"
-
-
-@pytest.mark.asyncio
-async def test_compute_fresh_reviewer_trend_added_value(db_session: AsyncSession):
-    """added_value counts tasks where fresh-reviewer flagged what agent SR missed."""
-    from app.playbook_learning import compute_fresh_reviewer_trend
-
-    project = await _make_project(db_session)
-    tasks = []
-    # Current: 5 with reviewer flagging correctness, human confirmed all;
-    # agent SR caught it in first 2, missed in last 3 → added_value=3
-    for i in range(5):
-        agent_caught = i < 2
-        t = _make_fr_task(
-            project.id,
-            age_days=2,
-            reviewer_findings=[{"category": "correctness"}],
-            human_cats=["correctness"],
-            sr_failed_cats=["correctness"] if agent_caught else [],
-        )
-        db_session.add(t)
-        tasks.append(t)
-    # Previous: reviewer flags correctness, agent also caught all → added_value=0
-    for _ in range(5):
-        t = _make_fr_task(
-            project.id,
-            age_days=20,
-            reviewer_findings=[{"category": "correctness"}],
-            human_cats=["correctness"],
-            sr_failed_cats=["correctness"],
-        )
-        db_session.add(t)
-        tasks.append(t)
-    await db_session.flush()
-
-    result = await compute_fresh_reviewer_trend(project.id, db_session, tasks)
-
-    assert result is not None
-    av = result["added_value"]["correctness"]
-    assert av["current"] == 3
-    assert av["previous"] == 0
-
-
-@pytest.mark.asyncio
-async def test_compute_fresh_reviewer_trend_uses_any_iteration_confirmed_truth(
-    db_session: AsyncSession,
-):
-    """Later-iteration-only confirmations must count in hit rate and added value."""
-    from app.playbook_learning import compute_fresh_reviewer_trend
-
-    project = await _make_project(db_session)
-    tasks = []
-    for window_age in (2, 20):
-        for _ in range(5):
-            t = _make_fr_task(
-                project.id,
-                age_days=window_age,
-                reviewer_findings=[{"category": "correctness"}],
-                all_iteration_cats=["correctness"],
-                sr_failed_cats=[],
-            )
-            db_session.add(t)
-            tasks.append(t)
-    await db_session.flush()
-
-    result = await compute_fresh_reviewer_trend(project.id, db_session, tasks)
-
-    assert result is not None
-    cat = result["per_category_hit_rate"]["correctness"]
-    assert cat["current"] == 1.0
-    assert cat["previous"] == 1.0
-    av = result["added_value"]["correctness"]
-    assert av["current"] == 5
-    assert av["previous"] == 5
-
-
-@pytest.mark.asyncio
-async def test_compute_fresh_reviewer_trend_approval_rate_lift(
-    db_session: AsyncSession,
-):
-    """approval_rate_lift is fa_rate_with_reviewer minus fa_rate_without."""
-    from app.playbook_learning import compute_fresh_reviewer_trend
-
-    project = await _make_project(db_session)
-    tasks = []
-    # Current: 5 with reviewer (all succeed), 5 without (3/5 succeed)
-    for _ in range(5):
-        t = _make_fr_task(
-            project.id,
-            age_days=2,
-            reviewer_findings=[{"category": "style-conventions"}],
-            first_attempt_succeeded=True,
-        )
-        db_session.add(t)
-        tasks.append(t)
-    for i in range(5):
-        t = _make_fr_task(project.id, age_days=2, first_attempt_succeeded=(i < 3))
-        db_session.add(t)
-        tasks.append(t)
-    # Previous: 5 with reviewer (4/5 succeed), 5 without (4/5 succeed)
-    for i in range(5):
-        t = _make_fr_task(
-            project.id,
-            age_days=20,
-            reviewer_findings=[{"category": "style-conventions"}],
-            first_attempt_succeeded=(i < 4),
-        )
-        db_session.add(t)
-        tasks.append(t)
-    for i in range(5):
-        t = _make_fr_task(project.id, age_days=20, first_attempt_succeeded=(i < 4))
-        db_session.add(t)
-        tasks.append(t)
-    await db_session.flush()
-
-    result = await compute_fresh_reviewer_trend(project.id, db_session, tasks)
-
-    assert result is not None
-    lift = result["approval_rate_lift"]
-    # current lift = 1.0 - 0.6 = 0.4; previous lift = 0.8 - 0.8 = 0.0
-    assert lift["current"] == pytest.approx(0.4, abs=0.01)
-    assert lift["previous"] == pytest.approx(0.0, abs=0.01)
-    assert lift["trend"] == "improving"
-
-
-@pytest.mark.asyncio
-async def test_compute_fresh_reviewer_trend_stable_classification(
-    db_session: AsyncSession,
-):
-    """Hit rate delta < 5pp → trend='stable'."""
-    from app.playbook_learning import compute_fresh_reviewer_trend
-
-    project = await _make_project(db_session)
-    tasks = []
-    for window_age in (2, 20):
-        for i in range(5):
-            t = _make_fr_task(
-                project.id,
-                age_days=window_age,
-                reviewer_findings=[{"category": "security"}],
-                human_cats=["security"] if i < 4 else [],
-            )
-            db_session.add(t)
-            tasks.append(t)
-    await db_session.flush()
-
-    result = await compute_fresh_reviewer_trend(project.id, db_session, tasks)
-
-    assert result is not None
-    assert result["per_category_hit_rate"]["security"]["trend"] == "stable"
-
-
-@pytest.mark.asyncio
-async def test_compute_fresh_reviewer_trend_persists_to_sr_analytics(
-    db_session: AsyncSession,
-):
-    """Persists fresh_reviewer_trend to the dedicated SR analytics store."""
-    from app.playbook_learning import compute_fresh_reviewer_trend
-
-    project = await _make_project(db_session)
-    tasks = []
-    for window_age in (2, 20):
-        for _ in range(5):
-            t = _make_fr_task(
-                project.id,
-                age_days=window_age,
-                reviewer_findings=[{"category": "correctness"}],
-            )
-            db_session.add(t)
-            tasks.append(t)
-    await db_session.flush()
-
-    result = await compute_fresh_reviewer_trend(project.id, db_session, tasks)
-    await db_session.flush()
-
-    persisted = (await _read_sr_analytics(db_session, project)).get(
-        "fresh_reviewer_trend"
-    )
-    assert result is not None
-    assert persisted is not None
-    assert persisted["computed_at"] == result["computed_at"]
-    # No longer copied into design_doc.
-    await db_session.refresh(project)
-    assert (project.design_doc or {}).get("fresh_reviewer_trend") is None
-
-
-@pytest.mark.asyncio
-async def test_compute_fresh_reviewer_trend_mixed_fr_on_off_cycle_bucketing(
-    db_session: AsyncSession,
-):
-    """Cycle bucketing: tasks without reviewer_findings don't count toward sample size."""
-    from app.playbook_learning import compute_fresh_reviewer_trend
-
-    project = await _make_project(db_session)
-    c1 = _make_cycle(project.id, age_days=10)
-    c2 = _make_cycle(project.id, age_days=30)
-    db_session.add_all([c1, c2])
-    await db_session.flush()
-
-    tasks = []
-    # c1: 5 with reviewer, 10 without
-    for _ in range(5):
-        t = _make_fr_task(
-            project.id,
-            age_days=5,
-            reviewer_findings=[{"category": "correctness"}],
-            cycle_id=str(c1.id),
-        )
-        db_session.add(t)
-        tasks.append(t)
-    for _ in range(10):
-        t = _make_fr_task(project.id, age_days=5, cycle_id=str(c1.id))
-        db_session.add(t)
-        tasks.append(t)
-    # c2: 5 with reviewer
-    for _ in range(5):
-        t = _make_fr_task(
-            project.id,
-            age_days=25,
-            reviewer_findings=[{"category": "correctness"}],
-            cycle_id=str(c2.id),
-        )
-        db_session.add(t)
-        tasks.append(t)
-    await db_session.flush()
-
-    result = await compute_fresh_reviewer_trend(project.id, db_session, tasks)
-
-    assert result is not None
-    assert result["bucket_mode"] == "cycle"
-    assert result["current_sample_size"] == 5
-    assert result["previous_sample_size"] == 5
-
-
-@pytest.mark.asyncio
-async def test_compute_fresh_reviewer_trend_improving_classification(
-    db_session: AsyncSession,
-):
-    """Hit rate delta >= 5pp → trend='improving' for per_category_hit_rate."""
-    from app.playbook_learning import compute_fresh_reviewer_trend
-
-    project = await _make_project(db_session)
-    tasks = []
-    # Current: 5 flag correctness, all 5 confirmed → rate=1.0
-    for _ in range(5):
-        t = _make_fr_task(
-            project.id,
-            age_days=2,
-            reviewer_findings=[{"category": "correctness"}],
-            human_cats=["correctness"],
-        )
-        db_session.add(t)
-        tasks.append(t)
-    # Previous: 5 flag correctness, only 3 confirmed → rate=0.6
-    for i in range(5):
-        t = _make_fr_task(
-            project.id,
-            age_days=20,
-            reviewer_findings=[{"category": "correctness"}],
-            human_cats=["correctness"] if i < 3 else [],
-        )
-        db_session.add(t)
-        tasks.append(t)
-    await db_session.flush()
-
-    result = await compute_fresh_reviewer_trend(project.id, db_session, tasks)
-
-    assert result is not None
-    cat = result["per_category_hit_rate"]["correctness"]
-    assert cat["current"] == 1.0
-    assert cat["previous"] == round(3 / 5, 3)
-    assert cat["trend"] == "improving"
-
-
-@pytest.mark.asyncio
-async def test_compute_fresh_reviewer_trend_calendar_fallback(db_session: AsyncSession):
-    """Falls back to calendar bucketing (0-14d vs 14-28d) when no completed cycles exist."""
-    from app.playbook_learning import compute_fresh_reviewer_trend
-
-    project = await _make_project(db_session)
-    tasks = []
-    # No cycles → calendar mode; 5 tasks in 0-14d window
-    for _ in range(5):
-        t = _make_fr_task(
-            project.id, age_days=7, reviewer_findings=[{"category": "correctness"}]
-        )
-        db_session.add(t)
-        tasks.append(t)
-    # 5 tasks in 14-28d window
-    for _ in range(5):
-        t = _make_fr_task(
-            project.id, age_days=21, reviewer_findings=[{"category": "correctness"}]
-        )
-        db_session.add(t)
-        tasks.append(t)
-    await db_session.flush()
-
-    result = await compute_fresh_reviewer_trend(project.id, db_session, tasks)
-
-    assert result is not None
-    assert result["bucket_mode"] == "calendar"
-    assert result["current_sample_size"] == 5
-    assert result["previous_sample_size"] == 5
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Tests for compute_sr_reviewer_disagreements
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def _make_sr_reviewer_task(
-    project_id,
-    *,
-    age_days: float,
-    task_type: str = "create",
-    check_results: dict | None = None,
-    reviewer_findings: list | None = None,
-) -> Task:
-    """Build a completed Task with self-review outcome and fresh-reviewer findings."""
-    sro: dict = {"check_results": check_results or {}}
-    if reviewer_findings is not None:
-        sro["reviewer_findings"] = reviewer_findings
-    task = Task(
-        project_id=project_id,
-        title="SR reviewer task",
-        payloads=[{"type": task_type, "prompt": "do something"}],
-        status=TaskStatus.COMPLETED,
-        context={"_self_review_outcome": sro},
-    )
-    task.created_at = _utcnow() - timedelta(days=age_days)
-    return task
-
-
-@pytest.mark.asyncio
-async def test_compute_sr_reviewer_disagreements_returns_none_when_no_findings(
-    db_session: AsyncSession,
-):
-    """Returns None when no tasks have reviewer_findings."""
-    from app.playbook_learning import compute_sr_reviewer_disagreements
-
-    project = await _make_project(db_session)
-    tasks = []
-    for _ in range(3):
-        t = _make_sr_reviewer_task(project.id, age_days=1)
-        db_session.add(t)
-        tasks.append(t)
-    await db_session.flush()
-
-    result = await compute_sr_reviewer_disagreements(project.id, db_session, tasks)
-
-    assert result is None
-
-
-@pytest.mark.asyncio
-async def test_compute_sr_reviewer_disagreements_counts_disagreements(
-    db_session: AsyncSession,
-):
-    """Counts disagreements where reviewer flagged but SR passed/omitted the category."""
-    from app.playbook_learning import compute_sr_reviewer_disagreements
-
-    project = await _make_project(db_session)
-    tasks = []
-    # 3 tasks: reviewer flags correctness, SR omits it -> disagreement
-    for _ in range(3):
-        t = _make_sr_reviewer_task(
-            project.id,
-            age_days=1,
-            task_type="fix",
-            check_results={},
-            reviewer_findings=[
-                {"category": "correctness", "severity": "HIGH", "description": "bug"}
-            ],
-        )
-        db_session.add(t)
-        tasks.append(t)
-    # 1 task: reviewer flags correctness but SR already failed it -> NOT a disagreement
-    t2 = _make_sr_reviewer_task(
-        project.id,
-        age_days=2,
-        task_type="fix",
-        check_results={"correctness": {"passed": False, "issue": "x"}},
-        reviewer_findings=[
-            {"category": "correctness", "severity": "HIGH", "description": "bug"}
-        ],
-    )
-    db_session.add(t2)
-    tasks.append(t2)
-    await db_session.flush()
-
-    result = await compute_sr_reviewer_disagreements(project.id, db_session, tasks)
-
-    assert result is not None
-    assert result["window_days"] == 30
-    entries = result["disagreements"]
-    assert len(entries) == 1
-    assert entries[0]["category"] == "correctness"
-    assert entries[0]["task_type"] == "fix"
-    assert entries[0]["count"] == 3
-    # Examples should be included — capped at 3 per bucket by sr_blind_spots
-    assert "examples" in entries[0]
-    assert len(entries[0]["examples"]) >= 1
-    ex = entries[0]["examples"][0]
-    assert ex["severity"] == "HIGH"
-    assert "bug" in ex["description"]
-
-
-@pytest.mark.asyncio
-async def test_compute_sr_reviewer_disagreements_persists_to_dedicated_store(
-    db_session: AsyncSession,
-):
-    """Result is written to project.design_doc['sr_reviewer_disagreements']."""
-    from app.playbook_learning import compute_sr_reviewer_disagreements
-
-    project = await _make_project(db_session)
-    tasks = []
-    t = _make_sr_reviewer_task(
-        project.id,
-        age_days=1,
-        check_results={},
-        reviewer_findings=[
-            {
-                "category": "test-coverage",
-                "severity": "MEDIUM",
-                "description": "missing test",
-            }
-        ],
-    )
-    db_session.add(t)
-    tasks.append(t)
-    await db_session.flush()
-
-    await compute_sr_reviewer_disagreements(project.id, db_session, tasks)
-
-    stored = (await _read_sr_analytics(db_session, project)).get(
-        "sr_reviewer_disagreements"
-    ) or {}
-    assert stored.get("disagreements")
-    assert stored["disagreements"][0]["category"] == "test-coverage"
-
-
-@pytest.mark.asyncio
-async def test_compute_sr_reviewer_disagreements_excludes_old_tasks(
-    db_session: AsyncSession,
-):
-    """Tasks older than window_days are excluded."""
-    from app.playbook_learning import compute_sr_reviewer_disagreements
-
-    project = await _make_project(db_session)
-    tasks = []
-    t = _make_sr_reviewer_task(
-        project.id,
-        age_days=35,  # outside 30-day default window
-        check_results={},
-        reviewer_findings=[
-            {"category": "security", "severity": "HIGH", "description": "x"}
-        ],
-    )
-    db_session.add(t)
-    tasks.append(t)
-    await db_session.flush()
-
-    result = await compute_sr_reviewer_disagreements(project.id, db_session, tasks)
-
-    assert result is None
-
-
-@pytest.mark.asyncio
-async def test_compute_sr_reviewer_disagreements_excludes_non_code_types(
-    db_session: AsyncSession,
-):
-    """Only code-change task types (create/fix/refactor/migrate) are counted."""
-    from app.playbook_learning import compute_sr_reviewer_disagreements
-
-    project = await _make_project(db_session)
-    tasks = []
-    for ttype in ("research", "plan", "review"):
-        t = _make_sr_reviewer_task(
-            project.id,
-            age_days=1,
-            task_type=ttype,
-            check_results={},
-            reviewer_findings=[
-                {"category": "correctness", "severity": "HIGH", "description": "bug"}
-            ],
-        )
-        db_session.add(t)
-        tasks.append(t)
-    await db_session.flush()
-
-    result = await compute_sr_reviewer_disagreements(project.id, db_session, tasks)
-
-    assert result is None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Tests for _compute_cat_fp_stats (false-positive rate aggregator)
-# ─────────────────────────────────────────────────────────────────────────────
-
-
 def _make_fp_task(
     project_id,
     *,
     task_type: str = "create",
     sr_failed_cats: list[str],
-    reviewer_cats: list[str],
+    confirmed_cats: list[str],
 ) -> Task:
-    """Build a Task whose self-review flagged sr_failed_cats and whose reviewer caught reviewer_cats."""
+    """Build a task with author SR signals and independent-review truth."""
     check_results = {cat: {"passed": False, "issue": "x"} for cat in sr_failed_cats}
-    sro: dict = {
-        "check_results": check_results,
-        "reviewer_findings": [
-            {"category": cat, "severity": "HIGH", "description": "found"}
-            for cat in reviewer_cats
-        ],
-    }
+    sro: dict = {"check_results": check_results}
     task = Task(
         project_id=project_id,
         title="FP test task",
         payloads=[{"type": task_type, "prompt": "do something"}],
         status=TaskStatus.COMPLETED,
-        context={"_self_review_outcome": sro},
+        context={
+            "_self_review_outcome": sro,
+            "_first_attempt_rejection_categories": confirmed_cats,
+        },
     )
     return task
 
@@ -6360,7 +5164,6 @@ def _make_fp_quality_task(
     *,
     prompt_fingerprint: str,
     sr_failed_cats: list[str] | None = None,
-    reviewer_cats: list[str] | None = None,
     human_cats: list[str] | None = None,
     review_history: list[dict] | None = None,
     skipped: bool = False,
@@ -6380,10 +5183,6 @@ def _make_fp_quality_task(
                 cat: {"passed": False, "issue": "x"} for cat in (sr_failed_cats or [])
             },
             "blind_spots": [],
-            "reviewer_findings": [
-                {"category": cat, "severity": "HIGH", "description": "found"}
-                for cat in (reviewer_cats or [])
-            ],
         }
     context = {"_self_review_outcome": sro}
     if human_cats is not None:
@@ -6408,13 +5207,13 @@ def test_compute_cat_fp_stats_fp_and_tp_counts():
     tasks = [
         # correctness: SR flagged, reviewer also flagged → TP
         _make_fp_task(
-            project_id, sr_failed_cats=["correctness"], reviewer_cats=["correctness"]
+            project_id, sr_failed_cats=["correctness"], confirmed_cats=["correctness"]
         ),
         # correctness: SR flagged, reviewer missed → FP
-        _make_fp_task(project_id, sr_failed_cats=["correctness"], reviewer_cats=[]),
+        _make_fp_task(project_id, sr_failed_cats=["correctness"], confirmed_cats=[]),
         # security: SR flagged, reviewer missed → FP
         _make_fp_task(
-            project_id, sr_failed_cats=["security"], reviewer_cats=["correctness"]
+            project_id, sr_failed_cats=["security"], confirmed_cats=["correctness"]
         ),
     ]
 
@@ -6440,10 +5239,10 @@ def test_compute_cat_fp_stats_skips_non_code_types():
             project_id,
             task_type="research",
             sr_failed_cats=["correctness"],
-            reviewer_cats=[],
+            confirmed_cats=[],
         ),
         _make_fp_task(
-            project_id, task_type="plan", sr_failed_cats=["security"], reviewer_cats=[]
+            project_id, task_type="plan", sr_failed_cats=["security"], confirmed_cats=[]
         ),
     ]
 
@@ -6478,10 +5277,10 @@ def test_compute_cat_fp_stats_false_positive_rate_formula():
 
     project_id = uuid.uuid4()
     tasks = [
-        _make_fp_task(project_id, sr_failed_cats=["correctness"], reviewer_cats=[]),
-        _make_fp_task(project_id, sr_failed_cats=["correctness"], reviewer_cats=[]),
+        _make_fp_task(project_id, sr_failed_cats=["correctness"], confirmed_cats=[]),
+        _make_fp_task(project_id, sr_failed_cats=["correctness"], confirmed_cats=[]),
         _make_fp_task(
-            project_id, sr_failed_cats=["correctness"], reviewer_cats=["correctness"]
+            project_id, sr_failed_cats=["correctness"], confirmed_cats=["correctness"]
         ),
     ]
 
@@ -6523,7 +5322,7 @@ def test_compute_sr_quality_by_fingerprint_groups_metrics_and_gates_low_sr_sampl
                 project_id,
                 prompt_fingerprint="fp-a",
                 sr_failed_cats=["architecture"],
-                reviewer_cats=["architecture"],
+                human_cats=["architecture"],
             ),
             _make_fp_quality_task(
                 project_id,
@@ -6533,7 +5332,6 @@ def test_compute_sr_quality_by_fingerprint_groups_metrics_and_gates_low_sr_sampl
             _make_fp_quality_task(
                 project_id,
                 prompt_fingerprint="fp-a",
-                reviewer_cats=["security"],
                 human_cats=["security"],
             ),
             _make_fp_quality_task(
@@ -6549,7 +5347,6 @@ def test_compute_sr_quality_by_fingerprint_groups_metrics_and_gates_low_sr_sampl
             ),
         ],
         min_sample_size=2,
-        top_disagreement_categories=3,
     )
 
     assert set(results) == {"fp-a", "fp-b"}
@@ -6558,8 +5355,6 @@ def test_compute_sr_quality_by_fingerprint_groups_metrics_and_gates_low_sr_sampl
     assert a["sr_sample_size"] == 5
     assert a["sr_catch_sample_size"] == 4
     assert a["sr_catch_rate"] == 0.75
-    assert a["reviewer_rescue_sample_size"] == 1
-    assert a["reviewer_rescue_rate"] == 1.0
     assert a["sr_false_positive_sample_size"] == 4
     # test-coverage is confirmed only by review_history (no persisted rejection
     # category), which is no longer a confirmation source — so it now counts as a
@@ -6574,27 +5369,13 @@ def test_compute_sr_quality_by_fingerprint_groups_metrics_and_gates_low_sr_sampl
     assert fp_by_cat["performance"] == (1, 0)
     # review_history-only confirmation no longer suppresses the false positive.
     assert fp_by_cat["test-coverage"] == (1, 0)
-    disagreements = {
-        entry["category"]: (
-            entry["reviewer_overrode_sr_count"],
-            entry["sr_overrode_reviewer_count"],
-        )
-        for entry in a["sr_reviewer_disagreement_top_categories"]
-    }
-    assert disagreements == {
-        "correctness": (0, 1),
-        "performance": (0, 1),
-        "security": (1, 0),
-    }
     assert a["sr_catch_rate_delta_vs_project_mean"] == -0.05
 
     b = results["fp-b"]
     assert b["sr_sample_size"] == 1
     assert b["sr_catch_rate"] is None
-    assert b["reviewer_rescue_rate"] is None
     assert b["sr_false_positive_rate"] is None
     assert b["sr_false_positive_rate_by_category"] == []
-    assert b["sr_reviewer_disagreement_top_categories"] == []
 
 
 @pytest.mark.parametrize(
@@ -6608,11 +5389,7 @@ def test_compute_sr_quality_by_fingerprint_groups_metrics_and_gates_low_sr_sampl
     ],
 )
 def test_compute_sr_quality_by_fingerprint_excludes_reviewer_origin(origin):
-    """Reviewer-stamped passed=False entries must not inflate sr_catch_rate.
-
-    The category was actually missed by the author SR, so it must surface as a
-    reviewer rescue (miss) — not as an author catch.
-    """
+    """Retired auxiliary-origin entries must not inflate author catch rate."""
     from app.playbook_learning import compute_sr_quality_by_fingerprint
 
     project_id = uuid.uuid4()
@@ -6623,9 +5400,6 @@ def test_compute_sr_quality_by_fingerprint_excludes_reviewer_origin(origin):
             "correctness": {"passed": False, "issue": "x", "origin": origin},
         },
         "blind_spots": [],
-        "reviewer_findings": [
-            {"category": "correctness", "severity": "HIGH", "description": "found"}
-        ],
     }
     task = Task(
         project_id=project_id,
@@ -6633,16 +5407,18 @@ def test_compute_sr_quality_by_fingerprint_excludes_reviewer_origin(origin):
         payloads=[{"type": "create", "prompt": "do something"}],
         prompt_fingerprint="fp-rescue",
         status=TaskStatus.COMPLETED,
-        context={"_self_review_outcome": sro},
+        context={
+            "_self_review_outcome": sro,
+            "_first_attempt_rejection_categories": ["correctness"],
+        },
     )
 
     results = compute_sr_quality_by_fingerprint([task], min_sample_size=1)
 
     bucket = results["fp-rescue"]
-    # Reviewer flagged correctness, author SR did NOT (origin-stamped entries
-    # are excluded) — so this is a reviewer rescue, not an author catch.
+    # Independent review confirmed correctness, but the author SR did not catch
+    # it because the recorded signal came from a retired auxiliary origin.
     assert bucket["sr_catch_rate"] == 0.0
-    assert bucket["reviewer_rescue_rate"] == 1.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -6675,9 +5451,6 @@ def test_compute_cat_fp_stats_excludes_reviewer_origin_from_sr_failed(origin):
         "check_results": {
             "correctness": {"passed": False, "issue": "x", "origin": origin},
         },
-        "reviewer_findings": [
-            {"category": "correctness", "severity": "HIGH", "description": "found"}
-        ],
     }
     task = Task(
         project_id=project_id,
@@ -6701,7 +5474,7 @@ def test_compute_cat_fp_stats_legacy_no_origin_still_counts():
 
     project_id = uuid.uuid4()
     task = _make_fp_task(
-        project_id, sr_failed_cats=["correctness"], reviewer_cats=["correctness"]
+        project_id, sr_failed_cats=["correctness"], confirmed_cats=["correctness"]
     )
 
     cat_fp, _, _ = _compute_cat_fp_stats([task])
@@ -6710,7 +5483,6 @@ def test_compute_cat_fp_stats_legacy_no_origin_still_counts():
     assert cat_fp["correctness"].get("fp", 0) == 0
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "origin",
     [
@@ -6721,71 +5493,9 @@ def test_compute_cat_fp_stats_legacy_no_origin_still_counts():
         "operator_requested_recovery",
     ],
 )
-async def test_compute_fresh_reviewer_trend_added_value_excludes_reviewer_origin(
-    db_session: AsyncSession, origin
-):
-    """A reviewer-stamped passed=False must not silently absorb the rescue.
-
-    When the author SR's check_results entry was stamped by the reviewer
-    (origin in _REVIEWER_ORIGINS), the category was actually missed by the
-    author SR — so it must still count toward `cat_added_value`.
-    """
-    from app.playbook_learning import compute_fresh_reviewer_trend
-
-    project = await _make_project(db_session)
-    tasks: list[Task] = []
-
-    # Current window: 5 tasks, all reviewer-stamped on `correctness`.
-    # Pre-fix: agent_failed would include `correctness` and added_value=0.
-    # Post-fix: reviewer-origin excluded → added_value=5.
-    for _ in range(5):
-        check_results = {
-            "correctness": {"passed": False, "issue": "x", "origin": origin}
-        }
-        ctx = {
-            "_self_review_outcome": {
-                "check_results": check_results,
-                "reviewer_findings": [{"category": "correctness"}],
-            },
-            "_first_attempt_rejection_categories": ["correctness"],
-            "_first_attempt_succeeded": True,
-        }
-        t = Task(
-            project_id=project.id,
-            title="reviewer-rescue current",
-            payloads=[{"type": "create", "prompt": "do something"}],
-            status=TaskStatus.COMPLETED,
-            context=ctx,
-        )
-        t.created_at = _utcnow() - timedelta(days=2)
-        db_session.add(t)
-        tasks.append(t)
-
-    # Previous window: 5 tasks where author SR genuinely caught `correctness`
-    # (no origin field) → added_value=0 in previous bucket.
-    for _ in range(5):
-        t = _make_fr_task(
-            project.id,
-            age_days=20,
-            reviewer_findings=[{"category": "correctness"}],
-            human_cats=["correctness"],
-            sr_failed_cats=["correctness"],
-        )
-        db_session.add(t)
-        tasks.append(t)
-    await db_session.flush()
-
-    result = await compute_fresh_reviewer_trend(project.id, db_session, tasks)
-
-    assert result is not None
-    av = result["added_value"]["correctness"]
-    assert av["current"] == 5, (
-        f"reviewer-origin '{origin}' should still count as added_value (got {av['current']})"
-    )
-    assert av["previous"] == 0
 
 
-def test_stats_for_tasks_reviewer_origin_excluded_from_sr_failed_count():
+def test_stats_for_tasks_reviewer_origin_excluded_from_sr_failed_count(origin):
     """Reviewer-stamped failures must NOT inflate sr_failed_count / fp_count
     in `_stats_for_tasks`. The reviewer rescue is not a thing the author SR
     flagged, so it must not appear in the precision/false-positive metrics.
@@ -6809,7 +5519,7 @@ def test_stats_for_tasks_reviewer_origin_excluded_from_sr_failed_count():
         age_days=1,
         human_cats={"correctness": 1},
         sr_failed_cats=["security"],
-        check_result_overrides={"security": {"origin": "reviewer_disagreement"}},
+        check_result_overrides={"security": {"origin": origin}},
     )
 
     _count, cat_stats, _type_cat, _all_iter, _sev, _scope_cat = _stats_for_tasks(
@@ -6825,34 +5535,6 @@ def test_stats_for_tasks_reviewer_origin_excluded_from_sr_failed_count():
     if "security" in cat_stats:
         assert cat_stats["security"].get("sr_failed_count", 0) == 0
         assert cat_stats["security"].get("fp_count", 0) == 0
-
-
-def test_stats_for_tasks_reviewer_origin_keeps_combined_hit_count():
-    """Reviewer-stamped passed=False must still feed `reviewer_save_hit_count`.
-
-    The combined `hit_count` (and the origin-based split) is intentionally
-    inclusive of reviewer rescues — only the FP/precision side excludes them.
-    Locks in the invariant that the fix did not regress the split metrics.
-    """
-    from app.playbook_learning import _stats_for_tasks
-
-    project_id = uuid.uuid4()
-    # Reviewer-stamped passed=False on `correctness`, human also flagged it →
-    # this is a reviewer-save TP.
-    task = _make_sr_task(
-        project_id,
-        age_days=1,
-        human_cats={"correctness": 1},
-        sr_failed_cats=["correctness"],
-        check_result_overrides={"correctness": {"origin": "reviewer"}},
-    )
-
-    _count, cat_stats, _type_cat, _all_iter, _sev, _scope_cat = _stats_for_tasks([task])
-
-    cat = cat_stats.get("correctness") or {}
-    assert cat.get("hit_count", 0) == 1
-    assert cat.get("reviewer_save_hit_count", 0) == 1
-    assert cat.get("sr_alone_hit_count", 0) == 0
 
 
 def test_get_sr_alert_drilldown_tasks_reviewer_rescue_still_a_miss():
@@ -6894,132 +5576,6 @@ def test_get_sr_alert_drilldown_tasks_reviewer_rescue_still_a_miss():
     assert len(rows) == 1
     assert "correctness" in rows[0]["missed_categories"]
     assert "correctness" not in rows[0]["caught_categories"]
-
-
-def test_get_sr_alert_drilldown_tasks_includes_reviewer_findings():
-    """Each drilldown row includes missed_category_findings with severity and description."""
-    from app.playbook_learning import get_sr_alert_drilldown_tasks
-
-    project_id = uuid.uuid4()
-    ctx = {
-        "_self_review_outcome": {
-            "check_results": {"correctness": {"passed": True}},
-            "verdict": "pass",
-            "reviewer_findings": [
-                {
-                    "category": "correctness",
-                    "severity": "HIGH",
-                    "description": "The null check is missing on the payload field.",
-                }
-            ],
-        },
-        "_first_attempt_rejection_categories": ["correctness"],
-    }
-    task = Task(
-        project_id=project_id,
-        title="missing null check",
-        payloads=[{"type": "create", "prompt": "do something"}],
-        status=TaskStatus.COMPLETED,
-        context=ctx,
-    )
-    task.created_at = _utcnow() - timedelta(days=1)
-
-    rows = get_sr_alert_drilldown_tasks(
-        all_tasks=[task],
-        design_doc={},
-        categories=["correctness"],
-    )
-
-    assert len(rows) == 1
-    findings = rows[0]["missed_category_findings"]
-    assert "correctness" in findings
-    assert findings["correctness"]["severity"] == "HIGH"
-    assert (
-        findings["correctness"]["description"]
-        == "The null check is missing on the payload field."
-    )
-    assert findings["correctness"]["has_more"] is False
-
-
-def test_get_sr_alert_drilldown_tasks_fallback_when_no_reviewer_finding():
-    """When reviewer_findings has no entry for a missed category, a placeholder is used."""
-    from app.playbook_learning import get_sr_alert_drilldown_tasks
-
-    project_id = uuid.uuid4()
-    ctx = {
-        "_self_review_outcome": {
-            "check_results": {"correctness": {"passed": True}},
-            "verdict": "pass",
-            "reviewer_findings": [],
-        },
-        "_first_attempt_rejection_categories": ["correctness"],
-    }
-    task = Task(
-        project_id=project_id,
-        title="no findings task",
-        payloads=[{"type": "create", "prompt": "do something"}],
-        status=TaskStatus.COMPLETED,
-        context=ctx,
-    )
-    task.created_at = _utcnow() - timedelta(days=1)
-
-    rows = get_sr_alert_drilldown_tasks(
-        all_tasks=[task],
-        design_doc={},
-        categories=["correctness"],
-    )
-
-    assert len(rows) == 1
-    findings = rows[0]["missed_category_findings"]
-    assert findings["correctness"]["description"] == "no description recorded"
-    assert findings["correctness"]["severity"] is None
-
-
-def test_get_sr_alert_drilldown_tasks_truncates_long_description():
-    """Descriptions longer than 140 chars are truncated with has_more=True."""
-    from app.playbook_learning import get_sr_alert_drilldown_tasks
-
-    project_id = uuid.uuid4()
-    long_desc = "x" * 200
-    ctx = {
-        "_self_review_outcome": {
-            "check_results": {"security": {"passed": True}},
-            "verdict": "pass",
-            "reviewer_findings": [
-                {
-                    "category": "security",
-                    "severity": "CRITICAL",
-                    "description": long_desc,
-                }
-            ],
-        },
-        "_first_attempt_rejection_categories": ["security"],
-    }
-    task = Task(
-        project_id=project_id,
-        title="long desc task",
-        payloads=[{"type": "create", "prompt": "do something"}],
-        status=TaskStatus.COMPLETED,
-        context=ctx,
-    )
-    task.created_at = _utcnow() - timedelta(days=1)
-
-    rows = get_sr_alert_drilldown_tasks(
-        all_tasks=[task],
-        design_doc={},
-        categories=["security"],
-    )
-
-    assert len(rows) == 1
-    finding = rows[0]["missed_category_findings"]["security"]
-    assert len(finding["description"]) == 140
-    assert finding["has_more"] is True
-    assert finding["full_description"] == long_desc
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Tests for compute_edges_trend
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 def _make_edges_task(
@@ -7319,141 +5875,6 @@ async def test_compute_edges_trend_same_cycle_ids_as_sr_catch_rate(
     assert edges_result["bucket_mode"] == "cycle"
     assert sr_result["current_cycle_id"] == edges_result["current_cycle_id"]
     assert sr_result["previous_cycle_id"] == edges_result["previous_cycle_id"]
-
-
-@pytest.mark.asyncio
-async def test_compute_edges_trend_author_vs_reviewer_breakdown(
-    db_session: AsyncSession,
-):
-    """Per-origin breakdown surfaces author vs reviewer counts and the
-    reviewer_caught signal in the trend dict's `current` stats block."""
-    from app.playbook_learning import compute_edges_trend
-
-    project = await _make_project(db_session)
-    tasks = []
-    # Current window: 5 tasks; 3 have author edges, 2 of those also have a
-    # reviewer edge that catches a case the author missed.
-    current_edge_payloads = [
-        [
-            {"case": "off-by-one", "handled": True, "origin": "author"},
-            {"case": "null guard", "handled": False, "origin": "reviewer"},
-        ],
-        [
-            {"case": "empty list", "handled": True, "origin": "author"},
-            {"case": "race", "handled": False, "origin": "reviewer"},
-        ],
-        [{"case": "type-coerce", "handled": True, "origin": "author"}],
-        [],
-        [],
-    ]
-    for payload in current_edge_payloads:
-        t = _make_edges_task(project.id, age_days=2, edges_considered=payload)
-        db_session.add(t)
-        tasks.append(t)
-    # Previous window: 5 tasks, no reviewer edges at all.
-    for i in range(5):
-        t = _make_edges_task(
-            project.id,
-            age_days=20,
-            edges_considered=[{"case": f"prev-{i}", "handled": True}] if i < 3 else [],
-        )
-        db_session.add(t)
-        tasks.append(t)
-    await db_session.flush()
-
-    result = await compute_edges_trend(project.id, db_session, tasks)
-
-    assert result is not None
-    cur = result["current"]
-    assert cur["tasks_with_reviewer_edges_count"] == 2
-    assert cur["tasks_with_reviewer_edges_rate"] == round(2 / 5, 3)
-    assert cur["reviewer_caught_count"] == 2
-    # reviewer_caught_rate is denominated on tasks that HAVE reviewer edges
-    # (n_with_reviewer == 2), not on all tasks in the window: 2/2 == 1.0.
-    assert cur["reviewer_caught_rate"] == round(2 / 2, 3)
-    assert cur["author_avg_edges_per_task"] == 1.0
-    assert cur["reviewer_avg_edges_per_task"] == 1.0
-
-    prev = result["previous"]
-    assert prev["tasks_with_reviewer_edges_count"] == 0
-    assert prev["reviewer_caught_count"] == 0
-    # No reviewer edges in the previous window -> n_with_reviewer == 0, so the
-    # rate is None (not a 0/0 division) and no delta/trend can be computed.
-    assert prev["reviewer_caught_rate"] is None
-
-    assert result["reviewer_caught_rate_delta"] is None
-    assert result["reviewer_caught_trend"] is None
-
-
-@pytest.mark.asyncio
-async def test_compute_edges_trend_reviewer_caught_rate_denominator(
-    db_session: AsyncSession,
-):
-    """reviewer_caught_rate divides caught tasks by tasks-with-reviewer-edges
-    (n_with_reviewer), NOT by the whole window, and a rising ratio between
-    windows surfaces an ``improving`` reviewer_caught_trend.
-
-    This pins the denominator on ``_compute_edges_stats`` directly: reverting
-    it to ``n_total`` (or dropping the ``n_with_reviewer == 0`` None guard)
-    would change these numbers and fail here rather than at the promotion PR.
-    """
-    from app.playbook_learning import compute_edges_trend
-
-    project = await _make_project(db_session)
-    tasks = []
-
-    # Current window: 5 tasks. 4 carry a reviewer edge; 3 of those 4 catch a
-    # case the author missed -> reviewer_caught_rate == 3/4 (NOT 3/5).
-    def _author_hit(case, missed):
-        edges = [{"case": case, "handled": True, "origin": "author"}]
-        if missed:
-            edges.append({"case": missed, "handled": False, "origin": "reviewer"})
-        else:
-            # reviewer edge that agrees with the author (no catch)
-            edges.append({"case": case, "handled": True, "origin": "reviewer"})
-        return edges
-
-    current_payloads = [
-        _author_hit("a1", "miss-1"),
-        _author_hit("a2", "miss-2"),
-        _author_hit("a3", "miss-3"),
-        _author_hit("a4", None),  # reviewer present but caught nothing
-        [{"case": "a5", "handled": True, "origin": "author"}],  # no reviewer edge
-    ]
-    for payload in current_payloads:
-        t = _make_edges_task(project.id, age_days=2, edges_considered=payload)
-        db_session.add(t)
-        tasks.append(t)
-
-    # Previous window: 5 tasks. 2 carry a reviewer edge; 1 of those catches a
-    # miss -> reviewer_caught_rate == 1/2 == 0.5.
-    previous_payloads = [
-        _author_hit("p1", "pmiss-1"),
-        _author_hit("p2", None),
-        [{"case": "p3", "handled": True, "origin": "author"}],
-        [],
-        [],
-    ]
-    for payload in previous_payloads:
-        t = _make_edges_task(project.id, age_days=20, edges_considered=payload)
-        db_session.add(t)
-        tasks.append(t)
-    await db_session.flush()
-
-    result = await compute_edges_trend(project.id, db_session, tasks)
-
-    assert result is not None
-    cur = result["current"]
-    prev = result["previous"]
-    assert cur["tasks_with_reviewer_edges_count"] == 4
-    assert cur["reviewer_caught_count"] == 3
-    assert cur["reviewer_caught_rate"] == round(3 / 4, 3)
-    assert prev["tasks_with_reviewer_edges_count"] == 2
-    assert prev["reviewer_caught_count"] == 1
-    assert prev["reviewer_caught_rate"] == round(1 / 2, 3)
-
-    assert result["reviewer_caught_rate_delta"] == round(3 / 4 - 1 / 2, 3)
-    assert result["reviewer_caught_trend"] == "improving"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -9114,187 +7535,6 @@ async def test_compute_sr_catch_rate_trends_includes_co_failure_pairs(
 # ---------------------------------------------------------------------------
 
 
-def test_stats_for_tasks_lone_checker_recovery_is_reviewer_save():
-    """lone_checker_recovery origin counts as reviewer_save, not sr_alone."""
-    import uuid as _uuid
-    from app.playbook_learning import _stats_for_tasks
-
-    project_id = _uuid.uuid4()
-    check_results = {
-        "security": {
-            "passed": False,
-            "origin": "lone_checker_recovery",
-            "issue": "fresh-reviewer caught this",
-        }
-    }
-    ctx = {
-        "_self_review_outcome": {"check_results": check_results},
-        "_first_attempt_rejection_categories": {"security": 1},
-    }
-    t = Task(
-        project_id=project_id,
-        title="lone checker task",
-        payloads=[{"type": "create", "prompt": "p"}],
-        status=TaskStatus.COMPLETED,
-        context=ctx,
-    )
-    _, cat_stats, _, _, _, _ = _stats_for_tasks([t])
-    assert "security" in cat_stats
-    assert cat_stats["security"]["reviewer_save_hit_count"] == 1
-    assert cat_stats["security"]["sr_alone_hit_count"] == 0
-
-
-def test_stats_for_tasks_lone_checker_recovery_excluded_from_sr_failed_author():
-    """lone_checker_recovery findings are not counted as author SR false positives."""
-    import uuid as _uuid
-    from app.playbook_learning import _stats_for_tasks
-
-    project_id = _uuid.uuid4()
-    # SR passed (lone-checker reviewer flagged security), human did NOT reject.
-    check_results = {
-        "security": {
-            "passed": False,
-            "origin": "lone_checker_recovery",
-            "issue": "fresh-reviewer only",
-        }
-    }
-    ctx = {
-        "_self_review_outcome": {"check_results": check_results},
-        "_first_attempt_rejection_categories": {},
-    }
-    t = Task(
-        project_id=project_id,
-        title="lone checker no human rejection",
-        payloads=[{"type": "create", "prompt": "p"}],
-        status=TaskStatus.COMPLETED,
-        context=ctx,
-    )
-    _, cat_stats, _, _, _, _ = _stats_for_tasks([t])
-    # lone_checker_recovery is not an author SR failure, so fp_count must be 0.
-    security = cat_stats.get("security", {})
-    assert security.get("fp_count", 0) == 0
-
-
-def test_stats_for_tasks_operator_requested_recovery_is_reviewer_save():
-    """operator_requested_recovery origin counts as reviewer_save, not sr_alone."""
-    import uuid as _uuid
-    from app.playbook_learning import _stats_for_tasks
-
-    project_id = _uuid.uuid4()
-    check_results = {
-        "security": {
-            "passed": False,
-            "origin": "operator_requested_recovery",
-            "issue": "operator-requested re-review caught this",
-        }
-    }
-    ctx = {
-        "_self_review_outcome": {"check_results": check_results},
-        "_first_attempt_rejection_categories": {"security": 1},
-    }
-    t = Task(
-        project_id=project_id,
-        title="operator requested recovery task",
-        payloads=[{"type": "create", "prompt": "p"}],
-        status=TaskStatus.COMPLETED,
-        context=ctx,
-    )
-    _, cat_stats, _, _, _, _ = _stats_for_tasks([t])
-    assert "security" in cat_stats
-    assert cat_stats["security"]["reviewer_save_hit_count"] == 1
-    assert cat_stats["security"]["sr_alone_hit_count"] == 0
-
-
-def test_stats_for_tasks_operator_requested_recovery_excluded_from_sr_failed_author():
-    """operator_requested_recovery findings are not counted as author SR false positives."""
-    import uuid as _uuid
-    from app.playbook_learning import _stats_for_tasks
-
-    project_id = _uuid.uuid4()
-    # SR passed (operator-requested reviewer flagged security), human did NOT reject.
-    check_results = {
-        "security": {
-            "passed": False,
-            "origin": "operator_requested_recovery",
-            "issue": "operator-requested re-review only",
-        }
-    }
-    ctx = {
-        "_self_review_outcome": {"check_results": check_results},
-        "_first_attempt_rejection_categories": {},
-    }
-    t = Task(
-        project_id=project_id,
-        title="operator requested recovery no human rejection",
-        payloads=[{"type": "create", "prompt": "p"}],
-        status=TaskStatus.COMPLETED,
-        context=ctx,
-    )
-    _, cat_stats, _, _, _, _ = _stats_for_tasks([t])
-    # operator_requested_recovery is not an author SR failure, so fp_count must be 0.
-    security = cat_stats.get("security", {})
-    assert security.get("fp_count", 0) == 0
-
-
-# ---------------------------------------------------------------------------
-# miss_mode_breakdown per-category breakdown in compute_sr_catch_rate_trends
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_compute_sr_catch_rate_trends_miss_mode_breakdown(
-    db_session: AsyncSession,
-):
-    """compute_sr_catch_rate_trends attaches miss_mode_breakdown per category with correct counters."""
-    from app.playbook_learning import compute_sr_catch_rate_trends
-
-    project = await _make_project(db_session)
-    tasks = []
-    # Current window: 5 tasks on "correctness" with distinct reviewer origins.
-    # 1 reading_gap, 2 judgment_gap, 2 coverage_gap
-    current_specs = [
-        {"origin": "reviewer_recovery_after_incomplete_sr"},
-        {"origin": "reviewer_disagreement"},
-        {"origin": "reviewer_disagreement"},
-        {"origin": "reviewer"},
-        {"origin": "reviewer"},
-    ]
-    for spec in current_specs:
-        t = _make_sr_task(
-            project.id,
-            age_days=2,
-            human_cats={"correctness": 1},
-            sr_failed_cats=["correctness"],
-            check_result_overrides={"correctness": {"origin": spec["origin"]}},
-        )
-        db_session.add(t)
-        tasks.append(t)
-    # Previous window: 5 tasks (no origin tags)
-    for _ in range(5):
-        t = _make_sr_task(
-            project.id,
-            age_days=20,
-            human_cats={"correctness": 1},
-            sr_failed_cats=["correctness"],
-        )
-        db_session.add(t)
-        tasks.append(t)
-    await db_session.flush()
-
-    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
-    assert result is not None
-    cat = result["categories"]["correctness"]
-    breakdown = cat.get("miss_mode_breakdown")
-    assert breakdown is not None, (
-        "miss_mode_breakdown should be present for reviewer-origin misses"
-    )
-    assert breakdown["reading_gap"] == 1
-    assert breakdown["judgment_gap"] == 2
-    assert breakdown["coverage_gap"] == 2
-    # Both judgment_gap and coverage_gap tied at 2; dominant is one of them
-    assert breakdown["dominant_mode"] in ("judgment_gap", "coverage_gap")
-
-
 @pytest.mark.asyncio
 async def test_below_floor_flag_persisted_to_design_doc(db_session: AsyncSession):
     """below_floor=True is stored in design_doc categories when a category has
@@ -9629,8 +7869,7 @@ def _make_sr_task_production_shaped(
     - _first_attempt_rejection_categories (regression_risk, type-safety)
     - _all_iterations_rejection_categories (regression_risk, type-safety, correctness)
 
-    check_results distinguish sr_alone (regression_risk, no origin) vs
-    reviewer_save (type-safety, origin="reviewer").
+    check_results include author findings for both rejection categories.
 
     When all_hits=False, neither category appears in sr_failed so both are
     misses (hit_rate drops), exercising the miss path.
@@ -9644,7 +7883,6 @@ def _make_sr_task_production_shaped(
         check_results["type-safety"] = {
             "passed": False,
             "issue": "type hint missing for return value",
-            "origin": "reviewer",
         }
 
     ctx: dict = {
@@ -9694,132 +7932,6 @@ def _make_sr_task_production_shaped(
     )
     task.created_at = _utcnow() - timedelta(days=age_days)
     return task
-
-
-@pytest.mark.asyncio
-async def test_compute_sr_catch_rate_trends_e2e_production_shaped(
-    db_session: AsyncSession,
-):
-    """Non-degeneracy guard: the metric produces a real, in-range result on
-    production-shaped task data with full review_loop.review_history,
-    origin-tagged check_results, and both rejection-category sets.
-
-    Uses two completed StrategicCycles so cycle-mode engages. Asserts the
-    headline contract: data_sufficient=True, overall_hit_rate and
-    previous_overall_hit_rate are real floats in [0,1], categories is
-    non-empty with non-None current_hit_rate, and a trend label is present.
-    """
-    from app.playbook_learning import compute_sr_catch_rate_trends
-
-    project = await _make_project(db_session)
-    c_cycle = _make_cycle(project.id, age_days=5)
-    p_cycle = _make_cycle(project.id, age_days=30)
-    db_session.add(c_cycle)
-    db_session.add(p_cycle)
-    await db_session.flush()
-
-    tasks = []
-    # Current cycle: 5 tasks are full hits, 1 task misses — hit_rate 5/6 per category.
-    for _ in range(5):
-        t = _make_sr_task_production_shaped(project.id, age_days=3, all_hits=True)
-        t.strategic_cycle_id = c_cycle.id
-        db_session.add(t)
-        tasks.append(t)
-    t_miss = _make_sr_task_production_shaped(project.id, age_days=4, all_hits=False)
-    t_miss.strategic_cycle_id = c_cycle.id
-    db_session.add(t_miss)
-    tasks.append(t_miss)
-
-    # Previous cycle: all 6 tasks are full hits — hit_rate 6/6 = 1.0.
-    for _ in range(6):
-        t = _make_sr_task_production_shaped(project.id, age_days=25, all_hits=True)
-        t.strategic_cycle_id = p_cycle.id
-        db_session.add(t)
-        tasks.append(t)
-
-    await db_session.flush()
-
-    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
-
-    # ── Headline contract ─────────────────────────────────────────────────────
-    assert result is not None, "Should produce a real result on production-shaped data"
-    assert result["data_sufficient"] is True, "data_sufficient must be True"
-    assert result["bucket_mode"] == "cycle", (
-        "Should use cycle-mode with two completed cycles"
-    )
-
-    # overall_hit_rate is a real float in [0, 1]
-    overall = result["overall_hit_rate"]
-    assert isinstance(overall, float), (
-        f"overall_hit_rate must be a float, got {overall!r}"
-    )
-    assert 0.0 <= overall <= 1.0, f"overall_hit_rate out of range: {overall}"
-
-    previous_overall = result["previous_overall_hit_rate"]
-    assert isinstance(previous_overall, float), (
-        f"previous_overall_hit_rate must be a float, got {previous_overall!r}"
-    )
-    assert 0.0 <= previous_overall <= 1.0, (
-        f"previous_overall_hit_rate out of range: {previous_overall}"
-    )
-
-    # categories is non-empty; categories with findings must have non-None rates
-    cats = result["categories"]
-    assert cats, "categories must be non-empty"
-    for cat_name, cat_data in cats.items():
-        # A trend label must always be present
-        assert cat_data["trend"] in ("stable", "increasing", "decreasing"), (
-            f"category {cat_name!r} has unexpected trend: {cat_data['trend']!r}"
-        )
-        # current_hit_rate is None only when current_reviewer_finding_count == 0 (e.g. a
-        # category present in _all_iterations but not _first_attempt set); for
-        # categories that have findings in the current window, rate must be a
-        # real float in [0, 1].
-        if cat_data["current_reviewer_finding_count"] > 0:
-            hr = cat_data["current_hit_rate"]
-            assert hr is not None, (
-                f"category {cat_name!r} has None current_hit_rate despite "
-                f"current_reviewer_finding_count={cat_data['current_reviewer_finding_count']} — metric degenerated"
-            )
-            assert isinstance(hr, float), (
-                f"category {cat_name!r} current_hit_rate must be a float, got {hr!r}"
-            )
-            assert 0.0 <= hr <= 1.0, (
-                f"category {cat_name!r} current_hit_rate out of range: {hr}"
-            )
-
-    # At least the two explicitly-seeded categories must have current findings
-    assert any(d["current_reviewer_finding_count"] > 0 for d in cats.values()), (
-        "No category has current_reviewer_finding_count > 0 — metric degenerated"
-    )
-
-    # ── Origin-split wiring ───────────────────────────────────────────────────
-    # regression_risk should be an SR-alone hit; type-safety a reviewer-save hit
-    rr = cats.get("regression_risk")
-    ts = cats.get("type-safety")
-    assert rr is not None, "regression_risk must appear in categories"
-    assert ts is not None, "type-safety must appear in categories"
-
-    # SR-alone hits come from the 5 hitting tasks (no origin tag)
-    assert rr["sr_alone_hit_count"] == 5, (
-        f"Expected 5 sr_alone hits for regression_risk, got {rr['sr_alone_hit_count']}"
-    )
-    assert rr["reviewer_save_hit_count"] == 0
-
-    # reviewer_save hits come from the 5 hitting tasks (origin=reviewer)
-    assert ts["reviewer_save_hit_count"] == 5, (
-        f"Expected 5 reviewer_save hits for type-safety, got {ts['reviewer_save_hit_count']}"
-    )
-    assert ts["sr_alone_hit_count"] == 0
-
-    # ── Cycle-over-cycle rates ────────────────────────────────────────────────
-    # Current: 5/6 ≈ 0.833; Previous: 6/6 = 1.0
-    assert rr["current_hit_rate"] == round(5 / 6, 3), (
-        f"regression_risk current_hit_rate wrong: {rr['current_hit_rate']}"
-    )
-    assert rr["previous_hit_rate"] == 1.0, (
-        f"regression_risk previous_hit_rate wrong: {rr['previous_hit_rate']}"
-    )
 
 
 @pytest.mark.asyncio
@@ -10021,137 +8133,7 @@ async def test_refresh_sr_catch_rate_fetch_covers_both_windows(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tests for overall SR-alone (author-only) catch rate
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_overall_sr_alone_low_when_all_catches_are_reviewer_saves(
-    db_session: AsyncSession,
-):
-    """When all catches carry origin='reviewer', combined overall is high but SR-alone is 0."""
-    from app.playbook_learning import compute_sr_catch_rate_trends
-
-    project = await _make_project(db_session)
-    tasks = []
-    # Both windows: 6 tasks per window, all flagged by reviewer (not author).
-    for age in (2, 20):
-        for _ in range(6):
-            t = _make_sr_task(
-                project.id,
-                age_days=age,
-                human_cats={"correctness": 1},
-                sr_failed_cats=["correctness"],
-                check_result_overrides={"correctness": {"origin": "reviewer"}},
-            )
-            db_session.add(t)
-            tasks.append(t)
-    await db_session.flush()
-
-    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
-
-    assert result is not None
-    # Combined: all 6 correctness findings were caught → hit rate = 1.0
-    assert result["overall_hit_rate"] == 1.0, (
-        f"combined overall should be 1.0 but got {result['overall_hit_rate']}"
-    )
-    # SR-alone: none were caught by the author → rate = 0.0
-    assert result["overall_sr_alone_hit_rate"] == 0.0, (
-        f"SR-alone overall should be 0.0 but got {result['overall_sr_alone_hit_rate']}"
-    )
-    # Trend fields must be present
-    assert "overall_sr_alone_trend_verdict" in result
-    assert "overall_sr_alone_trend_significant" in result
-    assert "overall_sr_alone_trend_data_sufficient" in result
-
-
-@pytest.mark.asyncio
-async def test_overall_sr_alone_trend_data_sufficiency_gate(
-    db_session: AsyncSession,
-):
-    """SR-alone trend reports None for trend_significant when data is below threshold."""
-    from app.playbook_learning import compute_sr_catch_rate_trends, _MIN_SR_FINDINGS
-
-    project = await _make_project(db_session)
-    tasks = []
-    # Build _MIN_SR_FINDINGS tasks in each window — exactly at the threshold.
-    # Both windows have identical sr_alone rates so the z-test gives "stable".
-    for age in (2, 20):
-        for _ in range(_MIN_SR_FINDINGS):
-            t = _make_sr_task(
-                project.id,
-                age_days=age,
-                human_cats={"correctness": 1},
-                sr_failed_cats=["correctness"],  # sr_alone catch
-            )
-            db_session.add(t)
-            tasks.append(t)
-    await db_session.flush()
-
-    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
-
-    assert result is not None
-    # Data is sufficient and rates identical → verdict is "stable", not None
-    assert result["overall_sr_alone_trend_verdict"] == "stable"
-    # trend_significant is False (not None) when data sufficient but no change
-    assert result["overall_sr_alone_trend_significant"] is not None or (
-        result["overall_sr_alone_trend_data_sufficient"] is False
-    ), "trend_significant must be a bool (not None) when data is sufficient"
-
-
-@pytest.mark.asyncio
-async def test_overall_sr_alone_fields_present_when_data_insufficient(
-    db_session: AsyncSession,
-):
-    """When compute_sr_catch_rate_trends returns a result, all SR-alone keys are present."""
-    from app.playbook_learning import compute_sr_catch_rate_trends
-
-    project = await _make_project(db_session)
-    tasks = []
-    # Mix: some SR-alone, some reviewer saves in both windows (>= 5 each).
-    for age in (2, 20):
-        for i in range(6):
-            overrides = {"correctness": {"origin": "reviewer"}} if i % 2 == 0 else None
-            t = _make_sr_task(
-                project.id,
-                age_days=age,
-                human_cats={"correctness": 1},
-                sr_failed_cats=["correctness"],
-                check_result_overrides=overrides,
-            )
-            db_session.add(t)
-            tasks.append(t)
-    await db_session.flush()
-
-    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
-
-    assert result is not None
-    expected_keys = {
-        "overall_sr_alone_hit_rate",
-        "previous_overall_sr_alone_hit_rate",
-        "overall_sr_alone_trend_verdict",
-        "overall_sr_alone_trend_significant",
-        "overall_sr_alone_trend_data_sufficient",
-    }
-    missing = expected_keys - set(result.keys())
-    assert not missing, f"Missing SR-alone keys in result: {missing}"
-    # Rates must be floats in [0, 1], not None (we have both sr_alone and reviewer catches)
-    rate = result["overall_sr_alone_hit_rate"]
-    assert isinstance(rate, float) and 0.0 <= rate <= 1.0, (
-        f"overall_sr_alone_hit_rate should be float in [0,1], got {rate!r}"
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Regression: malformed (list-shaped) check_results must not crash consumers
-#
-# Agents occasionally emit ``_self_review_outcome.check_results`` as a JSON
-# list instead of the expected category->record dict. The outer-only
-# ``Dict[str, Any]`` schema validation lets it through, and a NON-EMPTY list is
-# truthy so the ``... or {}`` guard does not catch it — consumers that then call
-# ``.items()/.keys()/.get()`` raised AttributeError (≈90 in prod on the
-# claim_task hot path; the /prompt-fingerprint-analytics endpoint 500'd). The
-# ``safe_check_results`` guard degrades a non-dict shape to ``{}``.
+# Malformed self-review outcome compatibility
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -10169,7 +8151,6 @@ def _make_list_shaped_sr_task(project_id, *, task_type: str = "create") -> Task:
                     {"category": "correctness", "passed": False},
                     {"category": "security", "passed": False},
                 ],
-                "reviewer_findings": [{"category": "correctness"}],
             },
             "_first_attempt_rejection_categories": {"correctness": 1},
             "review_loop": {"ci_passed": True},

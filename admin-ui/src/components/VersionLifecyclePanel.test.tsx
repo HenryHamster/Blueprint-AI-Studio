@@ -59,14 +59,16 @@ function makeQualification(overrides: Partial<api.VersionQualification> = {}): a
   };
 }
 
-function makePromotionInFlightState(
+function makePromotionCheckWaitState(
   overrides: Partial<api.QualificationState> = {},
 ): api.QualificationState {
   return {
-    state: 'promotion_in_flight',
-    summary: 'Audit PASSED; a promotion PR is open and auto-merge is armed.',
+    state: 'promotion_check_wait',
+    summary:
+      'Audit PASSED; a promotion PR is in Blueprint\'s exact-head check wait.',
     promotion_pr_number: 4242,
     promotion_pr_url: 'https://example/pr/4242',
+    ci_state: 'pending',
     ...overrides,
   };
 }
@@ -941,10 +943,10 @@ describe('VersionLifecyclePanel', () => {
       expect(screen.getByText(/2 in-flight tasks will keep running against the new version/)).toBeInTheDocument();
     });
 
-    it('surfaces promotion-in-flight context before confirming a cut', async () => {
+    it('surfaces exact-head promotion check-wait context before confirming a cut', async () => {
       vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
       vi.mocked(api.cutVersion).mockRejectedValue(
-        new Error('a promotion PR is open and auto-merging — wait for it to land or cancel it before cutting (PR #7357 https://example/pr/7357)'),
+        new Error('a promotion PR is in Blueprint\'s exact-head check wait — wait for it to land or cancel it before cutting (PR #7357 https://example/pr/7357)'),
       );
 
       render(
@@ -952,7 +954,7 @@ describe('VersionLifecyclePanel', () => {
           data={makeVersionLifecycleResponse({
             current_version: makeCurrentVersion({
               version_number: 6,
-              qualification_state: makePromotionInFlightState({
+              qualification_state: makePromotionCheckWaitState({
                 promotion_pr_number: 7357,
                 promotion_pr_url: 'https://example/pr/7357',
                 promotion_age_seconds: 7500,
@@ -969,21 +971,21 @@ describe('VersionLifecyclePanel', () => {
 
       fireEvent.click(screen.getByRole('button', { name: /Cut\/Abandon/ }));
 
-      expect(screen.getByTestId('promotion-in-flight-freshness')).toHaveTextContent(
-        'Promotion PR #7357 open & auto-merging (in flight ~2h 5m (auto-timeout cap 4h))'
+      expect(screen.getByTestId('promotion-check-wait-freshness')).toHaveTextContent(
+        "Promotion PR #7357 in Blueprint's exact-head check wait (waiting ~2h 5m (timeout cap 4h)) — only the revalidated checked head can merge"
       );
       const consequences = screen.getByTestId('cut-consequences');
       expect(consequences).toHaveTextContent(
-        'Promotion PR #7357 is open and auto-merging (in flight ~2h 5m (auto-timeout cap 4h))'
+        "Promotion PR #7357 is open in Blueprint's exact-head check wait (waiting ~2h 5m (timeout cap 4h))"
       );
 
       fireEvent.click(screen.getByRole('button', { name: /^Cut$/ }));
 
-      // ConfirmDialog shows the promotion-in-flight context in the message
+      // ConfirmDialog shows the exact-head managed-wait context in the message.
       await waitFor(() => {
         expect(screen.getByTestId('confirm-dialog-confirm')).toBeInTheDocument();
       });
-      expect(screen.getByText(/promotion PR #7357 is open and auto-merging \(in flight ~2h 5m \(auto-timeout cap 4h\)\)/)).toBeInTheDocument();
+      expect(screen.getByText(/promotion PR #7357 is open in Blueprint's exact-head check wait \(waiting ~2h 5m \(timeout cap 4h\)\)/)).toBeInTheDocument();
       fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
       await waitFor(() => {
         expect(screen.getByText(/wait for it to land or cancel it before cutting/)).toBeInTheDocument();
@@ -1749,20 +1751,20 @@ describe('VersionLifecyclePanel', () => {
     });
   });
 
-  describe('promotion-in-flight locks qualify + phase controls', () => {
+  describe('exact-head promotion check-wait locks qualify + phase controls', () => {
     beforeEach(() => {
       vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
     });
 
-    const promotionInFlightState = makePromotionInFlightState();
+    const promotionCheckWaitState = makePromotionCheckWaitState();
 
-    it('disables Run Qualify and the phase flip while a promotion is in flight', () => {
+    it('disables Run Qualify and the phase flip while Blueprint owns the checked head', () => {
       render(
         <VersionLifecyclePanel
           data={makeVersionLifecycleResponse({
             current_version: makeCurrentVersion({
               phase: 'stabilize',
-              qualification_state: promotionInFlightState,
+              qualification_state: promotionCheckWaitState,
             }),
           })}
           loading={false}
@@ -1775,7 +1777,7 @@ describe('VersionLifecyclePanel', () => {
       // In stabilize phase, the phase-flip button targets build.
       expect(screen.getByRole('button', { name: /build/ })).toBeDisabled();
       // The note makes the locked state legible.
-      expect(screen.getByTestId('promotion-in-flight-note')).toHaveTextContent('#4242');
+      expect(screen.getByTestId('promotion-check-wait-note')).toHaveTextContent('#4242');
     });
 
     it('degrades cleanly to the PR-only lock copy when freshness timing is absent', () => {
@@ -1784,7 +1786,7 @@ describe('VersionLifecyclePanel', () => {
           data={makeVersionLifecycleResponse({
             current_version: makeCurrentVersion({
               phase: 'stabilize',
-              qualification_state: promotionInFlightState,
+              qualification_state: promotionCheckWaitState,
             }),
           })}
           loading={false}
@@ -1792,13 +1794,15 @@ describe('VersionLifecyclePanel', () => {
           onRefresh={mockRefresh}
         />
       );
-      expect(screen.queryByTestId('promotion-in-flight-freshness')).not.toBeInTheDocument();
-      expect(screen.getByTestId('promotion-in-flight-note')).toHaveTextContent(
-        'Promotion PR #4242 open & auto-merging — qualify & phase locked until it lands or is canceled'
+      expect(screen.getByTestId('promotion-check-wait-freshness')).toHaveTextContent(
+        "Promotion PR #4242 in Blueprint's exact-head check wait — only the revalidated checked head can merge"
+      );
+      expect(screen.getByTestId('promotion-check-wait-note')).toHaveTextContent(
+        "Promotion PR #4242 open in Blueprint's exact-head check wait; Blueprint revalidates the target and merges only the checked head after required checks pass"
       );
       expect(screen.getByRole('button', { name: /Run Qualify/ })).toHaveAttribute(
         'title',
-        'A promotion PR is open and auto-merging — wait for it to land or cancel it before re-qualifying'
+        "A promotion PR is open in Blueprint's exact-head check wait — Blueprint will merge only the revalidated checked head; wait for it to land or cancel it before re-qualifying"
       );
     });
 
@@ -1808,7 +1812,7 @@ describe('VersionLifecyclePanel', () => {
           data={makeVersionLifecycleResponse({
             current_version: makeCurrentVersion({
               phase: 'stabilize',
-              qualification_state: makePromotionInFlightState({
+              qualification_state: makePromotionCheckWaitState({
                 promotion_age_seconds: 12600,
                 promotion_timeout_seconds: 14400,
                 promotion_nearing_timeout: true,
@@ -1820,15 +1824,15 @@ describe('VersionLifecyclePanel', () => {
           onRefresh={mockRefresh}
         />
       );
-      expect(screen.getByTestId('promotion-in-flight-freshness')).toHaveTextContent(
-        'Promotion PR #4242 open & auto-merging (in flight ~3h 30m (auto-timeout cap 4h), nearing auto-timeout)'
+      expect(screen.getByTestId('promotion-check-wait-freshness')).toHaveTextContent(
+        "Promotion PR #4242 in Blueprint's exact-head check wait (waiting ~3h 30m (timeout cap 4h), nearing timeout)"
       );
-      expect(screen.getByTestId('promotion-in-flight-note')).toHaveTextContent(
-        'Promotion PR #4242 open & auto-merging (in flight ~3h 30m (auto-timeout cap 4h), nearing auto-timeout) — qualify & phase locked until it lands or is canceled'
+      expect(screen.getByTestId('promotion-check-wait-note')).toHaveTextContent(
+        "Promotion PR #4242 open in Blueprint's exact-head check wait (waiting ~3h 30m (timeout cap 4h), nearing timeout)"
       );
       expect(screen.getByRole('button', { name: /Run Qualify/ })).toHaveAttribute(
         'title',
-        'A promotion PR is open and auto-merging (in flight ~3h 30m (auto-timeout cap 4h), nearing auto-timeout) — wait for it to land or cancel it before re-qualifying'
+        "A promotion PR is open in Blueprint's exact-head check wait (waiting ~3h 30m (timeout cap 4h), nearing timeout) — Blueprint will merge only the revalidated checked head; wait for it to land or cancel it before re-qualifying"
       );
     });
 
@@ -1838,7 +1842,7 @@ describe('VersionLifecyclePanel', () => {
           data={makeVersionLifecycleResponse({
             current_version: makeCurrentVersion({
               phase: 'stabilize',
-              qualification_state: makePromotionInFlightState({
+              qualification_state: makePromotionCheckWaitState({
                 promotion_age_seconds: 14700,
                 promotion_timeout_seconds: 14400,
                 promotion_past_timeout: true,
@@ -1850,15 +1854,15 @@ describe('VersionLifecyclePanel', () => {
           onRefresh={mockRefresh}
         />
       );
-      expect(screen.getByTestId('promotion-in-flight-freshness')).toHaveTextContent(
-        'Promotion PR #4242 open & auto-merging (in flight ~4h 5m (auto-timeout cap 4h), past auto-timeout)'
+      expect(screen.getByTestId('promotion-check-wait-freshness')).toHaveTextContent(
+        "Promotion PR #4242 in Blueprint's exact-head check wait (waiting ~4h 5m (timeout cap 4h), past timeout)"
       );
-      expect(screen.getByTestId('promotion-in-flight-note')).toHaveTextContent(
-        'Promotion PR #4242 open & auto-merging (in flight ~4h 5m (auto-timeout cap 4h), past auto-timeout) — qualify & phase locked until it lands or is canceled'
+      expect(screen.getByTestId('promotion-check-wait-note')).toHaveTextContent(
+        "Promotion PR #4242 open in Blueprint's exact-head check wait (waiting ~4h 5m (timeout cap 4h), past timeout)"
       );
     });
 
-    it('leaves qualify + phase controls actionable when no promotion is in flight', () => {
+    it('leaves qualify + phase controls actionable when no promotion check wait exists', () => {
       render(
         <VersionLifecyclePanel
           data={makeVersionLifecycleResponse({
@@ -1875,7 +1879,7 @@ describe('VersionLifecyclePanel', () => {
 
       expect(screen.getByRole('button', { name: /Run Qualify/ })).toBeEnabled();
       expect(screen.getByRole('button', { name: /build/ })).toBeEnabled();
-      expect(screen.queryByTestId('promotion-in-flight-note')).not.toBeInTheDocument();
+      expect(screen.queryByTestId('promotion-check-wait-note')).not.toBeInTheDocument();
     });
   });
 
@@ -1884,31 +1888,18 @@ describe('VersionLifecyclePanel', () => {
       vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
     });
 
-    function makeCheckWaitState(
-      overrides: Partial<api.QualificationState> = {},
-    ): api.QualificationState {
-      return {
-        state: 'promotion_check_wait',
-        summary:
-          'Audit PASSED; a migration-carrying promotion PR is open. Blueprint is WAITING for required status checks and will retry the merge AUTOMATICALLY.',
-        promotion_pr_number: 9191,
-        promotion_pr_url: 'https://example/pr/9191',
-        migration_carrying: true,
-        ci_state: 'pending',
-        ...overrides,
-      };
-    }
-
-    // Plan-time acceptance target: the managed check-wait state must lock the
-    // re-qualify affordance (no fresh qualification needed/possible) and present
-    // copy distinct from native auto-merge.
+    // The managed check-wait state locks re-qualification because Blueprint
+    // already owns an exact checked head and no fresh qualification is needed.
     it('renders_managed_promotion_check_wait_without_requalify_affordance', () => {
       render(
         <VersionLifecyclePanel
           data={makeVersionLifecycleResponse({
             current_version: makeCurrentVersion({
               phase: 'stabilize',
-              qualification_state: makeCheckWaitState(),
+              qualification_state: makePromotionCheckWaitState({
+                promotion_pr_number: 9191,
+                promotion_pr_url: 'https://example/pr/9191',
+              }),
             }),
           })}
           loading={false}
@@ -1923,20 +1914,17 @@ describe('VersionLifecyclePanel', () => {
       expect(qualifyBtn).toBeDisabled();
       expect(qualifyBtn).toHaveAttribute(
         'title',
-        'A migration-carrying promotion PR is open and waiting for required checks — Blueprint retries the merge automatically; wait for it to land or cancel it before re-qualifying'
+        "A promotion PR is open in Blueprint's exact-head check wait — Blueprint will merge only the revalidated checked head; wait for it to land or cancel it before re-qualifying"
       );
       // The phase flip is locked too.
       expect(screen.getByRole('button', { name: /build/ })).toBeDisabled();
 
-      // Distinct check-wait note (NOT the native auto-merge note) carries the
-      // truth: waiting for required checks, auto-retry, no fresh qualify needed.
+      // The note carries the exact-head authority and no-fresh-qualify truth.
       const note = screen.getByTestId('promotion-check-wait-note');
       expect(note).toHaveTextContent('#9191');
-      expect(note).toHaveTextContent('waiting for required checks');
+      expect(note).toHaveTextContent('merges only the checked head');
       expect(note).toHaveTextContent('no fresh qualification needed');
-      // The native auto-merge note must NOT render for this state.
-      expect(screen.queryByTestId('promotion-in-flight-note')).not.toBeInTheDocument();
-      // The badge renders with the distinct check-wait label.
+      // The badge renders with the single check-wait label.
       expect(screen.getByText('promotion check wait')).toBeInTheDocument();
     });
 
@@ -1946,7 +1934,8 @@ describe('VersionLifecyclePanel', () => {
           data={makeVersionLifecycleResponse({
             current_version: makeCurrentVersion({
               phase: 'stabilize',
-              qualification_state: makeCheckWaitState({
+              qualification_state: makePromotionCheckWaitState({
+                promotion_pr_number: 9191,
                 promotion_age_seconds: 1800,
                 promotion_timeout_seconds: 14400,
               }),
@@ -1958,10 +1947,8 @@ describe('VersionLifecyclePanel', () => {
         />
       );
       expect(screen.getByTestId('promotion-check-wait-freshness')).toHaveTextContent(
-        'Migration-carrying promotion PR #9191 waiting for required checks (in flight ~30m (auto-timeout cap 4h)) — Blueprint retries the merge automatically'
+        "Promotion PR #9191 in Blueprint's exact-head check wait (waiting ~30m (timeout cap 4h)) — only the revalidated checked head can merge"
       );
-      // The native in-flight freshness must NOT render.
-      expect(screen.queryByTestId('promotion-in-flight-freshness')).not.toBeInTheDocument();
     });
 
     it('renders managed check-wait snapshot details', () => {
@@ -1970,7 +1957,8 @@ describe('VersionLifecyclePanel', () => {
           data={makeVersionLifecycleResponse({
             current_version: makeCurrentVersion({
               phase: 'stabilize',
-              qualification_state: makeCheckWaitState({
+              qualification_state: makePromotionCheckWaitState({
+                promotion_pr_number: 9191,
                 check_snapshot: {
                   state: 'pending',
                   classified_at: '2026-01-01T00:20:00Z',
@@ -2006,7 +1994,8 @@ describe('VersionLifecyclePanel', () => {
           data={makeVersionLifecycleResponse({
             current_version: makeCurrentVersion({
               phase: 'stabilize',
-              qualification_state: makeCheckWaitState({
+              qualification_state: makePromotionCheckWaitState({
+                promotion_pr_number: 9191,
                 ci_state: 'no_checks',
                 check_snapshot: {
                   state: 'no_checks',

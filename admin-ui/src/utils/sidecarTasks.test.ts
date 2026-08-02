@@ -29,36 +29,8 @@ describe('getSidecarBackref', () => {
   });
 
   it('ignores non-string and empty back-reference values', () => {
-    expect(getSidecarBackref(makeTask({ context: { review_second_opinion_for_task_id: 42 } }))).toBeNull();
+    expect(getSidecarBackref(makeTask({ context: { finding_challenge_for_task_id: 42 } }))).toBeNull();
     expect(getSidecarBackref(makeTask({ context: { quality_grader_for_task_id: '' } }))).toBeNull();
-  });
-});
-
-describe('deriveSidecarBadge — second-opinion', () => {
-  const sidecar = makeTask({
-    id: 'challenger-1',
-    status: 'COMPLETED',
-    context: { review_second_opinion_for_task_id: 'review-1' },
-  });
-
-  it.each([
-    ['challenged_confirmed', 'challenged ✓', 'positive'],
-    ['challenged_revised', 'challenged ~', 'mixed'],
-    ['challenged_rejected', 'challenged ✗', 'negative'],
-  ])('maps reconciliation state %s', (state, text, tone) => {
-    const primary = makeTask({ id: 'review-1', context: { review_second_opinion: { state } } });
-    expect(deriveSidecarBadge(sidecar, primary)).toMatchObject({ kind: 'second-opinion', text, tone });
-  });
-
-  it('is pending while the challenger is in flight', () => {
-    const inflight = makeTask({ ...sidecar, status: 'IN_PROGRESS' });
-    const primary = makeTask({ id: 'review-1' });
-    expect(deriveSidecarBadge(inflight, primary)).toMatchObject({ tone: 'pending' });
-  });
-
-  it('degrades to no-verdict when the challenger is terminal but nothing was recorded', () => {
-    const primary = makeTask({ id: 'review-1' });
-    expect(deriveSidecarBadge(sidecar, primary)).toMatchObject({ tone: 'mixed', text: 'challenge —' });
   });
 });
 

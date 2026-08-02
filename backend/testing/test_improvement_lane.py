@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
@@ -2954,8 +2954,25 @@ async def test_sweep_stranded_lanes_class1_recovery_dispatch_emits_operator_mess
     )
     lane_id = lane.id
 
-    with patch(
-        "app.runtime_config_state.is_improvement_lanes_enabled", return_value=True
+    with (
+        patch(
+            "app.runtime_config_state.is_improvement_lanes_enabled", return_value=True
+        ),
+        patch(
+            "app.github_token_resolver.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("gh-token", "owner", "repo"),
+        ),
+        patch(
+            "app.github.get_pull_request",
+            new_callable=AsyncMock,
+            return_value={
+                "state": "open",
+                "merged": False,
+                "base": {"sha": "b" * 40},
+                "head": {"sha": "h" * 40},
+            },
+        ),
     ):
         count = await sweep_stranded_lanes(db, _utcnow(), runtime_config={})
     await db.commit()
@@ -3020,8 +3037,25 @@ async def test_sweep_stranded_lanes_class1_recovery_task_carries_lane_chain_id(
     )
     lane_id = lane.id
 
-    with patch(
-        "app.runtime_config_state.is_improvement_lanes_enabled", return_value=True
+    with (
+        patch(
+            "app.runtime_config_state.is_improvement_lanes_enabled", return_value=True
+        ),
+        patch(
+            "app.github_token_resolver.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("gh-token", "owner", "repo"),
+        ),
+        patch(
+            "app.github.get_pull_request",
+            new_callable=AsyncMock,
+            return_value={
+                "state": "open",
+                "merged": False,
+                "base": {"sha": "b" * 40},
+                "head": {"sha": "h" * 40},
+            },
+        ),
     ):
         count = await sweep_stranded_lanes(db, _utcnow(), runtime_config={})
     await db.commit()

@@ -65,7 +65,6 @@ def classify_lane_waste_category(t: "Task") -> str:
     from app.failure_classification import INFRA_CLASSES
     from app.fix_loop_telemetry import has_terminal_divergence
     from app.review_heuristics import (
-        LANE_ARBITRATION,
         LANE_CI,
         LANE_CONFLICT,
         LANE_REVIEW_CONVERGENCE,
@@ -87,8 +86,6 @@ def classify_lane_waste_category(t: "Task") -> str:
         return "merge_conflict"
     if lane == LANE_CI:
         return "ci_churn"
-    if lane == LANE_ARBITRATION:
-        return "review_ambiguity"
     if lane == LANE_REVIEW_CONVERGENCE:
         iteration = rl.get("iteration")
         if isinstance(iteration, (int, float)):

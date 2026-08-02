@@ -26,9 +26,11 @@ import app.shared_state as _shared_state
 from app.models import (
     Artifact,
     ArtifactType,
+    DiscoveryCycle,
     LocalRunner,
     Project,
     StrategicSpawnRequest,
+    StrategicWatch,
     Task,
     TaskStatus,
     MessageType,
@@ -7393,7 +7395,7 @@ async def test_version_phase_qualification_state_reconciles_finalized_verdict(
     """The strategic payload's version_phase applies the finalized-verdict
     substitution (unified with the other open-version surfaces): a stale
     ``pending`` + ``promotion_pending`` record with an already-resolved verdict
-    reads the terminal status (NOT ``promotion_in_flight``) and surfaces the
+    reads the terminal status (NOT ``promotion_check_wait``) and surfaces the
     verdict disagreement explicitly."""
     from app.models import QualificationVerdict, ReleaseVersion
     from sqlalchemy.orm.attributes import flag_modified
@@ -7458,7 +7460,7 @@ async def test_version_phase_qualification_state_reconciles_finalized_verdict(
 
     qs = vp.get("qualification_state")
     assert qs is not None, "qualification_state must be present"
-    assert qs["state"] != "promotion_in_flight", (
+    assert qs["state"] != "promotion_check_wait", (
         f"finalized verdict must supersede the stale promotion_pending: {qs}"
     )
     assert qs["state"] == "promoted", qs
@@ -9191,11 +9193,11 @@ async def test_stabilize_hint_excludes_disabled_smoketest_from_binding(
 
 
 @pytest.mark.asyncio
-async def test_qualification_substate_hint_promotion_in_flight(
+async def test_qualification_substate_hint_promotion_check_wait(
     db_session, mocker, _lts_split_active
 ):
     """status='pending' WITH promotion_pending (audit passed, promotion PR open)
-    must be surfaced as PROMOTION_IN_FLIGHT — not read as 'audit still running'.
+    must be surfaced as PROMOTION_CHECK_WAIT — not read as 'audit still running'.
     Regression for incident 2026-06-02 where the agent waited on a promotion it
     should have been watching."""
     from app.models import ReleaseVersion
@@ -9220,7 +9222,6 @@ async def test_qualification_substate_hint_promotion_in_flight(
             "promotion_pending": {
                 "pr_number": 7357,
                 "pr_url": "https://github.com/x/y/pull/7357",
-                "auto_merge_enabled": True,
                 "enabled_at": (now - timedelta(minutes=30)).isoformat(),
             },
         },
@@ -9241,13 +9242,14 @@ async def test_qualification_substate_hint_promotion_in_flight(
     payload = tasks[0].payloads[0]
 
     suffix = payload.get("prompt_suffix", "")
-    assert "PROMOTION_IN_FLIGHT" in suffix, f"Expected sub-state hint; got: {suffix}"
-    assert "already cleared" in suffix
+    assert "PROMOTION_CHECK_WAIT" in suffix, f"Expected sub-state hint; got: {suffix}"
+    assert "required checks" in suffix
+    assert "exact base/head pair" in suffix
     assert "still running" in suffix  # the explicit "do NOT read as ..." clause
 
     vp = payload.get("version_phase") or {}
     qstate = vp.get("qualification_state", {})
-    assert qstate.get("state") == "promotion_in_flight"
+    assert qstate.get("state") == "promotion_check_wait"
     # The additive freshness context flows through to the strategic payload.
     assert qstate.get("promotion_age_seconds", 0) >= 1700  # ~30 min
     assert "promotion_past_timeout" in qstate
@@ -9347,7 +9349,7 @@ async def test_qualification_substate_hint_absent_while_auditing(
     ]
     payload = tasks[0].payloads[0]
     suffix = payload.get("prompt_suffix", "")
-    assert "PROMOTION_IN_FLIGHT" not in suffix
+    assert "PROMOTION_CHECK_WAIT" not in suffix
     assert "PROMOTION_FAILED" not in suffix
     vp = payload.get("version_phase") or {}
     assert vp.get("qualification_state", {}).get("state") == "qualifying"
@@ -9361,7 +9363,7 @@ async def test_qualification_substate_hint_suppressed_when_verdict_supersedes_pe
     and last_qualification still says 'pending'+'promotion_pending', the resolver
     substitutes the effective status to 'promoted'.  The prompt-suffix hint must
     use the resolver-applied qualification_state (NOT the raw last_qualification)
-    so PROMOTION_IN_FLIGHT is absent — the promotion already resolved."""
+    so PROMOTION_CHECK_WAIT is absent — the promotion already resolved."""
     from app.models import QualificationVerdict, ReleaseVersion
     from sqlalchemy.orm.attributes import flag_modified
 
@@ -9408,7 +9410,6 @@ async def test_qualification_substate_hint_suppressed_when_verdict_supersedes_pe
         "promotion_pending": {
             "pr_number": 9002,
             "pr_url": "https://github.com/x/y/pull/9002",
-            "auto_merge_enabled": True,
             "enabled_at": now.isoformat(),
         },
     }
@@ -9429,8 +9430,8 @@ async def test_qualification_substate_hint_suppressed_when_verdict_supersedes_pe
     payload = tasks[0].payloads[0]
 
     suffix = payload.get("prompt_suffix", "")
-    assert "PROMOTION_IN_FLIGHT" not in suffix, (
-        "prompt-suffix must NOT assert PROMOTION_IN_FLIGHT when the verdict "
+    assert "PROMOTION_CHECK_WAIT" not in suffix, (
+        "prompt-suffix must NOT assert PROMOTION_CHECK_WAIT when the verdict "
         f"has already finalized as promoted; got suffix: {suffix!r}"
     )
     # The version_phase qualification_state must reflect the resolved outcome
@@ -14205,7 +14206,6 @@ class TestBuildCycleStartReconciliation:
                 "promotion_pending": {
                     "pr_number": 9001,
                     "pr_url": "https://github.com/x/y/pull/9001",
-                    "auto_merge_enabled": True,
                 },
                 "confidence": 0.92,
                 "threshold": 0.80,
@@ -18195,18 +18195,17 @@ async def test_strategist_context_surfaces_direction_linked_knowledge(db_session
     assert matched["direction_knowledge"][0]["title"] == "Auth research findings"
 
 
-# ── spawn_fix op: one-time direction-free implementation dispatch ──────────────
+# ── spawn_task op: direction-free implementation dispatch ─────────────────────
 #
-# spawn_fix lets the strategist dispatch a ONE-TIME implementation task (bug fix,
-# CI remediation, isolated cleanup) with NO strategic direction. These tests
+# spawn_task lets the strategist dispatch bounded work with NO strategic
+# direction. These tests
 # exercise the production handler in routers/admin_agent_ops.py end-to-end over
-# the real /api/agent/strategic endpoint, mirroring the spawn_task harness in
-# test_pipeline.py but asserting the direction-free, one_time_fix provenance.
+# the real /api/agent/strategic endpoint and assert direction-free provenance.
 
 
 async def _make_strategic_review_task(db_session):
     """Create a project + IN_PROGRESS strategic_review task; return
-    (project, review_id) for spawn_fix endpoint tests."""
+    (project, review_id) for spawn_task endpoint tests."""
     project = Project(name="P", user_id="u1")
     db_session.add(project)
     await db_session.commit()
@@ -18225,10 +18224,10 @@ async def _make_strategic_review_task(db_session):
     return project, str(review.id)
 
 
-async def _post_spawn_fix(
+async def _post_spawn_task(
     db_session, task_id, *, title, prompt, spawn_type="create", expect_status=200
 ):
-    """POST a strategic spawn_fix op against the test app over the real endpoint.
+    """POST a strategic spawn_task op against the test app over the real endpoint.
 
     Returns the parsed JSON body (success body on 200, FastAPI error envelope on
     an expected error status)."""
@@ -18254,7 +18253,7 @@ async def _post_spawn_fix(
             resp = await ac.post(
                 "/api/agent/strategic",
                 json={
-                    "op": "spawn_fix",
+                    "op": "spawn_task",
                     "task_id": task_id,
                     "data": {"type": spawn_type, "title": title, "prompt": prompt},
                 },
@@ -18296,19 +18295,6 @@ async def _post_strategic_operation(db_session, task_id, *, op, data, expect_sta
     finally:
         app.dependency_overrides.pop(get_session, None)
         app.dependency_overrides.pop(verify_agent_token, None)
-
-
-def test_spawn_fix_registry_export_is_only_a_compatibility_subset():
-    """The historical export remains, but its types now use spawn_task."""
-    from app.task_capabilities import (
-        STRATEGIST_ONE_TIME_SPAWNABLE_TYPES,
-        STRATEGIST_SPAWNABLE_TASK_TYPES,
-    )
-
-    assert {"create", "refactor", "qa"} == STRATEGIST_ONE_TIME_SPAWNABLE_TYPES
-    assert STRATEGIST_ONE_TIME_SPAWNABLE_TYPES.issubset(
-        STRATEGIST_SPAWNABLE_TASK_TYPES
-    )
 
 
 @pytest.mark.asyncio
@@ -18373,14 +18359,14 @@ async def test_cancel_deferred_spawn_keeps_long_reason_out_of_bounded_column(db_
 
 
 @pytest.mark.asyncio
-async def test_spawn_fix_creates_task_without_direction_id(db_session):
-    """spawn_fix with a valid implementation type (create) creates a QUEUED task
-    carrying created_by=STRATEGIC_AGENT and the one-time-fix provenance, and with
+async def test_spawn_task_creates_task_without_direction_id(db_session):
+    """spawn_task with a valid implementation type (create) creates a QUEUED task
+    carrying created_by=STRATEGIC_AGENT provenance, and with
     NO direction_id anywhere — neither in context nor in the payload — so it can
     never surface in any direction portfolio logic."""
     _project, review_id = await _make_strategic_review_task(db_session)
 
-    body = await _post_spawn_fix(
+    body = await _post_spawn_task(
         db_session,
         review_id,
         title="Fix red CI test on automain",
@@ -18389,19 +18375,19 @@ async def test_spawn_fix_creates_task_without_direction_id(db_session):
     )
     assert body["status"] == "ok"
     assert body["op"] == "spawn_task"
-    assert body["deprecated_alias"] == "spawn_fix"
     assert body["type"] == "create"
     assert body["deduplicated"] is False
-    assert body["priority"] == 100
+    assert body["priority"] == 50
 
     spawned = (
         await db_session.execute(select(Task).where(Task.id == body["task_id"]))
     ).scalar_one()
     assert spawned.status == TaskStatus.QUEUED
     assert spawned.created_by == "STRATEGIC_AGENT"
+    assert spawned.priority == 50
     assert spawned.first_payload.get("type") == "create"
 
-    # The compatibility alias creates the same normal direction-free task.
+    # The canonical operation creates a normal direction-free task.
     ctx = spawned.context or {}
     assert ctx.get("spawned_by") == "strategic_direct"
     assert ctx.get("parent_strategic_task_id") == review_id
@@ -18412,11 +18398,44 @@ async def test_spawn_fix_creates_task_without_direction_id(db_session):
 
 
 @pytest.mark.asyncio
-async def test_spawn_fix_alias_routes_research_through_spawn_task(db_session):
-    """The compatibility alias uses the unified task-type policy."""
+async def test_spawn_task_inherits_low_direction_scheduler_priority(db_session):
+    """Resident roots use direction intent instead of an unconditional P100."""
+
+    project, review_id = await _make_strategic_review_task(db_session)
+    project.directions = [
+        {
+            "id": "d-low-priority",
+            "status": "active",
+            "priority": "low",
+            "text": "Useful work which should yield to higher-priority projects",
+        }
+    ]
+    db_session.add(project)
+    await db_session.commit()
+
+    body = await _post_strategic_operation(
+        db_session,
+        review_id,
+        op="spawn_task",
+        data={
+            "type": "create",
+            "title": "Implement low-priority improvement",
+            "prompt": "Implement the bounded improvement.",
+            "direction_id": "d-low-priority",
+            "idempotency_key": "low-priority-work-unit",
+        },
+    )
+
+    assert body["priority"] == 0
+    spawned = await db_session.get(Task, uuid.UUID(body["task_id"]))
+    assert spawned.priority == 0
+
+
+@pytest.mark.asyncio
+async def test_spawn_task_routes_research_through_unified_policy(db_session):
     _project, review_id = await _make_strategic_review_task(db_session)
 
-    body = await _post_spawn_fix(
+    body = await _post_spawn_task(
         db_session,
         review_id,
         title="Investigate something",
@@ -18425,20 +18444,90 @@ async def test_spawn_fix_alias_routes_research_through_spawn_task(db_session):
     )
     assert body["status"] == "ok"
     assert body["op"] == "spawn_task"
-    assert body["deprecated_alias"] == "spawn_fix"
+    spawned = await db_session.get(Task, uuid.UUID(body["task_id"]))
+    assert spawned.discovery_cycle_id is None
+    assert (
+        await db_session.execute(
+            select(StrategicWatch).where(
+                StrategicWatch.target_task_id == spawned.id
+            )
+        )
+    ).scalar_one().state == "pending"
 
 
 @pytest.mark.asyncio
-async def test_spawn_fix_fix_type_without_pr_context_fails_cleanly(db_session):
-    """``fix`` requires pr_number + branch a prompt-only one-time spawn cannot
-    supply, so it is not in STRATEGIST_ONE_TIME_SPAWNABLE_TYPES. The handler must
+async def test_direction_research_uses_one_discovery_cycle_without_raw_wake(db_session):
+    project, review_id = await _make_strategic_review_task(db_session)
+    project.directions = [
+        {
+            "id": "d-research",
+            "status": "active",
+            "priority": "medium",
+            "text": "Determine whether the bounded mechanism improves the product",
+        }
+    ]
+    db_session.add(project)
+    await db_session.commit()
+
+    first = await _post_strategic_operation(
+        db_session,
+        review_id,
+        op="spawn_task",
+        data={
+            "type": "research",
+            "title": "Investigate the mechanism",
+            "prompt": "Inspect the evidence and determine whether it is worth building.",
+            "direction_id": "d-research",
+            "idempotency_key": "research-mechanism",
+        },
+    )
+    first_task = await db_session.get(Task, uuid.UUID(first["task_id"]))
+    assert first_task.discovery_cycle_id is not None
+    cycle = await db_session.get(DiscoveryCycle, first_task.discovery_cycle_id)
+    assert cycle.source_research_task_id == first_task.id
+    assert (
+        await db_session.execute(
+            select(StrategicWatch).where(
+                StrategicWatch.target_task_id == first_task.id
+            )
+        )
+    ).scalar_one_or_none() is None
+
+    second = await _post_strategic_operation(
+        db_session,
+        review_id,
+        op="spawn_task",
+        data={
+            "type": "web_research",
+            "title": "Check the external frontier",
+            "prompt": "Check only the evidence needed to challenge the same bet.",
+            "direction_id": "d-research",
+            "idempotency_key": "research-frontier",
+            "watch": True,
+        },
+    )
+    second_task = await db_session.get(Task, uuid.UUID(second["task_id"]))
+    assert second_task.discovery_cycle_id == cycle.id
+    assert (
+        await db_session.execute(
+            select(StrategicWatch).where(
+                StrategicWatch.target_task_id == second_task.id
+            )
+        )
+    ).scalar_one().state == "pending"
+
+
+@pytest.mark.asyncio
+async def test_spawn_task_fix_type_without_pr_context_fails_cleanly(db_session):
+    """``fix`` requires pr_number + branch, which a prompt-only spawn does not
+    supply. The handler must
     reject it at the allowlist check with a clean 400 (not an opaque 500), and
     create NO task."""
     from sqlalchemy import func as _f
 
     _project, review_id = await _make_strategic_review_task(db_session)
 
-    body = await _post_spawn_fix(
+    body = await _post_spawn_task(
         db_session,
         review_id,
         title="Fix the thing",
@@ -18462,8 +18551,8 @@ async def test_spawn_fix_fix_type_without_pr_context_fails_cleanly(db_session):
 
 
 @pytest.mark.asyncio
-async def test_spawn_fix_idempotent_on_retry_duplicate(db_session):
-    """A retried spawn_fix (same source review, type and title within 30 min)
+async def test_spawn_task_idempotent_on_retry_duplicate(db_session):
+    """A retried spawn_task (same source review, type and title)
     returns the existing task instead of creating a duplicate, keyed on the
     strategic_direct_fix provenance."""
     from sqlalchemy import func as _f
@@ -18473,21 +18562,21 @@ async def test_spawn_fix_idempotent_on_retry_duplicate(db_session):
     title = "Fix flaky compute spawn test"
     prompt = "Reset the spend-gate global config in the fixture."
 
-    first = await _post_spawn_fix(
+    first = await _post_spawn_task(
         db_session, review_id, title=title, prompt=prompt, spawn_type="create"
     )
     assert first["status"] == "ok"
     assert first["deduplicated"] is False
     first_id = first["task_id"]
 
-    second = await _post_spawn_fix(
+    second = await _post_spawn_task(
         db_session, review_id, title=title, prompt=prompt, spawn_type="create"
     )
     assert second["status"] == "ok"
     assert second["deduplicated"] is True
     assert second["task_id"] == first_id
 
-    # Exactly one one-time-fix child exists for this review.
+    # Exactly one child exists for this review.
     count = (
         await db_session.execute(
             select(_f.count())
@@ -18505,8 +18594,7 @@ async def test_spawn_fix_idempotent_on_retry_duplicate(db_session):
 
 
 @pytest.mark.asyncio
-async def test_spawn_fix_alias_has_no_per_review_quota(db_session, mocker):
-    """The deprecated alias is not a separately capped dispatch lane."""
+async def test_spawn_task_has_no_routine_per_review_quota(db_session, mocker):
     from sqlalchemy import func as _f
 
     mocker.patch.dict(
@@ -18518,20 +18606,19 @@ async def test_spawn_fix_alias_has_no_per_review_quota(db_session, mocker):
 
     # Distinct titles (overlap below threshold) so semantic dedup never fires.
     for n in ("alpha", "beta"):
-        body = await _post_spawn_fix(
+        body = await _post_spawn_task(
             db_session, review_id, title=f"Fix {n}", prompt=f"do {n}"
         )
         assert body["status"] == "ok"
         assert body["deduplicated"] is False
 
-    third = await _post_spawn_fix(
+    third = await _post_spawn_task(
         db_session,
         review_id,
         title="Fix gamma",
         prompt="do gamma",
     )
     assert third["status"] == "ok"
-    assert third["deprecated_alias"] == "spawn_fix"
 
     # Only the two budgeted tasks exist; the third was not created.
     count = (

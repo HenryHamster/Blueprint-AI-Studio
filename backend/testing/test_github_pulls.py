@@ -344,13 +344,18 @@ async def test_merge_pr_success_and_conflict_shapes_unchanged(mocker):
 
     mocker.patch(
         "app.github._github_request",
-        new=mocker.AsyncMock(return_value=MockResponse(200, {"message": "Merged"})),
+        new=mocker.AsyncMock(
+            return_value=MockResponse(
+                200, {"message": "Merged", "sha": "merge-receipt-sha"}
+            )
+        ),
     )
     assert await github_pulls.merge_pull_request(
         "t", "o", "r", 1, allow_changes_requested=True
     ) == {
         "merged": True,
         "message": "Merged",
+        "sha": "merge-receipt-sha",
     }
 
     mocker.patch(
@@ -372,6 +377,18 @@ def test_changes_requested_override_is_limited_to_explicit_operator_lanes():
     """Autonomous merge callers may not opt out of the external-review veto."""
     app_dir = Path(__file__).resolve().parents[1] / "app"
     overrides = set()
+
+    def _calls_owned_by(function):
+        """Yield calls in *function* without attributing nested callbacks twice."""
+        pending = list(function.body)
+        while pending:
+            node = pending.pop()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                continue
+            if isinstance(node, ast.Call):
+                yield node
+            pending.extend(ast.iter_child_nodes(node))
+
     for source_path in app_dir.rglob("*.py"):
         tree = ast.parse(source_path.read_text(encoding="utf-8"))
         for function in (
@@ -379,9 +396,7 @@ def test_changes_requested_override_is_limited_to_explicit_operator_lanes():
             for node in ast.walk(tree)
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         ):
-            for call in (
-                node for node in ast.walk(function) if isinstance(node, ast.Call)
-            ):
+            for call in _calls_owned_by(function):
                 called = (
                     call.func.id
                     if isinstance(call.func, ast.Name)
@@ -407,9 +422,8 @@ def test_changes_requested_override_is_limited_to_explicit_operator_lanes():
                 )
 
     assert overrides == {
-        ("admin_task_mutations.py", "_handle_rollup_pr_approval"),
-        ("admin_task_mutations.py", "_merge_critical_pr"),
-        ("routers/admin_operator_triggers.py", "trigger_rollup"),
+        ("admin_task_mutations.py", "_submit_human_rollup_merge"),
+        ("admin_task_mutations.py", "_submit_human_critical_merge"),
     }
 
 @pytest.mark.asyncio

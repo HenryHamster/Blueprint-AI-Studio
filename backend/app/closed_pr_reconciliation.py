@@ -77,7 +77,6 @@ _REPLACEMENT_ATTEMPT_KEYS = frozenset(
         "review_wait_respawn_task_id",
         "review_wait_respawned",
         "review_wait_started",
-        "skip_rereview_minor_only",
         "test_coverage_result",
         "unverified_merge_reason",
         "update_branch_failures",

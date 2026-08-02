@@ -273,6 +273,19 @@ async def _apply_status_mutation(
         raise HTTPException(status_code=400, detail="Invalid status") from None
 
     admin_allowed = {TaskStatus.QUEUED, TaskStatus.CANCELLED}
+    task_type = str(task.first_payload.get("type") or "").lower()
+    if new_status == TaskStatus.QUEUED:
+        from app.review_execution_ownership import has_pending_pr_continuation
+
+        if has_pending_pr_continuation(task):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Cannot requeue {task_type} task while its post-commit "
+                    "continuation is pending; wait for recovery or cancel the "
+                    "task first"
+                ),
+            )
     raw_requeue_guidance = payload.get("requeue_prompt_suffix")
     if (
         new_status == TaskStatus.QUEUED
@@ -308,14 +321,6 @@ async def _apply_status_mutation(
                 detail="Cannot attach retry guidance: task has no agent payload",
             )
         requeue_guidance = raw_requeue_guidance.strip()
-        updated_payloads = [dict(item) for item in task.payloads]
-        materialize_operator_retry_guidance(updated_payloads[0], requeue_guidance)
-        task.payloads = [
-            validate_internal_payload(item, "admin:manual_requeue_guidance")
-            for item in updated_payloads
-        ]
-        changes["requeue_prompt_suffix"] = "materialized"
-
     if new_status not in admin_allowed and task.status in _TERMINAL_STATUSES:
         raise HTTPException(
             status_code=400,
@@ -323,7 +328,99 @@ async def _apply_status_mutation(
         )
 
     prior_status = task.status
-    task_type = (task.first_payload).get("type", "")
+    if new_status == TaskStatus.QUEUED and task_type in {"review", "fix"}:
+        from app.fix_admission import prepare_direct_fix_admission
+        from app.github import get_pull_request
+        from app.routers.agent import get_github_token_for_task
+        from app.review_admission import prepare_direct_review_admission
+        from app.review_execution_ownership import has_pending_pr_continuation
+
+        pr_number = (task.first_payload or {}).get("pr_number")
+        if pr_number is None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Cannot requeue {task_type} without PR",
+            )
+        gh_token, owner, repo = await get_github_token_for_task(task.id, session)
+
+        async def _fetch_requeued_pr() -> dict:
+            return await get_pull_request(
+                gh_token,
+                owner,
+                repo,
+                int(pr_number),
+                project_id=str(task.project_id),
+            )
+
+        if task_type == "fix":
+            admission = await prepare_direct_fix_admission(
+                session,
+                project_id=task.project_id,
+                pr_number=int(pr_number),
+                fix_task_id=task.id,
+                fetch_live_pr=_fetch_requeued_pr,
+            )
+        else:
+            admission = await prepare_direct_review_admission(
+                session,
+                project_id=task.project_id,
+                pr_number=int(pr_number),
+                fetch_live_pr=_fetch_requeued_pr,
+                review_task_id=task.id,
+            )
+        if not admission.allowed:
+            await session.rollback()
+            raise HTTPException(status_code=409, detail=admission.reason)
+
+        # Admission owns the PR lock.  Re-read the exact row under a definitive
+        # Task lock after the live lookup, discarding the route's stale identity-
+        # map snapshot.  This closes completion -> pending racing the initial
+        # guard without ever taking Task before PR.
+        with session.no_autoflush:
+            locked_task = (
+                (
+                    await session.execute(
+                        select(Task)
+                        .where(Task.id == task.id)
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                )
+                .scalars()
+                .first()
+            )
+        if locked_task is None:
+            await session.rollback()
+            raise HTTPException(status_code=404, detail="Task not found")
+        task = locked_task
+        if has_pending_pr_continuation(task):
+            await session.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Cannot requeue {task_type} task while its post-commit "
+                    "continuation is pending; wait for recovery or cancel the task first"
+                ),
+            )
+
+        requeue_loop = dict((task.context or {}).get("review_loop") or {})
+        if task_type == "fix":
+            requeue_loop["fix_target"] = dict(admission.fix_target or {})
+        else:
+            requeue_loop["review_target"] = dict(admission.review_target or {})
+        task.context = {**(task.context or {}), "review_loop": requeue_loop}
+        flag_modified(task, "context")
+        task.archived = False
+        changes["archived"] = False
+
+    if requeue_guidance is not None:
+        updated_payloads = [dict(item) for item in task.payloads]
+        materialize_operator_retry_guidance(updated_payloads[0], requeue_guidance)
+        task.payloads = [
+            validate_internal_payload(item, "admin:manual_requeue_guidance")
+            for item in updated_payloads
+        ]
+        changes["requeue_prompt_suffix"] = "materialized"
     if (
         new_status == TaskStatus.QUEUED
         and prior_status in _TERMINAL_STATUSES
@@ -699,9 +796,40 @@ async def _handle_rollup_pr_approval(
             )
             raise HTTPException(status_code=409, detail=detail)
 
-        merge_result = await merge_pull_request(
-            gh_token, owner, repo, rollup_pr_number, allow_changes_requested=True
+        async def _submit_human_rollup_merge(expected_head_sha: str) -> dict:
+            return await merge_pull_request(
+                gh_token,
+                owner,
+                repo,
+                rollup_pr_number,
+                project_id=str(task.project_id),
+                expected_head_sha=expected_head_sha,
+                allow_changes_requested=True,
+            )
+
+        from app.review_policy_merge import attempt_explicit_human_merge
+
+        _merge_authority, merge_result = await attempt_explicit_human_merge(
+            task,
+            session,
+            merge_call=_submit_human_rollup_merge,
+            gh_token=gh_token,
+            owner=owner,
+            repo=repo,
+            pr_number=rollup_pr_number,
+            branch=str(
+                ctx.get("plan_branch")
+                or ctx.get("research_branch")
+                or (task.first_payload).get("branch")
+                or ""
+            ),
+            base_branch=base_branch,
         )
+        if merge_result is None:
+            merge_result = {
+                "merged": False,
+                "message": "held because a same-PR code fix is active",
+            }
         if merge_result.get("merged"):
             _project = await session.get(Project, task.project_id)
             base_branch = (task.first_payload).get(
@@ -997,9 +1125,35 @@ async def _merge_critical_pr(
             )
             raise HTTPException(status_code=409, detail=detail)
 
-        merge_result = await merge_pull_request(
-            gh_token, owner, repo, pr_number, allow_changes_requested=True
+        async def _submit_human_critical_merge(expected_head_sha: str) -> dict:
+            return await merge_pull_request(
+                gh_token,
+                owner,
+                repo,
+                pr_number,
+                project_id=str(task.project_id),
+                expected_head_sha=expected_head_sha,
+                allow_changes_requested=True,
+            )
+
+        from app.review_policy_merge import attempt_explicit_human_merge
+
+        _merge_authority, merge_result = await attempt_explicit_human_merge(
+            task,
+            session,
+            merge_call=_submit_human_critical_merge,
+            gh_token=gh_token,
+            owner=owner,
+            repo=repo,
+            pr_number=pr_number,
+            branch=branch,
+            base_branch=base_branch,
         )
+        if merge_result is None:
+            merge_result = {
+                "merged": False,
+                "message": "held because a same-PR code fix is active",
+            }
         if merge_result.get("merged"):
             record_pr_merged = await merged_pr_counts_as_integration_landing(
                 task,
@@ -1138,6 +1292,35 @@ async def _apply_simple_mutations(
 ) -> None:
     """Apply payloads, parent_task_id, context, and post_commit_pending mutations."""
     if "payloads" in payload:
+        proposed_payloads = payload["payloads"]
+        proposed_first = (
+            proposed_payloads[0]
+            if isinstance(proposed_payloads, list)
+            and proposed_payloads
+            and isinstance(proposed_payloads[0], dict)
+            else {}
+        )
+        current_first = task.first_payload or {}
+        immutable_identity_keys = (
+            "type",
+            "pr_number",
+            "branch",
+            "base_branch",
+            "original_task_id",
+        )
+        changed_identity = [
+            key
+            for key in immutable_identity_keys
+            if proposed_first.get(key) != current_first.get(key)
+        ]
+        if changed_identity:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Generic payload mutation cannot retarget task authority "
+                    "identity: " + ", ".join(changed_identity)
+                ),
+            )
         task.payloads = payload["payloads"]
         changes["payloads"] = "updated"
 
@@ -1148,6 +1331,23 @@ async def _apply_simple_mutations(
         changes["parent_task_id"] = str(task.parent_task_id)
 
     if "context" in payload and isinstance(payload["context"], dict):
+        protected_context_keys = {
+            "review_loop",
+            "pr_merged",
+            "pr_closed_unmerged",
+            "pr_rejected",
+        }
+        attempted_protected = sorted(
+            protected_context_keys.intersection(payload["context"])
+        )
+        if attempted_protected:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Generic task context mutation cannot write merge-authority "
+                    "state: " + ", ".join(attempted_protected)
+                ),
+            )
         merged = {**(task.context or {}), **payload["context"]}
         if len(json.dumps(merged)) > 102400:
             raise HTTPException(
@@ -1322,6 +1522,10 @@ async def _commit_and_broadcast(
         from app.vm_lifecycle import _ensure_vm_deleted
 
         await _ensure_vm_deleted(old_vm, reason="admin_requeue")
+        # VM teardown may persist forensics through an independent session.  Do
+        # not rely on ORM attributes remaining loaded across that cross-session
+        # side effect: async lazy-loading below would raise MissingGreenlet.
+        await session.refresh(task)
 
     from app.rollup_management import _check_and_trigger_rollup, _cleanup_branches
 

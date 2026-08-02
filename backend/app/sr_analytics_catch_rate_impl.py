@@ -28,7 +28,6 @@ from app.sr_analytics_catch_rate import (
 from app.sr_analytics_common import (
     _EXAMPLE_MAX_CATS,
     _FLOOR_MIN_CONSECUTIVE_WINDOWS,
-    _HALLUCINATION_RATE_MIN_FINDINGS,
     _MIN_SR_FINDINGS,
     _MIN_SR_SAMPLE,
     _PASS_ENGAGEMENT_THINNING_ALERT_TITLE_PREFIX,
@@ -250,8 +249,6 @@ async def _compute_sr_catch_rate_trends_impl(
 
     empty_cat: dict[str, Any] = {
         "hit_count": 0,
-        "sr_alone_hit_count": 0,
-        "reviewer_save_hit_count": 0,
         "human_count": 0,
         "w_hit": 0.0,
         "w_total": 0.0,
@@ -275,17 +272,6 @@ async def _compute_sr_catch_rate_trends_impl(
         miss_rate = (
             round(1 - current_hit_rate, 3) if current_hit_rate is not None else None
         )
-        sr_alone_hit_rate = (
-            round(curr["sr_alone_hit_count"] / curr["human_count"], 3)
-            if curr["human_count"] > 0
-            else None
-        )
-        reviewer_save_rate = (
-            round(curr["reviewer_save_hit_count"] / curr["human_count"], 3)
-            if curr["human_count"] > 0
-            else None
-        )
-
         curr_findings = curr.get("human_count", 0)
         prev_findings = prev.get("human_count", 0)
         has_trend_data = (
@@ -404,10 +390,6 @@ async def _compute_sr_catch_rate_trends_impl(
             "current_reviewer_finding_count": curr_findings,
             "previous_reviewer_finding_count": prev_findings,
             "low_confidence_finding_count": curr_findings < _MIN_SR_FINDINGS,
-            "sr_alone_hit_count": int(curr.get("sr_alone_hit_count") or 0),
-            "reviewer_save_hit_count": int(curr.get("reviewer_save_hit_count") or 0),
-            "sr_alone_hit_rate": sr_alone_hit_rate,
-            "reviewer_save_rate": reviewer_save_rate,
             "miss_rate": miss_rate,
             "weighted_miss_rate": weighted_miss_rate,
             "trend": trend,
@@ -628,26 +610,12 @@ async def _compute_sr_catch_rate_trends_impl(
             if stats["human_count"] < _MIN_SR_SAMPLE:
                 continue
             hit_rate = round(stats["hit_count"] / stats["human_count"], 3)
-            sr_alone_hit_rate = (
-                round(stats["sr_alone_hit_count"] / stats["human_count"], 3)
-                if stats["human_count"] > 0
-                else None
-            )
-            reviewer_save_rate = (
-                round(stats["reviewer_save_hit_count"] / stats["human_count"], 3)
-                if stats["human_count"] > 0
-                else None
-            )
             raw_ex = stats.get("miss_examples", [])
             ex = _finalize_examples(raw_ex)
             entry: dict[str, Any] = {
                 "hit_rate": hit_rate,
                 "miss_rate": round(1 - hit_rate, 3),
                 "sample_count": stats["human_count"],
-                "sr_alone_hit_count": stats["sr_alone_hit_count"],
-                "reviewer_save_hit_count": stats["reviewer_save_hit_count"],
-                "sr_alone_hit_rate": sr_alone_hit_rate,
-                "reviewer_save_rate": reviewer_save_rate,
             }
             if ex:
                 entry["examples"] = ex
@@ -716,26 +684,12 @@ async def _compute_sr_catch_rate_trends_impl(
             if stats["human_count"] < _MIN_SR_SAMPLE:
                 continue
             hit_rate = round(stats["hit_count"] / stats["human_count"], 3)
-            sr_alone_hit_rate = (
-                round(stats["sr_alone_hit_count"] / stats["human_count"], 3)
-                if stats["human_count"] > 0
-                else None
-            )
-            reviewer_save_rate = (
-                round(stats["reviewer_save_hit_count"] / stats["human_count"], 3)
-                if stats["human_count"] > 0
-                else None
-            )
             raw_ex = stats.get("miss_examples", [])
             ex = _finalize_examples(raw_ex)
             entry: dict[str, Any] = {
                 "hit_rate": hit_rate,
                 "miss_rate": round(1 - hit_rate, 3),
                 "sample_count": stats["human_count"],
-                "sr_alone_hit_count": stats["sr_alone_hit_count"],
-                "reviewer_save_hit_count": stats["reviewer_save_hit_count"],
-                "sr_alone_hit_rate": sr_alone_hit_rate,
-                "reviewer_save_rate": reviewer_save_rate,
             }
             if ex:
                 entry["examples"] = ex
@@ -853,56 +807,6 @@ async def _compute_sr_catch_rate_trends_impl(
         else None
     )
 
-    current_sr_alone_hits = 0
-    current_sr_alone_humans = 0
-    previous_sr_alone_hits = 0
-    previous_sr_alone_humans = 0
-    for cat in all_cats:
-        c = current_stats.get(cat, empty_cat)
-        p = previous_stats.get(cat, empty_cat)
-        if c.get("human_count", 0) > 0:
-            current_sr_alone_hits += c.get("sr_alone_hit_count", 0)
-            current_sr_alone_humans += c["human_count"]
-        if p.get("human_count", 0) > 0:
-            previous_sr_alone_hits += p.get("sr_alone_hit_count", 0)
-            previous_sr_alone_humans += p["human_count"]
-    overall_sr_alone_hit_rate: float | None = (
-        round(current_sr_alone_hits / current_sr_alone_humans, 3)
-        if current_sr_alone_humans > 0
-        else None
-    )
-    previous_overall_sr_alone_hit_rate: float | None = (
-        round(previous_sr_alone_hits / previous_sr_alone_humans, 3)
-        if previous_sr_alone_humans > 0
-        else None
-    )
-    sr_alone_data_sufficient = (
-        overall_sr_alone_hit_rate is not None
-        and previous_overall_sr_alone_hit_rate is not None
-        and current_sr_alone_humans >= _MIN_SR_FINDINGS
-        and previous_sr_alone_humans >= _MIN_SR_FINDINGS
-    )
-    if sr_alone_data_sufficient:
-        sr_alone_delta = overall_sr_alone_hit_rate - previous_overall_sr_alone_hit_rate
-        sr_alone_sig = _is_trend_significant(
-            overall_sr_alone_hit_rate,
-            current_sr_alone_humans,
-            previous_overall_sr_alone_hit_rate,
-            previous_sr_alone_humans,
-        )
-        if sr_alone_sig and sr_alone_delta >= _TREND_DELTA_THRESHOLD:
-            overall_sr_alone_trend_verdict: str = "improving"
-        elif sr_alone_sig and sr_alone_delta <= -_TREND_DELTA_THRESHOLD:
-            overall_sr_alone_trend_verdict = "declining"
-        else:
-            overall_sr_alone_trend_verdict = "stable"
-        overall_sr_alone_trend_significant: bool | None = (
-            sr_alone_sig and abs(sr_alone_delta) >= _TREND_DELTA_THRESHOLD
-        )
-    else:
-        overall_sr_alone_trend_verdict = "stable"
-        overall_sr_alone_trend_significant = None
-
     overall_data_sufficient = (
         overall_hit_rate is not None
         and previous_overall_hit_rate is not None
@@ -959,11 +863,6 @@ async def _compute_sr_catch_rate_trends_impl(
         "overall_trend_verdict": overall_trend_verdict,
         "overall_trend_significant": overall_trend_significant,
         "overall_trend_data_sufficient": overall_data_sufficient,
-        "overall_sr_alone_hit_rate": overall_sr_alone_hit_rate,
-        "previous_overall_sr_alone_hit_rate": previous_overall_sr_alone_hit_rate,
-        "overall_sr_alone_trend_verdict": overall_sr_alone_trend_verdict,
-        "overall_sr_alone_trend_significant": overall_sr_alone_trend_significant,
-        "overall_sr_alone_trend_data_sufficient": sr_alone_data_sufficient,
         "current_finding_count": current_finding_count,
         "previous_finding_count": previous_finding_count,
     }
@@ -1001,77 +900,10 @@ async def _compute_sr_catch_rate_trends_impl(
     )
     result["by_direction"] = by_direction or {}
 
-    from app.sr_blind_spots import (
-        aggregate_sr_co_failure_pairs,
-        _count_reviewer_disagreement_directions,
-    )
+    from app.sr_blind_spots import aggregate_sr_co_failure_pairs
 
     co_pairs = aggregate_sr_co_failure_pairs(current_window_tasks)
     result["co_failure_pairs"] = co_pairs or []
-
-    failure_mode_dir_counts = _count_reviewer_disagreement_directions(
-        current_window_tasks
-    )
-    cat_failure_modes: dict[str, dict[str, int]] = {}
-    for (cat, _ttype), bucket in failure_mode_dir_counts.items():
-        if cat not in cat_failure_modes:
-            cat_failure_modes[cat] = {
-                "reading_gap": 0,
-                "judgment_gap": 0,
-                "coverage_gap": 0,
-            }
-        cat_failure_modes[cat]["reading_gap"] += bucket["miss_recovery_incomplete"]
-        cat_failure_modes[cat]["judgment_gap"] += bucket["miss_disagreement"]
-        cat_failure_modes[cat]["coverage_gap"] += bucket["miss_coverage_gap"]
-    for cat, data in categories.items():
-        modes = cat_failure_modes.get(cat)
-        if modes and sum(modes.values()) > 0:
-            dominant = max(modes.items(), key=lambda x: x[1])
-            data["miss_mode_breakdown"] = {**modes, "dominant_mode": dominant[0]}
-
-    curr_hall_total = 0
-    curr_hall_filtered = 0
-    for task in current_window_tasks:
-        sro = (getattr(task, "context", None) or {}).get("_self_review_outcome") or {}
-        rff = sro.get("reviewer_findings_filtered") or {}
-        task_total = rff.get("total_reviewer_findings")
-        task_filtered = rff.get("filtered_count")
-        if isinstance(task_total, int) and isinstance(task_filtered, int):
-            curr_hall_total += task_total
-            curr_hall_filtered += task_filtered
-    prev_hall_total = 0
-    prev_hall_filtered = 0
-    for task in previous_window_tasks:
-        sro = (getattr(task, "context", None) or {}).get("_self_review_outcome") or {}
-        rff = sro.get("reviewer_findings_filtered") or {}
-        task_total = rff.get("total_reviewer_findings")
-        task_filtered = rff.get("filtered_count")
-        if isinstance(task_total, int) and isinstance(task_filtered, int):
-            prev_hall_total += task_total
-            prev_hall_filtered += task_filtered
-    curr_hall_rate: float | None = (
-        round(curr_hall_filtered / curr_hall_total, 3)
-        if curr_hall_total >= _HALLUCINATION_RATE_MIN_FINDINGS
-        else None
-    )
-    prev_hall_rate: float | None = (
-        round(prev_hall_filtered / prev_hall_total, 3)
-        if prev_hall_total >= _HALLUCINATION_RATE_MIN_FINDINGS
-        else None
-    )
-    if curr_hall_rate is not None or prev_hall_rate is not None:
-        hall_delta: float | None = (
-            round(curr_hall_rate - prev_hall_rate, 3)
-            if curr_hall_rate is not None and prev_hall_rate is not None
-            else None
-        )
-        result["reviewer_hallucination_rate"] = {
-            "current_rate": curr_hall_rate,
-            "previous_rate": prev_hall_rate,
-            "current_sample": curr_hall_total,
-            "previous_sample": prev_hall_total,
-            "delta": hall_delta,
-        }
 
     doc["sr_catch_rate_trends"] = result
     sr_row.data = doc

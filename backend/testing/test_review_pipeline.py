@@ -56,18 +56,15 @@ from app.review_pipeline import (
     _feedback_jaccard,
     _feedback_token_set,
     _genuine_blocking_issue_exists,
-    _is_cross_cutting_pr,
     _is_pipeline_task_stale,
     _is_test_file,
     _is_verification_only_rejection,
     _max_review_iterations,
     _recent_consecutive_lane_count,
     _spawn_pipeline_task,
-    maybe_spawn_cross_cutting_safeguard,
     post_merge_summary_comment,
     should_auto_approve_diff,
     should_skip_initial_review,
-    should_skip_rereview,
     REVIEW_FIX_GOAL_PREAMBLE,
 )
 from testing.factories import make_project, make_task
@@ -80,6 +77,76 @@ def _review_target(project_id, pr_number: int, base_sha: str, head_sha: str) -> 
         "base_sha": base_sha,
         "head_sha": head_sha,
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "origin,fix_reason,source_loop,expected_head",
+    [
+        (
+            "review_approve_ci_failure",
+            "ci_failure",
+            {"head_sha": "approved-head"},
+            "approved-head",
+        ),
+        (
+            "ci_completion_failure",
+            "ci_failure",
+            {"reviewed_head_sha": "reviewed-ci-head", "head_sha": "later-head"},
+            "reviewed-ci-head",
+        ),
+        (
+            "ci_completion_merge_conflict",
+            "merge_conflict",
+            {"head_sha": "conflicted-head"},
+            "conflicted-head",
+        ),
+        (
+            "migration_guard",
+            "migration_guard",
+            {"review_target": {"head_sha": "migration-guard-head"}},
+            "migration-guard-head",
+        ),
+    ],
+)
+async def test_fix_origins_inherit_pre_fix_head_for_delta_rereview(
+    db_session, mocker, origin, fix_reason, source_loop, expected_head
+):
+    """Every post-approval fix origin preserves the cheap delta-review base."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_db_project(db_session)
+    source = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "review", "pr_number": 705, "branch": "feat/x"}],
+        context={
+            "scope": "small",
+            "review_loop": {
+                "iteration": 1,
+                "pr_number": 705,
+                "branch": "feat/x",
+                "base_branch": "main",
+                **source_loop,
+            },
+        },
+    )
+    await _persist(db_session, source)
+
+    fix_task, created = await _spawn_pipeline_task(
+        source,
+        "fix",
+        db_session,
+        705,
+        "feat/x",
+        "main",
+        original_task_id=str(source.id),
+        fix_reason=fix_reason,
+        fix_prompt="Repair the failed gate without changing unrelated behavior.",
+    )
+
+    assert created is True and fix_task is not None, origin
+    fix_loop = (fix_task.context or {}).get("review_loop", {})
+    assert fix_loop.get("reviewed_head_sha") == expected_head, origin
 
 
 @pytest.mark.asyncio
@@ -192,7 +259,6 @@ async def test_completed_exact_target_replays_structured_verdict(db_session, moc
             "issues": [{"severity": "major", "description": "broken"}],
             "reviewed_base_sha": "base-703",
             "reviewed_head_sha": "head-703",
-            "requires_rereview": True,
         }
     )
     completed_review = make_task(
@@ -1357,8 +1423,6 @@ async def test_review_spawns_when_all_prior_fixes_terminal(db_session, mocker):
         ],
         context={
             "scope": "small",
-            # iteration>1 so the first-review cross-cutting safeguard gate
-            # (iteration==1) is skipped — it needs github mocks we don't set up.
             "review_loop": {"iteration": 3, "original_task_id": str(original_task.id)},
         },
     )
@@ -1991,6 +2055,8 @@ async def test_approved_cap_exhaustion_records_distinct_outcome(db_session, mock
     from app.review_pipeline import _handle_cap_exhaustion
 
     project = await _make_db_project(db_session)
+    approved_head = "approved-cap-head"
+    approved_base = "approved-cap-base"
     orig = make_task(
         project_id=project.id,
         status=TaskStatus.EVALUATING,
@@ -1998,7 +2064,25 @@ async def test_approved_cap_exhaustion_records_distinct_outcome(db_session, mock
         context={
             "scope": "small",
             "direction_id": "dir-approved-cap",
-            "review_loop": {"review_approved": True, "pr_number": 404},
+            "review_loop": {
+                "review_approved": True,
+                "pr_number": 404,
+                "review_target": {
+                    "project_id": str(project.id),
+                    "pr_number": 404,
+                    "base_sha": approved_base,
+                    "head_sha": approved_head,
+                },
+                "review_history": [
+                    {
+                        "iteration": 1,
+                        "verdict": "APPROVE",
+                        "reviewed_head_sha": approved_head,
+                        "reviewed_base_sha": approved_base,
+                        "issues": [],
+                    }
+                ],
+            },
         },
     )
     db_session.add(orig)
@@ -2076,6 +2160,8 @@ async def test_approved_rollup_cap_preserved_not_closed(db_session, mocker):
     from app.review_pipeline import _handle_cap_exhaustion
 
     project = await _make_db_project(db_session)
+    approved_head = "approved-rollup-head"
+    approved_base = "approved-rollup-base"
     orig = make_task(
         project_id=project.id,
         status=TaskStatus.EVALUATING,
@@ -2085,7 +2171,25 @@ async def test_approved_rollup_cap_preserved_not_closed(db_session, mocker):
             "direction_id": "dir-approved-rollup-cap",
             "_is_rollup_review": True,
             "rollup_pr_number": 407,
-            "review_loop": {"review_approved": True, "pr_number": 407},
+            "review_loop": {
+                "review_approved": True,
+                "pr_number": 407,
+                "review_target": {
+                    "project_id": str(project.id),
+                    "pr_number": 407,
+                    "base_sha": approved_base,
+                    "head_sha": approved_head,
+                },
+                "review_history": [
+                    {
+                        "iteration": 1,
+                        "verdict": "APPROVE",
+                        "reviewed_head_sha": approved_head,
+                        "reviewed_base_sha": approved_base,
+                        "issues": [],
+                    }
+                ],
+            },
         },
     )
     db_session.add(orig)
@@ -3050,9 +3154,8 @@ async def test_review_history_feedback_is_bounded(db_session, mocker):
         context={
             "scope": "medium",
             "review_loop": {
-                # iteration>=2 so the iteration==1 cross-cutting safeguard is
-                # skipped; distinct prior/current issues so stuck-cycle does NOT
-                # fire (it would block the spawn and return None).
+                # Distinct prior/current issues so stuck-cycle does NOT fire
+                # (it would block the spawn and return None).
                 "iteration": 2,
                 "original_task_id": str(original_task.id),
                 "pr_number": 9501,
@@ -3101,10 +3204,18 @@ async def test_review_history_feedback_is_bounded(db_session, mocker):
     assert history[-1]["feedback"].endswith(_TRUNCATION_MARKER)
     assert history[0]["feedback"].endswith(_TRUNCATION_MARKER)
 
-    # Structured data every other consumer reads is preserved verbatim.
-    assert history[-1]["issues"] == current_issues
+    # Structured data every other consumer reads is preserved; the ledger
+    # chokepoint may add the stable issue_id used to carry blockers forward.
+    assert [
+        {key: value for key, value in issue.items() if key != "issue_id"}
+        for issue in history[-1]["issues"]
+    ] == current_issues
+    assert all(issue.get("issue_id") for issue in history[-1]["issues"])
     assert history[-1]["verdict"] == "REQUEST_CHANGES"
-    assert history[0]["issues"] == [_issue("alpha bravo charlie", "CRITICAL")]
+    assert [
+        {key: value for key, value in issue.items() if key != "issue_id"}
+        for issue in history[0]["issues"]
+    ] == [_issue("alpha bravo charlie", "CRITICAL")]
     assert history[0]["changed_files"] == ["a.py"]
 
     # The whole persisted context is now kilobytes, not the ~4 MB of raw feedback
@@ -4944,70 +5055,6 @@ async def test_strategic_context_propagates_to_spawned_fix(db_session, mocker):
     # review_loop is overridden with the pipeline's own iteration state, not carried verbatim.
     assert ctx.get("review_loop", {}).get("iteration") == 1
     assert ctx.get("review_loop", {}).get("pr_number") == 501
-
-
-@pytest.mark.asyncio
-async def test_second_opinion_state_not_propagated_to_spawned_tasks(db_session, mocker):
-    """The second-opinion key family is task-local review state and must NOT
-    ride the review→fix→review context copy. Regression (PR #9243): an
-    inherited reconciliation record fired the single-shot re-entry override on
-    the next review task, clobbering its fresh APPROVE with iteration-1's
-    REQUEST_CHANGES + verbatim issues — which then tripped the stuck-cycle
-    detector and falsely parked the chain."""
-    from app.task_completion import REVIEW_SECOND_OPINION_TASK_LOCAL_KEYS
-
-    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
-
-    project = await _make_db_project(db_session)
-    second_opinion_ctx = {
-        "review_second_opinion": {
-            "state": "unchallenged",
-            "primary_verdict": "REQUEST_CHANGES",
-            "reconciled_verdict": "REQUEST_CHANGES",
-            "surviving_issues": [{"description": "iteration-1 issue"}],
-            "review_task_id": str(uuid.uuid4()),
-        },
-    }
-    # The literal keys above must stay in lockstep with the canonical family —
-    # if a key is renamed or added, this test must be updated alongside it.
-    assert set(second_opinion_ctx) == set(REVIEW_SECOND_OPINION_TASK_LOCAL_KEYS)
-
-    source_task = make_task(
-        project_id=project.id,
-        status=TaskStatus.IN_PROGRESS,
-        payloads=[
-            {
-                "type": "review",
-                "pr_number": 502,
-                "branch": "feat/so",
-                "base_branch": "main",
-                "prompt": "Review X",
-            }
-        ],
-        context={"direction_id": str(uuid.uuid4()), **second_opinion_ctx},
-    )
-    db_session.add(source_task)
-    await db_session.commit()
-    await db_session.refresh(source_task)
-
-    result, created = await _spawn_pipeline_task(
-        source_task,
-        "fix",
-        db_session,
-        pr_number=502,
-        branch="feat/so",
-        base_branch="main",
-        fix_prompt="Address the review feedback",
-    )
-
-    assert created is True and result is not None
-    ctx = result.context or {}
-    for key in REVIEW_SECOND_OPINION_TASK_LOCAL_KEYS:
-        assert key not in ctx, (
-            f"task-local second-opinion key {key!r} must not propagate to "
-            f"spawned pipeline tasks"
-        )
-    assert ctx.get("direction_id"), "strategic context must still propagate"
 
 
 @pytest.mark.asyncio
@@ -9298,524 +9345,6 @@ class TestPostMergeSummaryComment:
         await post_merge_summary_comment(orig, ci, "tok", "owner", "repo", 42)
 
 
-# ── _is_cross_cutting_pr ──────────────────────────────────────────────────────
-
-
-class TestIsCrossCuttingPr:
-    """Pure unit tests — no DB required."""
-
-    def _task(
-        self, scope="small", changed_files=None, overflow_warned=False, diff_lines=None
-    ):
-        review_loop: dict = {}
-        if overflow_warned:
-            review_loop["scope_overflow_warned"] = True
-        ctx: dict = {"scope": scope}
-        if changed_files is not None:
-            ctx["_pr_changed_files"] = changed_files
-        if review_loop:
-            ctx["review_loop"] = review_loop
-        if diff_lines is not None:
-            ctx["_pr_diff_summary"] = [{"added": diff_lines, "removed": 0}]
-        return make_task(context=ctx)
-
-    def test_gate_disabled_returns_false(self):
-        import app.shared_state as ss
-
-        original = ss.runtime_config.get("cross_cutting_gate_enabled")
-        try:
-            ss.runtime_config["cross_cutting_gate_enabled"] = False
-            t = self._task(scope="large")
-            ok, reason = _is_cross_cutting_pr(t)
-            assert ok is False
-            assert "disabled" in reason
-        finally:
-            ss.runtime_config["cross_cutting_gate_enabled"] = (
-                original if original is not None else True
-            )
-
-    def test_large_scope_always_triggers(self):
-        t = self._task(scope="large")
-        ok, reason = _is_cross_cutting_pr(t)
-        assert ok is True
-        assert "large" in reason
-
-    def test_medium_scope_all_three_modules_triggers(self):
-        files = ["backend/app/foo.py", "agent/src/bar.ts", "admin-ui/src/baz.tsx"]
-        t = self._task(scope="medium", changed_files=files)
-        ok, reason = _is_cross_cutting_pr(t)
-        assert ok is True
-        assert "medium" in reason
-
-    def test_medium_scope_two_modules_no_trigger(self):
-        files = ["backend/app/foo.py", "agent/src/bar.ts"]
-        t = self._task(scope="medium", changed_files=files)
-        ok, _ = _is_cross_cutting_pr(t)
-        assert ok is False
-
-    def test_medium_scope_no_files_no_trigger(self):
-        t = self._task(scope="medium", changed_files=[])
-        ok, _ = _is_cross_cutting_pr(t)
-        assert ok is False
-
-    def test_overflow_warned_large_diff_triggers(self):
-        t = self._task(scope="small", overflow_warned=True, diff_lines=200)
-        ok, reason = _is_cross_cutting_pr(t)
-        assert ok is True
-        assert "overflow" in reason
-
-    def test_overflow_warned_small_diff_no_trigger(self):
-        t = self._task(scope="small", overflow_warned=True, diff_lines=50)
-        ok, _ = _is_cross_cutting_pr(t)
-        assert ok is False
-
-    def test_overflow_not_warned_even_with_large_diff_no_trigger(self):
-        t = self._task(scope="small", overflow_warned=False, diff_lines=500)
-        ok, _ = _is_cross_cutting_pr(t)
-        assert ok is False
-
-    def test_small_scope_no_overflow_no_trigger(self):
-        t = self._task(scope="small")
-        ok, _ = _is_cross_cutting_pr(t)
-        assert ok is False
-
-
-# ── maybe_spawn_cross_cutting_safeguard ───────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_maybe_spawn_cross_cutting_safeguard_not_cross_cutting(
-    db_session, mocker
-):
-    """Non-cross-cutting PRs return False without spawning anything."""
-    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
-    project = make_project()
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    orig = make_task(
-        project_id=project.id,
-        context={"scope": "small"},
-        payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
-    )
-    db_session.add(orig)
-    await db_session.commit()
-    await db_session.refresh(orig)
-
-    result = await maybe_spawn_cross_cutting_safeguard(
-        orig, 99, "feat/x", "main", db_session
-    )
-    assert result is False
-    assert orig.requires_approval is False
-    assert (orig.context or {}).get("safeguard_task_id") is None
-
-
-@pytest.mark.asyncio
-async def test_maybe_spawn_cross_cutting_safeguard_spawns_for_large_scope(
-    db_session, mocker
-):
-    """Large-scope PRs trigger a safeguard task and sets requires_approval."""
-    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
-    project = make_project()
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    orig = make_task(
-        project_id=project.id,
-        context={"scope": "large"},
-        payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
-    )
-    db_session.add(orig)
-    await db_session.commit()
-    await db_session.refresh(orig)
-
-    result = await maybe_spawn_cross_cutting_safeguard(
-        orig, 42, "feat/x", "main", db_session
-    )
-    assert result is True
-    assert orig.requires_approval is True
-    assert (orig.context or {}).get("safeguard_task_id") is not None
-    assert (orig.context or {}).get("safeguard_reason") == "scope=large"
-
-    # Safeguard task must exist in DB
-    safeguard_id = uuid.UUID((orig.context or {})["safeguard_task_id"])
-    safeguard = await db_session.get(Task, safeguard_id)
-    assert safeguard is not None
-    assert safeguard.parent_task_id == orig.id
-
-
-@pytest.mark.asyncio
-async def test_maybe_spawn_cross_cutting_safeguard_idempotent(db_session, mocker):
-    """If safeguard_task_id already set, second call is a no-op."""
-    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
-    project = make_project()
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    existing_id = str(uuid.uuid4())
-    orig = make_task(
-        project_id=project.id,
-        context={"scope": "large", "safeguard_task_id": existing_id},
-        payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
-    )
-    db_session.add(orig)
-    await db_session.commit()
-    await db_session.refresh(orig)
-
-    result = await maybe_spawn_cross_cutting_safeguard(
-        orig, 42, "feat/x", "main", db_session
-    )
-    assert result is False
-    # safeguard_task_id unchanged
-    assert (orig.context or {}).get("safeguard_task_id") == existing_id
-
-
-# ── _maybe_release_safeguard_gate ─────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_release_safeguard_gate_noop_for_non_safeguard(db_session):
-    """Task with no safeguard_for_task_id is a no-op."""
-    from app.task_completion import _maybe_release_safeguard_gate
-
-    t = make_task(context={})
-    # Should not raise and should not touch DB
-    await _maybe_release_safeguard_gate(t, [], db_session)
-
-
-@pytest.mark.asyncio
-async def test_release_safeguard_gate_maintains_on_critical_finding(db_session):
-    """Gate stays on (requires_approval=True) when a critical finding is present."""
-    from app.task_completion import _maybe_release_safeguard_gate
-
-    project = make_project()
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    orig = make_task(project_id=project.id, requires_approval=True)
-    db_session.add(orig)
-    await db_session.commit()
-    await db_session.refresh(orig)
-
-    safeguard = make_task(
-        project_id=project.id,
-        context={"safeguard_for_task_id": str(orig.id), "safeguard_pr_number": 7},
-    )
-    findings = [{"severity": "critical", "description": "SQL injection"}]
-    await _maybe_release_safeguard_gate(safeguard, findings, db_session)
-
-    await db_session.refresh(orig)
-    assert orig.requires_approval is True
-
-
-@pytest.mark.asyncio
-async def test_release_safeguard_gate_releases_on_low_findings(db_session):
-    """Gate is released (requires_approval=False) when findings are low severity."""
-    from app.task_completion import _maybe_release_safeguard_gate
-
-    project = make_project()
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    orig = make_task(project_id=project.id, requires_approval=True)
-    db_session.add(orig)
-    await db_session.commit()
-    await db_session.refresh(orig)
-
-    safeguard = make_task(
-        project_id=project.id,
-        context={"safeguard_for_task_id": str(orig.id), "safeguard_pr_number": 7},
-    )
-    findings = [{"severity": "low", "description": "Unused import"}]
-    await _maybe_release_safeguard_gate(safeguard, findings, db_session)
-
-    await db_session.refresh(orig)
-    assert orig.requires_approval is False
-
-
-@pytest.mark.asyncio
-async def test_release_safeguard_gate_sets_ci_waiting_when_evaluating(db_session):
-    """When orig is EVALUATING, gate release sets ci_waiting=True."""
-    from app.task_completion import _maybe_release_safeguard_gate
-
-    project = make_project()
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    orig = make_task(
-        project_id=project.id,
-        requires_approval=True,
-        status=TaskStatus.EVALUATING,
-        context={"review_loop": {"iteration": 1}},
-    )
-    db_session.add(orig)
-    await db_session.commit()
-    await db_session.refresh(orig)
-
-    safeguard = make_task(
-        project_id=project.id,
-        context={"safeguard_for_task_id": str(orig.id), "safeguard_pr_number": 7},
-    )
-    await _maybe_release_safeguard_gate(safeguard, [], db_session)
-
-    await db_session.refresh(orig)
-    assert orig.requires_approval is False
-    assert (orig.context or {}).get("review_loop", {}).get("ci_waiting") is True
-    assert (orig.context or {}).get("review_loop", {}).get("pr_number") == 7
-
-
-_SG_DUAL_HEAD_DIFF = (
-    "diff --git a/backend/alembic/versions/0002_dup.py "
-    "b/backend/alembic/versions/0002_dup.py\n"
-    "new file mode 100644\n"
-    "--- /dev/null\n"
-    "+++ b/backend/alembic/versions/0002_dup.py\n"
-    '+"""dup migration"""\n'
-    '+revision = "0002"\n'
-    '+down_revision = "0001"\n'
-)
-
-
-@pytest.mark.asyncio
-async def test_release_safeguard_gate_post_gate_merge_held_on_dual_head(
-    db_session, mocker
-):
-    """A gated post-gate merge (orig already COMPLETED) HOLDS on a dual head.
-
-    Exercises the _sg_gated=True branch of _maybe_release_safeguard_gate: the
-    held PR targets the project integration branch and adds a migration whose
-    revision id collides with one already on that branch, so the pre-merge
-    Alembic dual-head guard must block — merge_pull_request is never called and
-    the PR is left open for the guarded retry/resolver flow.
-    """
-    from app.task_completion import _maybe_release_safeguard_gate
-
-    project = make_project(integration_branch="automain")
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    # orig already terminalized (COMPLETED) with an open held PR — the path that
-    # fires the merge directly from the gate-release rather than via CI polling.
-    orig = make_task(
-        project_id=project.id,
-        requires_approval=True,
-        status=TaskStatus.COMPLETED,
-    )
-    db_session.add(orig)
-    await db_session.commit()
-    await db_session.refresh(orig)
-
-    safeguard = make_task(
-        project_id=project.id,
-        context={"safeguard_for_task_id": str(orig.id), "safeguard_pr_number": 42},
-    )
-
-    mocker.patch(
-        "app.task_completion.get_github_token_for_task",
-        new_callable=AsyncMock,
-        return_value=("tok", "owner", "repo"),
-    )
-    # PR is open, unmerged, and targets the integration branch -> _sg_gated=True.
-    mocker.patch(
-        "app.github.get_pull_request",
-        new_callable=AsyncMock,
-        return_value={
-            "state": "open",
-            "merged": False,
-            "base": {"ref": "automain"},
-        },
-    )
-    # Make the real dual-head guard see a same-revision collision on the target.
-    mocker.patch(
-        "app.github.get_pr_files",
-        new_callable=AsyncMock,
-        return_value=[{"filename": "backend/alembic/versions/0002_dup.py"}],
-    )
-    mocker.patch(
-        "app.github.get_pull_request_diff",
-        new_callable=AsyncMock,
-        return_value=_SG_DUAL_HEAD_DIFF,
-    )
-    mocker.patch(
-        "app.github.list_versions_at_ref",
-        new_callable=AsyncMock,
-        return_value=["0001_init.py", "0002_existing.py"],
-    )
-    merge_mock = mocker.patch(
-        "app.github.merge_pull_request",
-        new_callable=AsyncMock,
-        return_value={"merged": True},
-    )
-
-    await _maybe_release_safeguard_gate(safeguard, [], db_session)
-
-    # Gate still released, but the held merge was NOT fired — left open for the
-    # guarded retry/resolver flow.
-    merge_mock.assert_not_called()
-    await db_session.refresh(orig)
-    assert orig.requires_approval is False
-    # Idempotency flag was set with the gate-clear commit so the merge is never
-    # re-attempted from here even though it was held.
-    assert (orig.context or {}).get("_safeguard_merge_fired") is True
-
-
-# ── Cross-cutting gate: integration (spawn + merge-gate) ──────────────────────
-
-
-@pytest.mark.asyncio
-async def test_safeguard_spawned_and_merge_gate_set_for_large_scope_pr(
-    db_session, mocker
-):
-    """When a review is triggered for a large-scope PR, the pipeline must spawn a
-    safeguard (security_audit or qa) task AND set requires_approval=True on the
-    original task so it cannot be merged until the safeguard approves.
-
-    The agent spawn is mocked via maybe_spawn_cross_cutting_safeguard; the test
-    verifies both that the spawn was attempted and that the merge gate is armed."""
-    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch(
-        "app.routers.agent.get_github_token_for_task",
-        new_callable=AsyncMock,
-        return_value=("tok", "o", "r"),
-    )
-    mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
-    mocker.patch("app.github.add_issue_label", new_callable=AsyncMock)
-
-    safeguard_mock = mocker.patch(
-        "app.review_pipeline.maybe_spawn_cross_cutting_safeguard",
-        new_callable=AsyncMock,
-        wraps=maybe_spawn_cross_cutting_safeguard,
-    )
-
-    project = await _make_db_project(db_session)
-    original_task = make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[
-            {"type": "create", "prompt": "Ship big feature", "base_branch": "main"}
-        ],
-        context={
-            "scope": "large",
-            "_pr_changed_files": [
-                "backend/app/a.py",
-                "agent/src/index.ts",
-                "admin-ui/src/App.tsx",
-            ],
-        },
-    )
-    db_session.add(original_task)
-    await db_session.commit()
-    await db_session.refresh(original_task)
-
-    source_task = make_task(
-        project_id=project.id,
-        status=TaskStatus.IN_PROGRESS,
-        payloads=[
-            {
-                "type": "review",
-                "pr_number": 700,
-                "branch": "feat/big",
-                "base_branch": "main",
-                "original_task_id": str(original_task.id),
-            }
-        ],
-        context={
-            "scope": "large",
-            "review_loop": {"iteration": 0, "original_task_id": str(original_task.id)},
-        },
-    )
-    db_session.add(source_task)
-    await db_session.commit()
-    await db_session.refresh(source_task)
-
-    await _spawn_pipeline_task(
-        source_task,
-        "review",
-        db_session,
-        pr_number=700,
-        branch="feat/big",
-        base_branch="main",
-        original_task_id=str(original_task.id),
-    )
-
-    (
-        safeguard_mock.assert_awaited_once(),
-        ("A cross-cutting safeguard task must be spawned for large-scope PRs"),
-    )
-    await db_session.refresh(original_task)
-    assert original_task.requires_approval is True, (
-        "Original task must be merge-gated (requires_approval=True) until the safeguard approves"
-    )
-
-
-@pytest.mark.asyncio
-async def test_safeguard_not_spawned_for_small_scope_pr(db_session, mocker):
-    """Small-scope PRs must never trigger the cross-cutting safeguard gate,
-    even when they happen to touch multiple top-level modules."""
-    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
-
-    project = await _make_db_project(db_session)
-    original_task = make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "create", "prompt": "Small fix", "base_branch": "main"}],
-        context={
-            "scope": "small",
-            "_pr_changed_files": [
-                "backend/app/foo.py",
-                "agent/src/index.ts",
-                "admin-ui/src/App.tsx",
-            ],
-        },
-    )
-    db_session.add(original_task)
-    await db_session.commit()
-    await db_session.refresh(original_task)
-
-    source_task = make_task(
-        project_id=project.id,
-        status=TaskStatus.IN_PROGRESS,
-        payloads=[
-            {
-                "type": "review",
-                "pr_number": 701,
-                "branch": "feat/small",
-                "base_branch": "main",
-                "original_task_id": str(original_task.id),
-            }
-        ],
-        context={
-            "scope": "small",
-            "review_loop": {"iteration": 0, "original_task_id": str(original_task.id)},
-        },
-    )
-    db_session.add(source_task)
-    await db_session.commit()
-    await db_session.refresh(source_task)
-
-    await _spawn_pipeline_task(
-        source_task,
-        "review",
-        db_session,
-        pr_number=701,
-        branch="feat/small",
-        base_branch="main",
-        original_task_id=str(original_task.id),
-    )
-
-    await db_session.refresh(original_task)
-    assert original_task.requires_approval is not True, (
-        "Small-scope PRs must never be merge-gated by the cross-cutting safeguard"
-    )
-
-
 # ── compute_drift_signal ──────────────────────────────────────────────────────
 
 
@@ -11090,33 +10619,28 @@ _C4_USE_POSTGRES = os.getenv("USE_TEST_POSTGRES", "").lower() == "true" and os.g
 ).startswith("postgresql")
 
 
-def _mock_merge_success_deps(mocker):
+def _mock_merge_success_deps(mocker, *, head_ref: str, base_ref: str):
     """Mock GH deps so _process_post_commit's review/APPROVE path reaches the
-    merge-success block and merges. base_branch is a NON-integration branch so
-    the CI gate is skipped (is_ci_gated_merge=False → ci_status=None)."""
-    # All callers here drive an APPROVE verdict straight to the synchronous
-    # merge-success path. An APPROVE is always high-stakes, so the default-on
-    # second-opinion gate would park the review EVALUATING + spawn a panel
-    # challenger before any merge bookkeeping ran — defeating these tests'
-    # purpose. Disable the gate so the merge-success path under test runs
-    # directly (the gate itself is covered in
-    # test_task_lifecycle.py::test_second_opinion_*).
-    mocker.patch.dict(
-        "app.task_lifecycle._runtime_config",
-        {"review_second_opinion_gate_enabled": False},
-    )
+    merge-success block and merges for either an integration or staged base.
+    Callers choose ``base_ref``; the exact PR and check mocks keep both routes
+    deterministic."""
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new=AsyncMock(return_value=("tok", "owner", "repo")),
     )
-    # PR open + not merged, with a head sha (the merge-success path reads it).
+    # Full immutable PR identity lets the backend bind the reviewer verdict to
+    # the exact live target before exercising merge-success bookkeeping.
     mocker.patch(
         "app.github.get_pull_request",
         new=AsyncMock(
             return_value={
                 "state": "open",
                 "merged": False,
-                "head": {"sha": "deadbeef"},
+                "draft": False,
+                "mergeable": True,
+                "mergeable_state": "clean",
+                "head": {"ref": head_ref, "sha": "deadbeef"},
+                "base": {"ref": base_ref, "sha": "basebeef"},
             }
         ),
     )
@@ -11166,7 +10690,21 @@ def _mock_small_auto_merge_deps(mocker):
     )
     mocker.patch("app.github.get_pr_files", new=AsyncMock(return_value=[]))
     mocker.patch(
-        "app.task_lifecycle._merge_with_retry",
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "draft": False,
+                "mergeable": True,
+                "mergeable_state": "clean",
+                "head": {"ref": "feature-small", "sha": "head5150"},
+                "base": {"ref": "main", "sha": "base5150"},
+            }
+        ),
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
         new=AsyncMock(return_value={"merged": True, "message": "ok"}),
     )
     mocker.patch("app.github.create_pr_comment", new=AsyncMock(return_value=None))
@@ -11197,7 +10735,11 @@ async def test_merge_success_caller_blocks_then_runs_one_shots(db_session, mocke
     from app.task_lifecycle import _process_post_commit
     from app.schemas import AgentStatusPayload
 
-    _mock_merge_success_deps(mocker)
+    _mock_merge_success_deps(
+        mocker,
+        head_ref="research/c4-stg",
+        base_ref="research/c4-base",
+    )
 
     project = await _make_db_project(db_session)
 
@@ -11234,6 +10776,12 @@ async def test_merge_success_caller_blocks_then_runs_one_shots(db_session, mocke
                 "iteration": 1,
                 "review_approved": True,
                 "ci_passed": True,
+                "review_target": {
+                    "project_id": str(project.id),
+                    "pr_number": 4242,
+                    "base_sha": "basebeef",
+                    "head_sha": "deadbeef",
+                },
             }
         },
         latest_status_message="APPROVE",
@@ -11245,6 +10793,15 @@ async def test_merge_success_caller_blocks_then_runs_one_shots(db_session, mocke
         task_id=review_task.id,
         status=TaskStatus.COMPLETED,
         logs="APPROVE",
+        verdict_json=json.dumps(
+            {
+                "verdict": "APPROVE",
+                "feedback": "ok",
+                "issues": [],
+                "reviewed_head_sha": "deadbeef",
+                "reviewed_base_sha": "basebeef",
+            }
+        ),
     )
 
     _factory = async_sessionmaker(db_session.bind, class_=_AS, expire_on_commit=False)
@@ -11311,7 +10868,11 @@ async def test_merge_success_caller_runs_one_shots_when_uncontended(db_session, 
     from app.task_lifecycle import _process_post_commit
     from app.schemas import AgentStatusPayload
 
-    _mock_merge_success_deps(mocker)
+    _mock_merge_success_deps(
+        mocker,
+        head_ref="research/c4-stg2",
+        base_ref="research/c4-base2",
+    )
 
     project = await _make_db_project(db_session)
     parent = make_task(
@@ -11343,6 +10904,12 @@ async def test_merge_success_caller_runs_one_shots_when_uncontended(db_session, 
                 "iteration": 1,
                 "review_approved": True,
                 "ci_passed": True,
+                "review_target": {
+                    "project_id": str(project.id),
+                    "pr_number": 4343,
+                    "base_sha": "basebeef",
+                    "head_sha": "deadbeef",
+                },
             }
         },
         latest_status_message="APPROVE",
@@ -11354,6 +10921,15 @@ async def test_merge_success_caller_runs_one_shots_when_uncontended(db_session, 
         task_id=review_task.id,
         status=TaskStatus.COMPLETED,
         logs="APPROVE",
+        verdict_json=json.dumps(
+            {
+                "verdict": "APPROVE",
+                "feedback": "ok",
+                "issues": [],
+                "reviewed_head_sha": "deadbeef",
+                "reviewed_base_sha": "basebeef",
+            }
+        ),
     )
 
     _factory = async_sessionmaker(db_session.bind, class_=_AS, expire_on_commit=False)
@@ -11384,7 +10960,11 @@ async def test_approve_verdict_retires_improvement_lane(db_session, mocker):
     from app.models import ImprovementLane, ImprovementLaneStatus
     from app.review_fix_lane_pilot import LANE_CHAIN_ID_KEY
 
-    _mock_merge_success_deps(mocker)
+    _mock_merge_success_deps(
+        mocker,
+        head_ref="lane/approve-retire",
+        base_ref="main",
+    )
 
     project = await _make_db_project(db_session)
 
@@ -11429,6 +11009,12 @@ async def test_approve_verdict_retires_improvement_lane(db_session, mocker):
                 "iteration": 1,
                 "review_approved": True,
                 "ci_passed": True,
+                "review_target": {
+                    "project_id": str(project.id),
+                    "pr_number": 7777,
+                    "base_sha": "basebeef",
+                    "head_sha": "deadbeef",
+                },
             },
         },
         latest_status_message="APPROVE",
@@ -11440,6 +11026,15 @@ async def test_approve_verdict_retires_improvement_lane(db_session, mocker):
         task_id=review_task.id,
         status=TaskStatus.COMPLETED,
         logs="APPROVE",
+        verdict_json=json.dumps(
+            {
+                "verdict": "APPROVE",
+                "feedback": "ok",
+                "issues": [],
+                "reviewed_head_sha": "deadbeef",
+                "reviewed_base_sha": "basebeef",
+            }
+        ),
     )
 
     _factory = async_sessionmaker(db_session.bind, class_=_AS, expire_on_commit=False)
@@ -11579,7 +11174,11 @@ async def test_review_merge_to_distinct_promotion_target_alerts_without_pr_merge
     from app.task_lifecycle import _process_post_commit
     from app.schemas import AgentStatusPayload
 
-    _mock_merge_success_deps(mocker)
+    _mock_merge_success_deps(
+        mocker,
+        head_ref="research/promo-stg",
+        base_ref="main",
+    )
     dispatch_mock = mocker.patch(
         "app.notification_dispatch.dispatch_external_notification",
         new_callable=AsyncMock,
@@ -11618,6 +11217,12 @@ async def test_review_merge_to_distinct_promotion_target_alerts_without_pr_merge
                 "iteration": 1,
                 "review_approved": True,
                 "ci_passed": True,
+                "review_target": {
+                    "project_id": str(project.id),
+                    "pr_number": 6262,
+                    "base_sha": "basebeef",
+                    "head_sha": "deadbeef",
+                },
             }
         },
         latest_status_message="APPROVE",
@@ -11629,6 +11234,15 @@ async def test_review_merge_to_distinct_promotion_target_alerts_without_pr_merge
         task_id=review_task.id,
         status=TaskStatus.COMPLETED,
         logs="APPROVE",
+        verdict_json=json.dumps(
+            {
+                "verdict": "APPROVE",
+                "feedback": "ok",
+                "issues": [],
+                "reviewed_head_sha": "deadbeef",
+                "reviewed_base_sha": "basebeef",
+            }
+        ),
     )
 
     _factory = async_sessionmaker(db_session.bind, class_=_AS, expire_on_commit=False)
@@ -11797,7 +11411,11 @@ async def test_review_merge_on_single_branch_sets_pr_merged(db_session, mocker):
     from app.task_lifecycle import _process_post_commit
     from app.schemas import AgentStatusPayload
 
-    _mock_merge_success_deps(mocker)
+    _mock_merge_success_deps(
+        mocker,
+        head_ref="research/promo-stg",
+        base_ref="main",
+    )
     dispatch_mock = mocker.patch(
         "app.notification_dispatch.dispatch_external_notification",
         new_callable=AsyncMock,
@@ -11836,6 +11454,12 @@ async def test_review_merge_on_single_branch_sets_pr_merged(db_session, mocker):
                 "iteration": 1,
                 "review_approved": True,
                 "ci_passed": True,
+                "review_target": {
+                    "project_id": str(project.id),
+                    "pr_number": 6263,
+                    "base_sha": "basebeef",
+                    "head_sha": "deadbeef",
+                },
             }
         },
         latest_status_message="APPROVE",
@@ -11847,6 +11471,15 @@ async def test_review_merge_on_single_branch_sets_pr_merged(db_session, mocker):
         task_id=review_task.id,
         status=TaskStatus.COMPLETED,
         logs="APPROVE",
+        verdict_json=json.dumps(
+            {
+                "verdict": "APPROVE",
+                "feedback": "ok",
+                "issues": [],
+                "reviewed_head_sha": "deadbeef",
+                "reviewed_base_sha": "basebeef",
+            }
+        ),
     )
 
     _factory = async_sessionmaker(db_session.bind, class_=_AS, expire_on_commit=False)
@@ -14502,28 +14135,28 @@ async def test_terminal_outcome_detail_includes_lane_breakdown(db_session, mocke
     assert lane_counts_stored.get("ci") == 4 or "ci=4" in detail
 
 
-# ── Issue ledger: contested-region injection ──────────────────────────────────
+# ── Authoritative issue-ledger persistence ────────────────────────────────────
 
 
-def _contest_issue(
+def _ledger_issue(
+    issue_id: str,
     description: str,
+    *,
+    severity: str = "MAJOR",
     file: str = "backend/app/task_evaluators.py",
-    line: int = 42,
-    severity: str = "CRITICAL",
 ) -> dict:
     return {
+        "issue_id": issue_id,
         "description": description,
         "severity": severity,
         "file": file,
-        "line": line,
+        "line": 42,
     }
 
 
 @pytest.mark.asyncio
-async def test_contested_region_injects_fix_prompt_prefix(db_session, mocker):
-    """When review_history contains a contested region (demanded → applied → differently
-    demanded), _spawn_pipeline_task must prepend the CONTESTED-REGIONS prefix to the
-    fix task's prompt."""
+async def test_authoritative_ledger_serialized_into_review_loop(db_session, mocker):
+    """Every binding blocker is persisted; reviewer omission cannot hide an older one."""
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch(
         "app.notification_dispatch.dispatch_external_notification",
@@ -14540,202 +14173,7 @@ async def test_contested_region_injects_fix_prompt_prefix(db_session, mocker):
     await db_session.commit()
     await db_session.refresh(original_task)
 
-    # iter 0: region A demanded with description D1
-    # iter 1: region A absent → APPLIED
-    # iter 2: region A reappears with very different description D2 → CONTESTED
-    contested_history = [
-        {
-            "iteration": 0,
-            "verdict": "REQUEST_CHANGES",
-            "issues": [_contest_issue("replace old constants with new enum")],
-        },
-        {
-            "iteration": 1,
-            "verdict": "REQUEST_CHANGES",
-            "issues": [_issue("unrelated issue on different file")],
-        },
-        {
-            "iteration": 2,
-            "verdict": "REQUEST_CHANGES",
-            "issues": [_contest_issue("revert to original frozenset constants")],
-        },
-    ]
-    source_task = make_task(
-        project_id=project.id,
-        status=TaskStatus.IN_PROGRESS,
-        payloads=[
-            {
-                "type": "review",
-                "pr_number": 9400,
-                "branch": "contested1",
-                "base_branch": "main",
-                "original_task_id": str(original_task.id),
-            }
-        ],
-        context={
-            "scope": "medium",
-            "review_loop": {
-                "iteration": 2,
-                "original_task_id": str(original_task.id),
-                "pr_number": 9400,
-                "branch": "contested1",
-                "base_branch": "main",
-                "review_history": contested_history,
-            },
-        },
-    )
-    db_session.add(source_task)
-    await db_session.commit()
-    await db_session.refresh(source_task)
-
-    # current_issues uses a different description to avoid triggering the
-    # stuck-cycle detector (which compares last 2 history entries).
-    result, created = await _spawn_pipeline_task(
-        source_task,
-        "fix",
-        db_session,
-        pr_number=9400,
-        branch="contested1",
-        base_branch="main",
-        original_task_id=str(original_task.id),
-        fix_prompt="Fix these issues.",
-        current_feedback="revert to original frozenset constants",
-        current_issues=[_issue("add missing type annotation")],
-    )
-
-    assert result is not None and created is True
-    prompt = (result.payloads[0] if result.payloads else {}).get("prompt") or ""
-    assert "CONTESTED" in prompt
-    # Contested prefix should be first (topmost)
-    assert prompt.index("CONTESTED") < prompt.index("Fix these issues.")
-
-
-@pytest.mark.asyncio
-async def test_contested_region_appends_review_prompt_guidance(db_session, mocker):
-    """When contested regions exist, the review task's original_prompt gets the
-    CONTESTED-REGIONS appendix directing the reviewer to reconcile prior demands."""
-    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch(
-        "app.notification_dispatch.dispatch_external_notification",
-        new_callable=AsyncMock,
-    )
-
-    project = await _make_db_project(db_session)
-    original_task = make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
-    )
-    db_session.add(original_task)
-    await db_session.commit()
-    await db_session.refresh(original_task)
-
-    # Descriptions must have Jaccard < 0.5 to trigger CONTESTED (not RE_DEMANDED).
-    # "remove deprecated call site" vs "add back original method": 0 common tokens.
-    contested_history = [
-        {
-            "iteration": 0,
-            "verdict": "REQUEST_CHANGES",
-            "issues": [_contest_issue("remove deprecated call site")],
-        },
-        {
-            "iteration": 1,
-            "verdict": "REQUEST_CHANGES",
-            "issues": [_issue("unrelated issue on different file")],
-        },
-        {
-            "iteration": 2,
-            "verdict": "REQUEST_CHANGES",
-            "issues": [_contest_issue("add back original method implementation")],
-        },
-    ]
-    source_task = make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[
-            {
-                "type": "fix",
-                "pr_number": 9401,
-                "branch": "contested2",
-                "base_branch": "automain",
-                "original_task_id": str(original_task.id),
-            }
-        ],
-        context={
-            "scope": "medium",
-            "review_loop": {
-                "iteration": 3,
-                "original_task_id": str(original_task.id),
-                "pr_number": 9401,
-                "branch": "contested2",
-                "base_branch": "automain",
-                "review_history": contested_history,
-            },
-        },
-    )
-    db_session.add(source_task)
-    await db_session.commit()
-    await db_session.refresh(source_task)
-
-    result, created = await _spawn_pipeline_task(
-        source_task,
-        "review",
-        db_session,
-        pr_number=9401,
-        branch="contested2",
-        base_branch="automain",
-        original_task_id=str(original_task.id),
-        original_prompt="Review this PR for correctness.",
-    )
-
-    assert result is not None and created is True
-    original_prompt = (result.payloads[0] if result.payloads else {}).get(
-        "original_prompt"
-    ) or ""
-    assert "CONTESTED" in original_prompt
-    # Reconcile language and base-diff instruction must be present
-    assert "reconcil" in original_prompt.lower() or "coexist" in original_prompt.lower()
-    assert "git diff" in original_prompt
-    assert "origin/automain" in original_prompt
-
-
-@pytest.mark.asyncio
-async def test_contested_ledger_serialized_into_review_loop(db_session, mocker):
-    """When contested regions exist, review_loop['issue_ledger'] is written with
-    the contested list so future spawns can access the full oscillation history."""
-    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch(
-        "app.notification_dispatch.dispatch_external_notification",
-        new_callable=AsyncMock,
-    )
-
-    project = await _make_db_project(db_session)
-    original_task = make_task(
-        project_id=project.id,
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
-    )
-    db_session.add(original_task)
-    await db_session.commit()
-    await db_session.refresh(original_task)
-
-    contested_history = [
-        {
-            "iteration": 0,
-            "verdict": "REQUEST_CHANGES",
-            "issues": [_contest_issue("use list instead of frozenset")],
-        },
-        {
-            "iteration": 1,
-            "verdict": "REQUEST_CHANGES",
-            "issues": [_issue("unrelated issue")],
-        },
-        {
-            "iteration": 2,
-            "verdict": "REQUEST_CHANGES",
-            "issues": [_contest_issue("revert back to frozenset")],
-        },
-    ]
+    reviewed_head = "a" * 40
     source_task = make_task(
         project_id=project.id,
         status=TaskStatus.IN_PROGRESS,
@@ -14743,7 +14181,7 @@ async def test_contested_ledger_serialized_into_review_loop(db_session, mocker):
             {
                 "type": "review",
                 "pr_number": 9402,
-                "branch": "contested3",
+                "branch": "ledger-open",
                 "base_branch": "main",
                 "original_task_id": str(original_task.id),
             }
@@ -14754,9 +14192,18 @@ async def test_contested_ledger_serialized_into_review_loop(db_session, mocker):
                 "iteration": 2,
                 "original_task_id": str(original_task.id),
                 "pr_number": 9402,
-                "branch": "contested3",
+                "branch": "ledger-open",
                 "base_branch": "main",
-                "review_history": contested_history,
+                "review_history": [
+                    {
+                        "iteration": 0,
+                        "verdict": "REQUEST_CHANGES",
+                        "reviewed_head_sha": reviewed_head,
+                        "issues": [
+                            _ledger_issue("BP-prior", "prior null-check blocker")
+                        ],
+                    }
+                ],
             },
         },
     )
@@ -14769,33 +14216,151 @@ async def test_contested_ledger_serialized_into_review_loop(db_session, mocker):
         "fix",
         db_session,
         pr_number=9402,
-        branch="contested3",
+        branch="ledger-open",
         base_branch="main",
         original_task_id=str(original_task.id),
-        fix_prompt="Fix.",
-        current_feedback="revert back to frozenset",
-        # current_issues is a new issue (different from the last history entry)
-        # to avoid triggering the stuck-cycle detector.
-        current_issues=[_issue("update docstring format")],
+        fix_prompt="Fix all binding blockers.",
+        # Structured findings are durable review data even when the optional
+        # freeform feedback string is empty.
+        current_feedback="",
+        current_issues=[
+            _ledger_issue(
+                "BP-current",
+                "new race blocker",
+                file="backend/app/worker.py",
+            )
+        ],
+        reviewed_head_sha=reviewed_head,
     )
 
     assert result is not None and created is True
-    spawned_loop = (result.context or {}).get("review_loop", {})
-    ledger = spawned_loop.get("issue_ledger")
-    assert ledger is not None
-    assert len(ledger["contested"]) >= 1
-    c = ledger["contested"][0]
-    assert c["file"] == "backend/app/task_evaluators.py"
-    assert (
-        "frozenset" in c["demanded_description"]
-        or "frozenset" in c["reappeared_description"]
+    spawned_loop = (result.context or {})["review_loop"]
+    persisted_current = spawned_loop["review_history"][-1]["issues"]
+    assert [issue["description"] for issue in persisted_current] == [
+        "new race blocker"
+    ]
+    # History preserves the reviewer-supplied reference losslessly. The durable
+    # ledger below—not the raw trajectory row—owns identities for new demands.
+    assert persisted_current[0]["issue_id"] == "BP-current"
+    ledger = spawned_loop["issue_ledger"]
+    assert [row["description"] for row in ledger["open"]] == [
+        "prior null-check blocker",
+        "new race blocker",
+    ]
+    assert ledger["resolved"] == []
+    current_ledger_row = next(
+        row for row in ledger["open"] if row["description"] == "new race blocker"
     )
+    assert current_ledger_row["issue_id"].startswith("BP-")
+    assert current_ledger_row["issue_id"] != "BP-current"
+    assert "contested" not in ledger
 
 
 @pytest.mark.asyncio
-async def test_no_contested_regions_no_ledger_in_review_loop(db_session, mocker):
-    """When review_history has no contested regions, review_loop must NOT contain
-    an 'issue_ledger' key (avoid polluting context with empty dicts)."""
+async def test_spawn_preserves_compatible_authoritative_issue_reference(
+    db_session, mocker
+):
+    """Lifecycle propagation must not re-key a valid copied BP reference."""
+    from app.issue_ledger import build_issue_ledger
+
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    reviewed_head = "c" * 40
+    reviewed_base = "d" * 40
+    prior_entry = {
+        "iteration": 0,
+        "verdict": "REQUEST_CHANGES",
+        "reviewed_head_sha": reviewed_head,
+        "reviewed_base_sha": reviewed_base,
+        "issues": [
+            {
+                "description": "missing null guard handler",
+                "severity": "MAJOR",
+                "file": "backend/app/worker.py",
+                "line": 42,
+            }
+        ],
+    }
+    issue_id = build_issue_ledger([prior_entry])["open"][0]["issue_id"]
+    persisted_prior = {
+        **prior_entry,
+        "issues": [{**prior_entry["issues"][0], "issue_id": issue_id}],
+    }
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 9404,
+                "branch": "ledger-reraise",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "medium",
+            "review_loop": {
+                "iteration": 1,
+                "original_task_id": str(original_task.id),
+                "pr_number": 9404,
+                "branch": "ledger-reraise",
+                "base_branch": "main",
+                "review_history": [persisted_prior],
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task,
+        "fix",
+        db_session,
+        pr_number=9404,
+        branch="ledger-reraise",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Fix the binding blocker.",
+        current_feedback="",
+        current_issues=[
+            {
+                "issue_id": issue_id,
+                "description": "missing null guard before worker",
+                "severity": "MAJOR",
+                "file": "backend/app/worker.py",
+                "line": 42,
+            }
+        ],
+        reviewed_head_sha=reviewed_head,
+        reviewed_base_sha=reviewed_base,
+    )
+
+    assert result is not None and created is True
+    loop = (result.context or {})["review_loop"]
+    assert loop["review_history"][-1]["issues"][0]["issue_id"] == issue_id
+    assert [row["issue_id"] for row in loop["issue_ledger"]["open"]] == [
+        issue_id
+    ]
+
+
+@pytest.mark.asyncio
+async def test_empty_authoritative_ledger_is_not_serialized(db_session, mocker):
+    """Non-blocking history does not add empty ledger metadata to task context."""
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
     mocker.patch(
         "app.notification_dispatch.dispatch_external_notification",
@@ -14812,13 +14377,6 @@ async def test_no_contested_regions_no_ledger_in_review_loop(db_session, mocker)
     await db_session.commit()
     await db_session.refresh(original_task)
 
-    normal_history = [
-        {
-            "iteration": 0,
-            "verdict": "REQUEST_CHANGES",
-            "issues": [_issue("fix null check")],
-        },
-    ]
     source_task = make_task(
         project_id=project.id,
         status=TaskStatus.IN_PROGRESS,
@@ -14826,7 +14384,7 @@ async def test_no_contested_regions_no_ledger_in_review_loop(db_session, mocker)
             {
                 "type": "review",
                 "pr_number": 9403,
-                "branch": "clean1",
+                "branch": "ledger-empty",
                 "base_branch": "main",
                 "original_task_id": str(original_task.id),
             }
@@ -14837,9 +14395,22 @@ async def test_no_contested_regions_no_ledger_in_review_loop(db_session, mocker)
                 "iteration": 1,
                 "original_task_id": str(original_task.id),
                 "pr_number": 9403,
-                "branch": "clean1",
+                "branch": "ledger-empty",
                 "base_branch": "main",
-                "review_history": normal_history,
+                "review_history": [
+                    {
+                        "iteration": 0,
+                        "verdict": "REQUEST_CHANGES",
+                        "reviewed_head_sha": "b" * 40,
+                        "issues": [
+                            _ledger_issue(
+                                "BP-minor",
+                                "optional polish",
+                                severity="MINOR",
+                            )
+                        ],
+                    }
+                ],
             },
         },
     )
@@ -14852,21 +14423,26 @@ async def test_no_contested_regions_no_ledger_in_review_loop(db_session, mocker)
         "fix",
         db_session,
         pr_number=9403,
-        branch="clean1",
+        branch="ledger-empty",
         base_branch="main",
         original_task_id=str(original_task.id),
-        fix_prompt="Fix null check.",
-        current_feedback="fix null check",
-        # Different description from the history entry to avoid stuck-cycle detection.
-        current_issues=[_issue("add type annotation")],
+        fix_prompt="Polish.",
+        current_feedback="optional polish follow-up",
+        current_issues=[
+            _ledger_issue(
+                "BP-minor-2",
+                "another optional polish note",
+                severity="MINOR",
+            )
+        ],
+        reviewed_head_sha="b" * 40,
     )
 
     assert result is not None and created is True
-    spawned_loop = (result.context or {}).get("review_loop", {})
-    assert "issue_ledger" not in spawned_loop
+    assert "issue_ledger" not in (result.context or {})["review_loop"]
 
 
-# ── Reviewer-model pin ─────────────────────────────────────────────────────────
+
 
 
 @pytest.mark.asyncio
@@ -18362,11 +17938,19 @@ async def test_review_history_feedback_is_size_capped(db_session, mocker):
     assert len(history[-1]["feedback"]) == REVIEW_FEEDBACK_MAX_CHARS
     assert history[-1]["feedback"].endswith(_TRUNCATION_MARKER)
 
-    # Structured fields (what every non-similarity consumer reads) survive intact.
-    assert history[-1]["issues"] == [_issue("a fresh critical issue", "CRITICAL")]
-    assert history[0]["issues"] == [
+    # Structured fields survive intact apart from the stable issue_id added by
+    # the authoritative blocker ledger.
+    assert [
+        {key: value for key, value in issue.items() if key != "issue_id"}
+        for issue in history[-1]["issues"]
+    ] == [_issue("a fresh critical issue", "CRITICAL")]
+    assert [
+        {key: value for key, value in issue.items() if key != "issue_id"}
+        for issue in history[0]["issues"]
+    ] == [
         _issue("distinct critical issue number 0", "CRITICAL")
     ]
+    assert all(issue.get("issue_id") for issue in history[-1]["issues"])
 
     # The persisted row stays small: >2 MB of input feedback collapses to a
     # serialized context that is a tiny fraction of the multi-MB fat-row regime
@@ -18974,36 +18558,4 @@ class TestShouldSkipInitialReview:
     def test_intermediate_unknown_scope_skips(self):
         # Any scope that is not 'large' is treated as not requiring review.
         skip, _ = should_skip_initial_review(True, "unknown")
-        assert skip is True
-
-
-# ── should_skip_rereview ────────────────────────────────────────────────────
-
-
-class TestShouldSkipRereview:
-    def test_reviewer_waiver_skips(self):
-        skip, reason = should_skip_rereview("code_review", True)
-        assert skip is True
-        assert "waived" in reason
-
-    def test_ci_failure_skips(self):
-        skip, reason = should_skip_rereview("ci_failure", False)
-        assert skip is True
-        assert "ci_failure" in reason
-
-    def test_merge_conflict_skips(self):
-        skip, _ = should_skip_rereview("merge_conflict", False)
-        assert skip is True
-
-    def test_migration_guard_skips(self):
-        skip, _ = should_skip_rereview("migration_guard", False)
-        assert skip is True
-
-    def test_code_review_requires_rereview(self):
-        skip, reason = should_skip_rereview("code_review", False)
-        assert skip is False
-        assert "re-review required" in reason
-
-    def test_reviewer_waiver_applies_only_to_code_review(self):
-        skip, _ = should_skip_rereview("code_review", True)
         assert skip is True

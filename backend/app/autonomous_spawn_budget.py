@@ -1,6 +1,6 @@
 """Autonomous spawn-budget accounting.
 
-This module is the shared source of truth for classifying ORCHESTRATOR-created
+This module is the shared source of truth for classifying autonomously created
 tasks in a trailing window and for evaluating the global initiative/backstop
 spawn budgets.
 """
@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Mapping, Sequence
 
+from sqlalchemy import and_, or_
 from sqlmodel import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -26,6 +27,27 @@ DEFAULT_AUTONOMOUS_SPAWN_BUDGET_MODE = "observe"
 DEFAULT_AUTONOMOUS_INITIATIVE_TASKS_PER_HOUR = 50
 DEFAULT_AUTONOMOUS_BACKSTOP_TASKS_PER_HOUR = 50
 AUTONOMOUS_SPAWN_BUDGET_CATEGORY_KEYS = frozenset({"initiative", "servicing"})
+AUTONOMOUS_DIRECT_SPAWN_PROVENANCE = "strategic_direct"
+
+
+def autonomous_spawn_task_clause():
+    """SQL predicate for work authored by Blueprint's autonomous control plane.
+
+    Most autonomous tasks are created by ``ORCHESTRATOR``.  Resident Strategic
+    roots deliberately use ``STRATEGIC_AGENT`` so their provenance remains
+    distinct, but they consume the same fleet and model budget.  Count only the
+    direct-spawn provenance within that creator class so fixtures/manual rows
+    labelled ``STRATEGIC_AGENT`` do not accidentally enter the budget ledger.
+    """
+
+    return or_(
+        Task.created_by == "ORCHESTRATOR",
+        and_(
+            Task.created_by == "STRATEGIC_AGENT",
+            Task.context["spawned_by"].as_string()
+            == AUTONOMOUS_DIRECT_SPAWN_PROVENANCE,
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -278,7 +300,7 @@ async def compute_autonomous_spawn_budget_snapshot(
     # ``payloads``/``context`` JSONB columns. ``context`` accretes multi-hundred-KB
     # agent state over a task's lifetime, and this snapshot runs on HOT spawn paths
     # (every idle-research tick per project, every guarded strategic spawn) over ALL
-    # ORCHESTRATOR tasks in the trailing hour — at the 500/hr backstop a full-column
+    # autonomous tasks in the trailing hour — at the 500/hr backstop a full-column
     # fetch dragged tens of MB per check. The classifier needs only payloads[0] (its
     # ``type`` plus servicing-lineage key PRESENCE) and three small context keys, so
     # pull exactly those. The whole first payload element is projected (rather than
@@ -294,7 +316,7 @@ async def compute_autonomous_spawn_budget_snapshot(
             Task.parent_task_id,
             Task.depends_on,
         ).where(
-            Task.created_by == "ORCHESTRATOR",
+            autonomous_spawn_task_clause(),
             Task.created_at >= window_start,
             Task.created_at <= window_end,
         )

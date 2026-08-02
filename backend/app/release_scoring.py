@@ -1198,6 +1198,7 @@ BLOCKER_EXECUTION_SITE: dict[str, str] = {
     "ci_unresolved": EXECUTION_SITE_CANDIDATE,
     "audit_missing": EXECUTION_SITE_CANDIDATE,
     "test_file_deleted": EXECUTION_SITE_CANDIDATE,
+    "walkthrough_e2e_failed": EXECUTION_SITE_CANDIDATE,
     # Deployed-side: the category verdict ledger is composed and rendered by
     # the deployed qualifier.  Its recovery/minting path (acceptance-window,
     # unverified-merge, and metrics-integrity evidence) also imports and runs

@@ -50,7 +50,6 @@ export const HIGH_SIGNAL_NOTE_BADGE_LABELS: Readonly<Record<string, string>> = {
   release_build_stalled: 'Build Stalled',
   release_stabilize_stalled: 'Stabilize Stalled',
   release_ci_unresolved_stall: 'CI Stall',
-  release_auto_merge_stalled: 'Auto-merge Stalled',
   promotion_readiness_reached: 'Promotion Ready',
   strategic_steering_deferred: 'Steering Queued',
   strategic_steering_acted: 'Steering Reached',
@@ -71,7 +70,7 @@ export const HIGH_SIGNAL_NOTE_BADGE_LABELS: Readonly<Record<string, string>> = {
 export const HIGH_SIGNAL_NOTE_EVENTS: ReadonlySet<string> = new Set([
   'failure_alert', 'rollback_recommended', 'fix_loop_divergence_regressed',
   'release_calcifying', 'direction_outcome_stalled', 'release_build_stalled',
-  'release_stabilize_stalled', 'release_ci_unresolved_stall', 'release_auto_merge_stalled',
+  'release_stabilize_stalled', 'release_ci_unresolved_stall',
   'promotion_readiness_reached', 'strategic_steering_deferred', 'strategic_steering_acted',
   'direction_staged_activated',
   'capability_trial_ambiguous_lift_escalation',
@@ -84,7 +83,7 @@ export const HIGH_SIGNAL_NOTE_EVENTS: ReadonlySet<string> = new Set([
 export const CRITICAL_NOTE_EVENTS: ReadonlySet<string> = new Set([
   'failure_alert', 'rollback_recommended', 'fix_loop_divergence_regressed',
   'release_calcifying', 'direction_outcome_stalled', 'release_build_stalled',
-  'release_stabilize_stalled', 'release_ci_unresolved_stall', 'release_auto_merge_stalled',
+  'release_stabilize_stalled', 'release_ci_unresolved_stall',
   'promotion_readiness_reached',
   ...ESCALATION_EVENT_TYPES,
 ]);

@@ -344,8 +344,14 @@ async def lock_project_or_429(
     )
 
 
-async def acquire_pr_spawn_lock(session: AsyncSession, pr_number: int) -> None:
-    """Serialize pipeline-task spawns for a single PR via a Postgres advisory lock.
+async def acquire_pr_spawn_lock(
+    session: AsyncSession,
+    project_id: object,
+    pr_number: int,
+    *,
+    repo_identity: str | None = None,
+) -> None:
+    """Serialize task admission for one repository PR via an advisory lock.
 
     The dedup logic at the top of ``_spawn_pipeline_task`` reads existing
     pipeline tasks (SELECT … status IN active), decides whether to dedup /
@@ -356,12 +362,13 @@ async def acquire_pr_spawn_lock(session: AsyncSession, pr_number: int) -> None:
     that race. The result is a double-spawn that wastes an agent slot and
     has both review/fix tasks running against the same PR.
 
-    ``pg_advisory_xact_lock(pr_number)`` makes the SELECT-decide-INSERT
-    window structurally serial across concurrent transactions on the same
-    PR. The lock is held until the surrounding transaction commits or
-    rolls back, so the caller MUST commit (or rollback) at the end of the
-    spawn flow to release it. Different PRs hash to different lock keys
-    and proceed in parallel.
+    A repository-scoped key makes the SELECT-decide-INSERT window structurally
+    serial even when duplicate Blueprint projects point at the same GitHub PR,
+    without coupling unrelated repositories that happen to use the same PR
+    number. When repository identity is unavailable, project id is the safe
+    fallback. The lock is
+    held until the surrounding transaction commits or rolls back, so the caller
+    MUST commit (or rollback) at the end of the admission flow to release it.
 
     No-op on non-Postgres dialects (SQLite tests rely on
     serialization-by-event-loop within a single process and don't need
@@ -371,14 +378,59 @@ async def acquire_pr_spawn_lock(session: AsyncSession, pr_number: int) -> None:
         session: AsyncSession to issue the lock against. Must be the same
             session that performs the subsequent SELECT/INSERT — the lock
             is transaction-scoped, not session-scoped.
-        pr_number: Integer PR number. Cast to int for the int8 advisory
-            key; numbers up to 2**63-1 are valid keys.
+        project_id: Fallback identity and source for repository resolution.
+        pr_number: Integer PR number within that project.
     """
     if resolve_dialect_name(session) != "postgresql":
         return
+    normalized_repo = str(repo_identity or "").strip().lower()
+    if not normalized_repo:
+        resolved_repo = (
+            await session.execute(
+                select(Project.github_owner, Project.github_repo).where(
+                    Project.id == project_id
+                )
+            )
+        ).first()
+        if resolved_repo and resolved_repo[0] and resolved_repo[1]:
+            normalized_repo = f"{resolved_repo[0]}/{resolved_repo[1]}".lower()
+    lock_identity = (
+        f"repo:{normalized_repo}" if normalized_repo else f"project:{project_id}"
+    )
     await session.execute(
-        text("SELECT pg_advisory_xact_lock(:pr)"),
-        {"pr": int(pr_number)},
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+        {"key": f"review-pr:{lock_identity}:{int(pr_number)}"},
+    )
+
+
+async def acquire_merge_submission_locks(
+    session: AsyncSession,
+    *,
+    project_id: object,
+    repo_identity: str,
+    base_branch: str,
+    pr_number: int,
+) -> None:
+    """Serialize authoritative merge submissions for one base, then one PR.
+
+    Lock order is deliberately global: every merge takes the project/repository
+    base-branch lock first and the project-scoped PR admission lock second.
+    Reviews, fixes, CI, and other work remain parallel; only the final merge
+    submission boundary for PRs targeting the same base is serialized.
+    """
+    if resolve_dialect_name(session) != "postgresql":
+        return
+    normalized_repo = str(repo_identity or project_id).strip().lower()
+    normalized_base = str(base_branch or "").strip()
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+        {"key": f"review-merge-base:{normalized_repo}:{normalized_base}"},
+    )
+    await acquire_pr_spawn_lock(
+        session,
+        project_id,
+        pr_number,
+        repo_identity=normalized_repo,
     )
 
 
@@ -660,6 +712,13 @@ async def _with_project_locked_list_mutation(
         project.directions = final
         flag_modified(project, "directions")
         session.add(project)
+        # Persist the authoritative blob mutation inside this transaction
+        # before a caller acquires another projected Project lock. Those locks
+        # use populate_existing=True; with autoflush disabled (a valid session
+        # configuration) a follow-on vision/problem-model SELECT would
+        # otherwise overwrite this still-dirty attribute with its pre-mutation
+        # database value while the normalized Direction rows below survived.
+        await session.flush([project])
         # P2 (p2-direction-table): dual-write the normalised ``direction`` table
         # so it stays consistent with the authoritative blob during the
         # transition. Best-effort — a sync failure must never break the blob
@@ -1064,6 +1123,11 @@ async def with_problem_model_locked(
         project.problem_model = problem_model
         flag_modified(project, "problem_model")
         session.add(project)
+        # Match the directions helper's transactional guarantee: a later
+        # populate_existing Project projection (commonly the vision lock in a
+        # retire chain) must not refresh this unflushed mutation back to its
+        # pre-reconciliation value when autoflush is disabled.
+        await session.flush([project])
     return True
 
 

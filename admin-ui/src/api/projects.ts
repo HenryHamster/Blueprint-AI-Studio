@@ -386,7 +386,6 @@ export type QualificationStateValue =
   | 'qualifying'
   | 'audit_crashed'
   | 'promotion_check_wait'
-  | 'promotion_in_flight'
   | 'promotion_failed'
   | 'required_check_failed'
   | 'protection_blocked_review'
@@ -409,8 +408,8 @@ export interface QualificationState {
   summary: string;
   promotion_pr_number?: number | null;
   promotion_pr_url?: string | null;
-  // Additive promotion freshness context for the shared "promotion in flight"
-  // state. When absent, callers must fall back to the timeless PR-only copy.
+  // Additive freshness context for Blueprint's managed promotion check wait.
+  // When absent, callers fall back to timeless PR-only copy.
   promotion_enabled_at?: string | null;
   promotion_age_seconds?: number | null;
   promotion_timeout_seconds?: number | null;
@@ -421,11 +420,8 @@ export interface QualificationState {
   // Failing-check names / branch-protection detail surfaced for the
   // required_check_failed and protection_blocked_review states.
   detail?: string | null;
-  // Managed promotion check-wait context: a migration-carrying promotion PR is
-  // open and Blueprint is waiting for required checks before retrying the merge
-  // (distinct from native auto-merge 'promotion_in_flight'). These are additive
-  // and absent for native auto-merge.
-  migration_carrying?: boolean | null;
+  // Managed promotion check-wait context. Blueprint retains merge authority,
+  // waits for required checks, and revalidates the exact head before merging.
   check_snapshot?: ManagedCheckWaitSnapshot | null;
   ci_state?: string | null;
   blocker?: string | null;

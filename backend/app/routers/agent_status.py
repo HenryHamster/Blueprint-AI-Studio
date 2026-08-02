@@ -977,6 +977,12 @@ async def _persist_post_commit_pending(factory, task_id, reason: str, payload_du
                         # POST_COMMIT_MAX_PENDING_AGE_S backstop.
                         "first_pending_at": prior_meta.get("first_pending_at")
                         or _utcnow().isoformat(),
+                        # One durable continuation generation may be retried
+                        # many times, but a later agent completion gets a new
+                        # token. Recovery claims use it to reject ABA reuse of
+                        # the same status + pending bit.
+                        "generation_token": prior_meta.get("generation_token")
+                        or uuid.uuid4().hex,
                         "reason": reason,
                         "payload": payload_dump,
                         "attempts": int(prior_meta.get("attempts", 0)) + 1,
@@ -4403,6 +4409,7 @@ async def update_agent_status(
                 **(task.context or {}),
                 "_post_commit_pending_meta": {
                     "at": _utcnow().isoformat(),
+                    "generation_token": uuid.uuid4().hex,
                     "reason": "inline_running",
                     "payload": _payload_dump,
                     "attempts": 0,

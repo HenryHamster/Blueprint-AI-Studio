@@ -306,11 +306,8 @@ export const QUAL_STATE_STYLE: Record<QualificationStateValue, string> = {
   // still pending — loud red, NOT the amber 'qualifying' look. Keeps the top
   // badge in agreement with the audit-findings section's 'audit crashed' cue.
   audit_crashed: 'bg-red-500/10 border-red-500/30 text-red-400',
-  promotion_in_flight: 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400',
-  // Managed migration-carrying promotion PR waiting on required checks —
-  // Blueprint retries the merge automatically. Blue (waiting/in-progress),
-  // distinct from the green native auto-merge look so operators can tell the
-  // two promotion holds apart.
+  // Blueprint owns the promotion while required checks settle, then
+  // revalidates the exact target and merges only the checked head.
   promotion_check_wait: 'bg-blue-500/10 border-blue-500/30 text-blue-400',
   promotion_failed: 'bg-red-500/10 border-red-500/30 text-red-400',
   // Promotion PR's required status checks failed — loud red, like promotion_failed.
@@ -358,25 +355,25 @@ export function formatPromotionFreshnessContext(
   const ageSeconds = finiteSeconds(state?.promotion_age_seconds);
   if (ageSeconds == null) return null;
   const timeoutSeconds = finiteSeconds(state?.promotion_timeout_seconds);
-  let detailText = `in flight ~${formatDurationSec(ageSeconds)}`;
+  let detailText = `waiting ~${formatDurationSec(ageSeconds)}`;
   if (timeoutSeconds != null && timeoutSeconds > 0) {
-    detailText += ` (auto-timeout cap ${formatDurationSec(timeoutSeconds)})`;
+    detailText += ` (timeout cap ${formatDurationSec(timeoutSeconds)})`;
   }
   if (state?.promotion_past_timeout) {
     return {
-      detailText: `${detailText}, past auto-timeout`,
+      detailText: `${detailText}, past timeout`,
       toneClassName: 'text-red-400',
     };
   }
   if (state?.promotion_nearing_timeout) {
     return {
-      detailText: `${detailText}, nearing auto-timeout`,
+      detailText: `${detailText}, nearing timeout`,
       toneClassName: 'text-amber-400',
     };
   }
   return {
     detailText,
-    toneClassName: 'text-emerald-300',
+    toneClassName: 'text-blue-300',
   };
 }
 
@@ -1067,16 +1064,10 @@ export function CutConsequences({ cv, staged }: { cv: CurrentVersion; staged: St
             : 'No tasks are currently in flight.'}
         </p>
       )}
-      {qualState?.state === 'promotion_in_flight' && (
-        <p className={promotionFreshness?.toneClassName ?? 'text-emerald-300'}>
-          Promotion PR{qualState.promotion_pr_number ? ` #${qualState.promotion_pr_number}` : ''} is open and auto-merging
-          {promotionFreshness ? ` (${promotionFreshness.detailText})` : ''} — this cut will be rejected until it lands or is canceled.
-        </p>
-      )}
       {qualState?.state === 'promotion_check_wait' && (
         <p className={promotionFreshness?.toneClassName ?? 'text-blue-300'}>
-          Migration-carrying promotion PR{qualState.promotion_pr_number ? ` #${qualState.promotion_pr_number}` : ''} is open and waiting for required checks
-          {promotionFreshness ? ` (${promotionFreshness.detailText})` : ''} — Blueprint retries the merge automatically; this cut will be rejected until it lands or is canceled.
+          Promotion PR{qualState.promotion_pr_number ? ` #${qualState.promotion_pr_number}` : ''} is open in Blueprint&apos;s exact-head check wait
+          {promotionFreshness ? ` (${promotionFreshness.detailText})` : ''} — Blueprint revalidates the PR target and merges only the checked head after required checks pass; this cut will be rejected until it lands or is canceled.
         </p>
       )}
     </div>

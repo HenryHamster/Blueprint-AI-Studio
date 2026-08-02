@@ -31,6 +31,7 @@ The reaper carve-out for these tasks lives in ``reaper_orphan_classify.py``
 session seam both depend on.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -41,7 +42,7 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import bindparam, func, or_, text, update as sa_update
+from sqlalchemy import and_, bindparam, func, or_, text, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
@@ -272,6 +273,40 @@ _WORK_STATE_TERMINAL_WINDOW_SECONDS = 3600
 # ``agent_tasks._ANCESTOR_WALK_MAX_DEPTH`` — parent_task_id is admin-mutable
 # so an explicit cap prevents cycle-induced infinite recursion.
 _WORK_STATE_ANCESTOR_WALK_MAX_DEPTH = 20
+_RESIDENT_WAKE_BARRIER_LIMIT = 20
+_RESIDENT_WAKE_BARRIER_CONTEXT_KEYS = (
+    "event_type",
+    "receipt_kind",
+    "cycle_id",
+    "review_task_id",
+    "direction_key",
+    "verdict",
+    "confidence",
+    "policy_status",
+    "next_cycle_id",
+    "release_version_id",
+    "version_number",
+    "qualification_status",
+    "candidate_sha",
+    "promoted_sha",
+    "serving_status",
+    "served_sha",
+    "reason",
+)
+
+# Only settled StrategicCycle transitions are actionable to a standing
+# Resident.  Phase progress is already owned by the running task/cycle and used
+# to advance ``updated_at`` several times; treating every one of those writes as
+# a wake signal pays for another strategic turn without presenting a decision.
+_WORK_STATE_TERMINAL_CYCLE_OUTCOMES = (
+    "completed",
+    "failed_phase1",
+    "failed_phase2",
+    "failed_phase2_spawn",
+    "stalled_phase1",
+    "stalled_phase2",
+    "thinker_artifacts_missing",
+)
 
 # The resident task must be one of these (non-terminal) statuses to host / keep
 # hosting a session. Mirrors ``strategic_state_read_model._LIVE_STRATEGIC_TASK_STATUSES``.
@@ -1956,26 +1991,74 @@ async def _latest_operator_interaction_at(
     ).scalar_one_or_none()
 
 
+def _resident_wake_barrier_contract():
+    return and_(
+        ProjectMessage.context["audience"].as_string()
+        == "strategist-internal",
+        ProjectMessage.context["resident_wake_barrier"].as_boolean().is_(True),
+    )
+
+
+async def _resident_wake_barrier_receipts(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> list[dict[str, Any]]:
+    """Return bounded exact receipts for open semantic Resident barriers."""
+
+    rows = (
+        (
+            await session.execute(
+                select(ProjectMessage)
+                .where(
+                    ProjectMessage.project_id == project_id,
+                    ProjectMessage.status == "open",
+                    _resident_wake_barrier_contract(),
+                )
+                .order_by(ProjectMessage.created_at.asc(), ProjectMessage.id.asc())
+                .limit(_RESIDENT_WAKE_BARRIER_LIMIT)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    receipts: list[dict[str, Any]] = []
+    for row in rows:
+        context = row.context if isinstance(row.context, dict) else {}
+        receipts.append(
+            {
+                "id": str(row.id),
+                "event_type": str(context.get("event_type") or "")[:128],
+                "summary": str(row.content or "")[:2_000],
+                "created_at": row.created_at.isoformat(),
+                "task_id": str(row.from_task_id) if row.from_task_id else None,
+                "context": {
+                    key: context[key]
+                    for key in _RESIDENT_WAKE_BARRIER_CONTEXT_KEYS
+                    if key in context
+                },
+            }
+        )
+    return receipts
+
+
 async def _compute_resident_work_state(
     session: AsyncSession,
     project_id: uuid.UUID,
     *,
     resident_session_id: str | None = None,
+    resident_task_id: uuid.UUID | None = None,
 ) -> tuple[str | None, dict[str, int]]:
     """READ-ONLY snapshot of strategist-relevant world state for the heartbeat.
 
     Returns ``(work_state_rev, work_state_summary)``:
 
-    * ``work_state_rev`` — a monotonic marker: the newest ISO-8601 timestamp
-      across the change sources the strategist cares about — STRATEGIC_AGENT-
-      created tasks' and their descendant tasks' latest status transitions
-      (``Task.updated_at`` advances on every transition via ``onupdate``),
-      operator-authored ``ProjectMessage`` arrivals, and ``StrategicCycle``
-      mutation stamps, plus pending/fired ``StrategicWatch`` changes. The agent
-      compares this against the rev it recorded at
-      its last autonomous turn to decide whether the world moved. ``None`` when
-      the project has no such activity yet, in which case an older agent
-      degrades to floor-tick pacing.
+    * ``work_state_rev`` — a stable fingerprint over ACTIONABLE transitions:
+      operator arrivals, terminal Strategic cycles, blockers/failures, and the
+      quiescent barrier after the Resident's parallel task frontier drains.
+      Routine heartbeats, status messages, and intermediate
+      QUEUED/PROVISIONING/IN_PROGRESS/EVALUATING motion deliberately do not
+      change it. Exact watch receipts are paced independently by the agent so a
+      watch resolved later in the same heartbeat wakes exactly once.
     * ``work_state_summary`` — advisory ``{in_flight, terminal_since,
       new_operator_messages}`` counts feeding the agent's tick context.
 
@@ -1987,55 +2070,108 @@ async def _compute_resident_work_state(
     ignores this read-model path).
     """
     # One bounded recursive CTE aggregates the strategist task subtree without
-    # a Python-side walk or cycle risk.
+    # a Python-side walk or cycle risk. Every STRATEGIC_AGENT-created task is an
+    # anchor so descendants with another provenance are still visible. DISTINCT
+    # removes the duplicate paths produced when a Strategic-created descendant
+    # is both an anchor and reached recursively from its parent.
+    #
+    # Do not count the long-lived Resident host task itself as owned work: its
+    # generic task heartbeat keeps it IN_PROGRESS by design and would otherwise
+    # make ``in_flight`` permanently non-zero.
     terminal_cutoff = _utcnow() - timedelta(seconds=_WORK_STATE_TERMINAL_WINDOW_SECONDS)
     tree_row = (
         await session.execute(
             text("""
                 WITH RECURSIVE task_tree AS (
-                    SELECT id, updated_at, archived, status, 0 AS depth
+                    SELECT id, updated_at, completed_at, blocked_at, parked_at,
+                           archived, status, 0 AS depth
                     FROM task
                     WHERE project_id = :project_id
                       AND created_by = :created_by
+                      AND (:resident_task_id IS NULL OR id != :resident_task_id)
                     UNION ALL
-                    SELECT t.id, t.updated_at, t.archived, t.status,
+                    SELECT t.id, t.updated_at, t.completed_at, t.blocked_at,
+                           t.parked_at, t.archived, t.status,
                            tt.depth + 1
                     FROM task t
                     INNER JOIN task_tree tt ON t.parent_task_id = tt.id
                     WHERE t.project_id = :project_id
+                      AND (:resident_task_id IS NULL OR t.id != :resident_task_id)
                       AND tt.depth < :max_depth
+                ), task_state AS (
+                    SELECT DISTINCT id, updated_at, completed_at, blocked_at,
+                                    parked_at, archived, status
+                    FROM task_tree
                 )
                 SELECT
-                    max(updated_at) AS max_updated,
+                    max(coalesce(completed_at, updated_at)) FILTER (
+                        WHERE status IN ('COMPLETED', 'FAILED', 'CANCELLED')
+                    ) AS max_terminal,
+                    max(coalesce(completed_at, updated_at)) FILTER (
+                        WHERE status IN ('FAILED', 'CANCELLED')
+                    ) AS max_failure,
+                    max(coalesce(blocked_at, updated_at)) FILTER (
+                        WHERE NOT archived AND status = 'BLOCKED'
+                    ) AS max_blocked,
+                    max(coalesce(parked_at, updated_at)) FILTER (
+                        WHERE NOT archived AND status = 'PARKED'
+                    ) AS max_parked,
+                    count(*) FILTER (WHERE NOT archived) AS total,
                     count(*) FILTER (
                         WHERE NOT archived
-                          AND status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED')
+                          AND status IN (
+                              'QUEUED', 'PROVISIONING',
+                              'IN_PROGRESS', 'EVALUATING'
+                          )
                     ) AS in_flight,
                     count(*) FILTER (
+                        WHERE NOT archived AND status = 'BLOCKED'
+                    ) AS blocked,
+                    count(*) FILTER (
+                        WHERE NOT archived AND status = 'PARKED'
+                    ) AS parked,
+                    count(*) FILTER (WHERE status = 'COMPLETED') AS completed,
+                    count(*) FILTER (WHERE status = 'FAILED') AS failed,
+                    count(*) FILTER (WHERE status = 'CANCELLED') AS cancelled,
+                    count(*) FILTER (
                         WHERE status IN ('COMPLETED', 'FAILED', 'CANCELLED')
-                          AND updated_at >= :terminal_cutoff
+                          AND coalesce(completed_at, updated_at) >= :terminal_cutoff
                     ) AS terminal_since
-                FROM task_tree
+                FROM task_state
             """)
             .bindparams(
                 bindparam("project_id", type_=Task.__table__.c.project_id.type),
+                bindparam("resident_task_id", type_=Task.__table__.c.id.type),
                 bindparam("terminal_cutoff", type_=Task.__table__.c.updated_at.type),
             )
             .columns(
-                max_updated=Task.__table__.c.updated_at.type,
+                max_terminal=Task.__table__.c.updated_at.type,
+                max_failure=Task.__table__.c.updated_at.type,
+                max_blocked=Task.__table__.c.updated_at.type,
+                max_parked=Task.__table__.c.updated_at.type,
             ),
             {
                 "project_id": project_id,
                 "created_by": _STRATEGIC_AGENT_CREATED_BY,
+                "resident_task_id": resident_task_id,
                 "max_depth": _WORK_STATE_ANCESTOR_WALK_MAX_DEPTH,
                 "terminal_cutoff": terminal_cutoff,
             },
         )
     ).fetchone()
 
-    task_max = tree_row[0] if tree_row else None
-    in_flight: int = int(tree_row[1] or 0) if tree_row else 0
-    terminal_since: int = int(tree_row[2] or 0) if tree_row else 0
+    max_terminal = tree_row[0] if tree_row else None
+    max_failure = tree_row[1] if tree_row else None
+    max_blocked = tree_row[2] if tree_row else None
+    max_parked = tree_row[3] if tree_row else None
+    total: int = int(tree_row[4] or 0) if tree_row else 0
+    in_flight: int = int(tree_row[5] or 0) if tree_row else 0
+    blocked: int = int(tree_row[6] or 0) if tree_row else 0
+    parked: int = int(tree_row[7] or 0) if tree_row else 0
+    completed: int = int(tree_row[8] or 0) if tree_row else 0
+    failed: int = int(tree_row[9] or 0) if tree_row else 0
+    cancelled: int = int(tree_row[10] or 0) if tree_row else 0
+    terminal_since: int = int(tree_row[11] or 0) if tree_row else 0
 
     msg_max = (
         await session.execute(
@@ -2046,21 +2182,33 @@ async def _compute_resident_work_state(
             )
         )
     ).scalar_one_or_none()
-    cycle_max = (
+    terminal_cycle_max = (
         await session.execute(
             select(func.max(StrategicCycle.updated_at)).where(
                 StrategicCycle.project_id == project_id,
+                StrategicCycle.outcome.in_(_WORK_STATE_TERMINAL_CYCLE_OUTCOMES),
             )
         )
     ).scalar_one_or_none()
-    watch_max = (
+    # Release/qualification integration emits a narrow strategist-internal
+    # barrier message. Do not wake on the much larger generic internal feed
+    # (PR bookkeeping, telemetry, etc.); only this explicit boolean contract is
+    # an autonomous decision boundary. The revision marker considers all such
+    # rows so resolving the newest open row cannot roll the revision backwards;
+    # the separate count remains open-only for advisory activity state.
+    barrier_contract = _resident_wake_barrier_contract()
+    barrier_message_row = (
         await session.execute(
-            select(func.max(StrategicWatch.updated_at)).where(
-                StrategicWatch.project_id == project_id,
-                StrategicWatch.state.in_(("pending", "fired", "expired")),
-            )
+            select(
+                func.max(ProjectMessage.created_at).filter(barrier_contract),
+                func.count().filter(
+                    and_(barrier_contract, ProjectMessage.status == "open")
+                ),
+            ).where(ProjectMessage.project_id == project_id)
         )
-    ).scalar_one_or_none()
+    ).one()
+    barrier_msg_max = barrier_message_row[0]
+    pending_barriers = int(barrier_message_row[1] or 0)
     watch_counts = (
         await session.execute(
             select(
@@ -2071,16 +2219,55 @@ async def _compute_resident_work_state(
             ).where(StrategicWatch.project_id == project_id)
         )
     ).one()
-    # SQLite returns the raw aggregate as text, while asyncpg returns a
-    # tz-aware datetime. The ORM aggregates below use NaiveUTCDateTime.
-    if isinstance(task_max, str):
-        task_max = datetime.fromisoformat(task_max.replace("Z", "+00:00"))
-    if task_max is not None and task_max.tzinfo is not None:
-        task_max = task_max.astimezone(timezone.utc).replace(tzinfo=None)
-    stamps = [
-        dt for dt in (task_max, msg_max, cycle_max, watch_max) if dt is not None
-    ]
-    work_state_rev = max(stamps).isoformat() if stamps else None
+    def _stamp(value: datetime | str | None) -> str:
+        """Canonicalize SQLite text / asyncpg datetime aggregates."""
+
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        else:
+            parsed = value
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        return parsed.isoformat()
+
+    # Intermediate successful completions are deliberately absent while any
+    # work remains in flight. Once the whole frontier drains, the quiescent
+    # barrier carries the latest terminal stamp + settled counts and wakes one
+    # continuation turn. Failures/cancellations and blockers remain immediately
+    # actionable even while sibling work continues.
+    semantic_state: dict[str, Any] = {}
+    if msg_max is not None:
+        semantic_state["operator"] = _stamp(msg_max)
+    if barrier_msg_max is not None:
+        semantic_state["resident_barrier"] = _stamp(barrier_msg_max)
+    if terminal_cycle_max is not None:
+        semantic_state["terminal_cycle"] = _stamp(terminal_cycle_max)
+    if blocked or max_blocked is not None:
+        semantic_state["blocked"] = [blocked, _stamp(max_blocked)]
+    if parked or max_parked is not None:
+        semantic_state["parked"] = [parked, _stamp(max_parked)]
+    if failed or cancelled or max_failure is not None:
+        semantic_state["failed"] = [failed, cancelled, _stamp(max_failure)]
+    if total > 0 and in_flight == 0:
+        semantic_state["barrier"] = [
+            completed,
+            failed,
+            cancelled,
+            _stamp(max_terminal),
+        ]
+    work_state_rev = (
+        hashlib.sha256(
+            json.dumps(
+                semantic_state,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()[:24]
+        if semantic_state
+        else None
+    )
 
     new_operator_messages = (
         await session.execute(
@@ -2100,6 +2287,11 @@ async def _compute_resident_work_state(
         "new_operator_messages": int(new_operator_messages),
         "pending_watches": int(watch_counts[0] or 0),
         "fired_watches": int(watch_counts[1] or 0),
+        "pending_barriers": pending_barriers,
+        "blocked": int(blocked),
+        "parked": int(parked),
+        "failed": int(failed),
+        "quiescent": int(total > 0 and in_flight == 0),
     }
 
 
@@ -4488,9 +4680,27 @@ async def renew_resident_session_lease(
     # is not consulted by _classify_resident_session). Older agents ignore the
     # extra fields.
     work_state_rev, work_state_summary = await _compute_resident_work_state(
-        session, project.id, resident_session_id=session_id
+        session,
+        project.id,
+        resident_session_id=session_id,
+        resident_task_id=uuid.UUID(str(task_id)),
     )
     fired_watch_receipts: list[dict[str, Any]] = []
+    fired_barrier_receipts = await _resident_wake_barrier_receipts(
+        session,
+        project.id,
+    )
+    handled_message_id_set = {
+        value
+        for value in (handled_message_ids or [])
+        if isinstance(value, str) and value
+    }
+    if handled_message_id_set:
+        fired_barrier_receipts = [
+            receipt
+            for receipt in fired_barrier_receipts
+            if receipt["id"] not in handled_message_id_set
+        ]
     # Conversation availability is independent from mutation authority. A
     # resident may answer while a batch strategic cycle is active, but it must
     # stay chat-only until that cycle releases the project's strategic lane.
@@ -4569,6 +4779,7 @@ async def renew_resident_session_lease(
             "work_state_rev": work_state_rev,
             "work_state_summary": work_state_summary,
             "fired_watches": fired_watch_receipts,
+            "fired_barriers": fired_barrier_receipts,
             "exam_ledger": None,
             "active_direction_ids": active_direction_ids,
             "direction_grounding": direction_grounding,
@@ -4990,6 +5201,7 @@ async def renew_resident_session_lease(
             "work_state_rev": work_state_rev,
             "work_state_summary": work_state_summary,
             "fired_watches": fired_watch_receipts,
+            "fired_barriers": fired_barrier_receipts,
             "exam_ledger": None,
             "active_direction_ids": active_direction_ids,
             "direction_grounding": direction_grounding,
@@ -5013,13 +5225,16 @@ async def renew_resident_session_lease(
             "work_state_rev": work_state_rev,
             "work_state_summary": work_state_summary,
             "fired_watches": fired_watch_receipts,
+            "fired_barriers": fired_barrier_receipts,
             "exam_ledger": None,
             "active_direction_ids": active_direction_ids,
             "direction_grounding": direction_grounding,
         }
     # Resolve exact task watches while this heartbeat owns the project mutation
-    # boundary. The existing task-tree work_state_rev remains the wake signal;
-    # these bounded receipts preserve WHICH completion Strategic was awaiting.
+    # boundary. The agent separately fingerprints these bounded receipts: that
+    # preserves WHICH completion Strategic awaited and also lets a watch that
+    # fires during this heartbeat wake exactly once without folding routine task
+    # ``updated_at`` writes back into work_state_rev.
     try:
         from app.strategic_spawn_requests import drain_deferred_spawn_requests
         from app.strategic_watches import (
@@ -5100,9 +5315,10 @@ async def renew_resident_session_lease(
                 skip_locked=False,
                 timeout=10.0,
             )
-    # Mark inbound operator messages as handled so a restart does not re-answer
-    # them and so they stop counting as open backlog. Scoped to the project and
-    # session to avoid touching rows that belong to another session's conversation.
+    # Mark consumed operator messages and exact project-scoped wake barriers as
+    # handled. Ordinary NULL-session rows remain untouchable; only server-stamped
+    # strategist-internal barriers may be acknowledged by an owning Resident.
+    handled_state_changed = False
     if handled_message_ids:
         # Wrap in a SAVEPOINT so a DB error here only rolls back the
         # handled-ids UPDATE, leaving the outer transaction (the vision lease
@@ -5118,29 +5334,44 @@ async def renew_resident_session_lease(
                     pass
             if safe_ids:
                 async with session.begin_nested():
-                    await session.execute(
+                    handled_result = await session.execute(
                         sa_update(ProjectMessage)
                         .where(
                             ProjectMessage.project_id == project.id,
                             ProjectMessage.id.in_(safe_ids),
-                            # Strictly own-session: legacy/cadence NULL-session
-                            # rows are project-wide standing messages (e.g.
-                            # BUG_REPORTs) that a single session's heartbeat must
-                            # NOT resolve — the poll delivers them for visibility
-                            # only. Enforced invariant (test_heartbeat_handled_ids
-                            # _only_affect_own_session) and mirrored by
-                            # session_message_handoff's never-touch-unstamped rule.
-                            ProjectMessage.resident_session_id == session_id,
+                            or_(
+                                ProjectMessage.resident_session_id == session_id,
+                                and_(
+                                    ProjectMessage.resident_session_id.is_(None),
+                                    _resident_wake_barrier_contract(),
+                                ),
+                            ),
                             ProjectMessage.status == "open",
                         )
                         .values(status="handled")
                     )
+                    handled_state_changed = bool(handled_result.rowcount)
         except Exception:
             logger.warning(
                 "[RESIDENT_SESSION] handled_message_ids update failed for session %s — ignored",
                 session_id,
                 exc_info=True,
             )
+    if handled_state_changed:
+        # Return the post-ack baseline. Otherwise the next heartbeat can observe
+        # the Resident's own acknowledgement as a fresh state transition and
+        # schedule a redundant model turn.
+        await session.flush()
+        work_state_rev, work_state_summary = await _compute_resident_work_state(
+            session,
+            project.id,
+            resident_session_id=session_id,
+            resident_task_id=uuid.UUID(str(task_id)),
+        )
+        fired_barrier_receipts = await _resident_wake_barrier_receipts(
+            session,
+            project.id,
+        )
     # Emit the strategist-internal low-capture notice decided in-lock. Posts the
     # ledger row into THIS transaction so it commits atomically with the dedup
     # flag; failure to post is non-fatal (the flag is already set, so the notice
@@ -5250,6 +5481,7 @@ async def renew_resident_session_lease(
             "work_state_rev": work_state_rev,
             "work_state_summary": work_state_summary,
             "fired_watches": fired_watch_receipts,
+            "fired_barriers": fired_barrier_receipts,
             "exam_ledger": None,
             "active_direction_ids": active_direction_ids,
             "direction_grounding": direction_grounding,
@@ -5281,6 +5513,7 @@ async def renew_resident_session_lease(
             "work_state_rev": work_state_rev,
             "work_state_summary": work_state_summary,
             "fired_watches": fired_watch_receipts,
+            "fired_barriers": fired_barrier_receipts,
             "exam_ledger": None,
             "active_direction_ids": active_direction_ids,
             "direction_grounding": direction_grounding,
@@ -5301,6 +5534,7 @@ async def renew_resident_session_lease(
         "work_state_rev": work_state_rev,
         "work_state_summary": work_state_summary,
         "fired_watches": fired_watch_receipts,
+        "fired_barriers": fired_barrier_receipts,
         "exam_ledger": exam_ledger_str,
         "active_direction_ids": active_direction_ids,
         "direction_grounding": direction_grounding,

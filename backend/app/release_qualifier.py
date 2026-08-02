@@ -72,9 +72,9 @@ from app.models import (
     Task,
     TaskStatus,
 )
+from app.release_models import CriterionEvidence
 from app.notification_dispatch import (
     dispatch_external_notification,  # noqa: F401 — re-exported for tests / compat patch point
-    post_version_auto_merge_stall_message,  # noqa: F401 — re-exported for tests
     post_version_build_stalled_message,  # noqa: F401 — re-exported for tests
     post_version_calcification_message,  # noqa: F401 — re-exported for tests
     post_version_ci_unresolved_stall_message,  # noqa: F401 — re-exported for tests
@@ -97,6 +97,7 @@ from app.release_promotion import (
     _record_qualification_verdict,
     _recover_confidence_from_ci_unresolved,
     _relock_version_for_promotion_write,  # noqa: F401 — tests access via rq.*
+    _resolve_exact_promotion_receipt,
     _resolve_github_with_session,
     promote,
 )
@@ -104,7 +105,6 @@ from app.release_reconciliation import (
     _reconcile_if_ci_unresolved_now_green,  # noqa: F401 — re-exported for back-compat
     _reconcile_if_deploy_failed_recovered,  # noqa: F401 — re-exported for back-compat
     _reconcile_if_not_promoted_but_pr_merged,  # noqa: F401 — re-exported for back-compat
-    _reconcile_if_pending_auto_merge_landed,  # noqa: F401 — re-exported for back-compat
     _reconcile_if_promotion_failed_landed,  # noqa: F401 — re-exported for back-compat
     _reconcile_if_promotion_pending_timed_out,  # noqa: F401 — re-exported for back-compat
 )
@@ -182,13 +182,11 @@ from app.release_scoring import (
     is_contentless_goal,
 )
 from app.release_stall_alerts import (
-    _AUTO_MERGE_STALL_SECONDS,  # noqa: F401 — re-exported for back-compat
     _BUILD_STALL_AGE_DAYS,  # noqa: F401 — re-exported for back-compat
     _BUILD_STALL_MERGED_TASKS,  # noqa: F401 — re-exported for back-compat
     _MIN_CALCIFICATION_ATTEMPTS,  # noqa: F401 — re-exported for back-compat
     _STABILIZE_STALL_AGE_DAYS,  # noqa: F401 — re-exported for back-compat
     _STABILIZE_STALL_MERGED_TASKS,  # noqa: F401 — re-exported for back-compat
-    _check_version_auto_merge_stall,  # noqa: F401 — re-exported for tests
     _check_version_build_stall,  # noqa: F401 — re-exported for tests
     _check_version_calcification,  # noqa: F401 — re-exported for tests
     _check_version_ci_unresolved_stall,  # noqa: F401 — re-exported for tests
@@ -253,7 +251,6 @@ from app.release_readiness import (
 from app.shared_state import (
     get_project_integration_branch,
     resolve_project_promotion_enabled,
-    resolve_project_walkthrough_e2e_enabled,
     runtime_config as _runtime_config,
 )
 from app.time_utils import _utcnow
@@ -269,6 +266,81 @@ logger = logging.getLogger(__name__)
 _CONCLUSIVE_VERDICT_STATUSES: frozenset[str] = frozenset(
     {"promoted", "not_promoted", "dry_run"}
 )
+
+# Product probes are opt-in parts of a qualification attempt's decision
+# contract. Keep the set closed: silently dropping an unknown value would let a
+# caller believe an important/costly check ran when the verdict ignored it.
+_SUPPORTED_QUALIFICATION_PROBES: frozenset[str] = frozenset({"walkthrough_e2e"})
+
+# Frozen output contract of scripts/walkthrough/v26-live-walkthrough.cjs.  The
+# first three raw rows must stay coherent with
+# acceptance_criteria._WALKTHROUGH_META_REQUIRED_SUBCRITERIA: the fourth row is
+# their conjunction/meta result.  The workday slug is a supported legacy alias
+# for the registered meta criterion, so those two raw rows intentionally
+# collapse to one canonical evidence key.  No other raw or canonical duplicate
+# is part of the contract.
+_WALKTHROUGH_E2E_EXPECTED_RAW_RESULT_KEYS: frozenset[str] = frozenset(
+    {
+        "c-dfdc9d82",
+        "c-f52fd975",
+        "c-workday-session-lifecycle",
+        "c-5214996f",
+    }
+)
+_WALKTHROUGH_E2E_EXPECTED_CANONICAL_EVIDENCE_KEYS: frozenset[str] = frozenset(
+    {"c-dfdc9d82", "c-f52fd975", "c-5214996f"}
+)
+_WALKTHROUGH_E2E_ALLOWED_CANONICAL_COLLISION: frozenset[str] = frozenset(
+    {"c-workday-session-lifecycle", "c-5214996f"}
+)
+
+
+def _normalize_qualification_probes(raw: Any) -> frozenset[str]:
+    """Return a strict, bounded product-probe selection."""
+    if raw is None:
+        return frozenset()
+    if not isinstance(raw, (list, tuple, set, frozenset)):
+        raise ValueError("requested_probes must be a collection of probe names")
+    normalized: set[str] = set()
+    for item in raw:
+        if not isinstance(item, str):
+            raise ValueError("requested_probes entries must be strings")
+        probe = item.strip().lower()
+        if not probe:
+            raise ValueError("requested_probes entries must not be blank")
+        if probe not in _SUPPORTED_QUALIFICATION_PROBES:
+            raise ValueError(f"unsupported qualification probe: {probe[:80]}")
+        if probe in normalized:
+            raise ValueError(f"duplicate qualification probe: {probe}")
+        normalized.add(probe)
+    if len(normalized) > len(_SUPPORTED_QUALIFICATION_PROBES):
+        raise ValueError("requested_probes contains too many entries")
+    return frozenset(normalized)
+
+
+def _qualification_probe_contract_is_reusable(
+    prior_qual: dict[str, Any], current_probes: frozenset[str]
+) -> bool:
+    """Whether a conclusive record satisfies the current probe contract."""
+    try:
+        prior_probes = _normalize_qualification_probes(
+            prior_qual.get("requested_probes")
+        )
+    except ValueError:
+        return False
+    if prior_probes != current_probes:
+        return False
+    if "walkthrough_e2e" not in current_probes:
+        return True
+    result = prior_qual.get("walkthrough_e2e_result")
+    candidate_sha = str(prior_qual.get("candidate_sha") or "").strip()
+    return bool(
+        isinstance(result, dict)
+        and result.get("status") in {"passed", "failed"}
+        and candidate_sha
+        and result.get("candidate_sha") == candidate_sha
+        and result.get("exercised_engine_sha") == candidate_sha
+    )
 
 # Explicit enumeration of every dimension written by _dual_write_dimension_results.
 # This constant is asserted == LEDGER_DIMENSION_KEYS at module load so any drift
@@ -1442,6 +1514,8 @@ async def _qualification_in_flight(
         required_keys.append("challenge_task_id")
     if qual.get("merge_grade_task_id"):
         required_keys.append("merge_grade_task_id")
+    if "walkthrough_e2e" in set(qual.get("requested_probes") or []):
+        required_keys.append("walkthrough_e2e_task_id")
     child_ids: list[uuid.UUID] = []
     parse_failed = False
     for key in required_keys:
@@ -1463,17 +1537,16 @@ async def _qualification_in_flight(
         return True
     return any(row.status not in _TERMINAL_STATUSES for row in rows)
 
-def _promotion_in_flight_result(
+def _promotion_pending_result(
     version: release_version.ReleaseVersion,
     *,
     latest_verdict: Any = None,
 ) -> dict[str, Any] | None:
     """Return a promotion-blocking status dict, or None when not mid-promotion.
 
-    The status echoes the blocking sub-state: ``promotion_in_flight`` (native
-    GitHub auto-merge) or ``promotion_check_wait`` (the managed migration-
-    carrying wait whose merge the reconciler retries after required checks pass).
-    Re-qualifying while either state is active would overwrite the durable
+    The sole blocking sub-state is ``promotion_check_wait``: Blueprint owns the
+    persisted promotion PR and retries its exact target after required checks pass.
+    Re-qualifying while that state is active would overwrite the durable
     promotion-pending provenance, so every operator path uses this same guard.
     """
     from app.qualification_state_resolver import apply_verdict_substitution
@@ -2059,6 +2132,7 @@ async def _check_lts_sync_gate(
     candidate_sha: str,
     integration_branch: str,
     promotion_target: str,
+    requested_probes: frozenset[str] = frozenset(),
 ) -> dict[str, Any] | None:
     """Qualify-on-synced gate: don't score a candidate that is behind ``main``.
 
@@ -2157,6 +2231,7 @@ async def _check_lts_sync_gate(
     version.last_qualification = {
         "status": "deferred_unsynced",
         "candidate_sha": candidate_sha,
+        "requested_probes": sorted(requested_probes),
         "promotion_target": promotion_target,
         "first_deferred_at": first.isoformat(),
         "deferred_at": _utcnow().isoformat(),
@@ -2178,7 +2253,11 @@ async def _check_lts_sync_gate(
         waited_min,
         fall_through_min,
     )
-    return {"status": "deferred_unsynced", "candidate_sha": candidate_sha}
+    return {
+        "status": "deferred_unsynced",
+        "candidate_sha": candidate_sha,
+        "requested_probes": sorted(requested_probes),
+    }
 
 async def run_qualification(
     session: AsyncSession,
@@ -2190,6 +2269,7 @@ async def run_qualification(
     qualification_attempt_id: uuid.UUID | str | None = None,
     retry_episode: int = 0,
     retry_episode_cap: int | None = None,
+    requested_probes: list[str] | tuple[str, ...] | set[str] | None = None,
 ) -> dict[str, Any]:
     """Kick off qualification for the open release ``version``.
 
@@ -2241,7 +2321,8 @@ async def run_qualification(
          in ``_finalize_qualification`` applies it as a hard blocker.
       4. Lock the ``ReleaseVersion`` row, then re-check the in-flight /
          cached-verdict guards under the lock.
-      5. Spawn the active audit, merge-grade, and evidence children. Their
+      5. Spawn the active audit and merge-grade children, plus only the product
+         probes explicitly selected by the qualification requester. Their
          payloads carry the exact ``candidate_sha`` so every gate evaluates the
          snapshotted tree rather than a later integration-branch head.
       6. Stamp ``version.last_qualification = {status: "pending", ...}`` and
@@ -2259,6 +2340,25 @@ async def run_qualification(
     attempt_id = continued_attempt_id or uuid.uuid4()
     is_new_attempt = continued_attempt_id is None
     retry_episode = max(0, int(retry_episode or 0))
+    prior_qual = version.last_qualification or {}
+    raw_requested_probes: Any = requested_probes
+    if raw_requested_probes is None and continued_attempt_id is not None:
+        raw_requested_probes = prior_qual.get("requested_probes")
+    try:
+        effective_requested_probes = _normalize_qualification_probes(
+            raw_requested_probes
+        )
+    except ValueError as exc:
+        logger.warning(
+            "[RELEASE_QUALIFIER] refusing invalid product-probe selection for "
+            "v%d: %s",
+            version.version_number,
+            exc,
+        )
+        return {
+            "status": "invalid_requested_probes",
+            "detail": str(exc)[:200],
+        }
 
     # Guard 1: only qualify a stabilize-phase candidate.  Cheap, no I/O — do
     # it before resolving credentials so a wrong-phase call is a pure no-op.
@@ -2287,8 +2387,8 @@ async def run_qualification(
         )
         return {"status": "already_pending"}
 
-    # Cheap pre-lock promotion-in-flight check (no I/O beyond verdict fetch).
-    # A version whose audit passed and now has an open promotion PR auto-merging
+    # Cheap pre-lock promotion-pending check (no I/O beyond verdict fetch).
+    # A version whose audit passed and now has a managed promotion pending
     # must not be re-qualified: doing so spawns fresh expensive qualifier
     # children and clobbers the promotion-pending record.  Consistent with the
     # version-cut lever, which refuses in the same state.  Best-effort fast path
@@ -2300,11 +2400,11 @@ async def run_qualification(
     _latest_verdict_prelock = await resolve_newest_qualification_verdict(
         session, version
     )
-    _promo = _promotion_in_flight_result(version, latest_verdict=_latest_verdict_prelock)
+    _promo = _promotion_pending_result(version, latest_verdict=_latest_verdict_prelock)
     if _promo is not None:
         logger.info(
             "[RELEASE_QUALIFIER] run_qualification: version v%d has a promotion "
-            "in flight — skipping (promotion_in_flight, pre-lock)",
+            "pending — skipping (promotion_check_wait, pre-lock)",
             version.version_number,
         )
         return _promo
@@ -2316,6 +2416,13 @@ async def run_qualification(
             project_id,
         )
         return {"status": "project_not_found"}
+    if project.paused:
+        logger.info(
+            "[RELEASE_QUALIFIER] run_qualification: project %s is paused — "
+            "qualification spawning remains stopped",
+            project_id,
+        )
+        return {"status": "project_paused"}
 
     resolved = await _resolve_github_with_session(session, project)
     if resolved is None:
@@ -2326,6 +2433,7 @@ async def run_qualification(
             "qualification_attempt_id": str(attempt_id),
             "retry_episode": retry_episode,
             "retry_episode_cap": retry_episode_cap,
+            "requested_probes": sorted(effective_requested_probes),
         }
         flag_modified(version, "last_qualification")
         session.add(version)
@@ -2346,6 +2454,7 @@ async def run_qualification(
             "status": "no_credentials",
             "qualification_attempt_id": str(attempt_id),
             "retry_episode": retry_episode,
+            "requested_probes": sorted(effective_requested_probes),
         }
     token, owner, repo = resolved
 
@@ -2373,6 +2482,7 @@ async def run_qualification(
             "qualification_attempt_id": str(attempt_id),
             "retry_episode": retry_episode,
             "retry_episode_cap": retry_episode_cap,
+            "requested_probes": sorted(effective_requested_probes),
         }
         flag_modified(version, "last_qualification")
         session.add(version)
@@ -2390,6 +2500,7 @@ async def run_qualification(
             "status": "sha_error",
             "qualification_attempt_id": str(attempt_id),
             "retry_episode": retry_episode,
+            "requested_probes": sorted(effective_requested_probes),
         }
 
     # 3. CI check on the candidate SHA (cheap, orchestrator-side).  Done before
@@ -2427,6 +2538,9 @@ async def run_qualification(
         _pre_lock_qual.get("status") in _CONCLUSIVE_VERDICT_STATUSES
         and _pre_lock_qual.get("candidate_sha") == candidate_sha
         and not _legacy_smoke_tainted_verdict(_pre_lock_qual)
+        and _qualification_probe_contract_is_reusable(
+            _pre_lock_qual, effective_requested_probes
+        )
     )
     candidate_tree_entries = (
         None
@@ -2454,6 +2568,7 @@ async def run_qualification(
             candidate_sha=candidate_sha,
             integration_branch=integration_branch,
             promotion_target=promotion_target,
+            requested_probes=effective_requested_probes,
         )
         if _sync_gate is not None:
             return _sync_gate
@@ -2485,8 +2600,13 @@ async def run_qualification(
     #     reconstructs composite/base_record from the passing fields the
     #     promotion_failed record carries; a None return (state changed, cap hit,
     #     candidate already on main, lock contended) falls through to re-audit.
-    if _promotion_failed_reuse_eligible(_pre_lock_qual, candidate_diff_hash) and (
-        int(_pre_lock_qual.get("promotion_failure_count") or 0)
+    if (
+        not effective_requested_probes
+        and _qualification_probe_contract_is_reusable(
+            _pre_lock_qual, effective_requested_probes
+        )
+        and _promotion_failed_reuse_eligible(_pre_lock_qual, candidate_diff_hash)
+        and int(_pre_lock_qual.get("promotion_failure_count") or 0)
         < _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS
     ):
         if not allow_synchronous_reuse_promote:
@@ -2549,9 +2669,9 @@ async def run_qualification(
     #    PRE-DATES a ``promote()`` committed in another session — a bare
     #    ``with_for_update()`` SELECT acquires the DB lock but returns that SAME
     #    cached instance WITHOUT refreshing its attributes, so the under-lock
-    #    guards below (phase / in-flight / promotion-in-flight / cached-verdict)
+    #    guards below (phase / active attempt / managed promotion / cached verdict)
     #    would read STALE ``last_qualification``.  That is how a re-qualify slips
-    #    past the promotion-in-flight guard while a promotion PR is genuinely open
+    #    past the managed-promotion guard while a promotion PR is genuinely open
     #    in ``promotion_check_wait`` and spawns a redundant audit + merge-grade.
     #    Forcing the loaded row to overwrite the cached attributes makes the
     #    under-lock guards authoritative regardless of caller staleness (mirrors
@@ -2606,25 +2726,25 @@ async def run_qualification(
         )
         return {"status": "already_pending"}
 
-    # Guard 2b (under the lock): a promotion is in flight — the audit PASSED and
-    # a promotion PR is open and auto-merging (last_qualification.status ==
+    # Guard 2b (under the lock): a promotion is pending — the audit PASSED and
+    # a managed promotion owns the PR (last_qualification.status ==
     # "pending" + a promotion_pending sub-key, children already terminal).  This
     # is NOT "in flight" by the child-task definition above, and "pending" is not
     # a conclusive verdict, so neither Guard 2 nor Guard 3 catches it.  Spawning
     # fresh qualifier children here and overwriting the promotion-pending
     # record would discard the provenance the rest of the system relies on to
-    # know the promotion is still legitimately merging — so refuse (no-op),
+    # know the promotion is still legitimately pending — so refuse (no-op),
     # consistent with the version-cut lever.
     # Re-fetch the verdict under the lock (the pre-lock fetch may be stale if a
     # concurrent promotion finalized between the pre-lock check and here).
     _latest_verdict_locked = await resolve_newest_qualification_verdict(
         session, version
     )
-    _promo = _promotion_in_flight_result(version, latest_verdict=_latest_verdict_locked)
+    _promo = _promotion_pending_result(version, latest_verdict=_latest_verdict_locked)
     if _promo is not None:
         logger.info(
             "[RELEASE_QUALIFIER] run_qualification: version v%d has a promotion "
-            "in flight — skipping (promotion_in_flight)",
+            "pending — skipping (promotion_check_wait)",
             version.version_number,
         )
         return _promo
@@ -2643,7 +2763,21 @@ async def run_qualification(
     # same-SHA not_promoted verdict may re-run once the live coverage summary
     # shows the coverage gate would no longer fire (a retracted/superseded
     # criterion cleared the wedge) — the acceptance-contract safety valve.
+    # Product probes are decision-selected, not globally armed. A retry of the
+    # same qualification attempt inherits the frozen selection; a new request
+    # with no selection runs no product probe. The selection was strictly
+    # normalized before any GitHub I/O above.
     prior_qual = version.last_qualification or {}
+    if requested_probes is None and continued_attempt_id is not None:
+        try:
+            effective_requested_probes = _normalize_qualification_probes(
+                prior_qual.get("requested_probes")
+            )
+        except ValueError as exc:
+            return {
+                "status": "invalid_requested_probes",
+                "detail": str(exc)[:200],
+            }
     if continued_attempt_id is not None:
         projected_attempt_id = _coerce_qualification_attempt_id(
             prior_qual.get("qualification_attempt_id")
@@ -2738,6 +2872,10 @@ async def run_qualification(
         and _prior_diff_hash
         and candidate_diff_hash == _prior_diff_hash
         and prior_status != "not_promoted"
+        and not effective_requested_probes
+        and _qualification_probe_contract_is_reusable(
+            prior_qual, effective_requested_probes
+        )
     )
     if (
         prior_status in _CONCLUSIVE_VERDICT_STATUSES
@@ -2748,6 +2886,9 @@ async def run_qualification(
         and not ci_unresolved_recovered_same_sha
         and not criterion_coverage_recovered_same_sha
         and not legacy_smoke_tainted_verdict
+        and _qualification_probe_contract_is_reusable(
+            prior_qual, effective_requested_probes
+        )
     ):
         _reuse_reason = (
             "automain unchanged"
@@ -2823,16 +2964,10 @@ async def run_qualification(
     # Qualifier VM smoketests are retired. Preserve explicit archival fields in
     # qualification records, but never launch or score this legacy dimension.
     smoketest_enabled = False
-    # walkthrough_e2e_enabled gates the qualifier-spawned live-stack walkthrough
-    # evidence lane.  Resolved with the SAME source precedence as the smoketest
-    # gate — per-project build_config override, then the fleet runtime_config
-    # flag (default True).  The spawned child produces SHA-pinned
-    # CriterionEvidence and NEVER cascades a fix on failure (evidence-only).
-    _walkthrough_build_override = (project.build_config or {}).get("walkthrough_e2e_enabled")
-    if _walkthrough_build_override is not None:
-        walkthrough_e2e_enabled = bool(_walkthrough_build_override)
-    else:
-        walkthrough_e2e_enabled = resolve_project_walkthrough_e2e_enabled(project.id)
+    # A live-stack walkthrough is expensive and application-specific. It runs
+    # only when Strategic (or another explicit caller) selected it for this
+    # qualification decision; no fleet/project flag silently adds one.
+    walkthrough_e2e_requested = "walkthrough_e2e" in effective_requested_probes
     # Slice 3 (design 245212a4): the DEPLOYED-side env-preflight judge ships
     # DARK — env_preflight_enabled defaults False.  Resolve with the same source
     # precedence as the promotion rubric: per-project build_config override, then
@@ -3152,9 +3287,8 @@ async def run_qualification(
     _audit_needed = not (
         "audit" in resolved_dims and "test_erosion" in resolved_dims
     )
-    # The walkthrough_e2e child is evidence-only (no scored dimension), so it is
-    # gated purely on the enablement flag.
-    _walkthrough_e2e_needed = walkthrough_e2e_enabled
+    # The walkthrough_e2e child is an opt-in decision-bearing product probe.
+    _walkthrough_e2e_needed = walkthrough_e2e_requested
     _merge_grade_needed = (
         _merge_grade_goal_usable and "merge_grade" not in resolved_dims
     )
@@ -3258,6 +3392,7 @@ async def run_qualification(
             "qualification_attempt_id": str(attempt_id),
             "retry_episode": retry_episode,
             "retry_episode_cap": retry_episode_cap,
+            "requested_probes": sorted(effective_requested_probes),
         }
         # Read-modify-write is safe here (unlike the no_credentials / sha_error
         # early returns, which run pre-lock and use the atomic
@@ -3331,10 +3466,9 @@ async def run_qualification(
         "audit_challenge_spawn_error": audit_challenge_spawn_error,
         "audit_challenge_spawn_pending": audit_challenge_spawn_pending,
         "smoketest_task_id": smoketest_task_id,
-        # Evidence-only walkthrough child (None when the lane is disabled).  Not
-        # a required child for the in-flight / finalize gate — it produces
-        # CriterionEvidence, not a scored qualification dimension.
-        "walkthrough_e2e_enabled": walkthrough_e2e_enabled,
+        # Explicitly requested decision-bearing product probe. It is a required
+        # child for this attempt and finalization consumes its same-SHA result.
+        "requested_probes": sorted(effective_requested_probes),
         "walkthrough_e2e_task_id": walkthrough_e2e_task_id,
         "merge_grade_task_id": merge_grade_task_id,
         "rubric_snapshot": rubric_snapshot,
@@ -3403,7 +3537,7 @@ async def run_qualification(
         "audit_challenge_spawn_error": audit_challenge_spawn_error,
         "audit_challenge_spawn_pending": audit_challenge_spawn_pending,
         "smoketest_task_id": smoketest_task_id,
-        "walkthrough_e2e_enabled": walkthrough_e2e_enabled,
+        "requested_probes": sorted(effective_requested_probes),
         "walkthrough_e2e_task_id": walkthrough_e2e_task_id,
         "merge_grade_task_id": merge_grade_task_id,
     }
@@ -3433,6 +3567,164 @@ _AUDIT_CHALLENGE_BINDING_HOLDS: frozenset[str] = frozenset(
     }
 )
 
+
+def _evaluate_walkthrough_e2e_report(
+    report: Any, candidate_sha: str | None
+) -> dict[str, Any]:
+    """Validate and classify a decision-bearing walkthrough report.
+
+    A negative criterion is a valid quality result (``failed``). Structural or
+    provenance defects are ``invalid`` and therefore infrastructure failures,
+    never quality verdicts. The exercised live stack must identify the exact
+    candidate; checking only the report's requested SHA would accept a harness
+    that accidentally exercised another checkout.
+    """
+    expected_sha = str(candidate_sha or "").strip()
+    if not isinstance(report, dict):
+        return {"status": "invalid", "reason": "report_missing"}
+    report_sha = str(report.get("git_sha") or "").strip()
+    if not report_sha or report_sha != expected_sha:
+        return {
+            "status": "invalid",
+            "reason": "candidate_sha_mismatch",
+            "candidate_sha": report_sha or None,
+        }
+    exercised_sha = str(report.get("exercised_engine_sha") or "").strip()
+    if not exercised_sha or exercised_sha != expected_sha:
+        return {
+            "status": "invalid",
+            "reason": "exercised_engine_sha_mismatch",
+            "candidate_sha": report_sha,
+            "exercised_engine_sha": exercised_sha or None,
+        }
+    results = report.get("results")
+    if not isinstance(results, list):
+        return {
+            "status": "invalid",
+            "reason": "results_missing",
+            "candidate_sha": report_sha,
+            "exercised_engine_sha": exercised_sha,
+        }
+
+    normalized_results: list[dict[str, Any]] = []
+    seen_keys: set[str] = set()
+    for entry in results:
+        if not isinstance(entry, dict):
+            return {
+                "status": "invalid",
+                "reason": "result_entry_invalid",
+                "candidate_sha": report_sha,
+                "exercised_engine_sha": exercised_sha,
+            }
+        key = str(entry.get("criterion_key") or "").strip()
+        notes = entry.get("notes")
+        if (
+            not key
+            or len(key) > 120
+            or type(entry.get("passed")) is not bool
+            or (notes is not None and not isinstance(notes, str))
+        ):
+            return {
+                "status": "invalid",
+                "reason": "result_entry_invalid",
+                "candidate_sha": report_sha,
+                "exercised_engine_sha": exercised_sha,
+            }
+        if key in seen_keys:
+            return {
+                "status": "invalid",
+                "reason": "result_key_duplicate",
+                "candidate_sha": report_sha,
+                "exercised_engine_sha": exercised_sha,
+                "criterion_key": key,
+            }
+        seen_keys.add(key)
+        normalized_results.append(
+            {
+                "criterion_key": key,
+                "passed": entry["passed"],
+                "notes": notes[:500] if notes is not None else None,
+            }
+        )
+
+    if seen_keys != _WALKTHROUGH_E2E_EXPECTED_RAW_RESULT_KEYS:
+        return {
+            "status": "invalid",
+            "reason": "result_schema_mismatch",
+            "candidate_sha": report_sha,
+            "exercised_engine_sha": exercised_sha,
+            "missing_criterion_keys": sorted(
+                _WALKTHROUGH_E2E_EXPECTED_RAW_RESULT_KEYS - seen_keys
+            ),
+            "unexpected_criterion_keys": sorted(
+                seen_keys - _WALKTHROUGH_E2E_EXPECTED_RAW_RESULT_KEYS
+            ),
+        }
+
+    failed_keys = [
+        row["criterion_key"] for row in normalized_results if not row["passed"]
+    ]
+    return {
+        "status": "failed" if failed_keys else "passed",
+        "candidate_sha": report_sha,
+        "exercised_engine_sha": exercised_sha,
+        "result_count": len(normalized_results),
+        "failed_criterion_keys": failed_keys[:50],
+        "results": normalized_results,
+    }
+
+
+def _walkthrough_e2e_canonical_evidence_keys(
+    normalized_results: list[dict[str, Any]],
+) -> frozenset[str]:
+    """Resolve the frozen raw v26 schema to its unique evidence keys.
+
+    The legacy workday slug and the explicit meta row are the only intentional
+    many-to-one pair.  Keeping that exception exact prevents a later alias-table
+    edit from silently merging two otherwise independent probe outcomes.
+    """
+    from app.acceptance_criteria import _resolve_walkthrough_criterion_key
+
+    canonical_groups: dict[str, set[str]] = {}
+    for row in normalized_results:
+        raw_key = row["criterion_key"]
+        canonical_groups.setdefault(
+            _resolve_walkthrough_criterion_key(raw_key), set()
+        ).add(raw_key)
+    duplicate_groups = {
+        frozenset(raw_keys)
+        for raw_keys in canonical_groups.values()
+        if len(raw_keys) > 1
+    }
+    if duplicate_groups != {_WALKTHROUGH_E2E_ALLOWED_CANONICAL_COLLISION}:
+        raise ValueError("unexpected canonical criterion collision")
+    resolved_keys = frozenset(canonical_groups)
+    if resolved_keys != _WALKTHROUGH_E2E_EXPECTED_CANONICAL_EVIDENCE_KEYS:
+        raise ValueError("canonical evidence schema mismatch")
+    return resolved_keys
+
+
+def _apply_walkthrough_decision(
+    composite: dict[str, Any], result: dict[str, Any]
+) -> dict[str, Any]:
+    """Fold a valid requested walkthrough into the promotion decision."""
+    passed = result.get("status") == "passed"
+    updated = {
+        **composite,
+        "sub_scores": {
+            **(composite.get("sub_scores") or {}),
+            "walkthrough_e2e": 1.0 if passed else 0.0,
+        },
+    }
+    if passed:
+        return updated
+    return {
+        **updated,
+        "promote": False,
+        "blocker": "walkthrough_e2e_failed",
+    }
+
+
 def _advance_qualification_retry_episode(
     version: release_version.ReleaseVersion,
     record: dict[str, Any],
@@ -3453,6 +3745,10 @@ _BLOCKER_LABELS: dict[str, str] = {
     "ci_unresolved": "CI state could not be evaluated (pending, no check-runs, or GitHub I/O degraded)",
 
     "audit_missing": "the release audit produced no usable report",
+    "walkthrough_e2e_failed": (
+        "the explicitly requested live-stack walkthrough failed one or more "
+        "acceptance criteria"
+    ),
     "test_file_deleted": "the diff deleted a test file",
     "migration_identity_collision": (
         "an Alembic revision-identity collision between the candidate and the "
@@ -4032,7 +4328,7 @@ async def _collect_verified_merge_test_evidence(
                 seam_files.add(p.strip())
     return {"test_files": sorted(test_files), "seam_files": sorted(seam_files)}
 
-async def _guard_ci_unresolved_promotion_in_flight(
+async def _guard_ci_unresolved_promotion_pending(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
     candidate_sha: str | None,
@@ -4045,9 +4341,9 @@ async def _guard_ci_unresolved_promotion_in_flight(
     """Guard: before writing not_promoted for ci_unresolved, check for in-flight.
 
     Incident 2026-06-09: a transient DB error rolled back the promotion_pending
-    marker write after a release PR was created and auto-merge was armed. A
+    marker write after a release PR was created. A
     subsequent sweep re-evaluated CI as ci_unresolved (transient, not red) and
-    wrote not_promoted — clobbering a promotion in flight.
+    wrote not_promoted — clobbering a managed promotion.
 
     This guard runs UNDER the version row lock (caller holds it from
     _finalize_locked_version) before the not_promoted write. GitHub I/O here is
@@ -4056,9 +4352,9 @@ async def _guard_ci_unresolved_promotion_in_flight(
 
     (a) Candidate already on main — the PR merged while promotion_pending was
         being committed and the commit rolled back. Record success instead.
-    (b) Open release PR still exists — auto-merge is armed or pending CI.
-        Restore the promotion_pending sub-state so the reaper can confirm the
-        merge later rather than writing a spurious not_promoted.
+    (b) Open release PR still exists — restore the managed promotion_pending
+        sub-state so the reconciler can revalidate and retry it rather than
+        writing a spurious not_promoted.
 
     Returns a result dict if the guard handled the situation (caller should
     return early), or None to proceed with the normal not_promoted write.
@@ -4077,45 +4373,70 @@ async def _guard_ci_unresolved_promotion_in_flight(
         )
         return None
 
-    if await _candidate_already_on_main(
-        token, owner, repo, candidate_sha, version, project=project
-    ):
+    receipt = await _resolve_exact_promotion_receipt(
+        token,
+        owner,
+        repo,
+        candidate_sha,
+        version,
+        project=project,
+    )
+    if receipt is not None:
         logger.info(
             "[RELEASE_QUALIFIER] ci_unresolved guard: candidate %s for v%d is "
-            "already on main — recording promotion success instead of not_promoted",
+            "bound to an exact promotion receipt — recording success instead "
+            "of not_promoted",
             candidate_sha[:8],
             version.version_number,
         )
-        promoted_sha: str | None = None
-        try:
-            promoted_sha = await github.get_branch_sha(
-                token, owner, repo, promotion_target, live=True
+        receipt_pr_number = receipt.get("pr_number")
+        if receipt_pr_number is not None:
+            from app.rollup_migration_validation import (
+                _validate_migration_chain_post_merge,
             )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "[RELEASE_QUALIFIER] ci_unresolved guard: could not resolve %s "
-                "HEAD SHA for v%d (%s) — using candidate_sha as promoted_sha",
-                promotion_target,
-                version.version_number,
-                exc,
+
+            migration_status, migration_reason = (
+                await _validate_migration_chain_post_merge(
+                    token,
+                    owner,
+                    repo,
+                    int(receipt_pr_number),
+                    receipt["merge_commit_sha"],
+                )
             )
+            if migration_status == "defer":
+                return {
+                    "status": "pending",
+                    "reason": "promotion_receipt_validation_deferred",
+                }
+            if migration_status == "block":
+                return await _record_promotion_failure(
+                    session,
+                    version,
+                    _recover_confidence_from_ci_unresolved(base_record),
+                    "migration_guard_blocked",
+                    detail=migration_reason,
+                    pr_url=receipt.get("pr_url"),
+                    lock_released=False,
+                )
         return await _record_promotion_success(
             session,
             version,
             candidate_sha,
             _recover_confidence_from_ci_unresolved(base_record),
-            pr_url=_idempotent_pr_url(base_record),
+            pr_url=receipt.get("pr_url") or _idempotent_pr_url(base_record),
             token=token,
             owner=owner,
             repo=repo,
-            promoted_sha=promoted_sha,
+            empty_diff=bool(receipt.get("empty_diff")),
+            promoted_sha=receipt["merge_commit_sha"],
             already_landed=True,
             lock_released=False,
         )
 
-    # Candidate not yet on main — check whether the release PR is still open
-    # (auto-merge armed, PR CI still pending). If so, restore promotion_pending
-    # so the reaper confirms the merge rather than recording a spurious miss.
+    # Candidate not yet on main — check whether its release PR is still open.
+    # If so, restore the one canonical managed waiter so the reconciler checks
+    # CI, revalidates the exact target, and retries instead of recording a miss.
     release_branch = f"release-v{version.version_number}"
     try:
         open_prs = await github.get_open_pull_requests(
@@ -4126,6 +4447,9 @@ async def _guard_ci_unresolved_promotion_in_flight(
                 pr
                 for pr in open_prs
                 if (pr.get("head") or {}).get("ref") == release_branch
+                and (pr.get("head") or {}).get("sha") == candidate_sha
+                and (pr.get("base") or {}).get("ref") == promotion_target
+                and pr.get("state", "open") == "open"
             ),
             None,
         )
@@ -4143,45 +4467,20 @@ async def _guard_ci_unresolved_promotion_in_flight(
 
     pr_number = open_release_pr.get("number")
     pr_url = open_release_pr.get("html_url") or _idempotent_pr_url(base_record)
-    auto_merge_enabled = open_release_pr.get("auto_merge") is not None
     logger.info(
         "[RELEASE_QUALIFIER] ci_unresolved guard: open release PR #%s for v%d "
-        "found — restoring promotion_pending instead of writing not_promoted "
-        "(auto_merge=%s)",
+        "found — restoring managed_check_wait instead of writing not_promoted",
         pr_number,
         version.version_number,
-        auto_merge_enabled,
     )
-    # Detect whether the open release PR carries Alembic migrations.  The
-    # fail-safe default is True (migration-carrying): if the file-list fetch
-    # fails we must NOT route to the native-auto-merge path that bypasses
-    # Blueprint's re-entry guard.
-    from app.rollup_migration_validation import pr_touches_migrations
-
-    is_migration_pr = True
-    try:
-        is_migration_pr = await pr_touches_migrations(token, owner, repo, pr_number)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "[RELEASE_QUALIFIER] ci_unresolved guard: could not determine "
-            "migration status for PR #%s (v%d) (%s) — defaulting to "
-            "migration_carrying=True",
-            pr_number,
-            version.version_number,
-            exc,
-        )
 
     promotion_pending: dict[str, Any] = {
         "pr_number": pr_number,
         "pr_url": pr_url,
-        "auto_merge_enabled": auto_merge_enabled,
+        "managed_check_wait": True,
         "enabled_at": _utcnow().isoformat(),
         "restored_by_ci_unresolved_guard": True,
     }
-    if is_migration_pr:
-        promotion_pending["migration_carrying"] = True
-        promotion_pending["managed_check_wait"] = True
-        promotion_pending["why_not_native_automerge"] = "migration_guard_deferred"
 
     q = dict(version.last_qualification or {})
     q.update(_recover_confidence_from_ci_unresolved(base_record))
@@ -4190,15 +4489,11 @@ async def _guard_ci_unresolved_promotion_in_flight(
     version.last_qualification = q
     flag_modified(version, "last_qualification")
     session.add(version)
-    result_status = (
-        "pending_managed_check_wait" if is_migration_pr else "pending_auto_merge"
-    )
     return {
-        "status": result_status,
+        "status": "pending_managed_check_wait",
         "pr_number": pr_number,
         "pr_url": pr_url,
-        "auto_merge_enabled": auto_merge_enabled,
-        "managed_check_wait": is_migration_pr,
+        "managed_check_wait": True,
     }
 
 async def _merged_pr_numbers_for_version(
@@ -5200,6 +5495,9 @@ async def _record_rubric_provenance_outcome(
         "audit_task_id": qual.get("audit_task_id"),
         "smoketest_task_id": qual.get("smoketest_task_id"),
         "merge_grade_task_id": qual.get("merge_grade_task_id"),
+        "requested_probes": qual.get("requested_probes") or [],
+        "walkthrough_e2e_task_id": qual.get("walkthrough_e2e_task_id"),
+        "walkthrough_e2e_result": qual.get("walkthrough_e2e_result"),
         "rubric_snapshot": (
             rubric_provenance.get("criteria") if rubric_provenance else None
         ),
@@ -5330,6 +5628,15 @@ async def _finalize_qualification(
     # stamp false/None; legacy attempts retain their original metadata.
     smoketest_task_id = qual.get("smoketest_task_id")
     merge_grade_task_id = qual.get("merge_grade_task_id")
+    try:
+        requested_probes = _normalize_qualification_probes(
+            qual.get("requested_probes")
+        )
+    except ValueError:
+        return await _handle_infra_failure(
+            session, version, qual, "qualification_probe_contract_invalid"
+        )
+    walkthrough_e2e_task_id = qual.get("walkthrough_e2e_task_id")
     smoketest_enabled = bool(qual.get("smoketest_enabled", False))
     # Dimensions already resolved (passed/failed/blocked) for this candidate_sha
     # from a prior finalize, carried forward by run_qualification from the
@@ -5834,6 +6141,125 @@ async def _finalize_qualification(
                 merge_grade_task_id,
                 version.version_number,
             )
+
+    # --- Explicit product probe: decision-bearing walkthrough --------------
+    walkthrough_e2e_result: dict[str, Any] | None = None
+    if "walkthrough_e2e" in requested_probes:
+        if not walkthrough_e2e_task_id:
+            return await _handle_infra_failure(
+                session, version, qual, "walkthrough_e2e_task_missing"
+            )
+        try:
+            _walkthrough_task_obj = await session.get(
+                Task, uuid.UUID(str(walkthrough_e2e_task_id))
+            )
+        except (ValueError, TypeError):
+            return await _handle_infra_failure(
+                session, version, qual, "walkthrough_e2e_task_id_invalid"
+            )
+        if _walkthrough_task_obj is None:
+            return await _handle_infra_failure(
+                session, version, qual, "walkthrough_e2e_task_missing"
+            )
+        if _walkthrough_task_obj.status in _INFRA_FAILURE_TERMINAL_STATUSES:
+            return await _handle_infra_failure(
+                session,
+                version,
+                qual,
+                _enrich_infra_error(
+                    f"walkthrough_e2e_task_{_walkthrough_task_obj.status.lower()}",
+                    _walkthrough_task_obj,
+                ),
+            )
+        if _walkthrough_task_obj.status != TaskStatus.COMPLETED:
+            return await _handle_infra_failure(
+                session, version, qual, "walkthrough_e2e_task_not_terminal"
+            )
+
+        walkthrough_report = await _latest_artifact_logs(
+            session,
+            uuid.UUID(str(walkthrough_e2e_task_id)),
+            ArtifactType.WALKTHROUGH_E2E_REPORT,
+        )
+        walkthrough_e2e_result = _evaluate_walkthrough_e2e_report(
+            walkthrough_report, candidate_sha
+        )
+        if walkthrough_e2e_result.get("status") == "invalid":
+            return await _handle_infra_failure(
+                session,
+                version,
+                qual,
+                "walkthrough_e2e_report_"
+                + str(walkthrough_e2e_result.get("reason") or "invalid")[:80],
+            )
+
+        # The report may use supported legacy aliases, but every reported key
+        # must resolve to an ACTIVE criterion in the frozen version contract.
+        # Unknown keys are malformed evidence, not a quality failure.
+        from app.acceptance_criteria import WALKTHROUGH_E2E_EVIDENCE_KIND
+
+        active_criterion_keys = {
+            str(row.criterion_key)
+            for row in live_criterion_rows
+            if row.status == "active" and row.criterion_key
+        }
+        normalized_results = walkthrough_e2e_result.get("results") or []
+        try:
+            resolved_report_keys = _walkthrough_e2e_canonical_evidence_keys(
+                normalized_results
+            )
+        except ValueError:
+            return await _handle_infra_failure(
+                session, version, qual, "walkthrough_e2e_report_duplicate_criteria"
+            )
+        if resolved_report_keys - active_criterion_keys:
+            return await _handle_infra_failure(
+                session, version, qual, "walkthrough_e2e_report_unknown_criteria"
+            )
+
+        # A passing probe may promote only after its covered-tier evidence was
+        # durably ingested. The agent posts it before terminal status and the
+        # backend completion handler is an idempotent backstop; this read proves
+        # that seam instead of trusting a best-effort HTTP call.
+        if walkthrough_e2e_result.get("status") == "passed":
+            active_criteria_by_key = {
+                str(row.criterion_key): row
+                for row in live_criterion_rows
+                if row.status == "active" and row.criterion_key
+            }
+            expected_evidence = {
+                f"walkthrough_e2e:{attempt_id}:{key}": active_criteria_by_key[
+                    key
+                ].id
+                for key in resolved_report_keys
+            }
+            observed_evidence = (
+                await session.execute(
+                    select(CriterionEvidence).where(
+                        CriterionEvidence.project_id == version.project_id,
+                        CriterionEvidence.source_kind
+                        == WALKTHROUGH_E2E_EVIDENCE_KIND,
+                        CriterionEvidence.source_id.in_(set(expected_evidence)),
+                    )
+                )
+            ).scalars().all()
+            observed_by_source: dict[str, list[CriterionEvidence]] = {}
+            for evidence in observed_evidence:
+                if evidence.source_id:
+                    observed_by_source.setdefault(evidence.source_id, []).append(
+                        evidence
+                    )
+            if any(
+                len(observed_by_source.get(source_id, [])) != 1
+                or observed_by_source[source_id][0].criterion_id != criterion_id
+                for source_id, criterion_id in expected_evidence.items()
+            ):
+                return await _handle_infra_failure(
+                    session,
+                    version,
+                    qual,
+                    "walkthrough_e2e_evidence_missing",
+                )
 
     # --- Read the release_audit report -------------------------------------
     # When both audit and test_erosion dimensions are already resolved from a
@@ -7483,6 +7909,12 @@ async def _finalize_qualification(
     acceptance_window = await _compute_acceptance_window_aggregate(session, version)
     extended_sub_scores = dict(composite["sub_scores"])
     extended_sub_scores.update(acceptance_window)
+    if walkthrough_e2e_result is not None:
+        composite = _apply_walkthrough_decision(
+            composite, walkthrough_e2e_result
+        )
+        walkthrough_score = composite["sub_scores"]["walkthrough_e2e"]
+        extended_sub_scores["walkthrough_e2e"] = walkthrough_score
 
     # --- Dual-write handled by _dual_write_dimension_results after base_record
     # is fully assembled (below), where all dimensions including challenge are
@@ -7528,6 +7960,9 @@ async def _finalize_qualification(
         "audit_challenge_task_id": audit_challenge_task_id,
         "audit_challenge_spawn_error": qual.get("audit_challenge_spawn_error"),
         "smoketest_task_id": smoketest_task_id,
+        "requested_probes": sorted(requested_probes),
+        "walkthrough_e2e_task_id": walkthrough_e2e_task_id,
+        "walkthrough_e2e_result": walkthrough_e2e_result,
         "audit_findings": audit_findings,
         # Agent-authored, backend-preserved explanation of delta selection or
         # full fallback. Kept schema-free and shaped for later dimension detail.
@@ -7722,8 +8157,8 @@ async def _finalize_qualification(
         # Monotonic ledger guard (incident 2026-06-09): a ci_unresolved blocker
         # is transient — CI was pending or unresolvable, not red. Before writing
         # not_promoted for this reason, verify the candidate is not already on
-        # main and that there is no open release PR whose auto-merge is still
-        # armed. Either condition means a promotion is in flight and this not_promoted
+        # main and that there is no open release PR still awaiting managed
+        # reconciliation. Either condition means a promotion is pending and this not_promoted
         # would be a spurious miss.
         if composite.get("blocker") == "ci_unresolved":
             _guard_project = await session.get(Project, version.project_id)
@@ -7733,7 +8168,7 @@ async def _finalize_qualification(
                 )
                 if _guard_resolved is not None:
                     _gtoken, _gowner, _grepo = _guard_resolved
-                    _guard_result = await _guard_ci_unresolved_promotion_in_flight(
+                    _guard_result = await _guard_ci_unresolved_promotion_pending(
                         session,
                         version,
                         candidate_sha,
@@ -7993,6 +8428,10 @@ async def _required_children_terminal(
     challenge_required = bool(challenge_task_id_raw)
     merge_grade_task_id_raw = qual.get("merge_grade_task_id")
     merge_grade_required = bool(merge_grade_task_id_raw)
+    walkthrough_requested = "walkthrough_e2e" in set(
+        qual.get("requested_probes") or []
+    )
+    walkthrough_task_id_raw = qual.get("walkthrough_e2e_task_id")
 
     if not audit_task_id_raw and not audit_resolved:
         logger.warning(
@@ -8014,15 +8453,22 @@ async def _required_children_terminal(
         merge_grade_task_id = (
             uuid.UUID(str(merge_grade_task_id_raw)) if merge_grade_required else None
         )
+        walkthrough_task_id = (
+            uuid.UUID(str(walkthrough_task_id_raw))
+            if walkthrough_requested and walkthrough_task_id_raw
+            else None
+        )
     except (ValueError, TypeError, AttributeError):
         logger.warning(
             "[RELEASE_QUALIFIER] finalize-gate: version v%d has unparseable "
-            "active child task ids (audit=%r challenge=%r merge_grade=%r) — "
+            "active child task ids (audit=%r challenge=%r merge_grade=%r "
+            "walkthrough=%r) — "
             "not ready",
             version.version_number,
             audit_task_id_raw,
             challenge_task_id_raw,
             merge_grade_task_id_raw,
+            walkthrough_task_id_raw,
         )
         return False
 
@@ -8041,6 +8487,11 @@ async def _required_children_terminal(
         if merge_grade_task_id is not None
         else None
     )
+    walkthrough_task: Task | None = (
+        await session.get(Task, walkthrough_task_id)
+        if walkthrough_task_id is not None
+        else None
+    )
 
     # Strict attempt matching applies only to active children. Legacy smoke
     # children may belong to any historical attempt without blocking finalize.
@@ -8052,6 +8503,7 @@ async def _required_children_terminal(
             ("audit", audit_task),
             ("challenge", challenge_task),
             ("merge_grade", merge_grade_task),
+            ("walkthrough_e2e", walkthrough_task),
         ):
             if task is None:
                 continue
@@ -8078,6 +8530,7 @@ async def _required_children_terminal(
             and not merge_grade_resolved
             and merge_grade_task is None
         )
+        or (walkthrough_requested and walkthrough_task is None)
     ):
         logger.debug(
             "[RELEASE_QUALIFIER] finalize-gate: version v%d required active "
@@ -8103,12 +8556,17 @@ async def _required_children_terminal(
             and merge_grade_task is not None
             and merge_grade_task.status not in _TERMINAL_STATUSES
         )
+        or (
+            walkthrough_requested
+            and walkthrough_task is not None
+            and walkthrough_task.status not in _TERMINAL_STATUSES
+        )
     ):
         return False
 
     logger.info(
         "[RELEASE_QUALIFIER] finalize-gate: active children terminal for "
-        "version v%d (audit=%s/%s challenge=%s merge_grade=%s)",
+        "version v%d (audit=%s/%s challenge=%s merge_grade=%s walkthrough=%s)",
         version.version_number,
         audit_task.id if audit_task is not None else "resolved",
         audit_task.status if audit_task is not None else "N/A",
@@ -8118,6 +8576,9 @@ async def _required_children_terminal(
         f"{merge_grade_task.id}/{merge_grade_task.status}"
         if merge_grade_task is not None
         else ("resolved" if merge_grade_resolved else "not_spawned"),
+        f"{walkthrough_task.id}/{walkthrough_task.status}"
+        if walkthrough_task is not None
+        else "not_requested",
     )
     return True
 async def _maybe_reconcile_after_promotion_conflict(
@@ -8176,7 +8637,7 @@ async def _maybe_reconcile_after_promotion_conflict(
 
 # Qualification outcomes after which the strategic agent should re-plan: a
 # settled verdict (a promote, any flavour of miss, or a terminal infra
-# failure). Excludes the in-flight (``pending_auto_merge``), transient
+# failure). Excludes the managed promotion-pending, transient
 # (``audit_rate_limit_respawned``) and read-only no-op (``None``) states,
 # which do not represent a settled cut.
 _STRATEGIC_RETRIGGER_STATUSES: frozenset[str] = frozenset(
@@ -8196,7 +8657,7 @@ async def _maybe_trigger_strategic_after_qualification(
     *,
     session_factory=None,
 ) -> None:
-    """Best-effort: once a qualification has RESOLVED, kick a strategic review.
+    """Deliver a resolved qualification barrier to the strategic owner.
 
     A version cut deliberately lets the direction frontier go dry — the
     strategic agent winds its active directions down to a paused residual while
@@ -8206,8 +8667,9 @@ async def _maybe_trigger_strategic_after_qualification(
     it. With every direction paused, no tactical research spawns, so the
     strategic cadence counter never advances and the project sits idle with free
     VMs until the wall-clock backstop eventually fires (up to
-    ``strategic_max_interval_minutes`` later). Spawning a ``strategic_review``
-    here closes that gap immediately, for both promote and miss outcomes.
+    ``strategic_max_interval_minutes`` later). A live Resident receives a durable
+    exact receipt. Without one, the legacy one-shot strategic refresh remains the
+    compatibility path.
 
     Runs AFTER the dedicated finalize session committed + closed (mirrors
     ``_maybe_reconcile_after_promotion_conflict``): its own session, never under
@@ -8237,6 +8699,72 @@ async def _maybe_trigger_strategic_after_qualification(
                 return
             project = await session.get(Project, version.project_id)
             if project is None or not project.autonomous_enabled:
+                return
+            qualification_status = str(result.get("status") or "unknown")
+            qualification = dict(version.last_qualification or {})
+
+            from app.strategic_resident_session import (
+                read_resident_session,
+                resident_session_is_active,
+            )
+
+            resident_active = resident_session_is_active(
+                read_resident_session(project.vision)
+            )
+            # Promotion is not the final delivery boundary: every promoted
+            # version arms the promotion-merge serving provider.  Waking an
+            # expensive Resident here and again when serving resolves spends a
+            # second turn without a second decision.  The serving reconciler
+            # emits the consolidated success/failure receipt instead.
+            if qualification_status == "promoted" and (
+                resident_active or project.paused
+            ):
+                logger.info(
+                    "[RELEASE_QUALIFIER] v%d promoted — deferring the strategic "
+                    "receipt until serving resolves",
+                    version.version_number,
+                )
+                return
+
+            from app.notification_dispatch import post_event_message
+
+            await post_event_message(
+                session,
+                project.id,
+                event_type="release.qualification_resolved",
+                summary=(
+                    f"Qualification resolved for v{version.version_number}: "
+                    f"{qualification_status}."
+                ),
+                context={
+                    "release_version_id": str(version.id),
+                    "version_number": version.version_number,
+                    "qualification_status": qualification_status,
+                    "candidate_sha": result.get("candidate_sha")
+                    or qualification.get("candidate_sha"),
+                    "promoted_sha": version.promoted_sha,
+                    "serving_status": version.serving_status,
+                    "receipt_kind": "qualification_barrier",
+                    "resident_wake_barrier": True,
+                },
+                idempotency_key=(
+                    f"release:{version.id}:qualification:{qualification_status}:"
+                    f"{result.get('candidate_sha') or qualification.get('candidate_sha') or 'none'}"
+                ),
+            )
+            if project.paused:
+                # Preserve the exact outcome for the next session, but never
+                # create new agent work while the operator pause is active.
+                await session.commit()
+                return
+            if resident_active:
+                await session.commit()
+                logger.info(
+                    "[RELEASE_QUALIFIER] qualification resolved (%s) for v%d — "
+                    "delivered an exact receipt to the active Resident",
+                    qualification_status,
+                    version.version_number,
+                )
                 return
             # Lazy import — release_qualifier <-> strategic_spawning is circular.
             from app.strategic_spawning import _spawn_strategic_review
@@ -8342,9 +8870,9 @@ async def _finalize_in_dedicated_session(
     ``promoted`` / ``promotion_failed`` at the very end).  So a genuinely
     concurrent second caller can acquire the freed lock, pass the pending guard,
     and enter its own ``promote()``.  What actually serializes two overlapping
-    promotions is the idempotency machinery (``_candidate_already_on_main`` /
-    ``_promotion_pr_landed`` — an already-landed candidate routes straight to
-    success without a second merge) PLUS the ``version.status != "open"``
+    promotions is the exact-receipt machinery (an exactly identified landed PR
+    routes straight to success without a second merge) PLUS the
+    ``version.status != "open"``
     re-check that BOTH ``_record_promotion_success`` and
     ``_record_promotion_failure`` perform under the re-lock before the final
     state write (the loser sees ``status="promoted"`` and bails as
@@ -8585,7 +9113,7 @@ _FORCE_PROMOTE_NOOP_STATUSES: frozenset[str] = frozenset(
         "sha_error",
         "version_not_found",
         "not_open",
-        "promotion_in_flight",
+        "promotion_check_wait",
         "ci_not_green",
     }
 )
@@ -8632,7 +9160,7 @@ async def _force_promote_locked(
     from app.qualification_state_resolver import resolve_newest_qualification_verdict
 
     _latest_verdict_force = await resolve_newest_qualification_verdict(session, version)
-    _promo = _promotion_in_flight_result(version, latest_verdict=_latest_verdict_force)
+    _promo = _promotion_pending_result(version, latest_verdict=_latest_verdict_force)
     if _promo is not None:
         return _promo
     now = _utcnow()
@@ -9037,10 +9565,10 @@ async def _finalize_locked_version(
     # Checked first and child-state-independent (audit H2).
     if timeout_now is not None:
         # Skip the qualification timeout when the version is already awaiting a
-        # promotion auto-merge.  Qualification completed and passed; the pending
+        # managed promotion. Qualification completed and passed; the pending
         # clock now belongs to the promotion PR on main CI, not to qualifier
         # children.  The timeout backstop is only for qualifier children that
-        # never reach a terminal state.  The auto-merge stall check (separate
+        # never reach a terminal state. The managed-wait stall check (separate
         # lifecycle alert) handles the case where the PR is genuinely stuck.
         if qual.get("promotion_pending"):
             return None

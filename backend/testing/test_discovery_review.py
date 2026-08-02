@@ -10,6 +10,7 @@ import pytest
 from sqlmodel import select
 
 import app.discovery_review as discovery_review
+import app.discovery_review_packet as discovery_review_packet
 from app.discovery_admission import (
     authorize_discovery_task_execution,
     reserve_discovery_admission,
@@ -21,6 +22,7 @@ from app.discovery_review import (
     resolve_discovery_cycle,
     sweep_discovery_reviews,
 )
+from app.findings_index import FINALIZED_RESEARCH_FINDINGS_KEY
 from app.models import (
     Artifact,
     ArtifactType,
@@ -34,6 +36,27 @@ from app.models import (
     TaskStatus,
 )
 from app.time_utils import _utcnow
+
+
+def test_task_snapshot_excludes_unfinalized_research_findings():
+    task = Task(
+        project_id=uuid.uuid4(),
+        title="Research source",
+        payloads=[{"type": "research"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        plan_output=[{"title": "Rejected raw claim"}],
+        context={},
+    )
+
+    unfinalized = discovery_review_packet._task_snapshot(task)
+    assert json.loads(unfinalized["plan_output_excerpt"]) == []
+
+    task.context = {FINALIZED_RESEARCH_FINDINGS_KEY: True}
+    finalized = discovery_review_packet._task_snapshot(task)
+    assert json.loads(finalized["plan_output_excerpt"]) == [
+        {"title": "Rejected raw claim"}
+    ]
 
 
 async def _cycle_with_source(
@@ -59,6 +82,9 @@ async def _cycle_with_source(
         deadline_at=deadline_at,
         intent_snapshot={"goal": "prove useful behavior"},
         bet_snapshot={"hypothesis": "the mechanism helps"},
+        task_credit_limit=8,
+        attempt_credit_limit=4,
+        concurrency_limit=2,
     )
     db_session.add(cycle)
     await db_session.flush()
@@ -89,12 +115,12 @@ def _valid_result(cycle, review_task, evidence_ids, **overrides):
         "goal_progress_assessment": "The mechanism produced measurable progress.",
         "evidence_citations": [str(value) for value in evidence_ids],
         "contradictions": [],
-        "next_bet": {"hypothesis": "repeat against a harder case"},
-        "recommended_phase": "demonstrate",
+        "next_bet": dict(cycle.bet_snapshot or {}),
+        "recommended_phase": cycle.phase,
         "recommended_limits": {
-            "task_credit_limit": 3,
-            "attempt_credit_limit": 5,
-            "concurrency_limit": 1,
+            "task_credit_limit": None,
+            "attempt_credit_limit": None,
+            "concurrency_limit": None,
         },
         "operator_question": None,
     }
@@ -119,6 +145,29 @@ async def test_terminal_zero_finding_source_spawns_one_root_review(db_session):
     assert review.first_payload["type"] == "discovery_review"
     assert cycle.state == "reviewing"
     assert cycle.review_task_id == review.id
+
+
+@pytest.mark.asyncio
+async def test_paused_project_defers_ready_review_until_unpaused(db_session):
+    project, cycle, _ = await _cycle_with_source(db_session)
+    project.paused = True
+    db_session.add(project)
+    await db_session.flush()
+
+    paused = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+
+    assert paused.spawned is False
+    assert paused.ready is True
+    assert paused.reason == "project_paused"
+    assert cycle.state == "review_pending"
+    assert cycle.review_task_id is None
+
+    project.paused = False
+    db_session.add(project)
+    await db_session.flush()
+    resumed = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    assert resumed.spawned is True
+    assert cycle.state == "reviewing"
 
 
 @pytest.mark.asyncio
@@ -237,7 +286,6 @@ async def test_overdue_deferred_spawn_is_cancelled_and_releases_reserved_credit(
         cycle_id=cycle.id,
         admission_key=f"spawn-request:{request.id}",
         spawn_request_id=request.id,
-        mode="enforced",
     )
     assert reservation.allowed is True
     assert cycle.reserved_task_credits == 1
@@ -319,8 +367,10 @@ async def test_packet_limits_preserve_source_and_outcome_and_restrict_verdict(
     db_session,
     monkeypatch,
 ):
-    monkeypatch.setattr(discovery_review, "DISCOVERY_REVIEW_MAX_TASKS", 2)
-    monkeypatch.setattr(discovery_review, "DISCOVERY_REVIEW_MAX_ARTIFACTS", 1)
+    monkeypatch.setattr(discovery_review_packet, "DISCOVERY_REVIEW_MAX_TASKS", 2)
+    monkeypatch.setattr(
+        discovery_review_packet, "DISCOVERY_REVIEW_MAX_ARTIFACTS", 1
+    )
     project, cycle, source = await _cycle_with_source(db_session)
     extra_completed = Task(
         project_id=project.id,
@@ -368,7 +418,14 @@ async def test_packet_limits_preserve_source_and_outcome_and_restrict_verdict(
     assert str(failed.id) in task_source_ids
     assert str(extra_completed.id) not in task_source_ids
     assert manifest["tasks"] == {"total": 3, "included": 2, "omitted": 1}
-    assert manifest["artifacts"] == {"total": 2, "included": 1, "omitted": 1}
+    assert manifest["artifacts"] == {
+        "total": 2,
+        "required_total": 2,
+        "included": 1,
+        "omitted": 1,
+        "omitted_required": 1,
+        "omitted_optional": 0,
+    }
     assert manifest["required_evidence_omitted"] is True
     assert manifest["incomplete"] is True
     assert {"task_limit", "artifact_limit"} <= set(
@@ -393,8 +450,219 @@ async def test_packet_limits_preserve_source_and_outcome_and_restrict_verdict(
 
 
 @pytest.mark.asyncio
+async def test_redundant_artifact_history_is_optional_not_missing_evidence(
+    db_session,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        discovery_review_packet, "DISCOVERY_REVIEW_MAX_ARTIFACTS", 1
+    )
+    _, cycle, source = await _cycle_with_source(db_session)
+    now = _utcnow()
+    older = Artifact(
+        task_id=source.id,
+        artifact_type=ArtifactType.RESEARCH_FINDINGS,
+        logical_key="bounded-result",
+        storage_uri=f"gs://test/{source.id}/older.json",
+        logs='{"result":"superseded"}',
+        created_at=now - timedelta(minutes=1),
+    )
+    newest = Artifact(
+        task_id=source.id,
+        artifact_type=ArtifactType.RESEARCH_FINDINGS,
+        logical_key="bounded-result",
+        storage_uri=f"gs://test/{source.id}/newest.json",
+        logs='{"result":"authoritative"}',
+        created_at=now,
+    )
+    db_session.add(older)
+    db_session.add(newest)
+    await db_session.flush()
+
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    review = await db_session.get(Task, spawned.task_id)
+    manifest = review.first_payload["evidence_packet_manifest"]
+    artifact_entries = [
+        entry
+        for entry in review.first_payload["evidence_packet"]
+        if entry.get("source_kind") == "artifact"
+    ]
+
+    assert [entry["source_id"] for entry in artifact_entries] == [str(newest.id)]
+    assert manifest["artifacts"] == {
+        "total": 2,
+        "required_total": 1,
+        "included": 1,
+        "omitted": 1,
+        "omitted_required": 0,
+        "omitted_optional": 1,
+    }
+    assert manifest["required_evidence_omitted"] is False
+    assert manifest["incomplete"] is True
+    assert "artifact_redundancy_deduplicated" in manifest["incomplete_reasons"]
+
+    await complete_discovery_review(
+        db_session,
+        task=review,
+        raw_result=_valid_result(
+            cycle,
+            review,
+            [entry["evidence_id"] for entry in review.first_payload["evidence_packet"]],
+        ),
+    )
+    assert cycle.state == "reviewed"
+
+
+@pytest.mark.asyncio
+async def test_artifact_selection_prioritizes_outcome_over_repo_pointer(
+    db_session,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        discovery_review_packet, "DISCOVERY_REVIEW_MAX_ARTIFACTS", 1
+    )
+    _, cycle, source = await _cycle_with_source(db_session)
+    now = _utcnow()
+    outcome = Artifact(
+        task_id=source.id,
+        artifact_type=ArtifactType.RESEARCH_FINDINGS,
+        logical_key="outcome",
+        logs='{"result":"supported"}',
+        created_at=now - timedelta(minutes=1),
+    )
+    repo_pointer = Artifact(
+        task_id=source.id,
+        artifact_type=ArtifactType.GIT_COMMIT,
+        logical_key="implementation",
+        commit_hash="a" * 40,
+        created_at=now,
+    )
+    db_session.add(outcome)
+    db_session.add(repo_pointer)
+    await db_session.flush()
+
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    review = await db_session.get(Task, spawned.task_id)
+    artifact_entries = [
+        entry
+        for entry in review.first_payload["evidence_packet"]
+        if entry.get("source_kind") == "artifact"
+    ]
+
+    assert [entry["source_id"] for entry in artifact_entries] == [str(outcome.id)]
+    assert (
+        review.first_payload["evidence_packet_manifest"]["artifacts"][
+            "omitted_required"
+        ]
+        == 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_packet_bounds_oversized_task_text_and_legacy_metadata(db_session):
+    _, cycle, source = await _cycle_with_source(db_session)
+    source.title = "T" * 10_000
+    source.description = "D" * 20_000
+    oversized = DiscoveryEvidenceItem(
+        cycle_id=cycle.id,
+        semantic_role="external_observation",
+        source_kind="external",
+        source_id="oversized-metadata",
+        checksum="a" * 64,
+        content_type="application/json",
+        evidence_metadata={"blob": "x" * 100_000},
+        dedupe_key="external:oversized-metadata",
+    )
+    db_session.add(source)
+    db_session.add(oversized)
+    await db_session.flush()
+
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    review = await db_session.get(Task, spawned.task_id)
+    packet = review.first_payload["evidence_packet"]
+    manifest = review.first_payload["evidence_packet_manifest"]
+    source_entry = next(
+        entry for entry in packet if entry.get("source_id") == str(source.id)
+    )
+    source_snapshot = source_entry["evidence_metadata"]["snapshot"]
+    oversized_entry = next(
+        entry
+        for entry in packet
+        if entry.get("source_id") == "oversized-metadata"
+    )
+
+    assert (
+        len(source_snapshot["title"])
+        == discovery_review_packet.DISCOVERY_REVIEW_TASK_TITLE_CHARS
+    )
+    assert (
+        len(source_snapshot["description"])
+        == discovery_review_packet.DISCOVERY_REVIEW_TASK_DESCRIPTION_CHARS
+    )
+    assert oversized_entry["evidence_metadata_truncated"] is True
+    assert oversized_entry["evidence_metadata"]["truncated"] is True
+    assert (
+        len(oversized_entry["evidence_metadata"]["excerpt"])
+        == discovery_review_packet.DISCOVERY_REVIEW_EVIDENCE_METADATA_CHARS
+    )
+    assert len(json.dumps(packet)) < 20_000
+    assert manifest["required_evidence_omitted"] is True
+    assert "evidence_metadata_truncated" in manifest["incomplete_reasons"]
+
+    evidence_ids = [entry["evidence_id"] for entry in packet]
+    with pytest.raises(
+        DiscoveryReviewResultError,
+        match="incomplete packet permits only",
+    ):
+        await complete_discovery_review(
+            db_session,
+            task=review,
+            raw_result=_valid_result(cycle, review, evidence_ids),
+        )
+
+
+@pytest.mark.asyncio
+async def test_oversized_decision_snapshot_is_bounded_and_fails_closed(db_session):
+    _, cycle, _ = await _cycle_with_source(db_session)
+    cycle.intent_snapshot = {"goal": "x" * 50_000}
+    db_session.add(cycle)
+    await db_session.flush()
+
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    review = await db_session.get(Task, spawned.task_id)
+    payload = review.first_payload
+    manifest = payload["evidence_packet_manifest"]
+
+    assert payload["intent_snapshot"]["snapshot_truncated"] is True
+    assert len(payload["intent_snapshot"]["excerpt"]) == (
+        discovery_review_packet.DISCOVERY_REVIEW_DECISION_SNAPSHOT_CHARS
+    )
+    assert len(json.dumps(payload["intent_snapshot"])) < 9_000
+    assert manifest["decision_snapshots"]["intent"]["truncated"] is True
+    assert manifest["required_evidence_omitted"] is True
+    assert "intent_snapshot_truncated" in manifest["incomplete_reasons"]
+
+    with pytest.raises(
+        DiscoveryReviewResultError,
+        match="incomplete packet permits only",
+    ):
+        await complete_discovery_review(
+            db_session,
+            task=review,
+            raw_result=_valid_result(
+                cycle,
+                review,
+                [
+                    entry["evidence_id"]
+                    for entry in payload["evidence_packet"]
+                ],
+            ),
+        )
+
+
+@pytest.mark.asyncio
 async def test_incomplete_limited_packet_allows_inconclusive(db_session, monkeypatch):
-    monkeypatch.setattr(discovery_review, "DISCOVERY_REVIEW_MAX_TASKS", 1)
+    monkeypatch.setattr(discovery_review_packet, "DISCOVERY_REVIEW_MAX_TASKS", 1)
     _, cycle, source = await _cycle_with_source(db_session)
     omitted = Task(
         project_id=source.project_id,
@@ -441,7 +709,6 @@ async def test_review_control_task_is_authorized_without_descendant_charge(db_se
     decision = await authorize_discovery_task_execution(
         db_session,
         task=review,
-        mode="enforced",
     )
 
     assert decision.allowed is True
@@ -488,9 +755,9 @@ async def test_valid_result_transitions_and_notifies_without_resident(db_session
     ).scalar_one()
     assert successor.state == "open"
     assert successor.source_research_task_id is None
-    assert successor.phase == "demonstrate"
-    assert successor.bet_snapshot == {"hypothesis": "repeat against a harder case"}
-    assert successor.task_credit_limit == 3
+    assert successor.phase == cycle.phase
+    assert successor.bet_snapshot == cycle.bet_snapshot
+    assert successor.task_credit_limit == cycle.task_credit_limit
     message = (
         await db_session.execute(
             select(ProjectMessage).where(
@@ -504,6 +771,122 @@ async def test_valid_result_transitions_and_notifies_without_resident(db_session
     assert message.context["cycle_id"] == str(cycle.id)
     assert message.context["next_cycle_id"] == str(successor.id)
     assert message.context["review_result"]["next_bet"] == successor.bet_snapshot
+    assert "resident_wake_barrier" not in message.context
+
+
+@pytest.mark.asyncio
+async def test_automatic_successor_keeps_frozen_direction_proof_contract(db_session):
+    _, cycle, _ = await _cycle_with_source(db_session, state="reviewed")
+    frozen_direction = {
+        "id": cycle.direction_key,
+        "text": "Prove the bounded mechanism",
+        "context": {
+            "success_evidence": "The probe improves the target outcome.",
+            "retirement_condition": "Retire after two probes without improvement.",
+            "implementation_constraints": "Reuse the current runtime.",
+        },
+    }
+    cycle.bet_snapshot = {
+        "direction": frozen_direction,
+        "hypothesis": "the first mechanism helps",
+    }
+    await db_session.flush()
+
+    successor = await discovery_review._create_successor_cycle(
+        db_session,
+        cycle=cycle,
+        result={
+            "next_bet": {"hypothesis": "a narrower mechanism helps"},
+            "recommended_phase": cycle.phase,
+            "recommended_limits": {
+                "task_credit_limit": None,
+                "attempt_credit_limit": None,
+                "concurrency_limit": None,
+            },
+        },
+        now=_utcnow(),
+    )
+
+    assert successor.bet_snapshot == {
+        "direction": frozen_direction,
+        "hypothesis": "a narrower mechanism helps",
+    }
+    assert successor.mechanism_fingerprint == discovery_review._checksum(
+        successor.bet_snapshot
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("verdict", "delta_kind", "expected_reason"),
+    [
+        ("renew", "next_bet", "next_bet"),
+        ("inconclusive", "phase", "phase"),
+        ("renew", "limits", "task_credit_limit"),
+    ],
+)
+async def test_routine_label_cannot_hide_consequential_state_delta(
+    db_session,
+    verdict,
+    delta_kind,
+    expected_reason,
+):
+    _, cycle, _ = await _cycle_with_source(db_session)
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    first_review = await db_session.get(Task, spawned.task_id)
+    evidence_ids = [
+        entry["evidence_id"]
+        for entry in first_review.first_payload["evidence_packet"]
+    ]
+    overrides = {"verdict": verdict}
+    if delta_kind == "next_bet":
+        overrides["next_bet"] = {"hypothesis": "materially different bet"}
+    elif delta_kind == "phase":
+        overrides["recommended_phase"] = "demonstrate"
+    else:
+        overrides["recommended_limits"] = {
+            "task_credit_limit": cycle.task_credit_limit - 1,
+            "attempt_credit_limit": None,
+            "concurrency_limit": None,
+        }
+
+    await complete_discovery_review(
+        db_session,
+        task=first_review,
+        raw_result=_valid_result(
+            cycle,
+            first_review,
+            evidence_ids,
+            **overrides,
+        ),
+    )
+    confirmation = await db_session.get(Task, cycle.review_task_id)
+
+    assert confirmation.id != first_review.id
+    assert confirmation.first_payload["review_round"] == 2
+    assert confirmation.first_payload["effort"] == "max"
+    assert expected_reason in cycle.review_result.get("confirmation_reasons", [])
+
+    await complete_discovery_review(
+        db_session,
+        task=confirmation,
+        raw_result=_valid_result(
+            cycle,
+            confirmation,
+            evidence_ids,
+            **overrides,
+        ),
+    )
+    await db_session.flush()
+    message = (
+        await db_session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.from_task_id == confirmation.id
+            )
+        )
+    ).scalar_one()
+    assert cycle.state == "reviewed"
+    assert message.context["resident_wake_barrier"] is True
 
 
 @pytest.mark.asyncio
@@ -511,6 +894,7 @@ async def test_consequential_verdict_requires_matching_independent_review(db_ses
     _, cycle, _ = await _cycle_with_source(db_session)
     spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
     first_review = await db_session.get(Task, spawned.task_id)
+    assert first_review.first_payload["effort"] == "medium"
     evidence_ids = list(
         (
             await db_session.execute(
@@ -538,6 +922,7 @@ async def test_consequential_verdict_requires_matching_independent_review(db_ses
 
     assert confirmation.id != first_review.id
     assert confirmation.first_payload["review_round"] == 2
+    assert confirmation.first_payload["effort"] == "max"
     assert confirmation.first_payload["prior_review_task_id"] == str(first_review.id)
     assert confirmation.first_payload["confirmation_proposal"]["verdict"] == "pivot"
     assert cycle.state == "reviewing"
@@ -555,6 +940,18 @@ async def test_consequential_verdict_requires_matching_independent_review(db_ses
         ),
     )
 
+    cycle_tasks = (
+        await db_session.execute(
+            select(Task).where(Task.discovery_cycle_id == cycle.id)
+        )
+    ).scalars().all()
+    review_efforts = sorted(
+        candidate.first_payload["effort"]
+        for candidate in cycle_tasks
+        if candidate.first_payload.get("type") == "discovery_review"
+    )
+    assert review_efforts == ["max", "medium"]
+
     assert cycle.state == "reviewed"
     assert cycle.verdict == "pivot"
     successor = (
@@ -569,10 +966,71 @@ async def test_consequential_verdict_requires_matching_independent_review(db_ses
     assert successor.bet_snapshot == {
         "hypothesis": "try the paired constructor mechanism"
     }
+    await db_session.flush()
+    message = (
+        await db_session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.from_task_id == confirmation.id
+            )
+        )
+    ).scalar_one()
+    assert message.context["event_type"] == "discovery.review_completed"
+    assert message.context["resident_wake_barrier"] is True
+    assert message.context["policy_status"] == "continued"
 
 
 @pytest.mark.asyncio
-async def test_disagreeing_confirmation_routes_to_operator_without_continuing(
+async def test_pause_between_reviews_defers_frontier_confirmation(db_session):
+    project, cycle, _ = await _cycle_with_source(db_session)
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    first_review = await db_session.get(Task, spawned.task_id)
+    evidence_ids = list(
+        (
+            await db_session.execute(
+                select(DiscoveryEvidenceItem.id).where(
+                    DiscoveryEvidenceItem.cycle_id == cycle.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    project.paused = True
+    db_session.add(project)
+    await db_session.flush()
+
+    await complete_discovery_review(
+        db_session,
+        task=first_review,
+        raw_result=_valid_result(
+            cycle,
+            first_review,
+            evidence_ids,
+            verdict="pivot",
+        ),
+    )
+
+    assert cycle.state == "review_pending"
+    assert cycle.review_task_id == first_review.id
+    assert cycle.review_result["confirmation_deferred"] == "project_paused"
+    paused = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    assert paused.spawned is False
+    assert paused.reason == "project_paused"
+
+    project.paused = False
+    db_session.add(project)
+    await db_session.flush()
+    resumed = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    confirmation = await db_session.get(Task, resumed.task_id)
+    assert resumed.reason == "confirmation_spawned"
+    assert confirmation.id != first_review.id
+    assert confirmation.first_payload["review_round"] == 2
+    assert confirmation.first_payload["effort"] == "max"
+    assert cycle.state == "reviewing"
+
+
+@pytest.mark.asyncio
+async def test_disagreeing_confirmation_wakes_resident_without_continuing(
     db_session,
 ):
     _, cycle, _ = await _cycle_with_source(db_session)
@@ -623,7 +1081,9 @@ async def test_disagreeing_confirmation_routes_to_operator_without_continuing(
             )
         )
     ).scalar_one()
-    assert message.context["event_type"] == "discovery.operator_question"
+    assert message.context["event_type"] == "discovery.review_completed"
+    assert message.context["resident_wake_barrier"] is True
+    assert message.context["policy_status"] == "resident_adjudication_required"
 
 
 @pytest.mark.asyncio
@@ -667,7 +1127,8 @@ async def test_generation_cap_prevents_unbounded_autonomous_renewal(db_session):
             select(ProjectMessage).where(ProjectMessage.from_task_id == review.id)
         )
     ).scalar_one()
-    assert message.context["event_type"] == "discovery.operator_question"
+    assert message.context["event_type"] == "discovery.review_completed"
+    assert message.context["resident_wake_barrier"] is True
     assert (
         message.context["policy_status"]
         == "autonomous_generation_cap_reached"
@@ -675,7 +1136,7 @@ async def test_generation_cap_prevents_unbounded_autonomous_renewal(db_session):
 
 
 @pytest.mark.asyncio
-async def test_stop_verdict_is_operator_visible(db_session):
+async def test_stop_verdict_is_confirmed_then_wakes_resident(db_session):
     _, cycle, _ = await _cycle_with_source(db_session)
     spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
     review = await db_session.get(Task, spawned.task_id)
@@ -702,16 +1163,130 @@ async def test_stop_verdict_is_operator_visible(db_session):
             next_bet=None,
         ),
     )
+    confirmation = await db_session.get(Task, cycle.review_task_id)
+    assert confirmation.id != review.id
+    assert confirmation.first_payload["effort"] == "max"
+    await complete_discovery_review(
+        db_session,
+        task=confirmation,
+        raw_result=_valid_result(
+            cycle,
+            confirmation,
+            evidence_ids,
+            verdict="stop",
+            next_bet=None,
+        ),
+    )
     await db_session.flush()
 
+    message = (
+        await db_session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.from_task_id == confirmation.id
+            )
+        )
+    ).scalar_one()
+    assert cycle.state == "reviewed"
+    assert message.context["event_type"] == "discovery.review_completed"
+    assert message.context["resident_wake_barrier"] is True
+    assert message.context["policy_status"] == "resident_review_required"
+
+
+@pytest.mark.asyncio
+async def test_ask_operator_wakes_resident_without_confirmation(db_session):
+    _, cycle, _ = await _cycle_with_source(db_session)
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    review = await db_session.get(Task, spawned.task_id)
+
+    await complete_discovery_review(
+        db_session,
+        task=review,
+        raw_result=_valid_result(
+            cycle,
+            review,
+            [],
+            verdict="ask_operator",
+            next_bet=None,
+            operator_question="Should this direction be retired?",
+        ),
+    )
+    await db_session.flush()
+
+    cycle_tasks = list(
+        (
+            await db_session.execute(
+                select(Task).where(Task.discovery_cycle_id == cycle.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
     message = (
         await db_session.execute(
             select(ProjectMessage).where(ProjectMessage.from_task_id == review.id)
         )
     ).scalar_one()
+    review_tasks = [
+        task
+        for task in cycle_tasks
+        if task.first_payload.get("type") == "discovery_review"
+    ]
+    assert [task.id for task in review_tasks] == [review.id]
     assert cycle.state == "reviewed"
-    assert message.context["event_type"] == "discovery.operator_question"
-    assert message.context["policy_status"] == "operator_notified"
+    assert cycle.verdict == "ask_operator"
+    assert message.context["resident_wake_barrier"] is True
+    assert message.context["policy_status"] == "resident_review_required"
+
+
+@pytest.mark.asyncio
+async def test_expand_cannot_increase_limits_or_spawn_confirmation(db_session):
+    _, cycle, _ = await _cycle_with_source(db_session)
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    review = await db_session.get(Task, spawned.task_id)
+    evidence_ids = [
+        entry["evidence_id"]
+        for entry in review.first_payload["evidence_packet"]
+        if entry.get("evidence_id")
+    ]
+    result = _valid_result(
+        cycle,
+        review,
+        evidence_ids,
+        verdict="expand",
+        recommended_limits={
+            "task_credit_limit": cycle.task_credit_limit + 1,
+            "attempt_credit_limit": cycle.attempt_credit_limit,
+            "concurrency_limit": cycle.concurrency_limit,
+        },
+    )
+
+    with pytest.raises(
+        DiscoveryReviewResultError,
+        match="cannot increase autonomously",
+    ):
+        await complete_discovery_review(
+            db_session,
+            task=review,
+            raw_result=result,
+        )
+
+    cycle_tasks = list(
+        (
+            await db_session.execute(
+                select(Task).where(Task.discovery_cycle_id == cycle.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    review_tasks = [
+        task
+        for task in cycle_tasks
+        if task.first_payload.get("type") == "discovery_review"
+    ]
+    assert cycle.state == "review_blocked"
+    assert cycle.review_task_id == review.id
+    assert [task.id for task in review_tasks] == [review.id]
 
 
 @pytest.mark.asyncio
@@ -724,22 +1299,47 @@ async def test_operator_can_resume_halted_cycle_without_resident(
         db_session,
         state=source_state,
     )
+    frozen_direction = {
+        "id": cycle.direction_key,
+        "text": "Prove the bounded mechanism",
+        "context": {
+            "success_evidence": "The probe improves the target outcome.",
+            "retirement_condition": "Retire after two probes without improvement.",
+            "implementation_constraints": "Reuse the current runtime.",
+        },
+    }
+    cycle.bet_snapshot = {
+        "direction": frozen_direction,
+        "hypothesis": "the mechanism helps",
+    }
     cycle.verdict = "ask_operator"
     await db_session.flush()
+
+    proposed_bet = {
+        "hypothesis": "operator-selected bounded alternative",
+        "direction": {
+            "id": "rewritten-direction",
+            "context": {
+                "success_evidence": "A rewritten success threshold.",
+                "retirement_condition": "Never retire.",
+            },
+        },
+    }
 
     successor = await resolve_discovery_cycle(
         db_session,
         project_id=project.id,
         direction_key=cycle.direction_key,
         action="continue",
-        next_bet={"hypothesis": "operator-selected bounded alternative"},
+        next_bet=proposed_bet,
         note="Use the paired construction path.",
     )
 
     assert successor.state == "open"
     assert successor.generation == cycle.generation + 1
     assert successor.bet_snapshot == {
-        "hypothesis": "operator-selected bounded alternative"
+        "direction": frozen_direction,
+        "hypothesis": "operator-selected bounded alternative",
     }
     assert cycle.state == "superseded"
     assert cycle.review_result["operator_resolution"]["action"] == "continue"
@@ -749,7 +1349,7 @@ async def test_operator_can_resume_halted_cycle_without_resident(
         project_id=project.id,
         direction_key=cycle.direction_key,
         action="continue",
-        next_bet={"hypothesis": "operator-selected bounded alternative"},
+        next_bet=proposed_bet,
         note="Repeated request.",
     )
     assert replay.id == successor.id

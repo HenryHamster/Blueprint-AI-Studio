@@ -75,6 +75,54 @@ def _review_loop(task: Task) -> dict:
     return (task.context or {}).get("review_loop", {})
 
 
+def _patch_exact_pr_execution_target(
+    mocker,
+    *,
+    pr_number: int,
+    branch: str,
+    base_branch: str = "main",
+    base_sha: str,
+    head_sha: str,
+) -> dict:
+    """Bind review/fix transitions and their claim fence to one live target."""
+    live_pr = {
+        "number": pr_number,
+        "state": "open",
+        "merged": False,
+        "mergeable": True,
+        "mergeable_state": "clean",
+        "base": {"sha": base_sha, "ref": base_branch},
+        "head": {"sha": head_sha, "ref": branch},
+    }
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("fake-token", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.review_claim_fence.get_github_token_for_task",
+        new=AsyncMock(return_value=("fake-token", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(return_value=live_pr),
+    )
+    mocker.patch(
+        "app.review_claim_fence.get_pull_request",
+        new=AsyncMock(return_value=live_pr),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"status": "completed", "conclusion": "failure"}),
+    )
+    mocker.patch(
+        "app.github.submit_pr_review", new=AsyncMock(return_value={"id": 1})
+    )
+    mocker.patch(
+        "app.github.create_pr_comment", new=AsyncMock(return_value={"id": 1})
+    )
+    return live_pr
+
+
 async def _claim(client: AsyncClient, task: Task) -> None:
     """Claim a task and assert it moves to IN_PROGRESS."""
     token = create_agent_token(str(task.id), task.vm_instance_id)
@@ -117,11 +165,23 @@ async def test_full_review_fix_cycle(client: AsyncClient, db_session, mocker):
        with an incremented iteration counter.
     """
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle.fire_and_forget_vm_delete", return_value=None)
+    mocker.patch(
+        "app.orchestrator._persist_circuit_breakers",
+        new=AsyncMock(return_value=None),
+    )
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
     mocker.patch(
-        "app.routers.agent.get_github_token_for_task",
-        return_value=("fake-token", "owner", "repo"),
+        "app.security.scan_pr_for_injection",
+        new=AsyncMock(
+            return_value={
+                "blocked": False,
+                "findings": [],
+                "summary": "clean",
+                "report": "",
+            }
+        ),
     )
     # Warm-VM continuity (default-on) would leave spawned tasks with
     # vm_instance_id=None plus a warm_target_vm_id context pin, to be claimed
@@ -148,14 +208,28 @@ async def test_full_review_fix_cycle(client: AsyncClient, db_session, mocker):
         project_id=project.id,
         title="Implement feature",
         payloads=[
-            {"type": "create", "prompt": "Build a new feature", "base_branch": "main"}
+            {
+                "type": "create",
+                "prompt": "Build a new feature",
+                "base_branch": "research/full-cycle-base",
+            }
         ],
+        context={"scope": "large"},
         vm_instance_id=vm_id,
         status=TaskStatus.QUEUED,
     )
     db_session.add(create_task)
     await db_session.commit()
     await db_session.refresh(create_task)
+    task_branch = f"blueprint/task-{str(create_task.id)[:8]}"
+    live_pr = _patch_exact_pr_execution_target(
+        mocker,
+        pr_number=42,
+        branch=task_branch,
+        base_branch="research/full-cycle-base",
+        base_sha="full-cycle-base-42",
+        head_sha="full-cycle-head-42-v1",
+    )
 
     assert create_task.status == TaskStatus.QUEUED
 
@@ -220,7 +294,15 @@ async def test_full_review_fix_cycle(client: AsyncClient, db_session, mocker):
     assert review_task.status == TaskStatus.IN_PROGRESS
 
     feedback_text = "The authentication handler is missing a null check on user.id"
-    verdict_json = json.dumps({"verdict": "REQUEST_CHANGES", "feedback": feedback_text})
+    verdict_json = json.dumps(
+        {
+            "verdict": "REQUEST_CHANGES",
+            "feedback": feedback_text,
+            "issues": [{"severity": "major", "description": feedback_text}],
+            "reviewed_base_sha": "full-cycle-base-42",
+            "reviewed_head_sha": "full-cycle-head-42-v1",
+        }
+    )
     await _status(
         client,
         review_task,
@@ -271,6 +353,7 @@ async def test_full_review_fix_cycle(client: AsyncClient, db_session, mocker):
     await _claim(client, fix_task)
     await db_session.refresh(fix_task)
     assert fix_task.status == TaskStatus.IN_PROGRESS
+    live_pr["head"]["sha"] = "full-cycle-head-42-v2"
 
     await _status(
         client,
@@ -308,6 +391,13 @@ async def test_full_review_fix_cycle(client: AsyncClient, db_session, mocker):
     assert nr_loop.get("pr_number") == 42
     assert nr_loop.get("iteration") == 3  # create→review=1, review→fix=2, fix→review=3
     assert nr_loop.get("original_task_id") == str(create_task.id)
+    assert nr_loop.get("review_target") == {
+        "project_id": str(project.id),
+        "pr_number": 42,
+        "base_sha": "full-cycle-base-42",
+        "head_sha": "full-cycle-head-42-v2",
+    }
+    assert nr_loop.get("delta_base_sha") == "full-cycle-head-42-v1"
 
 
 # ---------------------------------------------------------------------------
@@ -321,20 +411,21 @@ async def test_create_task_spawns_review_on_pr_completion(
 ):
     """create task COMPLETED with PULL_REQUEST artifact → review task spawned."""
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle.fire_and_forget_vm_delete", return_value=None)
+    mocker.patch(
+        "app.orchestrator._persist_circuit_breakers",
+        new=AsyncMock(return_value=None),
+    )
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
     mocker.patch(
-        "app.routers.agent.get_github_token_for_task",
-        return_value=("fake-token", "owner", "repo"),
-    )
-    mocker.patch(
-        "app.github.get_pull_request",
-        AsyncMock(
+        "app.security.scan_pr_for_injection",
+        new=AsyncMock(
             return_value={
-                "merged": False,
-                "state": "open",
-                "base": {"ref": "main", "sha": "base-99"},
-                "head": {"sha": "head-99"},
+                "blocked": False,
+                "findings": [],
+                "summary": "clean",
+                "report": "",
             }
         ),
     )
@@ -356,14 +447,30 @@ async def test_create_task_spawns_review_on_pr_completion(
         project_id=project.id,
         title="Create feature Y",
         payloads=[
-            {"type": "create", "prompt": "Build feature Y", "base_branch": "main"}
+            {
+                "type": "create",
+                "prompt": "Build feature Y",
+                "base_branch": "research/spawn-review-base",
+            }
         ],
+        # Initial review is reserved for large-scope intermediate PRs; direct
+        # non-intermediate PRs intentionally use CI + the promotion gate.
+        context={"scope": "large"},
         vm_instance_id=vm_id,
         status=TaskStatus.QUEUED,
     )
     db_session.add(task)
     await db_session.commit()
     await db_session.refresh(task)
+    task_branch = f"blueprint/task-{str(task.id)[:8]}"
+    _patch_exact_pr_execution_target(
+        mocker,
+        pr_number=99,
+        branch=task_branch,
+        base_branch="research/spawn-review-base",
+        base_sha="base-99",
+        head_sha="head-99",
+    )
 
     await _claim(client, task)
     await db_session.refresh(task)
@@ -549,6 +656,19 @@ async def test_review_request_changes_api_error_does_not_close_pr(
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    _patch_exact_pr_execution_target(
+        mocker,
+        pr_number=888,
+        branch="research/abc888",
+        base_sha="api-error-base-888",
+        head_sha="api-error-head-888",
+    )
+    review_target = {
+        "project_id": str(project.id),
+        "pr_number": 888,
+        "base_sha": "api-error-base-888",
+        "head_sha": "api-error-head-888",
+    }
 
     parent_task = Task(
         project_id=project.id,
@@ -563,6 +683,7 @@ async def test_review_request_changes_api_error_does_not_close_pr(
                 "ci_waiting": True,
                 "ci_passed": True,
                 "iteration": 2,
+                "review_target": review_target,
             }
         },
     )
@@ -590,6 +711,7 @@ async def test_review_request_changes_api_error_does_not_close_pr(
                 "base_branch": "main",
                 "iteration": 2,
                 "original_task_id": str(parent_task.id),
+                "review_target": review_target,
             }
         },
         vm_instance_id=vm_id,
@@ -603,6 +725,11 @@ async def test_review_request_changes_api_error_does_not_close_pr(
         {
             "verdict": "REQUEST_CHANGES",
             "feedback": "Real changes are needed; do not treat as empty",
+            "issues": [
+                {"severity": "MAJOR", "description": "Fix the real defect"}
+            ],
+            "reviewed_base_sha": "api-error-base-888",
+            "reviewed_head_sha": "api-error-head-888",
         }
     )
     await _status(
@@ -643,6 +770,25 @@ async def test_review_request_changes_spawns_fix(
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        return_value=("fake-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={
+            "head": {"sha": "review-head-77", "ref": "blueprint/task-aabbccdd"},
+            "base": {"sha": "review-base-77", "ref": "main"},
+            "state": "open",
+            "merged": False,
+        },
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        return_value={"status": "completed", "conclusion": "failure"},
+    )
+    mocker.patch("app.github.submit_pr_review", return_value={"id": 1})
+    mocker.patch("app.github.create_pr_comment", return_value={"id": 1})
 
     project = Project(name="Spawn Fix Test", user_id="test-user-123")
     db_session.add(project)
@@ -667,6 +813,12 @@ async def test_review_request_changes_spawns_fix(
                 "branch": "blueprint/task-aabbccdd",
                 "base_branch": "main",
                 "iteration": 1,
+                "review_target": {
+                    "project_id": str(project.id),
+                    "pr_number": 77,
+                    "base_sha": "review-base-77",
+                    "head_sha": "review-head-77",
+                },
             }
         },
         vm_instance_id=vm_id,
@@ -677,7 +829,15 @@ async def test_review_request_changes_spawns_fix(
     await db_session.refresh(review_task)
 
     feedback = "Missing input validation on the /users endpoint"
-    verdict_json = json.dumps({"verdict": "REQUEST_CHANGES", "feedback": feedback})
+    verdict_json = json.dumps(
+        {
+            "verdict": "REQUEST_CHANGES",
+            "feedback": feedback,
+            "issues": [{"severity": "major", "description": feedback}],
+            "reviewed_base_sha": "review-base-77",
+            "reviewed_head_sha": "review-head-77",
+        }
+    )
     await _status(
         client,
         review_task,
@@ -787,163 +947,15 @@ async def test_fix_task_spawns_review_on_completion(
 
 
 @pytest.mark.asyncio
-async def test_review_explicit_waiver_marks_fix_skip_rereview(
+async def test_fix_task_always_gets_exact_head_rereview(
     client: AsyncClient, db_session, mocker
 ):
-    """Only an explicit reviewer waiver lets an ordinary fix skip follow-up."""
-    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
-    mocker.patch("app.main.provision_agent_vm", return_value=True)
-    mocker.patch("app.broadcast.broadcast_to_project")
-    # This test asserts the synchronous REQUEST_CHANGES→fix spawn: reviews
-    # finalize synchronously, so a concrete-issue REQUEST_CHANGES spawns the fix
-    # directly.
-
-    project = Project(name="Minor-Only Verdict Test", user_id="test-user-123")
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    review_task = Task(
-        project_id=project.id,
-        title="Review PR #61",
-        payloads=[
-            {
-                "type": "review",
-                "pr_number": 61,
-                "branch": "blueprint/task-minor061",
-                "base_branch": "main",
-            }
-        ],
-        context={
-            "review_loop": {
-                "pr_number": 61,
-                "branch": "blueprint/task-minor061",
-                "base_branch": "main",
-                "iteration": 1,
-            }
-        },
-        vm_instance_id="agent-vm-minor-review-001",
-        status=TaskStatus.IN_PROGRESS,
-    )
-    db_session.add(review_task)
-    await db_session.commit()
-    await db_session.refresh(review_task)
-
-    verdict_json = json.dumps(
-        {
-            "verdict": "REQUEST_CHANGES",
-            "feedback": "A couple of nits",
-            "issues": [
-                {"severity": "minor", "description": "Rename variable x to count"},
-                {"severity": "minor", "description": "Add a docstring to helper()"},
-            ],
-            "requires_rereview": False,
-        }
-    )
-    await _status(
-        client,
-        review_task,
-        status="COMPLETED",
-        verdict_json=verdict_json,
-        logs="Review: minor nits only",
-    )
-
-    result = await db_session.execute(
-        select(Task).where(
-            Task.project_id == project.id,
-            Task.id != review_task.id,
-        )
-    )
-    fix_tasks = [t for t in result.scalars().all() if _task_type(t) == "fix"]
-    assert len(fix_tasks) == 1
-    f_loop = _review_loop(fix_tasks[0])
-    assert f_loop.get("rereview_waived") is True
-
-
-@pytest.mark.asyncio
-async def test_review_malformed_rereview_choice_defaults_to_followup(
-    client: AsyncClient, db_session, mocker
-):
-    """A non-boolean requires_rereview is conservative even in valid JSON."""
-    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
-    mocker.patch("app.main.provision_agent_vm", return_value=True)
-    mocker.patch("app.broadcast.broadcast_to_project")
-    # Synchronous REQUEST_CHANGES→fix spawn under test: reviews finalize
-    # synchronously, so a concrete-issue REQUEST_CHANGES spawns the fix directly.
-
-    project = Project(name="Major Issue Verdict Test", user_id="test-user-123")
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    review_task = Task(
-        project_id=project.id,
-        title="Review PR #62",
-        payloads=[
-            {
-                "type": "review",
-                "pr_number": 62,
-                "branch": "blueprint/task-major062",
-                "base_branch": "main",
-            }
-        ],
-        context={
-            "review_loop": {
-                "pr_number": 62,
-                "branch": "blueprint/task-major062",
-                "base_branch": "main",
-                "iteration": 1,
-            }
-        },
-        vm_instance_id="agent-vm-major-review-001",
-        status=TaskStatus.IN_PROGRESS,
-    )
-    db_session.add(review_task)
-    await db_session.commit()
-    await db_session.refresh(review_task)
-
-    verdict_json = json.dumps(
-        {
-            "verdict": "REQUEST_CHANGES",
-            "feedback": "Needs work",
-            "issues": [
-                {"severity": "major", "description": "Null deref on user.id"},
-                {"severity": "minor", "description": "Rename variable x"},
-            ],
-            "requires_rereview": "false",
-        }
-    )
-    await _status(
-        client,
-        review_task,
-        status="COMPLETED",
-        verdict_json=verdict_json,
-        logs="Review: one major issue",
-    )
-
-    result = await db_session.execute(
-        select(Task).where(
-            Task.project_id == project.id,
-            Task.id != review_task.id,
-        )
-    )
-    fix_tasks = [t for t in result.scalars().all() if _task_type(t) == "fix"]
-    assert len(fix_tasks) == 1
-    f_loop = _review_loop(fix_tasks[0])
-    assert not f_loop.get("rereview_waived")
-
-
-@pytest.mark.asyncio
-async def test_fix_task_reviewer_waiver_skips_rereview(
-    client: AsyncClient, db_session, mocker
-):
-    """A fix task carrying the reviewer waiver COMPLETED → no re-review is
-    spawned; the task parks in EVALUATING/ci_waiting so CI gates the merge."""
+    """Every completed fix gets an exact-head re-review."""
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
 
-    project = Project(name="Minor-Only Skip Test", user_id="test-user-123")
+    project = Project(name="Exact-Head Rereview Test", user_id="test-user-123")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
@@ -967,7 +979,6 @@ async def test_fix_task_reviewer_waiver_skips_rereview(
                 "base_branch": "main",
                 "iteration": 2,
                 "fix_reason": "code_review",
-                "rereview_waived": True,
             }
         },
         vm_instance_id="agent-vm-minor-fix-001",
@@ -985,11 +996,7 @@ async def test_fix_task_reviewer_waiver_skips_rereview(
     )
 
     await db_session.refresh(fix_task)
-    # Parks in EVALUATING waiting for CI rather than spawning a re-review.
-    assert fix_task.status == TaskStatus.EVALUATING
-    fix_loop = _review_loop(fix_task)
-    assert fix_loop.get("ci_waiting") is True
-    assert fix_loop.get("review_approved") is True
+    assert fix_task.status == TaskStatus.COMPLETED
 
     result = await db_session.execute(
         select(Task).where(
@@ -998,10 +1005,7 @@ async def test_fix_task_reviewer_waiver_skips_rereview(
         )
     )
     review_tasks = [t for t in result.scalars().all() if _task_type(t) == "review"]
-    assert len(review_tasks) == 0, (
-        f"minor-only fix must not spawn a re-review, found: "
-        f"{[t.id for t in review_tasks]}"
-    )
+    assert len(review_tasks) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1091,10 +1095,10 @@ async def test_review_approve_does_not_spawn_fix(
 
 
 @pytest.mark.asyncio
-async def test_cached_approve_with_stale_base_respawns_after_discard_cap(
+async def test_cached_approve_with_stale_base_always_respawns_exact_target_review(
     client: AsyncClient, db_session, mocker
 ):
-    """A stale cached APPROVE cannot use the live-review discard escape hatch."""
+    """A stale cached APPROVE is never authoritative for the live target."""
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
@@ -1136,10 +1140,6 @@ async def test_cached_approve_with_stale_base_respawns_after_discard_cap(
             }
         ],
         context={
-            # Ordinary live reviews may use the bounded stale-target escape
-            # hatch. A cached replay must not: it is only authoritative for
-            # its exact original base/head target.
-            "stale_head_consecutive_discards": 2,
             "review_loop": {
                 "pr_number": 110,
                 "branch": "blueprint/task-stale-base",
@@ -1170,7 +1170,9 @@ async def test_cached_approve_with_stale_base_respawns_after_discard_cap(
     )
 
     await db_session.refresh(review_task)
-    assert "Stale-target approval discarded" in (review_task.latest_status_message or "")
+    assert "Stale/unproven approval discarded" in (
+        review_task.latest_status_message or ""
+    )
     result = await db_session.execute(
         select(Task).where(
             Task.project_id == project.id,
@@ -1200,8 +1202,16 @@ async def test_status_completed_idempotency_no_duplicate_fix(
     call should return 'already_terminal'.
     """
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle.fire_and_forget_vm_delete", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
+    _patch_exact_pr_execution_target(
+        mocker,
+        pr_number=20,
+        branch="blueprint/task-cafebabe",
+        base_sha="idem-base-20",
+        head_sha="idem-head-20",
+    )
 
     project = Project(name="Idempotency Test", user_id="test-user-123")
     db_session.add(project)
@@ -1226,6 +1236,12 @@ async def test_status_completed_idempotency_no_duplicate_fix(
                 "branch": "blueprint/task-cafebabe",
                 "base_branch": "main",
                 "iteration": 1,
+                "review_target": {
+                    "project_id": str(project.id),
+                    "pr_number": 20,
+                    "base_sha": "idem-base-20",
+                    "head_sha": "idem-head-20",
+                },
             }
         },
         vm_instance_id=vm_id,
@@ -1236,7 +1252,13 @@ async def test_status_completed_idempotency_no_duplicate_fix(
     await db_session.refresh(review_task)
 
     verdict_json = json.dumps(
-        {"verdict": "REQUEST_CHANGES", "feedback": "Fix the typo"}
+        {
+            "verdict": "REQUEST_CHANGES",
+            "feedback": "Fix the typo",
+            "issues": [{"severity": "major", "description": "Fix the typo"}],
+            "reviewed_base_sha": "idem-base-20",
+            "reviewed_head_sha": "idem-head-20",
+        }
     )
 
     # First status call — should spawn a fix task
@@ -1294,6 +1316,19 @@ async def test_verdict_parsed_from_logs_when_no_verdict_json(
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    _patch_exact_pr_execution_target(
+        mocker,
+        pr_number=33,
+        branch="blueprint/task-feedface",
+        base_sha="logs-base-33",
+        head_sha="logs-head-33",
+    )
+    review_target = {
+        "project_id": str(project.id),
+        "pr_number": 33,
+        "base_sha": "logs-base-33",
+        "head_sha": "logs-head-33",
+    }
 
     vm_id = "agent-vm-vf-review-001"
     review_task = Task(
@@ -1313,6 +1348,7 @@ async def test_verdict_parsed_from_logs_when_no_verdict_json(
                 "branch": "blueprint/task-feedface",
                 "base_branch": "main",
                 "iteration": 1,
+                "review_target": review_target,
             }
         },
         vm_instance_id=vm_id,
@@ -1325,7 +1361,9 @@ async def test_verdict_parsed_from_logs_when_no_verdict_json(
     # Provide a JSON verdict embedded in the logs (no top-level verdict_json field)
     logs_with_verdict = (
         "After reviewing the code I found several issues.\n\n"
-        '{"verdict": "REQUEST_CHANGES", "feedback": "Add error handling"}\n\n'
+        '{"verdict": "REQUEST_CHANGES", "feedback": "Add error handling", '
+        '"issues": [{"severity": "MAJOR", "description": "Missing error handling"}], '
+        '"reviewed_base_sha": "logs-base-33", "reviewed_head_sha": "logs-head-33"}\n\n'
         "Please address the above points."
     )
     await _status(
@@ -1498,6 +1536,17 @@ async def test_review_fix_cap_blocks_new_fix_on_iteration_limit(
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
+    mocker.patch(
+        "app.review_loop_convergence._pr_is_preservable_on_cap",
+        return_value=False,
+    )
+    _patch_exact_pr_execution_target(
+        mocker,
+        pr_number=88,
+        branch="blueprint/task-cap0001",
+        base_sha="cap-base-88",
+        head_sha="cap-head-88",
+    )
 
     project = Project(name="Cap Enforcement Test", user_id="test-user-123")
     db_session.add(project)
@@ -1539,6 +1588,12 @@ async def test_review_fix_cap_blocks_new_fix_on_iteration_limit(
                 "base_branch": "main",
                 "iteration": 10,
                 "original_task_id": str(original_task.id),
+                "review_target": {
+                    "project_id": str(project.id),
+                    "pr_number": 88,
+                    "base_sha": "cap-base-88",
+                    "head_sha": "cap-head-88",
+                },
             },
         },
         vm_instance_id="agent-vm-cap-review-001",
@@ -1549,7 +1604,15 @@ async def test_review_fix_cap_blocks_new_fix_on_iteration_limit(
     await db_session.refresh(review_task)
 
     feedback = "Still missing null checks"
-    verdict_json = json.dumps({"verdict": "REQUEST_CHANGES", "feedback": feedback})
+    verdict_json = json.dumps(
+        {
+            "verdict": "REQUEST_CHANGES",
+            "feedback": feedback,
+            "issues": [{"severity": "major", "description": feedback}],
+            "reviewed_base_sha": "cap-base-88",
+            "reviewed_head_sha": "cap-head-88",
+        }
+    )
     await _status(
         client,
         review_task,
@@ -1596,6 +1659,17 @@ async def test_review_fix_cap_ci_failure_lower_limit(
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
+    mocker.patch(
+        "app.review_loop_convergence._pr_is_preservable_on_cap",
+        return_value=False,
+    )
+    _patch_exact_pr_execution_target(
+        mocker,
+        pr_number=55,
+        branch="blueprint/task-ci0001",
+        base_sha="ci-cap-base-55",
+        head_sha="ci-cap-head-55",
+    )
 
     project = Project(name="CI Failure Cap Test", user_id="test-user-123")
     db_session.add(project)
@@ -1635,6 +1709,12 @@ async def test_review_fix_cap_ci_failure_lower_limit(
                 "iteration": 8,
                 "fix_reason": "ci_failure",
                 "original_task_id": str(original_task.id),
+                "review_target": {
+                    "project_id": str(project.id),
+                    "pr_number": 55,
+                    "base_sha": "ci-cap-base-55",
+                    "head_sha": "ci-cap-head-55",
+                },
             },
         },
         vm_instance_id="agent-vm-ci-review-001",
@@ -1645,7 +1725,15 @@ async def test_review_fix_cap_ci_failure_lower_limit(
     await db_session.refresh(review_task)
 
     verdict_json = json.dumps(
-        {"verdict": "REQUEST_CHANGES", "feedback": "CI errors remain"}
+        {
+            "verdict": "REQUEST_CHANGES",
+            "feedback": "CI errors remain",
+            "issues": [
+                {"severity": "major", "description": "CI errors remain"}
+            ],
+            "reviewed_base_sha": "ci-cap-base-55",
+            "reviewed_head_sha": "ci-cap-head-55",
+        }
     )
     await _status(
         client,
@@ -1693,6 +1781,17 @@ async def test_review_fix_cap_sets_status_message(
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
+    mocker.patch(
+        "app.review_loop_convergence._pr_is_preservable_on_cap",
+        return_value=False,
+    )
+    _patch_exact_pr_execution_target(
+        mocker,
+        pr_number=73,
+        branch="blueprint/task-msg0001",
+        base_sha="msg-cap-base-73",
+        head_sha="msg-cap-head-73",
+    )
 
     project = Project(name="Cap Status Message Test", user_id="test-user-123")
     db_session.add(project)
@@ -1731,6 +1830,12 @@ async def test_review_fix_cap_sets_status_message(
                 "base_branch": "main",
                 "iteration": 10,
                 "original_task_id": str(original_task.id),
+                "review_target": {
+                    "project_id": str(project.id),
+                    "pr_number": 73,
+                    "base_sha": "msg-cap-base-73",
+                    "head_sha": "msg-cap-head-73",
+                },
             },
         },
         vm_instance_id="agent-vm-msg-review-001",
@@ -1741,7 +1846,15 @@ async def test_review_fix_cap_sets_status_message(
     await db_session.refresh(review_task)
 
     verdict_json = json.dumps(
-        {"verdict": "REQUEST_CHANGES", "feedback": "More changes needed"}
+        {
+            "verdict": "REQUEST_CHANGES",
+            "feedback": "More changes needed",
+            "issues": [
+                {"severity": "major", "description": "More changes needed"}
+            ],
+            "reviewed_base_sha": "msg-cap-base-73",
+            "reviewed_head_sha": "msg-cap-head-73",
+        }
     )
     await _status(
         client,
@@ -1793,6 +1906,19 @@ async def test_stuck_cycle_detected_marks_original_and_returns_no_fix(
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    _patch_exact_pr_execution_target(
+        mocker,
+        pr_number=99,
+        branch="blueprint/task-stuck0001",
+        base_sha="stuck-base-99",
+        head_sha="stuck-head-99",
+    )
+    review_target = {
+        "project_id": str(project.id),
+        "pr_number": 99,
+        "base_sha": "stuck-base-99",
+        "head_sha": "stuck-head-99",
+    }
 
     original_task = Task(
         project_id=project.id,
@@ -1814,8 +1940,12 @@ async def test_stuck_cycle_detected_marks_original_and_returns_no_fix(
     # This entry is already in the review_loop context from the previous iteration
     prior_history_entry = {
         "iteration": 0,
+        "verdict": "REQUEST_CHANGES",
         "feedback": "Still missing validation",
         "issues": [repeated_issue],
+        "reviewed_base_sha": "stuck-base-99",
+        "reviewed_head_sha": "stuck-head-99",
+        "target_verified_by_backend": True,
     }
 
     # Review task at iteration=1. Its review_loop carries one prior history entry.
@@ -1842,6 +1972,7 @@ async def test_stuck_cycle_detected_marks_original_and_returns_no_fix(
                 "iteration": 1,
                 "original_task_id": str(original_task.id),
                 "review_history": [prior_history_entry],
+                "review_target": review_target,
             },
         },
         vm_instance_id="agent-vm-stuck-review-001",
@@ -1856,6 +1987,8 @@ async def test_stuck_cycle_detected_marks_original_and_returns_no_fix(
             "verdict": "REQUEST_CHANGES",
             "feedback": "Still missing validation",
             "issues": [repeated_issue],
+            "reviewed_base_sha": "stuck-base-99",
+            "reviewed_head_sha": "stuck-head-99",
         }
     )
     await _status(
@@ -2262,6 +2395,26 @@ async def test_ci_merge_rule_block_escalates_immediately(db_session, mocker):
                 "iteration": 1,
                 # Gate is open: review approved, CI passing — exercise the merge attempt
                 "review_approved": True,
+                "head_sha": "test-head-99",
+                "base_sha": "test-base-99",
+                "ci_checked_head_sha": "test-head-99",
+                "ci_checked_base_sha": "test-base-99",
+                "review_target": {
+                    "project_id": str(project.id),
+                    "pr_number": 99,
+                    "base_sha": "test-base-99",
+                    "head_sha": "test-head-99",
+                },
+                "review_history": [
+                    {
+                        "verdict": "APPROVE",
+                        "issues": [],
+                        "reviewed_base_sha": "test-base-99",
+                        "reviewed_head_sha": "test-head-99",
+                        "target_verified_by_backend": True,
+                        "review_task_id": "test-rule-block-review",
+                    }
+                ],
             },
         },
         vm_instance_id="agent-vm-rule-block-001",
@@ -2282,7 +2435,16 @@ async def test_ci_merge_rule_block_escalates_immediately(db_session, mocker):
     # Mock get_pull_request to indicate PR is still open (not already merged/closed)
     mocker.patch(
         "app.github.get_pull_request",
-        return_value={"merged": False, "state": "open"},
+        return_value={
+            "merged": False,
+            "state": "open",
+            "mergeable": True,
+            "head": {
+                "sha": "test-head-99",
+                "ref": "blueprint/rule-block-test",
+            },
+            "base": {"sha": "test-base-99", "ref": "main"},
+        },
     )
 
     ci_result = {"status": "completed", "conclusion": "success", "failed_logs": ""}
@@ -2485,6 +2647,24 @@ async def test_ci_passed_with_review_approved_merges(db_session, mocker):
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    review_target = {
+        "project_id": str(project.id),
+        "pr_number": 1500,
+        "base_sha": "gate-base-1500",
+        "head_sha": "gate-head-1500",
+    }
+    mocker.patch(
+        "app.review_merge_authority._fetch_live_review_target",
+        new=AsyncMock(
+            return_value={
+                **review_target,
+                "state": "open",
+                "merged": False,
+                "mergeable": True,
+                "mergeable_state": "clean",
+            }
+        ),
+    )
 
     task = Task(
         project_id=project.id,
@@ -2498,6 +2678,21 @@ async def test_ci_passed_with_review_approved_merges(db_session, mocker):
                 "branch": "research/abc",
                 "base_branch": "main",
                 "ci_wait_started": "2026-04-15T07:18:36",
+                "base_sha": "gate-base-1500",
+                "head_sha": "gate-head-1500",
+                "ci_checked_base_sha": "gate-base-1500",
+                "ci_checked_head_sha": "gate-head-1500",
+                "review_target": review_target,
+                "review_history": [
+                    {
+                        "verdict": "APPROVE",
+                        "issues": [],
+                        "reviewed_base_sha": "gate-base-1500",
+                        "reviewed_head_sha": "gate-head-1500",
+                        "target_verified_by_backend": True,
+                        "review_task_id": "gate-review-1500",
+                    }
+                ],
             },
         },
         vm_instance_id="agent-vm-gate-both-001",
@@ -2529,12 +2724,8 @@ async def test_ci_passed_with_review_approved_merges(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_ci_passed_legacy_verdict_still_merges(db_session, mocker):
-    """
-    Backward compat: tasks written before the gate split used `verdict="APPROVE"`
-    instead of `review_approved=True`. handle_ci_completion must still merge them
-    via the legacy fallback in _review_approved.
-    """
+async def test_ci_passed_legacy_verdict_requires_exact_review(db_session, mocker):
+    """A scalar legacy APPROVE is not durable merge authority."""
     from app.ci_completion import handle_ci_completion
 
     mocker.patch("app.broadcast.broadcast_to_project")
@@ -2542,7 +2733,7 @@ async def test_ci_passed_legacy_verdict_still_merges(db_session, mocker):
     mocker.patch("app.github.create_pr_comment", return_value=None)
     merge_mock = mocker.patch(
         "app.github.merge_pull_request",
-        return_value={"merged": True},
+        new=AsyncMock(return_value={"merged": True}),
     )
 
     project = Project(name="Gate legacy verdict", user_id="test-user-123")
@@ -2570,6 +2761,32 @@ async def test_ci_passed_legacy_verdict_still_merges(db_session, mocker):
     await db_session.commit()
     await db_session.refresh(task)
 
+    head_sha = "a" * 40
+    base_sha = "b" * 40
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "number": 1600,
+                "state": "open",
+                "merged": False,
+                "base": {"sha": base_sha},
+                "head": {"sha": head_sha},
+            }
+        ),
+    )
+    review_task = Task(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        title="Exact target review",
+        payloads=[{"type": "review"}],
+        status=TaskStatus.QUEUED,
+    )
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new=AsyncMock(return_value=(review_task, True)),
+    )
+
     ci_result = {"status": "completed", "conclusion": "success", "failed_logs": ""}
     await handle_ci_completion(
         task=task,
@@ -2579,13 +2796,30 @@ async def test_ci_passed_legacy_verdict_still_merges(db_session, mocker):
         repo="test-repo",
         session=db_session,
         source="webhook",
+        checked_head_sha=head_sha,
+        checked_base_sha=base_sha,
     )
 
-    await db_session.flush()
-    assert merge_mock.call_count >= 1, (
-        "Legacy verdict='APPROVE' must still satisfy the review gate so in-flight "
-        "tasks from before the gate split don't get stuck"
-    )
+    await db_session.refresh(task)
+    merge_mock.assert_not_awaited()
+    spawn_mock.assert_awaited_once()
+    assert spawn_mock.await_args.kwargs["review_target"] == {
+        "project_id": str(project.id),
+        "pr_number": 1600,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+        "base_ref": "",
+        "state": "open",
+        "merged": False,
+        "draft": False,
+        "mergeable": None,
+        "mergeable_state": "",
+    }
+    gated_loop = (task.context or {})["review_loop"]
+    assert gated_loop["review_approved"] is False
+    assert gated_loop["authoritative_review_required"] is True
+    assert gated_loop["authoritative_review_task_id"] == str(review_task.id)
+    assert "verdict" not in gated_loop
 
 
 @pytest.mark.asyncio
@@ -2664,6 +2898,19 @@ async def test_rollup_review_approval_writes_review_approved_on_parent(
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    _patch_exact_pr_execution_target(
+        mocker,
+        pr_number=1408,
+        branch="research/abc",
+        base_sha="rollup-base-1408",
+        head_sha="deadbeef",
+    )
+    review_target = {
+        "project_id": str(project.id),
+        "pr_number": 1408,
+        "base_sha": "rollup-base-1408",
+        "head_sha": "deadbeef",
+    }
 
     parent = Task(
         project_id=project.id,
@@ -2684,6 +2931,7 @@ async def test_rollup_review_approval_writes_review_approved_on_parent(
             "base_branch": "main",
             "original_task_id": str(parent.id),
             "ci_wait_started": "2026-04-15T07:18:36",
+            "review_target": review_target,
         },
     }
     db_session.add(parent)
@@ -2709,6 +2957,7 @@ async def test_rollup_review_approval_writes_review_approved_on_parent(
                 "base_branch": "main",
                 "original_task_id": str(parent.id),
                 "iteration": 1,
+                "review_target": review_target,
             }
         },
         vm_instance_id="agent-vm-rollup-review-001",
@@ -2718,7 +2967,15 @@ async def test_rollup_review_approval_writes_review_approved_on_parent(
     await db_session.commit()
     await db_session.refresh(review_task)
 
-    verdict_json = json.dumps({"verdict": "APPROVE", "feedback": "Looks fine"})
+    verdict_json = json.dumps(
+        {
+            "verdict": "APPROVE",
+            "feedback": "Looks fine",
+            "issues": [],
+            "reviewed_base_sha": "rollup-base-1408",
+            "reviewed_head_sha": "deadbeef",
+        }
+    )
     await _status(
         client,
         review_task,

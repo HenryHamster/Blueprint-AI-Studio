@@ -2167,18 +2167,18 @@ async def test_run_qualification_already_pending_is_noop(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_run_qualification_promotion_in_flight_is_noop(db_session, mocker):
-    """A version whose audit PASSED and now has an open promotion PR
-    auto-merging (status='pending' + a promotion_pending sub-key, children
+async def test_run_qualification_promotion_check_wait_is_noop(db_session, mocker):
+    """A version whose audit PASSED and now has an open managed promotion PR
+    (status='pending' + a promotion_pending sub-key, children
     terminal) must NOT be re-qualified: doing so would spawn a fresh heavy
     audit/smoketest pair and clobber the promotion-pending provenance.
-    run_qualification refuses with promotion_in_flight, spawns nothing, and
+    run_qualification refuses with promotion_check_wait, spawns nothing, and
     leaves the record untouched — consistent with the version-cut lever."""
     project, version = await _make_project_and_version(db_session, phase="stabilize")
 
     # Both children already terminal — by the child-task definition this is NOT
-    # "in flight", and 'pending' is not a conclusive verdict, so only the
-    # promotion-in-flight guard catches it.
+    # pending, and 'pending' is not a conclusive verdict, so the managed
+    # promotion guard catches it.
     audit_task = Task(
         project_id=project.id,
         title="audit-done",
@@ -2202,7 +2202,7 @@ async def test_run_qualification_promotion_in_flight_is_noop(db_session, mocker)
         "promotion_pending": {
             "pr_number": 4242,
             "pr_url": "https://github.com/o/r/pull/4242",
-            "auto_merge_enabled": True,
+            "managed_check_wait": True,
         },
     }
     db_session.add(version)
@@ -2218,7 +2218,7 @@ async def test_run_qualification_promotion_in_flight_is_noop(db_session, mocker)
     result = await rq.run_qualification(db_session, project.id, version)
     await db_session.commit()
 
-    assert result["status"] == "promotion_in_flight"
+    assert result["status"] == "promotion_check_wait"
     assert result["promotion_pr_number"] == 4242
     assert result["promotion_pr_url"] == "https://github.com/o/r/pull/4242"
     # The pre-lock guard fired before any GitHub I/O (no SHA snapshot).
@@ -2248,9 +2248,9 @@ async def test_run_qualification_ignores_stale_pending_when_verdict_finalized(
     """Stale-pending window: last_qualification.status='pending' with a
     promotion_pending sub-key but the newest QualificationVerdict row already
     has a finalized terminal_status (e.g. 'promoted'). In this window the
-    effective state is NOT promotion_in_flight — the verdict already resolved.
+    effective state is NOT promotion_check_wait — the verdict already resolved.
     run_qualification must proceed (return 'spawned'), not block with a false
-    promotion_in_flight refusal."""
+    promotion_check_wait refusal."""
     project, version = await _make_project_and_version(db_session, phase="stabilize")
 
     # Need a terminal audit child so _qualification_in_flight sees no live child.
@@ -2278,7 +2278,7 @@ async def test_run_qualification_ignores_stale_pending_when_verdict_finalized(
         "promotion_pending": {
             "pr_number": 9999,
             "pr_url": "https://github.com/o/r/pull/9999",
-            "auto_merge_enabled": True,
+            "managed_check_wait": True,
         },
     }
     db_session.add(version)
@@ -2303,7 +2303,7 @@ async def test_run_qualification_ignores_stale_pending_when_verdict_finalized(
     result = await rq.run_qualification(db_session, project.id, version)
     await db_session.commit()
 
-    # Must NOT refuse with promotion_in_flight — the verdict already resolved.
+    # Must NOT refuse with promotion_check_wait — the verdict already resolved.
     assert result["status"] == "spawned", (
         f"expected 'spawned' but got {result['status']!r}; "
         "stale-pending+finalized-verdict should be transparent to action guards"
@@ -2322,7 +2322,7 @@ async def test_run_qualification_stale_verdict_still_blocks_live_promotion(
     force-promoted that sha, opening a new promotion PR.  The verdict row is NOW
     stale relative to the live attempt.  apply_verdict_substitution must NOT use
     the pre-attempt verdict to classify the state as 'dry_run' — it must keep
-    promotion_pending visible so run_qualification blocks with promotion_in_flight.
+    promotion_pending visible so run_qualification blocks with promotion_check_wait.
     """
     from datetime import datetime
 
@@ -2362,7 +2362,7 @@ async def test_run_qualification_stale_verdict_still_blocks_live_promotion(
         "promotion_pending": {
             "pr_number": 7070,
             "pr_url": "https://github.com/o/r/pull/7070",
-            "auto_merge_enabled": True,
+            "managed_check_wait": True,
             "enabled_at": "2026-06-01T00:00:00",  # AFTER the verdict
         },
     }
@@ -2379,8 +2379,8 @@ async def test_run_qualification_stale_verdict_still_blocks_live_promotion(
     await db_session.commit()
 
     # The stale verdict must NOT unblock the live promotion — should still block.
-    assert result["status"] == "promotion_in_flight", (
-        f"expected 'promotion_in_flight' but got {result['status']!r}; "
+    assert result["status"] == "promotion_check_wait", (
+        f"expected 'promotion_check_wait' but got {result['status']!r}; "
         "a pre-attempt verdict must not suppress an active promotion_pending"
     )
     assert result["promotion_pr_number"] == 7070
@@ -2422,7 +2422,7 @@ async def test_abandon_current_version_stale_verdict_still_blocks_live_promotion
         "promotion_pending": {
             "pr_number": 8080,
             "pr_url": "https://github.com/o/r/pull/8080",
-            "auto_merge_enabled": False,
+            "managed_check_wait": True,
             "enabled_at": "2026-06-01T00:00:00",  # AFTER the verdict
         },
     }
@@ -2476,8 +2476,6 @@ async def test_run_qualification_managed_check_wait_is_noop(db_session, mocker):
         "promotion_pending": {
             "pr_number": 4343,
             "pr_url": "https://github.com/o/r/pull/4343",
-            "auto_merge_enabled": False,
-            "migration_carrying": True,
             "managed_check_wait": True,
         },
     }
@@ -2494,8 +2492,7 @@ async def test_run_qualification_managed_check_wait_is_noop(db_session, mocker):
     result = await rq.run_qualification(db_session, project.id, version)
     await db_session.commit()
 
-    # The managed check-wait hold blocks the duplicate qualify with its own
-    # distinct status (NOT promotion_in_flight, NOT a fresh audit spawn).
+    # The managed check-wait hold blocks a duplicate qualify without spawning.
     assert result["status"] == "promotion_check_wait"
     assert result["promotion_pr_number"] == 4343
     assert result["promotion_pr_url"] == "https://github.com/o/r/pull/4343"
@@ -2528,7 +2525,7 @@ async def test_run_qualification_refreshes_stale_check_wait_under_lock(
     cached BEFORE promote() committed the managed check_wait.  Without
     populate_existing on the under-lock FOR UPDATE re-select, that SELECT acquires
     the row lock but returns the SAME stale identity-map instance, so the
-    promotion-in-flight guard reads non-blocking state and spawns a fresh audit +
+    managed-promotion guard reads non-blocking state and spawns a fresh audit +
     merge-grade while the promotion PR is genuinely open.  With the fix the
     re-select overwrites the cached attributes, so the guard sees the committed
     check_wait and no-ops."""
@@ -2574,8 +2571,6 @@ async def test_run_qualification_refreshes_stale_check_wait_under_lock(
         "promotion_pending": {
             "pr_number": 909,
             "pr_url": "https://github.com/o/r/pull/909",
-            "auto_merge_enabled": False,
-            "migration_carrying": True,
             "managed_check_wait": True,
         },
     }
@@ -2605,7 +2600,7 @@ async def test_run_qualification_refreshes_stale_check_wait_under_lock(
     await db_session.commit()
 
     # The under-lock re-select refreshed the stale instance, so the
-    # promotion-in-flight guard caught the managed check_wait — no fresh spawn.
+    # managed-promotion guard caught the check_wait — no fresh spawn.
     assert result["status"] == "promotion_check_wait"
     assert result["promotion_pr_number"] == 909
 
@@ -3870,9 +3865,22 @@ async def test_run_qualification_promotion_failed_reuses_audit_and_repromotes(
         "app.github.create_pull_request",
         new=AsyncMock(return_value={"number": 91, "html_url": "http://pr/91"}),
     )
+    receipt_sha = "receipt0" * 5
     merge_mock = mocker.patch(
         "app.github.merge_pull_request",
         new=AsyncMock(return_value={"merged": True, "message": "Merged"}),
+    )
+    mocker.patch(
+        "app.github.create_tag",
+        new=AsyncMock(return_value={"ref": "refs/tags/v1"}),
+    )
+    # Promotion's staged-direction activation uses a production-owned nested
+    # session. SQLite's StaticPool has one connection, so keep that nested
+    # best-effort path on the test-owned session just like the connected
+    # promotion lifecycle fixtures.
+    mocker.patch(
+        "app.database.AsyncSessionLocal",
+        new=_shared_session_factory(db_session),
     )
     # A reuse must NOT spawn an audit child.
     audit_spawn = mocker.patch(
@@ -3904,8 +3912,10 @@ async def test_run_qualification_promotion_failed_reuses_audit_and_repromotes(
     # A promotion outcome, NOT "spawned" — the audit was reused.
     assert result["status"] == "promoted"
     assert result.get("reused_audit") is True
-    # The CURRENT candidate (the one carrying the fix) was promoted.
-    assert result["promoted_sha"] == "postmerg" * 5
+    # The CURRENT candidate (the one carrying the fix) was promoted, and the
+    # durable result is bound to the exact merged-PR receipt rather than a
+    # later-moving branch tip.
+    assert result["promoted_sha"] == receipt_sha
     # No audit child spawned; qualification_attempts NOT bumped (no fresh spawn).
     audit_spawn.assert_not_called()
     merge_mock.assert_awaited()
@@ -3916,6 +3926,7 @@ async def test_run_qualification_promotion_failed_reuses_audit_and_repromotes(
     next_version = await rv.current_open_version(db_session, project.id)
     assert next_version is not None
     assert next_version.version_number == 2
+    assert next_version.base_sha == receipt_sha
 
 
 @pytest.mark.asyncio

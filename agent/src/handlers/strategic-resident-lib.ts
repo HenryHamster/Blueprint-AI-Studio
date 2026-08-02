@@ -94,6 +94,15 @@ export interface StrategicWatchReceipt {
   };
 }
 
+export interface ResidentWakeBarrierReceipt {
+  id: string;
+  event_type?: string;
+  summary?: string;
+  created_at?: string;
+  task_id?: string | null;
+  context?: Record<string, unknown>;
+}
+
 export interface ResidentActivityUpdate {
   phase: 'working' | 'waiting';
   phase_started_at: string;
@@ -111,10 +120,12 @@ export interface SessionHeartbeatResponse {
   resident_incarnation_id?: string;
   admission_status?: 'legacy_grace';
   retry_after_seconds?: number;
-  /** Monotonic marker over strategist-relevant change sources (task transitions,
-   *  operator messages, direction/cycle mutations). State-gated pacing fires an
-   *  autonomous turn when this differs from the rev recorded at the last turn.
-   *  ABSENT (older backend that does not populate it) degrades to floor-tick
+  /** Stable fingerprint over actionable strategist-relevant transitions
+   *  (operator messages, blockers/failures, terminal cycles, and a drained task
+   *  frontier). Routine task heartbeat/progress writes do not change it.
+   *  State-gated pacing fires an autonomous turn when this differs from the rev
+   *  recorded at the last turn.
+   *  ABSENT (older backend that does not populate it) degrades to sparse exploration
    *  pacing — the same forward-compat pattern `authority_held` uses. */
   work_state_rev?: string;
   /** Optional compact counts feeding the tick context (in-flight tasks, terminal
@@ -124,6 +135,9 @@ export interface SessionHeartbeatResponse {
    *  says the world moved), these remain present until Strategic acknowledges
    *  the result through ack-watch. */
   fired_watches?: StrategicWatchReceipt[];
+  /** Exact server-authored semantic outcome receipts. A successful autonomous
+   *  turn acknowledges the delivered ids through handled_message_ids. */
+  fired_barriers?: ResidentWakeBarrierReceipt[];
   /** Serialized exam-ledger echoed from the heartbeat note, or null. Agents
    *  ignore this field; it is only used for roundtrip integrity checks. */
   exam_ledger?: string | null;
@@ -186,9 +200,10 @@ export interface ResidentConfig {
   turnTimeoutMs: number;
   /** false disables the autonomous self-prompt path (e.g. a read-only monitor mode) */
   autonomousEnabled: boolean;
-  /** Floor-tick interval for autonomous turns (ms): fire even with no state change so
-   *  the session never goes fully dark. Default: AUTONOMOUS_FLOOR_TICK_MS (600s). */
-  minTickMs: number;
+  /** Sparse fallback exploration interval (ms): run a model turn when no semantic
+   *  event has arrived. This is distinct from polling/heartbeats and does not keep
+   *  an otherwise stale continuation lease alive. Default: 4h. */
+  explorationIntervalMs: number;
   /** Per-turn stall budget for AUTONOMOUS turns (ms). Deeper than the operator default
    *  so a long read/verify/investigate step isn't clipped mid-thought. Default: 300s. */
   autonomousTurnTimeoutMs: number;
@@ -325,8 +340,8 @@ export function buildStagedDirectionsText(
  * Resolve the resident loop's timing knobs from the strategic payload the
  * backend ships (runtime settings surfaced onto the payload). Defaults: 5s idle
  * (heartbeat) tick, 1.5s inbound-message poll (fast operator pickup), 120s
- * operator response-progress target, 600s floor tick, 300s autonomous stall
- * budget, 3 ops/turn. The response-progress target is deliberately
+ * operator response-progress target, 4h unchanged-state exploration fallback,
+ * 300s autonomous stall budget, 3 ops/turn. The response-progress target is deliberately
  * non-destructive: a slow but healthy reply must remain usable.
  */
 export function residentConfig(payload: Record<string, unknown>): ResidentConfig {
@@ -336,7 +351,10 @@ export function residentConfig(payload: Record<string, unknown>): ResidentConfig
   // preserving enough rate-limit headroom for one overlapping replacement.
   const messagePollSec = num(payload.strategic_session_message_poll_seconds, 0.75);
   const turnTimeoutSec = num(payload.strategic_session_turn_timeout_seconds, 120);
-  const minTickSec = num(payload.strategic_session_min_tick_seconds, 600);
+  const explorationIntervalSec = num(
+    payload.strategic_session_exploration_interval_seconds,
+    14_400,
+  );
   const autonomousTurnTimeoutSec = num(payload.strategic_session_autonomous_turn_timeout_seconds, 300);
   const maxOpsPerTurn = Math.max(1, Math.round(num(payload.strategic_session_max_ops_per_turn, 3)));
   // interaction_mode === 'monitor' (or an explicit flag) makes the session
@@ -361,8 +379,12 @@ export function residentConfig(payload: Record<string, unknown>): ResidentConfig
     messagePollMs: Math.min(idleTickMs, Math.max(750, Math.round(messagePollSec * 1000))),
     turnTimeoutMs: Math.max(15_000, Math.round(turnTimeoutSec * 1000)),
     autonomousEnabled,
-    // Never poll slower than the idle tick (600s floor keeps the session lively).
-    minTickMs: Math.max(idleTickMs, Math.round(minTickSec * 1000)),
+    // The exploration fallback cannot be checked more frequently than the loop
+    // itself. Event/state/operator wakes remain immediate regardless of this knob.
+    explorationIntervalMs: Math.max(
+      idleTickMs,
+      Math.round(explorationIntervalSec * 1000),
+    ),
     autonomousTurnTimeoutMs: Math.max(15_000, Math.round(autonomousTurnTimeoutSec * 1000)),
     maxOpsPerTurn,
     compactionThresholdTokens,
@@ -1838,10 +1860,10 @@ export function admitDecisionEntry(
 }
 /** Default number of focus surfaces surfaced in the prompt each tick. */
 export const FOCUS_LIST_SIZE = 3;
-/** Default floor-tick interval (ms): even with no state change, review at least
- *  this often. Deliberately under the continuation-lease TTL so a session never
- *  goes fully dark, and matches design doc 9f769438's 600s floor. */
-export const AUTONOMOUS_FLOOR_TICK_MS = 600_000;
+/** Default interval for a deliberately sparse model-driven exploration turn when
+ * no semantic event has arrived. Four hours keeps autonomous discovery available
+ * without turning ordinary Resident idleness into a fixed upper-tier tax. */
+export const AUTONOMOUS_EXPLORATION_INTERVAL_MS = 14_400_000;
 export const EXAM_NOTE_CAP = 240;
 /**
  * Byte budget for the serialized exam ledger. Must stay below the backend's
@@ -2356,33 +2378,107 @@ export function classifyTickOutcome(params: {
 
 export interface AutonomousTurnGateState {
   /** work_state_rev from the latest heartbeat (undefined/null = backend does not
-   *  populate it → this signal is skipped and pacing degrades to the floor tick). */
+   *  populate it → this signal is skipped and pacing degrades to exploration). */
   currentWorkStateRev?: string | null;
   /** the rev recorded at the last autonomous turn */
   lastTurnWorkStateRev?: string | null;
   /** the previous autonomous turn ended AGENDA-CONTINUE */
   previousTurnAgendaContinue: boolean;
+  /** a code-owned corrective/review obligation requires another real turn */
+  followupTurnPending?: boolean;
   /** an operator turn just completed (act on fresh conversation) */
   operatorTurnJustCompleted: boolean;
+  /** stable identity of currently fired/expired watch receipts */
+  currentFiredWatchRev?: string;
+  /** fired-watch identity recorded after the last completed autonomous turn */
+  lastTurnFiredWatchRev?: string;
+  /** true while owned tasks or pending/unacknowledged watches remain */
+  ownedWorkPending?: boolean;
   /** ms since the last autonomous turn (Infinity before the first) */
   msSinceLastAutonomousTurn: number;
-  /** floor-tick interval; default AUTONOMOUS_FLOOR_TICK_MS */
-  floorTickMs?: number;
+  /** unchanged-state exploration interval; default AUTONOMOUS_EXPLORATION_INTERVAL_MS */
+  explorationIntervalMs?: number;
 }
 
 /**
- * Pure pacing predicate: run an autonomous turn when ANY of — the world moved
- * (heartbeat work_state_rev differs from the rev at the last turn), the agent
- * declared more work (AGENDA-CONTINUE), an operator turn just completed, or the
- * floor tick elapsed. ABSENT work_state_rev degrades to floor-tick pacing.
+ * Pure pacing predicate. Operator work, an explicit immediate agenda, code-owned
+ * correction, new watch receipt, or an actionable world-state change all run.
+ * The first turn also runs so a fresh/recovered session can orient. After that,
+ * unchanged-state exploration is disabled while owned work/watches are pending:
+ * the backend waits cheaply and the next semantic event wakes the model.
  */
 export function shouldRunAutonomousTurn(state: AutonomousTurnGateState): boolean {
   if (state.operatorTurnJustCompleted) return true;
   if (state.previousTurnAgendaContinue) return true;
+  if (state.followupTurnPending) return true;
+  if (
+    state.currentFiredWatchRev
+    && state.currentFiredWatchRev !== state.lastTurnFiredWatchRev
+  ) return true;
   const rev = state.currentWorkStateRev;
   if (rev !== undefined && rev !== null && rev !== state.lastTurnWorkStateRev) return true;
-  const floor = state.floorTickMs ?? AUTONOMOUS_FLOOR_TICK_MS;
-  return state.msSinceLastAutonomousTurn >= floor;
+  if (state.msSinceLastAutonomousTurn === Number.POSITIVE_INFINITY) return true;
+  if (state.ownedWorkPending) return false;
+  const explorationInterval = state.explorationIntervalMs
+    ?? AUTONOMOUS_EXPLORATION_INTERVAL_MS;
+  return state.msSinceLastAutonomousTurn >= explorationInterval;
+}
+
+/** Stable, order-independent identity for the actionable watch receipts in one
+ * heartbeat. Receipt bodies may gain additive fields; ids/state are the agenda
+ * identity and therefore the only pacing inputs. */
+export function firedWatchRevision(watches: StrategicWatchReceipt[]): string {
+  return watches
+    .map((watch) => `${watch.id}:${watch.state ?? 'fired'}`)
+    .sort()
+    .join('|');
+}
+
+export function wakeBarrierRevision(
+  barriers: ResidentWakeBarrierReceipt[],
+): string {
+  return barriers.map((barrier) => barrier.id).sort().join('|');
+}
+
+/** Coalesce successful parallel child receipts at the drained-frontier barrier.
+ * Direct Strategic spawns register a watch by default, so waking on every
+ * COMPLETED child would otherwise defeat semantic task coalescing. Expiry,
+ * failure, cancellation, and unknown receipt shapes remain immediately
+ * actionable; successful receipts stay durable and all appear in the prompt
+ * when the sibling frontier drains or another genuine turn occurs. */
+export function actionableFiredWatchRevision(
+  watches: StrategicWatchReceipt[],
+  summary: Record<string, unknown> | null | undefined,
+): string {
+  const inFlight = summary?.in_flight;
+  if (typeof inFlight !== 'number' || !Number.isFinite(inFlight) || inFlight <= 0) {
+    return firedWatchRevision(watches);
+  }
+  return firedWatchRevision(watches.filter((watch) => {
+    if (watch.state === 'expired') return true;
+    const terminal = watch.terminal_status
+      ?? (typeof watch.receipt?.terminal_status === 'string'
+        ? watch.receipt.terminal_status
+        : null);
+    return terminal !== 'COMPLETED';
+  }));
+}
+
+/** Whether unchanged-state exploration turns should stay suppressed. The compact
+ * backend summary is advisory and may contain unknown additive keys. */
+export function hasPendingOwnedWork(
+  summary: Record<string, unknown> | null | undefined,
+): boolean {
+  const positive = (key: string): boolean => {
+    const value = summary?.[key];
+    return typeof value === 'number' && Number.isFinite(value) && value > 0;
+  };
+  // Fired watches and barrier messages have their own exact one-shot wake
+  // identities. They stay durable/open until explicitly handled, so treating
+  // their continued presence as pending execution would suppress exploration
+  // forever if a turn failed to acknowledge/resolve them. Only work that can
+  // still move on its own keeps the model asleep between semantic events.
+  return positive('in_flight') || positive('pending_watches');
 }
 
 /**
@@ -2404,6 +2500,7 @@ export function buildAutonomousPrompt(
   decisionsRegisterText = '',
   operatorDecisionReview: PendingOperatorDecisionReview | boolean = false,
   firedWatches: StrategicWatchReceipt[] = [],
+  firedBarriers: ResidentWakeBarrierReceipt[] = [],
 ): string {
   const lines: string[] = [];
 
@@ -2469,6 +2566,23 @@ export function buildAutonomousPrompt(
     lines.push('');
   }
 
+  if (firedBarriers.length > 0) {
+    lines.push(
+      'SEMANTIC OUTCOME RECEIPTS (handle before normal rotating examination):',
+      'These exact server-authored receipts woke this turn. Inspect and act on the',
+      'decision boundary; they are acknowledged automatically only after this turn completes.',
+    );
+    for (const barrier of firedBarriers.slice(0, 20)) {
+      const eventType = barrier.event_type || 'outcome';
+      const summary = barrier.summary || 'Outcome receipt ready';
+      const context = barrier.context && Object.keys(barrier.context).length > 0
+        ? `; context=${JSON.stringify(barrier.context)}`
+        : '';
+      lines.push(`- receipt=${barrier.id}; event=${eventType}; ${summary}${context}`.slice(0, 1800));
+    }
+    lines.push('');
+  }
+
   lines.push(
     'No operator message is pending. Complete ONE meaningful unit of progress this',
     `turn. A unit may chain investigate → decide → act → verify, and may batch up to`,
@@ -2476,7 +2590,7 @@ export function buildAutonomousPrompt(
     'welcome: read code, task outcomes, a direction, or the qualification findings',
     'before deciding — do not stop at revision numbers or counts.',
     '',
-    'Tasks run concurrently after spawn_task or spawn_fix. When bounded work is',
+    'Tasks run concurrently after spawn_task. When bounded work is',
     'genuinely independent, dispatch parallel TASKS under the owning direction.',
     'Do not create directions to parallelize implementation or consume capacity;',
     'a direction is a durable outcome lane, and activating one creates recurring attention.',

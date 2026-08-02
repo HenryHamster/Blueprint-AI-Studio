@@ -110,23 +110,6 @@ def _serialize_sr_catch_rate_trends(sr_trends: Dict[str, Any]) -> Dict[str, Any]
         "overall_trend_verdict": sr_trends.get("overall_trend_verdict"),
         "overall_trend_significant": sr_trends.get("overall_trend_significant"),
         "overall_trend_data_sufficient": sr_trends.get("overall_trend_data_sufficient"),
-        # Author-only (SR-alone) overall rates and significance-gated trend — mirrors the
-        # combined overall fields above but uses only catches from origin='sr', excluding
-        # fresh-reviewer rescues. Promoted explicitly so callers can detect when the author
-        # self-review is regressing even while the combined gate looks healthy.
-        "overall_sr_alone_hit_rate": sr_trends.get("overall_sr_alone_hit_rate"),
-        "previous_overall_sr_alone_hit_rate": sr_trends.get(
-            "previous_overall_sr_alone_hit_rate"
-        ),
-        "overall_sr_alone_trend_verdict": sr_trends.get(
-            "overall_sr_alone_trend_verdict"
-        ),
-        "overall_sr_alone_trend_significant": sr_trends.get(
-            "overall_sr_alone_trend_significant"
-        ),
-        "overall_sr_alone_trend_data_sufficient": sr_trends.get(
-            "overall_sr_alone_trend_data_sufficient"
-        ),
     }
     for key, value in sr_trends.items():
         serialized.setdefault(key, value)
@@ -247,83 +230,9 @@ def _compute_sr_disallowed_blind_spot_rate(
     }
 
 
-def _compute_fresh_reviewer_effectiveness(
-    terminal_tasks: List[Task],
-) -> "Dict[str, Any]":
-    """Compute fresh-reviewer pass effectiveness: approval rate lift and per-category
-    hit rate (did reviewer-LLM confirm what fresh-reviewer flagged?). Always returns a dict
-    so callers can check sample_size before trusting rates.
-    """
-    code_change_tasks = [
-        t
-        for t in terminal_tasks
-        if (t.first_payload or {}).get("type") in _SR_CODE_CHANGE_TYPES
-        and "_first_attempt_succeeded" in (t.context or {})
-    ]
-    tasks_with_reviewer = [
-        t
-        for t in code_change_tasks
-        if (t.context or {}).get("_self_review_outcome", {}).get("reviewer_findings")
-    ]
-    # Baseline excludes clean-reviewed tasks (where reviewer pass ran but found nothing).
-    # Only include tasks where no reviewer pass ran at all.
-    tasks_without_reviewer = [
-        t
-        for t in code_change_tasks
-        if "_self_review_outcome" not in (t.context or {})
-    ]
-
-    def _fa_rate(tasks: List[Task]) -> "float | None":
-        measured = [t for t in tasks if "_first_attempt_succeeded" in (t.context or {})]
-        if not measured:
-            return None
-        return round(
-            sum(1 for t in measured if t.context["_first_attempt_succeeded"])
-            / len(measured),
-            2,
-        )
-
-    tasks_with_both = [
-        t
-        for t in tasks_with_reviewer
-        if has_reviewer_confirmed_categories(t.context or {})
-    ]
-    cat_flagged: Dict[str, int] = {}
-    cat_confirmed: Dict[str, int] = {}
-    cat_added_value: Dict[str, int] = {}
-    for t in tasks_with_both:
-        ctx = t.context or {}
-        findings = ctx.get("_self_review_outcome", {}).get("reviewer_findings") or []
-        reviewer_confirmed_cats = reviewer_confirmed_categories(ctx)
-        check_results = safe_check_results(ctx.get("_self_review_outcome", {}))
-        agent_failed = _author_sr_failed_categories(check_results)
-        for finding in findings:
-            cat = finding.get("category") if isinstance(finding, dict) else None
-            if not cat:
-                continue
-            cat_flagged[cat] = cat_flagged.get(cat, 0) + 1
-            if cat in reviewer_confirmed_cats:
-                cat_confirmed[cat] = cat_confirmed.get(cat, 0) + 1
-            if cat not in agent_failed and cat in reviewer_confirmed_cats:
-                cat_added_value[cat] = cat_added_value.get(cat, 0) + 1
-
-    return {
-        "fresh_reviewer_sample_size": len(tasks_with_reviewer),
-        "fresh_reviewer_first_attempt_approval_rate": _fa_rate(tasks_with_reviewer),
-        "baseline_first_attempt_approval_rate": _fa_rate(tasks_without_reviewer),
-        "per_category_hit_rate": {
-            cat: round(cat_confirmed.get(cat, 0) / total, 3)
-            for cat, total in cat_flagged.items()
-            if total >= 2
-        },
-        "reviewer_finding_added_value": dict(cat_added_value),
-        "prediction_sample_size": len(tasks_with_both),
-    }
-
-
 def _sr_miss_drilldown(
     sr_outcome: Dict[str, Any], missed_categories: set[str]
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+) -> dict[str, Any]:
     check_results = safe_check_results(sr_outcome)
     sr_check_results = {}
     for cat in missed_categories:
@@ -334,70 +243,16 @@ def _sr_miss_drilldown(
                 "issue": result.get("issue"),
                 "origin": result.get("origin"),
             }
-    reviewer_findings = [
-        {
-            "category": finding.get("category"),
-            "severity": finding.get("severity"),
-            "description": (finding.get("description") or "")[:400],
-        }
-        for finding in (sr_outcome.get("reviewer_findings") or [])
-        if isinstance(finding, dict) and finding.get("category") in missed_categories
+    return sr_check_results
+
+
+def _author_edges(edges: List[Any]) -> list[dict[str, Any]]:
+    """Return author evidence while ignoring retired auxiliary-review entries."""
+    return [
+        entry
+        for entry in edges
+        if isinstance(entry, dict) and entry.get("origin") != "reviewer"
     ]
-    return sr_check_results, reviewer_findings
-
-
-def _partition_edges_by_origin(edges: List[Any]) -> "tuple[list, list]":
-    """Split an edges_considered list into (author, reviewer) entries.
-
-    Entries without an explicit ``origin`` field are treated as author entries.
-    Non-dict entries are dropped (matches the existing read pattern in
-    aggregation code which silently skips malformed entries).
-    """
-    author: list = []
-    reviewer: list = []
-    for e in edges:
-        if not isinstance(e, dict):
-            continue
-        if e.get("origin") == "reviewer":
-            reviewer.append(e)
-        else:
-            author.append(e)
-    return author, reviewer
-
-
-def _reviewer_caught_author_miss(author_entries: list, reviewer_entries: list) -> bool:
-    """Return True iff at least one reviewer entry catches what the author missed.
-
-    A reviewer catch is one of:
-      * reviewer raises a ``case`` not present in the author's entries (mismatch
-        compared by lowercased + trimmed case strings); or
-      * reviewer flags ``handled: false`` for a case the author had marked
-        ``handled: true`` (default-True when missing).
-
-    Entries on either side missing/non-string ``case`` are skipped — we cannot
-    correlate them, and per spec we skip rather than crash.
-    """
-
-    def _norm(c: Any) -> "str | None":
-        return c.strip().lower() if isinstance(c, str) and c.strip() else None
-
-    author_handled: dict[str, bool] = {}
-    for e in author_entries:
-        c = _norm(e.get("case"))
-        if c is None:
-            continue
-        h = bool(e.get("handled", True))
-        author_handled[c] = author_handled.get(c, False) or h
-
-    for e in reviewer_entries:
-        c = _norm(e.get("case"))
-        if c is None:
-            continue
-        if c not in author_handled:
-            return True
-        if author_handled[c] and not bool(e.get("handled", True)):
-            return True
-    return False
 
 
 def _compute_edges_considered_metrics(
@@ -408,14 +263,6 @@ def _compute_edges_considered_metrics(
     Computes avg edges enumerated per task and unhandled-edge-flagged rate.
     Correlates tasks with vs. without enumerated edges against correctness/
     error-handling reviewer rejections to validate field utility.
-
-    Author vs reviewer breakdowns: entries may now carry ``origin: "reviewer"``
-    (from the fresh-reviewer pass) or ``origin: "author"`` (or no origin, the
-    legacy default). The existing ``avg_edges_per_task`` /
-    ``tasks_with_edges_rate`` / ``unhandled_edge_flagged_rate`` keys describe
-    the COMBINED edges array. New per-origin keys break out author vs reviewer
-    contributions and report ``reviewer_caught_count`` — tasks where the
-    reviewer raised an edge the author missed.
 
     Returns None when fewer than 3 qualifying code-change tasks exist.
     """
@@ -434,30 +281,18 @@ def _compute_edges_considered_metrics(
     tasks_with_all_handled: List[Task] = []
     total_edges = 0
     unhandled_flagged = 0
-    total_author_edges = 0
-    total_reviewer_edges = 0
-    n_with_author = 0
-    n_with_reviewer = 0
-    reviewer_caught = 0
     for t in code_change_tasks:
         edges = (t.context or {}).get("_self_review_outcome", {}).get(
             "edges_considered"
         ) or []
         if not isinstance(edges, list):
             edges = []
-        author_e, reviewer_e = _partition_edges_by_origin(edges)
-        total_author_edges += len(author_e)
-        total_reviewer_edges += len(reviewer_e)
-        if author_e:
-            n_with_author += 1
-            if any(not e.get("handled", True) for e in author_e):
+        edges = _author_edges(edges)
+        if edges:
+            if any(not e.get("handled", True) for e in edges):
                 tasks_with_unhandled_flag.append(t)
             else:
                 tasks_with_all_handled.append(t)
-        if reviewer_e:
-            n_with_reviewer += 1
-            if _reviewer_caught_author_miss(author_e, reviewer_e):
-                reviewer_caught += 1
         if edges:
             tasks_with_edges.append(t)
             total_edges += len(edges)
@@ -504,18 +339,6 @@ def _compute_edges_considered_metrics(
         "correctness_rejection_rate_with_all_handled": _rejection_rate(
             tasks_with_all_handled
         ),
-        "author_avg_edges_per_task": round(total_author_edges / n_with_author, 2)
-        if n_with_author
-        else None,
-        "reviewer_avg_edges_per_task": round(total_reviewer_edges / n_with_reviewer, 2)
-        if n_with_reviewer
-        else None,
-        "tasks_with_reviewer_edges_count": n_with_reviewer,
-        "tasks_with_reviewer_edges_rate": round(n_with_reviewer / sample_size, 3),
-        "reviewer_caught_count": reviewer_caught,
-        "reviewer_caught_rate": round(reviewer_caught / n_with_reviewer, 3)
-        if n_with_reviewer
-        else None,
     }
 
 
@@ -690,7 +513,6 @@ def compute_review_quality_metrics(terminal_tasks: List[Task]) -> Dict[str, Any]
         and has_reviewer_confirmed_categories(t.context or {})
     ]
     self_review_prediction_accuracy = compute_sr_prediction_accuracy(tasks_with_both)
-    fresh_reviewer_effectiveness = _compute_fresh_reviewer_effectiveness(terminal_tasks)
     edges_considered_metrics = _compute_edges_considered_metrics(terminal_tasks)
     # Retired: parallel_review_effectiveness measured review-task parallelization,
     # but had no consumer and two placeholder subfields never had real inputs.
@@ -699,6 +521,5 @@ def compute_review_quality_metrics(terminal_tasks: List[Task]) -> Dict[str, Any]
         "self_review_effectiveness": self_review_effectiveness,
         "self_review_prediction_accuracy": self_review_prediction_accuracy,
         "review_accuracy": review_accuracy,
-        "fresh_reviewer_effectiveness": fresh_reviewer_effectiveness,
         "edges_considered_metrics": edges_considered_metrics,
     }

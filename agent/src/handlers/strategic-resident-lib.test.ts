@@ -17,7 +17,7 @@ import {
   retainPendingOperatorDecisionReview, MAX_REVIEW_ATTEMPTS,
   classifyOperatorDecisionReview,
   openFoundLeads, classifyTickOutcome, shouldRunAutonomousTurn,
-  AUTONOMOUS_FLOOR_TICK_MS,
+  AUTONOMOUS_EXPLORATION_INTERVAL_MS,
   serializeLedger, restoreLedger, refreshSurfaceCatalog,
   EXAM_RECORDS_CAP, EXAM_NOTE_CAP, EXAM_LEDGER_MAX_BYTES,
   MAX_IMAGE_BASE64_LENGTH, MAX_IMAGE_DOWNLOAD_BYTES, MAX_IMAGES_PER_TURN, MAX_TEXT_ATTACHMENT_BYTES,
@@ -41,7 +41,7 @@ describe('residentConfig', () => {
     expect(c.messagePollMs).toBe(750); // backend-budgeted fast pickup default
     expect(c.turnTimeoutMs).toBe(120_000);
     expect(c.autonomousEnabled).toBe(true);
-    expect(c.minTickMs).toBe(600_000);
+    expect(c.explorationIntervalMs).toBe(14_400_000);
     expect(c.autonomousTurnTimeoutMs).toBe(300_000);
     expect(c.maxOpsPerTurn).toBe(3);
     expect(c.compactionThresholdTokens).toBeUndefined(); // model-derived by default
@@ -54,7 +54,7 @@ describe('residentConfig', () => {
       strategic_session_idle_tick_seconds: 3,
       strategic_session_message_poll_seconds: 1,
       strategic_session_turn_timeout_seconds: 90,
-      strategic_session_min_tick_seconds: 120,
+      strategic_session_exploration_interval_seconds: 7200,
       strategic_session_autonomous_turn_timeout_seconds: 180,
       strategic_session_max_ops_per_turn: 5,
       strategic_session_operator_ack_threshold_seconds: 30,
@@ -62,7 +62,7 @@ describe('residentConfig', () => {
     expect(c.idleTickMs).toBe(3000);
     expect(c.messagePollMs).toBe(1000);
     expect(c.turnTimeoutMs).toBe(90_000);
-    expect(c.minTickMs).toBe(120_000);
+    expect(c.explorationIntervalMs).toBe(7_200_000);
     expect(c.autonomousTurnTimeoutMs).toBe(180_000);
     expect(c.maxOpsPerTurn).toBe(5);
     expect(c.operatorAckThresholdMs).toBe(0);
@@ -99,13 +99,13 @@ describe('residentConfig', () => {
     expect(c.messagePollMs).toBe(1000); // clamped down to the idle tick
   });
 
-  it('minTickMs is never below the idle tick', () => {
+  it('explorationIntervalMs is never below the idle tick', () => {
     const c = residentConfig({
       strategic_session_idle_tick_seconds: 30,
-      strategic_session_min_tick_seconds: 5,
+      strategic_session_exploration_interval_seconds: 5,
     });
-    // min_tick (5s) is below idle_tick (30s) — clamp to idle_tick
-    expect(c.minTickMs).toBe(30_000);
+    // exploration interval (5s) is below idle_tick (30s) — clamp to idle_tick
+    expect(c.explorationIntervalMs).toBe(30_000);
   });
 
   it('disables autonomous work in monitor mode', () => {
@@ -1472,7 +1472,7 @@ describe('buildAutonomousPrompt (dynamic, evidence-gated)', () => {
 
   it('parallelizes bounded tasks without direction sharding', () => {
     const p = buildAutonomousPrompt(focus, [], [], false);
-    expect(p).toContain('Tasks run concurrently after spawn_task or spawn_fix');
+    expect(p).toContain('Tasks run concurrently after spawn_task');
     expect(p).toContain('parallel TASKS under the owning direction');
     expect(p).toContain('Do not create directions to parallelize implementation');
     expect(p).toContain('activating one creates recurring attention');
@@ -2526,7 +2526,7 @@ describe('shouldRunAutonomousTurn (state-gated pacing)', () => {
     previousTurnAgendaContinue: false,
     operatorTurnJustCompleted: false,
     msSinceLastAutonomousTurn: 0,
-    floorTickMs: AUTONOMOUS_FLOOR_TICK_MS,
+    explorationIntervalMs: AUTONOMOUS_EXPLORATION_INTERVAL_MS,
   };
 
   it('fires when an operator turn just completed', () => {
@@ -2542,19 +2542,19 @@ describe('shouldRunAutonomousTurn (state-gated pacing)', () => {
     expect(shouldRunAutonomousTurn({ ...base, currentWorkStateRev: 'r1', lastTurnWorkStateRev: 'r1' })).toBe(false);
   });
 
-  it('fires when the floor tick has elapsed', () => {
-    expect(shouldRunAutonomousTurn({ ...base, msSinceLastAutonomousTurn: AUTONOMOUS_FLOOR_TICK_MS })).toBe(true);
-    expect(shouldRunAutonomousTurn({ ...base, msSinceLastAutonomousTurn: AUTONOMOUS_FLOOR_TICK_MS - 1 })).toBe(false);
+  it('fires when the sparse exploration interval has elapsed', () => {
+    expect(shouldRunAutonomousTurn({ ...base, msSinceLastAutonomousTurn: AUTONOMOUS_EXPLORATION_INTERVAL_MS })).toBe(true);
+    expect(shouldRunAutonomousTurn({ ...base, msSinceLastAutonomousTurn: AUTONOMOUS_EXPLORATION_INTERVAL_MS - 1 })).toBe(false);
   });
 
-  it('degrades to floor-tick pacing when work_state_rev is absent (older backend)', () => {
-    // No rev signal + floor not elapsed + no other trigger → do NOT fire.
+  it('degrades to sparse exploration pacing when work_state_rev is absent (older backend)', () => {
+    // No rev signal + exploration interval not elapsed + no other trigger → do NOT fire.
     expect(shouldRunAutonomousTurn({ ...base, currentWorkStateRev: undefined, msSinceLastAutonomousTurn: 10 })).toBe(false);
-    // ...but the floor tick still fires it.
-    expect(shouldRunAutonomousTurn({ ...base, currentWorkStateRev: undefined, msSinceLastAutonomousTurn: AUTONOMOUS_FLOOR_TICK_MS })).toBe(true);
+    // ...but the sparse exploration fallback still fires it.
+    expect(shouldRunAutonomousTurn({ ...base, currentWorkStateRev: undefined, msSinceLastAutonomousTurn: AUTONOMOUS_EXPLORATION_INTERVAL_MS })).toBe(true);
   });
 
-  it('runs the first-ever tick (Infinity since last) via the floor', () => {
+  it('runs the first-ever turn immediately, independent of exploration cadence', () => {
     expect(shouldRunAutonomousTurn({ ...base, msSinceLastAutonomousTurn: Number.POSITIVE_INFINITY })).toBe(true);
   });
 
@@ -2568,7 +2568,7 @@ describe('shouldRunAutonomousTurn (state-gated pacing)', () => {
       ...base,
       currentWorkStateRev: revAfterOwnOp,
       lastTurnWorkStateRev: revAfterOwnOp, // baseline already folded in own writes
-      msSinceLastAutonomousTurn: 0, // floor not elapsed
+      msSinceLastAutonomousTurn: 0, // exploration interval not elapsed
     })).toBe(false);
 
     // But a GENUINE external change (different rev since the loop set its baseline)

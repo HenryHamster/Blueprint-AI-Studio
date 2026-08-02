@@ -129,6 +129,93 @@ async def test_already_terminal_watch_fires_immediately_and_registration_replays
 
 
 @pytest.mark.asyncio
+async def test_write_watch_waits_for_integration_landing(db_session):
+    project, owner, target = await _project_and_tasks(db_session)
+    target.status = TaskStatus.COMPLETED
+    target.payloads = [{"type": "create"}]
+    target.context = {"review_loop": {"pr_number": 4242}}
+    db_session.add(target)
+    await db_session.commit()
+
+    watch, created = await register_task_watch(
+        db_session,
+        project_id=project.id,
+        created_by_task_id=owner.id,
+        target_task_id=target.id,
+        purpose="report the shipped change",
+    )
+    await db_session.commit()
+    assert created is True
+    assert watch.state == WATCH_PENDING
+    assert watch.receipt["condition"] == "landed"
+
+    # Agent terminal is not a product milestone while the PR remains in review.
+    assert await resolve_project_task_watches(
+        db_session, project_id=project.id
+    ) == []
+
+    target.context = {
+        **(target.context or {}),
+        "pr_merged": True,
+        "landed_on_integration": True,
+        "merge_commit_sha": "a" * 40,
+    }
+    db_session.add(target)
+    await db_session.commit()
+
+    visible = await resolve_project_task_watches(
+        db_session, project_id=project.id
+    )
+    assert [row.id for row in visible] == [watch.id]
+    assert visible[0].receipt["outcome"] == "landed"
+    assert visible[0].receipt["pr_number"] == 4242
+    assert visible[0].receipt["landed_on_integration"] is True
+    assert visible[0].receipt["merge_commit_sha"] == "a" * 40
+
+
+@pytest.mark.asyncio
+async def test_write_watch_surfaces_blocker_without_waiting_for_terminal(db_session):
+    project, owner, target = await _project_and_tasks(db_session)
+    target.payloads = [{"type": "create"}]
+    target.status = TaskStatus.BLOCKED
+    target.context = {
+        "blocker": {"kind": "dependency", "reason": "base branch missing"}
+    }
+    db_session.add(target)
+    await db_session.commit()
+
+    watch, created = await register_task_watch(
+        db_session,
+        project_id=project.id,
+        created_by_task_id=owner.id,
+        target_task_id=target.id,
+    )
+    assert created is True
+    assert watch.state == WATCH_FIRED
+    assert watch.receipt["outcome"] == "blocked"
+    assert watch.receipt["blocker"]["kind"] == "dependency"
+
+
+@pytest.mark.asyncio
+async def test_write_watch_surfaces_completed_no_pr_result(db_session):
+    project, owner, target = await _project_and_tasks(db_session)
+    target.payloads = [{"type": "refactor"}]
+    target.status = TaskStatus.COMPLETED
+    target.context = {}
+    db_session.add(target)
+    await db_session.commit()
+
+    watch, _ = await register_task_watch(
+        db_session,
+        project_id=project.id,
+        created_by_task_id=owner.id,
+        target_task_id=target.id,
+    )
+    assert watch.state == WATCH_FIRED
+    assert watch.receipt["outcome"] == "completed_without_pr"
+
+
+@pytest.mark.asyncio
 async def test_pending_watch_expires_visibly(db_session):
     project, owner, target = await _project_and_tasks(db_session)
     watch, _ = await register_task_watch(

@@ -178,10 +178,9 @@ _BASELINE_GATE_STAGE_KEYWORDS: list[str] = [
     "viewport",
 ]
 
-# REVIEWER_PASS: fresh-reviewer disagreement, build-gate conflicts
+# REVIEWER_PASS: independent-review disagreement and build-gate conflicts
 _REVIEWER_PASS_PATTERNS: list[re.Pattern] = [
     re.compile(r"reviewer.{0,30}disagree", re.IGNORECASE),
-    re.compile(r"fresh.{0,10}reviewer.{0,30}(fail|reject|flag)", re.IGNORECASE),
     re.compile(r"build.{0,10}gate.{0,20}(disagree|conflict)", re.IGNORECASE),
     re.compile(r"reviewer.pass.{0,20}(fail|reject)", re.IGNORECASE),
     re.compile(r"review.{0,10}pipeline.{0,20}regression", re.IGNORECASE),
@@ -193,7 +192,6 @@ _REVIEWER_PASS_PATTERNS: list[re.Pattern] = [
 _REVIEWER_PASS_STAGE_KEYWORDS: list[str] = [
     "review",
     "reviewer",
-    "fresh_reviewer",
     "review_pipeline",
 ]
 

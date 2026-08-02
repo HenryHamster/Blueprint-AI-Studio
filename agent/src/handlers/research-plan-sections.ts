@@ -284,7 +284,6 @@ export const QUALIFICATION_STATE_VOCAB: ReadonlySet<string> = new Set([
   'promotion_confirmation_timed_out',
   'promotion_deploy_failed',
   'promotion_failed',
-  'promotion_in_flight',
   'protection_blocked_review',
   'qualifying',
   'required_check_failed',
@@ -599,10 +598,12 @@ When the version is in **stabilize** and you judge it ready for release — hard
 \`\`\`json
 {
   "qualify_request": {
-    "reason": "One sentence explaining why the version is ready to qualify now."
+    "reason": "One sentence explaining why the version is ready to qualify now.",
+    "probes": ["walkthrough_e2e"]
   }
 }
 \`\`\`
+Normally omit \`probes\`: qualification should judge evidence already earned by task acceptance, review, and CI. Request \`walkthrough_e2e\` only when the release decision genuinely depends on live product behavior that existing evidence cannot establish; it consumes an additional runner checkout.
 Only request qualification from the **stabilize** phase — it is ignored in **build**. If the version is not yet release-ready, do NOT emit \`qualify_request\` — omitting it means "not ready." \`version_phase_decision\` and \`qualify_request\` are independent: you may emit either, both, or neither.
 
 **Hold qualification only for legitimate blockers, and keep work flowing while you wait.** Do NOT rush to qualify — readiness is a real judgment, and shipping a half-hardened version to hit a cadence is its own failure. But the trap this phase actually fell into is the opposite: *stalling* — holding qualification on something that is not a real blocker and that nothing is actively working. A legitimate hold is a genuine must-ship concern (a correctness regression, an unmet acceptance criterion, a broken core path) that is being actively driven to resolution. A straggler you are "waiting to land" from a paused or churn-stalled direction is NOT a legitimate hold — nothing is driving it, so the wait is open-ended. In that state the answer is not to rush-qualify; it is to get honest about the gate: if the pending work is genuinely must-ship, re-activate it as an actively-worked fix; if it is only nice-to-have, stop treating it as a blocker. And never let the phase sit idle while you wait — there is always hardening, cleanup, or test-coverage work to keep flowing.

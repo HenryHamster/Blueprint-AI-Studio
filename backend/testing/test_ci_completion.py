@@ -19,7 +19,7 @@ import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import sessionmaker
 
-from app.ci_completion import _normalize_merge_error
+from app.ci_completion import _normalize_merge_error, _review_approved
 from app.migration_reservations import allocate_migration_reservation
 from app.models import Alert, Project, Task, TaskStatus
 
@@ -64,6 +64,26 @@ def _default_external_review_decision_clear(mocker):
     mocker.patch(
         "app.github_pulls.get_pull_request_review_decision",
         AsyncMock(return_value=None),
+    )
+
+
+@pytest.fixture(autouse=True)
+def _default_exact_merge_target(mocker):
+    """Bind ordinary merge fixtures to a deterministic live base/head pair."""
+
+    async def _get_target(
+        _token, _owner, _repo, pr_number, *, project_id, **_kwargs
+    ):
+        return {
+            "project_id": project_id,
+            "pr_number": pr_number,
+            "base_sha": f"test-base-{pr_number}",
+            "head_sha": f"test-head-{pr_number}",
+        }
+
+    mocker.patch(
+        "app.review_merge_authority._fetch_live_review_target",
+        new=AsyncMock(side_effect=_get_target),
     )
 
 
@@ -142,6 +162,43 @@ def test_normalize_merge_error_structural_equivalence():
     assert _normalize_merge_error(a) == _normalize_merge_error(b)
 
 
+def test_review_merge_permission_requires_durable_flag_or_policy_marker():
+    assert _review_approved({"verdict": "APPROVE"}) is False
+    assert _review_approved({"review_approved": True}) is True
+    assert _review_approved({"review_not_required": True}) is False
+    assert (
+        _review_approved(
+            {
+                "review_not_required": True,
+                "review_policy_reason": "small scoped policy bypass",
+            }
+        )
+        is True
+    )
+    assert (
+        _review_approved(
+            {
+                "review_not_required": True,
+                "review_policy_reason": "stale policy marker",
+                "review_history": [{"verdict": "REQUEST_CHANGES"}],
+            }
+        )
+        is False
+    )
+    assert (
+        _review_approved(
+            {
+                "review_not_required": True,
+                "review_policy_reason": "malformed history must fail closed",
+                "review_history": {},
+            }
+        )
+        is False
+    )
+    assert _review_approved({"review_approved": "true"}) is False
+    assert _review_approved({"review_not_required": "true"}) is False
+
+
 # ---------------------------------------------------------------------------
 # Merge retry / escalation tests
 # ---------------------------------------------------------------------------
@@ -161,10 +218,29 @@ def _make_task(
         "branch": "blueprint/test-branch",
         "base_branch": "main",
         "iteration": 1,
-        "review_approved": True,
+        # Most merge-helper tests exercise a deliberate no-initial-review
+        # policy path. Empty history is authorized only by this durable marker;
+        # authoritative-review tests explicitly override it to False.
+        "review_not_required": True,
+        "review_policy_reason": "test fixture explicit no-review policy",
     }
     if ci_loop_extra:
         loop.update(ci_loop_extra)
+    checked_head = str(loop.get("ci_checked_head_sha") or loop.get("head_sha") or f"test-head-{pr_number}")
+    checked_base = str(loop.get("ci_checked_base_sha") or loop.get("base_sha") or f"test-base-{pr_number}")
+    loop.setdefault("head_sha", checked_head)
+    loop.setdefault("base_sha", checked_base)
+    loop.setdefault("ci_checked_head_sha", checked_head)
+    loop.setdefault("ci_checked_base_sha", checked_base)
+    loop.setdefault(
+        "review_target",
+        {
+            "project_id": str(project.id),
+            "pr_number": pr_number,
+            "base_sha": checked_base,
+            "head_sha": checked_head,
+        },
+    )
     task = Task(
         project_id=project.id,
         title="CI merge test task",
@@ -252,6 +328,17 @@ async def test_merge_retry_succeeds_on_second_attempt_poll(db_session, mocker):
         project,
         ci_loop_extra={"head_sha": "reviewed-head-sha"},
     )
+    mocker.patch(
+        "app.review_merge_authority._fetch_live_review_target",
+        new=AsyncMock(
+            return_value={
+                "project_id": str(project.id),
+                "pr_number": 42,
+                "base_sha": "test-base-42",
+                "head_sha": "reviewed-head-sha",
+            }
+        ),
+    )
     await db_session.commit()
     await db_session.refresh(task)
 
@@ -259,7 +346,10 @@ async def test_merge_retry_succeeds_on_second_attempt_poll(db_session, mocker):
         task, "fake-token", "owner", "repo", db_session, source="poll"
     )
 
-    assert result is True, "Should return True after successful retry"
+    assert result is True, (
+        "Should return True after successful retry; "
+        f"status={task.latest_status_message!r} context={task.context!r}"
+    )
     assert task.status == TaskStatus.COMPLETED
     assert merge_mock.call_count == 2, (
         "Should have called merge twice (initial + 1 retry)"
@@ -284,7 +374,7 @@ async def test_merge_retry_all_attempts_fail_poll(db_session, mocker):
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
         "app.github.get_pull_request",
-        return_value={"merged": False, "state": "open"},
+        return_value={"merged": False, "state": "open", "mergeable_state": "clean"},
     )
     # All 4 calls (initial + 3 retries) fail
     merge_mock = mocker.patch(
@@ -296,17 +386,6 @@ async def test_merge_retry_all_attempts_fail_poll(db_session, mocker):
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
-
-    # Pre-existing in-flight fix task → `already_fixing` gate skips the
-    # rebase-fix spawn so this test validates the retry-counter increment path.
-    existing_fix = Task(
-        project_id=project.id,
-        title="existing fix",
-        payloads=[{"type": "fix", "pr_number": 42}],
-        status=TaskStatus.IN_PROGRESS,
-        vm_instance_id=f"agent-vm-fix-{uuid.uuid4().hex[:8]}",
-    )
-    db_session.add(existing_fix)
 
     task = _make_task(db_session, project)
     await db_session.commit()
@@ -380,7 +459,7 @@ async def test_merge_no_retry_for_webhook_source(db_session, mocker):
     sleep_mock = mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
         "app.github.get_pull_request",
-        return_value={"merged": False, "state": "open"},
+        return_value={"merged": False, "state": "open", "mergeable_state": "clean"},
     )
     merge_mock = mocker.patch(
         "app.github.merge_pull_request",
@@ -391,17 +470,6 @@ async def test_merge_no_retry_for_webhook_source(db_session, mocker):
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
-
-    # Pre-existing in-flight fix task → `already_fixing` gate skips the
-    # rebase-fix spawn so this test exercises the webhook one-shot path.
-    existing_fix = Task(
-        project_id=project.id,
-        title="existing fix",
-        payloads=[{"type": "fix", "pr_number": 42}],
-        status=TaskStatus.IN_PROGRESS,
-        vm_instance_id=f"agent-vm-fix-{uuid.uuid4().hex[:8]}",
-    )
-    db_session.add(existing_fix)
 
     task = _make_task(db_session, project)
     await db_session.commit()
@@ -927,7 +995,7 @@ async def test_merge_failure_counter_increments(db_session, mocker):
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
         "app.github.get_pull_request",
-        return_value={"merged": False, "state": "open"},
+        return_value={"merged": False, "state": "open", "mergeable_state": "clean"},
     )
     mocker.patch(
         "app.github.merge_pull_request",
@@ -938,18 +1006,6 @@ async def test_merge_failure_counter_increments(db_session, mocker):
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
-
-    # Pre-existing in-flight fix task for this PR → `already_fixing` gate skips
-    # the rebase-fix spawn in _attempt_merge_with_retry_and_escalation, which
-    # lets this test exercise the ordinary transient-retry accumulation path.
-    existing_fix = Task(
-        project_id=project.id,
-        title="existing fix",
-        payloads=[{"type": "fix", "pr_number": 42}],
-        status=TaskStatus.IN_PROGRESS,
-        vm_instance_id=f"agent-vm-fix-{uuid.uuid4().hex[:8]}",
-    )
-    db_session.add(existing_fix)
 
     task = _make_task(db_session, project, ci_loop_extra={"merge_failures": 4})
     await db_session.commit()
@@ -989,7 +1045,7 @@ async def test_merge_failure_escalates_at_10_failures(db_session, mocker):
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
         "app.github.get_pull_request",
-        return_value={"merged": False, "state": "open"},
+        return_value={"merged": False, "state": "open", "mergeable_state": "clean"},
     )
     mocker.patch(
         "app.github.merge_pull_request",
@@ -1000,17 +1056,6 @@ async def test_merge_failure_escalates_at_10_failures(db_session, mocker):
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
-
-    # Pre-existing in-flight fix task → `already_fixing` gate skips the
-    # rebase-fix spawn so this test validates the 10-failure alert escalation.
-    existing_fix = Task(
-        project_id=project.id,
-        title="existing fix",
-        payloads=[{"type": "fix", "pr_number": 42}],
-        status=TaskStatus.IN_PROGRESS,
-        vm_instance_id=f"agent-vm-fix-{uuid.uuid4().hex[:8]}",
-    )
-    db_session.add(existing_fix)
 
     task = _make_task(db_session, project, ci_loop_extra={"merge_failures": 9})
     await db_session.commit()
@@ -1051,7 +1096,7 @@ async def test_merge_failure_escalation_dedups_until_hard_cap(db_session, mocker
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
         "app.github.get_pull_request",
-        return_value={"merged": False, "state": "open"},
+        return_value={"merged": False, "state": "open", "mergeable_state": "clean"},
     )
     mocker.patch(
         "app.github.merge_pull_request",
@@ -1062,17 +1107,6 @@ async def test_merge_failure_escalation_dedups_until_hard_cap(db_session, mocker
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
-
-    # Pre-existing in-flight fix task → `already_fixing` gate skips the
-    # rebase-fix spawn so this test validates the dedup behavior.
-    existing_fix = Task(
-        project_id=project.id,
-        title="existing fix",
-        payloads=[{"type": "fix", "pr_number": 42}],
-        status=TaskStatus.IN_PROGRESS,
-        vm_instance_id=f"agent-vm-fix-{uuid.uuid4().hex[:8]}",
-    )
-    db_session.add(existing_fix)
 
     # Already escalated, mid-way to the cap (HARD_CAP - 3). This call pushes
     # failures to HARD_CAP - 2 — still below the cap — and must NOT alert again.
@@ -1186,17 +1220,6 @@ async def test_merge_failure_hard_cap_marks_failed(db_session, mocker):
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
-
-    # Pre-existing in-flight fix task → `already_fixing` gate skips the
-    # rebase-fix spawn so this test exercises the hard-cap path.
-    existing_fix = Task(
-        project_id=project.id,
-        title="existing fix",
-        payloads=[{"type": "fix", "pr_number": 42}],
-        status=TaskStatus.IN_PROGRESS,
-        vm_instance_id=f"agent-vm-fix-{uuid.uuid4().hex[:8]}",
-    )
-    db_session.add(existing_fix)
 
     # One below the cap so this call crosses it; merge_escalated already True
     # so we test that the cap fires independently of the escalation rung.
@@ -1695,17 +1718,6 @@ async def test_mergeable_state_clean_does_not_escalate_on_keyword(db_session, mo
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
-
-    # Pre-existing in-flight fix task → `already_fixing` gate skips the
-    # rebase-fix spawn so this test exercises the clean-state non-escalation path.
-    existing_fix = Task(
-        project_id=project.id,
-        title="existing fix",
-        payloads=[{"type": "fix", "pr_number": 42}],
-        status=TaskStatus.IN_PROGRESS,
-        vm_instance_id=f"agent-vm-fix-{uuid.uuid4().hex[:8]}",
-    )
-    db_session.add(existing_fix)
 
     task = _make_task(db_session, project)
     await db_session.commit()
@@ -2618,7 +2630,7 @@ async def test_merge_different_errors_do_not_trigger_early_exit(db_session, mock
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
         "app.github.get_pull_request",
-        return_value={"merged": False, "state": "open"},
+        return_value={"merged": False, "state": "open", "mergeable_state": "clean"},
     )
     mocker.patch(
         "app.github.merge_pull_request",
@@ -2629,17 +2641,6 @@ async def test_merge_different_errors_do_not_trigger_early_exit(db_session, mock
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
-
-    # Pre-existing in-flight fix task → `already_fixing` gate skips the
-    # rebase-fix spawn so this test exercises the streak-reset path on new error.
-    existing_fix = Task(
-        project_id=project.id,
-        title="existing fix",
-        payloads=[{"type": "fix", "pr_number": 42}],
-        status=TaskStatus.IN_PROGRESS,
-        vm_instance_id=f"agent-vm-fix-{uuid.uuid4().hex[:8]}",
-    )
-    db_session.add(existing_fix)
 
     task = _make_task(
         db_session,
@@ -3299,6 +3300,18 @@ def _make_task_no_base(db_session, project, pr_number: int = 77):
                 "branch": "blueprint/feature-x",
                 "iteration": 1,
                 "review_approved": True,
+                "review_not_required": True,
+                "review_policy_reason": "test fixture explicit no-review policy",
+                "head_sha": f"test-head-{pr_number}",
+                "base_sha": f"test-base-{pr_number}",
+                "ci_checked_head_sha": f"test-head-{pr_number}",
+                "ci_checked_base_sha": f"test-base-{pr_number}",
+                "review_target": {
+                    "project_id": str(project.id),
+                    "pr_number": pr_number,
+                    "base_sha": f"test-base-{pr_number}",
+                    "head_sha": f"test-head-{pr_number}",
+                },
             }
         },
         vm_instance_id=f"agent-vm-base-{uuid.uuid4().hex[:8]}",
@@ -4352,6 +4365,8 @@ def _make_ci_waiting_task(session, project, *, pr_number: int = 1001) -> Task:
                 "ci_waiting": True,
                 "ci_passed": True,
                 "review_approved": True,
+                "review_not_required": True,
+                "review_policy_reason": "test fixture explicit no-review policy",
             }
         },
     )
@@ -6329,3 +6344,578 @@ async def test_nonempty_effective_diff_still_merges(db_session, mocker):
     # instance (committed downstream by the caller / orig-session); assert the
     # in-memory status directly, mirroring the other merge-success tests.
     assert task.status == TaskStatus.COMPLETED
+
+
+# ===========================================================================
+# Authoritative exact-target review gate at the merge boundary
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_same_head_blocker_survives_later_approve_and_spawn_rollback(
+    db_session, mocker
+):
+    """A same-head APPROVE cannot erase an earlier binding blocker.
+
+    Exercise the parked CI-success entrypoint and simulate the rollback/expiry
+    behavior that _spawn_pipeline_task can trigger. The gate state must still be
+    restored durably, the exact target must be passed to the reviewer, and a
+    second CI signal must not request another review.
+    """
+    from app.ci_completion import handle_ci_completion
+
+    head_sha = "a" * 40
+    base_sha = "b" * 40
+    pr_number = 15001
+    project = Project(name="Authoritative blocker gate", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    review_history = [
+        {
+            "iteration": 1,
+            "verdict": "REQUEST_CHANGES",
+            "reviewed_head_sha": head_sha,
+            "reviewed_base_sha": base_sha,
+            "issues": [
+                {
+                    "issue_id": "BP-ci-boundary-blocker",
+                    "severity": "major",
+                    "description": "Merge path can publish unresolved work",
+                    "file": "backend/app/ci_completion.py",
+                    "line": 1,
+                }
+            ],
+        },
+        {
+            "iteration": 2,
+            "verdict": "APPROVE",
+            "reviewed_head_sha": head_sha,
+            "reviewed_base_sha": base_sha,
+            "issues": [],
+        },
+    ]
+    task = _make_task(
+        db_session,
+        project,
+        pr_number=pr_number,
+        ci_loop_extra={
+            # Simulate a stale policy marker surviving into a reviewed chain.
+            # Real history must defeat and clear it.
+            "review_not_required": True,
+            "review_history": review_history,
+            # The latest reviewer did claim approval, which enters the merge
+            # boundary; the binding same-head blocker must still defeat it.
+            "review_approved": True,
+            "head_sha": head_sha,
+            "base_sha": base_sha,
+            # A stale scalar token must be cleared when authority fails.
+            "verdict": "APPROVE",
+        },
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    live_target = {
+        "project_id": str(project.id),
+        "pr_number": pr_number,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+    }
+    mocker.patch(
+        "app.review_merge_authority._fetch_live_review_target",
+        new=AsyncMock(return_value=live_target),
+    )
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": True}),
+    )
+    mocker.patch(
+        "app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None)
+    )
+
+    review_task = Task(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        title="Exact target review",
+        payloads=[{"type": "review"}],
+        status=TaskStatus.QUEUED,
+    )
+
+    async def _spawn_after_rollback(*args, **kwargs):
+        await args[2].rollback()
+        return review_task, True
+
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new=AsyncMock(side_effect=_spawn_after_rollback),
+    )
+    ci_result = {"status": "completed", "conclusion": "success"}
+
+    first_result = await handle_ci_completion(
+        task,
+        ci_result,
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="poll",
+    )
+
+    assert first_result is True
+    merge_mock.assert_not_awaited()
+    spawn_mock.assert_awaited_once()
+    assert spawn_mock.await_args.kwargs["review_target"] == live_target
+
+    await db_session.refresh(task)
+    gated_loop = (task.context or {})["review_loop"]
+    assert gated_loop["review_approved"] is False
+    assert gated_loop["authoritative_review_required"] is True
+    assert gated_loop["authoritative_review_task_id"] == str(review_task.id)
+    assert gated_loop["authoritative_review_target"] == live_target
+    assert gated_loop["issue_ledger"]["open"][0]["description"] == (
+        "Merge path can publish unresolved work"
+    )
+    assert "verdict" not in gated_loop
+    assert "review_not_required" not in gated_loop
+    assert "review_policy_reason" not in gated_loop
+
+    # The durable gate state sends later CI signals down the ordinary parked
+    # path, so the same unresolved episode cannot create a duplicate reviewer.
+    second_result = await handle_ci_completion(
+        task,
+        ci_result,
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="poll",
+    )
+    assert second_result is True
+    assert spawn_mock.await_count == 1
+    merge_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_empty_history_with_claimed_approval_requires_exact_review(
+    db_session, mocker
+):
+    """review_approved without history or a policy marker is unproven."""
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    head_sha = "c" * 40
+    base_sha = "d" * 40
+    pr_number = 15002
+    project = Project(name="Empty history gate", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = _make_task(
+        db_session,
+        project,
+        pr_number=pr_number,
+        ci_loop_extra={
+            "review_not_required": False,
+            "review_history": [],
+            # The lifecycle hint is deliberately unproven without exact history.
+            "review_approved": True,
+            "head_sha": head_sha,
+            "base_sha": base_sha,
+        },
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    live_target = {
+        "project_id": str(project.id),
+        "pr_number": pr_number,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+    }
+    review_task = _make_fake_review_task(project.id)
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new=AsyncMock(return_value=(review_task, True)),
+    )
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": True}),
+    )
+    mocker.patch(
+        "app.review_merge_authority._fetch_live_review_target",
+        new=AsyncMock(return_value=live_target),
+    )
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task,
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="poll",
+    )
+
+    assert result is False
+    merge_mock.assert_not_awaited()
+    spawn_mock.assert_awaited_once()
+    assert spawn_mock.await_args.kwargs["review_target"] == live_target
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "trailing_review",
+    [
+        {"iteration": 2, "verdict": "REQUEST_CHANGES", "issues": []},
+        {"iteration": 2, "verdict": "COMMENT", "feedback": "Needs another look"},
+        {"iteration": 2, "feedback": "Malformed reviewer output"},
+    ],
+)
+async def test_latest_non_approval_cannot_reuse_older_exact_approval(
+    db_session, mocker, trailing_review
+):
+    """Every newer review row, even malformed, invalidates an older APPROVE."""
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    head_sha = "e" * 40
+    base_sha = "f" * 40
+    pr_number = 15003
+    project = Project(name="Latest review authority", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    history = [
+        {
+            "iteration": 1,
+            "verdict": "APPROVE",
+            "reviewed_head_sha": head_sha,
+            "reviewed_base_sha": base_sha,
+            "issues": [],
+        },
+        {
+            **trailing_review,
+            "reviewed_head_sha": head_sha,
+            "reviewed_base_sha": base_sha,
+        },
+    ]
+    task = _make_task(
+        db_session,
+        project,
+        pr_number=pr_number,
+        ci_loop_extra={
+            "review_not_required": True,
+            "review_history": history,
+            "head_sha": head_sha,
+            "base_sha": base_sha,
+        },
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    live_target = {
+        "project_id": str(project.id),
+        "pr_number": pr_number,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+    }
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new=AsyncMock(return_value=(_make_fake_review_task(project.id), True)),
+    )
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": True}),
+    )
+    mocker.patch(
+        "app.review_merge_authority._fetch_live_review_target",
+        new=AsyncMock(return_value=live_target),
+    )
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task,
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="poll",
+    )
+
+    assert result is False
+    merge_mock.assert_not_awaited()
+    spawn_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_later_comment_with_major_blocker_invalidates_exact_approval(
+    db_session, mocker
+):
+    """Structured COMMENT evidence cannot be skipped to reuse an older APPROVE."""
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    head_sha = "7" * 40
+    base_sha = "8" * 40
+    pr_number = 15006
+    project = Project(name="Comment review authority", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    blocker_description = "Comment found a same-head merge-boundary defect"
+    history = [
+        {
+            "iteration": 1,
+            "verdict": "APPROVE",
+            "reviewed_head_sha": head_sha,
+            "reviewed_base_sha": base_sha,
+            "issues": [],
+        },
+        {
+            "iteration": 2,
+            "verdict": "COMMENT",
+            "reviewed_head_sha": head_sha,
+            "reviewed_base_sha": base_sha,
+            "issues": [
+                {
+                    "severity": "MAJOR",
+                    "description": blocker_description,
+                    "file": "backend/app/ci_completion.py",
+                    "line": 204,
+                }
+            ],
+        },
+    ]
+    task = _make_task(
+        db_session,
+        project,
+        pr_number=pr_number,
+        ci_loop_extra={
+            "review_history": history,
+            "head_sha": head_sha,
+            "base_sha": base_sha,
+        },
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    live_target = {
+        "project_id": str(project.id),
+        "pr_number": pr_number,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+    }
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new=AsyncMock(return_value=(_make_fake_review_task(project.id), True)),
+    )
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": True}),
+    )
+    mocker.patch(
+        "app.review_merge_authority._fetch_live_review_target",
+        new=AsyncMock(return_value=live_target),
+    )
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task,
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="poll",
+    )
+
+    assert result is False
+    merge_mock.assert_not_awaited()
+    spawn_mock.assert_awaited_once()
+    gated_loop = (task.context or {})["review_loop"]
+    assert gated_loop["authoritative_review_required"] is True
+    assert [
+        row["description"] for row in gated_loop["issue_ledger"]["open"]
+    ] == [blocker_description]
+
+
+@pytest.mark.asyncio
+async def test_unresolved_live_target_retries_exact_review_before_parking(
+    db_session, mocker
+):
+    """A transient target lookup failure cannot strand an unproven merge."""
+    from app.ci_completion import handle_ci_completion
+
+    head_sha = "3" * 40
+    base_sha = "4" * 40
+    pr_number = 15005
+    project = Project(name="Retry exact review target", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = _make_task(
+        db_session,
+        project,
+        pr_number=pr_number,
+        ci_loop_extra={
+            "review_not_required": False,
+            "review_history": [],
+            "review_approved": True,
+            "head_sha": head_sha,
+            "base_sha": base_sha,
+        },
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    live_target = {
+        "project_id": str(project.id),
+        "pr_number": pr_number,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+    }
+    target_mock = mocker.patch(
+        "app.review_merge_authority._fetch_live_review_target",
+        new=AsyncMock(
+            side_effect=[
+                RuntimeError("temporary GitHub failure"),
+                live_target,
+            ]
+        ),
+    )
+    review_task = _make_fake_review_task(project.id)
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new=AsyncMock(return_value=(review_task, True)),
+    )
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": True}),
+    )
+    mocker.patch(
+        "app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None)
+    )
+    ci_result = {"status": "completed", "conclusion": "success"}
+
+    await handle_ci_completion(
+        task,
+        ci_result,
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="poll",
+    )
+    await db_session.refresh(task)
+    first_loop = (task.context or {})["review_loop"]
+    assert first_loop["authoritative_review_required"] is True
+    assert "authoritative_review_task_id" not in first_loop
+    assert "authoritative_review_target_unresolved_at" in first_loop
+    spawn_mock.assert_not_awaited()
+
+    await handle_ci_completion(
+        task,
+        ci_result,
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="poll",
+    )
+
+    assert target_mock.await_count == 2
+    spawn_mock.assert_awaited_once()
+    assert spawn_mock.await_args.kwargs["review_target"] == live_target
+    merge_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_latest_exact_approval_with_empty_ledger_can_merge(db_session, mocker):
+    """A blocker-free latest APPROVE for the live target reaches the merger."""
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    head_sha = "1" * 40
+    base_sha = "2" * 40
+    pr_number = 15004
+    project = Project(name="Exact approval merge", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    history = [
+        {
+            "iteration": 1,
+            "verdict": "APPROVE",
+            "reviewed_head_sha": head_sha,
+            "reviewed_base_sha": base_sha,
+            "target_verified_by_backend": True,
+            "review_task_id": str(uuid.uuid4()),
+            "issues": [],
+        }
+    ]
+    task = _make_task(
+        db_session,
+        project,
+        pr_number=pr_number,
+        ci_loop_extra={
+            "review_not_required": True,
+            "review_history": history,
+            # The lifecycle has consumed this exact approval before entering
+            # the merge helper; history is the proof, while this scalar is part
+            # of the lock-window snapshot that protects against revocation.
+            "review_approved": True,
+            "head_sha": head_sha,
+            "base_sha": base_sha,
+        },
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    live_target = {
+        "project_id": str(project.id),
+        "pr_number": pr_number,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+    }
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    # Keep the merge-helper contract test isolated from the unrelated
+    # dedicated-session build-config refresh.  SQLite's single test connection
+    # cannot model that production session boundary without one scope rolling
+    # back the other's uncommitted lifecycle mutation.
+    mocker.patch(
+        "app.ci_completion._refresh_empty_build_config_after_integration_landing",
+        new=AsyncMock(return_value=False),
+    )
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task", new_callable=AsyncMock
+    )
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": True}),
+    )
+    mocker.patch(
+        "app.review_merge_authority._fetch_live_review_target",
+        new=AsyncMock(return_value=live_target),
+    )
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task,
+        "fake-token",
+        "owner",
+        "repo",
+        db_session,
+        source="poll",
+    )
+
+    assert result is True
+    merge_mock.assert_awaited_once()
+    assert merge_mock.await_args.kwargs["expected_head_sha"] == head_sha
+    spawn_mock.assert_not_awaited()
+    # The helper owns both the successful lifecycle transition and the
+    # authoritative proof-state normalization.  Its caller owns the commit, so
+    # model that boundary and then assert the durable row rather than the stale
+    # pre-relock Python object.
+    await db_session.commit()
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    authoritative_loop = (task.context or {})["review_loop"]
+    assert authoritative_loop["issue_ledger"]["open"] == []
+    assert authoritative_loop["review_target"] == live_target
+    assert "review_not_required" not in authoritative_loop
+    assert "review_policy_reason" not in authoritative_loop

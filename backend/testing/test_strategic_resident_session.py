@@ -2679,13 +2679,12 @@ def test_resident_reaper_uses_own_heartbeat_window():
 
 @pytest.mark.asyncio
 async def test_heartbeat_handled_ids_only_affect_own_session(db_session, monkeypatch):
-    """handled_message_ids in renew_resident_session_lease must ONLY mark messages
-    as 'handled' when their resident_session_id matches the active session.
+    """Handled ids affect own-session messages and exact server wake barriers.
 
     Legacy / cadence messages (resident_session_id IS NULL) and messages pinned
     to a different session must remain untouched even when their IDs appear in
-    handled_message_ids.  This is the invariant enforced at
-    strategic_resident_session.py::L3425 (WHERE resident_session_id == session_id).
+    handled_message_ids. A NULL-session strategist-internal wake barrier is the
+    only project-scoped exception.
     """
     project = await _make_project(db_session)
     task = await _make_task(db_session, project)
@@ -2730,13 +2729,49 @@ async def test_heartbeat_handled_ids_only_affect_own_session(db_session, monkeyp
         status="open",
         resident_session_id="ss-other-entirely",
     )
-    db_session.add_all([own_msg, null_session_msg, other_session_msg])
+    wake_barrier = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.NOTE,
+        from_type="system",
+        content="Promoted v7 is serving the expected SHA.",
+        status="open",
+        resident_session_id=None,
+        context={
+            "audience": "strategist-internal",
+            "event_type": "release.serving_confirmed",
+            "resident_wake_barrier": True,
+            "served_sha": "abc123",
+        },
+    )
+    db_session.add_all(
+        [own_msg, null_session_msg, other_session_msg, wake_barrier]
+    )
     await db_session.commit()
-    for m in (own_msg, null_session_msg, other_session_msg):
+    for m in (own_msg, null_session_msg, other_session_msg, wake_barrier):
         await db_session.refresh(m)
 
     project = await db_session.get(Project, project.id)
-    await renew_resident_session_lease(
+    initial = await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=session_id,
+        task_id=started["task_id"],
+        progress=False,
+    )
+    assert initial["fired_barriers"] == [
+        {
+            "id": str(wake_barrier.id),
+            "event_type": "release.serving_confirmed",
+            "summary": "Promoted v7 is serving the expected SHA.",
+            "created_at": wake_barrier.created_at.isoformat(),
+            "task_id": None,
+            "context": {
+                "event_type": "release.serving_confirmed",
+                "served_sha": "abc123",
+            },
+        }
+    ]
+    acknowledged = await renew_resident_session_lease(
         db_session,
         project,
         session_id=session_id,
@@ -2746,12 +2781,28 @@ async def test_heartbeat_handled_ids_only_affect_own_session(db_session, monkeyp
             str(own_msg.id),
             str(null_session_msg.id),
             str(other_session_msg.id),
+            str(wake_barrier.id),
         ],
     )
+    assert acknowledged["fired_barriers"] == []
+    assert acknowledged["work_state_summary"]["pending_barriers"] == 0
+
+    followup = await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=session_id,
+        task_id=started["task_id"],
+        progress=False,
+    )
+    assert followup["fired_barriers"] == []
+    assert followup["work_state_summary"]["pending_barriers"] == 0
+    assert followup["work_state_rev"] == acknowledged["work_state_rev"]
+    assert acknowledged["work_state_rev"] == initial["work_state_rev"]
 
     await db_session.refresh(own_msg)
     await db_session.refresh(null_session_msg)
     await db_session.refresh(other_session_msg)
+    await db_session.refresh(wake_barrier)
 
     assert own_msg.status == "handled", (
         "Own-session message must be marked handled by the heartbeat"
@@ -2762,6 +2813,7 @@ async def test_heartbeat_handled_ids_only_affect_own_session(db_session, monkeyp
     assert other_session_msg.status == "open", (
         "Message from a different session must NOT be marked handled"
     )
+    assert wake_barrier.status == "handled"
 
 
 # ---------------------------------------------------------------------------

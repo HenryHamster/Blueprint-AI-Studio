@@ -31,6 +31,20 @@ import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { resolveCandidateSha } from './specialized.js';
 import { CandidateStackController } from './walkthrough-stack.js';
 
+// Frozen output contract of scripts/walkthrough/v26-live-walkthrough.cjs.
+// The first three raw rows are the substantive gates consumed by backend
+// _WALKTHROUGH_META_REQUIRED_SUBCRITERIA; c-5214996f is their conjunction.
+// The workday slug intentionally aliases that registered meta criterion in the
+// backend, but both raw rows must still be present exactly once so a truncated
+// harness result can never look like a complete probe.
+export const WALKTHROUGH_V26_RESULT_KEYS = [
+  'c-dfdc9d82',
+  'c-f52fd975',
+  'c-workday-session-lifecycle',
+  'c-5214996f',
+] as const;
+const WALKTHROUGH_V26_RESULT_KEY_SET = new Set<string>(WALKTHROUGH_V26_RESULT_KEYS);
+
 /**
  * Map a per-criterion result entry to the shape expected by the
  * WalkthroughE2EEvidenceRequest endpoint.
@@ -53,13 +67,32 @@ function normalizeResultEntry(r: Record<string, unknown>): {
 function isValidWalkthroughResult(value: unknown): value is {
   git_sha: string;
   run_timestamp: string;
-  results: Array<{ criterion_key: string; passed: boolean; notes?: string }>;
+  results: Array<{ criterion_key: string; passed: boolean; notes?: string | null }>;
 } {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const v = value as Record<string, unknown>;
-  return typeof v.git_sha === 'string'
-    && typeof v.run_timestamp === 'string'
-    && Array.isArray(v.results);
+  if (
+    typeof v.git_sha !== 'string'
+    || typeof v.run_timestamp !== 'string'
+    || !Array.isArray(v.results)
+    || v.results.length !== WALKTHROUGH_V26_RESULT_KEYS.length
+  ) return false;
+
+  const seen = new Set<string>();
+  for (const rawEntry of v.results) {
+    if (!rawEntry || typeof rawEntry !== 'object' || Array.isArray(rawEntry)) return false;
+    const entry = rawEntry as Record<string, unknown>;
+    const key = entry.criterion_key;
+    if (
+      typeof key !== 'string'
+      || !WALKTHROUGH_V26_RESULT_KEY_SET.has(key)
+      || seen.has(key)
+      || typeof entry.passed !== 'boolean'
+      || (entry.notes != null && typeof entry.notes !== 'string')
+    ) return false;
+    seen.add(key);
+  }
+  return seen.size === WALKTHROUGH_V26_RESULT_KEYS.length;
 }
 
 /** True iff `bwrap --version` runs (the binary is present and executable). */
@@ -219,7 +252,7 @@ export async function handleWalkthroughE2e(
   if (!projectId) throw new Error('project_id is required in walkthrough_e2e payload');
   if (!candidateSha) throw new Error('candidate_sha is required in walkthrough_e2e payload');
 
-  // ── Clone (full history — candidate SHA may be older than shallow depth) ──
+  // ── Shallow clone + exact candidate fetch ────────────────────────────────
   statusRef.value = `Cloning ${owner}/${repo} for walkthrough_e2e...`;
   sendLog(
     ws,
@@ -232,13 +265,13 @@ export async function handleWalkthroughE2e(
     githubToken: ghToken,
     branch: rawBaseBranch,
     baseBranch: rawBaseBranch,
-    depth: 0, // full history required to reach the pinned SHA
+    depth: 1,
   });
 
   // ── Pin to candidate SHA (mirrors handleSmoketest) ────────────────────────
   sendLog(ws, `Fetching + checking out candidate commit ${candidateSha.slice(0, 12)}...\n`);
   try {
-    execFileSync('git', ['fetch', 'origin', candidateSha], {
+    execFileSync('git', ['fetch', '--depth', '1', 'origin', candidateSha], {
       cwd: WORKSPACE,
       stdio: ['ignore', 'pipe', 'pipe'],
     });

@@ -1,8 +1,8 @@
 """Decision-parity tests for the consolidated review-skip policy.
 
-These tests pin the review-skip *decisions* that were previously scattered
-across ``review_heuristics.py`` and inline blocks in ``task_lifecycle.py`` and
-prove the consolidated ``review_policy`` module produces IDENTICAL outcomes.
+These tests pin the review-policy decisions consolidated from
+``review_heuristics.py`` and ``task_lifecycle.py``. Initial-review and
+auto-approve vectors retain migration parity.
 
 Each test compares a faithful reference implementation of the OLD control flow
 (the wiring that lived inline in ``task_lifecycle.py``) against the new
@@ -10,8 +10,6 @@ Each test compares a faithful reference implementation of the OLD control flow
 
   1. Initial-review skip           → should_skip_initial_review
   2. Auto-approve-small-main gate  → evaluate_auto_approve_small_main
-  3. Re-review incl. scan-blocked  → should_skip_re_review
-
 All functions under test are pure (no DB / no async), so these run in the
 standalone suite without a database.
 """
@@ -25,8 +23,6 @@ from app.review_policy import (
     evaluate_auto_approve_small_main,
     should_auto_approve_diff,
     should_skip_initial_review,
-    should_skip_re_review,
-    should_skip_rereview,
 )
 from app.shared_state import runtime_config
 from testing.factories import make_task
@@ -76,30 +72,6 @@ def _old_auto_approve_small_main_skip(
         return False
     skip, _ = should_auto_approve_diff(task, direction_data)
     return skip
-
-
-def _old_rereview_outcome(
-    fix_reason: str, rereview_waived: bool, scan_blocked: bool
-) -> str:
-    """Mirrors the OLD three-way task_lifecycle branch:
-    ``if not scan_blocked and skip: ci_wait / elif not scan_blocked: spawn / else: blocked``."""
-    skip, _ = should_skip_rereview(fix_reason, rereview_waived)
-    if not scan_blocked and skip:
-        return "ci_wait"
-    if not scan_blocked:
-        return "spawn_review"
-    return "blocked"
-
-
-def _new_rereview_outcome(
-    fix_reason: str, rereview_waived: bool, scan_blocked: bool
-) -> str:
-    d = should_skip_re_review(fix_reason, rereview_waived, scan_blocked)
-    if d.rule == "security_blocked":
-        return "blocked"
-    if d.skip:
-        return "ci_wait"
-    return "spawn_review"
 
 
 # ── Parity: initial-review skip ───────────────────────────────────────────────
@@ -213,53 +185,6 @@ class TestAutoApproveSmallMainParity:
         d = evaluate_auto_approve_small_main(t, False, "small", _DIR_FAVORABLE)
         assert d.skip is False
         assert d.skip == _old_auto_approve_small_main_skip(t, False, "small", _DIR_FAVORABLE)
-
-
-# ── Parity: re-review incl. scan-blocked override ─────────────────────────────
-
-
-_FIX_REASONS = ["ci_failure", "merge_conflict", "migration_guard", "code_review"]
-
-
-class TestReReviewSkipParity:
-    @pytest.mark.parametrize("fix_reason", _FIX_REASONS)
-    @pytest.mark.parametrize("rereview_waived", [True, False])
-    @pytest.mark.parametrize("scan_blocked", [True, False])
-    def test_matches_reference(self, fix_reason, rereview_waived, scan_blocked):
-        assert _new_rereview_outcome(fix_reason, rereview_waived, scan_blocked) == _old_rereview_outcome(
-            fix_reason, rereview_waived, scan_blocked
-        )
-
-    def test_scan_blocked_overrides_everything(self):
-        # Even a skip-eligible ci_failure fix must NOT skip or spawn when blocked.
-        d = should_skip_re_review("ci_failure", False, scan_blocked=True)
-        assert d.rule == "security_blocked"
-        assert d.skip is False
-
-    def test_ci_failure_skips_to_ci_wait(self):
-        d = should_skip_re_review("ci_failure", False, scan_blocked=False)
-        assert d.skip is True
-        assert d.rule == "ci_failure"
-
-    def test_merge_conflict_skips(self):
-        d = should_skip_re_review("merge_conflict", False, scan_blocked=False)
-        assert d.skip is True
-        assert d.rule == "merge_conflict"
-
-    def test_migration_guard_skips(self):
-        d = should_skip_re_review("migration_guard", False, scan_blocked=False)
-        assert d.skip is True
-        assert d.rule == "migration_guard"
-
-    def test_reviewer_waiver_skips(self):
-        d = should_skip_re_review("code_review", True, scan_blocked=False)
-        assert d.skip is True
-        assert d.rule == "reviewer_waived"
-
-    def test_plain_code_review_spawns(self):
-        d = should_skip_re_review("code_review", False, scan_blocked=False)
-        assert d.skip is False
-        assert d.rule == "none"
 
 
 # ── Mechanical hedge detection ────────────────────────────────────────────────

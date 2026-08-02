@@ -13,7 +13,15 @@ from typing import Dict, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Header, Query, Request
 from fastapi.responses import JSONResponse
-from sqlalchemy import Uuid, and_, bindparam, func, or_, text
+from sqlalchemy import (
+    Uuid,
+    and_,
+    bindparam,
+    func,
+    inspect as sqlalchemy_inspect,
+    or_,
+    text,
+)
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
@@ -27,6 +35,10 @@ from app.auth import (
 )
 from app.database import get_session, AsyncSessionLocal, resolve_dialect_name
 from app.landed_signal import is_merged_completion
+from app.findings_index import (
+    FINALIZED_RESEARCH_FINDINGS_KEY,
+    resolve_research_findings_for_surface_from_state,
+)
 from app.models import (
     Project,
     Task,
@@ -109,6 +121,18 @@ router = APIRouter(prefix="/api/agent", tags=["agent"])
 _COMMIT_SHA_PATTERN = re.compile(r"^[0-9a-f]{7,40}$")
 _CLAIM_REPLAY_CONTEXT_KEY = "_agent_claim_replay"
 _CLAIM_REPLAY_WINDOW = timedelta(minutes=5)
+_CLAIM_TASK_CONTRACT_ATTRIBUTES = frozenset(
+    {
+        "id",
+        "project_id",
+        "discovery_cycle_id",
+        "context",
+        "payloads",
+        "title",
+        "description",
+        "parent_task_id",
+    }
+)
 
 
 def _claim_replay_is_valid(
@@ -361,6 +385,13 @@ _AGENT_SPAWN_FORBIDDEN_CONTEXT_KEYS = frozenset(
         # verdict with proven=True and a recognized proof_kind (e.g. "named_test")
         # would survive untouched and later mint a gate-clearing capability proof.
         "code_acceptance_verdict",
+        # Merge/review authority is backend-owned. A child may request a review
+        # or fix payload, but it cannot mint proof/bypass/terminal state in the
+        # surrounding context.
+        "review_loop",
+        "pr_merged",
+        "pr_closed_unmerged",
+        "pr_rejected",
     }
 )
 
@@ -419,15 +450,6 @@ async def verify_agent_token(
         "/api/agent/credentials/rotate",
         "/api/agent/next-role",
         "/api/agent/vm-heartbeat",
-    ) or (
-        # Self-merge: an automatic fresh-reviewer pass runs AFTER ./done has
-        # already posted the task's terminal status, then persists its findings
-        # back into the now-COMPLETED task's own _self_review_outcome. Treat the
-        # reviewer-merge path as terminal-task-allowed so the same VM can land
-        # that merge; the vm_instance_mismatch guard below still rejects a
-        # DIFFERENT VM replaying a leaked terminal-task token.
-        request.url.path.startswith("/api/agent/tasks/")
-        and request.url.path.endswith("/reviewer-merge")
     )
     # Issue M3 freshness check (warm-VM rev): only the warm-VM idempotent
     # paths /next-role and /vm-heartbeat carry the replay risk for terminal
@@ -749,47 +771,6 @@ async def agent_git_read_token(
     return {"token": gh_token, "owner": owner, "repo": repo}
 
 
-async def _stamp_reviewer_recovery_count(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    high_iter_rows,
-) -> None:
-    """Count tasks tagged as reviewer-recovery-after-incomplete-SR and stamp the
-    aggregate onto ``ProjectSRAnalytics.data['sr_catch_rate_trends']``.
-
-    Detection scans both the top-level ``reviewer_recovery_origin`` marker and
-    per-category ``check_results[*].origin`` entries — the marker can land in
-    either spot depending on which path tagged it. No-op when nothing matched.
-    """
-    recovery_count = sum(
-        1
-        for t in high_iter_rows
-        if (
-            (t.context or {})
-            .get("_self_review_outcome", {})
-            .get("reviewer_recovery_origin")
-            == "reviewer_recovery_after_incomplete_sr"
-        )
-        or any(
-            isinstance(v, dict)
-            and v.get("origin") == "reviewer_recovery_after_incomplete_sr"
-            for v in safe_check_results(
-                (t.context or {}).get("_self_review_outcome", {})
-            ).values()
-        )
-    )
-    if recovery_count <= 0:
-        return
-    from app.task_locking import with_sr_analytics_locked
-
-    def _update(data: dict) -> None:
-        trends = dict(data.get("sr_catch_rate_trends") or {})
-        trends["reviewer_recovery_after_incomplete_sr_count"] = recovery_count
-        data["sr_catch_rate_trends"] = trends
-
-    await with_sr_analytics_locked(session, project_id, _update)
-
-
 async def _refresh_sr_catch_rate(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -921,6 +902,36 @@ async def claim_task(
         raise HTTPException(
             status_code=403, detail="task-scoped token required to claim"
         ) from None
+    # Structural PR execution fence.  It performs an unlocked identity peek,
+    # then acquires the canonical repo/PR advisory lock *before* the definitive
+    # Task row lock and final live-target check.  Merge authority holds the same
+    # lock through its PUT, so even an unknown producer/reaper cannot start a
+    # review or writer across publication.
+    from app.review_claim_fence import lock_pr_task_for_execution
+
+    pr_fence = await lock_pr_task_for_execution(
+        session,
+        task_id=token_task_uuid,
+        claimable_statuses=(
+            TaskStatus.QUEUED,
+            TaskStatus.PROVISIONING,
+            TaskStatus.IN_PROGRESS,
+        ),
+        expected_vm_instance_id=vm_id,
+    )
+    if pr_fence.applies and not pr_fence.allowed and pr_fence.reason:
+        if pr_fence.retryable:
+            await session.rollback()
+            raise HTTPException(
+                status_code=503,
+                detail=f"PR execution fence unavailable: {pr_fence.reason}",
+                headers={"Retry-After": "2"},
+            )
+        await session.commit()
+        raise HTTPException(
+            status_code=409,
+            detail=f"Task {token_task_id} cannot execute: {pr_fence.reason}",
+        )
     stmt = (
         select(Task)
         .where(
@@ -930,10 +941,22 @@ async def claim_task(
         )
         .with_for_update(skip_locked=True)
     )
-    result = await session.execute(stmt)
-    task = result.scalars().first()
+    task = pr_fence.task if pr_fence.allowed else None
+    if task is None:
+        result = await session.execute(stmt)
+        task = result.scalars().first()
 
-    idempotent_replay = False
+    idempotent_replay = bool(
+        task is not None
+        and task.status == TaskStatus.IN_PROGRESS
+        and _claim_replay_is_valid(task, token, now=_utcnow())
+    )
+    if task is not None and task.status == TaskStatus.IN_PROGRESS and not idempotent_replay:
+        # Let the established replay branch below return the normal terminal
+        # distinction for a stale/different token.  The PR lock and final live
+        # validation have already run, so a valid replay cannot bypass the
+        # structural execution fence.
+        task = None
     if not task:
         # Distinguish "no task" from "task locked by another process"
         check = await session.execute(
@@ -1030,6 +1053,22 @@ async def claim_task(
     if session.new or session.dirty:
         await session.commit()
         await session.refresh(task)
+
+    # The PR execution fence starts from a deliberately narrow load_only()
+    # identity projection.  SQLAlchemy keeps that projection on the instance,
+    # so commit + refresh() reloads only columns that were already loaded;
+    # claim-response columns such as discovery_cycle_id can remain expired.
+    # A synchronous attribute read below would then issue async DB I/O outside
+    # greenlet_spawn (MissingGreenlet).  Explicitly hydrate only the durable
+    # task fields this endpoint reads while building the execution contract.
+    # Ordinary non-PR claims already have them loaded and pay no extra query.
+    _claim_state = sqlalchemy_inspect(task)
+    _missing_claim_attributes = sorted(
+        _CLAIM_TASK_CONTRACT_ATTRIBUTES
+        & (set(_claim_state.unloaded) | set(_claim_state.expired_attributes))
+    )
+    if _missing_claim_attributes:
+        await session.refresh(task, attribute_names=_missing_claim_attributes)
 
     # Snapshot the claim-time scalars used while building the rest of the
     # response. The best-effort enrichment below (SR-trend analytics, review
@@ -1181,7 +1220,6 @@ async def claim_task(
             "github_repo": project.github_repo,
             "build_config": _build_cfg_annotated,
             "approval_gate_config": project.approval_gate_config or {},
-            "enable_fresh_reviewer": _build_cfg.get("enable_fresh_reviewer", False),
             "enable_parallel_review": _build_cfg.get("enable_parallel_review", False),
             "enable_parallel_fix": _build_cfg.get("enable_parallel_fix", False),
             "enable_self_improvement": project.enable_self_improvement,
@@ -1420,9 +1458,7 @@ async def claim_task(
                 Artifact,
                 and_(
                     Artifact.task_id == Task.id,
-                    Artifact.artifact_type.in_(
-                        [ArtifactType.PULL_REQUEST, ArtifactType.RESEARCH_FINDINGS]
-                    ),
+                    Artifact.artifact_type == ArtifactType.PULL_REQUEST,
                 ),
             )
             .where(
@@ -1502,9 +1538,7 @@ async def claim_task(
                 Artifact,
                 and_(
                     Artifact.task_id == Task.id,
-                    Artifact.artifact_type.in_(
-                        [ArtifactType.PULL_REQUEST, ArtifactType.RESEARCH_FINDINGS]
-                    ),
+                    Artifact.artifact_type == ArtifactType.PULL_REQUEST,
                 ),
             )
             .where(_history_ranked.c.rn <= 50)
@@ -1523,6 +1557,39 @@ async def claim_task(
                     history_artifact
                 )
         history_tasks_rows = [history_tasks_by_id[tid] for tid in history_task_order]
+
+        # Accepted research summaries come from the finalized task snapshot,
+        # never the submission-time RESEARCH_FINDINGS artifact. Fetch the heavy
+        # JSON only for completed research rows across the two bounded windows.
+        _research_context_tasks = {
+            t.id: t
+            for t in [*terminal_tasks_rows, *history_tasks_rows]
+            if t.status == TaskStatus.COMPLETED
+            and (t.first_payload or {}).get("type") == "research"
+            and (t.context or {}).get(FINALIZED_RESEARCH_FINDINGS_KEY) is True
+        }
+        _research_findings_summary_by_id: dict[uuid.UUID, str] = {}
+        if _research_context_tasks:
+            _research_plan_rows = (
+                await session.execute(
+                    select(Task.id, Task.plan_output).where(
+                        Task.id.in_(list(_research_context_tasks))
+                    )
+                )
+            ).all()
+            for _research_id, _research_plan_output in _research_plan_rows:
+                _research_task = _research_context_tasks[_research_id]
+                _surface_findings = resolve_research_findings_for_surface_from_state(
+                    _research_plan_output,
+                    _research_task.context,
+                    status=_research_task.status,
+                    task_type="research",
+                )
+                if _surface_findings:
+                    _research_findings_summary_by_id[_research_id] = json.dumps(
+                        _surface_findings
+                    )[:8000]
+
         # Detach history rows from the session so that a session.rollback() in
         # one SR-analytics error handler cannot expire the already-loaded
         # attributes and cascade MissingGreenlet lazy-load failures into sibling
@@ -1545,11 +1612,7 @@ async def claim_task(
                     if a.artifact_type == ArtifactType.PULL_REQUEST and a.pr_url:
                         pr_url = a.pr_url
                         break
-            research_findings_summary = None
-            for a in task_artifacts:
-                if a.artifact_type == ArtifactType.RESEARCH_FINDINGS and a.logs:
-                    research_findings_summary = a.logs[:8000]
-                    break
+            research_findings_summary = _research_findings_summary_by_id.get(t.id)
             t_ctx = t.context or {}
             t_prompt = (p.get("prompt") or p.get("description") or t.description or "")[
                 :300
@@ -1595,11 +1658,7 @@ async def claim_task(
                     if a.artifact_type == ArtifactType.PULL_REQUEST and a.pr_url:
                         pr_url = a.pr_url
                         break
-            research_findings_summary = None
-            for a in task_artifacts:
-                if a.artifact_type == ArtifactType.RESEARCH_FINDINGS and a.logs:
-                    research_findings_summary = a.logs[:8000]
-                    break
+            research_findings_summary = _research_findings_summary_by_id.get(t.id)
             t_ctx = t.context or {}
             t_prompt = (p.get("prompt") or p.get("description") or t.description or "")[
                 :300
@@ -1721,11 +1780,7 @@ async def claim_task(
                         if a.artifact_type == ArtifactType.PULL_REQUEST and a.pr_url:
                             pr_url = a.pr_url
                             break
-                research_findings_summary = None
-                for a in t_arts:
-                    if a.artifact_type == ArtifactType.RESEARCH_FINDINGS and a.logs:
-                        research_findings_summary = a.logs[:8000]
-                        break
+                research_findings_summary = _research_findings_summary_by_id.get(t.id)
                 is_failed = t.status in (TaskStatus.FAILED, TaskStatus.CANCELLED)
                 t_prompt = (
                     p.get("prompt") or p.get("description") or t.description or ""
@@ -2099,20 +2154,6 @@ async def claim_task(
                 with contextlib.suppress(Exception):
                     await session.rollback()
             try:
-                from app.sr_analytics import compute_fresh_reviewer_trend
-
-                await compute_fresh_reviewer_trend(
-                    project_id=_claimed_project_id,
-                    session=session,
-                    all_tasks=list(high_iter_rows),
-                )
-            except Exception:
-                logger.exception(
-                    "[AGENT] Failed to compute fresh_reviewer_trend (non-critical)"
-                )
-                with contextlib.suppress(Exception):
-                    await session.rollback()
-            try:
                 from app.sr_analytics import compute_edges_trend
 
                 await compute_edges_trend(
@@ -2122,30 +2163,6 @@ async def claim_task(
                 )
             except Exception:
                 logger.exception("[AGENT] Failed to compute edges_trend (non-critical)")
-                with contextlib.suppress(Exception):
-                    await session.rollback()
-            try:
-                await _stamp_reviewer_recovery_count(
-                    session, _claimed_project_id, high_iter_rows
-                )
-            except Exception:
-                logger.exception(
-                    "[AGENT] Failed to compute reviewer_recovery_after_incomplete_sr_count (non-critical)"
-                )
-                with contextlib.suppress(Exception):
-                    await session.rollback()
-            try:
-                from app.sr_analytics import compute_sr_reviewer_disagreements
-
-                await compute_sr_reviewer_disagreements(
-                    project_id=_claimed_project_id,
-                    session=session,
-                    all_tasks=list(high_iter_rows),
-                )
-            except Exception:
-                logger.exception(
-                    "[AGENT] Failed to compute sr_reviewer_disagreements (non-critical)"
-                )
                 with contextlib.suppress(Exception):
                     await session.rollback()
 
@@ -3379,18 +3396,6 @@ async def claim_task(
                         "[AGENT] Failed to compute research sr_regression_risk_test_signal_trends (non-critical)"
                     )
                 try:
-                    from app.sr_analytics import compute_fresh_reviewer_trend
-
-                    await compute_fresh_reviewer_trend(
-                        project_id=task.project_id,
-                        session=session,
-                        all_tasks=list(high_iter_rows),
-                    )
-                except Exception:
-                    logger.exception(
-                        "[AGENT] Failed to compute research fresh_reviewer_trend (non-critical)"
-                    )
-                try:
                     from app.sr_analytics import compute_edges_trend
 
                     await compute_edges_trend(
@@ -3401,26 +3406,6 @@ async def claim_task(
                 except Exception:
                     logger.exception(
                         "[AGENT] Failed to compute research edges_trend (non-critical)"
-                    )
-                try:
-                    await _stamp_reviewer_recovery_count(
-                        session, task.project_id, high_iter_rows
-                    )
-                except Exception:
-                    logger.exception(
-                        "[AGENT] Failed to compute research reviewer_recovery_after_incomplete_sr_count (non-critical)"
-                    )
-                try:
-                    from app.sr_analytics import compute_sr_reviewer_disagreements
-
-                    await compute_sr_reviewer_disagreements(
-                        project_id=task.project_id,
-                        session=session,
-                        all_tasks=list(high_iter_rows),
-                    )
-                except Exception:
-                    logger.exception(
-                        "[AGENT] Failed to compute research sr_reviewer_disagreements (non-critical)"
                     )
                 success_summary: list[str] = []
                 for scope_name, counts in research_scope_rates.items():
@@ -3675,10 +3660,6 @@ async def claim_task(
                     r_delta = data.get("recall_delta")
                     if isinstance(r_delta, (int, float)):
                         entry["recall_delta"] = r_delta
-                    # Regression signals consumed by the agent-side
-                    # failure-mode hint (self-review.ts:formatFailureModeHintForSrPrompt):
-                    # it renders only when below_floor/trend marks the category
-                    # regressing AND miss_mode_breakdown carries a dominant_mode.
                     trend = data.get("trend")
                     if isinstance(trend, str) and trend:
                         entry["trend"] = trend
@@ -3688,9 +3669,6 @@ async def claim_task(
                     engagement_thinning = data.get("engagement_thinning")
                     if isinstance(engagement_thinning, bool):
                         entry["engagement_thinning"] = engagement_thinning
-                    miss_mode_breakdown = data.get("miss_mode_breakdown")
-                    if isinstance(miss_mode_breakdown, dict):
-                        entry["miss_mode_breakdown"] = miss_mode_breakdown
                     return entry
 
                 cats = {
@@ -3849,26 +3827,6 @@ async def claim_task(
                 "[AGENT] Failed to inject sr_co_failure_pairs (non-critical)"
             )
 
-    # Inject persistent SR blind-spot hint for categories exceeding disagreement threshold
-    # across >=2 consecutive 7-day windows. Shape: project_context.persistent_blind_spots
-    if task_type in ("create", "fix", "refactor", "migrate") and project_for_playbook:
-        try:
-            from app.sr_blind_spots import (
-                get_sr_persistent_blind_spot_hint,
-            )
-
-            _pbs = await get_sr_persistent_blind_spot_hint(
-                session, project_for_playbook.id
-            )
-            if _pbs:
-                if "project_context" not in response:
-                    response["project_context"] = {}
-                response["project_context"]["persistent_blind_spots"] = _pbs
-        except Exception:
-            logger.exception(
-                "[AGENT] Failed to inject persistent_blind_spots (non-critical)"
-            )
-
     # Inject concrete recent miss examples for the worst-performing SR categories.
     # Unlike sr_blind_spot_themes (aggregated keyword patterns), these are verbatim
     # reviewer findings that SR missed in the most recent window — giving the agent
@@ -3942,29 +3900,6 @@ async def claim_task(
         except Exception:
             logger.exception(
                 "[AGENT] Failed to inject sr_recent_miss_examples (non-critical)"
-            )
-
-    # Inject pre-computed SR vs fresh-reviewer disagreements from the dedicated
-    # SR analytics row.
-    # Shape: project_context.sr_reviewer_disagreements =
-    #   {window_days, disagreements: [{category, task_type, count, examples?}]}
-    if task_type in CODE_REVIEW_GATED_TASK_TYPES and project_for_playbook:
-        try:
-            _disagreements_raw = _sr_analytics_data.get("sr_reviewer_disagreements")
-            if (
-                isinstance(_disagreements_raw, dict)
-                and isinstance(_disagreements_raw.get("disagreements"), list)
-                and _disagreements_raw["disagreements"]
-            ):
-                if "project_context" not in response:
-                    response["project_context"] = {}
-                response["project_context"]["sr_reviewer_disagreements"] = {
-                    "window_days": _disagreements_raw.get("window_days", 30),
-                    "disagreements": _disagreements_raw["disagreements"],
-                }
-        except Exception:
-            logger.exception(
-                "[AGENT] Failed to inject sr_reviewer_disagreements (non-critical)"
             )
 
     # Inject scoped architecture context for create/fix/refactor tasks
@@ -5642,6 +5577,8 @@ async def spawn_subtask(
     }
 
     new_tasks = []
+    returned_task_ids: list[str] = []
+    _spawn_repo_auth: tuple[str, str, str] | None = None
     for payload in req.payloads:
         try:
             payload = validate_task_payload(payload)
@@ -5686,7 +5623,107 @@ async def spawn_subtask(
                 task_requires_approval = True
         else:
             task_requires_approval = req.requires_approval
+        new_task_id = uuid.uuid4()
+        _spawn_review_loop: dict | None = None
+        if payload.get("type") == "fix" and payload.get("pr_number") is not None:
+            from app.fix_admission import prepare_direct_fix_admission
+
+            if _spawn_repo_auth is None:
+                _spawn_repo_auth = await get_github_token_for_task(
+                    parent_task.id, session
+                )
+            _fix_token, _fix_owner, _fix_repo = _spawn_repo_auth
+            _fix_pr_number = int(payload["pr_number"])
+
+            async def _fetch_spawn_fix_pr(
+                *,
+                _token: str = _fix_token,
+                _owner: str = _fix_owner,
+                _repo: str = _fix_repo,
+                _pr_number: int = _fix_pr_number,
+            ) -> dict:
+                return await get_pull_request(
+                    _token,
+                    _owner,
+                    _repo,
+                    _pr_number,
+                    project_id=str(parent_task.project_id),
+                )
+
+            admission = await prepare_direct_fix_admission(
+                session,
+                project_id=parent_task.project_id,
+                pr_number=_fix_pr_number,
+                fix_task_id=new_task_id,
+                fetch_live_pr=_fetch_spawn_fix_pr,
+            )
+            if not admission.allowed:
+                await session.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Cannot queue fix for PR #{_fix_pr_number}: "
+                        f"{admission.reason}"
+                    ),
+                )
+            _spawn_review_loop = {
+                "pr_number": _fix_pr_number,
+                "branch": str(payload.get("branch") or ""),
+                "base_branch": str(payload.get("base_branch") or ""),
+                "fix_target": dict(admission.fix_target or {}),
+            }
+        elif payload.get("type") == "review" and payload.get("pr_number") is not None:
+            from app.review_admission import prepare_direct_review_admission
+
+            if _spawn_repo_auth is None:
+                _spawn_repo_auth = await get_github_token_for_task(
+                    parent_task.id, session
+                )
+            _review_token, _review_owner, _review_repo = _spawn_repo_auth
+            _review_pr_number = int(payload["pr_number"])
+
+            async def _fetch_spawn_review_pr(
+                *,
+                _token: str = _review_token,
+                _owner: str = _review_owner,
+                _repo: str = _review_repo,
+                _pr_number: int = _review_pr_number,
+            ) -> dict:
+                return await get_pull_request(
+                    _token,
+                    _owner,
+                    _repo,
+                    _pr_number,
+                    project_id=str(parent_task.project_id),
+                )
+
+            review_admission = await prepare_direct_review_admission(
+                session,
+                project_id=parent_task.project_id,
+                pr_number=_review_pr_number,
+                fetch_live_pr=_fetch_spawn_review_pr,
+            )
+            if review_admission.existing_task is not None:
+                returned_task_ids.append(str(review_admission.existing_task.id))
+                continue
+            if not review_admission.allowed or review_admission.review_target is None:
+                await session.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Cannot queue review for PR #{_review_pr_number}: "
+                        f"{review_admission.reason}"
+                    ),
+                )
+            _spawn_review_loop = {
+                "pr_number": _review_pr_number,
+                "branch": str(payload.get("branch") or ""),
+                "base_branch": str(payload.get("base_branch") or ""),
+                "review_target": dict(review_admission.review_target),
+                "review_history": [],
+            }
         new_task = Task(
+            id=new_task_id,
             project_id=parent_task.project_id,
             title=payload.get("title", f"Subtask of {parent_task.title}"),
             description=payload.get("description", ""),
@@ -5695,6 +5732,11 @@ async def spawn_subtask(
                 **sanitized_context,
                 "spawn_depth": spawn_depth + 1,
                 "parent_context": parent_context,
+                **(
+                    {"review_loop": _spawn_review_loop}
+                    if _spawn_review_loop is not None
+                    else {}
+                ),
             },
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
             status=TaskStatus.QUEUED,
@@ -5709,6 +5751,7 @@ async def spawn_subtask(
         )
         session.add(new_task)
         new_tasks.append(new_task)
+        returned_task_ids.append(str(new_task.id))
 
     await session.commit()
 
@@ -5737,8 +5780,8 @@ async def spawn_subtask(
     await session.commit()
 
     return {
-        "message": f"Successfully spawned {len(new_tasks)} subtasks",
-        "task_ids": [str(t.id) for t in new_tasks],
+        "message": f"Successfully accepted {len(returned_task_ids)} subtasks",
+        "task_ids": returned_task_ids,
         "requires_approval": req.requires_approval,
     }
 
@@ -5750,128 +5793,6 @@ async def spawn_subtask(
 # their own seam: app.routers.agent_strategic_fetch (registered under the same
 # /api/agent prefix in app.main). They share auth via verify_agent_token,
 # which stays here.
-
-
-# Recognized recovery-origin flavors an agent may stamp on a merged SR outcome.
-# When an agent omits ``reviewer_recovery_origin`` the operator-requested path
-# defaults to ``operator_requested_recovery`` (byte-for-byte legacy behavior);
-# a self-merge from the enabled (non-recovery) path leaves no recovery origin.
-_VALID_REVIEWER_RECOVERY_ORIGINS = frozenset(
-    {
-        "reviewer_recovery_after_incomplete_sr",
-        "lone_checker_recovery",
-        "operator_requested_recovery",
-    }
-)
-
-
-class _ReviewerFinding(BaseModel):
-    model_config = ConfigDict(extra="allow")
-    category: str | None = Field(None, max_length=100)
-    severity: str | None = Field(None, max_length=20)
-    description: str | None = Field(None, max_length=2000)
-
-
-class ReviewerMergeRequest(BaseModel):
-    model_config = ConfigDict(extra="allow")
-    reviewer_findings: list[_ReviewerFinding] = Field(default=[], max_length=100)
-    reviewer_edges_considered: list[dict] = Field(default=[], max_length=50)
-    # Optional recovery-origin flavor the agent computed in-VM. Absent for the
-    # legacy operator-requested request shape (defaults preserve that path).
-    reviewer_recovery_origin: str | None = None
-
-
-@router.post("/tasks/{original_task_id}/reviewer-merge")
-@limiter.limit("30/minute")
-async def merge_operator_reviewer_findings(
-    request: Request,
-    original_task_id: uuid.UUID,
-    req: ReviewerMergeRequest,
-    session: AsyncSession = Depends(get_session),
-    token: dict = Depends(verify_agent_token),
-):
-    """Merge fresh-reviewer findings into an existing task's SR outcome.
-
-    Two authorization paths are accepted:
-
-    * **operator-requested** — the requesting task's
-      ``context.operator_requested_review_for`` equals the target task id (an
-      operator spawned a dedicated review task for another task's PR); and
-    * **self-merge** — the requesting task id (token ``sub``) equals the target
-      task id (a task persisting its own automatic fresh-reviewer output into
-      its ``_self_review_outcome`` after the terminal status was already posted).
-
-    Anything else is rejected with 403.
-    """
-    requesting_task_id = token.get("sub")
-    if not requesting_task_id:
-        raise HTTPException(status_code=403, detail="No task in token")
-
-    requesting_task = await session.get(Task, uuid.UUID(requesting_task_id))
-    if not requesting_task:
-        raise HTTPException(status_code=404, detail="Requesting task not found")
-
-    ctx = requesting_task.context or {}
-    is_self = str(requesting_task_id) == str(original_task_id)
-    is_operator = str(ctx.get("operator_requested_review_for")) == str(original_task_id)
-    if not (is_self or is_operator):
-        raise HTTPException(
-            status_code=403, detail="Not authorized for this target task"
-        )
-
-    original_task = await session.get(Task, original_task_id)
-    if not original_task:
-        raise HTTPException(status_code=404, detail="Original task not found")
-
-    # Resolve the effective recovery origin. A request that supplies a recognized
-    # flavor wins; otherwise the operator path defaults to
-    # ``operator_requested_recovery`` (legacy behavior) and a non-operator
-    # self-merge carries no recovery origin (plain reviewer / enabled path).
-    recovery_origin = req.reviewer_recovery_origin
-    if recovery_origin not in _VALID_REVIEWER_RECOVERY_ORIGINS:
-        recovery_origin = "operator_requested_recovery" if is_operator else None
-
-    orig_ctx = dict(original_task.context or {})
-    sr = dict(orig_ctx.get("_self_review_outcome") or {})
-    findings_dicts = [f.model_dump() for f in req.reviewer_findings]
-    sr["reviewer_findings"] = findings_dicts
-    if recovery_origin:
-        sr["reviewer_recovery_origin"] = recovery_origin
-
-    check_results = dict(safe_check_results(sr))
-    for finding in findings_dicts:
-        cat = finding.get("category")
-        if cat:
-            existing = check_results.get(cat)
-            if not existing or existing.get("passed") is True:
-                if recovery_origin:
-                    finding_origin = recovery_origin
-                elif existing and existing.get("passed") is True:
-                    finding_origin = "reviewer_disagreement"
-                else:
-                    finding_origin = "reviewer"
-                check_results[cat] = {
-                    "passed": False,
-                    "issue": f"[reviewer] {finding.get('description', '')}",
-                    "origin": finding_origin,
-                }
-    sr["check_results"] = check_results
-
-    if req.reviewer_edges_considered:
-        sr["reviewer_edges_considered"] = req.reviewer_edges_considered
-
-    orig_ctx["_self_review_outcome"] = sr
-    original_task.context = orig_ctx
-    flag_modified(original_task, "context")
-    session.add(original_task)
-    await session.commit()
-
-    await broadcast_to_project(
-        str(original_task.project_id),
-        "task_updated",
-        {"task_id": str(original_task_id)},
-    )
-    return {"status": "merged", "finding_count": len(req.reviewer_findings)}
 
 
 # ---------------------------------------------------------------------------

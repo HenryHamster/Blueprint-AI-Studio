@@ -145,10 +145,14 @@ def _infer_infra_leg(infra_error: str) -> str:
         return "migration_identity"
     if infra_error.startswith("smoketest"):
         return "smoketest"
+    if infra_error.startswith("walkthrough_e2e") or infra_error.startswith(
+        "qualification_probe"
+    ):
+        return "walkthrough_e2e"
     return "audit"
 
 
-def _infer_dimension_from_infra_error(infra_error: str) -> str:
+def _infer_dimension_from_infra_error(infra_error: str) -> str | None:
     """Map an infra_error code to the qualification ledger dimension it belongs to.
 
     Per-dimension failure isolation (Phase 1, design doc "From Batch Attempts to a
@@ -175,6 +179,12 @@ def _infer_dimension_from_infra_error(infra_error: str) -> str:
         return "migration_identity"
     if code.startswith("smoketest"):
         return "smoketest"
+    if code.startswith("walkthrough_e2e") or code.startswith(
+        "qualification_probe"
+    ):
+        # Product probes are attempt-scoped decision evidence, not reusable
+        # dimensions in the cross-attempt fact ledger.
+        return None
     if code.startswith("merge_grade"):
         return "merge_grade"
     if code.startswith("ci"):
@@ -226,6 +236,10 @@ async def _collect_terminal_infra_child_events(
     challenge_id = qual.get("challenge_task_id") or qual.get("audit_challenge_task_id")
     if challenge_id:
         terminal_ids.append(("challenge", str(challenge_id)))
+    if qual.get("walkthrough_e2e_task_id"):
+        terminal_ids.append(
+            ("walkthrough_e2e", str(qual.get("walkthrough_e2e_task_id")))
+        )
 
     seen_failed_ids = {
         str(row.get("failed_task_id"))
@@ -999,6 +1013,9 @@ async def _handle_infra_failure(
         "audit_challenge_task_id": qual.get("audit_challenge_task_id"),
         "audit_challenge_spawn_error": qual.get("audit_challenge_spawn_error"),
         "smoketest_task_id": qual.get("smoketest_task_id"),
+        "requested_probes": qual.get("requested_probes") or [],
+        "walkthrough_e2e_task_id": qual.get("walkthrough_e2e_task_id"),
+        "walkthrough_e2e_result": qual.get("walkthrough_e2e_result"),
     }
     version.last_qualification = record
     flag_modified(version, "last_qualification")

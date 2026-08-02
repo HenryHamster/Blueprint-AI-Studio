@@ -31,6 +31,39 @@ async def _create_project(session: AsyncSession, **overrides) -> Project:
     return project
 
 
+def _review_target(project_id: uuid.UUID, pr_number: int) -> dict[str, str | int]:
+    return {
+        "project_id": str(project_id),
+        "pr_number": pr_number,
+        "base_sha": f"base-{pr_number}",
+        "head_sha": f"head-{pr_number}",
+    }
+
+
+@pytest.fixture(autouse=True)
+def _mock_live_review_target(mocker):
+    """Keep guard-rail tests behind the real exact-target admission boundary."""
+    mocker.patch(
+        "app.branch_cleanup._get_project_github_token",
+        new_callable=mocker.AsyncMock,
+        return_value="test-token",
+    )
+
+    async def _open_pr(_token, _owner, _repo, pr_number, **_kwargs):
+        return {
+            "state": "open",
+            "merged": False,
+            "base": {"sha": f"base-{pr_number}"},
+            "head": {"sha": f"head-{pr_number}"},
+        }
+
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=mocker.AsyncMock,
+        side_effect=_open_pr,
+    )
+
+
 async def _create_auto_review_task(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -53,6 +86,10 @@ async def _create_auto_review_task(
         context={
             "auto_review": True,
             "pr_number": pr_number,
+            "review_loop": {
+                "review_target": _review_target(project_id, pr_number),
+                "target_assigned_by_backend": True,
+            },
         },
         status=status,
         created_by="SYSTEM_AUTO_REVIEW",
@@ -89,6 +126,7 @@ async def _call_inner(session, project_id, *, pr_number=99, config=None):
         pr_title="My PR title",
         project_id=project_id,
         config=config or _default_config(),
+        webhook_pr={"number": pr_number, "state": "open"},
         session=session,
     )
 
@@ -140,6 +178,7 @@ async def test_title_truncation(db_session: AsyncSession):
         pr_title=long_title,
         project_id=project.id,
         config=_default_config(),
+        webhook_pr={"number": 1, "state": "open"},
         session=db_session,
     )
 

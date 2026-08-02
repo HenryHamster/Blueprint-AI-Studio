@@ -41,13 +41,11 @@ from app.release_reconciliation import (
     _reconcile_if_deploy_failed_recovered,
     _reconcile_if_managed_check_wait,
     _reconcile_if_not_promoted_but_pr_merged,
-    _reconcile_if_pending_auto_merge_landed,
     _reconcile_if_pending_qualification_superseded,
     _reconcile_if_promotion_failed_landed,
     _reconcile_if_promotion_pending_timed_out,
 )
 from app.release_stall_alerts import (
-    _check_version_auto_merge_stall,
     _check_version_build_stall,
     _check_version_calcification,
     _check_version_ci_unresolved_stall,
@@ -112,10 +110,6 @@ def _hotfix_audit_was_attempted(qual: dict[str, Any]) -> bool:
         qual.get("status") == "pending"
         and isinstance(promotion_pending, dict)
         and promotion_pending.get("pr_number") is not None
-        and (
-            "auto_merge_enabled" in promotion_pending
-            or promotion_pending.get("managed_check_wait") is True
-        )
     )
     return qual.get("status") == "promoted" or persisted_wait
 
@@ -313,6 +307,7 @@ async def _cancel_qualifier_children(
         "smoketest_task_id",
         "challenge_task_id",
         "merge_grade_task_id",
+        "walkthrough_e2e_task_id",
     ]
     now = _utcnow()
 
@@ -816,7 +811,12 @@ async def _reconcile_if_criterion_coverage_now_complete(
                 attested,
             )
             result = await release_qualifier.run_qualification(
-                session, version.project_id, version
+                session,
+                version.project_id,
+                version,
+                requested_probes=(version.last_qualification or {}).get(
+                    "requested_probes"
+                ),
             )
             if result and result.get("status") == "spawned":
                 await session.commit()
@@ -1213,7 +1213,7 @@ async def _promote_dry_run_pass_if_enabled(
     stale candidates (automain has advanced) are skipped and will re-qualify via
     normal paths.  When the candidate is current it enters the normal promotion
     machinery via ``_force_promote_in_dedicated_session``, which preserves all
-    promotion-in-flight idempotency guards.
+    managed-promotion idempotency guards.
 
     Returns True when a promotion was initiated, False otherwise.
     """
@@ -1525,9 +1525,9 @@ async def _run_auto_qualification_trigger_for_version(
     # function and the resolver's cap uses the same threshold.
     consecutive_infra_errors = int(qual.get("consecutive_infra_errors") or 0) if qual else 0
 
-    # Determine in-flight and promotion-in-flight guards cheaply from stored state.
+    # Determine active-attempt and managed-promotion guards cheaply from stored state.
     in_flight = status == "pending"
-    promotion_in_flight = bool(qual.get("promotion_pending")) if qual else False
+    promotion_check_wait = bool(qual.get("promotion_pending")) if qual else False
 
     # Gather the sha-keyed acceptance-ledger verdict for the last-evaluated
     # candidate (DB-only, cheap). Only the not_promoted/criterion_coverage
@@ -1641,7 +1641,7 @@ async def _run_auto_qualification_trigger_for_version(
         automain_ci_state=automain_ci_state,
         blocker=blocker,
         in_flight=in_flight,
-        promotion_in_flight=promotion_in_flight,
+        promotion_check_wait=promotion_check_wait,
         consecutive_infra_errors=consecutive_infra_errors,
     )
 
@@ -1730,7 +1730,7 @@ async def _run_lifecycle_stall_alerts(
     For each open version this opens its OWN dedicated session and RE-SELECTs the
     version row inside that transaction rather than merging the sweep-START
     snapshot.  The stall checks that mutate ``last_qualification``
-    (``_check_version_auto_merge_stall`` / ``_check_version_managed_check_wait_stall``)
+    (notably ``_check_version_managed_check_wait_stall``)
     rebuild the verdict from ``version.last_qualification``; if that value is the
     stale sweep-start snapshot (as it was under the old ``merge(load=False)`` of
     the outer-scan object), the rebuilt verdict clobbers a ``last_qualification``
@@ -1770,9 +1770,6 @@ async def _run_lifecycle_stall_alerts(
                 alerted = (
                     await _check_version_promotion_readiness(alert_session, v)
                     or alerted
-                )
-                alerted = (
-                    await _check_version_auto_merge_stall(alert_session, v) or alerted
                 )
                 alerted = (
                     await _check_version_managed_check_wait_stall(alert_session, v)
@@ -2182,7 +2179,7 @@ async def sweep_stuck_qualifications(
     # Reconcile open versions whose promotion-failure candidate is already on
     # main.  A promotion_failed version is kept open so the next strategic cycle
     # can retry, but if the blocked PR later lands out-of-band (operator merge,
-    # a stalled auto-merge fires, a transient CI block clears) nothing calls the
+    # an operator later merges it, or a transient CI block clears) nothing calls the
     # idempotency check again.  This loop fills that gap: for each open version
     # with last_qualification.status=="promotion_failed" it checks whether the
     # candidate is now reachable from main and, if so, records the promotion as
@@ -2329,39 +2326,11 @@ async def sweep_stuck_qualifications(
                 version_id,
             )
 
-    # Reconcile open versions whose promotion PR is awaiting auto-merge but
-    # has already landed on main (normal path: required CI passed, auto-merge
-    # fired) or was closed without merging (can never auto-merge, drives
-    # version to promotion_failed so retry machinery applies).
-    for version_id in version_ids:
-        try:
-            reconciled = await _reconcile_if_pending_auto_merge_landed(
-                version_id,
-                session_factory=session_factory,
-            )
-        except Exception:
-            logger.exception(
-                "[RELEASE_QUALIFIER] sweep: pending_auto_merge reconcile check "
-                "failed for version %s",
-                version_id,
-            )
-            continue
-        if reconciled:
-            finalized += 1
-            logger.info(
-                "[RELEASE_QUALIFIER] sweep reconciled version %s "
-                "(pending_auto_merge drove to terminal state)",
-                version_id,
-            )
-
-    # Reconcile open versions with a migration-carrying promotion PR in
-    # managed_check_wait mode.  These versions have
-    # last_qualification.promotion_pending.managed_check_wait=True and were NOT
-    # delegated to GitHub native auto-merge (because the pre-merge Alembic guard
-    # must be re-run after CI passes).  This rung: (a) records success when the
-    # candidate lands out-of-band, (b) re-runs the guard and retries the merge
-    # when CI turns green, and (c) records terminal failures for red CI,
-    # migration guard blocks, and non-check protection blocks.  Runs BEFORE the
+    # Reconcile every open version with a persisted promotion PR. The managed
+    # waiter canonicalizes legacy rows, records out-of-band success, checks CI,
+    # re-runs the migration guard, revalidates the exact base/head pair, and
+    # retries the merge itself. It also records terminal red-CI, migration, and
+    # protection failures. Runs BEFORE the
     # pending-superseded loop (which handles pending WITHOUT promotion_pending)
     # and BEFORE the timeout backstop so a just-merged PR is never mis-classified
     # as timed-out in the same sweep.
@@ -2392,8 +2361,8 @@ async def sweep_stuck_qualifications(
     # already reachable from the promotion target, record the correct supersession
     # provenance promptly rather than waiting for the 6h qualification_timeout
     # backstop which would stamp the wrong blocker.  Runs AFTER the
-    # pending_auto_merge loop (which handles pending WITH promotion_pending) so a
-    # normally-landed auto-merge is never mis-classified as superseded.
+    # managed promotion loop (which handles pending WITH promotion_pending) so a
+    # normally-landed promotion is never mis-classified as superseded.
     for version_id in version_ids:
         try:
             reconciled = await _reconcile_if_pending_qualification_superseded(
@@ -2420,8 +2389,8 @@ async def sweep_stuck_qualifications(
     # timeout (the qualifier children already terminated), but nothing replaced
     # that backstop for the sub-state itself: if the promotion PR stays open
     # with pending/absent CI (or every GitHub call fails) the
-    # _reconcile_if_pending_auto_merge_landed terminal-state path is a no-op and
-    # the version strands indefinitely, blocking the whole self-improve loop.
+    # managed reconciliation cannot reach a terminal state, the version would
+    # otherwise strand indefinitely and block the whole self-improve loop.
     # This pure-DB check force-fails a promotion_pending older than the cap as
     # promotion_pending_timeout, clearing the sub-state so the version returns to
     # stabilize and the qualification-timeout backstop + retry machinery re-arm

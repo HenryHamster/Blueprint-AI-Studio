@@ -619,8 +619,8 @@ def detect_hedges_in_diff(diff_files: list[dict]) -> list[dict]:
 
 
 # ── Per-lane iteration cap accounting ─────────────────────────────────────────
-# Review-fix iteration budget lanes — mechanical churn (conflict resolution,
-# CI fixes, second-opinion arbitration) must not crowd out review-convergence
+# Review-fix iteration budget lanes — mechanical churn (conflict resolution
+# and CI fixes) must not crowd out review-convergence
 # work. Each lane has a sub-cap; non-review lanes share a collective ceiling so
 # review_convergence always retains at least (global_cap - collective_ceil)
 # iterations regardless of churn volume.
@@ -628,18 +628,15 @@ def detect_hedges_in_diff(diff_files: list[dict]) -> list[dict]:
 # Lane values:
 #   conflict         — merge_conflict or update_branch_failed fix iterations
 #   ci               — ci_failure fix iterations
-#   arbitration      — second-opinion/dispute iterations
 #   review_convergence — everything else (code-review fix + review tasks)
 LANE_CONFLICT = "conflict"
 LANE_CI = "ci"
-LANE_ARBITRATION = "arbitration"
 LANE_REVIEW_CONVERGENCE = "review_convergence"
 
 # Default sub-caps (runtime-config-tunable; see review_pipeline._LANE_CAPS).
 LANE_CAP_CONFLICT_DEFAULT = 4
 LANE_CAP_CI_DEFAULT = 6
-LANE_CAP_ARBITRATION_DEFAULT = 2
-LANE_CAP_NON_REVIEW_DEFAULT = 8  # conflict + ci + arbitration collectively
+LANE_CAP_NON_REVIEW_DEFAULT = 8  # conflict + ci collectively
 
 # Number of consecutive conflict-lane fix completions that trigger persistent-
 # conflict escalation BEFORE the lane sub-cap fires. The loop closes the PR and

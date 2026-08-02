@@ -609,9 +609,7 @@ def _compact_last_qualification(qual: dict[str, Any] | None) -> dict[str, Any] |
             for key in (
                 "pr_number",
                 "pr_url",
-                "auto_merge_enabled",
                 "managed_check_wait",
-                "migration_carrying",
                 "ci_state",
             )
             if promotion_pending.get(key) is not None
@@ -1788,7 +1786,7 @@ async def agent_fetch_qualification(
             automain_ci_state=None,
             blocker=_lq.get("blocker"),
             in_flight=_status == "pending",
-            promotion_in_flight=bool(_lq.get("promotion_pending")),
+            promotion_check_wait=bool(_lq.get("promotion_pending")),
             last_attempt=_lq if _lq else None,
             knob=get_auto_qualification_triggers_mode(),
             evaluated_at=_utcnow().isoformat(),
@@ -1939,9 +1937,7 @@ async def agent_fetch_qualification(
                 for key in (
                     "pr_number",
                     "pr_url",
-                    "auto_merge_enabled",
                     "managed_check_wait",
-                    "migration_carrying",
                     "ci_state",
                 )
                 if promotion_pending.get(key) is not None
@@ -1996,9 +1992,7 @@ async def agent_fetch_qualification(
             for key in (
                 "pr_number",
                 "pr_url",
-                "auto_merge_enabled",
                 "managed_check_wait",
-                "migration_carrying",
                 "ci_state",
             )
             if promotion_pending.get(key) is not None
@@ -2406,7 +2400,7 @@ SECTION_FETCH_INVENTORY: dict[str, str | None] = {
     "available_capabilities": None, "local_runner_status": None,
     # Tiny autonomous session cadence scalars — runtime config, no fetch path
     "strategic_session_idle_tick_seconds": None,
-    "strategic_session_min_tick_seconds": None,
+    "strategic_session_exploration_interval_seconds": None,
     "strategic_session_max_ops_per_turn": None,
     "strategic_session_message_poll_seconds": None,
     "strategic_session_turn_timeout_seconds": None,

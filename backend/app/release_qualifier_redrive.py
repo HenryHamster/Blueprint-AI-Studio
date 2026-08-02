@@ -218,7 +218,10 @@ async def _redrive_deferred_unsynced_qualification(
         ):
             return False
         result = await release_qualifier.run_qualification(
-            redrive_session, version.project_id, version
+            redrive_session,
+            version.project_id,
+            version,
+            requested_probes=qual.get("requested_probes"),
         )
         if result and result.get("status") == "spawned":
             await redrive_session.commit()
@@ -295,6 +298,7 @@ async def _redrive_error_qualification(
             or version.active_qualification_attempt_id,
             retry_episode=int(qual.get("retry_episode") or 0) + 1,
             retry_episode_cap=_MAX_ERROR_REDRIVE_ATTEMPTS,
+            requested_probes=qual.get("requested_probes"),
         )
         # COMMIT on every outcome — do NOT roll back the non-spawned paths.
         #
@@ -539,6 +543,7 @@ async def _redrive_infra_failure_qualification(
             or version.active_qualification_attempt_id,
             retry_episode=int(qual.get("retry_episode") or 0) + 1,
             retry_episode_cap=_MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS,
+            requested_probes=qual.get("requested_probes"),
         )
         # COMMIT on every outcome — do NOT roll back the non-spawned paths.
         # run_qualification writes a new last_qualification (and bumps
@@ -576,7 +581,10 @@ async def _redrive_rubric_qualification(
         ):
             return False
         result = await release_qualifier.run_qualification(
-            redrive_session, version.project_id, version
+            redrive_session,
+            version.project_id,
+            version,
+            requested_probes=qual.get("requested_probes"),
         )
         await redrive_session.commit()
         return bool(result and result.get("status") == "spawned")
@@ -709,7 +717,10 @@ async def _redrive_not_promoted_qualification(
         # have no code anchor; rewriting the old status to non-conclusive lets
         # exactly one fresh pending qualification replace it.
         result = await release_qualifier.run_qualification(
-            redrive_session, version.project_id, version
+            redrive_session,
+            version.project_id,
+            version,
+            requested_probes=qual.get("requested_probes"),
         )
         if result and result.get("status") == "spawned":
             await redrive_session.commit()
@@ -962,6 +973,7 @@ async def _redrive_promotion_failed_qualification(
             version,
             session_factory=session_factory,
             allow_synchronous_reuse_promote=True,
+            requested_probes=qual.get("requested_probes"),
         )
         # "spawned" = a fresh audit ran; "reused_audit" = the passing-audit
         # reuse-promote fired (it committed on its OWN dedicated session).  Both
@@ -1043,6 +1055,7 @@ async def _redrive_dry_run_candidate(
             version,
             session_factory=session_factory,
             allow_synchronous_reuse_promote=True,
+            requested_probes=qual.get("requested_probes"),
         )
         if result and (
             result.get("status") == "spawned" or result.get("reused_audit")

@@ -18,6 +18,7 @@ from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
+from app.direction_contract import DIRECTION_CONTRACT_FIELDS
 from app.models import (
     DiscoveryAdmission,
     DiscoveryCycle,
@@ -30,11 +31,7 @@ from app.time_utils import _utcnow
 
 
 DiscoveryAdmissionKind = Literal["logical_task", "attempt"]
-DiscoveryAdmissionMode = Literal["shadow", "enforced"]
-
-DISCOVERY_ADMISSION_MODES = frozenset({"shadow", "enforced"})
 DISCOVERY_ADMISSION_KINDS = frozenset({"logical_task", "attempt"})
-DEFAULT_DISCOVERY_ADMISSION_MODE: DiscoveryAdmissionMode = "shadow"
 DEFAULT_DISCOVERY_TASK_CREDIT_LIMIT = 8
 DEFAULT_DISCOVERY_ATTEMPT_CREDIT_LIMIT = 4
 DEFAULT_DISCOVERY_CONCURRENCY_LIMIT = 2
@@ -55,46 +52,17 @@ class DiscoveryAdmissionDecision:
     """Machine-readable result shared by admission and dispatch call sites."""
 
     allowed: bool
-    enforced: bool
     reason: str
     cycle_id: uuid.UUID | None
     admission_id: uuid.UUID | None = None
     admission_kind: str | None = None
     idempotent: bool = False
-    shadow_violation: bool = False
     # A denied claim can either be transient (currently no concurrency slot) or
     # permanent for this task (the envelope closed before it was admitted).
     # Dispatch callers use this signal to avoid leaving permanently ineligible
     # QUEUED work stranded forever.
     terminal_denial: bool = False
     details: Mapping[str, Any] | None = None
-
-
-def normalize_discovery_admission_mode(raw: Any) -> DiscoveryAdmissionMode:
-    mode = str(raw or DEFAULT_DISCOVERY_ADMISSION_MODE).strip().lower()
-    # Accept the adjective used by older runtime-config conventions while
-    # exposing one canonical value in decisions and persisted metadata.
-    if mode == "enforce":
-        mode = "enforced"
-    if mode not in DISCOVERY_ADMISSION_MODES:
-        raise ValueError(
-            "discovery admission mode must be one of: "
-            f"{', '.join(sorted(DISCOVERY_ADMISSION_MODES))}"
-        )
-    return mode  # type: ignore[return-value]
-
-
-def discovery_admission_mode_from_runtime(
-    runtime_config: Mapping[str, Any],
-) -> DiscoveryAdmissionMode:
-    """Read the gradual-rollout mode from runtime configuration."""
-
-    return normalize_discovery_admission_mode(
-        runtime_config.get(
-            "discovery_admission_mode",
-            DEFAULT_DISCOVERY_ADMISSION_MODE,
-        )
-    )
 
 
 def _as_uuid(value: Any, *, field_name: str) -> uuid.UUID:
@@ -115,6 +83,7 @@ async def ensure_discovery_cycle_for_research(
     runtime_config: Mapping[str, Any] | None = None,
     candidate_sha: str | None = None,
     now: datetime | None = None,
+    join_open_cycle: bool = False,
 ) -> DiscoveryCycle | None:
     """Return the live direction cycle, bootstrapping generation one if absent.
 
@@ -128,7 +97,6 @@ async def ensure_discovery_cycle_for_research(
     key = str(direction_key or "").strip()
     if not key or len(key) > 128:
         raise ValueError("direction_key must contain 1 to 128 characters")
-    mode = discovery_admission_mode_from_runtime(runtime_config or {})
     live = (
         await session.execute(
             select(DiscoveryCycle)
@@ -149,14 +117,12 @@ async def ensure_discovery_cycle_for_research(
         )
     ).scalar_one_or_none()
     if live is not None:
-        if live.state == "open" and live.source_research_task_id is None:
+        if live.state == "open" and (
+            live.source_research_task_id is None or join_open_cycle
+        ):
             if candidate_sha:
                 live.candidate_sha = candidate_sha
             return live
-        if mode == "shadow":
-            # Shadow observes one representative cohort but must not suppress
-            # the pre-existing autonomous root cadence.
-            return None
         raise DiscoveryCycleUnavailable(
             f"direction {key} already has cycle {live.id} in state {live.state}"
         )
@@ -173,11 +139,10 @@ async def ensure_discovery_cycle_for_research(
         )
     ).scalar_one_or_none()
     if latest is not None and latest.verdict is not None:
-        if mode == "enforced":
-            raise DiscoveryCycleUnavailable(
-                f"direction {key} is awaiting policy resolution after "
-                f"{latest.verdict}"
-            )
+        raise DiscoveryCycleUnavailable(
+            f"direction {key} is awaiting policy resolution after "
+            f"{latest.verdict}"
+        )
 
     generation = int(
         (
@@ -211,6 +176,17 @@ async def ensure_discovery_cycle_for_research(
         )
         if direction.get(field) is not None
     }
+    direction_context = direction.get("context")
+    if isinstance(direction_context, Mapping):
+        proof_contract = {
+            field: direction_context[field]
+            for field in DIRECTION_CONTRACT_FIELDS
+            if field in direction_context
+        }
+        if proof_contract:
+            # Only the canonical proof contract crosses this boundary. Other
+            # mutable Strategic context must not silently become review truth.
+            direction_snapshot["context"] = proof_contract
     bet_snapshot = {
         "direction": direction_snapshot,
         "claim": str(direction.get("text") or "")[:2_000],
@@ -386,17 +362,13 @@ async def resolve_discovery_cycle_lineage(
 def _policy_decision(
     *,
     cycle_id: uuid.UUID,
-    mode: DiscoveryAdmissionMode,
     reason: str,
     details: Mapping[str, Any] | None = None,
 ) -> DiscoveryAdmissionDecision:
-    enforced = mode == "enforced"
     return DiscoveryAdmissionDecision(
-        allowed=not enforced,
-        enforced=enforced,
+        allowed=False,
         reason=reason,
         cycle_id=cycle_id,
-        shadow_violation=not enforced,
         details=details,
     )
 
@@ -422,21 +394,17 @@ async def _evaluate_cycle_policy(
     cycle: DiscoveryCycle,
     admission_kind: DiscoveryAdmissionKind,
     units: int,
-    mode: DiscoveryAdmissionMode,
     now: datetime,
-    task_id: uuid.UUID | None = None,
 ) -> DiscoveryAdmissionDecision | None:
     if cycle.state not in DISCOVERY_ADMITTING_STATES:
         return _policy_decision(
             cycle_id=cycle.id,
-            mode=mode,
             reason="cycle_not_admitting",
             details={"state": cycle.state},
         )
     if cycle.deadline_at is not None and now >= cycle.deadline_at:
         return _policy_decision(
             cycle_id=cycle.id,
-            mode=mode,
             reason="deadline_expired",
             details={"deadline_at": cycle.deadline_at.isoformat()},
         )
@@ -450,7 +418,6 @@ async def _evaluate_cycle_policy(
     if limit is not None and used + units > limit:
         return _policy_decision(
             cycle_id=cycle.id,
-            mode=mode,
             reason=f"{admission_kind}_credit_limit",
             details={"used": used, "requested": units, "limit": limit},
         )
@@ -470,7 +437,6 @@ async def reserve_discovery_admission(
     # Compatibility alias for early integration callers.
     credit_kind: DiscoveryAdmissionKind | None = None,
     units: int = 1,
-    mode: DiscoveryAdmissionMode | str = DEFAULT_DISCOVERY_ADMISSION_MODE,
     task_id: uuid.UUID | str | None = None,
     spawn_request_id: uuid.UUID | str | None = None,
     metadata: Mapping[str, Any] | None = None,
@@ -480,11 +446,8 @@ async def reserve_discovery_admission(
 
     The cycle row is locked before the idempotency lookup and counter update,
     serializing all reservations for a cycle without requiring a retry loop
-    around the unique ledger key.  Policy violations are recorded and allowed
-    in shadow mode; invariant violations always fail closed.
+    around the unique ledger key. Policy and invariant violations fail closed.
     """
-
-    normalized_mode = normalize_discovery_admission_mode(mode)
     normalized_cycle_id = _as_uuid(cycle_id, field_name="cycle_id")
     if credit_kind is not None:
         if admission_kind != "logical_task" and admission_kind != credit_kind:
@@ -516,14 +479,12 @@ async def reserve_discovery_admission(
     if cycle is None:
         return DiscoveryAdmissionDecision(
             allowed=False,
-            enforced=normalized_mode == "enforced",
             reason="cycle_not_found",
             cycle_id=normalized_cycle_id,
         )
     if cycle.state in {"reviewing", "reviewed", "review_blocked", "cancelled"}:
         return DiscoveryAdmissionDecision(
             allowed=False,
-            enforced=True,
             reason="cycle_review_frozen",
             cycle_id=normalized_cycle_id,
             terminal_denial=True,
@@ -542,7 +503,6 @@ async def reserve_discovery_admission(
         if existing.admission_kind != admission_kind or existing.units != units:
             return DiscoveryAdmissionDecision(
                 allowed=False,
-                enforced=True,
                 reason="idempotency_mismatch",
                 cycle_id=normalized_cycle_id,
                 admission_id=existing.id,
@@ -564,7 +524,6 @@ async def reserve_discovery_admission(
         ):
             return DiscoveryAdmissionDecision(
                 allowed=False,
-                enforced=True,
                 reason="idempotency_owner_mismatch",
                 cycle_id=normalized_cycle_id,
                 admission_id=existing.id,
@@ -578,7 +537,6 @@ async def reserve_discovery_admission(
         if existing.state == "released":
             return DiscoveryAdmissionDecision(
                 allowed=False,
-                enforced=True,
                 reason="admission_released",
                 cycle_id=normalized_cycle_id,
                 admission_id=existing.id,
@@ -587,15 +545,11 @@ async def reserve_discovery_admission(
             )
         return DiscoveryAdmissionDecision(
             allowed=True,
-            enforced=normalized_mode == "enforced",
             reason=f"already_{existing.state}",
             cycle_id=normalized_cycle_id,
             admission_id=existing.id,
             admission_kind=existing.admission_kind,
             idempotent=True,
-            shadow_violation=bool(
-                (existing.admission_metadata or {}).get("shadow_violation")
-            ),
         )
 
     policy = await _evaluate_cycle_policy(
@@ -603,22 +557,11 @@ async def reserve_discovery_admission(
         cycle=cycle,
         admission_kind=admission_kind,
         units=units,
-        mode=normalized_mode,
         now=now or _utcnow(),
-        task_id=normalized_task_id,
     )
     if policy is not None and not policy.allowed:
         return policy
 
-    admission_metadata = dict(metadata or {})
-    if policy is not None:
-        admission_metadata.update(
-            {
-                "shadow_violation": True,
-                "shadow_reason": policy.reason,
-                "shadow_details": dict(policy.details or {}),
-            }
-        )
     admission = DiscoveryAdmission(
         cycle_id=normalized_cycle_id,
         admission_key=key,
@@ -626,7 +569,7 @@ async def reserve_discovery_admission(
         task_id=normalized_task_id,
         spawn_request_id=normalized_request_id,
         units=units,
-        admission_metadata=admission_metadata,
+        admission_metadata=dict(metadata or {}),
     )
     session.add(admission)
     if admission_kind == "logical_task":
@@ -639,13 +582,10 @@ async def reserve_discovery_admission(
     await session.flush()
     return DiscoveryAdmissionDecision(
         allowed=True,
-        enforced=normalized_mode == "enforced",
-        reason=policy.reason if policy is not None else "reserved",
+        reason="reserved",
         cycle_id=normalized_cycle_id,
         admission_id=admission.id,
         admission_kind=admission_kind,
-        shadow_violation=policy is not None,
-        details=policy.details if policy is not None else None,
     )
 
 
@@ -746,12 +686,10 @@ async def validate_discovery_dispatch_authority(
     cycle_id: uuid.UUID | str,
     admission_key: str | None = None,
     task_id: uuid.UUID | str | None = None,
-    mode: DiscoveryAdmissionMode | str = DEFAULT_DISCOVERY_ADMISSION_MODE,
     now: datetime | None = None,
 ) -> DiscoveryAdmissionDecision:
     """Validate dispatch authority without charging or mutating admission state."""
 
-    normalized_mode = normalize_discovery_admission_mode(mode)
     normalized_cycle_id = _as_uuid(cycle_id, field_name="cycle_id")
     normalized_task_id = (
         _as_uuid(task_id, field_name="task_id") if task_id is not None else None
@@ -766,14 +704,12 @@ async def validate_discovery_dispatch_authority(
     if cycle is None:
         return DiscoveryAdmissionDecision(
             allowed=False,
-            enforced=normalized_mode == "enforced",
             reason="cycle_not_found",
             cycle_id=normalized_cycle_id,
         )
     if cycle.state in {"reviewing", "reviewed", "review_blocked", "cancelled"}:
         return DiscoveryAdmissionDecision(
             allowed=False,
-            enforced=True,
             reason="cycle_review_frozen",
             cycle_id=normalized_cycle_id,
             terminal_denial=True,
@@ -793,7 +729,6 @@ async def validate_discovery_dispatch_authority(
         if admission is None or admission.state == "released":
             policy = _policy_decision(
                 cycle_id=normalized_cycle_id,
-                mode=normalized_mode,
                 reason=(
                     "admission_missing"
                     if admission is None
@@ -808,7 +743,6 @@ async def validate_discovery_dispatch_authority(
         ):
             return DiscoveryAdmissionDecision(
                 allowed=False,
-                enforced=True,
                 reason="admission_owner_mismatch",
                 cycle_id=normalized_cycle_id,
                 admission_id=admission.id,
@@ -829,7 +763,6 @@ async def validate_discovery_dispatch_authority(
         if admission is None or admission.state == "released":
             return _policy_decision(
                 cycle_id=normalized_cycle_id,
-                mode=normalized_mode,
                 reason=(
                     "admission_missing"
                     if admission is None
@@ -843,7 +776,6 @@ async def validate_discovery_dispatch_authority(
         if cycle.state not in DISCOVERY_ADMITTING_STATES:
             return _policy_decision(
                 cycle_id=normalized_cycle_id,
-                mode=normalized_mode,
                 reason="cycle_not_admitting",
                 details={"state": cycle.state},
             )
@@ -851,7 +783,6 @@ async def validate_discovery_dispatch_authority(
         if cycle.deadline_at is not None and check_time >= cycle.deadline_at:
             return _policy_decision(
                 cycle_id=normalized_cycle_id,
-                mode=normalized_mode,
                 reason="deadline_expired",
                 details={"deadline_at": cycle.deadline_at.isoformat()},
             )
@@ -864,13 +795,11 @@ async def validate_discovery_dispatch_authority(
         if active >= cycle.concurrency_limit:
             return _policy_decision(
                 cycle_id=normalized_cycle_id,
-                mode=normalized_mode,
                 reason="concurrency_limit",
                 details={"active": active, "limit": cycle.concurrency_limit},
             )
     return DiscoveryAdmissionDecision(
         allowed=True,
-        enforced=normalized_mode == "enforced",
         reason="authority_valid",
         cycle_id=normalized_cycle_id,
         admission_id=admission.id if admission is not None else None,
@@ -884,7 +813,6 @@ async def authorize_discovery_task_execution(
     session: AsyncSession,
     *,
     task: Task,
-    mode: DiscoveryAdmissionMode | str = DEFAULT_DISCOVERY_ADMISSION_MODE,
     now: datetime | None = None,
 ) -> DiscoveryAdmissionDecision:
     """Resolve, repair, admit, and validate discovery execution authority.
@@ -897,7 +825,6 @@ async def authorize_discovery_task_execution(
     already accepted work drains normally.
     """
 
-    normalized_mode = normalize_discovery_admission_mode(mode)
     cycle_id = task.discovery_cycle_id
     if cycle_id is None:
         cycle_id = await resolve_discovery_cycle_lineage(
@@ -907,7 +834,6 @@ async def authorize_discovery_task_execution(
         if cycle_id is None:
             return DiscoveryAdmissionDecision(
                 allowed=True,
-                enforced=normalized_mode == "enforced",
                 reason="not_discovery_scoped",
                 cycle_id=None,
             )
@@ -934,7 +860,6 @@ async def authorize_discovery_task_execution(
         ):
             return DiscoveryAdmissionDecision(
                 allowed=True,
-                enforced=normalized_mode == "enforced",
                 reason="discovery_review_control_task",
                 cycle_id=review_cycle.id,
                 details={"charged": False},
@@ -994,7 +919,6 @@ async def authorize_discovery_task_execution(
             admission_key=admission_key,
             admission_kind=admission_kind,
             task_id=task.id,
-            mode=normalized_mode,
             metadata={
                 "source": "execution_authority_backstop",
                 **(
@@ -1008,13 +932,11 @@ async def authorize_discovery_task_execution(
         if not late.allowed:
             return DiscoveryAdmissionDecision(
                 allowed=False,
-                enforced=late.enforced,
                 reason=late.reason,
                 cycle_id=late.cycle_id,
                 admission_id=late.admission_id,
                 admission_kind=late.admission_kind,
                 idempotent=late.idempotent,
-                shadow_violation=late.shadow_violation,
                 terminal_denial=late.reason != "concurrency_limit",
                 details=late.details,
             )
@@ -1040,7 +962,6 @@ async def authorize_discovery_task_execution(
     ):
         return DiscoveryAdmissionDecision(
             allowed=False,
-            enforced=True,
             reason="admission_settlement_failed",
             cycle_id=cycle_id,
             admission_id=settlement_admission_id,
@@ -1053,31 +974,17 @@ async def authorize_discovery_task_execution(
         cycle_id=cycle_id,
         admission_key=admission_key_to_consume,
         task_id=task.id,
-        mode=normalized_mode,
         now=now,
     )
     if not decision.allowed:
         return DiscoveryAdmissionDecision(
             allowed=False,
-            enforced=decision.enforced,
             reason=decision.reason,
             cycle_id=decision.cycle_id,
             admission_id=decision.admission_id,
             admission_kind=decision.admission_kind,
             idempotent=decision.idempotent,
-            shadow_violation=decision.shadow_violation,
             terminal_denial=decision.reason != "concurrency_limit",
             details=decision.details,
-        )
-    if late is not None and late.shadow_violation:
-        return DiscoveryAdmissionDecision(
-            allowed=True,
-            enforced=False,
-            reason=late.reason,
-            cycle_id=decision.cycle_id,
-            admission_id=decision.admission_id,
-            admission_kind=decision.admission_kind,
-            shadow_violation=True,
-            details=late.details,
         )
     return decision

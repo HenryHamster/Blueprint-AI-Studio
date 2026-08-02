@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, inspect as sqlalchemy_inspect, or_
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
@@ -129,10 +129,24 @@ async def backfill_artifact_prerequisites(task: Task, session) -> None:
     completed still receives artifact pointers before launch.  Idempotent:
     skips any pointer whose artifact_id is already present in the list.
     """
-    if not task.depends_on:
-        return
     try:
-        dep_ids = list(task.depends_on)
+        # PR claim fencing initially projects only the task identity and can
+        # leave its load-only options attached to the ORM instance even after
+        # the definitive row lock and claim commit.  Reading ``depends_on``
+        # synchronously in that state triggers an async lazy load and raises
+        # MissingGreenlet.  Refresh only the inputs this async helper owns when
+        # they are absent/expired; fully-loaded ordinary claims pay no query.
+        state = sqlalchemy_inspect(task)
+        required_attrs = {"depends_on", "project_id", "context"}
+        missing_attrs = sorted(
+            required_attrs & (set(state.unloaded) | set(state.expired_attributes))
+        )
+        if missing_attrs:
+            await session.refresh(task, attribute_names=missing_attrs)
+
+        dep_ids = list(task.depends_on or [])
+        if not dep_ids:
+            return
         query = select(Task).where(
             Task.id.in_(dep_ids),
             Task.status == TaskStatus.COMPLETED,

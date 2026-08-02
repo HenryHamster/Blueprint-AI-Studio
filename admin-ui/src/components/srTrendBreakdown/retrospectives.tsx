@@ -1,7 +1,6 @@
 /* eslint-disable react-hooks/set-state-in-effect */
 import { useEffect, useState } from 'react';
 import { AlertTriangle, ChevronDown, ChevronRight } from 'lucide-react';
-import { reviewerSeverityColor } from './primitives';
 import type { SrMissedTask, SrUnhandledEdgesTask } from './types';
 
 const WINDOW_OPTIONS: { label: string; days: number }[] = [
@@ -142,34 +141,20 @@ export function SrMissedRetrospective({
                 <div className="mt-1.5 flex flex-col gap-1">
                   {task.missed_categories.map(category => {
                     const sr = task.sr_check_results?.[category];
-                    const reviewer = task.reviewer_findings?.find(finding => finding.category === category);
                     return (
                       <div key={category} className="rounded border border-neutral-800/60 bg-neutral-950/50 p-1.5">
                         <div className="mb-1 text-neutral-400">{category}</div>
-                        <div className="grid gap-2 md:grid-cols-2">
-                          <div className="rounded border border-neutral-800/50 bg-neutral-900/60 p-1.5">
-                            <div className="mb-0.5 text-ui-xs uppercase tracking-wide text-neutral-500">SR</div>
-                            {sr ? (
-                              <>
-                                <div className={`font-mono ${sr.passed ? 'text-emerald-400' : 'text-red-400'}`}>{sr.passed ? 'passed' : 'failed'}</div>
-                                {sr.issue && <div className="text-neutral-400">{sr.issue}</div>}
-                                {sr.origin && <div className="text-neutral-600">origin: {sr.origin}</div>}
-                              </>
-                            ) : (
-                              <div className="text-neutral-500">not recorded</div>
-                            )}
-                          </div>
-                          <div className="rounded border border-neutral-800/50 bg-neutral-900/60 p-1.5">
-                            <div className="mb-0.5 text-ui-xs uppercase tracking-wide text-neutral-500">Reviewer</div>
-                            {reviewer ? (
-                              <>
-                                <div className={`inline-flex rounded px-1 py-0.5 text-ui-xs font-mono ${reviewerSeverityColor(reviewer.severity)}`}>{reviewer.severity ?? 'unknown'}</div>
-                                <div className="text-neutral-400">{reviewer.description}</div>
-                              </>
-                            ) : (
-                              <div className="text-neutral-500">{category}</div>
-                            )}
-                          </div>
+                        <div className="rounded border border-neutral-800/50 bg-neutral-900/60 p-1.5">
+                          <div className="mb-0.5 text-ui-xs uppercase tracking-wide text-neutral-500">Self-review evidence</div>
+                          {sr ? (
+                            <>
+                              <div className={`font-mono ${sr.passed ? 'text-emerald-400' : 'text-red-400'}`}>{sr.passed ? 'passed' : 'failed'}</div>
+                              {sr.issue && <div className="text-neutral-400">{sr.issue}</div>}
+                              {sr.origin && <div className="text-neutral-600">origin: {sr.origin}</div>}
+                            </>
+                          ) : (
+                            <div className="text-neutral-500">not recorded</div>
+                          )}
                         </div>
                       </div>
                     );

@@ -1,11 +1,8 @@
-"""Tests for release_stall_alerts — managed_check_wait, auto-merge, and deploy-failed checks.
+"""Tests for release_stall_alerts — managed promotion and deploy-failed checks.
 
 Covers:
-  * _check_version_managed_check_wait_stall — threshold gate (no fire before 20 min),
-    first-fire WARNING, escalation to ERROR after 2h, re-alert suppression within the
-    20-min re-alert interval.
-  * _check_version_auto_merge_stall — SKIPS versions in managed_check_wait sub-state
-    (those are handled by the dedicated MCW checker with a much shorter threshold).
+  * _check_version_managed_check_wait_stall — threshold gate, first-fire WARNING,
+    escalation to ERROR, and re-alert suppression within the shared interval.
   * _alert_promotion_deploy_failed — first-fire creates ERROR alert, reason codes, idempotency.
   * _resolve_promotion_deploy_failed_alert — no-op when none open, dismisses open alert, idempotent.
 """
@@ -24,7 +21,6 @@ from app.release_stall_alerts import (
     _MANAGED_CHECK_WAIT_STALL_CRITICAL_SECONDS,
     _MANAGED_CHECK_WAIT_STALL_SECONDS,
     _alert_promotion_deploy_failed,
-    _check_version_auto_merge_stall,
     _check_version_managed_check_wait_stall,
     _deploy_failed_alert_title,
     _resolve_promotion_deploy_failed_alert,
@@ -62,10 +58,7 @@ def _mcw_qual(
     pending: dict = {
         "pr_number": 99,
         "pr_url": "https://github.com/acme/widget/pull/99",
-        "auto_merge_enabled": False,
-        "migration_carrying": True,
         "managed_check_wait": True,
-        "why_not_native_automerge": "migration_guard_deferred",
         "enabled_at": enabled_at,
         "ci_state": "pending",
     }
@@ -88,7 +81,7 @@ def _mcw_qual(
 
 @pytest.mark.asyncio
 async def test_mcw_stall_does_not_fire_before_threshold(db_session):
-    """No alert fires when the managed_check_wait sub-state is under 20 min old."""
+    """No alert fires before the managed-wait threshold."""
     _project, version = await _make_project_and_version(db_session)
     version.last_qualification = _mcw_qual(
         enabled_seconds_ago=_MANAGED_CHECK_WAIT_STALL_SECONDS - 60
@@ -114,7 +107,7 @@ async def test_mcw_stall_does_not_fire_before_threshold(db_session):
 
 @pytest.mark.asyncio
 async def test_mcw_stall_fires_warning_at_threshold(db_session):
-    """After 20 min a WARNING-severity alert fires and mcw_last_alerted_at is stamped."""
+    """At the threshold a WARNING alert fires and stamps the dedup anchor."""
     _project, version = await _make_project_and_version(db_session)
     version.last_qualification = _mcw_qual(
         enabled_seconds_ago=_MANAGED_CHECK_WAIT_STALL_SECONDS + 60
@@ -138,7 +131,7 @@ async def test_mcw_stall_fires_warning_at_threshold(db_session):
     )
     assert len(alerts) == 1
     assert alerts[0].severity == AlertSeverity.WARNING
-    assert "managed_check_wait" in alerts[0].title.lower()
+    assert "promotion check wait" in alerts[0].title.lower()
 
     await db_session.refresh(version)
     pending = version.last_qualification["promotion_pending"]
@@ -147,8 +140,43 @@ async def test_mcw_stall_fires_warning_at_threshold(db_session):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("raw_enabled_at", [None, "bad-clock"])
+async def test_mcw_stall_repairs_missing_or_invalid_clock(
+    db_session, raw_enabled_at
+):
+    _project, version = await _make_project_and_version(db_session)
+    started_at = (
+        _utcnow() - timedelta(seconds=_MANAGED_CHECK_WAIT_STALL_SECONDS + 60)
+    ).isoformat()
+    pending = {
+        "pr_number": 42,
+        "pr_url": "https://github.com/acme/widget/pull/42",
+    }
+    if raw_enabled_at is not None:
+        pending["enabled_at"] = raw_enabled_at
+    version.last_qualification = {
+        "status": "pending",
+        "started_at": started_at,
+        "candidate_sha": "abcd" * 10,
+        "promotion_pending": pending,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    fired = await _check_version_managed_check_wait_stall(db_session, version)
+    await db_session.commit()
+
+    assert fired is True
+    await db_session.refresh(version)
+    canonical = version.last_qualification["promotion_pending"]
+    assert canonical["enabled_at"] == started_at
+    assert canonical["managed_check_wait"] is True
+
+
+@pytest.mark.asyncio
 async def test_mcw_stall_escalates_to_error_after_critical_threshold(db_session):
-    """After 2h (_MANAGED_CHECK_WAIT_STALL_CRITICAL_SECONDS) the alert severity escalates to ERROR."""
+    """At the critical threshold the alert severity escalates to ERROR."""
     _project, version = await _make_project_and_version(db_session)
     version.last_qualification = _mcw_qual(
         enabled_seconds_ago=_MANAGED_CHECK_WAIT_STALL_CRITICAL_SECONDS + 60
@@ -176,7 +204,7 @@ async def test_mcw_stall_escalates_to_error_after_critical_threshold(db_session)
 
 @pytest.mark.asyncio
 async def test_mcw_stall_suppressed_within_realert_interval(db_session):
-    """A second call within the 20-min re-alert window returns False (no duplicate alert)."""
+    """A second call within the re-alert window returns False."""
     _project, version = await _make_project_and_version(db_session)
     version.last_qualification = _mcw_qual(
         enabled_seconds_ago=_MANAGED_CHECK_WAIT_STALL_SECONDS + 120,
@@ -203,7 +231,7 @@ async def test_mcw_stall_suppressed_within_realert_interval(db_session):
 
 @pytest.mark.asyncio
 async def test_mcw_stall_refires_after_realert_interval(db_session):
-    """A second call AFTER the 20-min re-alert window fires again and increments alert_count."""
+    """A call after the re-alert window fires and increments alert_count."""
     _project, version = await _make_project_and_version(db_session)
     version.last_qualification = _mcw_qual(
         enabled_seconds_ago=_MANAGED_CHECK_WAIT_STALL_SECONDS + 120,
@@ -224,43 +252,6 @@ async def test_mcw_stall_refires_after_realert_interval(db_session):
 
     await db_session.refresh(version)
     assert version.last_qualification["promotion_pending"]["mcw_alert_count"] == 2
-
-
-# ---------------------------------------------------------------------------
-# _check_version_auto_merge_stall — must skip managed_check_wait versions
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_auto_merge_stall_skips_managed_check_wait(db_session, mocker):
-    """_check_version_auto_merge_stall returns False without creating an alert when
-    the pending sub-state has managed_check_wait=True (handled by the MCW checker)."""
-    mocker.patch(
-        "app.release_stall_alerts._release_qualifier_module",
-        return_value=rq,
-    )
-    _project, version = await _make_project_and_version(db_session)
-    # Use a very old enabled_at so the auto-merge threshold would fire if MCW weren't skipped.
-    version.last_qualification = _mcw_qual(
-        enabled_seconds_ago=rq._AUTO_MERGE_STALL_SECONDS + 3600
-    )
-    db_session.add(version)
-    await db_session.commit()
-    await db_session.refresh(version)
-
-    fired = await _check_version_auto_merge_stall(db_session, version)
-    assert fired is False
-
-    alerts = (
-        (
-            await db_session.execute(
-                select(Alert).where(Alert.project_id == version.project_id)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    assert len(alerts) == 0
 
 
 # ---------------------------------------------------------------------------

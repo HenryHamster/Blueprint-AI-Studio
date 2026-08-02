@@ -254,7 +254,7 @@ async def test_agent_claim_surfaces_reserved_migration_revision(
 
 @pytest.mark.asyncio
 async def test_agent_claim_fix_task_inherits_reservation_via_original_task_id(
-    client: AsyncClient, db_session
+    client: AsyncClient, db_session, mocker
 ):
     """A fix task inherits the create task's reservation in the real spawn topology.
 
@@ -267,7 +267,12 @@ async def test_agent_claim_fix_task_inherits_reservation_via_original_task_id(
     """
     from app.models import MigrationReservation, MigrationReservationStatus
 
-    project = Project(name="Agent Claim Fix Inherit", user_id="test-user-123")
+    project = Project(
+        name="Agent Claim Fix Inherit",
+        user_id="test-user-123",
+        github_owner="owner",
+        github_repo="repo",
+    )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
@@ -312,6 +317,16 @@ async def test_agent_claim_fix_task_inherits_reservation_via_original_task_id(
                 "original_task_id": str(create_task.id),
             }
         ],
+        context={
+            "review_loop": {
+                "fix_target": {
+                    "project_id": str(project.id),
+                    "pr_number": 42,
+                    "base_sha": "base-42",
+                    "head_sha": "head-42",
+                }
+            }
+        },
         parent_task_id=plan_task.id,
         vm_instance_id="agent-vm-fix-inherit",
     )
@@ -323,6 +338,22 @@ async def test_agent_claim_fix_task_inherits_reservation_via_original_task_id(
     # fix task has no reservation of its own.
     assert fix_task.parent_task_id == plan_task.id
     assert fix_task.parent_task_id != create_task.id
+
+    mocker.patch(
+        "app.review_claim_fence.get_github_token_for_task",
+        new=AsyncMock(return_value=("token", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.review_claim_fence.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "base": {"sha": "base-42"},
+                "head": {"sha": "head-42"},
+            }
+        ),
+    )
 
     token = create_agent_token(str(fix_task.id), "agent-vm-fix-inherit")
     resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
@@ -336,7 +367,7 @@ async def test_agent_claim_fix_task_inherits_reservation_via_original_task_id(
 
 @pytest.mark.asyncio
 async def test_agent_claim_review_task_inherits_reservation_via_review_loop_context(
-    client: AsyncClient, db_session
+    client: AsyncClient, db_session, mocker
 ):
     """A review task inherits the reservation via context.review_loop.original_task_id.
 
@@ -346,7 +377,12 @@ async def test_agent_claim_review_task_inherits_reservation_via_review_loop_cont
     """
     from app.models import MigrationReservation, MigrationReservationStatus
 
-    project = Project(name="Agent Claim Review Inherit", user_id="test-user-123")
+    project = Project(
+        name="Agent Claim Review Inherit",
+        user_id="test-user-123",
+        github_owner="owner",
+        github_repo="repo",
+    )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
@@ -378,13 +414,39 @@ async def test_agent_claim_review_task_inherits_reservation_via_review_loop_cont
     review_task = Task(
         project_id=project.id,
         payloads=[{"type": "review", "pr_number": 7}],
-        context={"review_loop": {"original_task_id": str(create_task.id)}},
+        context={
+            "review_loop": {
+                "original_task_id": str(create_task.id),
+                "review_target": {
+                    "project_id": str(project.id),
+                    "pr_number": 7,
+                    "base_sha": "base-7",
+                    "head_sha": "head-7",
+                },
+            }
+        },
         parent_task_id=plan_task.id,
         vm_instance_id="agent-vm-review-inherit",
     )
     db_session.add(review_task)
     await db_session.commit()
     await db_session.refresh(review_task)
+
+    mocker.patch(
+        "app.review_claim_fence.get_github_token_for_task",
+        new=AsyncMock(return_value=("token", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.review_claim_fence.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "base": {"sha": "base-7"},
+                "head": {"sha": "head-7"},
+            }
+        ),
+    )
 
     token = create_agent_token(str(review_task.id), "agent-vm-review-inherit")
     resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
@@ -394,6 +456,61 @@ async def test_agent_claim_review_task_inherits_reservation_via_review_loop_cont
         "provisional_revision": "0211",
         "provisional_down_revision": "0209",
     }
+
+
+@pytest.mark.asyncio
+async def test_pr_review_idempotent_claim_replay_rechecks_live_fence(
+    client: AsyncClient, db_session, mocker
+):
+    project = Project(
+        name="PR claim replay fence",
+        user_id="test-user-123",
+        github_owner="owner",
+        github_repo="repo",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    target = {
+        "project_id": str(project.id),
+        "pr_number": 8,
+        "base_sha": "base-8",
+        "head_sha": "head-8",
+    }
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "review", "pr_number": 8}],
+        context={"review_loop": {"review_target": target}},
+        vm_instance_id="agent-vm-pr-replay",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    mocker.patch(
+        "app.review_claim_fence.get_github_token_for_task",
+        new=AsyncMock(return_value=("token", "owner", "repo")),
+    )
+    live_mock = mocker.patch(
+        "app.review_claim_fence.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "base": {"sha": "base-8"},
+                "head": {"sha": "head-8"},
+            }
+        ),
+    )
+    token = create_agent_token(str(task.id), "agent-vm-pr-replay")
+    headers = {"x-agent-token": token}
+
+    first = await client.post("/api/agent/claim", headers=headers)
+    replay = await client.post("/api/agent/claim", headers=headers)
+
+    assert first.status_code == 200
+    assert replay.status_code == 200
+    assert replay.json()["task_id"] == str(task.id)
+    assert live_mock.await_count == 2
 
 
 @pytest.mark.asyncio

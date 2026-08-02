@@ -210,9 +210,8 @@ GET/PATCH config pattern as `integration-branch` and `promotion-target`:
   metacharacters — or the request returns `422`.
 
 Writes take effect for agents **immediately** through the existing task-claim
-response seam, with no agent-side change: the agent's fresh-reviewer escalates
-review effort when a sensitive path is touched, and the PR merge path requires
-human approval before merging changes to those files.
+response seam. The review and PR merge paths require human approval before
+merging changes to configured sensitive files.
 
 Blueprint's own self-repo is seeded with default infra/critical file lists by
 Alembic migration `0120_seed_self_repo_approval_gate_config.py` (only where

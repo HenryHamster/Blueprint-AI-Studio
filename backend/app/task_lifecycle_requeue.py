@@ -486,6 +486,24 @@ async def _requeue_parent_task(
         if child.status != TaskStatus.FAILED:
             continue
 
+        # Review/fix rows are PR-control-plane work, not generic plan children.
+        # Cloning them here bypasses exact-target admission and even rewrites an
+        # existing PR's base branch to the parent staging branch.  Leave the
+        # failed evidence in place; review authority/pipeline recovery re-drives
+        # current-target work through the canonical repo/PR boundary.
+        child_payload = child.first_payload
+        if (
+            child_payload.get("type") in {"review", "fix"}
+            and child_payload.get("pr_number")
+        ):
+            logger.info(
+                "[REQUEUE] Skipping generic clone of PR %s task %s; "
+                "canonical review pipeline must re-drive it",
+                child_payload.get("type"),
+                child.id,
+            )
+            continue
+
         # Skip children that hit the review-fix cap: their PR is auto-closed and
         # marked terminal by _handle_cap_exhaustion. Cloning would spawn a fresh
         # create task + fresh PR, which typically re-hits the same merge conflict

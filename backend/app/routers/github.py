@@ -638,6 +638,7 @@ async def github_webhook(
                             pr_title=pr_title,
                             project_id=auto_review_project.id,
                             config=auto_review_config,
+                            webhook_pr=pr_data,
                         )
                         return {"status": "auto_review_triggered"}
 
@@ -892,6 +893,7 @@ async def github_webhook(
                     gh_repo,
                     session,
                     source="webhook",
+                    checked_head_sha=head_sha,
                 )
                 logger.info(
                     f"[WEBHOOK] CI completed for {head_sha[:8]} — handled task {task.id} via webhook"

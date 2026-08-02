@@ -1,8 +1,9 @@
-"""Modularity tripwire + smoke tests for ``app.findings_index``.
+"""Modularity tripwire + smoke tests for findings services.
 
-The read-only findings-index query surface (``lookup_findings_by_source_ref``,
-``query_findings_index``, ``_shelve_findings_for_next_cycle``) was extracted
-from ``app.research_completion`` into ``app.findings_index``.
+The read-only query surface (``lookup_findings_by_source_ref`` and
+``query_findings_index``) lives in ``app.findings_index``. The mutating
+``_shelve_findings_for_next_cycle`` recovery helper lives in
+``app.findings_shelving``.
 ``research_completion`` re-exports each symbol so the seven external importers
 that historically did ``from app.research_completion import ...`` keep working
 (and so ``test_memo_exit_e2e`` can still monkeypatch
@@ -12,8 +13,8 @@ This tripwire mirrors ``test_orchestrator_modularity.py``'s facade contract:
 
   1. Each extracted symbol is NOT re-defined at module top-level inside
      ``research_completion.py`` (re-export imports are allowed/expected).
-  2. Each symbol IS importable from BOTH ``app.research_completion`` and
-     ``app.findings_index`` and resolves to the SAME object.
+  2. Each symbol IS importable from its canonical module and
+     ``app.research_completion`` and resolves to the SAME object.
 """
 
 from __future__ import annotations
@@ -29,11 +30,12 @@ RESEARCH_COMPLETION_PATH = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "app", "research_completion.py")
 )
 
-EXTRACTED_SYMBOLS = (
-    "lookup_findings_by_source_ref",
-    "query_findings_index",
-    "_shelve_findings_for_next_cycle",
-)
+EXTRACTED_SYMBOL_MODULES = {
+    "lookup_findings_by_source_ref": "app.findings_index",
+    "query_findings_index": "app.findings_index",
+    "_shelve_findings_for_next_cycle": "app.findings_shelving",
+}
+EXTRACTED_SYMBOLS = tuple(EXTRACTED_SYMBOL_MODULES)
 
 
 def _top_level_definitions(source: str) -> dict[str, str]:
@@ -74,22 +76,23 @@ class TestExtractedSymbolsNotRedefinedInResearchCompletion:
         ]
         assert not violations, (
             "research_completion.py re-defines symbols extracted to "
-            "app.findings_index. This shadows the canonical implementation "
+            "their canonical findings modules. This shadows the implementation "
             "and re-grows the module.\n\nRe-defined symbols:\n"
             + "\n".join(violations)
-            + "\n\nFix: keep the definition in app.findings_index and "
-            "re-export it via `from app.findings_index import <name>  # noqa: F401`."
+            + "\n\nFix: keep each definition in its canonical findings module and "
+            "re-export it from research_completion with an import."
         )
 
 
 class TestExtractedSymbolsImportableFromBothModules:
     @pytest.mark.parametrize("symbol", EXTRACTED_SYMBOLS)
     def test_symbol_importable_and_identical(self, symbol: str):
-        canonical = importlib.import_module("app.findings_index")
+        canonical_name = EXTRACTED_SYMBOL_MODULES[symbol]
+        canonical = importlib.import_module(canonical_name)
         facade = importlib.import_module("app.research_completion")
 
         assert hasattr(canonical, symbol), (
-            f"app.findings_index.{symbol} is missing — the extraction "
+            f"{canonical_name}.{symbol} is missing — the extraction "
             f"target lost a symbol."
         )
         assert hasattr(facade, symbol), (
@@ -99,7 +102,7 @@ class TestExtractedSymbolsImportableFromBothModules:
         )
         assert getattr(canonical, symbol) is getattr(facade, symbol), (
             f"app.research_completion.{symbol} is not the same object as "
-            f"app.findings_index.{symbol} — the facade must re-export, not "
+            f"{canonical_name}.{symbol} — the facade must re-export, not "
             f"re-implement."
         )
 
@@ -122,7 +125,10 @@ class TestQueryFindingsIndexSmoke:
         task = MagicMock()
         task.id = "t-1"
         task.status = TaskStatus.COMPLETED
-        task.context = {"direction_id": "d-1"}
+        task.context = {
+            "direction_id": "d-1",
+            "research_findings_finalized": True,
+        }
         task.created_at = None
         task.first_payload = {"type": "research"}
         task.plan_output = [
@@ -149,7 +155,10 @@ class TestQueryFindingsIndexSmoke:
         task = MagicMock()
         task.id = "t-2"
         task.status = TaskStatus.COMPLETED
-        task.context = {"direction_id": "d-2"}
+        task.context = {
+            "direction_id": "d-2",
+            "research_findings_finalized": True,
+        }
         task.created_at = None
         task.first_payload = {"type": "research"}
         task.plan_output = [
@@ -175,7 +184,10 @@ class TestQueryFindingsIndexSmoke:
         task = MagicMock()
         task.id = "t-3"
         task.status = TaskStatus.COMPLETED
-        task.context = {"direction_id": "d-3"}
+        task.context = {
+            "direction_id": "d-3",
+            "research_findings_finalized": True,
+        }
         task.created_at = None
         task.first_payload = {"type": "research"}
         task.plan_output = [
@@ -209,7 +221,10 @@ class TestQueryFindingsIndexSmoke:
         task = MagicMock()
         task.id = "t-ch1"
         task.status = TaskStatus.COMPLETED
-        task.context = {"direction_id": "d-ch"}
+        task.context = {
+            "direction_id": "d-ch",
+            "research_findings_finalized": True,
+        }
         task.created_at = None
         task.first_payload = {"type": "research"}
         task.plan_output = [
@@ -246,7 +261,10 @@ class TestQueryFindingsIndexSmoke:
         task = MagicMock()
         task.id = "t-no-ch"
         task.status = TaskStatus.COMPLETED
-        task.context = {"direction_id": "d-no-ch"}
+        task.context = {
+            "direction_id": "d-no-ch",
+            "research_findings_finalized": True,
+        }
         task.created_at = None
         task.first_payload = {"type": "research"}
         task.plan_output = [
@@ -269,7 +287,10 @@ class TestQueryFindingsIndexSmoke:
             t = MagicMock()
             t.id = task_id
             t.status = TaskStatus.COMPLETED
-            t.context = {"direction_id": "d-agr"}
+            t.context = {
+                "direction_id": "d-agr",
+                "research_findings_finalized": True,
+            }
             t.created_at = None
             t.first_payload = {"type": "research"}
             t.plan_output = [
@@ -308,7 +329,10 @@ class TestQueryFindingsIndexSmoke:
         task = MagicMock()
         task.id = "t-trunc"
         task.status = TaskStatus.COMPLETED
-        task.context = {"direction_id": "d-trunc"}
+        task.context = {
+            "direction_id": "d-trunc",
+            "research_findings_finalized": True,
+        }
         task.created_at = None
         task.first_payload = {"type": "research"}
         task.plan_output = [
@@ -327,3 +351,66 @@ class TestQueryFindingsIndexSmoke:
         rows = await query_findings_index(session, "proj-trunc")
         assert len(rows) == 1
         assert len(rows[0]["challenge_summary"]["reason"]) == 200
+
+    @pytest.mark.asyncio
+    async def test_raw_completed_plan_output_is_not_indexed(self):
+        """A pre-gate/legacy plan must not revive a rejected finding."""
+        from app.findings_index import query_findings_index
+        from app.models import TaskStatus
+
+        task = MagicMock()
+        task.id = "t-raw"
+        task.status = TaskStatus.COMPLETED
+        task.context = {"direction_id": "d-raw"}
+        task.created_at = None
+        task.first_payload = {"type": "research"}
+        task.plan_output = [
+            {
+                "title": "Refuted raw finding",
+                "description": "must remain dead",
+                "_adversarial_verdict": "fail",
+            }
+        ]
+
+        rows = await query_findings_index(self._mock_session([task]), "proj-raw")
+
+        assert rows == []
+
+    @pytest.mark.asyncio
+    async def test_source_lookup_uses_same_finalized_gate(self):
+        from app.findings_index import lookup_findings_by_source_ref
+        from app.models import TaskStatus
+
+        raw = MagicMock()
+        raw.id = "t-source-raw"
+        raw.status = TaskStatus.COMPLETED
+        raw.context = {"direction_id": "d-source"}
+        raw.created_at = None
+        raw.first_payload = {"type": "research"}
+        raw.plan_output = [
+            {
+                "title": "Rejected source finding",
+                "sources": [{"type": "file", "ref": "backend/app/target.py"}],
+            }
+        ]
+        accepted = MagicMock()
+        accepted.id = "t-source-final"
+        accepted.status = TaskStatus.COMPLETED
+        accepted.context = {
+            "direction_id": "d-source",
+            "research_findings_finalized": True,
+        }
+        accepted.created_at = None
+        accepted.first_payload = {"type": "research"}
+        accepted.plan_output = [
+            {
+                "title": "Accepted source finding",
+                "sources": [{"type": "file", "ref": "backend/app/target.py"}],
+            }
+        ]
+
+        rows = await lookup_findings_by_source_ref(
+            self._mock_session([raw, accepted]), "proj-source", "backend/app/target.py"
+        )
+
+        assert [row["finding_title"] for row in rows] == ["Accepted source finding"]

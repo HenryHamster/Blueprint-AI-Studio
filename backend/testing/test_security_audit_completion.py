@@ -42,10 +42,6 @@ def _quiet_audit_io(mocker):
         "app.task_completion.broadcast_to_project", new=AsyncMock(return_value=None)
     )
     mocker.patch(
-        "app.task_completion._maybe_release_safeguard_gate",
-        new=AsyncMock(return_value=None),
-    )
-    mocker.patch(
         "app.task_completion.get_github_token_for_task",
         new=AsyncMock(return_value=("tok", "owner", "repo")),
     )

@@ -396,15 +396,15 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
         if ci_loop.get("merge_rule_blocked"):
             await session.rollback()
             continue  # Merge blocked by branch protection — requires manual intervention
-        # C5: skip approval/safeguard-gated rows while the gate is set
-        # (and gates are enabled). handle_ci_completion ->
+        # Skip approval-gated rows while the gate is set (and gates are
+        # enabled). handle_ci_completion ->
         # _attempt_merge_with_retry_and_escalation now re-checks
         # requires_approval and refuses to merge, so polling a gated
         # row would just churn GitHub I/O every cycle for no progress.
-        # The merge resumes once the safeguard/operator clears the flag
-        # (which also re-arms ci_waiting). With gates OFF the flag is
+        # The merge resumes once the operator clears the flag. With gates OFF
+        # the flag is
         # advisory only, so do not skip. This is the orchestrator-side
-        # half of the merge-call invariant (cluster C5 fix #2).
+        # half of the merge-call invariant.
         if ci_task.requires_approval and _runtime_config.get(
             "require_approval_gates", True
         ):
@@ -2910,6 +2910,8 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                 ci_repo,
                 session,
                 source="poll",
+                checked_head_sha=ci_head_sha,
+                checked_base_sha=(pr_data.get("base") or {}).get("sha") or "",
             )
         except Exception as e:
             # ci_task may be expired after handle_ci_completion's

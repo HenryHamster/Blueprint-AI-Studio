@@ -319,7 +319,6 @@ DIGEST_PAYLOAD_METRIC_MANIFEST: dict[str, dict] = {
     "self_review_skip_rate": {"consumer": "CatchUpReviewQualitySection"},
     "sr_disallowed_blind_spot_rate": {"consumer": "ReviewQualitySection"},
     "review_accuracy": {"consumer": "CatchUpReviewQualitySection"},
-    "fresh_reviewer_effectiveness": {"consumer": "CatchUpReviewQualitySection"},
     "edges_trend": {"consumer": "ReviewQualitySection"},
     "rejection_pattern_summary": {
         "consumer": "RejectionPatternSummary, CatchUpCostDiagnosticsSection"
@@ -1507,11 +1506,6 @@ async def _compute_digest(
     # --- Latest strategic cycle + prediction calibration ---
     latest_cycle = None
     prediction_calibration: Dict[str, Any] | None = None
-    # Retired: fresh_reviewer_trend digest emission — the computation stays live
-    # (sr_reviewer_trends.compute_fresh_reviewer_trend persists it to
-    # project.design_doc, and pipeline_health.py emits it on its own surface),
-    # but the digest-payload copy had no named reader (no UI component renders
-    # digest.fresh_reviewer_trend). Removed to satisfy the consumer invariant.
     edges_trend: Optional[Dict[str, Any]] = None
     self_review_prediction_accuracy_trends: Optional[Dict[str, Any]] = None
     sr_regression_risk_test_signal_trends: Optional[Dict[str, Any]] = None
@@ -1600,9 +1594,6 @@ async def _compute_digest(
                 for c in _sc_history
                 if c.get("outcome") not in (None, "in_progress")
             ]
-            # Retired: fresh_reviewer_trend extraction from design_doc — its digest
-            # payload key had no named reader (see retirement note above). The
-            # underlying design_doc["fresh_reviewer_trend"] persistence is untouched.
             # Edges-considered cycle-over-cycle trend persisted by compute_edges_trend.
             _et = (
                 await _read_telemetry_or_doc(
@@ -2136,10 +2127,8 @@ async def _compute_digest(
         "self_review_skip_rate": _self_review_skip_rate,
         "sr_disallowed_blind_spot_rate": _sr_disallowed_blind_spot_rate,
         "review_accuracy": _review_quality["review_accuracy"],
-        "fresh_reviewer_effectiveness": _review_quality["fresh_reviewer_effectiveness"],
-        # Retired: fresh_reviewer_trend / edges_considered_metrics digest keys —
-        # both were emitted without a named reader (no UI component reads them;
-        # edges_trend below IS consumed by ReviewQualitySection and stays). The
+        # Retired: edges_considered_metrics digest key was emitted without a
+        # named reader (edges_trend below IS consumed by ReviewQualitySection).
         # _compute_edges_considered_metrics computation remains live (used by
         # pipeline_health.py and re-exported for external importers).
         "edges_trend": edges_trend,

@@ -46,7 +46,9 @@ import {
   buildSurfaceCatalog, nextFocus, classifyTickOutcome, openFoundLeads, parseTickVerdict,
   classifyOperatorDecisionReview, mergePendingOperatorDecisionReview,
   retainPendingOperatorDecisionReview, advancePendingOperatorDecisionReview, MAX_REVIEW_ATTEMPTS,
-  shouldRunAutonomousTurn, EXAM_RECORDS_CAP, FOCUS_LIST_SIZE,
+  shouldRunAutonomousTurn, actionableFiredWatchRevision, wakeBarrierRevision,
+  hasPendingOwnedWork,
+  EXAM_RECORDS_CAP, FOCUS_LIST_SIZE,
   serializeLedger, restoreLedger, refreshSurfaceCatalog,
   compactionThreshold, formatDirectionGroundingText, buildCompactionCheckpoint,
   decisionsRegisterText, DECISIONS_REGISTER_CAP, isSettledDecisionVerdict, admitDecisionEntry,
@@ -58,7 +60,8 @@ import {
   type CompactionCheckpointContext, type DecisionsRegisterEntry,
   type PendingOperatorDecisionReview,
   type CheckpointGrounding, type CheckpointStateResponse,
-  type StrategicWatchReceipt, type ResidentActivityUpdate,
+  type StrategicWatchReceipt, type ResidentWakeBarrierReceipt,
+  type ResidentActivityUpdate,
 } from './strategic-resident-lib.js';
 import {
   formatResidentRepoSnapshot,
@@ -1296,15 +1299,20 @@ export async function handleStrategicResident(
   };
   // An operator turn just completed → run an autonomous turn to act on it.
   let operatorTurnJustCompleted = false;
-  // Pacing state for shouldRunAutonomousTurn: 0 = never run (floor fires first).
+  // Pacing state for shouldRunAutonomousTurn: 0 = never run (first turn fires immediately).
   let lastAutonomousTurnAt = 0;
   let lastAutonomousWorkStateRev: string | null = null;
+  let lastAutonomousFiredWatchRev = '';
   // Latest work_state_rev observed on a heartbeat (undefined until the backend
-  // that populates it lands — absence degrades to floor-tick pacing).
+  // that populates it lands — absence degrades to sparse exploration pacing).
   let currentWorkStateRev: string | null = null;
+  let currentWorkStateSummary: Record<string, unknown> | null = null;
   // Exact task-completion receipts returned by the heartbeat. They remain in
   // autonomous prompts until the backend observes an explicit ack-watch.
   let firedStrategicWatches: StrategicWatchReceipt[] = [];
+  // Exact server-authored outcome barriers. A completed autonomous turn sends
+  // their ids back as handled; interrupted turns deliberately leave them open.
+  let firedResidentBarriers: ResidentWakeBarrierReceipt[] = [];
   // Pacing for the "watching" ephemeral status line emitted while gated-idle so
   // deliberate quiet looks different from a dark/crashed session.
   let lastWatchingEmitAt = 0;
@@ -2248,9 +2256,21 @@ export async function handleStrategicResident(
     if (typeof resp.work_state_rev === 'string') {
       currentWorkStateRev = resp.work_state_rev;
     }
+    if (
+      resp.work_state_summary !== null
+      && typeof resp.work_state_summary === 'object'
+      && !Array.isArray(resp.work_state_summary)
+    ) {
+      currentWorkStateSummary = resp.work_state_summary;
+    }
     if (Array.isArray(resp.fired_watches)) {
       firedStrategicWatches = resp.fired_watches.filter(
         (watch): watch is StrategicWatchReceipt => typeof watch.id === 'string',
+      );
+    }
+    if (Array.isArray(resp.fired_barriers)) {
+      firedResidentBarriers = resp.fired_barriers.filter(
+        (barrier): barrier is ResidentWakeBarrierReceipt => typeof barrier.id === 'string',
       );
     }
     if (Array.isArray(resp.active_direction_ids)) {
@@ -4718,24 +4738,36 @@ export async function handleStrategicResident(
         continue;
       }
 
-      // 2. Autonomous path: state-gated so ticks fire on real signals rather than
-      // loop speed. Run when the world moved (heartbeat work_state_rev differs
-      // from the rev at the last turn), the agent declared more work
-      // (AGENDA-CONTINUE), an operator turn just completed, or the floor tick
-      // elapsed. Otherwise wait like passive mode — no self-prompt against
-      // unchanged state.
+      // 2. Autonomous path: state-gated so turns fire on real signals rather
+      // than loop speed. A pending task/watch frontier suppresses unchanged-state
+      // exploration: heartbeats wait cheaply until a blocker, failure, drained barrier,
+      // exact watch receipt, or operator decision makes another turn actionable.
+      const currentFiredWatchRev = [
+        actionableFiredWatchRevision(
+          firedStrategicWatches,
+          currentWorkStateSummary,
+        ),
+        wakeBarrierRevision(firedResidentBarriers),
+      ].join('#');
+      const ownedWorkPending = hasPendingOwnedWork(currentWorkStateSummary);
       if (!shouldRunAutonomousTurn({
         currentWorkStateRev,
         lastTurnWorkStateRev: lastAutonomousWorkStateRev,
         previousTurnAgendaContinue,
+        followupTurnPending: correctiveNextTick || operatorDecisionReview !== null,
         operatorTurnJustCompleted,
+        currentFiredWatchRev,
+        lastTurnFiredWatchRev: lastAutonomousFiredWatchRev,
+        ownedWorkPending,
         msSinceLastAutonomousTurn: lastAutonomousTurnAt === 0
           ? Number.POSITIVE_INFINITY : Date.now() - lastAutonomousTurnAt,
-        floorTickMs: cfg.minTickMs,
+        explorationIntervalMs: cfg.explorationIntervalMs,
       })) {
-        const nextReviewAt = lastAutonomousTurnAt === 0
+        const nextReviewAt = ownedWorkPending
+          ? null
+          : lastAutonomousTurnAt === 0
           ? new Date().toISOString()
-          : new Date(lastAutonomousTurnAt + cfg.minTickMs).toISOString();
+          : new Date(lastAutonomousTurnAt + cfg.explorationIntervalMs).toISOString();
         setResidentActivity(
           'waiting',
           'Watching for task, project, or operator movement',
@@ -4750,12 +4782,14 @@ export async function handleStrategicResident(
           if (msSinceWatching >= cfg.idleTickMs * 2) {
             const rawInFlight = hb?.work_state_summary?.in_flight;
             const inFlight = typeof rawInFlight === 'number' ? rawInFlight : null;
-            const msUntilFloor = lastAutonomousTurnAt === 0
+            const msUntilExploration = lastAutonomousTurnAt === 0
               ? 0
-              : Math.max(0, cfg.minTickMs - (Date.now() - lastAutonomousTurnAt));
-            const nextReview = msUntilFloor < 60_000
+              : Math.max(0, cfg.explorationIntervalMs - (Date.now() - lastAutonomousTurnAt));
+            const nextReview = ownedWorkPending
+              ? 'on an actionable state change'
+              : msUntilExploration < 60_000
               ? 'soon'
-              : `~${Math.round(msUntilFloor / 60_000)}min`;
+              : `~${Math.round(msUntilExploration / 60_000)}min`;
             const taskNote = inFlight !== null ? `${inFlight} task${inFlight === 1 ? '' : 's'} in flight; ` : '';
             streamer.status(`watching — ${taskNote}next review ${nextReview} or on state change`);
             lastWatchingEmitAt = Date.now();
@@ -4821,6 +4855,7 @@ export async function handleStrategicResident(
           decisionsRegisterText(decisionsReg),
           reviewForTurn ?? false,
           firedStrategicWatches,
+          firedResidentBarriers,
         ),
         false,
         null,
@@ -5018,15 +5053,34 @@ export async function handleStrategicResident(
         r.appliedStrategicOp
           ? 'Strategic progress recorded; watching for movement'
           : 'Review complete; watching for movement',
-        new Date(lastAutonomousTurnAt + cfg.minTickMs).toISOString(),
+        hasPendingOwnedWork(currentWorkStateSummary)
+          ? null
+          : new Date(lastAutonomousTurnAt + cfg.explorationIntervalMs).toISOString(),
       );
-      const hb = await heartbeat(r.appliedStrategicOp && authorityHeld);
+      const consumedBarrierIds = turnInterrupted
+        ? undefined
+        : firedResidentBarriers.map((barrier) => barrier.id);
+      const hb = await heartbeat(
+        r.appliedStrategicOp && authorityHeld,
+        consumedBarrierIds,
+      );
       // Record the pacing baseline AFTER the post-turn heartbeat so the loop's own
       // writes are already folded into the rev we compare against next iteration.
       // Recording it pre-turn would leave lastAutonomousWorkStateRev behind the
       // heartbeat's updated currentWorkStateRev, causing the gate to fire again on
       // the loop's own applied ops (self-echo).
       lastAutonomousWorkStateRev = currentWorkStateRev;
+      // An interrupted turn did not consume an exact watch agenda receipt; keep
+      // its prior baseline so the receipt immediately re-arms after preemption.
+      if (!turnInterrupted) {
+        lastAutonomousFiredWatchRev = [
+          actionableFiredWatchRevision(
+            firedStrategicWatches,
+            currentWorkStateSummary,
+          ),
+          wakeBarrierRevision(firedResidentBarriers),
+        ].join('#');
+      }
       if (hb?.stop_requested || watch.kind === 'stop') break;
 
       // Authority lapsed mid-turn ⇒ fall through to passive mode next iteration.

@@ -3759,205 +3759,6 @@ class TestConfirmAppliedPlaybookEntries:
 
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# review_is_high_stakes gate
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-def test_review_is_high_stakes_approve_trunk_large_diff():
-    """APPROVE on trunk with a large diff is high-stakes and should challenge."""
-    from app.task_evaluators import review_is_high_stakes
-
-    review_task = make_task(payloads=[{"type": "review"}])
-    result = review_is_high_stakes(
-        "APPROVE",
-        [],
-        [],
-        review_task,
-        base_branch="automain",
-        trunk_branches=("automain", "main"),
-        diff_non_test_lines=200,
-        diff_non_test_file_count=10,
-    )
-    assert result is True
-
-
-def test_review_is_high_stakes_approve_trunk_small_diff_skips():
-    """APPROVE on trunk with a trivially small diff should NOT trigger the challenge."""
-    from app.task_evaluators import review_is_high_stakes
-
-    review_task = make_task(payloads=[{"type": "review"}])
-    # 10 non-test lines, 1 non-test file — well below default thresholds (50 / 4)
-    result = review_is_high_stakes(
-        "APPROVE",
-        [],
-        [],
-        review_task,
-        base_branch="automain",
-        trunk_branches=("automain", "main"),
-        diff_non_test_lines=10,
-        diff_non_test_file_count=1,
-    )
-    assert result is False
-
-
-def test_review_is_high_stakes_approve_trunk_no_diff_info_challenges():
-    """When diff size is unknown (None), fail-open and still challenge."""
-    from app.task_evaluators import review_is_high_stakes
-
-    review_task = make_task(payloads=[{"type": "review"}])
-    result = review_is_high_stakes(
-        "APPROVE",
-        [],
-        [],
-        review_task,
-        base_branch="automain",
-        trunk_branches=("automain", "main"),
-        diff_non_test_lines=None,
-        diff_non_test_file_count=None,
-    )
-    assert result is True
-
-
-def test_review_is_high_stakes_request_changes_always_false():
-    """REQUEST_CHANGES is never high-stakes regardless of diff size."""
-    from app.task_evaluators import review_is_high_stakes
-
-    review_task = make_task(payloads=[{"type": "review"}])
-    result = review_is_high_stakes(
-        "REQUEST_CHANGES",
-        [],
-        [],
-        review_task,
-        base_branch="automain",
-        trunk_branches=("automain", "main"),
-        diff_non_test_lines=5,
-        diff_non_test_file_count=1,
-    )
-    assert result is False
-
-
-def test_review_is_high_stakes_approve_non_trunk_always_false():
-    """APPROVE on a non-trunk branch (e.g. research/) never triggers a challenge."""
-    from app.task_evaluators import review_is_high_stakes
-
-    review_task = make_task(payloads=[{"type": "review"}])
-    result = review_is_high_stakes(
-        "APPROVE",
-        [],
-        [],
-        review_task,
-        base_branch="research/foo",
-        trunk_branches=("automain", "main"),
-        diff_non_test_lines=5,
-        diff_non_test_file_count=1,
-    )
-    assert result is False
-
-
-def test_review_is_high_stakes_small_diff_at_exact_threshold():
-    """A diff at exactly the threshold (49 lines, 4 files) is exempt; at
-    exactly min_lines it is NOT exempt (< min_lines, not <=)."""
-    from app.task_evaluators import review_is_high_stakes
-
-    review_task = make_task(payloads=[{"type": "review"}])
-    # 49 lines, 4 files — below both defaults (50 / 4) → exempt
-    assert (
-        review_is_high_stakes(
-            "APPROVE",
-            [],
-            [],
-            review_task,
-            base_branch="automain",
-            trunk_branches=("automain",),
-            diff_non_test_lines=49,
-            diff_non_test_file_count=4,
-        )
-        is False
-    )
-    # 50 lines, 4 files — lines are NOT < 50 → high-stakes
-    assert (
-        review_is_high_stakes(
-            "APPROVE",
-            [],
-            [],
-            review_task,
-            base_branch="automain",
-            trunk_branches=("automain",),
-            diff_non_test_lines=50,
-            diff_non_test_file_count=4,
-        )
-        is True
-    )
-    # 49 lines, 5 files — files exceed max (> 4) → high-stakes
-    assert (
-        review_is_high_stakes(
-            "APPROVE",
-            [],
-            [],
-            review_task,
-            base_branch="automain",
-            trunk_branches=("automain",),
-            diff_non_test_lines=49,
-            diff_non_test_file_count=5,
-        )
-        is True
-    )
-
-
-def test_review_is_high_stakes_observable_behavior_overrides_small_diff():
-    """An observable_behavior task is always high-stakes regardless of diff size."""
-    from app.task_evaluators import review_is_high_stakes
-
-    review_task = make_task(payloads=[{"type": "review"}])
-    # Small diff with observable_behavior — should still be high-stakes
-    assert (
-        review_is_high_stakes(
-            "APPROVE",
-            [],
-            [],
-            review_task,
-            base_branch="automain",
-            trunk_branches=("automain", "main"),
-            diff_non_test_lines=10,
-            diff_non_test_file_count=1,
-            is_observable_behavior=True,
-        )
-        is True
-    )
-    # Same small diff without observable_behavior — exempt as usual
-    assert (
-        review_is_high_stakes(
-            "APPROVE",
-            [],
-            [],
-            review_task,
-            base_branch="automain",
-            trunk_branches=("automain", "main"),
-            diff_non_test_lines=10,
-            diff_non_test_file_count=1,
-            is_observable_behavior=False,
-        )
-        is False
-    )
-    # non-APPROVE with observable_behavior — still not high-stakes
-    # (only APPROVE triggers the challenge, even for observable_behavior)
-    assert (
-        review_is_high_stakes(
-            "REQUEST_CHANGES",
-            [],
-            [],
-            review_task,
-            base_branch="automain",
-            trunk_branches=("automain", "main"),
-            diff_non_test_lines=10,
-            diff_non_test_file_count=1,
-            is_observable_behavior=True,
-        )
-        is False
-    )
-
-
 @pytest.mark.asyncio
 async def test_spawn_forward_quality_grader_sets_sonnet_quality_tier(db_session):
     """spawn_forward_quality_grader must set quality_tier='sonnet' in the spawned
@@ -4064,10 +3865,6 @@ class TestHandleSecurityAuditCompletion:
             return_value=[],
         )
         mocker.patch("app.task_completion._runtime_config", {})
-        mocker.patch(
-            "app.task_completion._maybe_release_safeguard_gate",
-            new_callable=AsyncMock,
-        )
         if logs is None:
             logs = _SECURITY_AUDIT_FINDINGS_JSON
         await _handle_security_audit_completion(task, logs, db_session)
@@ -4415,27 +4212,52 @@ class TestWalkthroughE2ECompletionIngestsOrRemoved:
         await db_session.commit()
         await db_session.refresh(version)
 
-        # Create two active criteria for the project/version.
+        # Register the three canonical evidence criteria behind the frozen
+        # four-row v26 report (workday slug + meta row intentionally collapse).
         crit_a = await ac.create_criterion(
             db_session, project.id, version.id, "Runner enroll flow"
         )
+        crit_a.criterion_key = "c-dfdc9d82"
+        db_session.add(crit_a)
+        await db_session.commit()
         crit_b = await ac.create_criterion(
             db_session, project.id, version.id, "Iframe token flow"
         )
+        crit_b.criterion_key = "c-f52fd975"
+        db_session.add(crit_b)
+        await db_session.commit()
+        crit_meta = await ac.create_criterion(
+            db_session, project.id, version.id, "Complete walkthrough meta flow"
+        )
+        crit_meta.criterion_key = "c-5214996f"
+        db_session.add(crit_meta)
+        await db_session.commit()
 
         # Build a well-formed artifact in the correct schema.
         artifact = json.dumps(
             {
                 "git_sha": sha,
+                "exercised_engine_sha": sha,
                 "run_timestamp": "2026-01-01T00:00:00Z",
                 "results": [
                     {"criterion_key": crit_a.criterion_key, "passed": True, "notes": "ok"},
                     {"criterion_key": crit_b.criterion_key, "passed": False, "notes": "fail"},
+                    {"criterion_key": "c-workday-session-lifecycle", "passed": True, "notes": "ok"},
+                    {"criterion_key": crit_meta.criterion_key, "passed": False, "notes": "iframe failed"},
                 ],
             }
         )
 
-        task = make_task(project_id=project.id, status=TaskStatus.COMPLETED)
+        task = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={
+                "release_version_id": str(version.id),
+                "candidate_sha": sha,
+                "qualification_attempt_id": "attempt-1",
+            },
+            payloads=[{"type": "walkthrough_e2e", "candidate_sha": sha}],
+        )
         db_session.add(task)
         await db_session.commit()
         await db_session.refresh(task)
@@ -4452,14 +4274,20 @@ class TestWalkthroughE2ECompletionIngestsOrRemoved:
 
         ev_b = await ac.get_evidence_for_criterion(db_session, crit_b.id)
         assert ev_b == [], "Failed criterion must not gain evidence"
+        ev_meta = await ac.get_evidence_for_criterion(db_session, crit_meta.id)
+        assert ev_meta == [], "Failed meta gate must not gain alias-collapsed evidence"
 
         # SHA mismatch: writes nothing (SHA-match safety).
         mismatched_artifact = json.dumps(
             {
                 "git_sha": "b" * 40,
+                "exercised_engine_sha": "b" * 40,
                 "run_timestamp": "2026-01-01T00:00:00Z",
                 "results": [
-                    {"criterion_key": crit_b.criterion_key, "passed": True, "notes": "ok"},
+                    {"criterion_key": "c-dfdc9d82", "passed": True, "notes": "ok"},
+                    {"criterion_key": "c-f52fd975", "passed": True, "notes": "ok"},
+                    {"criterion_key": "c-workday-session-lifecycle", "passed": True, "notes": "ok"},
+                    {"criterion_key": "c-5214996f", "passed": True, "notes": "ok"},
                 ],
             }
         )
@@ -4487,11 +4315,15 @@ class TestHandleWalkthroughE2eCompletionStandalone:
     not exercised by the DB-backed integration test above.
     """
 
-    def _make_task(self, project_id=None):
+    def _make_task(self, project_id=None, candidate_sha=None):
         import uuid
         task = MagicMock()
         task.id = uuid.uuid4()
         task.project_id = project_id or uuid.uuid4()
+        task.context = {"candidate_sha": candidate_sha} if candidate_sha else {}
+        task.first_payload = (
+            {"candidate_sha": candidate_sha} if candidate_sha else {}
+        )
         return task
 
     def _make_session(self):
@@ -4502,7 +4334,7 @@ class TestHandleWalkthroughE2eCompletionStandalone:
     @pytest.mark.asyncio
     async def test_unparseable_artifact_is_noop(self):
         from app.task_completion import _handle_walkthrough_e2e_completion
-        task = self._make_task()
+        task = self._make_task(candidate_sha="abc123")
         session = self._make_session()
         await _handle_walkthrough_e2e_completion(task, "not json", session)
         session.rollback.assert_not_called()
@@ -4521,12 +4353,18 @@ class TestHandleWalkthroughE2eCompletionStandalone:
     @pytest.mark.asyncio
     async def test_no_open_version_is_noop(self):
         from app.task_completion import _handle_walkthrough_e2e_completion
-        task = self._make_task()
+        task = self._make_task(candidate_sha="abc123")
         session = self._make_session()
         artifact = json.dumps({
             "git_sha": "abc123",
+            "exercised_engine_sha": "abc123",
             "run_timestamp": "2026-01-01T00:00:00Z",
-            "results": [{"criterion_key": "c-abc", "passed": True}],
+            "results": [
+                {"criterion_key": "c-dfdc9d82", "passed": True},
+                {"criterion_key": "c-f52fd975", "passed": True},
+                {"criterion_key": "c-workday-session-lifecycle", "passed": True},
+                {"criterion_key": "c-5214996f", "passed": True},
+            ],
         })
         with patch("app.acceptance_criteria.record_walkthrough_e2e_evidence") as mock_rwe, \
              patch("app.release_version.current_open_version", new=AsyncMock(return_value=None)):
@@ -4537,15 +4375,19 @@ class TestHandleWalkthroughE2eCompletionStandalone:
     async def test_valid_artifact_calls_record_walkthrough_e2e_evidence(self):
         """The handler delegates to record_walkthrough_e2e_evidence with correct kwargs."""
         from app.task_completion import _handle_walkthrough_e2e_completion
-        task = self._make_task()
-        session = self._make_session()
         sha = "deadbeef1234567890abcdef"
+        task = self._make_task(candidate_sha=sha)
+        session = self._make_session()
+        session.get = AsyncMock(return_value=task)
         results = [
             {"criterion_key": "c-dfdc9d82", "passed": True, "notes": "step 1 ok"},
             {"criterion_key": "c-f52fd975", "passed": False, "notes": None},
+            {"criterion_key": "c-workday-session-lifecycle", "passed": True, "notes": "ok"},
+            {"criterion_key": "c-5214996f", "passed": False, "notes": "iframe failed"},
         ]
         artifact = json.dumps({
             "git_sha": sha,
+            "exercised_engine_sha": sha,
             "run_timestamp": "2026-01-01T00:00:00Z",
             "results": results,
         })
@@ -4608,184 +4450,3 @@ def test_meta_criterion_requires_substantive_subcriteria():
     # Empty batch → gate fails.
     assert _walkthrough_meta_criterion_gate([]) is False, \
         "gate must fail on empty results"
-
-
-# ---------------------------------------------------------------------------
-# _handle_criterion_coverage_trial_completion — acceptance earn-loop ingestion
-# ---------------------------------------------------------------------------
-
-
-async def _setup_criterion_trial(
-    db_session,
-    *,
-    enrolled_head_sha=None,
-    criterion_text="Executed-test criterion",
-    source_task_id="src-task-1",
-    test_refs=("testing/test_exec.py",),
-):
-    """Create an open version + criterion + an enrolled criterion_coverage_trial task."""
-    from app import acceptance_criteria as ac
-    from app.models import Project, ReleaseVersion
-
-    project = Project(name="CCT-Ingest", user_id="cct-user")
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
-    db_session.add(version)
-    await db_session.commit()
-    await db_session.refresh(version)
-
-    crit = await ac.create_criterion(db_session, project.id, version.id, criterion_text)
-
-    enrollment = {
-        "type": "criterion_coverage_trial",
-        "criterion_ids": [crit.criterion_key],
-        "source_task_id": source_task_id,
-        "test_refs": list(test_refs),
-        "head_sha": enrolled_head_sha,
-        "max_test_files": 10,
-        "wall_clock_seconds": 900,
-    }
-    task = make_task(
-        project_id=project.id,
-        payloads=[enrollment],
-        status=TaskStatus.EVALUATING,
-    )
-    db_session.add(task)
-    await db_session.commit()
-    await db_session.refresh(task)
-    return project, version, crit, task
-
-
-@pytest.mark.asyncio
-async def test_criterion_coverage_trial_green_mints_covered(db_session):
-    """A green trial result mints exactly one SHA-pinned covered executed row."""
-    from app import acceptance_criteria as ac
-    from app.task_completion import _handle_criterion_coverage_trial_completion
-
-    _project, _version, crit, task = await _setup_criterion_trial(db_session)
-    result = {
-        "type": "criterion_coverage_trial",
-        "criterion_ids": [crit.criterion_key],
-        "source_task_id": "src-task-1",
-        "head_sha": "deadbeefcafe0001",
-        "queued_head_sha": None,
-        "test_refs": ["testing/test_exec.py"],
-        "ran": True,
-        "passed": True,
-        "could_not_run": False,
-    }
-    with patch(
-        "app.task_completion._runtime_config",
-        {"acceptance_earn_execution_trials_enabled": True},
-    ):
-        await _handle_criterion_coverage_trial_completion(
-            task, json.dumps(result), db_session
-        )
-
-    ev = await ac.get_evidence_for_criterion(db_session, crit.id)
-    assert len(ev) == 1
-    assert ev[0].source_kind == ac.EXECUTED_NAMED_TEST_EVIDENCE_KIND
-    assert ev[0].detail["executed_sha"] == "deadbeefcafe0001"
-    assert ac.compute_criterion_coverage(ev) == "covered"
-
-
-@pytest.mark.asyncio
-async def test_criterion_coverage_trial_flag_off_is_noop(db_session):
-    """Flag OFF ⇒ a green result mints nothing (no-op)."""
-    from app import acceptance_criteria as ac
-    from app.task_completion import _handle_criterion_coverage_trial_completion
-
-    _project, _version, crit, task = await _setup_criterion_trial(db_session)
-    result = {
-        "type": "criterion_coverage_trial",
-        "criterion_ids": [crit.criterion_key],
-        "source_task_id": "src-task-1",
-        "head_sha": "deadbeefcafe0001",
-        "test_refs": ["testing/test_exec.py"],
-        "ran": True,
-        "passed": True,
-        "could_not_run": False,
-    }
-    with patch(
-        "app.task_completion._runtime_config",
-        {"acceptance_earn_execution_trials_enabled": False},
-    ):
-        await _handle_criterion_coverage_trial_completion(
-            task, json.dumps(result), db_session
-        )
-
-    assert await ac.get_evidence_for_criterion(db_session, crit.id) == []
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "mutation",
-    [
-        {"passed": False},           # red run
-        {"ran": False},              # never executed
-        {"could_not_run": True},     # infra could not target the tests
-        {"head_sha": ""},            # no executed SHA to pin
-    ],
-)
-async def test_criterion_coverage_trial_non_green_mints_nothing(db_session, mutation):
-    """Red / not-run / could-not-run / no-SHA results mint nothing and never demote."""
-    from app import acceptance_criteria as ac
-    from app.task_completion import _handle_criterion_coverage_trial_completion
-
-    _project, _version, crit, task = await _setup_criterion_trial(db_session)
-    result = {
-        "type": "criterion_coverage_trial",
-        "criterion_ids": [crit.criterion_key],
-        "source_task_id": "src-task-1",
-        "head_sha": "deadbeefcafe0001",
-        "test_refs": ["testing/test_exec.py"],
-        "ran": True,
-        "passed": True,
-        "could_not_run": False,
-    }
-    result.update(mutation)
-    with patch(
-        "app.task_completion._runtime_config",
-        {"acceptance_earn_execution_trials_enabled": True},
-    ):
-        await _handle_criterion_coverage_trial_completion(
-            task, json.dumps(result), db_session
-        )
-
-    assert await ac.get_evidence_for_criterion(db_session, crit.id) == []
-
-
-@pytest.mark.asyncio
-async def test_criterion_coverage_trial_sha_mismatch_mints_nothing(db_session):
-    """A reported SHA that does not match the enrolled bound SHA mints nothing."""
-    from app import acceptance_criteria as ac
-    from app.task_completion import _handle_criterion_coverage_trial_completion
-
-    _project, _version, crit, task = await _setup_criterion_trial(
-        db_session, enrolled_head_sha="1111111111111111"
-    )
-    result = {
-        "type": "criterion_coverage_trial",
-        "criterion_ids": [crit.criterion_key],
-        "source_task_id": "src-task-1",
-        "head_sha": "2222222222222222",  # drifted from enrolled checkout
-        "test_refs": ["testing/test_exec.py"],
-        "ran": True,
-        "passed": True,
-        "could_not_run": False,
-    }
-    with patch(
-        "app.task_completion._runtime_config",
-        {"acceptance_earn_execution_trials_enabled": True},
-    ):
-        await _handle_criterion_coverage_trial_completion(
-            task, json.dumps(result), db_session
-        )
-
-    assert await ac.get_evidence_for_criterion(db_session, crit.id) == []
-    # The rejection is stamped for visibility, not silently dropped.
-    await db_session.refresh(task)
-    assert "criterion_coverage_trial_contradiction" in (task.context or {})

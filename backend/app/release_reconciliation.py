@@ -45,11 +45,27 @@ from app.release_promotion import (
     _delete_release_branch_best_effort,
     _idempotent_pr_url,
     _lts_branch_names,
-    _promotion_pr_landed,
     _record_promotion_failure,
     _record_promotion_success,
     _recover_confidence_from_ci_unresolved,
+    _resolve_exact_promotion_receipt,
     _resolve_github_with_session,
+)
+from app.release_promotion_pending import (
+    _LEGACY_NATIVE_PROMOTION_PENDING_KEYS,
+    _MANAGED_CHECK_WAIT_SNAPSHOT_DETAIL_LIMIT,
+    _PROMOTION_PENDING_ABSENT,
+    _PROMOTION_PENDING_CLAIM,
+    _PROMOTION_PENDING_MALFORMED,
+    _PROMOTION_PENDING_MANAGED,
+    _canonicalize_promotion_pending,
+    _classify_405_message,
+    _increment_pending_transient_red_count,
+    _managed_check_wait_snapshot,
+    _normalize_legacy_promotion_pending,
+    _parse_promotion_pending_time,
+    _persist_managed_check_wait_snapshot,
+    _promotion_pending_fallback_enabled_at,
 )
 from app.rollup_migration_validation import _validate_migration_chain_post_merge
 from app.ci_resolution import (
@@ -67,34 +83,28 @@ logger = logging.getLogger(__name__)
 # Audit C9: hard wall-clock deadline on the ``promotion_pending`` sub-state.
 #
 # When a qualification PASSES and promotion fires but the promotion PR's CI is
-# still pending (GitHub 405, no conflict), ``promote()`` enables auto-merge and
-# leaves ``last_qualification.status == "pending"`` with a ``promotion_pending``
-# sub-state so the reaper can confirm the merge later.  By design that sub-state
+# still pending (GitHub 405, no conflict), ``promote()`` leaves
+# ``last_qualification.status == "pending"`` with a managed
+# ``promotion_pending`` sub-state so Blueprint can retry later. By design that state
 # *bypasses* the 6h qualification-timeout backstop
 # (``_finalize_in_dedicated_session`` returns early when ``promotion_pending`` is
 # present) — the qualifier children already terminated, so that backstop no
 # longer applies and killing the version would discard a passing PR mid-CI.
 #
-# But nothing replaced that backstop for the ``promotion_pending`` state itself.
-# The only recovery is ``_reconcile_if_pending_auto_merge_landed`` detecting a
-# terminal PR state (merged / closed / CI-red); that path is a no-op when the PR
-# stays open with pending/absent CI or when the GitHub calls fail, so a version
-# can strand in ``promotion_pending`` indefinitely and block the whole
-# self-improve loop while becoming operator-invisible after the single-fire
-# stall alert.
+# The managed reconciler retries an exact target; this separate deadline keeps
+# persistent PR/API failure from stranding the self-improve loop indefinitely.
 #
-# This deadline is the replacement backstop: once a ``promotion_pending``
-# sub-state has aged past the cap we record a ``promotion_pending_timeout``
-# failure, which clears ``promotion_pending`` (sending the version back to
-# stabilize) and re-arms the normal qualification-timeout backstop + retry
-# machinery on the next cycle.  The default (24h) is deliberately well beyond
-# the 4h stall alert and any realistic CI duration so it only fires on a
-# genuinely wedged promotion, never on a slow-but-progressing one.
+# This deadline is the replacement backstop.  Once a managed PR has aged past
+# the cap, the sweeper first persists cleanup debt, then classifies GitHub's
+# authoritative PR state.  An exact merged receipt records success; a closed
+# unmerged PR or an open PR that can be closed records timeout failure; unknown
+# state or failed closure retains the debt and the qualification fence for the
+# next sweep.  The default (24h) is deliberately well beyond the 4h stall alert
+# and any realistic CI duration so it only fires on a genuinely wedged
+# promotion, never on a slow-but-progressing one.
 _PROMOTION_PENDING_TIMEOUT_SECONDS_DEFAULT = 24 * 3600
-# A bare promotion CLAIM (``promotion_pending`` carrying ``claiming`` with no
-# ``pr_number`` yet) is written under-lock by promote() immediately before it
-# releases the row lock for its GitHub I/O, so a concurrent re-qualify cannot
-# clobber the in-flight promotion.  IMPORTANT: on the straight-through success
+# A bare pre-PR claim is written under-lock before GitHub I/O so concurrent
+# qualification cannot clobber the in-flight promotion. On straight-through success
 # path promote() writes NO intermediate pr_number record — it goes claim →
 # create_branch → create_pull_request → merge → _record_promotion_success — so
 # the DB shows a bare claim for the ENTIRE promote() I/O, not merely between
@@ -107,8 +117,6 @@ _PROMOTION_PENDING_TIMEOUT_SECONDS_DEFAULT = 24 * 3600
 # GC'd promptly.  DO NOT lower this toward the "PR opens in seconds" figure — the
 # bare-claim window is the WHOLE I/O, not the pre-PR sliver.
 _PROMOTION_CLAIM_TIMEOUT_SECONDS = 30 * 60
-_MANAGED_CHECK_WAIT_SNAPSHOT_DETAIL_LIMIT = 10
-_MANAGED_CHECK_WAIT_DETAIL_TEXT_LIMIT = 160
 # Number of consecutive sweeps where CI is red due to only transient conclusions
 # (cancelled/timed_out) before the reconciler escalates to the normal terminal
 # path.  Overridable via runtime_config["max_transient_ci_red_sweeps"].
@@ -117,301 +125,6 @@ _TRANSIENT_CI_RED_SWEEP_DEFAULT = 5
 # error before the reconciler surfaces a distinct warning so operators know
 # that a green-but-stuck appearance may be an API-error masquerade.
 _API_ERROR_SWEEP_WARN_THRESHOLD = 3
-
-
-_TERMINAL_405_SUBSTRINGS = (
-    "pull request is closed",
-    "auto merge was disabled",
-    "auto-merge was disabled",
-    "not enabled",
-    "merge commits are not allowed",
-)
-_RETRIABLE_405_SUBSTRINGS = (
-    "required status check",
-    "required checks",
-    "base branch was recently updated",
-    "waiting for status",
-)
-
-
-def _classify_405_message(msg: str) -> str:
-    """Classify a GitHub 405 merge-refusal message as 'terminal' or 'retriable'.
-
-    GitHub returns 405 for both permanent blockers (PR closed, auto-merge
-    disabled, branch-protection config changed) and transient ones (required
-    checks not yet passed).  A terminal 405 must be recorded as a distinct
-    failure so operators see the real cause; a retriable 405 should leave the
-    version pending for the next sweep.
-
-    Returns 'terminal', 'retriable', or 'unknown' (treated as retriable by the
-    caller so we never prematurely kill a version on an unrecognised message).
-    """
-    lower = msg.lower()
-    for substr in _TERMINAL_405_SUBSTRINGS:
-        if substr in lower:
-            return "terminal"
-    for substr in _RETRIABLE_405_SUBSTRINGS:
-        if substr in lower:
-            return "retriable"
-    return "unknown"
-
-
-def _trim_check_snapshot_text(value: object) -> str | None:
-    if not isinstance(value, str):
-        return None
-    value = value.strip()
-    if not value:
-        return None
-    return value[:_MANAGED_CHECK_WAIT_DETAIL_TEXT_LIMIT]
-
-
-def _managed_check_wait_snapshot(
-    *,
-    ci_state: str,
-    classified_at: datetime,
-    head_sha: str | None = None,
-    check_result: dict | None = None,
-    reason: str | None = None,
-    detail: str | None = None,
-    from_api_error: bool = False,
-    api_error_sweep_count: int = 0,
-) -> dict:
-    """Build a bounded operator snapshot for a non-terminal check-wait sweep."""
-
-    details = []
-    raw_details = (
-        check_result.get("details") if isinstance(check_result, dict) else None
-    )
-    if isinstance(raw_details, list):
-        for raw in raw_details[:_MANAGED_CHECK_WAIT_SNAPSHOT_DETAIL_LIMIT]:
-            if not isinstance(raw, dict):
-                continue
-            item = {
-                "name": _trim_check_snapshot_text(raw.get("name")) or "unknown",
-            }
-            status = _trim_check_snapshot_text(raw.get("status"))
-            conclusion = _trim_check_snapshot_text(raw.get("conclusion"))
-            if status is not None:
-                item["status"] = status
-            if conclusion is not None:
-                item["conclusion"] = conclusion
-            details.append(item)
-    else:
-        raw_details = []
-
-    snapshot = {
-        "state": ci_state,
-        "classified_at": classified_at.isoformat(),
-        "head_sha": head_sha,
-        "total_checks": len(raw_details),
-        "checks": details,
-        "truncated": len(raw_details) > _MANAGED_CHECK_WAIT_SNAPSHOT_DETAIL_LIMIT,
-    }
-    if reason:
-        snapshot["reason"] = reason
-    if detail:
-        snapshot["detail"] = detail[:_MANAGED_CHECK_WAIT_DETAIL_TEXT_LIMIT]
-    if from_api_error:
-        snapshot["api_error"] = True
-        snapshot["api_error_sweep_count"] = api_error_sweep_count
-    return snapshot
-
-
-async def _persist_managed_check_wait_snapshot(
-    session,
-    version_id: uuid.UUID,
-    *,
-    pr_number: int,
-    ci_state: str,
-    snapshot: dict,
-) -> bool:
-    """Persist additive CI telemetry without clobbering promotion PR provenance."""
-
-    try:
-        # The row lock was released by the earlier commit, so this session may
-        # still be holding a stale identity-map copy. Expire before the
-        # FOR-UPDATE re-read so we evaluate the current DB state, not the cached
-        # pre-I/O instance.
-        session.expire_all()
-        locked: release_version.ReleaseVersion | None = (
-            (
-                await session.execute(
-                    select(release_version.ReleaseVersion)
-                    .where(release_version.ReleaseVersion.id == version_id)
-                    .with_for_update()
-                    .execution_options(populate_existing=True)
-                )
-            )
-            .scalars()
-            .first()
-        )
-        if locked is None or locked.status != "open":
-            return False
-        qual = dict(locked.last_qualification or {})
-        if qual.get("status") != "pending":
-            return False
-        pending = qual.get("promotion_pending")
-        if not isinstance(pending, dict) or not pending.get("managed_check_wait"):
-            return False
-        if pending.get("pr_number") != pr_number:
-            return False
-
-        updated_pending = dict(pending)
-        updated_pending["ci_state"] = ci_state
-        updated_pending["ci_classified_at"] = snapshot.get("classified_at")
-        updated_pending["check_snapshot"] = snapshot
-        # Track consecutive API-error sweeps so the reconciler can distinguish
-        # an api-error masquerade from genuine in-progress CI.
-        if snapshot.get("api_error"):
-            updated_pending["api_error_sweep_count"] = snapshot.get(
-                "api_error_sweep_count", 1
-            )
-        else:
-            updated_pending.pop("api_error_sweep_count", None)
-        # Reset consecutive-transient-red counter whenever CI leaves the red
-        # state so intermittent flakiness does not accumulate non-consecutively.
-        if ci_state != _CI_RED:
-            updated_pending.pop("transient_red_count", None)
-        qual["promotion_pending"] = updated_pending
-        locked.last_qualification = qual
-        flag_modified(locked, "last_qualification")
-        session.add(locked)
-        await session.commit()
-        return True
-    except Exception:
-        logger.exception(
-            "[RELEASE_QUALIFIER] reconcile managed_check_wait: failed to persist "
-            "check snapshot for version %s",
-            version_id,
-        )
-        try:
-            await session.rollback()
-        except Exception:
-            logger.exception(
-                "[RELEASE_QUALIFIER] reconcile managed_check_wait: rollback failed "
-                "after check snapshot persist error for version %s",
-                version_id,
-            )
-        return False
-
-
-async def _reset_pending_transient_red_count(
-    session,
-    version_id: uuid.UUID,
-    *,
-    pr_number: int,
-) -> None:
-    """Reset ``promotion_pending.transient_red_count`` to 0 when CI is no longer red.
-
-    Called whenever CI transitions away from red (green or pending) so that
-    intermittent transient failures do not accumulate non-consecutively.
-    """
-    try:
-        session.expire_all()
-        locked: release_version.ReleaseVersion | None = (
-            (
-                await session.execute(
-                    select(release_version.ReleaseVersion)
-                    .where(release_version.ReleaseVersion.id == version_id)
-                    .with_for_update()
-                    .execution_options(populate_existing=True)
-                )
-            )
-            .scalars()
-            .first()
-        )
-        if locked is None or locked.status != "open":
-            return
-        qual = dict(locked.last_qualification or {})
-        if qual.get("status") != "pending":
-            return
-        pending = qual.get("promotion_pending")
-        if not isinstance(pending, dict):
-            return
-        if pending.get("pr_number") != pr_number:
-            return
-        if not pending.get("transient_red_count"):
-            return
-        updated_pending = dict(pending)
-        updated_pending.pop("transient_red_count", None)
-        qual["promotion_pending"] = updated_pending
-        locked.last_qualification = qual
-        flag_modified(locked, "last_qualification")
-        session.add(locked)
-        await session.commit()
-    except Exception:
-        logger.exception(
-            "[RELEASE_QUALIFIER] transient_red_count: reset failed for version %s",
-            version_id,
-        )
-        try:
-            await session.rollback()
-        except Exception:
-            logger.exception(
-                "[RELEASE_QUALIFIER] transient_red_count: rollback after reset "
-                "failed for version %s",
-                version_id,
-            )
-
-
-async def _increment_pending_transient_red_count(
-    session,
-    version_id: uuid.UUID,
-    *,
-    pr_number: int,
-) -> int:
-    """Increment ``promotion_pending.transient_red_count`` for *version_id*.
-
-    Returns the NEW count after increment, or 0 when the update cannot be
-    applied (version no longer open/pending, PR number mismatch, etc.).
-    """
-    try:
-        session.expire_all()
-        locked: release_version.ReleaseVersion | None = (
-            (
-                await session.execute(
-                    select(release_version.ReleaseVersion)
-                    .where(release_version.ReleaseVersion.id == version_id)
-                    .with_for_update()
-                    .execution_options(populate_existing=True)
-                )
-            )
-            .scalars()
-            .first()
-        )
-        if locked is None or locked.status != "open":
-            return 0
-        qual = dict(locked.last_qualification or {})
-        if qual.get("status") != "pending":
-            return 0
-        pending = qual.get("promotion_pending")
-        if not isinstance(pending, dict):
-            return 0
-        if pending.get("pr_number") != pr_number:
-            return 0
-        updated_pending = dict(pending)
-        new_count = (updated_pending.get("transient_red_count") or 0) + 1
-        updated_pending["transient_red_count"] = new_count
-        qual["promotion_pending"] = updated_pending
-        locked.last_qualification = qual
-        flag_modified(locked, "last_qualification")
-        session.add(locked)
-        await session.commit()
-        return new_count
-    except Exception:
-        logger.exception(
-            "[RELEASE_QUALIFIER] transient_red_count: failed to persist for version %s",
-            version_id,
-        )
-        try:
-            await session.rollback()
-        except Exception:
-            logger.exception(
-                "[RELEASE_QUALIFIER] transient_red_count: rollback failed for "
-                "version %s",
-                version_id,
-            )
-        return 0
 
 
 async def _refresh_release_artifact_rows(
@@ -709,30 +422,32 @@ async def _reconcile_if_promotion_failed_landed(
                 return False
             token, owner, repo = resolved
 
-            if not await _candidate_already_on_main(
-                token, owner, repo, candidate_sha, version, project=project
-            ):
-                return False
-
-            pr_number = _pr_number_from_url(base_record.get("pr_url"))
-            if pr_number is None:
-                logger.warning(
-                    "[RELEASE_QUALIFIER] reconcile: candidate %s for v%d is "
-                    "on main, but the promotion_failed PR number could not be "
-                    "parsed from %r — deferring live target validation",
-                    candidate_sha[:8],
-                    version.version_number,
-                    base_record.get("pr_url"),
-                )
-                return False
-
-            alembic_status, alembic_reason = await _validate_migration_chain_post_merge(
+            pr_number_hint = _pr_number_from_url(base_record.get("pr_url"))
+            receipt = await _resolve_exact_promotion_receipt(
                 token,
                 owner,
                 repo,
-                pr_number,
-                promotion_target,
+                candidate_sha,
+                version,
+                project=project,
+                pr_number=pr_number_hint,
             )
+            if receipt is None:
+                return False
+
+            pr_number = receipt.get("pr_number")
+            if pr_number is None:
+                alembic_status, alembic_reason = "ok", "empty diff"
+            else:
+                alembic_status, alembic_reason = (
+                    await _validate_migration_chain_post_merge(
+                        token,
+                        owner,
+                        repo,
+                        int(pr_number),
+                        receipt["merge_commit_sha"],
+                    )
+                )
             if alembic_status == "defer":
                 logger.warning(
                     "[RELEASE_QUALIFIER] reconcile: candidate %s for v%d is "
@@ -770,36 +485,17 @@ async def _reconcile_if_promotion_failed_landed(
                 version.version_number,
             )
 
-            _integration_branch, promotion_target = _lts_branch_names(project)
-            promoted_sha: str | None = None
-            try:
-                promoted_sha = await github.get_branch_sha(
-                    token,
-                    owner,
-                    repo,
-                    promotion_target,
-                    project_id=str(version.project_id),
-                    live=True,
-                )
-            except Exception as exc:  # noqa: BLE001 — fallback to candidate_sha
-                logger.warning(
-                    "[RELEASE_QUALIFIER] reconcile: could not resolve %s HEAD "
-                    "SHA for v%d (%s) — using candidate_sha as promoted_sha",
-                    promotion_target,
-                    version.version_number,
-                    exc,
-                )
-
             result = await _record_promotion_success(
                 session,
                 version,
                 candidate_sha,
                 base_record,
-                pr_url=_idempotent_pr_url(base_record),
+                pr_url=receipt.get("pr_url") or _idempotent_pr_url(base_record),
                 token=token,
                 owner=owner,
                 repo=repo,
-                promoted_sha=promoted_sha,
+                empty_diff=bool(receipt.get("empty_diff")),
+                promoted_sha=receipt["merge_commit_sha"],
                 already_landed=True,
                 lock_released=True,
             )
@@ -831,8 +527,8 @@ async def _reconcile_if_not_promoted_but_pr_merged(
     """Reconcile an open version recorded as not_promoted/ci_unresolved whose PR merged.
 
     Incident 2026-06-09: a transient DB error rolled back the promotion_pending
-    marker write after a release PR was created and auto-merge was armed on
-    GitHub. A subsequent finalize saw no promotion_pending, re-evaluated CI as
+    marker write after a release PR was created. A subsequent finalize saw no
+    promotion_pending, re-evaluated CI as
     ci_unresolved (a transient state, not a hard failure), and recorded
     not_promoted — even though the PR merged 15 seconds later.
 
@@ -922,10 +618,43 @@ async def _reconcile_if_not_promoted_but_pr_merged(
                 return False
             token, owner, repo = resolved
 
-            if not await _candidate_already_on_main(
-                token, owner, repo, candidate_sha, version, project=project
-            ):
+            receipt = await _resolve_exact_promotion_receipt(
+                token,
+                owner,
+                repo,
+                candidate_sha,
+                version,
+                project=project,
+                pr_number=_pr_number_from_url(base_record.get("pr_url")),
+            )
+            if receipt is None:
                 return False
+
+            receipt_pr_number = receipt.get("pr_number")
+            if receipt_pr_number is not None:
+                alembic_status, alembic_reason = (
+                    await _validate_migration_chain_post_merge(
+                        token,
+                        owner,
+                        repo,
+                        int(receipt_pr_number),
+                        receipt["merge_commit_sha"],
+                    )
+                )
+                if alembic_status == "defer":
+                    return False
+                if alembic_status == "block":
+                    await _record_promotion_failure(
+                        session,
+                        version,
+                        base_record,
+                        "migration_guard_blocked",
+                        detail=alembic_reason,
+                        pr_url=receipt.get("pr_url"),
+                        lock_released=True,
+                    )
+                    await session.commit()
+                    return True
 
             logger.info(
                 "[RELEASE_QUALIFIER] reconcile not_promoted/ci_unresolved: "
@@ -934,35 +663,17 @@ async def _reconcile_if_not_promoted_but_pr_merged(
                 candidate_sha[:8],
                 version.version_number,
             )
-            promoted_sha: str | None = None
-            try:
-                promoted_sha = await github.get_branch_sha(
-                    token,
-                    owner,
-                    repo,
-                    promotion_target,
-                    project_id=str(version.project_id),
-                    live=True,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "[RELEASE_QUALIFIER] reconcile not_promoted/ci_unresolved: "
-                    "could not resolve %s HEAD SHA for v%d (%s) — using candidate_sha",
-                    promotion_target,
-                    version.version_number,
-                    exc,
-                )
-
             result = await _record_promotion_success(
                 session,
                 version,
                 candidate_sha,
                 base_record,
-                pr_url=_idempotent_pr_url(base_record),
+                pr_url=receipt.get("pr_url") or _idempotent_pr_url(base_record),
                 token=token,
                 owner=owner,
                 repo=repo,
-                promoted_sha=promoted_sha,
+                empty_diff=bool(receipt.get("empty_diff")),
+                promoted_sha=receipt["merge_commit_sha"],
                 already_landed=True,
                 lock_released=True,
             )
@@ -1120,7 +831,12 @@ async def _reconcile_if_ci_unresolved_now_green(
                 version.version_number,
             )
             result = await _rq_mod.run_qualification(
-                session, version.project_id, version
+                session,
+                version.project_id,
+                version,
+                requested_probes=(version.last_qualification or {}).get(
+                    "requested_probes"
+                ),
             )
             if result and result.get("status") == "spawned":
                 await session.commit()
@@ -1139,331 +855,6 @@ async def _reconcile_if_ci_unresolved_now_green(
                 logger.exception(
                     "[RELEASE_QUALIFIER] reconcile ci_unresolved_now_green: "
                     "rollback failed for version %s after unexpected error",
-                    version_id,
-                )
-            return False
-
-
-async def _reconcile_if_pending_auto_merge_landed(
-    version_id: uuid.UUID,
-    *,
-    session_factory=None,
-) -> bool:
-    """Reconcile an open version whose promotion PR has actually merged."""
-    factory = session_factory or AsyncSessionLocal
-    async with factory() as session:
-        try:
-            version: release_version.ReleaseVersion | None = (
-                (
-                    await session.execute(
-                        select(release_version.ReleaseVersion)
-                        .where(release_version.ReleaseVersion.id == version_id)
-                        .with_for_update()
-                    )
-                )
-                .scalars()
-                .first()
-            )
-            if version is None:
-                return False
-            if version.status != "open":
-                return False
-            qual = version.last_qualification or {}
-            if qual.get("status") != "pending":
-                return False
-            pending = qual.get("promotion_pending")
-            if not pending:
-                return False
-            # managed_check_wait records are owned by _reconcile_if_managed_check_wait
-            # (they require a re-run of the Alembic guard before merging and must
-            # NOT be merged via native auto-merge).  Skip them here.
-            if pending.get("managed_check_wait"):
-                return False
-            pr_number = pending.get("pr_number")
-            if not pr_number:
-                return False
-            candidate_sha: str | None = qual.get("candidate_sha")
-            if not candidate_sha:
-                return False
-
-            base_record = {k: v for k, v in qual.items() if k != "promotion_pending"}
-            pr_url: str = pending.get("pr_url") or _idempotent_pr_url(base_record)
-
-            project = await session.get(Project, version.project_id)
-            if project is None:
-                return False
-
-            # Single-branch repo guard (LTS model inactive) — mirrors the
-            # promote() guard.  When the integration branch IS the promotion
-            # target promote() never opens a release PR (it records an inert
-            # success), so there is no pending promotion PR to reconcile and
-            # _candidate_already_on_main would always be True on the single
-            # branch.  Bail out inert, mirroring the back-merge guard's
-            # "lts_inactive" skip semantics.
-            integration_branch, promotion_target = _lts_branch_names(project)
-            if integration_branch == promotion_target:
-                logger.debug(
-                    "[RELEASE_QUALIFIER] reconcile pending_auto_merge: v%d "
-                    "integration branch (%s) is the promotion target — "
-                    "single-branch repo, LTS inactive; nothing to reconcile",
-                    version.version_number,
-                    promotion_target,
-                )
-                return False
-
-            try:
-                await session.commit()
-            except Exception:
-                logger.exception(
-                    "[RELEASE_QUALIFIER] reconcile pending_auto_merge: failed to "
-                    "release row lock for v%d before GitHub I/O — skipping",
-                    version.version_number,
-                )
-                try:
-                    await session.rollback()
-                except Exception:
-                    logger.exception(
-                        "[RELEASE_QUALIFIER] reconcile pending_auto_merge: rollback "
-                        "failed for v%d after commit error",
-                        version.version_number,
-                    )
-                return False
-
-            resolved = await _resolve_github_with_session(session, project)
-            if resolved is None:
-                logger.warning(
-                    "[RELEASE_QUALIFIER] reconcile pending_auto_merge: no GitHub "
-                    "credentials for v%d — skipping reconcile",
-                    version.version_number,
-                )
-                return False
-            token, owner, repo = resolved
-
-            if await _candidate_already_on_main(
-                token, owner, repo, candidate_sha, version, project=project
-            ):
-                (
-                    alembic_status,
-                    alembic_reason,
-                ) = await _validate_migration_chain_post_merge(
-                    token,
-                    owner,
-                    repo,
-                    int(pr_number),
-                    promotion_target,
-                )
-                if alembic_status == "defer":
-                    logger.warning(
-                        "[RELEASE_QUALIFIER] reconcile pending_auto_merge: "
-                        "candidate %s for v%d is on main, but post-merge "
-                        "Alembic health check is deferred: %s",
-                        candidate_sha[:8],
-                        version.version_number,
-                        alembic_reason,
-                    )
-                    return False
-                if alembic_status == "block":
-                    logger.warning(
-                        "[RELEASE_QUALIFIER] reconcile pending_auto_merge: "
-                        "candidate %s for v%d is on main, but the live target "
-                        "Alembic chain has a genuine third-party collision — "
-                        "recording promotion_failed: %s",
-                        candidate_sha[:8],
-                        version.version_number,
-                        alembic_reason,
-                    )
-                    await _record_promotion_failure(
-                        session,
-                        version,
-                        base_record,
-                        "migration_guard_blocked",
-                        detail=alembic_reason,
-                        pr_url=pr_url,
-                        lock_released=True,
-                    )
-                    await session.commit()
-                    return True
-
-                logger.info(
-                    "[RELEASE_QUALIFIER] reconcile pending_auto_merge: candidate "
-                    "%s for v%d is on main — recording promotion",
-                    candidate_sha[:8],
-                    version.version_number,
-                )
-                _integration_branch, promotion_target = _lts_branch_names(project)
-                promoted_sha: str | None = None
-                try:
-                    promoted_sha = await github.get_branch_sha(
-                        token,
-                        owner,
-                        repo,
-                        promotion_target,
-                        project_id=str(version.project_id),
-                        live=True,
-                    )
-                except Exception as exc:  # noqa: BLE001 — fallback to candidate_sha
-                    logger.warning(
-                        "[RELEASE_QUALIFIER] reconcile pending_auto_merge: could "
-                        "not resolve %s HEAD SHA for v%d (%s) — using "
-                        "candidate_sha as promoted_sha",
-                        promotion_target,
-                        version.version_number,
-                        exc,
-                    )
-                result = await _record_promotion_success(
-                    session,
-                    version,
-                    candidate_sha,
-                    base_record,
-                    pr_url,
-                    token=token,
-                    owner=owner,
-                    repo=repo,
-                    promoted_sha=promoted_sha,
-                    already_landed=True,
-                    lock_released=True,
-                )
-                await session.commit()
-                return result.get("status") == "promoted" and not result.get(
-                    "already_promoted"
-                )
-
-            try:
-                pr_data = await github.get_pull_request(
-                    token,
-                    owner,
-                    repo,
-                    int(pr_number),
-                    project_id=str(version.project_id),
-                )
-                if pr_data.get("state") == "closed" and not pr_data.get("merged"):
-                    logger.warning(
-                        "[RELEASE_QUALIFIER] reconcile pending_auto_merge: PR #%s "
-                        "for v%d is closed without merge — driving to "
-                        "promotion_failed so retry machinery applies",
-                        pr_number,
-                        version.version_number,
-                    )
-                    await _record_promotion_failure(
-                        session,
-                        version,
-                        base_record,
-                        "pr_closed_without_merge",
-                        detail=f"PR #{pr_number} was closed without merging",
-                        pr_url=pr_url,
-                        lock_released=True,
-                    )
-                    await session.commit()
-                    return True
-
-                if pr_data.get("state") == "open":
-                    pr_head_sha: str | None = (pr_data.get("head") or {}).get("sha")
-                    if pr_head_sha:
-                        try:
-                            check_result = await github.get_check_runs_cached(
-                                token,
-                                owner,
-                                repo,
-                                pr_head_sha,
-                                project_id=str(version.project_id),
-                                treat_missing_as_success=False,
-                            )
-                            ci_state = _classify_check_runs(check_result)
-                            if ci_state != _CI_RED:
-                                await _reset_pending_transient_red_count(
-                                    session,
-                                    version.id,
-                                    pr_number=int(pr_number),
-                                )
-                            if ci_state == _CI_RED:
-                                if not _check_result_has_genuine_failure(check_result):
-                                    # Only transient conclusions (cancelled /
-                                    # timed_out) — do not tear down the PR.
-                                    new_count = (
-                                        await _increment_pending_transient_red_count(
-                                            session,
-                                            version.id,
-                                            pr_number=int(pr_number),
-                                        )
-                                    )
-                                    max_sweeps = _max_transient_ci_red_sweeps()
-                                    if new_count < max_sweeps:
-                                        logger.warning(
-                                            "[RELEASE_QUALIFIER] reconcile "
-                                            "pending_auto_merge: PR #%s for v%d has "
-                                            "transient-only red CI (cancelled/"
-                                            "timed_out, sweep %d/%d) — leaving "
-                                            "pending",
-                                            pr_number,
-                                            version.version_number,
-                                            new_count,
-                                            max_sweeps,
-                                        )
-                                        return False
-                                    logger.warning(
-                                        "[RELEASE_QUALIFIER] reconcile "
-                                        "pending_auto_merge: PR #%s for v%d reached "
-                                        "transient-red sweep cap (%d) — escalating "
-                                        "to pr_ci_red",
-                                        pr_number,
-                                        version.version_number,
-                                        max_sweeps,
-                                    )
-                                logger.warning(
-                                    "[RELEASE_QUALIFIER] reconcile pending_auto_merge: "
-                                    "PR #%s for v%d has conclusively failed CI — "
-                                    "driving to promotion_failed so retry machinery "
-                                    "applies",
-                                    pr_number,
-                                    version.version_number,
-                                )
-                                await _record_promotion_failure(
-                                    session,
-                                    version,
-                                    base_record,
-                                    "pr_ci_red",
-                                    detail=(
-                                        f"PR #{pr_number} CI is conclusively failed "
-                                        f"(sha={pr_head_sha[:8]}); auto-merge will "
-                                        "never fire"
-                                    ),
-                                    pr_url=pr_url,
-                                    lock_released=True,
-                                )
-                                await session.commit()
-                                return True
-                        except Exception as exc:  # noqa: BLE001 — CI fetch failure → leave pending
-                            logger.warning(
-                                "[RELEASE_QUALIFIER] reconcile pending_auto_merge: "
-                                "could not fetch CI for PR #%s head %s for v%d "
-                                "(%s) — leaving pending",
-                                pr_number,
-                                pr_head_sha[:8] if pr_head_sha else "unknown",
-                                version.version_number,
-                                exc,
-                            )
-            except Exception as exc:  # noqa: BLE001 — PR state check must not abort sweep
-                logger.warning(
-                    "[RELEASE_QUALIFIER] reconcile pending_auto_merge: could not "
-                    "check PR #%s state for v%d (%s) — leaving pending",
-                    pr_number,
-                    version.version_number,
-                    exc,
-                )
-
-            return False
-        except Exception:
-            logger.exception(
-                "[RELEASE_QUALIFIER] reconcile pending_auto_merge: unexpected "
-                "error for version %s",
-                version_id,
-            )
-            try:
-                await session.rollback()
-            except Exception:
-                logger.exception(
-                    "[RELEASE_QUALIFIER] reconcile pending_auto_merge: rollback "
-                    "failed for version %s after unexpected error",
                     version_id,
                 )
             return False
@@ -1612,7 +1003,12 @@ async def _harvest_promotion_ci_failures(
                             )
                             if _rq_version is not None:
                                 _rq_result = await _rq_mod.run_qualification(
-                                    _rq_session, project_id, _rq_version
+                                    _rq_session,
+                                    project_id,
+                                    _rq_version,
+                                    requested_probes=(
+                                        _rq_version.last_qualification or {}
+                                    ).get("requested_probes"),
                                 )
                                 if _rq_result and _rq_result.get("status") == "spawned":
                                     await _rq_session.commit()
@@ -1676,17 +1072,142 @@ async def _harvest_promotion_ci_failures(
         )
 
 
+async def _finish_managed_check_wait_landing(
+    session,
+    version: release_version.ReleaseVersion,
+    *,
+    token: str,
+    owner: str,
+    repo: str,
+    pr_number: int,
+    candidate_sha: str,
+    base_record: dict,
+    pr_url: str,
+    promotion_target: str,
+    release_branch: str,
+    promoted_sha: str,
+    source: str,
+) -> bool:
+    """Validate and record one authoritative managed promotion landing."""
+
+    alembic_status, alembic_reason = await _validate_migration_chain_post_merge(
+        token, owner, repo, pr_number, promoted_sha
+    )
+    if alembic_status == "defer":
+        logger.warning(
+            "[RELEASE_QUALIFIER] reconcile managed_check_wait: candidate %s "
+            "for v%d landed via %s, post-merge Alembic deferred: %s",
+            candidate_sha[:8],
+            version.version_number,
+            source,
+            alembic_reason,
+        )
+        return False
+    if alembic_status == "block":
+        await _cleanup_managed_check_wait_failure_artifacts(
+            token,
+            owner,
+            repo,
+            release_branch,
+            version,
+            pr_number,
+        )
+        await _record_promotion_failure(
+            session,
+            version,
+            base_record,
+            "migration_guard_blocked",
+            detail=alembic_reason,
+            pr_url=pr_url,
+            lock_released=True,
+        )
+        await session.commit()
+        return True
+
+    logger.info(
+        "[RELEASE_QUALIFIER] reconcile managed_check_wait: candidate %s for "
+        "v%d is already on %s via %s — recording promoted",
+        candidate_sha[:8],
+        version.version_number,
+        promotion_target,
+        source,
+    )
+    result = await _record_promotion_success(
+        session,
+        version,
+        candidate_sha,
+        base_record,
+        pr_url,
+        token=token,
+        owner=owner,
+        repo=repo,
+        promoted_sha=promoted_sha,
+        already_landed=True,
+        lock_released=True,
+    )
+    await session.commit()
+    return result.get("status") == "promoted" and not result.get("already_promoted")
+
+
+async def _record_promotion_integrity_incident(
+    session,
+    version: release_version.ReleaseVersion,
+    base_record: dict,
+    *,
+    pr_url: str,
+    detail: str,
+    evidence: dict,
+) -> None:
+    """Record an unqualified landed PR as a stop-level, non-redrivable incident."""
+
+    version_id = version.id
+    await _record_promotion_failure(
+        session,
+        version,
+        base_record,
+        "promotion_pr_identity_mismatch",
+        detail=(
+            f"STOP-LEVEL promotion integrity incident: {detail}. Automatic "
+            "promotion redrive is disabled until an operator repairs the target."
+        ),
+        pr_url=pr_url,
+        lock_released=True,
+    )
+    session.expire_all()
+    locked = (
+        (
+            await session.execute(
+                select(release_version.ReleaseVersion)
+                .where(release_version.ReleaseVersion.id == version_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if locked is None or locked.status != "open":
+        return
+    incident = dict(locked.last_qualification or {})
+    incident["status"] = "promotion_integrity_violation"
+    incident["automatic_redrive_blocked"] = True
+    incident["integrity_evidence"] = evidence
+    locked.last_qualification = incident
+    flag_modified(locked, "last_qualification")
+    session.add(locked)
+
+
 async def _reconcile_if_managed_check_wait(
     version_id: uuid.UUID,
     *,
     session_factory=None,
 ) -> bool:
-    """Reconcile a migration-carrying promotion PR in managed_check_wait mode.
+    """Reconcile a promotion PR in ``managed_check_wait`` mode.
 
-    For a pending version with ``promotion_pending.managed_check_wait=True``
-    (set by ``promote()`` instead of delegating to GitHub native auto-merge),
-    this reconciler periodically re-checks whether the required CI has passed
-    and re-runs the Alembic dual-head guard before retrying the merge.
+    For a pending version with ``promotion_pending.managed_check_wait=True``,
+    this reconciler periodically checks CI on one exact
+    head, re-runs the Alembic guard, revalidates the base/head pair, and submits
+    an expected-head merge.
 
     Resolution paths:
 
@@ -1726,25 +1247,73 @@ async def _reconcile_if_managed_check_wait(
             qual = version.last_qualification or {}
             if qual.get("status") != "pending":
                 return False
-            pending = qual.get("promotion_pending")
-            if not pending or not pending.get("managed_check_wait"):
+            pending, pending_kind, pending_was_normalized = (
+                _canonicalize_promotion_pending(
+                    qual.get("promotion_pending"),
+                    qualification=qual,
+                    version=version,
+                )
+            )
+            if pending_kind == _PROMOTION_PENDING_ABSENT:
+                return False
+            if pending_kind == _PROMOTION_PENDING_MALFORMED:
+                base_record = {
+                    k: v for k, v in qual.items() if k != "promotion_pending"
+                }
+                await _record_promotion_failure(
+                    session,
+                    version,
+                    base_record,
+                    "promotion_pending_malformed",
+                    detail=(
+                        "promotion_pending was neither a persisted promotion PR "
+                        "nor a candidate-bound promotion claim"
+                    ),
+                    lock_released=False,
+                )
+                await session.commit()
+                return True
+            if pending is None or pending_kind != _PROMOTION_PENDING_MANAGED:
                 return False
             pr_number = pending.get("pr_number")
             if not pr_number:
                 return False
+
+            if pending_was_normalized:
+                canonical_qual = dict(qual)
+                canonical_qual["promotion_pending"] = pending
+                version.last_qualification = canonical_qual
+                flag_modified(version, "last_qualification")
+                session.add(version)
+                qual = canonical_qual
+
             candidate_sha: str | None = qual.get("candidate_sha")
             if not candidate_sha:
+                if pending_was_normalized:
+                    await session.commit()
                 return False
 
             base_record = {k: v for k, v in qual.items() if k != "promotion_pending"}
             pr_url: str = pending.get("pr_url") or _idempotent_pr_url(base_record)
 
+            # A timed-out PR retains its identity until close succeeds.  The
+            # timeout reconciler owns that cleanup debt; never let the ordinary
+            # managed waiter merge it while cleanup is pending.
+            if pending.get("cleanup_required"):
+                if pending_was_normalized:
+                    await session.commit()
+                return False
+
             project = await session.get(Project, version.project_id)
             if project is None:
+                if pending_was_normalized:
+                    await session.commit()
                 return False
 
             integration_branch, promotion_target = _lts_branch_names(project)
             if integration_branch == promotion_target:
+                if pending_was_normalized:
+                    await session.commit()
                 return False
 
             # Capture the primitives the promotion-CI harvest needs while the ORM
@@ -1803,88 +1372,32 @@ async def _reconcile_if_managed_check_wait(
             token, owner, repo = resolved
             release_branch = f"release-v{version.version_number}"
 
-            # 1. Check out-of-band landing first — the PR may have been merged
-            #    externally while we were waiting.
-            if await _candidate_already_on_main(
-                token, owner, repo, candidate_sha, version, project=project
-            ):
-                (
-                    alembic_status,
-                    alembic_reason,
-                ) = await _validate_migration_chain_post_merge(
-                    token, owner, repo, int(pr_number), promotion_target
-                )
-                if alembic_status == "defer":
-                    logger.warning(
-                        "[RELEASE_QUALIFIER] reconcile managed_check_wait: "
-                        "candidate %s for v%d on main, post-merge Alembic "
-                        "deferred: %s",
-                        candidate_sha[:8],
-                        version.version_number,
-                        alembic_reason,
-                    )
-                    return False
-                if alembic_status == "block":
-                    await _cleanup_managed_check_wait_failure_artifacts(
-                        token,
-                        owner,
-                        repo,
-                        release_branch,
-                        version,
-                        int(pr_number),
-                    )
-                    await _record_promotion_failure(
-                        session,
-                        version,
-                        base_record,
-                        "migration_guard_blocked",
-                        detail=alembic_reason,
-                        pr_url=pr_url,
-                        lock_released=True,
-                    )
-                    await session.commit()
-                    return True
-                logger.info(
-                    "[RELEASE_QUALIFIER] reconcile managed_check_wait: candidate "
-                    "%s for v%d is already on main (out-of-band) — recording "
-                    "promoted",
-                    candidate_sha[:8],
-                    version.version_number,
-                )
-                promoted_sha_oob: str | None = None
-                try:
-                    promoted_sha_oob = await github.get_branch_sha(
-                        token,
-                        owner,
-                        repo,
-                        promotion_target,
-                        project_id=str(version.project_id),
-                        live=True,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "[RELEASE_QUALIFIER] reconcile managed_check_wait: could "
-                        "not resolve %s HEAD for v%d (%s)",
-                        promotion_target,
-                        version.version_number,
-                        exc,
-                    )
-                result_oob = await _record_promotion_success(
+            # 1. Check an exact out-of-band receipt first — ancestry alone cannot
+            #    bind this candidate to a promotion PR or identify its merge SHA.
+            landed_receipt = await _resolve_exact_promotion_receipt(
+                token,
+                owner,
+                repo,
+                candidate_sha,
+                version,
+                project=project,
+                pr_number=int(pr_number),
+            )
+            if landed_receipt is not None:
+                return await _finish_managed_check_wait_landing(
                     session,
                     version,
-                    candidate_sha,
-                    base_record,
-                    pr_url,
                     token=token,
                     owner=owner,
                     repo=repo,
-                    promoted_sha=promoted_sha_oob,
-                    already_landed=True,
-                    lock_released=True,
-                )
-                await session.commit()
-                return result_oob.get("status") == "promoted" and not result_oob.get(
-                    "already_promoted"
+                    pr_number=int(pr_number),
+                    candidate_sha=candidate_sha,
+                    base_record=base_record,
+                    pr_url=pr_url,
+                    promotion_target=promotion_target,
+                    release_branch=release_branch,
+                    promoted_sha=landed_receipt["merge_commit_sha"],
+                    source="exact promotion receipt",
                 )
 
             # 2. Inspect the PR state and check runs.
@@ -1905,6 +1418,97 @@ async def _reconcile_if_managed_check_wait(
                     exc,
                 )
                 return False
+
+            if pr_data.get("merged") is True:
+                merged_head = pr_data.get("head") or {}
+                merged_base = pr_data.get("base") or {}
+                merged_head_sha = str(merged_head.get("sha") or "").strip()
+                merged_commit_sha = str(
+                    pr_data.get("merge_commit_sha") or ""
+                ).strip()
+                merged_identity_matches = (
+                    merged_head_sha == candidate_sha
+                    and merged_head.get("ref") == release_branch
+                    and merged_base.get("ref") == promotion_target
+                    and bool(merged_commit_sha)
+                )
+                if not merged_identity_matches:
+                    detail = (
+                        f"merged PR #{pr_number} identity was "
+                        f"{merged_base.get('ref')}/{merged_head.get('ref')}@"
+                        f"{merged_head_sha[:8] or 'missing'}, expected "
+                        f"{promotion_target}/{release_branch}@{candidate_sha[:8]}"
+                    )
+                    logger.error(
+                        "[RELEASE_QUALIFIER] reconcile managed_check_wait: %s — "
+                        "refusing to record an unqualified landing",
+                        detail,
+                    )
+                    await _record_promotion_integrity_incident(
+                        session,
+                        version,
+                        base_record,
+                        pr_url=pr_url,
+                        detail=detail,
+                        evidence={
+                            "pr_number": int(pr_number),
+                            "pr_url": pr_url,
+                            "expected_base_ref": promotion_target,
+                            "expected_head_ref": release_branch,
+                            "expected_candidate_sha": candidate_sha,
+                            "observed_base_ref": merged_base.get("ref"),
+                            "observed_head_ref": merged_head.get("ref"),
+                            "observed_head_sha": merged_head_sha,
+                            "observed_merge_commit_sha": merged_commit_sha,
+                        },
+                    )
+                    await session.commit()
+                    return True
+                try:
+                    merge_reachable = await github.is_ancestor_of(
+                        token,
+                        owner,
+                        repo,
+                        merged_commit_sha,
+                        promotion_target,
+                        project_id=str(version.project_id),
+                    )
+                except Exception:  # noqa: BLE001 — exact recovery must defer
+                    merge_reachable = None
+                if merge_reachable is not True:
+                    await _persist_managed_check_wait_snapshot(
+                        session,
+                        version.id,
+                        pr_number=int(pr_number),
+                        ci_state=_CI_PENDING,
+                        snapshot=_managed_check_wait_snapshot(
+                            ci_state=_CI_PENDING,
+                            classified_at=_utcnow(),
+                            head_sha=merged_head_sha,
+                            reason="merge_receipt_reachability_unconfirmed",
+                            detail=(
+                                f"merge commit {merged_commit_sha[:8]} "
+                                f"reachability from {promotion_target} is "
+                                f"{merge_reachable!r}"
+                            ),
+                        ),
+                    )
+                    return False
+                return await _finish_managed_check_wait_landing(
+                    session,
+                    version,
+                    token=token,
+                    owner=owner,
+                    repo=repo,
+                    pr_number=int(pr_number),
+                    candidate_sha=candidate_sha,
+                    base_record=base_record,
+                    pr_url=pr_url,
+                    promotion_target=promotion_target,
+                    release_branch=release_branch,
+                    promoted_sha=merged_commit_sha,
+                    source="authoritative merged PR",
+                )
 
             if pr_data.get("state") == "closed" and not pr_data.get("merged"):
                 logger.warning(
@@ -1964,7 +1568,44 @@ async def _reconcile_if_managed_check_wait(
                 )
                 return False
 
-            pr_head_sha: str | None = (pr_data.get("head") or {}).get("sha")
+            pr_head = pr_data.get("head") or {}
+            pr_base = pr_data.get("base") or {}
+            pr_head_sha: str | None = pr_head.get("sha")
+            pr_base_sha: str | None = pr_base.get("sha")
+            identity_matches_qualified_candidate = (
+                pr_head.get("ref") == release_branch
+                and pr_base.get("ref") == promotion_target
+                and pr_head_sha == candidate_sha
+            )
+            if not identity_matches_qualified_candidate:
+                detail = (
+                    f"observed {pr_base.get('ref')}/{pr_head.get('ref')}@"
+                    f"{str(pr_head_sha or '')[:8] or 'missing'}, expected "
+                    f"{promotion_target}/{release_branch}@{candidate_sha[:8]}"
+                )
+                logger.error(
+                    "[RELEASE_QUALIFIER] reconcile managed_check_wait: PR #%s "
+                    "for v%d no longer carries the qualified candidate (%s) — "
+                    "leaving pending for branch repair; merge forbidden",
+                    pr_number,
+                    version.version_number,
+                    detail,
+                )
+                classified_at = _utcnow()
+                await _persist_managed_check_wait_snapshot(
+                    session,
+                    version.id,
+                    pr_number=int(pr_number),
+                    ci_state=_CI_PENDING,
+                    snapshot=_managed_check_wait_snapshot(
+                        ci_state=_CI_PENDING,
+                        classified_at=classified_at,
+                        head_sha=pr_head_sha,
+                        reason="qualified_candidate_mismatch",
+                        detail=detail,
+                    ),
+                )
+                return False
             if not pr_head_sha:
                 logger.warning(
                     "[RELEASE_QUALIFIER] reconcile managed_check_wait: PR #%s "
@@ -2262,6 +1903,107 @@ async def _reconcile_if_managed_check_wait(
                 await session.commit()
                 return True
 
+            # CI and the migration guard authorised the exact target observed
+            # above.  Serialize final submissions to this repository/base and
+            # PR with the canonical review/fix lock order, then re-read the live
+            # pair inside both locks immediately before the expected-head PUT.
+            # If either side advanced, leave the version pending so the next
+            # sweep re-runs all evidence against the new pair.
+            target_checked_at = _utcnow()
+            initial_target_valid = bool(
+                pr_head_sha
+                and pr_base_sha
+                and pr_head.get("ref") == release_branch
+                and pr_base.get("ref") == promotion_target
+                and pr_head_sha == candidate_sha
+            )
+            from app.task_locking import acquire_merge_submission_locks
+
+            await acquire_merge_submission_locks(
+                session,
+                project_id=version.project_id,
+                repo_identity=f"{owner}/{repo}",
+                base_branch=promotion_target,
+                pr_number=int(pr_number),
+            )
+            try:
+                fresh_pr_data = await github.get_pull_request(
+                    token,
+                    owner,
+                    repo,
+                    int(pr_number),
+                    project_id=str(version.project_id),
+                )
+            except Exception as exc:  # noqa: BLE001 — retry next sweep
+                logger.warning(
+                    "[RELEASE_QUALIFIER] reconcile managed_check_wait: could "
+                    "not re-read PR #%s target after checks for v%d (%s) — "
+                    "leaving pending",
+                    pr_number,
+                    version.version_number,
+                    exc,
+                )
+                await _persist_managed_check_wait_snapshot(
+                    session,
+                    version.id,
+                    pr_number=int(pr_number),
+                    ci_state=ci_state,
+                    snapshot=_managed_check_wait_snapshot(
+                        ci_state=ci_state,
+                        classified_at=target_checked_at,
+                        head_sha=pr_head_sha,
+                        check_result=check_result,
+                        reason="pr_target_refetch_failed",
+                        detail=str(exc),
+                    ),
+                )
+                return False
+
+            fresh_head = fresh_pr_data.get("head") or {}
+            fresh_base = fresh_pr_data.get("base") or {}
+            fresh_head_sha = str(fresh_head.get("sha") or "").strip()
+            fresh_base_sha = str(fresh_base.get("sha") or "").strip()
+            target_changed = (
+                not initial_target_valid
+                or fresh_pr_data.get("state") != "open"
+                or fresh_head.get("ref") != release_branch
+                or fresh_base.get("ref") != promotion_target
+                or fresh_head_sha != candidate_sha
+                or fresh_head_sha != pr_head_sha
+                or fresh_base_sha != pr_base_sha
+            )
+            if target_changed:
+                detail = (
+                    f"{pr_base.get('ref')}@{str(pr_base_sha or '')[:8]}/"
+                    f"{pr_head.get('ref')}@{str(pr_head_sha or '')[:8]} -> "
+                    f"{fresh_base.get('ref')}@{fresh_base_sha[:8]}/"
+                    f"{fresh_head.get('ref')}@{fresh_head_sha[:8]} "
+                    f"state={fresh_pr_data.get('state')}"
+                )
+                logger.info(
+                    "[RELEASE_QUALIFIER] reconcile managed_check_wait: PR #%s "
+                    "target changed while checks ran for v%d (%s) — leaving "
+                    "pending for exact-target revalidation",
+                    pr_number,
+                    version.version_number,
+                    detail,
+                )
+                await _persist_managed_check_wait_snapshot(
+                    session,
+                    version.id,
+                    pr_number=int(pr_number),
+                    ci_state=ci_state,
+                    snapshot=_managed_check_wait_snapshot(
+                        ci_state=ci_state,
+                        classified_at=target_checked_at,
+                        head_sha=pr_head_sha,
+                        check_result=check_result,
+                        reason="pr_target_changed_after_checks",
+                        detail=detail,
+                    ),
+                )
+                return False
+
             # 5. Attempt the merge.
             try:
                 merge_result = await github.merge_pull_request(
@@ -2271,6 +2013,7 @@ async def _reconcile_if_managed_check_wait(
                     int(pr_number),
                     merge_method="merge",
                     project_id=str(version.project_id),
+                    expected_head_sha=pr_head_sha,
                 )
             except Exception as exc:  # noqa: BLE001 — transient error, leave pending
                 logger.warning(
@@ -2284,15 +2027,16 @@ async def _reconcile_if_managed_check_wait(
 
             if not merge_result.get("merged"):
                 # Disambiguate: the PR may have already merged (idempotency).
-                if await _promotion_pr_landed(
+                retry_receipt = await _resolve_exact_promotion_receipt(
                     token,
                     owner,
                     repo,
-                    int(pr_number),
                     candidate_sha,
                     version,
                     project=project,
-                ):
+                    pr_number=int(pr_number),
+                )
+                if retry_receipt is not None:
                     logger.info(
                         "[RELEASE_QUALIFIER] reconcile managed_check_wait: PR #%s "
                         "for v%d returned merged=False but is in fact merged — "
@@ -2301,7 +2045,10 @@ async def _reconcile_if_managed_check_wait(
                         version.version_number,
                     )
                     # Fall through to the success block below.
-                    merge_result = {"merged": True}
+                    merge_result = {
+                        "merged": True,
+                        "sha": retry_receipt["merge_commit_sha"],
+                    }
                 elif merge_result.get("conflict"):
                     msg = merge_result.get("message", "merge not completed")
                     logger.warning(
@@ -2502,24 +2249,28 @@ async def _reconcile_if_managed_check_wait(
             await _delete_release_branch_best_effort(
                 token, owner, repo, release_branch, version
             )
-            promoted_sha_new: str | None = None
-            try:
-                promoted_sha_new = await github.get_branch_sha(
+            promoted_sha_new: str | None = (
+                str(merge_result.get("sha") or "").strip() or None
+            )
+            if promoted_sha_new is None:
+                success_receipt = await _resolve_exact_promotion_receipt(
                     token,
                     owner,
                     repo,
-                    promotion_target,
-                    project_id=str(version.project_id),
-                    live=True,
+                    candidate_sha,
+                    version,
+                    project=project,
+                    pr_number=int(pr_number),
                 )
-            except Exception as exc:  # noqa: BLE001 — fallback to candidate_sha
-                logger.warning(
-                    "[RELEASE_QUALIFIER] reconcile managed_check_wait: could not "
-                    "resolve %s HEAD for v%d (%s)",
-                    promotion_target,
-                    version.version_number,
-                    exc,
-                )
+                if success_receipt is None:
+                    logger.warning(
+                        "[RELEASE_QUALIFIER] reconcile managed_check_wait: merge "
+                        "succeeded for PR #%s but no exact merge receipt is "
+                        "readable yet — retaining managed wait",
+                        pr_number,
+                    )
+                    return False
+                promoted_sha_new = success_receipt["merge_commit_sha"]
             result = await _record_promotion_success(
                 session,
                 version,
@@ -2560,17 +2311,48 @@ async def _cleanup_managed_check_wait_failure_artifacts(
     release_branch: str,
     version: release_version.ReleaseVersion,
     pr_number: int,
-) -> None:
-    """Close the managed-check promotion PR and delete its branch best-effort."""
+) -> bool:
+    """Close the managed promotion PR and best-effort delete its branch.
+
+    The return value is authoritative only for PR closure.  Branch deletion is
+    cosmetic after a terminal close, but callers must retain cleanup debt when
+    the PR itself could still be open or they could redrive a duplicate.
+    """
+    closed = False
     try:
-        await github.close_pull_request(
-            token,
-            owner,
-            repo,
-            pr_number,
-            project_id=str(version.project_id),
+        closed = bool(
+            await github.close_pull_request(
+                token,
+                owner,
+                repo,
+                pr_number,
+                project_id=str(version.project_id),
+            )
         )
-    except Exception as exc:  # noqa: BLE001 — cleanup must not block failure recording
+        if not closed:
+            try:
+                pr_state = await github.get_pull_request(
+                    token,
+                    owner,
+                    repo,
+                    pr_number,
+                    project_id=str(version.project_id),
+                )
+                closed = (
+                    pr_state.get("state") == "closed"
+                    and pr_state.get("merged") is not True
+                )
+            except Exception:  # noqa: BLE001 — retain debt when state is unknown
+                closed = False
+            if not closed:
+                logger.warning(
+                    "[RELEASE_QUALIFIER] reconcile managed_check_wait: close of "
+                    "PR #%s for v%d was not acknowledged and terminal state "
+                    "could not be confirmed — retaining cleanup debt",
+                    pr_number,
+                    version.version_number,
+                )
+    except Exception as exc:  # noqa: BLE001 — caller decides whether debt may clear
         logger.warning(
             "[RELEASE_QUALIFIER] reconcile managed_check_wait: could not close "
             "PR #%s for v%d (%s) — continuing with branch cleanup",
@@ -2581,6 +2363,7 @@ async def _cleanup_managed_check_wait_failure_artifacts(
     await _delete_release_branch_best_effort(
         token, owner, repo, release_branch, version
     )
+    return closed
 
 
 async def _reconcile_if_pending_qualification_superseded(
@@ -2591,7 +2374,7 @@ async def _reconcile_if_pending_qualification_superseded(
     """Reconcile an open version whose pending qualification candidate landed out-of-band.
 
     When an operator force-promotes a candidate to the promotion target without
-    going through the normal qualification -> promotion_pending -> auto-merge
+    going through the normal qualification -> managed promotion
     path, the version is left with ``last_qualification.status == "pending"``
     and NO ``promotion_pending`` sub-key.  The 6h qualification_timeout backstop
     eventually fires, but stamps ``blocker='qualification_timeout'`` — wrong
@@ -2630,8 +2413,8 @@ async def _reconcile_if_pending_qualification_superseded(
             if qual.get("status") != "pending":
                 return False
             # promotion_pending means the qualifier itself initiated a promotion
-            # PR — that path is owned by _reconcile_if_pending_auto_merge_landed
-            # and _reconcile_if_promotion_pending_timed_out.
+            # PR — that path is owned by _reconcile_if_managed_check_wait and
+            # _reconcile_if_promotion_pending_timed_out.
             if qual.get("promotion_pending"):
                 return False
             candidate_sha: str | None = qual.get("candidate_sha")
@@ -2821,19 +2604,17 @@ async def _reconcile_if_promotion_pending_timed_out(
 
     Audit C9: the replacement backstop for the ``promotion_pending`` sub-state,
     which intentionally bypasses the 6h qualification timeout (see the module
-    docstring on ``_PROMOTION_PENDING_TIMEOUT_SECONDS_DEFAULT``).  Pure DB work —
-    no GitHub I/O — so it fires even when GitHub calls fail (the exact case the
-    ``_reconcile_if_pending_auto_merge_landed`` terminal-state path cannot
-    handle).
+    comment on ``_PROMOTION_PENDING_TIMEOUT_SECONDS_DEFAULT``).
 
     For an ``open`` version with ``last_qualification.status == "pending"`` and a
     ``promotion_pending`` sub-state whose ``enabled_at`` age exceeds the
-    configurable cap, records a ``_record_promotion_failure`` with error
-    ``promotion_pending_timeout``.  Because ``base_record`` excludes
-    ``promotion_pending``, that failure CLEARS the sub-state — the version goes
-    back to stabilize, and on the next cycle the normal qualification-timeout
-    backstop + retry machinery are re-armed.  ``main`` is never touched, so this
-    is always safe.  Returns True iff a timeout failure was recorded.
+    configurable cap, first persists ``cleanup_required`` without clearing the
+    PR identity.  GitHub is then authoritative: an exact merged receipt records
+    promotion success; a closed-unmerged PR (or an open PR successfully closed)
+    records ``promotion_pending_timeout`` and clears the sub-state; a wrong
+    merged identity records a stop-level integrity incident; and unknown state
+    or failed closure retains cleanup debt for a later sweep.  Returns True iff
+    a terminal success/failure/integrity result was recorded.
     """
     factory = session_factory or AsyncSessionLocal
     async with factory() as session:
@@ -2856,19 +2637,45 @@ async def _reconcile_if_promotion_pending_timed_out(
             qual = version.last_qualification or {}
             if qual.get("status") != "pending":
                 return False
-            pending = qual.get("promotion_pending")
-            if not pending:
+            raw_pending = qual.get("promotion_pending")
+            pending, pending_kind, pending_was_normalized = (
+                _canonicalize_promotion_pending(
+                    raw_pending,
+                    qualification=qual,
+                    version=version,
+                )
+            )
+            if pending_kind == _PROMOTION_PENDING_ABSENT:
                 return False
+            base_record = {k: v for k, v in qual.items() if k != "promotion_pending"}
+            if pending_kind == _PROMOTION_PENDING_MALFORMED:
+                await _record_promotion_failure(
+                    session,
+                    version,
+                    base_record,
+                    "promotion_pending_malformed",
+                    detail=(
+                        "promotion_pending was neither a persisted promotion PR "
+                        "nor a candidate-bound promotion claim"
+                    ),
+                    lock_released=False,
+                )
+                await session.commit()
+                return True
+            if pending is None:
+                return False
+            if pending_was_normalized:
+                qual = dict(qual)
+                qual["promotion_pending"] = pending
+                version.last_qualification = qual
+                flag_modified(version, "last_qualification")
+                session.add(version)
 
-            enabled_at_str = pending.get("enabled_at")
-            if not enabled_at_str:
-                # No clock to age against — leave it; the auto-merge stall alert
-                # (which has the same missing-enabled_at guard) surfaces this.
-                return False
-            try:
-                enabled_at = datetime.fromisoformat(enabled_at_str)
-            except (ValueError, TypeError):
-                return False
+            # Canonicalization guarantees a parseable clock for both valid
+            # shapes.  Keep this defensive fallback total for hand-built rows.
+            enabled_at = _parse_promotion_pending_time(pending.get("enabled_at"))
+            if enabled_at is None:
+                enabled_at = _promotion_pending_fallback_enabled_at(qual, version)
 
             cap_seconds = _promotion_pending_timeout_seconds()
             # A bare promotion CLAIM (``claiming`` + no ``pr_number``) is only
@@ -2876,9 +2683,7 @@ async def _reconcile_if_promotion_pending_timed_out(
             # the short claim bound, promote() crashed between claiming and
             # opening the PR, so GC it now instead of letting it inherit the 24h
             # cap and wedge the version out of re-qualification.
-            _is_bare_claim = bool(pending.get("claiming")) and not pending.get(
-                "pr_number"
-            )
+            _is_bare_claim = pending_kind == _PROMOTION_PENDING_CLAIM
             if _is_bare_claim:
                 # A bare claim is promote()'s crashed I/O window, not a promotion
                 # waiting on pipeline progress — it will NOT self-heal on resume,
@@ -2901,28 +2706,13 @@ async def _reconcile_if_promotion_pending_timed_out(
                     _deploy_state, enabled_at, pending.get("pause_baseline")
                 )
             if age_seconds < cap_seconds:
+                if pending_was_normalized:
+                    await session.commit()
                 return False
 
             age_hours = age_seconds / 3600.0
             pr_number = pending.get("pr_number")
             pr_url: str | None = pending.get("pr_url")
-            # A migration-carrying promotion held in managed_check_wait is owned
-            # by _reconcile_if_managed_check_wait, but that reconciler has no hard
-            # timeout of its own, so this pure-DB backstop is its only escape from
-            # a promotion that never reaches a terminal CI/merge signal.  Unlike
-            # the managed reconciler's red/closed paths, this backstop does NOT
-            # close the PR — so after it clears promotion_pending the promotion PR
-            # is left OPEN, and the promotion_failed re-driver would then open a
-            # FRESH promotion PR that races the orphan (wasting a full audit +
-            # merge-grade on the duplicate).  Remember whether this is a managed
-            # record so we can best-effort tear the orphan down after the lock is
-            # released.
-            _managed_check_wait = bool(pending.get("managed_check_wait"))
-            # base_record drops promotion_pending (mirrors
-            # _reconcile_if_pending_auto_merge_landed) so the recorded failure
-            # CLEARS the sub-state and re-arms the qualification-timeout backstop.
-            base_record = {k: v for k, v in qual.items() if k != "promotion_pending"}
-
             if _is_bare_claim:
                 logger.warning(
                     "[RELEASE_QUALIFIER] reconcile promotion_claim_abandoned: v%d "
@@ -2959,61 +2749,220 @@ async def _reconcile_if_promotion_pending_timed_out(
                     f"without a terminal merge/close/CI signal — force-failed so "
                     f"the version retries qualification"
                 )
+
+            if _is_bare_claim:
+                await _record_promotion_failure(
+                    session,
+                    version,
+                    base_record,
+                    _timeout_error,
+                    detail=_timeout_detail,
+                    pr_url=pr_url,
+                    lock_released=False,
+                )
+                await session.commit()
+                return True
+
+            # A persisted PR must reach a confirmed terminal state before its
+            # identity is removed.  Otherwise a close/API failure followed by a
+            # restart lets the redriver open a second promotion PR while the
+            # first is still live.  Persist the cleanup debt first; the ordinary
+            # managed reconciler refuses to merge cleanup-required rows and every
+            # later timeout sweep resumes this exact PR.
+            cleanup_pending = dict(pending)
+            cleanup_pending["cleanup_required"] = True
+            cleanup_pending["timeout_error"] = _timeout_error
+            cleanup_pending["timeout_detail"] = _timeout_detail
+            cleanup_qual = dict(qual)
+            cleanup_qual["promotion_pending"] = cleanup_pending
+            version.last_qualification = cleanup_qual
+            flag_modified(version, "last_qualification")
+            session.add(version)
+            await session.commit()
+
+            _ver = await session.get(release_version.ReleaseVersion, version_id)
+            _proj = (
+                await session.get(Project, _ver.project_id)
+                if _ver is not None
+                else None
+            )
+            if _ver is None or _proj is None:
+                return False
+            _resolved = await _resolve_github_with_session(session, _proj)
+            if _resolved is None:
+                logger.warning(
+                    "[RELEASE_QUALIFIER] reconcile promotion_pending_timeout: "
+                    "PR #%s cleanup still requires GitHub credentials — debt "
+                    "retained; requalification remains fenced",
+                    pr_number,
+                )
+                return False
+            _token, _owner, _repo = _resolved
+            _integration_branch, _promotion_target = _lts_branch_names(_proj)
+            _release_branch = f"release-v{_ver.version_number}"
+            try:
+                current_pr = await github.get_pull_request(
+                    _token,
+                    _owner,
+                    _repo,
+                    int(pr_number),
+                    project_id=str(_ver.project_id),
+                )
+            except Exception as exc:  # noqa: BLE001 — unknown state retains debt
+                logger.warning(
+                    "[RELEASE_QUALIFIER] reconcile promotion_pending_timeout: "
+                    "could not classify PR #%s before cleanup (%s) — retaining "
+                    "debt",
+                    pr_number,
+                    exc,
+                )
+                return False
+
+            if current_pr.get("merged") is True:
+                current_head = current_pr.get("head") or {}
+                current_base = current_pr.get("base") or {}
+                current_merge_sha = str(
+                    current_pr.get("merge_commit_sha") or ""
+                ).strip()
+                expected_candidate = str(cleanup_qual.get("candidate_sha") or "")
+                if not (
+                    current_head.get("ref") == _release_branch
+                    and current_head.get("sha") == expected_candidate
+                    and current_base.get("ref") == _promotion_target
+                    and current_merge_sha
+                ):
+                    detail = (
+                        f"timed-out PR #{pr_number} merged as "
+                        f"{current_base.get('ref')}/{current_head.get('ref')}@"
+                        f"{str(current_head.get('sha') or '')[:8] or 'missing'}, "
+                        f"expected {_promotion_target}/{_release_branch}@"
+                        f"{expected_candidate[:8]}"
+                    )
+                    await _record_promotion_integrity_incident(
+                        session,
+                        _ver,
+                        base_record,
+                        pr_url=str(pr_url or ""),
+                        detail=detail,
+                        evidence={
+                            "pr_number": int(pr_number),
+                            "pr_url": pr_url,
+                            "expected_base_ref": _promotion_target,
+                            "expected_head_ref": _release_branch,
+                            "expected_candidate_sha": expected_candidate,
+                            "observed_base_ref": current_base.get("ref"),
+                            "observed_head_ref": current_head.get("ref"),
+                            "observed_head_sha": current_head.get("sha"),
+                            "observed_merge_commit_sha": current_merge_sha,
+                        },
+                    )
+                    await session.commit()
+                    return True
+                receipt = await _resolve_exact_promotion_receipt(
+                    _token,
+                    _owner,
+                    _repo,
+                    expected_candidate,
+                    _ver,
+                    project=_proj,
+                    pr_number=int(pr_number),
+                )
+                if receipt is None:
+                    return False
+                return await _finish_managed_check_wait_landing(
+                    session,
+                    _ver,
+                    token=_token,
+                    owner=_owner,
+                    repo=_repo,
+                    pr_number=int(pr_number),
+                    candidate_sha=expected_candidate,
+                    base_record=base_record,
+                    pr_url=receipt.get("pr_url") or str(pr_url or ""),
+                    promotion_target=_promotion_target,
+                    release_branch=_release_branch,
+                    promoted_sha=receipt["merge_commit_sha"],
+                    source="timeout cleanup race",
+                )
+
+            if (
+                current_pr.get("state") == "closed"
+                and current_pr.get("merged") is False
+            ):
+                await _delete_release_branch_best_effort(
+                    _token, _owner, _repo, _release_branch, _ver
+                )
+                cleanup_confirmed = True
+            elif current_pr.get("state") == "open":
+                cleanup_confirmed = (
+                    await _cleanup_managed_check_wait_failure_artifacts(
+                        _token,
+                        _owner,
+                        _repo,
+                        _release_branch,
+                        _ver,
+                        int(pr_number),
+                    )
+                )
+            else:
+                return False
+            if not cleanup_confirmed:
+                return False
+
+            # Re-lock and prove this is still the same cleanup debt before
+            # clearing it into a promotion_failed record.  A concurrent landing
+            # or operator action wins without being overwritten.
+            session.expire_all()
+            locked: release_version.ReleaseVersion | None = (
+                (
+                    await session.execute(
+                        select(release_version.ReleaseVersion)
+                        .where(release_version.ReleaseVersion.id == version_id)
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if locked is None or locked.status != "open":
+                return False
+            locked_qual = locked.last_qualification or {}
+            locked_pending, locked_kind, _ = _canonicalize_promotion_pending(
+                locked_qual.get("promotion_pending"),
+                qualification=locked_qual,
+                version=locked,
+            )
+            if (
+                locked_kind != _PROMOTION_PENDING_MANAGED
+                or locked_pending is None
+                or locked_pending.get("pr_number") != int(pr_number)
+                or not locked_pending.get("cleanup_required")
+            ):
+                return False
+            locked_base_record = {
+                k: v
+                for k, v in locked_qual.items()
+                if k != "promotion_pending"
+            }
+            locked_version_number = locked.version_number
             await _record_promotion_failure(
                 session,
-                version,
-                base_record,
-                _timeout_error,
-                detail=_timeout_detail,
-                pr_url=pr_url,
+                locked,
+                locked_base_record,
+                str(locked_pending.get("timeout_error") or _timeout_error),
+                detail=str(locked_pending.get("timeout_detail") or _timeout_detail),
+                pr_url=locked_pending.get("pr_url"),
                 lock_released=False,
             )
             await session.commit()
-
-            # Best-effort: close the orphaned managed-check-wait promotion PR and
-            # delete its release branch now that the row lock is released (no
-            # GitHub I/O is held under the lock).  Fresh PK reloads avoid touching
-            # the commit-expired ORM instances (MissingGreenlet).  Fail-open: any
-            # error leaves today's behavior (PR closed by a later sweep / operator)
-            # and never turns the recorded timeout into an exception.
-            if _managed_check_wait and pr_number:
-                try:
-                    _ver = await session.get(
-                        release_version.ReleaseVersion, version_id
-                    )
-                    _proj = (
-                        await session.get(Project, _ver.project_id)
-                        if _ver is not None
-                        else None
-                    )
-                    if _ver is not None and _proj is not None:
-                        _resolved = await _resolve_github_with_session(session, _proj)
-                        if _resolved is not None:
-                            _token, _owner, _repo = _resolved
-                            await _cleanup_managed_check_wait_failure_artifacts(
-                                _token,
-                                _owner,
-                                _repo,
-                                f"release-v{_ver.version_number}",
-                                _ver,
-                                int(pr_number),
-                            )
-                            logger.info(
-                                "[RELEASE_QUALIFIER] reconcile "
-                                "promotion_pending_timeout: closed orphaned "
-                                "managed_check_wait promotion PR #%s and deleted "
-                                "release-v%d so the re-qualify does not race it",
-                                pr_number,
-                                _ver.version_number,
-                            )
-                except Exception:
-                    logger.warning(
-                        "[RELEASE_QUALIFIER] reconcile promotion_pending_timeout: "
-                        "best-effort cleanup of orphaned managed_check_wait PR #%s "
-                        "failed — leaving it for a later sweep / operator",
-                        pr_number,
-                        exc_info=True,
-                    )
+            logger.info(
+                "[RELEASE_QUALIFIER] reconcile promotion_pending_timeout: "
+                "confirmed PR #%s terminal, cleared cleanup debt, and returned "
+                "v%d to stabilize",
+                pr_number,
+                locked_version_number,
+            )
             return True
         except Exception:
             logger.exception(
@@ -3315,6 +3264,33 @@ async def _confirm_serving_or_fail(
                 await _record_post_promotion_outcome(
                     session, version, "serving_confirmed", _now
                 )
+                from app.notification_dispatch import post_event_message
+
+                await post_event_message(
+                    session,
+                    version.project_id,
+                    event_type="release.serving_confirmed",
+                    summary=(
+                        f"Promoted v{version.version_number} is serving "
+                        f"{(version.served_sha or version.promoted_sha or '')[:12]}."
+                    ),
+                    context={
+                        "release_version_id": str(version.id),
+                        "version_number": version.version_number,
+                        "serving_status": "serving_confirmed",
+                        "promoted_sha": version.promoted_sha,
+                        "served_sha": version.served_sha,
+                        "served_at": (
+                            version.served_at.isoformat() if version.served_at else None
+                        ),
+                        "qualification_status": (version.last_qualification or {}).get(
+                            "status"
+                        ),
+                        "receipt_kind": "serving_barrier",
+                        "resident_wake_barrier": True,
+                    },
+                    idempotency_key=f"release:{version.id}:serving:confirmed",
+                )
                 await session.commit()
                 logger.info(
                     "[RELEASE_QUALIFIER] serving confirmed for promoted v%d "
@@ -3336,6 +3312,30 @@ async def _confirm_serving_or_fail(
                 session.add(version)
                 await _record_post_promotion_outcome(
                     session, version, "confirmation_timed_out", _now
+                )
+                from app.notification_dispatch import post_event_message
+
+                await post_event_message(
+                    session,
+                    version.project_id,
+                    event_type="release.serving_confirmation_timed_out",
+                    summary=(
+                        f"Serving confirmation timed out for promoted "
+                        f"v{version.version_number}: {aggregate_reason}."
+                    ),
+                    context={
+                        "release_version_id": str(version.id),
+                        "version_number": version.version_number,
+                        "serving_status": "confirmation_timed_out",
+                        "promoted_sha": version.promoted_sha,
+                        "qualification_status": (version.last_qualification or {}).get(
+                            "status"
+                        ),
+                        "reason": aggregate_reason,
+                        "receipt_kind": "serving_barrier",
+                        "resident_wake_barrier": True,
+                    },
+                    idempotency_key=f"release:{version.id}:serving:timed_out",
                 )
                 try:
                     from app.strategic_trigger import request_strategic_refresh
@@ -3372,6 +3372,30 @@ async def _confirm_serving_or_fail(
             )
             await _record_post_promotion_outcome(
                 session, version, "deploy_failed", _now
+            )
+            from app.notification_dispatch import post_event_message
+
+            await post_event_message(
+                session,
+                version.project_id,
+                event_type="release.serving_failed",
+                summary=(
+                    f"Serving failed for promoted v{version.version_number}: "
+                    f"{aggregate_reason}."
+                ),
+                context={
+                    "release_version_id": str(version.id),
+                    "version_number": version.version_number,
+                    "serving_status": "deploy_failed",
+                    "promoted_sha": version.promoted_sha,
+                    "qualification_status": (version.last_qualification or {}).get(
+                        "status"
+                    ),
+                    "reason": aggregate_reason,
+                    "receipt_kind": "serving_barrier",
+                    "resident_wake_barrier": True,
+                },
+                idempotency_key=f"release:{version.id}:serving:failed",
             )
             # Loud operator alert (ERROR), deduped via deploy_confirm_alerted_at.
             try:

@@ -16310,11 +16310,17 @@ async def _map_direction_to_criterion(db_session, project, direction_id, *, cove
 async def test_apply_post_spawn_state_completes_when_owned_criterion_covered(
     db_session, mocker
 ):
-    """Site 1: when the owned criterion IS covered, the saturated proven direction
-    still auto-completes exactly as before the gate."""
+    """A covered owned criterion does not replace the direction proof contract.
+
+    The saturated direction completes because its declared success evidence has
+    a challenge-approved ``met`` judgment; criterion coverage remains supporting
+    release evidence and does not become a second success authority.
+    """
     direction_id = "d-site1-covered"
     direction = {
         **_active_direction(direction_id, "Saturated proven, covered criterion"),
+        "context": {"success_evidence": "The owned outcome is verified"},
+        "evidence_progress": {"status": "met", "challenge_approved": True},
         "research_history": [
             {"timestamp": "2026-01-01T00:00:00", "tasks_created": 1, "prs_merged": 1},
             {"timestamp": "2026-01-02T00:00:00", "tasks_created": 0, "prs_merged": 1},
@@ -16402,25 +16408,27 @@ async def test_apply_post_spawn_state_completes_when_owned_criterion_covered(
     )
     assert target is not None
     assert target.get("status") == "completed", (
-        "Site 1 must still auto-complete a saturated proven direction whose owned "
-        "criterion is covered"
+        "A saturated proof-complete direction must complete when its owned "
+        "criterion is also covered"
     )
     assert target.get("auto_completed") is True
 
 
 @pytest.mark.asyncio
 async def test_exhausted_saturated_proven_direction_auto_completes(db_session, mocker):
-    """A fully-exhausted saturated direction auto-completes when all findings are deduped.
+    """A proof-complete saturated direction completes when findings are deduped.
 
     Covers the zero-spawn (all-deduped) path through apply_post_spawn_state.
-    Before the fix, the guard `entry.get("tasks_created", 0) > 0` prevented
-    auto-completion exactly for the most exhausted directions — those where every
-    finding was already known and nothing spawned. After the fix, the criteria
-    (saturated + total_merged >= 3) are evaluated regardless of tasks_created.
+    Saturation and merge counts are only supporting evidence: the direction has
+    a declared success contract and an independently challenge-approved ``met``
+    judgment, so this remains a successful completion rather than a mechanical
+    activity-threshold decision.
     """
     direction_id = "d-exhaust-sat1"
     direction = {
         **_active_direction(direction_id, "Exhausted saturated direction"),
+        "context": {"success_evidence": "The exhausted path is verified complete"},
+        "evidence_progress": {"status": "met", "challenge_approved": True},
         # 3 prior low-output cycles → _compute_saturation returns True
         "research_history": [
             {"timestamp": "2026-01-01T00:00:00", "tasks_created": 1, "prs_merged": 1},
@@ -16518,15 +16526,18 @@ async def test_exhausted_saturated_proven_direction_auto_completes(db_session, m
 async def test_no_findings_saturated_proven_direction_auto_completes(
     db_session, mocker
 ):
-    """A saturated, proven direction is auto-completed via the no-findings path.
+    """A proof-complete saturated direction completes via the no-findings path.
 
     Covers _stamp_no_findings_refractory: when 3+ consecutive unproductive
-    cycles make the direction saturated AND total_merged >= 3, the direction
-    is marked completed in the same locked write that stamps the refractory.
+    cycles make the direction saturated, its declared success evidence has a
+    challenge-approved ``met`` judgment, so the direction is marked completed
+    in the same locked write that stamps the refractory.
     """
     direction_id = "d-nf-sat-proven"
     direction = {
         **_active_direction(direction_id, "No-findings saturated proven"),
+        "context": {"success_evidence": "No further actionable findings remain"},
+        "evidence_progress": {"status": "met", "challenge_approved": True},
         # 2 prior consecutive unproductive cycles — one more makes it saturated
         "consecutive_unproductive_cycles": 2,
         "research_history": [

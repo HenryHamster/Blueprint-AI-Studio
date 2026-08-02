@@ -30,7 +30,7 @@ def _research_task(findings: list[dict], created_at: datetime) -> Task:
         project_id=uuid.uuid4(),
         title="research",
         payloads=[{"type": "research"}],
-        context={},
+        context={"research_findings_finalized": True},
         status=TaskStatus.COMPLETED,
         created_by="ORCHESTRATOR",
         plan_output=findings,
@@ -138,6 +138,27 @@ def test_extended_rates_none_when_no_findings():
     assert rates["grade_success_rate"]["HIGH"] is None
     assert rates["calibration_score"] is None
     assert rates["generalized_calibration_score"] is None
+
+
+def test_unfinalized_research_findings_do_not_enter_actionability_truth():
+    research = _research_task(
+        [
+            {
+                "title": "Rejected raw finding",
+                "actionability_grade": "HIGH",
+                "direction_id": "dir-raw",
+            }
+        ],
+        created_at=_utcnow() - timedelta(hours=1),
+    )
+    research.context = {}
+
+    counts, tasked, merged, succeeded = _aggregate_actionability_extended(
+        [research], [], {research.id}
+    )
+
+    assert counts == {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
+    assert tasked == merged == succeeded == {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
 
 
 def test_extended_code_only_matches_merge_metrics():

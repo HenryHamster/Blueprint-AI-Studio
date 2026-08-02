@@ -8,24 +8,21 @@ override). They now live here as documented, independently-testable functions.
 
 Two kinds of thing live here:
 
-1. **Primitive predicates** — ``should_auto_approve_diff``,
-   ``should_skip_initial_review``, ``should_skip_rereview`` — pure
-   ``(skip, reason)``-returning functions moved verbatim from
+1. **Primitive predicates** — ``should_auto_approve_diff`` and
+   ``should_skip_initial_review`` — pure ``(skip, reason)``-returning functions moved from
    ``review_heuristics.py``. Their behavior is unchanged; only their home
    moved. ``review_pipeline`` re-exports them so existing callers/tests that
    import from ``app.review_pipeline`` keep working unchanged.
 
-2. **Composite decision functions** — ``evaluate_auto_approve_small_main`` and
-   ``should_skip_re_review`` — that aggregate the primitives plus the two rules
-   that used to be inline in ``task_lifecycle.py`` (the direction-acceptance
-   gate on main-branch auto-approve, and the security-scan-blocked override on
-   re-review). These return a :class:`ReviewSkipDecision` so the caller can
+2. **Composite decision functions** — ``evaluate_auto_approve_small_main``
+   aggregates the primitives plus the direction-acceptance gate that used to
+   be inline in ``task_lifecycle.py``. It returns a
+   :class:`ReviewSkipDecision` so the caller can
    distinguish *why* a decision was reached (which named rule fired) instead of
    re-deriving it from a bare boolean.
 
 Everything here is side-effect-free and DB/async-free: callers resolve the
-direction row (DB I/O) and run the security scan (network I/O) themselves, then
-pass the resolved data in. Keeping this module pure is what makes the
+direction row (DB I/O) themselves, then pass the resolved data in. Keeping this module pure is what makes the
 decision-parity test suite (``test_review_policy_parity.py``) able to pin every
 rule vector without a database.
 """
@@ -170,29 +167,6 @@ def should_skip_initial_review(is_intermediate: bool, scope: str) -> tuple[bool,
     return (False, f"{scope} scope on intermediate branch: full review required")
 
 
-def should_skip_rereview(
-    fix_reason: str, rereview_waived: bool
-) -> tuple[bool, str]:
-    """Whether to skip re-review after a fix task completes.
-
-    Skips when the fix addresses mechanical issues that don't change the
-    review decision (CI failures, merge conflicts, migration repairs), or
-    when the reviewer explicitly waived follow-up review for an ordinary
-    code-review fix.
-
-    Does NOT consider the security-scan override — a blocked scan halts the
-    whole flow, which is a separate outcome from skip/re-review. The composite
-    :func:`should_skip_re_review` layers that override on top of this predicate.
-
-    Returns (skip, reason).
-    """
-    if fix_reason == "code_review" and rereview_waived:
-        return (True, "reviewer waived follow-up review: CI gates the merge")
-    if fix_reason in ("ci_failure", "merge_conflict", "migration_guard"):
-        return (True, f"{fix_reason}: original review already approved; CI gates merge")
-    return (False, f"{fix_reason}: re-review required")
-
-
 # --- Rule: AUTO_APPROVE_SMALL_MAIN (with DIRECTION_ACCEPTANCE_GATE sub-rule) ---
 # Why this rule exists:
 #   Trivially small main-branch (non-staging) diffs from directions with a
@@ -277,46 +251,3 @@ def evaluate_auto_approve_small_main(
             True, reason, "auto_approve_small", {"acceptance": acceptance}
         )
     return ReviewSkipDecision(False, reason, "none", {"acceptance": acceptance})
-
-
-# --- Rule: SECURITY_BLOCKED (re-review override) ---
-# Why this rule exists:
-#   When the post-fix security scan blocks the PR, the task is flagged for
-#   manual approval. Neither skipping to CI-wait nor spawning a fresh re-review
-#   is appropriate — the flow must halt and wait for a human. This override
-#   takes precedence over every skip reason below it.
-#
-# When it fires: scan_blocked is True (the caller ran the scan and it blocked).
-#
-# What it does: returns skip=False with rule="security_blocked" so the caller
-#   can distinguish "do nothing / await approval" from "spawn re-review".
-def should_skip_re_review(
-    fix_reason: str,
-    rereview_waived: bool,
-    scan_blocked: bool,
-) -> ReviewSkipDecision:
-    """Composite re-review decision including the security-scan override.
-
-    Returns a :class:`ReviewSkipDecision`:
-      - ``rule == "security_blocked"`` (skip=False) → the scan blocked the PR;
-        the caller must NOT spawn a re-review nor park for CI. The task is
-        already flagged for manual approval.
-      - ``skip == True`` → mechanical or reviewer-waived fix; park for CI instead of
-        re-reviewing (rule names which mechanical reason fired).
-      - ``skip == False, rule == "none"`` → spawn a fresh re-review.
-    """
-    if scan_blocked:
-        return ReviewSkipDecision(
-            False,
-            "security scan blocked fix output; manual approval required",
-            "security_blocked",
-        )
-    skip, reason = should_skip_rereview(fix_reason, rereview_waived)
-    if not skip:
-        return ReviewSkipDecision(False, reason, "none")
-    rule = (
-        "reviewer_waived"
-        if rereview_waived and fix_reason == "code_review"
-        else fix_reason
-    )
-    return ReviewSkipDecision(True, reason, rule)

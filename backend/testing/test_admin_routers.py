@@ -132,6 +132,33 @@ async def _make_project(session, owner_id=TEST_USER_ID, name="Test Project", rol
     return project
 
 
+def _patch_explicit_merge_target(
+    mocker, project_id, pr_number: int, *, base_ref: str
+):
+    """Bind human-approved merge tests to one live immutable PR target."""
+    target = {
+        "project_id": str(project_id),
+        "pr_number": pr_number,
+        "base_sha": f"base-{pr_number}",
+        "head_sha": f"head-{pr_number}",
+        "base_ref": base_ref,
+        "state": "open",
+        "merged": False,
+        "draft": False,
+        "mergeable": True,
+        "mergeable_state": "clean",
+    }
+    for patch_target in (
+        "app.review_policy_merge._fetch_live_review_target",
+        "app.review_merge_authority._fetch_live_review_target",
+    ):
+        mocker.patch(
+            patch_target,
+            new_callable=AsyncMock,
+            return_value=dict(target),
+        )
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # admin_users.py — User Management & Project Members
 # (moved to test_admin_routers__users.py)
@@ -474,7 +501,7 @@ class TestNotificationConfigSettings:
 
     @pytest.mark.asyncio
     async def test_strategic_session_settings(self, client: AsyncClient):
-        """The five strategic-session settings expose their contract
+        """The strategic-session settings expose their contract
         defaults on GET, round-trip through PATCH, and reject bad values.
 
         Other builders reference these by name, so the names + defaults are
@@ -482,6 +509,7 @@ class TestNotificationConfigSettings:
         strategic_local_hold_timeout_seconds (900),
         strategic_session_idle_tick_seconds (5),
         strategic_session_turn_timeout_seconds (120),
+        strategic_session_exploration_interval_seconds (14400),
         strategic_session_max_unattended_seconds (7200).
 
         Note: the legacy ``strategic_session_enabled`` feature flag was retired
@@ -493,6 +521,7 @@ class TestNotificationConfigSettings:
         assert data["strategic_local_hold_timeout_seconds"] == 900
         assert data["strategic_session_idle_tick_seconds"] == 5
         assert data["strategic_session_turn_timeout_seconds"] == 120
+        assert data["strategic_session_exploration_interval_seconds"] == 14_400
         assert data["strategic_session_max_unattended_seconds"] == 7200
 
         # Integer knobs round-trip and clamp to their documented ranges.
@@ -503,6 +532,7 @@ class TestNotificationConfigSettings:
                 "strategic_local_hold_timeout_seconds": 600,
                 "strategic_session_idle_tick_seconds": 3,
                 "strategic_session_turn_timeout_seconds": 300,
+                "strategic_session_exploration_interval_seconds": 21_600,
                 "strategic_session_max_unattended_seconds": 7200,
             },
         )
@@ -512,6 +542,7 @@ class TestNotificationConfigSettings:
         assert data["strategic_local_hold_timeout_seconds"] == 600
         assert data["strategic_session_idle_tick_seconds"] == 3
         assert data["strategic_session_turn_timeout_seconds"] == 300
+        assert data["strategic_session_exploration_interval_seconds"] == 21_600
         assert data["strategic_session_max_unattended_seconds"] == 7200
 
         # Out-of-range / non-numeric are rejected. The continuation TTL and
@@ -524,6 +555,9 @@ class TestNotificationConfigSettings:
             ("strategic_local_hold_timeout_seconds", 43_200),  # > 7200 ceiling
             ("strategic_session_idle_tick_seconds", 0),  # < 1
             ("strategic_session_turn_timeout_seconds", 99999),  # > 3600
+            ("strategic_session_exploration_interval_seconds", 3_599),  # < 1h
+            ("strategic_session_exploration_interval_seconds", 86_401),  # > 24h
+            ("strategic_session_min_tick_seconds", 600),  # retired ambiguous key
             ("strategic_session_max_unattended_seconds", 30),  # < 60
             ("strategic_session_max_unattended_seconds", 99999),  # > 28800
         ):
@@ -1935,6 +1969,7 @@ class TestEvergreenFillSettingsPersist:
                 "strategic_local_hold_timeout_seconds": 600,
                 "strategic_session_idle_tick_seconds": 3,
                 "strategic_session_turn_timeout_seconds": 300,
+                "strategic_session_exploration_interval_seconds": 21_600,
                 "strategic_session_max_unattended_seconds": 7200,
             },
         )
@@ -1949,6 +1984,12 @@ class TestEvergreenFillSettingsPersist:
         assert row.runtime_config_json["strategic_session_idle_tick_seconds"] == 3
         assert row.runtime_config_json["strategic_session_turn_timeout_seconds"] == 300
         assert (
+            row.runtime_config_json[
+                "strategic_session_exploration_interval_seconds"
+            ]
+            == 21_600
+        )
+        assert (
             row.runtime_config_json["strategic_session_max_unattended_seconds"] == 7200
         )
 
@@ -1958,6 +1999,9 @@ class TestEvergreenFillSettingsPersist:
         _shared_state.runtime_config["strategic_local_hold_timeout_seconds"] = 900
         _shared_state.runtime_config["strategic_session_idle_tick_seconds"] = 5
         _shared_state.runtime_config["strategic_session_turn_timeout_seconds"] = 120
+        _shared_state.runtime_config[
+            "strategic_session_exploration_interval_seconds"
+        ] = 14_400
         _shared_state.runtime_config["strategic_session_max_unattended_seconds"] = 7200
 
         await sync_runtime_config_from_state(row)
@@ -1969,6 +2013,12 @@ class TestEvergreenFillSettingsPersist:
         assert _shared_state.runtime_config["strategic_session_idle_tick_seconds"] == 3
         assert (
             _shared_state.runtime_config["strategic_session_turn_timeout_seconds"] == 300
+        )
+        assert (
+            _shared_state.runtime_config[
+                "strategic_session_exploration_interval_seconds"
+            ]
+            == 21_600
         )
         assert (
             _shared_state.runtime_config["strategic_session_max_unattended_seconds"]
@@ -4241,11 +4291,12 @@ class TestModifyTaskApplySeam:
 
     @pytest.mark.asyncio
     async def test_apply_simple_mutations_payloads(self, db_session):
-        """_apply_simple_mutations updates task.payloads when payload key present."""
+        """_apply_simple_mutations updates non-authority payload fields."""
         from app.admin_task_mutations import _apply_simple_mutations
 
         project = await _make_project(db_session)
         task = await self._make_task(db_session, project.id)
+        task.payloads = [{"type": "create", "prompt": "old"}]
 
         changes: dict = {}
         await _apply_simple_mutations(
@@ -4557,6 +4608,12 @@ class TestModifyTaskApplySeam:
         )
         mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
         mocker.patch("app.rollup_management._cleanup_branches", new_callable=AsyncMock)
+        _patch_explicit_merge_target(
+            mocker,
+            project.id,
+            321,
+            base_ref="release/main",
+        )
 
         changes: dict = {}
         await _handle_rollup_pr_approval(
@@ -4649,6 +4706,12 @@ class TestModifyTaskApplySeam:
         )
         mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
         mocker.patch("app.rollup_management._cleanup_branches", new_callable=AsyncMock)
+        _patch_explicit_merge_target(
+            mocker,
+            project.id,
+            654,
+            base_ref="release/candidate-1",
+        )
 
         changes: dict = {}
         await _handle_rollup_pr_approval(
@@ -4843,11 +4906,11 @@ class TestModifyTaskApplySeam:
 
 class TestTriggerQualify:
     @pytest.mark.asyncio
-    async def test_qualify_rejects_promotion_in_flight(
+    async def test_qualify_rejects_promotion_check_wait(
         self, client: AsyncClient, db_session
     ):
-        """Re-running qualification while a promotion PR is open and auto-merging
-        is rejected with a 409 — run_qualification no-ops (promotion_in_flight)
+        """Re-running qualification while a managed promotion PR is open
+        is rejected with a 409 — run_qualification no-ops (promotion_check_wait)
         and the endpoint surfaces it, mirroring the version-cut lever, instead of
         spawning a fresh audit/smoketest pair that clobbers the pending record."""
         from datetime import timedelta
@@ -4855,8 +4918,8 @@ class TestTriggerQualify:
 
         project = await _make_project(db_session)
         version = await _make_open_version(db_session, project.id, phase="stabilize")
-        # A terminal audit child — by the child-task definition this is NOT "in
-        # flight", so only the promotion-in-flight guard catches it.
+        # A terminal audit child is not live, so only the managed-promotion
+        # ownership guard catches it.
         audit_task = Task(
             project_id=project.id,
             title="audit-done",
@@ -4876,7 +4939,6 @@ class TestTriggerQualify:
             "promotion_pending": {
                 "pr_number": 9753,
                 "pr_url": "https://example/pr/9753",
-                "auto_merge_enabled": True,
                 "enabled_at": (_utcnow() - timedelta(minutes=45)).isoformat(),
             },
         }
@@ -4885,9 +4947,9 @@ class TestTriggerQualify:
 
         resp = await client.post(f"/api/admin/projects/{project.id}/qualify")
         assert resp.status_code == 409
-        assert "promotion PR is open and auto-merging" in resp.text
-        # The qualify 409 surfaces the in-flight age derived from enabled_at.
-        assert "in flight ~" in resp.text
+        assert "managed promotion is pending" in resp.text
+        # The qualify 409 surfaces the managed-wait age derived from enabled_at.
+        assert "waiting ~" in resp.text
 
         # The promotion-pending record survives untouched.
         await db_session.refresh(version)
@@ -5385,6 +5447,12 @@ class TestBulkApprove:
         )
         mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
         mocker.patch("app.rollup_management._cleanup_branches", new_callable=AsyncMock)
+        _patch_explicit_merge_target(
+            mocker,
+            project.id,
+            456,
+            base_ref="release/candidate-1",
+        )
 
         resp = await client.post(
             "/api/admin/tasks/bulk-action",
@@ -5676,7 +5744,7 @@ class TestRequeueClearsBlockerMetadata:
 class TestManualRequeueGuidance:
     @pytest.mark.asyncio
     async def test_stale_fix_prompt_gets_agent_facing_operator_guidance(
-        self, db_session
+        self, db_session, mocker
     ):
         """Manual guidance lands in payload.prompt_suffix, not internal context."""
         from fastapi import BackgroundTasks
@@ -5706,6 +5774,34 @@ class TestManualRequeueGuidance:
         db_session.add(task)
         await db_session.commit()
         await db_session.refresh(task)
+
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("token", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.github.get_pull_request",
+            new_callable=AsyncMock,
+            return_value={
+                "state": "open",
+                "merged": False,
+                "base": {"sha": "base-15420"},
+                "head": {"sha": "head-15420"},
+            },
+        )
+
+        async def _expire_task_during_vm_cleanup(*_args, **_kwargs):
+            # Production teardown can write forensics through another session.
+            # Model the resulting stale identity-map state deterministically and
+            # keep this guidance test from attempting a real GCP deletion.
+            db_session.expire(task)
+            return True
+
+        mocker.patch(
+            "app.vm_lifecycle._ensure_vm_deleted",
+            new=AsyncMock(side_effect=_expire_task_during_vm_cleanup),
+        )
 
         await modify_task_apply(
             task,
@@ -6016,8 +6112,8 @@ class TestTriggerForcePromote:
         assert exc_info.value.status_code == 404
 
     @pytest.mark.asyncio
-    async def test_promotion_in_flight_maps_to_409(self, db_session, mocker):
-        """A ``promotion_in_flight`` guard result surfaces as HTTP 409 with the
+    async def test_promotion_check_wait_maps_to_409(self, db_session, mocker):
+        """A ``promotion_check_wait`` guard result surfaces as HTTP 409 with the
         blocking PR number embedded in the detail."""
         from fastapi import HTTPException
         from app.routers.admin_operator_triggers import (
@@ -6030,7 +6126,7 @@ class TestTriggerForcePromote:
             "app.release_qualifier.force_promote_current_version",
             new=AsyncMock(
                 return_value={
-                    "status": "promotion_in_flight",
+                    "status": "promotion_check_wait",
                     "promotion_pr_number": 4242,
                 }
             ),
@@ -6283,9 +6379,36 @@ class TestTriggerRollup:
             return_value={
                 "html_url": "https://github.com/owner/repo/pull/654",
                 "number": 654,
+                "head": {"ref": "research/abc12345", "sha": "head654"},
+                "base": {"ref": "release/candidate-1", "sha": "base654"},
             },
         )
         mocker.patch(
+            "app.github.get_pull_request",
+            new_callable=AsyncMock,
+            return_value={
+                "state": "open",
+                "head": {"ref": "research/abc12345", "sha": "head654"},
+                "base": {"ref": "release/candidate-1", "sha": "base654"},
+            },
+        )
+        mocker.patch(
+            "app.review_merge_authority._fetch_live_review_target",
+            new_callable=AsyncMock,
+            return_value={
+                "project_id": str(project.id),
+                "pr_number": 654,
+                "base_sha": "base654",
+                "head_sha": "head654",
+                "base_ref": "release/candidate-1",
+                "state": "open",
+                "merged": False,
+                "draft": False,
+                "mergeable": True,
+                "mergeable_state": "clean",
+            },
+        )
+        merge_mock = mocker.patch(
             "app.github.merge_pull_request",
             new_callable=AsyncMock,
             return_value={"merged": True},
@@ -6306,7 +6429,103 @@ class TestTriggerRollup:
         assert (task.context or {}).get("pr_merged") is None
         assert (task.context or {}).get("rollup_pr_number") == 654
         assert "awaiting downstream landing" in (task.latest_status_message or "")
+        assert merge_mock.call_args.kwargs["expected_head_sha"] == "head654"
         delete_branch_mock.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("changed_side", ["head", "base"])
+    async def test_intermediate_rollup_holds_when_target_changes_after_guard(
+        self, db_session, mocker, changed_side
+    ):
+        from app.routers.admin_operator_triggers import trigger_rollup
+
+        project = await _make_project(db_session)
+        project.integration_branch = "automain"
+        project.promotion_target = "release/main"
+        project.build_config = {"staging_branch_prefixes": ["release/"]}
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            title="Manual rollup target race",
+            payloads=[{"type": "research", "prompt": "rollup"}],
+            status=TaskStatus.EVALUATING,
+            context={
+                "plan_branch": "research/abc12345",
+                "parent_base": "release/candidate-1",
+                "direction_id": "dir-1",
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        mocker.patch(
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
+        )
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("token", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.github.create_pull_request",
+            new_callable=AsyncMock,
+            return_value={
+                "html_url": "https://github.com/owner/repo/pull/655",
+                "number": 655,
+                "head": {"ref": "research/abc12345", "sha": "head-old"},
+                "base": {"ref": "release/candidate-1", "sha": "base-old"},
+            },
+        )
+        mocker.patch(
+            "app.github.get_pull_request",
+            new_callable=AsyncMock,
+            return_value={
+                "state": "open",
+                "head": {"ref": "research/abc12345", "sha": "head-old"},
+                "base": {"ref": "release/candidate-1", "sha": "base-old"},
+            },
+        )
+        mocker.patch(
+            "app.review_merge_authority._fetch_live_review_target",
+            new_callable=AsyncMock,
+            return_value={
+                "project_id": str(project.id),
+                "pr_number": 655,
+                "base_sha": "base-new" if changed_side == "base" else "base-old",
+                "head_sha": "head-new" if changed_side == "head" else "head-old",
+                "base_ref": "release/candidate-1",
+                "state": "open",
+                "merged": False,
+                "draft": False,
+                "mergeable": True,
+                "mergeable_state": "clean",
+            },
+        )
+        merge_mock = mocker.patch(
+            "app.github.merge_pull_request",
+            new_callable=AsyncMock,
+            return_value={"merged": True},
+        )
+
+        result = await trigger_rollup(
+            task.id,
+            session=db_session,
+            current_user={"user_id": TEST_USER_ID},
+        )
+
+        merge_mock.assert_not_awaited()
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.EVALUATING
+        assert (
+            result["merge_blocked_reason"]
+            == "authoritative review gate held merge"
+        )
+        assert "live base/head" in (task.latest_status_message or "").lower()
 
     @pytest.mark.asyncio
     async def test_already_merged_rollup_skips_pr_merged_on_promotion_target(
@@ -12639,18 +12858,10 @@ class TestPostCommitPendingField:
             status=TaskStatus.QUEUED,
             payloads=[{"type": "create"}],
         )
-        reviewer_task = Task(
-            project_id=project.id,
-            title="Operator requested reviewer",
-            status=TaskStatus.IN_PROGRESS,
-            payloads=[{"type": "review"}],
-            context={"operator_requested_review_for": str(task.id)},
-        )
-        db_session.add_all([task, other_task, reviewer_task])
+        db_session.add_all([task, other_task])
         await db_session.commit()
         await db_session.refresh(task)
         await db_session.refresh(other_task)
-        await db_session.refresh(reviewer_task)
         base_created_at = datetime(2026, 1, 1, 12, 0, 0)
         messages = [
             ProjectMessage(
@@ -12660,14 +12871,6 @@ class TestPostCommitPendingField:
                 message_type=MessageType.NOTE,
                 content="unrelated newer task",
                 created_at=base_created_at + timedelta(minutes=6),
-            ),
-            ProjectMessage(
-                project_id=project.id,
-                from_task_id=reviewer_task.id,
-                from_type="agent",
-                message_type=MessageType.NOTE,
-                content="operator requested reviewer update",
-                created_at=base_created_at + timedelta(minutes=5),
             ),
             ProjectMessage(
                 project_id=project.id,
@@ -12717,9 +12920,8 @@ class TestPostCommitPendingField:
         assert resp.status_code == 200, resp.text
 
         sideboard_messages = resp.json()["sideboard_context"]["messages"]
-        assert sideboard_messages["total_recent"] == 5
+        assert sideboard_messages["total_recent"] == 4
         assert [item["content"] for item in sideboard_messages["items"]] == [
-            "operator requested reviewer update",
             "convergence link",
             "source task context",
             "task context",
@@ -14070,43 +14272,6 @@ class TestStrategistDisposeCompletionDebt:
         assert any(x.get("task_id") == body["task_id"] for x in linked), (
             f"spawned task must be linked; got detail={entry.detail!r}"
         )
-
-    @pytest.mark.asyncio
-    async def test_spawn_fix_links_debt(self, client: AsyncClient, db_session):
-        """spawn_fix with debt_id also links to the debt row."""
-        from app.models import CompletionDebtEntry
-
-        project = await _make_project(db_session)
-        entry = CompletionDebtEntry(
-            project_id=project.id, kind="no_ci_gate", title="Gate fell open"
-        )
-        db_session.add(entry)
-        await db_session.commit()
-        await db_session.refresh(entry)
-        task, token = await self._make_strategic_task(db_session, project, vm="vm-fix-link")
-
-        resp = await client.post(
-            "/api/agent/strategic",
-            headers={"x-agent-token": token},
-            json={
-                "task_id": str(task.id),
-                "op": "spawn_fix",
-                "data": {
-                    "type": "create",
-                    "title": "Wire the enforce gate",
-                    "prompt": "Implement the enforce path for the no-CI gate",
-                    "debt_id": str(entry.id),
-                },
-            },
-        )
-        assert resp.status_code == 200, resp.text
-        body = resp.json()
-        assert body["op"] == "spawn_task"
-        assert body["deprecated_alias"] == "spawn_fix"
-        assert body["linked_debt_id"] == str(entry.id)
-        await db_session.refresh(entry)
-        linked = (entry.detail or {}).get("linked_tasks") or []
-        assert any(x.get("task_id") == body["task_id"] for x in linked)
 
 
 @pytest.mark.asyncio

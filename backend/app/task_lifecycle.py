@@ -24,6 +24,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.database import AsyncSessionLocal
+from app.context_bounds import bound_review_history
 from app.models import (
     Task,
     TaskHistory,
@@ -59,14 +60,15 @@ from app.review_pipeline import (
     SPAWN_REASON_KEY,
     _genuine_blocking_issue_exists,
     _spawn_pipeline_task,
+    build_issue_ledger,
     build_ci_failure_fix_prompt,
     build_merge_conflict_fix_prompt,
     detect_fix_all_issue_class,
     fix_all_occurrences_directive,
     reconciled_approve_markers,
     evaluate_auto_approve_small_main,
+    ensure_issue_ids,
     should_skip_initial_review,
-    should_skip_re_review,
 )
 from app.failure_classification import (
     classify_failure,
@@ -252,6 +254,117 @@ async def _resolve_live_review_target(
     return None
 
 
+async def _persist_stale_review_evidence(
+    task: Task,
+    session: AsyncSession,
+    *,
+    original_task_id: str,
+    pr_number: int,
+    review_loop: dict,
+    review_entry: dict,
+    live_target: dict[str, str | int] | None,
+) -> None:
+    """Append a late/stale verdict after newer proof and revoke publication.
+
+    Completion order is authoritative here: an older-target review that lands
+    late cannot be discarded behind a newer APPROVE. Its blockers remain in
+    the durable ledger until a subsequent exact-target review resolves them.
+    """
+    from app.task_locking import acquire_pr_spawn_lock
+
+    await acquire_pr_spawn_lock(session, task.project_id, pr_number)
+    entry = {**review_entry, "review_task_id": str(task.id)}
+    child_history = [
+        row
+        for row in (review_loop.get("review_history") or [])
+        if isinstance(row, dict) and row.get("review_task_id") != str(task.id)
+    ]
+    task_history = bound_review_history([*child_history, entry])
+    task_ledger = build_issue_ledger(
+        task_history,
+        **(
+            {"seed_ledger": review_loop.get("issue_ledger")}
+            if review_loop.get("issue_ledger") is not None
+            else {}
+        ),
+        stamp_complete=True,
+    )
+    gated_loop = {
+        **review_loop,
+        "review_approved": False,
+        "review_history": task_history,
+        "issue_ledger": task_ledger,
+        "authoritative_review_required": True,
+        **({"review_target": dict(live_target)} if live_target else {}),
+    }
+    for key in ("review_not_required", "review_policy_reason", "verdict"):
+        gated_loop.pop(key, None)
+    task.context = {**(task.context or {}), "review_loop": gated_loop}
+    flag_modified(task, "context")
+    session.add(task)
+
+    if not original_task_id:
+        return
+    try:
+        orig = await _lock_original_task(
+            session,
+            original_task_id,
+            source="late_review_authority_revoke",
+            skip_locked=False,
+        )
+    except _OriginalTaskLockTimeout as exc:
+        raise PostCommitFinalCommitFailed(
+            f"could not revoke parent authority for late review on PR #{pr_number}"
+        ) from exc
+    if orig is None:
+        task.requires_approval = True
+        return
+
+    parent_loop = dict((orig.context or {}).get("review_loop") or {})
+    parent_history = [
+        row
+        for row in (parent_loop.get("review_history") or [])
+        if isinstance(row, dict) and row.get("review_task_id") != str(task.id)
+    ]
+    # Preserve every parent-only completion, including one at the same numeric
+    # iteration. Iteration is planning metadata, not a total ordering across
+    # concurrently admitted reviews.
+    combined = list(parent_history)
+    for row in child_history:
+        row_id = str(row.get("review_task_id") or "")
+        if row_id and any(
+            str(existing.get("review_task_id") or "") == row_id
+            for existing in combined
+        ):
+            continue
+        if row not in combined:
+            combined.append(row)
+    combined_history = bound_review_history([*combined, entry])
+    parent_ledger = build_issue_ledger(
+        combined_history,
+        **(
+            {"seed_ledger": parent_loop.get("issue_ledger")}
+            if parent_loop.get("issue_ledger") is not None
+            else {}
+        ),
+        stamp_complete=True,
+    )
+    parent_loop.update(
+        {
+            "review_approved": False,
+            "review_history": combined_history,
+            "issue_ledger": parent_ledger,
+            "authoritative_review_required": True,
+            **({"review_target": dict(live_target)} if live_target else {}),
+        }
+    )
+    for key in ("review_not_required", "review_policy_reason", "verdict"):
+        parent_loop.pop(key, None)
+    orig.context = {**(orig.context or {}), "review_loop": parent_loop}
+    flag_modified(orig, "context")
+    session.add(orig)
+
+
 class PostCommitLocked(Exception):
     """Raised when post-commit cannot acquire its project/task lock pair."""
 
@@ -296,7 +409,6 @@ from app.retry_prompt import (  # noqa: E402, F401, RUF100
     _BUILD_GATE_PATTERN,
     _RETRY_SUFFIX_AUTO_PREFIXES,
     _SCOPE_OVERFLOW_THRESHOLDS,
-    _append_approve_to_review_history,
     _build_retry_prompt_suffix,
     _build_scope_overflow_details,
     _copy_analysis_artifacts_to_previous,
@@ -318,7 +430,6 @@ from app.task_lifecycle_requeue import (  # noqa: E402, F401, RUF100
 from app.task_lifecycle_github_helpers import (  # noqa: E402, F401, RUF100
     _comment_with_retry,
     _get_approval_gate_file_lists,
-    _merge_with_retry,
     _pick_merge_method,
 )
 
@@ -1072,6 +1183,8 @@ async def _process_post_commit(
     payload: AgentStatusPayload,
     _session_factory=None,
     _expected_childless_recovery_token: str | None = None,
+    _expected_post_commit_claim_token: str | None = None,
+    _expected_post_commit_status: TaskStatus | None = None,
 ) -> dict:
     """Post-commit processing: review pipeline, completion handlers, rollup, aggregation.
 
@@ -1103,7 +1216,6 @@ async def _process_post_commit(
         _handle_memo_completion,
         _handle_repo_bootstrap_completion,
         _handle_capability_proof_trial_completion,
-        _handle_criterion_coverage_trial_completion,
         _handle_walkthrough_e2e_completion,
         _try_recover_memo_from_parse_failure,
         _record_remediation_if_terminal,
@@ -1294,6 +1406,29 @@ async def _process_post_commit(
                 logger.info(
                     "[POST_COMMIT SWEEP] Skipping stale marker-less recovery "
                     "claim for task %s after lifecycle-lock revalidation",
+                    str(task_id)[:8],
+                )
+                return {"status": "accepted", "recovery_skipped": True}
+
+        # Marker-based recovery claims are leases too. Revalidate the exact
+        # claim while holding canonical Project -> Task locks immediately
+        # before any handler can spawn or mutate. Status/pending alone are not
+        # authority: a later completion can recreate the same values (ABA).
+        if _expected_post_commit_claim_token is not None:
+            pending_meta = dict(
+                (task.context or {}).get("_post_commit_pending_meta") or {}
+            )
+            claim_is_current = bool(
+                task.post_commit_pending
+                and not task.archived
+                and task.status == _expected_post_commit_status
+                and pending_meta.get("claim_token")
+                == _expected_post_commit_claim_token
+            )
+            if not claim_is_current:
+                logger.info(
+                    "[POST_COMMIT SWEEP] Skipping stale pending recovery claim "
+                    "for task %s after lifecycle-lock revalidation",
                     str(task_id)[:8],
                 )
                 return {"status": "accepted", "recovery_skipped": True}
@@ -1544,27 +1679,6 @@ async def _process_post_commit(
                             _memo_rec_exc,
                         )
 
-            # C5: release the cross-cutting safeguard merge gate when the
-            # safeguard task itself FAILS. The gate is released only on the
-            # security_audit COMPLETED branch (_handle_security_audit_completion),
-            # so a FAILED/reaped safeguard would otherwise leave orig.requires_
-            # approval=True forever — a permanent strand (services.py then 2h-
-            # timeout-FAILs the healthy parent, discarding merged siblings).
-            # Pass findings=None: a failed safeguard produced no blocker, so the
-            # gate releases (post-hoc review) rather than hanging indefinitely.
-            # _maybe_release_safeguard_gate no-ops for non-safeguard tasks.
-            if task.first_payload.get("type") == "security_audit":
-                try:
-                    from app.task_completion import _maybe_release_safeguard_gate
-
-                    await _maybe_release_safeguard_gate(task, None, session)
-                except Exception as _sg_exc:
-                    logger.warning(
-                        "[SAFEGUARD] Failed to release gate on FAILED safeguard %s: %r",
-                        task.id,
-                        _sg_exc,
-                    )
-
         # Anti-poisoning: resolve playbook entries the task wrote while
         # IN_PROGRESS. On COMPLETED, clear pending_source so peers can see
         # them. On FAILED/CANCELLED, drop them entirely so a task that
@@ -1600,8 +1714,13 @@ async def _process_post_commit(
         # 1–4 above (dependent unblocking, failure recording, investigation  # noqa: RUF003
         # spawns) and releases the lock; the rest of post-commit processing
         # operates on the already-loaded task object without re-locking.
-        if session.dirty or session.new:
-            await session.commit()
+        # Commit even when the unit of work is clean: the Phase-B3 entry path
+        # acquired Project->Task row locks before loading this object, and a
+        # clean COMPLETED review still retains those transaction locks. Every
+        # subsequent review/fix transition takes PR->Task, so conditionally
+        # retaining the initial Task lock would invert the order against direct
+        # fix admission (PR lock, then all same-PR task rows) and deadlock.
+        await session.commit()
 
         # 5. Review Pipeline — auto-spawn review/fix tasks based on completed task type
         if payload.status == TaskStatus.COMPLETED:
@@ -1717,7 +1836,24 @@ async def _process_post_commit(
                 _skip_initial, _skip_initial_reason = should_skip_initial_review(
                     is_intermediate, scope
                 )
-                if _skip_initial or auto_approve_small:
+                _existing_review_history = (
+                    ((task.context or {}).get("review_loop") or {}).get(
+                        "review_history"
+                    )
+                )
+                _history_allows_initial_bypass = _existing_review_history is None or (
+                    isinstance(_existing_review_history, list)
+                    and not _existing_review_history
+                )
+                if (_skip_initial or auto_approve_small) and _history_allows_initial_bypass:
+                    _review_bypass_fields = {
+                        "review_not_required": True,
+                        "review_policy_reason": (
+                            "auto_approve_small"
+                            if auto_approve_small
+                            else _skip_initial_reason
+                        ),
+                    }
                     # Security scan then auto-merge, skip model review.
                     # Policy is encapsulated in should_skip_initial_review
                     # (review_heuristics). auto_approve_small is an independent
@@ -1725,6 +1861,38 @@ async def _process_post_commit(
                     try:
                         gh_token, owner, repo = await get_github_token_for_task(
                             task.id, session
+                        )
+                        _bypass_pr_snapshot = await get_pull_request(
+                            gh_token,
+                            owner,
+                            repo,
+                            pr_number,
+                            project_id=str(task.project_id),
+                        )
+                        _bypass_target = {
+                            "project_id": str(task.project_id),
+                            "pr_number": int(pr_number),
+                            "base_sha": str(
+                                (_bypass_pr_snapshot.get("base") or {}).get("sha")
+                                or ""
+                            ),
+                            "head_sha": str(
+                                (_bypass_pr_snapshot.get("head") or {}).get("sha")
+                                or ""
+                            ),
+                        }
+                        if not _bypass_target["base_sha"] or not _bypass_target[
+                            "head_sha"
+                        ]:
+                            raise RuntimeError(
+                                "cannot bind no-review policy to immutable PR target"
+                            )
+                        _review_bypass_fields.update(
+                            {
+                                "review_target": dict(_bypass_target),
+                                "base_sha": _bypass_target["base_sha"],
+                                "head_sha": _bypass_target["head_sha"],
+                            }
                         )
 
                         # Always run security scan before any merge
@@ -1930,6 +2098,7 @@ async def _process_post_commit(
                                     "pr_number": pr_number,
                                     "branch": branch,
                                     "base_branch": base_branch,
+                                    **_review_bypass_fields,
                                 }
                                 if _dh_verdict == "defer":
                                     task.status = TaskStatus.EVALUATING
@@ -1976,6 +2145,9 @@ async def _process_post_commit(
                                         from app.task_completion import (
                                             _reset_review_loop_pr_head_cache,
                                         )
+                                        from app.ci_merge_helpers import (
+                                            revoke_review_authority_for_active_fix,
+                                        )
 
                                         task.status = TaskStatus.EVALUATING
                                         task.latest_status_message = (
@@ -1986,22 +2158,30 @@ async def _process_post_commit(
                                             f"against {base_branch}; awaiting fresh CI "
                                             "on the rewritten PR head"
                                         )[:500]
-                                        task.context = {
-                                            **(task.context or {}),
-                                            "_migration_finalization": _finalization,
-                                            "review_loop": {
-                                                **_reset_review_loop_pr_head_cache(
-                                                    (task.context or {}).get(
-                                                        "review_loop"
-                                                    )
-                                                ),
+                                        _finalized_loop = (
+                                            _reset_review_loop_pr_head_cache(
+                                                (task.context or {}).get("review_loop")
+                                            )
+                                        )
+                                        _finalized_loop = (
+                                            revoke_review_authority_for_active_fix(
+                                                task, review_loop=_finalized_loop
+                                            )
+                                        )
+                                        _finalized_loop.update(
+                                            {
                                                 "ci_waiting": True,
-                                                "review_approved": True,
                                                 "ci_passed": False,
+                                                "authoritative_review_required": True,
                                                 "pr_number": pr_number,
                                                 "branch": branch,
                                                 "base_branch": base_branch,
-                                            },
+                                            }
+                                        )
+                                        task.context = {
+                                            **(task.context or {}),
+                                            "_migration_finalization": _finalization,
+                                            "review_loop": _finalized_loop,
                                         }
                                         session.add(task)
                                         await session.commit()
@@ -2021,15 +2201,79 @@ async def _process_post_commit(
                                 await session.commit()
                                 return {"status": "accepted"}
 
-                        merge_result = await _merge_with_retry(  # premerge-guard-exempt: migration PRs are parked above in the dual-head guard branch (returns "accepted"); this merge only runs for staging-only branches that never carry a migration onto the integration trunk
-                            merge_pull_request,
+                        # Recheck after scan/guard I/O. A changed base alters
+                        # the effective diff and a changed head invalidates the
+                        # evidence; either race requires an exact review.
+                        _bypass_live_pr = await get_pull_request(
                             gh_token,
                             owner,
                             repo,
                             pr_number,
                             project_id=str(task.project_id),
-                            merge_method=_pick_merge_method(task),
                         )
+                        _bypass_live_target = {
+                            "project_id": str(task.project_id),
+                            "pr_number": int(pr_number),
+                            "base_sha": str(
+                                (_bypass_live_pr.get("base") or {}).get("sha") or ""
+                            ),
+                            "head_sha": str(
+                                (_bypass_live_pr.get("head") or {}).get("sha") or ""
+                            ),
+                        }
+                        _bypass_loop = {
+                            **((task.context or {}).get("review_loop") or {}),
+                            "ci_passed": True,
+                            "ci_waiting": False,
+                            "pr_number": pr_number,
+                            "branch": branch,
+                            "base_branch": base_branch,
+                            **_review_bypass_fields,
+                        }
+                        task.context = {
+                            **(task.context or {}),
+                            "review_loop": _bypass_loop,
+                        }
+                        flag_modified(task, "context")
+                        from app.review_merge_authority import (
+                            attempt_merge_with_authority,
+                        )
+
+                        async def _submit_bypass_merge(
+                            expected_head_sha: str,
+                        ) -> dict:
+                            return await merge_pull_request(  # premerge-guard-exempt: migration PRs are parked above in the dual-head guard branch (returns "accepted"); this merge only runs for staging-only branches that never carry a migration onto the integration trunk
+                                gh_token,
+                                owner,
+                                repo,
+                                pr_number,
+                                project_id=str(task.project_id),
+                                merge_method=_pick_merge_method(task),
+                                expected_head_sha=expected_head_sha,
+                            )
+
+                        _merge_authority, merge_result = (
+                            await attempt_merge_with_authority(
+                            task,
+                            session,
+                            merge_call=_submit_bypass_merge,
+                            gh_token=gh_token,
+                            owner=owner,
+                            repo=repo,
+                            ci_loop=_bypass_loop,
+                            pr_number=pr_number,
+                            branch=branch,
+                            base_branch=base_branch,
+                            original_task_id=str(task.id),
+                            checked_head_sha=str(_bypass_live_target["head_sha"]),
+                            checked_base_sha=str(_bypass_live_target["base_sha"]),
+                            retry_nonterminal=True,
+                        )
+                        )
+                        if merge_result is None:
+                            session.add(task)
+                            await session.commit()
+                            return {"status": "accepted"}
                         if merge_result.get("merged"):
                             _record_pr_merged = is_intermediate
                             if not _record_pr_merged:
@@ -2119,8 +2363,8 @@ async def _process_post_commit(
                             )
                             # Probe GitHub for the PR's mergeable_state so we can
                             # route the recovery correctly:
-                            #   blocked / unstable → CI gating; queue GitHub auto-merge
-                            #     and let it fire when checks clear.
+                            #   blocked / unstable / clean → park on CI and let
+                            #     the shared exact-target authority boundary merge.
                             #   dirty → real merge conflict (sibling cluster touched
                             #     overlapping files between PR creation and the merge
                             #     attempt). Spawn a `fix` task — fix is the rebase-
@@ -2141,8 +2385,6 @@ async def _process_post_commit(
                             # review for tasks that need it.
                             recovery_type = "review"
                             try:
-                                from app.github import enable_auto_merge
-
                                 pr_detail = await get_pull_request(
                                     gh_token,
                                     owner,
@@ -2152,49 +2394,15 @@ async def _process_post_commit(
                                 )
                                 ms = (pr_detail.get("mergeable_state") or "").lower()
                                 if ms in ("blocked", "unstable", "clean"):
-                                    from app.rollup_migration_validation import (
-                                        pr_touches_migrations,
+                                    # Native GitHub auto-merge is deliberately
+                                    # not used: it has no expected-head compare-
+                                    # and-swap and can publish a later push.
+                                    recovery_type = None
+                                    logger.info(
+                                        f"[PIPELINE] PR #{pr_number} "
+                                        f"(mergeable_state={ms}) — parking for "
+                                        "Blueprint's exact-target CI merge"
                                     )
-
-                                    # Migration-carrying PRs must NOT be delegated to
-                                    # GitHub native auto-merge: the target branch can
-                                    # advance while checks are still pending, so the
-                                    # eventual merge could land against a different
-                                    # migration chain than the one Blueprint validated.
-                                    # Skip delegation and park in CI-wait so
-                                    # handle_ci_completion re-enters and re-runs the
-                                    # pre-merge Alembic guard against the live ci_base
-                                    # before merging.
-                                    if await pr_touches_migrations(
-                                        gh_token, owner, repo, pr_number
-                                    ):
-                                        recovery_type = None
-                                        logger.info(
-                                            f"[PIPELINE] PR #{pr_number} (mergeable_state={ms}) "
-                                            f"touches Alembic migrations — skipping GitHub auto-merge; "
-                                            f"parking in CI-wait for re-validation against {base_branch}"
-                                        )
-                                    else:
-                                        am_result = await enable_auto_merge(  # premerge-guard-exempt: only the non-migration branch reaches here; migration-touching PRs are diverted to CI-wait re-validation in the if-branch above, so auto-merge never fires for a migration PR
-                                            gh_token,
-                                            owner,
-                                            repo,
-                                            pr_number,
-                                            project_id=str(task.project_id),
-                                        )
-                                        if am_result.get("enabled"):
-                                            logger.info(
-                                                f"[PIPELINE] Enabled GitHub auto-merge on PR #{pr_number} (mergeable_state={ms})"
-                                            )
-                                        else:
-                                            logger.info(
-                                                f"[PIPELINE] Auto-merge enablement declined for PR #{pr_number}: {am_result.get('message')}"
-                                            )
-                                        if ms == "clean":
-                                            # PR is clean/ready — transient API failure, not a real
-                                            # conflict. Skip recovery task spawn; let auto-merge
-                                            # fire when GitHub is ready.
-                                            recovery_type = None
                                 elif ms == "dirty":
                                     recovery_type = "fix"
                             except Exception as _am_exc:
@@ -2204,40 +2412,35 @@ async def _process_post_commit(
                             # Spawn the recovery task. For DIRTY conflicts on cluster
                             # sub-PRs we use `fix` (rebase + resolve); otherwise
                             # `review` (the existing default).
-                            # When recovery_type is None (clean state) no spawn fires —
-                            # auto-merge was re-enabled above and the task parks in CI-wait.
+                            # When recovery_type is None, no spawn fires; the
+                            # task parks for the shared exact-head CI merge.
                             #
-                            # Pass fix_reason="merge_conflict" so the fix-completion
-                            # handler can route straight to security-scan + auto-merge
-                            # WITHOUT a re-review. Rationale (per the small/medium
-                            # intermediate path): the original task was scope-gated
-                            # to skip review entirely; once the conflict is resolved
-                            # there's no review-worthy logic change to re-assess —
-                            # rebase output is mechanical. This keeps the cost model
-                            # symmetric with the no-conflict happy path.
+                            # Pass fix_reason="merge_conflict" for lane/accounting
+                            # provenance. Any pushed recovery fix invalidates this
+                            # initial-review bypass and receives the standard bounded
+                            # exact-head delta review before merge.
                             if recovery_type is None:
                                 logger.info(
-                                    f"[PIPELINE] Auto-merge failed for PR #{pr_number} (mergeable_state=clean) — re-enabled auto-merge, parking in CI-wait"
+                                    f"[PIPELINE] Auto-merge deferred for PR #{pr_number} "
+                                    f"(mergeable_state={ms}) — parking in CI-wait"
                                 )
                                 task.status = TaskStatus.EVALUATING
-                                task.latest_status_message = f"Auto-merge failed for PR #{pr_number} (clean state) — parked for CI-wait retry"
-                                # Small/medium intermediate (and auto_approve_small) explicitly
-                                # skip review — no review task will ever set review_approved.
-                                # mergeable_state="clean" also implies CI is already green.
-                                # Pre-satisfy both gate flags so handle_ci_completion can merge
-                                # on the next signal instead of stranding the task on
-                                # _review_approved.
+                                task.latest_status_message = (
+                                    f"PR #{pr_number} parked for Blueprint's "
+                                    "exact-target CI merge"
+                                )
                                 task.context = {
                                     **(task.context or {}),
                                     "review_loop": {
                                         "ci_waiting": True,
                                         "review_approved": True,
-                                        "ci_passed": True,
+                                        "ci_passed": ms == "clean",
                                         "pr_number": pr_number,
                                         "branch": branch,
                                         "base_branch": base_branch,
                                         "original_task_id": str(task.id),
                                         "ci_wait_started": _utcnow().isoformat(),
+                                        **_review_bypass_fields,
                                     },
                                 }
                                 session.add(task)
@@ -2537,15 +2740,6 @@ async def _process_post_commit(
                     "original_task_id", ""
                 ) or task_payload.get("original_task_id", "")
                 original_prompt = task_payload.get("original_prompt", "")
-                # A cached replay is only valid for the exact immutable target
-                # that produced it. Unlike an ordinary live reviewer result, it
-                # must never use the bounded stale-target escape hatch below:
-                # doing so would let an old cached APPROVE merge a changed PR.
-                is_cached_verdict_replay = bool(
-                    task_payload.get("cached_verdict_json")
-                    and task_payload.get("cached_review_task_id")
-                )
-
                 if not pr_number or not branch:
                     logger.info(
                         f"[REVIEW PIPELINE] Review task {task.id} missing pr_number ({pr_number}) or branch ({branch}) — cannot continue pipeline"
@@ -2606,6 +2800,7 @@ async def _process_post_commit(
                 verdict = "REQUEST_CHANGES"
                 feedback = verdict_text
                 issues = []
+                resolutions: list[dict] = []
                 investigated_files: list[str] = []
 
                 # Parse verdict: prefer structured verdict_json field, fall back to log parsing
@@ -2614,10 +2809,6 @@ async def _process_post_commit(
                 review_was_parallelized = False
                 reviewed_head_sha: str = ""
                 reviewed_base_sha: str = ""
-                # Missing or malformed output deliberately requires a follow-up
-                # review. Only a literal JSON boolean ``false`` is a waiver.
-                requires_rereview = True
-
                 # Method 1: verdict_json field (from /tmp/verdict.json on the agent)
                 if payload.verdict_json:
                     try:
@@ -2628,6 +2819,11 @@ async def _process_post_commit(
                             issues = (
                                 vj.get("issues", [])
                                 if isinstance(vj.get("issues"), list)
+                                else []
+                            )
+                            resolutions = (
+                                vj.get("resolutions", [])
+                                if isinstance(vj.get("resolutions"), list)
                                 else []
                             )
                             raw_investigated = vj.get("investigated_files")
@@ -2642,12 +2838,6 @@ async def _process_post_commit(
                             )
                             reviewed_head_sha = str(vj.get("reviewed_head_sha") or "")
                             reviewed_base_sha = str(vj.get("reviewed_base_sha") or "")
-                            if vj.get("verdict") == "REQUEST_CHANGES":
-                                requires_rereview = (
-                                    vj["requires_rereview"]
-                                    if isinstance(vj.get("requires_rereview"), bool)
-                                    else True
-                                )
                             verdict_parsed = True
                             logger.info(
                                 f"[REVIEW PIPELINE] Verdict from verdict_json field: {verdict}"
@@ -2671,12 +2861,11 @@ async def _process_post_commit(
                                 if isinstance(candidate.get("issues"), list)
                                 else []
                             )
-                            if candidate.get("verdict") == "REQUEST_CHANGES":
-                                requires_rereview = (
-                                    candidate["requires_rereview"]
-                                    if isinstance(candidate.get("requires_rereview"), bool)
-                                    else True
-                                )
+                            resolutions = (
+                                candidate.get("resolutions", [])
+                                if isinstance(candidate.get("resolutions"), list)
+                                else []
+                            )
                             reviewed_head_sha = str(
                                 candidate.get("reviewed_head_sha") or ""
                             )
@@ -2845,6 +3034,159 @@ async def _process_post_commit(
                         task.context = {**(task.context or {}), **_markers}
                         session.add(task)
                         feedback = f"{_vd_note}\n\n{feedback}" if feedback else _vd_note
+                        # These entries describe missing local verification, not
+                        # code defects.  Once authoritative CI proves the gate,
+                        # do not feed them into the binding blocker ledger that
+                        # intentionally ingests structured findings independent
+                        # of a legacy/malformed verdict token.
+                        issues = []
+
+                # Authoritative current-head blocker ledger. The existing
+                # review_history used to be advisory: any later APPROVE (or
+                # simple omission) made an earlier REQUEST_CHANGES disappear,
+                # even when both reviews examined the identical commit. Attach
+                # stable identities, then reconcile this verdict against the
+                # binding open set. A changed exact head can prove a fix; the
+                # same head requires an explicit refuted/adjudicated disposition.
+                _review_iteration = int(review_loop.get("iteration") or 0)
+                issues = ensure_issue_ids(
+                    issues,
+                    reviewed_head_sha=reviewed_head_sha,
+                    iteration=_review_iteration,
+                )
+                _current_review_entry = {
+                    "iteration": _review_iteration,
+                    "verdict": verdict,
+                    "feedback": feedback,
+                    "issues": issues,
+                    "resolutions": resolutions,
+                    "reviewed_head_sha": reviewed_head_sha,
+                    "reviewed_base_sha": reviewed_base_sha,
+                    **(
+                        {"delta_base_sha": review_loop.get("delta_base_sha")}
+                        if review_loop.get("delta_base_sha")
+                        else {}
+                    ),
+                }
+                _completion_review_target = await _resolve_live_review_target(
+                    task, session, pr_number
+                )
+                _assigned_review_target = review_loop.get("review_target")
+                try:
+                    _assigned_pr_number = int(
+                        (_assigned_review_target or {}).get("pr_number") or 0
+                    )
+                except (AttributeError, TypeError, ValueError):
+                    _assigned_pr_number = 0
+                _assigned_target_matches = bool(
+                    isinstance(_assigned_review_target, dict)
+                    and str(_assigned_review_target.get("project_id") or "")
+                    == str(task.project_id)
+                    and _assigned_pr_number == int(pr_number)
+                    and reviewed_head_sha
+                    == str(_assigned_review_target.get("head_sha") or "")
+                    and reviewed_base_sha
+                    == str(_assigned_review_target.get("base_sha") or "")
+                )
+                if (
+                    _assigned_target_matches
+                    and _completion_review_target is not None
+                    and reviewed_head_sha
+                    == str(_completion_review_target.get("head_sha") or "")
+                    and reviewed_base_sha
+                    == str(_completion_review_target.get("base_sha") or "")
+                ):
+                    # Only the backend may grant closure provenance.  Agent-
+                    # supplied SHAs are compared first, then overwritten from
+                    # the server target and bound to this durable review row.
+                    _current_review_entry.update(
+                        {
+                            "reviewed_head_sha": str(
+                                _completion_review_target["head_sha"]
+                            ),
+                            "reviewed_base_sha": str(
+                                _completion_review_target["base_sha"]
+                            ),
+                            "target_verified_by_backend": True,
+                            "review_task_id": str(task.id),
+                        }
+                    )
+                _prior_issue_ledger = review_loop.get("issue_ledger")
+                _authoritative_ledger = build_issue_ledger(
+                    [
+                        *(review_loop.get("review_history") or []),
+                        _current_review_entry,
+                    ],
+                    **(
+                        {"seed_ledger": _prior_issue_ledger}
+                        if _prior_issue_ledger is not None
+                        else {}
+                    ),
+                    stamp_complete=True,
+                )
+                _open_blockers = list(_authoritative_ledger.get("open") or [])
+                if _open_blockers:
+                    # The fix-facing issue list is always the complete binding
+                    # open set, not just what the latest reviewer happened to
+                    # repeat. This closes the same-head A-omitted/B-raised gap:
+                    # the backend ledger, not reviewer omission, owns closure.
+                    issues = [
+                        {
+                            "issue_id": blocker.get("issue_id"),
+                            "severity": blocker.get("severity", "major"),
+                            "description": blocker.get("description", ""),
+                            **(
+                                {"file": blocker.get("file")}
+                                if blocker.get("file")
+                                else {}
+                            ),
+                            **(
+                                {"line": blocker.get("line")}
+                                if blocker.get("line") is not None
+                                else {}
+                            ),
+                            **(
+                                {"symbol": blocker.get("symbol")}
+                                if blocker.get("symbol")
+                                else {}
+                            ),
+                        }
+                        for blocker in _open_blockers
+                    ]
+                if verdict == "APPROVE" and _open_blockers:
+                    logger.warning(
+                        "[REVIEW PIPELINE] PR #%s: APPROVE cannot clear %d "
+                        "unresolved blocker(s) on the same/unproven head; "
+                        "continuing through the fix + exact-SHA delta-review path",
+                        pr_number,
+                        len(_open_blockers),
+                    )
+                    verdict = "REQUEST_CHANGES"
+                    _ledger_note = (
+                        "Approval withheld: the following prior blocker(s) have "
+                        "no authoritative disposition on this exact head. Each "
+                        "must be fixed on a new commit, explicitly refuted, or "
+                        "adjudicated: "
+                        + ", ".join(
+                            str(blocker.get("issue_id") or "unknown")
+                            for blocker in _open_blockers
+                        )
+                    )
+                    feedback = (
+                        f"{_ledger_note}\n\n{feedback}" if feedback else _ledger_note
+                    )
+                _current_review_entry = {
+                    **_current_review_entry,
+                    "verdict": verdict,
+                    "feedback": feedback,
+                    "issues": list(issues),
+                }
+                task.context = {
+                    **(task.context or {}),
+                    "issue_ledger": _authoritative_ledger,
+                }
+                flag_modified(task, "context")
+                session.add(task)
 
                 # If verdict was unparseable, flag the original task for manual review
                 if verdict_unparseable:
@@ -3008,14 +3350,13 @@ async def _process_post_commit(
                         "verdict": verdict,
                         "feedback": feedback,
                         "issues": issues,
+                        "resolutions": resolutions,
                         "investigated_files": investigated_files,
                         # Cache only a verdict whose agent-stamped SHAs matched
                         # the live target; preserve both for replay validation.
                         "reviewed_head_sha": target["head_sha"],
                         "reviewed_base_sha": target["base_sha"],
                     }
-                    if verdict == "REQUEST_CHANGES":
-                        replay_verdict["requires_rereview"] = requires_rereview
                     task.context = {
                         **(task.context or {}),
                         "review_result": {
@@ -3047,6 +3388,93 @@ async def _process_post_commit(
                             "[PIPELINE] retire_chain_lane (APPROVE) failed (non-critical)",
                             exc_info=True,
                         )
+
+                    # Validate immutable review provenance before *any* approval
+                    # side effect, including the rollup-parent handoff below.
+                    # Previously the direct-merge path checked SHAs later, but
+                    # the rollup path could set parent.review_approved and merge
+                    # before reaching that guard.
+                    _live_approve_target = await _resolve_live_review_target(
+                        task, session, pr_number
+                    )
+                    if _live_approve_target is None:
+                        task.status = TaskStatus.COMPLETED
+                        task.requires_approval = True
+                        task.latest_status_message = (
+                            f"Approval for PR #{pr_number} withheld: could not prove "
+                            "the live immutable review target"
+                        )
+                        session.add(task)
+                        await session.commit()
+                        return {"status": "accepted"}
+                    if (
+                        not reviewed_head_sha
+                        or not reviewed_base_sha
+                        or reviewed_head_sha != _live_approve_target["head_sha"]
+                        or reviewed_base_sha != _live_approve_target["base_sha"]
+                    ):
+                        task.status = TaskStatus.COMPLETED
+                        task.latest_status_message = (
+                            f"Stale/unproven approval discarded for PR #{pr_number} "
+                            f"(reviewed {reviewed_base_sha[:8]}..{reviewed_head_sha[:8]}, "
+                            f"now {str(_live_approve_target['base_sha'])[:8]}.."
+                            f"{str(_live_approve_target['head_sha'])[:8]}) — "
+                            "respawning exact-target review"
+                        )
+                        await _persist_stale_review_evidence(
+                            task,
+                            session,
+                            original_task_id=original_task_id,
+                            pr_number=pr_number,
+                            review_loop=review_loop,
+                            review_entry=_current_review_entry,
+                            live_target=_live_approve_target,
+                        )
+                        task.context = {
+                            **(task.context or {}),
+                            "_review_stale_head": True,
+                        }
+                        flag_modified(task, "context")
+                        session.add(task)
+                        await _spawn_pipeline_task(
+                            task,
+                            "review",
+                            session,
+                            pr_number,
+                            branch,
+                            base_branch,
+                            original_task_id=original_task_id,
+                            review_target=_live_approve_target,
+                        )
+                        await session.commit()
+                        return {"status": "accepted"}
+
+                    # Persist one canonical exact-target approval proof before
+                    # branching into rollup handoff, CI wait, guarded merge, or
+                    # retry parking. Rebuilding it once avoids duplicated PR-file
+                    # fetches while giving every merge boundary the same evidence.
+                    _approved_history = bound_review_history(
+                        [
+                            *(review_loop.get("review_history") or []),
+                            _current_review_entry,
+                        ]
+                    )
+                    review_loop = {
+                        **review_loop,
+                        "review_approved": True,
+                        "review_history": _approved_history,
+                        "issue_ledger": _authoritative_ledger,
+                        "review_target": dict(_live_approve_target),
+                        "head_sha": str(_live_approve_target["head_sha"]),
+                        "base_sha": str(_live_approve_target["base_sha"]),
+                    }
+                    review_loop.pop("review_not_required", None)
+                    review_loop.pop("review_policy_reason", None)
+                    # Keep the exact approval local until the next authority
+                    # boundary.  Persisting it here dirtied the Task before the
+                    # original-task/project peeks below; production autoflush
+                    # then acquired Task before PR/base advisory locks and
+                    # deadlocked with admission's PR -> Task order.
                     # Rollup gate handoff: when the original task is parking in CI wait
                     # (rollup-to-main / large rollup path in rollup_management), the parent
                     # owns the merge gate. The review task must NOT merge directly — it
@@ -3188,6 +3616,16 @@ async def _process_post_commit(
                                 # task row is held by a peer, defer the handoff —
                                 # the parent's own poll will pick up review_approved
                                 # on the next iteration once the lock clears.
+                                # Publication/fix admission owns the project/PR
+                                # lock before any authority-bearing parent row
+                                # mutation. Persist the exact approval under
+                                # that order, then release before the merge path
+                                # acquires its global base->PR lock pair.
+                                from app.task_locking import acquire_pr_spawn_lock
+
+                                await acquire_pr_spawn_lock(
+                                    session, task.project_id, pr_number
+                                )
                                 _orig = await _lock_original_task(
                                     session,
                                     original_task_id,
@@ -3216,7 +3654,35 @@ async def _process_post_commit(
                                     _orig_pid_str = str(_orig.project_id)
                                     _orig_id_str = str(_orig.id)
                                     _orig_status_snap = _orig.status
-                                    _orig_loop["review_approved"] = True
+                                    _orig_checked_head_sha = str(
+                                        _orig_loop.get("ci_checked_head_sha")
+                                        or _orig_loop.get("head_sha")
+                                        or ""
+                                    )
+                                    _orig_checked_base_sha = str(
+                                        _orig_loop.get("ci_checked_base_sha") or ""
+                                    )
+                                    _orig_loop.update(
+                                        {
+                                            "review_approved": True,
+                                            "review_history": _approved_history,
+                                            "issue_ledger": _authoritative_ledger,
+                                            "review_target": dict(_live_approve_target),
+                                            "head_sha": str(
+                                                _live_approve_target["head_sha"]
+                                            ),
+                                            "base_sha": str(
+                                                _live_approve_target["base_sha"]
+                                            ),
+                                        }
+                                    )
+                                    # An actual exact-target review supersedes
+                                    # any earlier initial-review bypass marker.
+                                    _orig_loop.pop("review_not_required", None)
+                                    _orig_loop.pop("review_policy_reason", None)
+                                    _orig_loop.pop(
+                                        "authoritative_review_required", None
+                                    )
                                     _orig.context = {
                                         **(_orig.context or {}),
                                         "review_loop": _orig_loop,
@@ -3236,9 +3702,15 @@ async def _process_post_commit(
                                         resolved_by=f"review_approve_pr_{pr_number}",
                                     )
                                     session.add(_orig)
+                                    task.context = {
+                                        **(task.context or {}),
+                                        "review_loop": dict(review_loop),
+                                    }
+                                    flag_modified(task, "context")
                                     task.status = TaskStatus.COMPLETED
                                     task.latest_status_message = f"Review approved for rollup PR #{pr_number} — handed off to CI gate"
                                     session.add(task)
+                                    await session.commit()
 
                                     if _orig_loop.get("ci_passed"):
                                         try:
@@ -3270,6 +3742,8 @@ async def _process_post_commit(
                                                 source="review_approval",
                                                 precomputed_migration_guard=_pre_rollup_mig_guard,
                                                 precomputed_size_cap=_pre_rollup_size_cap,
+                                                checked_head_sha=_orig_checked_head_sha,
+                                                checked_base_sha=_orig_checked_base_sha,
                                             )
                                         except Exception as _gate_e:
                                             logger.error(
@@ -3322,6 +3796,11 @@ async def _process_post_commit(
                                 f"**Blueprint Review Pipeline**: Merge aborted — reviewed branch `{branch}` does not match PR head `{pr_head}`.",
                             )
                             task.latest_status_message = f"Branch mismatch: reviewed {branch}, PR head is {pr_head}"
+                            task.context = {
+                                **(task.context or {}),
+                                "review_loop": dict(review_loop),
+                            }
+                            flag_modified(task, "context")
                             session.add(task)
                             await session.commit()
                             raise ValueError(f"Branch mismatch: {branch} vs {pr_head}")
@@ -3344,86 +3823,58 @@ async def _process_post_commit(
                         head_sha = pr_data.get("head", {}).get("sha", "")
                         live_base_sha = str(pr_data.get("base", {}).get("sha", ""))
                         approve_target_is_stale = (
-                            (
-                                reviewed_head_sha
-                                and head_sha
-                                and reviewed_head_sha != head_sha
-                            )
-                            or (
-                                reviewed_base_sha
-                                and reviewed_head_sha
-                                and live_base_sha
-                                and reviewed_base_sha != live_base_sha
-                            )
+                            not reviewed_head_sha
+                            or not reviewed_base_sha
+                            or reviewed_head_sha != head_sha
+                            or reviewed_base_sha != live_base_sha
                         )
                         if approve_target_is_stale:
-                            stale_discard_count = int(
-                                (task.context or {}).get(
-                                    "stale_head_consecutive_discards", 0
-                                )
-                            )
                             # Do not let an APPROVE issued for a different
-                            # comparison range enter CI/merge lifecycle. Mirror
-                            # the REQUEST_CHANGES stale-target handoff below;
-                            # the bounded second-discard escape hatch remains
-                            # for a PR that is actively changing underneath us.
-                            if stale_discard_count < 2 or is_cached_verdict_replay:
-                                if not (task.context or {}).get("_review_stale_head"):
-                                    task.context = {
-                                        **(task.context or {}),
-                                        "stale_head_consecutive_discards": stale_discard_count
-                                        + 1,
-                                        "_review_stale_head": True,
+                            # comparison range enter CI/merge lifecycle. There
+                            # is deliberately no discard-count escape hatch:
+                            # repeated branch motion can cost another bounded
+                            # delta review, but it can never make a stale
+                            # approval authoritative.
+                            if not (task.context or {}).get("_review_stale_head"):
+                                task.context = {
+                                    **(task.context or {}),
+                                    "_review_stale_head": True,
+                                }
+                                flag_modified(task, "context")
+                                task.status = TaskStatus.COMPLETED
+                                task.latest_status_message = (
+                                    f"Stale/unproven approval discarded for PR #{pr_number} "
+                                    f"(reviewed {reviewed_base_sha[:8]}..{reviewed_head_sha[:8]}, "
+                                    f"now {live_base_sha[:8]}..{head_sha[:8]}) — "
+                                    "respawning exact-target review"
+                                )
+                                session.add(task)
+                                fresh_review, _ = await _spawn_pipeline_task(
+                                    task,
+                                    "review",
+                                    session,
+                                    pr_number,
+                                    branch,
+                                    base_branch,
+                                    original_task_id=original_task_id,
+                                    review_target={
+                                        "project_id": str(task.project_id),
+                                        "pr_number": int(pr_number),
+                                        "base_sha": live_base_sha,
+                                        "head_sha": head_sha,
                                     }
-                                    flag_modified(task, "context")
-                                    task.status = TaskStatus.COMPLETED
-                                    task.latest_status_message = (
-                                        f"Stale-target approval discarded for PR #{pr_number} "
-                                        f"(reviewed {reviewed_base_sha[:8]}..{reviewed_head_sha[:8]}, "
-                                        f"now {live_base_sha[:8]}..{head_sha[:8]}) — "
-                                        "respawning fresh review"
-                                    )
-                                    session.add(task)
-                                    fresh_review, _ = await _spawn_pipeline_task(
-                                        task,
-                                        "review",
-                                        session,
+                                    if live_base_sha and head_sha
+                                    else None,
+                                )
+                                if fresh_review:
+                                    logger.info(
+                                        "[REVIEW PIPELINE] Discarded stale/unproven "
+                                        "approval for PR #%s; spawned review %s",
                                         pr_number,
-                                        branch,
-                                        base_branch,
-                                        original_task_id=original_task_id,
-                                        review_target={
-                                            "project_id": str(task.project_id),
-                                            "pr_number": int(pr_number),
-                                            "base_sha": live_base_sha,
-                                            "head_sha": head_sha,
-                                        }
-                                        if live_base_sha and head_sha
-                                        else None,
+                                        fresh_review.id,
                                     )
-                                    if fresh_review:
-                                        logger.info(
-                                            "[REVIEW PIPELINE] Discarded stale-target "
-                                            "approval for PR #%s; spawned review %s",
-                                            pr_number,
-                                            fresh_review.id,
-                                        )
-                                # A post-commit retry can re-enter after this
-                                # task already spawned its replacement. Cached
-                                # replays must stop safely rather than falling
-                                # through to the ordinary escape hatch.
-                                await session.commit()
-                                return {"status": "accepted"}
-                            logger.warning(
-                                "[REVIEW PIPELINE] PR #%s: stale-target approval "
-                                "reached discard escape hatch; continuing without "
-                                "caching (reviewed=%s..%s, live=%s..%s)",
-                                pr_number,
-                                reviewed_base_sha[:8],
-                                reviewed_head_sha[:8],
-                                live_base_sha[:8],
-                                head_sha[:8],
-                            )
+                            await session.commit()
+                            return {"status": "accepted"}
                         if (
                             reviewed_head_sha == head_sha
                             and reviewed_base_sha
@@ -3468,24 +3919,6 @@ async def _process_post_commit(
 
                         if ci_status and ci_status["status"] != "completed":
                             # CI still running — park task in EVALUATING (no VM consumed)
-                            try:
-                                _approve_files = [
-                                    f.get("filename", "")
-                                    for f in (
-                                        await get_pr_files(
-                                            gh_token, owner, repo, pr_number
-                                        )
-                                    )
-                                    if isinstance(f, dict) and f.get("filename")
-                                ]
-                            except Exception as _af_e:
-                                logger.warning(
-                                    f"[REVIEW PIPELINE] APPROVE entry: failed to fetch PR files for #{pr_number}: {_af_e}"
-                                )
-                                _approve_files = []
-                            _approved_history = _append_approve_to_review_history(
-                                review_loop, _approve_files
-                            )
                             task.status = TaskStatus.EVALUATING
                             task.latest_status_message = (
                                 f"Review approved, waiting for CI on PR #{pr_number}..."
@@ -3497,7 +3930,10 @@ async def _process_post_commit(
                                     "ci_waiting": True,
                                     "review_approved": True,
                                     "review_history": _approved_history,
+                                    "issue_ledger": _authoritative_ledger,
+                                    "review_target": dict(_live_approve_target),
                                     "head_sha": head_sha,
+                                    "base_sha": live_base_sha,
                                     "pr_number": pr_number,
                                     "branch": branch,
                                     "base_branch": base_branch,
@@ -3543,6 +3979,21 @@ async def _process_post_commit(
                             # continuity onto downstream spawns. The reviewer's VM
                             # is releasing on this APPROVE, so the new fix must
                             # cold-provision rather than wait for a dying poll.
+                            # Preserve the authoritative approval/ledger for the
+                            # successor, but only after owning the same PR lock
+                            # that the spawn boundary uses. This keeps PR -> Task
+                            # ordering without dropping proof from the fix chain.
+                            from app.task_locking import acquire_pr_spawn_lock
+
+                            await acquire_pr_spawn_lock(
+                                session, task.project_id, pr_number
+                            )
+                            task.context = {
+                                **(task.context or {}),
+                                "review_loop": dict(review_loop),
+                            }
+                            flag_modified(task, "context")
+                            session.add(task)
                             fix_task, _ = await _spawn_pipeline_task(
                                 task,
                                 "fix",
@@ -3587,6 +4038,12 @@ async def _process_post_commit(
                                     orig_task.status = TaskStatus.EVALUATING
                                     orig_task.latest_status_message = f"Review approved — awaiting human approval to merge (critical files: {', '.join(critical_touched)})"
                                     session.add(orig_task)
+                                    task.context = {
+                                        **(task.context or {}),
+                                        "review_loop": dict(review_loop),
+                                    }
+                                    flag_modified(task, "context")
+                                    session.add(task)
                                     await session.commit()
                                     await broadcast_to_project(
                                         str(orig_task.project_id),
@@ -3633,6 +4090,12 @@ async def _process_post_commit(
                                     )
                                     _approval_orig.latest_status_message = f"Review approved — awaiting human approval to merge ({reason})"
                                     session.add(_approval_orig)
+                                    task.context = {
+                                        **(task.context or {}),
+                                        "review_loop": dict(review_loop),
+                                    }
+                                    flag_modified(task, "context")
+                                    session.add(task)
                                     await session.commit()
                                     await broadcast_to_project(
                                         str(_approval_orig.project_id),
@@ -3765,6 +4228,9 @@ async def _process_post_commit(
                                         from app.task_completion import (
                                             _reset_review_loop_pr_head_cache,
                                         )
+                                        from app.ci_merge_helpers import (
+                                            revoke_review_authority_for_active_fix,
+                                        )
 
                                         task.status = TaskStatus.EVALUATING
                                         task.latest_status_message = (
@@ -3775,21 +4241,29 @@ async def _process_post_commit(
                                             f"against {base_branch}; awaiting fresh CI "
                                             "on the rewritten PR head"
                                         )[:500]
-                                        task.context = {
-                                            **(task.context or {}),
-                                            "_migration_finalization": _finalization,
-                                            "review_loop": {
-                                                **_reset_review_loop_pr_head_cache(
-                                                    review_loop
-                                                ),
+                                        _finalized_loop = (
+                                            _reset_review_loop_pr_head_cache(review_loop)
+                                        )
+                                        _finalized_loop = (
+                                            revoke_review_authority_for_active_fix(
+                                                task, review_loop=_finalized_loop
+                                            )
+                                        )
+                                        _finalized_loop.update(
+                                            {
                                                 "ci_waiting": True,
-                                                "review_approved": True,
                                                 "ci_passed": False,
+                                                "authoritative_review_required": True,
                                                 "pr_number": pr_number,
                                                 "branch": branch,
                                                 "base_branch": base_branch,
                                                 "original_task_id": original_task_id,
-                                            },
+                                            }
+                                        )
+                                        task.context = {
+                                            **(task.context or {}),
+                                            "_migration_finalization": _finalization,
+                                            "review_loop": _finalized_loop,
                                         }
                                         session.add(task)
                                         await session.commit()
@@ -3812,15 +4286,48 @@ async def _process_post_commit(
                                 action_taken = True
                                 return {"status": "accepted"}
 
-                        merge_result = await _merge_with_retry(  # premerge-guard-exempt: migration PRs are parked above in the dual-head guard branch (returns "accepted"); this merge only runs for staging-only branches that never carry a migration onto the integration trunk
-                            merge_pull_request,
-                            gh_token,
-                            owner,
-                            repo,
-                            pr_number,
-                            project_id=str(task.project_id),
-                            merge_method=_pick_merge_method(task),
+                        from app.review_merge_authority import (
+                            attempt_merge_with_authority,
                         )
+
+                        async def _submit_approved_merge(
+                            expected_head_sha: str,
+                        ) -> dict:
+                            return await merge_pull_request(  # premerge-guard-exempt: migration PRs are parked above in the dual-head guard branch (returns "accepted"); this merge only runs for staging-only branches that never carry a migration onto the integration trunk
+                                gh_token,
+                                owner,
+                                repo,
+                                pr_number,
+                                project_id=str(task.project_id),
+                                merge_method=_pick_merge_method(task),
+                                expected_head_sha=expected_head_sha,
+                            )
+
+                        _merge_authority, merge_result = (
+                            await attempt_merge_with_authority(
+                            task,
+                            session,
+                            merge_call=_submit_approved_merge,
+                            gh_token=gh_token,
+                            owner=owner,
+                            repo=repo,
+                            ci_loop=review_loop,
+                            pr_number=pr_number,
+                            branch=branch,
+                            base_branch=base_branch,
+                            original_task_id=original_task_id,
+                            checked_head_sha=str(_live_approve_target["head_sha"]),
+                            checked_base_sha=str(_live_approve_target["base_sha"]),
+                            retry_nonterminal=True,
+                        )
+                        )
+                        if merge_result is None:
+                            session.add(task)
+                            await session.commit()
+                            action_taken = True
+                            return {"status": "accepted"}
+
+                        review_loop = _merge_authority.review_loop
 
                         if merge_result.get("merged"):
                             await _comment_with_retry(
@@ -4552,27 +5059,8 @@ async def _process_post_commit(
                             )
                             from app import pause_clock
 
-                            try:
-                                _approve_files = [
-                                    f.get("filename", "")
-                                    for f in (
-                                        await get_pr_files(
-                                            gh_token, owner, repo, pr_number
-                                        )
-                                    )
-                                    if isinstance(f, dict) and f.get("filename")
-                                ]
-                            except Exception as _af_e:
-                                logger.warning(
-                                    f"[REVIEW PIPELINE] APPROVE entry: failed to fetch PR files for #{pr_number}: {_af_e}"
-                                )
-                                _approve_files = []
                             merge_wait_loop = dict(review_loop)
-                            merge_wait_loop["review_history"] = (
-                                _append_approve_to_review_history(
-                                    review_loop, _approve_files
-                                )
-                            )
+                            merge_wait_loop["review_history"] = _approved_history
                             merge_wait_loop["ci_waiting"] = True
                             merge_wait_loop["review_approved"] = True
                             merge_wait_loop["ci_passed"] = (
@@ -4609,22 +5097,6 @@ async def _process_post_commit(
                             f"[REVIEW PIPELINE] Failed to merge PR #{pr_number}, parking in CI-wait: {e}",
                             exc_info=True,
                         )
-                        # Best-effort: gh_token may not be in scope if the failure
-                        # happened before the auth call.  An empty file list here
-                        # still records that the iteration was approved.
-                        try:
-                            _approve_files = [
-                                f.get("filename", "")
-                                for f in (
-                                    await get_pr_files(gh_token, owner, repo, pr_number)
-                                )
-                                if isinstance(f, dict) and f.get("filename")
-                            ]
-                        except Exception:
-                            _approve_files = []
-                        _approved_history = _append_approve_to_review_history(
-                            review_loop, _approve_files
-                        )
                         task.status = TaskStatus.EVALUATING
                         task.latest_status_message = f"Review approved, merge attempt failed ({type(e).__name__}) — CI monitor will retry"
                         task.context = {
@@ -4634,7 +5106,12 @@ async def _process_post_commit(
                                 "ci_waiting": True,
                                 "review_approved": True,
                                 "review_history": _approved_history,
+                                "issue_ledger": _authoritative_ledger,
+                                "review_target": dict(_live_approve_target),
                                 "head_sha": head_sha,
+                                "base_sha": str(
+                                    _live_approve_target["base_sha"]
+                                ),
                                 "pr_number": pr_number,
                                 "branch": branch,
                                 "base_branch": base_branch,
@@ -4874,101 +5351,96 @@ async def _process_post_commit(
                             exc_info=True,
                         )
 
-                    # Stale-target guard: the review ran against a different PR
-                    # base or head than the current one. Discard the verdict and
-                    # respawn a fresh review so lifecycle actions are not guided by
-                    # a diff whose comparison range has changed. Backward compat:
-                    # old verdicts without either reviewed SHA are treated as current.
-                    if (
-                        (reviewed_head_sha and head_sha and reviewed_head_sha != head_sha)
-                        or (
-                            reviewed_base_sha
-                            and reviewed_head_sha
-                            and base_sha
-                            and reviewed_base_sha != base_sha
+                    # Stale/unproven-target guard: REQUEST_CHANGES can launch a
+                    # code-writing fix only when the reviewer proved the exact
+                    # immutable base/head it inspected. Missing provenance is no
+                    # safer than a mismatch. If GitHub cannot provide the live
+                    # target, fail closed for operator attention rather than
+                    # expanding to an unpinned review or using stale guidance.
+                    if not head_sha or not base_sha:
+                        task.status = TaskStatus.COMPLETED
+                        task.requires_approval = True
+                        task.latest_status_message = (
+                            f"Review changes for PR #{pr_number} withheld: could not "
+                            "prove the live immutable review target"
                         )
-                    ):
-                        _stale_discard_count = int(
-                            (task.context or {}).get(
-                                "stale_head_consecutive_discards", 0
+                        task.context = {
+                            **(task.context or {}),
+                            "_review_target_unavailable": True,
+                        }
+                        flag_modified(task, "context")
+                        session.add(task)
+                        await session.commit()
+                        return {"status": "accepted"}
+
+                    review_target_unproven = (
+                        not reviewed_head_sha
+                        or not reviewed_base_sha
+                        or reviewed_head_sha != head_sha
+                        or reviewed_base_sha != base_sha
+                    )
+                    if review_target_unproven:
+                        # A stale finding can waste a fix iteration just as a
+                        # stale approval can merge bad code. Always discard and
+                        # respawn against the immutable live target; idempotent
+                        # spawn keys bound duplicate work without weakening the
+                        # target invariant.
+                        if not (task.context or {}).get("_review_stale_head"):
+                            task.status = TaskStatus.COMPLETED
+                            task.latest_status_message = (
+                                f"Stale-target review discarded for PR #{pr_number} "
+                                f"(reviewed {reviewed_base_sha[:8]}..{reviewed_head_sha[:8]}, "
+                                f"now {base_sha[:8]}..{head_sha[:8]}) — respawning exact-target review"
                             )
-                        )
-                        if _stale_discard_count < 2 or is_cached_verdict_replay:
-                            # Discard: mark this review as stale, respawn fresh review.
-                            # _review_stale_head: underscore-prefix so it is NOT propagated
-                            # to the fresh review task (only exempts THIS discarded review
-                            # from the iteration cap). stale_head_consecutive_discards has
-                            # no underscore so it IS propagated, letting the fresh review
-                            # inherit the running count and eventually accept on the 2nd hit.
-                            #
-                            # Replay guard: _review_stale_head being set means a prior run
-                            # already committed the counter increment and spawned the fresh
-                            # review.  Skip both actions to avoid double-increment and
-                            # double-spawn.
-                            if not (task.context or {}).get("_review_stale_head"):
-                                task.context = {
-                                    **(task.context or {}),
-                                    "stale_head_consecutive_discards": _stale_discard_count
-                                    + 1,
-                                    "_review_stale_head": True,
+                            await _persist_stale_review_evidence(
+                                task,
+                                session,
+                                original_task_id=original_task_id,
+                                pr_number=pr_number,
+                                review_loop=review_loop,
+                                review_entry=_current_review_entry,
+                                live_target={
+                                    "project_id": str(task.project_id),
+                                    "pr_number": int(pr_number),
+                                    "base_sha": base_sha,
+                                    "head_sha": head_sha,
+                                },
+                            )
+                            task.context = {
+                                **(task.context or {}),
+                                "_review_stale_head": True,
+                            }
+                            flag_modified(task, "context")
+                            session.add(task)
+                            fresh_review, _ = await _spawn_pipeline_task(
+                                task,
+                                "review",
+                                session,
+                                pr_number,
+                                branch,
+                                base_branch,
+                                original_task_id=original_task_id,
+                                review_target={
+                                    "project_id": str(task.project_id),
+                                    "pr_number": int(pr_number),
+                                    "base_sha": base_sha,
+                                    "head_sha": head_sha,
                                 }
-                                flag_modified(task, "context")
-                                task.status = TaskStatus.COMPLETED
-                                task.latest_status_message = (
-                                    f"Stale-target review discarded for PR #{pr_number} "
-                                    f"(reviewed {reviewed_base_sha[:8]}..{reviewed_head_sha[:8]}, "
-                                    f"now {base_sha[:8]}..{head_sha[:8]}) — respawning fresh review"
-                                )
-                                session.add(task)
-                                logger.warning(
-                                    f"[REVIEW PIPELINE] PR #{pr_number}: stale-target verdict "
-                                    f"discarded (reviewed={reviewed_base_sha[:8]}..{reviewed_head_sha[:8]}, "
-                                    f"live={base_sha[:8]}..{head_sha[:8]}) — respawning review "
-                                    f"(discard #{_stale_discard_count + 1})"
-                                )
-                                fresh_review, _ = await _spawn_pipeline_task(
-                                    task,
-                                    "review",
-                                    session,
+                                if base_sha and head_sha
+                                else None,
+                            )
+                            if fresh_review:
+                                logger.info(
+                                    "[REVIEW PIPELINE] Spawned exact-target review "
+                                    "%s for PR #%s after stale-head discard",
+                                    fresh_review.id,
                                     pr_number,
-                                    branch,
-                                    base_branch,
-                                    original_task_id=original_task_id,
-                                    review_target={
-                                        "project_id": str(task.project_id),
-                                        "pr_number": int(pr_number),
-                                        "base_sha": base_sha,
-                                        "head_sha": head_sha,
-                                    }
-                                    if base_sha and head_sha
-                                    else None,
                                 )
-                                if fresh_review:
-                                    logger.info(
-                                        f"[REVIEW PIPELINE] Spawned fresh review "
-                                        f"{fresh_review.id} for PR #{pr_number} "
-                                        f"after stale-head discard"
-                                    )
-                            await session.commit()
-                            return {"status": "accepted"}
-                        else:
-                            # 2nd consecutive stale target: accept verdict, annotate it.
-                            _stale_note = (
-                                f"_(Reviewer judged {reviewed_base_sha[:8]}..{reviewed_head_sha[:8]}; "
-                                f"PR is now {base_sha[:8]}..{head_sha[:8]}.)_\n\n"
-                            )
-                            feedback = _stale_note + feedback
-                            logger.warning(
-                                f"[REVIEW PIPELINE] PR #{pr_number}: 2nd consecutive "
-                                f"stale-target discard — accepting verdict with annotation "
-                                f"(reviewed={reviewed_base_sha[:8]}..{reviewed_head_sha[:8]}, "
-                                f"live={base_sha[:8]}..{head_sha[:8]})"
-                            )
+                        await session.commit()
+                        return {"status": "accepted"}
 
                     # A cached verdict must have evaluated this exact head.
-                    # The stale-head safety valve above can eventually accept a
-                    # stale result to keep the live workflow moving, but it must
-                    # never make that result reusable on a later dispatch.
+                    # Only exact-target verdicts are reusable on a later dispatch.
                     if (
                         reviewed_head_sha == head_sha
                         and reviewed_base_sha == base_sha
@@ -4983,6 +5455,168 @@ async def _process_post_commit(
                             if base_sha and head_sha
                             else None
                         )
+
+                    # A same-head change request is merge-authority revocation,
+                    # not merely input to the next fix agent.  The originating
+                    # task can already be parked on green CI with an older exact
+                    # APPROVE (or an initial-review bypass marker).  Revoke that
+                    # proof and persist this review's bounded history + ledger on
+                    # the parent *before* a code-writing fix is allowed to commit.
+                    # Otherwise CI can race the fix spawn and publish the bytes
+                    # that this reviewer just blocked.
+                    if original_task_id:
+                        from app.task_locking import acquire_pr_spawn_lock
+
+                        await acquire_pr_spawn_lock(
+                            session, task.project_id, pr_number
+                        )
+                        try:
+                            _orig = await _lock_original_task(
+                                session,
+                                original_task_id,
+                                source="review_blocker_authority_revoke",
+                                skip_locked=False,
+                            )
+                        except _OriginalTaskLockTimeout as _revoke_lock_err:
+                            # The status endpoint's write-ahead post_commit_pending
+                            # marker makes this whole completion replayable.  Fail
+                            # closed and preserve that retry path; never spawn the
+                            # fix while the parent can still look approved.
+                            raise PostCommitFinalCommitFailed(
+                                "could not durably revoke parent review authority "
+                                f"for {original_task_id} before fixing PR #{pr_number}"
+                            ) from _revoke_lock_err
+
+                        if _orig is None:
+                            task.requires_approval = True
+                            task.latest_status_message = (
+                                f"Review blocked PR #{pr_number}, but its originating "
+                                "task is missing; fix withheld for manual recovery"
+                            )
+                            session.add(task)
+                            await session.commit()
+                            return {"status": "accepted"}
+
+                        _orig_loop = dict(
+                            (_orig.context or {}).get("review_loop", {}) or {}
+                        )
+
+                        # The review task owns the chain history it actually
+                        # received.  A parent can still carry a pre-cutover,
+                        # empty, or stale copy, so never prefer that copy merely
+                        # because it is a list.  Preserve only parent entries
+                        # whose iteration is genuinely newer than everything
+                        # known to this review task, then make the completing
+                        # review the final entry.
+                        _child_history = review_loop.get("review_history") or []
+                        if not isinstance(_child_history, list):
+                            _child_history = []
+                        _child_history = [
+                            _entry
+                            for _entry in _child_history
+                            if isinstance(_entry, dict)
+                        ]
+
+                        _parent_history_raw = _orig_loop.get("review_history") or []
+                        if not isinstance(_parent_history_raw, list):
+                            _parent_history_raw = []
+                        _child_review_ids = {
+                            str(_entry.get("review_task_id") or "")
+                            for _entry in _child_history
+                            if _entry.get("review_task_id")
+                        }
+                        _parent_only_entries = [
+                            _entry
+                            for _entry in _parent_history_raw
+                            if isinstance(_entry, dict)
+                            and (
+                                not _entry.get("review_task_id")
+                                or str(_entry.get("review_task_id"))
+                                not in _child_review_ids
+                            )
+                            and _entry not in _child_history
+                        ]
+
+                        _review_task_id = str(task.id)
+                        _parent_entry = {
+                            **_current_review_entry,
+                            # ``issues`` was expanded above to the complete
+                            # binding open set.  Persist that set, rather than
+                            # the narrower list captured before ledger rebuild,
+                            # so history bounding can never forget an omitted
+                            # blocker from an earlier child review.
+                            "issues": list(issues),
+                            "review_task_id": _review_task_id,
+                        }
+                        _parent_history = [
+                            _entry
+                            for _entry in [*_child_history, *_parent_only_entries]
+                            if _entry.get("review_task_id") != _review_task_id
+                        ]
+                        _parent_history = bound_review_history(
+                            [*_parent_history, _parent_entry]
+                        )
+                        _prior_parent_ledger = _orig_loop.get("issue_ledger")
+                        _parent_ledger = build_issue_ledger(
+                            _parent_history,
+                            **(
+                                {"seed_ledger": _prior_parent_ledger}
+                                if _prior_parent_ledger is not None
+                                else {}
+                            ),
+                            stamp_complete=True,
+                        )
+                        _parent_target = {
+                            "project_id": str(task.project_id),
+                            "pr_number": int(pr_number),
+                            "base_sha": base_sha,
+                            "head_sha": head_sha,
+                        }
+
+                        _orig_loop["review_approved"] = False
+                        _orig_loop["review_history"] = _parent_history
+                        _orig_loop["issue_ledger"] = _parent_ledger
+                        _orig_loop["review_target"] = _parent_target
+                        _orig_loop["base_sha"] = base_sha
+                        _orig_loop["head_sha"] = head_sha
+                        for _stale_authority_key in (
+                            "verdict",
+                            "review_not_required",
+                            "review_policy_reason",
+                            "authoritative_review_required",
+                            "authoritative_review_task_id",
+                            "authoritative_review_target",
+                            "authoritative_review_target_unresolved_at",
+                        ):
+                            _orig_loop.pop(_stale_authority_key, None)
+
+                        if _orig_loop.get("ci_waiting"):
+                            from app import pause_clock
+
+                            _orig_loop["ci_wait_started"] = _utcnow().isoformat()
+                            try:
+                                _orig_loop[
+                                    "ci_wait_pause_baseline"
+                                ] = await pause_clock.current_baseline(session)
+                            except Exception as _pause_err:  # noqa: BLE001
+                                logger.warning(
+                                    "[REVIEW PIPELINE] Could not refresh pause "
+                                    "baseline while revoking parent %s: %r",
+                                    str(original_task_id)[:8],
+                                    _pause_err,
+                                )
+
+                        _orig.context = {
+                            **(_orig.context or {}),
+                            "review_loop": _orig_loop,
+                        }
+                        flag_modified(_orig, "context")
+                        session.add(_orig)
+                        # This commit is intentionally before _spawn_pipeline_task:
+                        # that helper may commit or roll back internally.  A spawn
+                        # failure must leave the parent safely revoked and the
+                        # post-commit sweep free to retry the idempotent spawn.
+                        await session.commit()
 
                     # CI vs reviewer build-gate disagreement detector. When the
                     # reviewer flags build/lint complaints but CI shows the
@@ -5061,61 +5695,20 @@ async def _process_post_commit(
                         original_task_id=original_task_id,
                         current_feedback=feedback,
                         current_issues=issues,
+                        current_resolutions=resolutions,
                         investigated_files=investigated_files,
-                        rereview_waived=not requires_rereview,
                         reviewed_head_sha=reviewed_head_sha or head_sha,
+                        reviewed_base_sha=reviewed_base_sha or base_sha,
+                        target_verified_by_backend=bool(
+                            _current_review_entry.get(
+                                "target_verified_by_backend"
+                            )
+                        ),
                     )
                     if fix_task:
                         logger.info(
                             f"[REVIEW PIPELINE] Spawned fix for PR #{pr_number} → task {fix_task.id}"
                         )
-                        # Reset the parking parent's CI-wait clock: each spawned fix
-                        # is a fresh cycle of work, so the 30-min backstop in
-                        # services.py should count from here instead of the initial
-                        # rollup-creation timestamp.  Without this, a rollup that
-                        # legitimately cycles through 3-4 fix iterations gets killed
-                        # mid-pipeline.
-                        if original_task_id:
-                            try:
-                                # Phase A1: skip_locked + bounded retry. If the
-                                # parent row is held, skip the ci_wait reset —
-                                # it's an optimization (resets the 30-min
-                                # backstop clock), not correctness; the parent
-                                # will still terminate, just on the original
-                                # baseline if reset is missed.
-                                _orig = await _lock_original_task(
-                                    session,
-                                    original_task_id,
-                                    source="review_ci_wait_reset",
-                                )
-                                if _orig:
-                                    _orig_loop = dict(
-                                        (_orig.context or {}).get("review_loop", {})
-                                        or {}
-                                    )
-                                    if _orig_loop.get("ci_waiting"):
-                                        from app import pause_clock
-
-                                        _orig_loop["ci_wait_started"] = (
-                                            _utcnow().isoformat()
-                                        )
-                                        _orig_loop[
-                                            "ci_wait_pause_baseline"
-                                        ] = await pause_clock.current_baseline(session)
-                                        _orig.context = {
-                                            **(_orig.context or {}),
-                                            "review_loop": _orig_loop,
-                                        }
-                                        flag_modified(_orig, "context")
-                                        session.add(_orig)
-                                else:
-                                    logger.info(
-                                        f"[REVIEW PIPELINE] ci_wait reset skipped for parent {original_task_id[:8]} — row contended"
-                                    )
-                            except Exception as _reset_err:
-                                logger.warning(
-                                    f"[REVIEW PIPELINE] Failed to reset ci_wait_started on parent {original_task_id[:8]}: {_reset_err}"
-                                )
                     else:
                         task.latest_status_message = f"Fix not spawned for PR #{pr_number} — iteration cap reached"
                         task.requires_approval = True
@@ -5177,7 +5770,7 @@ async def _process_post_commit(
                                 {
                                     "description": i.get("description", ""),
                                     "severity": i.get("severity", "minor"),
-                                    "iteration": review_iteration,
+                                    "iteration": _review_iteration,
                                 }
                                 for i in issues
                                 if i.get("description")
@@ -5188,7 +5781,7 @@ async def _process_post_commit(
                                 )
                                 if orig_task:
                                     task_ctx = dict(orig_task.context or {})
-                                    if review_iteration == 1:
+                                    if _review_iteration == 1:
                                         buckets = (
                                             await cache_first_attempt_classification(
                                                 task_ctx, rh_items
@@ -5202,7 +5795,7 @@ async def _process_post_commit(
                                         if items
                                     }
                                     if rejection_cats:
-                                        if review_iteration == 1:
+                                        if _review_iteration == 1:
                                             task_ctx[
                                                 "_first_attempt_rejection_categories"
                                             ] = rejection_cats
@@ -5366,73 +5959,16 @@ async def _process_post_commit(
                     session.add(task)
                     await session.commit()
 
-                fix_reason = review_loop.get("fix_reason", "code_review")
-                rereview_waived = (
-                    fix_reason == "code_review"
-                    and review_loop.get("rereview_waived") is True
-                )
-                # Skip re-review for fixes whose origin doesn't add review-worthy
-                # logic on top of an already-decided merge gate:
-                #   - ci_failure  → original review already approved code; CI is
-                #                   the only gate. Wait for CI then merge.
-                #   - merge_conflict → cluster sub-PR rebase. The original task
-                #                   was scope-gated to skip review (small/medium
-                #                   intermediate); rebase output is mechanical;
-                #                   re-reviewing would be inconsistent with the
-                #                   no-conflict happy path. Wait for CI then merge.
-                #   - migration_guard → targeted Alembic chain repair after the
-                #                   pre-merge guard blocked an approved PR. The
-                #                   repair may drop already-landed semantic work
-                #                   or renumber genuinely new schema work.
-                #                   Wait for CI then merge.
-                #   - explicit reviewer waiver → the reviewer delegated closure
-                #                   of this ordinary code-review fix to the fixer
-                #                   and normal CI; it is not a mechanical proof.
-                #   - security scan blocked → halt and wait for manual approval;
-                #                   neither skip-to-CI nor re-review is spawned.
-                # The full policy (including the scan-blocked override) is owned by
-                # review_policy.should_skip_re_review.
-                _rr_decision = should_skip_re_review(
-                    fix_reason, rereview_waived, scan_blocked
-                )
-                if _rr_decision.rule == "security_blocked":
+                # Every pushed fix invalidates prior approval. The only exception
+                # is a blocking security scan, which halts for manual approval.
+                if scan_blocked:
                     # Scan blocked the fix output; task already flagged for manual
                     # approval above. Do not park for CI or spawn a re-review.
                     pass
-                elif _rr_decision.skip:
-                    from app import pause_clock
-
-                    ci_loop = review_loop.copy()
-                    # Per-episode respawn budget: a fix completion starts a fresh
-                    # review-wait episode.  Reset the backstop's per-episode count
-                    # so a respawn consumed in an earlier episode (e.g. a superseded
-                    # review) does not permanently exhaust the budget.
-                    ci_loop.pop("review_wait_respawn_count", None)
-                    ci_loop["ci_waiting"] = True
-                    ci_loop["review_approved"] = True
-                    ci_loop["ci_wait_started"] = _utcnow().isoformat()
-                    ci_loop[
-                        "ci_wait_pause_baseline"
-                    ] = await pause_clock.current_baseline(session)
-                    ci_loop["ci_poll_interval"] = 30
-                    task.status = TaskStatus.EVALUATING
-                    task.context = {**(task.context or {}), "review_loop": ci_loop}
-                    if fix_reason == "ci_failure":
-                        label = "CI-only fix"
-                    elif fix_reason == "merge_conflict":
-                        label = "merge-conflict fix"
-                    elif fix_reason == "migration_guard":
-                        label = "migration-guard fix"
-                    else:
-                        label = "reviewer-waived fix"
-                    task.latest_status_message = f"{label} applied for PR #{pr_number} — waiting for CI (review skipped: {_rr_decision.reason})"
-                    session.add(task)
-                    await session.commit()
-                    logger.info(
-                        f"[REVIEW PIPELINE] {label} for PR #{pr_number} (skip reason={_rr_decision.reason}) — skipping re-review, waiting for CI"
-                    )
                 else:
-                    # Not blocked and no skip reason: spawn a fresh re-review.
+                    # Every pushed fix invalidates the prior verdict. Close the
+                    # loop with the bounded exact-head delta review for every fix
+                    # origin; security-blocked is the only non-review outcome.
                     review_task, _ = await _spawn_pipeline_task(
                         task,
                         "review",
@@ -5441,7 +5977,11 @@ async def _process_post_commit(
                         branch,
                         base_branch,
                         original_task_id=original_task_id,
-                        delta_base_sha=str(review_loop.get("reviewed_head_sha") or ""),
+                        delta_base_sha=str(
+                            review_loop.get("reviewed_head_sha")
+                            or review_loop.get("head_sha")
+                            or ""
+                        ),
                         review_target=rereview_target,
                     )
                     if review_task:
@@ -5494,7 +6034,11 @@ async def _process_post_commit(
                                 branch,
                                 base_branch,
                                 original_task_id=original_task_id,
-                                delta_base_sha=str(review_loop.get("reviewed_head_sha") or ""),
+                                delta_base_sha=str(
+                                    review_loop.get("reviewed_head_sha")
+                                    or review_loop.get("head_sha")
+                                    or ""
+                                ),
                                 review_target=rereview_target,
                             )
                             if review_task:
@@ -5662,7 +6206,6 @@ async def _process_post_commit(
                     "discovery_review": _handle_discovery_review_completion,
                     "repo_bootstrap": _handle_repo_bootstrap_completion,
                     "capability_proof_trial": _handle_capability_proof_trial_completion,
-                    "criterion_coverage_trial": _handle_criterion_coverage_trial_completion,
                     "walkthrough_e2e": _handle_walkthrough_e2e_completion,
                 }
                 _capability = (
@@ -5736,6 +6279,29 @@ async def _process_post_commit(
                     )
                     return {"status": "accepted"}
                 task = _recovered_task
+                if _expected_post_commit_claim_token is not None:
+                    from app.review_execution_ownership import (
+                        POST_COMMIT_CONTINUATION_STATUSES,
+                    )
+
+                    pending_meta = dict(
+                        (task.context or {}).get("_post_commit_pending_meta") or {}
+                    )
+                    claim_is_current = bool(
+                        task.post_commit_pending
+                        and not task.archived
+                        and task.status in POST_COMMIT_CONTINUATION_STATUSES
+                        and pending_meta.get("claim_token")
+                        == _expected_post_commit_claim_token
+                    )
+                    if not claim_is_current:
+                        logger.info(
+                            "[POST_COMMIT SWEEP] Pending recovery claim for task %s "
+                            "lost authority during completion handler; preserving "
+                            "the newer lifecycle state",
+                            str(task_id)[:8],
+                        )
+                        return {"status": "accepted", "recovery_skipped": True}
                 if _expected_childless_recovery_token is not None:
                     recovery_meta = dict(
                         (task.context or {}).get(

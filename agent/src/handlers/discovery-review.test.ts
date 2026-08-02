@@ -5,7 +5,6 @@ vi.mock('./discovery-review-deps.js', () => {
     DEFAULT_TOOL_GUIDANCE: '',
     WORKSPACE: '/tmp/discovery-review-test',
     buildContextPrefix: vi.fn().mockReturnValue(''),
-    buildFileTree: vi.fn().mockReturnValue(''),
     buildPromptSizeTelemetry: vi.fn().mockReturnValue({
       prompt_size_bytes: 0,
       prompt_section_count: 0,
@@ -19,6 +18,7 @@ vi.mock('./discovery-review-deps.js', () => {
     ]),
     git: vi.fn(),
     persistAndPostStatus: vi.fn(),
+    preparePacketOnlyWorkspace: vi.fn(),
     prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined),
     providerAutoInjectsClaudeMd: vi.fn().mockReturnValue(false),
     readClaudeMd: vi.fn().mockReturnValue(''),
@@ -29,7 +29,7 @@ vi.mock('./discovery-review-deps.js', () => {
     sendLog: vi.fn(),
     setCurrentPromptFingerprint: vi.fn(),
     setPromptSizeTelemetry: vi.fn(),
-    strVal: vi.fn((value: unknown, fallback = '') =>
+    strVal: vi.fn((value: unknown, fallback: string = ''): string =>
       typeof value === 'string' ? value : fallback),
     validateBranchName: vi.fn((value: string) => value),
   };
@@ -38,6 +38,7 @@ vi.mock('./discovery-review-deps.js', () => {
 import {
   git,
   persistAndPostStatus,
+  preparePacketOnlyWorkspace,
   prepareWorkspaceForRole,
   runClaudeCode,
 } from './discovery-review-deps.js';
@@ -132,6 +133,12 @@ describe('discovery review verdict contract', () => {
         validationContext,
       ).ok,
     ).toBe(false);
+    expect(
+      validateDiscoveryReviewShape(
+        validResult({ next_bet: { blob: 'x'.repeat(9_000) } }),
+        validationContext,
+      ).ok,
+    ).toBe(false);
   });
 
   it('fails closed on unsupported empty-packet verdicts', () => {
@@ -218,6 +225,75 @@ describe('discovery review prompt and handler', () => {
     expect(prompt).toContain('Output ONLY one JSON object');
   });
 
+  it('bounds decision snapshots even when the prompt helper is called directly', () => {
+    const prompt = buildDiscoveryReviewPrompt(
+      payload({ intent_snapshot: { goal: 'x'.repeat(20_000) } }),
+      {},
+      CANDIDATE_SHA,
+    );
+
+    expect(prompt).toContain('"local_guard": true');
+    expect(prompt).not.toContain('x'.repeat(9_000));
+    expect(prompt.length).toBeLessThan(18_000);
+  });
+
+  it('uses the resolved lower-tier model and effort for an ordinary review', async () => {
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0,
+      allOutput: JSON.stringify(validResult()),
+      lastResultText: JSON.stringify(validResult()),
+    });
+    const statusRef = { value: '' };
+
+    await handleDiscoveryReview(
+      'task-routine-tier',
+      payload({ effort: 'medium' }),
+      {},
+      'token',
+      'owner',
+      'repo',
+      null,
+      statusRef,
+      'gpt-5.6-terra',
+      'medium',
+    );
+
+    expect(runClaudeCode).toHaveBeenCalledOnce();
+    expect(runClaudeCode).toHaveBeenCalledWith(
+      expect.any(String),
+      null,
+      statusRef,
+      'gpt-5.6-terra',
+      'medium',
+      ['Write', 'Edit', 'NotebookEdit'],
+    );
+  });
+
+  it('makes confirmation disagreement an explicit operator handoff', () => {
+    const prompt = buildDiscoveryReviewPrompt(
+      payload({
+        review_round: 2,
+        effort: 'max',
+        prior_review_task_id: '123e4567-e89b-42d3-a456-426614174099',
+        confirmation_proposal: {
+          verdict: 'expand',
+          next_bet: { claim: 'expand the bounded bet' },
+          recommended_phase: 'productize',
+          recommended_limits: {
+            task_credit_limit: 3,
+            attempt_credit_limit: 5,
+            concurrency_limit: 2,
+          },
+        },
+      }),
+      {},
+      CANDIDATE_SHA,
+    );
+
+    expect(prompt).toMatch(/fail\s+closed/);
+    expect(prompt).toContain('operator for adjudication');
+  });
+
   it('performs one structured repair and persists the repaired verdict', async () => {
     vi.mocked(runClaudeCode)
       .mockResolvedValueOnce({
@@ -242,13 +318,46 @@ describe('discovery review prompt and handler', () => {
       { value: '' },
     );
 
-    expect(prepareWorkspaceForRole).toHaveBeenCalledOnce();
+    expect(prepareWorkspaceForRole).toHaveBeenCalledWith(
+      expect.objectContaining({ depth: 1 }),
+    );
+    expect(git).toHaveBeenCalledWith([
+      'fetch',
+      '--depth=1',
+      '--no-tags',
+      'origin',
+      CANDIDATE_SHA,
+    ]);
     expect(runClaudeCode).toHaveBeenCalledTimes(2);
     expect(persistAndPostStatus).toHaveBeenLastCalledWith(
       'task-1',
       expect.objectContaining({
         status: 'COMPLETED',
         artifact_type: 'DISCOVERY_REVIEW',
+      }),
+    );
+  });
+
+  it('rejects an oversized server snapshot before preparing a workspace', async () => {
+    await handleDiscoveryReview(
+      'task-oversized-contract',
+      payload({ intent_snapshot: { goal: 'x'.repeat(20_000) } }),
+      {},
+      'token',
+      'owner',
+      'repo',
+      null,
+      { value: '' },
+    );
+
+    expect(prepareWorkspaceForRole).not.toHaveBeenCalled();
+    expect(preparePacketOnlyWorkspace).not.toHaveBeenCalled();
+    expect(runClaudeCode).not.toHaveBeenCalled();
+    expect(persistAndPostStatus).toHaveBeenLastCalledWith(
+      'task-oversized-contract',
+      expect.objectContaining({
+        status: 'FAILED',
+        failure_category: 'discovery_review_contract_invalid',
       }),
     );
   });
@@ -271,6 +380,10 @@ describe('discovery review prompt and handler', () => {
       { value: '' },
     );
 
+    expect(prepareWorkspaceForRole).not.toHaveBeenCalled();
+    expect(preparePacketOnlyWorkspace).toHaveBeenCalledWith(
+      '/tmp/discovery-review-test',
+    );
     expect(runClaudeCode).toHaveBeenCalledTimes(2);
     expect(persistAndPostStatus).toHaveBeenLastCalledWith(
       'task-2',

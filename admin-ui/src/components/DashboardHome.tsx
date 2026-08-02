@@ -154,7 +154,6 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
     blindSpots,
     srRecentMisses,
     srRecentMissesTotal,
-    srReviewerDisagreements,
     directionSrBreakdown,
     fingerprintAnalytics,
     taskDurationStats,
@@ -448,7 +447,6 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
             blindSpots={blindSpots}
             expandedBlindSpotThemes={expandedBlindSpotThemes}
             onToggleBlindSpotTheme={handleToggleBlindSpotTheme}
-            srReviewerDisagreements={srReviewerDisagreements}
             directionSrBreakdown={directionSrBreakdown}
             srTrends={digest?.self_review_prediction_accuracy_trends}
             fingerprintAnalytics={fingerprintAnalytics}

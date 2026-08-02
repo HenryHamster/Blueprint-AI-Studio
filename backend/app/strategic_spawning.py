@@ -65,6 +65,7 @@ from app.release_artifacts import (
 )
 from app.autonomous_spawn_budget import (
     DEFAULT_AUTONOMOUS_SPAWN_BUDGET_MODE,
+    autonomous_spawn_task_clause,
     autonomous_spawn_budget_config_from_runtime,
     build_autonomous_spawn_budget_guard,
     compute_autonomous_spawn_budget_snapshot,
@@ -1011,7 +1012,6 @@ _QUAL_STATUS_STATE_MAP: dict[str, frozenset[str]] = {
     "pending": frozenset(
         {
             "qualifying",
-            "promotion_in_flight",
             "promotion_check_wait",
             "audit_crashed",
         }
@@ -4002,7 +4002,7 @@ async def _strategic_spawn_budget_guard(
                     select(func.count())
                     .select_from(Task)
                     .where(
-                        Task.created_by == "ORCHESTRATOR",
+                        autonomous_spawn_task_clause(),
                         Task.created_at >= one_hour_ago,
                     )
                 )
@@ -5635,10 +5635,10 @@ async def _spawn_strategic_review(
         )
         # Ship the resident-session pacing knobs from _runtime_config onto the
         # payload so the agent's residentConfig() reads LIVE, operator-tunable
-        # values instead of falling back to hardcoded defaults. All six knobs are
-        # wired end-to-end: idle_tick, turn_timeout, and message_poll (existing);
-        # min_tick, max_ops_per_turn, and autonomous_turn_timeout (new).
-        # All are tiny critical-tier scalars (never trimmed).
+        # values instead of falling back to hardcoded defaults. The exploration
+        # interval is deliberately distinct from cheap polling/heartbeats: only
+        # an unchanged-state MODEL turn uses it. All are tiny critical-tier
+        # scalars (never trimmed).
         _res_pacing_knobs = {
             "strategic_session_idle_tick_seconds": int(
                 _runtime_config.get("strategic_session_idle_tick_seconds", 5)
@@ -5649,8 +5649,10 @@ async def _spawn_strategic_review(
             "strategic_session_message_poll_seconds": float(
                 _runtime_config.get("strategic_session_message_poll_seconds", 1.5)
             ),
-            "strategic_session_min_tick_seconds": int(
-                _runtime_config.get("strategic_session_min_tick_seconds", 600)
+            "strategic_session_exploration_interval_seconds": int(
+                _runtime_config.get(
+                    "strategic_session_exploration_interval_seconds", 14_400
+                )
             ),
             "strategic_session_max_ops_per_turn": int(
                 _runtime_config.get("strategic_session_max_ops_per_turn", 3)
@@ -6036,7 +6038,7 @@ async def _spawn_strategic_review(
                 # ``audit_crashed`` instead of telling the strategist to wait on a
                 # dead audit and burn a cycle), AND the newest finalized verdict
                 # (so a stale ``pending`` + ``promotion_pending`` record does not
-                # read ``promotion_in_flight`` when the promotion already
+                # read ``promotion_check_wait`` when the promotion already
                 # resolved). Previously to_phase_block threaded only the audit
                 # child and never applied the finalized-verdict substitution, so
                 # this surface disagreed with the agent fetch verb in the
@@ -6834,7 +6836,7 @@ async def _spawn_strategic_review(
                 else _failed_deploy_directive
             )
     # Qualification sub-state directive — last_qualification.status is overloaded
-    # ("pending" = audit-scoring OR promotion-PR-open-and-auto-merging), which
+    # ("pending" = audit-scoring OR managed promotion pending), which
     # made the agent conflate "wait for the audit" with "the promotion is
     # failing" and burn whole cycles waiting (incident 2026-06-02). Surface the
     # disambiguated sub-state as an explicit directive for the two states the
@@ -6846,7 +6848,6 @@ async def _spawn_strategic_review(
         )
 
         _QUAL_HINT_STATES = {
-            "promotion_in_flight",
             "promotion_check_wait",
             "promotion_failed",
             "required_check_failed",

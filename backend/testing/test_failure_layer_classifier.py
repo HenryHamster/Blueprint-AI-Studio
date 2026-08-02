@@ -219,7 +219,7 @@ class TestBaselineGate:
 
 class TestReviewerPass:
     def test_reviewer_disagreement(self):
-        msg = "fresh reviewer disagreed with self-review verdict on correctness"
+        msg = "independent reviewer disagreed with self-review verdict on correctness"
         result = classify_layers("CODE_ERROR", msg)
         assert LAYER_REVIEWER_PASS in result
 
@@ -353,7 +353,7 @@ class TestMultiLayer:
     def test_lint_gate_with_baseline_and_reviewer(self):
         msg = (
             "ruff E501 errors in unchanged files triggered baseline_violation; "
-            "fresh reviewer disagreed on whether to fix pre-existing errors"
+            "independent reviewer disagreed on whether to fix pre-existing errors"
         )
         result = classify_layers("CODE_ERROR", msg)
         assert LAYER_BASELINE_GATE in result
@@ -363,7 +363,7 @@ class TestMultiLayer:
         msg = (
             "error while loading shared libraries: libatk-1.0.so.0; "
             "no jobs ran in CI; scope too broad; ruff E302 in unchanged files; "
-            "fresh reviewer disagreed"
+            "independent reviewer disagreed"
         )
         result = classify_layers("PROVISION_FAILURE", msg)
         for tag in result:

@@ -380,7 +380,6 @@ EXPECTED_TYPES = {
     "repo_bootstrap",
     "salvage_bundle",
     "capability_proof_trial",
-    "criterion_coverage_trial",
     "memory_consolidation",
     "walkthrough_e2e",
 }
@@ -462,6 +461,7 @@ def _discovery_review_payload() -> dict:
                 "checksum": "a" * 64,
                 "artifact_id": "33333333-3333-4333-8333-333333333333",
                 "evidence_metadata": {"score": 0.7},
+                "evidence_metadata_truncated": True,
             }
         ],
         "packet_checksum": "b" * 64,
@@ -477,6 +477,7 @@ def test_discovery_review_payload_strict_contract_round_trips():
     assert result["type"] == "discovery_review"
     assert result["expected_revision"] == 3
     assert result["evidence_packet"][0]["semantic_role"] == "primary_result"
+    assert result["evidence_packet"][0]["evidence_metadata_truncated"] is True
 
 
 @pytest.mark.parametrize(

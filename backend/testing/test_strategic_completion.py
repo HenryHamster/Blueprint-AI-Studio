@@ -1399,6 +1399,23 @@ class TestRecordRetiredDirectionMemory:
             "metrics": {"cycles": 0, "prs_merged": 0},
         }
 
+    def test_explicit_exhaustion_is_not_reclassified_by_merged_activity(self):
+        vision: dict = {}
+        direction = {
+            "id": "d-exhausted",
+            "text": "Bounded investigation found no remaining route",
+            "retirement_outcome": "exhausted",
+            "research_history": [{"prs_merged": 4}],
+        }
+
+        record_retired_direction_memory(
+            vision, direction, reason="automatic terminal transition"
+        )
+
+        entry = vision["_recently_retired_directions"][0]
+        assert entry["retirement_outcome"] == "exhausted"
+        assert entry["retired_outcome"]["classification"] == "exhausted"
+
     def test_fifo_eviction_at_cap(self):
         from app.strategic_completion import _RETIRED_MEMORY_CAP
 
@@ -9597,6 +9614,35 @@ async def test_handle_strategic_completion_preserves_collections_on_bootstrap(
 # ── qualify_request transport (automain LTS Phase 3 / batch 3b) ──────────────
 
 
+def test_extract_qualify_request_normalizes_explicit_supported_probes():
+    from app.strategic_completion import extract_qualify_request
+
+    assert extract_qualify_request(
+        {
+            "reason": "  live behavior is release-critical  ",
+            "probes": [" WALKTHROUGH_E2E "],
+        }
+    ) == {
+        "reason": "live behavior is release-critical",
+        "probes": ["walkthrough_e2e"],
+    }
+    assert extract_qualify_request({"reason": "ready"}) == {
+        "reason": "ready",
+        "probes": [],
+    }
+
+
+@pytest.mark.parametrize(
+    "probes",
+    ["walkthrough_e2e", ["unsupported"], [7], [""], ["walkthrough_e2e"] * 2],
+)
+def test_extract_qualify_request_rejects_invalid_probe_contract(probes):
+    from app.strategic_completion import extract_qualify_request
+
+    with pytest.raises(ValueError):
+        extract_qualify_request({"reason": "ready", "probes": probes})
+
+
 @pytest.mark.asyncio
 async def test_qualify_request_flows_end_to_end(client, db_session, mocker):
     """End-to-end: a qualify_request embedded in a set_problem_model call is
@@ -9679,6 +9725,7 @@ async def test_qualify_request_flows_end_to_end(client, db_session, mocker):
                 "gaps": [],
                 "qualify_request": {
                     "reason": "Hardening is sufficient; the version is release-ready.",
+                    "probes": ["walkthrough_e2e"],
                 },
             },
         },
@@ -9704,6 +9751,9 @@ async def test_qualify_request_flows_end_to_end(client, db_session, mocker):
     # is used (not db_session), so check project_id and version identity only.
     assert call_args[1] == project.id
     assert call_args[2].id == version.id
+    assert run_qualification.await_args.kwargs["requested_probes"] == [
+        "walkthrough_e2e"
+    ]
 
     # The context key is consumed and popped — no stale key left over.
     await db_session.refresh(task)

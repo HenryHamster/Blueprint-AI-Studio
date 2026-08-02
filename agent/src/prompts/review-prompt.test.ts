@@ -213,6 +213,14 @@ describe('buildReviewVerdictInstructions — block on substantiated code defects
     expect(out).toContain('enumerate every blocker');
   });
 
+  it('copies authoritative issue ids when re-raising and omits ids for new findings', () => {
+    expect(out).toContain('copy its exact BP-... id');
+    expect(out).toContain('omit this field for a genuinely new finding');
+    expect(out).toContain('Never hash, recompute, or invent an id');
+    expect(out).toContain('"issue_id": "BP-..."');
+    expect(out).not.toContain('BP-... (copy');
+  });
+
   it('removes the "when uncertain, pick REQUEST_CHANGES" tie-breaker', () => {
     expect(out).not.toContain('If you are uncertain between APPROVE and REQUEST_CHANGES, pick REQUEST_CHANGES');
     expect(out).not.toContain('another round is cheap');
@@ -228,31 +236,6 @@ describe('buildReviewVerdictInstructions — block on substantiated code defects
     expect(out).toContain('/tmp/review_verdict_task-xyz.json');
   });
 
-  it('requires the reviewer to choose whether a requested fix needs independent re-review', () => {
-    expect(out).toContain('"requires_rereview": false');
-    expect(out).toContain('REQUEST_CHANGES verdict MUST include the boolean `requires_rereview`');
-    expect(out).toContain('`true` — an independent follow-up review is required');
-    expect(out).toContain('`false` — you are comfortable delegating closure');
-    expect(out).toContain('not mechanical proof that the repair is correct');
-    expect(out).toContain('localized, fully specified repair with a focused regression test');
-    expect(out).toContain('Do not choose `true` merely because the issue is labeled critical or major');
-  });
-
-  it('keeps requires_rereview out of APPROVE verdicts', () => {
-    const approveExample = out.match(/\{\"verdict\": \"APPROVE\"[^\n]*/)?.[0] ?? '';
-    expect(approveExample).not.toContain('requires_rereview');
-    expect(out).toContain('APPROVE` ignores `requires_rereview`; omit it from APPROVE verdicts');
-  });
-
-  it('uses the same re-review instructions in the repair-format prompt', () => {
-    const repairOut = buildReviewVerdictInstructions('task-xyz', { repairContext: true });
-    expect(repairOut).toContain('requires_rereview');
-    expect(repairOut).toContain('independent follow-up review is required');
-    expect(repairOut).toContain('Your review analysis is complete above');
-  });
-});
-
-describe('buildReviewPromptFingerprintContent — no duplicate constants', () => {
   it('fingerprint content does not contain duplicate file-restrictions sentence', () => {
     const content = buildReviewPromptFingerprintContent();
     // The file-restrictions sentence should appear exactly once in the fingerprint,

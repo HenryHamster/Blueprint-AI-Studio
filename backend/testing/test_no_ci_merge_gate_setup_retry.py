@@ -42,6 +42,8 @@ from app.review_pipeline import _spawn_pipeline_task
 PR_NUMBER = 5151
 BRANCH = "feat/setup-flake"
 BASE = "main"
+BASE_SHA = "base-5151"
+HEAD_SHA = "head-5151"
 
 
 @pytest.fixture(autouse=True)
@@ -73,6 +75,12 @@ async def _make_no_ci_project(db_session) -> Project:
 
 
 def _make_parent_task(db_session, project) -> Task:
+    review_target = {
+        "project_id": str(project.id),
+        "pr_number": PR_NUMBER,
+        "base_sha": BASE_SHA,
+        "head_sha": HEAD_SHA,
+    }
     loop = {
         "pr_number": PR_NUMBER,
         "branch": BRANCH,
@@ -80,6 +88,21 @@ def _make_parent_task(db_session, project) -> Task:
         "iteration": 1,
         "review_approved": True,
         "ci_waiting": True,
+        "base_sha": BASE_SHA,
+        "head_sha": HEAD_SHA,
+        "ci_checked_base_sha": BASE_SHA,
+        "ci_checked_head_sha": HEAD_SHA,
+        "review_target": review_target,
+        "review_history": [
+            {
+                "verdict": "APPROVE",
+                "issues": [],
+                "reviewed_base_sha": BASE_SHA,
+                "reviewed_head_sha": HEAD_SHA,
+                "target_verified_by_backend": True,
+                "review_task_id": "test-no-ci-setup-review",
+            }
+        ],
     }
     task = Task(
         project_id=project.id,
@@ -151,7 +174,7 @@ def _is_verify_crash(outcome: str, verdict: dict | None) -> bool:
     return outcome == "undetected" and verdict is None
 
 
-def _patch_github(mocker):
+def _patch_github(mocker, project_id):
     from unittest.mock import AsyncMock
 
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
@@ -165,6 +188,17 @@ def _patch_github(mocker):
     mocker.patch(
         "app.rollup_size_preflight.preflight_rollup_size_caps",
         AsyncMock(return_value=("ok", None)),
+    )
+    mocker.patch(
+        "app.review_merge_authority._fetch_live_review_target",
+        AsyncMock(
+            return_value={
+                "project_id": str(project_id),
+                "pr_number": PR_NUMBER,
+                "base_sha": BASE_SHA,
+                "head_sha": HEAD_SHA,
+            }
+        ),
     )
 
 
@@ -206,12 +240,12 @@ async def _set_unverified_reason(db_session, parent, reason):
 async def test_setup_failed_verify_task_retries_then_merges_unverified_with_setup_reason(
     db_session, mocker
 ):
-    _patch_github(mocker)
     merge_mock = mocker.patch(
         "app.github.merge_pull_request", return_value={"merged": True}
     )
 
     project = await _make_no_ci_project(db_session)
+    _patch_github(mocker, project.id)
     parent = _make_parent_task(db_session, project)
     await db_session.commit()
     await db_session.refresh(parent)

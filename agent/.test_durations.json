@@ -565,12 +565,6 @@
       "flaky": false
     },
     {
-      "file": "src/handlers/review-fix-issue-dedup.test.ts",
-      "duration_ms": 4,
-      "tests": 7,
-      "flaky": false
-    },
-    {
       "file": "src/_agent_scripts/materialize_manifest.parity.test.ts",
       "duration_ms": 3,
       "tests": 1,

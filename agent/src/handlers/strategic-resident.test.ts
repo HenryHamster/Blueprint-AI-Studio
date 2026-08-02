@@ -1330,7 +1330,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       strategic_session_autonomous: true,
       strategic_session_idle_tick_seconds: 1,
       strategic_session_message_poll_seconds: 0.001,
-      strategic_session_min_tick_seconds: 1,
+      strategic_session_exploration_interval_seconds: 1,
     });
     // Let startup, the initial empty poll, and Fast's foreground poll settle.
     await vi.advanceTimersByTimeAsync(1_000);
@@ -1424,7 +1424,7 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
       typed_fast_enabled: false,
       strategic_session_autonomous: true,
       strategic_session_message_poll_seconds: 0.001,
-      strategic_session_min_tick_seconds: 1,
+      strategic_session_exploration_interval_seconds: 1,
     });
     await vi.advanceTimersByTimeAsync(5_000);
 
@@ -2924,7 +2924,7 @@ describe('handleStrategicResident — autonomous marker-miss corrective loop', (
     let interruptedHeartbeatNote = '';
     // Increment work_state_rev on every heartbeat so the post-turn rev differs
     // from the liveness rev observed during gating — deterministically firing the
-    // second autonomous tick without waiting on the floor interval.
+    // second autonomous tick without waiting on the exploration interval.
     let rev = 0;
 
     mockApiGet.mockImplementation((url: string) => {

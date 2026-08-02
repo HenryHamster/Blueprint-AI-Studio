@@ -54,6 +54,7 @@ from app.ci_resolution import (
     classify_merge_test_verdict,
 )
 from app.direction_outcomes import _counts_as_failure
+from app.findings_index import finalized_research_findings_from_state
 from app.knowledge_query import (
     COMPUTE_KNOWLEDGE_ACCEPTANCE_GRADE_ACCEPTANCE,
     COMPUTE_KNOWLEDGE_ACCEPTANCE_GRADE_KEY,
@@ -203,17 +204,16 @@ def _evaluate_research(task: Task) -> TaskOutcome:
 
     The honest success signal is whether at least one finding survived ingestion
     validation (citations resolve on HEAD), deduplication, and actionability
-    gating and was routed to work — recorded by the completion handler as
-    ``context['research_surviving_findings']`` (spawned + capacity/health-deferred
-    findings). A cycle whose findings were ALL rejected as stale duplicates,
-    citations absent on HEAD, or low-actionability records ``0`` survivors and is
-    a terminal-but-empty ``neutral`` even though its raw ``plan_output`` still
-    holds every parsed finding for admin visibility.
+    gating and was routed to a durable, non-cancelled child — recorded by the
+    completion handler as ``context['research_surviving_findings']``. Capacity-
+    deferred findings remain recoverable intent but do not make this cycle a
+    success. A cycle whose findings were all rejected, deferred, or cancelled
+    records ``0`` survivors and is a terminal-but-empty ``neutral``. Raw pre-gate
+    ``plan_output`` is resumable handler state and is never an outcome signal.
 
-    When the survivor count is absent (a task whose dispatch predates this signal,
-    or that never reached dispatch) we fall back to the legacy heuristic: at least
-    one titled finding on ``plan_output``. A FAILED/CANCELLED research task is a
-    ``failure``.
+    When the survivor count is absent, only the finalized finding snapshot may
+    supply a positive legacy-compatible signal. Unfinalized legacy rows fail
+    closed to ``neutral``. A FAILED/CANCELLED research task is a ``failure``.
     """
     if _counts_as_failure(task):
         return TaskOutcome("failure", KIND_RESEARCH_QUALITY)
@@ -226,8 +226,16 @@ def _evaluate_research(task: Task) -> TaskOutcome:
         if survived > 0:
             return TaskOutcome("success", KIND_RESEARCH_QUALITY)
         return TaskOutcome("neutral", KIND_RESEARCH_QUALITY)
-    plan_output = _task_local_attr(task, "plan_output")
-    actionable = [f for f in _findings_list(plan_output) if f.get("title")]
+    actionable = [
+        finding
+        for finding in finalized_research_findings_from_state(
+            _task_local_attr(task, "plan_output"),
+            context,
+            status=_task_local_attr(task, "status"),
+            task_type=_task_type(task),
+        )
+        if finding.get("title")
+    ]
     if actionable:
         return TaskOutcome("success", KIND_RESEARCH_QUALITY)
     return TaskOutcome("neutral", KIND_RESEARCH_QUALITY)

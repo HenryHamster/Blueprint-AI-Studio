@@ -2439,48 +2439,12 @@ def test_compute_review_quality_metrics_includes_later_iteration_only_confirmati
     assert pred["false_alarm_rate"] == 0.0
 
 
-def test_compute_review_quality_metrics_fresh_reviewer_uses_any_iteration_truth():
-    """Fresh-reviewer effectiveness must sample and confirm against the same
-    later-iteration-aware reviewer truth as prediction accuracy."""
-    tasks = [
-        make_task(
-            status=TaskStatus.COMPLETED,
-            payloads=[{"type": "fix"}],
-            context={
-                "_first_attempt_succeeded": False,
-                "_all_iterations_rejection_categories": {"correctness": 1},
-                "_self_review_outcome": {
-                    "check_results": {"correctness": {"passed": True}},
-                    "reviewer_findings": [
-                        {
-                            "category": "correctness",
-                            "severity": "HIGH",
-                            "description": "confirmed later",
-                        }
-                    ],
-                },
-            },
-        )
-        for _ in range(3)
-    ]
-
-    result = compute_review_quality_metrics(tasks)
-    fre = result["fresh_reviewer_effectiveness"]
-
-    assert fre["fresh_reviewer_sample_size"] == 3
-    assert fre["prediction_sample_size"] == 3
-    assert fre["per_category_hit_rate"]["correctness"] == 1.0
-    assert fre["reviewer_finding_added_value"]["correctness"] == 3
-
-
 def test_compute_review_quality_metrics_empty_returns_nones():
     """Empty input → every metric is None / empty-ish per sample-size guards."""
     result = compute_review_quality_metrics([])
     assert result["self_review_effectiveness"] is None
     assert result["self_review_prediction_accuracy"] is None
     assert result["review_accuracy"] is None
-    # _compute_fresh_reviewer_effectiveness always returns a dict; we just check shape.
-    assert isinstance(result["fresh_reviewer_effectiveness"], dict)
 
 
 def test_compute_review_quality_metrics_self_review_effectiveness_shape():
@@ -2545,6 +2509,7 @@ def test_compute_non_code_outcomes_mixed_portfolio():
     research = make_task(
         status=TaskStatus.COMPLETED,
         payloads=[{"type": "research"}],
+        context={"research_surviving_findings": 1},
         plan_output=[{"title": "Investigate", "actionability_grade": "HIGH"}],
         created_at=in_window,
     )
@@ -2637,6 +2602,10 @@ def test_compute_non_code_outcomes_includes_window_straddling_terminal_task():
         status=TaskStatus.COMPLETED,
         payloads=[{"type": "research"}],
         plan_output=[{"title": "Investigate", "actionability_grade": "HIGH"}],
+        # Raw research output is resumable handler state, not an outcome. Pin
+        # the durable post-ingestion survivor signal so this test isolates the
+        # completion-window behavior it is named for.
+        context={"research_surviving_findings": 1},
         created_at=created_before_window,
         status_log=[{"s": "COMPLETED", "t": completed_in_window.isoformat()}],
     )
@@ -2667,6 +2636,10 @@ def test_outer_loop_convergence_non_code_outcomes_includes_straddling_task():
         status=TaskStatus.COMPLETED,
         payloads=[{"type": "research"}],
         plan_output=[{"title": "Finding", "actionability_grade": "HIGH"}],
+        # Raw research output is resumable handler state, not an outcome. Pin
+        # the durable post-ingestion survivor signal so this test isolates the
+        # completion-window behavior it is named for.
+        context={"research_surviving_findings": 1},
         created_at=created_before_window,
         status_log=[{"s": "COMPLETED", "t": completed_in_window.isoformat()}],
     )

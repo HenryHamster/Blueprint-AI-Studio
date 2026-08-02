@@ -862,7 +862,7 @@ def test_trigger_resolver_returns_not_applicable_for_promoted():
             automain_ci_state="green",
             blocker=None,
             in_flight=False,
-            promotion_in_flight=False,
+            promotion_check_wait=False,
             consecutive_infra_errors=0,
         )
         assert decision.fire is False, (
@@ -3877,8 +3877,8 @@ def test_research_direction_state_already_fixed_deadlock_alert_stamps_event_type
     )
 
 
-def test_research_completion_direction_auto_completed_alert_stamps_event_type():
-    """research_completion Alert for 'Direction auto-completed' must stamp event_type.
+def test_research_completion_direction_terminal_alert_stamps_honest_event_type():
+    """research_completion must distinguish successful completion from retirement.
 
     Finding p2: research_completion.py builds a 'Direction auto-completed' Alert without
     event_type, so it has a NULL event_type. operator_visible_alert_filter is fail-closed
@@ -3886,21 +3886,38 @@ def test_research_completion_direction_auto_completed_alert_stamps_event_type():
     Stamping event_type='research.direction_auto_completed' (STRATEGIST_INTERNAL) ensures
     the filter routes it correctly.
     """
+    import ast
     import inspect
     import app.research_completion as rc_mod
 
-    # Get source of the module to check that the Alert constructor has event_type stamped.
     source = inspect.getsource(rc_mod)
-    # Both research_direction_state and research_completion have direction_auto_completed Alerts.
-    # Count occurrences of event_type="research.direction_auto_completed" — must appear in
-    # research_completion too (not only research_direction_state).
-    count = source.count('event_type="research.direction_auto_completed"')
-    assert count >= 1, (
-        "research_completion.py must pass event_type='research.direction_auto_completed' "
-        "to its 'Direction auto-completed' Alert constructor; found 0 occurrences — "
-        "without this stamp the NULL event_type is silently excluded by the fail-closed "
-        "IN-allowlist filter and the alert never appears in the operator UI"
-    )
+    assert '"research.direction_auto_completed"' in source
+    assert '"research.direction_auto_retired"' in source
+    tree = ast.parse(source)
+    terminal_event_types = {
+        "research.direction_auto_completed",
+        "research.direction_auto_retired",
+    }
+    event_type_values = [
+        keyword.value
+        for call in ast.walk(tree)
+        if isinstance(call, ast.Call)
+        and (
+            (isinstance(call.func, ast.Name) and call.func.id == "Alert")
+            or (isinstance(call.func, ast.Attribute) and call.func.attr == "Alert")
+        )
+        for keyword in call.keywords
+        if keyword.arg == "event_type"
+    ]
+    assert any(
+        terminal_event_types
+        <= {
+            node.value
+            for node in ast.walk(value)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        }
+        for value in event_type_values
+    ), "research_completion must select the terminal event from the actual outcome"
 
 
 def test_strategist_internal_alert_event_types_are_registered():
@@ -3918,6 +3935,7 @@ def test_strategist_internal_alert_event_types_are_registered():
 
     expected = {
         "research.direction_auto_completed": STRATEGIST_INTERNAL,
+        "research.direction_auto_retired": STRATEGIST_INTERNAL,
         "research.dedup_deadlock": STRATEGIST_INTERNAL,
         "research.already_fixed_deadlock": STRATEGIST_INTERNAL,
     }
@@ -5056,7 +5074,7 @@ def test_f20_11_infra_failure_maps_to_dedicated_redrive_trigger():
         automain_ci_state="success",
         blocker=None,
         in_flight=False,
-        promotion_in_flight=False,
+        promotion_check_wait=False,
         consecutive_infra_errors=1,
     )
 
@@ -7682,6 +7700,7 @@ def test_880_1_fail_closed_design_already_pinned():
         "research.dedup_deadlock",
         "research.already_fixed_deadlock",
         "research.direction_auto_completed",
+        "research.direction_auto_retired",
     ):
         assert route_event(event_type) == STRATEGIST_INTERNAL, (
             f"{event_type!r} must route to STRATEGIST_INTERNAL — "

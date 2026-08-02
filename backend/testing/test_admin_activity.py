@@ -248,16 +248,38 @@ async def test_completed_event_task_type_uses_projected_first_payload(
 async def test_research_finding_count_from_narrow_plan_output_fetch(
     client: AsyncClient, db_session
 ):
-    """RESEARCH_FINDINGS finding_count is computed from the narrowly-fetched
-    plan_output (which is no longer loaded for every terminal feed row)."""
+    """RESEARCH_FINDINGS count comes from the narrowly fetched final snapshot."""
     project = await _make_project(db_session, name="Activity Research Project")
     task = Task(
         project_id=project.id,
         payloads=[{"type": "research", "prompt": "x"}],
         status=TaskStatus.COMPLETED,
         title="Research task",
-        context={},
+        context={"research_findings_finalized": True},
         plan_output=[{"finding": "a"}, {"finding": "b"}, {"finding": "c"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    resp = await client.get("/api/admin/activity")
+    assert resp.status_code == 200
+    research = [e for e in resp.json()["events"] if e["type"] == "RESEARCH_FINDINGS"]
+    assert len(research) == 1
+    assert research[0]["task_id"] == str(task.id)
+    assert research[0]["finding_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_raw_research_artifact_does_not_create_finding_event(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session, name="Activity Raw Research Project")
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "x"}],
+        status=TaskStatus.COMPLETED,
+        title="Rejected research task",
+        context={},
+        plan_output=[{"title": "Rejected raw finding"}],
     )
     db_session.add(task)
     await db_session.commit()
@@ -266,17 +288,16 @@ async def test_research_finding_count_from_narrow_plan_output_fetch(
         Artifact(
             task_id=task.id,
             artifact_type=ArtifactType.RESEARCH_FINDINGS,
-            logs="[]",
+            logs='[{"title":"Rejected raw finding"}]',
         )
     )
     await db_session.commit()
 
     resp = await client.get("/api/admin/activity")
+
     assert resp.status_code == 200
     research = [e for e in resp.json()["events"] if e["type"] == "RESEARCH_FINDINGS"]
-    assert len(research) == 1
-    assert research[0]["task_id"] == str(task.id)
-    assert research[0]["finding_count"] == 3
+    assert research == []
 
 
 @pytest.mark.asyncio

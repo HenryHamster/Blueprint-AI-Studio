@@ -1126,7 +1126,6 @@ async def test_return_structure_has_all_required_keys():
         "self_review_effectiveness",
         "self_review_prediction_accuracy",
         "self_review_prediction_accuracy_trends",
-        "fresh_reviewer_trend",
         "edges_trend",
         "edges_considered_metrics",
         "review_accuracy",

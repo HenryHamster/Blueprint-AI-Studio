@@ -1,7 +1,27 @@
 // Review-history formatting helpers extracted from review-fix.ts.
 // These are pure functions with no I/O dependencies.
 
-import type { ReviewHistoryEntry } from './review-fix-issue-dedup.js';
+export type ReviewHistoryIssue = {
+  issue_id?: string;
+  severity: string;
+  description: string;
+  file?: string;
+  line?: number;
+};
+export type IssueResolution = {
+  issue_id?: string;
+  disposition?: 'fixed' | 'refuted' | 'adjudicated';
+  reason?: string;
+};
+export type ReviewHistoryEntry = {
+  iteration: number;
+  feedback: string;
+  issues?: ReviewHistoryIssue[];
+  verdict?: 'APPROVE' | 'REQUEST_CHANGES';
+  changed_files?: string[];
+  reviewed_head_sha?: string;
+  resolutions?: IssueResolution[];
+};
 
 type DriftInEntry = {
   file: string;
@@ -99,13 +119,6 @@ export function formatDriftSection(drift: DriftSignal | undefined): string {
     'those from leftover drift, not to reflexively revert.\n\n';
   return body;
 }
-
-// Truncation budget for raw review-feedback text in the per-iteration history
-// section. Used identically in the reviewer and fixer prompt builders below —
-// if they diverge, a fix agent may address feedback that the next reviewer
-// cannot see, causing false "not addressed" flags. Preferring structured
-// `issues` (which have no truncation) happens before this cap kicks in.
-export const REVIEW_FEEDBACK_HISTORY_CHARS = 1500;
 
 // Mirrors backend _max_review_iterations (review_pipeline.py): ci_failure=8,
 // small=10, medium=12, else=16. Keep in sync — if this drifts, the agent will

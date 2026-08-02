@@ -166,7 +166,7 @@ function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, onUnarchiveP
       )}
 
       {/* Side-car presence/outcome badges — this row is the PRIMARY of one or
-          more nested side-cars (second-opinion challenger, grader, ...). */}
+          more nested grader or finding-challenge tasks. */}
       {sidecarBadges?.map((b, i) => (
         <span
           key={`${b.kind}-${i}`}

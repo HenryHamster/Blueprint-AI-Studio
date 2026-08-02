@@ -104,7 +104,6 @@ const PROMOTION_CHECK_WAIT_DATA: VersionLifecycleResponse = {
       summary: 'Migration-carrying promotion PR open; waiting for required CI checks to pass',
       promotion_pr_number: 9876,
       promotion_pr_url: 'https://github.com/HenryHamster/BlueprintAIStudio/pull/9876',
-      migration_carrying: true,
       promotion_age_seconds: 1800,
       promotion_timeout_seconds: 7200,
       check_snapshot: {

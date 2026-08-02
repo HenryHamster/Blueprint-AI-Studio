@@ -32,7 +32,6 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
@@ -46,7 +45,6 @@ from app.json_extract import (
     scan_balanced_json_objects,
 )
 from app.models import Task, TaskStatus
-from app.shared_state import runtime_config as _runtime_config
 from app.task_capabilities import get_task_capability
 
 logger = logging.getLogger(__name__)
@@ -150,72 +148,6 @@ CHALLENGE_INDETERMINATE = "indeterminate"
 # layout.  Version 1 is the first versioned shape; legacy records (missing the
 # key) pre-date versioning and should be treated as version 0 by consumers.
 FINDING_CHALLENGE_RECORD_SCHEMA_VERSION = 1
-
-
-def review_is_high_stakes(
-    verdict: str,
-    issues: list | None,
-    investigated_files: list | None,
-    review_task: Task,
-    *,
-    base_branch: str | None,
-    trunk_branches: Collection[str],
-    diff_non_test_lines: int | None = None,
-    diff_non_test_file_count: int | None = None,
-    is_observable_behavior: bool = False,
-) -> bool:
-    """Predicate: does this ordinary ``review`` verdict warrant a second opinion?
-
-    Narrow by design — a panel challenge is a full extra agent run, so it is
-    reserved for the one verdict that commits something irreversible: an
-    APPROVE on a PR targeting a trunk branch (the project's integration branch
-    or promotion target), which hands the PR straight to auto-merge.
-
-    Everything else self-corrects more cheaply without a challenge:
-
-    * a REQUEST_CHANGES feeds the fix loop, and the fixed PR is re-reviewed —
-      a wrong rejection costs one fix iteration, not a bad merge;
-    * reviews of PRs targeting non-trunk branches (e.g. ``research/*``) are
-      re-covered by the rollup review at the trunk boundary.
-
-    Trivially small diffs (non-test lines < ``review_second_opinion_min_lines``
-    AND non-test file count <= ``review_second_opinion_min_files``) are also
-    exempted — a one-line typo fix does not need a full extra second-opinion run.
-    Pass ``diff_non_test_lines`` and ``diff_non_test_file_count`` from the
-    source task's ``_pr_diff_summary`` / ``_pr_changed_files`` context; when
-    absent the size exemption is skipped (fail-open toward challenging).
-
-    Override: when ``is_observable_behavior`` is True (the reviewed task's
-    acceptance evidence is ``observable_behavior`` — the self-reported proof
-    path with no machine-checkable assertion), the small-diff exemption is
-    skipped and the review is always treated as high-stakes regardless of
-    diff size.
-
-    Kept as a single function so operators can re-broaden or further narrow it
-    without touching the lifecycle wiring.
-    """
-    if not (
-        verdict == "APPROVE"
-        and base_branch is not None
-        and base_branch in trunk_branches
-    ):
-        return False
-
-    # observable_behavior tasks always warrant a second opinion regardless of
-    # diff size — they are the only evidence kind that produces
-    # satisfied=True, proven=False (entirely self-reported with no
-    # machine-checkable assertion). A small diff does not make that weaker
-    # proof path more trustworthy.
-    if is_observable_behavior:
-        return True
-
-    if diff_non_test_lines is not None and diff_non_test_file_count is not None:
-        min_lines = int(_runtime_config.get("review_second_opinion_min_lines", 50))
-        min_files = int(_runtime_config.get("review_second_opinion_min_files", 4))
-        if diff_non_test_lines < min_lines and diff_non_test_file_count <= min_files:
-            return False
-
-    return True
 
 
 @dataclass(frozen=True)
@@ -1510,9 +1442,8 @@ async def spawn_forward_quality_grader(
                 "prompt": prompt,
                 "base_branch": base_branch,
                 "scope": "small",
-                # Deliberate cost-efficiency tier: mid-pipeline second opinion,
-                # not the final merge gate (spawn_review_second_opinion = Opus).
-                # Accepted finding; pinned by test_spawn_forward_quality_grader_sets_sonnet_quality_tier.
+                # Deliberate cost-efficiency tier for this bounded grader;
+                # pinned by test_spawn_forward_quality_grader_sets_sonnet_quality_tier.
                 "quality_tier": "sonnet",
             }
         ],
@@ -1562,9 +1493,6 @@ async def spawn_forward_quality_grader(
         source_task.id,
     )
     return grader
-
-
-# (safeguard_challenge lane removed — observe-only, no measured lift)
 
 
 def parse_grader_verdict(logs: str | None, completed: bool = True) -> EvaluationVerdict:

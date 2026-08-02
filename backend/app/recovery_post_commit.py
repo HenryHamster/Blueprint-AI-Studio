@@ -3,10 +3,9 @@
 Extracted from ``app.recovery_sweeps`` alongside ``app.recovery_evaluating`` to
 keep each module below its size cap.  This module is now a thin re-export hub:
 
-* ``app.recovery_post_commit_pending`` — post-commit-pending sweep cluster
-  (``_sweep_post_commit_pending``, ``_claim_and_bump_total_attempts``,
-  ``_build_post_commit_abandoned_context``,
-  ``_recover_childless_evaluating_without_marker``)
+* ``app.recovery_post_commit_claim`` — atomic pending-recovery ownership helpers
+* ``app.recovery_post_commit_pending`` — post-commit-pending sweep and the
+  marker-less childless recovery guard
 * ``app.recovery_post_commit_orphans`` — orphan-recovery sweep
   (``_spawn_review_for_recovered_task``, ``_recover_orphaned_tasks``)
 * ``app.recovery_sidecar`` — stranded-sidecar sweep
@@ -36,10 +35,12 @@ from app.recovery_infrastructure import (  # noqa: F401
     _try_bootstrap_spawn_advisory_lock,
     _sweep_bootstrap_recovery,
 )
-from app.recovery_post_commit_pending import (  # noqa: F401
-    POST_COMMIT_MAX_PENDING_AGE_S,
+from app.recovery_post_commit_claim import (  # noqa: F401
     _claim_and_bump_total_attempts,
     _build_post_commit_abandoned_context,
+)
+from app.recovery_post_commit_pending import (  # noqa: F401
+    POST_COMMIT_MAX_PENDING_AGE_S,
     _sweep_post_commit_pending,
     _CHILDLESS_EVALUATING_NO_MARKER_GRACE_S,
     _recover_childless_evaluating_without_marker,

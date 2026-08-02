@@ -187,14 +187,6 @@
       "resolveReferenceRepo"
     ]
   },
-  "handlers/criterion-coverage-trial.test.ts": {
-    "../workspacePrep.js": [
-      "getLastWorkspacePrepOutcome",
-      "listWorkspaceTopDirs",
-      "resetWorkspacePrepOutcome",
-      "resolveReferenceRepo"
-    ]
-  },
   "handlers/design-doc.test.ts": {
     "../workspacePrep.js": [
       "getLastWorkspacePrepOutcome",

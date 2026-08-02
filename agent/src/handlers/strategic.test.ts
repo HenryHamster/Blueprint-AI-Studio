@@ -2209,7 +2209,7 @@ describe('handleStrategic executor prompt: arms-based compute_experiment commiss
     expect(executorPrompt).toContain('$BLUEPRINT_ARTIFACT_DIR');
     expect(executorPrompt).toContain('manifest.json');
     expect(executorPrompt).toContain('./artifacts fetch <compute-job-id>');
-    expect(vi.mocked(writeArtifactsHelper)).toHaveBeenCalledWith('/tmp/workspace');
+    expectCalledWith(writeArtifactsHelper, '/tmp/workspace');
   });
 });
 

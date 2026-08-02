@@ -1263,7 +1263,7 @@ def test_to_phase_block_carries_qualification_state():
 
 
 def test_to_phase_block_carries_promotion_freshness():
-    """The strategic version_phase payload inherits the in-flight freshness keys
+    """The strategic version_phase payload inherits promotion freshness keys
     via the shared qualification_state pass-through."""
     enabled_at = (_utcnow() - timedelta(minutes=10)).isoformat()
     version = ReleaseVersion(
@@ -1275,13 +1275,13 @@ def test_to_phase_block_carries_promotion_freshness():
             "status": "pending",
             "promotion_pending": {
                 "pr_number": 7357,
-                "auto_merge_enabled": True,
+                "managed_check_wait": True,
                 "enabled_at": enabled_at,
             },
         },
     )
     qstate = rv.to_phase_block(version)["qualification_state"]
-    assert qstate["state"] == "promotion_in_flight"
+    assert qstate["state"] == "promotion_check_wait"
     assert qstate["promotion_enabled_at"] == enabled_at
     assert qstate["promotion_age_seconds"] >= 590
     assert "promotion_past_timeout" in qstate
@@ -1633,7 +1633,7 @@ def test_qual_state_pending_audit_is_qualifying():
     assert "audit" in state["summary"].lower()
 
 
-def test_qual_state_pending_with_promotion_is_promotion_in_flight():
+def test_qual_state_pending_with_promotion_is_promotion_check_wait():
     """status='pending' WITH a promotion_pending sub-key = audit passed, the
     promotion PR is open — the case the agent misread as 'still auditing'."""
     state = rv.summarize_qualification_state(
@@ -1642,16 +1642,16 @@ def test_qual_state_pending_with_promotion_is_promotion_in_flight():
             "promotion_pending": {
                 "pr_number": 7357,
                 "pr_url": "https://example/pr/7357",
-                "auto_merge_enabled": True,
+                "managed_check_wait": True,
             },
         }
     )
-    assert state["state"] == "promotion_in_flight"
+    assert state["state"] == "promotion_check_wait"
     assert state["promotion_pr_number"] == 7357
     assert state["promotion_pr_url"] == "https://example/pr/7357"
     # The summary must NOT tell the agent the audit is still running.
     assert "passed" in state["summary"].lower()
-    assert "armed" in state["summary"].lower()
+    assert "waiting" in state["summary"].lower()
 
 
 def test_summarize_qualification_state_audit_crashed_overrides_pending():
@@ -1698,8 +1698,8 @@ def test_summarize_qualification_state_bare_promotion_claim_blocks():
     under the row lock BEFORE releasing it for its 30-120s of GitHub I/O, so a
     concurrent re-qualify can't clobber the in-flight promotion. The claim has no
     ``pr_number`` yet (the PR isn't open), so summarize must still classify it as
-    ``promotion_in_flight`` ∈ ``PROMOTION_BLOCKING_STATES`` — that is what makes
-    Guard 2b (``_promotion_in_flight_result``) and the version-cut lever refuse a
+    ``promotion_check_wait`` ∈ ``PROMOTION_BLOCKING_STATES`` — that is what makes
+    Guard 2b (``_promotion_pending_result``) and the version-cut lever refuse a
     concurrent qualify from the instant the claim commits. If this regressed to
     ``qualifying`` the clobber race (PR #12492) would reopen."""
     state = rv.summarize_qualification_state(
@@ -1714,7 +1714,7 @@ def test_summarize_qualification_state_bare_promotion_claim_blocks():
         }
     )
     assert state is not None
-    assert state["state"] == "promotion_in_flight"
+    assert state["state"] == "promotion_check_wait"
     assert state["state"] in rv.PROMOTION_BLOCKING_STATES
     # No PR exists yet — the claim precedes the promotion PR being opened.
     assert state.get("promotion_pr_number") is None
@@ -1753,8 +1753,8 @@ def test_qual_state_running_smoketest_does_not_mask_crashed_audit():
     assert state["state"] == "audit_crashed"
 
 
-def test_qual_state_promotion_in_flight_freshness_keys_when_enabled_at_fresh():
-    """A fresh enabled_at yields additive age / auto-timeout context without
+def test_qual_state_promotion_check_wait_freshness_keys_when_enabled_at_fresh():
+    """A fresh enabled_at yields additive age / timeout context without
     disturbing the existing state name or PR keys."""
     enabled_at = (_utcnow() - timedelta(minutes=5)).isoformat()
     state = rv.summarize_qualification_state(
@@ -1763,12 +1763,12 @@ def test_qual_state_promotion_in_flight_freshness_keys_when_enabled_at_fresh():
             "promotion_pending": {
                 "pr_number": 7357,
                 "pr_url": "https://example/pr/7357",
-                "auto_merge_enabled": True,
+                "managed_check_wait": True,
                 "enabled_at": enabled_at,
             },
         }
     )
-    assert state["state"] == "promotion_in_flight"
+    assert state["state"] == "promotion_check_wait"
     assert state["promotion_pr_number"] == 7357
     assert state["promotion_enabled_at"] == enabled_at
     assert state["promotion_age_seconds"] >= 290  # ~5 min, allow clock slack
@@ -1777,10 +1777,10 @@ def test_qual_state_promotion_in_flight_freshness_keys_when_enabled_at_fresh():
     assert state["promotion_past_timeout"] is False
     assert state["promotion_nearing_timeout"] is False
     # The freshness is reflected in the human summary.
-    assert "in flight" in state["summary"].lower()
+    assert "waiting" in state["summary"].lower()
 
 
-def test_qual_state_promotion_in_flight_past_timeout():
+def test_qual_state_promotion_check_wait_past_timeout():
     """An enabled_at older than the cap flags promotion_past_timeout."""
     from app import release_reconciliation
 
@@ -1791,17 +1791,17 @@ def test_qual_state_promotion_in_flight_past_timeout():
             "status": "pending",
             "promotion_pending": {
                 "pr_number": 7357,
-                "auto_merge_enabled": True,
+                "managed_check_wait": True,
                 "enabled_at": enabled_at,
             },
         }
     )
     assert state["promotion_past_timeout"] is True
     assert state["promotion_nearing_timeout"] is False
-    assert "passed the auto-timeout" in state["summary"].lower()
+    assert "passed the timeout" in state["summary"].lower()
 
 
-def test_qual_state_promotion_in_flight_nearing_timeout():
+def test_qual_state_promotion_check_wait_nearing_timeout():
     """An enabled_at past 80% of the cap (but under it) flags nearing."""
     from app import release_reconciliation
 
@@ -1813,17 +1813,17 @@ def test_qual_state_promotion_in_flight_nearing_timeout():
             "status": "pending",
             "promotion_pending": {
                 "pr_number": 7357,
-                "auto_merge_enabled": True,
+                "managed_check_wait": True,
                 "enabled_at": enabled_at,
             },
         }
     )
     assert state["promotion_past_timeout"] is False
     assert state["promotion_nearing_timeout"] is True
-    assert "nearing the auto-timeout" in state["summary"].lower()
+    assert "nearing the timeout" in state["summary"].lower()
 
 
-def test_qual_state_promotion_in_flight_respects_runtime_cap_override(monkeypatch):
+def test_qual_state_promotion_check_wait_respects_runtime_cap_override(monkeypatch):
     """The cap is the same configurable one the reconciliation sweep uses."""
     from app.shared_state import runtime_config
 
@@ -1834,7 +1834,7 @@ def test_qual_state_promotion_in_flight_respects_runtime_cap_override(monkeypatc
             "status": "pending",
             "promotion_pending": {
                 "pr_number": 7357,
-                "auto_merge_enabled": True,
+                "managed_check_wait": True,
                 "enabled_at": enabled_at,
             },
         }
@@ -1843,7 +1843,7 @@ def test_qual_state_promotion_in_flight_respects_runtime_cap_override(monkeypatc
     assert state["promotion_past_timeout"] is True
 
 
-def test_qual_state_promotion_in_flight_missing_enabled_at_is_timeless():
+def test_qual_state_promotion_check_wait_missing_enabled_at_is_timeless():
     """Missing enabled_at falls back to the prior keyless behavior, no error."""
     state = rv.summarize_qualification_state(
         {
@@ -1851,29 +1851,29 @@ def test_qual_state_promotion_in_flight_missing_enabled_at_is_timeless():
             "promotion_pending": {
                 "pr_number": 7357,
                 "pr_url": "https://example/pr/7357",
-                "auto_merge_enabled": True,
+                "managed_check_wait": True,
             },
         }
     )
-    assert state["state"] == "promotion_in_flight"
+    assert state["state"] == "promotion_check_wait"
     assert state["promotion_pr_number"] == 7357
     for key in rv._PROMOTION_FRESHNESS_KEYS:
         assert key not in state
 
 
-def test_qual_state_promotion_in_flight_invalid_enabled_at_is_timeless():
+def test_qual_state_promotion_check_wait_invalid_enabled_at_is_timeless():
     """An unparseable enabled_at falls back to keyless behavior, no error."""
     state = rv.summarize_qualification_state(
         {
             "status": "pending",
             "promotion_pending": {
                 "pr_number": 7357,
-                "auto_merge_enabled": True,
+                "managed_check_wait": True,
                 "enabled_at": "not-a-timestamp",
             },
         }
     )
-    assert state["state"] == "promotion_in_flight"
+    assert state["state"] == "promotion_check_wait"
     for key in rv._PROMOTION_FRESHNESS_KEYS:
         assert key not in state
 
@@ -1885,12 +1885,12 @@ def test_format_promotion_freshness_phrasing():
     past = rv.format_promotion_freshness(
         {"promotion_age_seconds": 7200, "promotion_past_timeout": True}
     )
-    assert "in flight ~2h" in past
-    assert "past auto-timeout" in past
+    assert "waiting ~2h" in past
+    assert "past timeout" in past
     nearing = rv.format_promotion_freshness(
         {"promotion_age_seconds": 3600, "promotion_nearing_timeout": True}
     )
-    assert "nearing auto-timeout" in nearing
+    assert "nearing timeout" in nearing
 
 
 def test_qual_state_promotion_failed_surfaces_reason():
@@ -1903,11 +1903,8 @@ def test_qual_state_promotion_failed_surfaces_reason():
     assert "fresh qualify" in state["summary"].lower()
 
 
-def test_qual_state_managed_check_wait_is_distinct_state():
-    """status='pending' WITH a managed_check_wait promotion_pending = a
-    migration-carrying PR waiting on required checks; Blueprint retries the merge
-    automatically. This is a DISTINCT state from native auto-merge — the copy
-    must say it is waiting for checks and does NOT need a fresh qualification."""
+def test_qual_state_managed_check_wait_forwards_ci_snapshot():
+    """The sole managed promotion state forwards persisted check diagnostics."""
     enabled_at = (_utcnow() - timedelta(minutes=10)).isoformat()
     state = rv.summarize_qualification_state(
         {
@@ -1915,8 +1912,6 @@ def test_qual_state_managed_check_wait_is_distinct_state():
             "promotion_pending": {
                 "pr_number": 9191,
                 "pr_url": "https://example/pr/9191",
-                "auto_merge_enabled": False,
-                "migration_carrying": True,
                 "managed_check_wait": True,
                 "enabled_at": enabled_at,
                 "ci_state": "pending",
@@ -1939,7 +1934,6 @@ def test_qual_state_managed_check_wait_is_distinct_state():
     assert state["state"] == "promotion_check_wait"
     assert state["promotion_pr_number"] == 9191
     assert state["promotion_pr_url"] == "https://example/pr/9191"
-    assert state["migration_carrying"] is True
     # The additive CI context is forwarded for operator surfaces.
     assert state["ci_state"] == "pending"
     assert state["check_snapshot"]["state"] == "pending"
@@ -1947,14 +1941,14 @@ def test_qual_state_managed_check_wait_is_distinct_state():
     assert state["check_snapshot"]["checks"] == [
         {"name": "CI / Backend", "status": "in_progress"}
     ]
-    # Freshness keys are present (same machinery as in-flight).
+    # Freshness keys are present on the same managed state.
     assert state["promotion_enabled_at"] == enabled_at
     assert state["promotion_age_seconds"] >= 590
-    # Copy must explicitly say waiting for required checks + auto-retry, and must
+    # Copy must explicitly say waiting for required checks + retry, and must
     # NOT tell the reader a fresh qualification is needed.
     lowered = state["summary"].lower()
     assert "required" in lowered and "check" in lowered
-    assert "automatically" in lowered
+    assert "retry" in lowered
     assert "does not need a fresh qualification" in lowered
 
 
@@ -2010,7 +2004,7 @@ def test_promotion_blocking_states_set_contents():
     """The exported blocking set names exactly the two mid-promotion holds so
     every operator guard agrees by construction."""
     assert rv.PROMOTION_BLOCKING_STATES == frozenset(
-        {"promotion_in_flight", "promotion_check_wait"}
+        {"promotion_check_wait", "promotion_check_wait"}
     )
 
 
@@ -2244,11 +2238,11 @@ class TestQualificationStateVocab:
                 },
                 {},
             ),
-            # promotion_in_flight — pending with non-managed promo
+            # promotion_check_wait — pending with non-managed promo
             (
                 {
                     "status": "pending",
-                    "promotion_pending": {"auto_merge_enabled": True},
+                    "promotion_pending": {"managed_check_wait": True},
                 },
                 {},
             ),
@@ -2305,7 +2299,7 @@ class TestQualificationStateVocab:
     def test_prompt_suffix_hint_states_subset_of_vocab(self):
         """The 5-state prompt-suffix set in strategic_spawning stays inside vocab."""
         hint_states = {
-            "promotion_in_flight",
+            "promotion_check_wait",
             "promotion_check_wait",
             "promotion_failed",
             "required_check_failed",
@@ -2341,9 +2335,9 @@ class TestQualificationStateVocab:
                 {"status": "pending", "promotion_pending": {"managed_check_wait": True}},
                 {},
             ),
-            # promotion_in_flight — normal (non-managed) promotion PR open
+            # promotion_check_wait — normal (non-managed) promotion PR open
             (
-                {"status": "pending", "promotion_pending": {"auto_merge_enabled": True}},
+                {"status": "pending", "promotion_pending": {"managed_check_wait": True}},
                 {},
             ),
         ]
@@ -3133,7 +3127,7 @@ async def test_abandon_concurrent_race_guard_independent_of_idempotency(db_sessi
 
 
 @pytest.mark.asyncio
-async def test_abandon_current_version_blocked_when_promotion_in_flight(db_session):
+async def test_abandon_current_version_blocked_when_promotion_check_wait(db_session):
     """abandon_current_version raises VersionCutBlockedByPromotion when the
     version's last_qualification carries promotion_pending and no finalized
     verdict row exists (true in-flight promotion must still block)."""

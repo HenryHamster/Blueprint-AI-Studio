@@ -638,8 +638,9 @@ echo "$PR_URL" > /tmp/pr_url_${cfg.taskId}
 #
 # State semantics (from GitHub):
 #   clean / has_hooks  → mergeable, will merge / fast-forward fine
-#   blocked / unstable → CI gating; auto-merge handles it
-#   behind             → out-of-date with base; GitHub or auto-rebase fixes
+#   blocked / unstable → required checks/reviews; Blueprint waits, then
+#                        revalidates the exact head/base before managed merge
+#   behind             → base advanced; Blueprint must rebase and revalidate
 #   dirty              → real merge conflict; needs rebase + manual resolve
 #   draft              → marked draft; no action
 #
@@ -691,7 +692,7 @@ if [ -n "$PR_NUMBER" ]; then
       exit 4
     fi
     if [ "$PR_STATE" = "behind" ]; then
-      echo "[pr] note: PR #$PR_NUMBER is behind origin/${cfg.baseBranch}; auto-merge will rebase when CI clears"
+      echo "[pr] note: PR #$PR_NUMBER is behind origin/${cfg.baseBranch}; Blueprint will require a managed rebase and exact-target revalidation before merge"
     fi
   fi
 fi

@@ -1,7 +1,7 @@
 """Agent-facing task-status fetch endpoints.
 
 Lets the strategic agent inspect the status and outcome of tasks it spawned
-via spawn_task/spawn_fix, as well as transitive descendants of those tasks
+via spawn_task, as well as transitive descendants of those tasks
 (children spawned by the orchestrator on behalf of the strategist).
 
 Auth/scoping follows the same ``_resolve_agent_project`` pattern used in

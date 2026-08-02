@@ -36,6 +36,10 @@ from app.direction_metrics import (
     build_evicted_cycle_snapshot,
 )
 from app.direction_outcomes import credit_gate_merged_count
+from app.direction_terminal_guard import (
+    direction_success_evidence_met,
+    mark_auto_direction_terminal,
+)
 from app.failure_classification import CO_DEFERRED_SHELVED
 from app.research_context import (
     _build_research_context,
@@ -296,16 +300,19 @@ async def _maybe_autocomplete_exhausted_direction(
     *,
     exhausted: bool | None = None,
 ) -> bool:
-    """Route a genuinely-exhausted direction to terminal COMPLETED under the
-    shared guardrails. Returns True iff the direction was completed.
+    """Route a genuinely exhausted direction to non-successful retirement.
+
+    Returns ``True`` iff the direction was retired.  Exhaustion is terminal but
+    explicitly distinct from successful completion; it must never inherit the
+    success semantics of the old merge-count route.
 
     Supersedes the #10112 dedup-deadlock auto-pause and the #10113 already-fixed
     -deadlock alert-only no-op: a direction with no new work left (saturated /
     dedup-deadlocked / already-fixed-deadlocked) that is NOT externally frozen and
-    NOT code-failing is retired terminally instead of looping forever. The proven
-    >=3-verified-merge completion route stays a separate, additive path.
+    NOT code-failing is retired terminally instead of looping forever. Successful
+    completion remains a separate route gated by declared success evidence.
 
-    Preserves the same completion side-effects as the proven-merge route:
+    Preserves the same automatic-terminal side-effects as the success route:
     ``auto_completed`` / ``auto_completed_reason`` / ``completed_at`` stamps, an
     INFO Alert, the deferred diagnosis archive, and the milestone message. The
     ``exhausted`` override lets a caller that has already detected a specific
@@ -320,10 +327,12 @@ async def _maybe_autocomplete_exhausted_direction(
         return False
 
     reason = _exhaustion_complete_reason(d)
-    d["status"] = "completed"
-    d["completed_at"] = _utcnow().isoformat()
-    d["auto_completed"] = True
-    d["auto_completed_reason"] = reason
+    mark_auto_direction_terminal(
+        d,
+        outcome="exhausted",
+        reason=reason,
+        completed_at=_utcnow().isoformat(),
+    )
     # Capture diagnosis info for the deferred design_doc archive write (same as the
     # proven-merge route), performed after the directions commit.
     pending_archived.append((dict(d), did))
@@ -331,10 +340,11 @@ async def _maybe_autocomplete_exhausted_direction(
         Alert(
             project_id=task.project_id,
             severity=AlertSeverity.INFO,
-            event_type="research.direction_auto_completed",
-            title="Direction auto-completed",
+            event_type="research.direction_auto_retired",
+            title="Direction auto-retired",
             message=(
-                f"Direction '{d.get('text', did)[:80]}' was auto-completed: {reason}."
+                f"Direction '{d.get('text', did)[:80]}' was auto-retired as "
+                f"exhausted: {reason}."
             ),
         )
     )
@@ -347,7 +357,7 @@ async def _maybe_autocomplete_exhausted_direction(
             session,
             task.project_id,
             direction_text=d.get("text", ""),
-            milestone="auto-completed",
+            milestone="auto-retired",
             reason=reason,
             direction_id=did,
         )
@@ -356,7 +366,7 @@ async def _maybe_autocomplete_exhausted_direction(
             f"[NOTIFY] Failed to post direction milestone message: {_notify_exc}"
         )
     logger.info(
-        f"[RESEARCH] Auto-completed exhausted direction {did} "
+        f"[RESEARCH] Auto-retired exhausted direction {did} "
         f"(reason: {reason!r}, task {task.id})"
     )
     return True
@@ -990,13 +1000,13 @@ async def apply_post_spawn_state(
 
                         record_outcome_progress_snapshot(d)
 
-                    # Auto-complete if saturated and proven by merged PRs.
-                    # Require >= 3 merged PRs for the PROVEN route (retires a
-                    # productive saturated direction with a 'verified PRs merged'
-                    # reason). When fewer than 3 are proven, fall back to the ADDITIVE
-                    # exhaustion route: a genuinely-exhausted direction (saturated with
-                    # no recent output) completes regardless of merge count under the
-                    # code-failing / externally-frozen guardrails.
+                    # Resolve a saturated direction against its DECLARED outcome.
+                    # A challenge-approved evidence_progress=met judgment over a
+                    # non-empty success_evidence contract is the only successful
+                    # route. Merge/activity counts remain context, never proof.
+                    # Otherwise, a genuinely exhausted direction may retire under
+                    # the existing code-failure / external-freeze guardrails, but
+                    # that terminal outcome is explicitly non-successful.
                     if d.get("status") == "active" and d.get("possibly_saturated"):
                         history = d.get("research_history", [])
                         agg = d.get("history_aggregate", {})
@@ -1013,28 +1023,18 @@ async def apply_post_spawn_state(
                             )
                             - int(agg.get("total_stranded_prs_merged", 0) or 0),
                         )
-                        # The PROVEN-merge SUCCESS route and the exhaustion
-                        # route each fall back to their own merge-count /
-                        # deadlock logic. The acceptance contract is enforced
-                        # only at qualify (the ledger gate in compute_composite),
-                        # so there is no pre-qualification coverage precondition
-                        # on direction retirement here.
-                        if total_merged < 3:
-                            await _maybe_autocomplete_exhausted_direction(
-                                session,
-                                task,
-                                d,
-                                did,
-                                _pending_archived_diagnoses,
-                            )
-                        elif total_merged >= 3:
+                        if direction_success_evidence_met(d):
                             total_cycles = len(history) + (agg.get("total_cycles") or 0)
-                            d["status"] = "completed"
-                            d["completed_at"] = _utcnow().isoformat()
-                            d["auto_completed"] = True
-                            d["auto_completed_reason"] = (
-                                f"Auto-completed: direction saturated with {total_merged} "
-                                f"verified PRs merged across {total_cycles} cycles"
+                            _success_reason = (
+                                "Auto-completed: declared success evidence met "
+                                f"after {total_merged} verified PRs merged across "
+                                f"{total_cycles} cycles"
+                            )
+                            mark_auto_direction_terminal(
+                                d,
+                                outcome="success_evidence_met",
+                                reason=_success_reason,
+                                completed_at=_utcnow().isoformat(),
                             )
                             # Capture diagnosis info for deferred design_doc write
                             # inside with_design_doc_locked (after the directions commit).
@@ -1046,14 +1046,16 @@ async def apply_post_spawn_state(
                                 title="Direction auto-completed",
                                 message=(
                                     f"Direction '{d.get('text', did)[:80]}' was auto-completed: "
-                                    f"saturated with {total_merged} verified PRs merged across {total_cycles} cycles."
+                                    "its declared success evidence was met "
+                                    f"({total_merged} verified PRs merged across "
+                                    f"{total_cycles} cycles)."
                                 ),
                             )
                             session.add(alert)
                             try:
                                 from app.notification_dispatch import (
                                     post_direction_milestone_message,
-                                )  # noqa: PLC0415
+                                )
 
                                 await post_direction_milestone_message(
                                     session,
@@ -1067,6 +1069,14 @@ async def apply_post_spawn_state(
                                 logger.warning(
                                     f"[NOTIFY] Failed to post direction milestone message: {_notify_exc}"
                                 )
+                        else:
+                            await _maybe_autocomplete_exhausted_direction(
+                                session,
+                                task,
+                                d,
+                                did,
+                                _pending_archived_diagnoses,
+                            )
 
             # Also apply sub-research annotation directly on the in-memory
             # `directions` list before the locked write so both updates land

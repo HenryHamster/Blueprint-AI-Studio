@@ -43,7 +43,6 @@ from app.playbook_sr_metrics import (  # noqa: F401
     _EXAMPLE_MAX_PER_CAT,
     _EXECUTION_EVIDENCE_CATEGORIES,
     _FLOOR_MIN_CONSECUTIVE_WINDOWS,
-    _HALLUCINATION_RATE_MIN_FINDINGS,
     _MIN_DIRECTION_SR_SAMPLE,
     _MIN_SR_FINDINGS,
     _MIN_SR_SAMPLE,
@@ -71,9 +70,7 @@ from app.playbook_sr_metrics import (  # noqa: F401
     _compute_reasoning_engagement,
     _format_sr_alert_title,
     _is_trend_significant,
-    _partition_edges_by_origin,
     _percentile,
-    _reviewer_caught_author_miss,
     _sr_skip_stats,
     _stats_for_tasks,
     _task_prompt_fingerprint,
@@ -129,11 +126,7 @@ from app.playbook_storage import (  # noqa: F401
 # Re-exports from sibling SR analytics modules for names not already covered by
 # the playbook_sr_metrics re-export block above. Existing callers continue to
 # ``from app.playbook_learning import <name>``.
-from app.sr_reviewer_trends import (  # noqa: E402,F401
-    compute_edges_trend,
-    compute_fresh_reviewer_trend,
-    compute_sr_reviewer_disagreements,
-)
+from app.sr_edges_trends import compute_edges_trend  # noqa: E402,F401
 from app.sr_signal_trends import (  # noqa: E402,F401
     _FALSE_ATTESTATION_RATE_THRESHOLD,
     compute_sr_false_attestation_trends,
@@ -394,7 +387,6 @@ def compute_sr_quality_by_fingerprint(
     tasks: list,
     *,
     min_sample_size: int = 3,
-    top_disagreement_categories: int = 3,
 ) -> dict[str, dict[str, Any]]:
     """Compute additive SR-quality metrics for prompt fingerprint analytics."""
     from app.sr_blind_spots import (  # noqa: PLC0415
@@ -416,9 +408,6 @@ def compute_sr_quality_by_fingerprint(
                 "sr_sample_size": 0,
                 "catch_hits": 0,
                 "catch_total": 0,
-                "reviewer_rescues": 0,
-                "reviewer_rescue_total": 0,
-                "disagreements": {},
             },
         )
         bucket["tasks"].append(task)
@@ -435,35 +424,16 @@ def compute_sr_quality_by_fingerprint(
             and not result.get("passed", True)
             and result.get("origin") not in _REVIEWER_ORIGINS
         }
-        reviewer_cats = {
-            finding.get("category")
-            for finding in (sro.get("reviewer_findings") or [])
-            if isinstance(finding, dict) and finding.get("category")
-        }
         rev_hist = (ctx.get("review_loop") or {}).get("review_history") or []
         confirmed = (
-            reviewer_cats
-            | set(ctx.get("_first_attempt_rejection_categories") or {})
+            set(ctx.get("_first_attempt_rejection_categories") or {})
             | set(_categorize_review_issues(rev_hist).keys())
         )
         hits = len(confirmed & sr_failed)
-        misses = confirmed - sr_failed
         bucket["catch_hits"] += hits
         bucket["catch_total"] += len(confirmed)
-        bucket["reviewer_rescue_total"] += len(misses)
-        bucket["reviewer_rescues"] += len(misses & reviewer_cats)
         project_catch_hits += hits
         project_catch_total += len(confirmed)
-        for cat in reviewer_cats - sr_failed:
-            entry = bucket["disagreements"].setdefault(
-                cat, {"reviewer_overrode_sr_count": 0, "sr_overrode_reviewer_count": 0}
-            )
-            entry["reviewer_overrode_sr_count"] += 1
-        for cat in sr_failed - reviewer_cats:
-            entry = bucket["disagreements"].setdefault(
-                cat, {"reviewer_overrode_sr_count": 0, "sr_overrode_reviewer_count": 0}
-            )
-            entry["sr_overrode_reviewer_count"] += 1
 
     project_catch_rate = (
         round(project_catch_hits / project_catch_total, 3)
@@ -478,12 +448,9 @@ def compute_sr_quality_by_fingerprint(
                 {
                     "sr_catch_rate": None,
                     "sr_catch_sample_size": bucket["catch_total"],
-                    "reviewer_rescue_rate": None,
-                    "reviewer_rescue_sample_size": bucket["reviewer_rescue_total"],
                     "sr_false_positive_rate": None,
                     "sr_false_positive_sample_size": 0,
                     "sr_false_positive_rate_by_category": [],
-                    "sr_reviewer_disagreement_top_categories": [],
                     "sr_catch_rate_delta_vs_project_mean": None,
                 }
             )
@@ -501,14 +468,6 @@ def compute_sr_quality_by_fingerprint(
             {
                 "sr_catch_rate": catch_rate,
                 "sr_catch_sample_size": bucket["catch_total"],
-                "reviewer_rescue_rate": (
-                    round(
-                        bucket["reviewer_rescues"] / bucket["reviewer_rescue_total"], 3
-                    )
-                    if bucket["reviewer_rescue_total"]
-                    else None
-                ),
-                "reviewer_rescue_sample_size": bucket["reviewer_rescue_total"],
                 "sr_false_positive_rate": (
                     round(fp_total / (fp_total + tp_total), 3)
                     if (fp_total + tp_total)
@@ -534,24 +493,6 @@ def compute_sr_quality_by_fingerprint(
                             item[0],
                         ),
                     )
-                ],
-                "sr_reviewer_disagreement_top_categories": [
-                    {
-                        "category": cat,
-                        "sample_size": counts["reviewer_overrode_sr_count"]
-                        + counts["sr_overrode_reviewer_count"],
-                        **counts,
-                    }
-                    for cat, counts in sorted(
-                        bucket["disagreements"].items(),
-                        key=lambda item: (
-                            -(
-                                item[1]["reviewer_overrode_sr_count"]
-                                + item[1]["sr_overrode_reviewer_count"]
-                            ),
-                            item[0],
-                        ),
-                    )[:top_disagreement_categories]
                 ],
                 "sr_catch_rate_delta_vs_project_mean": (
                     round(catch_rate - project_catch_rate, 3)

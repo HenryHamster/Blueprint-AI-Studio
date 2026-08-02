@@ -496,6 +496,11 @@ VERSION_PHASE_DECISION_CONTEXT_KEY = "_strategic_version_phase_decision"
 # Advisory only (logged, not stored on ReleaseVersion), so a generous cap is fine.
 _QUALIFY_REQUEST_REASON_MAX = 500
 
+# Expensive product probes are selected by the strategist at the qualification
+# decision, not by a fleet-wide timer/flag.  Keep this closed and deliberately
+# small: each supported value names a real, decision-bearing qualifier child.
+_QUALIFY_REQUEST_PROBE_KINDS = frozenset({"walkthrough_e2e"})
+
 # Transient task.context key carrying an agent-emitted qualify_request from the
 # set_problem_model endpoint to _handle_strategic_completion's API path. Mirrors
 # VERSION_PHASE_DECISION_CONTEXT_KEY — one source of truth so producer + consumer
@@ -1103,9 +1108,10 @@ def extract_version_phase_decision(raw: object) -> dict | None:
 def extract_qualify_request(raw: object) -> dict | None:
     """Validate + normalize a raw ``qualify_request`` value.
 
-    Accepts the {reason} value the strategic agent embeds as a top-level sibling
-    in the ``set-problem-model`` payload and returns a clean ``{"reason": str}``
-    dict, or ``None`` when the input is absent or unusable. A qualify_request is
+    Accepts the ``{reason, probes?}`` value the strategic agent embeds as a
+    top-level sibling in the ``set-problem-model`` payload and returns a clean
+    request. ``probes`` is a bounded list of explicitly requested, supported
+    product probes. A qualify_request is
     the agent's transient signal that an ``open`` version in ``stabilize`` is
     release-ready and the heavy qualifier should run (automain-lts-plan-v1.md
     Phase 3) — never durable model state.
@@ -1123,7 +1129,24 @@ def extract_qualify_request(raw: object) -> dict | None:
         if isinstance(reason_raw, str)
         else ""
     )
-    return {"reason": reason}
+    probes_raw = raw.get("probes") if "probes" in raw else []
+    probes: list[str] = []
+    if not isinstance(probes_raw, list):
+        raise ValueError("qualify_request.probes must be a list")
+    if len(probes_raw) > len(_QUALIFY_REQUEST_PROBE_KINDS):
+        raise ValueError("qualify_request.probes contains too many entries")
+    for item in probes_raw:
+        if not isinstance(item, str):
+            raise ValueError("qualify_request.probes entries must be strings")
+        probe = item.strip().lower()
+        if not probe:
+            raise ValueError("qualify_request.probes entries must not be blank")
+        if probe not in _QUALIFY_REQUEST_PROBE_KINDS:
+            raise ValueError(f"unsupported qualification probe: {probe[:80]}")
+        if probe in probes:
+            raise ValueError(f"duplicate qualification probe: {probe}")
+        probes.append(probe)
+    return {"reason": reason, "probes": probes}
 
 
 def extract_new_version_goal(raw: object) -> str | None:
@@ -1431,7 +1454,7 @@ async def _apply_qualify_request(
 ) -> None:
     """Parse and apply an optional ``qualify_request`` from the strategic agent.
 
-    ``request`` is the raw {reason: str} value from either:
+    ``request`` is the raw ``{reason: str, probes?: list[str]}`` value from either:
       - the API path: ``task.context[QUALIFY_REQUEST_CONTEXT_KEY]``
       - the fallback / log-parse path: ``parsed.get("qualify_request")``
 
@@ -1453,6 +1476,20 @@ async def _apply_qualify_request(
         return
     reason_raw = request.get("reason")
     reason = reason_raw.strip() or None if isinstance(reason_raw, str) else None
+    try:
+        normalized_request = extract_qualify_request(request)
+    except ValueError as exc:
+        logger.warning(
+            "[STRATEGIC] Task %s (%s path): invalid qualify_request ignored: %s",
+            task.id,
+            path,
+            exc,
+        )
+        return
+    if normalized_request is None:
+        return
+    reason = normalized_request["reason"] or None
+    requested_probes = normalized_request["probes"]
     # Initialised outside the try so the except clause can record a durable
     # failure on the version row even if run_qualification throws.
     open_ver = None
@@ -1560,7 +1597,12 @@ async def _apply_qualify_request(
                 path,
                 project.id,
             )
-        result = await _rq.run_qualification(session, project.id, open_ver)
+        result = await _rq.run_qualification(
+            session,
+            project.id,
+            open_ver,
+            requested_probes=requested_probes,
+        )
         logger.info(
             "[STRATEGIC] Task %s (%s path): qualify_request ran qualification "
             "for project %s version v%d — status=%s (reason=%r)",
@@ -2846,11 +2888,10 @@ def _direction_externally_frozen(direction: dict) -> bool:
 
 
 def _exhaustion_complete_reason(direction: dict) -> str:
-    """Build the ``auto_completed_reason`` for an exhaustion-completed direction.
+    """Build the reason for an exhaustion-retired direction.
 
-    Distinguished from the proven-merge route's "verified PRs merged" wording so
-    operators can tell a saturated/deadlocked retirement apart from a productive
-    one. Includes the verified merge count (which may be <3 or zero) for context.
+    Exhaustion is explicitly non-successful.  The verified merge count remains
+    useful context, but can never promote this outcome to success.
     """
     history = direction.get("research_history") or []
     agg = direction.get("history_aggregate") or {}
@@ -2858,7 +2899,7 @@ def _exhaustion_complete_reason(direction: dict) -> str:
         agg.get("total_verified_prs_merged", agg.get("total_prs_merged", 0)) or 0
     )
     return (
-        f"Auto-completed: direction saturated/deadlocked and exhausted with "
+        f"Auto-retired as exhausted: direction saturated/deadlocked with "
         f"{total_merged} verified PRs merged (no new work remaining)"
     )
 
@@ -2866,7 +2907,7 @@ def _exhaustion_complete_reason(direction: dict) -> str:
 def _should_autocomplete_exhausted(
     direction: dict, *, exhausted: bool | None = None
 ) -> bool:
-    """Shared decision: should this direction be terminally completed as exhausted?
+    """Shared decision: should this direction retire as exhausted?
 
     ``exhausted`` lets a caller that has ALREADY detected a specific deadlock
     signal (e.g. the already-fixed site detects on ``history[:-1]`` because the
@@ -3452,6 +3493,7 @@ def record_retired_direction_memory(
     classification = classify_retired_direction_outcome(
         reason,
         prs_merged=metrics["prs_merged"],
+        retirement_outcome=direction.get("retirement_outcome"),
     )
 
     entry: dict = {
@@ -3469,6 +3511,10 @@ def record_retired_direction_memory(
             "metrics": metrics,
         },
     }
+    if direction.get("retirement_outcome"):
+        entry["retirement_outcome"] = str(direction["retirement_outcome"])[
+            :_RETIRED_OUTCOME_CHAR_CAP
+        ]
     gap_id = direction.get("gap_id")
     if gap_id:
         entry["gap_id"] = str(gap_id)
@@ -6475,7 +6521,8 @@ async def _handle_strategic_completion(
     # above), so this fallback is effectively unreached today — but the two
     # paths are kept symmetric so a future fallback-only emission path can't
     # silently drop one signal. Shapes: version_phase_decision = {phase:
-    # "build"|"stabilize", reasoning: str}; qualify_request = {reason: str}.
+    # "build"|"stabilize", reasoning: str}; qualify_request = {reason: str,
+    # probes?: ["walkthrough_e2e"]}.
     _vpd_parsed = parsed.get("version_phase_decision")
     await _apply_version_phase_decision(
         _vpd_parsed, task, project, session, path="fallback"

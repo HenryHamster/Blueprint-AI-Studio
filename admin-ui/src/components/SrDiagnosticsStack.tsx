@@ -1,5 +1,5 @@
-import { type PromptFingerprintAnalyticsResponse, type SrReviewerDisagreementsEnvelope } from '../api';
-import { SrMissedRetrospective, SrReviewerDisagreementsPanel, DirectionSrBreakdownPanel, type SrMissedTask, type DirectionSrEntry } from './SrTrendBreakdown';
+import { type PromptFingerprintAnalyticsResponse } from '../api';
+import { SrMissedRetrospective, DirectionSrBreakdownPanel, type SrMissedTask, type DirectionSrEntry } from './SrTrendBreakdown';
 import { SrUnhandledEdgesRetrospectivesPanel } from './SrUnhandledEdgesRetrospectivesPanel';
 import { type SrTrendWithFixIterations } from './ReviewQualitySection';
 
@@ -49,7 +49,6 @@ interface SrDiagnosticsStackProps {
   blindSpots: BlindSpotsData | null;
   expandedBlindSpotThemes: Set<string>;
   onToggleBlindSpotTheme: (theme: string) => void;
-  srReviewerDisagreements: SrReviewerDisagreementsEnvelope | null;
   directionSrBreakdown: DirectionSrBreakdownData | null;
   srTrends?: SrTrendWithFixIterations | null;
   fingerprintAnalytics: PromptFingerprintAnalyticsResponse | null;
@@ -66,7 +65,6 @@ export function SrDiagnosticsStack({
   blindSpots,
   expandedBlindSpotThemes,
   onToggleBlindSpotTheme,
-  srReviewerDisagreements,
   directionSrBreakdown,
   srTrends,
   fingerprintAnalytics,
@@ -151,24 +149,6 @@ export function SrDiagnosticsStack({
         </section>
       )}
 
-      {/* SR Reviewer Disagreements */}
-      {!loading && srReviewerDisagreements && srReviewerDisagreements.disagreements.length > 0 && (
-        <section>
-          <p className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-2">
-            SR ↔ Reviewer Disagreements
-            <span className="ml-1 text-neutral-600 font-normal normal-case tracking-normal">· {srReviewerDisagreements.window_days}d · {
-              srReviewerDisagreements.total_distinct_categories !== undefined
-                ? `top ${srReviewerDisagreements.returned_entries ?? srReviewerDisagreements.disagreements.length} of ${srReviewerDisagreements.total_distinct_categories} categor${srReviewerDisagreements.total_distinct_categories !== 1 ? 'ies' : 'y'}`
-                : `${srReviewerDisagreements.total_entries} categor${srReviewerDisagreements.total_entries !== 1 ? 'ies' : 'y'}`
-            }</span>
-          </p>
-          <SrReviewerDisagreementsPanel
-            data={srReviewerDisagreements}
-            onSelectTask={onViewTaskById}
-          />
-        </section>
-      )}
-
       {/* Per-Direction SR Catch-Rate */}
       {!loading && directionSrBreakdown && directionSrBreakdown.directions.length > 0 && (
         <section data-testid="direction-sr-breakdown">
@@ -209,18 +189,8 @@ export function SrDiagnosticsStack({
                   </div>
                   <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-ui-sm text-neutral-500">
                     <span>catch <span className={`font-semibold ${catchColor}`}>{catchRate != null ? `${Math.round(catchRate * 100)}%` : '--'}</span>{' '}<span className="text-neutral-600">n={fp.sr_catch_sample_size}</span>{delta != null && <span className={`ml-1 ${deltaColor}`}>({delta >= 0 ? '+' : ''}{Math.round(delta * 100)}pp)</span>}</span>
-                    <span>rescue <span className="font-semibold text-neutral-300">{fp.reviewer_rescue_rate != null ? `${Math.round(fp.reviewer_rescue_rate * 100)}%` : '--'}</span>{' '}<span className="text-neutral-600">n={fp.reviewer_rescue_sample_size}</span></span>
                     {fp.sr_false_positive_rate != null && <span>FP <span className="font-semibold text-neutral-300">{Math.round(fp.sr_false_positive_rate * 100)}%</span>{' '}<span className="text-neutral-600">n={fp.sr_false_positive_sample_size}</span></span>}
                   </div>
-                  {fp.sr_reviewer_disagreement_top_categories.length > 0 && (
-                    <div className="flex flex-wrap gap-1 mt-1">
-                      {fp.sr_reviewer_disagreement_top_categories.slice(0, 3).map((d) => (
-                        <span key={d.category} className="text-ui-xs px-1 py-0.5 rounded bg-neutral-800/60 text-neutral-400 border border-neutral-700/40">
-                          {d.category}
-                        </span>
-                      ))}
-                    </div>
-                  )}
                 </div>
               );
             })}

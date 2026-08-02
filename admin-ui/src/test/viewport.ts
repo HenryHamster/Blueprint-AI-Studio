@@ -493,6 +493,5 @@ export function stressDigestPayload(): Record<string, unknown> {
         started_at: '2026-05-06T00:00:00Z', running_cost_usd: 0.87,
         direction_text: directionText, scope: 'small', review_iteration: 1, review_cap: 3 },
     ],
-    fresh_reviewer_effectiveness: null,
   };
 }

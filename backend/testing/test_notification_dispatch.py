@@ -905,6 +905,45 @@ async def test_post_event_message_registered_internal_event_is_tagged(db_session
 
 
 @pytest.mark.asyncio
+async def test_post_event_message_idempotency_key_returns_existing_row(db_session):
+    project_id = await _persist_test_project(db_session)
+    key = f"release:{uuid.uuid4()}:serving:confirmed"
+
+    first = await post_event_message(
+        db_session,
+        project_id,
+        "release.serving_confirmed",
+        "First receipt",
+        idempotency_key=key,
+    )
+    await db_session.commit()
+    second = await post_event_message(
+        db_session,
+        project_id,
+        "release.serving_confirmed",
+        "Retry must not duplicate",
+        idempotency_key=key,
+    )
+
+    assert first is not None
+    assert second is not None
+    assert second.id == first.id
+    rows = (
+        (
+            await db_session.execute(
+                _select(ProjectMessage).where(
+                    ProjectMessage.project_id == project_id,
+                    ProjectMessage.idempotency_key == key,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 1
+
+
+@pytest.mark.asyncio
 async def test_post_event_message_with_context_and_task_id(db_session):
     project_id = await _persist_test_project(db_session)
     task_id = uuid.uuid4()

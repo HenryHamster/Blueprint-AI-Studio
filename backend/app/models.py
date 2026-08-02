@@ -3508,12 +3508,14 @@ class StrategicSpawnRequest(SQLModel, table=True):
 
 
 class StrategicWatch(SQLModel, table=True):
-    """One-shot, durable Strategic agenda receipt for a task reaching terminal.
+    """One-shot durable receipt for a task reaching an actionable boundary.
 
     This is deliberately not ``TaskWakeRegistration``: a Resident watch must not
     park or advance the long-lived Strategic task. The existing heartbeat detects
     world-state movement; this row preserves which exact task mattered and keeps
-    the fired receipt visible until Strategic acknowledges it.
+    the fired receipt visible until Strategic acknowledges it. Knowledge tasks
+    resolve at agent terminal; write tasks resolve only once their work lands or
+    becomes blocked, fails, needs approval, or completes without a PR.
     """
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
@@ -8141,8 +8143,8 @@ class ProjectLaneBaseline(SQLModel, table=True):
 class ProjectSRAnalytics(SQLModel, table=True):
     """Persisted self-review analytics telemetry for a project.
 
-    Replaces the sr_catch_rate_trends, fresh_reviewer_trend, edges_trend,
-    sr_reviewer_disagreements, sr_regression_risk_test_signal_trends,
+    Replaces the sr_catch_rate_trends, edges_trend,
+    sr_regression_risk_test_signal_trends,
     sr_false_attestation_trends, sr_blind_spot_signal_last_computed_at,
     viewport_coverage_snapshot, fix_loop_divergence_* keys in design_doc.
     One row per project; the data dict holds all SR analytics keys.

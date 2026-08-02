@@ -1,4 +1,5 @@
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
+import path from 'node:path';
 
 // ── Module mocks ─────────────────────────────────────────────────────────────
 // Mock fs so we can flip warm-vs-cold detection deterministically and intercept
@@ -176,8 +177,14 @@ describe('prepareWorkspaceForRole', () => {
 
     expect(fsMocks.readdirSync).toHaveBeenCalledWith('/ws');
     // Each child removed individually; the mountpoint itself is never removed.
-    expect(fsMocks.rmSync).toHaveBeenCalledWith('/ws/file.txt', { recursive: true, force: true });
-    expect(fsMocks.rmSync).toHaveBeenCalledWith('/ws/subdir', { recursive: true, force: true });
+    expect(fsMocks.rmSync).toHaveBeenCalledWith(
+      path.join('/ws', 'file.txt'),
+      { recursive: true, force: true },
+    );
+    expect(fsMocks.rmSync).toHaveBeenCalledWith(
+      path.join('/ws', 'subdir'),
+      { recursive: true, force: true },
+    );
     expect(fsMocks.rmSync).toHaveBeenCalledTimes(2);
     expect(cloneWithRetryMock).toHaveBeenCalledTimes(1);
   });

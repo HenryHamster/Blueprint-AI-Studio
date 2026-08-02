@@ -1,6 +1,6 @@
 import { strVal } from '../prompt.js';
 import { MEDIUM_ANALYSIS_PLAN_FILE_LIMIT } from '../constants.js';
-import { formatProjectBlindSpotSummary, formatSrRecentMissExamplesForSrPrompt, formatFailureModeHintForSrPrompt, formatPersistentBlindSpotHintForSrPrompt } from './self-review.js';
+import { formatProjectBlindSpotSummary, formatSrRecentMissExamplesForSrPrompt } from './self-review.js';
 
 function parseResearchSummary(raw: string): string {
   try {
@@ -388,12 +388,6 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
     sr_flag_sample_size?: number;
     engagement_thinning?: boolean;
     below_floor?: boolean;
-    miss_mode_breakdown?: {
-      reading_gap?: number;
-      judgment_gap?: number;
-      coverage_gap?: number;
-      dominant_mode?: string | null;
-    } | null;
   };
   const srCatchRate = ctx.self_review_catch_rate as {
     categories?: Record<string, SRCatchRateCategory>;
@@ -469,39 +463,6 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
           budget -= candidate.length;
           break;
         }
-      }
-    }
-  }
-
-  // Build failure-mode hint block — surfaces dominant miss origin for regressing categories
-  // so agents know what to fix: re-reading files, calibration, or category coverage.
-  let failureModeHintLines: string[] = [];
-  if (srSource && Object.keys(srSource).length > 0) {
-    const rendered = formatFailureModeHintForSrPrompt(srSource);
-    if (rendered) {
-      const candidateLines = rendered.split('\n');
-      const candidate = candidateLines.join('\n');
-      if (candidate.length <= budget) {
-        failureModeHintLines = candidateLines;
-        budget -= candidate.length;
-      }
-    }
-  }
-
-  // Build persistent blind-spot hint block — highest-priority signal (chronic misses across ≥2 windows).
-  // Surfaces categories where fresh/human reviewer has consistently caught issues the agent's SR missed.
-  // Only included if budget allows.
-  const persistentBlindSpots = ctx.persistent_blind_spots as {
-    categories: Array<{ category: string; task_type: string; rate: number }>;
-    hint: string | null;
-  } | null | undefined;
-  let persistentBlindSpotLines: string[] = [];
-  if (persistentBlindSpots) {
-    const rendered = formatPersistentBlindSpotHintForSrPrompt(persistentBlindSpots);
-    if (rendered) {
-      if (rendered.length <= budget) {
-        persistentBlindSpotLines = rendered.split('\n');
-        budget -= rendered.length;
       }
     }
   }
@@ -620,54 +581,6 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
     }
   }
 
-  // Build SR vs fresh-reviewer disagreement calibration block — only if budget allows.
-  // Shape: ctx.sr_reviewer_disagreements = { disagreements: [{category, task_type, count, examples?}], window_days: number }
-  type SRReviewerDisagreementExample = { severity: string; description: string };
-  type SRReviewerDisagreementEntry = { category: string; task_type: string; count: number; examples?: SRReviewerDisagreementExample[] };
-  const srReviewerDisagreementsData = ctx.sr_reviewer_disagreements as {
-    disagreements?: SRReviewerDisagreementEntry[];
-    window_days?: number;
-  } | null | undefined;
-  let srReviewerDisagreementLines: string[] = [];
-  if (srReviewerDisagreementsData?.disagreements && srReviewerDisagreementsData.disagreements.length > 0) {
-    const rawEntries = srReviewerDisagreementsData.disagreements;
-    const windowDays = srReviewerDisagreementsData.window_days ?? 30;
-    // Prioritize entries matching the current task type, then show cross-type entries
-    const forCurrentType = taskType ? rawEntries.filter((e) => e.task_type === taskType) : [];
-    const forOtherTypes = taskType ? rawEntries.filter((e) => e.task_type !== taskType) : rawEntries;
-    const ordered = [...forCurrentType, ...forOtherTypes].slice(0, 8);
-    if (ordered.length > 0) {
-      const typeScope = taskType ? ` — especially in ${taskType} tasks` : '';
-      const buildDisagreementLines = (withExamples: boolean): string[] => {
-        const lines: string[] = [
-          '### SR vs Fresh-Reviewer Disagreements',
-          `Categories where self-review passed but the fresh reviewer caught issues (last ${windowDays} days)${typeScope}. Apply extra scrutiny here:`,
-        ];
-        for (const entry of ordered) {
-          const typeSuffix = taskType && entry.task_type !== taskType ? ` (${entry.task_type} tasks)` : '';
-          lines.push(`- **${entry.category}**: ${entry.count} disagreement${entry.count === 1 ? '' : 's'}${typeSuffix}`);
-          if (withExamples && entry.examples && entry.examples.length > 0) {
-            for (const ex of entry.examples.slice(0, 3)) {
-              const desc = ex.description.slice(0, 200);
-              lines.push(`  - [${ex.severity}] ${desc}`);
-            }
-          }
-        }
-        lines.push('');
-        return lines;
-      };
-      for (const withExamples of [true, false]) {
-        const candidateLines = buildDisagreementLines(withExamples);
-        const candidate = candidateLines.join('\n');
-        if (candidate.length <= budget) {
-          srReviewerDisagreementLines = candidateLines;
-          budget -= candidate.length;
-          break;
-        }
-      }
-    }
-  }
-
   // Build project-wide SR blind-spot themes (last 14 days) — only if budget allows.
   // Surfaced from backend agent.py injection: ctx.sr_blind_spot_themes is
   // [{theme, count}, ...] sorted by count desc, capped at 8.
@@ -766,6 +679,6 @@ export function formatProjectContext(ctx: Record<string, unknown>, taskType = ''
     footerLines.push('');
   }
 
-  const allLines = [...header, ...activeLines, ...lessonsLines, ...queuedLines, ...directionRecentLines, ...recentLines, ...healthLines, ...reviewIssueLines, ...srBlindSpotLines, ...failureModeHintLines, ...persistentBlindSpotLines, ...srForDirectionLines, ...srFPCalibrationLines, ...srReviewerDisagreementLines, ...srBlindSpotThemesLines, ...srRecentMissLines, ...moduleFeedbackLines, ...dirQualityLines, ...prLines, ...siblingLines, ...cochangeLines, ...footerLines];
+  const allLines = [...header, ...activeLines, ...lessonsLines, ...queuedLines, ...directionRecentLines, ...recentLines, ...healthLines, ...reviewIssueLines, ...srBlindSpotLines, ...srForDirectionLines, ...srFPCalibrationLines, ...srBlindSpotThemesLines, ...srRecentMissLines, ...moduleFeedbackLines, ...dirQualityLines, ...prLines, ...siblingLines, ...cochangeLines, ...footerLines];
   return allLines.join('\n');
 }

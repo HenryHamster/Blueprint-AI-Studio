@@ -3450,6 +3450,7 @@ describe('strategic executor prompt — step 1 / step 5 sibling-field consistenc
     expect(p).toContain('set-problem-model');
     expect(p).toContain('version_phase_decision');
     expect(p).toContain('qualify_request');
+    expect(p).toContain('walkthrough_e2e');
   });
 
   it('step 5 instructs editing /tmp/problem_model_<taskId>.json IN PLACE (not a separate inline emit)', async () => {

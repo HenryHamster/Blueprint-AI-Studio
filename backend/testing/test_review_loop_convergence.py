@@ -31,6 +31,42 @@ async def _make_db_project(db_session, **project_kwargs) -> Project:
     return project
 
 
+def _authoritative_approval_loop(
+    project_id: uuid.UUID,
+    pr_number: int,
+    *,
+    head_sha: str | None = None,
+    base_sha: str | None = None,
+    history: list[dict] | None = None,
+) -> dict:
+    """Build the durable exact-target proof used by cap classification."""
+    head_sha = head_sha or f"head-{pr_number}"
+    base_sha = base_sha or f"base-{pr_number}"
+    review_history = history or [
+        {
+            "iteration": 1,
+            "verdict": "APPROVE",
+            "issues": [],
+            "reviewed_head_sha": head_sha,
+            "reviewed_base_sha": base_sha,
+        }
+    ]
+    return {
+        "pr_number": pr_number,
+        # Kept to model the normal lifecycle handoff; the classifier must not
+        # rely on this hint without the exact durable proof below.
+        "review_approved": True,
+        "review_history": review_history,
+        "review_target": {
+            "project_id": str(project_id),
+            "pr_number": pr_number,
+            "head_sha": head_sha,
+            "base_sha": base_sha,
+        },
+        "issue_ledger": {"open": [], "resolved": []},
+    }
+
+
 def _mock_preservable_pr(mocker, *, changed_files: int, mergeable_state: str):
     """Mock GitHub side effects + get_pull_request for the preserve-work path.
 
@@ -77,6 +113,101 @@ def _mock_pr_lookup_fails(mocker):
         side_effect=RuntimeError("GitHub down"),
     )
     return close_mock
+
+
+# ── Exact approval authority ────────────────────────────────────────────────
+
+
+def test_cap_after_approve_requires_exact_durable_proof():
+    from app.review_loop_convergence import _cap_exhausted_after_approve
+
+    project_id = uuid.uuid4()
+    loop = _authoritative_approval_loop(project_id, 701)
+    orig = make_task(project_id=project_id, context={"review_loop": loop})
+    source = make_task(project_id=project_id, context={})
+
+    assert _cap_exhausted_after_approve(orig, source, 701) is True
+
+
+@pytest.mark.parametrize(
+    "legacy_context",
+    [
+        {"review_loop": {"review_approved": True}},
+        {"review_loop": {"verdict": "APPROVE"}},
+        {"blueprint_review_verdict": "APPROVE"},
+        {
+            "review_loop": {
+                "review_approved": True,
+                "review_history": [{"verdict": "APPROVE", "issues": []}],
+            }
+        },
+    ],
+)
+def test_cap_after_approve_rejects_legacy_or_unproven_markers(legacy_context):
+    from app.review_loop_convergence import _cap_exhausted_after_approve
+
+    project_id = uuid.uuid4()
+    orig = make_task(project_id=project_id, context=legacy_context)
+    source = make_task(project_id=project_id, context={})
+
+    assert _cap_exhausted_after_approve(orig, source, 702) is False
+
+
+def test_cap_after_approve_rejects_same_head_open_blocker():
+    from app.review_loop_convergence import _cap_exhausted_after_approve
+
+    project_id = uuid.uuid4()
+    head_sha = "same-head"
+    base_sha = "same-base"
+    history = [
+        {
+            "iteration": 1,
+            "verdict": "REQUEST_CHANGES",
+            "reviewed_head_sha": head_sha,
+            "reviewed_base_sha": base_sha,
+            "issues": [
+                {
+                    "severity": "MAJOR",
+                    "description": "The merge gate can still fail open",
+                    "file": "backend/app/gate.py",
+                    "line": 20,
+                }
+            ],
+        },
+        {
+            "iteration": 2,
+            "verdict": "APPROVE",
+            "reviewed_head_sha": head_sha,
+            "reviewed_base_sha": base_sha,
+            "issues": [],
+        },
+    ]
+    loop = _authoritative_approval_loop(
+        project_id,
+        703,
+        head_sha=head_sha,
+        base_sha=base_sha,
+        history=history,
+    )
+    # Exercise rebuilding from history, rather than relying on a precomputed
+    # open ledger to reject the contradictory same-head approval.
+    loop.pop("issue_ledger")
+    orig = make_task(project_id=project_id, context={"review_loop": loop})
+    source = make_task(project_id=project_id, context={})
+
+    assert _cap_exhausted_after_approve(orig, source, 703) is False
+
+
+def test_cap_after_approve_rejects_mismatched_pinned_target():
+    from app.review_loop_convergence import _cap_exhausted_after_approve
+
+    project_id = uuid.uuid4()
+    loop = _authoritative_approval_loop(project_id, 704)
+    loop["review_target"] = {**loop["review_target"], "head_sha": "newer-head"}
+    orig = make_task(project_id=project_id, context={"review_loop": loop})
+    source = make_task(project_id=project_id, context={})
+
+    assert _cap_exhausted_after_approve(orig, source, 704) is False
 
 
 # ── _pr_is_preservable_on_cap: back-merge resolver branch ────────────────────
@@ -616,12 +747,7 @@ async def test_approved_dirty_rollup_routed_to_preserve_not_close(db_session, mo
         context={
             "_is_rollup_review": True,
             "rollup_pr_number": 102,
-            # Approved — no outstanding changes requested.
-            "review_loop": {
-                "pr_number": 102,
-                "review_approved": True,
-                "review_history": [{"verdict": "APPROVE", "issues": []}],
-            },
+            "review_loop": _authoritative_approval_loop(project.id, 102),
         },
     )
     db_session.add(orig)
@@ -629,7 +755,7 @@ async def test_approved_dirty_rollup_routed_to_preserve_not_close(db_session, mo
         project_id=project.id,
         status=TaskStatus.IN_PROGRESS,
         payloads=[{"type": "fix", "pr_number": 102, "original_task_id": str(orig.id)}],
-        context={"review_loop": {"pr_number": 102, "review_approved": True}},
+        context={"review_loop": _authoritative_approval_loop(project.id, 102)},
     )
     db_session.add(source_task)
     await db_session.commit()
@@ -722,9 +848,11 @@ async def test_spawn_lock_released_before_preservability_get(
     from app.review_loop_convergence import _handle_cap_exhaustion
 
     project = await _make_db_project(db_session)
-    review_loop = {"pr_number": 140, "review_history": [{"verdict": "APPROVE", "issues": []}]}
-    if after_approve:
-        review_loop["review_approved"] = True
+    review_loop = (
+        _authoritative_approval_loop(project.id, 140)
+        if after_approve
+        else {"pr_number": 140}
+    )
     orig = make_task(
         project_id=project.id,
         status=TaskStatus.EVALUATING,

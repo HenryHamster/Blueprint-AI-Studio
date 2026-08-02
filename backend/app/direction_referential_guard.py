@@ -15,7 +15,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 CriterionLinkClassification = Literal["valid", "dangling", "inactive"]
-RetiredDirectionOutcome = Literal["landed", "success_evidence_met", "abandoned"]
+RetiredDirectionOutcome = Literal[
+    "landed",
+    "success_evidence_met",
+    "stopped",
+    "failed",
+    "exhausted",
+    "obsolete",
+    "pivoted",
+    "abandoned",
+]
 
 # Positive success-signal words. Matched as WHOLE tokens (word boundaries), not
 # raw substrings, so a literally-negating word such as "unmerged" (token !=
@@ -56,14 +65,14 @@ def classify_retired_direction_outcome(
     reason: str | None,
     *,
     prs_merged: int | None = None,
+    retirement_outcome: str | None = None,
 ) -> RetiredDirectionOutcome:
     """Classify why a retired direction is relevant to a future create.
 
-    Merged work is the strongest signal that the prior direction landed. When no
-    merge count is available, success/evidence language in the retirement reason
-    records the softer "success_evidence_met" outcome. Everything else is treated
-    as abandoned/stopped work so callers do not mistake a generic retirement for
-    delivered work.
+    An explicit stored outcome is authoritative.  Merged work may establish only
+    that some work landed; it never establishes that the direction's declared
+    success evidence was met. Legacy entries without an explicit outcome retain
+    the conservative reason/merge fallback for grounding old data.
 
     The success-language scan is NEGATION-AWARE: a success token only counts when
     no negating word ("not"/"no"/"un-"/"failed"/"unmet"/"without" ...) sits within
@@ -72,8 +81,16 @@ def classify_retired_direction_outcome(
     strategist as delivered work. Ambiguous negations bias toward "abandoned",
     the safe default (never over-report success).
     """
-    if isinstance(prs_merged, int) and prs_merged > 0:
-        return "landed"
+    explicit = str(retirement_outcome or "").strip().lower()
+    if explicit in {
+        "success_evidence_met",
+        "stopped",
+        "failed",
+        "exhausted",
+        "obsolete",
+        "pivoted",
+    }:
+        return explicit  # type: ignore[return-value]
     tokens = re.findall(r"[a-z0-9]+", (reason or "").lower())
     for i, tok in enumerate(tokens):
         if tok not in _SUCCESS_REASON_TOKENS:
@@ -82,6 +99,8 @@ def classify_retired_direction_outcome(
         if any(w in _NEGATION_TOKENS for w in window):
             continue  # negated ("not met", "un merged") — not a success signal
         return "success_evidence_met"
+    if isinstance(prs_merged, int) and prs_merged > 0:
+        return "landed"
     return "abandoned"
 
 
@@ -117,10 +136,20 @@ def build_retired_direction_grounding(
         raw_metrics.get("prs_merged", memory_entry.get("prs_merged"))
     )
     cycles = _coerce_int(raw_metrics.get("cycles", memory_entry.get("cycles")))
-    if classification not in {"landed", "success_evidence_met", "abandoned"}:
+    if classification not in {
+        "landed",
+        "success_evidence_met",
+        "stopped",
+        "failed",
+        "exhausted",
+        "obsolete",
+        "pivoted",
+        "abandoned",
+    }:
         classification = classify_retired_direction_outcome(
             str(memory_entry.get("reason") or ""),
             prs_merged=prs_merged,
+            retirement_outcome=memory_entry.get("retirement_outcome"),
         )
 
     annotation: dict[str, Any] = {

@@ -5,7 +5,6 @@ import {
   fetchAgentServingShas,
   type AgentServingShasResponse,
   type PromptFingerprintAnalyticsResponse,
-  type SrReviewerDisagreementsEnvelope,
 } from '../api';
 import { usePoller, DEFAULT_POLL_MS } from './usePoller';
 import type { MediumScopeMeasurement } from '../components/MediumScopeWidget';
@@ -28,7 +27,6 @@ export interface UseProjectMetricsResult {
   blindSpots: BlindSpotsData | null;
   srRecentMisses: SrMissedTask[] | null;
   srRecentMissesTotal: number;
-  srReviewerDisagreements: SrReviewerDisagreementsEnvelope | null;
   directionSrBreakdown: DirectionSrBreakdownData | null;
   fingerprintAnalytics: PromptFingerprintAnalyticsResponse | null;
   taskDurationStats: TaskDurationStats | null;
@@ -51,7 +49,6 @@ export function useProjectMetrics(
   const [blindSpots, setBlindSpots] = useState<BlindSpotsData | null>(null);
   const [srRecentMisses, setSrRecentMisses] = useState<SrMissedTask[] | null>(null);
   const [srRecentMissesTotal, setSrRecentMissesTotal] = useState<number>(0);
-  const [srReviewerDisagreements, setSrReviewerDisagreements] = useState<SrReviewerDisagreementsEnvelope | null>(null);
   const [directionSrBreakdown, setDirectionSrBreakdown] = useState<DirectionSrBreakdownData | null>(null);
   const [fingerprintAnalytics, setFingerprintAnalytics] = useState<PromptFingerprintAnalyticsResponse | null>(null);
   const [taskDurationStats, setTaskDurationStats] = useState<TaskDurationStats | null>(null);
@@ -76,7 +73,6 @@ export function useProjectMetrics(
     setBlindSpots(null);
     setSrRecentMisses(null);
     setSrRecentMissesTotal(0);
-    setSrReviewerDisagreements(null);
     setDirectionSrBreakdown(null);
     setFingerprintAnalytics(null);
     setTaskDurationStats(null);
@@ -126,12 +122,6 @@ export function useProjectMetrics(
           try {
             const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/sr-blind-spots`);
             if (!signal.aborted && res.ok) setBlindSpots(await res.json());
-          } catch { /* silent */ }
-        })(),
-        (async () => {
-          try {
-            const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/sr-reviewer-disagreements`);
-            if (!signal.aborted && res.ok) setSrReviewerDisagreements(await res.json());
           } catch { /* silent */ }
         })(),
         (async () => {
@@ -218,7 +208,6 @@ export function useProjectMetrics(
     blindSpots,
     srRecentMisses,
     srRecentMissesTotal,
-    srReviewerDisagreements,
     directionSrBreakdown,
     fingerprintAnalytics,
     taskDurationStats,

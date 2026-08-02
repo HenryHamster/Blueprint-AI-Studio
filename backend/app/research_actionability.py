@@ -3,7 +3,9 @@
 from datetime import datetime
 from typing import Optional
 
+from app.findings_index import finalized_research_findings_from_state
 from app.landed_signal import is_merged_completion
+from app.models import TaskStatus
 
 _MAX_ACTIONABILITY_CYCLES = 50
 
@@ -34,11 +36,13 @@ def _aggregate_actionability_extended(
     dir_research_first_at: dict[str, datetime] = {}
 
     for t in research_tasks_in_bucket:
-        raw = t.plan_output
-        if not isinstance(raw, list):
-            continue
-        for f in raw:
-            if not isinstance(f, dict) or not f.get("title"):
+        for f in finalized_research_findings_from_state(
+            t.plan_output,
+            t.context,
+            status=TaskStatus.COMPLETED,
+            task_type="research",
+        ):
+            if not f.get("title"):
                 continue
             grade = f.get("actionability_grade", "MEDIUM")
             if grade not in grade_counts:

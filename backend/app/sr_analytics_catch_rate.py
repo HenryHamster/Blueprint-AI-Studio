@@ -6,7 +6,7 @@ these names for older imports.
 """
 
 import uuid
-from typing import Any, Literal, Optional
+from typing import Any, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -28,53 +28,13 @@ from app.sr_blind_spots import (
 )
 
 
-def _partition_edges_by_origin(edges: list) -> "tuple[list, list]":
-    """Split edges_considered into (author, reviewer) entries.
-
-    Entries without an explicit ``origin`` field count as author entries.
-    Non-dict entries are dropped.
-    """
-    author: list = []
-    reviewer: list = []
-    for e in edges:
-        if not isinstance(e, dict):
-            continue
-        if e.get("origin") == "reviewer":
-            reviewer.append(e)
-        else:
-            author.append(e)
-    return author, reviewer
-
-
-def _reviewer_caught_author_miss(author_entries: list, reviewer_entries: list) -> bool:
-    """Whether the reviewer caught a case the author missed in this task.
-
-    A catch is either a reviewer entry whose ``case`` (lowercased + trimmed)
-    is absent from the author entries, OR a reviewer entry that flags
-    ``handled: false`` for a case the author had marked ``handled: true``.
-    Entries with missing/non-string ``case`` are skipped.
-    """
-
-    def _norm(c: Any) -> Optional[str]:
-        return c.strip().lower() if isinstance(c, str) and c.strip() else None
-
-    author_handled: dict[str, bool] = {}
-    for e in author_entries:
-        c = _norm(e.get("case"))
-        if c is None:
-            continue
-        h = bool(e.get("handled", True))
-        author_handled[c] = author_handled.get(c, False) or h
-
-    for e in reviewer_entries:
-        c = _norm(e.get("case"))
-        if c is None:
-            continue
-        if c not in author_handled:
-            return True
-        if author_handled[c] and not bool(e.get("handled", True)):
-            return True
-    return False
+def _author_edges(edges: list) -> list[dict[str, Any]]:
+    """Return author evidence while ignoring retired auxiliary-review entries."""
+    return [
+        entry
+        for entry in edges
+        if isinstance(entry, dict) and entry.get("origin") != "reviewer"
+    ]
 
 
 def _compute_edges_stats(tasks: list) -> Optional[dict[str, Any]]:
@@ -111,30 +71,18 @@ def _compute_edges_stats(tasks: list) -> Optional[dict[str, Any]]:
     with_all_handled: list = []
     total_edges = 0
     unhandled_flagged = 0
-    total_author_edges = 0
-    total_reviewer_edges = 0
-    n_with_author = 0
-    n_with_reviewer = 0
-    reviewer_caught = 0
     for t in code_tasks:
         edges = (t.context or {}).get("_self_review_outcome", {}).get(
             "edges_considered"
         ) or []
         if not isinstance(edges, list):
             edges = []
-        author_e, reviewer_e = _partition_edges_by_origin(edges)
-        total_author_edges += len(author_e)
-        total_reviewer_edges += len(reviewer_e)
-        if author_e:
-            n_with_author += 1
-            if any(not e.get("handled", True) for e in author_e):
+        edges = _author_edges(edges)
+        if edges:
+            if any(not e.get("handled", True) for e in edges):
                 with_unhandled_flag.append(t)
             else:
                 with_all_handled.append(t)
-        if reviewer_e:
-            n_with_reviewer += 1
-            if _reviewer_caught_author_miss(author_e, reviewer_e):
-                reviewer_caught += 1
         if edges:
             with_edges.append(t)
             total_edges += len(edges)
@@ -176,18 +124,6 @@ def _compute_edges_stats(tasks: list) -> Optional[dict[str, Any]]:
         "correctness_rejection_rate_with_all_handled": _rejection_rate(
             with_all_handled
         ),
-        "author_avg_edges_per_task": round(total_author_edges / n_with_author, 2)
-        if n_with_author
-        else None,
-        "reviewer_avg_edges_per_task": round(total_reviewer_edges / n_with_reviewer, 2)
-        if n_with_reviewer
-        else None,
-        "tasks_with_reviewer_edges_count": n_with_reviewer,
-        "tasks_with_reviewer_edges_rate": round(n_with_reviewer / n_total, 3),
-        "reviewer_caught_count": reviewer_caught,
-        "reviewer_caught_rate": round(reviewer_caught / n_with_reviewer, 3)
-        if n_with_reviewer
-        else None,
     }
 
 
@@ -230,14 +166,6 @@ def _stats_for_tasks(
     """
     _sw = {"CRITICAL": 3, "MAJOR": 2, "MINOR": 1}
 
-    def _origin_bucket(
-        entry: dict[str, Any] | None,
-    ) -> Literal["sr_alone", "reviewer_save"]:
-        origin = entry.get("origin") if isinstance(entry, dict) else None
-        if isinstance(origin, str) and origin in _REVIEWER_ORIGINS:
-            return "reviewer_save"
-        return "sr_alone"
-
     count = 0
     cat_stats: dict[str, dict] = {}
     type_cat_stats: dict[str, dict[str, dict]] = {}
@@ -256,17 +184,12 @@ def _stats_for_tasks(
         if is_skipped_sr_outcome(sro):
             continue
         check_results = safe_check_results(sro)
-        # Combined view (author SR + reviewer save) — feeds hit/origin-split
-        # counters below where _origin_bucket separates `sr_alone` vs
-        # `reviewer_save`, so reviewer-stamped entries must remain present.
-        sr_failed = {c for c, r in check_results.items() if not r.get("passed", True)}
-        # Author-only view — used for FP/sr_failed_count attribution. A
-        # reviewer-stamped failure does not represent something the author SR
-        # caught, so it must not inflate the precision/false-positive metrics.
-        sr_failed_author = {
+        # Only author self-review signals count. Retired auxiliary-origin rows
+        # remain readable but cannot inflate current catch-rate analytics.
+        sr_failed = {
             c
-            for c in sr_failed
-            if (check_results.get(c) or {}).get("origin") not in _REVIEWER_ORIGINS
+            for c, r in check_results.items()
+            if not r.get("passed", True) and r.get("origin") not in _REVIEWER_ORIGINS
         }
         rev_hist = (ctx.get("review_loop") or {}).get("review_history") or []
         cat_weights: dict[str, int] = {}
@@ -294,12 +217,10 @@ def _stats_for_tasks(
         # reviewer-stamped overrides are not falsely attributed to the author
         # SR's precision.
         all_reviewer_flagged = set(rev_cats.keys()) | reviewer_confirmed_cats
-        for cat in sr_failed_author:
+        for cat in sr_failed:
             if cat not in cat_stats:
                 cat_stats[cat] = {
                     "hit_count": 0,
-                    "sr_alone_hit_count": 0,
-                    "reviewer_save_hit_count": 0,
                     "human_count": 0,
                     "w_hit": 0.0,
                     "w_total": 0.0,
@@ -332,8 +253,6 @@ def _stats_for_tasks(
             if cat not in cat_stats:
                 cat_stats[cat] = {
                     "hit_count": 0,
-                    "sr_alone_hit_count": 0,
-                    "reviewer_save_hit_count": 0,
                     "human_count": 0,
                     "w_hit": 0.0,
                     "w_total": 0.0,
@@ -347,11 +266,6 @@ def _stats_for_tasks(
             if cat in sr_failed:
                 cat_stats[cat]["hit_count"] += 1
                 cat_stats[cat]["w_hit"] += w
-                bucket = _origin_bucket(check_results.get(cat))
-                if bucket == "sr_alone":
-                    cat_stats[cat]["sr_alone_hit_count"] += 1
-                else:
-                    cat_stats[cat]["reviewer_save_hit_count"] += 1
             else:
                 for issue in rev_cats.get(cat, []):
                     cat_stats[cat]["miss_examples"].append(
@@ -363,19 +277,12 @@ def _stats_for_tasks(
                 if cat not in type_cat_stats[task_type]:
                     type_cat_stats[task_type][cat] = {
                         "hit_count": 0,
-                        "sr_alone_hit_count": 0,
-                        "reviewer_save_hit_count": 0,
                         "human_count": 0,
                         "miss_examples": [],
                     }
                 type_cat_stats[task_type][cat]["human_count"] += 1
                 if cat in sr_failed:
                     type_cat_stats[task_type][cat]["hit_count"] += 1
-                    bucket = _origin_bucket(check_results.get(cat))
-                    if bucket == "sr_alone":
-                        type_cat_stats[task_type][cat]["sr_alone_hit_count"] += 1
-                    else:
-                        type_cat_stats[task_type][cat]["reviewer_save_hit_count"] += 1
                 else:
                     for issue in rev_cats.get(cat, []):
                         type_cat_stats[task_type][cat]["miss_examples"].append(
@@ -387,19 +294,12 @@ def _stats_for_tasks(
                 if cat not in scope_cat_stats[task_scope]:
                     scope_cat_stats[task_scope][cat] = {
                         "hit_count": 0,
-                        "sr_alone_hit_count": 0,
-                        "reviewer_save_hit_count": 0,
                         "human_count": 0,
                         "miss_examples": [],
                     }
                 scope_cat_stats[task_scope][cat]["human_count"] += 1
                 if cat in sr_failed:
                     scope_cat_stats[task_scope][cat]["hit_count"] += 1
-                    bucket = _origin_bucket(check_results.get(cat))
-                    if bucket == "sr_alone":
-                        scope_cat_stats[task_scope][cat]["sr_alone_hit_count"] += 1
-                    else:
-                        scope_cat_stats[task_scope][cat]["reviewer_save_hit_count"] += 1
                 else:
                     for issue in rev_cats.get(cat, []):
                         scope_cat_stats[task_scope][cat]["miss_examples"].append(

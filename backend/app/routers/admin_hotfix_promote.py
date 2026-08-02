@@ -47,7 +47,7 @@ async def trigger_hotfix_promote(
 
     OWNER-only.  ``reason`` is mandatory (it is the audit justification) and
     ``ack_inert_until_deploy`` must be true.  Maps: scope_rejected → 400 (with the
-    offending files), no_open_version → 404, promotion_in_flight → 409.
+    offending files), no_open_version → 404, promotion_check_wait → 409.
     """
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "owner"
@@ -91,9 +91,9 @@ async def trigger_hotfix_promote(
             status_code=404,
             detail="No open release version found for this project.",
         )
-    if status == "promotion_in_flight":
+    if status == "promotion_check_wait":
         detail = (
-            "a promotion PR is open and auto-merging — wait for it to land or "
+            "a managed promotion is pending — wait for it to land or "
             "cancel it before hotfix-promoting"
         )
         pr_number = result.get("promotion_pr_number")

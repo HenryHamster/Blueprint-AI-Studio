@@ -55,6 +55,14 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     "review_feedback": STRATEGIST_INTERNAL,
     "feedback_acknowledgment": STRATEGIST_INTERNAL,
     "discovery.review_completed": STRATEGIST_INTERNAL,
+    "discovery.review_blocked": STRATEGIST_INTERNAL,
+    # Exact release-barrier receipts are private Resident input. They advance
+    # planning only after qualification/deployment has actually resolved and
+    # must not create duplicate operator notifications.
+    "release.qualification_resolved": STRATEGIST_INTERNAL,
+    "release.serving_confirmation_timed_out": STRATEGIST_INTERNAL,
+    "release.serving_confirmed": STRATEGIST_INTERNAL,
+    "release.serving_failed": STRATEGIST_INTERNAL,
     # Two-speed Resident handoff packets are private coordination between the
     # Fast Resident and Workday; they must never appear in the operator thread.
     "workday_consultation": STRATEGIST_INTERNAL,
@@ -67,7 +75,6 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     "direction_burn_pause": OPERATOR_ACTION_NEEDED,
     "direction_outcome_scaffolding_escalation": OPERATOR_ACTION_NEEDED,
     "direction_churn_pause": OPERATOR_ACTION_NEEDED,
-    "discovery.review_blocked": OPERATOR_ACTION_NEEDED,
     "discovery.operator_question": OPERATOR_ACTION_NEEDED,
     # High-signal → operator-fyi
     "artifact_handoff_failed": OPERATOR_ACTION_NEEDED,
@@ -81,7 +88,6 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     "direction_outcome_stalled": OPERATOR_FYI,
     "direction_staged_activated": OPERATOR_FYI,
     "promotion_readiness_reached": OPERATOR_FYI,
-    "release_auto_merge_stalled": OPERATOR_FYI,
     "strategic_steering_deferred": OPERATOR_FYI,
     "strategic_steering_acted": OPERATOR_FYI,
     # Trial progress/verdicts are platform control-loop bookkeeping, not
@@ -191,7 +197,6 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     "release.build_stalled": OPERATOR_FYI,
     "release.stabilize_stalled": OPERATOR_FYI,
     "release.promotion_deploy_failed": OPERATOR_ACTION_NEEDED,
-    "release.promotion_auto_merge_stalled": OPERATOR_ACTION_NEEDED,
     "release.managed_check_wait_stalled": OPERATOR_FYI,
     "release.qualification_timeout": OPERATOR_ACTION_NEEDED,
     "release.qualification_crash_loop": OPERATOR_ACTION_NEEDED,
@@ -206,6 +211,7 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     # Research directions
     "research.stale_staged_direction": STRATEGIST_INTERNAL,
     "research.direction_auto_completed": STRATEGIST_INTERNAL,
+    "research.direction_auto_retired": STRATEGIST_INTERNAL,
     "research.churn_retirement_recommended": STRATEGIST_INTERNAL,
     "research.anomaly_auto_adjusted": STRATEGIST_INTERNAL,
     "research.escalation_delivery_failed": OPERATOR_ACTION_NEEDED,

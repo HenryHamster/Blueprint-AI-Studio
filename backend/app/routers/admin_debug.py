@@ -50,6 +50,10 @@ from app.task_evaluators import (
     spawn_forward_quality_grader,
 )
 from app.finding_deduplication import finding_hash as _finding_hash
+from app.findings_index import (
+    FINALIZED_RESEARCH_FINDINGS_KEY,
+    finalized_research_findings_from_state,
+)
 
 # ---------------------------------------------------------------------------
 # Canary spawn-gate probe
@@ -1764,7 +1768,7 @@ async def get_recent_findings(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    """Return recent research findings with actionability grades and grade distribution."""
+    """Return finalized research findings and their actionability distribution."""
     await _get_user_project(project_id, current_user["user_id"], session)
     cutoff = _utcnow() - timedelta(days=7)
     result = await session.execute(
@@ -1775,6 +1779,7 @@ async def get_recent_findings(
             Task.status == TaskStatus.COMPLETED,
             Task.created_at >= cutoff,
             Task.plan_output.isnot(None),
+            Task.context[FINALIZED_RESEARCH_FINDINGS_KEY].as_boolean().is_(True),
             Task.payloads[0]["type"].as_string() == "research",
         )
         .order_by(Task.created_at.desc())
@@ -1785,11 +1790,14 @@ async def get_recent_findings(
     findings_out: list[dict] = []
     grade_counts: dict[str, int] = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
     for t in tasks:
-        raw = t.plan_output
-        if not isinstance(raw, list):
-            continue
-        for f in raw:
-            if not isinstance(f, dict) or not f.get("title"):
+        findings = finalized_research_findings_from_state(
+            t.plan_output,
+            t.context,
+            status=TaskStatus.COMPLETED,
+            task_type="research",
+        )
+        for f in findings:
+            if not f.get("title"):
                 continue
             grade = f.get("actionability_grade", "MEDIUM")
             if grade not in grade_counts:

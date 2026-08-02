@@ -11,7 +11,6 @@ import json
 import logging
 import re
 import uuid
-from datetime import timedelta
 from typing import Any, List, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -207,7 +206,6 @@ STRATEGIC_AGENT_OPS: frozenset[str] = frozenset({
     "create_message",
     "resolve_message",
     "spawn_task",
-    "spawn_fix",
     "cancel_task",
     "watch_task",
     "ack_watch",
@@ -223,7 +221,6 @@ STRATEGIC_AGENT_OPS: frozenset[str] = frozenset({
     "dismiss_knowledge",
     "request_qualification",
 })
-
 
 def _cap_str(
     value: Any, max_len: int, field_name: str, warnings: List[str] | None = None
@@ -1168,7 +1165,6 @@ async def strategic_operation(
             status_code=403,
             detail="Only strategic agents can modify directions/vision",
         )
-
     task = await session.get(Task, payload.task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -3996,10 +3992,12 @@ async def strategic_operation(
             }
         )
 
-    elif payload.op == "spawn_task" or payload.op == "spawn_fix":
-        # One capability-driven task dispatch contract. spawn_fix is accepted for
-        # one compatibility release but routes through this exact path.
-        legacy_spawn_fix = payload.op == "spawn_fix"
+    elif payload.op == "spawn_task":
+        if project.paused:
+            raise HTTPException(
+                status_code=409,
+                detail="project is paused; strategic spawning is disabled",
+            )
         spawn_type = data.get("type")
         allowed_spawn_types = (
             STRATEGIST_SPAWNABLE_TASK_TYPES | STRATEGIST_CONTEXTUAL_TASK_TYPES
@@ -4026,12 +4024,47 @@ async def strategic_operation(
         prompt = _cap_str(raw_prompt, 10_000, "prompt", warnings)
         title = _cap_str(raw_title, 200, "title", warnings)
         direction_id = data.get("direction_id")
-        if direction_id and not any(
-            d.get("id") == direction_id for d in (project.directions or [])
-        ):
+        direction_entry = next(
+            (
+                direction
+                for direction in (project.directions or [])
+                if direction.get("id") == direction_id
+            ),
+            None,
+        )
+        if direction_id and direction_entry is None:
             raise HTTPException(
                 status_code=400, detail=f"Unknown direction_id: {direction_id}"
             )
+        direct_discovery_cycle_id: uuid.UUID | None = None
+        if spawn_type in {"research", "web_research"} and direction_entry is not None:
+            from app.discovery_admission import (
+                DiscoveryCycleUnavailable,
+                ensure_discovery_cycle_for_research,
+            )
+
+            try:
+                direct_cycle = await ensure_discovery_cycle_for_research(
+                    session,
+                    project=project,
+                    direction_key=str(direction_id),
+                    direction=direction_entry,
+                    runtime_config=_runtime_config,
+                    join_open_cycle=True,
+                )
+            except DiscoveryCycleUnavailable as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            assert direct_cycle is not None
+            direct_discovery_cycle_id = direct_cycle.id
+        # Direct Strategic work participates in the same weighted scheduler as
+        # ordinary autonomous work.  A hardcoded 100 made every Resident root
+        # jump ahead of unrelated projects/tasks; inherit the direction's real
+        # high/medium/low intent instead, with normal medium priority for
+        # direction-free bounded work.
+        spawn_priority = {"high": 100, "medium": 50, "low": 0}.get(
+            str((direction_entry or {}).get("priority") or "medium").lower(),
+            50,
+        )
 
         # Optional explicit criterion_ids — validated against active keys at
         # task-creation time (same as direction-row inheritance below). Allows
@@ -4247,6 +4280,12 @@ async def strategic_operation(
                 ),
             )
 
+        if "watch" in data and not isinstance(data.get("watch"), bool):
+            raise HTTPException(status_code=400, detail="watch must be a boolean")
+        default_watch = not (
+            spawn_type in {"research", "web_research"}
+            and direct_discovery_cycle_id is not None
+        )
         normalized_specification = {
             "debt_id": str(data.get("debt_id")) if data.get("debt_id") else None,
             "task": {
@@ -4254,10 +4293,10 @@ async def strategic_operation(
                 "description": prompt[:500],
                 "payloads": [spawn_payload],
                 "context": new_task_ctx,
-                "priority": 100,
+                "priority": spawn_priority,
                 "criterion_ids": _task_criterion_ids,
                 "requires_approval": spawn_requires_approval,
-                "watch": data.get("watch", True) is not False,
+                "watch": data.get("watch", default_watch),
                 "watch_purpose": str(data.get("watch_purpose") or "")[:1000],
             }
         }
@@ -4270,14 +4309,12 @@ async def strategic_operation(
                 specification=normalized_specification,
                 idempotency_key=data.get("idempotency_key"),
                 direction_id=str(direction_id) if direction_id else None,
+                discovery_cycle_id=direct_discovery_cycle_id,
                 burst_cap=int(
                     _runtime_config.get("strategist_spawn_window_cap", 100)
                 ),
                 burst_window_minutes=int(
                     _runtime_config.get("strategist_spawn_window_minutes", 60)
-                ),
-                discovery_admission_mode=str(
-                    _runtime_config.get("discovery_admission_mode", "shadow")
                 ),
             )
         except ValueError as exc:
@@ -4297,18 +4334,14 @@ async def strategic_operation(
                             if submission.request.not_before
                             else None
                         ),
-                        **(
-                            {"deprecated_alias": "spawn_fix"}
-                            if legacy_spawn_fix
-                            else {}
-                        ),
                     }
                 ),
                 status_code=202,
             )
         logger.info(
             f"[STRATEGIC API] Accepted {spawn_type} task {new_task.id} "
-            f"(priority=100) from strategic review {task.id} for project {project.id}"
+            f"(priority={spawn_priority}) from strategic review {task.id} "
+            f"for project {project.id}"
         )
         return _resp(
             {
@@ -4317,13 +4350,8 @@ async def strategic_operation(
                 "request_id": str(submission.request.id),
                 "task_id": str(new_task.id),
                 "type": spawn_type,
-                "priority": 100,
+                "priority": spawn_priority,
                 "deduplicated": submission.replayed,
-                **(
-                    {"deprecated_alias": "spawn_fix"}
-                    if legacy_spawn_fix
-                    else {}
-                ),
                 **(
                     {"linked_debt_id": submission.linked_debt_id}
                     if submission.linked_debt_id
@@ -4387,7 +4415,12 @@ async def strategic_operation(
         version_phase_decision = extract_version_phase_decision(
             pm_data.pop("version_phase_decision", None)
         )
-        qualify_request = extract_qualify_request(pm_data.pop("qualify_request", None))
+        try:
+            qualify_request = extract_qualify_request(
+                pm_data.pop("qualify_request", None)
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         new_version_goal = extract_new_version_goal(
             pm_data.pop("new_version_goal", None)
         )
@@ -6465,9 +6498,11 @@ async def strategic_operation(
         # (or operator) can request a fresh qualification run without having to
         # construct a set_problem_model payload.
         #
-        # Data shape: {"reason": "<string>"}. reason is optional — an absent or
-        # empty reason is treated as "". Wrong-phase is a no-op (same behavior as
-        # qualify_request via set_problem_model). The qualification runs
+        # Data shape: {"reason": "<string>", "probes": ["walkthrough_e2e"]}.
+        # Both fields are optional. Probes are explicit because they consume an
+        # additional runner checkout; ordinary qualification judges evidence
+        # already earned by task acceptance, review, and CI. Wrong-phase is a
+        # no-op (same behavior as qualify_request via set_problem_model). The qualification runs
         # post-commit on its own fresh session for the same structural reason as
         # the set_problem_model path: avoid holding any DB lock during slow GitHub
         # I/O (CI-compliance scan + run_qualification).
@@ -6476,9 +6511,12 @@ async def strategic_operation(
             extract_qualify_request,
         )
 
-        qualify_request = extract_qualify_request(
-            data if isinstance(data, dict) else {}
-        )
+        try:
+            qualify_request = extract_qualify_request(
+                data if isinstance(data, dict) else {}
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         ctx = task.context or {}
         task.context = {**ctx, "_strategic_api_called": True}
         flag_modified(task, "context")
@@ -6494,16 +6532,18 @@ async def strategic_operation(
         )
         logger.info(
             "[STRATEGIC API] request_qualification applied for task %s project %s "
-            "(reason=%r) — release qualifier ran if open version is in stabilize",
+            "(reason=%r probes=%s) — release qualifier ran if open version is in stabilize",
             _rq_task_id,
             _rq_project_id,
             (qualify_request or {}).get("reason"),
+            (qualify_request or {}).get("probes") or [],
         )
         return _resp(
             {
                 "status": "ok",
                 "op": "request_qualification",
                 "reason_received": (qualify_request or {}).get("reason") or None,
+                "probes_received": (qualify_request or {}).get("probes") or [],
             }
         )
 

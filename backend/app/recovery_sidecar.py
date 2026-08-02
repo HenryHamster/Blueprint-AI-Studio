@@ -39,7 +39,7 @@ async def _clear_stranded_pending_marker(
 
     Called after ``trigger_stranded_sidecar_resolution`` returns *without
     raising*. When the resolver terminally concludes "nothing left to apply" —
-    the second-opinion challenge was already resolved / this is a replayed
+    the side-car verdict was already resolved / this is a replayed
     terminal status, or the resolver's own view of the source (derived from the
     sidecar's SOURCE_KEY) diverged from the sweep-selected one — it returns
     normally but does NOT clear the durable
@@ -111,8 +111,8 @@ async def _clear_stranded_pending_marker(
 async def _sweep_stranded_sidecar_sources() -> None:
     """Unstrand EVALUATING source tasks whose side-car challenger died silently.
 
-    Side-car challengers (quality grader, safeguard challenge, finding challenge,
-    review second-opinion) normally resolve their source task by POSTing terminal
+    Side-car challengers (quality graders and finding challenges) normally
+    resolve their source task by POSTing terminal
     status to the agent status-update route.  A side-car that never posts — reaper
     kill, VM death after retries exhausted, cancellation — leaves the source
     parked EVALUATING indefinitely.

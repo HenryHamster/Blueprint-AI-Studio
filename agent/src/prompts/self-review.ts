@@ -3,8 +3,6 @@
 // re-read. When self-review was flagged incomplete_review (diff truncated and
 // the retry still reported zero files read), the reviewer needs to scrutinize
 // unverified files — the self-review's PASS verdict did not examine them.
-// Also surfaces reviewer_findings written by the fresh-reviewer pass when
-// project_metadata.enable_fresh_reviewer is enabled (see standard.ts).
 // Returns '' when no self-review outcome is present or nothing is worth
 // surfacing.
 export function formatSelfReviewBlindSpots(
@@ -18,15 +16,6 @@ export function formatSelfReviewBlindSpots(
   const truncatedFilesRead = Array.isArray(selfReviewOutcome.truncated_files_read)
     ? (selfReviewOutcome.truncated_files_read as unknown[]).filter((f): f is string => typeof f === 'string')
     : [];
-  type FindingRaw = Record<string, unknown>;
-  const reviewerFindings = Array.isArray(selfReviewOutcome.reviewer_findings)
-    ? (selfReviewOutcome.reviewer_findings as unknown[]).filter(
-        (f): f is FindingRaw =>
-          typeof f === 'object' && f !== null &&
-          typeof (f as FindingRaw).category === 'string' &&
-          typeof (f as FindingRaw).description === 'string',
-      )
-    : [];
   const blindSpots = Array.isArray(selfReviewOutcome.blind_spots)
     ? (selfReviewOutcome.blind_spots as unknown[]).filter((s): s is string => typeof s === 'string' && s.length > 0)
     : [];
@@ -38,7 +27,7 @@ export function formatSelfReviewBlindSpots(
       )
     : [];
   const incomplete = categories.includes('incomplete_review');
-  if (!incomplete && truncatedFilesRead.length === 0 && reviewerFindings.length === 0 && blindSpots.length === 0 && edgesConsidered.length === 0) return '';
+  if (!incomplete && truncatedFilesRead.length === 0 && blindSpots.length === 0 && edgesConsidered.length === 0) return '';
 
   const verifiedSet = new Set(truncatedFilesRead);
   const unverified = changedFilePaths.filter(p => p && !verifiedSet.has(p));
@@ -54,18 +43,6 @@ export function formatSelfReviewBlindSpots(
   }
   if (unverified.length > 0) {
     lines.push(`- Files NOT verified by self-review (prioritize careful review of these):\n${unverified.map(f => `  - ${f}`).join('\n')}`);
-  }
-  if (reviewerFindings.length > 0) {
-    const sevOrder = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW'];
-    const sorted = [...reviewerFindings].sort((a, b) => {
-      const ai = sevOrder.indexOf(String(a.severity));
-      const bi = sevOrder.indexOf(String(b.severity));
-      return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
-    });
-    lines.push(
-      `- Fresh-reviewer findings (a second read-only session flagged these before ./done — verify each was addressed or is a false positive):\n` +
-      sorted.map(f => `  - [${String(f.severity)}] ${String(f.category)}: ${String(f.description)}`).join('\n'),
-    );
   }
   if (edgesConsidered.length > 0) {
     const unhandled = edgesConsidered.filter(e => e.handled === false);
@@ -206,25 +183,6 @@ export function formatSrRecentMissExamplesForSrPrompt(
   );
 }
 
-// Format a persistent blind-spot tightening hint for injection into the agent's
-// self-review prompt. Consumed when a category's reviewer-disagreement rate
-// exceeds the threshold for ≥2 consecutive aggregation windows (computed by
-// sr_blind_spots.compute_persistent_sr_blind_spot_hint in the backend).
-// Returns '' when no persistent categories are present or hint is absent.
-export function formatPersistentBlindSpotHintForSrPrompt(
-  data: {
-    categories: Array<{ category: string; task_type: string; rate: number }>;
-    hint: string | null;
-  } | null | undefined,
-): string {
-  if (!data || !Array.isArray(data.categories) || data.categories.length === 0) return '';
-  if (!data.hint) return '';
-  return (
-    `## Persistent Self-Review Blind Spots\n` +
-    `${data.hint}\n\n`
-  );
-}
-
 // Format a pre-execution loosen-hint for categories with a reliably high false-positive
 // rate. When fp_rate >= 0.5 and sample_size >= 10, the agent has chronically over-flagged
 // that category — instruct it to require concrete evidence before flagging there.
@@ -351,52 +309,6 @@ export function formatSrCoFailurePairsForSrPrompt(
     `## Co-failure pairs — re-check before marking PASS\n` +
     `These categories frequently miss together. After you finish one, revisit its partner:\n` +
     `${rows}\n\n`
-  );
-}
-
-// Format failure-mode hints for injection into the agent's self-review prompt.
-// Surfaces the dominant miss origin for regressing categories so the agent
-// knows what kind of fix is needed: re-reading files (reading_gap), improving
-// judgment on an examined category (judgment_gap), or ensuring all categories
-// are scored (coverage_gap). Returns '' when no regressing categories have
-// breakdown data. Only called for code-change task types.
-export function formatFailureModeHintForSrPrompt(
-  categories: Record<string, {
-    miss_rate?: number | null;
-    below_floor?: boolean;
-    trend?: string;
-    miss_mode_breakdown?: {
-      reading_gap?: number;
-      judgment_gap?: number;
-      coverage_gap?: number;
-      dominant_mode?: string | null;
-    } | null;
-  }> | null | undefined,
-): string {
-  if (!categories || typeof categories !== 'object') return '';
-
-  const MODE_LABELS: Record<string, string> = {
-    reading_gap: 're-read all changed files before scoring (past misses were due to incomplete file coverage)',
-    judgment_gap: 'apply calibration and evidence-anchor work — reviewer disagreed after you examined the category',
-    coverage_gap: 'ensure you score this category — past misses had no SR entry for it at all',
-  };
-
-  const rows: string[] = [];
-  for (const [cat, data] of Object.entries(categories)) {
-    const isRegressing = data.below_floor === true || data.trend === 'decreasing';
-    if (!isRegressing) continue;
-    const breakdown = data.miss_mode_breakdown;
-    if (!breakdown || !breakdown.dominant_mode) continue;
-    const label = MODE_LABELS[breakdown.dominant_mode];
-    if (!label) continue;
-    rows.push(`- **${cat}** (dominant miss mode: ${breakdown.dominant_mode}): ${label}`);
-  }
-  if (rows.length === 0) return '';
-
-  return (
-    `## Failure-mode hints for regressing categories\n` +
-    `These categories are below the catch-rate floor or declining. The dominant reviewer-rescue pattern tells you what to fix:\n` +
-    rows.join('\n') + `\n\n`
   );
 }
 

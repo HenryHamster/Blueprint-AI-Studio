@@ -3240,7 +3240,7 @@ async def test_post_commit_sweep_bump_failure_does_not_poison_batch(svc_db, mock
     # the post-failure attempts-bump path runs for it.
     call_log: list[str] = []
 
-    async def fake_process(task_id, _payload):
+    async def fake_process(task_id, _payload, **_kwargs):
         call_log.append(str(task_id))
         raise RuntimeError("simulated _process_post_commit retry exhaustion")
 
@@ -3344,7 +3344,7 @@ async def test_post_commit_sweep_abandons_lock_starved_marker_by_age(svc_db, moc
     # The age backstop must short-circuit BEFORE the heavy retry runs.
     called: list[str] = []
 
-    async def fake_process(task_id, _payload):
+    async def fake_process(task_id, _payload, **_kwargs):
         called.append(str(task_id))
         raise RuntimeError("retry must not run for an age-terminalized marker")
 
@@ -3436,7 +3436,7 @@ async def test_post_commit_sweep_defers_cleanly_when_row_held(svc_db, mocker):
 
     process_calls: list[str] = []
 
-    async def fake_process(task_id, _payload):
+    async def fake_process(task_id, _payload, **_kwargs):
         process_calls.append(str(task_id))
 
     mocker.patch(
@@ -3449,10 +3449,21 @@ async def test_post_commit_sweep_defers_cleanly_when_row_held(svc_db, mocker):
     )
 
     # Return None for stuck task (row held), let other task claim normally.
-    async def fake_claim(task_id, pending_meta):
+    async def fake_claim(
+        task_id,
+        pending_meta,
+        *,
+        expected_status,
+        expected_generation_token=None,
+    ):
         if str(task_id) == str(stuck_id):
             return None  # simulate row held by peer
-        return await _real_claim(task_id, pending_meta)
+        return await _real_claim(
+            task_id,
+            pending_meta,
+            expected_status=expected_status,
+            expected_generation_token=expected_generation_token,
+        )
 
     mocker.patch(
         "app.recovery_post_commit_pending._claim_and_bump_total_attempts",
@@ -3508,7 +3519,7 @@ async def test_post_commit_sweep_claim_bumps_total_attempts_before_process(
     # Track the DB value of total_attempts at the moment _process_post_commit is called.
     ta_at_process_time: list[int] = []
 
-    async def probe_process(tid, _payload):
+    async def probe_process(tid, _payload, **_kwargs):
         # Read the live DB value under a fresh session to see what was committed.
         from app.services import AsyncSessionLocal
         from app.models import Task as _Task
@@ -3568,7 +3579,7 @@ async def test_post_commit_sweep_ceiling_fires_via_claim_bump_no_process(
 
     process_calls: list[str] = []
 
-    async def fake_process(tid, _payload):
+    async def fake_process(tid, _payload, **_kwargs):
         process_calls.append(str(tid))
 
     mocker.patch(
@@ -3646,7 +3657,7 @@ async def test_post_commit_sweep_transient_failure_does_not_bump_attempts(
     svc_db.add(task)
     await svc_db.commit()
 
-    async def transient_fail(task_id, _payload):
+    async def transient_fail(task_id, _payload, **_kwargs):
         # Mirrors a GitHub secondary-rate-limit surfacing from a post-commit
         # GitHub call (review-spawn / rollup gate).
         raise RuntimeError("You have exceeded a secondary rate limit (429)")
@@ -3689,7 +3700,7 @@ async def test_post_commit_sweep_postcommitlocked_does_not_bump_attempts(
     svc_db.add(task)
     await svc_db.commit()
 
-    async def locked(task_id, _payload):
+    async def locked(task_id, _payload, **_kwargs):
         raise PostCommitLocked(f"task {task_id} row held by peer after 3 retries")
 
     mocker.patch("app.routers.agent_status._process_post_commit", side_effect=locked)
@@ -3719,7 +3730,7 @@ async def test_post_commit_sweep_persistent_failure_still_bumps_attempts(
     svc_db.add(task)
     await svc_db.commit()
 
-    async def persistent_fail(task_id, _payload):
+    async def persistent_fail(task_id, _payload, **_kwargs):
         raise ValueError("malformed completion payload — handler keeps crashing")
 
     mocker.patch(
@@ -3783,7 +3794,7 @@ async def test_post_commit_sweep_transient_failure_advances_total_attempts(
     svc_db.add(task)
     await svc_db.commit()
 
-    async def transient_fail(task_id, _payload):
+    async def transient_fail(task_id, _payload, **_kwargs):
         raise RuntimeError("You have exceeded a secondary rate limit (429)")
 
     mocker.patch(

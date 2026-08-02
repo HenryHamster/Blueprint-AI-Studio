@@ -92,7 +92,6 @@ _MIN_SR_SAMPLE = 5
 _MIN_SR_FINDINGS = 5
 # Minimum total reviewer findings (across tasks in a window) required to emit
 # a hallucination-rate value; prevents noisy rates on tiny windows.
-_HALLUCINATION_RATE_MIN_FINDINGS = 10
 _MIN_DIRECTION_SR_SAMPLE = 3
 
 # Example-collection caps for miss-example surfacing in the agent prompt.
@@ -229,12 +228,7 @@ def _compute_cat_fp_stats(
         if not sr_failed:
             continue
         reviewer_confirmed_cats = reviewer_confirmed_categories(ctx)
-        reviewer_cats = {
-            finding.get("category")
-            for finding in (sro.get("reviewer_findings") or [])
-            if isinstance(finding, dict) and finding.get("category")
-        }
-        confirmed = reviewer_confirmed_cats | reviewer_cats
+        confirmed = reviewer_confirmed_cats
         task_scope = ctx.get("scope", DEFAULT_TASK_SCOPE)
         for category in sr_failed:
             bucket = cat_fp.setdefault(category, {"fp": 0, "tp": 0})
