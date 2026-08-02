@@ -205,6 +205,7 @@ resource "google_service_networking_connection" "restore_verifier" {
 
   depends_on = [
     google_project_service.restore_verifier_prerequisite,
+    google_project_iam_member.recovery_service_networking_service_agent,
     terraform_data.restore_verifier_prerequisite_configuration,
   ]
 

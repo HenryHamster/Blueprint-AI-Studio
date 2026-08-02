@@ -24,6 +24,7 @@ _PROJECT_NUMBER_RE = re.compile(r"^[1-9][0-9]{5,20}$")
 _BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]$")
 _REGION_RE = re.compile(r"^[a-z]+-[a-z0-9]+[0-9]$")
 _NETWORK_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
+_SAFE_API_TOKEN_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
 _REVISION_RE = re.compile(r"^[a-zA-Z0-9_.-]{1,64}$")
 _PREFIX_RE = re.compile(r"^[a-zA-Z0-9_./-]{1,160}$")
 _INSTANCE_RE = re.compile(r"^[a-z][a-z0-9-]{0,96}[a-z0-9]$")
@@ -46,10 +47,32 @@ _REQUIRED_COLUMNS = {
 class DrillError(RuntimeError):
     """A deliberately non-sensitive drill failure."""
 
-    def __init__(self, stage: str, code: str):
+    def __init__(
+        self,
+        stage: str,
+        code: str,
+        *,
+        diagnostic: dict[str, Any] | None = None,
+    ):
         super().__init__(f"{stage}:{code}")
         self.stage = stage
         self.code = code
+        self.diagnostic = dict(diagnostic or {})
+
+
+class AdminApiError(DrillError):
+    """A non-sensitive Cloud SQL Admin API failure classification."""
+
+    def __init__(
+        self,
+        stage: str,
+        code: str,
+        *,
+        definitive_rejection: bool,
+        diagnostic: dict[str, Any] | None = None,
+    ):
+        super().__init__(stage, code, diagnostic=diagnostic)
+        self.definitive_rejection = definitive_rejection
 
 
 def _required(env: dict[str, str], name: str) -> str:
@@ -90,6 +113,7 @@ class Config:
     bucket_name: str
     region: str
     private_network: str
+    private_service_range: str
     expected_revision: str
     archive_prefix: str
     evidence_prefix: str
@@ -109,6 +133,7 @@ class Config:
         bucket = _required(values, "RECOVERY_BUCKET")
         region = _required(values, "RECOVERY_REGION")
         network = _required(values, "RECOVERY_PRIVATE_NETWORK")
+        private_service_range = _required(values, "RECOVERY_PRIVATE_SERVICE_RANGE")
         revision = _required(values, "EXPECTED_ALEMBIC_REVISION")
         archive_prefix = values.get(
             "RECOVERY_ARCHIVE_PREFIX", "local-postgres-exports/"
@@ -151,6 +176,8 @@ class Config:
             or not _NETWORK_NAME_RE.fullmatch(network_name)
         ):
             raise DrillError("configuration", "network_not_in_recovery_project")
+        if not _NETWORK_NAME_RE.fullmatch(private_service_range):
+            raise DrillError("configuration", "invalid_private_service_range")
         if not _REVISION_RE.fullmatch(revision):
             raise DrillError("configuration", "invalid_expected_revision")
         if (
@@ -201,6 +228,7 @@ class Config:
             bucket_name=bucket,
             region=region,
             private_network=f"/{normalized_network}",
+            private_service_range=private_service_range,
             expected_revision=revision,
             archive_prefix=archive_prefix,
             evidence_prefix=evidence_prefix,
@@ -492,17 +520,67 @@ class SqlAdminRest:
         params: dict[str, str] | None = None,
         allow_not_found: bool = False,
     ) -> dict[str, Any] | None:
-        response = self._session.request(
-            method,
-            f"{self._BASE}{path}",
-            json=body,
-            params=params,
-            timeout=self._request_timeout,
-        )
+        try:
+            response = self._session.request(
+                method,
+                f"{self._BASE}{path}",
+                json=body,
+                params=params,
+                timeout=self._request_timeout,
+            )
+        except Exception as exc:
+            raise AdminApiError(
+                stage,
+                "admin_api_transport_failed",
+                definitive_rejection=False,
+            ) from exc
         if allow_not_found and response.status_code == 404:
             return None
         if response.status_code < 200 or response.status_code >= 300:
-            raise DrillError(stage, "admin_api_request_failed")
+            status = int(response.status_code)
+            codes = {
+                400: "admin_api_bad_request",
+                401: "admin_api_unauthorized",
+                403: "admin_api_forbidden",
+                404: "admin_api_not_found",
+                409: "admin_api_conflict",
+                429: "admin_api_rate_limited",
+            }
+            code = codes.get(
+                status,
+                "admin_api_unavailable" if status >= 500 else "admin_api_request_failed",
+            )
+            diagnostic: dict[str, Any] = {"http_status": status}
+            try:
+                error_payload = response.json()
+            except (TypeError, ValueError):
+                error_payload = None
+            if isinstance(error_payload, dict):
+                error = error_payload.get("error")
+                if isinstance(error, dict):
+                    provider_status = error.get("status")
+                    errors = error.get("errors")
+                    provider_reason = (
+                        errors[0].get("reason")
+                        if isinstance(errors, list)
+                        and errors
+                        and isinstance(errors[0], dict)
+                        else None
+                    )
+                    for key, value in (
+                        ("provider_status", provider_status),
+                        ("provider_reason", provider_reason),
+                    ):
+                        if isinstance(value, str) and _SAFE_API_TOKEN_RE.fullmatch(value):
+                            diagnostic[key] = re.sub(
+                                r"(?<=[a-z0-9])(?=[A-Z])", "_", value
+                            ).replace("-", "_").upper()
+            raise AdminApiError(
+                stage,
+                code,
+                definitive_rejection=status in {400, 401, 403, 404, 409, 422},
+                diagnostic=diagnostic,
+            )
         if not response.content:
             return {}
         try:
@@ -562,6 +640,15 @@ class SqlAdminRest:
             f"/projects/{self.project_id}/instances/{name}",
             stage="instance_verify",
         ) or {}
+
+    def get_instance_if_exists(self, name: str) -> dict[str, Any] | None:
+        name = self._part(name, _INSTANCE_RE)
+        return self._request(
+            "GET",
+            f"/projects/{self.project_id}/instances/{name}",
+            stage="cleanup_reconcile",
+            allow_not_found=True,
+        )
 
     def create_database(self, instance: str, database: str) -> str:
         instance = self._part(instance, _INSTANCE_RE)
@@ -673,8 +760,8 @@ def _instance_body(config: Config, name: str, expires_at: datetime) -> dict[str,
             "ipConfiguration": {
                 "ipv4Enabled": False,
                 "privateNetwork": config.private_network,
+                "allocatedIpRange": config.private_service_range,
                 "authorizedNetworks": [],
-                "enablePrivatePathForGoogleCloudServices": True,
             },
             "userLabels": {
                 "blueprint-purpose": "restore-drill",
@@ -683,6 +770,26 @@ def _instance_body(config: Config, name: str, expires_at: datetime) -> dict[str,
             },
         },
     }
+
+
+def _is_owned_cleanup_target(
+    instance: dict[str, Any] | None,
+    config: Config,
+    name: str,
+    expires_at: datetime,
+) -> bool:
+    if not isinstance(instance, dict):
+        return False
+    settings = instance.get("settings")
+    labels = settings.get("userLabels") if isinstance(settings, dict) else None
+    return (
+        instance.get("project") == config.recovery_project_id
+        and instance.get("name") == name
+        and isinstance(labels, dict)
+        and labels.get("blueprint-purpose") == "restore-drill"
+        and labels.get("blueprint-drill") == name.removeprefix("bp-restore-")
+        and labels.get("expires-epoch") == str(int(expires_at.timestamp()))
+    )
 
 
 def _reconcile_drill_instances(
@@ -971,7 +1078,7 @@ def run_drill(config: Config, runtime: Runtime) -> tuple[int, dict[str, Any]]:
         },
     }
     archive: Archive | None = None
-    instance_requested = False
+    instance_request_state = "not_requested"
     proxy = None
     password = ""
     failure: DrillError | None = None
@@ -999,11 +1106,17 @@ def run_drill(config: Config, runtime: Runtime) -> tuple[int, dict[str, Any]]:
         evidence["stage"] = "instance_create"
         # Record cleanup intent before the create request: an ambiguous API
         # response can still mean the instance was created server-side.
-        instance_requested = True
+        instance_request_state = "ambiguous"
         evidence["cleanup"]["intent_recorded"] = True
-        operation = runtime.sql.create_instance(
-            drill_id, _instance_body(config, drill_id, expires_at)
-        )
+        try:
+            operation = runtime.sql.create_instance(
+                drill_id, _instance_body(config, drill_id, expires_at)
+            )
+            instance_request_state = "accepted"
+        except AdminApiError as exc:
+            if exc.definitive_rejection:
+                instance_request_state = "rejected"
+            raise
         _wait_operation(runtime, config, operation, stage="instance_create")
 
         evidence["stage"] = "instance_verify"
@@ -1072,28 +1185,54 @@ def run_drill(config: Config, runtime: Runtime) -> tuple[int, dict[str, Any]]:
                 "completed": False,
                 "failure_code": proxy_cleanup_failure.code,
             }
-        if instance_requested:
-            evidence["cleanup"]["attempted"] = True
-            try:
-                delete_operation = runtime.sql.delete_instance(drill_id)
-                if delete_operation:
-                    _wait_operation(
-                        runtime, config, delete_operation, stage="cleanup"
+        if instance_request_state == "rejected":
+            evidence["cleanup"].update({"completed": True, "not_required": True})
+        elif instance_request_state in {"ambiguous", "accepted"}:
+            cleanup_target_confirmed = instance_request_state == "accepted"
+            if instance_request_state == "ambiguous":
+                evidence["cleanup"]["ownership_check_attempted"] = True
+                try:
+                    cleanup_target_confirmed = _is_owned_cleanup_target(
+                        runtime.sql.get_instance_if_exists(drill_id),
+                        config,
+                        drill_id,
+                        expires_at,
                     )
-                evidence["cleanup"]["completed"] = True
-            except Exception:
-                cleanup_failure = DrillError("cleanup", "instance_cleanup_failed")
-                evidence["cleanup"]["failure_code"] = cleanup_failure.code
-                if failure is None:
-                    failure = cleanup_failure
-                evidence["outcome"] = "failure"
-                evidence["stage"] = cleanup_failure.stage
-                evidence["failure_code"] = cleanup_failure.code
+                    evidence["cleanup"]["ownership_check_completed"] = True
+                except Exception:
+                    cleanup_target_confirmed = False
+                    evidence["cleanup"]["ownership_check_completed"] = False
+                    evidence["cleanup"][
+                        "ownership_check_failure_code"
+                    ] = "cleanup_reconcile_failed"
+                if not cleanup_target_confirmed:
+                    evidence["cleanup"]["deferred_to_janitor"] = True
+            if not cleanup_target_confirmed:
+                evidence["cleanup"]["completed"] = False
+            else:
+                evidence["cleanup"]["attempted"] = True
+                try:
+                    delete_operation = runtime.sql.delete_instance(drill_id)
+                    if delete_operation:
+                        _wait_operation(
+                            runtime, config, delete_operation, stage="cleanup"
+                        )
+                    evidence["cleanup"]["completed"] = True
+                except Exception:
+                    cleanup_failure = DrillError("cleanup", "instance_cleanup_failed")
+                    evidence["cleanup"]["failure_code"] = cleanup_failure.code
+                    if failure is None:
+                        failure = cleanup_failure
+                    evidence["outcome"] = "failure"
+                    evidence["stage"] = cleanup_failure.stage
+                    evidence["failure_code"] = cleanup_failure.code
 
     if failure is not None:
         evidence["outcome"] = "failure"
         evidence["stage"] = failure.stage
         evidence["failure_code"] = failure.code
+        if failure.diagnostic:
+            evidence["failure_diagnostic"] = failure.diagnostic
         evidence.pop("observed_revision", None)
     evidence["finished_at"] = runtime.now().astimezone(timezone.utc).isoformat()
     object_name = _safe_evidence_name(config, started_at, drill_id)

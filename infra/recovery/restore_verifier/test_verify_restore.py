@@ -27,6 +27,7 @@ def config(**overrides):
         "RECOVERY_PRIVATE_NETWORK": (
             "projects/blueprint-recovery/global/networks/recovery"
         ),
+        "RECOVERY_PRIVATE_SERVICE_RANGE": "blueprint-restore-private-services",
         "EXPECTED_ALEMBIC_REVISION": "0711",
         "CLOUD_SQL_PROXY_BINARY": str(Path(__file__).resolve()),
     }
@@ -107,6 +108,10 @@ class FakeSql:
             },
             "ipAddresses": [{"type": "PRIVATE", "ipAddress": "10.2.0.3"}],
         }
+
+    def get_instance_if_exists(self, name):
+        self.calls.append(("get_instance_if_exists", name))
+        return None
 
     def create_database(self, instance, database):
         self.calls.append(("create_database", instance, database))
@@ -278,6 +283,10 @@ class ConfigTests(unittest.TestCase):
                     "projects/blueprint-production/global/networks/default"
                 )
             )
+        with self.assertRaisesRegex(
+            verifier.DrillError, "invalid_private_service_range"
+        ):
+            config(RECOVERY_PRIVATE_SERVICE_RANGE="projects/unsafe/ranges/escape")
 
     def test_bounds_cost_and_timeout_controls(self):
         with self.assertRaisesRegex(verifier.DrillError, "invalid_max_rpo_hours"):
@@ -503,6 +512,31 @@ class StorageTests(unittest.TestCase):
 
 
 class CloudSqlContractTests(unittest.TestCase):
+    def test_managed_service_agents_have_explicit_standard_roles(self):
+        recovery_dir = Path(__file__).parents[1]
+        main = (recovery_dir / "main.tf").read_text(encoding="utf-8")
+        iam = (recovery_dir / "iam.tf").read_text(encoding="utf-8")
+        prerequisites = (recovery_dir / "restore_verifier_prerequisites.tf").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            'resource "google_project_service_identity" "service_networking"', main
+        )
+        self.assertIn('service  = "servicenetworking.googleapis.com"', main)
+        self.assertIn('role    = "roles/cloudsql.serviceAgent"', iam)
+        self.assertIn(
+            "google_project_service_identity.cloud_sql[0].email", iam
+        )
+        self.assertIn('role    = "roles/servicenetworking.serviceAgent"', iam)
+        self.assertIn(
+            "google_project_service_identity.service_networking[0].email", iam
+        )
+        self.assertIn(
+            "google_project_iam_member.recovery_service_networking_service_agent,",
+            prerequisites,
+        )
+
     def test_restore_verifier_can_read_only_its_bucket_metadata(self):
         terraform = (
             Path(__file__).parents[1] / "restore_verifier.tf"
@@ -556,6 +590,10 @@ class CloudSqlContractTests(unittest.TestCase):
         self.assertEqual(ip_config["authorizedNetworks"], [])
         self.assertIn("blueprint-recovery", ip_config["privateNetwork"])
         self.assertEqual(
+            ip_config["allocatedIpRange"], "blueprint-restore-private-services"
+        )
+        self.assertNotIn("enablePrivatePathForGoogleCloudServices", ip_config)
+        self.assertEqual(
             settings["userLabels"]["blueprint-purpose"], "restore-drill"
         )
         self.assertIn("expires-epoch", settings["userLabels"])
@@ -582,6 +620,45 @@ class CloudSqlContractTests(unittest.TestCase):
         self.assertEqual(
             kwargs["json"]["importContext"]["fileType"], "SQL"
         )
+
+    def test_rest_client_preserves_only_safe_failure_diagnostics(self):
+        response = SimpleNamespace(
+            status_code=400,
+            content=b"secret",
+            json=lambda: {
+                "error": {
+                    "status": "INVALID_ARGUMENT",
+                    "message": "database password super-secret-token",
+                    "errors": [{"reason": "badRequest", "message": "secret"}],
+                }
+            },
+        )
+        session = Mock()
+        session.request.return_value = response
+        client = verifier.SqlAdminRest(session, "blueprint-recovery")
+        with self.assertRaises(verifier.AdminApiError) as raised:
+            client.create_instance("bp-restore-202607301200-a1b2c3", {})
+        self.assertTrue(raised.exception.definitive_rejection)
+        self.assertEqual(raised.exception.code, "admin_api_bad_request")
+        self.assertEqual(
+            raised.exception.diagnostic,
+            {
+                "http_status": 400,
+                "provider_status": "INVALID_ARGUMENT",
+                "provider_reason": "BAD_REQUEST",
+            },
+        )
+        self.assertNotIn("secret", json.dumps(raised.exception.diagnostic))
+
+    def test_rest_client_transport_failure_is_ambiguous_and_non_sensitive(self):
+        session = Mock()
+        session.request.side_effect = RuntimeError("secret transport detail")
+        client = verifier.SqlAdminRest(session, "blueprint-recovery")
+        with self.assertRaises(verifier.AdminApiError) as raised:
+            client.create_instance("bp-restore-202607301200-a1b2c3", {})
+        self.assertFalse(raised.exception.definitive_rejection)
+        self.assertEqual(raised.exception.code, "admin_api_transport_failed")
+        self.assertEqual(raised.exception.diagnostic, {})
 
     def test_instance_verification_rejects_any_public_address(self):
         instance = {
@@ -743,7 +820,7 @@ class DrillLifecycleTests(unittest.TestCase):
         self.assertEqual(len(storage.writes), 1)
         self.assertEqual(len(logger.writes), 1)
 
-    def test_create_request_failure_still_uses_pre_recorded_cleanup_intent(self):
+    def test_ambiguous_create_without_owned_target_defers_to_janitor(self):
         class AmbiguousCreateSql(FakeSql):
             def create_instance(self, name, body):
                 self.calls.append(("create_instance", name, body))
@@ -754,9 +831,171 @@ class DrillLifecycleTests(unittest.TestCase):
         exit_code, evidence = verifier.run_drill(config(), rt)
         self.assertEqual(exit_code, 1)
         self.assertTrue(evidence["cleanup"]["intent_recorded"])
+        self.assertTrue(evidence["cleanup"]["ownership_check_attempted"])
+        self.assertTrue(evidence["cleanup"]["ownership_check_completed"])
+        self.assertTrue(evidence["cleanup"]["deferred_to_janitor"])
+        self.assertFalse(evidence["cleanup"]["attempted"])
+        self.assertFalse(evidence["cleanup"]["completed"])
+        self.assertFalse(any(call[0] == "delete_instance" for call in sql.calls))
+
+    def test_definitive_create_rejection_does_not_issue_delete(self):
+        class RejectedCreateSql(FakeSql):
+            def create_instance(self, name, body):
+                self.calls.append(("create_instance", name, body))
+                raise verifier.AdminApiError(
+                    "instance_create",
+                    "admin_api_bad_request",
+                    definitive_rejection=True,
+                    diagnostic={"http_status": 400, "provider_status": "INVALID_ARGUMENT"},
+                )
+
+        sql = RejectedCreateSql()
+        rt, *_ = runtime(sql=sql)
+        exit_code, evidence = verifier.run_drill(config(), rt)
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(evidence["failure_code"], "admin_api_bad_request")
+        self.assertEqual(evidence["failure_diagnostic"]["http_status"], 400)
+        self.assertTrue(evidence["cleanup"]["intent_recorded"])
+        self.assertFalse(evidence["cleanup"]["attempted"])
+        self.assertTrue(evidence["cleanup"]["completed"])
+        self.assertTrue(evidence["cleanup"]["not_required"])
+        self.assertFalse(any(call[0] == "delete_instance" for call in sql.calls))
+
+    def test_create_conflict_is_definitive_and_never_deletes(self):
+        response = SimpleNamespace(
+            status_code=409,
+            content=b'{"error":{"status":"ALREADY_EXISTS"}}',
+            json=lambda: {"error": {"status": "ALREADY_EXISTS"}},
+        )
+        session = Mock()
+        session.request.return_value = response
+        client = verifier.SqlAdminRest(session, "blueprint-recovery")
+        with self.assertRaises(verifier.AdminApiError) as raised:
+            client.create_instance("bp-restore-202607301200-a1b2c3", {})
+        self.assertTrue(raised.exception.definitive_rejection)
+        self.assertEqual(raised.exception.code, "admin_api_conflict")
+
+    def test_rate_limit_is_ambiguous_for_ownership_gated_reconciliation(self):
+        response = SimpleNamespace(
+            status_code=429,
+            content=b'{"error":{"status":"RESOURCE_EXHAUSTED"}}',
+            json=lambda: {"error": {"status": "RESOURCE_EXHAUSTED"}},
+        )
+        session = Mock()
+        session.request.return_value = response
+        client = verifier.SqlAdminRest(session, "blueprint-recovery")
+        with self.assertRaises(verifier.AdminApiError) as raised:
+            client.create_instance("bp-restore-202607301200-a1b2c3", {})
+        self.assertFalse(raised.exception.definitive_rejection)
+        self.assertEqual(raised.exception.code, "admin_api_rate_limited")
+
+    def test_ambiguous_admin_api_failure_still_issues_delete(self):
+        class AmbiguousCreateSql(FakeSql):
+            def create_instance(self, name, body):
+                self.calls.append(("create_instance", name, body))
+                raise verifier.AdminApiError(
+                    "instance_create",
+                    "admin_api_unavailable",
+                    definitive_rejection=False,
+                    diagnostic={"http_status": 503},
+                )
+
+            def get_instance_if_exists(self, name):
+                self.calls.append(("get_instance_if_exists", name))
+                return {
+                    "project": "blueprint-recovery",
+                    "name": name,
+                    "settings": {
+                        "userLabels": {
+                            "blueprint-purpose": "restore-drill",
+                            "blueprint-drill": name.removeprefix("bp-restore-"),
+                            "expires-epoch": str(
+                                int((NOW + timedelta(hours=3)).timestamp())
+                            ),
+                        }
+                    },
+                }
+
+        sql = AmbiguousCreateSql()
+        rt, *_ = runtime(sql=sql)
+        exit_code, evidence = verifier.run_drill(config(), rt)
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(evidence["failure_diagnostic"], {"http_status": 503})
         self.assertTrue(evidence["cleanup"]["attempted"])
         self.assertTrue(evidence["cleanup"]["completed"])
         self.assertTrue(any(call[0] == "delete_instance" for call in sql.calls))
+
+    def test_ambiguous_create_never_deletes_absent_or_unowned_instance(self):
+        class AmbiguousCreateSql(FakeSql):
+            def create_instance(self, name, body):
+                self.calls.append(("create_instance", name, body))
+                raise verifier.AdminApiError(
+                    "instance_create",
+                    "admin_api_transport_failed",
+                    definitive_rejection=False,
+                )
+
+            def get_instance_if_exists(self, name):
+                self.calls.append(("get_instance_if_exists", name))
+                return {
+                    "project": "blueprint-recovery",
+                    "name": name,
+                    "settings": {"userLabels": {"blueprint-purpose": "foreign"}},
+                }
+
+        sql = AmbiguousCreateSql()
+        rt, *_ = runtime(sql=sql)
+        exit_code, evidence = verifier.run_drill(config(), rt)
+        self.assertEqual(exit_code, 1)
+        self.assertTrue(evidence["cleanup"]["ownership_check_attempted"])
+        self.assertTrue(evidence["cleanup"]["ownership_check_completed"])
+        self.assertTrue(evidence["cleanup"]["deferred_to_janitor"])
+        self.assertFalse(evidence["cleanup"]["attempted"])
+        self.assertFalse(evidence["cleanup"]["completed"])
+        self.assertFalse(any(call[0] == "delete_instance" for call in sql.calls))
+
+    def test_ambiguous_create_records_reconciliation_failure(self):
+        class AmbiguousCreateSql(FakeSql):
+            def create_instance(self, name, body):
+                self.calls.append(("create_instance", name, body))
+                raise verifier.AdminApiError(
+                    "instance_create",
+                    "admin_api_transport_failed",
+                    definitive_rejection=False,
+                )
+
+            def get_instance_if_exists(self, name):
+                self.calls.append(("get_instance_if_exists", name))
+                raise verifier.AdminApiError(
+                    "cleanup_reconcile",
+                    "admin_api_forbidden",
+                    definitive_rejection=True,
+                    diagnostic={"http_status": 403},
+                )
+
+        sql = AmbiguousCreateSql()
+        rt, *_ = runtime(sql=sql)
+        exit_code, evidence = verifier.run_drill(config(), rt)
+        self.assertEqual(exit_code, 1)
+        self.assertTrue(evidence["cleanup"]["ownership_check_attempted"])
+        self.assertFalse(evidence["cleanup"]["ownership_check_completed"])
+        self.assertEqual(
+            evidence["cleanup"]["ownership_check_failure_code"],
+            "cleanup_reconcile_failed",
+        )
+        self.assertTrue(evidence["cleanup"]["deferred_to_janitor"])
+        self.assertFalse(any(call[0] == "delete_instance" for call in sql.calls))
+
+    def test_primary_failure_survives_cleanup_failure(self):
+        sql = FakeSql(fail_stage="archive_import", cleanup_fails=True)
+        rt, *_ = runtime(sql=sql)
+        exit_code, evidence = verifier.run_drill(config(), rt)
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(evidence["stage"], "archive_import")
+        self.assertEqual(evidence["failure_code"], "operation_failed")
+        self.assertEqual(
+            evidence["cleanup"]["failure_code"], "instance_cleanup_failed"
+        )
 
     def test_bucket_evidence_failure_is_logged_as_a_failed_drill(self):
         storage = FakeStorage(fail_writes=True)

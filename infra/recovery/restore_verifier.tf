@@ -3,19 +3,20 @@ locals {
   restore_janitor_enabled  = local.recovery_enabled && var.enable_restore_janitor
   recovery_job_enabled     = local.restore_verifier_enabled || local.restore_janitor_enabled
   recovery_job_env = local.recovery_job_enabled ? {
-    RECOVERY_PROJECT_ID          = var.recovery_project_id
-    RECOVERY_PROJECT_NUMBER      = tostring(data.google_project.recovery[0].number)
-    SOURCE_PROJECT_ID            = var.source_project_id
-    RECOVERY_BUCKET              = google_storage_bucket.db_backup[0].name
-    RECOVERY_REGION              = var.recovery_region
-    RECOVERY_PRIVATE_NETWORK     = "projects/${var.recovery_project_id}/global/networks/${var.restore_verifier_private_network}"
-    EXPECTED_ALEMBIC_REVISION    = var.restore_verifier_expected_revision
-    RECOVERY_ARCHIVE_PREFIX      = "local-postgres-exports/"
-    EXPECTED_ARCHIVE_NAME        = var.restore_verifier_expected_archive_name
-    EXPECTED_ARCHIVE_GENERATION  = var.restore_verifier_expected_archive_generation
-    EXPECTED_MANIFEST_GENERATION = var.restore_verifier_expected_manifest_generation
-    EXPECTED_ARCHIVE_SHA256      = var.restore_verifier_expected_archive_sha256
-    EXPECTED_ARCHIVE_SIZE_BYTES  = var.restore_verifier_expected_archive_size_bytes == 0 ? "" : tostring(var.restore_verifier_expected_archive_size_bytes)
+    RECOVERY_PROJECT_ID            = var.recovery_project_id
+    RECOVERY_PROJECT_NUMBER        = tostring(data.google_project.recovery[0].number)
+    SOURCE_PROJECT_ID              = var.source_project_id
+    RECOVERY_BUCKET                = google_storage_bucket.db_backup[0].name
+    RECOVERY_REGION                = var.recovery_region
+    RECOVERY_PRIVATE_NETWORK       = "projects/${var.recovery_project_id}/global/networks/${var.restore_verifier_private_network}"
+    RECOVERY_PRIVATE_SERVICE_RANGE = google_compute_global_address.restore_verifier_private_services[0].name
+    EXPECTED_ALEMBIC_REVISION      = var.restore_verifier_expected_revision
+    RECOVERY_ARCHIVE_PREFIX        = "local-postgres-exports/"
+    EXPECTED_ARCHIVE_NAME          = var.restore_verifier_expected_archive_name
+    EXPECTED_ARCHIVE_GENERATION    = var.restore_verifier_expected_archive_generation
+    EXPECTED_MANIFEST_GENERATION   = var.restore_verifier_expected_manifest_generation
+    EXPECTED_ARCHIVE_SHA256        = var.restore_verifier_expected_archive_sha256
+    EXPECTED_ARCHIVE_SIZE_BYTES    = var.restore_verifier_expected_archive_size_bytes == 0 ? "" : tostring(var.restore_verifier_expected_archive_size_bytes)
   } : {}
 }
 
@@ -173,6 +174,8 @@ resource "google_cloud_run_v2_job" "restore_drill" {
   depends_on = [
     terraform_data.restore_verifier_configuration,
     google_project_iam_member.restore_verifier_sql,
+    google_project_iam_member.recovery_cloud_sql_service_agent,
+    google_project_iam_member.recovery_service_networking_service_agent,
     google_storage_bucket_iam_member.restore_verifier_reader,
     google_storage_bucket_iam_member.restore_verifier_bucket_metadata_reader,
     google_storage_bucket_iam_member.restore_verifier_evidence_writer,

@@ -189,6 +189,15 @@ resource "google_project_service_identity" "cloud_run" {
   depends_on = [google_project_service.required]
 }
 
+resource "google_project_service_identity" "service_networking" {
+  provider = google-beta
+  count    = local.restore_verifier_prerequisites_enabled ? 1 : 0
+  project  = var.recovery_project_id
+  service  = "servicenetworking.googleapis.com"
+
+  depends_on = [google_project_service.restore_verifier_prerequisite]
+}
+
 # Google can return newly created managed service-agent addresses before those
 # principals are visible to Cloud KMS IAM. Give IAM propagation a bounded head
 # start so a first apply does not fail halfway through with "does not exist".
