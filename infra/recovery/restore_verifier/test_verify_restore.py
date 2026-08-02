@@ -474,6 +474,19 @@ class StorageTests(unittest.TestCase):
         ):
             verifier.RecoveryStorage(wrong_project, config()).latest_archive(NOW)
 
+    def test_bucket_metadata_failure_has_fixed_diagnostic(self):
+        client = self.client_with_archive()
+        client.bucket.return_value.reload.side_effect = PermissionError(
+            "sensitive provider detail"
+        )
+
+        with self.assertRaises(verifier.DrillError) as raised:
+            verifier.RecoveryStorage(client, config()).latest_archive(NOW)
+
+        self.assertEqual(raised.exception.stage, "storage_scope")
+        self.assertEqual(raised.exception.code, "bucket_metadata_unavailable")
+        self.assertNotIn("sensitive", str(raised.exception))
+
     def test_evidence_write_is_create_only_and_structured(self):
         blob = Mock()
         client = Mock()
@@ -490,6 +503,29 @@ class StorageTests(unittest.TestCase):
 
 
 class CloudSqlContractTests(unittest.TestCase):
+    def test_restore_verifier_can_read_only_its_bucket_metadata(self):
+        terraform = (
+            Path(__file__).parents[1] / "restore_verifier.tf"
+        ).read_text(encoding="utf-8")
+        role_start = terraform.index(
+            'resource "google_storage_bucket_iam_member" '
+            '"restore_verifier_bucket_metadata_reader"'
+        )
+        role_end = terraform.index(
+            'resource "google_storage_bucket_iam_member" '
+            '"restore_verifier_evidence_writer"'
+        )
+        role = terraform[role_start:role_end]
+
+        self.assertIn('role   = "roles/storage.legacyBucketReader"', role)
+        self.assertIn("bucket = google_storage_bucket.db_backup[0].name", role)
+        self.assertIn("google_service_account.restore_verifier[0].email", role)
+        self.assertIn(
+            "google_storage_bucket_iam_member."
+            "restore_verifier_bucket_metadata_reader,",
+            terraform,
+        )
+
     def test_restore_verifier_sql_role_can_consume_enabled_api(self):
         terraform = (
             Path(__file__).parents[1] / "restore_verifier.tf"

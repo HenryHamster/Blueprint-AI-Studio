@@ -109,6 +109,13 @@ resource "google_storage_bucket_iam_member" "restore_verifier_reader" {
   member = "serviceAccount:${google_service_account.restore_verifier[0].email}"
 }
 
+resource "google_storage_bucket_iam_member" "restore_verifier_bucket_metadata_reader" {
+  count  = local.restore_verifier_enabled ? 1 : 0
+  bucket = google_storage_bucket.db_backup[0].name
+  role   = "roles/storage.legacyBucketReader"
+  member = "serviceAccount:${google_service_account.restore_verifier[0].email}"
+}
+
 resource "google_storage_bucket_iam_member" "restore_verifier_evidence_writer" {
   count  = local.restore_verifier_enabled ? 1 : 0
   bucket = google_storage_bucket.db_backup[0].name
@@ -167,6 +174,7 @@ resource "google_cloud_run_v2_job" "restore_drill" {
     terraform_data.restore_verifier_configuration,
     google_project_iam_member.restore_verifier_sql,
     google_storage_bucket_iam_member.restore_verifier_reader,
+    google_storage_bucket_iam_member.restore_verifier_bucket_metadata_reader,
     google_storage_bucket_iam_member.restore_verifier_evidence_writer,
     google_kms_crypto_key_iam_member.restore_verifier_decrypter,
     google_compute_subnetwork.restore_verifier,

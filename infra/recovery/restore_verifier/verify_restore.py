@@ -263,7 +263,12 @@ class RecoveryStorage:
     def _bucket(self) -> Any:
         bucket = self._client.bucket(self._config.bucket_name)
         if not self._bucket_verified:
-            bucket.reload(timeout=60)
+            try:
+                bucket.reload(timeout=60)
+            except Exception as exc:
+                raise DrillError(
+                    "storage_scope", "bucket_metadata_unavailable"
+                ) from exc
             project_number = str(getattr(bucket, "project_number", "") or "")
             if project_number != self._config.recovery_project_number:
                 raise DrillError("storage_scope", "bucket_not_in_recovery_project")
