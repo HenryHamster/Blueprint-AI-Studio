@@ -34,6 +34,7 @@ from app.payload_schemas import (
     _MAX_PAYLOAD_BYTES,
 )
 import app.shared_state as _shared_state
+from app import strategic_cycle
 from app.shared_state import (
     get_project_integration_branch as _get_project_integration_branch,
     runtime_config as _runtime_config,
@@ -1568,7 +1569,9 @@ async def _spawn_research_task_inner(
                     session,
                     apply_spawn_budget_guard=True,
                     expected_legacy_generation=legacy_generation,
-                    cycle_id=pending_sr.get("cycle_id"),
+                    cycle_id=await strategic_cycle.active_cycle_id_for_retry(
+                        session, pending_sr.get("cycle_id")
+                    ),
                     operator_steered=bool(pending_sr.get("operator_steered")),
                     steering_excerpt=pending_sr.get("steering_excerpt"),
                     preferred_runner_target_id=pending_sr.get(

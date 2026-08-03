@@ -4778,6 +4778,7 @@ async def _handle_design_doc_completion(
     phase2_spawned = False
     phase2_spawn_failed = False
     phase2_failure_reason: str | None = None
+    phase2_failure_outcome: str | None = None
     phase1_cycle_id = task.strategic_cycle_id or (task.context or {}).get(
         "strategic_cycle_id"
     )
@@ -4916,10 +4917,25 @@ async def _handle_design_doc_completion(
                 f"Design doc: {page_count} pages, rev {rev} — strategic review spawned"
             )
         else:
-            # Spawn silently skipped (active strategic task) — create retry marker
+            # Spawn silently skipped (active strategic task). The architecture
+            # cycle cannot advance after Phase 1, so terminalize this cycle
+            # before committing the durable retry marker and completion receipt.
             logger.warning(
                 f"[DESIGN DOC] Phase 2 spawn skipped for task {task_id_str} (active strategic task exists)"
             )
+            phase2_failure_reason = "skipped: active strategic task exists"
+            if cycle_id:
+                from app import strategic_cycle as _sc
+
+                failed_cycle = await _sc.mark_failure(
+                    session,
+                    cycle_id,
+                    phase="phase2_spawn",
+                    reason=phase2_failure_reason,
+                )
+                if failed_cycle is not None:
+                    phase2_spawn_failed = True
+                    phase2_failure_outcome = failed_cycle.outcome
             task.latest_status_message = status_message = (
                 f"Design doc: {page_count} pages, rev {rev} — strategic review deferred (active task exists)"
             )
@@ -5005,9 +5021,11 @@ async def _handle_design_doc_completion(
         # task.project_id / task.id / task.latest_status_message here would
         # lazy-load and raise MissingGreenlet (the site that failed task
         # 94594516, 2026-06-11, after the a9bf1317 partial fix).
-        phase_state = "failed" if phase2_spawn_failed else "deferred"
+        phase_state = phase2_failure_outcome or (
+            "failed" if phase2_spawn_failed else "deferred"
+        )
         completion: dict[str, Any] = {
-            "status": phase_state,
+            "status": "failed" if phase2_spawn_failed else "deferred",
             "status_message": status_message,
         }
         if phase2_spawn_failed:

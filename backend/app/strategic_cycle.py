@@ -156,6 +156,29 @@ async def get_by_task(session: AsyncSession, task_id) -> Optional[StrategicCycle
     return result.scalars().first()
 
 
+async def active_cycle_id_for_retry(
+    session: AsyncSession,
+    cycle_id: str | None,
+) -> str | None:
+    """Return ``cycle_id`` only while its cycle is still retryable.
+
+    A pending Phase-2 retry is allowed to create a new strategy-only cycle after
+    its original architecture cycle was terminalized. Returning ``None`` for a
+    missing or terminal row keeps the retry marker durable without allowing the
+    later spawn to mutate that historical cycle back to ``phase2_running``.
+    The final spawn transaction performs its own locked recheck for races.
+    """
+    if not cycle_id:
+        return None
+    result = await session.execute(
+        select(StrategicCycle.id).where(
+            StrategicCycle.id == cycle_id,
+            StrategicCycle.outcome.in_(ACTIVE_OUTCOMES),
+        )
+    )
+    return result.scalar_one_or_none()
+
+
 async def reconcile_terminal_task(
     session: AsyncSession,
     task: Task,
