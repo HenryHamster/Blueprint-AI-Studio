@@ -74,6 +74,7 @@ import { matchesStatusFilter } from './utils/statusFilter';
 import { pipelineTaskIdForAttentionItem } from './utils/strategicAttention';
 import { STATUS_OPTIONS } from './constants';
 import { reportUiLoadTiming } from './uiLoadTiming';
+import { resolveCompletionToastKind, resolveCompletionToastMessage } from './utils/completionToastKind';
 
 type PipelineDirectionOption = { id: string; text: string };
 const PIPELINE_SECTION_ORDER: readonly PipelineSection[] = ['flow', 'board', 'archive'];
@@ -181,7 +182,8 @@ export default function App() {
     if (!cycleCompletion) return;
     if (cycleCompletion === lastCycleCompletionToastRef.current) return;
     lastCycleCompletionToastRef.current = cycleCompletion;
-    addToast('Strategic cycle complete', 'success');
+    const toastKind = resolveCompletionToastKind(cycleCompletion.status);
+    addToast(resolveCompletionToastMessage(toastKind), toastKind);
   }, [cycleCompletion, addToast]);
   const [openMessageCount, setOpenMessageCount] = useState(0);
   const [newSinceLastVisit, setNewSinceLastVisit] = useState(0);
