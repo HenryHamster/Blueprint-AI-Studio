@@ -22,11 +22,15 @@ sudo env -i \
   --revision FULL_GIT_SHA
 ```
 
-The bootstrap installs a new content-addressed script bundle, redirects only
-the API unit's future starts to the new wrapper, and installs the edge drop-in
-that resets the legacy `BindsTo`. It performs `daemon-reload` but does not
-restart the API, worker, database, backup timer, or edge. It verifies all five
-unit markers and every role environment remain unchanged.
+The bootstrap installs a new content-addressed script bundle and redirects only
+the API unit's future starts to the new wrapper. Because systemd dependencies
+cannot be removed by a drop-in, it snapshots the legacy edge base unit and
+noninteractive drop-in, renders the complete reviewed edge unit with the live
+immutable helper and environment paths, and retires the obsolete drop-in to a
+root-only recovery copy. It preserves original file modes for rollback,
+performs `daemon-reload`, and does not restart the API, worker, database,
+backup timer, or edge. It verifies the effective dependency and hardening
+contracts, all five unit markers, and every unrelated role/base file.
 
 ## Release
 
