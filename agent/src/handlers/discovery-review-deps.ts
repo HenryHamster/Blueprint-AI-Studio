@@ -7,13 +7,13 @@
  */
 export {
   persistAndPostStatus,
-  runIsolatedTextOnlyMemory,
   sanitize,
   sendHeartbeatSync,
   sendLog,
   setCurrentPromptFingerprint,
   strVal,
 } from '../index.js';
+export { runIsolatedTextOnlyMemory } from '../providers/runners.js';
 export {
   cleanupPacketOnlyWorkspace,
   preparePacketOnlyWorkspace,

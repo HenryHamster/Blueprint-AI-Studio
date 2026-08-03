@@ -73,7 +73,7 @@ import {
   refreshRuntimeState,
   getProviderRunner, providerSupportsNativeSubagents,
   __setRunClaudeCodeOverrideForSmoke, __setCommandExistsOverrideForSmoke, codexStreamHasTurnCompleted,
-  runClaudeCode, runIsolatedTextOnlyMemory, runProviderAgent,
+  runClaudeCode, runProviderAgent,
   getLastProviderRunErrorReport, clearLastProviderRunErrorReport,
   type LLMCliTranslation, type ClaudeOutput, type RunnerCommand,
   type ValidationCommand, type ProviderRunner, type ProviderRunErrorReport,
@@ -87,7 +87,7 @@ export {
   refreshRuntimeState,
   getProviderRunner, providerSupportsNativeSubagents,
   __setRunClaudeCodeOverrideForSmoke, __setCommandExistsOverrideForSmoke, codexStreamHasTurnCompleted,
-  runClaudeCode, runIsolatedTextOnlyMemory, runProviderAgent,
+  runClaudeCode, runProviderAgent,
   getLastProviderRunErrorReport, clearLastProviderRunErrorReport,
 };
 export type { LLMCliTranslation, ClaudeOutput, RunnerCommand, ValidationCommand, ProviderRunner, ProviderRunErrorReport };
