@@ -358,6 +358,7 @@
     "test_review_loop_convergence.py": 1900,
     "test_empty_repo_onboarding.py": 1900,
     "test_warm_pool.py": 1850,
+    "test_discovery_review.py": 1807,
     "test_evergreen_backlog.py": 1800,
     "test_anomaly_actions.py": 1800,
     "test_failure_residual.py": 1750,

@@ -10,7 +10,6 @@ from sqlmodel import select
 
 from app.models import (
     CompletionDebtEntry,
-    DiscoveryCycle,
     Project,
     StrategicSpawnRequest,
     StrategicWatch,
@@ -19,14 +18,12 @@ from app.models import (
 )
 from app.strategic_spawn_requests import (
     MAX_DRAIN_PER_PASS,
-    _dispatch_request,
     cancel_deferred_spawn_request,
     drain_deferred_spawn_requests,
     drain_due_strategic_spawn_requests,
     submit_strategic_spawn,
 )
 from app.time_utils import _utcnow
-from testing.conftest import TestingSessionLocal, USE_POSTGRES
 
 
 async def _owner(db_session):
@@ -513,87 +510,6 @@ async def test_cancelled_deferred_request_never_drains(db_session):
             burst_cap=1,
             burst_window_minutes=60,
         )
-
-
-@pytest.mark.skipif(
-    not USE_POSTGRES,
-    reason="requires independent transactions and PostgreSQL row locks",
-)
-@pytest.mark.asyncio
-async def test_review_cancellation_cannot_commit_orphan_from_stale_drain(db_session):
-    project, owner = await _owner(db_session)
-    cycle = DiscoveryCycle(
-        project_id=project.id,
-        direction_key=f"stale-drain-{uuid.uuid4().hex}",
-        outcome_kind="mixed",
-    )
-    db_session.add(cycle)
-    await db_session.flush()
-    request_key = f"review-race-{uuid.uuid4().hex}"
-    request = StrategicSpawnRequest(
-        project_id=project.id,
-        parent_task_id=owner.id,
-        discovery_cycle_id=cycle.id,
-        idempotency_key=request_key,
-        task_type="create",
-        specification=_spec("Race child", watch=False),
-        specification_hash="c" * 64,
-        state="deferred",
-        not_before=_utcnow() - timedelta(minutes=1),
-    )
-    db_session.add(request)
-    await db_session.flush()
-    request_id = request.id
-    cycle_id = cycle.id
-    await db_session.commit()
-
-    async with TestingSessionLocal() as stale_drain:
-        stale_request = await stale_drain.get(StrategicSpawnRequest, request_id)
-        assert stale_request is not None
-
-        # Review wins after the drain selected its candidate, cancels the
-        # durable intent, and freezes the evidence cohort in one transaction.
-        async with TestingSessionLocal() as review:
-            locked_cycle = (
-                await review.execute(
-                    select(DiscoveryCycle)
-                    .where(DiscoveryCycle.id == cycle_id)
-                    .with_for_update()
-                )
-            ).scalar_one()
-            locked_request = (
-                await review.execute(
-                    select(StrategicSpawnRequest)
-                    .where(StrategicSpawnRequest.id == request_id)
-                    .with_for_update()
-                )
-            ).scalar_one()
-            locked_request.state = "cancelled"
-            locked_request.admission_reason = "discovery_cycle_review_boundary"
-            locked_request.not_before = None
-            locked_cycle.state = "reviewing"
-            review.add(locked_request)
-            review.add(locked_cycle)
-            await review.commit()
-
-        # Resident heartbeat catches this drain failure and still commits its
-        # outer transaction. That commit must not persist the pre-review Task.
-        with pytest.raises(ValueError, match="no longer dispatchable"):
-            await _dispatch_request(stale_drain, request=stale_request)
-        await stale_drain.commit()
-
-    persisted_request = await db_session.get(StrategicSpawnRequest, request_id)
-    await db_session.refresh(persisted_request)
-    assert persisted_request.state == "cancelled"
-    assert persisted_request.task_id is None
-    assert (
-        await db_session.execute(
-            select(Task).where(
-                Task.project_id == project.id,
-                Task.title == "Race child",
-            )
-        )
-    ).scalar_one_or_none() is None
 
 
 @pytest.mark.asyncio
