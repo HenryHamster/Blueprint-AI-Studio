@@ -380,8 +380,15 @@ describe('useLogViewer reconnect truth', () => {
     // Reconnect with durable authority confirming the cycle is still live.
     act(() => { ws.onopen?.({}); });
 
-    // Both the activity flag and the progress snapshot must be preserved.
+    // Activity remains live, while durable phase identity wins over the stale
+    // phase-one event snapshot.
     expect(result.current.lv.strategistActive).toBe(true);
-    expect(result.current.lv.cycleProgress).toMatchObject({ task_id: 'task-2', cycle_id: 'cycle-7' });
+    expect(result.current.lv.cycleProgress).toMatchObject({
+      task_id: 'phase-2',
+      cycle_id: 'cycle-7',
+      phase_number: 2,
+      phase_label: 'Strategic review',
+      phase_state: 'phase2_running',
+    });
   });
 });

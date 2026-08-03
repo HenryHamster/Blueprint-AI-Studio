@@ -52,7 +52,7 @@ const makeState = (
 describe('Strategic reconnect projection', () => {
   it('restores_dropped_terminal_receipt_from_latest_cycle', () => {
     const strategicReadModelRef = {
-      current: makeState(makeCycle(), null),
+      current: makeState(makeCycle({ phase2_task_id: null, outcome: 'phase1_running' }), null),
     };
     const { result } = renderHook(() => useLogViewer({
       fetchTasksRef: { current: vi.fn() },
@@ -66,6 +66,15 @@ describe('Strategic reconnect projection', () => {
       result.current.projectStrategicState(strategicReadModelRef.current);
     });
     expect(result.current.strategistActive).toBe(true);
+
+    strategicReadModelRef.current = makeState(makeCycle({
+      phase2_task_id: 'phase-2',
+      outcome: 'phase2_running',
+    }), null);
+    act(() => { result.current.projectStrategicState(strategicReadModelRef.current); });
+    expect(result.current.cycleProgress).toMatchObject({
+      task_id: 'phase-2', phase_number: 2, phase_label: 'Strategic review', phase_state: 'phase2_running',
+    });
 
     strategicReadModelRef.current = makeState(null, makeCycle({
       outcome: 'completed',

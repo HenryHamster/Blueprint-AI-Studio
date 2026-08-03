@@ -217,9 +217,19 @@ export function useLogViewer({
       setStrategistActive(true);
       setCycleProgress(previous => {
         const next = strategicCycleProgressFromDurableState(activeCycle);
-        // Keep live steering metadata while refreshing the durable phase/task
-        // identity; the durable read model does not carry the excerpt.
-        return previous?.cycle_id === next.cycle_id ? { ...next, ...previous } : next;
+        // Keep only live steering metadata while refreshing the durable
+        // phase/task identity. The durable read model is authoritative for
+        // every cycle and phase field, and does not carry the excerpt.
+        if (!previous || previous.cycle_id !== next.cycle_id) return next;
+        return {
+          ...next,
+          ...(previous.steering_origin !== undefined
+            ? { steering_origin: previous.steering_origin }
+            : {}),
+          ...(previous.steering_excerpt !== undefined
+            ? { steering_excerpt: previous.steering_excerpt }
+            : {}),
+        };
       });
       setLastCycleCompletion(previous => (
         previous?.cycle_id && previous.cycle_id !== activeCycle.id ? null : previous
@@ -232,9 +242,27 @@ export function useLogViewer({
     const latestCycle = state.strategic.latest_cycle;
     if (!latestCycle) return;
     const durableCompletion = strategicCycleCompletionFromDurableState(latestCycle);
-    setLastCycleCompletion(previous => (
-      previous?.cycle_id === durableCompletion.cycle_id ? previous : durableCompletion
-    ));
+    setLastCycleCompletion(previous => {
+      if (!previous || previous.cycle_id !== durableCompletion.cycle_id) return durableCompletion;
+
+      // The durable cycle is authoritative for status and every field it
+      // exposes. Preserve only receipt details that the read model cannot
+      // represent, such as the live challenge summary and direction ids.
+      return {
+        ...durableCompletion,
+        ...(previous.staged_count !== undefined ? { staged_count: previous.staged_count } : {}),
+        ...(previous.updated_count !== undefined ? { updated_count: previous.updated_count } : {}),
+        ...(previous.created_direction_ids !== undefined
+          ? { created_direction_ids: previous.created_direction_ids }
+          : {}),
+        ...(previous.retired_direction_ids !== undefined
+          ? { retired_direction_ids: previous.retired_direction_ids }
+          : {}),
+        ...(previous.strategic_judgment_challenge !== undefined
+          ? { strategic_judgment_challenge: previous.strategic_judgment_challenge }
+          : {}),
+      };
+    });
   }, []);
   const gatedTypesRefreshSeqRef = useRef(0);
   const [ceilingDeferredProjectIds, setCeilingDeferredProjectIds] = useState<Set<string>>(new Set());
