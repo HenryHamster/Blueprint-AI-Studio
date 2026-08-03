@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 # Baked-in production orchestrator base URL. Keep in sync with the admin-UI
 # constant DEFAULT_ORCHESTRATOR_URL in admin-ui/src/components/FleetRunnersPanel.utils.ts
 # so the enroll dialog only appends --url when the project points elsewhere.
-DEFAULT_ORCHESTRATOR_URL = "https://blueprint-orchestrator-mmtfi5aysa-uc.a.run.app"
+DEFAULT_ORCHESTRATOR_URL = "https://hamsterwheel.tail552e05.ts.net"
 
 # The node agent (agent/dist/index.js) requires a modern Node runtime and spawns
 # provider CLIs for agent tasks. Everything else is handled by local_runner's

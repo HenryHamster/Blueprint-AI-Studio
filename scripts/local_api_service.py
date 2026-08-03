@@ -10,12 +10,14 @@ import stat
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import local_worker_service as worker
 
 _CONTAINER_NAME = "blueprint-local-api"
 _ROLE_LABEL = "com.blueprint.role"
 _ROLE = "api"
+_DEPLOY_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _REQUIRED_API_SECRETS = frozenset(
     {
         "DATABASE_URL",
@@ -42,14 +44,13 @@ _REQUIRED_API_CONFIG = frozenset(
 _OPTIONAL_API_CONFIG = frozenset(
     {
         "INITIAL_ADMIN_EMAIL",
+        "ADMIN_UI_URL",
         "ADMIN_JWT_SECRET",
         "ADMIN_JWT_EXPIRE_MINUTES",
         "ADMIN_API_KEY_ALLOWED_IPS",
     }
 )
-_ALLOWED_API_ENV = (
-    _REQUIRED_API_SECRETS | _REQUIRED_API_CONFIG | _OPTIONAL_API_CONFIG
-)
+_ALLOWED_API_ENV = _REQUIRED_API_SECRETS | _REQUIRED_API_CONFIG | _OPTIONAL_API_CONFIG
 
 
 def _load_api_secrets(path_text: str) -> dict[str, str]:
@@ -74,16 +75,15 @@ def _load_api_secrets(path_text: str) -> dict[str, str]:
     unknown = set(payload) - _ALLOWED_API_ENV
     if unknown:
         raise ValueError(
-            "API secrets contain unsupported keys: "
-            + ", ".join(sorted(unknown))
+            "API secrets contain unsupported keys: " + ", ".join(sorted(unknown))
         )
     missing = (_REQUIRED_API_SECRETS | _REQUIRED_API_CONFIG) - set(payload)
     if missing:
-        raise ValueError(
-            "API secrets are missing: " + ", ".join(sorted(missing))
-        )
+        raise ValueError("API secrets are missing: " + ", ".join(sorted(missing)))
     if any(not isinstance(value, str) or not value for value in payload.values()):
-        raise ValueError("every API secret and configuration value must be a non-empty string")
+        raise ValueError(
+            "every API secret and configuration value must be a non-empty string"
+        )
     for name, value in payload.items():
         allowed_controls = {"\n"} if name == "GITHUB_PRIVATE_KEY" else set()
         if any(
@@ -108,6 +108,27 @@ def _load_api_secrets(path_text: str) -> dict[str, str]:
         raise ValueError("ARTIFACT_BUCKET_NAME does not match GCP_PROJECT_ID")
     if not payload["ORCHESTRATOR_URL"].startswith("https://"):
         raise ValueError("ORCHESTRATOR_URL must use HTTPS")
+    admin_ui_url = payload.get("ADMIN_UI_URL", payload["ORCHESTRATOR_URL"])
+    parsed_admin_ui_url = urlsplit(admin_ui_url)
+    try:
+        port = parsed_admin_ui_url.port
+    except ValueError as exc:
+        raise ValueError("ADMIN_UI_URL must be a canonical HTTPS origin") from exc
+    if (
+        parsed_admin_ui_url.scheme != "https"
+        or not parsed_admin_ui_url.hostname
+        or parsed_admin_ui_url.username is not None
+        or parsed_admin_ui_url.password is not None
+        or parsed_admin_ui_url.path not in ("", "/")
+        or parsed_admin_ui_url.query
+        or parsed_admin_ui_url.fragment
+    ):
+        raise ValueError("ADMIN_UI_URL must be a canonical HTTPS origin")
+    hostname = parsed_admin_ui_url.hostname
+    normalized_host = f"[{hostname}]" if ":" in hostname else hostname
+    if port is not None:
+        normalized_host = f"{normalized_host}:{port}"
+    payload["ADMIN_UI_URL"] = f"https://{normalized_host}"
     return payload
 
 
@@ -199,17 +220,22 @@ def command() -> tuple[list[str], dict[str, str]]:
             "GOOGLE_APPLICATION_CREDENTIALS": "/var/run/blueprint/gcp.json",
         }
     )
-    forwarded = sorted(
-        _ALLOWED_API_ENV
-        | {
-            "BLUEPRINT_PROCESS_ROLE",
-            "BLUEPRINT_DEPLOYMENT_MODE",
-            "PYTHONDONTWRITEBYTECODE",
-            "HOME",
-            "PORT",
-            "GOOGLE_APPLICATION_CREDENTIALS",
-        }
-    )
+    deploy_sha = os.environ.get("BLUEPRINT_API_DEPLOY_SHA", "").strip()
+    if deploy_sha:
+        if not _DEPLOY_SHA_RE.fullmatch(deploy_sha):
+            raise ValueError("BLUEPRINT_API_DEPLOY_SHA must be a full git SHA")
+        environment["DEPLOY_SHA"] = deploy_sha
+    runtime_environment = {
+        "BLUEPRINT_PROCESS_ROLE",
+        "BLUEPRINT_DEPLOYMENT_MODE",
+        "PYTHONDONTWRITEBYTECODE",
+        "HOME",
+        "PORT",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+    }
+    if deploy_sha:
+        runtime_environment.add("DEPLOY_SHA")
+    forwarded = sorted(_ALLOWED_API_ENV | runtime_environment)
     argv = [
         "docker",
         "run",

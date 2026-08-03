@@ -49,6 +49,7 @@ from app.time_utils import _utcnow
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/github", tags=["github"])
+_SAFE_ADMIN_FALLBACK = "https://blueprint-admin-9c6b7.web.app"
 
 # Webhook dedup: track recent GitHub delivery IDs to prevent duplicate processing
 _webhook_delivery_ids: OrderedDict = (
@@ -57,6 +58,56 @@ _webhook_delivery_ids: OrderedDict = (
 _webhook_dedup_lock = asyncio.Lock()
 _WEBHOOK_DEDUP_MAX = 1000
 _WEBHOOK_DEDUP_TTL = 600  # 10 minutes
+
+
+def _canonical_ui_origin(value: str, *, allow_local_http: bool = False) -> str | None:
+    """Return an exact safe UI origin, rejecting paths, credentials, and wildcards."""
+
+    parsed = urllib.parse.urlsplit(value.strip())
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    local = parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+    schemes = {"https", "http"} if allow_local_http and local else {"https"}
+    if (
+        not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in ("", "/")
+        or parsed.query
+        or parsed.fragment
+        or parsed.scheme not in schemes
+    ):
+        return None
+    host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+    if port is not None:
+        host = f"{host}:{port}"
+    return f"{parsed.scheme}://{host}"
+
+
+def _allowed_admin_origins(default_admin_url: str) -> set[str]:
+    values = [default_admin_url, *os.getenv("ALLOWED_ORIGINS", "").split(",")]
+    return {
+        origin
+        for value in values
+        if (origin := _canonical_ui_origin(value, allow_local_http=True)) is not None
+    }
+
+
+def _admin_fallback_origin() -> str:
+    configured = os.getenv("ADMIN_UI_URL", _SAFE_ADMIN_FALLBACK)
+    return _canonical_ui_origin(configured, allow_local_http=True) or _SAFE_ADMIN_FALLBACK
+
+
+def _github_callback_uri() -> str | None:
+    configured = (os.getenv("ORCHESTRATOR_URL") or "").strip()
+    if not configured:
+        return None
+    origin = _canonical_ui_origin(configured, allow_local_http=True)
+    if origin is None:
+        raise HTTPException(status_code=500, detail="ORCHESTRATOR_URL is invalid")
+    return f"{origin}/api/github/oauth/callback"
 
 
 async def _load_tasks_for_artifacts(
@@ -140,27 +191,23 @@ async def github_oauth_authorize(
         )
 
     # Default to ADMIN_UI_URL when the caller did not pass one. A dynamic value is
-    # accepted so localhost dev and PR-preview hosts can come back to themselves,
-    # but it must clear an allowlist or we'd be a happy open-redirect helper.
-    default_admin_url = os.getenv(
-        "ADMIN_UI_URL", "https://blueprint-admin-9c6b7.web.app"
+    # accepted so the retained Firebase rollback UI and localhost development can
+    # come back to themselves, but it must exactly match a configured origin or
+    # we'd be an open-redirect helper.
+    configured_admin_url = os.getenv("ADMIN_UI_URL", _SAFE_ADMIN_FALLBACK)
+    default_admin_url = _canonical_ui_origin(
+        configured_admin_url, allow_local_http=True
     )
+    if default_admin_url is None:
+        raise HTTPException(status_code=500, detail="ADMIN_UI_URL is invalid")
     admin_url = default_admin_url
     if redirect_uri is not None and redirect_uri != "":
-        parsed_redirect = urllib.parse.urlparse(redirect_uri)
-        allowed_hosts = {
-            urllib.parse.urlparse(default_admin_url).netloc,
-            "localhost",
-            "127.0.0.1",
-        }
-        if (
-            parsed_redirect.scheme not in ("http", "https")
-            or parsed_redirect.netloc not in allowed_hosts
-        ):
+        candidate = _canonical_ui_origin(redirect_uri, allow_local_http=True)
+        if candidate is None or candidate not in _allowed_admin_origins(default_admin_url):
             raise HTTPException(
-                status_code=400, detail="Invalid redirect_uri: host not in allowlist"
+                status_code=400, detail="Invalid redirect_uri: origin not in allowlist"
             )
-        admin_url = redirect_uri
+        admin_url = candidate
 
     # Sign a state token so the callback can verify which user initiated the flow.
     import jwt as pyjwt
@@ -183,9 +230,8 @@ async def github_oauth_authorize(
         f"&scope=repo"
         f"&allow_signup=false"
     )
-    orch_base = (os.getenv("ORCHESTRATOR_URL") or "").rstrip("/")
-    if orch_base:
-        callback = f"{orch_base}/api/github/oauth/callback"
+    callback = _github_callback_uri()
+    if callback:
         auth_url = f"{auth_url}&redirect_uri={urllib.parse.quote(callback, safe='')}"
     return {"url": auth_url}
 
@@ -208,7 +254,8 @@ async def github_oauth_callback(
     import jwt as pyjwt
     from app.auth import AGENT_JWT_ALGORITHM, AGENT_JWT_SECRET
 
-    fallback_admin = os.getenv("ADMIN_UI_URL", "https://blueprint-admin-9c6b7.web.app")
+    fallback_admin = _admin_fallback_origin()
+    allowed_admin_origins = _allowed_admin_origins(fallback_admin)
     try:
         state_payload = pyjwt.decode(
             state, AGENT_JWT_SECRET, algorithms=[AGENT_JWT_ALGORITHM]
@@ -221,12 +268,18 @@ async def github_oauth_callback(
     if state_payload.get("type") != "github_oauth":
         return RedirectResponse(url=f"{fallback_admin}?github_error=invalid_state")
     firebase_user_id = state_payload["sub"]
-    admin_url = state_payload.get("admin_url") or fallback_admin
+    state_admin_url = state_payload.get("admin_url")
+    admin_url = (
+        _canonical_ui_origin(state_admin_url, allow_local_http=True)
+        if isinstance(state_admin_url, str)
+        else None
+    )
+    if admin_url not in allowed_admin_origins:
+        return RedirectResponse(url=f"{fallback_admin}?github_error=invalid_state")
 
     try:
         # GitHub requires the same redirect_uri here that was passed to /authorize.
-        orch_base = (os.getenv("ORCHESTRATOR_URL") or "").rstrip("/")
-        callback_uri = f"{orch_base}/api/github/oauth/callback" if orch_base else None
+        callback_uri = _github_callback_uri()
         token_data = await exchange_oauth_code(code, redirect_uri=callback_uri)
         user_token = token_data["access_token"]
 

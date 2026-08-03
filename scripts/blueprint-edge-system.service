@@ -1,6 +1,6 @@
 [Unit]
 Description=Blueprint node role: edge
-BindsTo=blueprint-api.service
+Wants=blueprint-api.service
 Requires=tailscaled.service
 Wants=network-online.target
 After=network-online.target tailscaled.service blueprint-api.service

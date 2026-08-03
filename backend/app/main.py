@@ -24,14 +24,16 @@ from fastapi import (
     HTTPException,
     Request,
 )
-from fastapi.responses import JSONResponse, FileResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 from slowapi.errors import RateLimitExceeded
 from app.csrf import CSRFMiddleware
+from app.frontend_static import (
+    install_frontend_routes,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 from app.database import get_session, AsyncSessionLocal
@@ -2130,52 +2132,10 @@ app.add_middleware(
 app.add_middleware(RequestDurationMiddleware)
 
 
-@app.get("/")
-def read_root():
-    return {"status": "online", "service": "Blueprint Orchestrator"}
+static_dir = os.path.join(os.path.dirname(__file__), "..", "static")
+install_frontend_routes(app, static_dir)
 
 
 # _github_token_cache, invalidate_github_token_cache, get_github_token_for_task
 # — extracted to app.github_token_resolver (re-exported from app.routers.agent).
 # GitHub proxy endpoints — moved to app.routers.agent.
-
-
-# --- Static Files for Frontend (One-Line Deploy) ---
-static_dir = os.path.join(os.path.dirname(__file__), "..", "static")
-if os.path.exists(static_dir):
-    # Mount the assets directory specifically
-    assets_dir = os.path.join(static_dir, "assets")
-    if os.path.exists(assets_dir):
-        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
-
-    # Serve index.html for all other non-API routes (SPA fallback)
-    # Use api_route to handle all methods — prevents 405 for missing API routes
-    # (a GET-only catch-all causes Starlette to return 405 for POST/PATCH/DELETE
-    # on paths not registered in any router, even if those paths start with "api/")
-    @app.api_route(
-        "/{full_path:path}",
-        methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
-    )
-    async def serve_spa(full_path: str, request: Request = None):
-        # Don't intercept API routes or WebSocket upgrade requests
-        if full_path.startswith("api/"):
-            raise HTTPException(status_code=404, detail="API route not found")
-        if request and request.headers.get("upgrade", "").lower() == "websocket":
-            raise HTTPException(status_code=404, detail="WebSocket route")
-
-        # Check if the requested file exists (e.g., favicon.ico, robots.txt)
-        file_path = os.path.abspath(os.path.join(static_dir, full_path))
-
-        # Ensure the resolved path is strictly within the static directory
-        if not file_path.startswith(os.path.abspath(static_dir)):
-            raise HTTPException(status_code=403, detail="Access denied")
-
-        if os.path.isfile(file_path):
-            return FileResponse(file_path)
-
-        # Fallback to index.html for SPA routing
-        index_path = os.path.join(static_dir, "index.html")
-        if os.path.exists(index_path):
-            return FileResponse(index_path)
-
-        raise HTTPException(status_code=404, detail="Not found")

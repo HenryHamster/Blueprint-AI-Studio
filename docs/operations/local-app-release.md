@@ -1,0 +1,64 @@
+# Hamsterwheel application release
+
+Hamsterwheel is the production API, worker, database, and edge host. A normal
+push to `main` builds and publishes a combined backend plus admin-UI image, but
+does not automatically wake the recovery-only Cloud Run service or run the
+retired Cloud SQL migration job. The build uploads `local-app-release.json`
+with an exact Artifact Registry digest and Git revision.
+
+## One-time release bootstrap
+
+The first rollout uses `bootstrap_local_app_release.py` because hamsterwheel's
+currently installed immutable bundle predates the release command and deploy
+SHA forwarding. Transfer that script and its allowlisted sibling files to one
+root-owned `0700` bootstrap directory, verify their reviewed SHA-256 values,
+then run:
+
+```bash
+sudo env -i \
+  SUDO_USER=henry_hamster \
+  PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+  /var/lib/blueprint/bootstrap/local-app-release/bootstrap_local_app_release.py \
+  --revision FULL_GIT_SHA
+```
+
+The bootstrap installs a new content-addressed script bundle, redirects only
+the API unit's future starts to the new wrapper, and installs the edge drop-in
+that resets the legacy `BindsTo`. It performs `daemon-reload` but does not
+restart the API, worker, database, backup timer, or edge. It verifies all five
+unit markers and every role environment remain unchanged.
+
+## Release
+
+Run the root-owned immutable `local_app_release.py` with the artifact's exact
+`image_ref` and `revision`. Do not use a tag.
+
+```bash
+sudo env -i \
+  SUDO_USER=henry_hamster \
+  PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+  /usr/local/lib/blueprint-node/REVIEWED_BUNDLE/local_app_release.py \
+  --image IMAGE_AT_SHA256 \
+  --expected-revision FULL_GIT_SHA
+```
+
+The release tool verifies the installed local-control-plane manifest, image
+digest and labels, static-tree manifest, service ownership, public origin,
+database/backup/edge file hashes, and health endpoints. It retains the prior
+image, restarts the worker before the API, and automatically restores both
+role environment files and services if any activation check fails. Root-only
+receipts are written below `/var/lib/blueprint/local-app-releases/`.
+
+Cloud Run remains a manually activated recovery target. Firebase Hosting
+remains a separately deployed rollback UI, and its origin must remain present
+in `ALLOWED_ORIGINS` so GitHub OAuth can return to it safely. Before activation,
+verify:
+
+- `ORCHESTRATOR_URL` is exactly the Funnel HTTPS origin and `ADMIN_UI_URL`
+  resolves to that same origin;
+- the Funnel hostname is a Firebase Auth authorized domain;
+- both the Funnel and Firebase rollback origins are exact `ALLOWED_ORIGINS`;
+- the GitHub OAuth callback is the Funnel origin plus
+  `/api/github/oauth/callback`;
+- the recovery Cloud Run/Cloud SQL path remains disabled unless its database
+  has first been explicitly reconciled from authoritative local PostgreSQL.

@@ -219,7 +219,7 @@ class RenderTests(unittest.TestCase):
         self.assertIn("After=blueprint-database.service", rendered)
         self.assertNotIn("blueprint-database-proxy.service", rendered)
 
-    def test_edge_uses_dedicated_oneshot_unit_bound_to_api(self):
+    def test_edge_uses_dedicated_oneshot_unit_ordered_after_api(self):
         edge_entrypoint = node._system_script_bundle()[0][
             node._TAILSCALE_FUNNEL_SERVICE
         ]
@@ -233,7 +233,8 @@ class RenderTests(unittest.TestCase):
             )
         self.assertIn("Type=oneshot", rendered)
         self.assertIn("RemainAfterExit=yes", rendered)
-        self.assertIn("BindsTo=blueprint-api.service", rendered)
+        self.assertIn("Wants=blueprint-api.service", rendered)
+        self.assertNotIn("BindsTo=blueprint-api.service", rendered)
         self.assertIn("Requires=tailscaled.service", rendered)
         self.assertIn(
             "WantedBy=multi-user.target blueprint-api.service tailscaled.service",
@@ -245,6 +246,11 @@ class RenderTests(unittest.TestCase):
         )
         self.assertNotIn(str(node._TAILSCALE_FUNNEL_SERVICE), rendered)
         self.assertNotRegex(rendered, r"@[A-Z_]+@")
+
+    def test_edge_api_decoupling_drop_in_resets_legacy_binds_to(self):
+        drop_in = (node._SCRIPT_DIR / "blueprint-edge-api-decoupling.conf").read_text()
+        self.assertIn("BindsTo=\n", drop_in)
+        self.assertIn("Wants=blueprint-api.service", drop_in)
 
     def test_database_uses_explicit_oneshot_controller_lifecycle(self):
         database_entrypoint = node._system_script_bundle()[0][
@@ -585,14 +591,15 @@ class InstallTests(unittest.TestCase):
         self.assertIn("RandomizedDelaySec=30m", backup_timer)
         self.assertIn("Type=oneshot", edge_unit)
         self.assertIn("RemainAfterExit=yes", edge_unit)
-        self.assertIn("BindsTo=blueprint-api.service", edge_unit)
+        self.assertIn("Wants=blueprint-api.service", edge_unit)
+        self.assertNotIn("BindsTo=blueprint-api.service", edge_unit)
         self.assertIn(
             f"ExecStop={self.trusted_system_python} {self.script_root}",
             edge_unit,
         )
         self.assertNotIn(str(node._SCRIPT_DIR), edge_unit)
         installed_scripts = list(self.script_root.glob("*/*.py"))
-        self.assertEqual(len(installed_scripts), 9)
+        self.assertEqual(len(installed_scripts), 11)
         bundle_dirs = {path.parent for path in installed_scripts}
         self.assertEqual(len(bundle_dirs), 1)
         bundle_dir = bundle_dirs.pop()
@@ -610,6 +617,8 @@ class InstallTests(unittest.TestCase):
         self.assertTrue(
             (bundle_dir / "live_source_rehearsal_export.py").is_file()
         )
+        self.assertTrue((bundle_dir / "local_app_release.py").is_file())
+        self.assertTrue((bundle_dir / "frontend_release_manifest.py").is_file())
         if os.name != "nt":
             for script in installed_scripts:
                 self.assertEqual(script.stat().st_uid, os.getuid())

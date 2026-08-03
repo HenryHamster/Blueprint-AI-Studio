@@ -25,8 +25,7 @@ class LocalApiServiceTests(unittest.TestCase):
         self.google_credentials = self.root / "api-gcp.json"
         self.payload = {
             "DATABASE_URL": (
-                "postgresql+asyncpg://user:p%40ss@10.0.0.2:5432/"
-                "blueprint?ssl=require"
+                "postgresql+asyncpg://user:p%40ss@10.0.0.2:5432/blueprint?ssl=require"
             ),
             "AGENT_JWT_SECRET": "a" * 32,
             "WS_TICKET_SECRET": "w" * 32,
@@ -34,8 +33,7 @@ class LocalApiServiceTests(unittest.TestCase):
             "GITHUB_CLIENT_ID": "client-id",
             "GITHUB_CLIENT_SECRET": "client-secret",
             "GITHUB_PRIVATE_KEY": (
-                "-----BEGIN PRIVATE KEY-----\nkey-material\n"
-                "-----END PRIVATE KEY-----"
+                "-----BEGIN PRIVATE KEY-----\nkey-material\n-----END PRIVATE KEY-----"
             ),
             "GITHUB_WEBHOOK_SECRET": "webhook-secret",
             "GITHUB_PAT_ENCRYPTION_KEY": "fernet-key",
@@ -71,13 +69,34 @@ class LocalApiServiceTests(unittest.TestCase):
         return {
             "BLUEPRINT_API_IMAGE_ID": f"sha256:{'a' * 64}",
             "BLUEPRINT_API_SECRETS_FILE": str(self.secrets),
-            "BLUEPRINT_API_GOOGLE_CREDENTIALS_FILE": str(
-                self.google_credentials
-            ),
+            "BLUEPRINT_API_GOOGLE_CREDENTIALS_FILE": str(self.google_credentials),
             "BLUEPRINT_CONTROL_PLANE_NETWORK": "blueprint-control-plane",
             "BLUEPRINT_API_PORT": "8080",
             "BLUEPRINT_DATABASE_MODE": database_mode,
         }
+
+    @patch.object(api, "_assert_container_slot")
+    @patch.object(api.worker, "_network_gateway", return_value="172.20.0.1")
+    @patch.object(api.worker, "_assert_no_host_ci_runner")
+    def test_api_deploy_sha_is_validated_and_forwarded(
+        self, _ci_guard, _gateway, _container_slot
+    ):
+        environment = self._environment(database_mode="local-postgres")
+        environment["BLUEPRINT_API_DEPLOY_SHA"] = "b" * 40
+        with patch.dict(os.environ, environment, clear=True):
+            argv, child_env = api.command()
+        self.assertEqual(child_env["DEPLOY_SHA"], "b" * 40)
+        forwarded = {
+            argv[index + 1] for index, item in enumerate(argv[:-1]) if item == "--env"
+        }
+        self.assertIn("DEPLOY_SHA", forwarded)
+
+        environment["BLUEPRINT_API_DEPLOY_SHA"] = "short"
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            self.assertRaisesRegex(ValueError, "full git SHA"),
+        ):
+            api.command()
 
     @patch.object(api, "_assert_container_slot")
     @patch.object(api.worker, "_network_gateway", return_value="172.20.0.1")
@@ -99,18 +118,13 @@ class LocalApiServiceTests(unittest.TestCase):
         container_slot.assert_called_once_with(
             f"sha256:{'a' * 64}", "blueprint-control-plane"
         )
-        self.assertEqual(
-            argv[argv.index("--publish") + 1], "127.0.0.1:8080:8080"
-        )
+        self.assertEqual(argv[argv.index("--publish") + 1], "127.0.0.1:8080:8080")
         self.assertIn("blueprint-control-plane", argv)
         self.assertNotIn("--add-host", argv)
         self.assertEqual(child_env["BLUEPRINT_PROCESS_ROLE"], "api")
-        self.assertEqual(
-            child_env["BLUEPRINT_DEPLOYMENT_MODE"], "local-production"
-        )
-        self.assertIn(
-            "@blueprint-postgres:5432/", child_env["DATABASE_URL"]
-        )
+        self.assertEqual(child_env["BLUEPRINT_DEPLOYMENT_MODE"], "local-production")
+        self.assertEqual(child_env["ADMIN_UI_URL"], self.payload["ORCHESTRATOR_URL"])
+        self.assertIn("@blueprint-postgres:5432/", child_env["DATABASE_URL"])
         self.assertIn("ssl=disable", child_env["DATABASE_URL"])
         self.assertIn("--memory", argv)
         self.assertIn("--memory-swap", argv)
@@ -123,9 +137,7 @@ class LocalApiServiceTests(unittest.TestCase):
         self.assertNotIn(self.payload["DATABASE_URL"], command_text)
         self.assertNotIn(self.payload["GITHUB_PRIVATE_KEY"], command_text)
         forwarded = {
-            argv[index + 1]
-            for index, item in enumerate(argv[:-1])
-            if item == "--env"
+            argv[index + 1] for index, item in enumerate(argv[:-1]) if item == "--env"
         }
         self.assertFalse(
             {
@@ -141,6 +153,24 @@ class LocalApiServiceTests(unittest.TestCase):
             }
             & forwarded
         )
+        self.assertIn("ADMIN_UI_URL", forwarded)
+
+    def test_api_secret_bundle_accepts_only_https_admin_ui_url(self):
+        self.payload["ADMIN_UI_URL"] = "http://insecure.example"
+        self.secrets.write_text(json.dumps(self.payload), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "canonical HTTPS origin"):
+            api._load_api_secrets(str(self.secrets))
+
+        for invalid_url in (
+            "https://user@example.com",
+            "https://example.com/path",
+            "https://example.com?next=evil",
+            "https://example.com#fragment",
+        ):
+            self.payload["ADMIN_UI_URL"] = invalid_url
+            self.secrets.write_text(json.dumps(self.payload), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "canonical HTTPS origin"):
+                api._load_api_secrets(str(self.secrets))
 
     @patch.object(api, "_assert_container_slot")
     @patch.object(api.worker, "_network_gateway", return_value="172.20.0.1")
@@ -164,9 +194,7 @@ class LocalApiServiceTests(unittest.TestCase):
             "172.20.0.1",
         )
         self.assertIn("host.docker.internal:172.20.0.1", argv)
-        self.assertIn(
-            "@host.docker.internal:5433/", child_env["DATABASE_URL"]
-        )
+        self.assertIn("@host.docker.internal:5433/", child_env["DATABASE_URL"])
         self.assertIn("ssl=disable", child_env["DATABASE_URL"])
 
     def test_mutable_api_image_and_privileged_port_are_rejected(self):
@@ -204,9 +232,7 @@ class LocalApiServiceTests(unittest.TestCase):
         del self.payload["GITHUB_WEBHOOK_SECRET"]
         del self.payload["METRICS_TOKEN"]
         self.secrets.write_text(json.dumps(self.payload), encoding="utf-8")
-        with self.assertRaisesRegex(
-            ValueError, "GITHUB_WEBHOOK_SECRET.*METRICS_TOKEN"
-        ):
+        with self.assertRaisesRegex(ValueError, "GITHUB_WEBHOOK_SECRET.*METRICS_TOKEN"):
             api._load_api_secrets(str(self.secrets))
 
     def test_api_rejects_dedicated_worker_credentials(self):
@@ -262,9 +288,7 @@ class LocalApiServiceTests(unittest.TestCase):
             stdout="",
             stderr="Error: No such object: blueprint-local-api",
         )
-        api._assert_container_slot(
-            f"sha256:{'a' * 64}", "blueprint-control-plane"
-        )
+        api._assert_container_slot(f"sha256:{'a' * 64}", "blueprint-control-plane")
 
 
 if __name__ == "__main__":
