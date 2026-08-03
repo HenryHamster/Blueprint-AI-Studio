@@ -38,6 +38,46 @@ def _fake_reader(module_line_count: int):
     return _reader
 
 
+def test_cap_bump_resolves_directions_router_breach():
+    """The cap bump for the cited 1f2d0ba9 directions breach is retained.
+
+    That SHA counted 2,111 lines against the old 2,100 cap.  The canonical
+    policy therefore raises the cap to 2,450; this merge-test gate checks the
+    tracked cap and the real router file together so reverting the remediation
+    or allowing the router to outgrow the new cap fails explicitly.
+    """
+    json_path = os.path.join(os.path.dirname(__file__), "module_size_limits.json")
+    data = csl.load_limits(json_path)
+    backend_caps = data.get("backend", {})
+
+    target_rel = "routers/directions.py"
+    assert target_rel in backend_caps, (
+        f"{target_rel} must have a cap entry in module_size_limits.json"
+    )
+    assert backend_caps[target_rel] == csl._bump_size_limit(2111) == 2450
+
+    backend_root = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "app")
+    )
+    target_path = os.path.join(backend_root, target_rel)
+    assert os.path.isfile(target_path), f"{target_path} must exist on disk"
+
+    actual_count = csl.count_lines(target_path)
+    result = csl.classify_size_record(
+        target_rel,
+        actual_count,
+        backend_caps[target_rel],
+        "backend",
+        with_verdict=False,
+    )
+    assert not result["breach"], (
+        f"{target_rel} has {actual_count} lines which exceeds its cap of "
+        f"{backend_caps[target_rel]}. Run `python3 "
+        "backend/testing/check_size_limits.py --fix` and commit the updated "
+        "module_size_limits.json."
+    )
+
+
 async def _fake_resolve(_session, _project):
     return ("token", "owner", "repo")
 
