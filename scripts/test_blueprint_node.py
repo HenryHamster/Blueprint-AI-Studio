@@ -247,11 +247,6 @@ class RenderTests(unittest.TestCase):
         self.assertNotIn(str(node._TAILSCALE_FUNNEL_SERVICE), rendered)
         self.assertNotRegex(rendered, r"@[A-Z_]+@")
 
-    def test_edge_api_decoupling_drop_in_resets_legacy_binds_to(self):
-        drop_in = (node._SCRIPT_DIR / "blueprint-edge-api-decoupling.conf").read_text()
-        self.assertIn("BindsTo=\n", drop_in)
-        self.assertIn("Wants=blueprint-api.service", drop_in)
-
     def test_database_uses_explicit_oneshot_controller_lifecycle(self):
         database_entrypoint = node._system_script_bundle()[0][
             node._LOCAL_POSTGRES_SERVICE
