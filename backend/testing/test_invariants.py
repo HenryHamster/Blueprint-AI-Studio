@@ -12707,7 +12707,7 @@ class TestProblemModelWritePathInvariants:
     # When changing a file, update these line numbers.
     _SAFE_SITES: dict[tuple[str, int], str] = {
         # task_locking.py: project.problem_model write-back inside with_problem_model_locked
-        ("task_locking.py", 1123): "sanitize_problem_model_raw(…) -> project.problem_model write-back inside with_problem_model_locked",
+        ("task_locking.py", 1127): "sanitize_problem_model_raw(…) -> project.problem_model write-back inside with_problem_model_locked",
         # lifecycle.py: sanitize_problem_model_raw -> startup healing write-back
         ("lifecycle.py", 501): "sanitize_problem_model_raw(...) strips packer markers before startup healing write-back",
         # direction_lifecycle.py: sanitize_problem_model_raw -> reconcile_gaps_for_retired_directions
