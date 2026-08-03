@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 import subprocess
 import sys
@@ -9,7 +10,7 @@ import tarfile
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import call, patch
+from unittest.mock import Mock, call, patch
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -26,6 +27,42 @@ def completed(argv: list[str] | None = None) -> subprocess.CompletedProcess[str]
 
 
 class LocalAppReleaseTests(unittest.TestCase):
+    @staticmethod
+    def _managed_container_record(
+        name: str,
+        image: str,
+        container_id: str,
+    ) -> dict[str, object]:
+        role = "api" if name.endswith("api") else "worker"
+        return {
+            "Id": container_id,
+            "Name": f"/{name}",
+            "Image": image,
+            "Config": {
+                "Image": image,
+                "Labels": (
+                    {"com.blueprint.role": role} if role == "api" else {}
+                ),
+                "Env": [f"BLUEPRINT_PROCESS_ROLE={role}"],
+            },
+            "HostConfig": {
+                "AutoRemove": True,
+                "ReadonlyRootfs": True,
+                "NetworkMode": "blueprint-control-plane",
+            },
+            "NetworkSettings": {
+                "Networks": {"blueprint-control-plane": {}},
+            },
+            "Mounts": [
+                {
+                    "Type": "bind",
+                    "Destination": "/var/run/blueprint/gcp.json",
+                    "RW": False,
+                }
+            ],
+            "State": {"Running": True},
+        }
+
     @staticmethod
     def _tar_payload(entries: list[tuple[str, bytes, bytes]]) -> io.BytesIO:
         payload = io.BytesIO()
@@ -115,6 +152,355 @@ class LocalAppReleaseTests(unittest.TestCase):
         self.assertIn("objsubid=1", leadership_sql)
         self.assertIn("application_name='blueprint-worker'", leadership_sql)
 
+    def test_managed_container_cleanup_uses_immutable_container_id(self):
+        name = "blueprint-local-worker"
+        container_id = "1" * 64
+        record = self._managed_container_record(name, OLD_IMAGE, container_id)
+        calls: list[list[str]] = []
+
+        def run(argv, **_kwargs):
+            calls.append(argv)
+            return completed(argv)
+
+        with (
+            patch.object(
+                release,
+                "_container_record",
+                side_effect=[record, record],
+            ),
+            patch.object(release, "_run", side_effect=run),
+            patch.object(release, "_wait_unit_stopped"),
+        ):
+            release._stop_unit_container(
+                "blueprint-worker.service",
+                name,
+                frozenset({OLD_IMAGE, NEW_IMAGE}),
+            )
+
+        stop = next(call for call in calls if call[2:4] == ["stop", "--timeout"])
+        remove = next(call for call in calls if call[2:4] == ["rm", "--force"])
+        self.assertEqual(stop[-1], container_id)
+        self.assertEqual(remove[-1], container_id)
+        self.assertNotEqual(stop[-1], name)
+        self.assertNotEqual(remove[-1], name)
+
+    def test_foreign_container_is_rejected_before_any_mutation(self):
+        name = "blueprint-local-api"
+        foreign = self._managed_container_record(name, "sha256:" + "9" * 64, "2" * 64)
+        with (
+            patch.object(release, "_container_record", return_value=foreign),
+            patch.object(release, "_run") as run_mock,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "unrecognized"):
+                release._stop_unit_container(
+                    "blueprint-api.service",
+                    name,
+                    frozenset({OLD_IMAGE, NEW_IMAGE}),
+                )
+        run_mock.assert_not_called()
+
+    def test_container_name_reuse_does_not_remove_replacement(self):
+        name = "blueprint-local-worker"
+        original = self._managed_container_record(name, OLD_IMAGE, "3" * 64)
+        replacement = self._managed_container_record(name, OLD_IMAGE, "4" * 64)
+        calls: list[list[str]] = []
+
+        def run(argv, **_kwargs):
+            calls.append(argv)
+            return completed(argv)
+
+        with (
+            patch.object(
+                release,
+                "_container_record",
+                side_effect=[original, None, replacement],
+            ),
+            patch.object(release, "_run", side_effect=run),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "reused"):
+                release._stop_unit_container(
+                    "blueprint-worker.service",
+                    name,
+                    frozenset({OLD_IMAGE, NEW_IMAGE}),
+                )
+        remove_calls = [call for call in calls if call[2:4] == ["rm", "--force"]]
+        self.assertEqual(remove_calls, [])
+
+    def test_wait_unit_stopped_requires_terminal_unit_and_absent_container(self):
+        with (
+            patch.object(
+                release,
+                "_unit_stop_state",
+                side_effect=[("deactivating", "123"), ("inactive", "0")],
+            ) as state_mock,
+            patch.object(
+                release,
+                "_container_record",
+                side_effect=[None, None, None, None],
+            ) as record_mock,
+            patch.object(release.time, "sleep"),
+        ):
+            release._wait_unit_stopped(
+                "blueprint-worker.service",
+                "blueprint-local-worker",
+                "5" * 64,
+                timeout=5,
+            )
+        self.assertEqual(state_mock.call_count, 2)
+        self.assertEqual(record_mock.call_count, 4)
+
+    def test_restart_waits_for_stop_before_start_and_readiness(self):
+        events: list[str] = []
+        with (
+            patch.object(
+                release,
+                "_stop_unit_container",
+                side_effect=lambda *_args, **_kwargs: events.append("stopped"),
+            ),
+            patch.object(
+                release,
+                "_run",
+                side_effect=lambda argv, **_kwargs: (
+                    events.append("started") or completed(argv)
+                    if argv[:3] == ["/usr/bin/systemctl", "start", "blueprint-worker.service"]
+                    else completed(argv)
+                ),
+            ),
+            patch.object(
+                release,
+                "_wait_service_container",
+                side_effect=lambda *_args, **_kwargs: events.append("ready"),
+            ),
+        ):
+            release._restart_service(
+                "blueprint-worker.service",
+                NEW_IMAGE,
+                allowed_images=frozenset({OLD_IMAGE, NEW_IMAGE}),
+            )
+        self.assertEqual(events, ["stopped", "started", "ready"])
+
+    def test_transient_readiness_is_retried_until_success(self):
+        attempts = 0
+
+        def operation() -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts < 3:
+                raise release._TransientNotReady("container not present yet")
+
+        with patch.object(release.time, "sleep"):
+            release._wait_verified(operation, "transient readiness", timeout=5, interval=0)
+        self.assertEqual(attempts, 3)
+
+    def test_terminal_readiness_failure_is_not_retried(self):
+        operation = Mock(side_effect=RuntimeError("wrong image"))
+        with (
+            patch.object(release.time, "sleep") as sleep_mock,
+            self.assertRaisesRegex(RuntimeError, "wrong image"),
+        ):
+            release._wait_verified(operation, "terminal failure", timeout=5, interval=0)
+        operation.assert_called_once_with()
+        sleep_mock.assert_not_called()
+
+    def test_registry_credential_is_opened_safely_and_identity_pinned(self):
+        credential = {
+            "type": "service_account",
+            "project_id": "blueprint-orchestrator",
+            "client_email": release._WORKER_REGISTRY_READER,
+            "private_key": "secret-private-key",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "worker.json"
+            path.write_text(json.dumps(credential), encoding="utf-8")
+            path.chmod(0o600)
+            expected_uid = path.stat().st_uid
+            self.assertEqual(
+                json.loads(
+                    release._secure_registry_credential(str(path), expected_uid)
+                )["client_email"],
+                release._WORKER_REGISTRY_READER,
+            )
+
+            with self.assertRaisesRegex(ValueError, "unsafe"):
+                release._secure_registry_credential(str(path), expected_uid + 1)
+
+            path.chmod(0o640)
+            with self.assertRaisesRegex(ValueError, "unsafe"):
+                release._secure_registry_credential(str(path), expected_uid)
+            path.chmod(0o600)
+
+            link = root / "worker-link.json"
+            link.symlink_to(path)
+            with self.assertRaises(OSError):
+                release._secure_registry_credential(str(link), expected_uid)
+
+            hardlink = root / "worker-hardlink.json"
+            os.link(path, hardlink)
+            with self.assertRaisesRegex(ValueError, "unsafe"):
+                release._secure_registry_credential(str(path), expected_uid)
+
+            fifo = root / "worker.fifo"
+            os.mkfifo(fifo, 0o600)
+            with self.assertRaisesRegex(ValueError, "unsafe"):
+                release._secure_registry_credential(str(fifo), expected_uid)
+
+        with tempfile.TemporaryDirectory() as directory:
+            wrong = Path(directory) / "wrong.json"
+            credential["client_email"] = "foreign@example.invalid"
+            wrong.write_text(json.dumps(credential), encoding="utf-8")
+            wrong.chmod(0o600)
+            with self.assertRaisesRegex(ValueError, "wrong identity"):
+                release._secure_registry_credential(
+                    str(wrong), wrong.stat().st_uid
+                )
+
+    def test_registry_auth_uses_stdin_and_exact_disposable_config(self):
+        secret = '{"private_key":"must-not-leak"}'
+        with tempfile.TemporaryDirectory() as parent:
+            auth_directory = Path(parent) / "blueprint-registry-auth-abcdef12"
+            auth_directory.mkdir(mode=0o700)
+            calls: list[tuple[list[str], dict[str, object]]] = []
+
+            def run(argv, **kwargs):
+                calls.append((argv, kwargs))
+                if "login" in argv:
+                    auth_directory.mkdir(exist_ok=True)
+                    auth_directory.chmod(0o700)
+                    config = auth_directory / "config.json"
+                    config.write_text("{}", encoding="utf-8")
+                    config.chmod(0o600)
+                return completed(argv)
+
+            with (
+                patch.object(release, "_cleanup_stale_registry_auth"),
+                patch.object(
+                    release.tempfile,
+                    "mkdtemp",
+                    return_value=str(auth_directory),
+                ),
+                patch.object(release, "_run", side_effect=run),
+            ):
+                with release._registry_auth(secret) as config:
+                    self.assertEqual(config, auth_directory)
+                    self.assertTrue(auth_directory.is_dir())
+
+            self.assertFalse(auth_directory.exists())
+            login_argv, login_kwargs = calls[0]
+            logout_argv, logout_kwargs = calls[-1]
+            self.assertEqual(login_argv[1:3], ["--config", str(auth_directory)])
+            self.assertEqual(logout_argv[1:3], ["--config", str(auth_directory)])
+            self.assertEqual(login_kwargs["input_text"], secret)
+            self.assertNotIn(secret, " ".join(login_argv + logout_argv))
+            self.assertNotIn("input_text", logout_kwargs)
+
+    def test_registry_auth_cleanup_runs_when_caller_fails(self):
+        with tempfile.TemporaryDirectory() as parent:
+            auth_directory = Path(parent) / "blueprint-registry-auth-abcdef12"
+            auth_directory.mkdir(mode=0o700)
+
+            def run(argv, **_kwargs):
+                if "login" in argv:
+                    auth_directory.mkdir(exist_ok=True)
+                    auth_directory.chmod(0o700)
+                    config = auth_directory / "config.json"
+                    config.write_text("{}", encoding="utf-8")
+                    config.chmod(0o600)
+                return completed(argv)
+
+            with (
+                patch.object(release, "_cleanup_stale_registry_auth"),
+                patch.object(
+                    release.tempfile,
+                    "mkdtemp",
+                    return_value=str(auth_directory),
+                ),
+                patch.object(release, "_run", side_effect=run),
+                self.assertRaisesRegex(RuntimeError, "candidate verification failed"),
+            ):
+                with release._registry_auth("secret"):
+                    raise RuntimeError("candidate verification failed")
+            self.assertFalse(auth_directory.exists())
+
+    def test_registry_auth_removes_config_when_logout_raises(self):
+        with tempfile.TemporaryDirectory() as parent:
+            auth_directory = Path(parent) / "blueprint-registry-auth-abcdef12"
+            auth_directory.mkdir(mode=0o700)
+
+            def run(argv, **_kwargs):
+                if "login" in argv:
+                    config = auth_directory / "config.json"
+                    config.write_text("{}", encoding="utf-8")
+                    config.chmod(0o600)
+                    return completed(argv)
+                raise OSError("logout transport failed")
+
+            with (
+                patch.object(release, "_cleanup_stale_registry_auth"),
+                patch.object(
+                    release.tempfile,
+                    "mkdtemp",
+                    return_value=str(auth_directory),
+                ),
+                patch.object(release, "_run", side_effect=run),
+                self.assertRaisesRegex(RuntimeError, "docker logout failed"),
+            ):
+                with release._registry_auth("secret"):
+                    pass
+            self.assertFalse(auth_directory.exists())
+
+    def test_registry_login_failure_is_sanitized_and_cleans_config(self):
+        secret = "private-key-fragment"
+        with tempfile.TemporaryDirectory() as parent:
+            auth_directory = Path(parent) / "blueprint-registry-auth-abcdef12"
+            auth_directory.mkdir(mode=0o700)
+
+            def run(argv, **_kwargs):
+                if "login" in argv:
+                    config = auth_directory / "config.json"
+                    config.write_text("{}", encoding="utf-8")
+                    config.chmod(0o600)
+                    raise RuntimeError(f"provider echoed {secret}")
+                return completed(argv)
+
+            with (
+                patch.object(release, "_cleanup_stale_registry_auth"),
+                patch.object(
+                    release.tempfile,
+                    "mkdtemp",
+                    return_value=str(auth_directory),
+                ),
+                patch.object(release, "_run", side_effect=run),
+                self.assertRaisesRegex(RuntimeError, "registry login failed") as caught,
+            ):
+                with release._registry_auth(secret):
+                    pass
+            self.assertNotIn(secret, str(caught.exception))
+            self.assertFalse(auth_directory.exists())
+
+    def test_stale_registry_auth_cleanup_is_bounded_and_fail_closed(self):
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent)
+            valid = root / "blueprint-registry-auth-abcdef12"
+            valid.mkdir(mode=0o700)
+            config = valid / "config.json"
+            config.write_text("{}", encoding="utf-8")
+            config.chmod(0o600)
+            with patch.object(release.Path, "glob", return_value=[valid]):
+                release._cleanup_stale_registry_auth(valid.stat().st_uid)
+            self.assertFalse(valid.exists())
+
+            unsafe = root / "blueprint-registry-auth-ghijkl34"
+            unsafe.mkdir(mode=0o700)
+            unexpected = unsafe / "unexpected"
+            unexpected.write_text("do not delete", encoding="utf-8")
+            with (
+                patch.object(release.Path, "glob", return_value=[unsafe]),
+                self.assertRaisesRegex(RuntimeError, "unexpected files"),
+            ):
+                release._cleanup_stale_registry_auth(unsafe.stat().st_uid)
+            self.assertEqual(unexpected.read_text(encoding="utf-8"), "do not delete")
+
     def test_role_update_is_unique_and_preserves_other_bytes(self):
         original = b"# comment\nBLUEPRINT_API_IMAGE_ID=sha256:old\nKEEP=value\n"
         updated = release._replace_role_values(
@@ -146,7 +532,11 @@ class LocalAppReleaseTests(unittest.TestCase):
             + OLD_IMAGE.encode()
             + b"\nBLUEPRINT_API_SECRETS_FILE=/safe/api.json\n"
         )
-        worker = b"BLUEPRINT_WORKER_IMAGE_ID=" + OLD_IMAGE.encode() + b"\n"
+        worker = (
+            b"BLUEPRINT_WORKER_IMAGE_ID="
+            + OLD_IMAGE.encode()
+            + b"\nBLUEPRINT_WORKER_GOOGLE_CREDENTIALS_FILE=/safe/worker.json\n"
+        )
 
         def role_file(path: Path) -> bytes:
             return api if "/api/" in path.as_posix() else worker
@@ -162,6 +552,9 @@ class LocalAppReleaseTests(unittest.TestCase):
                 ),
                 "container": stack.enter_context(
                     patch.object(release, "_verify_container")
+                ),
+                "restart": stack.enter_context(
+                    patch.object(release, "_restart_service")
                 ),
             }
             stack.enter_context(patch.object(release, "_is_root", return_value=True))
@@ -206,6 +599,20 @@ class LocalAppReleaseTests(unittest.TestCase):
             )
             stack.enter_context(patch.object(release, "_prepare_evidence_root"))
             stack.enter_context(
+                patch.object(
+                    release,
+                    "_secure_registry_credential",
+                    return_value='{"type":"service_account"}',
+                )
+            )
+            mocks["registry"] = stack.enter_context(
+                patch.object(
+                    release,
+                    "_registry_auth",
+                    return_value=contextlib.nullcontext(Path("/tmp/registry")),
+                )
+            )
+            stack.enter_context(
                 patch.object(release, "_verify_frontend", return_value="e" * 64)
             )
             stack.enter_context(
@@ -216,7 +623,6 @@ class LocalAppReleaseTests(unittest.TestCase):
                     release, "_retain_prior_image", return_value="retained:old"
                 )
             )
-            stack.enter_context(patch.object(release, "_wait_active"))
             stack.enter_context(patch.object(release, "_verify_services_stable"))
             stack.enter_context(patch.object(release, "_verify_worker_ready"))
             stack.enter_context(
@@ -237,6 +643,48 @@ class LocalAppReleaseTests(unittest.TestCase):
             mocks["evidence"] = evidence_mock
             yield mocks
 
+    def test_registry_cleanup_failure_never_mutates_roles_or_services(self):
+        @contextlib.contextmanager
+        def failing_registry_cleanup():
+            yield Path("/tmp/registry")
+            raise RuntimeError("registry credential cleanup failed")
+
+        with self._release_patches() as mocks:
+            mocks["registry"].return_value = failing_registry_cleanup()
+            with self.assertRaisesRegex(
+                RuntimeError, "registry credential cleanup failed"
+            ):
+                release.release(IMAGE_REF, REVISION)
+            mocks["atomic"].assert_not_called()
+            mocks["restart"].assert_not_called()
+
+    def test_registry_cleanup_finishes_before_first_role_write(self):
+        events: list[str] = []
+
+        @contextlib.contextmanager
+        def tracked_registry():
+            yield Path("/tmp/registry")
+            events.append("registry-cleaned")
+
+        with self._release_patches() as mocks:
+            mocks["registry"].side_effect = lambda _credential: tracked_registry()
+            mocks["atomic"].side_effect = lambda *_args: events.append("role-write")
+            release.release(IMAGE_REF, REVISION)
+        self.assertLess(events.index("registry-cleaned"), events.index("role-write"))
+
+    def test_candidate_pull_failure_never_mutates_roles_or_services(self):
+        def run(argv, **_kwargs):
+            if "pull" in argv:
+                raise RuntimeError("candidate pull failed")
+            return completed(argv)
+
+        with self._release_patches() as mocks:
+            mocks["run"].side_effect = run
+            with self.assertRaisesRegex(RuntimeError, "candidate pull failed"):
+                release.release(IMAGE_REF, REVISION)
+            mocks["atomic"].assert_not_called()
+            mocks["restart"].assert_not_called()
+
     def test_success_updates_only_api_and_worker_and_restarts_worker_first(self):
         with self._release_patches() as mocks:
             evidence = release.release(IMAGE_REF, REVISION)
@@ -252,32 +700,93 @@ class LocalAppReleaseTests(unittest.TestCase):
                     "/etc/blueprint/nodes/henry_hamster/roles/worker/role.env",
                 },
             )
-            restarts = [
-                item
-                for item in mocks["run"].call_args_list
-                if item.args[0][:2] == ["/usr/bin/systemctl", "restart"]
-            ]
             self.assertEqual(
-                restarts,
+                mocks["restart"].call_args_list,
                 [
                     call(
-                        [
-                            "/usr/bin/systemctl",
-                            "restart",
-                            "blueprint-worker.service",
-                        ],
-                        timeout=120,
+                        "blueprint-worker.service",
+                        NEW_IMAGE,
+                        allowed_images=frozenset({OLD_IMAGE, NEW_IMAGE}),
                     ),
                     call(
-                        [
-                            "/usr/bin/systemctl",
-                            "restart",
-                            "blueprint-api.service",
-                        ],
-                        timeout=120,
+                        "blueprint-api.service",
+                        NEW_IMAGE,
+                        allowed_images=frozenset({OLD_IMAGE, NEW_IMAGE}),
                     ),
                 ],
             )
+
+    def test_worker_activation_failure_rolls_back_only_touched_worker(self):
+        def restart(unit: str, image: str, **_kwargs) -> None:
+            if unit == "blueprint-worker.service" and image == NEW_IMAGE:
+                raise RuntimeError("worker activation failed")
+
+        with self._release_patches() as mocks:
+            mocks["restart"].side_effect = restart
+            with self.assertRaisesRegex(RuntimeError, "rolled back"):
+                release.release(IMAGE_REF, REVISION)
+            self.assertEqual(
+                mocks["restart"].call_args_list,
+                [
+                    call(
+                        "blueprint-worker.service",
+                        NEW_IMAGE,
+                        allowed_images=frozenset({OLD_IMAGE, NEW_IMAGE}),
+                    ),
+                    call(
+                        "blueprint-worker.service",
+                        OLD_IMAGE,
+                        allowed_images=frozenset({OLD_IMAGE, NEW_IMAGE}),
+                    ),
+                ],
+            )
+
+    def test_api_activation_failure_rolls_back_both_touched_units(self):
+        def restart(unit: str, image: str, **_kwargs) -> None:
+            if unit == "blueprint-api.service" and image == NEW_IMAGE:
+                raise RuntimeError("API activation failed")
+
+        with self._release_patches() as mocks:
+            mocks["restart"].side_effect = restart
+            with self.assertRaisesRegex(RuntimeError, "rolled back"):
+                release.release(IMAGE_REF, REVISION)
+            self.assertEqual(
+                mocks["restart"].call_args_list,
+                [
+                    call(
+                        "blueprint-worker.service",
+                        NEW_IMAGE,
+                        allowed_images=frozenset({OLD_IMAGE, NEW_IMAGE}),
+                    ),
+                    call(
+                        "blueprint-api.service",
+                        NEW_IMAGE,
+                        allowed_images=frozenset({OLD_IMAGE, NEW_IMAGE}),
+                    ),
+                    call(
+                        "blueprint-worker.service",
+                        OLD_IMAGE,
+                        allowed_images=frozenset({OLD_IMAGE, NEW_IMAGE}),
+                    ),
+                    call(
+                        "blueprint-api.service",
+                        OLD_IMAGE,
+                        allowed_images=frozenset({OLD_IMAGE, NEW_IMAGE}),
+                    ),
+                ],
+            )
+
+    def test_preactivation_write_failure_never_mutates_services(self):
+        with self._release_patches() as mocks:
+            mocks["atomic"].side_effect = [
+                None,
+                OSError("worker role write failed"),
+                None,
+                None,
+            ]
+            with self.assertRaisesRegex(RuntimeError, "rolled back"):
+                release.release(IMAGE_REF, REVISION)
+            mocks["restart"].assert_not_called()
 
     def test_health_failure_restores_both_files_and_prior_containers(self):
         with self._release_patches(health_error=RuntimeError("bad health")) as mocks:
