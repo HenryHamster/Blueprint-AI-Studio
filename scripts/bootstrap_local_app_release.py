@@ -23,7 +23,7 @@ _API_DROP_IN = Path(
     "/etc/systemd/system/blueprint-api.service.d/20-local-app-release.conf"
 )
 _EDGE_DROP_IN = Path(
-    "/etc/systemd/system/blueprint-edge.service.d/10-api-lifecycle.conf"
+    "/etc/systemd/system/blueprint-edge.service.d/90-api-lifecycle.conf"
 )
 _REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
 _UNITS = (

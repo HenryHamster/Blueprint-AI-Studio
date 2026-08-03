@@ -11,6 +11,12 @@ import bootstrap_local_app_release as bootstrap
 
 
 class BootstrapLocalAppReleaseTests(unittest.TestCase):
+    def test_edge_reset_loads_after_installed_funnel_drop_in(self):
+        self.assertGreater(
+            bootstrap._EDGE_DROP_IN.name,
+            "10-noninteractive-funnel.conf",
+        )
+
     def test_bundle_digest_is_order_independent(self):
         first = bootstrap._bundle_digest({"a.py": b"a", "b.py": b"b"})
         second = bootstrap._bundle_digest({"b.py": b"b", "a.py": b"a"})
