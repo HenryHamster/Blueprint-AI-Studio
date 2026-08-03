@@ -485,6 +485,38 @@ async def sweep_stalled_strategic_cycles(
     from app.models import DeploymentState
 
     _deploy_state = await session.get(DeploymentState, 1)
+    # Converge old residue first: a linked task that is already FAILED or
+    # CANCELLED is a terminal lifecycle fact, not an age-based stall.  This
+    # must run while paused too; only the time-based path below is pause-aware.
+    terminal_phase_tasks = (
+        await strategic_cycle.terminal_phase_tasks_requiring_reconciliation(session)
+    )
+    reconciled_terminal_cycles = 0
+    # Snapshot the completion events BEFORE the commit expires the rows. These
+    # cycles are removed from the stalled population below, so this pass owns
+    # the strategic_cycle_completed broadcast the stalled path would otherwise
+    # have fired — without it the operator's "Strategist working…" indicator
+    # would stick on against a terminal cycle.
+    reconciled_completion_events: list[dict] = []
+    for terminal_task in terminal_phase_tasks:
+        reconciled = await strategic_cycle.reconcile_terminal_task(
+            session, terminal_task, source="stalled_cycle_reaper"
+        )
+        if reconciled is not None:
+            reconciled_terminal_cycles += 1
+            reconciled_completion_events.append(
+                strategic_cycle.terminal_completion_event(reconciled, terminal_task)
+            )
+    if reconciled_terminal_cycles:
+        await session.commit()
+        await strategic_cycle.emit_terminal_completion_events(
+            reconciled_completion_events
+        )
+        logger.info(
+            "[REAPER] Reconciled %s already-terminal strategic phase task(s)",
+            reconciled_terminal_cycles,
+        )
+
     stalled = await strategic_cycle.find_stalled(session, deploy_state=_deploy_state)
     _step7_now = _utcnow()
     if not stalled:

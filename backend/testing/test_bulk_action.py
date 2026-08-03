@@ -27,6 +27,7 @@ from app.models import (
     Project,
     ProjectMember,
     ProjectStatus,
+    StrategicCycle,
     Task,
     TaskStatus,
 )
@@ -138,6 +139,152 @@ async def test_single_admin_requeue_strips_blocked_escalation_context(db_session
     enter_blocked_state(task, waiting_on="dep", reason="blocked again")
     mark_blocker_escalated(task, detail="second deadline")
     assert (task.context or {})["blocker"]["escalation_detail"] == "second deadline"
+
+
+@pytest.mark.asyncio
+async def test_single_admin_cancel_reconciles_its_cascaded_strategic_child(
+    db_session, mocker
+):
+    """The single-task admin path reconciles a phase task cancelled by cascade."""
+    from app import strategic_cycle
+    from app.admin_task_mutations import modify_task_apply
+
+    emit = mocker.patch(
+        "app.strategic_events.emit_strategic_cycle_completed", new_callable=AsyncMock
+    )
+
+    project = await _make_project_with_member(db_session)
+    parent = await _make_task(
+        db_session, project, status=TaskStatus.IN_PROGRESS, task_type="plan"
+    )
+    phase1_task = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        title="strategic child",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "design_doc_update"}],
+    )
+    db_session.add(phase1_task)
+    await db_session.commit()
+    cycle = await strategic_cycle.create(
+        db_session, project_id=project.id, phase1_task_id=phase1_task.id
+    )
+    await db_session.commit()
+
+    await modify_task_apply(
+        parent,
+        {"status": TaskStatus.CANCELLED.value},
+        BackgroundTasks(),
+        db_session,
+    )
+    await db_session.refresh(phase1_task)
+    await db_session.refresh(cycle)
+
+    assert phase1_task.status == TaskStatus.CANCELLED
+    assert cycle.outcome == strategic_cycle.OUTCOME_FAILED_PHASE1
+    assert "source=admin_task_mutation_cascade" in (cycle.failure_reason or "")
+    # A durably terminal cycle with no completion broadcast leaves the operator
+    # UI showing an active strategist forever.
+    emit.assert_awaited_once()
+    assert emit.await_args.args[1] == str(phase1_task.id)
+    assert emit.await_args.args[2] == 1
+    assert emit.await_args.kwargs["cycle_id"] == str(cycle.id)
+    assert emit.await_args.kwargs["phase_state"] == (
+        strategic_cycle.OUTCOME_FAILED_PHASE1
+    )
+    assert emit.await_args.kwargs["completion"]["status"] == "CANCELLED"
+
+
+@pytest.mark.asyncio
+async def test_single_admin_failure_reconciles_linked_phase1_cycle(db_session, mocker):
+    """The single-task status mutation uses the same failure rule as cancel."""
+    from app import strategic_cycle
+    from app.admin_task_mutations import modify_task_apply
+
+    emit = mocker.patch(
+        "app.strategic_events.emit_strategic_cycle_completed", new_callable=AsyncMock
+    )
+
+    project = await _make_project_with_member(db_session)
+    task = await _make_task(
+        db_session,
+        project,
+        status=TaskStatus.IN_PROGRESS,
+        task_type="design_doc_update",
+    )
+    cycle = await strategic_cycle.create(
+        db_session, project_id=project.id, phase1_task_id=task.id
+    )
+    await db_session.commit()
+
+    await modify_task_apply(
+        task,
+        {"status": TaskStatus.FAILED.value},
+        BackgroundTasks(),
+        db_session,
+    )
+    await db_session.refresh(cycle)
+
+    assert cycle.outcome == strategic_cycle.OUTCOME_FAILED_PHASE1
+    assert "source=admin_task_mutation" in (cycle.failure_reason or "")
+    emit.assert_awaited_once()
+    assert emit.await_args.args[2] == 1
+    assert emit.await_args.kwargs["cycle_id"] == str(cycle.id)
+    assert emit.await_args.kwargs["phase_state"] == (
+        strategic_cycle.OUTCOME_FAILED_PHASE1
+    )
+    assert emit.await_args.kwargs["completion"]["status"] == "FAILED"
+
+
+@pytest.mark.asyncio
+async def test_bulk_cancel_reconciles_linked_phase2_cycle(
+    client: AsyncClient, db_session, mocker
+):
+    """The public bulk endpoint persists phase-2 failure in its transaction."""
+    from app import strategic_cycle
+
+    emit = mocker.patch(
+        "app.strategic_events.emit_strategic_cycle_completed", new_callable=AsyncMock
+    )
+
+    project = await _make_project_with_member(db_session)
+    task = await _make_task(
+        db_session,
+        project,
+        status=TaskStatus.IN_PROGRESS,
+        task_type="strategic_review",
+    )
+    cycle = StrategicCycle(
+        id="sc-bulk-cancel-phase2",
+        project_id=project.id,
+        outcome=strategic_cycle.OUTCOME_PHASE2_RUNNING,
+        phase1_started_at=task.created_at,
+        phase2_started_at=task.created_at,
+        phase2_task_id=task.id,
+    )
+    db_session.add(cycle)
+    await db_session.commit()
+
+    response = await client.post(
+        "/api/admin/tasks/bulk-action",
+        json={"action": "cancel", "task_ids": [str(task.id)]},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["results"] == [{"task_id": str(task.id), "status": "ok"}]
+    await db_session.refresh(task)
+    await db_session.refresh(cycle)
+    assert task.status == TaskStatus.CANCELLED
+    assert cycle.outcome == strategic_cycle.OUTCOME_FAILED_PHASE2
+    assert "source=admin_bulk_cancel" in (cycle.failure_reason or "")
+    emit.assert_awaited_once()
+    assert emit.await_args.args[1] == str(task.id)
+    assert emit.await_args.args[2] == 2
+    assert emit.await_args.kwargs["cycle_id"] == "sc-bulk-cancel-phase2"
+    assert emit.await_args.kwargs["phase_state"] == (
+        strategic_cycle.OUTCOME_FAILED_PHASE2
+    )
+    assert emit.await_args.kwargs["completion"]["status"] == "CANCELLED"
 
 
 @pytest.mark.asyncio

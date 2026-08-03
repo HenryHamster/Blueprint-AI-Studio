@@ -22,7 +22,7 @@ import uuid
 from datetime import timedelta
 from typing import Any, Mapping, Optional
 
-from sqlalchemy import desc, func, select
+from sqlalchemy import and_, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -31,6 +31,7 @@ from app.models import (
     DeploymentState,
     StrategicCycle,
     Task,
+    TaskStatus,
 )
 from app.problem_model import sanitize_problem_model_raw
 from app.strategic_constants import CYCLE_SUMMARY_MAX
@@ -66,6 +67,16 @@ OUTCOME_STALLED_PHASE1 = "stalled_phase1"
 OUTCOME_STALLED_PHASE2 = "stalled_phase2"
 OUTCOME_FAILED_PHASE2_SPAWN = "failed_phase2_spawn"
 OUTCOME_THINKER_ARTIFACTS_MISSING = "thinker_artifacts_missing"
+
+# A task can be terminalized by several writers (the agent status endpoint,
+# single-task administration, bulk administration, or the recovery sweep).
+# These are the only task states that mean its linked running phase failed.
+_TERMINAL_FAILURE_TASK_STATUSES = frozenset(
+    {TaskStatus.FAILED, TaskStatus.CANCELLED}
+)
+_PHASE1_RECONCILABLE_OUTCOMES = frozenset(
+    {OUTCOME_IN_PROGRESS, OUTCOME_PHASE1_RUNNING}
+)
 
 
 def new_cycle_id() -> str:
@@ -137,6 +148,148 @@ async def get_by_task(session: AsyncSession, task_id) -> Optional[StrategicCycle
     )
     result = await session.execute(stmt)
     return result.scalars().first()
+
+
+async def reconcile_terminal_task(
+    session: AsyncSession,
+    task: Task,
+    *,
+    source: str,
+) -> Optional[StrategicCycle]:
+    """Terminalize the active cycle phase linked to a failed/cancelled task.
+
+    The phase comes from the row's task linkage, rather than the task payload:
+    a phase-1 task can legitimately become terminal after its cycle advanced to
+    phase 2.  In that case this is deliberately a no-op.  The same strict
+    outcome checks make repeated delivery idempotent and leave completed or
+    otherwise terminal cycles untouched.
+    """
+    if task.status not in _TERMINAL_FAILURE_TASK_STATUSES:
+        return None
+
+    phase1_match = and_(
+        StrategicCycle.phase1_task_id == task.id,
+        StrategicCycle.outcome.in_(_PHASE1_RECONCILABLE_OUTCOMES),
+    )
+    phase2_match = and_(
+        StrategicCycle.phase2_task_id == task.id,
+        StrategicCycle.outcome == OUTCOME_PHASE2_RUNNING,
+    )
+    cycle = (
+        await session.execute(
+            select(StrategicCycle).where(
+                StrategicCycle.project_id == task.project_id,
+                or_(phase1_match, phase2_match),
+            )
+        )
+    ).scalars().first()
+    if cycle is None:
+        return None
+
+    phase = "phase1" if cycle.phase1_task_id == task.id else "phase2"
+    status = getattr(task.status, "value", str(task.status))
+    bounded_source = (source or "unknown")[:120]
+    reason = (
+        f"terminal_task_reconciliation: source={bounded_source} "
+        f"task_id={task.id} status={status}"
+    )[:500]
+    return await mark_failure(session, cycle.id, phase=phase, reason=reason)
+
+
+def terminal_completion_event(
+    cycle: StrategicCycle,
+    task: Task,
+) -> dict[str, Any]:
+    """Snapshot the canonical ``strategic_cycle_completed`` args for a cycle that
+    :func:`reconcile_terminal_task` just terminalized.
+
+    A durably terminal cycle whose completion is never broadcast leaves the
+    connected UI showing "Strategist working…" forever — ``strategistActive`` is
+    only cleared by ``strategic_cycle_completed`` or a project switch
+    (admin-ui/src/hooks/useLogViewer.ts).  So every reconciliation site pairs its
+    write with this event.
+
+    Callers MUST build the snapshot BEFORE their commit (a commit expires the
+    ORM instances, so a later attribute read would lazy-load outside the
+    transaction) and emit it AFTER, via
+    :func:`emit_terminal_completion_events`.
+    """
+    phase = 1 if cycle.phase1_task_id == task.id else 2
+    return {
+        "project_id": str(cycle.project_id),
+        "task_id": str(task.id),
+        "phase": phase,
+        "cycle_id": str(cycle.id),
+        # The resulting terminal outcome (failed_phase1 / failed_phase2), not a
+        # generic "failed" literal — the UI mirrors this into cycle state.
+        "phase_state": cycle.outcome,
+        "completion": {
+            "status": getattr(task.status, "value", str(task.status)),
+            "status_message": task.latest_status_message,
+            "failure_reason": cycle.failure_reason,
+        },
+    }
+
+
+async def emit_terminal_completion_events(events) -> None:
+    """Broadcast reconciliation completion events. POST-COMMIT ONLY.
+
+    Never raises: a broadcast failure must not turn an already-committed
+    administrative cancellation / lifecycle transition into a 500, and the
+    remaining events still go out.
+    """
+    from app.strategic_events import emit_strategic_cycle_completed
+
+    for event in events or ():
+        try:
+            await emit_strategic_cycle_completed(
+                event["project_id"],
+                event["task_id"],
+                event["phase"],
+                cycle_id=event["cycle_id"],
+                phase_state=event["phase_state"],
+                completion=event["completion"],
+            )
+        except Exception as exc:  # noqa: BLE001 - best-effort post-commit signal
+            logger.warning(
+                "[STRATEGIC_CYCLE] terminal completion broadcast failed for "
+                f"cycle {event.get('cycle_id')}: {exc!r}"
+            )
+
+
+async def terminal_phase_tasks_requiring_reconciliation(
+    session: AsyncSession,
+    *,
+    limit: int = 50,
+) -> list[Task]:
+    """Return active-cycle phase tasks already failed or cancelled.
+
+    This intentionally ignores elapsed time and pipeline pause state.  It is
+    used by the stalled-cycle reaper to converge residue created before the
+    synchronous terminal writers were wired to :func:`reconcile_terminal_task`.
+    """
+    phase1_match = and_(
+        StrategicCycle.phase1_task_id == Task.id,
+        StrategicCycle.outcome.in_(_PHASE1_RECONCILABLE_OUTCOMES),
+    )
+    phase2_match = and_(
+        StrategicCycle.phase2_task_id == Task.id,
+        StrategicCycle.outcome == OUTCOME_PHASE2_RUNNING,
+    )
+    stmt = (
+        select(Task)
+        .join(
+            StrategicCycle,
+            and_(
+                StrategicCycle.project_id == Task.project_id,
+                or_(phase1_match, phase2_match),
+            ),
+        )
+        .where(Task.status.in_(_TERMINAL_FAILURE_TASK_STATUSES))
+        .order_by(Task.id.asc())
+        .limit(limit)
+    )
+    return list((await session.execute(stmt)).scalars().all())
 
 
 async def recent_for_agent_context(

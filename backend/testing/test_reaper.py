@@ -6079,13 +6079,24 @@ async def test_step7_stalled_cycle_live_task_not_declared_stalled(
 
 
 @pytest.mark.asyncio
-async def test_step7_stalled_cycle_already_terminal_task_untouched(
+async def test_step7_reconciles_already_terminal_task_while_pipeline_paused(
     reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
 ):
-    """Linked task already FAILED — cycle is declared stalled without re-mutating the task."""
+    """A paused sweep reconciles terminal residue without declaring a time stall."""
+    from app.models import DeploymentState, DeploymentStatus
+
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
 
     project = await _make_project(reaper_db)
+    now = _utcnow()
+    reaper_db.add(
+        DeploymentState(
+            id=1,
+            status=DeploymentStatus.PAUSED,
+            paused_at=now - timedelta(hours=4),
+            paused_kind="manual",
+        )
+    )
     task = Task(
         project_id=project.id,
         title="strategic-already-failed",
@@ -6102,7 +6113,7 @@ async def test_step7_stalled_cycle_already_terminal_task_untouched(
         project_id=project.id,
         outcome="phase1_running",
         phase1_task_id=task.id,
-        phase1_started_at=_utcnow() - timedelta(hours=4),
+        phase1_started_at=now - timedelta(hours=4),
     )
     reaper_db.add(cycle)
     await reaper_db.commit()
@@ -6116,7 +6127,82 @@ async def test_step7_stalled_cycle_already_terminal_task_untouched(
     assert task.latest_status_message == "crashed earlier", (
         "task message must not be overwritten"
     )
-    assert cycle.outcome == "stalled_phase1", "cycle must be declared stalled"
+    assert cycle.outcome == "failed_phase1"
+    assert "source=stalled_cycle_reaper" in (cycle.failure_reason or "")
+    assert "reaper_stall" not in (cycle.failure_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_step7_terminal_residue_broadcasts_completion_after_commit(
+    reaper_db, mocker
+):
+    """The terminal-residue pass owns the completion broadcast it takes over.
+
+    These cycles are removed from the stalled population, so without this emit a
+    cycle whose phase task already FAILED would be durably terminal while the
+    operator UI kept showing "Strategist working…" (strategistActive is cleared
+    only by strategic_cycle_completed or a project switch).
+    """
+    project = await _make_project(reaper_db)
+    task = Task(
+        project_id=project.id,
+        title="strategic-already-failed",
+        payloads=[{"type": "design_doc_update", "scope": "medium"}],
+        status=TaskStatus.FAILED,
+        latest_status_message="crashed earlier",
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+    cycle = StrategicCycle(
+        id=_make_cycle_id(),
+        project_id=project.id,
+        outcome="phase1_running",
+        phase1_task_id=task.id,
+        phase1_started_at=_utcnow() - timedelta(hours=4),
+    )
+    reaper_db.add(cycle)
+    await reaper_db.commit()
+
+    events: list = []
+    real_commit = reaper_db.commit
+
+    async def _tracking_commit(*args, **kwargs):
+        events.append("commit")
+        return await real_commit(*args, **kwargs)
+
+    async def _tracking_broadcast(project_id, event, payload):
+        events.append(("broadcast", event, payload))
+
+    mocker.patch.object(reaper_db, "commit", side_effect=_tracking_commit)
+    mocker.patch("app.broadcast.broadcast_to_project", side_effect=_tracking_broadcast)
+    mocker.patch(
+        "app.strategic_events.broadcast_to_project", side_effect=_tracking_broadcast
+    )
+
+    await _rs.sweep_stalled_strategic_cycles(
+        reaper_db,
+        _utcnow(),
+        heartbeat_stale_cutoff_fn=lambda _task, now: now - timedelta(minutes=5),
+    )
+
+    await reaper_db.refresh(cycle)
+    assert cycle.outcome == "failed_phase1"
+    completion = next(
+        event
+        for event in events
+        if isinstance(event, tuple) and event[1] == "strategic_cycle_completed"
+    )
+    payload = completion[2]
+    assert payload["task_id"] == str(task.id)
+    assert payload["cycle_id"] == str(cycle.id)
+    assert payload["phase"] == payload["phase_number"] == 1
+    assert payload["phase_state"] == "failed_phase1"
+    assert payload["completion"]["status"] == "FAILED"
+    assert payload["refetch"] == {"surfaces": ["strategic_session", "directions"]}
+    assert events.index("commit") < events.index(completion), (
+        "completion must be broadcast AFTER the reconciliation commit"
+    )
 
 
 @pytest.mark.asyncio

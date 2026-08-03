@@ -1468,7 +1468,36 @@ async def bulk_action_tasks(
                         child, session, reason="admin_bulk_cancel_cascade"
                     )
 
+                from app import strategic_cycle
+
+                # Snapshot the completion events before the commit expires the
+                # rows: a cycle this bulk cancel terminalizes must broadcast
+                # strategic_cycle_completed, or the operator UI keeps showing an
+                # active strategist against a terminal cycle row.
+                _strategic_completion_events = []
+                _reconciled = await strategic_cycle.reconcile_terminal_task(
+                    session, task, source="admin_bulk_cancel"
+                )
+                if _reconciled is not None:
+                    _strategic_completion_events.append(
+                        strategic_cycle.terminal_completion_event(_reconciled, task)
+                    )
+                for child in active_children:
+                    _reconciled_child = await strategic_cycle.reconcile_terminal_task(
+                        session, child, source="admin_bulk_cancel_cascade"
+                    )
+                    if _reconciled_child is not None:
+                        _strategic_completion_events.append(
+                            strategic_cycle.terminal_completion_event(
+                                _reconciled_child, child
+                            )
+                        )
+
                 await session.commit()
+
+                await strategic_cycle.emit_terminal_completion_events(
+                    _strategic_completion_events
+                )
 
                 # Delete VMs using values saved before commit (avoids lazy
                 # loads on expired ORM objects).

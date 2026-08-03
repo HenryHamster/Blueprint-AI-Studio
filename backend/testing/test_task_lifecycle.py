@@ -34,6 +34,7 @@ from sqlmodel import SQLModel, select
 from app.migration_reservations import allocate_migration_reservation
 from app.models import (
     Project,
+    StrategicCycle,
     Task,
     TaskStatus,
     PoolVm,
@@ -7927,11 +7928,11 @@ async def test_post_commit_strategic_backstop_raise_does_not_500(tl_db, mocker):
     )
     session, factory = tl_db
     project = await _make_project(session)
-    # The backstop fires for ANY task carrying a strategic_cycle_id in context
-    # (it reads payload type only to pick the phase label). Use a non-strategic
-    # task type so the post-commit task acquisition takes the plain task-only
-    # lock path rather than the strategic Project→Task pair-lock (which relies
-    # on FOR UPDATE skip_locked that the SQLite test harness does not honor).
+    # Use a non-strategic task type so the post-commit task acquisition takes
+    # the plain task-only lock path rather than the strategic Project→Task
+    # pair-lock (which relies on FOR UPDATE skip_locked that the SQLite test
+    # harness does not honor). The real linked cycle below exercises the
+    # current reconciliation lookup contract.
     task = await _make_task(
         session,
         project.id,
@@ -7940,6 +7941,15 @@ async def test_post_commit_strategic_backstop_raise_does_not_500(tl_db, mocker):
         context={"strategic_cycle_id": str(uuid.uuid4())},
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
     )
+    cycle = StrategicCycle(
+        id=task.context["strategic_cycle_id"],
+        project_id=project.id,
+        outcome="phase1_running",
+        phase1_task_id=task.id,
+        phase1_started_at=_utcnow(),
+    )
+    session.add(cycle)
+    await session.commit()
     payload = AgentStatusPayload(task_id=task.id, status=TaskStatus.FAILED)
 
     # Must return cleanly, not raise PendingRollbackError on the final commit.
@@ -7970,9 +7980,6 @@ async def test_strategic_backstop_skips_advanced_cycle(
     phase1_running IS a genuine stall and must still be caught."""
     session, factory = tl_db
     mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
-    # Force the phase-1 label regardless of task type (a real design_doc_update
-    # would take the strategic pair-lock path the SQLite harness can't honor).
-    mocker.patch("app.task_lifecycle.strategic_phase_for", return_value="phase1")
 
     class _Cycle:
         outcome = cycle_outcome
@@ -7983,14 +7990,24 @@ async def test_strategic_backstop_skips_advanced_cycle(
     mark = mocker.patch("app.strategic_cycle.mark_failure", new_callable=AsyncMock)
 
     project = await _make_project(session)
+    cycle_id = str(uuid.uuid4())
     task = await _make_task(
         session,
         project.id,
         task_type="research",
         status=TaskStatus.FAILED,
-        context={"strategic_cycle_id": str(uuid.uuid4())},
+        context={"strategic_cycle_id": cycle_id},
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
     )
+    cycle = StrategicCycle(
+        id=cycle_id,
+        project_id=project.id,
+        outcome=cycle_outcome,
+        phase1_task_id=task.id,
+        phase1_started_at=_utcnow(),
+    )
+    session.add(cycle)
+    await session.commit()
     payload = AgentStatusPayload(task_id=task.id, status=TaskStatus.FAILED)
     await _process_post_commit(task.id, payload, _session_factory=factory)
 
@@ -7999,6 +8016,67 @@ async def test_strategic_backstop_skips_advanced_cycle(
         assert mark.await_args.kwargs.get("phase") == "phase1"
     else:
         mark.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_completed_strategic_handler_failure_reconciles_cycle_immediately(
+    tl_db, mocker
+):
+    """A failed COMPLETED handler must close its still-running strategic phase.
+
+    Handler recovery changes the current task to FAILED after the agent payload
+    has already been committed as COMPLETED. The lifecycle backstop must use
+    that current status rather than the stale payload status.
+    """
+    session, factory = tl_db
+    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
+    mocker.patch(
+        "app.strategic_completion._handle_strategic_completion",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("strategic completion failed"),
+    )
+
+    project = await _make_project(session)
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="strategic_review",
+        status=TaskStatus.COMPLETED,
+        context={"strategic_cycle_id": "sc-handler-failure"},
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+    cycle = StrategicCycle(
+        id="sc-handler-failure",
+        project_id=project.id,
+        outcome="phase2_running",
+        phase2_task_id=task.id,
+        phase1_started_at=_utcnow(),
+        phase2_started_at=_utcnow(),
+    )
+    session.add(cycle)
+    await session.commit()
+
+    emit = mocker.patch(
+        "app.strategic_events.emit_strategic_cycle_completed", new_callable=AsyncMock
+    )
+
+    payload = AgentStatusPayload(task_id=task.id, status=TaskStatus.COMPLETED)
+    result = await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    assert result["status"] == "received"
+    await session.refresh(task)
+    await session.refresh(cycle)
+    assert task.status == TaskStatus.FAILED
+    assert cycle.outcome == "failed_phase2"
+    assert cycle.phase2_completed_at is not None
+    # Durable terminal state and the connected UI must not diverge: the emit is
+    # driven by the reconciled cycle, not by the (COMPLETED) payload status.
+    emit.assert_awaited_once()
+    emit_kwargs = emit.await_args.kwargs
+    assert emit.await_args.args[2] == 2
+    assert emit_kwargs["cycle_id"] == "sc-handler-failure"
+    assert emit_kwargs["phase_state"] == "failed_phase2"
+    assert emit_kwargs["completion"]["status"] == "FAILED"
 
 
 # ── QP6: main-branch auto-approve gate uses the strict tested helper ──────────
@@ -10687,4 +10765,3 @@ async def test_requeue_llm_cost_zero_for_unpriced_provider_model(tl_db, mocker):
     assert clone_ctx.get("_prior_attempts_llm_cost", 0.0) == 0.0, (
         "Unpriced provider/model must contribute $0, not fail the requeue"
     )
-

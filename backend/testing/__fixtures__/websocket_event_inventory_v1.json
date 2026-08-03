@@ -4674,6 +4674,22 @@
       "workbench_resource": null
     },
     {
+      "callee": "emit_strategic_cycle_completed",
+      "canonical_callee": "emit_strategic_cycle_completed",
+      "classification": "strategic_v1_helper",
+      "event": "strategic_cycle_completed",
+      "event_expression": null,
+      "event_is_literal": true,
+      "lineno": 245,
+      "notes": "",
+      "occurrence": 1,
+      "payload_arg_kind": "none",
+      "scope": "emit_terminal_completion_events",
+      "source_path": "backend/app/strategic_cycle.py",
+      "workbench_action": null,
+      "workbench_resource": null
+    },
+    {
       "callee": "broadcast_to_project",
       "canonical_callee": "broadcast_to_project",
       "classification": "strategic_v1_emitter",
@@ -5402,7 +5418,7 @@
     "message_v1_payload": 26,
     "raw_websocket_control": 3,
     "strategic_v1_emitter": 4,
-    "strategic_v1_helper": 22,
+    "strategic_v1_helper": 23,
     "transport": 5,
     "workbench_v1_emitter": 1,
     "workbench_v1_helper": 14

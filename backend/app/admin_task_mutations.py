@@ -512,6 +512,7 @@ async def _apply_status_mutation(
             )
 
     children_cleanup_for_bg: List[tuple] = []
+    cascade_targets: Dict[uuid.UUID, Task] = {}
     if new_status == TaskStatus.CANCELLED:
         cancellation_source_id = str(task.id)
         active_children = (
@@ -593,6 +594,37 @@ async def _apply_status_mutation(
                 len(cascade_targets),
                 task.id,
             )
+
+    if new_status in (TaskStatus.CANCELLED, TaskStatus.FAILED):
+        from app import strategic_cycle
+
+        # Snapshot the completion events while the rows are still fresh; they
+        # are emitted post-commit by _commit_and_broadcast. Without the emit a
+        # durably terminal cycle leaves the connected UI showing "Strategist
+        # working…" forever (useLogViewer clears it only on
+        # strategic_cycle_completed or a project switch).
+        strategic_completion_events: List[Dict[str, Any]] = []
+        reconciled = await strategic_cycle.reconcile_terminal_task(
+            session, task, source="admin_task_mutation"
+        )
+        if reconciled is not None:
+            strategic_completion_events.append(
+                strategic_cycle.terminal_completion_event(reconciled, task)
+            )
+        for child in cascade_targets.values():
+            reconciled_child = await strategic_cycle.reconcile_terminal_task(
+                session, child, source="admin_task_mutation_cascade"
+            )
+            if reconciled_child is not None:
+                strategic_completion_events.append(
+                    strategic_cycle.terminal_completion_event(
+                        reconciled_child, child
+                    )
+                )
+        if strategic_completion_events:
+            # Internal-only marker: popped in _commit_and_broadcast before the
+            # TaskHistory row is built, then emitted after its commit.
+            changes["_strategic_completion_events"] = strategic_completion_events
 
     if parent_vm_id_for_bg or parent_acct_id_for_bg or children_cleanup_for_bg:
         background_tasks.add_task(
@@ -1503,6 +1535,10 @@ async def _commit_and_broadcast(
     _check_merged_rollup_parent_now = bool(
         changes.pop("_check_merged_rollup_parent_now", False)
     )
+    # Internal-only marker set by _apply_status_mutation for every strategic
+    # cycle its terminal transition reconciled. Popped before history, then
+    # broadcast after the commit below (post-commit emit convention).
+    _strategic_completion_events = changes.pop("_strategic_completion_events", None)
 
     session.add(task)
     history = TaskHistory(
@@ -1513,6 +1549,13 @@ async def _commit_and_broadcast(
     session.add(history)
     await session.commit()
     await session.refresh(task)
+
+    if _strategic_completion_events:
+        from app import strategic_cycle
+
+        await strategic_cycle.emit_terminal_completion_events(
+            _strategic_completion_events
+        )
 
     if _refresh_direction_after_merge:
         await _refresh_direction_outcomes_for_task(task)

@@ -930,6 +930,115 @@ async def test_mark_failure_phase2_spawn_records_outcome(db_session):
 
 
 @pytest.mark.asyncio
+async def test_reconcile_terminal_task_reconciles_linked_phase_and_is_idempotent(
+    db_session,
+):
+    """A task's cycle linkage, not its payload, selects the failed phase."""
+    project = await _make_project(db_session)
+    phase1_task = Task(
+        project_id=project.id,
+        title="cancelled phase one",
+        status=TaskStatus.CANCELLED,
+        payloads=[{"type": "unrelated_type"}],
+    )
+    phase2_task = Task(
+        project_id=project.id,
+        title="failed phase two",
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "unrelated_type"}],
+    )
+    db_session.add_all([phase1_task, phase2_task])
+    await db_session.commit()
+
+    await strategic_cycle.create(
+        db_session, project_id=project.id, phase1_task_id=phase1_task.id
+    )
+    phase2_cycle = StrategicCycle(
+        id="sc-terminal-phase2",
+        project_id=project.id,
+        outcome=strategic_cycle.OUTCOME_PHASE2_RUNNING,
+        phase1_started_at=_utcnow(),
+        phase2_started_at=_utcnow(),
+        phase2_task_id=phase2_task.id,
+    )
+    db_session.add(phase2_cycle)
+    await db_session.commit()
+
+    reconciled_phase1 = await strategic_cycle.reconcile_terminal_task(
+        db_session, phase1_task, source="test_single_cancel"
+    )
+    reconciled_phase2 = await strategic_cycle.reconcile_terminal_task(
+        db_session, phase2_task, source="test_bulk_failure"
+    )
+    await db_session.commit()
+
+    assert reconciled_phase1 is not None
+    assert reconciled_phase1.outcome == strategic_cycle.OUTCOME_FAILED_PHASE1
+    assert reconciled_phase1.phase1_completed_at is not None
+    assert reconciled_phase1.failure_reason == (
+        f"terminal_task_reconciliation: source=test_single_cancel "
+        f"task_id={phase1_task.id} status=CANCELLED"
+    )
+    assert reconciled_phase2 is not None
+    assert reconciled_phase2.outcome == strategic_cycle.OUTCOME_FAILED_PHASE2
+    assert reconciled_phase2.phase2_completed_at is not None
+    assert reconciled_phase2.failure_reason == (
+        f"terminal_task_reconciliation: source=test_bulk_failure "
+        f"task_id={phase2_task.id} status=FAILED"
+    )
+
+    original_reason = reconciled_phase1.failure_reason
+    assert (
+        await strategic_cycle.reconcile_terminal_task(
+            db_session, phase1_task, source="duplicate_delivery"
+        )
+        is None
+    )
+    assert reconciled_phase1.failure_reason == original_reason
+
+
+@pytest.mark.asyncio
+async def test_reconcile_terminal_task_never_regresses_phase1_after_phase2_started(
+    db_session,
+):
+    project = await _make_project(db_session)
+    phase1_task = Task(
+        project_id=project.id,
+        title="late phase one failure",
+        status=TaskStatus.CANCELLED,
+        payloads=[{"type": "design_doc_update"}],
+    )
+    phase2_task = Task(
+        project_id=project.id,
+        title="active phase two",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "strategic_review"}],
+    )
+    db_session.add_all([phase1_task, phase2_task])
+    await db_session.commit()
+    cycle = StrategicCycle(
+        id="sc-phase2-protected",
+        project_id=project.id,
+        outcome=strategic_cycle.OUTCOME_PHASE2_RUNNING,
+        phase1_task_id=phase1_task.id,
+        phase2_task_id=phase2_task.id,
+        phase1_started_at=_utcnow(),
+        phase1_completed_at=_utcnow(),
+        phase2_started_at=_utcnow(),
+    )
+    db_session.add(cycle)
+    await db_session.commit()
+
+    reconciled = await strategic_cycle.reconcile_terminal_task(
+        db_session, phase1_task, source="late_agent_status"
+    )
+
+    assert reconciled is None
+    assert cycle.outcome == strategic_cycle.OUTCOME_PHASE2_RUNNING
+    assert cycle.phase2_completed_at is None
+
+
+@pytest.mark.asyncio
 async def test_strategic_debug_recent_cycles_from_table(client, db_session):
     """GET /strategic-debug returns recent_cycles and last_cycle from the
     StrategicCycle table, not the retired vision._strategic_cycle_history JSONB."""
