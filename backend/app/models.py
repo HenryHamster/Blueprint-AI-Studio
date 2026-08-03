@@ -7808,6 +7808,54 @@ class LocalRunner(SQLModel, table=True):
     )
 
 
+class ServiceCredential(SQLModel, table=True):
+    """A revocable machine credential for non-human API consumers.
+
+    Authenticates as ``principal_user_id`` (a non-human user id holding ordinary
+    ProjectMember rows), restricted to the endpoint allowlists of its ``scopes``
+    (see app/service_credentials.py). Never admin; plaintext token is shown once
+    at mint time and only its SHA256 hash is stored.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    name: str = Field(
+        sa_column=Column(String(64), nullable=False, unique=True, index=True)
+    )
+    description: str | None = Field(
+        default=None, sa_column=Column(String(255), nullable=True)
+    )
+    principal_user_id: str = Field(
+        sa_column=Column(String(128), nullable=False, index=True)
+    )
+    # SHA256 hex digest of the secret token (never the plaintext).
+    token_hash: str = Field(
+        sa_column=Column(String(64), nullable=False, unique=True, index=True)
+    )
+    # First characters of the plaintext (e.g. "bpsc_Ab12Cd34") for display/identification.
+    token_prefix: str = Field(sa_column=Column(String(16), nullable=False))
+    scopes: List[str] = Field(
+        default_factory=list,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'[]'")),
+    )
+    expires_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    revoked_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    created_by: str = Field(sa_column=Column(String(128), nullable=False))
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    last_used_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    last_used_path: str | None = Field(
+        default=None, sa_column=Column(String(255), nullable=True)
+    )
+
+
 class RunnerProjectBinding(SQLModel, table=True):
     """Runner-level project allow-list — one row per (runner, project) grant.
 
