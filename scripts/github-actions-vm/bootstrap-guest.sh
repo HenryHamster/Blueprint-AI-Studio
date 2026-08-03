@@ -26,6 +26,7 @@ install -m 0644 -o root -g root \
 install -m 0644 -o root -g root \
   /usr/local/lib/blueprint/github-actions-vm/blueprint-github-actions@.service \
   /etc/systemd/system/blueprint-github-actions@.service
+/usr/local/lib/blueprint/github-actions-vm/install-volume-maintenance.sh
 
 systemctl mask --now docker.service docker.socket containerd.service
 systemctl daemon-reload
