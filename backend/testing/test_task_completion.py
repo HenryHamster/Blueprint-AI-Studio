@@ -34,6 +34,7 @@ from app.task_completion import (
     _validate_plan_dependencies,
     _ensure_branch,
     _handle_plan_completion,
+    _handle_design_doc_completion,
     _record_remediation_outcome,
     _record_remediation_if_terminal,
     _record_project_remediation_outcome,
@@ -43,12 +44,67 @@ from app.task_completion import (
     BLUEPRINT_PR_META_MARKER,
     BLUEPRINT_PR_MERGE_SUMMARY_MARKER,
 )
-from app.models import PoolVmState, Task, TaskStatus
+from app.models import PoolVmState, StrategicCycle, Task, TaskStatus
 from testing.factories import make_project, make_task
 
 _USE_POSTGRES = os.getenv("USE_TEST_POSTGRES", "").lower() == "true" and os.getenv(
     "DATABASE_URL", ""
 ).startswith("postgresql")
+
+
+@pytest.mark.asyncio
+async def test_phase2_spawn_exception_emits_negative_receipt_for_failed_cycle(
+    db_session, mocker
+):
+    """A spawn exception must agree with the durable failed phase-two outcome.
+
+    The active-task skip is covered by the deferred-path regression in
+    ``test_strategic_completion.py``; this test keeps the exception contract in
+    the task-completion suite and verifies the durable cycle alongside the
+    post-commit event envelope.
+    """
+    project = make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        payloads=[{"type": "design_doc_update", "prompt": "update"}],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    cycle = StrategicCycle(
+        id="cycle-phase2-spawn-failure",
+        project_id=project.id,
+        phase1_task_id=task.id,
+    )
+    task.strategic_cycle_id = cycle.id
+    db_session.add_all([cycle, task])
+    await db_session.commit()
+
+    mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(side_effect=RuntimeError("spawn boom")),
+    )
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new=AsyncMock())
+    emit = AsyncMock()
+    mocker.patch("app.strategic_events.emit_strategic_cycle_completed", new=emit)
+
+    await _handle_design_doc_completion(task, "", db_session, project=project)
+
+    await db_session.refresh(cycle)
+    assert cycle.outcome == "failed_phase2_spawn"
+    assert cycle.failure_reason == "spawn boom"
+    emit.assert_awaited_once()
+    receipt = emit.await_args.kwargs
+    assert receipt["phase_state"] == "failed"
+    assert receipt["completion"]["status"] == "failed"
+    assert receipt["completion"]["failure_reason"] == "spawn boom"
+    assert "FAILED to spawn" in receipt["completion"]["status_message"]
 
 
 # ── _compute_first_attempt_succeeded ────────────────────────────────────────

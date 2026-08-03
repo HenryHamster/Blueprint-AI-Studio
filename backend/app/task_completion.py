@@ -4776,6 +4776,8 @@ async def _handle_design_doc_completion(
     # never sticks on. Only a successful _spawn_strategic_review (which emits its
     # own Phase-2 started) is exempt — that keeps the cycle visibly active.
     phase2_spawned = False
+    phase2_spawn_failed = False
+    phase2_failure_reason: str | None = None
     phase1_cycle_id = task.strategic_cycle_id or (task.context or {}).get(
         "strategic_cycle_id"
     )
@@ -4942,6 +4944,8 @@ async def _handle_design_doc_completion(
             session.add(project)
     except Exception as chain_exc:
         # Only pre-captured identifiers in here — task may be expired (see above).
+        phase2_spawn_failed = True
+        phase2_failure_reason = str(chain_exc)[:200]
         logger.error(
             f"[DESIGN DOC] Failed to chain Phase 2 for task {task_id_str}: {chain_exc}",
             exc_info=True,
@@ -4981,7 +4985,7 @@ async def _handle_design_doc_completion(
                 session,
                 cycle_id,
                 phase="phase2_spawn",
-                reason=str(chain_exc)[:200],
+                reason=phase2_failure_reason,
             )
         flag_modified(project, "vision")
         session.add(project)
@@ -5001,16 +5005,20 @@ async def _handle_design_doc_completion(
         # task.project_id / task.id / task.latest_status_message here would
         # lazy-load and raise MissingGreenlet (the site that failed task
         # 94594516, 2026-06-11, after the a9bf1317 partial fix).
+        phase_state = "failed" if phase2_spawn_failed else "deferred"
+        completion: dict[str, Any] = {
+            "status": phase_state,
+            "status_message": status_message,
+        }
+        if phase2_spawn_failed:
+            completion["failure_reason"] = phase2_failure_reason
         await emit_strategic_cycle_completed(
             task_project_id,
             task_id_value,
             1,
             cycle_id=cycle_id,
-            phase_state="deferred",
-            completion={
-                "status": "deferred",
-                "status_message": status_message,
-            },
+            phase_state=phase_state,
+            completion=completion,
         )
 
 

@@ -15080,8 +15080,9 @@ class TestDesignDocCompletionStrategistEvent:
 
         emit.assert_awaited_once()
         assert emit.await_args.args == (project.id, task.id, 1)
-        assert emit.await_args.kwargs["phase_state"] == "deferred"
-        assert emit.await_args.kwargs["completion"]["status"] == "deferred"
+        assert emit.await_args.kwargs["phase_state"] == "failed"
+        assert emit.await_args.kwargs["completion"]["status"] == "failed"
+        assert emit.await_args.kwargs["completion"]["failure_reason"] == "spawn boom"
         assert (
             "FAILED to spawn" in emit.await_args.kwargs["completion"]["status_message"]
         )
