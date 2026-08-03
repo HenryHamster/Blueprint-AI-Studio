@@ -37,6 +37,10 @@ from app.allowed_users import (
     normalize_allowed_user_email,
     resolve_allowed_user_by_email,
 )
+from app.service_credentials import (
+    TOKEN_PREFIX as SERVICE_TOKEN_PREFIX,
+    authenticate_service_token,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -620,6 +624,11 @@ async def get_current_user(
                 "Failed to resolve admin UID from DB; falling back to literal"
             )
         return {"user_id": admin_uid, "email": "admin@system.local", "role": "admin"}
+
+    # 3. Service credential (machine token, e.g. observer bots). Prefixed so we
+    #    never send a machine token through Firebase verification.
+    if token.startswith(SERVICE_TOKEN_PREFIX):
+        return await authenticate_service_token(token, session, request)
 
     try:
         decoded_token = firebase_auth.verify_id_token(token)

@@ -105,6 +105,9 @@ from app.routers.admin_acceptance_criteria import router as admin_acceptance_cri
 from app.routers.admin_direction_events import router as admin_direction_events_router
 from app.routers.admin_state import router as admin_state_router
 from app.routers.admin_operator_attention import router as admin_operator_attention_router
+from app.routers.admin_service_credentials import (
+    router as admin_service_credentials_router,
+)
 from app.shared_state import limiter
 import app.shared_state as _shared_state
 from app.shared_state import runtime_config as _runtime_config
@@ -117,7 +120,7 @@ logger = logging.getLogger(__name__)
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0722"
+EXPECTED_SCHEMA_REVISION = "0723"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -1004,6 +1007,7 @@ app.include_router(admin_health_router)
 app.include_router(admin_state_router)
 app.include_router(admin_acceptance_criteria_router)
 app.include_router(admin_operator_attention_router)
+app.include_router(admin_service_credentials_router)
 app.include_router(admin_evergreen_router)
 app.include_router(admin_orchestrator_errors_router)
 app.include_router(admin_scope_measurement_router)
