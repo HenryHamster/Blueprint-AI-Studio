@@ -6206,6 +6206,110 @@ async def test_step7_terminal_residue_broadcasts_completion_after_commit(
 
 
 @pytest.mark.asyncio
+async def test_step7_terminal_residue_reloads_task_before_reconciliation(
+    reaper_db, mocker
+):
+    """A stale terminal discovery row cannot terminalize a requeued task's cycle."""
+    from app import strategic_cycle
+
+    project = await _make_project(reaper_db)
+    task = Task(
+        project_id=project.id,
+        title="strategic-requeued",
+        payloads=[{"type": "design_doc_update", "scope": "medium"}],
+        status=TaskStatus.QUEUED,
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+    cycle = StrategicCycle(
+        id=_make_cycle_id(),
+        project_id=project.id,
+        outcome="phase1_running",
+        phase1_task_id=task.id,
+        phase1_started_at=_utcnow(),
+    )
+    reaper_db.add(cycle)
+    await reaper_db.commit()
+
+    stale_candidate = Task(
+        id=task.id,
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+    )
+    mocker.patch.object(
+        strategic_cycle,
+        "terminal_phase_tasks_requiring_reconciliation",
+        return_value=[stale_candidate],
+    )
+    completion_events = mocker.patch.object(
+        strategic_cycle,
+        "emit_terminal_completion_events",
+        new_callable=AsyncMock,
+    )
+
+    await _rs.sweep_stalled_strategic_cycles(
+        reaper_db,
+        _utcnow(),
+        heartbeat_stale_cutoff_fn=lambda _task, now: now - timedelta(minutes=5),
+    )
+
+    await reaper_db.refresh(task)
+    await reaper_db.refresh(cycle)
+    assert task.status == TaskStatus.QUEUED
+    assert cycle.outcome == "phase1_running"
+    completion_events.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_step7_terminal_residue_defers_contended_task(reaper_db, mocker):
+    """A task held by another writer is deferred without a receipt."""
+    from contextlib import asynccontextmanager
+    from app import strategic_cycle
+
+    project = await _make_project(reaper_db)
+    task = Task(
+        project_id=project.id,
+        title="strategic-contended",
+        payloads=[{"type": "design_doc_update", "scope": "medium"}],
+        status=TaskStatus.FAILED,
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+    cycle = StrategicCycle(
+        id=_make_cycle_id(),
+        project_id=project.id,
+        outcome="phase1_running",
+        phase1_task_id=task.id,
+        phase1_started_at=_utcnow(),
+    )
+    reaper_db.add(cycle)
+    await reaper_db.commit()
+
+    @asynccontextmanager
+    async def _held_task(*_args, **_kwargs):
+        yield None
+
+    mocker.patch("app.task_locking.task_lock", _held_task)
+    completion_events = mocker.patch.object(
+        strategic_cycle,
+        "emit_terminal_completion_events",
+        new_callable=AsyncMock,
+    )
+
+    await _rs.sweep_stalled_strategic_cycles(
+        reaper_db,
+        _utcnow(),
+        heartbeat_stale_cutoff_fn=lambda _task, now: now - timedelta(minutes=5),
+    )
+
+    await reaper_db.refresh(cycle)
+    assert cycle.outcome == "phase1_running"
+    completion_events.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_step7_stalled_cycle_broadcasts_after_commit(reaper_db, mocker):
     """Phase-one stall broadcasts its alert then canonical completion after commit."""
     project = await _make_project(reaper_db)

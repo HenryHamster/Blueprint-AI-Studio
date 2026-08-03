@@ -27,6 +27,7 @@ from app.models import (
     MessageType,
     Project,
     ProjectMember,
+    StrategicCycle,
     ProjectMessage,
     Task,
     TaskStatus,
@@ -174,6 +175,32 @@ async def _make_runner(db_session, project: Project) -> LocalRunner:
     await db_session.commit()
     await db_session.refresh(runner)
     return runner
+
+
+async def _link_phase2_cycle(db_session, project: Project, task: Task) -> StrategicCycle:
+    cycle = StrategicCycle(
+        id=f"sc-{uuid.uuid4().hex[:8]}",
+        project_id=project.id,
+        outcome="phase2_running",
+        phase1_started_at=_utcnow(),
+        phase1_completed_at=_utcnow(),
+        phase2_started_at=_utcnow(),
+        phase2_task_id=task.id,
+    )
+    db_session.add(cycle)
+    await db_session.commit()
+    return cycle
+
+
+def _assert_resident_terminal_receipt(emit, cycle: StrategicCycle, source: str):
+    emit.assert_awaited_once()
+    event = emit.await_args.args[0][0]
+    assert event["cycle_id"] == cycle.id
+    assert event["phase"] == 2
+    assert event["phase_state"] == "failed_phase2"
+    assert event["completion"]["status"] == "CANCELLED"
+    assert f"source={source}" in event["completion"]["failure_reason"]
+    return event
 
 
 @pytest.mark.asyncio
@@ -1807,6 +1834,13 @@ async def test_stop_ends_task_releases_continuation_and_hands_off_messages(
     started = await start_resident_session(
         db_session, project, operator_user_id=TEST_USER_ID
     )
+    cycle = await _link_phase2_cycle(db_session, project, task)
+    factory = _test_session_factory(db_session)
+    emit = AsyncMock()
+    monkeypatch.setattr(resident_session_module, "AsyncSessionLocal", factory)
+    monkeypatch.setattr(
+        "app.strategic_cycle.emit_terminal_completion_events", emit
+    )
     vision = dict(project.vision or {})
     blob = dict(vision[RESIDENT_SESSION_KEY])
     blob["typed_fast"] = {
@@ -1864,6 +1898,161 @@ async def test_stop_ends_task_releases_continuation_and_hands_off_messages(
     assert pending.resident_session_id is None
     assert pending.handling_state == MessageHandlingState.PENDING
     assert pending.handled_by_task_id is None
+    refreshed_cycle = await db_session.get(StrategicCycle, cycle.id)
+    await db_session.refresh(refreshed_cycle)
+    assert refreshed_cycle.outcome == "failed_phase2"
+    _assert_resident_terminal_receipt(emit, cycle, "resident_operator_stop")
+
+
+@pytest.mark.asyncio
+async def test_stop_with_strategic_api_marker_preserves_cancelled_cycle_disposition(
+    db_session, monkeypatch
+):
+    """A stop receipt must remain authoritative after API side effects run."""
+    project = await _make_project(db_session)
+    task = await _make_task(db_session, project)
+    cycle = await _link_phase2_cycle(db_session, project, task)
+    task.status = TaskStatus.CANCELLED
+    task.context = {
+        "strategic_cycle_id": cycle.id,
+        "_strategic_api_called": True,
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    terminal_emit = AsyncMock()
+    completion_emit = AsyncMock()
+    monkeypatch.setattr(
+        resident_session_module,
+        "AsyncSessionLocal",
+        _test_session_factory(db_session),
+    )
+    monkeypatch.setattr(
+        "app.strategic_cycle.emit_terminal_completion_events", terminal_emit
+    )
+    monkeypatch.setattr(
+        "app.strategic_events.emit_strategic_cycle_completed", completion_emit
+    )
+
+    await resident_session_module._run_resident_completion_on_stop(task.id)
+
+    refreshed_cycle = await db_session.get(StrategicCycle, cycle.id)
+    await db_session.refresh(refreshed_cycle)
+    assert refreshed_cycle.outcome == "failed_phase2"
+    _assert_resident_terminal_receipt(
+        terminal_emit, cycle, "resident_operator_stop"
+    )
+    completion_emit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stale_worker_supersession_reconciles_cycle_and_emits_receipt(
+    db_session, monkeypatch
+):
+    project = await _make_project(db_session)
+    old_task = await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    started = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    cycle = await _link_phase2_cycle(db_session, project, old_task)
+    stale_at = _utcnow() - timedelta(
+        seconds=resident_session_module._RESIDENT_WORKER_HEARTBEAT_STALE_SECONDS + 1
+    )
+    old_task = await db_session.get(Task, old_task.id)
+    old_task.status = TaskStatus.QUEUED
+    old_task.last_heartbeat = stale_at
+    project = await db_session.get(Project, project.id)
+    vision = dict(project.vision or {})
+    blob = dict(vision[RESIDENT_SESSION_KEY])
+    blob["started_at"] = (_utcnow() - timedelta(minutes=10)).isoformat()
+    blob["worker_heartbeat_at"] = stale_at.isoformat()
+    blob["updated_at"] = stale_at.isoformat()
+    vision[RESIDENT_SESSION_KEY] = blob
+    project.vision = vision
+    flag_modified(project, "vision")
+    db_session.add_all([project, old_task])
+    await db_session.commit()
+    emit = AsyncMock()
+    monkeypatch.setattr(
+        "app.strategic_cycle.emit_terminal_completion_events", emit
+    )
+    replaced = await start_resident_session(
+        db_session,
+        project,
+        operator_user_id=TEST_USER_ID,
+        session_factory=_test_session_factory(db_session),
+    )
+
+    assert replaced["task_id"] != started["task_id"]
+    refreshed_old_task = await db_session.get(Task, old_task.id)
+    refreshed_cycle = await db_session.get(StrategicCycle, cycle.id)
+    await db_session.refresh(refreshed_old_task)
+    await db_session.refresh(refreshed_cycle)
+    assert refreshed_old_task.status == TaskStatus.CANCELLED
+    assert refreshed_cycle.outcome == "failed_phase2"
+    _assert_resident_terminal_receipt(
+        emit, cycle, "resident_worker_supersession"
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_start_compensation_reconciles_cycle_and_emits_receipt(
+    db_session, monkeypatch
+):
+    project = await _make_project(db_session)
+    session_id = "ss-failed-start"
+    task = Task(
+        project_id=project.id,
+        title="Resident strategic review",
+        payloads=[{"type": "strategic_review"}],
+        status=TaskStatus.PROVISIONING,
+        context={
+            "_resident_session": True,
+            "strategic_session_id": session_id,
+            "_resident_worker_generation": 1,
+        },
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(task)
+    await db_session.flush()
+    cycle = await _link_phase2_cycle(db_session, project, task)
+    project.vision = {
+        RESIDENT_SESSION_KEY: {
+            "session_id": session_id,
+            "worker_generation": 1,
+            "status": "active",
+            "task_id": str(task.id),
+        }
+    }
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+    emit = AsyncMock()
+    monkeypatch.setattr(
+        "app.strategic_cycle.emit_terminal_completion_events", emit
+    )
+
+    await resident_session_module._release_start_claim(
+        project.id,
+        session_id,
+        task.id,
+        worker_generation=1,
+        session_factory=_test_session_factory(db_session),
+    )
+
+    refreshed_task = await db_session.get(Task, task.id)
+    refreshed_cycle = await db_session.get(StrategicCycle, cycle.id)
+    refreshed_project = await db_session.get(Project, project.id)
+    await db_session.refresh(refreshed_task)
+    await db_session.refresh(refreshed_cycle)
+    await db_session.refresh(refreshed_project)
+    assert refreshed_task.status == TaskStatus.CANCELLED
+    assert refreshed_cycle.outcome == "failed_phase2"
+    assert RESIDENT_SESSION_KEY not in (refreshed_project.vision or {})
+    _assert_resident_terminal_receipt(
+        emit, cycle, "resident_start_compensation"
+    )
 
 
 @pytest.mark.asyncio

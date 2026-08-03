@@ -201,6 +201,38 @@ describe('useLogViewer reconnect truth', () => {
     expect(result.current.lv.strategistActive).toBe(false);
   });
 
+  it('restores a durable cancellation receipt after a dropped completion broadcast', async () => {
+    const strategicReadModelRef = {
+      current: strategicState(cycle(), null),
+    };
+    const { result } = setup({ strategicReadModelRef });
+    const ws = await connect(result);
+
+    act(() => {
+      ws.emit({
+        event: 'strategic_cycle_started',
+        data: { task_id: 'task-1', cycle_id: 'cycle-cancelled', phase: 'strategic_review' },
+      });
+    });
+
+    strategicReadModelRef.current = strategicState(null, cycle({
+      id: 'cycle-cancelled',
+      outcome: 'failed_phase1',
+      has_active_task: false,
+      terminal_disposition: 'cancelled',
+      summary_text: 'Strategic review cancelled',
+      failure_reason: 'Cancelled by operator',
+    }));
+    act(() => { ws.onopen?.({}); });
+
+    expect(result.current.lv.lastCycleCompletion).toMatchObject({
+      cycle_id: 'cycle-cancelled',
+      status: 'CANCELLED',
+      status_message: 'Strategic review cancelled',
+      failure_reason: 'Cancelled by operator',
+    });
+  });
+
   // ── Backward compat: no durable ref behaves as before ─────────────────────
   it('resets strategistActive to false on reconnect when no durable ref is provided', async () => {
     // Without a durable authority ref the hook applies the conservative safety-net
@@ -354,6 +386,86 @@ describe('useLogViewer reconnect truth', () => {
     const fetchDirections = result.current.fetchDirectionsRef.current as ReturnType<typeof vi.fn>;
     act(() => { vi.advanceTimersByTime(500); });
     expect(fetchDirections).toHaveBeenCalledTimes(1);
+  });
+
+  it('ignores a late prior-cycle completion without losing newer activity or receipt', async () => {
+    const { result } = setup();
+    const ws = await connect(result);
+
+    act(() => {
+      ws.emit({
+        event: 'strategic_cycle_started',
+        data: { task_id: 'task-a', cycle_id: 'cycle-a', phase_number: 1 },
+      });
+      ws.emit({
+        event: 'strategic_cycle_completed',
+        data: {
+          cycle_id: 'cycle-a',
+          completion: { status: 'failed', failure_reason: 'old cycle' },
+        },
+      });
+      ws.emit({
+        event: 'strategic_cycle_started',
+        data: {
+          task_id: 'task-b',
+          cycle_id: 'cycle-b',
+          phase_number: 2,
+          phase_label: 'Strategic review',
+        },
+      });
+    });
+
+    expect(result.current.lv.strategistActive).toBe(true);
+    expect(result.current.lv.cycleProgress).toMatchObject({
+      task_id: 'task-b',
+      cycle_id: 'cycle-b',
+      phase_number: 2,
+    });
+    expect(result.current.lv.lastCycleCompletion).toBeNull();
+
+    act(() => {
+      ws.emit({
+        event: 'strategic_cycle_completed',
+        data: {
+          cycle_id: 'cycle-a',
+          completion: { status: 'failed', failure_reason: 'late old cycle' },
+        },
+      });
+    });
+
+    expect(result.current.lv.strategistActive).toBe(true);
+    expect(result.current.lv.cycleProgress).toMatchObject({ task_id: 'task-b', cycle_id: 'cycle-b' });
+    expect(result.current.lv.lastCycleCompletion).toBeNull();
+
+    act(() => {
+      ws.emit({
+        event: 'strategic_cycle_completed',
+        data: {
+          cycle_id: 'cycle-b',
+          completion: { status: 'completed', status_message: 'new cycle' },
+        },
+      });
+    });
+    expect(result.current.lv.lastCycleCompletion).toMatchObject({
+      cycle_id: 'cycle-b',
+      status: 'completed',
+      status_message: 'new cycle',
+    });
+
+    act(() => {
+      ws.emit({
+        event: 'strategic_cycle_completed',
+        data: {
+          cycle_id: 'cycle-a',
+          completion: { status: 'failed', failure_reason: 'late old cycle again' },
+        },
+      });
+    });
+    expect(result.current.lv.lastCycleCompletion).toMatchObject({
+      cycle_id: 'cycle-b',
+      status: 'completed',
+      status_message: 'new cycle',
+    });
   });
 
   // ── Active cycle preserved: cycleProgress also retained ───────────────────

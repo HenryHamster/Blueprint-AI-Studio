@@ -75,11 +75,16 @@ function strategicCycleProgressFromDurableState(cycle: StrategicStateCycle): Str
 
 function strategicCycleCompletionFromDurableState(cycle: StrategicStateCycle): StrategicCycleCompletion {
   const outcome = cycle.outcome.toLowerCase();
-  const status = outcome === 'completed'
-    ? 'completed'
-    : outcome.includes('cancel')
-      ? 'CANCELLED'
-      : 'FAILED';
+  const disposition = cycle.terminal_disposition?.toLowerCase();
+  const status = disposition === 'cancelled'
+    ? 'CANCELLED'
+    : disposition === 'failed'
+      ? 'FAILED'
+      : outcome === 'completed'
+        ? 'completed'
+        : outcome.includes('cancel')
+          ? 'CANCELLED'
+          : 'FAILED';
   return {
     cycle_id: cycle.id,
     status,
@@ -207,6 +212,9 @@ export function useLogViewer({
   const [lastCycleCompletion, setLastCycleCompletion] = useState<StrategicCycleCompletion | null>(null);
   // Live strategic-session transcript buffer, appended from strategic_session events.
   const [strategicSessionTranscript, setStrategicSessionTranscript] = useState<StrategicSessionDelta[]>([]);
+  // Keep the latest known cycle identity so delayed completion frames from an
+  // older cycle cannot overwrite newer activity or its durable receipt.
+  const currentCycleIdRef = useRef<string | null>(null);
   const projectStrategicState = useCallback((state: StrategicStateResponse | null) => {
     if (!state || (
       selectedProjectIdRef.current != null
@@ -214,6 +222,7 @@ export function useLogViewer({
     )) return;
     const activeCycle = state.strategic.active_cycle;
     if (strategicCycleIsActive(activeCycle)) {
+      currentCycleIdRef.current = activeCycle.id;
       setStrategistActive(true);
       setCycleProgress(previous => {
         const next = strategicCycleProgressFromDurableState(activeCycle);
@@ -240,6 +249,7 @@ export function useLogViewer({
     setStrategistActive(false);
     setCycleProgress(null);
     const latestCycle = state.strategic.latest_cycle;
+    currentCycleIdRef.current = latestCycle?.id ?? null;
     if (!latestCycle) return;
     const durableCompletion = strategicCycleCompletionFromDurableState(latestCycle);
     setLastCycleCompletion(previous => {
@@ -339,6 +349,7 @@ export function useLogViewer({
     setStrategistActive(false);
     setCycleProgress(null);
     setLastCycleCompletion(null);
+    currentCycleIdRef.current = null;
     // The transcript is a per-project live buffer; a fresh project starts empty
     // and the strategic session re-streams its own strategic_session deltas.
     setStrategicSessionTranscript([]);
@@ -680,6 +691,9 @@ export function useLogViewer({
         return;
       }
       if (msg.event === 'strategic_cycle_started') {
+        currentCycleIdRef.current = typeof msg.data?.cycle_id === 'string'
+          ? msg.data.cycle_id
+          : null;
         setStrategistActive(true);
         setLastCycleCompletion(null); // clear previous receipt when new cycle begins
         setCycleProgress({
@@ -692,18 +706,28 @@ export function useLogViewer({
           steering_excerpt: msg.data?.steering_excerpt,
         });
       } else if (msg.event === 'strategic_cycle_completed') {
-        setStrategistActive(false);
-        setCycleProgress(null);
-        if (msg.data?.completion && typeof msg.data.completion === 'object') {
-          const completion = {
-            ...(msg.data.completion as StrategicCycleCompletion),
-            cycle_id: typeof msg.data?.cycle_id === 'string' ? msg.data.cycle_id : undefined,
-          };
-          setLastCycleCompletion(previous => (
-            completion.cycle_id && previous?.cycle_id === completion.cycle_id
-              ? previous
-              : completion
-          ));
+        const completionCycleId = typeof msg.data?.cycle_id === 'string'
+          ? msg.data.cycle_id
+          : undefined;
+        const isStaleCompletion = Boolean(
+          completionCycleId
+          && currentCycleIdRef.current
+          && completionCycleId !== currentCycleIdRef.current,
+        );
+        if (!isStaleCompletion) {
+          setStrategistActive(false);
+          setCycleProgress(null);
+          if (msg.data?.completion && typeof msg.data.completion === 'object') {
+            const completion = {
+              ...(msg.data.completion as StrategicCycleCompletion),
+              cycle_id: completionCycleId,
+            };
+            setLastCycleCompletion(previous => (
+              completion.cycle_id && previous?.cycle_id === completion.cycle_id
+                ? previous
+                : completion
+            ));
+          }
         }
       }
       // Handle lifecycle state above before the canonical envelope's directions
@@ -782,6 +806,7 @@ export function useLogViewer({
           // conservative reset; production App always supplies the ref.
           setStrategistActive(false);
           setCycleProgress(null);
+          currentCycleIdRef.current = null;
         }
         if (isReconnect) refreshStrategicReadModel();
         // Add system log for all tracked tasks

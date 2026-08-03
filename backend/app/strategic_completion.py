@@ -4107,12 +4107,19 @@ async def _handle_strategic_completion(
     *,
     project: Project | None = None,
     message_sequences: list[int] | None = None,
+    preserve_terminal_cycle_disposition: bool = False,
 ):
     """Handle strategic review completion.
 
     Vision and direction updates were already applied incrementally via POST /api/agent/strategic
     during agent execution. This handler just records final status and checks for issues.
     Falls back to log parsing for backward compatibility if the agent used the old approach.
+
+    ``preserve_terminal_cycle_disposition`` is used only by the resident-stop
+    bridge after it reconciles a cancelled/failed linked task.  API side effects
+    (version decisions, release requests, and retirement memos) still need
+    processing, but that already-emitted terminal receipt is authoritative:
+    this handler must not overwrite the failed cycle or broadcast a success.
 
     Phase C3 / Round 3 C3 + C4: callers in the post-commit chain pre-acquire
     the project lock once at the top of ``_process_post_commit`` via the
@@ -4325,21 +4332,24 @@ async def _handle_strategic_completion(
                     f"[STRATEGIC] Task {task.id}: failed to compute knowledge counts (non-fatal)",
                     exc_info=True,
                 )
-            completed_cycle = await strategic_cycle.mark_phase2_completed(
-                session,
-                cycle_id,
-                summary_text=_summary,
-                cycle_reasoning=_cycle_reasoning,
-                directions_created=dirs_created,
-                directions_retired=dirs_retired,
-                tasks_spawned=tasks_spawned,
-                vision_updated=_vision_updated,
-                memos_available=_memos_available,
-                memos_cited=_memos_cited,
-                knowledge_available=_knowledge_available,
-                knowledge_cited=_knowledge_cited,
-                extra_metadata=_extra,
-            )
+            if preserve_terminal_cycle_disposition:
+                completed_cycle = None
+            else:
+                completed_cycle = await strategic_cycle.mark_phase2_completed(
+                    session,
+                    cycle_id,
+                    summary_text=_summary,
+                    cycle_reasoning=_cycle_reasoning,
+                    directions_created=dirs_created,
+                    directions_retired=dirs_retired,
+                    tasks_spawned=tasks_spawned,
+                    vision_updated=_vision_updated,
+                    memos_available=_memos_available,
+                    memos_cited=_memos_cited,
+                    knowledge_available=_knowledge_available,
+                    knowledge_cited=_knowledge_cited,
+                    extra_metadata=_extra,
+                )
         else:
             completed_cycle = None
         # OPTIONAL refinement: persist per-direction evidence_progress verdicts
@@ -4371,17 +4381,18 @@ async def _handle_strategic_completion(
         # a fresh ``project.vision = …`` assignment would trip it. A ``.pop()``
         # is a call, not an assignment node, so it adds no counted write.
         _cur_vision = project.vision
-        if _cur_vision and (
-            "_strategic_failures" in _cur_vision
-            or "_strategic_failures_at" in _cur_vision
-        ):
-            _cur_vision.pop("_strategic_failures", None)
-            _cur_vision.pop("_strategic_failures_at", None)
-            flag_modified(project, "vision")
-            logger.info(
-                f"[STRATEGIC] Task {task.id}: reset _strategic_failures breaker "
-                f"on successful cycle (project {project.id})"
-            )
+        if not preserve_terminal_cycle_disposition:
+            if _cur_vision and (
+                "_strategic_failures" in _cur_vision
+                or "_strategic_failures_at" in _cur_vision
+            ):
+                _cur_vision.pop("_strategic_failures", None)
+                _cur_vision.pop("_strategic_failures_at", None)
+                flag_modified(project, "vision")
+                logger.info(
+                    f"[STRATEGIC] Task {task.id}: reset _strategic_failures breaker "
+                    f"on successful cycle (project {project.id})"
+                )
         session.add(project)
         _adoption_suffix_msg = (
             f", {adoption_declared} capability adoption decision(s) declared"
@@ -4389,11 +4400,12 @@ async def _handle_strategic_completion(
             else ""
         )
         _spawn_suffix_msg = f", {tasks_spawned} tasks spawned" if tasks_spawned else ""
-        task.latest_status_message = (
-            f"Strategic review complete — vision rev {vision_rev}, {active_dirs} "
-            f"active directions, {dirs_created} created, {dirs_retired} retired"
-            f"{_adoption_suffix_msg}{_spawn_suffix_msg}"
-        )
+        if not preserve_terminal_cycle_disposition:
+            task.latest_status_message = (
+                f"Strategic review complete — vision rev {vision_rev}, {active_dirs} "
+                f"active directions, {dirs_created} created, {dirs_retired} retired"
+                f"{_adoption_suffix_msg}{_spawn_suffix_msg}"
+            )
         session.add(task)
         # Audit: check for unaddressed FEEDBACK messages
         remaining_feedback_result = await session.execute(
@@ -4498,27 +4510,29 @@ async def _handle_strategic_completion(
         await _apply_qualify_request_post_commit(
             _qr_ctx, task_id=_qr_task_id, project_id=_qr_project_id, path="api"
         )
-        # Post-commit: the live strategic ops already emitted per-write
-        # `strategic_updated` events during execution; here we close the cycle.
-        from app.strategic_events import emit_strategic_cycle_completed
+        if not preserve_terminal_cycle_disposition:
+            # Post-commit: the live strategic ops already emitted per-write
+            # `strategic_updated` events during execution; here we close the cycle.
+            from app.strategic_events import emit_strategic_cycle_completed
 
-        await emit_strategic_cycle_completed(
-            task.project_id,
-            task.id,
-            2,
-            cycle_id=cycle_id,
-            completion=_strategic_event_completion_summary(
-                task,
-                project,
-                cycle=completed_cycle,
-                status="completed",
-            ),
-        )
+            await emit_strategic_cycle_completed(
+                task.project_id,
+                task.id,
+                2,
+                cycle_id=cycle_id,
+                completion=_strategic_event_completion_summary(
+                    task,
+                    project,
+                    cycle=completed_cycle,
+                    status="completed",
+                ),
+            )
         logger.info(
             f"[STRATEGIC] Task {task.id} complete via API: vision rev {vision_rev}, {active_dirs} active directions"
             f"{_adoption_suffix_msg}{_spawn_suffix_msg}"
         )
-        await _maybe_retry_workday_auto_start(task.project_id)
+        if not preserve_terminal_cycle_disposition:
+            await _maybe_retry_workday_auto_start(task.project_id)
         return
 
     # Fallback: try log-based parsing for backward compatibility

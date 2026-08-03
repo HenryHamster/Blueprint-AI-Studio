@@ -68,6 +68,12 @@ OUTCOME_STALLED_PHASE2 = "stalled_phase2"
 OUTCOME_FAILED_PHASE2_SPAWN = "failed_phase2_spawn"
 OUTCOME_THINKER_ARTIFACTS_MISSING = "thinker_artifacts_missing"
 
+# Optional cycle metadata written when a linked terminal task is reconciled.
+# Legacy rows omit this key and continue to use their outcome for inference.
+CYCLE_META_TERMINAL_DISPOSITION = "terminal_disposition"
+TERMINAL_DISPOSITION_CANCELLED = "cancelled"
+TERMINAL_DISPOSITION_FAILED = "failed"
+
 # A task can be terminalized by several writers (the agent status endpoint,
 # single-task administration, bulk administration, or the recovery sweep).
 # These are the only task states that mean its linked running phase failed.
@@ -193,7 +199,19 @@ async def reconcile_terminal_task(
         f"terminal_task_reconciliation: source={bounded_source} "
         f"task_id={task.id} status={status}"
     )[:500]
-    return await mark_failure(session, cycle.id, phase=phase, reason=reason)
+    reconciled = await mark_failure(session, cycle.id, phase=phase, reason=reason)
+    if reconciled is None:
+        return None
+    metadata = dict(reconciled.cycle_metadata or {})
+    metadata[CYCLE_META_TERMINAL_DISPOSITION] = (
+        TERMINAL_DISPOSITION_CANCELLED
+        if task.status == TaskStatus.CANCELLED
+        else TERMINAL_DISPOSITION_FAILED
+    )
+    reconciled.cycle_metadata = metadata
+    flag_modified(reconciled, "cycle_metadata")
+    session.add(reconciled)
+    return reconciled
 
 
 def terminal_completion_event(

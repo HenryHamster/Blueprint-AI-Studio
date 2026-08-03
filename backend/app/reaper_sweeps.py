@@ -478,6 +478,7 @@ async def sweep_stalled_strategic_cycles(
     from app.broadcast import broadcast_to_project as _bcast
     from app.strategic_events import emit_strategic_cycle_completed
     from app.strategic_runtime_work import task_is_strategic_local_runner_hold
+    from app.task_locking import project_lock, task_lock
 
     # Pause-aware: a cycle whose completion handler simply could not run while
     # the pipeline was paused must not be force-terminated as "stalled". Passing
@@ -497,21 +498,62 @@ async def sweep_stalled_strategic_cycles(
     # the strategic_cycle_completed broadcast the stalled path would otherwise
     # have fired — without it the operator's "Strategist working…" indicator
     # would stick on against a terminal cycle.
-    reconciled_completion_events: list[dict] = []
+    terminal_tasks_by_project: dict[object, list] = {}
     for terminal_task in terminal_phase_tasks:
-        reconciled = await strategic_cycle.reconcile_terminal_task(
-            session, terminal_task, source="stalled_cycle_reaper"
+        terminal_tasks_by_project.setdefault(terminal_task.project_id, []).append(
+            terminal_task
         )
-        if reconciled is not None:
-            reconciled_terminal_cycles += 1
-            reconciled_completion_events.append(
-                strategic_cycle.terminal_completion_event(reconciled, terminal_task)
+    for project_id in sorted(terminal_tasks_by_project, key=str):
+        project_completion_events: list[dict] = []
+        async with project_lock(session, project_id, skip_locked=True) as locked_project:
+            if locked_project is None:
+                logger.info(
+                    "[REAPER] Deferring terminal Strategic residue for contended "
+                    "project %s",
+                    project_id,
+                )
+                continue
+            for terminal_task in sorted(
+                terminal_tasks_by_project[project_id], key=lambda task: str(task.id)
+            ):
+                # Discovery is deliberately unlocked and returns candidates only.
+                # Re-lock and reload each task before reconciling so a concurrent
+                # requeue or lifecycle writer cannot turn stale residue into a
+                # false terminal cycle.
+                async with task_lock(
+                    session, terminal_task.id, skip_locked=True
+                ) as locked_task:
+                    if locked_task is None:
+                        logger.info(
+                            "[REAPER] Deferring terminal Strategic residue for "
+                            "contended task %s",
+                            terminal_task.id,
+                        )
+                        continue
+                    if (
+                        locked_task.project_id != locked_project.id
+                        or locked_task.status
+                        not in (TaskStatus.FAILED, TaskStatus.CANCELLED)
+                    ):
+                        continue
+                    reconciled = await strategic_cycle.reconcile_terminal_task(
+                        session, locked_task, source="stalled_cycle_reaper"
+                    )
+                    if reconciled is not None:
+                        reconciled_terminal_cycles += 1
+                        project_completion_events.append(
+                            strategic_cycle.terminal_completion_event(
+                                reconciled, locked_task
+                            )
+                        )
+            # Release the Project/Task locks even when every candidate was
+            # contended or became non-terminal after discovery.
+            await session.commit()
+        if project_completion_events:
+            await strategic_cycle.emit_terminal_completion_events(
+                project_completion_events
             )
     if reconciled_terminal_cycles:
-        await session.commit()
-        await strategic_cycle.emit_terminal_completion_events(
-            reconciled_completion_events
-        )
         logger.info(
             "[REAPER] Reconciled %s already-terminal strategic phase task(s)",
             reconciled_terminal_cycles,

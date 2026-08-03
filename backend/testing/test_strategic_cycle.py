@@ -975,6 +975,15 @@ async def test_reconcile_terminal_task_reconciles_linked_phase_and_is_idempotent
     )
     await db_session.commit()
 
+    persisted_phase1 = await strategic_cycle.get(db_session, reconciled_phase1.id)
+    persisted_phase2 = await strategic_cycle.get(db_session, reconciled_phase2.id)
+    assert persisted_phase1.cycle_metadata[
+        strategic_cycle.CYCLE_META_TERMINAL_DISPOSITION
+    ] == strategic_cycle.TERMINAL_DISPOSITION_CANCELLED
+    assert persisted_phase2.cycle_metadata[
+        strategic_cycle.CYCLE_META_TERMINAL_DISPOSITION
+    ] == strategic_cycle.TERMINAL_DISPOSITION_FAILED
+
     assert reconciled_phase1 is not None
     assert reconciled_phase1.outcome == strategic_cycle.OUTCOME_FAILED_PHASE1
     assert reconciled_phase1.phase1_completed_at is not None
@@ -982,6 +991,9 @@ async def test_reconcile_terminal_task_reconciles_linked_phase_and_is_idempotent
         f"terminal_task_reconciliation: source=test_single_cancel "
         f"task_id={phase1_task.id} status=CANCELLED"
     )
+    assert reconciled_phase1.cycle_metadata[
+        strategic_cycle.CYCLE_META_TERMINAL_DISPOSITION
+    ] == strategic_cycle.TERMINAL_DISPOSITION_CANCELLED
     assert reconciled_phase2 is not None
     assert reconciled_phase2.outcome == strategic_cycle.OUTCOME_FAILED_PHASE2
     assert reconciled_phase2.phase2_completed_at is not None
@@ -989,6 +1001,9 @@ async def test_reconcile_terminal_task_reconciles_linked_phase_and_is_idempotent
         f"terminal_task_reconciliation: source=test_bulk_failure "
         f"task_id={phase2_task.id} status=FAILED"
     )
+    assert reconciled_phase2.cycle_metadata[
+        strategic_cycle.CYCLE_META_TERMINAL_DISPOSITION
+    ] == strategic_cycle.TERMINAL_DISPOSITION_FAILED
 
     original_reason = reconciled_phase1.failure_reason
     assert (

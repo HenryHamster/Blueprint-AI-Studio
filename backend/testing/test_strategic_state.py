@@ -101,6 +101,33 @@ EXPECTED_CURATED_METRIC_PROVENANCE = {
 }
 
 
+def test_cycle_summary_projects_terminal_disposition_and_preserves_legacy_rows():
+    from app.strategic_state_read_model import _cycle_summary
+
+    cancelled = StrategicCycle(
+        id="sc-cancelled",
+        project_id="project-1",
+        outcome="failed_phase1",
+        cycle_metadata={"terminal_disposition": "cancelled"},
+    )
+    legacy = StrategicCycle(
+        id="sc-legacy",
+        project_id="project-1",
+        outcome="failed_phase1",
+        cycle_metadata={},
+    )
+    malformed = StrategicCycle(
+        id="sc-malformed",
+        project_id="project-1",
+        outcome="failed_phase1",
+        cycle_metadata={"terminal_disposition": "unknown"},
+    )
+
+    assert _cycle_summary(cancelled)["terminal_disposition"] == "cancelled"
+    assert _cycle_summary(legacy)["terminal_disposition"] is None
+    assert _cycle_summary(malformed)["terminal_disposition"] is None
+
+
 def _assert_curated_metric_provenance(metrics: dict[str, dict]) -> None:
     assert set(metrics) == set(WORK_SESSION_METRIC_REGISTRY)
     assert set(EXPECTED_CURATED_METRIC_PROVENANCE).issubset(metrics)
