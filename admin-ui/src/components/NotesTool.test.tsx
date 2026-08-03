@@ -96,7 +96,7 @@ describe('NotesTool — autosave loop + conflict data-loss', () => {
     document.body.appendChild(host);
     const r = createRoot(host);
     root = r;
-    await act(async () => { r.render(<NotesTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
+    await act(async () => { r.render(<NotesTool projectId="proj-a" tool={SAMPLE_TOOL} readOnly={false} />); });
     // Flush the mount-time fetch microtasks.
     await act(async () => { await Promise.resolve(); await Promise.resolve(); });
     if (!host) throw new Error('host not mounted');
@@ -138,7 +138,7 @@ describe('NotesTool — autosave loop + conflict data-loss', () => {
     await act(async () => {
       root?.render(
         <StrictMode>
-          <NotesTool projectId="proj-a" tool={SAMPLE_TOOL} />
+          <NotesTool projectId="proj-a" tool={SAMPLE_TOOL} readOnly={false} />
         </StrictMode>,
       );
     });
@@ -288,7 +288,7 @@ describe('NotesTool — autosave loop + conflict data-loss', () => {
     await act(async () => { typeInto(textareaA, 'A queued edit'); });
 
     const toolB = { ...SAMPLE_TOOL, id: 'notes-2', slug: 'notes-2' };
-    await act(async () => { root?.render(<NotesTool projectId="proj-a" tool={toolB} />); });
+    await act(async () => { root?.render(<NotesTool projectId="proj-a" tool={toolB} readOnly={false} />); });
     await act(async () => { await Promise.resolve(); await Promise.resolve(); });
     expect((host!.querySelector('textarea') as HTMLTextAreaElement).value).toBe('tool B');
 

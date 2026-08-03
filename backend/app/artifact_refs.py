@@ -20,6 +20,7 @@ from app.models import (
     ProjectTool,
     _utcnow,
 )
+from app.admin_helpers import PROJECT_WRITE_ROLES
 from app.task_locking import lock_project_or_429
 
 
@@ -160,7 +161,7 @@ async def create_tool_artifact_ref(
             .where(
                 ProjectMember.project_id == project_id,
                 ProjectMember.user_id == actor_user_id,
-                ProjectMember.role.in_(["member", "owner"]),
+                ProjectMember.role.in_(PROJECT_WRITE_ROLES),
             )
             .with_for_update()
         )

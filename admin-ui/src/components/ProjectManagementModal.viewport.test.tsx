@@ -46,6 +46,7 @@ const PROJECTS = [
 const DEFAULT_PROPS = {
   projects: PROJECTS,
   selectedProjectId: 'proj-1',
+  canManageProject: () => true,
   onNewProject: () => {},
   onRefreshProjects: () => {},
   onSelectProject: () => {},

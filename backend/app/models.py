@@ -443,8 +443,9 @@ class AllowedUser(SQLModel, table=True):
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     email: str = Field(index=True, unique=True)
     firebase_uid: str | None = Field(default=None, index=True)
-    # Allowed values: 'admin' | 'user'. Enforced server-side by
-    # ``chk_alloweduser_role`` (alembic 0065 / audit L-S1, Postgres-only).
+    # Allowed values: 'admin' | 'user' | 'invited'. ``invited`` is internal
+    # pre-login provenance and is promoted to ``user`` on first verified claim.
+    # Enforced by ``chk_alloweduser_role`` (alembic 0067, expanded by 0721).
     role: str = Field(default="user")
     display_name: str | None = None
     # TIMESTAMPTZ + server_default (migration 0061 / audit H-S4 + H-S5):
@@ -914,6 +915,18 @@ class ProjectMember(SQLModel, table=True):
         sa_column=Column(NaiveUTCDateTime, nullable=False),
     )
 
+    # Existing production index from migration 0024. Declaring it here keeps
+    # SQLModel-created test schemas aligned with Alembic and makes invitation
+    # idempotency rely on the same canonical uniqueness in every dialect.
+    __table_args__ = (
+        Index(
+            "ix_projectmember_project_user",
+            "project_id",
+            "user_id",
+            unique=True,
+        ),
+    )
+
 
 class MessagesLastSeen(SQLModel, table=True):
     """Per-operator, per-project last-seen timestamp for the messages panel divider.
@@ -1280,7 +1293,7 @@ class Task(SQLModel, table=True):
     created_by: str = Field(default="USER", index=True)
     launched_by_user_id: str | None = Field(
         default=None
-    )  # Firebase UID of the user who launched this task (for launcher-pays billing)
+    )  # Firebase UID of the launcher for attribution; project owner funds execution.
     idempotency_key: str | None = Field(
         default=None, sa_column=Column(String(255), nullable=True)
     )

@@ -43,7 +43,18 @@ vi.mock('../api', () => ({
     }
     return new Response('{}', { status: 200 });
   }),
-  authGet: vi.fn(async () => {
+  authGet: vi.fn(async (url: string) => {
+    if (url.includes('/api/github/status')) {
+      return new Response(JSON.stringify({
+        identity_linked: true,
+        credential_kind: 'oauth',
+        account_name: 'octocat',
+        app_configured: true,
+        app_installation_linked: true,
+        app_installation_reachable: true,
+        installation_count: 1,
+      }), { status: 200 });
+    }
     return new Response(
       JSON.stringify({
         repositories: [
@@ -101,12 +112,17 @@ vi.mock('../api', () => ({
  */
 async function driveToSuccess(host: HTMLElement): Promise<void> {
   const user = userEvent.setup();
-  // authGet mock resolves the repo list asynchronously — let it populate.
-  await act(async () => { await new Promise((resolve) => setTimeout(resolve, 120)); });
-  const repoBtn = Array.from(host.querySelectorAll('button')).find((b) =>
-    b.textContent?.includes('example/repo-one'),
-  );
-  await act(async () => { if (repoBtn) await user.click(repoBtn); });
+  // Identity status now resolves before repository discovery, so wait for both
+  // requests rather than assuming the old single-fetch timing.
+  let repoBtn: HTMLButtonElement | undefined;
+  for (let attempt = 0; attempt < 10 && !repoBtn; attempt += 1) {
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
+    repoBtn = Array.from(host.querySelectorAll('button')).find((button) =>
+      button.textContent?.includes('example/repo-one'),
+    );
+  }
+  expect(repoBtn).toBeDefined();
+  await act(async () => { await user.click(repoBtn!); });
   const continueBtn = Array.from(host.querySelectorAll('button')).find((b) => b.textContent?.trim() === 'Continue');
   await act(async () => { if (continueBtn) await user.click(continueBtn); });
   await act(async () => { await new Promise((resolve) => setTimeout(resolve, 120)); });

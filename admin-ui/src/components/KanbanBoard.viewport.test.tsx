@@ -62,6 +62,7 @@ function makeTask(overrides: Partial<Task> = {}): Task {
 }
 
 const BASE_PROPS = {
+  readOnly: false,
   loading: false,
   maxRetries: 3,
   actionLoadingMap: {},

@@ -71,7 +71,7 @@ describe('WhiteboardTool — viewport regression', () => {
       document.body.appendChild(host);
       const r = createRoot(host);
       root = r;
-      await act(async () => { r.render(<WhiteboardTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
+      await act(async () => { r.render(<WhiteboardTool projectId="proj-a" tool={SAMPLE_TOOL} readOnly={false} />); });
       await act(async () => { await new Promise(resolve => setTimeout(resolve, 100)); });
     });
     if (!host) throw new Error('host not mounted');
@@ -94,7 +94,7 @@ describe('WhiteboardTool — viewport regression', () => {
       document.body.appendChild(host);
       const r = createRoot(host);
       root = r;
-      await act(async () => { r.render(<WhiteboardTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
+      await act(async () => { r.render(<WhiteboardTool projectId="proj-a" tool={SAMPLE_TOOL} readOnly={false} />); });
       await act(async () => { await new Promise(resolve => setTimeout(resolve, 100)); });
     });
     if (!host) throw new Error('host not mounted');
@@ -115,7 +115,7 @@ describe('WhiteboardTool — viewport regression', () => {
     document.body.appendChild(host);
     const r = createRoot(host);
     root = r;
-    await act(async () => { r.render(<WhiteboardTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
+    await act(async () => { r.render(<WhiteboardTool projectId="proj-a" tool={SAMPLE_TOOL} readOnly={false} />); });
     if (!host) throw new Error('host not mounted');
     expect(host.textContent).toContain('Loading whiteboard');
     await act(async () => {
@@ -136,7 +136,7 @@ describe('WhiteboardTool — viewport regression', () => {
     document.body.appendChild(host);
     const r = createRoot(host);
     root = r;
-    await act(async () => { r.render(<WhiteboardTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
+    await act(async () => { r.render(<WhiteboardTool projectId="proj-a" tool={SAMPLE_TOOL} readOnly={false} />); });
     await act(async () => { await vi.runAllTimersAsync(); });
     if (!host) throw new Error('host not mounted');
     // Should still have a canvas and controls.
@@ -154,7 +154,7 @@ describe('WhiteboardTool — viewport regression', () => {
     document.body.appendChild(host);
     const r = createRoot(host);
     root = r;
-    await act(async () => { r.render(<WhiteboardTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
+    await act(async () => { r.render(<WhiteboardTool projectId="proj-a" tool={SAMPLE_TOOL} readOnly={false} />); });
     await act(async () => { await vi.runAllTimersAsync(); });
     if (!host) throw new Error('host not mounted');
     expect(host.textContent).toContain('Network error');
@@ -174,7 +174,7 @@ describe('WhiteboardTool — viewport regression', () => {
     document.body.appendChild(host);
     const r = createRoot(host);
     root = r;
-    await act(async () => { r.render(<WhiteboardTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
+    await act(async () => { r.render(<WhiteboardTool projectId="proj-a" tool={SAMPLE_TOOL} readOnly={false} />); });
     await act(async () => { await vi.runAllTimersAsync(); });
     if (!host) throw new Error('host not mounted');
     // Color buttons
@@ -203,7 +203,7 @@ describe('WhiteboardTool — viewport regression', () => {
     document.body.appendChild(host);
     const r = createRoot(host);
     root = r;
-    await act(async () => { r.render(<WhiteboardTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
+    await act(async () => { r.render(<WhiteboardTool projectId="proj-a" tool={SAMPLE_TOOL} readOnly={false} />); });
     await act(async () => { await vi.runAllTimersAsync(); });
 
     if (!host) throw new Error('host not mounted');
@@ -230,7 +230,7 @@ describe('WhiteboardTool — viewport regression', () => {
       document.body.appendChild(host);
       const r = createRoot(host);
       root = r;
-      await act(async () => { r.render(<WhiteboardTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
+      await act(async () => { r.render(<WhiteboardTool projectId="proj-a" tool={SAMPLE_TOOL} readOnly={false} />); });
       await act(async () => { await new Promise(resolve => setTimeout(resolve, 100)); });
     });
   });

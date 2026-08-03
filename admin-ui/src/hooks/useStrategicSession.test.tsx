@@ -1,8 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { act, renderHook, cleanup, waitFor } from '@testing-library/react';
-import { useStrategicSession } from './useStrategicSession';
+import { useStrategicSession as useStrategicSessionHook } from './useStrategicSession';
 import {
-  startStrategicSession, stopStrategicSession, updateStrategicWorkbenchState,
+  checkInStrategicSession, startStrategicSession, stopStrategicSession, updateStrategicWorkbenchState,
 } from '../strategicStateApi';
 import type {
   StrategicLivenessResponse,
@@ -27,7 +27,12 @@ vi.mock('../utils/strategicContextDescriptor', async (importOriginal) => ({
   buildStrategicContextDescriptor: vi.fn(() => null),
 }));
 
-type ReadModel = Parameters<typeof useStrategicSession>[0]['strategicReadModel'];
+type StrategicSessionOptions = Parameters<typeof useStrategicSessionHook>[0];
+type ReadModel = StrategicSessionOptions['strategicReadModel'];
+
+function useStrategicSession(options: Omit<StrategicSessionOptions, 'canOperateProject'> & { canOperateProject?: boolean }) {
+  return useStrategicSessionHook({ canOperateProject: true, ...options });
+}
 
 function makeReadModel(data: StrategicStateResponse | null): ReadModel {
   return {
@@ -165,6 +170,37 @@ describe('useStrategicSession liveness fallback', () => {
 
     rerender();
     expect(startStrategicSession).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not start, retry, or mutate Strategic session state for a viewer', async () => {
+    const readModel = makeReadModel(null);
+    const { result } = renderHook(() =>
+      useStrategicSession({
+        selectedProjectId: 'proj-1',
+        canOperateProject: false,
+        addToast: vi.fn(),
+        strategicReadModel: readModel,
+        strategicLiveness: makeLiveness(),
+      }),
+    );
+
+    act(() => {
+      result.current.persistStrategicWorkbench({ interaction_mode: 'continuous' });
+      result.current.handleSelectStrategicRunner('runner-1');
+      result.current.updateStrategicSessionRefs(() => [{ kind: 'task', id: 'task-1' }]);
+    });
+    await act(async () => {
+      await result.current.handleStrategicCheckIn();
+      await result.current.handleStartStrategicSession();
+      await result.current.handleStopStrategicSession();
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+    });
+
+    expect(startStrategicSession).not.toHaveBeenCalled();
+    expect(stopStrategicSession).not.toHaveBeenCalled();
+    expect(checkInStrategicSession).not.toHaveBeenCalled();
+    expect(updateStrategicWorkbenchState).not.toHaveBeenCalled();
+    expect(readModel.refresh).not.toHaveBeenCalled();
   });
 
   it('lets explicit runner selection own a live Chat to Workday start', async () => {
@@ -833,5 +869,46 @@ describe('useStrategicSession liveness fallback', () => {
       () => expect(startStrategicSession).toHaveBeenCalledTimes(2),
       { timeout: 1_000 },
     );
+  });
+
+  it('keeps callbacks captured before an operate downgrade from making Strategic writes', async () => {
+    const readModel = makeReadModel(makeHeavyState());
+    const { result, rerender } = renderHook(
+      ({ canOperateProject }: { canOperateProject: boolean }) =>
+        useStrategicSession({
+          selectedProjectId: 'proj-1',
+          canOperateProject,
+          addToast: vi.fn(),
+          strategicReadModel: readModel,
+          strategicLiveness: null,
+        }),
+      { initialProps: { canOperateProject: true } },
+    );
+    const staleCallbacks = {
+      persist: result.current.persistStrategicWorkbench,
+      updateRefs: result.current.updateStrategicSessionRefs,
+      selectRunner: result.current.handleSelectStrategicRunner,
+      checkIn: result.current.handleStrategicCheckIn,
+      start: result.current.handleStartStrategicSession,
+      stop: result.current.handleStopStrategicSession,
+    };
+
+    rerender({ canOperateProject: false });
+    vi.clearAllMocks();
+    await act(async () => {
+      staleCallbacks.persist({ interaction_mode: 'continuous' });
+      staleCallbacks.updateRefs(refs => refs);
+      staleCallbacks.selectRunner('runner-after-revocation');
+      await staleCallbacks.checkIn();
+      await staleCallbacks.start();
+      await staleCallbacks.stop();
+      await Promise.resolve();
+    });
+
+    expect(updateStrategicWorkbenchState).not.toHaveBeenCalled();
+    expect(checkInStrategicSession).not.toHaveBeenCalled();
+    expect(startStrategicSession).not.toHaveBeenCalled();
+    expect(stopStrategicSession).not.toHaveBeenCalled();
+    expect(readModel.refresh).not.toHaveBeenCalled();
   });
 });

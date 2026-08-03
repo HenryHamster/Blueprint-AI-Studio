@@ -762,9 +762,11 @@ interface Props {
    *  recent-outcome rows render the task id as a keyboard-accessible link;
    *  when absent the id degrades to plain text. */
   onNavigateToTask?: (taskId: string) => void;
+  /** Preserve runner health and telemetry while suppressing every mutation. */
+  readOnly: boolean;
 }
 
-export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refreshSignal, live, onNavigateToTask }: Props) {
+export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refreshSignal, live, onNavigateToTask, readOnly = true }: Props) {
   const [runners, setRunners] = useState<FleetRunner[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -834,9 +836,11 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
       // Fetch each runner's project allow-list concurrently. Best-effort: a
       // per-runner failure resolves to null and simply omits that runner's
       // Projects section rather than failing the whole panel load.
-      const lists = await Promise.all(
-        data.map(r => listRunnerProjects(r.enrollment_project_id ?? projectId, r.id).catch(() => null)),
-      );
+      const lists = readOnly
+        ? data.map(() => null)
+        : await Promise.all(
+            data.map(r => listRunnerProjects(r.enrollment_project_id ?? projectId, r.id).catch(() => null)),
+          );
       if (epoch !== requestEpochRef.current) return;
       if (mountedRef.current) {
         const map: Record<string, RunnerProjectAllowList> = {};
@@ -853,11 +857,26 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
     } finally {
       if (epoch === requestEpochRef.current && mountedRef.current) setLoading(false);
     }
-  }, [projectId]);
+  }, [projectId, readOnly]);
+
+  // Tokens, confirmations and configuration drafts are mutation authority.
+  // Drop them immediately if the caller's access is downgraded while mounted.
+  useEffect(() => {
+    if (!readOnly) return;
+    setPendingConfirm(null);
+    setPendingToken(null);
+    setExpandedConfig(null);
+    setAddingProjectFor(null);
+    setAddProjectSelection('');
+  }, [readOnly]);
 
   // Load the owner's project set once per projectId — the candidate list for the
   // add-picker. Best-effort: on failure the picker just has no options to add.
   useEffect(() => {
+    if (readOnly) {
+      setOwnedProjects([]);
+      return;
+    }
     let cancelled = false;
     async function run() {
       try {
@@ -869,7 +888,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
     }
     void run();
     return () => { cancelled = true; };
-  }, [projectId]);
+  }, [projectId, readOnly]);
 
   // load() is invoked through an effect-local async function so the setState
   // calls it performs land after an await (not synchronously in the effect
@@ -955,6 +974,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
   }, [pendingToken, rotateConnected, rotateWaitTimedOut]);
 
   const handleEnroll = async (preset: RunnerSetupPreset = 'default') => {
+    if (readOnly) return;
     setEnrollingPreset(preset);
     try {
       const result = preset === 'strategic_local'
@@ -975,15 +995,17 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
   };
 
   const handleRotate = (runner: FleetRunner) => {
+    if (readOnly) return;
     setPendingConfirm({ type: 'rotate', runner });
   };
 
   const handleRevoke = (runner: FleetRunner) => {
+    if (readOnly) return;
     setPendingConfirm({ type: 'revoke', runner });
   };
 
   const executeConfirmedAction = async () => {
-    if (!pendingConfirm) return;
+    if (readOnly || !pendingConfirm) return;
     const { type, runner } = pendingConfirm;
     setPendingConfirm(null);
     if (type === 'rotate') {
@@ -1017,6 +1039,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
   };
 
   const handleAddRunnerProject = async (runner: FleetRunner, addProjectId: string) => {
+    if (readOnly) return;
     setMutatingProjects(runner.id);
     try {
       await addRunnerProject(runner.enrollment_project_id ?? projectId, runner.id, addProjectId);
@@ -1031,6 +1054,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
   };
 
   const handleRemoveRunnerProject = async (runner: FleetRunner, addedProjectId: string) => {
+    if (readOnly) return;
     setMutatingProjects(runner.id);
     try {
       await removeRunnerProject(runner.enrollment_project_id ?? projectId, runner.id, addedProjectId);
@@ -1043,6 +1067,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
   };
 
   const handleUpdateStatus = async (runner: FleetRunner, status: 'active' | 'paused' | 'draining') => {
+    if (readOnly) return;
     setUpdatingStatus(runner.id);
     try {
       await patchRunnerStatus(runner.enrollment_project_id ?? projectId, runner.id, status);
@@ -1135,21 +1160,25 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
           >
             <RefreshCw className="w-3.5 h-3.5" />
           </button>
-          <button
-            onClick={() => handleEnroll('strategic_local')}
-            disabled={enrollingPreset !== null}
-            className="min-h-[44px] rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 text-xs font-semibold text-emerald-300 transition-colors hover:bg-emerald-500/15 disabled:opacity-50 md:min-h-9"
-            title="Enroll a local runner restricted to strategic_review and design_doc_update"
-          >
-            {enrollingPreset === 'strategic_local' ? 'Enrolling...' : 'Strategic runner'}
-          </button>
-          <button
-            onClick={() => handleEnroll('default')}
-            disabled={enrollingPreset !== null}
-            className="min-h-[44px] rounded-md border border-neutral-700 bg-[#151c25] px-3 text-xs font-semibold text-neutral-100 transition-colors hover:border-neutral-600 hover:bg-neutral-800 disabled:opacity-50 md:min-h-9"
-          >
-            {enrollingPreset === 'default' ? 'Enrolling...' : 'Enroll runner'}
-          </button>
+          {!readOnly && (
+            <>
+              <button
+                onClick={() => handleEnroll('strategic_local')}
+                disabled={enrollingPreset !== null}
+                className="min-h-[44px] rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 text-xs font-semibold text-emerald-300 transition-colors hover:bg-emerald-500/15 disabled:opacity-50 md:min-h-9"
+                title="Enroll a local runner restricted to strategic_review and design_doc_update"
+              >
+                {enrollingPreset === 'strategic_local' ? 'Enrolling...' : 'Strategic runner'}
+              </button>
+              <button
+                onClick={() => handleEnroll('default')}
+                disabled={enrollingPreset !== null}
+                className="min-h-[44px] rounded-md border border-neutral-700 bg-[#151c25] px-3 text-xs font-semibold text-neutral-100 transition-colors hover:border-neutral-600 hover:bg-neutral-800 disabled:opacity-50 md:min-h-9"
+              >
+                {enrollingPreset === 'default' ? 'Enrolling...' : 'Enroll runner'}
+              </button>
+            </>
+          )}
         </div>
       </div>
 
@@ -1229,7 +1258,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
         <div className="py-4 text-center text-xs text-neutral-500">Loading…</div>
       ) : runners.length === 0 ? (
         <div className="rounded-md border border-dashed border-neutral-800 py-6 text-center text-xs text-neutral-500">
-          No runners enrolled. Click <span className="text-neutral-300">Enroll runner</span> to register one.
+          {readOnly ? 'No runners are enrolled for this project.' : <>No runners enrolled. Click <span className="text-neutral-300">Enroll runner</span> to register one.</>}
         </div>
       ) : (
         <div className="space-y-2">
@@ -1470,6 +1499,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                   </div>
                 </div>
                 <div className="flex shrink-0 items-center gap-2.5">
+                {!readOnly && <>
                 {(isActive || isDraining) && (
                   <button
                     onClick={() => void handleUpdateStatus(runner, 'paused')}
@@ -1513,6 +1543,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                 >
                   <SlidersHorizontal className="w-3.5 h-3.5" />
                 </button>
+                </>}
                 <button
                   onClick={() => setExpandedTelemetry(telemetryOpen ? null : runner.id)}
                   className={`flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-md transition-colors hover:bg-sky-500/10 hover:text-sky-300 md:min-h-9 md:min-w-9 ${telemetryOpen ? 'text-sky-300' : 'text-neutral-500'}`}
@@ -1522,6 +1553,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                 >
                   <Activity className="w-3.5 h-3.5" />
                 </button>
+                {!readOnly && <>
                 <button
                   onClick={() => handleRotate(runner)}
                   disabled={rotating === runner.id}
@@ -1540,9 +1572,10 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                 >
                   <Trash2 className="w-3.5 h-3.5" />
                 </button>
+                </>}
                 </div>
               </div>
-              {configOpen && (
+              {!readOnly && configOpen && (
                 <FleetRunnerConfigPanel
                   key={`config-${runner.id}`}
                   projectId={runner.enrollment_project_id ?? projectId}
@@ -1571,7 +1604,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                           {name}
                           {p.is_enrollment ? (
                             <span className="text-neutral-500">(default)</span>
-                          ) : (
+                          ) : !readOnly ? (
                             <button
                               onClick={() => void handleRemoveRunnerProject(runner, p.project_id)}
                               disabled={mutatingProjects === runner.id}
@@ -1581,11 +1614,11 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                             >
                               <span className="text-xs">✕</span>
                             </button>
-                          )}
+                          ) : null}
                         </span>
                       );
                     })}
-                    {addingProjectFor === runner.id ? (
+                    {!readOnly && (addingProjectFor === runner.id ? (
                       <span
                         className="inline-flex items-center gap-1 rounded border border-neutral-700 bg-[#151c25] px-1.5 py-0.5 text-xs text-neutral-300"
                         data-testid="fleet-runner-add-project-editor"
@@ -1637,7 +1670,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                       >
                         + Add project
                       </button>
-                    )}
+                    ))}
                   </div>
                 </div>
               )}
@@ -1655,7 +1688,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
         </div>
       )}
 
-      {pendingToken && (
+      {!readOnly && pendingToken && (
         <TokenDialog
           runnerId={pendingToken.runnerId}
           token={pendingToken.token}
@@ -1673,7 +1706,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
         />
       )}
 
-      {pendingConfirm && (
+      {!readOnly && pendingConfirm && (
         <ConfirmDialog
           title={pendingConfirm.type === 'rotate' ? 'Rotate runner token' : 'Revoke runner'}
           message={pendingConfirm.type === 'rotate'

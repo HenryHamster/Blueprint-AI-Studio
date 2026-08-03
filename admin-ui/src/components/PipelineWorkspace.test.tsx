@@ -4,6 +4,8 @@ import { PipelineWorkspace, type PipelineWorkspaceProps } from './PipelineWorksp
 import type { Task } from './TaskCard';
 import type { TrackLogEntry } from '../types/task';
 
+let capturedKanbanProps: Record<string, unknown> | null = null;
+
 vi.mock('./ArchiveView', () => ({
   default: ({ setShowArchive }: { setShowArchive: (show: boolean) => void }) => (
     <div data-testid="archive-view">
@@ -17,7 +19,10 @@ vi.mock('./PipelineView', () => ({
 }));
 
 vi.mock('./KanbanBoard', () => ({
-  KanbanBoard: () => <div data-testid="kanban-board" />,
+  KanbanBoard: (props: Record<string, unknown>) => {
+    capturedKanbanProps = props;
+    return <div data-testid="kanban-board" />;
+  },
 }));
 
 vi.mock('./TaskContextRail', () => ({
@@ -43,7 +48,11 @@ function renderWorkspace(overrides: Partial<PipelineWorkspaceProps> = {}) {
     makeTask({ id: 'task-1', title: 'Visible task', status: 'IN_PROGRESS' }),
     makeTask({ id: 'task-2', title: 'Queued task', status: 'QUEUED' }),
   ];
+  const canOperateProject = Object.prototype.hasOwnProperty.call(overrides, 'canOperateProject')
+    ? overrides.canOperateProject as boolean
+    : true;
   const props: PipelineWorkspaceProps = {
+    canOperateProject,
     surface: {
       pipelineSection: 'flow',
       onPipelineSectionChange: vi.fn(),
@@ -128,6 +137,69 @@ function renderWorkspace(overrides: Partial<PipelineWorkspaceProps> = {}) {
 
 afterEach(() => {
   vi.useRealTimers();
+  capturedKanbanProps = null;
+});
+
+describe('PipelineWorkspace access boundary', () => {
+  test('captures a read-only board with inert mutation callbacks for viewers', async () => {
+    const onApprove = vi.fn();
+    const onBulkToggle = vi.fn();
+    const onDuplicate = vi.fn();
+
+    renderWorkspace({
+      canOperateProject: false,
+      surface: {
+        pipelineSection: 'board',
+        onPipelineSectionChange: vi.fn(),
+        showArchive: false,
+        setShowArchive: vi.fn(),
+        viewMode: 'kanban',
+        setViewMode: vi.fn(),
+      },
+      board: {
+        onApprove,
+        onBulkToggle,
+        onDuplicate,
+        selectionMode: true,
+        selectedTaskIds: new Set(['task-1']),
+      } as Partial<PipelineWorkspaceProps['board']> as PipelineWorkspaceProps['board'],
+    });
+
+    expect(await screen.findByTestId('kanban-board')).toBeInTheDocument();
+    expect(capturedKanbanProps).toMatchObject({
+      readOnly: true,
+      selectionMode: false,
+    });
+    expect(capturedKanbanProps?.selectedTaskIds).toEqual(new Set());
+
+    (capturedKanbanProps?.onApprove as (id: string) => void)('task-1');
+    (capturedKanbanProps?.onBulkToggle as (ids: string[], selected: boolean) => void)(['task-1'], true);
+    (capturedKanbanProps?.onDuplicate as (task: Task) => void)(makeTask());
+    expect(onApprove).not.toHaveBeenCalled();
+    expect(onBulkToggle).not.toHaveBeenCalled();
+    expect(onDuplicate).not.toHaveBeenCalled();
+  });
+
+  test('fails closed when canOperateProject is undefined at runtime', async () => {
+    const onApprove = vi.fn();
+    renderWorkspace({
+      canOperateProject: undefined as never,
+      surface: {
+        pipelineSection: 'board',
+        onPipelineSectionChange: vi.fn(),
+        showArchive: false,
+        setShowArchive: vi.fn(),
+        viewMode: 'kanban',
+        setViewMode: vi.fn(),
+      },
+      board: { onApprove, selectionMode: true } as Partial<PipelineWorkspaceProps['board']> as PipelineWorkspaceProps['board'],
+    });
+
+    expect(await screen.findByTestId('kanban-board')).toBeInTheDocument();
+    expect(capturedKanbanProps).toMatchObject({ readOnly: true, selectionMode: false });
+    (capturedKanbanProps?.onApprove as (id: string) => void)('task-1');
+    expect(onApprove).not.toHaveBeenCalled();
+  });
 });
 
 describe('PipelineWorkspace status strip', () => {

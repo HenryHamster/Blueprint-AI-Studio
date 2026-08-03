@@ -91,7 +91,11 @@ describe('useDirectionsData addDirection idempotency', () => {
     });
 
     const { result } = renderHook(() =>
-      useDirectionsData({ selectedProjectId: 'proj-1', addToast: vi.fn() }),
+      useDirectionsData({
+        selectedProjectId: 'proj-1',
+        addToast: vi.fn(),
+        canOperateProject: true,
+      }),
     );
 
     await waitFor(() => {

@@ -5,6 +5,13 @@ import path from 'node:path';
 const appSource = readFileSync(path.join(process.cwd(), 'src', 'App.tsx'), 'utf8');
 
 describe('App workbench wiring', () => {
+  test('reopens the in-progress new-project modal after GitHub OAuth returns', () => {
+    expect(appSource).toContain("import { shouldResumeNewProjectAfterGitHubOAuth } from './utils/newProjectOAuthResume';");
+    expect(appSource).toContain('const [resumeNewProjectFromGitHub] = useState(shouldResumeNewProjectAfterGitHubOAuth);');
+    expect(appSource).toContain('const [showNewProjectModal, setShowNewProjectModal] = useState(resumeNewProjectFromGitHub);');
+    expect(appSource).toContain('resumeFromGitHub={resumeNewProjectFromGitHub}');
+  });
+
   test('keeps chat Workday lifecycle wired to live session state and runner controls', () => {
     const control = appSource.match(/<StrategicSessionControl[\s\S]*?\/>/)?.[0] ?? '';
 

@@ -1,7 +1,7 @@
-# Onboarding a New Repository
+# User, Project, and Collaborator Onboarding
 
-This guide walks an operator through bringing a **new, non-self GitHub
-repository** under Blueprint management, end to end. It complements
+This is the canonical guide for joining Blueprint, creating a project from a
+**new, non-self GitHub repository**, and adding collaborators. It complements
 [Deploy.md](../Deploy.md), which covers standing up the platform itself
 (creating the GitHub App, deploying to Cloud Run, granting admin). Once the
 platform is running, follow the steps below for each repository you want
@@ -16,13 +16,50 @@ Everything here is grounded in the actual columns and routers:
 > Blueprint's own repo. The self-repo (`is_self_repo = true`) only differs in a
 > few seeded defaults, noted explicitly below.
 
+## Who controls what
+
+Platform access and project membership are separate. Being allowed to sign in
+does not make someone a platform administrator, and a project role grants no
+control over other projects.
+
+| Identity / role | Resources it can use | Typical authority |
+|---|---|---|
+| Allowlisted user | Blueprint UI plus projects where they have membership | Link a GitHub identity; create a project only for a repo where that identity has GitHub `push` or `admin`; become owner of the project they create. |
+| Project viewer | One project's read surfaces | Inspect project state and results; no task or configuration mutation. |
+| Project member | One project's ordinary work surfaces | Viewer access plus member-authorized task and direction work; secrets and owner-only settings stay hidden. |
+| Project owner | One project's configuration and membership | Manage project configuration, collaborators, automation, and owner-authorized actions. |
+| Platform admin | Deployment-wide resources | Configure the server, users, providers, runners, and paid/shared resources such as onboarding-time warm-pool capacity. Admin status does not replace the GitHub App's repository access. |
+
+Invite collaborators from the project's member management UI and give the
+least-powerful role they need. Project configuration endpoints document their
+exact `viewer`, `member`, or `owner` requirement in
+[API_REFERENCE.md](API_REFERENCE.md); deployment-wide settings remain admin-only.
+
 ---
 
-## 1. Install the GitHub App on the target repository
+## 1. Establish both GitHub identities
 
-Blueprint authenticates to each repository as a **GitHub App installation**, not
-as a user. Before onboarding a repo, install the platform's GitHub App on it (or
-on the org, scoped to include the repo):
+Self-service onboarding requires two independent identities. They answer
+different security questions and neither substitutes for the other. A trusted
+platform administrator may use the API without a linked caller credential, but
+the App installation is still required; the **New Project** wizard consistently
+requires the linked identity for its preview-first flow.
+
+| Identity | What it proves | Where it is used |
+|---|---|---|
+| Caller's linked GitHub OAuth credential or fine-grained PAT | The person creating the project has `push` or `admin` permission on this exact repository. | Repository picker and onboarding authorization. The token is stored through the existing user secret reference; it is never placed in the OAuth resume snapshot or onboarding payload. |
+| Blueprint GitHub App installation | The Blueprint service can reach the repository with its configured Contents, Pull requests, Commit statuses, Issues, and Checks permissions. | Repository detection, initialization, agent Git operations, checks, issues, and PR workflows. |
+
+In **New Project**, connect your GitHub account first. The repository picker is
+the intersection of repositories writable by your linked identity and
+repositories reachable by the App. Manual entry does not bypass the same
+server-side checks. While OAuth redirects away, the wizard preserves an explicit
+allowlist of form fields in `sessionStorage` and never serializes a credential or
+token field; free-form project text should still not contain secrets. It reopens
+the snapshot only after a successful `github_connected` return.
+
+Then install the platform's GitHub App on the repository (or on the org, scoped
+to include it):
 
 1. Go to the GitHub App's public page (the App you created in
    [Deploy.md → GitHub App Setup](../Deploy.md#github-app-setup)).
@@ -30,7 +67,7 @@ on the org, scoped to include the repo):
 3. Confirm the App has the required repository permissions: Contents (R&W),
    Pull requests (R&W), Commit statuses (R&W), Issues (R&W), Checks (R).
 
-### How the installation token is resolved
+### How the App installation token is resolved
 
 The backend resolves a short-lived installation token on demand via
 `get_repo_installation_token(owner, repo)` in `backend/app/github_auth.py`
@@ -45,18 +82,18 @@ The backend resolves a short-lived installation token on demand via
 - If the App is **not installed** on the repo, the installation lookup returns a
   non-200 and `get_repo_installation_token` returns `None`.
 
-**Consequence for onboarding:** the onboard endpoint needs a token to detect the
-repo's default branch. If no installation token is available, it responds with
-**HTTP 422**:
+**Consequence for onboarding:** after caller authorization succeeds, the onboard
+endpoint still needs an App token to detect the repo's default branch. If the
+App cannot reach the repository, it responds with **HTTP 422**:
 
 ```
 422 Unprocessable Entity
-{"detail": "No installation token available — cannot detect default branch."}
+{"error":{"code":422,"message":"Your GitHub authorization is valid, but the Blueprint GitHub App is not installed for this repository."}}
 ```
 
-So if onboarding returns 422, the fix is almost always "install the App on the
-repo (and verify `GITHUB_APP_ID` / `GITHUB_PRIVATE_KEY` are set in the backend
-environment)."
+This is distinct from **403**, which means the caller's linked identity lacks
+`push`/`admin` or is not linked, and from **502/503**, which indicate a transient
+GitHub or credential-resolution failure.
 
 ---
 
@@ -65,7 +102,11 @@ environment)."
 Create the project through the admin UI **New Project** wizard
 (`admin-ui/src/components/NewProjectModal.tsx`), which calls
 `POST /api/admin/projects/onboard` (`OnboardPayload` in `backend/app/schemas.py`).
-The endpoint requires an admin caller and is rate-limited to 10/min.
+The endpoint accepts any authenticated, allowlisted user; non-admin callers must
+pass the caller GitHub permission check, while a trusted platform admin has the
+documented API bypass. The new project records the caller as `owner`. It is
+rate-limited to 10/min. Only the optional onboarding-time warm-pool mutation is
+platform-admin-only.
 
 ### Fields the operator provides
 
@@ -73,9 +114,13 @@ The endpoint requires an admin caller and is rate-limited to 10/min.
 |-------|----------|-------------|
 | `github_owner` | ✅ | GitHub org/user (the wizard parses this from `owner/repo` or a full URL). |
 | `github_repo` | ✅ | Repository name. |
+| `preview_only` | — | `true` performs authorization, App reachability, empty-repo initialization, default-branch lookup, and build detection but creates no Blueprint project. The wizard uses this before its confirmation step. |
 | `name` | — | Display name. Defaults to `{owner}/{repo}` when omitted. |
-| `build_config_override` | — | A `BuildConfig`-shaped dict merged **on top of** auto-detection (override wins). This is where you can supply `build_config.migration` for a non-standard Python layout; omit it to fall back to Blueprint defaults. The wizard does not send this today. |
+| `build_config_override` | — | A `BuildConfig`-shaped dict merged **on top of** auto-detection (override wins). The wizard sends the operator-edited merge-gate draft shown after preview. |
 | `promotion_target` | — | Promotion/LTS branch. The wizard's "Promotion target" input maps here; blank means "same as integration". |
+| `goal` | — | User purpose (up to 5,000 characters), seeded into strategic intent and the project conversation. |
+| `initial_steering` | — | Optional `context` and `constraints` used to ground the first strategic cycle; unsupported keys are ignored. |
+| `warm_pool_target_size` | — | Enables and seeds paid warm capacity for this project. Platform-admin-only; normal project creation does not require it. |
 
 ### Fields the handler auto-derives (not operator input)
 
@@ -112,17 +157,28 @@ The `onboard_project` handler in `admin_onboard.py` derives the rest:
   writes `_auto_remediation`, `_issue_implementation`, and `_auto_review` config
   blocks into `design_doc` all with `enabled: false`, so none of those three
   pipelines act until you opt in (step 3).
-  - **Caveat — `autonomous_enabled` is NOT disabled by onboarding.** The
-    `Project.autonomous_enabled` column defaults to `True`
-    (`backend/app/models.py`) and the onboard handler never sets it, so a freshly
-    onboarded non-self project has `autonomous_enabled=True`. Autonomous task
-    spawning is therefore enabled by default; flip it off via
-    `PATCH /projects/{project_id}/autonomous` (`{ "enabled": false }`) if you want
-    to gate it before the other pipelines are turned on.
+  - **Safe onboarding default:** the onboard handler explicitly creates new
+    projects with `autonomous_enabled=False`. The legacy model default remains
+    unchanged for existing code paths, but self-service onboarding does not begin
+    autonomous task spawning until a project owner deliberately enables it after
+    reviewing repository access, build/merge verification, resource limits, and
+    approval gates.
 
-On success the endpoint returns `{ "project_id", "build_config", "default_branch" }`,
-and the wizard shows the detected build config plus toggles for the automation
-features.
+### Preview, creation result, and failures are different
+
+| Outcome | Durable effect | Response / operator action |
+|---|---|---|
+| Preview success (`preview_only=true`) | No Blueprint `Project`, membership, goal message, warm-pool setting, or bootstrap task is created. An empty GitHub repo may receive its required initial commit because branch detection must target a real branch. | Returns `build_config`, `default_branch`, and `merge_verification_verdict`. Review and edit the draft before creation. |
+| Create success | Creates the project in `DEPLOYING` status with `autonomous_enabled=False`, creates owner membership, stores branch/build configuration, seeds disabled automation and strategic intent, and may spawn the best-effort bootstrap task even though recurring autonomy is off. | Returns HTTP 200 with `project_id`, `build_config`, `default_branch`, and `merge_verification_verdict`. When an admin requested `warm_pool_target_size`, `warm_pool` additionally reports either the enabled target/seed summary or `{ "enabled": false, "error": "setup_failed" }`; that optional post-create failure does not roll back the project. |
+| Authorization failure | No project is created. | For non-admin self-service, `403`: link GitHub or use an identity with `push`/`admin` to the exact repo. `401`: linked credential expired; reconnect. A trusted platform admin is the explicit caller-check bypass, but still needs App reachability. |
+| App reachability failure | No project is created. | `422`: install/configure the Blueprint App for the repo. This is not a caller-role failure. |
+| Request validation failure | No project is created. | `422` with `"message":"Validation Error"` and a `details` array means the payload itself is invalid (for example, an out-of-range warm-pool size), not that the App is unreachable. |
+| Rate or dependency failure | No project is created unless an explicitly documented post-create optional action reports a warning. | `429`: retry after GitHub/rate-limit window. `502/503`: GitHub, App token, default-branch, initialization, or stored-credential service was unavailable; retry or inspect server configuration. |
+| Build detection incomplete | Creation can proceed safely with a durable `detection_incomplete` marker. | The landing-time refresh retries detection; distinguish this from an intentionally test-less repo, whose completed detection records that fact without the marker. |
+
+The wizard presents these distinctions separately: caller connection, App
+installation reachability, preview errors, editable detected configuration, and
+the final creation result are not collapsed into a generic "GitHub failed."
 
 ---
 
@@ -170,14 +226,18 @@ existing value. Notable knobs (see `BuildConfig` in `schemas.py`):
 
 ### Automation opt-in
 
-When you're ready for Blueprint to act autonomously, enable the pipelines (all
-default off):
+When repository access, verification, limits, and approval gates are ready,
+enable only the pipelines you intend to operate. New onboarded projects begin
+with autonomous spawning and all three automation pipelines off:
 
 - `PATCH /projects/{project_id}/auto-remediation` — auto-fix CI failures on the
   integration branch.
 - `PATCH /projects/{project_id}/issue-implementation` — spawn tasks from labeled
   issues.
-- `PATCH /projects/{project_id}/auto-review` — auto-review opened PRs.
+- `PATCH /projects/{project_id}/auto-review` — admit eligible opened/synchronized
+  PRs to review when webhook targeting, branch, rate, concurrency, dedupe, and
+  project-policy checks pass. Enabling it is not a promise that every PR is
+  reviewed.
 - `PATCH /projects/{project_id}/autonomous` — toggle `autonomous_enabled`
   (`{ "enabled": true }`).
 
@@ -307,18 +367,23 @@ for the `ReleaseVersion` and `QualificationVerdict` schemas.
 
 ## Quick checklist
 
-1. Install the platform GitHub App on the target repo (Contents/PRs/Statuses/Issues/Checks).
-2. Confirm `GITHUB_APP_ID` and `GITHUB_PRIVATE_KEY` are set in the backend env.
-3. Create the project via the admin UI **New Project** wizard (or
-   `POST /api/admin/projects/onboard`). A 422 means the App isn't installed / no token.
-4. Review the auto-detected build config and default branch.
+1. Link the creating user's GitHub OAuth identity or fine-grained PAT; confirm it
+   has `push` or `admin` permission on the exact repository.
+2. Install the platform GitHub App on the target repo
+   (Contents/PRs/Statuses/Issues/Checks) and confirm `GITHUB_APP_ID` /
+   `GITHUB_PRIVATE_KEY` are configured server-side.
+3. Create the project via **New Project** (or
+   `POST /api/admin/projects/onboard`). Treat 403 caller authorization, 422 App
+   reachability or payload validation (distinguished by the response message),
+   and 502/503 dependency failures as different problems.
+4. Review the previewed build config, merge-verification verdict, and default
+   branch before creation.
 5. Tune `integration_branch` / `promotion_target` / namespace / prefixes if the
    repo uses a non-default branch model.
-6. Enable the design-doc automation pipelines (`auto-remediation`,
-   `issue-implementation`, `auto-review`) when ready — these are seeded off. Note
-   that `autonomous_enabled` defaults **on**, so disable it via
-   `PATCH /projects/{project_id}/autonomous` first if you want to gate autonomous
-   spawning before turning the pipelines on.
+6. Keep the safe onboarding default while validating the project:
+   `autonomous_enabled`, `auto-remediation`, `issue-implementation`, and
+   `auto-review` all start off. Owners should enable each deliberately after
+   resource limits and approval policy are ready.
 7. Set `approval_gate_config` (`infra_files` / `critical_files`) via
    `PATCH /api/admin/projects/{project_id}/approval-gate-config` if your repo has
    sensitive paths that should require human approval before merge.

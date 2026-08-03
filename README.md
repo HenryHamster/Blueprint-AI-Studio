@@ -217,7 +217,7 @@ Comprehensive documentation is available in the `docs/` directory:
 - **[TESTING_GUIDE.md](docs/TESTING_GUIDE.md)** — Testing strategies and best practices for backend, frontend, and agent
 - **[DEBUG_GUIDE.md](docs/DEBUG_GUIDE.md)** — Troubleshooting failed tasks and interpreting logs
 - **[DEVELOPMENT_GUIDE.md](docs/DEVELOPMENT_GUIDE.md)** — Local development setup and workflow
-- **[ONBOARDING.md](docs/ONBOARDING.md)** — Bringing a new repository under Blueprint management
+- **[ONBOARDING.md](docs/ONBOARDING.md)** — Canonical user, project, collaborator, and GitHub onboarding guide
 
 ### Standards & Guidelines
 - **[CLAUDE.md](CLAUDE.md)** — Project-specific coding standards and file restrictions

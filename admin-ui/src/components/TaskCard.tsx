@@ -322,6 +322,7 @@ function HighlightText({ text, query }: { text: string; query?: string }) {
 
 interface TaskCardProps {
   task: Task;
+  readOnly: boolean;
   maxRetries?: number;
   actionLoading?: string;
   compact?: boolean;
@@ -543,7 +544,7 @@ function PlanPreview({ subtasks }: { subtasks: Array<{ title: string; depends_on
   );
 }
 
-export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function TaskCard({ task, actionLoading, compact, blockingCount, selectionMode, onToggleTaskSelection, onCtrlClick, colIdx, cardIdx, onNavigate, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onOpenSelfReview, onTrack, isTracked, onDuplicate, searchQuery, onDirectionClick }, ref) {
+export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function TaskCard({ task, readOnly = true, actionLoading, compact, blockingCount, selectionMode, onToggleTaskSelection, onCtrlClick, colIdx, cardIdx, onNavigate, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onOpenSelfReview, onTrack, isTracked, onDuplicate, searchQuery, onDirectionClick }, ref) {
   const [editing, setEditing] = useState(false);
   const [editPrompt, setEditPrompt] = useState(task.description || '');
   const [descExpanded, setDescExpanded] = useState(false);
@@ -566,6 +567,19 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
   }, []);
 
   useEffect(() => {
+    if (!readOnly) return;
+    if (confirmTimeoutRef.current) clearTimeout(confirmTimeoutRef.current);
+    if (confirmIntervalRef.current) clearInterval(confirmIntervalRef.current);
+    confirmTimeoutRef.current = null;
+    confirmIntervalRef.current = null;
+    setConfirmAction(null);
+    setConfirmCountdown(3);
+    setEditing(false);
+    setShowChangesForm(false);
+    setShowOverflowMenu(false);
+  }, [readOnly]);
+
+  useEffect(() => {
     if (!showOverflowMenu) return;
     function handleClick(e: MouseEvent) {
       if (overflowMenuRef.current && !overflowMenuRef.current.contains(e.target as Node)) {
@@ -577,6 +591,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
   }, [showOverflowMenu]);
 
   const handleDestructiveClick = (action: 'cancel' | 'dismiss' | 'archive', callback: () => void) => {
+    if (readOnly) return;
     if (confirmAction === action) {
       if (confirmTimeoutRef.current) clearTimeout(confirmTimeoutRef.current);
       if (confirmIntervalRef.current) clearInterval(confirmIntervalRef.current);
@@ -659,7 +674,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
         break;
       case ' ':
         e.preventDefault();
-        if (selectionMode && onToggleTaskSelection) {
+        if (!readOnly && selectionMode && onToggleTaskSelection) {
           onToggleTaskSelection(task.id);
         } else {
           onViewLogs(task);
@@ -733,7 +748,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
       role="article"
       onKeyDown={handleRootKeyDown}
       onClick={(e) => {
-        if ((e.ctrlKey || e.metaKey) && onCtrlClick) {
+        if (!readOnly && (e.ctrlKey || e.metaKey) && onCtrlClick) {
           e.preventDefault();
           e.stopPropagation();
           onCtrlClick(task.id);
@@ -747,7 +762,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
         </div>
         <div className="flex items-center gap-1 shrink-0">
           {/* Hover quick-action toolbar — always visible on mobile (≤ sm), hover-only on desktop */}
-          <div className="flex items-center gap-0.5 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity duration-150">
+          {!readOnly && <div className="flex items-center gap-0.5 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity duration-150">
             {task.requires_approval && (task.status === 'QUEUED' || task.status === 'EVALUATING') && (
               <button
                 title="Approve"
@@ -797,7 +812,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
                 <Copy className="w-3.5 h-3.5" />
               </button>
             )}
-          </div>
+          </div>}
           <StatusBadge status={task.status} />
           {isActive && task.last_heartbeat && (
             <div className="flex items-center gap-0.5" title={heartbeat.text}>
@@ -1198,7 +1213,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
         </div>
       </div>
 
-      {task.requires_approval && !['FAILED', 'CANCELLED'].includes(task.status) ? (
+      {!readOnly && task.requires_approval && !['FAILED', 'CANCELLED'].includes(task.status) ? (
         <div className={`flex flex-col gap-2 ${compact ? 'mt-2' : 'mt-4'}`}>
           <button onClick={() => onApprove(task.id)} disabled={!!actionLoading} className={`w-full bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-400 border border-emerald-500/30 rounded-md font-semibold transition-colors flex items-center justify-center gap-2 min-h-[44px] ${compact ? 'py-1.5 text-xs' : 'py-2.5 text-sm'} ${actionLoading && actionLoading !== 'approve' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`}>
             {actionLoading === 'approve' ? <Activity className={compact ? 'w-3.5 h-3.5 animate-spin' : 'w-4 h-4 animate-spin'} /> : <CheckCircle className={compact ? 'w-3.5 h-3.5' : 'w-4 h-4'} />}{(task.task_type as string) === 'compute_experiment' ? (() => { const cap = (task.payloads?.[0] as Record<string, unknown> | undefined)?.spend_cap_usd; return cap != null ? `Approve Spend ($${Number(cap).toFixed(2)})` : 'Approve Spend'; })() : 'Approve & Merge'}
@@ -1247,7 +1262,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
 
       {/* Cancel/Archive for active and terminal-non-failed tasks handled via hover toolbar + drawer */}
 
-      {task.status === 'FAILED' ? (
+      {!readOnly && task.status === 'FAILED' ? (
         compact ? (
           editing ? (
             <div className="mt-2 space-y-2">

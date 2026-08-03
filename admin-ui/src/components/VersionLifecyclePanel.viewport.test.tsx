@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
-import { act } from 'react';
-import { VersionLifecyclePanel } from './VersionLifecyclePanel';
+import { act, type ComponentProps } from 'react';
+import { VersionLifecyclePanel as VersionLifecyclePanelComponent } from './VersionLifecyclePanel';
 import {
   expectMinTouchTargetAt,
   expectNoOverflowAt,
@@ -12,6 +12,25 @@ import type {
   VersionSummaryResponse,
 } from '../api';
 import { fetchVersionSummary } from '../api';
+
+type VersionLifecyclePanelTestProps = Omit<
+  ComponentProps<typeof VersionLifecyclePanelComponent>,
+  'readOnly' | 'canManageProject' | 'canManagePlatform'
+> & Partial<Pick<
+  ComponentProps<typeof VersionLifecyclePanelComponent>,
+  'readOnly' | 'canManageProject' | 'canManagePlatform'
+>>;
+
+function VersionLifecyclePanel(props: VersionLifecyclePanelTestProps) {
+  return (
+    <VersionLifecyclePanelComponent
+      readOnly={false}
+      canManageProject
+      canManagePlatform
+      {...props}
+    />
+  );
+}
 
 vi.mock('../api', () => ({
   apiFetch: vi.fn(async () => new Response('{}', { status: 200 })),

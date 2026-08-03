@@ -38,8 +38,8 @@ import {
 } from '../api/projectTools';
 import { loadHiddenManifestSlugs } from './projectToolHidden';
 
-function MockWidget({ tool }: ToolComponentProps) {
-  return <div className="p-2 text-xs">{tool.title} content</div>;
+function MockWidget({ tool, readOnly }: ToolComponentProps) {
+  return <div className="p-2 text-xs" data-testid="mock-widget" data-read-only={String(!!readOnly)}>{tool.title} content</div>;
 }
 
 beforeAll(() => {
@@ -148,12 +148,49 @@ describe('ProjectToolHost — configure / rename / role gating', () => {
     expect(findButton('Configure')).toBeUndefined();
     expect(findButton('Disable')).toBeUndefined();
     expect(findButton('Remove')).toBeUndefined();
+    expect(h().querySelector('[data-testid="mock-widget"]')?.getAttribute('data-read-only')).toBe('false');
   });
 
-  test('undefined role is treated as owner (backend still guards)', async () => {
+  test('undefined role fails closed while role data is unavailable', async () => {
     await mount(<ProjectToolHost projectId="proj-a" />);
-    expect(findButton('+ Add tool')).toBeTruthy();
-    expect(findButton('Configure')).toBeTruthy();
+    expect(h().textContent).toContain('My Widget content');
+    expect(findButton('+ Add tool')).toBeUndefined();
+    expect(findButton('Configure')).toBeUndefined();
+    expect(findButton('Disable')).toBeUndefined();
+    expect(findButton('Remove')).toBeUndefined();
+    expect(h().querySelector('[data-testid="mock-widget"]')?.getAttribute('data-read-only')).toBe('true');
+  });
+
+  test('role downgrade clears owner mutation UI and stale handlers fail closed', async () => {
+    vi.mocked(createProjectTool).mockResolvedValue({ ...TOOL, id: 'created-tool' });
+    vi.mocked(deleteProjectTool).mockResolvedValue(undefined);
+    await mount(<ProjectToolHost projectId="proj-a" myRole="owner" />);
+
+    await act(async () => { requireButton('Configure').click(); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(30); });
+    const staleSave = requireButton('Save');
+    await act(async () => { requireButton('Remove').click(); });
+    const staleDelete = requireButton('Permanently remove');
+    await act(async () => { requireButton('+ Add tool').click(); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(30); });
+    const addTitle = Array.from(h().querySelectorAll('input[type="text"]')).at(-1) as HTMLInputElement;
+    await act(async () => { setInputValue(addTitle, 'Viewer must not create'); });
+    const staleCreate = requireButton('Create');
+
+    await rerender(<ProjectToolHost projectId="proj-a" myRole="viewer" />);
+    expect(findButton('Save')).toBeUndefined();
+    expect(findButton('Create')).toBeUndefined();
+    expect(findButton('Permanently remove')).toBeUndefined();
+    expect(h().querySelector('[data-testid="mock-widget"]')?.getAttribute('data-read-only')).toBe('true');
+
+    await act(async () => {
+      staleSave.click();
+      staleDelete.click();
+      staleCreate.click();
+    });
+    expect(vi.mocked(updateProjectTool)).not.toHaveBeenCalled();
+    expect(vi.mocked(deleteProjectTool)).not.toHaveBeenCalled();
+    expect(vi.mocked(createProjectTool)).not.toHaveBeenCalled();
   });
 
   test('rename persists the new title via updateProjectTool', async () => {

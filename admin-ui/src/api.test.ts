@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  apiFetch,
   previewOnboardProject,
   createComputeExperiment,
   fetchComputeJobs,
@@ -13,6 +14,7 @@ import {
   fetchProjectAlertDomains,
   updateProjectAlertDomains,
 } from './api';
+import { getIdToken } from './firebase';
 
 vi.mock('./firebase', () => ({
   auth: { currentUser: null, onAuthStateChanged: () => () => {} },
@@ -22,6 +24,82 @@ vi.mock('./firebase', () => ({
   onAuthChange: vi.fn(() => () => {}),
   signOut: vi.fn(),
 }));
+
+describe('apiFetch cancellation', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.mocked(getIdToken).mockReset();
+    vi.mocked(getIdToken).mockResolvedValue('test-token');
+    vi.useRealTimers();
+  });
+
+  it('does not acquire auth or fetch when already aborted', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const fetchMock = vi.spyOn(globalThis, 'fetch');
+    const tokenMock = vi.mocked(getIdToken);
+    tokenMock.mockClear();
+
+    await expect(apiFetch('/cancelled', undefined, 2, 30_000, controller.signal, false))
+      .rejects.toMatchObject({ name: 'AbortError' });
+
+    expect(tokenMock).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('does not fetch when aborted while auth is resolving', async () => {
+    let resolveToken!: (token: string) => void;
+    vi.mocked(getIdToken).mockReturnValueOnce(new Promise(resolve => { resolveToken = resolve; }));
+    const fetchMock = vi.spyOn(globalThis, 'fetch');
+    const controller = new AbortController();
+
+    const request = apiFetch('/cancel-during-auth', undefined, 2, 30_000, controller.signal, false);
+    controller.abort();
+    resolveToken('late-token');
+
+    await expect(request).rejects.toMatchObject({ name: 'AbortError' });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('cancels retry backoff without issuing another fetch', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response('{}', { status: 503 }),
+    );
+    const controller = new AbortController();
+    const request = apiFetch('/cancel-retry', undefined, 2, 30_000, controller.signal, false);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    controller.abort();
+
+    await expect(request).rejects.toMatchObject({ name: 'AbortError' });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps non-deduplicated callers cancellation-independent', async () => {
+    let callIndex = 0;
+    let resolveSecond!: (response: Response) => void;
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation((_url, init) => (
+      new Promise<Response>((resolve, reject) => {
+        const index = callIndex++;
+        const signal = init?.signal;
+        signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+        if (index === 1) resolveSecond = resolve;
+      })
+    ));
+    const first = new AbortController();
+    const second = new AbortController();
+
+    const firstRequest = apiFetch('/same-resource', undefined, 0, 30_000, first.signal, false);
+    const secondRequest = apiFetch('/same-resource', undefined, 0, 30_000, second.signal, false);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    first.abort();
+    resolveSecond(new Response('{}', { status: 200 }));
+
+    await expect(firstRequest).rejects.toMatchObject({ name: 'AbortError' });
+    await expect(secondRequest).resolves.toMatchObject({ ok: true });
+    expect(second.signal.aborted).toBe(false);
+  });
+});
 
 describe('previewOnboardProject', () => {
   afterEach(() => {

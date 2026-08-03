@@ -12,6 +12,7 @@ import { isCancellableTaskStatus, taskCancelConsequence } from './taskCancelCopy
 
 interface TaskDetailDrawerProps {
   task: Task;
+  canOperateProject: boolean;
   tasks?: Task[];
   logLines: string[];
   logsConnecting?: boolean;
@@ -272,6 +273,7 @@ function ChangesTabContent({
 
 export const TaskDetailDrawer = memo(function TaskDetailDrawer({
   task,
+  canOperateProject = false,
   tasks,
   logLines,
   logsConnecting = false,
@@ -319,13 +321,13 @@ export const TaskDetailDrawer = memo(function TaskDetailDrawer({
   const [detailTask, setDetailTask] = useState<Task | null>(null);
 
   // Stable callbacks replacing inline arrow functions to minimize child re-renders.
-  const handleApprove = useCallback(() => onApprove(task.id), [onApprove, task.id]);
-  const handleCancel = useCallback(() => onCancel(task.id), [onCancel, task.id]);
-  const handleRetry = useCallback(() => onRetry(task.id), [onRetry, task.id]);
-  const handleDismiss = useCallback(() => onDismiss(task.id), [onDismiss, task.id]);
-  const handleDuplicate = useCallback(() => onDuplicate?.(task), [onDuplicate, task]);
-  const handleResetIterationCap = useCallback(() => onResetIterationCap?.(task.id), [onResetIterationCap, task.id]);
-  const handleTriggerRollup = useCallback(() => onTriggerRollup?.(task.id), [onTriggerRollup, task.id]);
+  const handleApprove = useCallback(() => { if (canOperateProject) onApprove(task.id); }, [canOperateProject, onApprove, task.id]);
+  const handleCancel = useCallback(() => { if (canOperateProject) onCancel(task.id); }, [canOperateProject, onCancel, task.id]);
+  const handleRetry = useCallback(() => { if (canOperateProject) onRetry(task.id); }, [canOperateProject, onRetry, task.id]);
+  const handleDismiss = useCallback(() => { if (canOperateProject) onDismiss(task.id); }, [canOperateProject, onDismiss, task.id]);
+  const handleDuplicate = useCallback(() => { if (canOperateProject) onDuplicate?.(task); }, [canOperateProject, onDuplicate, task]);
+  const handleResetIterationCap = useCallback(() => { if (canOperateProject) onResetIterationCap?.(task.id); }, [canOperateProject, onResetIterationCap, task.id]);
+  const handleTriggerRollup = useCallback(() => { if (canOperateProject) onTriggerRollup?.(task.id); }, [canOperateProject, onTriggerRollup, task.id]);
 
   // Fetch full task detail (status_log, plan_output) which are omitted from the list endpoint.
   useEffect(() => {
@@ -498,11 +500,11 @@ export const TaskDetailDrawer = memo(function TaskDetailDrawer({
     URL.revokeObjectURL(url);
   };
 
-  const showApproval = task.requires_approval && !['FAILED', 'CANCELLED'].includes(task.status);
-  const showCancel = isCancellableTaskStatus(task.status) && !task.requires_approval;
-  const showFailedActions = task.status === 'FAILED';
-  const showResetCap = !!onResetIterationCap && hasReviewPr(task);
-  const showTriggerRollup = !!onTriggerRollup && task.status === 'EVALUATING';
+  const showApproval = canOperateProject && task.requires_approval && !['FAILED', 'CANCELLED'].includes(task.status);
+  const showCancel = canOperateProject && isCancellableTaskStatus(task.status) && !task.requires_approval;
+  const showFailedActions = canOperateProject && task.status === 'FAILED';
+  const showResetCap = canOperateProject && !!onResetIterationCap && hasReviewPr(task);
+  const showTriggerRollup = canOperateProject && !!onTriggerRollup && task.status === 'EVALUATING';
   const [showChangesForm, setShowChangesForm] = useState(false);
   const [changesFeedback, setChangesFeedback] = useState('');
 
@@ -540,7 +542,7 @@ export const TaskDetailDrawer = memo(function TaskDetailDrawer({
               </div>
             </div>
             <div className="flex items-center gap-1 shrink-0">
-              {onDuplicate && (
+              {canOperateProject && onDuplicate && (
                 <button
                   onClick={handleDuplicate}
                   title="Duplicate task"
@@ -715,14 +717,14 @@ export const TaskDetailDrawer = memo(function TaskDetailDrawer({
                     />
                     <div className="flex gap-2">
                       <button
-                        onClick={() => { onRequestChanges(task.id, changesFeedback, 'fix'); setShowChangesForm(false); setChangesFeedback(''); }}
+                        onClick={() => { if (!canOperateProject) return; onRequestChanges(task.id, changesFeedback, 'fix'); setShowChangesForm(false); setChangesFeedback(''); }}
                         disabled={!changesFeedback.trim() || !!actionLoading}
                         className="flex-1 bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 border border-amber-500/20 py-2 min-h-[44px] rounded-lg text-sm font-medium transition-colors disabled:opacity-30 disabled:cursor-not-allowed flex items-center justify-center gap-1.5"
                       >
                         {actionLoading === 'request-changes' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : null} Send Fix
                       </button>
                       <button
-                        onClick={() => { onRequestChanges(task.id, changesFeedback || 'Re-review requested', 'review'); setShowChangesForm(false); setChangesFeedback(''); }}
+                        onClick={() => { if (!canOperateProject) return; onRequestChanges(task.id, changesFeedback || 'Re-review requested', 'review'); setShowChangesForm(false); setChangesFeedback(''); }}
                         disabled={!!actionLoading}
                         className="flex-1 bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border border-blue-500/20 py-2 min-h-[44px] rounded-lg text-sm font-medium transition-colors flex items-center justify-center gap-1.5"
                       >
@@ -849,7 +851,7 @@ export const TaskDetailDrawer = memo(function TaskDetailDrawer({
                       className="flex-1 px-3 py-1.5 rounded-lg bg-neutral-900 border border-neutral-700 text-sm text-neutral-200 focus:outline-none focus:border-blue-500"
                     />
                     <button
-                      onClick={() => { onEditPrompt(task.id, editPromptValue); setEditingPrompt(false); }}
+                      onClick={() => { if (!canOperateProject) return; onEditPrompt(task.id, editPromptValue); setEditingPrompt(false); }}
                       disabled={!!actionLoading}
                       className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-1.5"
                     >

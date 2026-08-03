@@ -26,6 +26,7 @@ from app.models import (
     Project,
 )
 from app.time_utils import _utcnow
+from app.allowed_users import normalize_allowed_user_email
 
 # Session-scoped advisory lock ID for background-leader election.
 # Stored as signed int64 (PostgreSQL bigint) via two's-complement conversion.
@@ -364,9 +365,12 @@ async def _seed_initial_admin():
         if count == 0:
             initial_email = os.getenv("INITIAL_ADMIN_EMAIL")
             if initial_email:
-                seed_session.add(AllowedUser(email=initial_email, role="admin"))
+                normalized_email = normalize_allowed_user_email(initial_email)
+                seed_session.add(
+                    AllowedUser(email=normalized_email, role="admin")
+                )
                 await seed_session.commit()
-                logger.info(f"[STARTUP] Seeded initial admin: {initial_email}")
+                logger.info(f"[STARTUP] Seeded initial admin: {normalized_email}")
             else:
                 logger.warning(
                     "[STARTUP] AllowedUser table is empty and INITIAL_ADMIN_EMAIL not set. No users can sign in."

@@ -112,14 +112,18 @@ describe('AutonomousStatus badge', () => {
 });
 
 describe('AutonomousStatus expanded dropdown', () => {
-  async function renderExpanded(projects: unknown[], debugOverride = makeDebug()) {
+  async function renderExpanded(
+    projects: unknown[],
+    debugOverride = makeDebug(),
+    projectRole: 'owner' | 'member' | 'viewer' = 'owner',
+  ) {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(statusResponse(projects)));
     apiFetchMock.mockImplementation((path: string) => {
       if (path.includes('/autonomy-debug')) return Promise.resolve(jsonResponse(debugOverride));
       return Promise.resolve({ ok: false });
     });
     const user = userEvent.setup();
-    await act(async () => { render(<AutonomousStatus />); });
+    await act(async () => { render(<AutonomousStatus projectRoles={{ 'proj-1': projectRole }} />); });
     await user.click(screen.getByTitle('Autonomous Pipeline Status'));
     // Flush the async debug fetch triggered by the debug poller's leading call
     // (fetchDebug runs only when expanded, so it fires after the click).
@@ -145,7 +149,7 @@ describe('AutonomousStatus expanded dropdown', () => {
   it('shows project name and toggle button', async () => {
     await renderExpanded([makeProject({ project_name: 'My Repo', autonomous_enabled: true })]);
     expect(screen.getByText('My Repo')).toBeTruthy();
-    expect(screen.getByText('Enabled')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Enabled' })).toBeTruthy();
   });
 
   it('shows Disabled button for a disabled project', async () => {
@@ -197,6 +201,36 @@ describe('AutonomousStatus expanded dropdown', () => {
     expect(screen.getByText('Reset Circuit Breaker')).toBeTruthy();
   });
 
+  it('lets members reset a breaker but not toggle project autonomy', async () => {
+    const openDebug = makeDebug({
+      circuit_breaker: {
+        state: 'OPEN', failure_count: 3, success_count: 0,
+        opened_at: new Date().toISOString(), cooldown_seconds: 300,
+        cooldown_ends_at: new Date(Date.now() + 200000).toISOString(),
+      },
+    });
+    await renderExpanded([makeProject({ autonomous_enabled: true })], openDebug, 'member');
+
+    expect(screen.queryByRole('button', { name: 'Enabled' })).toBeNull();
+    expect(screen.getByText('Enabled')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Reset Circuit Breaker' })).toBeTruthy();
+  });
+
+  it('shows viewers status only, without autonomy or breaker controls', async () => {
+    const openDebug = makeDebug({
+      circuit_breaker: {
+        state: 'OPEN', failure_count: 3, success_count: 0,
+        opened_at: new Date().toISOString(), cooldown_seconds: 300,
+        cooldown_ends_at: new Date(Date.now() + 200000).toISOString(),
+      },
+    });
+    await renderExpanded([makeProject({ autonomous_enabled: true })], openDebug, 'viewer');
+
+    expect(screen.queryByRole('button', { name: 'Enabled' })).toBeNull();
+    expect(screen.getByText('Enabled')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Reset Circuit Breaker' })).toBeNull();
+  });
+
   it('shows spawn-guard diagnostics when spawn is blocked', async () => {
     const blockedDebug = makeDebug({
       spawn_blocked: true,
@@ -215,7 +249,7 @@ describe('AutonomousStatus expanded dropdown', () => {
     apiFetchMock.mockResolvedValue({ ok: false });
 
     const user = userEvent.setup();
-    await act(async () => { render(<AutonomousStatus />); });
+    await act(async () => { render(<AutonomousStatus projectRoles={{ 'proj-1': 'owner' }} />); });
     await user.click(screen.getByTitle('Autonomous Pipeline Status'));
     await act(async () => {});
 
@@ -237,7 +271,7 @@ describe('AutonomousStatus expanded dropdown', () => {
     apiFetchMock.mockResolvedValue({ ok: false });
 
     const user = userEvent.setup();
-    await act(async () => { render(<AutonomousStatus />); });
+    await act(async () => { render(<AutonomousStatus projectRoles={{ 'proj-1': 'owner' }} />); });
     await user.click(screen.getByTitle('Autonomous Pipeline Status'));
     await act(async () => {});
 
@@ -267,7 +301,7 @@ describe('AutonomousStatus expanded dropdown', () => {
     });
 
     const user = userEvent.setup();
-    await act(async () => { render(<AutonomousStatus />); });
+    await act(async () => { render(<AutonomousStatus projectRoles={{ 'proj-1': 'owner' }} />); });
     await user.click(screen.getByTitle('Autonomous Pipeline Status'));
     await act(async () => {});
 
@@ -287,7 +321,7 @@ describe('AutonomousStatus expanded dropdown', () => {
     fetchMock.mockResolvedValueOnce(statusResponse([makeProject({ autonomous_enabled: false })]));
 
     const user = userEvent.setup();
-    await act(async () => { render(<AutonomousStatus />); });
+    await act(async () => { render(<AutonomousStatus projectRoles={{ 'proj-1': 'owner' }} />); });
     await user.click(screen.getByTitle('Autonomous Pipeline Status'));
     await act(async () => {});
 

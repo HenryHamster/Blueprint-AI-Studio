@@ -115,7 +115,7 @@ const WINDOW_OPTIONS = [
   { label: '7d', value: 168 },
 ];
 
-export function DashboardHome({ tasks, selectedProjectId, projects, globalActiveCount, globalQueuedCount, scopedActiveCount, scopedQueuedCount, onViewTask, onDirectionClick, onCategoryClick, onScopeClick, onConfigureTargets, onSpawnOrphanFix, gatedTaskTypes }: DashboardHomeProps) {
+export function DashboardHome({ tasks, selectedProjectId, projects, globalActiveCount, globalQueuedCount, scopedActiveCount, scopedQueuedCount, onViewTask, onDirectionClick, onCategoryClick, onScopeClick, onConfigureTargets, onSpawnOrphanFix, gatedTaskTypes, userRole }: DashboardHomeProps) {
   const [fixLoopTrendDays, setFixLoopTrendDays] = useState<7 | 14 | 30>(7);
   const [windowHours, setWindowHours] = useState(24);
   const [selectedSrCategory, setSelectedSrCategory] = useState<string>('');
@@ -142,8 +142,9 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
     ? scopedQueuedCount
     : (globalQueuedCount ?? pageQueuedCount);
 
-  const { digest, digestStale, loading, lastFetchError, sparkData, refetchDigest } = useDashboardDigest(selectedProjectId, windowHours, activeCount, queuedCount);
-  const { openPRs, openPRsStale, openPRsDegraded, openPRsIntegrationBranch, openPRsPromotionTarget, openPRsRefreshing, fetchOpenPRs } = useOpenPRs(selectedProjectId);
+  const isAdmin = userRole === 'admin';
+  const { digest, digestStale, loading, lastFetchError, sparkData, refetchDigest } = useDashboardDigest(selectedProjectId, windowHours, activeCount, queuedCount, isAdmin);
+  const { openPRs, openPRsStale, openPRsDegraded, openPRsIntegrationBranch, openPRsPromotionTarget, openPRsRefreshing, fetchOpenPRs } = useOpenPRs(selectedProjectId, isAdmin);
   const {
     measurementData,
     scopeBaselines,
@@ -160,7 +161,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
     healthOverview,
     fleetUtilization,
     agentServingShas,
-  } = useProjectMetrics(selectedProjectId, windowHours, selectedSrCategory);
+  } = useProjectMetrics(selectedProjectId, windowHours, selectedSrCategory, isAdmin);
 
   const selectedProject = useMemo(() => projects?.find(p => p.id === selectedProjectId), [projects, selectedProjectId]);
   const srCatchRateTargets = selectedProject?.sr_catch_rate_targets;

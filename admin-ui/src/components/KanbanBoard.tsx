@@ -53,6 +53,7 @@ const SORT_LABELS: Record<SortBy, string> = {
 
 interface KanbanBoardProps {
   tasks: Task[];
+  readOnly: boolean;
   columns: KanbanColumn[];
   loading: boolean; // true only on first load before data is available
   maxRetries: number;
@@ -101,6 +102,7 @@ function saveColumnOrder(order: Record<string, string[]>) {
 
 export function KanbanBoard({
   tasks,
+  readOnly = true,
   columns,
   loading,
   maxRetries,
@@ -424,6 +426,7 @@ export function KanbanBoard({
                 <SortableContext items={taskIds} strategy={verticalListSortingStrategy}>
                   {columnTasks.slice(0, mobileShowAll ? columnTasks.length : DEFAULT_MAX_VISIBLE).map((task, cardIdx) => (
                     <SortableCard
+                      readOnly={readOnly}
                       key={task.id}
                       task={task}
                       maxRetries={maxRetries}
@@ -484,7 +487,7 @@ export function KanbanBoard({
               <div className="flex items-center justify-between mb-3">
                 <h2 className={`text-ui-md font-bold uppercase tracking-widest ${col.id === 'EVALUATING' ? 'text-amber-400' : 'text-neutral-400'}`}>{col.label}</h2>
                 <div className="flex items-center gap-1.5">
-                  {selectionMode && columnTasks.length > 0 && (
+                  {!readOnly && selectionMode && columnTasks.length > 0 && (
                     <ColumnSelectCheckbox
                       columnTasks={columnTasks}
                       selectedTaskIds={selectedTaskIds}
@@ -497,7 +500,7 @@ export function KanbanBoard({
                   <span className="text-ui-sm bg-neutral-800 text-neutral-300 px-2 py-0.5 rounded-full font-medium border border-neutral-700">
                     {columnTasks.length}
                   </span>
-                  {isArchivable && columnTasks.length > 0 && (
+                  {!readOnly && isArchivable && columnTasks.length > 0 && (
                     <ColumnArchiveButton
                       taskIds={taskIds}
                       columnLabel={col.label}
@@ -526,6 +529,7 @@ export function KanbanBoard({
 
           return (
             <KanbanColumnComponent
+              readOnly={readOnly}
               key={col.id}
               col={col}
               colIdx={colIdx}
@@ -572,6 +576,7 @@ export function KanbanBoard({
       <DragOverlay>
         {activeTask && (
           <SortableCard
+            readOnly={readOnly}
             task={activeTask}
             maxRetries={maxRetries}
             actionLoadingMap={actionLoadingMap}

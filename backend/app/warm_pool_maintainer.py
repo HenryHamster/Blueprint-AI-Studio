@@ -29,7 +29,6 @@ from datetime import datetime, timedelta
 from typing import Awaitable, Callable
 
 from sqlalchemy import func, or_, select, update
-from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.orm.exc import ObjectDeletedError
 
 from app.database import AsyncSessionLocal
@@ -389,6 +388,7 @@ async def retire_and_delete_pool_vm(
     reason: str,
     claim_grace_seconds: int = _RETIRING_CLAIM_GRACE_SECONDS,
     force: bool = False,
+    abandon_leased_handoff: bool = False,
 ) -> bool:
     """Atomically CLAIM a pool member, then tear it down. Returns True iff we won.
 
@@ -413,10 +413,14 @@ async def retire_and_delete_pool_vm(
     crashed prior teardown, guarded on ``updated_at`` staleness
     (``claim_grace_seconds``) so a peer's in-flight teardown is never duplicated.
 
-    After winning, the RETIRING marker is committed, then the GCP VM + its
-    pre-staged secret are deleted, then the registry row is removed. A crash
-    after the marker commit leaves a stale-``updated_at`` RETIRING row that the
-    next sweep adopts.
+    Forced operator/global drains may set ``abandon_leased_handoff``. The atomic
+    claim then retains and RETURNS the row's current ``leased_task_id``. After
+    winning, the canonical pool-abandon helper clears that exact task's
+    pin/reservation and commits it together with the RETIRING marker before
+    physical teardown begins. This remains correct if a stale scan saw IDLE but
+    the member was leased meanwhile, or saw task A before a release/re-lease to
+    task B. A crash after that marker commit leaves a stale-``updated_at``
+    RETIRING row that the next sweep adopts.
     """
     from app.vm_lifecycle import _ensure_vm_deleted
 
@@ -477,21 +481,28 @@ async def retire_and_delete_pool_vm(
             accrued = idle_cost_usd(elapsed)
     banked = (member.idle_cost_banked or 0.0) + accrued
 
+    claim_values = {
+        "state": PoolVmState.RETIRING,
+        "lease_expires_at": None,
+        "idle_since": None,
+        "idle_cost_banked": banked,
+        "updated_at": now,
+    }
+    if not abandon_leased_handoff:
+        claim_values["leased_task_id"] = None
+
     result = await session.execute(
         update(PoolVm)
         .where(PoolVm.id == member_id, *claim_where)
-        .values(
-            state=PoolVmState.RETIRING,
-            leased_task_id=None,
-            lease_expires_at=None,
-            idle_since=None,
-            idle_cost_banked=banked,
-            updated_at=now,
-        )
+        .values(**claim_values)
+        .returning(PoolVm.leased_task_id)
     )
-    claimed = result.rowcount or 0
-    await session.commit()
-    if claimed == 0:
+    claimed_row = result.first()
+    if claimed_row is None:
+        # Preserve the historical safe session boundary. A rollback expires the
+        # caller's stale scan object and existing loops may synchronously inspect
+        # it on the losing path, triggering MissingGreenlet under async ORM.
+        await session.commit()
         # Lost the claim — a peer leased / is retiring / already deleted it.
         logger.debug(
             "[WARM-POOL] skip teardown of %s (reason=%s) — already "
@@ -500,6 +511,24 @@ async def retire_and_delete_pool_vm(
             reason,
         )
         return False
+
+    current_leased_task_id = claimed_row[0]
+    if abandon_leased_handoff and current_leased_task_id is not None:
+        # The atomic UPDATE above is still uncommitted. The canonical helper
+        # snapshots/clears the durable reservation marker + task pin and commits
+        # them with this RETIRING claim, then reverts the in-memory counters.
+        # Only the UPDATE winner reaches this point, so concurrent drain scans
+        # cannot both stage a daily decrement for the same handoff.
+        from app.warm_pool import abandon_pool_dispatch
+
+        await abandon_pool_dispatch(
+            session,
+            task_id=current_leased_task_id,
+            vm_instance_id=vm_id,
+            reason=reason,
+        )
+    else:
+        await session.commit()
 
     # Delete the VM (best-effort; _ensure_vm_deleted also cleans the secret and
     # is idempotent if the orphan-cleanup sweep already removed it).
@@ -610,7 +639,11 @@ async def drain_global_warm_pool(*, session_factory=AsyncSessionLocal) -> int:
                     continue  # deleted by a peer since the batch load
             try:
                 if await retire_and_delete_pool_vm(
-                    session, member, reason="pool_global_disable", force=True
+                    session,
+                    member,
+                    reason="pool_global_disable",
+                    force=True,
+                    abandon_leased_handoff=True,
                 ):
                     retired += 1
             except Exception:
@@ -2405,32 +2438,21 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
         reserved_lane_id = member.reserved_lane_id  # capture before teardown
         try:
             if await retire_and_delete_pool_vm(
-                session, member, reason=reason, claim_grace_seconds=claim_grace
+                session,
+                member,
+                reason=reason,
+                claim_grace_seconds=claim_grace,
+                abandon_leased_handoff=_queued_warm_pin_task_id is not None,
             ):
                 retired += 1
-                # Clear the warm-pool pin from a QUEUED task whose handoff window
-                # expired so the orchestrator can cold-dispatch it instead of
-                # waiting indefinitely for a dead VM to claim it.
                 if _queued_warm_pin_task_id is not None:
-                    fresh_queued = await session.get(Task, _queued_warm_pin_task_id)
-                    if (
-                        fresh_queued is not None
-                        and fresh_queued.status == TaskStatus.QUEUED
-                    ):
-                        ctx = dict(fresh_queued.context or {})
-                        ctx.pop("warm_target_vm_id", None)
-                        ctx.pop(WARM_POOL_PIN_KEY, None)
-                        fresh_queued.context = ctx
-                        flag_modified(fresh_queued, "context")
-                        session.add(fresh_queued)
-                        await session.commit()
-                        logger.info(
-                            "[WARM-POOL] cleared warm-pool pin from QUEUED task %s "
-                            "(orphaned lease on vm %s reclaimed; "
-                            "task restored to cold-dispatch queue)",
-                            _queued_warm_pin_task_id,
-                            vm_id,
-                        )
+                    logger.info(
+                        "[WARM-POOL] cleared warm-pool pin from QUEUED task %s "
+                        "(orphaned lease on vm %s reclaimed; "
+                        "task restored to cold-dispatch queue)",
+                        _queued_warm_pin_task_id,
+                        vm_id,
+                    )
                 # Affinity degradation: reaping a reserved member breaks the
                 # lane's workspace continuity. Silently degrade so the lane's
                 # next resume cold-preps rather than waiting on a VM that is

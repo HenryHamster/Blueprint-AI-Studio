@@ -14,6 +14,7 @@ export interface DirectionGroup {
 }
 
 export interface DirectionsListProps {
+  readOnly?: boolean;
   loading: boolean;
   selectedProjectId: string | null;
   directions: Direction[];
@@ -86,6 +87,7 @@ export function DirectionsList(props: DirectionsListProps) {
     onViewFindings,
     onViewKnowledge,
     onNavigateToTask,
+    readOnly = true,
   } = props;
 
   return (
@@ -147,6 +149,7 @@ export function DirectionsList(props: DirectionsListProps) {
                     {items.map(d => (
                       <ErrorBoundary key={d.id} level="widget">
                       <DirectionCard
+                        readOnly={readOnly}
                         direction={d}
                         statusKey={key}
                         activeItems={activeItems}

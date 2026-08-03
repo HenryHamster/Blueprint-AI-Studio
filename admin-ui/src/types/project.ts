@@ -407,8 +407,9 @@ export interface AutoReviewConfig {
 
 export interface ProjectMemberEntry {
   id: string;
-  user_id: string;
+  user_id: string | null;
   email?: string;
   role: 'owner' | 'member' | 'viewer';
+  status?: 'pending' | 'active';
   created_at: string | null;
 }

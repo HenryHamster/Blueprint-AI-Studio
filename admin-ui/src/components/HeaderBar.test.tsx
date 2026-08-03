@@ -46,6 +46,7 @@ function makeProps(overrides: Record<string, unknown> = {}) {
     openMessageCount: 0,
     onOpenNewTaskModal: vi.fn(),
     onOpenSettings: vi.fn(),
+    canManagePlatform: true,
     onSignOut: vi.fn(),
     userEmail: 'test@example.com',
     wsRef: { current: null } as React.RefObject<WebSocket | null>,
@@ -123,5 +124,13 @@ describe('HeaderBar ceiling-deferred indicator', () => {
     const el = render(<HeaderBar {...makeProps({ ceilingDeferredProjectIds: undefined })} />);
     act(() => {});
     expect(el.textContent).not.toContain('ceiling');
+  });
+});
+
+describe('HeaderBar platform access', () => {
+  test('hides Runtime settings when platform-management access is unavailable', () => {
+    const el = render(<HeaderBar {...makeProps({ canManagePlatform: false })} />);
+    expect(el.querySelector('button[title="Runtime settings"]')).toBeNull();
+    expect(el.textContent).not.toContain('Runtime settings');
   });
 });

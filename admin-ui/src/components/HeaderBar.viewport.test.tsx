@@ -38,6 +38,7 @@ function makeProps() {
     openMessageCount: 0,
     onOpenNewTaskModal: noop,
     onOpenSettings: noop,
+    canManagePlatform: true,
     onSignOut: noop,
     userEmail: 'test@example.com',
     wsRef: { current: null },

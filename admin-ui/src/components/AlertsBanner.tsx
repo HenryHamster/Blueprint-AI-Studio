@@ -48,15 +48,16 @@ interface AlertsBannerProps {
   onDismissAll?: () => void;
   onViewTask?: (taskId: string) => void;
   projectId?: string;
+  canMutate: boolean;
 }
 
-export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask, projectId }: AlertsBannerProps) {
+export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask, projectId, canMutate = false }: AlertsBannerProps) {
   const [expanded, setExpanded] = useState(false);
   const [acknowledgingAlertId, setAcknowledgingAlertId] = useState<string | null>(null);
   const [acknowledgedAlertIds, setAcknowledgedAlertIds] = useState<Set<string>>(new Set());
 
   const handleAcknowledge = useCallback(async (alert: Alert) => {
-    if (!projectId || acknowledgingAlertId === alert.id) return;
+    if (!canMutate || !projectId || acknowledgingAlertId === alert.id) return;
     if (alert.acknowledged_at || acknowledgedAlertIds.has(alert.id)) return;
     setAcknowledgingAlertId(alert.id);
     try {
@@ -73,7 +74,7 @@ export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask, proj
     } finally {
       setAcknowledgingAlertId(null);
     }
-  }, [projectId, acknowledgingAlertId, acknowledgedAlertIds]);
+  }, [canMutate, projectId, acknowledgingAlertId, acknowledgedAlertIds]);
 
   if (alerts.length === 0) return null;
 
@@ -84,7 +85,7 @@ export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask, proj
 
   return (
     <div className="mb-4 flex flex-col gap-2 shrink-0">
-      {alerts.length > 1 && onDismissAll && (
+      {alerts.length > 1 && (onDismissAll || shouldCollapse) && (
         <div className="flex justify-end gap-3">
           {shouldCollapse && (
             <button
@@ -95,13 +96,15 @@ export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask, proj
               <span className="hidden md:inline">{expanded ? 'Collapse' : `Show all ${alerts.length} alerts`}</span>
             </button>
           )}
-          <button
-            onClick={onDismissAll}
-            className="text-xs text-neutral-400 hover:text-neutral-200 transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center px-2 md:px-0"
-          >
-            <span className="hidden md:inline">Dismiss all</span>
-            <span className="md:hidden">✕</span>
-          </button>
+          {canMutate && onDismissAll && (
+            <button
+              onClick={onDismissAll}
+              className="text-xs text-neutral-400 hover:text-neutral-200 transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center px-2 md:px-0"
+            >
+              <span className="hidden md:inline">Dismiss all</span>
+              <span className="md:hidden">✕</span>
+            </button>
+          )}
         </div>
       )}
       {visibleAlerts.map(alert => (
@@ -126,7 +129,7 @@ export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask, proj
                 </button>
               );
             })()}
-            {projectId && (() => {
+            {canMutate && projectId && (() => {
               const isAcknowledged = !!(alert.acknowledged_at) || acknowledgedAlertIds.has(alert.id);
               const isAcknowledging = acknowledgingAlertId === alert.id;
               if (isAcknowledged) {
@@ -154,13 +157,15 @@ export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask, proj
                 </button>
               );
             })()}
-            <button
-              onClick={() => onDismiss(alert.id)}
-              className="shrink-0 opacity-60 hover:opacity-100 transition-opacity p-2.5 md:p-0 min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
-              title="Dismiss"
-            >
-              <X className="w-4 h-4" />
-            </button>
+            {canMutate && (
+              <button
+                onClick={() => onDismiss(alert.id)}
+                className="shrink-0 opacity-60 hover:opacity-100 transition-opacity p-2.5 md:p-0 min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
+                title="Dismiss"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            )}
           </div>
         </div>
       ))}

@@ -87,6 +87,7 @@ function makeTask(overrides: Partial<Task> = {}): Task {
 }
 
 const kanbanBaseProps = {
+  readOnly: false,
   loading: false,
   maxRetries: 3,
   actionLoadingMap: {},

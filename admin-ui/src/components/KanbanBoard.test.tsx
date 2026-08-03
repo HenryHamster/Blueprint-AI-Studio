@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { KanbanBoard, type KanbanColumn } from './KanbanBoard';
+import { KanbanColumn as KanbanColumnComponent } from './KanbanColumn';
 import type { Task } from '../types/task';
 
 vi.mock('@dnd-kit/core', () => ({
@@ -64,6 +65,7 @@ function makeTask(overrides: Partial<Task> = {}): Task {
 function makeProps(overrides: Record<string, unknown> = {}) {
   return {
     tasks: [] as Task[],
+    readOnly: false,
     columns: testColumns,
     loading: false,
     maxRetries: 3,
@@ -170,6 +172,56 @@ describe('KanbanBoard', () => {
     render(<KanbanBoard {...makeProps({ tasks, selectionMode: true })} />);
     const checkboxes = screen.getAllByRole('checkbox');
     expect(checkboxes.length).toBeGreaterThan(0);
+  });
+
+  it('fails closed when board readOnly is undefined at runtime', () => {
+    const task = makeTask({ id: '1', title: 'Done Task', status: 'COMPLETED' });
+    render(<KanbanBoard {...makeProps({ tasks: [task], selectionMode: true, readOnly: undefined })} />);
+
+    expect(screen.getAllByText('Done Task').length).toBeGreaterThan(0);
+    expect(screen.queryByRole('checkbox')).toBeNull();
+    expect(screen.queryByTitle('Archive all Completed tasks')).toBeNull();
+  });
+
+  it('fails closed when column readOnly is undefined at runtime', () => {
+    const task = makeTask({ id: '1', title: 'Done Task', status: 'COMPLETED' });
+    render(
+      <KanbanColumnComponent
+        readOnly={undefined as never}
+        col={{ id: 'COMPLETED', label: 'Completed', includes: ['COMPLETED'] }}
+        colIdx={0}
+        columnTasks={[task]}
+        loading={false}
+        isCollapsed={false}
+        sortBy="newest"
+        compact={false}
+        selectionMode
+        selectedTaskIds={new Set()}
+        blockingMap={{}}
+        maxRetries={3}
+        actionLoadingMap={{}}
+        onBulkToggle={vi.fn()}
+        onApprove={vi.fn()}
+        onRequestChanges={vi.fn()}
+        onCancel={vi.fn()}
+        onRetry={vi.fn()}
+        onEditPrompt={vi.fn()}
+        onDismiss={vi.fn()}
+        onArchive={vi.fn()}
+        onArchiveColumn={vi.fn()}
+        onViewLogs={vi.fn()}
+        onToggleTaskSelection={vi.fn()}
+        toggleCollapse={vi.fn()}
+        handleResizeStart={vi.fn()}
+        showResizeHandle={false}
+        getCardRef={() => vi.fn()}
+        handleNavigate={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('Done Task')).toBeInTheDocument();
+    expect(screen.queryByRole('checkbox')).toBeNull();
+    expect(screen.queryByTitle('Archive all Completed tasks')).toBeNull();
   });
 
   it('archive button appears for terminal columns with tasks and fires handler on second click', async () => {

@@ -5,6 +5,21 @@ import { RuntimeWorkspace } from './RuntimeWorkspace';
 import type { RuntimeSection } from './OperatorWorkspaces';
 import { expectMinTouchTargetAt, expectNoOverflowAt, expectNoTextTruncationAt } from '../test/viewport';
 
+vi.mock('../hooks/useProjectResourceSummary', () => ({
+  PROJECT_RESOURCE_SUMMARY_POLL_MS: 30_000,
+  useProjectResourceSummary: () => ({
+    projectId: 'proj-1',
+    loading: false,
+    error: null,
+    data: {
+      project_id: 'proj-1',
+      policy: { execution_resources: 'project owner', attribution: 'launcher', managed_by: 'owner' },
+      accounts: { total: 12, enabled: 10, enabled_below_cap: 7, at_cap: 3, project_active_tasks: 4, project_daily_task_count: 28, project_daily_task_cap: 120, project_max_concurrent_tasks: 18 },
+      runners: { total: 8, online: 6, offline: 2 },
+    },
+  }),
+}));
+
 vi.mock('./ConsoleHome', () => ({
   ConsoleHome: () => <div className="min-h-[220px] rounded-md border border-neutral-800 p-3">health</div>,
 }));
@@ -43,7 +58,7 @@ function runtimeProps(runtimeSection: RuntimeSection) {
     onRuntimeConfigSectionChange: vi.fn(),
     selectedProjectId: 'proj-1',
     selectedProjectRepoLabel: 'org/repo',
-    projects: [],
+    projects: [{ id: 'proj-1', my_role: 'owner' }] as never,
     tasks: [],
     scopedActiveCount: 1,
     scopedQueuedCount: 2,
@@ -108,6 +123,7 @@ describe('RuntimeWorkspace viewport regression', () => {
 
   test('devices surface fits mobile width without nested-panel overflow', async () => {
     await expectNoOverflowAt(375, () => renderRuntime('devices'));
+    expect(document.querySelector('[data-testid="project-resource-availability"]')).not.toBeNull();
   });
 
   test('accounts surface fits mobile and desktop workspace viewports', async () => {
@@ -129,7 +145,8 @@ describe('RuntimeWorkspace viewport regression', () => {
   });
 
   test('compute surface does not duplicate the child panel header copy', async () => {
-    await expectNoOverflowAt(1024, () => renderRuntime('compute'));
+    await expectNoOverflowAt(375, () => renderRuntime('compute'));
+    expect(document.querySelector('[data-testid="project-resource-availability"]')).not.toBeNull();
     expect(document.body.textContent).not.toContain('Active experiments, held approvals, and terminal run analysis.');
   });
 });

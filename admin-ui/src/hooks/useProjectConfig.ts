@@ -17,6 +17,7 @@ import {
   updateProjectResourceEnvelope,
   type ResourceEnvelopePatch,
 } from '../api';
+import { resolveAccess } from '../accessControl';
 
 /**
  * Project-scoped configuration domain: the per-project config blocks that
@@ -35,12 +36,17 @@ export function useProjectConfig(
   selectedProjectRepoRef: React.MutableRefObject<string | null>,
   defaultTaskBranchRef: React.MutableRefObject<string | null>,
 ) {
+  const selectedProjectRole = projects.find(project => project.id === selectedProjectId)?.my_role;
+  const projectAccess = resolveAccess(undefined, selectedProjectRole);
+  const canReadProjectConfig = projectAccess.canOperateProject;
+  const canManageProject = projectAccess.canManageProject;
+
   // ── Auto-remediation config (project-scoped) ────────────────────────────
   const [autoRemediationConfig, setAutoRemediationConfig] = useState<AutoRemediationConfig | null>(null);
   const [autoRemediationStats, setAutoRemediationStats] = useState<AutoRemediationStats | null>(null);
 
   useEffect(() => {
-    if (!selectedProjectId) {
+    if (!selectedProjectId || !canReadProjectConfig) {
       setAutoRemediationConfig(null);
       setAutoRemediationStats(null);
       return;
@@ -52,10 +58,10 @@ export function useProjectConfig(
         if (data?.stats) setAutoRemediationStats(data.stats);
       })
       .catch(() => {});
-  }, [selectedProjectId]);
+  }, [selectedProjectId, canReadProjectConfig]);
 
   const handleUpdateAutoRemediationConfig = async (config: AutoRemediationConfig) => {
-    if (!selectedProjectId) return;
+    if (!selectedProjectId || !canManageProject) return;
     const prev = autoRemediationConfig;
     setAutoRemediationConfig(config);
     try {
@@ -78,7 +84,7 @@ export function useProjectConfig(
   const [issueImplementationConfig, setIssueImplementationConfig] = useState<IssueImplementationConfig | null>(null);
 
   useEffect(() => {
-    if (!selectedProjectId) {
+    if (!selectedProjectId || !canReadProjectConfig) {
       setIssueImplementationConfig(null);
       return;
     }
@@ -86,10 +92,10 @@ export function useProjectConfig(
       .then(res => res.ok ? res.json() : null)
       .then(data => { if (data?.config) setIssueImplementationConfig(data.config); })
       .catch(() => {});
-  }, [selectedProjectId]);
+  }, [selectedProjectId, canReadProjectConfig]);
 
   const handleUpdateIssueImplementationConfig = async (update: IssueImplementationConfigUpdate) => {
-    if (!selectedProjectId) return;
+    if (!selectedProjectId || !canManageProject) return;
     const prev = issueImplementationConfig;
     // Optimistic update: preserve server-derived base_branch from prev/default.
     if (prev) setIssueImplementationConfig({ ...prev, ...update });
@@ -118,7 +124,7 @@ export function useProjectConfig(
   const [resourceEnvelopeError, setResourceEnvelopeError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!selectedProjectId) {
+    if (!selectedProjectId || !canReadProjectConfig) {
       setAutoReviewConfig(null);
       return;
     }
@@ -126,10 +132,10 @@ export function useProjectConfig(
       .then(res => res.ok ? res.json() : null)
       .then(data => { if (data?.config) setAutoReviewConfig(data.config); })
       .catch(() => {});
-  }, [selectedProjectId]);
+  }, [selectedProjectId, canReadProjectConfig]);
 
   useEffect(() => {
-    if (!selectedProjectId) {
+    if (!selectedProjectId || !canReadProjectConfig) {
       setResourceEnvelopeData(null);
       setResourceEnvelopeLoading(false);
       setResourceEnvelopeError(null);
@@ -147,10 +153,10 @@ export function useProjectConfig(
       .finally(() => {
         setResourceEnvelopeLoading(false);
       });
-  }, [selectedProjectId]);
+  }, [selectedProjectId, canReadProjectConfig]);
 
   const handleUpdateAutoReviewConfig = async (patch: Partial<AutoReviewConfig>) => {
-    if (!selectedProjectId || Object.keys(patch).length === 0) return;
+    if (!selectedProjectId || !canManageProject || Object.keys(patch).length === 0) return;
     const prev = autoReviewConfig;
     setAutoReviewConfig(prev ? { ...prev, ...patch } : prev);
     try {
@@ -170,7 +176,7 @@ export function useProjectConfig(
   };
 
   const handleUpdateResourceEnvelope = async (patch: ResourceEnvelopePatch) => {
-    if (!selectedProjectId) return;
+    if (!selectedProjectId || !canManageProject) return;
     const prev = resourceEnvelopeData;
     if (prev) setResourceEnvelopeData({ ...prev, ...patch });
     try {
@@ -195,7 +201,7 @@ export function useProjectConfig(
   const [promotionTargetError, setPromotionTargetError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!selectedProjectId) {
+    if (!selectedProjectId || !canReadProjectConfig) {
       setIntegrationBranchData(null);
       setIntegrationBranchLoaded(false);
       setIntegrationBranchError(null);
@@ -212,10 +218,10 @@ export function useProjectConfig(
         setIntegrationBranchLoaded(true);
         setIntegrationBranchError('Failed to load integration branch');
       });
-  }, [selectedProjectId]);
+  }, [selectedProjectId, canReadProjectConfig]);
 
   const handleUpdateIntegrationBranch = async (branch: string | null) => {
-    if (!selectedProjectId) return;
+    if (!selectedProjectId || !canManageProject) return;
     const prev = integrationBranchData;
     try {
       const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/integration-branch`, {
@@ -235,7 +241,7 @@ export function useProjectConfig(
   };
 
   useEffect(() => {
-    if (!selectedProjectId) {
+    if (!selectedProjectId || !canReadProjectConfig) {
       setPromotionTargetData(null);
       setPromotionTargetLoaded(false);
       setPromotionTargetError(null);
@@ -252,12 +258,12 @@ export function useProjectConfig(
         setPromotionTargetLoaded(true);
         setPromotionTargetError('Failed to load promotion target');
       });
-  }, [selectedProjectId]);
+  }, [selectedProjectId, canReadProjectConfig]);
 
   useEffect(() => {
     const project = projects.find(p => p.id === selectedProjectId) ?? null;
     selectedProjectRepoRef.current = project ? `${project.github_owner}/${project.github_repo}` : null;
-    const branchConfigReady = !selectedProjectId || (
+    const branchConfigReady = !selectedProjectId || !canReadProjectConfig || (
       integrationBranchLoaded &&
       promotionTargetLoaded &&
       !integrationBranchError &&
@@ -269,6 +275,7 @@ export function useProjectConfig(
   }, [
     projects,
     selectedProjectId,
+    canReadProjectConfig,
     promotionTargetData,
     integrationBranchData,
     integrationBranchLoaded,
@@ -279,7 +286,7 @@ export function useProjectConfig(
     defaultTaskBranchRef,
   ]);
 
-  const taskBranchDefaultsReady = !selectedProjectId || (
+  const taskBranchDefaultsReady = !selectedProjectId || !canReadProjectConfig || (
     integrationBranchLoaded &&
     promotionTargetLoaded &&
     !integrationBranchError &&
@@ -289,7 +296,7 @@ export function useProjectConfig(
   const taskBranchDefaultsError = integrationBranchError || promotionTargetError;
 
   const handleUpdatePromotionTarget = async (branch: string | null) => {
-    if (!selectedProjectId) return;
+    if (!selectedProjectId || !canManageProject) return;
     const prev = promotionTargetData;
     try {
       const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/promotion-target`, {

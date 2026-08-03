@@ -40,8 +40,7 @@ export function WelcomeScreen({ onCreateProject, onSignOut }: WelcomeScreenProps
             <p className="text-xs text-neutral-400 leading-relaxed">
               <Users className="w-3.5 h-3.5 inline text-neutral-500 mr-1 -mt-0.5" />
               <strong className="text-neutral-300">Already have a project?</strong>{' '}
-              Ask an existing project owner or admin to add you as a Project Member
-              — they can do this from the Project Members panel.
+              Ask the project owner to add you from Project → Manage → Access.
             </p>
           </div>
         </div>

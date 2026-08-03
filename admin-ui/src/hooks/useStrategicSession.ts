@@ -21,6 +21,7 @@ type StrategicSessionRefs = StrategicWorkbenchState['selected_refs'];
 
 interface UseStrategicSessionOptions {
   selectedProjectId: string | null;
+  canOperateProject: boolean;
   addToast: (message: string, type: 'success' | 'error' | 'info') => void;
   strategicReadModel: StrategicReadModel;
   /**
@@ -34,12 +35,19 @@ interface UseStrategicSessionOptions {
 
 export function useStrategicSession({
   selectedProjectId,
+  canOperateProject,
   addToast,
   strategicReadModel,
   strategicLiveness,
 }: UseStrategicSessionOptions) {
   const selectedProjectIdRef = useRef(selectedProjectId);
   selectedProjectIdRef.current = selectedProjectId;
+  const canOperateProjectRef = useRef(canOperateProject);
+  canOperateProjectRef.current = canOperateProject;
+  const hasCurrentOperateAccess = useCallback(
+    (projectId: string) => canOperateProjectRef.current && selectedProjectIdRef.current === projectId,
+    [],
+  );
 
   const [optimisticStrategicWorkbench, setOptimisticStrategicWorkbench] = useState<StrategicWorkbenchState | null>(null);
   const [savingStrategicWorkbench, setSavingStrategicWorkbench] = useState(false);
@@ -83,6 +91,18 @@ export function useStrategicSession({
     setCheckingInStrategicSession(false);
     setStrategicSessionBusy(false);
   }, [selectedProjectId]);
+
+  useEffect(() => {
+    if (canOperateProject) return;
+    // Invalidate saves which were queued by callbacks rendered before the
+    // downgrade. The queued continuation also checks the live capability ref
+    // before making its write.
+    strategicWorkbenchSaveSeqRef.current += 1;
+    strategicWorkbenchSaveQueueRef.current = Promise.resolve();
+    setSavingStrategicWorkbench(false);
+    setCheckingInStrategicSession(false);
+    setStrategicSessionBusy(false);
+  }, [canOperateProject]);
 
   const strategicReadModelWorkbench = strategicReadModel.data?.project_id === selectedProjectId
     ? strategicReadModel.data?.workbench ?? null
@@ -177,6 +197,8 @@ export function useStrategicSession({
   // reload or on some unrelated read-model field changing.
   useEffect(() => {
     if (
+      !canOperateProject
+      ||
       !selectedProjectId
       || strategicInteractionMode !== 'continuous'
       || strategicSessionState?.trim().toLowerCase() !== 'starting'
@@ -195,6 +217,7 @@ export function useStrategicSession({
     return () => window.clearTimeout(timer);
   }, [
     selectedProjectId,
+    canOperateProject,
     strategicInteractionMode,
     strategicSessionState,
     residentStrategicSession?.started_at,
@@ -207,7 +230,7 @@ export function useStrategicSession({
   // one. An explicit retry hold is already healthy/dormant and must not be poked.
   useEffect(() => {
     const projectId = selectedProjectId;
-    if (!projectId || strategicInteractionMode !== 'continuous') {
+    if (!canOperateProject || !projectId || strategicInteractionMode !== 'continuous') {
       // Leaving Workday is an explicit re-entry boundary. A later transition
       // back to continuous may start the resident again.
       strategicWorkdayExplicitlyStoppedProjectRef.current = null;
@@ -257,10 +280,11 @@ export function useStrategicSession({
     let retryTimer: number | null = null;
     let retryAttempt = 0;
     const ensureWorkday = async () => {
-      if (strategicWorkdayExplicitlyStoppedProjectRef.current === projectId) return;
+      if (!hasCurrentOperateAccess(projectId) || strategicWorkdayExplicitlyStoppedProjectRef.current === projectId) return;
       try {
         let request = strategicWorkdayEnsureInflightRef.current.get(ensureKey);
         if (!request) {
+          if (!hasCurrentOperateAccess(projectId)) return;
           request = startStrategicSession(projectId, {
             ...(preferredRunnerId ? { runner_id: preferredRunnerId } : {}),
             expected_interaction_mode: 'continuous',
@@ -274,17 +298,17 @@ export function useStrategicSession({
         }
         const response = await request;
         if (response.ensure_outcome === 'mode_changed') {
-          if (cancelled || selectedProjectIdRef.current !== projectId) return;
+          if (cancelled || !hasCurrentOperateAccess(projectId)) return;
           const retryDelayMs = Math.min(250 * (2 ** retryAttempt), 10_000);
           retryAttempt += 1;
           retryTimer = window.setTimeout(() => {
             retryTimer = null;
-            if (strategicWorkdayExplicitlyStoppedProjectRef.current === projectId) return;
+            if (!hasCurrentOperateAccess(projectId) || strategicWorkdayExplicitlyStoppedProjectRef.current === projectId) return;
             void ensureWorkday();
           }, retryDelayMs);
           return;
         }
-        if (cancelled || selectedProjectIdRef.current !== projectId) return;
+        if (cancelled || !hasCurrentOperateAccess(projectId)) return;
         const returnedSession = response.session;
         const returnedWorker = returnedSession?.worker_state?.trim().toLowerCase();
         const returnedStatus = returnedSession?.status?.trim().toLowerCase();
@@ -314,19 +338,20 @@ export function useStrategicSession({
           retryAttempt += 1;
           retryTimer = window.setTimeout(() => {
             retryTimer = null;
+            if (!hasCurrentOperateAccess(projectId)) return;
             void ensureWorkday();
           }, retryDelayMs);
           return;
         }
         strategicWorkdayEnsuredKeysRef.current.add(ensureKey);
-        void refreshStrategicReadModel();
+        if (hasCurrentOperateAccess(projectId)) void refreshStrategicReadModel();
       } catch {
-        if (cancelled || selectedProjectIdRef.current !== projectId) return;
+        if (cancelled || !hasCurrentOperateAccess(projectId)) return;
         const retryDelayMs = Math.min(250 * (2 ** retryAttempt), 10_000);
         retryAttempt += 1;
         retryTimer = window.setTimeout(() => {
           retryTimer = null;
-          if (strategicWorkdayExplicitlyStoppedProjectRef.current === projectId) return;
+          if (!hasCurrentOperateAccess(projectId) || strategicWorkdayExplicitlyStoppedProjectRef.current === projectId) return;
           void ensureWorkday();
         }, retryDelayMs);
       }
@@ -338,6 +363,7 @@ export function useStrategicSession({
     };
   }, [
     selectedProjectId,
+    canOperateProject,
     strategicInteractionMode,
     strategicSessionActive,
     residentStrategicSession?.worker_state,
@@ -349,6 +375,7 @@ export function useStrategicSession({
     strategicSessionSelectedRunnerId,
     refreshStrategicReadModel,
     strategicWorkdayRecoveryTick,
+    hasCurrentOperateAccess,
   ]);
 
   const chatComposerContextDescriptor = useMemo(
@@ -374,7 +401,7 @@ export function useStrategicSession({
 
   const persistStrategicWorkbench = useCallback((patch: Partial<StrategicWorkbenchState>) => {
     const projectId = selectedProjectId;
-    if (!projectId) return;
+    if (!projectId || !hasCurrentOperateAccess(projectId)) return;
     if (patch.interaction_mode !== undefined) {
       strategicWorkbenchOperatorSurfaceTouchedRef.current = true;
     }
@@ -388,18 +415,19 @@ export function useStrategicSession({
     const save = strategicWorkbenchSaveQueueRef.current
       .catch(() => undefined)
       .then(async () => {
+        if (!hasCurrentOperateAccess(projectId)) return;
         try {
           const result = await updateStrategicWorkbenchState(projectId, patch);
-          const armingOutcome = selectedProjectIdRef.current === projectId ? parseArmingOutcome(result.arming) : null;
+          const armingOutcome = hasCurrentOperateAccess(projectId) ? parseArmingOutcome(result.arming) : null;
           const armingToast = workbenchArmingToastCopy(armingOutcome);
           if (armingToast) addToast(armingToast, armingOutcome === 'not_armed' ? 'info' : 'success');
-          if (selectedProjectIdRef.current !== projectId || strategicWorkbenchSaveSeqRef.current !== saveSeq) return;
+          if (!hasCurrentOperateAccess(projectId) || strategicWorkbenchSaveSeqRef.current !== saveSeq) return;
           const saved = result.workbench;
           strategicWorkbenchStateRef.current = saved;
           setOptimisticStrategicWorkbench(saved);
           void strategicReadModel.refresh();
         } catch {
-          if (selectedProjectIdRef.current === projectId && strategicWorkbenchSaveSeqRef.current === saveSeq) {
+          if (hasCurrentOperateAccess(projectId) && strategicWorkbenchSaveSeqRef.current === saveSeq) {
             strategicWorkbenchStateRef.current = base;
             setOptimisticStrategicWorkbench(base);
             if (patch.preferred_runner_id !== undefined) {
@@ -411,14 +439,14 @@ export function useStrategicSession({
             addToast('Could not save Strategic session', 'error');
           }
         } finally {
-          if (selectedProjectIdRef.current === projectId && strategicWorkbenchSaveSeqRef.current === saveSeq) setSavingStrategicWorkbench(false);
+          if (hasCurrentOperateAccess(projectId) && strategicWorkbenchSaveSeqRef.current === saveSeq) setSavingStrategicWorkbench(false);
         }
       });
     strategicWorkbenchSaveQueueRef.current = save.then(
       () => undefined,
       () => undefined,
     );
-  }, [selectedProjectId, addToast, strategicReadModel, strategicReadModelWorkbench]);
+  }, [selectedProjectId, addToast, strategicReadModel, strategicReadModelWorkbench, hasCurrentOperateAccess]);
 
   const updateStrategicSessionRefs = useCallback((updateRefs: (refs: StrategicSessionRefs) => StrategicSessionRefs) => {
     const baseRefs = (strategicWorkbenchStateRef.current ?? strategicReadModelWorkbench)?.selected_refs ?? [];
@@ -426,13 +454,15 @@ export function useStrategicSession({
   }, [persistStrategicWorkbench, strategicReadModelWorkbench]);
 
   const handleSelectStrategicRunner = useCallback((runnerId: string | null) => {
+    const projectId = selectedProjectIdRef.current;
+    if (!projectId || !hasCurrentOperateAccess(projectId)) return;
     strategicRunnerSelectionRef.current = { touched: true, value: runnerId };
     persistStrategicWorkbench({ preferred_runner_id: runnerId });
-  }, [persistStrategicWorkbench]);
+  }, [persistStrategicWorkbench, hasCurrentOperateAccess]);
 
   const handleStrategicCheckIn = useCallback(async () => {
     const projectId = selectedProjectId;
-    if (!projectId || checkingInStrategicSession) return;
+    if (!projectId || !hasCurrentOperateAccess(projectId) || checkingInStrategicSession) return;
     setCheckingInStrategicSession(true);
     try {
       const workbenchContext = strategicWorkbenchStateRef.current ?? strategicReadModelWorkbench;
@@ -444,7 +474,7 @@ export function useStrategicSession({
         workbench_context: workbenchContext ? { ...workbenchContext } : undefined,
         idempotency_key: strategicCheckInIdempotencyKeyRef.current,
       });
-      if (selectedProjectIdRef.current !== projectId) return;
+      if (!hasCurrentOperateAccess(projectId)) return;
       strategicCheckInIdempotencyKeyRef.current = null;
       addToast('Strategic check-in recorded', 'success');
       if (strategicReadModel.data) {
@@ -453,23 +483,24 @@ export function useStrategicSession({
         void strategicReadModel.refresh();
       }
     } catch {
-      if (selectedProjectIdRef.current === projectId) {
+      if (hasCurrentOperateAccess(projectId)) {
         addToast('Could not record Strategic check-in', 'error');
       }
     } finally {
-      if (selectedProjectIdRef.current === projectId) setCheckingInStrategicSession(false);
+      if (hasCurrentOperateAccess(projectId)) setCheckingInStrategicSession(false);
     }
-  }, [checkingInStrategicSession, addToast, strategicReadModel, strategicReadModelWorkbench, selectedProjectId]);
+  }, [checkingInStrategicSession, addToast, strategicReadModel, strategicReadModelWorkbench, selectedProjectId, hasCurrentOperateAccess]);
 
   const handleStartStrategicSession = useCallback(async () => {
     const projectId = selectedProjectId;
-    if (!projectId || strategicSessionBusy) return;
+    if (!projectId || !hasCurrentOperateAccess(projectId) || strategicSessionBusy) return;
     strategicWorkdayExplicitlyStoppedProjectRef.current = null;
     setStrategicSessionBusy(true);
     try {
       // Wait before reading the selection: a failed save reconciles the
       // optimistic runner ref to the still-visible persisted value.
       await strategicWorkbenchSaveQueueRef.current;
+      if (!hasCurrentOperateAccess(projectId)) return;
       const selectedRunnerId = strategicRunnerSelectionRef.current.touched
         ? strategicRunnerSelectionRef.current.value
         : (
@@ -486,43 +517,43 @@ export function useStrategicSession({
           workerGeneration: startResponse.session.worker_generation ?? null,
         };
       }
-      if (selectedProjectIdRef.current !== projectId) return;
+      if (!hasCurrentOperateAccess(projectId)) return;
       addToast('Strategic session starting', 'success');
       void strategicReadModel.refresh();
     } catch (err) {
-      if (selectedProjectIdRef.current === projectId) {
+      if (hasCurrentOperateAccess(projectId)) {
         addToast(err instanceof Error ? err.message : 'Could not start Strategic session', 'error');
       }
     } finally {
-      if (selectedProjectIdRef.current === projectId) {
+      if (hasCurrentOperateAccess(projectId)) {
         setStrategicSessionBusy(false);
       }
     }
-  }, [strategicSessionBusy, addToast, strategicReadModel, strategicReadModelWorkbench, selectedProjectId]);
+  }, [strategicSessionBusy, addToast, strategicReadModel, strategicReadModelWorkbench, selectedProjectId, hasCurrentOperateAccess]);
 
   const handleStopStrategicSession = useCallback(async () => {
     const projectId = selectedProjectId;
-    if (!projectId || strategicSessionBusy) return;
+    if (!projectId || !hasCurrentOperateAccess(projectId) || strategicSessionBusy) return;
     // Suppress auto-ensure immediately so an already-scheduled recovery cannot
     // undo the operator's explicit Stop while the request is in flight.
     strategicWorkdayExplicitlyStoppedProjectRef.current = projectId;
     setStrategicSessionBusy(true);
     try {
       await stopStrategicSession(projectId);
-      if (selectedProjectIdRef.current !== projectId) return;
+      if (!hasCurrentOperateAccess(projectId)) return;
       addToast('Strategic session stopping', 'success');
       void strategicReadModel.refresh();
     } catch (err) {
       if (strategicWorkdayExplicitlyStoppedProjectRef.current === projectId) {
         strategicWorkdayExplicitlyStoppedProjectRef.current = null;
       }
-      if (selectedProjectIdRef.current === projectId) {
+      if (hasCurrentOperateAccess(projectId)) {
         addToast(err instanceof Error ? err.message : 'Could not stop Strategic session', 'error');
       }
     } finally {
-      if (selectedProjectIdRef.current === projectId) setStrategicSessionBusy(false);
+      if (hasCurrentOperateAccess(projectId)) setStrategicSessionBusy(false);
     }
-  }, [strategicSessionBusy, addToast, strategicReadModel, selectedProjectId]);
+  }, [strategicSessionBusy, addToast, strategicReadModel, selectedProjectId, hasCurrentOperateAccess]);
 
   const taskContextSessionProps = useMemo(() => ({
     sessionRefs: strategicWorkbenchState?.selected_refs,

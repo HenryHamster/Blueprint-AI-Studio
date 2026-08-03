@@ -485,6 +485,7 @@ async def lease_idle_pool_vm(
     project_id: uuid.UUID,
     account_id: str | None = None,
     provider: str | None = None,
+    auth_mode: str | None = None,
     model: str | None = None,
     excluded_account_ids: list[str] | None = None,
     leased_task_id: uuid.UUID | None = None,
@@ -505,11 +506,11 @@ async def lease_idle_pool_vm(
     Compatibility (all required for a match):
       - ``project_id`` MUST equal the member's project (hard tenant isolation;
         a member never serves another tenant's task).
-      - When ``account_id`` / ``provider`` / ``model`` are provided, the member's
+      - When ``account_id`` / ``provider`` / ``auth_mode`` / ``model`` are provided, the member's
         corresponding pinned value MUST equal it. A None requirement is a
         wildcard for that dimension (the candidate task did not pin it). The VM
         runs on the credentials baked into its boot manifest, so an
-        account/provider/model mismatch would silently run the task on the wrong
+        account/provider/auth-mode/model mismatch would silently run the task on the wrong
         account — hence these are equality gates, not best-effort. The caller is
         responsible for passing the RESOLVED identity (post LLM-routing), not the
         task's raw context, so routing/blacklist decisions are honored.
@@ -540,14 +541,15 @@ async def lease_idle_pool_vm(
         PoolVm.project_id == project_id,
         PoolVm.state == PoolVmState.IDLE,
     ]
-    # Account + model are re-targeted together by the claim-time manifest, so
-    # both gates relax under allow_account_mismatch; provider relaxes only with
-    # the additional cross-provider flag (it also needs the agent to swap the
-    # provider/auth-mode constants).
+    # Account + auth mode + model are re-targeted together by the claim-time
+    # manifest, so all three gates relax under allow_account_mismatch; provider
+    # relaxes only with the additional cross-provider flag.
     if account_id is not None and not allow_account_mismatch:
         filters.append(PoolVm.account_id == account_id)
     if provider is not None and not allow_provider_mismatch:
         filters.append(PoolVm.provider == provider)
+    if auth_mode is not None and not allow_account_mismatch:
+        filters.append(PoolVm.auth_mode == auth_mode)
     if model is not None and not allow_account_mismatch:
         filters.append(PoolVm.model == model)
     if excluded_account_ids:
@@ -964,6 +966,12 @@ async def mark_pool_vm_retiring(
 # to the pool (origin "warm_pool") and by the orchestrator's skip-provision
 # branch so a pool pin is honored under the warm-pool flag, not warm-continuity.
 WARM_POOL_PIN_KEY = "warm_pool_pin"
+# Durable ownership marker for the account reservation acquired immediately
+# before a warm-pool lease. This is deliberately distinct from llm_account_id:
+# the latter is runtime attribution and can exist without a pre-acquired slot;
+# this key means the lease owns exactly one active+daily reservation that must be
+# consumed by a successful claim or reverted by an abandonment path.
+WARM_POOL_RESERVATION_ACCOUNT_KEY = "_warm_pool_reservation_account_id"
 # warm-claim origin value attributing a lift to the pool dispatch hook (alongside
 # the existing "next_role_endpoint" and "backlog_reuse" origins).
 WARM_POOL_ORIGIN = "warm_pool"
@@ -977,6 +985,7 @@ async def try_pool_dispatch(
     required_model: str | None = None,
     required_account: str | None = None,
     required_auth_mode: str | None = None,
+    reserved_account_id: str | None = None,
     excluded_account_ids: list[str] | None = None,
     lease_ttl_secs: int | None = None,
 ) -> PoolVm | None:
@@ -1086,6 +1095,7 @@ async def try_pool_dispatch(
             project_id=task.project_id,
             account_id=required_account,
             provider=required_provider,
+            auth_mode=required_auth_mode,
             model=required_model,
             excluded_account_ids=excluded_account_ids,
             leased_task_id=task.id,
@@ -1189,6 +1199,7 @@ async def try_pool_dispatch(
         resolved_provider=required_provider,
         resolved_auth_mode=required_auth_mode,
         resolved_model=required_model,
+        reserved_account_id=reserved_account_id,
     )
     # Best-effort: if the lane dispatched to a VM other than its reserved one,
     # update workspace_vm_instance_id so the lane row reflects the actual VM
@@ -1259,6 +1270,7 @@ def _pin_task_to_pool_vm(
     resolved_provider: str | None = None,
     resolved_auth_mode: str | None = None,
     resolved_model: str | None = None,
+    reserved_account_id: str | None = None,
 ) -> None:
     """Pin a QUEUED task to a leased pool VM so its agent claims it warm.
 
@@ -1304,12 +1316,172 @@ def _pin_task_to_pool_vm(
         task.llm_account_id = run_account
     new_ctx["warm_target_vm_id"] = member.vm_instance_id
     new_ctx[WARM_POOL_PIN_KEY] = True
+    if reserved_account_id:
+        new_ctx[WARM_POOL_RESERVATION_ACCOUNT_KEY] = str(reserved_account_id)
     deadline = member.lease_expires_at or (
         _utcnow() + timedelta(seconds=_DEFAULT_LEASE_TTL_SECS)
     )
     new_ctx["warm_handoff_deadline"] = deadline.isoformat()
     task.context = new_ctx
     flag_modified(task, "context")
+
+
+def pool_reservation_account_id(task: Task | None) -> str | None:
+    """Return the durable account reservation owned by a pool pin, if any."""
+    if task is None or not isinstance(task.context, dict):
+        return None
+    value = task.context.get(WARM_POOL_RESERVATION_ACCOUNT_KEY)
+    return str(value) if value else None
+
+
+async def abandon_pool_dispatch(
+    session,
+    *,
+    vm_instance_id: str,
+    task: Task | None = None,
+    task_id: uuid.UUID | str | None = None,
+    reason: str,
+) -> str | None:
+    """Persistently abandon one pool handoff, then best-effort release its slot.
+
+    The marker, task pin, and LEASED binding are cleared in one DB commit before
+    the in-memory account counters are reverted. Re-entry after that commit sees
+    no marker and therefore cannot stage another daily ``-1`` mutation.
+
+    There is deliberately no outbox for the post-commit in-memory release. If
+    that release fails or the process exits in the narrow gap, accounting stays
+    conservatively over-counted: the existing DB-backed pool rebuild heals
+    global/project active concurrency, while a persisted daily ``+1`` may remain
+    until the existing daily reset. That conservative charge is the intentional
+    no-outbox tradeoff; the task is still safely unpinned and cannot be
+    dispatched twice. Successful claims consume the same marker and are
+    released normally by task completion.
+    """
+    # Callers that pass ``task`` already hold its execution/selector lock and
+    # intentionally use this helper to clean up non-QUEUED outcomes (for
+    # example, capability-proof parking). Preserve that behavior. The task-id
+    # path is different: forced drains race /next-role, so ownership must be
+    # decided only after acquiring the same Task row lock as the claimant.
+    member = None
+    task_locked_here = False
+    resolved_task_id = task.id if task is not None else task_id
+    if task is None and resolved_task_id is None:
+        member = await get_pool_vm(session, vm_instance_id)
+        resolved_task_id = member.leased_task_id if member is not None else None
+    if task is None and resolved_task_id is not None:
+        task = (
+            await session.execute(
+                select(Task)
+                .where(Task.id == uuid.UUID(str(resolved_task_id)))
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        task_locked_here = True
+    if member is None:
+        # Lock order is Task -> PoolVm for the task-id path, matching
+        # /next-role. get_pool_vm is an MVCC read (not FOR UPDATE), so a forced
+        # drain that already owns the PoolVm CAS cannot deadlock with a claimant
+        # that owns Task and is reading the member's prior committed identity.
+        member = await get_pool_vm(session, vm_instance_id)
+
+    cleanup_task = task
+    if task_locked_here:
+        # A successful /next-role commit transfers the reservation to normal
+        # task-completion accounting. Once that happens the drain still owns
+        # physical retirement, but it no longer owns the task pin/account slot.
+        # Conversely, if this lock was acquired first, clearing the complete
+        # QUEUED pool tuple makes the blocked claimant decline safely.
+        locked_ctx = task.context if task is not None and isinstance(task.context, dict) else {}
+        member_owns_handoff = bool(
+            member is not None
+            and member.state == PoolVmState.RETIRING
+            and str(member.leased_task_id or "") == str(task.id if task else "")
+        )
+        still_owns_handoff = bool(
+            task is not None
+            and task.status == TaskStatus.QUEUED
+            and locked_ctx.get(WARM_POOL_PIN_KEY)
+            and str(locked_ctx.get("warm_target_vm_id") or "") == vm_instance_id
+            and (
+                task.vm_instance_id == vm_instance_id
+                or member_owns_handoff
+            )
+        )
+        if not still_owns_handoff:
+            cleanup_task = None
+
+    reservation_account_id = pool_reservation_account_id(cleanup_task)
+    reservation_project_id = (
+        str(cleanup_task.project_id)
+        if cleanup_task is not None and cleanup_task.project_id
+        else None
+    )
+    task_label = str(task.id) if task is not None else str(resolved_task_id or "")
+    if cleanup_task is not None:
+        ctx = dict(cleanup_task.context or {})
+        for key in (
+            "warm_target_vm_id",
+            WARM_POOL_PIN_KEY,
+            "warm_target_pr",
+            "warm_handoff_deadline",
+            WARM_POOL_RESERVATION_ACCOUNT_KEY,
+        ):
+            ctx.pop(key, None)
+        cleanup_task.context = ctx
+        if cleanup_task.vm_instance_id == vm_instance_id:
+            cleanup_task.vm_instance_id = None
+        flag_modified(cleanup_task, "context")
+        session.add(cleanup_task)
+
+    expected_task_id = task.id if task is not None else resolved_task_id
+    if member is not None and (
+        expected_task_id is None
+        or member.leased_task_id is None
+        or str(member.leased_task_id) == str(expected_task_id)
+    ):
+        if member.state == PoolVmState.RETIRING:
+            # Forced drains atomically claimed LEASED -> RETIRING while retaining
+            # the returned task id. Clear that binding in the same commit as the
+            # task pin; the physical teardown follows after this helper returns.
+            member.leased_task_id = None
+            member.lease_expires_at = None
+            session.add(member)
+        else:
+            await mark_pool_vm_retiring(
+                session,
+                vm_instance_id,
+                source_states=(PoolVmState.LEASED,),
+            )
+
+    await session.commit()
+    if reservation_account_id:
+        from app.max_plan_pool import release_max_plan_account
+
+        try:
+            await release_max_plan_account(
+                reservation_account_id,
+                revert_daily_task_count=True,
+                project_id=reservation_project_id,
+            )
+        except Exception:  # DB cleanup already committed
+            logger.exception(
+                "[WARM-POOL] reservation release failed after abandon commit; "
+                "active capacity remains over-counted until pool rebuild and a "
+                "persisted daily charge may remain until daily reset "
+                "vm=%s task=%s account=%s",
+                vm_instance_id,
+                task_label,
+                reservation_account_id,
+            )
+    logger.info(
+        "[WARM-POOL] abandoned dispatch vm=%s task=%s reason=%s reservation=%s",
+        vm_instance_id,
+        task_label,
+        reason,
+        reservation_account_id,
+    )
+    return reservation_account_id
 
 
 # NOTE: the pool-hit-vs-cold-dispatch funnel lives in warm_backlog_reuse

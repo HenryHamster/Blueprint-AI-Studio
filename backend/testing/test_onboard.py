@@ -267,6 +267,7 @@ class TestOnboardNonAdminOwnership:
         project = await db_session.get(Project, data["project_id"])
         assert project is not None
         assert project.user_id == "fresh-user-999"
+        assert project.autonomous_enabled is False
 
         member = (
             await db_session.execute(
@@ -4179,6 +4180,7 @@ class TestOnboardRepoBootstrapSpawn:
         project_id = resp.json()["project_id"]
         project = await db_session.get(Project, project_id)
         assert project is not None
+        assert project.autonomous_enabled is False
 
         tasks = (
             (

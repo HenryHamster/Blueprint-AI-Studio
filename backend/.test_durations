@@ -11661,7 +11661,6 @@
   "testing/test_orchestrator.py::TestWarmVMSkipProvision::test_pool_dispatch_cold_fall_through_records_funnel": 0.33643922500232293,
   "testing/test_orchestrator.py::TestWarmVMSkipProvision::test_pool_dispatch_commit_error_falls_back_to_cold": 0.3250422929995693,
   "testing/test_orchestrator.py::TestWarmVMSkipProvision::test_pool_dispatch_lease_hit_skips_cold_provision": 0.32666040399817575,
-  "testing/test_orchestrator.py::TestWarmVMSkipProvision::test_pool_pin_unresponsive_clears_releases_and_resets_vm_id": 0.32811050299824274,
   "testing/test_orchestrator.py::TestWarmVMSkipProvision::test_project_paused_after_candidate_scan_not_dispatched": 0.3209078239979135,
   "testing/test_orchestrator.py::TestWarmVMSkipProvision::test_project_spend_ceiling_defers_dispatch": 0.32100583400097094,
   "testing/test_orchestrator.py::TestWarmVMSkipProvision::test_project_vm_cap_defers_only_capped_project": 0.3514072120015044,

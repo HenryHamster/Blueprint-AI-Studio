@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { ToolComponentProps } from '../toolRegistry';
 import {
   fetchToolContent,
@@ -167,7 +167,7 @@ type ArtifactPreparationState =
   | { status: 'waiting'; operation: PendingWhiteboardArtifactOperation }
   | { status: 'terminal'; operation: PendingWhiteboardArtifactOperation };
 
-export default function WhiteboardTool({ projectId, tool }: ToolComponentProps) {
+export default function WhiteboardTool({ projectId, tool, readOnly }: ToolComponentProps) {
   const surfaceRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
@@ -195,6 +195,10 @@ export default function WhiteboardTool({ projectId, tool }: ToolComponentProps) 
   const savingRef = useRef(false);
   const pendingRef = useRef(false);
   const mountedRef = useRef(true);
+  const readOnlyRef = useRef(readOnly);
+  useLayoutEffect(() => {
+    readOnlyRef.current = readOnly;
+  }, [readOnly]);
 
   // In-progress freehand stroke (world coords), not yet committed to content.
   const liveStrokeRef = useRef<Stroke | null>(null);
@@ -247,13 +251,14 @@ export default function WhiteboardTool({ projectId, tool }: ToolComponentProps) 
     return () => {
       cancelled = true;
     };
-  }, [projectId, tool.id]);
+  }, [projectId, tool.id, readOnly]);
 
   // -----------------------------------------------------------------------
   // Content mutation — the single funnel that keeps refs + dirty state in sync
   // -----------------------------------------------------------------------
 
   const applyContent = useCallback((next: CanvasContent) => {
+    if (readOnlyRef.current) return;
     contentRef.current = next;
     setContent(next);
     setDirty(serialize(next) !== lastSavedRef.current);
@@ -304,6 +309,7 @@ export default function WhiteboardTool({ projectId, tool }: ToolComponentProps) 
   }, [projectId, tool.id]);
 
   const flush = useCallback(async () => {
+    if (readOnlyRef.current) return false;
     if (savingRef.current) {
       pendingRef.current = true;
       return false;
@@ -360,6 +366,7 @@ export default function WhiteboardTool({ projectId, tool }: ToolComponentProps) 
   const settleArtifactPreparation = useCallback(async (
     operation: PendingWhiteboardArtifactOperation,
   ) => {
+    if (readOnlyRef.current) return false;
     if (mountedRef.current) {
       setActionError(null);
       setArtifactPreparation({ status: 'preparing', operation });
@@ -407,6 +414,7 @@ export default function WhiteboardTool({ projectId, tool }: ToolComponentProps) 
     intent: ToolResidentHandoffIntent,
     replaces?: PendingWhiteboardArtifactOperation,
   ) => {
+    if (readOnlyRef.current) throw new Error('Viewer access is read-only.');
     let saved = await flush();
     if (saved && serialize(contentRef.current) !== lastSavedRef.current) saved = await flush();
     if (!saved || serialize(contentRef.current) !== lastSavedRef.current) {
@@ -478,6 +486,7 @@ export default function WhiteboardTool({ projectId, tool }: ToolComponentProps) 
   // Pending preparation belongs to the operator/project/tool, not this mounted
   // tab. Resume it on remount and when another tab persists the same operation.
   useEffect(() => {
+    if (readOnly) return;
     const actorUserId = auth.currentUser?.uid ?? auth.currentUser?.email;
     if (!actorUserId) return;
     let cancelled = false;
@@ -517,22 +526,23 @@ export default function WhiteboardTool({ projectId, tool }: ToolComponentProps) 
       cancelled = true;
       window.removeEventListener('storage', onStorage);
     };
-  }, [projectId, settleArtifactPreparation, tool.id]);
+  }, [projectId, settleArtifactPreparation, tool.id, readOnly]);
 
   // Debounced autosave. Re-armed on every content change while dirty; a bare
   // revision refresh (dirty=false) never schedules a save.
   useEffect(() => {
+    if (readOnly) return;
     if (loadState.status !== 'ready' || !dirty) return;
     const timer = setTimeout(() => {
       void flush();
     }, DEBOUNCE_MS);
     return () => clearTimeout(timer);
-  }, [content, dirty, loadState.status, flush]);
+  }, [content, dirty, loadState.status, flush, readOnly]);
 
   // Flush any pending change on unmount so switching away never drops edits.
   useEffect(() => {
     return () => {
-      if (serialize(contentRef.current) !== lastSavedRef.current) {
+      if (!readOnlyRef.current && serialize(contentRef.current) !== lastSavedRef.current) {
         void flush();
       }
     };
@@ -623,7 +633,7 @@ export default function WhiteboardTool({ projectId, tool }: ToolComponentProps) 
       // Only react to gestures that start on the empty surface — node handlers
       // stop propagation.
       setSelectedId(null);
-      if (mode === 'draw') {
+      if (!readOnlyRef.current && mode === 'draw') {
         drawingRef.current = true;
         const p = screenToWorld(e.clientX, e.clientY);
         liveStrokeRef.current = { color, width: lineWidth, points: [p] };
@@ -820,7 +830,7 @@ export default function WhiteboardTool({ projectId, tool }: ToolComponentProps) 
   // Paste images directly onto the canvas.
   const onPaste = useCallback(
     (e: React.ClipboardEvent) => {
-      if (loadState.status !== 'ready') return;
+      if (readOnlyRef.current || loadState.status !== 'ready') return;
       const items = e.clipboardData?.items;
       if (!items) return;
       const images: File[] = [];
@@ -935,7 +945,7 @@ export default function WhiteboardTool({ projectId, tool }: ToolComponentProps) 
   return (
     <div className="flex flex-col gap-2">
       {/* Toolbar */}
-      <div
+      {!readOnly && <div
         className="flex flex-wrap items-center gap-1.5"
         data-viewport-allow-overflow
         data-viewport-allow-small-target
@@ -1077,10 +1087,10 @@ export default function WhiteboardTool({ projectId, tool }: ToolComponentProps) 
         >
           {statusLabel}
         </span>
-      </div>
+      </div>}
 
       {/* Hidden file inputs */}
-      <input
+      {!readOnly && <input
         ref={imageInputRef}
         type="file"
         accept="image/*"
@@ -1090,8 +1100,8 @@ export default function WhiteboardTool({ projectId, tool }: ToolComponentProps) 
           if (e.target.files) void handleFiles(e.target.files, 'image');
           e.target.value = '';
         }}
-      />
-      <input
+      />}
+      {!readOnly && <input
         ref={docInputRef}
         type="file"
         accept="application/pdf,.pdf"
@@ -1101,11 +1111,11 @@ export default function WhiteboardTool({ projectId, tool }: ToolComponentProps) 
           if (e.target.files) void handleFiles(e.target.files, 'document');
           e.target.value = '';
         }}
-      />
+      />}
 
-      {actionError && <p className="text-xs text-amber-400">{actionError}</p>}
+      {!readOnly && actionError && <p className="text-xs text-amber-400">{actionError}</p>}
 
-      <ToolResidentHandoffControls
+      {!readOnly && <ToolResidentHandoffControls
         toolLabel="Whiteboard"
         disabledReason={
           saveStatus === 'saving'
@@ -1120,9 +1130,9 @@ export default function WhiteboardTool({ projectId, tool }: ToolComponentProps) 
         }
         preparing={artifactPreparation.status === 'preparing'}
         onHandoff={handoffToConversation}
-      />
+      />}
 
-      {artifactPreparation.status === 'waiting' && (
+      {!readOnly && artifactPreparation.status === 'waiting' && (
         <div className="rounded border border-sky-500/30 bg-sky-950/20 p-2 text-xs text-sky-200" role="status">
           <p>The Whiteboard preparation is durable but still waiting. Its exact upload receipt will be reused.</p>
           <button
@@ -1142,7 +1152,7 @@ export default function WhiteboardTool({ projectId, tool }: ToolComponentProps) 
         </div>
       )}
 
-      {artifactPreparation.status === 'terminal' && (
+      {!readOnly && artifactPreparation.status === 'terminal' && (
         <div className="rounded border border-amber-500/30 bg-amber-950/20 p-2 text-xs text-amber-200" role="alert">
           <p>{artifactPreparation.operation.last_error || 'Whiteboard preparation needs a fresh render.'}</p>
           <p className="mt-1 text-amber-300/80">Your Share/Ask intent is preserved.</p>
@@ -1179,7 +1189,7 @@ export default function WhiteboardTool({ projectId, tool }: ToolComponentProps) 
         onPointerLeave={endGesture}
         onPointerCancel={endGesture}
         onWheel={onWheel}
-        onPaste={onPaste}
+        onPaste={readOnly ? undefined : onPaste}
         tabIndex={0}
       >
         {/* Stroke layer (screen space) */}
@@ -1201,6 +1211,7 @@ export default function WhiteboardTool({ projectId, tool }: ToolComponentProps) 
               onChangeText={text => updateNode(node.id, { text } as Partial<CanvasNode>)}
               onDelete={() => deleteNode(node.id)}
               onSelect={() => setSelectedId(node.id)}
+              readOnly={readOnly}
             />
           ))}
         </div>
@@ -1212,7 +1223,7 @@ export default function WhiteboardTool({ projectId, tool }: ToolComponentProps) 
         )}
       </div>
 
-      {saveError && (
+      {!readOnly && saveError && (
         <p className="text-xs text-amber-400">
           {saveError}
           <button
@@ -1244,6 +1255,7 @@ interface CanvasNodeViewProps {
   onChangeText: (text: string) => void;
   onDelete: () => void;
   onSelect: () => void;
+  readOnly: boolean;
 }
 
 function CanvasNodeView({
@@ -1255,8 +1267,9 @@ function CanvasNodeView({
   onChangeText,
   onDelete,
   onSelect,
+  readOnly,
 }: CanvasNodeViewProps) {
-  const interactive = mode === 'select';
+  const interactive = !readOnly && mode === 'select';
   return (
     <div
       className={`pointer-events-auto absolute flex flex-col overflow-hidden rounded border ${
@@ -1268,7 +1281,7 @@ function CanvasNodeView({
         // selection, so swallow the event before it reaches the surface.
         e.stopPropagation();
         // Dragging the header (not an inner control) moves the node.
-        if ((e.target as HTMLElement).dataset.nodeHandle === 'body') {
+        if (!readOnly && (e.target as HTMLElement).dataset.nodeHandle === 'body') {
           onPointerDownMove(e, node);
         } else {
           onSelect();
@@ -1285,14 +1298,14 @@ function CanvasNodeView({
         <span data-node-handle="body" className="truncate">
           {node.type === 'text' ? 'Text' : node.type === 'image' ? node.name ?? 'Image' : node.name}
         </span>
-        <button
+        {!readOnly && <button
           type="button"
           aria-label="Delete item"
           onClick={onDelete}
           className="shrink-0 text-neutral-500 hover:text-red-400"
         >
           ✕
-        </button>
+        </button>}
       </div>
 
       {/* Body */}
@@ -1300,7 +1313,8 @@ function CanvasNodeView({
         {node.type === 'text' && (
           <textarea
             value={node.text}
-            onChange={e => onChangeText(e.target.value)}
+            onChange={e => { if (!readOnly) onChangeText(e.target.value); }}
+            readOnly={readOnly}
             placeholder="Type here…"
             className="h-full w-full resize-none bg-transparent p-1.5 text-xs text-neutral-100 outline-none"
             style={{ color: node.color }}

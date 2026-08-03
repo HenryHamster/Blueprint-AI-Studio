@@ -66,7 +66,9 @@ describe('pending Whiteboard ArtifactRef operation', () => {
       { state: 'ready', artifact_ref: ARTIFACT_REF },
     ];
     const request = vi.fn().mockImplementation(async () => responses.shift());
-    const wait = vi.fn(async () => undefined);
+    const wait = vi.fn(async (delayMs: number) => {
+      void delayMs;
+    });
 
     const result = await settlePendingWhiteboardArtifactOperation(pending, { request, wait });
 
@@ -89,7 +91,9 @@ describe('pending Whiteboard ArtifactRef operation', () => {
     const request = vi.fn()
       .mockRejectedValueOnce(new TypeError('network response lost'))
       .mockResolvedValueOnce({ state: 'ready', artifact_ref: ARTIFACT_REF });
-    const wait = vi.fn(async () => undefined);
+    const wait = vi.fn(async (delayMs: number) => {
+      void delayMs;
+    });
 
     const result = await settlePendingWhiteboardArtifactOperation(pending, { request, wait });
 

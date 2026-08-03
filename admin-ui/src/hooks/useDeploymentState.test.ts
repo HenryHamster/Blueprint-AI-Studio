@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { renderHook, waitFor, cleanup } from '@testing-library/react';
-import { useDeploymentState } from './useDeploymentState';
-import { authGet } from '../api';
+import { useDeploymentState as useDeploymentStateHook } from './useDeploymentState';
+import { authGet, authHeaders } from '../api';
 
 vi.mock('../api', () => ({
   authHeaders: vi.fn().mockResolvedValue({ Authorization: 'Bearer ***', 'Content-Type': 'application/json' }),
@@ -10,6 +10,22 @@ vi.mock('../api', () => ({
 }));
 
 const mockAuthGet = vi.mocked(authGet);
+const mockAuthHeaders = vi.mocked(authHeaders);
+
+// Existing behavior tests exercise the full operator surface. Access-specific
+// tests below call the hook directly with a non-admin persona.
+function useDeploymentState(
+  addToast: Parameters<typeof useDeploymentStateHook>[0],
+  user: Parameters<typeof useDeploymentStateHook>[1],
+  fetchTasksRef: Parameters<typeof useDeploymentStateHook>[2],
+  selectedProjectId: string | null = null,
+  pollerEnabled = true,
+) {
+  return useDeploymentStateHook(addToast, user, fetchTasksRef, selectedProjectId, pollerEnabled, {
+    isPlatformAdmin: true,
+    canViewProject: true,
+  });
+}
 
 function makeUser() {
   return { uid: 'user-1', email: 'test@example.com' } as Parameters<typeof useDeploymentState>[1];
@@ -91,6 +107,110 @@ describe('useDeploymentState', () => {
       expect(mockAuthGet).toHaveBeenCalledWith(expect.stringContaining('/api/health/detailed'));
       expect(mockAuthGet).toHaveBeenCalledWith(expect.stringContaining('/api/admin/projects/proj-123/diagnostics'));
     });
+  });
+
+  it('keeps project diagnostics for viewers without polling global runtime endpoints', async () => {
+    renderHook(() => useDeploymentStateHook(
+      vi.fn(),
+      makeUser(),
+      { current: vi.fn() },
+      'proj-123',
+      true,
+      { isPlatformAdmin: false, canViewProject: true },
+    ));
+
+    await waitFor(() => {
+      expect(mockAuthGet).toHaveBeenCalledWith(expect.stringContaining('/api/admin/projects/proj-123/diagnostics'));
+    });
+    const urls = mockAuthGet.mock.calls.map(([url]) => String(url));
+    expect(urls.some(url => url.includes('/api/admin/deploy-state'))).toBe(false);
+    expect(urls.some(url => url.includes('/api/admin/zone-health'))).toBe(false);
+    expect(urls.some(url => url.includes('/api/debug/orchestrator'))).toBe(false);
+    expect(urls.some(url => url.includes('/api/health/detailed'))).toBe(false);
+  });
+
+  it('makes every global deployment mutation callback inert for non-admin users', async () => {
+    const fetchTasks = vi.fn();
+    const { result } = renderHook(() => useDeploymentStateHook(
+      vi.fn(),
+      makeUser(),
+      { current: fetchTasks },
+      'proj-123',
+      true,
+      { isPlatformAdmin: false, canViewProject: true },
+    ));
+
+    await result.current.handlePausePipeline();
+    await result.current.handleResumePipeline();
+    await result.current.handleResetHealth();
+    await result.current.handleRollback();
+    await result.current.handleMarkStable();
+    await result.current.handleRepairState();
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(fetchTasks).not.toHaveBeenCalled();
+  });
+
+  it('keeps callbacks captured as admin inert after an admin-to-viewer downgrade', async () => {
+    const addToast = vi.fn();
+    const fetchTasks = vi.fn();
+    const { result, rerender } = renderHook(
+      ({ isPlatformAdmin }) => useDeploymentStateHook(
+        addToast,
+        makeUser(),
+        { current: fetchTasks },
+        'proj-123',
+        true,
+        { isPlatformAdmin, canViewProject: true },
+      ),
+      { initialProps: { isPlatformAdmin: true } },
+    );
+    const staleCallbacks = {
+      pause: result.current.handlePausePipeline,
+      resume: result.current.handleResumePipeline,
+      reset: result.current.handleResetHealth,
+      rollback: result.current.handleRollback,
+      markStable: result.current.handleMarkStable,
+      repair: result.current.handleRepairState,
+    };
+
+    rerender({ isPlatformAdmin: false });
+    fetchSpy.mockClear();
+    await staleCallbacks.pause();
+    await staleCallbacks.resume();
+    await staleCallbacks.reset();
+    await staleCallbacks.rollback();
+    await staleCallbacks.markStable();
+    await staleCallbacks.repair();
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(fetchTasks).not.toHaveBeenCalled();
+    expect(addToast).not.toHaveBeenCalled();
+  });
+
+  it('does not dispatch a global mutation when admin access is revoked while auth headers are pending', async () => {
+    let resolveHeaders!: (headers: Record<string, string>) => void;
+    mockAuthHeaders.mockReturnValueOnce(new Promise(resolve => { resolveHeaders = resolve; }));
+    const addToast = vi.fn();
+    const { result, rerender } = renderHook(
+      ({ isPlatformAdmin }) => useDeploymentStateHook(
+        addToast,
+        makeUser(),
+        { current: vi.fn() },
+        null,
+        true,
+        { isPlatformAdmin, canViewProject: false },
+      ),
+      { initialProps: { isPlatformAdmin: true } },
+    );
+
+    const pendingPause = result.current.handlePausePipeline();
+    rerender({ isPlatformAdmin: false });
+    resolveHeaders({ Authorization: 'Bearer stale' });
+    await pendingPause;
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(addToast).not.toHaveBeenCalled();
   });
 
   // --- Health polling on mount ---
@@ -252,6 +372,88 @@ describe('useDeploymentState', () => {
     // With no selectedProjectId the effect bails out immediately, leaving
     // diagnostics null (if it were fetched the mock would return {} not null).
     expect(result.current.diagnostics).toBeNull();
+  });
+
+  it('ignores a diagnostics response from the previously selected project', async () => {
+    let resolveOldDiagnostics!: (response: Response) => void;
+    mockAuthGet.mockImplementation((url: string) => {
+      if (url.includes('/projects/proj-old/diagnostics')) {
+        return new Promise<Response>(resolve => { resolveOldDiagnostics = resolve; });
+      }
+      if (url.includes('/projects/proj-new/diagnostics')) return okGet({ project: 'new' });
+      return okGet({});
+    });
+
+    const { result, rerender } = renderHook(
+      ({ projectId }) => useDeploymentStateHook(
+        vi.fn(), makeUser(), { current: vi.fn() }, projectId, true,
+        { isPlatformAdmin: false, canViewProject: true },
+      ),
+      { initialProps: { projectId: 'proj-old' } },
+    );
+    await waitFor(() => expect(resolveOldDiagnostics).toBeTypeOf('function'));
+
+    rerender({ projectId: 'proj-new' });
+    await waitFor(() => expect(result.current.diagnostics).toEqual({ project: 'new' }));
+    resolveOldDiagnostics({ ok: true, json: async () => ({ project: 'old' }) } as Response);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(result.current.diagnostics).toEqual({ project: 'new' });
+  });
+
+  it('does not repopulate diagnostics after project capability loss', async () => {
+    let resolveDiagnostics!: (response: Response) => void;
+    mockAuthGet.mockImplementation((url: string) => {
+      if (url.includes('/projects/proj-123/diagnostics')) {
+        return new Promise<Response>(resolve => { resolveDiagnostics = resolve; });
+      }
+      return okGet({});
+    });
+
+    const { result, rerender } = renderHook(
+      ({ canViewProject }) => useDeploymentStateHook(
+        vi.fn(), makeUser(), { current: vi.fn() }, 'proj-123', true,
+        { isPlatformAdmin: false, canViewProject },
+      ),
+      { initialProps: { canViewProject: true } },
+    );
+    await waitFor(() => expect(resolveDiagnostics).toBeTypeOf('function'));
+
+    rerender({ canViewProject: false });
+    expect(result.current.diagnostics).toBeNull();
+    resolveDiagnostics({ ok: true, json: async () => ({ project: 'stale' }) } as Response);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(result.current.diagnostics).toBeNull();
+  });
+
+  it('does not repopulate global deployment state after admin capability loss', async () => {
+    let resolveDeployState!: (response: Response) => void;
+    mockAuthGet.mockImplementation((url: string) => {
+      if (url.includes('/api/admin/deploy-state')) {
+        return new Promise<Response>(resolve => { resolveDeployState = resolve; });
+      }
+      return okGet({});
+    });
+
+    const { result, rerender } = renderHook(
+      ({ isPlatformAdmin }) => useDeploymentStateHook(
+        vi.fn(), makeUser(), { current: vi.fn() }, null, true,
+        { isPlatformAdmin, canViewProject: false },
+      ),
+      { initialProps: { isPlatformAdmin: true } },
+    );
+    await waitFor(() => expect(resolveDeployState).toBeTypeOf('function'));
+
+    rerender({ isPlatformAdmin: false });
+    expect(result.current.deployState).toBeNull();
+    resolveDeployState({ ok: true, json: async () => ({ status: 'STALE' }) } as Response);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(result.current.deployState).toBeNull();
   });
 
   // --- Action handlers ---

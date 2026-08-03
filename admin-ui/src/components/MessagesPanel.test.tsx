@@ -2,7 +2,15 @@ import { describe, test, expect, vi, afterEach, beforeEach } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { waitFor } from '@testing-library/react';
-import { MessagesPanel, type MessagesPanelProps } from './MessagesPanel';
+import { MessagesPanel as MessagesPanelComponent, type MessagesPanelProps } from './MessagesPanel';
+
+type MessagesPanelTestProps = Omit<MessagesPanelProps, 'canOperateProject'> & {
+  canOperateProject?: boolean;
+};
+
+function MessagesPanel(props: MessagesPanelTestProps) {
+  return <MessagesPanelComponent canOperateProject={true} {...props} />;
+}
 import type { ProjectMessage } from './MessageBubble';
 import type { StrategicStateResponse } from '../strategicStateApi';
 import {
@@ -471,6 +479,44 @@ describe('MessagesPanel chrome modes', () => {
     expect(conversationRequests.some(
       url => url.includes(`limit=${CONVERSATION_INITIAL_WINDOW}`),
     )).toBe(true);
+  });
+
+  test.each([
+    { accessLabel: 'false', canOperateProject: false },
+    { accessLabel: 'undefined at runtime', canOperateProject: undefined as never },
+  ])('viewer reads the Strategic conversation with access $accessLabel without starting call or mutation surfaces', async ({ canOperateProject }) => {
+    const onDismissAlert = vi.fn();
+    const onDismissAllAlerts = vi.fn();
+    const onStrategicInteraction = vi.fn();
+    const message = makeMsg({ content: 'Viewer-readable update', surface: 'conversation' });
+    const el = await renderPanel({
+      canOperateProject,
+      filterChrome: 'minimal',
+      strategicState: makeStrategicState(),
+      onStrategicInteraction,
+      onDismissAlert,
+      onDismissAllAlerts,
+      alerts: [{
+        id: 'alert-1', project_id: 'proj-1', severity: 'WARNING', title: 'Capacity warning',
+        message: 'Read-only alert', task_id: null, created_at: new Date().toISOString(),
+        dismissed_at: null, acknowledged_at: null,
+      }],
+    }, [message]);
+
+    await waitFor(() => expect(el.textContent).toContain('Viewer-readable update'));
+    expect(el.querySelector('textarea')).toBeNull();
+    expect(el.querySelector('button[aria-label="Acknowledge alert"]')).toBeNull();
+    expect(el.querySelector('button[title="Dismiss"]')).toBeNull();
+    expect(el.textContent).not.toContain('Dismiss all');
+    expect(el.textContent).not.toContain('Cancel steer');
+    expect(onDismissAlert).not.toHaveBeenCalled();
+    expect(onDismissAllAlerts).not.toHaveBeenCalled();
+    expect(onStrategicInteraction).not.toHaveBeenCalled();
+    expect(vi.mocked(apiFetch).mock.calls.some(([url]) => String(url).includes('/strategic-call'))).toBe(false);
+    expect(vi.mocked(apiFetch).mock.calls.some(([, init]) => {
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      return method !== 'GET';
+    })).toBe(false);
   });
 
   test('opens a durable tool handoff as an exact conversation draft', async () => {

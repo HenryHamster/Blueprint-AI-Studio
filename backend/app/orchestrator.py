@@ -65,6 +65,7 @@ from app.database import AsyncSessionLocal
 from app.discovery_admission import (
     authorize_discovery_task_execution,
 )
+from app.execution_principal import resolve_project_execution_principal
 from app.models import (
     DeploymentState,
     Project,
@@ -764,7 +765,6 @@ CANDIDATE_LIGHT_COLUMNS = (
     Task.retry_after_until,
     Task.context,
     Task.depends_on,
-    Task.launched_by_user_id,
     Task.project_id,
     Task.payloads,
     Task.status_log,
@@ -1232,8 +1232,8 @@ async def orchestrator_worker():
         _ensure_vm_deleted,
     )
     from app.warm_pool import (
+        abandon_pool_dispatch,
         is_warm_pool_enabled,
-        mark_pool_vm_retiring,
         try_pool_dispatch,
     )
 
@@ -2180,19 +2180,17 @@ async def orchestrator_worker():
                     (await session.execute(candidate_stmt)).scalars().all()
                 )
 
-                # Per-user pool availability cache. Rate-limit-origin retry_after
+                # Per-principal pool availability cache. Rate-limit-origin retry_after
                 # holds (set without _infra_wait) can be released early when the
-                # dispatching user's own pool recovers. Checking the global pool
-                # would release tasks whose user pool is still exhausted, only to
+                # project's own pool recovers. Checking the global pool would
+                # release tasks whose project pool is still exhausted, only to
                 # re-block them at dispatch.
                 # Keyed by (user_id, model) — model=None is conservative and would
                 # hold a Sonnet task when only Opus is rate-limited (or vice versa).
                 _user_pool_available: Dict[Tuple[str, str | None], bool] = {}
-                # R5-W5 MED-5: cache Project→user_id within a single dispatch
-                # cycle. When task.launched_by_user_id is NULL, the previous
-                # implementation called session.get(Project, ...) per task —
-                # 50 NULL-launcher candidates = 50 redundant Project SELECTs
-                # every cycle.
+                # Cache Project→user_id within a single dispatch cycle. The
+                # project owner is the execution-resource principal for every
+                # task, including member-launched work.
                 _project_user_cache: Dict[uuid.UUID, str] = {}
                 # Pre-warm the project cache for ALL candidate tasks' projects
                 # so the eligibility loop and dispatch section never issue per-task
@@ -2211,15 +2209,11 @@ async def orchestrator_worker():
                         _project_user_cache[_pid] = _uid  # noqa: PERF403
 
                 async def _user_has_available_account(task: Task) -> bool:
-                    user_id = task.launched_by_user_id
-                    if not user_id:
-                        cached = _project_user_cache.get(task.project_id)  # noqa: B023
-                        if cached is not None:
-                            user_id = cached
-                        else:
-                            proj = await session.get(Project, task.project_id)  # noqa: B023
-                            user_id = proj.user_id if proj else ""
-                            _project_user_cache[task.project_id] = user_id  # noqa: B023
+                    user_id = await resolve_project_execution_principal(
+                        session,  # noqa: B023
+                        task.project_id,
+                        owner_cache=_project_user_cache,  # noqa: B023
+                    )
                     model = _extract_task_model(task)
                     cache_key = (user_id, model)
                     if cache_key in _user_pool_available:  # noqa: B023
@@ -2996,7 +2990,6 @@ async def orchestrator_worker():
                                 Task.retry_after_until,
                                 Task.context,
                                 Task.depends_on,
-                                Task.launched_by_user_id,
                                 Task.project_id,
                                 Task.payloads,
                                 Task.status_log,
@@ -3685,25 +3678,34 @@ async def orchestrator_worker():
                             # feed the pool breaker, NOT the warm-continuity pin-clear
                             # metric, so the two breakers stay independent.
                             if _is_pool_pin:
-                                from app.models import PoolVmState as _PoolVmState
-
-                                await mark_pool_vm_retiring(
+                                # One canonical abandonment seam owns the
+                                # durable pin/lease/account-reservation cleanup.
+                                # In particular, the selected account's daily
+                                # charge must be reverted when this handoff never
+                                # reaches a claim.
+                                await abandon_pool_dispatch(
                                     session,
-                                    _warm_target_vm_id,
-                                    source_states=(_PoolVmState.LEASED,),
+                                    task=task,
+                                    vm_instance_id=_warm_target_vm_id,
+                                    reason=_clear_reason,
                                 )
                                 if _clear_reason != "circuit_breaker":
                                     _shared_state.record_pool_claim_failure(
                                         _clear_reason
                                     )
-                                # _pin_task_to_pool_vm stamped this retiring member's
-                                # vm_instance_id onto the task. Reset it so the cold
-                                # fall-through below mints a FRESH agent-vm- id instead
-                                # of re-creating a GCP instance named after the VM we
-                                # just scheduled for teardown (name collision racing the
-                                # reaper's delete). Chain pins leave vm_instance_id None
-                                # so they are unaffected; only pool pins set it.
-                                task.vm_instance_id = None
+                                # abandon_pool_dispatch commits and therefore releases
+                                # the selector lock. The loop-local ORM object is now a
+                                # stale snapshot that another dispatcher may already be
+                                # reselecting. Never continue into runtime selection or
+                                # cold provisioning in this cycle; reacquire the task
+                                # through the normal locked selector next cycle.
+                                logger.info(
+                                    "[ORCHESTRATOR] Warm-pool pin abandoned for task %s "
+                                    "(%s); deferring reselection to next cycle",
+                                    task.id,
+                                    _clear_reason,
+                                )
+                                continue
                             elif _is_parked_retarget:
                                 # Park-and-retarget stamped the held VM id onto
                                 # vm_instance_id (agent_status.py) so the reaper can
@@ -3755,25 +3757,14 @@ async def orchestrator_worker():
                         _sticky = (task.context or {}).get(
                             "provision_failed_accounts"
                         ) or []
-                        # Launcher pays; fall back to project owner for autonomous tasks.
-                        # R6-W3-D: reuse the cycle-local _project_user_cache built during
-                        # eligibility filtering so we don't re-issue a Project SELECT per
-                        # dispatched task (extends R5-W5 MED-5 from the eligibility scan
-                        # to the dispatch site).
-                        if task.launched_by_user_id:
-                            dispatch_user_id = task.launched_by_user_id
-                        else:
-                            cached_owner = _project_user_cache.get(task.project_id)
-                            if cached_owner is not None:
-                                dispatch_user_id = cached_owner
-                            else:
-                                task_project = await session.get(
-                                    Project, task.project_id
-                                )
-                                dispatch_user_id = (
-                                    task_project.user_id if task_project else ""
-                                )
-                                _project_user_cache[task.project_id] = dispatch_user_id
+                        # Task launchers remain attribution only. Provider
+                        # accounts, credentials, and caps are project resources,
+                        # so dispatch always resolves through Project.user_id.
+                        dispatch_user_id = await resolve_project_execution_principal(
+                            session,
+                            task.project_id,
+                            owner_cache=_project_user_cache,
+                        )
                         task_model = _extract_task_model(task)
                         # Prune stale blacklist entries — accounts whose model cooldown has expired
                         # should be eligible again, otherwise rate-limited tasks get stuck forever
@@ -3875,6 +3866,11 @@ async def orchestrator_worker():
                                     else None
                                 ),
                                 required_auth_mode=runtime_selection.auth_mode,
+                                reserved_account_id=(
+                                    str(_iter_preclaimed_account_id)
+                                    if _iter_preclaimed_account_id
+                                    else None
+                                ),
                                 excluded_account_ids=_effective_blacklist,
                             )
                             if _leased_member is not None:

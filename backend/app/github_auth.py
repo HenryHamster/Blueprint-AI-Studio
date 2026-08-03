@@ -342,6 +342,16 @@ async def get_user_installations(user_token: str) -> list[dict]:
         resp = await _github_request("GET", url, headers)
         if resp.status_code != 200:
             logger.error(f"Failed to fetch user installations: {resp.text}")
+            from app import github as _gh
+
+            if _gh.is_github_rate_limited_response(resp):
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail="GitHub rate limit prevented installation discovery. Retry later.",
+                    headers={
+                        "Retry-After": resp.headers.get("Retry-After", "60")
+                    },
+                )
             raise HTTPException(
                 status_code=resp.status_code, detail="Failed to fetch GitHub App installations"
             )

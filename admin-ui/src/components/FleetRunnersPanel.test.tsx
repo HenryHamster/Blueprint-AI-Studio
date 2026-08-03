@@ -1,9 +1,17 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
-import { act } from 'react';
-import { FleetRunnersPanel } from './FleetRunnersPanel';
+import { act, type ComponentProps } from 'react';
+import { FleetRunnersPanel as FleetRunnersPanelComponent } from './FleetRunnersPanel';
 import { runnerSetupSnippets, runnerInstallSnippet, RUNNER_PREREQUISITES, DEFAULT_ORCHESTRATOR_URL } from './FleetRunnersPanel.utils';
 import type { FleetRunner } from '../api';
+
+type FleetRunnersPanelTestProps = Omit<ComponentProps<typeof FleetRunnersPanelComponent>, 'readOnly'> & {
+  readOnly?: boolean;
+};
+
+function FleetRunnersPanel(props: FleetRunnersPanelTestProps) {
+  return <FleetRunnersPanelComponent readOnly={false} {...props} />;
+}
 
 const SAMPLE_RUNNERS: FleetRunner[] = [
   {
@@ -114,7 +122,7 @@ describe('FleetRunnersPanel — behavioral', () => {
 
   async function mount(
     projectId = 'proj-test',
-    opts: { onNavigateToTask?: (taskId: string) => void } = {},
+    opts: { onNavigateToTask?: (taskId: string) => void; readOnly?: boolean } = {},
   ) {
     host = document.createElement('div');
     document.body.appendChild(host);
@@ -122,12 +130,59 @@ describe('FleetRunnersPanel — behavioral', () => {
     root = r;
     await act(async () => {
       r.render(
-        <FleetRunnersPanel projectId={projectId} onNavigateToTask={opts.onNavigateToTask} />,
+        <FleetRunnersPanel
+          projectId={projectId}
+          onNavigateToTask={opts.onNavigateToTask}
+          readOnly={opts.readOnly ?? false}
+        />,
       );
     });
     await act(async () => {});
     return host as HTMLDivElement;
   }
+
+  test('read-only mode retains runner telemetry access and hides every mutation surface', async () => {
+    const el = await mount('proj-test', { readOnly: true });
+
+    expect(el.textContent).toContain('gpu-worker-01');
+    expect(el.querySelector('[aria-label^="Toggle telemetry for runner"]')).not.toBeNull();
+    expect(el.textContent).not.toContain('Enroll runner');
+    expect(el.querySelector('[data-testid="fleet-runner-configure-toggle"]')).toBeNull();
+    expect(el.querySelector('[aria-label^="Pause runner"]')).toBeNull();
+    expect(el.querySelector('[aria-label^="Drain runner"]')).toBeNull();
+    expect(el.querySelector('[aria-label^="Rotate token for runner"]')).toBeNull();
+    expect(el.querySelector('[aria-label^="Revoke runner"]')).toBeNull();
+    expect(el.querySelector('[aria-label^="Add project to runner"]')).toBeNull();
+    expect(vi.mocked(registerFleetRunner)).not.toHaveBeenCalled();
+    expect(vi.mocked(rotateFleetRunnerToken)).not.toHaveBeenCalled();
+    expect(vi.mocked(revokeFleetRunner)).not.toHaveBeenCalled();
+    expect(vi.mocked(addRunnerProject)).not.toHaveBeenCalled();
+    expect(vi.mocked(removeRunnerProject)).not.toHaveBeenCalled();
+  });
+
+  test('read-only polling never calls the owner-only runner-project fanout', async () => {
+    vi.useFakeTimers();
+    try {
+      await mount('proj-viewer', { readOnly: true });
+      expect(listFleetRunners).toHaveBeenCalledTimes(1);
+      expect(listRunnerProjects).not.toHaveBeenCalled();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000);
+      });
+
+      expect(listFleetRunners).toHaveBeenCalledTimes(2);
+      expect(listRunnerProjects).not.toHaveBeenCalled();
+    } finally {
+      const r = root;
+      if (r) {
+        act(() => r.unmount());
+        root = null;
+      }
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
 
   test('bound runner is labelled shared and routes ownership separately from project stats', async () => {
     const shared: FleetRunner = {

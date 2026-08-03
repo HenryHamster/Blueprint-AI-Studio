@@ -54,6 +54,7 @@ describe('ProjectBuildConfigSection — staging prefix error handling', () => {
         onDetect={vi.fn(async () => {})}
         detectAvailable={true}
         projectId="test-project"
+        canSave={true}
       />,
     );
 
@@ -106,6 +107,7 @@ describe('ProjectBuildConfigSection — staging prefix error handling', () => {
         onDetect={vi.fn(async () => {})}
         detectAvailable={true}
         projectId="test-project"
+        canSave={true}
       />,
     );
 

@@ -13,6 +13,8 @@ import { WorkbenchSurface } from './WorkbenchLayout';
 import type { PipelineSection } from '../hooks/useWorkbenchCommands';
 import { timeAgo } from '../utils/time';
 
+const READ_ONLY_NOOP = () => undefined;
+
 type ArchiveProps = ComponentProps<typeof ArchiveView>;
 type TaskContextRailProps = ComponentProps<typeof TaskContextRail>;
 type PipelineStreamProps = Pick<TaskStreamPanelProps, 'trackedTaskIds' | 'trackedLogs' | 'tasks' | 'onUntrack' | 'onUntrackAll'>;
@@ -124,6 +126,7 @@ export interface PipelineWorkspaceStatus {
 }
 
 export interface PipelineWorkspaceProps {
+  canOperateProject: boolean;
   surface: PipelineSurfaceProps;
   chrome: PipelineChromeProps;
   archive: PipelineArchiveProps;
@@ -585,6 +588,7 @@ function PipelineSideboard({ flow, rail, metrics, stream }: PipelineSideboardPro
 }
 
 export const PipelineWorkspace = memo(function PipelineWorkspace({
+  canOperateProject = false,
   surface,
   chrome,
   archive,
@@ -618,6 +622,9 @@ export const PipelineWorkspace = memo(function PipelineWorkspace({
         <Suspense fallback={null}>
           <ArchiveView
             {...archive}
+            onRetryTask={canOperateProject ? archive.onRetryTask : undefined}
+            onUnarchiveTask={canOperateProject ? archive.onUnarchiveTask : undefined}
+            onPurgeArchive={canOperateProject ? archive.onPurgeArchive : undefined}
             setShowArchive={(show) => {
               surface.setShowArchive(show);
               if (!show) {
@@ -649,9 +656,9 @@ export const PipelineWorkspace = memo(function PipelineWorkspace({
                     hasActiveFilters={flow.hasActiveFilters}
                     onViewLogs={flow.onViewLogs}
                     onNavigateToParent={flow.onNavigateToParent}
-                    onClearWaveDeps={flow.onClearWaveDeps}
-                    onArchiveGroup={flow.onArchiveGroup}
-                    onUnarchiveTask={flow.onUnarchiveTask}
+                    onClearWaveDeps={canOperateProject ? flow.onClearWaveDeps : undefined}
+                    onArchiveGroup={canOperateProject ? flow.onArchiveGroup : undefined}
+                    onUnarchiveTask={canOperateProject ? flow.onUnarchiveTask : undefined}
                   />
                 </Suspense>
               </main>
@@ -676,6 +683,7 @@ export const PipelineWorkspace = memo(function PipelineWorkspace({
               <main data-testid="pipeline-board-main" className="min-h-0 min-w-0 overflow-hidden px-3 py-3 md:px-4 lg:col-start-1 lg:row-start-1">
                 <Suspense fallback={null}>
                   <KanbanBoard
+                    readOnly={!canOperateProject}
                     tasks={board.tasks}
                     columns={board.columns}
                     loading={board.loading}
@@ -683,25 +691,25 @@ export const PipelineWorkspace = memo(function PipelineWorkspace({
                     actionLoadingMap={board.actionLoadingMap}
                     compact={board.compact}
                     sortBy={board.sortBy}
-                    selectionMode={board.selectionMode}
-                    selectedTaskIds={board.selectedTaskIds}
-                    onToggleTaskSelection={board.onToggleTaskSelection}
-                    onCtrlClick={board.onCtrlClick}
-                    onBulkToggle={board.onBulkToggle}
-                    onShiftSelect={board.onShiftSelect}
+                    selectionMode={canOperateProject && board.selectionMode}
+                    selectedTaskIds={canOperateProject ? board.selectedTaskIds : new Set()}
+                    onToggleTaskSelection={canOperateProject ? board.onToggleTaskSelection : READ_ONLY_NOOP}
+                    onCtrlClick={canOperateProject ? board.onCtrlClick : READ_ONLY_NOOP}
+                    onBulkToggle={canOperateProject ? board.onBulkToggle : READ_ONLY_NOOP}
+                    onShiftSelect={canOperateProject ? board.onShiftSelect : READ_ONLY_NOOP}
                     hasActiveFilters={board.hasActiveFilters}
-                    onArchiveColumn={board.onArchiveColumn}
-                    onApprove={board.onApprove}
-                    onRequestChanges={board.onRequestChanges}
-                    onCancel={board.onCancel}
-                    onRetry={board.onRetry}
-                    onEditPrompt={board.onEditPrompt}
-                    onDismiss={board.onDismiss}
-                    onArchive={board.onArchive}
+                    onArchiveColumn={canOperateProject ? board.onArchiveColumn : READ_ONLY_NOOP}
+                    onApprove={canOperateProject ? board.onApprove : READ_ONLY_NOOP}
+                    onRequestChanges={canOperateProject ? board.onRequestChanges : READ_ONLY_NOOP}
+                    onCancel={canOperateProject ? board.onCancel : READ_ONLY_NOOP}
+                    onRetry={canOperateProject ? board.onRetry : READ_ONLY_NOOP}
+                    onEditPrompt={canOperateProject ? board.onEditPrompt : READ_ONLY_NOOP}
+                    onDismiss={canOperateProject ? board.onDismiss : READ_ONLY_NOOP}
+                    onArchive={canOperateProject ? board.onArchive : READ_ONLY_NOOP}
                     onViewLogs={board.onViewLogs}
                     onTrack={board.onTrack}
                     trackedTaskIds={board.trackedTaskIds}
-                    onDuplicate={board.onDuplicate}
+                    onDuplicate={canOperateProject ? board.onDuplicate : READ_ONLY_NOOP}
                     searchQuery={board.searchQuery}
                     onDirectionClick={board.onDirectionClick}
                   />

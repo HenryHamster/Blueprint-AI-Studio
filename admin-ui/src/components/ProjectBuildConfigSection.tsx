@@ -21,6 +21,7 @@ interface ProjectBuildConfigSectionProps {
   onDetect: () => Promise<void>;
   detectAvailable: boolean;
   projectId?: string | null;
+  canSave?: boolean;
   /**
    * Backend-computed merge-gate verdict. When provided, it is rendered directly;
    * when omitted, the component derives it from the project list it already fetches
@@ -52,6 +53,7 @@ export function ProjectBuildConfigSection({
   onDetect,
   detectAvailable,
   projectId,
+  canSave = false,
   mergeVerificationVerdict,
   mergeGateRuntime,
 }: ProjectBuildConfigSectionProps) {
@@ -184,6 +186,7 @@ export function ProjectBuildConfigSection({
   }, [projectId, buildConfig, mergeVerificationVerdict]);
 
   const handleSave = async () => {
+    if (!canSave) return;
     setSaving(true);
     try {
       await onSave({
@@ -210,7 +213,7 @@ export function ProjectBuildConfigSection({
   };
 
   const handleSaveStagingPrefixes = async () => {
-    if (!projectId) return;
+    if (!projectId || !canSave) return;
     const trimmed = stagingPrefixes.map(p => p.trim()).filter(Boolean);
     setStagingPrefixesSaving(true);
     setStagingPrefixesError('');
@@ -231,7 +234,7 @@ export function ProjectBuildConfigSection({
   };
 
   const handleRevertStagingPrefixes = async () => {
-    if (!projectId) return;
+    if (!projectId || !canSave) return;
     setStagingPrefixesSaving(true);
     setStagingPrefixesError('');
     try {
@@ -251,6 +254,7 @@ export function ProjectBuildConfigSection({
   };
 
   const handleDetect = async () => {
+    if (!canSave) return;
     preservedBranchOnDetect.current = { namespace: taskBranchNamespace, prefix: taskBranchPrefix, prTitlePrefix };
     setDetecting(true);
     try {
@@ -274,6 +278,7 @@ export function ProjectBuildConfigSection({
 
   return (
     <div className="space-y-6">
+      <fieldset disabled={!canSave} className="contents">
       {/* Repository info */}
       <div>
         <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Repository</h3>
@@ -841,6 +846,10 @@ export function ProjectBuildConfigSection({
             {saving ? 'Saving...' : 'Save Build Config'}
           </button>
         </div>
+      )}
+      </fieldset>
+      {!canSave && (
+        <p className="text-right text-xs text-neutral-500">Project owner access is required to change build configuration.</p>
       )}
     </div>
   );

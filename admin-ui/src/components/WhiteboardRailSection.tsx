@@ -10,6 +10,7 @@ const WhiteboardTool = lazy(() => import('./WhiteboardTool'));
 
 interface Props {
   projectId?: string | null;
+  readOnly?: boolean;
 }
 
 type State =
@@ -27,7 +28,7 @@ type State =
  * tool exists yet, it points the operator there rather than exposing create
  * buttons in the strategic session.
  */
-export function WhiteboardRailSection({ projectId }: Props) {
+export function WhiteboardRailSection({ projectId, readOnly = true }: Props) {
   const [state, setState] = useState<State>({ status: 'idle' });
   const [open, setOpen] = useState(false);
 
@@ -109,7 +110,7 @@ export function WhiteboardRailSection({ projectId }: Props) {
             </div>
             <div className="min-h-0 flex-1 overflow-auto p-4 custom-scrollbar">
               <Suspense fallback={<p className="text-sm text-neutral-500">Loading canvas…</p>}>
-                <WhiteboardTool projectId={projectId} tool={tool} />
+                <WhiteboardTool projectId={projectId} tool={tool} readOnly={readOnly} />
               </Suspense>
             </div>
           </div>

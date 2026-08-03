@@ -4581,6 +4581,8 @@ class _FakeLoadSession:
         if self._call_count == 1:
             return _FakeScalarsResult(self._accounts)
         if self._call_count == 2:
+            return _FakeScalarsResult(row[0] for row in self._project_rows)
+        if self._call_count == 3:
             return _FakeScalarsResult(self._active_tasks)
         return _FakeScalarsResult(self._project_rows)
 

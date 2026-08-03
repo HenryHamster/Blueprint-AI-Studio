@@ -7,15 +7,15 @@ leak across projects: every handler resolves the project (and the tool row
 scoped to it) through ``_get_user_project_with_role`` before touching data.
 
 Endpoints (all under ``/api/admin``):
-  GET    /projects/{project_id}/tools                      list (member+)
+  GET    /projects/{project_id}/tools                      list (viewer+)
   POST   /projects/{project_id}/tools                      register (owner)
   PATCH  /projects/{project_id}/tools/{tool_id}            update metadata (owner)
   DELETE /projects/{project_id}/tools/{tool_id}            deregister (owner)
-  GET    /projects/{project_id}/tools/{tool_id}/content    fetch content (member+)
+  GET    /projects/{project_id}/tools/{tool_id}/content    fetch content (viewer+)
   PUT    /projects/{project_id}/tools/{tool_id}/content    save content (member+)
   POST   /projects/{project_id}/tools/seed                 seed defaults (owner)
-  GET    /projects/{project_id}/tools/manifest             discover project-declared tools (member+)
-  POST   /projects/{project_id}/tools/{tool_slug}/asset-token  mint capability JWT (member+)
+  GET    /projects/{project_id}/tools/manifest             discover project-declared tools (viewer+)
+  POST   /projects/{project_id}/tools/{tool_slug}/asset-token  mint read-only asset JWT (viewer+)
   GET    /projects/{project_id}/tools/{tool_slug}/assets/{path:path}  serve tool assets (JWT auth)
 
 The content-save path uses ``lock_project_or_429`` to serialise writes and an
@@ -825,16 +825,16 @@ async def _get_project_tool(
     return tool
 
 
-async def _get_tool_for_member(
+async def _get_tool_for_viewer(
     session: AsyncSession, project_id: uuid.UUID, tool_id: uuid.UUID, user_id: str
 ) -> ProjectTool:
-    """Authorize a user as project member then fetch the tool, or raise.
+    """Authorize a project viewer then fetch the scoped tool, or raise.
 
-    Combines the member-level auth check with the scoped tool lookup so a
+    Combines the viewer-level auth check with the scoped tool lookup so a
     future content-path endpoint cannot accidentally skip membership
     enforcement.
     """
-    await _get_user_project_with_role(project_id, user_id, session, "member")
+    await _get_user_project_with_role(project_id, user_id, session, "viewer")
     return await _get_project_tool(session, project_id, tool_id)
 
 
@@ -849,9 +849,9 @@ async def list_project_tools(
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
 ):
-    """List a project's registered tools (member+). Lean projection, no content."""
+    """List a project's registered tools (viewer+). Lean projection, no content."""
     await _get_user_project_with_role(
-        project_id, current_user["user_id"], session, "member"
+        project_id, current_user["user_id"], session, "viewer"
     )
     # Total count so the frontend can render pagination controls.
     count_result = await session.execute(
@@ -1016,8 +1016,8 @@ async def get_project_tool_content(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    """Fetch a tool's mutable content document plus its revision (member+)."""
-    tool = await _get_tool_for_member(
+    """Fetch a tool's content document plus its revision (viewer+)."""
+    tool = await _get_tool_for_viewer(
         session, project_id, tool_id, current_user["user_id"]
     )
     return {"content": tool.content or {}, "content_revision": tool.content_revision}
@@ -1414,7 +1414,7 @@ async def get_project_tool_artifact_ref(
     """Retrieve one immutable tool revision through project membership."""
 
     await _get_user_project_with_role(
-        project_id, current_user["user_id"], session, "member"
+        project_id, current_user["user_id"], session, "viewer"
     )
     from app.artifact_refs import artifact_ref_projection, get_project_artifact_ref
 
@@ -1504,10 +1504,10 @@ async def discover_project_tool_manifest(
 
     Graceful handling: no connected repo → empty list; no manifest file →
     empty list; malformed manifest → structured error in the response body.
-    Requires member role on the project.
+    Requires viewer role on the project.
     """
     project = await _get_user_project_with_role(
-        project_id, current_user["user_id"], session, "member"
+        project_id, current_user["user_id"], session, "viewer"
     )
     result = await _discover_manifest_tools(project)
     return result
@@ -1534,7 +1534,7 @@ async def mint_tool_asset_token(
     ``.blueprint/tools.json`` manifest.
     """
     project = await _get_user_project_with_role(
-        project_id, current_user["user_id"], session, "member"
+        project_id, current_user["user_id"], session, "viewer"
     )
     # Resolve the manifest to verify the slug exists.
     result = await _discover_manifest_tools(project)

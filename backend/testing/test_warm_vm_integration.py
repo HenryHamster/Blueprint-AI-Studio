@@ -1174,6 +1174,28 @@ async def test_warm_pool_full_lifecycle_provision_lease_claim_cost(
         # A newly-QUEUED task makes the project demand-active so the maintainer
         # bootstraps its (zero-member) pool up to target via the deficit path.
         acct, provider, model = "acct-warm-1", "anthropic", "claude-opus-4-8"
+        # This integration calls the dispatch seam directly, so there is no
+        # orchestrator-owned reservation marker. Seed the concrete account the
+        # claim must exact-reserve before it is allowed to run.
+        account = {
+            "id": acct,
+            "name": "Warm Pool E2E Account",
+            "provider": provider,
+            "auth_mode": "oauth",
+            "model": model,
+            "oauth_token": "test-token",
+            "enabled": True,
+            "runtime_ready": True,
+            "active_tasks": 0,
+            "daily_task_count": 0,
+            "project_state": {},
+            "disabled_models": {},
+        }
+        mocker.patch("app.max_plan_pool._account_by_id", new={acct: account})
+        mocker.patch(
+            "app.max_plan_pool._max_plan_pools",
+            new={project.user_id: [account]},
+        )
         task = Task(
             project_id=project.id,
             title="Queued work to be served warm by the pool",

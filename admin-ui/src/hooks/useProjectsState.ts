@@ -30,7 +30,7 @@ export function useProjectsState(
           setProjectsFetchError('Failed to load projects');
           setProjectsLoaded(true);
           if (!silent) addToast('Failed to load projects', 'error');
-          return;
+          return null;
         }
         const data = await res.json() as { items: unknown[]; has_more: boolean };
         allItems.push(...(data.items || []));
@@ -39,10 +39,12 @@ export function useProjectsState(
       }
       setProjects(allItems as never[]);
       setProjectsFetchError(null);
+      return allItems as Project[];
     } catch (err) {
       console.error('Failed to fetch projects:', err);
       setProjectsFetchError('Failed to load projects');
       if (!silent) addToast('Failed to load projects', 'error');
+      return null;
     } finally {
       setProjectsLoaded(true);
     }

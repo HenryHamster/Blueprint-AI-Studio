@@ -4,6 +4,7 @@ import { Zap, ZapOff, AlertTriangle, RefreshCw, Lock, Clock, PlayCircle, Gauge, 
 import { API_BASE_URL, authHeaders, apiFetch } from '../api';
 import { secondsUntil, parseTimestamp, snapshotFreshness } from '../utils/time';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
+import { resolveAccess, type ProjectRole } from '../accessControl';
 
 // Matches _MAX_PAYLOAD_BYTES from backend/app/payload_schemas.py
 const MAX_PAYLOAD_KB = 190;
@@ -179,6 +180,7 @@ interface AutonomousStatusProps {
   onRefreshTasks?: () => void;
   wsRef?: RefObject<WebSocket | null>;
   pauseReason?: string | null;
+  projectRoles?: Readonly<Record<string, ProjectRole>>;
 }
 
 // Four-phase lifecycle: Idle (between ticks), Checking (evaluating), Running
@@ -675,7 +677,7 @@ function ArchitectureSection({ strategic }: { strategic: StrategicDebug }) {
   );
 }
 
-export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason }: AutonomousStatusProps) {
+export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason, projectRoles = {} }: AutonomousStatusProps) {
   const [projects, setProjects] = useState<ProjectAutonomousStatus[]>([]);
   const [debugData, setDebugData] = useState<Record<string, AutonomyDebug>>({});
   const [strategicData, setStrategicData] = useState<Record<string, StrategicDebug>>({});
@@ -942,26 +944,37 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason }: Autonom
           )}
 
           <div className={stale ? STALE_CLASSES : undefined}>
-          {projects.map(p => {
-            const debug = debugData[p.project_id];
-            const strategic = strategicData[p.project_id];
-            return (
+            {projects.map(p => {
+              const debug = debugData[p.project_id];
+              const strategic = strategicData[p.project_id];
+              const access = resolveAccess(undefined, projectRoles[p.project_id]);
+              return (
               <div key={p.project_id} className="mb-3 last:mb-0 bg-neutral-950 border border-neutral-800 rounded-lg p-3">
                 {/* Header */}
                 <div className="flex items-center justify-between mb-2">
                   <span className="text-xs font-medium text-neutral-200 truncate max-w-[200px]">{p.project_name}</span>
-                  {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
-                  <button
-                    onClick={() => toggleAutonomy(p.project_id, !p.autonomous_enabled)}
-                    disabled={toggling === p.project_id}
-                    className={`text-ui-sm font-semibold uppercase tracking-wider px-2 py-0.5 rounded transition-colors ${
+                  {access.canManageProject ? (
+                    /* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */
+                    <button
+                      onClick={() => toggleAutonomy(p.project_id, !p.autonomous_enabled)}
+                      disabled={toggling === p.project_id}
+                      className={`text-ui-sm font-semibold uppercase tracking-wider px-2 py-0.5 rounded transition-colors ${
+                        p.autonomous_enabled
+                          ? 'bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20'
+                          : 'bg-neutral-800 text-neutral-500 hover:bg-neutral-700'
+                      } ${toggling === p.project_id ? 'opacity-50' : ''}`}
+                    >
+                      {p.autonomous_enabled ? 'Enabled' : 'Disabled'}
+                    </button>
+                  ) : (
+                    <span className={`text-ui-sm font-semibold uppercase tracking-wider px-2 py-0.5 rounded ${
                       p.autonomous_enabled
-                        ? 'bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20'
-                        : 'bg-neutral-800 text-neutral-500 hover:bg-neutral-700'
-                    } ${toggling === p.project_id ? 'opacity-50' : ''}`}
-                  >
-                    {p.autonomous_enabled ? 'Enabled' : 'Disabled'}
-                  </button>
+                        ? 'bg-emerald-500/10 text-emerald-400'
+                        : 'bg-neutral-800 text-neutral-500'
+                    }`}>
+                      {p.autonomous_enabled ? 'Enabled' : 'Disabled'}
+                    </span>
+                  )}
                 </div>
                 {errors[p.project_id] && (
                   <div className="mb-2 rounded-md bg-red-500/10 border border-red-500/30 px-2 py-1 flex items-center gap-1.5">
@@ -975,7 +988,7 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason }: Autonom
                   {debug ? (
                     <>
                       <CircuitBreakerDetail cb={debug.circuit_breaker} />
-                      {(debug.circuit_breaker.state === 'OPEN' || debug.circuit_breaker.state === 'HALF_OPEN') && (
+                      {access.canOperateProject && (debug.circuit_breaker.state === 'OPEN' || debug.circuit_breaker.state === 'HALF_OPEN') && (
                         <div className="flex justify-end">
                           {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                           <button

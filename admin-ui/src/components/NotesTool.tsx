@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { ToolComponentProps } from '../toolRegistry';
 import {
   createResidentToolArtifactRef,
@@ -39,14 +39,14 @@ const serialize = (text: string) => JSON.stringify({ text });
 // Component
 // ---------------------------------------------------------------------------
 
-export default function NotesTool({ projectId, tool }: ToolComponentProps) {
+export default function NotesTool({ projectId, tool, readOnly }: ToolComponentProps) {
   // A keyed inner component gives every project/tool identity an independent
   // ref set and save queue. Slow completions from the unmounted predecessor can
   // finish its own queued saves but cannot update or read the successor.
-  return <NotesDocument key={`${projectId}:${tool.id}`} projectId={projectId} tool={tool} />;
+  return <NotesDocument key={`${projectId}:${tool.id}`} projectId={projectId} tool={tool} readOnly={readOnly} />;
 }
 
-function NotesDocument({ projectId, tool }: ToolComponentProps) {
+function NotesDocument({ projectId, tool, readOnly }: ToolComponentProps) {
   const [state, setState] = useState<State>({ status: 'loading' });
   const [mode, setMode] = useState<Mode>('edit');
   const [saving, setSaving] = useState(false);
@@ -67,6 +67,10 @@ function NotesDocument({ projectId, tool }: ToolComponentProps) {
   const pendingRef = useRef(false);
   const conflictRef = useRef(false);
   const mountedRef = useRef(true);
+  const readOnlyRef = useRef(readOnly);
+  useLayoutEffect(() => {
+    readOnlyRef.current = readOnly;
+  }, [readOnly]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -110,13 +114,14 @@ function NotesDocument({ projectId, tool }: ToolComponentProps) {
     return () => {
       cancelled = true;
     };
-  }, [projectId, tool.id]);
+  }, [projectId, tool.id, readOnly]);
 
   // -----------------------------------------------------------------------
   // Editing
   // -----------------------------------------------------------------------
 
   const handleChange = useCallback((value: string) => {
+    if (readOnlyRef.current) return;
     textRef.current = value;
     setDirty(serialize(value) !== lastSavedRef.current);
     if (savingRef.current) pendingRef.current = true;
@@ -137,6 +142,7 @@ function NotesDocument({ projectId, tool }: ToolComponentProps) {
   // -----------------------------------------------------------------------
 
   const flush = useCallback(async () => {
+    if (readOnlyRef.current) return false;
     if (conflictRef.current) return false;
     if (savingRef.current) {
       pendingRef.current = true;
@@ -210,6 +216,7 @@ function NotesDocument({ projectId, tool }: ToolComponentProps) {
   const handoffToConversation = useCallback(async (
     intent: ToolResidentHandoffIntent,
   ) => {
+    if (readOnlyRef.current) throw new Error('Viewer access is read-only.');
     if (conflictRef.current) throw new Error('Resolve the Notes conflict before sharing.');
     let saved = await flush();
     if (saved && serialize(textRef.current) !== lastSavedRef.current) saved = await flush();
@@ -267,6 +274,7 @@ function NotesDocument({ projectId, tool }: ToolComponentProps) {
   // actually differs from the last-saved snapshot (not on a bare revision
   // refresh), and never while a conflict awaits operator resolution.
   useEffect(() => {
+    if (readOnly) return;
     if (state.status !== 'ok') return;
     if (conflict) return;
     if (!dirty) return;
@@ -274,13 +282,13 @@ function NotesDocument({ projectId, tool }: ToolComponentProps) {
       void flush();
     }, DEBOUNCE_MS);
     return () => clearTimeout(timer);
-  }, [state.status, state.status === 'ok' ? state.text : '', dirty, flush, conflict]);
+  }, [state.status, state.status === 'ok' ? state.text : '', dirty, flush, conflict, readOnly]);
 
   // Switching tabs or projects must not discard a change still inside its
   // debounce window. The same single-flight flush also queues edits made
   // while a slow request is in progress.
   useEffect(() => () => {
-    if (serialize(textRef.current) !== lastSavedRef.current) void flush();
+    if (!readOnlyRef.current && serialize(textRef.current) !== lastSavedRef.current) void flush();
   }, [flush]);
 
   // -----------------------------------------------------------------------
@@ -305,6 +313,14 @@ function NotesDocument({ projectId, tool }: ToolComponentProps) {
   }
 
   const text = state.status === 'ok' ? state.text : '';
+
+  if (readOnly) {
+    return (
+      <div className="min-h-[16rem] w-full overflow-x-auto rounded border border-neutral-700 bg-[#1a1a2e] p-3" data-testid="notes-read-only">
+        {text ? <MarkdownContent content={text} /> : <p className="text-sm italic text-neutral-500">Nothing here yet.</p>}
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col gap-2">

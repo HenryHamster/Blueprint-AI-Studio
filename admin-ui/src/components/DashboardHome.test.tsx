@@ -1,9 +1,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { DashboardHome } from './DashboardHome';
+import type { ComponentProps } from 'react';
+import { DashboardHome as DashboardHomeComponent } from './DashboardHome';
 import type { Task } from '../types/task';
 import type { ProjectDiagnostics } from '../types/diagnostics';
+
+function DashboardHome(props: ComponentProps<typeof DashboardHomeComponent>) {
+  return <DashboardHomeComponent {...props} userRole={props.userRole ?? 'admin'} />;
+}
 
 const { apiFetchMock, fetchQualificationVerdictsMock, fetchTaskMock, fetchFleetUtilizationMock, fetchAgentServingShasMock, setVersionPhaseMock, capturedProps } = vi.hoisted(() => ({
   apiFetchMock: vi.fn(),

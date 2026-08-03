@@ -11,6 +11,7 @@ interface ProjectAutoRemediationSectionProps {
   onSave: (config: AutoRemediationConfig) => Promise<void>;
   integrationBranch?: string | null;
   promotionTarget?: string | null;
+  canSave?: boolean;
 }
 
 const DEFAULT_CONFIG_BASE: Omit<AutoRemediationConfig, 'branch_whitelist'> = {
@@ -42,6 +43,7 @@ export function ProjectAutoRemediationSection({
   onSave,
   integrationBranch,
   promotionTarget,
+  canSave = false,
 }: ProjectAutoRemediationSectionProps) {
   const defaultWhitelist = defaultBranchWhitelist(integrationBranch, promotionTarget);
   const effective = config ?? { ...DEFAULT_CONFIG_BASE, branch_whitelist: defaultWhitelist };
@@ -64,6 +66,7 @@ export function ProjectAutoRemediationSection({
   }, [config, integrationBranch, promotionTarget]);
 
   const handleSave = async () => {
+    if (!canSave) return;
     setSaving(true);
     try {
       await onSave({
@@ -92,6 +95,7 @@ export function ProjectAutoRemediationSection({
 
   return (
     <div className="space-y-6">
+      <fieldset disabled={!canSave} className="contents">
       {/* Repository info */}
       <div>
         <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Repository</h3>
@@ -262,6 +266,10 @@ export function ProjectAutoRemediationSection({
           {saving ? 'Saving...' : 'Save Auto-Remediation Config'}
         </button>
       </div>
+      </fieldset>
+      {!canSave && (
+        <p className="text-right text-xs text-neutral-500">Project owner access is required to change auto-remediation settings.</p>
+      )}
     </div>
   );
 }
