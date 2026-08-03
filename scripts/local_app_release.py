@@ -20,7 +20,9 @@ import subprocess
 import tarfile
 import tempfile
 import time
+import urllib.error
 import urllib.request
+from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
@@ -61,6 +63,14 @@ _PROTECTED_UNIT_FILES = (
 )
 _PROTECTED_UNIT_DIRS = (Path("/etc/systemd/system/blueprint-edge.service.d"),)
 _PUBLIC_ORIGIN_RE = re.compile(r"^https://[^/]+$")
+_REGISTRY_HOST = "us-central1-docker.pkg.dev"
+_WORKER_REGISTRY_READER = (
+    "blueprint-local-worker-runtime@blueprint-orchestrator.iam.gserviceaccount.com"
+)
+
+
+class _TransientNotReady(RuntimeError):
+    """A bounded readiness poll may retry this state."""
 
 
 def _is_root() -> bool:
@@ -68,15 +78,25 @@ def _is_root() -> bool:
 
 
 def _run(
-    argv: list[str], *, timeout: int = 180, check: bool = True
+    argv: list[str],
+    *,
+    timeout: int = 180,
+    check: bool = True,
+    input_text: str | None = None,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(
-        argv,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=timeout,
-    )
+    try:
+        result = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+            input=input_text,
+            env=env,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"command timed out ({argv[0]})") from exc
     if check and result.returncode != 0:
         diagnostic = (result.stderr or result.stdout).strip()
         raise RuntimeError(f"command failed ({argv[0]}): {diagnostic}")
@@ -274,6 +294,130 @@ def _role_value(payload: bytes, key: str) -> str:
     return values[0]
 
 
+def _secure_registry_credential(path_text: str, expected_uid: int) -> str:
+    path = Path(path_text)
+    if not path.is_absolute():
+        raise ValueError("worker Google credentials path must be absolute")
+    fd = os.open(
+        path,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+    )
+    try:
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != expected_uid
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) & 0o077
+        ):
+            raise ValueError("unsafe worker Google credentials file")
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            fd = -1
+            text = handle.read()
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError("worker Google credentials are not valid JSON") from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("type") != "service_account"
+        or payload.get("project_id") != "blueprint-orchestrator"
+        or payload.get("client_email") != _WORKER_REGISTRY_READER
+        or not isinstance(payload.get("private_key"), str)
+    ):
+        raise ValueError("worker Google credentials have the wrong identity")
+    return text
+
+
+def _remove_registry_auth_directory(directory: Path, expected_uid: int) -> None:
+    info = directory.lstat()
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or info.st_uid != expected_uid
+        or stat.S_IMODE(info.st_mode) != 0o700
+    ):
+        raise RuntimeError("unsafe registry credential directory")
+    entries = list(directory.iterdir())
+    if any(entry.name != "config.json" for entry in entries):
+        raise RuntimeError("registry credential directory contains unexpected files")
+    for entry in entries:
+        entry_info = entry.lstat()
+        if (
+            not stat.S_ISREG(entry_info.st_mode)
+            or stat.S_ISLNK(entry_info.st_mode)
+            or entry_info.st_uid != expected_uid
+            or entry_info.st_nlink != 1
+            or stat.S_IMODE(entry_info.st_mode) & 0o077
+        ):
+            raise RuntimeError("unsafe registry credential config")
+        entry.unlink()
+    directory.rmdir()
+
+
+def _cleanup_stale_registry_auth(expected_uid: int) -> None:
+    for directory in sorted(Path("/run").glob("blueprint-registry-auth-*")):
+        if re.fullmatch(r"blueprint-registry-auth-[A-Za-z0-9_-]{6,16}", directory.name) is None:
+            raise RuntimeError("unexpected registry credential directory name")
+        _remove_registry_auth_directory(directory, expected_uid)
+
+
+@contextlib.contextmanager
+def _registry_auth(credential_text: str) -> Iterator[Path]:
+    expected_uid = os.geteuid()
+    _cleanup_stale_registry_auth(expected_uid)
+    directory = Path(tempfile.mkdtemp(prefix="blueprint-registry-auth-", dir="/run"))
+    os.chmod(directory, 0o700)
+    cleanup_errors: list[str] = []
+    try:
+        try:
+            _run(
+                [
+                    "/usr/bin/docker",
+                    "--config",
+                    str(directory),
+                    "login",
+                    "--username",
+                    "_json_key",
+                    "--password-stdin",
+                    f"https://{_REGISTRY_HOST}",
+                ],
+                input_text=credential_text,
+            )
+        except (OSError, RuntimeError) as exc:
+            raise RuntimeError("registry login failed") from exc
+        credential_text = ""
+        yield directory
+    finally:
+        try:
+            logout = _run(
+                [
+                    "/usr/bin/docker",
+                    "--config",
+                    str(directory),
+                    "logout",
+                    _REGISTRY_HOST,
+                ],
+                check=False,
+            )
+            if logout.returncode != 0:
+                cleanup_errors.append("docker logout failed")
+        except (OSError, RuntimeError):
+            cleanup_errors.append("docker logout failed")
+        finally:
+            try:
+                _remove_registry_auth_directory(directory, expected_uid)
+            except (OSError, RuntimeError) as exc:
+                cleanup_errors.append(f"credential removal failed: {exc}")
+        if cleanup_errors:
+            raise RuntimeError(
+                "registry credential cleanup failed: " + "; ".join(cleanup_errors)
+            )
+
+
 def _atomic_write(path: Path, payload: bytes) -> None:
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
@@ -461,18 +605,184 @@ def _verify_frontend(image_ref: str, revision: str) -> str:
         return str(manifest["tree_sha256"])
 
 
-def _wait_active(unit: str, *, timeout: int = 90) -> None:
+def _wait_verified(
+    operation: Callable[[], None],
+    description: str,
+    *,
+    timeout: float = 120,
+    interval: float = 2,
+) -> None:
+    deadline = time.monotonic() + timeout
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            operation()
+            return
+        except urllib.error.HTTPError as exc:
+            if exc.code not in {502, 503, 504}:
+                raise
+            last_error = exc
+        except (urllib.error.URLError, _TransientNotReady) as exc:
+            last_error = exc
+        time.sleep(interval)
+    raise RuntimeError(f"{description} did not become ready: {last_error}")
+
+
+def _container_record(name: str) -> dict[str, object] | None:
+    result = _run(
+        ["/usr/bin/docker", "container", "inspect", name], check=False
+    )
+    if result.returncode != 0:
+        diagnostic = (result.stderr or result.stdout).strip()
+        if "No such container" in diagnostic:
+            return None
+        raise RuntimeError(f"cannot inspect {name}: {diagnostic}")
+    try:
+        records = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"invalid container inspection for {name}") from exc
+    if not isinstance(records, list) or len(records) != 1 or not isinstance(records[0], dict):
+        raise RuntimeError(f"ambiguous container inspection for {name}")
+    return records[0]
+
+
+def _validate_managed_container(
+    name: str, record: dict[str, object], allowed_images: frozenset[str]
+) -> str:
+    container_id = record.get("Id")
+    image_id = record.get("Image")
+    config = record.get("Config")
+    host_config = record.get("HostConfig")
+    mounts = record.get("Mounts")
+    expected_role = "api" if name == "blueprint-local-api" else "worker"
+    if (
+        not isinstance(container_id, str)
+        or re.fullmatch(r"[0-9a-f]{64}", container_id) is None
+        or record.get("Name") != f"/{name}"
+        or image_id not in allowed_images
+        or not isinstance(config, dict)
+        or config.get("Image") != image_id
+        or not isinstance(host_config, dict)
+        or host_config.get("AutoRemove") is not True
+        or host_config.get("ReadonlyRootfs") is not True
+        or host_config.get("NetworkMode") != "blueprint-control-plane"
+        or not isinstance(config.get("Env"), list)
+        or f"BLUEPRINT_PROCESS_ROLE={expected_role}" not in config["Env"]
+        or not isinstance(mounts, list)
+        or not any(
+            isinstance(mount, dict)
+            and mount.get("Type") == "bind"
+            and mount.get("Destination") == "/var/run/blueprint/gcp.json"
+            and mount.get("RW") is False
+            for mount in mounts
+        )
+    ):
+        raise RuntimeError(f"refusing to stop unrecognized container {name}")
+    labels = config.get("Labels")
+    if name == "blueprint-local-api" and (
+        not isinstance(labels, dict) or labels.get("com.blueprint.role") != "api"
+    ):
+        raise RuntimeError("refusing to stop API container without role label")
+    return container_id
+
+
+def _unit_stop_state(unit: str) -> tuple[str, str]:
+    properties = _parse_systemctl_properties(
+        _run(
+            [
+                "/usr/bin/systemctl",
+                "show",
+                unit,
+                "--property=ActiveState",
+                "--property=MainPID",
+            ]
+        ).stdout,
+        {"ActiveState", "MainPID"},
+    )
+    return properties["ActiveState"], properties["MainPID"]
+
+
+def _wait_unit_stopped(
+    unit: str,
+    container: str,
+    captured_id: str | None,
+    *,
+    timeout: float = 90,
+) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        named = _container_record(container)
+        if named is not None and named.get("Id") != captured_id:
+            raise RuntimeError(f"container name {container} was reused during stop")
+        captured = _container_record(captured_id) if captured_id is not None else None
+        active_state, main_pid = _unit_stop_state(unit)
         if (
-            _run(
-                ["/usr/bin/systemctl", "is-active", "--quiet", unit], check=False
-            ).returncode
-            == 0
+            active_state in {"inactive", "failed"}
+            and main_pid == "0"
+            and named is None
+            and captured is None
         ):
             return
         time.sleep(1)
-    raise RuntimeError(f"{unit} did not become active")
+    raise RuntimeError(f"{unit} and {container} did not stop cleanly")
+
+
+def _stop_unit_container(
+    unit: str, container: str, allowed_images: frozenset[str]
+) -> None:
+    existing = _container_record(container)
+    container_id = None
+    if existing is not None:
+        container_id = _validate_managed_container(
+            container, existing, allowed_images
+        )
+    _run(["/usr/bin/systemctl", "stop", "--no-block", unit])
+    if container_id is not None:
+        stop = _run(
+            [
+                "/usr/bin/docker",
+                "container",
+                "stop",
+                "--timeout",
+                "60",
+                container_id,
+            ],
+            timeout=75,
+            check=False,
+        )
+        remaining = _container_record(container_id)
+        if remaining is not None:
+            _validate_managed_container(container, remaining, allowed_images)
+            _run(
+                ["/usr/bin/docker", "container", "rm", "--force", container_id],
+                timeout=30,
+            )
+        elif stop.returncode != 0 and "No such container" not in (
+            stop.stderr or stop.stdout
+        ):
+            raise RuntimeError(f"failed to stop managed container {container_id}")
+    _wait_unit_stopped(unit, container, container_id)
+
+
+def _wait_service_container(unit: str, container: str, image_id: str) -> None:
+    def verify() -> None:
+        _runtime_state(unit)
+        _verify_container(container, image_id)
+
+    _wait_verified(verify, f"{unit} container", timeout=120, interval=1)
+
+
+def _restart_service(
+    unit: str,
+    image_id: str,
+    *,
+    allowed_images: frozenset[str],
+) -> None:
+    container = _CONTAINERS[unit]
+    _stop_unit_container(unit, container, allowed_images)
+    _run(["/usr/bin/systemctl", "reset-failed", unit], check=False)
+    _run(["/usr/bin/systemctl", "start", unit], timeout=120)
+    _wait_service_container(unit, container, image_id)
 
 
 def _runtime_state(unit: str) -> tuple[str, str, str]:
@@ -490,7 +800,7 @@ def _runtime_state(unit: str) -> tuple[str, str, str]:
         {"ActiveState", "MainPID", "NRestarts"},
     )
     if properties["ActiveState"] != "active" or properties["MainPID"] == "0":
-        raise RuntimeError(f"{unit} is not stably active")
+        raise _TransientNotReady(f"{unit} is not stably active")
     return (
         properties["ActiveState"],
         properties["MainPID"],
@@ -507,9 +817,16 @@ def _verify_services_stable(*, observation_seconds: float = 40) -> None:
 
 
 def _verify_container(name: str, image_id: str) -> None:
-    records = json.loads(_run(["/usr/bin/docker", "container", "inspect", name]).stdout)
-    if records[0].get("Image") != image_id:
-        raise RuntimeError(f"{name} is not running the candidate image")
+    record = _container_record(name)
+    if record is None:
+        raise _TransientNotReady(f"{name} does not exist yet")
+    if record.get("Image") != image_id:
+        raise RuntimeError(f"{name} is running the wrong image")
+    state = record.get("State")
+    if not isinstance(state, dict):
+        raise RuntimeError(f"{name} has malformed state metadata")
+    if state.get("Running") is not True:
+        raise _TransientNotReady(f"{name} is not running yet")
 
 
 def _local_version_payload() -> bytes:
@@ -544,11 +861,10 @@ def _verify_worker_ready() -> None:
         ["/usr/bin/docker", "logs", "--tail", "500", "blueprint-local-worker"]
     )
     logs = log_result.stdout + log_result.stderr
-    if (
-        "Application startup complete." not in logs
-        or "Traceback (most recent call last)" in logs
-    ):
-        raise RuntimeError("worker startup log is not healthy")
+    if "Traceback (most recent call last)" in logs:
+        raise RuntimeError("worker startup log contains a traceback")
+    if "Application startup complete." not in logs:
+        raise _TransientNotReady("worker startup is not complete")
     query = (
         "SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid "
         "WHERE l.locktype='advisory' AND l.mode='ExclusiveLock' AND l.granted "
@@ -576,8 +892,12 @@ def _verify_worker_ready() -> None:
         leader_locks = int(result.stdout.strip())
     except ValueError as exc:
         raise RuntimeError("worker leadership query returned invalid output") from exc
+    if leader_locks == 0:
+        raise _TransientNotReady(
+            "worker does not yet hold the background leadership lock"
+        )
     if leader_locks != 1:
-        raise RuntimeError("worker does not hold the exact background leadership lock")
+        raise RuntimeError("multiple worker background leadership locks detected")
 
 
 def _public_snapshot(public_url: str) -> tuple[bytes, str]:
@@ -590,7 +910,7 @@ def _public_snapshot(public_url: str) -> tuple[bytes, str]:
     return version, hashlib.sha256(root).hexdigest()
 
 
-def _verify_health(public_url: str, revision: str, image_id: str) -> None:
+def _verify_health_once(public_url: str, revision: str, image_id: str) -> None:
     status, _headers, payload = _fetch("http://127.0.0.1:8080/api/version")
     version = json.loads(payload)
     if status != 200 or version.get("sha") != revision:
@@ -624,11 +944,19 @@ def _verify_health(public_url: str, revision: str, image_id: str) -> None:
     if status != 200 or "immutable" not in asset_headers.get("cache-control", ""):
         raise RuntimeError("public frontend immutable asset health check failed")
     for unit, container in _CONTAINERS.items():
-        _wait_active(unit)
+        _runtime_state(unit)
         _verify_container(container, image_id)
     _verify_worker_ready()
+
+
+def _verify_health(public_url: str, revision: str, image_id: str) -> None:
+    _wait_verified(
+        lambda: _verify_health_once(public_url, revision, image_id),
+        "candidate API, UI, and worker health",
+        timeout=180,
+    )
     _verify_services_stable()
-    _verify_worker_ready()
+    _wait_verified(_verify_worker_ready, "worker leadership", timeout=60)
 
 
 def _hash_protected_tree(node_root: Path) -> dict[str, str]:
@@ -747,7 +1075,8 @@ def release(image_ref: str, revision: str) -> Path:
         api_path: _secure_role_file(api_path),
         worker_path: _secure_role_file(worker_path),
     }
-    public_url = _public_origin(snapshots[api_path], _uid_for_user(install_user))
+    install_uid = _uid_for_user(install_user)
+    public_url = _public_origin(snapshots[api_path], install_uid)
     prior_api = _role_value(snapshots[api_path], "BLUEPRINT_API_IMAGE_ID")
     prior_worker = _role_value(snapshots[worker_path], "BLUEPRINT_WORKER_IMAGE_ID")
     if prior_api != prior_worker or not _IMAGE_ID_RE.fullmatch(prior_api):
@@ -765,10 +1094,28 @@ def release(image_ref: str, revision: str) -> Path:
     prior_public_snapshot = _public_snapshot(public_url)
     _prepare_evidence_root(_EVIDENCE_ROOT)
 
-    _run(["/usr/bin/docker", "pull", image_ref], timeout=600)
+    registry_credential = _secure_registry_credential(
+        _role_value(
+            snapshots[worker_path], "BLUEPRINT_WORKER_GOOGLE_CREDENTIALS_FILE"
+        ),
+        install_uid,
+    )
+    with _registry_auth(registry_credential) as registry_config:
+        _run(
+            [
+                "/usr/bin/docker",
+                "--config",
+                str(registry_config),
+                "pull",
+                image_ref,
+            ],
+            timeout=600,
+        )
+    registry_credential = ""
     bundle_sha256 = _verify_frontend(image_ref, revision)
     image_id = _inspect_candidate(image_ref, revision, bundle_sha256)
     retained_tag = _retain_prior_image(prior_api)
+    allowed_images = frozenset({prior_api, image_id})
 
     def receipt(outcome: str, error: str, markers_match: bool) -> dict[str, object]:
         return {
@@ -787,6 +1134,7 @@ def release(image_ref: str, revision: str) -> Path:
             "untouched_unit_markers_match": markers_match,
         }
 
+    touched_units: list[str] = []
     try:
         _atomic_write(
             api_path,
@@ -805,8 +1153,14 @@ def release(image_ref: str, revision: str) -> Path:
             ),
         )
         for unit in _ACTIVATION_ORDER:
-            _run(["/usr/bin/systemctl", "restart", unit], timeout=120)
-            _wait_active(unit)
+            touched_units.append(unit)
+            _restart_service(unit, image_id, allowed_images=allowed_images)
+            if unit == "blueprint-worker.service":
+                _wait_verified(
+                    _verify_worker_ready,
+                    "candidate worker leadership",
+                    timeout=120,
+                )
         _verify_health(public_url, revision, image_id)
         if _hash_protected_tree(node_root) != protected_before:
             raise RuntimeError("release changed protected database/backup/edge files")
@@ -826,10 +1180,15 @@ def release(image_ref: str, revision: str) -> Path:
                 _atomic_write(path, payload)
             except Exception as rollback_exc:
                 rollback_errors.append(f"restore {path}: {rollback_exc}")
-        for unit in _ACTIVATION_ORDER:
+        for unit in (unit for unit in _ACTIVATION_ORDER if unit in touched_units):
             try:
-                _run(["/usr/bin/systemctl", "restart", unit], timeout=120)
-                _wait_active(unit)
+                _restart_service(unit, prior_api, allowed_images=allowed_images)
+                if unit == "blueprint-worker.service":
+                    _wait_verified(
+                        _verify_worker_ready,
+                        "rollback worker leadership",
+                        timeout=120,
+                    )
             except Exception as rollback_exc:  # pragma: no cover - emergency path
                 rollback_errors.append(f"{unit}: {rollback_exc}")
         for container in _CONTAINERS.values():
@@ -837,18 +1196,45 @@ def release(image_ref: str, revision: str) -> Path:
                 _verify_container(container, prior_api)
             except Exception as rollback_exc:
                 rollback_errors.append(f"{container}: {rollback_exc}")
-        try:
-            _verify_services_stable()
-            _verify_worker_ready()
-        except Exception as rollback_exc:
-            rollback_errors.append(f"service stability: {rollback_exc}")
-        try:
+
+        def verify_local_rollback() -> None:
             if _local_version_payload() != prior_version_payload:
-                rollback_errors.append(
-                    "local API version did not return to prior value"
+                raise _TransientNotReady(
+                    "local API version has not returned to its prior value"
                 )
+
+        try:
+            _wait_verified(
+                verify_local_rollback,
+                "rollback local API",
+                timeout=180,
+            )
         except Exception as rollback_exc:
             rollback_errors.append(f"local API version: {rollback_exc}")
+
+        def verify_public_rollback() -> None:
+            if _public_snapshot(public_url) != prior_public_snapshot:
+                raise _TransientNotReady(
+                    "public API/UI has not returned to its prior snapshot"
+                )
+
+        try:
+            _wait_verified(
+                verify_public_rollback,
+                "rollback public API/UI",
+                timeout=180,
+            )
+        except Exception as rollback_exc:
+            rollback_errors.append(f"public rollback health: {rollback_exc}")
+        try:
+            _verify_services_stable()
+            _wait_verified(
+                _verify_worker_ready,
+                "rollback worker stability",
+                timeout=60,
+            )
+        except Exception as rollback_exc:
+            rollback_errors.append(f"service stability: {rollback_exc}")
         try:
             if _hash_protected_tree(node_root) != protected_before:
                 rollback_errors.append("protected database/backup/edge files drifted")
@@ -862,11 +1248,6 @@ def release(image_ref: str, revision: str) -> Path:
         except Exception as rollback_exc:
             markers_match = False
             rollback_errors.append(f"untouched unit verification: {rollback_exc}")
-        try:
-            if _public_snapshot(public_url) != prior_public_snapshot:
-                rollback_errors.append("public API/UI did not return to prior state")
-        except Exception as rollback_exc:
-            rollback_errors.append(f"public rollback health: {rollback_exc}")
         outcome = "rollback_incomplete" if rollback_errors else "rolled_back"
         rollback_message = (
             f"release failed ({error}); ROLLBACK_INCOMPLETE: {rollback_errors}"
