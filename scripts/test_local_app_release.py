@@ -38,6 +38,7 @@ class LocalAppReleaseTests(unittest.TestCase):
             "Id": container_id,
             "Name": f"/{name}",
             "Image": image,
+            "State": {"Running": True},
             "Config": {
                 "Image": image,
                 "Labels": (
@@ -152,7 +153,7 @@ class LocalAppReleaseTests(unittest.TestCase):
         self.assertIn("objsubid=1", leadership_sql)
         self.assertIn("application_name='blueprint-worker'", leadership_sql)
 
-    def test_managed_container_cleanup_uses_immutable_container_id(self):
+    def test_successful_stop_waits_for_docker_auto_remove(self):
         name = "blueprint-local-worker"
         container_id = "1" * 64
         record = self._managed_container_record(name, OLD_IMAGE, container_id)
@@ -178,11 +179,171 @@ class LocalAppReleaseTests(unittest.TestCase):
             )
 
         stop = next(call for call in calls if call[2:4] == ["stop", "--timeout"])
-        remove = next(call for call in calls if call[2:4] == ["rm", "--force"])
         self.assertEqual(stop[-1], container_id)
-        self.assertEqual(remove[-1], container_id)
         self.assertNotEqual(stop[-1], name)
+        self.assertEqual(
+            [call for call in calls if call[2:4] == ["rm", "--force"]], []
+        )
+
+    def test_failed_stop_force_removes_only_captured_managed_container(self):
+        name = "blueprint-local-worker"
+        container_id = "5" * 64
+        record = self._managed_container_record(name, OLD_IMAGE, container_id)
+        calls: list[list[str]] = []
+
+        def run(argv, **_kwargs):
+            calls.append(argv)
+            if argv[1:4] == ["container", "stop", "--timeout"]:
+                return subprocess.CompletedProcess(argv, 1, "", "stop failed")
+            return completed(argv)
+
+        with (
+            patch.object(release, "_container_record", side_effect=[record, record]),
+            patch.object(release, "_run", side_effect=run),
+            patch.object(release, "_wait_unit_stopped"),
+        ):
+            release._stop_unit_container(
+                "blueprint-worker.service",
+                name,
+                frozenset({OLD_IMAGE, NEW_IMAGE}),
+            )
+
+        remove = next(call for call in calls if call[2:4] == ["rm", "--force"])
+        self.assertEqual(remove[-1], container_id)
         self.assertNotEqual(remove[-1], name)
+
+    def test_removal_already_in_progress_waits_without_duplicate_remove(self):
+        name = "blueprint-local-worker"
+        container_id = "6" * 64
+        record = self._managed_container_record(name, OLD_IMAGE, container_id)
+        calls: list[list[str]] = []
+
+        def run(argv, **_kwargs):
+            calls.append(argv)
+            if argv[1:4] == ["container", "stop", "--timeout"]:
+                return subprocess.CompletedProcess(
+                    argv,
+                    1,
+                    "",
+                    f"removal of container {container_id} is already in progress",
+                )
+            return completed(argv)
+
+        with (
+            patch.object(release, "_container_record", side_effect=[record, record]),
+            patch.object(release, "_run", side_effect=run),
+            patch.object(release, "_wait_unit_stopped") as wait_mock,
+        ):
+            release._stop_unit_container(
+                "blueprint-worker.service",
+                name,
+                frozenset({OLD_IMAGE, NEW_IMAGE}),
+            )
+
+        self.assertEqual(
+            [call for call in calls if call[2:4] == ["rm", "--force"]], []
+        )
+        wait_mock.assert_called_once_with(
+            "blueprint-worker.service", name, container_id
+        )
+
+    def test_failed_stop_of_stopped_container_waits_without_force_remove(self):
+        name = "blueprint-local-worker"
+        container_id = "7" * 64
+        record = self._managed_container_record(name, OLD_IMAGE, container_id)
+        record["State"] = {"Running": False}
+        calls: list[list[str]] = []
+
+        def run(argv, **_kwargs):
+            calls.append(argv)
+            if argv[1:4] == ["container", "stop", "--timeout"]:
+                return subprocess.CompletedProcess(argv, 1, "", "is not running")
+            return completed(argv)
+
+        with (
+            patch.object(release, "_container_record", side_effect=[record, record]),
+            patch.object(release, "_run", side_effect=run),
+            patch.object(release, "_wait_unit_stopped") as wait_mock,
+        ):
+            release._stop_unit_container(
+                "blueprint-worker.service",
+                name,
+                frozenset({OLD_IMAGE, NEW_IMAGE}),
+            )
+
+        self.assertEqual(
+            [call for call in calls if call[2:4] == ["rm", "--force"]], []
+        )
+        wait_mock.assert_called_once()
+
+    def test_force_remove_racing_with_auto_remove_uses_terminal_gate(self):
+        name = "blueprint-local-worker"
+        container_id = "8" * 64
+        record = self._managed_container_record(name, OLD_IMAGE, container_id)
+        calls: list[list[str]] = []
+
+        def run(argv, **_kwargs):
+            calls.append(argv)
+            if argv[1:4] == ["container", "stop", "--timeout"]:
+                return subprocess.CompletedProcess(argv, 1, "", "stop failed")
+            if argv[1:4] == ["container", "rm", "--force"]:
+                return subprocess.CompletedProcess(
+                    argv,
+                    1,
+                    "",
+                    f"removal of container {container_id} is already in progress",
+                )
+            return completed(argv)
+
+        with (
+            patch.object(release, "_container_record", side_effect=[record, record]),
+            patch.object(release, "_run", side_effect=run),
+            patch.object(release, "_wait_unit_stopped") as wait_mock,
+        ):
+            release._stop_unit_container(
+                "blueprint-worker.service",
+                name,
+                frozenset({OLD_IMAGE, NEW_IMAGE}),
+            )
+
+        wait_mock.assert_called_once_with(
+            "blueprint-worker.service", name, container_id
+        )
+
+    def test_failed_stop_after_auto_remove_uses_terminal_gate(self):
+        name = "blueprint-local-worker"
+        container_id = "9" * 64
+        record = self._managed_container_record(name, OLD_IMAGE, container_id)
+        calls: list[list[str]] = []
+
+        def run(argv, **_kwargs):
+            calls.append(argv)
+            if argv[1:4] == ["container", "stop", "--timeout"]:
+                return subprocess.CompletedProcess(
+                    argv,
+                    1,
+                    "",
+                    f"removal of container {container_id} is already in progress",
+                )
+            return completed(argv)
+
+        with (
+            patch.object(release, "_container_record", side_effect=[record, None]),
+            patch.object(release, "_run", side_effect=run),
+            patch.object(release, "_wait_unit_stopped") as wait_mock,
+        ):
+            release._stop_unit_container(
+                "blueprint-worker.service",
+                name,
+                frozenset({OLD_IMAGE, NEW_IMAGE}),
+            )
+
+        self.assertEqual(
+            [call for call in calls if call[2:4] == ["rm", "--force"]], []
+        )
+        wait_mock.assert_called_once_with(
+            "blueprint-worker.service", name, container_id
+        )
 
     def test_foreign_container_is_rejected_before_any_mutation(self):
         name = "blueprint-local-api"
