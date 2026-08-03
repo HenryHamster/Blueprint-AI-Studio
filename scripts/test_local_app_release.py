@@ -125,15 +125,48 @@ class LocalAppReleaseTests(unittest.TestCase):
         )
 
     def test_worker_readiness_executes_psql_in_real_database_container(self):
+        container_id = "a" * 64
+
         def run(argv, **_kwargs):
-            if argv[1] == "logs":
+            if argv[1:3] == ["exec", container_id]:
                 return subprocess.CompletedProcess(
-                    argv, 0, "Application startup complete.\n", ""
+                    argv,
+                    0,
+                    json.dumps(
+                        {
+                            "status": "degraded",
+                            "is_leader": True,
+                            "orchestrator_alive": True,
+                        }
+                    ),
+                    "",
                 )
             return subprocess.CompletedProcess(argv, 0, "1\n", "")
 
-        with patch.object(release, "_run", side_effect=run) as run_mock:
+        with (
+            patch.object(
+                release,
+                "_container_record",
+                return_value={"Id": container_id, "State": {"Running": True}},
+            ),
+            patch.object(release, "_run", side_effect=run) as run_mock,
+        ):
             release._verify_worker_ready()
+        self.assertEqual(
+            run_mock.call_args_list[0].args[0],
+            [
+                "/usr/bin/docker",
+                "exec",
+                container_id,
+                "/usr/local/bin/python",
+                "-c",
+                run_mock.call_args_list[0].args[0][-1],
+            ],
+        )
+        self.assertIn(
+            "http://127.0.0.1:8080/health",
+            run_mock.call_args_list[0].args[0][-1],
+        )
         database_call = run_mock.call_args_list[1].args[0]
         self.assertEqual(
             database_call[:7],
@@ -152,6 +185,37 @@ class LocalAppReleaseTests(unittest.TestCase):
         self.assertIn("objid='3944657387'::oid", leadership_sql)
         self.assertIn("objsubid=1", leadership_sql)
         self.assertIn("application_name='blueprint-worker'", leadership_sql)
+
+    def test_worker_readiness_rejects_untrusted_container_id(self):
+        with (
+            patch.object(
+                release,
+                "_container_record",
+                return_value={"Id": "--follow", "State": {"Running": True}},
+            ),
+            patch.object(release, "_run") as run_mock,
+            self.assertRaisesRegex(RuntimeError, "trusted immutable ID"),
+        ):
+            release._verify_worker_ready()
+        run_mock.assert_not_called()
+
+    def test_worker_readiness_retries_until_internal_health_is_leader_ready(self):
+        container_id = "a" * 64
+        with (
+            patch.object(
+                release,
+                "_container_record",
+                return_value={"Id": container_id, "State": {"Running": True}},
+            ),
+            patch.object(
+                release,
+                "_run",
+                return_value=subprocess.CompletedProcess([], 1, "", "starting"),
+            ) as run_mock,
+            self.assertRaisesRegex(release._TransientNotReady, "not ready"),
+        ):
+            release._verify_worker_ready()
+        self.assertEqual(run_mock.call_count, 1)
 
     def test_successful_stop_waits_for_docker_auto_remove(self):
         name = "blueprint-local-worker"
@@ -452,6 +516,14 @@ class LocalAppReleaseTests(unittest.TestCase):
         with patch.object(release.time, "sleep"):
             release._wait_verified(operation, "transient readiness", timeout=5, interval=0)
         self.assertEqual(attempts, 3)
+
+    def test_connection_reset_during_startup_is_retried_until_success(self):
+        operation = Mock(side_effect=[ConnectionResetError("peer reset"), None])
+        with patch.object(release.time, "sleep"):
+            release._wait_verified(
+                operation, "API startup", timeout=5, interval=0
+            )
+        self.assertEqual(operation.call_count, 2)
 
     def test_terminal_readiness_failure_is_not_retried(self):
         operation = Mock(side_effect=RuntimeError("wrong image"))
