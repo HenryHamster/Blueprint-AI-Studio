@@ -137,6 +137,11 @@ def render_cloud_init(plan: VmPlan, ssh_public_key: str) -> str:
         ("blueprint-runner-network@.service", "0644"),
         ("blueprint-dockerd@.service", "0644"),
         ("blueprint-github-actions@.service", "0644"),
+        ("prune-runner-volumes.sh", "0755"),
+        ("thaw-owned-runners.sh", "0755"),
+        ("blueprint-actions-volume-gc.service", "0644"),
+        ("blueprint-actions-volume-gc.timer", "0644"),
+        ("install-volume-maintenance.sh", "0755"),
     )
     write_files = []
     for name, permissions in assets:

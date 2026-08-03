@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import os
 import shutil
+import socket
 import stat
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -76,6 +78,11 @@ class RenderTests(unittest.TestCase):
             "blueprint-runner-network@.service",
             "blueprint-dockerd@.service",
             "blueprint-github-actions@.service",
+            "prune-runner-volumes.sh",
+            "thaw-owned-runners.sh",
+            "blueprint-actions-volume-gc.service",
+            "blueprint-actions-volume-gc.timer",
+            "install-volume-maintenance.sh",
         ):
             self.assertIn(name, rendered)
 
@@ -88,6 +95,154 @@ class RenderTests(unittest.TestCase):
 
 
 class AssetSecurityTests(unittest.TestCase):
+    def _volume_gc_harness(self, temporary: str, *, freezer_state: str) -> tuple[dict[str, str], Path, Path]:
+        root = Path(temporary)
+        state_root = root / "state"
+        socket_root = root / "sockets"
+        ownership_root = root / "ownership"
+        cgroup_root = root / "cgroup"
+        mock_bin = root / "bin"
+        log_path = root / "systemctl.log"
+        for path in (state_root, socket_root / "1", cgroup_root, mock_bin):
+            path.mkdir(parents=True, exist_ok=True)
+
+        cgroup = (
+            cgroup_root
+            / "system.slice"
+            / "system-blueprint\\x2dgithub\\x2dactions.slice"
+            / "blueprint-github-actions@1.service"
+        )
+        cgroup.mkdir(parents=True)
+        (cgroup / "cgroup.procs").write_text(f"{os.getpid()}\n", encoding="utf-8")
+
+        commands = {
+            "df": """
+                #!/usr/bin/env bash
+                printf 'Size Avail Use%%\\n100000000000 1000000000 99%%\\n'
+            """,
+            "install": """
+                #!/usr/bin/env bash
+                mkdir -p -- "${@: -1}"
+            """,
+            "stat": """
+                #!/usr/bin/env bash
+                if [[ "$*" == *"%u:%a"* ]]; then printf '0:600\\n'; else printf '0 660\\n'; fi
+            """,
+            "docker": """
+                #!/usr/bin/env bash
+                case "$*" in
+                  *"info --format"*) printf '%s/docker-1\\n' "$BLUEPRINT_ACTIONS_STATE_ROOT" ;;
+                  *"image ls"*) printf 'sha256:test-image\\n' ;;
+                  *"volume ls"*) printf 'test-volume\\n' ;;
+                  *" ps --quiet"*) : ;;
+                  *"volume prune --force"*) printf 'Total reclaimed space: 1GB\\n' ;;
+                  *) exit 2 ;;
+                esac
+            """,
+            "systemctl": """
+                #!/usr/bin/env bash
+                printf '%s\\n' "$*" >> "$BLUEPRINT_TEST_SYSTEMCTL_LOG"
+                case "$1" in
+                  is-active) printf 'active\\n' ;;
+                  show)
+                    if [[ "$*" == *"FreezerState"* ]]; then
+                      printf '%s\\n' "$BLUEPRINT_TEST_FREEZER_STATE"
+                    else
+                      printf '/system.slice/system-blueprint\\x2dgithub\\x2dactions.slice/blueprint-github-actions@1.service\\n'
+                    fi
+                    ;;
+                  freeze)
+                    if [[ "${BLUEPRINT_TEST_KILL_ON_FREEZE:-0}" == "1" ]]; then
+                      kill -KILL "$PPID"
+                    fi
+                    ;;
+                  thaw) : ;;
+                  *) exit 2 ;;
+                esac
+            """,
+        }
+        for name, body in commands.items():
+            path = mock_bin / name
+            path.write_text(textwrap.dedent(body).lstrip(), encoding="utf-8")
+            path.chmod(0o755)
+
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "PATH": f"{mock_bin}:{environment['PATH']}",
+                "BLUEPRINT_ACTIONS_STATE_ROOT": str(state_root),
+                "BLUEPRINT_ACTIONS_SOCKET_ROOT": str(socket_root),
+                "BLUEPRINT_ACTIONS_CGROUP_ROOT": str(cgroup_root),
+                "BLUEPRINT_ACTIONS_GC_LOCK_FILE": str(root / "gc.lock"),
+                "BLUEPRINT_ACTIONS_GC_OWNERSHIP_ROOT": str(ownership_root),
+                "BLUEPRINT_TEST_SYSTEMCTL_LOG": str(log_path),
+                "BLUEPRINT_TEST_FREEZER_STATE": freezer_state,
+            }
+        )
+        return environment, socket_root / "1" / "docker.sock", log_path
+
+    @unittest.skipIf(os.name == "nt", "requires POSIX signals and Unix sockets")
+    def test_volume_gc_hard_kill_after_freeze_is_recovered_by_stop_post(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            environment, socket_path, log_path = self._volume_gc_harness(
+                temporary, freezer_state="running"
+            )
+            listener = socket.socket(socket.AF_UNIX)
+            try:
+                listener.bind(str(socket_path))
+                environment["BLUEPRINT_TEST_KILL_ON_FREEZE"] = "1"
+                result = subprocess.run(
+                    ["bash", str(ASSET_DIR / "prune-runner-volumes.sh")],
+                    env=environment,
+                    check=False,
+                    timeout=10,
+                )
+            finally:
+                listener.close()
+
+            self.assertEqual(result.returncode, -9)
+            marker = Path(environment["BLUEPRINT_ACTIONS_GC_OWNERSHIP_ROOT"]) / "frozen-1"
+            self.assertEqual(
+                marker.read_text(encoding="utf-8").strip(),
+                "blueprint-github-actions@1.service",
+            )
+            environment.pop("BLUEPRINT_TEST_KILL_ON_FREEZE")
+            subprocess.run(
+                ["bash", str(ASSET_DIR / "thaw-owned-runners.sh")],
+                env=environment,
+                check=True,
+                timeout=10,
+            )
+            self.assertFalse(marker.exists())
+            calls = log_path.read_text(encoding="utf-8")
+            self.assertIn("freeze blueprint-github-actions@1.service", calls)
+            self.assertIn("thaw blueprint-github-actions@1.service", calls)
+
+    @unittest.skipIf(os.name == "nt", "requires a Unix socket")
+    def test_volume_gc_leaves_operator_prefrozen_runner_untouched(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            environment, socket_path, log_path = self._volume_gc_harness(
+                temporary, freezer_state="frozen"
+            )
+            listener = socket.socket(socket.AF_UNIX)
+            try:
+                listener.bind(str(socket_path))
+                result = subprocess.run(
+                    ["bash", str(ASSET_DIR / "prune-runner-volumes.sh")],
+                    env=environment,
+                    check=False,
+                    timeout=10,
+                )
+            finally:
+                listener.close()
+            self.assertEqual(result.returncode, 1)
+            calls = log_path.read_text(encoding="utf-8")
+            self.assertNotIn("freeze blueprint-github-actions@1.service", calls)
+            self.assertNotIn("thaw blueprint-github-actions@1.service", calls)
+            self.assertFalse(
+                (Path(environment["BLUEPRINT_ACTIONS_GC_OWNERSHIP_ROOT"]) / "frozen-1").exists()
+            )
+
     def test_host_image_and_cloud_image_are_immutable_inputs(self):
         dockerfile = (ASSET_DIR / "Dockerfile").read_text(encoding="utf-8")
         self.assertIn(f"FROM {gav.HOST_CONTAINER_BASE}", dockerfile)
@@ -218,6 +373,89 @@ class AssetSecurityTests(unittest.TestCase):
         self.assertIn('[[ "$daemon_ready" == "true" ]]', installer)
         self.assertIn('if [[ -f "$runner_root/.runner"', installer)
         self.assertIn('["agentName"]', installer)
+
+    def test_volume_gc_is_pressure_quiescence_and_scope_guarded(self):
+        cleanup = (ASSET_DIR / "prune-runner-volumes.sh").read_text(encoding="utf-8")
+        self.assertIn('PRESSURE_PERCENT=70', cleanup)
+        self.assertIn('MIN_FREE_BYTES=$((30 * 1024 * 1024 * 1024))', cleanup)
+        self.assertIn('for slot in 1 2 3 4', cleanup)
+        self.assertIn('systemctl freeze "$unit"', cleanup)
+        self.assertIn('systemctl thaw "$frozen_unit"', cleanup)
+        self.assertIn("trap 'terminate 143' TERM", cleanup)
+        self.assertIn('exit "$status"', cleanup)
+        self.assertIn('--property=FreezerState', cleanup)
+        self.assertIn('reason=runner_pre_frozen', cleanup)
+        self.assertIn('system-blueprint\\\\x2dgithub\\\\x2dactions.slice', cleanup)
+        self.assertIn('"$comm" != "Runner.Worker"', cleanup)
+        self.assertIn('sleep 2', cleanup)
+        self.assertIn('docker --host "unix://$SOCKET_ROOT/$slot/docker.sock"', cleanup)
+        self.assertIn('actual_root="$(docker_for_slot', cleanup)
+        self.assertIn('volume prune --force', cleanup)
+        self.assertIn('images_before=', cleanup)
+        self.assertIn('images_after=', cleanup)
+        self.assertIn('timeout --signal=TERM --kill-after=5s 30s', cleanup)
+        for excluded in (
+            'volume prune --all',
+            'volume rm',
+            'image prune',
+            'system prune',
+            'container prune',
+            'network prune',
+            '/run/docker.sock',
+        ):
+            self.assertNotIn(excluded, cleanup)
+
+    def test_volume_gc_timer_is_hardened_and_persistent(self):
+        service = (ASSET_DIR / "blueprint-actions-volume-gc.service").read_text(
+            encoding="utf-8"
+        )
+        timer = (ASSET_DIR / "blueprint-actions-volume-gc.timer").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('NoNewPrivileges=yes', service)
+        self.assertIn('ProtectSystem=strict', service)
+        self.assertIn('CapabilityBoundingSet=', service)
+        self.assertIn('RuntimeMaxSec=5min', service)
+        self.assertIn(
+            'ExecStopPost=/usr/local/lib/blueprint/github-actions-vm/thaw-owned-runners.sh',
+            service,
+        )
+        self.assertIn('OnUnitActiveSec=15min', timer)
+        self.assertIn('RandomizedDelaySec=2min', timer)
+        self.assertNotIn('Persistent=true', timer)
+
+    def test_existing_vm_has_reviewable_maintenance_install_path(self):
+        host_installer = (
+            Path(__file__).parent / "install-github-actions-vm.sh"
+        ).read_text(encoding="utf-8")
+        install = host_installer.split("install_maintenance() {", 1)[1].split(
+            "stop() {", 1
+        )[0]
+        self.assertIn('guest_status', install)
+        self.assertIn('require_command tar', install)
+        self.assertIn('install-volume-maintenance.sh', install)
+        self.assertIn('/run/blueprint-actions-volume-gc-install', install)
+        self.assertIn('--no-same-permissions', install)
+        self.assertNotIn(
+            '--directory /usr/local/lib/blueprint/github-actions-vm', install
+        )
+        self.assertNotIn('systemctl stop', install)
+        self.assertIn('maintenance-status) maintenance_status', host_installer)
+
+        guest_installer = (ASSET_DIR / "install-volume-maintenance.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('flock --timeout 300', guest_installer)
+        self.assertIn('mv --force --no-target-directory', guest_installer)
+        self.assertIn('cmp --silent', guest_installer)
+
+    def test_volume_gc_fallback_thaws_only_owned_markers(self):
+        thaw = (ASSET_DIR / "thaw-owned-runners.sh").read_text(encoding="utf-8")
+        self.assertIn('for slot in 1 2 3 4', thaw)
+        self.assertIn('[[ -f "$marker" && ! -L "$marker" ]] || continue', thaw)
+        self.assertIn('"0:600"', thaw)
+        self.assertIn('expected="blueprint-github-actions@$slot.service"', thaw)
+        self.assertNotIn('for unit in', thaw)
 
     def test_registration_secret_is_fixed_path_private_and_shredded(self):
         installer = (ASSET_DIR / "install-runners.sh").read_text(encoding="utf-8")

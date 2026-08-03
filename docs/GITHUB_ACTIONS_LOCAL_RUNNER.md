@@ -67,6 +67,25 @@ export BLUEPRINT_ACTIONS_VM_STATE="$HOME/.blueprint/github-actions-vm"
 ./scripts/install-github-actions-vm.sh guest-status
 ```
 
+The guest checks storage pressure every 15 minutes. Below 70% filesystem usage
+and with at least 30 GiB free it makes no changes. Under pressure it handles
+only the four allowlisted runner daemons. For each slot it freezes the runner
+listener, proves that its exact systemd cgroup has no `Runner.Worker`, observes
+zero running containers twice, and then asks Docker to prune anonymous,
+unreferenced volumes. It always thaws the listener, including through a systemd
+cleanup fallback if the helper is terminated. Named volumes, images, build
+cache, containers, networks, the host Docker daemon, and Blueprint application
+or database data are never pruned. Ambiguous state fails closed and is logged.
+
+Install or refresh this maintenance policy on an existing running guest without
+stopping runners or touching active jobs:
+
+```bash
+export BLUEPRINT_ACTIONS_VM_STATE="$HOME/.blueprint/github-actions-vm"
+./scripts/install-github-actions-vm.sh install-maintenance
+./scripts/install-github-actions-vm.sh maintenance-status
+```
+
 Runner registration is a separate cutover step using a short-lived GitHub
 registration token in a mode-0600 file:
 

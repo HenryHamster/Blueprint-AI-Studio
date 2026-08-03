@@ -325,6 +325,30 @@ register_runners() {
     "$BLUEPRINT_ACTIONS_VM_RUNNERS"
 }
 
+install_maintenance() {
+  local maintenance_assets=(
+    prune-runner-volumes.sh
+    thaw-owned-runners.sh
+    blueprint-actions-volume-gc.service
+    blueprint-actions-volume-gc.timer
+    install-volume-maintenance.sh
+  )
+  ensure_state_root
+  require_command tar
+  guest_status
+  tar --create --file - --directory "$ASSET_DIR" "${maintenance_assets[@]}" \
+    | guest_ssh \
+      "sudo install -d -m 0700 -o root -g root /run/blueprint-actions-volume-gc-install && sudo rm -f -- /run/blueprint-actions-volume-gc-install/prune-runner-volumes.sh /run/blueprint-actions-volume-gc-install/thaw-owned-runners.sh /run/blueprint-actions-volume-gc-install/blueprint-actions-volume-gc.service /run/blueprint-actions-volume-gc-install/blueprint-actions-volume-gc.timer /run/blueprint-actions-volume-gc-install/install-volume-maintenance.sh && sudo tar --extract --file - --directory /run/blueprint-actions-volume-gc-install --no-same-owner --no-same-permissions && sudo chown -h root:root /run/blueprint-actions-volume-gc-install/* && sudo bash /run/blueprint-actions-volume-gc-install/install-volume-maintenance.sh /run/blueprint-actions-volume-gc-install"
+  printf 'Installed and enabled pressure-gated Actions volume maintenance.\n'
+}
+
+maintenance_status() {
+  ensure_state_root
+  guest_status
+  guest_ssh \
+    "systemctl is-enabled blueprint-actions-volume-gc.timer && systemctl is-active blueprint-actions-volume-gc.timer && systemctl list-timers blueprint-actions-volume-gc.timer --no-pager"
+}
+
 stop() {
   if container_exists "$QEMU_CONTAINER"; then
     docker stop --timeout 120 "$QEMU_CONTAINER"
@@ -337,7 +361,7 @@ stop() {
 }
 
 usage() {
-  printf 'Usage: %s {plan|prepare|start|status|guest-status|register|stop}\n' "$0"
+  printf 'Usage: %s {plan|prepare|start|status|guest-status|register|install-maintenance|maintenance-status|stop}\n' "$0"
 }
 
 validate_configuration
@@ -357,6 +381,8 @@ case "${1:-}" in
   status) status ;;
   guest-status) guest_status ;;
   register) register_runners ;;
+  install-maintenance) install_maintenance ;;
+  maintenance-status) maintenance_status ;;
   stop) stop ;;
   *) usage; exit 2 ;;
 esac

@@ -19,3 +19,7 @@ agent/.dockerignore text eol=lf
 # from a Windows local runner. Keep shell and service definitions free of CRLF.
 infra/livekit/bin/* text eol=lf
 scripts/blueprint-livekit-system.service text eol=lf
+
+# Local release bootstrap files are transferred from developer worktrees and
+# executed directly on Linux. CRLF corrupts their env/python shebangs.
+scripts/*release*.py text eol=lf
