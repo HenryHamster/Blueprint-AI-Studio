@@ -1,4 +1,4 @@
-"""Data-shape regression tests for the 0721 discovery-controller migration."""
+"""Data-shape regression tests for the 0722 discovery-controller migration."""
 
 from __future__ import annotations
 
@@ -59,7 +59,7 @@ async def _upgrade(engine, destination: str) -> None:
 
 @requires_postgres
 @pytest.mark.asyncio
-async def test_0721_does_not_reopen_inconclusive_predecessor_with_successor():
+async def test_0722_does_not_reopen_inconclusive_predecessor_with_successor():
     project_id = uuid.uuid4()
     predecessor_id = uuid.uuid4()
     successor_id = uuid.uuid4()
@@ -108,7 +108,7 @@ async def test_0721_does_not_reopen_inconclusive_predecessor_with_successor():
                 },
             )
 
-        await _upgrade(engine, "0721")
+        await _upgrade(engine, "0722")
 
         async with engine.connect() as connection:
             rows = {
