@@ -68,7 +68,7 @@ import { useCommandPaletteState } from './hooks/useCommandPaletteState';
 import { useStrategicContextNavigation } from './hooks/useStrategicContextNavigation';
 import { useWorkbenchCommands, type PipelineSection } from './hooks/useWorkbenchCommands';
 import { useVersionLifecycle, hasVersionLifecycleData } from './hooks/useVersionLifecycle';
-import { type StrategicAccountSpendStatus, type StrategicStateAttentionItem } from './strategicStateApi';
+import { type StrategicAccountSpendStatus, type StrategicStateAttentionItem, type StrategicStateResponse } from './strategicStateApi';
 import { parseTimestamp } from './utils/time';
 import { matchesStatusFilter } from './utils/statusFilter';
 import { pipelineTaskIdForAttentionItem } from './utils/strategicAttention';
@@ -165,7 +165,8 @@ export default function App() {
     if (message) setRealtimeCanonicalProjection({ message, canonicalRefetchRequired });
     else setMessageRealtimeRefreshSignal(value => value + 1);
   };
-  const s = useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, refreshFleetRunnersRef });
+  const strategicReadModelRef = useRef<StrategicStateResponse | null>(null);
+  const s = useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, refreshFleetRunnersRef, strategicReadModelRef });
   const searchInputRef = useRef<HTMLInputElement>(null);
   const [pipelineContextTask, setPipelineContextTask] = useState<Task | null>(null);
   const pipelineContextRequestRef = useRef(0);
@@ -488,6 +489,14 @@ export default function App() {
   const combinedAlerts = useMemo(() => [...zoneHealthAlerts, ...s.alerts], [zoneHealthAlerts, s.alerts]);
 
   const strategicReadModel = useStrategicReadModel(s.selectedProjectId, { pollerEnabled: chatPollersEnabled });
+  // useAppState owns the realtime hook, while the durable read model is loaded
+  // here after its project selection is known. Keep a ref for reconnect-time
+  // projection and explicitly apply each fresh snapshot for initial-load truth.
+  strategicReadModelRef.current = strategicReadModel.data;
+  const projectStrategicState = s.projectStrategicState;
+  useEffect(() => {
+    projectStrategicState(strategicReadModel.data);
+  }, [projectStrategicState, strategicReadModel.data]);
   const strategicLiveness = useStrategicLiveness(s.selectedProjectId, { enabled: chatPollersEnabled });
   const {
     strategicWorkbenchState, strategicInteractionMode, strategicSessionActive,

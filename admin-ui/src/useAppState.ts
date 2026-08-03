@@ -26,6 +26,7 @@ import { useAlertsState } from './hooks/useAlertsState';
 import { useProjectConfig } from './hooks/useProjectConfig';
 import { resolveTaskCapabilities } from './taskCapabilities';
 import { isEditableShortcutEvent } from './hooks/keyboardTargets';
+import type { StrategicStateResponse } from './strategicStateApi';
 
 export type { DeployState } from './types/settings';
 
@@ -44,6 +45,7 @@ interface UseAppStateOptions {
   refreshStrategicReadModelRef?: MutableRefObject<() => void>;
   refreshMessagesRef?: MutableRefObject<(message?: ProjectMessage, canonicalRefetchRequired?: boolean) => void>;
   refreshFleetRunnersRef?: MutableRefObject<() => void>;
+  strategicReadModelRef?: MutableRefObject<StrategicStateResponse | null>;
 }
 
 function useShallowMemo<T extends Record<string, unknown>>(value: T): T {
@@ -95,7 +97,7 @@ function useShallowMemo<T extends Record<string, unknown>>(value: T): T {
   }, [value]);
 }
 
-export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, refreshFleetRunnersRef }: UseAppStateOptions = {}) {
+export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, refreshFleetRunnersRef, strategicReadModelRef }: UseAppStateOptions = {}) {
   // ── Composed hooks ──────────────────────────────────────────────────────
   const { user, authLoading, userRole, accessDenied, error, setError } = useAuth();
   const { toasts, addToast, dismissToast } = useToasts();
@@ -172,6 +174,7 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
     strategistActive,
     cycleProgress,
     lastCycleCompletion,
+    projectStrategicState,
     strategicSessionTranscript,
     trackedTaskIds, trackedLogs, trackTask, untrackTask, untrackAll,
   } = useLogViewer({
@@ -184,6 +187,7 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
     refreshFleetRunnersRef,
     selectedProjectId,
     realtimeWsEnabled: !authLoading && Boolean(user),
+    strategicReadModelRef,
   });
 
   const [researchFeed, setResearchFeed] = useState<Task[]>([]);
@@ -743,6 +747,7 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
     // Directions
     showDirections, setShowDirections,
     fetchDirectionsRef, strategistActive, cycleProgress, lastCycleCompletion,
+    projectStrategicState,
     // Metrics
     showMetrics, setShowMetrics, metricsHistory, cumulativeCost, cumulativeVmHours, metricsWindow, setMetricsWindow,
     // Archive

@@ -9,9 +9,8 @@
  *      strategic_cycle_completed event was lost while disconnected must clear
  *      stale activity (strategistActive = false).
  *
- * The durable authority is the read-model ref passed in as
- * `strategicCycleDurablelyActiveRef`; the hook uses its current value at
- * onopen time to decide whether to clear.
+ * The durable authority is the Strategic read-model ref passed in as
+ * `strategicReadModelRef`; the hook projects its current cycle at onopen time.
  *
  * This file also retains the full canonical strategic_cycle_completed-envelope
  * test and verifies lifecycle-before-refetch ordering.
@@ -20,6 +19,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
 import { useRef } from 'react';
 import { useLogViewer } from '../useLogViewer';
+import type { StrategicStateCycle, StrategicStateResponse } from '../../strategicStateApi';
 
 vi.mock('../../api', () => ({
   authHeaders: vi.fn().mockResolvedValue({ Authorization: 'Bearer ***' }),
@@ -52,7 +52,7 @@ class MockWebSocket {
 function setup(options: {
   selectedProjectId?: string | null;
   realtimeWsEnabled?: boolean;
-  cycleDurablelyActiveRef?: React.MutableRefObject<boolean>;
+  strategicReadModelRef?: React.MutableRefObject<StrategicStateResponse | null>;
 } = {}) {
   return renderHook(() => {
     const fetchTasksRef = useRef<() => void>(vi.fn());
@@ -72,10 +72,47 @@ function setup(options: {
       refreshFleetRunnersRef,
       selectedProjectId: options.selectedProjectId,
       realtimeWsEnabled: options.realtimeWsEnabled,
-      strategicCycleDurablelyActiveRef: options.cycleDurablelyActiveRef,
+      strategicReadModelRef: options.strategicReadModelRef,
     });
     return { lv, fetchTasksRef, fetchDirectionsRef, refreshStrategicReadModelRef, refreshMessagesRef };
   });
+}
+
+function cycle(overrides: Partial<StrategicStateCycle> = {}): StrategicStateCycle {
+  return {
+    id: 'cycle-1',
+    outcome: 'phase2_running',
+    has_active_task: true,
+    stale: false,
+    phase1_task_id: 'phase-1',
+    phase2_task_id: 'phase-2',
+    phase1_started_at: null,
+    phase1_completed_at: null,
+    phase2_started_at: null,
+    phase2_completed_at: null,
+    summary_text: null,
+    failure_reason: null,
+    directions_created: 0,
+    directions_retired: 0,
+    tasks_spawned: 0,
+    vision_updated: false,
+    problem_model_changed: false,
+    running_update_changed: false,
+    ...overrides,
+  };
+}
+
+function strategicState(activeCycle: StrategicStateCycle | null, latestCycle: StrategicStateCycle | null): StrategicStateResponse {
+  return {
+    project_id: 'proj1',
+    strategic: {
+      active_cycle: activeCycle,
+      active_task: null,
+      active_phase: null,
+      latest_cycle: latestCycle,
+      refresh: { pending: null },
+    },
+  } as StrategicStateResponse;
 }
 
 async function connect(result: ReturnType<typeof setup>['result']) {
@@ -127,9 +164,9 @@ describe('useLogViewer reconnect truth', () => {
 
   // ── Scenario 1: active-cycle preservation ─────────────────────────────────
   it('preserves strategistActive on reconnect when cycle is durably active', async () => {
-    // The durable read-model ref reports the cycle is still running.
-    const cycleDurablelyActiveRef = { current: true };
-    const { result } = setup({ cycleDurablelyActiveRef });
+    // The durable read-model reports the cycle is still running.
+    const strategicReadModelRef = { current: strategicState(cycle(), null) };
+    const { result } = setup({ strategicReadModelRef });
     const ws = await connect(result);
 
     act(() => {
@@ -145,9 +182,11 @@ describe('useLogViewer reconnect truth', () => {
 
   // ── Scenario 2: dropped-completion recovery ───────────────────────────────
   it('clears strategistActive on reconnect when durable authority reports no active cycle', async () => {
-    // The durable read-model ref reports no active cycle (cycle has finished).
-    const cycleDurablelyActiveRef = { current: false };
-    const { result } = setup({ cycleDurablelyActiveRef });
+    // The durable read-model reports no active cycle (cycle has finished).
+    const strategicReadModelRef = {
+      current: strategicState(null, cycle({ outcome: 'failed_phase2', has_active_task: false, summary_text: 'Strategic review failed' })),
+    };
+    const { result } = setup({ strategicReadModelRef });
     const ws = await connect(result);
 
     act(() => {
@@ -319,8 +358,8 @@ describe('useLogViewer reconnect truth', () => {
 
   // ── Active cycle preserved: cycleProgress also retained ───────────────────
   it('retains cycleProgress on reconnect when cycle is durably active', async () => {
-    const cycleDurablelyActiveRef = { current: true };
-    const { result } = setup({ cycleDurablelyActiveRef });
+    const strategicReadModelRef = { current: strategicState(cycle({ id: 'cycle-7' }), null) };
+    const { result } = setup({ strategicReadModelRef });
     const ws = await connect(result);
 
     act(() => {
