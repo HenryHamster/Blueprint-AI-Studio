@@ -622,7 +622,12 @@ def _wait_verified(
             if exc.code not in {502, 503, 504}:
                 raise
             last_error = exc
-        except (urllib.error.URLError, _TransientNotReady) as exc:
+        except (
+            ConnectionError,
+            TimeoutError,
+            urllib.error.URLError,
+            _TransientNotReady,
+        ) as exc:
             last_error = exc
         time.sleep(interval)
     raise RuntimeError(f"{description} did not become ready: {last_error}")
@@ -886,14 +891,46 @@ def _fetch(
 
 
 def _verify_worker_ready() -> None:
-    log_result = _run(
-        ["/usr/bin/docker", "logs", "--tail", "500", "blueprint-local-worker"]
+    record = _container_record("blueprint-local-worker")
+    if record is None:
+        raise _TransientNotReady("worker container does not exist yet")
+    container_id = record.get("Id")
+    if not isinstance(container_id, str) or re.fullmatch(
+        r"[0-9a-f]{64}", container_id
+    ) is None:
+        raise RuntimeError("worker container has no trusted immutable ID")
+    state = record.get("State")
+    if not isinstance(state, dict) or state.get("Running") is not True:
+        raise _TransientNotReady("worker container is not running yet")
+    health_result = _run(
+        [
+            "/usr/bin/docker",
+            "exec",
+            container_id,
+            "/usr/local/bin/python",
+            "-c",
+            (
+                "import sys,urllib.request;"
+                "r=urllib.request.urlopen('http://127.0.0.1:8080/health',timeout=5);"
+                "sys.stdout.buffer.write(r.read(200000))"
+            ),
+        ],
+        timeout=10,
+        check=False,
     )
-    logs = log_result.stdout + log_result.stderr
-    if "Traceback (most recent call last)" in logs:
-        raise RuntimeError("worker startup log contains a traceback")
-    if "Application startup complete." not in logs:
-        raise _TransientNotReady("worker startup is not complete")
+    if health_result.returncode != 0:
+        raise _TransientNotReady("worker health endpoint is not ready")
+    try:
+        worker_health = json.loads(health_result.stdout)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise RuntimeError("worker health endpoint returned invalid JSON") from exc
+    if (
+        not isinstance(worker_health, dict)
+        or worker_health.get("status") not in {"healthy", "degraded"}
+        or worker_health.get("is_leader") is not True
+        or worker_health.get("orchestrator_alive") is not True
+    ):
+        raise _TransientNotReady("worker health endpoint is not leader-ready")
     query = (
         "SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid "
         "WHERE l.locktype='advisory' AND l.mode='ExclusiveLock' AND l.granted "
