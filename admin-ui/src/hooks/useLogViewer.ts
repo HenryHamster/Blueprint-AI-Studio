@@ -23,7 +23,7 @@ interface UseLogViewerDeps {
   realtimeWsEnabled?: boolean;
   /** Current durable Strategic read-model snapshot, populated by App. */
   strategicReadModelRef?: React.MutableRefObject<StrategicStateResponse | null>;
-  canViewProject?: boolean;
+  canViewProject: boolean;
   isAdmin?: boolean;
 }
 
@@ -197,7 +197,7 @@ export function useLogViewer({
   selectedProjectId,
   realtimeWsEnabled = true,
   strategicReadModelRef,
-  canViewProject = true,
+  canViewProject,
   isAdmin = false,
 }: UseLogViewerDeps) {
   const [logTask, setLogTask] = useState<Task | null>(null);

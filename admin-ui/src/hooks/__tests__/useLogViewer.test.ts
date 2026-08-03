@@ -74,6 +74,7 @@ function setup(options: {
       selectedProjectId: options.selectedProjectId,
       realtimeWsEnabled: options.realtimeWsEnabled,
       strategicReadModelRef: options.strategicReadModelRef,
+      canViewProject: true,
     });
     return { lv, fetchTasksRef, fetchDirectionsRef, refreshStrategicReadModelRef, refreshMessagesRef };
   });

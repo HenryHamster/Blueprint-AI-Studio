@@ -15134,7 +15134,8 @@ class TestDesignDocCompletionStrategistEvent:
         strat_fail_db.add(project)
         await strat_fail_db.commit()
         await strat_fail_db.refresh(project)
-        cycle = await strategic_cycle.create(strat_fail_db, project_id=project.id)
+        project_id = project.id
+        cycle = await strategic_cycle.create(strat_fail_db, project_id=project_id)
         await strat_fail_db.commit()
         assert (
             await strategic_cycle.active_cycle_id_for_retry(strat_fail_db, cycle.id)
@@ -15164,7 +15165,7 @@ class TestDesignDocCompletionStrategistEvent:
         assert (
             await _finalize_strategic_review_spawn(
                 strat_fail_db,
-                project_id=project.id,
+                project_id=project_id,
                 project_name=project.name,
                 payload={"type": "strategic_review"},
                 cycle_id=cycle.id,
@@ -15184,7 +15185,7 @@ class TestDesignDocCompletionStrategistEvent:
         assert cycle.outcome == strategic_cycle.OUTCOME_FAILED_PHASE2_SPAWN
         assert cycle.phase2_task_id is None
         tasks = (
-            (await strat_fail_db.execute(select(Task).where(Task.project_id == project.id)))
+            (await strat_fail_db.execute(select(Task).where(Task.project_id == project_id)))
             .scalars()
             .all()
         )
