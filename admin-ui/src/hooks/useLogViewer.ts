@@ -20,6 +20,12 @@ interface UseLogViewerDeps {
   refreshFleetRunnersRef?: React.MutableRefObject<() => void>;
   selectedProjectId?: string | null;
   realtimeWsEnabled?: boolean;
+  /** Durable read-model authority: true when the backend confirms a strategic
+   *  cycle is currently active. When provided, reconnect preserves
+   *  strategistActive instead of clearing it — avoiding false inactivity during
+   *  a running cycle. When absent or false, reconnect resets stale activity
+   *  caused by a dropped strategic_cycle_completed event. */
+  strategicCycleDurablelyActiveRef?: React.MutableRefObject<boolean>;
 }
 
 /** Live state captured from a strategic_cycle_started event. */
@@ -144,6 +150,7 @@ export function useLogViewer({
   refreshFleetRunnersRef,
   selectedProjectId,
   realtimeWsEnabled = true,
+  strategicCycleDurablelyActiveRef,
 }: UseLogViewerDeps) {
   const [logTask, setLogTask] = useState<Task | null>(null);
   const [logLines, setLogLines] = useState<string[]>([]);
@@ -662,9 +669,13 @@ export function useLogViewer({
         // Client-side safety net: clear any stale "strategist working" state on
         // (re)connect. If a strategic_cycle_completed was dropped while the WS
         // was down, the indicator would otherwise stick on; a fresh cycle will
-        // re-emit strategic_cycle_started.
-        setStrategistActive(false);
-        setCycleProgress(null);
+        // re-emit strategic_cycle_started. However, if the durable read-model
+        // confirms the cycle is still active, preserve the live indicator so a
+        // reconnect mid-cycle doesn't incorrectly hide activity.
+        if (!strategicCycleDurablelyActiveRef?.current) {
+          setStrategistActive(false);
+          setCycleProgress(null);
+        }
         // Add system log for all tracked tasks
         for (const tid of trackedTaskIdsRef.current) {
           appendTrackLog(tid, 'system', 'Stream connected');
@@ -753,7 +764,7 @@ export function useLogViewer({
       setLogsConnecting(false);
       setLogLines(prev => [...prev, `[Connection error: ${err}]`]);
     }
-  }, [handleWsMessage, appendTrackLog, fetchTasksRef, hasActiveWsForProject, refreshGatedTaskTypes, refreshMessagesRef]);
+  }, [handleWsMessage, appendTrackLog, fetchTasksRef, hasActiveWsForProject, refreshGatedTaskTypes, refreshMessagesRef, strategicCycleDurablelyActiveRef]);
 
   // Keep connectWsRef in sync so the online listener can call the latest version
   useEffect(() => { connectWsRef.current = connectWs; }, [connectWs]);
