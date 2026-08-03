@@ -56,6 +56,7 @@ describe('KanbanColumn — viewport regression', () => {
       await act(async () => {
         r.render(
           <KanbanColumn
+            readOnly={false}
             col={{ id: 'IN_PROGRESS', label: 'In Progress', includes: ['IN_PROGRESS'] }}
             colIdx={0}
             columnTasks={[makeTask()]}
@@ -100,6 +101,7 @@ describe('KanbanColumn — viewport regression', () => {
       await act(async () => {
         r.render(
           <KanbanColumn
+            readOnly={false}
             col={{ id: 'COMPLETED', label: 'Completed', includes: ['COMPLETED'] }}
             colIdx={1}
             columnTasks={[makeTask({ status: 'COMPLETED' })]}
@@ -144,6 +146,7 @@ describe('KanbanColumn — viewport regression', () => {
       await act(async () => {
         r.render(
           <KanbanColumn
+            readOnly={false}
             col={{ id: 'FAILED', label: 'Failed', includes: ['FAILED'] }}
             colIdx={2}
             columnTasks={[makeTask({ status: 'FAILED' })]}

@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import type { ComponentProps } from 'react';
 
 const apiMocks = vi.hoisted(() => ({
   authGet: vi.fn(),
@@ -26,8 +27,16 @@ vi.mock('../api', () => ({
   fetchTaskPrFiles: apiMocks.fetchTaskPrFiles,
 }));
 
-import { TaskDetailDrawer } from './TaskDetailDrawer';
+import { TaskDetailDrawer as TaskDetailDrawerComponent } from './TaskDetailDrawer';
 import type { Task } from '../types/task';
+
+type TaskDetailDrawerTestProps = Omit<ComponentProps<typeof TaskDetailDrawerComponent>, 'canOperateProject'> & {
+  canOperateProject?: boolean;
+};
+
+function TaskDetailDrawer(props: TaskDetailDrawerTestProps) {
+  return <TaskDetailDrawerComponent canOperateProject={true} {...props} />;
+}
 
 function makeTask(overrides: Partial<Task> = {}): Task {
   return {
@@ -99,6 +108,47 @@ describe('TaskDetailDrawer', () => {
   it('renders task title in the details tab', () => {
     render(<TaskDetailDrawer task={makeTask()} logLines={[]} {...baseHandlers} />);
     expect(screen.getByText('Test Task')).toBeInTheDocument();
+  });
+
+  it('viewer can read task detail without mutation controls or callbacks', async () => {
+    const user = userEvent.setup();
+    const onDuplicate = vi.fn();
+    render(
+      <TaskDetailDrawer
+        task={makeTask({ status: 'QUEUED', requires_approval: true })}
+        logLines={[]}
+        canOperateProject={false}
+        onDuplicate={onDuplicate}
+        {...baseHandlers}
+      />,
+    );
+
+    expect(screen.getByText('Test Task')).toBeInTheDocument();
+    expect(screen.queryByTitle('Duplicate task')).toBeNull();
+    expect(screen.queryByText('Approve')).toBeNull();
+    expect(screen.queryByText('Request changes')).toBeNull();
+    await user.keyboard('a');
+    expect(onDuplicate).not.toHaveBeenCalled();
+    expect(baseHandlers.onApprove).not.toHaveBeenCalled();
+    expect(baseHandlers.onRequestChanges).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when canOperateProject is undefined at runtime', () => {
+    const onDuplicate = vi.fn();
+    render(
+      <TaskDetailDrawerComponent
+        task={makeTask({ status: 'QUEUED', requires_approval: true })}
+        logLines={[]}
+        canOperateProject={undefined as never}
+        onDuplicate={onDuplicate}
+        {...baseHandlers}
+      />,
+    );
+
+    expect(screen.getByText('Test Task')).toBeInTheDocument();
+    expect(screen.queryByTitle('Duplicate task')).toBeNull();
+    expect(screen.queryByText('Approve')).toBeNull();
+    expect(onDuplicate).not.toHaveBeenCalled();
   });
 
   it('renders task description in the details tab', () => {

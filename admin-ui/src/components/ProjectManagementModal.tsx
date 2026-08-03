@@ -8,6 +8,8 @@ import type { Project } from '../types/project';
 interface ProjectManagementModalProps {
   projects: Project[];
   selectedProjectId: string | null;
+  /** Owner-only row controls; absent/false fails closed. */
+  canManageProject?: (project: Project) => boolean;
   onNewProject: () => void;
   onRefreshProjects: () => void;
   onSelectProject: (id: string | null) => void;
@@ -19,6 +21,7 @@ type Confirm = { type: 'delete' | 'reset'; projectId: string; projectLabel: stri
 export function ProjectManagementModal({
   projects,
   selectedProjectId,
+  canManageProject,
   onNewProject,
   onRefreshProjects,
   onSelectProject,
@@ -187,6 +190,7 @@ export function ProjectManagementModal({
           const label = `${project.github_owner}/${project.github_repo}`;
           const isBusy = busyId === project.id;
           const isConfirming = confirm?.projectId === project.id;
+          const canManage = canManageProject?.(project) === true;
           return (
             <div
               key={project.id}
@@ -207,7 +211,7 @@ export function ProjectManagementModal({
               </div>
               {isBusy ? (
                 <Loader2 className="w-3.5 h-3.5 animate-spin text-neutral-500 shrink-0" data-testid="busy-spinner" />
-              ) : !isConfirming ? (
+              ) : canManage && !isConfirming ? (
                 <div className="flex items-center gap-1 shrink-0">
                   {tab === 'active' && (
                     <>

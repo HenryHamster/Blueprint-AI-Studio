@@ -54,6 +54,7 @@ interface ConsoleHomeProps {
   onShowAnalytics: () => void;
   onOpenFleet?: () => void;
   onCreateTask?: () => void;
+  isAdmin?: boolean;
 }
 
 function NeedsAttentionSection({
@@ -226,13 +227,14 @@ export function ConsoleHome({
   onShowAnalytics,
   onOpenFleet,
   onCreateTask,
+  isAdmin = false,
 }: ConsoleHomeProps) {
   const pageActiveCount = tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING').length;
   const pageQueuedCount = tasks.filter(t => t.status === 'QUEUED').length;
   const activeCount = selectedProjectId && scopedActiveCount != null ? scopedActiveCount : (globalActiveCount ?? pageActiveCount);
   const queuedCount = selectedProjectId && scopedQueuedCount != null ? scopedQueuedCount : (globalQueuedCount ?? pageQueuedCount);
 
-  const { digest, digestStale, loading, lastFetchError, sparkData } = useDashboardDigest(selectedProjectId, 168, activeCount, queuedCount);
+  const { digest, digestStale, loading, lastFetchError, sparkData } = useDashboardDigest(selectedProjectId, 168, activeCount, queuedCount, isAdmin);
   // True once a digest has actually arrived — lets empty sections distinguish
   // "all clear" from "not loaded / fetch failed".
   const digestReady = digest != null;
@@ -249,7 +251,7 @@ export function ConsoleHome({
     } catch {
       if (!signal.aborted) setFleetLoading(false);
     }
-  }, { intervalMs: DEFAULT_POLL_MS, enabled: true, deps: [] });
+  }, { intervalMs: DEFAULT_POLL_MS, enabled: isAdmin, deps: [isAdmin] });
 
   const successRate = digest?.success_rate;
   const totalCost = digest?.spot_cost_usd;

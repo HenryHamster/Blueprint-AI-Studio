@@ -1,5 +1,5 @@
 /* eslint-disable react-hooks/refs, react-hooks/set-state-in-effect */
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import type { Task } from '../types/task';
 import { API_BASE_URL, apiFetch, authHeaders, authGet, resetTaskIterationCap, triggerTaskRollup } from '../api';
 import { STATUS_OPTIONS } from '../constants';
@@ -57,6 +57,7 @@ interface UseTasksStateDeps {
   prevTasksRef: React.MutableRefObject<Task[]>;
   // Project scope — when set, task list and counts are scoped to this project.
   selectedProjectId: string | null;
+  canOperateProject: boolean;
   // Direction filter — when set, only tasks belonging to this direction are shown.
   directionFilter?: string | null;
 }
@@ -68,8 +69,12 @@ export function useTasksState(deps: UseTasksStateDeps) {
     fetchArchiveTasks,
     selectedTaskIds, setSelectedTaskIds, setSelectionMode, setConfirmDialog,
     fetchTasksRef, prevTasksRef,
-    selectedProjectId, directionFilter,
+    selectedProjectId, canOperateProject, directionFilter,
   } = deps;
+  const canOperateProjectRef = useRef(canOperateProject);
+  canOperateProjectRef.current = canOperateProject;
+  const selectedProjectIdRef = useRef(selectedProjectId);
+  selectedProjectIdRef.current = selectedProjectId;
 
   const [tasks, setTasks] = useState<Task[]>([]);
   const [totalTasks, setTotalTasks] = useState(0);
@@ -104,6 +109,10 @@ export function useTasksState(deps: UseTasksStateDeps) {
   // Reset page and selection when project scope changes
   useEffect(() => {
     setPage(1);
+    setTasks([]);
+    prevTasksRef.current = [];
+    setInitialLoading(false);
+    setRefreshing(false);
     setSelectedTaskIds(new Set());
     setSelectionMode(false);
     setScopedActiveCount(null);
@@ -112,7 +121,18 @@ export function useTasksState(deps: UseTasksStateDeps) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedProjectId]);
 
+  // A viewer may keep reading the same project, but any selection created
+  // while operate access existed must not survive a downgrade.
+  useEffect(() => {
+    if (canOperateProject) return;
+    setSelectedTaskIds(new Set());
+    setSelectionMode(false);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canOperateProject]);
+
   const fetchTasks = async () => {
+    const requestProjectId = selectedProjectId;
+    const requestIsCurrent = () => selectedProjectIdRef.current === requestProjectId;
     if (tasks.length === 0) {
       setInitialLoading(true);
     } else {
@@ -131,8 +151,10 @@ export function useTasksState(deps: UseTasksStateDeps) {
         url += `&direction_id=${encodeURIComponent(directionFilter)}`;
       }
       const res = await authGet(url);
+      if (!requestIsCurrent()) return;
       if (res.ok) {
         const data = await res.json();
+        if (!requestIsCurrent()) return;
         let newTasks: Task[];
         if (Array.isArray(data)) {
           newTasks = data;
@@ -215,26 +237,33 @@ export function useTasksState(deps: UseTasksStateDeps) {
         setApiHealthy(false);
       }
     } catch (err) {
+      if (!requestIsCurrent()) return;
       console.error('Failed to fetch tasks:', err);
       setError('Failed to connect to backend server.');
       setApiHealthy(false);
     } finally {
-      setInitialLoading(false);
-      setRefreshing(false);
-      setFetchEpoch(epoch => epoch + 1);
+      if (requestIsCurrent()) {
+        setInitialLoading(false);
+        setRefreshing(false);
+        setFetchEpoch(epoch => epoch + 1);
+      }
     }
   };
   fetchTasksRef.current = fetchTasks;
 
   const fetchCounts = async () => {
+    const requestProjectId = selectedProjectId;
+    const requestIsCurrent = () => selectedProjectIdRef.current === requestProjectId;
     let url = `${API_BASE_URL}/api/admin/tasks/counts`;
     if (selectedProjectId) {
       url += `?project_id=${encodeURIComponent(selectedProjectId)}`;
     }
     try {
       const res = await authGet(url);
+      if (!requestIsCurrent()) return;
       if (!res.ok) return;
       const data = await res.json();
+      if (!requestIsCurrent()) return;
       if (data.active_count !== undefined) setGlobalActiveCount(data.active_count);
       if (data.evaluating_count !== undefined) setGlobalEvaluatingCount(data.evaluating_count);
       if (data.queued_count !== undefined) setGlobalQueuedCount(data.queued_count);
@@ -248,6 +277,7 @@ export function useTasksState(deps: UseTasksStateDeps) {
   };
 
   const handleApprove = async (taskId: string) => {
+    if (!canOperateProjectRef.current) return;
     const original = tasks.find(t => t.id === taskId);
     setTasks(prev => prev.map(t => t.id === taskId ? { ...t, requires_approval: false, status: 'IN_PROGRESS' } : t));
     setActionLoadingMap(m => ({ ...m, [taskId]: 'approve' }));
@@ -275,6 +305,7 @@ export function useTasksState(deps: UseTasksStateDeps) {
   };
 
   const handleRequestChanges = async (taskId: string, feedback: string, action: 'fix' | 'review' = 'fix') => {
+    if (!canOperateProjectRef.current) return;
     setActionLoadingMap(m => ({ ...m, [taskId]: 'request-changes' }));
     try {
       const res = await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}/request-changes`, {
@@ -297,6 +328,7 @@ export function useTasksState(deps: UseTasksStateDeps) {
   };
 
   const handleCancel = async (taskId: string) => {
+    if (!canOperateProjectRef.current) return;
     const original = tasks.find(t => t.id === taskId);
     setTasks(prev => prev.map(t => t.id === taskId ? { ...t, status: 'CANCELLED' } : t));
     setActionLoadingMap(m => ({ ...m, [taskId]: 'cancel' }));
@@ -324,6 +356,7 @@ export function useTasksState(deps: UseTasksStateDeps) {
   };
 
   const handleRetry = async (taskId: string) => {
+    if (!canOperateProjectRef.current) return;
     const original = tasks.find(t => t.id === taskId);
     setTasks(prev => prev.map(t => t.id === taskId ? { ...t, status: 'QUEUED' } : t));
     setActionLoadingMap(m => ({ ...m, [taskId]: 'retry' }));
@@ -352,6 +385,7 @@ export function useTasksState(deps: UseTasksStateDeps) {
   };
 
   const handleEditPrompt = async (taskId: string, newPrompt: string) => {
+    if (!canOperateProjectRef.current) return;
     setActionLoadingMap(m => ({ ...m, [taskId]: 'edit' }));
     try {
       const res = await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}`, {
@@ -375,6 +409,7 @@ export function useTasksState(deps: UseTasksStateDeps) {
   };
 
   const handleDismiss = async (taskId: string) => {
+    if (!canOperateProjectRef.current) return;
     setActionLoadingMap(m => ({ ...m, [taskId]: 'dismiss' }));
     try {
       const res = await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}`, {
@@ -398,6 +433,7 @@ export function useTasksState(deps: UseTasksStateDeps) {
   };
 
   const handleArchiveTask = async (taskId: string) => {
+    if (!canOperateProjectRef.current) return;
     setActionLoadingMap(m => ({ ...m, [taskId]: 'archive' }));
     try {
       const res = await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}/archive`, {
@@ -420,6 +456,7 @@ export function useTasksState(deps: UseTasksStateDeps) {
   };
 
   const handleUnarchiveTask = async (taskId: string) => {
+    if (!canOperateProjectRef.current) return;
     setActionLoadingMap(m => ({ ...m, [taskId]: 'unarchive' }));
     try {
       const res = await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}/unarchive`, {
@@ -445,6 +482,7 @@ export function useTasksState(deps: UseTasksStateDeps) {
   };
 
   const handleBulkArchive = async (filter: 'completed' | 'terminal') => {
+    if (!canOperateProjectRef.current) return;
     try {
       const res = await fetch(`${API_BASE_URL}/api/admin/tasks/bulk-archive`, {
         method: 'POST',
@@ -463,7 +501,7 @@ export function useTasksState(deps: UseTasksStateDeps) {
   };
 
   const handleBulkAction = async (action: 'approve' | 'retry', taskIds: string[]) => {
-    if (taskIds.length === 0) return;
+    if (!canOperateProjectRef.current || taskIds.length === 0) return;
     try {
       const res = await fetch(`${API_BASE_URL}/api/admin/tasks/bulk-action`, {
         method: 'POST',
@@ -485,6 +523,7 @@ export function useTasksState(deps: UseTasksStateDeps) {
   };
 
   const handleBulkArchiveSelected = async () => {
+    if (!canOperateProjectRef.current) return;
     const ids = Array.from(selectedTaskIds);
     if (ids.length === 0) return;
     try {
@@ -507,7 +546,7 @@ export function useTasksState(deps: UseTasksStateDeps) {
   };
 
   const handleBulkArchiveColumn = async (taskIds: string[]) => {
-    if (taskIds.length === 0) return;
+    if (!canOperateProjectRef.current || taskIds.length === 0) return;
     // Chunk to avoid large single requests that can hit Cloud Run request timeouts.
     const CHUNK_SIZE = 100;
     try {
@@ -532,6 +571,7 @@ export function useTasksState(deps: UseTasksStateDeps) {
   };
 
   const handleResetIterationCap = async (taskId: string) => {
+    if (!canOperateProjectRef.current) return;
     setActionLoadingMap(m => ({ ...m, [taskId]: 'reset-iteration-cap' }));
     try {
       const data = await resetTaskIterationCap(taskId);
@@ -545,6 +585,7 @@ export function useTasksState(deps: UseTasksStateDeps) {
   };
 
   const handleTriggerRollup = async (taskId: string) => {
+    if (!canOperateProjectRef.current) return;
     setActionLoadingMap(m => ({ ...m, [taskId]: 'trigger-rollup' }));
     try {
       const data = await triggerTaskRollup(taskId);
@@ -559,7 +600,7 @@ export function useTasksState(deps: UseTasksStateDeps) {
   };
 
   const handleBulkCancel = async (taskIds: string[]) => {
-    if (taskIds.length === 0) return;
+    if (!canOperateProjectRef.current || taskIds.length === 0) return;
     try {
       const res = await fetch(`${API_BASE_URL}/api/admin/tasks/bulk-action`, {
         method: 'POST',

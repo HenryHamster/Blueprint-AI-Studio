@@ -64,6 +64,7 @@ function remediationResultMeta(result: string | null | undefined): Pick<Remediat
 }
 
 export interface DirectionCardProps {
+  readOnly?: boolean;
   direction: Direction;
   statusKey: string;
   activeItems: Direction[];
@@ -129,6 +130,7 @@ export interface DirectionCardProps {
 }
 
 function DirectionCardImpl({
+  readOnly = true,
   direction: d,
   statusKey: key,
   activeItems,
@@ -426,7 +428,7 @@ function DirectionCardImpl({
         <div>
           <div className="flex items-start gap-2">
             <p className="text-sm text-neutral-200 flex-1">{d.text}</p>
-            <div className="flex items-center gap-1 shrink-0">
+            {!readOnly && <div className="flex items-center gap-1 shrink-0">
               {/* reason: inline direction action button in dense card; text-ui-sm py-0.5 matches card density */}
               <button
                 data-viewport-allow-small-target
@@ -445,7 +447,7 @@ function DirectionCardImpl({
               >
                 Reject
               </button>
-            </div>
+            </div>}
           </div>
           {d.proposal_rationale && (
             <blockquote className="mt-2 border-l-2 border-purple-800/50 pl-2 text-ui-md text-purple-300/80 italic leading-relaxed">
@@ -477,7 +479,7 @@ function DirectionCardImpl({
         <div>
           <div className="flex items-start gap-2">
             <p className="text-sm text-neutral-400 flex-1">{d.text}</p>
-            <div className="flex items-center gap-1 shrink-0">
+            {!readOnly && <div className="flex items-center gap-1 shrink-0">
               {/* reason: inline direction action button in dense card; text-ui-sm py-0.5 matches card density */}
               <button
                 data-viewport-allow-small-target
@@ -496,7 +498,7 @@ function DirectionCardImpl({
               >
                 Approve
               </button>
-            </div>
+            </div>}
           </div>
           {d.proposal_rationale && (
             <blockquote className="mt-2 border-l-2 border-neutral-700/50 pl-2 text-ui-md text-neutral-500 italic leading-relaxed">
@@ -528,7 +530,7 @@ function DirectionCardImpl({
         <div>
           <div className="flex items-start gap-2">
             <p className="text-sm text-neutral-200 flex-1">{d.text}</p>
-            <div className="flex items-center gap-1 shrink-0">
+            {!readOnly && <div className="flex items-center gap-1 shrink-0">
               {/* reason: inline direction action button in dense card; text-ui-sm py-0.5 matches card density */}
               <button
                 data-viewport-allow-small-target
@@ -547,7 +549,7 @@ function DirectionCardImpl({
               >
                 Cancel
               </button>
-            </div>
+            </div>}
           </div>
           {d.completion_criteria && (
             <p className="mt-1.5 text-ui-md text-neutral-500 leading-relaxed">
@@ -593,7 +595,7 @@ function DirectionCardImpl({
           </div>
           {/* Retarget — bind this staged direction to a different (current-or-
               later) version. Defaults the input to the currently-open version. */}
-          {retargetStagedDirection && (
+          {!readOnly && retargetStagedDirection && (
             <div className="flex items-center gap-1.5 mt-2">
               <span className="text-ui-sm text-neutral-500">Retarget to v</span>
               <input
@@ -620,7 +622,7 @@ function DirectionCardImpl({
             </div>
           )}
         </div>
-      ) : editingId === d.id ? (
+      ) : !readOnly && editingId === d.id ? (
         /* Edit mode */
         <div className="space-y-2">
           <input
@@ -761,7 +763,7 @@ function DirectionCardImpl({
         <div>
           <div className="flex items-start gap-2">
             <p className="text-sm text-neutral-200 flex-1">{d.text}</p>
-            <div className="flex items-center gap-1 shrink-0">
+            {!readOnly && <div className="flex items-center gap-1 shrink-0">
               {key === 'active' && (() => {
                 const idx = activeItems.findIndex(x => x.id === d.id);
                 return (<>
@@ -859,7 +861,7 @@ function DirectionCardImpl({
               <button data-viewport-allow-small-target onClick={handleDelete} className="text-neutral-400 hover:text-red-400 transition-colors p-0.5">
                 <Trash2 className="w-3 h-3" />
               </button>
-            </div>
+            </div>}
           </div>
           {d.completion_criteria && (
             <p className="mt-1.5 text-ui-md text-neutral-500 leading-relaxed">
@@ -910,14 +912,14 @@ function DirectionCardImpl({
                 )}
               </div>
               {/* reason: inline unhold action button in dense hold-banner; text-ui-sm py-0.5 matches card density */}
-              <button
+              {!readOnly && <button
                 data-viewport-allow-small-target
                 onClick={handleUnhold}
                 className="text-ui-sm px-2 py-0.5 rounded border border-red-700 text-red-200 hover:bg-red-900/40 shrink-0"
                 title="Clear the hold so this direction can spawn autonomous tasks again"
               >
                 unhold
-              </button>
+              </button>}
             </div>
           )}
           {/* Churn-retirement recommendation banner — operator must explicitly
@@ -938,7 +940,7 @@ function DirectionCardImpl({
                   </p>
                 )}
               </div>
-              <div className="flex items-center gap-1 shrink-0">
+              {!readOnly && <div className="flex items-center gap-1 shrink-0">
                 {/* reason: inline direction action button in dense card; text-ui-sm py-0.5 matches card density */}
                 <button
                   data-viewport-allow-small-target
@@ -982,7 +984,7 @@ function DirectionCardImpl({
                     </div>
                   )}
                 </div>
-              </div>
+              </div>}
             </div>
           )}
           {/* Positive completion suggestion */}
@@ -1087,7 +1089,7 @@ function DirectionCardImpl({
             <span className={`text-ui-sm px-1.5 py-0.5 rounded border font-medium ${priorityColors[d.priority]}`}>
               {d.priority}
             </span>
-            {d.status === 'active' || d.status === 'paused' ? (
+            {!readOnly && (d.status === 'active' || d.status === 'paused') ? (
               // reason: inline status toggle chip in dense direction row; text-ui-sm py-0.5
               <button
                 data-viewport-allow-small-target
@@ -1161,7 +1163,7 @@ function DirectionCardImpl({
               )
             )}
             {/* Reactivate button for auto-paused directions */}
-            {d.auto_paused && key === 'paused' && (
+            {!readOnly && d.auto_paused && key === 'paused' && (
               // reason: inline direction action chip; text-ui-sm py-0.5 matches card density
               <button
                 data-viewport-allow-small-target
@@ -1172,7 +1174,7 @@ function DirectionCardImpl({
               </button>
             )}
             {/* Mark Complete button for possibly-complete directions */}
-            {d.possibly_complete && key === 'active' && (
+            {!readOnly && d.possibly_complete && key === 'active' && (
               // reason: inline mark-complete action chip; text-ui-sm py-0.5 matches card density
               <button
                 data-viewport-allow-small-target
@@ -1342,10 +1344,10 @@ function DirectionCardImpl({
               {d.pending_update.rationale && (
                 <div className="text-neutral-500 italic mt-1">{d.pending_update.rationale}</div>
               )}
-              <div className="flex gap-2 mt-2">
+              {!readOnly && <div className="flex gap-2 mt-2">
                 <button onClick={() => applyDirectionUpdate(d)} className="text-xs px-2 py-0.5 min-h-[44px] rounded border bg-emerald-950/40 border-emerald-900/50 text-emerald-400 hover:bg-emerald-900/40 transition-colors">Apply</button>
                 <button onClick={() => dismissDirectionUpdate(d.id)} className="text-xs px-2 py-0.5 min-h-[44px] rounded border bg-neutral-800/60 border-neutral-700/60 text-neutral-400 hover:text-neutral-300 transition-colors">Dismiss</button>
-              </div>
+              </div>}
             </div>
           )}
           {d.research_history && d.research_history.length > 0 && (

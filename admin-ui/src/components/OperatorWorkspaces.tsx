@@ -1,5 +1,6 @@
-import { lazy, Suspense, type MutableRefObject } from 'react';
+import { lazy, Suspense, useEffect, useRef, type MutableRefObject } from 'react';
 import {
+  ArrowLeft,
   Users,
   Wrench,
 } from 'lucide-react';
@@ -7,7 +8,7 @@ import { ProjectToolHost } from './ProjectToolHost';
 import { DirectionsPanel } from './DirectionsPanel';
 import type { SettingsSectionRouterProps } from './SettingsSectionRouter';
 const SettingsSectionRouter = lazy(() => import('./SettingsSectionRouter').then(m => ({ default: m.SettingsSectionRouter })));
-import { WorkbenchPanel, WorkbenchSurface } from './WorkbenchLayout';
+import { WorkbenchPanel, WorkbenchSurface, type WorkbenchTab } from './WorkbenchLayout';
 import {
   PROJECT_MANAGE_SECTIONS,
   resolveProjectManageItem,
@@ -16,6 +17,7 @@ import {
 } from './OperatorWorkspaceSections';
 import type { StrategicCycleCompletion, StrategicCycleProgress } from '../hooks/useLogViewer';
 import type { Project } from '../types/project';
+import { resolveAccess } from '../accessControl';
 
 export type { ProjectManageSection, ProjectSection, RuntimeSection, RuntimeSettingsSection } from './OperatorWorkspaceSections';
 
@@ -70,7 +72,6 @@ interface ProjectWorkspaceProps {
   cycleProgress?: StrategicCycleProgress | null;
   lastCycleCompletion?: StrategicCycleCompletion | null;
   onOpenProjectManagement: () => void;
-  onOpenProjectMembers: () => void;
   onViewFindings: (directionId: string) => void;
   onViewKnowledge: (directionId: string) => void;
   onNavigateToTask: (taskId: string) => void;
@@ -92,30 +93,64 @@ export function ProjectWorkspace({
   cycleProgress,
   lastCycleCompletion,
   onOpenProjectManagement,
-  onOpenProjectMembers,
   onViewFindings,
   onViewKnowledge,
   onNavigateToTask,
 }: ProjectWorkspaceProps) {
   const activeProjectManageItem = resolveProjectManageItem(projectManageSection);
+  const membersAccessHeadingRef = useRef<HTMLHeadingElement>(null);
   const ActiveProjectManageIcon = activeProjectManageItem.icon;
   const activeProjectSettingsSection = activeProjectManageItem.id === 'overview' ? null : activeProjectManageItem.id;
   const actionButtonClass = 'workbench-focus inline-flex min-h-11 items-center gap-1.5 rounded-md border border-workbench-border bg-workbench-layer px-3 text-xs font-semibold text-neutral-300 transition-colors hover:border-workbench-border-strong hover:bg-workbench-hover hover:text-neutral-100 sm:min-h-9';
+  const projectAccess = resolveAccess(undefined, selectedProject?.my_role);
+  const canOperateProject = projectAccess.canOperateProject;
+  const canManageProject = projectAccess.canManageProject;
+  const activeProjectSection = projectSection === 'manage' && !canManageProject
+    ? 'directions'
+    : projectSection;
+  const membersAccessOpen = activeProjectSection === 'manage' && projectManageSection === 'access';
+
+  useEffect(() => {
+    if (!membersAccessOpen) return;
+    membersAccessHeadingRef.current?.focus();
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || event.defaultPrevented) return;
+      event.preventDefault();
+      onProjectManageSectionChange('overview');
+    };
+    document.addEventListener('keydown', handleEscape);
+    return () => document.removeEventListener('keydown', handleEscape);
+  }, [membersAccessOpen, onProjectManageSectionChange]);
+  const projectTabs: WorkbenchTab<ProjectSection>[] = [
+    { id: 'running-update', label: 'Update' },
+    { id: 'directions', label: 'Directions' },
+    { id: 'problem-model', label: 'Model' },
+    { id: 'design-doc', label: 'Design' },
+    { id: 'tools', label: 'Tools' },
+  ];
+  if (canManageProject) {
+    projectTabs.splice(projectTabs.length - 1, 0, { id: 'manage', label: 'Manage' });
+  }
 
   const projectSurfaceActions = (
     <>
-      <button
-        type="button"
-        onClick={onOpenProjectManagement}
-        className={actionButtonClass}
-      >
-        <Wrench className="h-3.5 w-3.5" />
-        Projects
-      </button>
-      {selectedProjectId && (
+      {(!selectedProjectId || canManageProject) && (
         <button
           type="button"
-          onClick={onOpenProjectMembers}
+          onClick={onOpenProjectManagement}
+          className={actionButtonClass}
+        >
+          <Wrench className="h-3.5 w-3.5" />
+          Projects
+        </button>
+      )}
+      {selectedProjectId && canManageProject && (
+        <button
+          type="button"
+          onClick={() => {
+            onProjectManageSectionChange('access');
+            onProjectSectionChange('manage');
+          }}
           className={actionButtonClass}
         >
           <Users className="h-3.5 w-3.5" />
@@ -129,22 +164,15 @@ export function ProjectWorkspace({
     <WorkbenchSurface
       title="Project"
       subtitle={selectedProjectRepoLabel ?? 'Select a project to manage durable context'}
-      tabs={[
-        { id: 'running-update', label: 'Update' },
-        { id: 'directions', label: 'Directions' },
-        { id: 'problem-model', label: 'Model' },
-        { id: 'design-doc', label: 'Design' },
-        { id: 'manage', label: 'Manage' },
-        { id: 'tools', label: 'Tools' },
-      ]}
-      activeTab={projectSection}
+      tabs={projectTabs}
+      activeTab={activeProjectSection}
       onTabChange={onProjectSectionChange}
       actions={projectSurfaceActions}
       tabLayout="stacked"
       flush
       contentClassName="min-h-0 min-w-0 overflow-hidden"
     >
-      {projectSection === 'tools' ? (
+      {activeProjectSection === 'tools' ? (
         selectedProjectId ? (
           <div className="min-h-0 overflow-auto p-4 custom-scrollbar">
             <ProjectToolHost projectId={selectedProjectId} myRole={selectedProject?.my_role} />
@@ -155,12 +183,12 @@ export function ProjectWorkspace({
             onProjectSectionChange={onProjectSectionChange}
           />
         )
-      ) : projectSection !== 'manage' && !selectedProjectId ? (
+      ) : activeProjectSection !== 'manage' && !selectedProjectId ? (
         <ProjectNoSelectionState
           onOpenProjectManagement={onOpenProjectManagement}
           onProjectSectionChange={onProjectSectionChange}
         />
-      ) : projectSection !== 'manage' ? (
+      ) : activeProjectSection !== 'manage' ? (
         <DirectionsPanel
           addToast={addToast}
           selectedProjectId={selectedProjectId}
@@ -169,8 +197,10 @@ export function ProjectWorkspace({
           strategistActive={strategistActive}
           cycleProgress={cycleProgress}
           lastCycleCompletion={lastCycleCompletion}
-          activeTab={projectSection}
+          activeTab={activeProjectSection}
           onActiveTabChange={onProjectSectionChange}
+          readOnly={!canOperateProject}
+          canManageGlobalSettings={settingsRouterProps.isAdmin && canOperateProject}
           showHeaderTitle={false}
           showInternalTabs={false}
           onViewFindings={onViewFindings}
@@ -298,11 +328,27 @@ export function ProjectWorkspace({
             ) : (
               <div className="mx-auto max-w-6xl space-y-4">
                 <div className="flex min-w-0 items-start gap-3 border-b border-neutral-800 pb-3">
+                  {membersAccessOpen && (
+                    <button
+                      type="button"
+                      onClick={() => onProjectManageSectionChange('overview')}
+                      className="workbench-focus flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-workbench-border text-neutral-400 transition-colors hover:bg-workbench-hover hover:text-neutral-100"
+                      aria-label="Back to project management"
+                    >
+                      <ArrowLeft className="h-4 w-4" />
+                    </button>
+                  )}
                   <span className="workbench-layer flex h-9 w-9 shrink-0 items-center justify-center rounded-md border text-neutral-300">
                     <ActiveProjectManageIcon className="h-4 w-4" />
                   </span>
                   <div className="min-w-0">
-                    <h2 className="text-sm font-semibold text-neutral-100">{activeProjectManageItem.label}</h2>
+                    <h2
+                      ref={membersAccessOpen ? membersAccessHeadingRef : undefined}
+                      tabIndex={membersAccessOpen ? -1 : undefined}
+                      className="text-sm font-semibold text-neutral-100 outline-none"
+                    >
+                      {activeProjectManageItem.label}
+                    </h2>
                     <p className="mt-1 text-xs text-neutral-500">{activeProjectManageItem.description}</p>
                   </div>
                 </div>

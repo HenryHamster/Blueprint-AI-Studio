@@ -116,6 +116,7 @@ describe('RunningUpdatePanel — viewport regression', () => {
       r.render(
         <RunningUpdatePanel
           {...BASE_PROPS}
+          readOnly={false}
           document="Original body"
           onEdited={onEdited}
         />,
@@ -176,6 +177,7 @@ describe('RunningUpdatePanel — viewport regression', () => {
       r.render(
         <RunningUpdatePanel
           {...BASE_PROPS}
+          readOnly={false}
           document="Original body"
           addToast={addToast}
           onEdited={onEdited}
@@ -264,6 +266,7 @@ describe('RunningUpdatePanel — viewport regression', () => {
         r.render(
           <RunningUpdatePanel
             {...BASE_PROPS}
+            readOnly={false}
             document="Test content"
             acknowledgedAt={new Date(Date.now() - 3_600_000).toISOString()}
           />,

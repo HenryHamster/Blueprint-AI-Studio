@@ -26,17 +26,18 @@ export function useDashboardDigest(
   windowHours: number,
   activeCount: number,
   queuedCount: number,
+  enabled: boolean,
 ): UseDashboardDigestResult {
   const [digest, setDigest] = useState<DashboardDigestData | null>(null);
   const [digestStale, setDigestStale] = useState(false);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(enabled);
   const [lastFetchError, setLastFetchError] = useState(false);
   const [sparkData, setSparkData] = useState<SparkPoint[]>([]);
   const [refreshTrigger, setRefreshTrigger] = useState(0);
 
   // Scope key combines the inputs that define which project/window we are
   // displaying. Used to detect scope changes and invalidate scoped state.
-  const scopeKey = `${selectedProjectId}:${windowHours}`;
+  const scopeKey = `${selectedProjectId}:${windowHours}:${enabled}`;
 
   // Tracks the scope key for which we last received a successful digest
   // response. A mismatch means "no data yet" for the current scope (project
@@ -58,7 +59,7 @@ export function useDashboardDigest(
     setLastResetKey(scopeKey);
     setDigest(null);
     setDigestStale(false);
-    setLoading(true);
+    setLoading(enabled);
     setLastFetchError(false);
     setSparkData([]);
   }
@@ -82,7 +83,9 @@ export function useDashboardDigest(
 
   // Incrementing refreshTrigger forces usePoller to re-run its leading call
   // immediately (e.g. after a successful anomaly-throttle restore).
-  const refetchDigest = useCallback(() => setRefreshTrigger(n => n + 1), []);
+  const refetchDigest = useCallback(() => {
+    if (enabled) setRefreshTrigger(n => n + 1);
+  }, [enabled]);
 
   usePoller(async (signal) => {
     let digestOk = false;
@@ -145,7 +148,7 @@ export function useDashboardDigest(
     } else {
       diagnosticsPromise.then(checkError);
     }
-  }, { intervalMs: DEFAULT_POLL_MS, deps: [selectedProjectId, windowHours, refreshTrigger] });
+  }, { intervalMs: DEFAULT_POLL_MS, enabled, deps: [selectedProjectId, windowHours, refreshTrigger] });
 
   return { digest, digestStale, loading, lastFetchError, sparkData, refetchDigest };
 }

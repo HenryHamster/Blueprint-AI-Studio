@@ -2184,7 +2184,7 @@ async def get_project_strategic_state(
     a browser refresh, while deeper editing still lives in the Project workspace.
     """
     project = await _get_user_project_with_role(
-        project_id, current_user["user_id"], session, "member"
+        project_id, current_user["user_id"], session, "viewer"
     )
 
     # Sequential session.execute() calls: AsyncSession does not support
@@ -2691,11 +2691,11 @@ async def get_project_strategic_liveness(
     fingerprints, context package, runtime summary, event/job feeds, SHA/GitHub
     freshness, or integrity checks — so it resolves in a fraction of the time. The
     full read model still hydrates afterward via ``strategic-state`` and takes over
-    once it lands. Guarded with the same ``member``-role project-access check the
-    sibling strategic endpoints use.
+    once it lands. Guarded with the same viewer-safe project-access check as the
+    sibling Strategic read models.
     """
     project = await _get_user_project_with_role(
-        project_id, current_user["user_id"], session, "member"
+        project_id, current_user["user_id"], session, "viewer"
     )
     # Cheap workbench row (indexed lookup) — the mode indicator's only input.
     workbench_state = await get_strategic_workbench_state(
@@ -2775,7 +2775,7 @@ async def get_project_strategic_conversation(
     instead of the full read-model assembly.
     """
     await _get_user_project_with_role(
-        project_id, current_user["user_id"], session, "member"
+        project_id, current_user["user_id"], session, "viewer"
     )
     lookup_key = (client_idempotency_key or idempotency_key or "").strip() or None
     search = (search or "").strip() or None
@@ -3370,7 +3370,7 @@ async def get_conversation_attachment_download_url(
     """Resolve one authorized durable attachment identity to a fresh URL."""
 
     await _get_user_project_with_role(
-        project_id, current_user["user_id"], session, "member"
+        project_id, current_user["user_id"], session, "viewer"
     )
     message = (
         await session.execute(

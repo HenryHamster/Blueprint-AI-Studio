@@ -1,8 +1,28 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
-import { VersionLifecyclePanel } from './VersionLifecyclePanel';
+import type { ComponentProps } from 'react';
+import { VersionLifecyclePanel as VersionLifecyclePanelComponent } from './VersionLifecyclePanel';
 import * as api from '../api';
 import type { VersionLifecycleResponse } from '../api';
+
+type VersionLifecyclePanelTestProps = Omit<
+  ComponentProps<typeof VersionLifecyclePanelComponent>,
+  'readOnly' | 'canManageProject' | 'canManagePlatform'
+> & Partial<Pick<
+  ComponentProps<typeof VersionLifecyclePanelComponent>,
+  'readOnly' | 'canManageProject' | 'canManagePlatform'
+>>;
+
+function VersionLifecyclePanel(props: VersionLifecyclePanelTestProps) {
+  return (
+    <VersionLifecyclePanelComponent
+      readOnly={false}
+      canManageProject
+      canManagePlatform
+      {...props}
+    />
+  );
+}
 
 vi.mock('../firebase', () => ({
   auth: { currentUser: null, onAuthStateChanged: () => () => {} },
@@ -91,6 +111,121 @@ describe('VersionLifecyclePanel', () => {
     vi.clearAllMocks();
     mockRefresh.mockClear();
     vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+  });
+
+  it('read-only mode retains lifecycle state while hiding every mutation control', () => {
+    render(
+      <VersionLifecyclePanel
+        data={makeVersionLifecycleResponse({
+          current_version: makeCurrentVersion({ phase: 'stabilize', serving_status: 'deploy_failed' }),
+          promotion_enabled_effective: false,
+          promotion_enabled_source: 'fleet',
+        })}
+        loading={false}
+        projectId="proj-1"
+        onRefresh={mockRefresh}
+        userRole="admin"
+        readOnly
+      />,
+    );
+
+    expect(screen.getByText('v1')).toBeInTheDocument();
+    expect(screen.getByTitle('Initial version')).toHaveTextContent('Initial version');
+    expect(screen.queryByTestId('phase-controls')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Edit' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Enable' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Arm' })).not.toBeInTheDocument();
+    expect(screen.queryByTestId('clear-deploy-failed')).not.toBeInTheDocument();
+    expect(vi.mocked(api.setVersionPhase)).not.toHaveBeenCalled();
+    expect(vi.mocked(api.setVersionGoal)).not.toHaveBeenCalled();
+    expect(vi.mocked(api.triggerQualify)).not.toHaveBeenCalled();
+    expect(vi.mocked(api.cutVersion)).not.toHaveBeenCalled();
+  });
+
+  it('splits member operations, project-owner controls, and platform-admin controls', () => {
+    const data = makeVersionLifecycleResponse({
+      promotion_enabled: false,
+      promotion_enabled_effective: false,
+      promotion_enabled_source: 'fleet',
+    });
+    const { rerender } = render(
+      <VersionLifecyclePanel
+        data={data}
+        loading={false}
+        projectId="proj-1"
+        onRefresh={mockRefresh}
+        canManageProject={false}
+        canManagePlatform={false}
+      />,
+    );
+
+    expect(screen.getByTestId('phase-controls')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Edit' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Arm' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Enable' })).not.toBeInTheDocument();
+
+    rerender(
+      <VersionLifecyclePanel
+        data={data}
+        loading={false}
+        projectId="proj-1"
+        onRefresh={mockRefresh}
+        canManageProject
+        canManagePlatform={false}
+      />,
+    );
+    expect(screen.getByRole('button', { name: 'Arm' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Enable' })).not.toBeInTheDocument();
+
+    rerender(
+      <VersionLifecyclePanel
+        data={data}
+        loading={false}
+        projectId="proj-1"
+        onRefresh={mockRefresh}
+        canManageProject={false}
+        canManagePlatform
+      />,
+    );
+    expect(screen.queryByRole('button', { name: 'Arm' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Enable' })).toBeInTheDocument();
+  });
+
+  it('closes an owner-only promotion confirmation when access is downgraded', async () => {
+    const data = makeVersionLifecycleResponse({
+      promotion_enabled: false,
+      promotion_enabled_effective: false,
+      promotion_enabled_source: 'fleet',
+    });
+    const { rerender } = render(
+      <VersionLifecyclePanel
+        data={data}
+        loading={false}
+        projectId="proj-1"
+        onRefresh={mockRefresh}
+        canManageProject
+        canManagePlatform={false}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Arm' }));
+    expect(screen.getByText('Arm project live promotion?')).toBeInTheDocument();
+
+    rerender(
+      <VersionLifecyclePanel
+        data={data}
+        loading={false}
+        projectId="proj-1"
+        onRefresh={mockRefresh}
+        canManageProject={false}
+        canManagePlatform={false}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.queryByText('Arm project live promotion?')).not.toBeInTheDocument();
+    });
+    expect(vi.mocked(api.setProjectPromotionEnabled)).not.toHaveBeenCalled();
   });
 
   it('separates lifetime qualifications from the current error retry episode', () => {
@@ -2870,7 +3005,14 @@ describe('VersionLifecyclePanel', () => {
 
       // Non-admin: hidden.
       rerender(
-        <VersionLifecyclePanel data={data} loading={false} projectId="proj-1" onRefresh={mockRefresh} userRole="user" />
+        <VersionLifecyclePanel
+          data={data}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+          userRole="user"
+          canManagePlatform={false}
+        />
       );
       expect(screen.queryByTestId('clear-deploy-failed')).not.toBeInTheDocument();
     });

@@ -1,8 +1,17 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { AlertsBanner } from './AlertsBanner';
+import type { ComponentProps } from 'react';
+import { AlertsBanner as AlertsBannerComponent } from './AlertsBanner';
 import type { Alert } from '../types/alert';
+
+type AlertsBannerTestProps = Omit<ComponentProps<typeof AlertsBannerComponent>, 'canMutate'> & {
+  canMutate?: boolean;
+};
+
+function AlertsBanner(props: AlertsBannerTestProps) {
+  return <AlertsBannerComponent canMutate={true} {...props} />;
+}
 
 const { mockApiFetch } = vi.hoisted(() => ({
   mockApiFetch: vi.fn(),
@@ -71,6 +80,26 @@ describe('AlertsBanner', () => {
   it('does not render acknowledge button when projectId is not provided', () => {
     render(<AlertsBanner alerts={[alert]} onDismiss={vi.fn()} />);
     expect(screen.queryByRole('button', { name: 'Acknowledge alert' })).not.toBeInTheDocument();
+  });
+
+  it('fails closed when canMutate is undefined at runtime', () => {
+    const onDismiss = vi.fn();
+    const onDismissAll = vi.fn();
+    render(
+      <AlertsBannerComponent
+        alerts={[alert, { ...alert, id: 'alert-2' }]}
+        onDismiss={onDismiss}
+        onDismissAll={onDismissAll}
+        projectId="project-1"
+        canMutate={undefined as never}
+      />,
+    );
+
+    expect(screen.getAllByText('Warm pool saturation')).toHaveLength(2);
+    expect(screen.queryByRole('button', { name: 'Acknowledge alert' })).toBeNull();
+    expect(screen.queryByTitle('Dismiss')).toBeNull();
+    expect(screen.queryByText('Dismiss all')).toBeNull();
+    expect(mockApiFetch).not.toHaveBeenCalled();
   });
 
   it('renders acknowledged state when alert.acknowledged_at is set', () => {

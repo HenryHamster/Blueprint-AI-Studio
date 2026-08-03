@@ -9,7 +9,7 @@ Welcome to the Blueprint documentation. This directory contains comprehensive gu
 ### Getting Started
 - **[../README.md](../README.md)** — Project overview, quick start, architecture, and high-level description
 - **[../Deploy.md](../Deploy.md)** — Production deployment on GCP Cloud Run with Terraform and Packer
-- **[ONBOARDING.md](ONBOARDING.md)** — Onboard a new repository end to end (GitHub App install, the onboard endpoint and auto-derived fields, post-onboard branch/build tuning, and approval-gate config)
+- **[ONBOARDING.md](ONBOARDING.md)** — Canonical guide for user access, project roles, both GitHub identities, repository creation, collaborators, safe autonomy defaults, and post-onboard configuration
 - **[../CONTRIBUTING.md](../CONTRIBUTING.md)** — Contributor environment setup and the clone → branch → test → PR workflow
 - **[../CLAUDE.md](../CLAUDE.md)** — Project coding standards, file restrictions, and development guidelines
 

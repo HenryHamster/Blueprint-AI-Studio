@@ -27,6 +27,9 @@ import {
 } from './OperatorWorkspaceSections';
 import type { ComputeExperimentForm } from '../hooks/useTaskModal';
 import type { Project } from '../types/project';
+import { resolveAccess } from '../accessControl';
+import { useProjectResourceSummary } from '../hooks/useProjectResourceSummary';
+import { ProjectResourceAvailabilityCard } from './ProjectResourceAvailabilityCard';
 
 function RuntimeSectionIntro<T extends string>({
   item,
@@ -214,10 +217,27 @@ export function RuntimeWorkspace({
   versionLifecycleRefreshing,
   refreshVersionLifecycle,
 }: RuntimeWorkspaceProps) {
-  const runtimeSettingsSections = visibleRuntimeSettingsSections(userRole);
-  const activeRuntimeItem = resolveRuntimeItem(runtimeSection);
+  const selectedProjectRole = projects.find(project => project.id === selectedProjectId)?.my_role;
+  const access = resolveAccess(userRole, selectedProjectRole);
+  const isPlatformAdmin = access.isPlatformAdmin;
+  const canViewProject = access.canViewProject;
+  const canOperateProject = access.canOperateProject;
+  const canManageProject = access.canManageProject;
+  const runtimeSettingsSections = isPlatformAdmin ? visibleRuntimeSettingsSections(userRole) : [];
   const activeRuntimeSettingsItem = resolveRuntimeSettingsItem(runtimeConfigSection, userRole);
   const hasVersionData = hasVersionLifecycleData(versionLifecycle);
+  const visibleRuntimeSections = RUNTIME_SECTIONS.filter(
+    s => (isPlatformAdmin || s.id === 'devices' || s.id === 'compute' || s.id === 'version-lifecycle')
+      && (s.id !== 'version-lifecycle' || hasVersionData),
+  );
+  const effectiveRuntimeSection = visibleRuntimeSections.some(item => item.id === runtimeSection)
+    ? runtimeSection
+    : visibleRuntimeSections[0]?.id ?? 'devices';
+  const effectiveSelectedProjectId = canViewProject ? selectedProjectId : null;
+  const resourceSummary = useProjectResourceSummary(
+    effectiveSelectedProjectId,
+    effectiveRuntimeSection === 'devices' || effectiveRuntimeSection === 'compute',
+  );
   const [agentServingShas, setAgentServingShas] = useState<AgentServingShasResponse | null>(null);
   usePoller(async (signal) => {
     if (!selectedProjectId) { setAgentServingShas(null); return; }
@@ -227,10 +247,8 @@ export function RuntimeWorkspace({
     } catch {
       if (!signal.aborted) setAgentServingShas(null);
     }
-  }, { intervalMs: DEFAULT_POLL_MS, deps: [selectedProjectId] });
-  const visibleRuntimeSections = RUNTIME_SECTIONS.filter(
-    s => s.id !== 'version-lifecycle' || hasVersionData,
-  );
+  }, { intervalMs: DEFAULT_POLL_MS, enabled: !!selectedProjectId && canViewProject, deps: [selectedProjectId, canViewProject] });
+  const activeRuntimeItem = resolveRuntimeItem(effectiveRuntimeSection);
   const actionButtonClass = 'inline-flex min-h-11 min-w-11 items-center justify-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/70 px-0 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100 sm:min-h-9 sm:min-w-0 sm:px-3';
   const runtimeAccounts = settingsRouterProps.maxPlanAccounts ?? [];
   const accountTotal = runtimeAccounts.length;
@@ -272,14 +290,14 @@ export function RuntimeWorkspace({
       title="Runtime"
       subtitle="Overview, devices, compute, accounts, settings"
       tabs={visibleRuntimeSections.map(({ id, label }) => ({ id, label }))}
-      activeTab={runtimeSection}
+      activeTab={effectiveRuntimeSection}
       onTabChange={onRuntimeSectionChange}
       actions={runtimeSurfaceActions}
       tabLayout="stacked"
       flush
-      contentClassName={runtimeSection === 'settings' ? 'min-h-0 min-w-0 overflow-hidden' : 'min-h-0 min-w-0 overflow-auto p-3 custom-scrollbar'}
+      contentClassName={effectiveRuntimeSection === 'settings' ? 'min-h-0 min-w-0 overflow-hidden' : 'min-h-0 min-w-0 overflow-auto p-3 custom-scrollbar'}
     >
-      {runtimeSection === 'health' ? (
+      {effectiveRuntimeSection === 'health' ? (
         <div className="mx-auto flex max-w-7xl flex-col gap-3">
           <RuntimeSectionIntro
             item={activeRuntimeItem}
@@ -309,6 +327,7 @@ export function RuntimeWorkspace({
             onShowAnalytics={() => onRuntimeSectionChange('analytics')}
             onOpenFleet={onOpenFleet}
             onCreateTask={onCreateTask}
+            isAdmin={userRole === 'admin'}
           />
           {selectedProjectId && (
             <CompletionDebtPanel
@@ -317,7 +336,7 @@ export function RuntimeWorkspace({
             />
           )}
         </div>
-      ) : runtimeSection === 'devices' ? (
+      ) : effectiveRuntimeSection === 'devices' ? (
         <div className="mx-auto flex max-w-7xl flex-col gap-3">
           <RuntimeSectionIntro
             item={activeRuntimeItem}
@@ -335,14 +354,19 @@ export function RuntimeWorkspace({
               tone={selectedProjectId ? 'good' : 'warn'}
             />
           </RuntimeSectionIntro>
-          <div className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_minmax(360px,420px)]">
-            <section className="workbench-layer min-w-0 rounded-md border p-3" aria-label="Warm VM devices">
-              <Suspense fallback={null}>
-                <WarmVmPanel onViewTask={onViewTaskById} projects={projects} />
-              </Suspense>
-            </section>
+          {effectiveSelectedProjectId && (
+            <ProjectResourceAvailabilityCard {...resourceSummary} />
+          )}
+          <div className={`grid gap-3 ${isPlatformAdmin ? 'xl:grid-cols-[minmax(0,1fr)_minmax(360px,420px)]' : ''}`}>
+            {isPlatformAdmin && (
+              <section className="workbench-layer min-w-0 rounded-md border p-3" aria-label="Warm VM devices">
+                <Suspense fallback={null}>
+                  <WarmVmPanel onViewTask={onViewTaskById} projects={projects} />
+                </Suspense>
+              </section>
+            )}
             <section className="workbench-layer min-w-0 rounded-md border p-3" aria-label="Self-hosted runner devices">
-              {selectedProjectId ? (
+              {selectedProjectId && canViewProject ? (
                 <Suspense fallback={null}>
                   <FleetRunnersPanel
                     projectId={selectedProjectId}
@@ -350,6 +374,7 @@ export function RuntimeWorkspace({
                     refreshSignal={fleetRunnersRefreshSignal}
                     live={wsConnected}
                     onNavigateToTask={onViewTaskById}
+                    readOnly={!canManageProject}
                   />
                 </Suspense>
               ) : (
@@ -360,7 +385,7 @@ export function RuntimeWorkspace({
             </section>
           </div>
         </div>
-      ) : runtimeSection === 'compute' ? (
+      ) : effectiveRuntimeSection === 'compute' ? (
         <div className="mx-auto flex max-w-7xl flex-col gap-3">
           <RuntimeSectionIntro
             item={activeRuntimeItem}
@@ -377,19 +402,23 @@ export function RuntimeWorkspace({
               tone={globalActiveCount > 0 ? 'info' : 'neutral'}
             />
           </RuntimeSectionIntro>
+          {effectiveSelectedProjectId && (
+            <ProjectResourceAvailabilityCard {...resourceSummary} />
+          )}
           <Suspense fallback={null}>
             <ComputeJobsPanel
-              projectId={selectedProjectId}
+              projectId={canViewProject ? selectedProjectId : null}
               onNavigateToTask={onViewTaskById}
               onLaunchCompute={onLaunchCompute}
               onCloneExperiment={onCloneExperiment}
               onApproveExperiment={onApproveExperiment}
               onDismissExperiment={onDismissExperiment}
               onNavigateToKnowledge={onNavigateToKnowledge}
+              readOnly={!canOperateProject}
             />
           </Suspense>
         </div>
-      ) : runtimeSection === 'analytics' ? (
+      ) : effectiveRuntimeSection === 'analytics' ? (
         <Suspense fallback={null}>
           <DashboardHome
             tasks={tasks}
@@ -407,9 +436,9 @@ export function RuntimeWorkspace({
             userRole={userRole}
           />
         </Suspense>
-      ) : runtimeSection === 'version-lifecycle' ? (
+      ) : effectiveRuntimeSection === 'version-lifecycle' ? (
         <div className="mx-auto max-w-6xl space-y-4">
-          {selectedProjectId ? (
+          {selectedProjectId && canViewProject ? (
             <Suspense fallback={null}>
               <VersionLifecyclePanel
                 data={versionLifecycle}
@@ -421,6 +450,9 @@ export function RuntimeWorkspace({
                 lastSuccessfulRefreshAt={versionLifecycleLastSuccessAt}
                 refreshing={versionLifecycleRefreshing}
                 agentServingShas={agentServingShas}
+                readOnly={!canOperateProject}
+                canManageProject={canManageProject}
+                canManagePlatform={access.canManagePlatform}
               />
             </Suspense>
           ) : (
@@ -429,7 +461,7 @@ export function RuntimeWorkspace({
             </div>
           )}
         </div>
-      ) : runtimeSection === 'accounts' ? (
+      ) : effectiveRuntimeSection === 'accounts' ? (
         <div className="mx-auto flex max-w-6xl flex-col gap-3">
           <RuntimeSectionIntro
             item={activeRuntimeItem}

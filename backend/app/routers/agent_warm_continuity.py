@@ -37,11 +37,11 @@ from app.auth import (
 from app.broadcast import broadcast_to_project
 from app.capability_execution_fence import (
     block_task_for_capability_proof,
-    clear_warm_dispatch_pin,
     evaluate_execution_authority_block,
 )
 from app.claim_analytics import stamp_warm_claim_timing
 from app.database import get_session, resolve_dialect_name
+from app.execution_principal import resolve_project_execution_principal
 from app.models import Task, TaskStatus, _utcnow
 from app.routers.agent import verify_agent_token
 from app.shared_state import limiter
@@ -316,25 +316,6 @@ def _norm_account(value) -> str | None:
     return s or None
 
 
-async def _project_user_id(session: AsyncSession, project_id) -> str:
-    """Return the owning user_id for ``project_id`` (empty string if absent).
-
-    This is the FALLBACK pool owner. Cold dispatch (orchestrator.py) scopes the
-    account pool to ``task.launched_by_user_id`` when set (the launcher pays) and
-    falls back to ``Project.user_id`` only for autonomous tasks with no launcher;
-    the re-target path mirrors that order, using this helper for the fallback leg.
-    """
-    if project_id is None:
-        return ""
-    from app.models import Project
-
-    result = await session.execute(
-        select(Project.user_id).where(Project.id == project_id)
-    )
-    row = result.first()
-    return str(row[0]) if row and row[0] else ""
-
-
 async def _resolve_retarget(
     session: AsyncSession,
     task: Task,
@@ -367,15 +348,11 @@ async def _resolve_retarget(
     )
 
     runtime_config = _shared_state.runtime_config
-    # Mirror cold dispatch's pool scoping: the launcher pays, so prefer
-    # ``task.launched_by_user_id`` and fall back to the project owner only for
-    # autonomous tasks with no launcher. Backlog reuse has no launched_by filter,
-    # so a user-launched task whose launcher != project owner is reachable here;
-    # selecting from the project owner's pool would mis-attribute cost and, when
-    # the owner's pool has no matching account, yield a synthetic account=None
-    # result (no manifest/slot) that strands the task on the VM's boot creds.
-    user_id = task.launched_by_user_id or await _project_user_id(
-        session, task.project_id
+    # Warm retargeting is another execution-resource selection boundary, so it
+    # uses the same project owner principal as cold dispatch and local runners.
+    user_id = await resolve_project_execution_principal(
+        session,
+        task.project_id,
     )
     # Union the same two blacklist keys cold dispatch unions into its effective
     # blacklist: caller-supplied ``blacklisted_accounts`` plus sticky
@@ -474,6 +451,7 @@ async def _resolve_retarget(
 
         await release_max_plan_account(
             acquired_account_id,
+            revert_daily_task_count=True,
             project_id=str(task.project_id) if task.project_id else None,
         )
         raise
@@ -586,7 +564,36 @@ async def _finalize_warm_claim(
     OpenAI OAuth claims also receive the latest manifest when staying on the
     same account because refresh tokens rotate independently of account identity.
     The field remains additive for older agents that ignore it.
+
+    A warm-pool lease may carry a durable reservation-account marker stamped by
+    the orchestrator. That marker, rather than dispatch origin or a caller
+    boolean, transfers ownership of the already-acquired slot into finalization.
     """
+    from app.warm_pool import (
+        WARM_POOL_PIN_KEY,
+        WARM_POOL_RESERVATION_ACCOUNT_KEY,
+        abandon_pool_dispatch,
+        pool_reservation_account_id,
+    )
+
+    transferred_account_id = pool_reservation_account_id(task)
+
+    def _pool_ownership_tuple(candidate: Task) -> tuple[str | None, bool, str, str]:
+        candidate_ctx = candidate.context if isinstance(candidate.context, dict) else {}
+        return (
+            pool_reservation_account_id(candidate),
+            bool(candidate_ctx.get(WARM_POOL_PIN_KEY)),
+            str(candidate_ctx.get("warm_target_vm_id") or ""),
+            str(candidate.vm_instance_id or ""),
+        )
+
+    # Only the pool path transfers ownership across the selector -> PR fence
+    # lock reorder. Markerless direct pool leases are valid, so snapshot the
+    # complete pin identity rather than treating the marker alone as identity.
+    pre_pr_pool_ownership = (
+        _pool_ownership_tuple(task) if origin == "warm_pool" else None
+    )
+
     # Candidate selectors arrive holding the Task row. PR work has a stricter
     # repo/PR -> Task order shared with merge publication, so release the
     # selector lock and reacquire it through the centralized execution fence
@@ -604,19 +611,67 @@ async def _finalize_warm_claim(
             task_id=warm_task_id,
             claimable_statuses=(TaskStatus.QUEUED,),
         )
-        if not pr_fence.allowed or pr_fence.task is None:
-            from app.warm_pool import release_pool_vm
+        fenced_task = pr_fence.task
+        if pre_pr_pool_ownership is not None:
+            if fenced_task is None:
+                logger.warning(
+                    "[NEXT-ROLE][pr-execution-fence] Declining unverifiable pool "
+                    "claim for task %s on vm %s after lock reorder",
+                    warm_task_id,
+                    vm_instance_id,
+                )
+                return Response(status_code=204)
 
-            fenced_task = pr_fence.task
-            if fenced_task is not None:
-                clear_warm_dispatch_pin(fenced_task)
-                session.add(fenced_task)
-            await release_pool_vm(
-                session,
-                vm_instance_id,
-                owning_task_id=warm_task_id,
+            refreshed_pool_ownership = _pool_ownership_tuple(fenced_task)
+            if refreshed_pool_ownership != pre_pr_pool_ownership:
+                # A concurrent abandon or re-dispatch changed ownership while
+                # the selector lock was released. Never clean up here: the new
+                # tuple may belong to a different VM/lease even when it reused
+                # the same account marker.
+                logger.warning(
+                    "[NEXT-ROLE][pr-execution-fence] Declining stale pool claim "
+                    "for task %s on vm %s: ownership changed during lock reorder "
+                    "(%s -> %s)",
+                    warm_task_id,
+                    vm_instance_id,
+                    pre_pr_pool_ownership,
+                    refreshed_pool_ownership,
+                )
+                return Response(status_code=204)
+
+            refreshed_transfer, refreshed_pin, refreshed_target, refreshed_vm = (
+                refreshed_pool_ownership
             )
-            await session.commit()
+            if not (
+                refreshed_pin
+                and refreshed_target == str(vm_instance_id)
+                and refreshed_vm == str(vm_instance_id)
+            ):
+                # Ownership is unchanged, so this caller still owns cleanup;
+                # the tuple is simply malformed for the requesting VM.
+                await abandon_pool_dispatch(
+                    session,
+                    task=fenced_task,
+                    vm_instance_id=vm_instance_id,
+                    reason="pr_reservation_pin_mismatch",
+                )
+                logger.warning(
+                    "[NEXT-ROLE][pr-execution-fence] Declining malformed pool "
+                    "claim for task %s on vm %s: ownership tuple does not match",
+                    warm_task_id,
+                    vm_instance_id,
+                )
+                return Response(status_code=204)
+            transferred_account_id = refreshed_transfer
+
+        if not pr_fence.allowed or fenced_task is None:
+            await abandon_pool_dispatch(
+                session,
+                task=fenced_task,
+                task_id=warm_task_id,
+                vm_instance_id=vm_instance_id,
+                reason="pr_execution_fence",
+            )
             logger.warning(
                 "[NEXT-ROLE][pr-execution-fence] Declining warm claim (%s) "
                 "for task %s on vm %s: %s",
@@ -626,30 +681,27 @@ async def _finalize_warm_claim(
                 pr_fence.reason or "task no longer claimable",
             )
             return Response(status_code=204)
-        task = pr_fence.task
+        task = fenced_task
 
     # Execution-authority fence (shared with cold dispatch): re-grade this locked
     # QUEUED task's capability-proof requirements against the live gate mode +
     # platform ledger BEFORE it flips to IN_PROGRESS, acquires an account, or
     # mints a JWT. Under enforce, unproven proof parks the task BLOCKED with
-    # machine-resolvable needs and DECLINES the warm claim (204). No account has
-    # been acquired yet at this point, so the only transient state to unwind is
-    # the warm pin and any pool-VM lease — both released consistently below so
-    # the member returns to the idle pool instead of lingering LEASED on a task
-    # that will no longer run warm.
+    # machine-resolvable needs and DECLINES the warm claim (204). Chain/backlog
+    # claims have not acquired an account yet; a warm-pool claim owns the slot
+    # transferred with its lease, so the decline path releases that reservation
+    # alongside the warm pin and pool-VM lease.
     _fence_blocking = await evaluate_execution_authority_block(session, task)
     if _fence_blocking:
-        from app.warm_pool import release_pool_vm
-
         block_task_for_capability_proof(
             task, _fence_blocking, source=f"warm claim ({origin})"
         )
-        clear_warm_dispatch_pin(task)
-        await release_pool_vm(
-            session, vm_instance_id, owning_task_id=task.id
+        await abandon_pool_dispatch(
+            session,
+            task=task,
+            vm_instance_id=vm_instance_id,
+            reason="capability_proof_fence",
         )
-        session.add(task)
-        await session.commit()
         logger.warning(
             "[NEXT-ROLE][capability-proof-enforce] Declining warm claim (%s) for "
             "task %s on vm %s — required capability proof not current: %s; parked "
@@ -700,6 +752,11 @@ async def _finalize_warm_claim(
         boot_account = await _vm_boot_account_identity(
             session, vm_instance_id, exclude_task_id=task.id
         )
+    if boot_account is None and vm_boot and _norm_account(vm_boot.get("account_id")):
+        # The immediate prior task's first-class completion columns are also a
+        # canonical boot identity. Older rows may predate the duplicated
+        # context.llm_account_id stamp that the role-chain lookup uses.
+        boot_account = dict(vm_boot)
 
     # Warm re-target: resolve + acquire the claimed task's own account and stamp
     # it onto ctx BEFORE the timing write so a single context commit persists
@@ -709,7 +766,7 @@ async def _finalize_warm_claim(
     # after the slot was acquired) — acquire/release stays airtight rather than
     # reconciliation-dependent.
     secret_manifest: dict | None = None
-    acquired_account_id: str | None = None
+    acquired_account_id: str | None = transferred_account_id
     retargeted = False
     # Mint the new JWT BEFORE committing the IN_PROGRESS transition. If mint
     # raises, the rollback restores QUEUED so a retry can succeed instead of
@@ -718,6 +775,7 @@ async def _finalize_warm_claim(
         AGENT_TOKEN_TTL_HOURS if refresh_capable else AGENT_BOOTSTRAP_TOKEN_TTL_HOURS
     )
     _warm_task_id_str = str(task.id)
+    _warm_project_id_str = str(task.project_id) if task.project_id else None
     try:
         if vm_boot is not None and _shared_state.runtime_config.get(
             "warm_retarget_enabled", False
@@ -725,7 +783,6 @@ async def _finalize_warm_claim(
             secret_manifest, ctx, acquired_account_id = await _resolve_retarget(
                 session, task, vm_instance_id, vm_boot, ctx, task_type
             )
-            retargeted = True
             if ctx.pop("park_retarget_claim_blocked", False):
                 await session.rollback()
                 logger.info(
@@ -735,6 +792,53 @@ async def _finalize_warm_claim(
                     vm_instance_id,
                 )
                 return Response(status_code=204)
+            # A selection attempt is not a retarget. Account-less/env fallback
+            # results acquire no slot and must continue through the exact boot
+            # account gate/stamp below (or decline there).
+            retargeted = acquired_account_id is not None
+
+        if (
+            not retargeted
+            and boot_account is not None
+            and acquired_account_id is None
+        ):
+            from app.max_plan_pool import reserve_max_plan_account
+
+            task_blacklist = ctx.get("blacklisted_accounts") or []
+            sticky_blacklist = ctx.get("provision_failed_accounts") or []
+            effective_blacklist = list(
+                dict.fromkeys(
+                    [
+                        *(task_blacklist if isinstance(task_blacklist, list) else []),
+                        *(
+                            sticky_blacklist
+                            if isinstance(sticky_blacklist, list)
+                            else []
+                        ),
+                    ]
+                )
+            )
+            owner_user_id = await resolve_project_execution_principal(
+                session, task.project_id
+            )
+            boot_reserved = await reserve_max_plan_account(
+                boot_account["account_id"],
+                user_id=owner_user_id,
+                project_id=str(task.project_id) if task.project_id else None,
+                model=boot_account.get("model"),
+                blacklist=effective_blacklist or None,
+                count_daily_task=True,
+            )
+            if not boot_reserved:
+                await session.rollback()
+                logger.info(
+                    "[NEXT-ROLE] Warm claim for task %s on vm %s deferred: "
+                    "boot account is not eligible in the project owner pool",
+                    _warm_task_id_str,
+                    vm_instance_id,
+                )
+                return Response(status_code=204)
+            acquired_account_id = str(boot_account["account_id"])
 
         # Baseline boot-account attribution. The VM's LLM credentials are frozen
         # into its boot secret manifest, so a backlog/chain claim that bypasses
@@ -823,6 +927,10 @@ async def _finalize_warm_claim(
             confirm_lane_warm_resume(
                 ctx, has_checkpoint=bool(ctx.get("lane_checkpoint_sha"))
             )
+        # A successful claim consumes the transfer marker. The normal task
+        # completion path now owns the active reservation and must release only
+        # concurrency, preserving the daily charge.
+        ctx.pop(WARM_POOL_RESERVATION_ACCOUNT_KEY, None)
         task.context = ctx
         task.llm_account_id = ctx.get("llm_account_id")
         flag_modified(task, "context")
@@ -836,34 +944,33 @@ async def _finalize_warm_claim(
         session.add(task)
         await session.commit()
     except Exception as exc:
-        # Release the slot acquired by the re-target so acquire/release stays
-        # balanced when the claim does not land.
-        if acquired_account_id:
+        await session.rollback()
+        if transferred_account_id:
+            # The DB rollback restored the durable marker + QUEUED pool pin.
+            # Abandon them together so a retry cannot infer ownership from
+            # origin and cannot double-release the selected account.
+            await abandon_pool_dispatch(
+                session,
+                task_id=_warm_task_id_str,
+                vm_instance_id=vm_instance_id,
+                reason="finalize_error",
+            )
+        elif acquired_account_id:
+            # Chain/backlog finalization acquired its own fresh reservation and
+            # has no durable pool-transfer marker.
             from app.max_plan_pool import release_max_plan_account
 
             await release_max_plan_account(
                 acquired_account_id,
-                project_id=str(task.project_id) if task.project_id else None,
+                revert_daily_task_count=True,
+                project_id=_warm_project_id_str,
             )
-        await session.rollback()
         if isinstance(exc, HTTPException):
             raise
         logger.exception("[NEXT-ROLE] warm-claim finalize failed; rolling back")
         raise HTTPException(status_code=500, detail="token_mint_failed") from exc
 
     await session.refresh(task)
-
-    # Reserve the boot account's concurrency slot immediately. The DB context is
-    # already stamped above, so the next reconciliation cycle will re-base this
-    # count from the DB — but until then the in-memory pool would under-count the
-    # reused work. Reserving here closes that sub-cycle window so per-account caps
-    # cannot be bypassed by reuse. No-op when the account is absent from the pool.
-    # Skipped when re-target acquired the task's own account (its slot was already
-    # reserved inside _resolve_retarget).
-    if not retargeted and boot_account is not None:
-        from app.max_plan_pool import reserve_max_plan_account
-
-        await reserve_max_plan_account(boot_account["account_id"])
 
     # Broadcast AFTER the commit so a rollback path doesn't fire a spurious
     # event.
@@ -971,8 +1078,14 @@ async def next_role(
             f"(delete reason={_delete_reason})"
         )
         from app.warm_backlog_reuse import record_chain_doomed as _record_chain_doomed
+        from app.warm_pool import abandon_pool_dispatch
 
         _record_chain_doomed()
+        await abandon_pool_dispatch(
+            session,
+            vm_instance_id=req.vm_instance_id,
+            reason="vm_doomed_preclaim",
+        )
         return Response(status_code=204)
 
     # Postgres can use the JSONB ``?`` operator (``has_key``) against
@@ -1000,8 +1113,10 @@ async def next_role(
     from app.warm_pool import (
         WARM_POOL_ORIGIN,
         WARM_POOL_PIN_KEY,
+        abandon_pool_dispatch,
         get_pool_vm,
         is_warm_pool_enabled,
+        pool_reservation_account_id,
     )
 
     if is_warm_pool_enabled() and not _shared_state.is_warm_pool_suppressed():
@@ -1075,6 +1190,29 @@ async def next_role(
             else:
                 # Account wildcard / local VM: no re-target, run on boot identity.
                 run_account = member_boot
+            transferred_account_id = pool_reservation_account_id(pool_task)
+            if transferred_account_id and (
+                run_account is None
+                or run_account.get("account_id") != transferred_account_id
+            ):
+                await abandon_pool_dispatch(
+                    session,
+                    task=pool_task,
+                    vm_instance_id=req.vm_instance_id,
+                    reason="reservation_identity_mismatch",
+                )
+                return Response(status_code=204)
+            if run_account is None:
+                # A lease with neither a transferred reservation nor a concrete
+                # boot identity cannot be charged/stamped coherently. Decline it
+                # instead of running an unaccounted pool role.
+                await abandon_pool_dispatch(
+                    session,
+                    task=pool_task,
+                    vm_instance_id=req.vm_instance_id,
+                    reason="accountless_pool_lease",
+                )
+                return Response(status_code=204)
             # Re-target the agent's credentials when the resolved run account
             # differs from the member's frozen boot identity. Without this the
             # task would silently execute on the member's wrong frozen account
@@ -1083,16 +1221,16 @@ async def next_role(
             # and emitting the manifest is exactly what keeps the relaxed lease
             # safe — so this is unconditional on any detected mismatch.
             secret_manifest = None
-            account_mismatch = (
-                run_account is not None
-                and member_boot is not None
-                and (
+            manifest_required = run_account is not None and (
+                member_boot is None
+                or (
                     run_account["account_id"] != member_boot["account_id"]
                     or run_account.get("provider") != member_boot.get("provider")
+                    or run_account.get("auth_mode") != member_boot.get("auth_mode")
                     or run_account.get("model") != member_boot.get("model")
                 )
             )
-            if account_mismatch:
+            if manifest_required:
                 from app.max_plan_pool import build_account_retarget_manifest
 
                 secret_manifest = build_account_retarget_manifest(
@@ -1124,11 +1262,17 @@ async def next_role(
                     logger.warning(
                         "[NEXT-ROLE] Aborting warm_pool claim for task "
                         f"{pool_task.id} on vm {req.vm_instance_id}: account "
-                        f"mismatch (boot={member_boot['account_id']} "
+                        f"identity requires materialization (boot="
+                        f"{(member_boot or {}).get('account_id')} "
                         f"run={run_account['account_id']}) but re-target manifest "
                         "unavailable; falling back to cold dispatch"
                     )
-                    await session.rollback()
+                    await abandon_pool_dispatch(
+                        session,
+                        task=pool_task,
+                        vm_instance_id=req.vm_instance_id,
+                        reason="retarget_manifest_unavailable",
+                    )
                     return Response(status_code=204)
             try:
                 result = await _finalize_warm_claim(

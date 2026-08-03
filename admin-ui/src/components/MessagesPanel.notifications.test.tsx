@@ -2,10 +2,16 @@ import { describe, test, expect, vi, afterEach, beforeEach } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { render, waitFor } from '@testing-library/react';
-import { MessagesPanel } from './MessagesPanel';
+import { MessagesPanel as MessagesPanelComponent, type MessagesPanelProps } from './MessagesPanel';
+
 import { effectiveSignal, loadEventPrefs, saveEventPrefs, EVENT_PREFS_KEY, eventPrefsKey, isCriticalSeverity } from './MessagesPanel.utils';
 import type { ProjectMessage } from './MessageBubble';
 import type { StrategicStateResponse } from '../strategicStateApi';
+
+type MessagesPanelTestProps = Omit<MessagesPanelProps, 'canOperateProject'> & { canOperateProject?: boolean };
+function MessagesPanel(props: MessagesPanelTestProps) {
+  return <MessagesPanelComponent canOperateProject={true} {...props} />;
+}
 
 // Full replacement (NOT a partial mock): the real `../firebase` calls
 // initializeApp()/getAuth() at module load, which we must not run in jsdom.

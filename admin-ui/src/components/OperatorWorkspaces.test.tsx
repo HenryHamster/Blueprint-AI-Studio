@@ -18,6 +18,23 @@ import type { SectionId } from './settingsSections';
 import type { Task } from './TaskCard';
 import type { Project } from '../types/project';
 
+const resourceSummaryHookMock = vi.hoisted(() => vi.fn(() => ({
+  projectId: 'proj-1',
+  loading: false,
+  error: null,
+  data: {
+    project_id: 'proj-1',
+    policy: { execution_resources: 'project owner', attribution: 'launcher', managed_by: 'owner' },
+    accounts: { total: 3, enabled: 3, enabled_below_cap: 2, at_cap: 1, project_active_tasks: 1, project_daily_task_count: 4, project_daily_task_cap: 30, project_max_concurrent_tasks: 6 },
+    runners: { total: 2, online: 1, offline: 1 },
+  },
+})));
+
+vi.mock('../hooks/useProjectResourceSummary', () => ({
+  PROJECT_RESOURCE_SUMMARY_POLL_MS: 30_000,
+  useProjectResourceSummary: resourceSummaryHookMock,
+}));
+
 vi.mock('./DirectionsPanel', () => ({
   DirectionsPanel: ({ activeTab }: { activeTab: string }) => <div data-testid="directions-panel">{activeTab}</div>,
 }));
@@ -31,11 +48,11 @@ vi.mock('./WarmVmPanel', () => ({
 }));
 
 vi.mock('./FleetRunnersPanel', () => ({
-  FleetRunnersPanel: () => <div>Runners</div>,
+  FleetRunnersPanel: ({ readOnly }: { readOnly?: boolean }) => <div data-testid="fleet-runners-panel" data-read-only={String(!!readOnly)}>Runners</div>,
 }));
 
 vi.mock('./ComputeJobsPanel', () => ({
-  ComputeJobsPanel: () => <div>Compute jobs</div>,
+  ComputeJobsPanel: ({ readOnly }: { readOnly?: boolean }) => <div data-testid="compute-jobs-panel" data-read-only={String(!!readOnly)}>Compute jobs</div>,
   CompactJobsTable: () => <div>Compact jobs table</div>,
   default: () => <div>Compute jobs</div>,
 }));
@@ -45,8 +62,23 @@ vi.mock('./DashboardHome', () => ({
 }));
 
 vi.mock('./VersionLifecyclePanel', () => ({
-  VersionLifecyclePanel: ({ data }: { data: { current_version?: { version_number: number } | null } | null }) => (
-    <div data-testid="version-lifecycle-panel">
+  VersionLifecyclePanel: ({
+    data,
+    readOnly,
+    canManageProject,
+    canManagePlatform,
+  }: {
+    data: { current_version?: { version_number: number } | null } | null;
+    readOnly?: boolean;
+    canManageProject?: boolean;
+    canManagePlatform?: boolean;
+  }) => (
+    <div
+      data-testid="version-lifecycle-panel"
+      data-read-only={String(!!readOnly)}
+      data-can-manage-project={String(!!canManageProject)}
+      data-can-manage-platform={String(!!canManagePlatform)}
+    >
       {data?.current_version ? `v${data.current_version.version_number}` : 'no version data'}
     </div>
   ),
@@ -102,7 +134,6 @@ function projectProps(overrides: {
     settingsRouterProps: {} as never,
     addToast: vi.fn(),
     onOpenProjectManagement: vi.fn(),
-    onOpenProjectMembers: vi.fn(),
     onViewFindings: vi.fn(),
     onViewKnowledge: vi.fn(),
     onNavigateToTask: vi.fn(),
@@ -115,6 +146,7 @@ function runtimeProps(overrides: {
   userRole?: 'admin' | 'user' | null;
   selectedProjectId?: string | null;
   selectedProjectRepoLabel?: string | null;
+  projectRole?: Project['my_role'];
   onRuntimeSectionChange?: (section: RuntimeSection) => void;
   onRuntimeConfigSectionChange?: (section: RuntimeSettingsSection) => void;
 } = {}) {
@@ -125,7 +157,7 @@ function runtimeProps(overrides: {
     onRuntimeConfigSectionChange: overrides.onRuntimeConfigSectionChange ?? vi.fn(),
     selectedProjectId: overrides.selectedProjectId ?? 'proj-1',
     selectedProjectRepoLabel: overrides.selectedProjectRepoLabel ?? 'acme/widgets',
-    projects: [makeProject()],
+    projects: [makeProject({ my_role: overrides.projectRole ?? 'owner' })],
     tasks: [] as Task[],
     scopedActiveCount: 1,
     scopedQueuedCount: 2,
@@ -171,31 +203,155 @@ describe('Operator workspaces', () => {
     expect(onRuntimeSectionChange).toHaveBeenCalledWith('compute');
   });
 
-  test('shows admin-only runtime settings only for admins and falls back for non-admin selection', async () => {
+  test('hides global runtime surfaces for ordinary users and falls back to project devices', async () => {
     const { rerender } = render(<RuntimeWorkspace {...runtimeProps({ userRole: 'user', runtimeConfigSection: 'deploy' })} />);
 
-    const nav = screen.getByLabelText('Runtime settings sections');
-    expect(within(nav).queryByRole('button', { name: /Deploy/ })).not.toBeInTheDocument();
-    expect(within(nav).queryByRole('button', { name: /Provider routing/ })).not.toBeInTheDocument();
-    expect(await screen.findByTestId('settings-section')).toHaveTextContent('general');
+    const tabs = screen.getByLabelText('Runtime sections');
+    expect(within(tabs).queryByRole('button', { name: 'Overview' })).not.toBeInTheDocument();
+    expect(within(tabs).queryByRole('button', { name: 'Accounts' })).not.toBeInTheDocument();
+    expect(within(tabs).queryByRole('button', { name: 'Analytics' })).not.toBeInTheDocument();
+    expect(within(tabs).queryByRole('button', { name: 'Settings' })).not.toBeInTheDocument();
+    expect(within(tabs).getByRole('button', { name: 'Devices' })).toBeInTheDocument();
+    expect(await screen.findByTestId('fleet-runners-panel')).toBeInTheDocument();
+    expect(screen.queryByText('VM Fleet')).not.toBeInTheDocument();
 
     rerender(<RuntimeWorkspace {...runtimeProps({ userRole: 'admin', runtimeConfigSection: 'deploy' })} />);
     expect(within(screen.getByLabelText('Runtime settings sections')).getByRole('button', { name: /Deploy/ })).toBeInTheDocument();
     expect(await screen.findByTestId('settings-section')).toHaveTextContent('deploy');
   });
 
-  test('keeps project settings disabled when no project is selected', () => {
+  test('keeps project runtime panels visible but read-only for project viewers', async () => {
+    const versionLifecycle = {
+      current_version: { version_number: 7 },
+      recent_versions: [],
+      promotion_enabled: false,
+      promotion_readiness: null,
+    } as never;
+    const { rerender } = render(
+      <RuntimeWorkspace {...runtimeProps({ userRole: 'user', projectRole: 'viewer', runtimeSection: 'devices' })} />,
+    );
+    expect(await screen.findByTestId('fleet-runners-panel')).toHaveAttribute('data-read-only', 'true');
+
+    rerender(<RuntimeWorkspace {...runtimeProps({ userRole: 'user', projectRole: 'viewer', runtimeSection: 'compute' })} />);
+    expect(await screen.findByTestId('compute-jobs-panel')).toHaveAttribute('data-read-only', 'true');
+
+    rerender(
+      <RuntimeWorkspace
+        {...runtimeProps({ userRole: 'user', projectRole: 'viewer', runtimeSection: 'version-lifecycle' })}
+        versionLifecycle={versionLifecycle}
+      />,
+    );
+    expect(await screen.findByTestId('version-lifecycle-panel')).toHaveAttribute('data-read-only', 'true');
+  });
+
+  test('maps owner, member, and viewer access to the backend operation floors', async () => {
+    const versionLifecycle = {
+      current_version: { version_number: 7 },
+      recent_versions: [],
+      promotion_enabled: false,
+      promotion_readiness: null,
+    } as never;
+    const { rerender } = render(
+      <RuntimeWorkspace {...runtimeProps({ userRole: 'user', projectRole: 'owner', runtimeSection: 'devices' })} />,
+    );
+    expect(await screen.findByTestId('fleet-runners-panel')).toHaveAttribute('data-read-only', 'false');
+
+    rerender(<RuntimeWorkspace {...runtimeProps({ userRole: 'user', projectRole: 'member', runtimeSection: 'devices' })} />);
+    expect(await screen.findByTestId('fleet-runners-panel')).toHaveAttribute('data-read-only', 'true');
+
+    rerender(<RuntimeWorkspace {...runtimeProps({ userRole: 'user', projectRole: 'member', runtimeSection: 'compute' })} />);
+    expect(await screen.findByTestId('compute-jobs-panel')).toHaveAttribute('data-read-only', 'false');
+
+    rerender(
+      <RuntimeWorkspace
+        {...runtimeProps({ userRole: 'user', projectRole: 'member', runtimeSection: 'version-lifecycle' })}
+        versionLifecycle={versionLifecycle}
+      />,
+    );
+    const memberVersion = await screen.findByTestId('version-lifecycle-panel');
+    expect(memberVersion).toHaveAttribute('data-read-only', 'false');
+    expect(memberVersion).toHaveAttribute('data-can-manage-project', 'false');
+    expect(memberVersion).toHaveAttribute('data-can-manage-platform', 'false');
+
+    rerender(
+      <RuntimeWorkspace
+        {...runtimeProps({ userRole: 'user', projectRole: 'owner', runtimeSection: 'version-lifecycle' })}
+        versionLifecycle={versionLifecycle}
+      />,
+    );
+    const ownerVersion = await screen.findByTestId('version-lifecycle-panel');
+    expect(ownerVersion).toHaveAttribute('data-can-manage-project', 'true');
+    expect(ownerVersion).toHaveAttribute('data-can-manage-platform', 'false');
+
+    rerender(
+      <RuntimeWorkspace
+        {...runtimeProps({ userRole: 'admin', projectRole: 'member', runtimeSection: 'version-lifecycle' })}
+        versionLifecycle={versionLifecycle}
+      />,
+    );
+    const adminMemberVersion = await screen.findByTestId('version-lifecycle-panel');
+    expect(adminMemberVersion).toHaveAttribute('data-read-only', 'false');
+    expect(adminMemberVersion).toHaveAttribute('data-can-manage-project', 'false');
+    expect(adminMemberVersion).toHaveAttribute('data-can-manage-platform', 'true');
+
+    rerender(<RuntimeWorkspace {...runtimeProps({ userRole: 'user', projectRole: 'viewer', runtimeSection: 'compute' })} />);
+    expect(await screen.findByTestId('compute-jobs-panel')).toHaveAttribute('data-read-only', 'true');
+  });
+
+  test('shows the same read-only project resource summary to owner, member, and viewer personas', async () => {
+    const { rerender } = render(
+      <RuntimeWorkspace {...runtimeProps({ userRole: 'user', projectRole: 'owner', runtimeSection: 'devices' })} />,
+    );
+    expect(await screen.findByTestId('project-resource-availability')).toBeInTheDocument();
+    expect(resourceSummaryHookMock).toHaveBeenLastCalledWith('proj-1', true);
+
+    rerender(<RuntimeWorkspace {...runtimeProps({ userRole: 'user', projectRole: 'member', runtimeSection: 'compute' })} />);
+    expect(await screen.findByTestId('project-resource-availability')).toBeInTheDocument();
+    expect(resourceSummaryHookMock).toHaveBeenLastCalledWith('proj-1', true);
+
+    rerender(<RuntimeWorkspace {...runtimeProps({ userRole: 'user', projectRole: 'viewer', runtimeSection: 'devices' })} />);
+    const card = await screen.findByTestId('project-resource-availability');
+    expect(card).toHaveTextContent('Execution uses project resources');
+    expect(within(card).queryByRole('button')).not.toBeInTheDocument();
+    expect(resourceSummaryHookMock).toHaveBeenLastCalledWith('proj-1', true);
+  });
+
+  test('withholds the resource summary when the selected project is not in the confirmed project list', () => {
+    render(
+      <RuntimeWorkspace
+        {...runtimeProps({ userRole: 'user', projectRole: 'viewer', runtimeSection: 'devices', selectedProjectId: 'unrelated-project' })}
+      />,
+    );
+    expect(screen.queryByTestId('project-resource-availability')).not.toBeInTheDocument();
+    expect(resourceSummaryHookMock).toHaveBeenLastCalledWith(null, true);
+  });
+
+  test('enables resource polling only while Devices or Compute is the effective surface', () => {
+    const { rerender } = render(
+      <RuntimeWorkspace {...runtimeProps({ userRole: 'admin', projectRole: 'owner', runtimeSection: 'health' })} />,
+    );
+    expect(resourceSummaryHookMock).toHaveBeenLastCalledWith('proj-1', false);
+    expect(screen.queryByTestId('project-resource-availability')).not.toBeInTheDocument();
+
+    rerender(<RuntimeWorkspace {...runtimeProps({ userRole: 'admin', projectRole: 'owner', runtimeSection: 'compute' })} />);
+    expect(resourceSummaryHookMock).toHaveBeenLastCalledWith('proj-1', true);
+    expect(screen.getByTestId('project-resource-availability')).toBeInTheDocument();
+
+    rerender(<RuntimeWorkspace {...runtimeProps({ userRole: 'admin', projectRole: 'owner', runtimeSection: 'analytics' })} />);
+    expect(resourceSummaryHookMock).toHaveBeenLastCalledWith('proj-1', false);
+    expect(screen.queryByTestId('project-resource-availability')).not.toBeInTheDocument();
+  });
+
+  test('keeps project settings unreachable when no project is selected', () => {
     render(
       <ProjectWorkspace
         {...projectProps({ selectedProject: null, selectedProjectId: null, projectManageSection: 'overview' })}
       />,
     );
 
-    expect(screen.getAllByText('No project selected')).toHaveLength(2);
+    expect(screen.getByText('No project is selected for this workspace.')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /Members/ })).not.toBeInTheDocument();
-    expect(within(screen.getByLabelText('Project management sections')).getByRole('button', { name: /Build/ })).toBeDisabled();
-    expect(within(screen.getByLabelText('Project management sections')).getByRole('button', { name: /Access/ })).toBeDisabled();
-    expect(screen.getAllByRole('button', { name: /Build/ }).some(button => button.hasAttribute('disabled'))).toBe(true);
+    expect(screen.queryByLabelText('Project management sections')).not.toBeInTheDocument();
   });
 
   test('shows actionable project recovery when a project-scoped tab has no selected project', async () => {
@@ -315,7 +471,7 @@ describe('Operator workspaces', () => {
         {...runtimeProps({
           runtimeSection: 'settings',
           runtimeConfigSection: 'notifications',
-          userRole: 'user',
+          userRole: 'admin',
         })}
         selectedProjectId={null}
         selectedProjectRepoLabel={null}
@@ -334,7 +490,7 @@ describe('Operator workspaces', () => {
     expect(status).toHaveTextContent('Events');
     expect(status).toHaveTextContent('stale');
     expect(status).toHaveTextContent('Role');
-    expect(status).toHaveTextContent('user');
+    expect(status).toHaveTextContent('admin');
     expect(screen.getByTestId('settings-section')).toHaveTextContent('notifications');
   });
 

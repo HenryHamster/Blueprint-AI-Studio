@@ -75,7 +75,9 @@ describe('pending Whiteboard ArtifactRef operation', () => {
       if (!response) throw new Error('Expected a queued artifact-ref response.');
       return response;
     });
-    const wait = vi.fn(async (delayMs: number) => { void delayMs; });
+    const wait = vi.fn(async (delayMs: number) => {
+      void delayMs;
+    });
 
     const result = await settlePendingWhiteboardArtifactOperation(pending, { request, wait });
 
@@ -98,7 +100,9 @@ describe('pending Whiteboard ArtifactRef operation', () => {
     const request = vi.fn()
       .mockRejectedValueOnce(new TypeError('network response lost'))
       .mockResolvedValueOnce({ state: 'ready', artifact_ref: ARTIFACT_REF });
-    const wait = vi.fn(async () => undefined);
+    const wait = vi.fn(async (delayMs: number) => {
+      void delayMs;
+    });
 
     const result = await settlePendingWhiteboardArtifactOperation(pending, { request, wait });
 

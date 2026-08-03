@@ -3017,6 +3017,75 @@ class TestMaxPlanPool:
         assert entry["id"] == str(acct_id)
         assert entry["active_tasks"] == 2, "Only IN_PROGRESS tasks should be counted"
 
+    @pytest.mark.asyncio
+    async def test_load_max_plan_pool_counts_queued_warm_reservation_at_cap(
+        self, db_session, mocker, reset_max_plan_pool
+    ):
+        """A restart cannot reopen a cap=1 slot owned by a queued pool lease."""
+        mocker.patch(
+            "app.max_plan_pool.AsyncSessionLocal", _FakeSessionFactory(db_session)
+        )
+
+        project = make_project(name="Queued warm reservation", user_id=_TEST_USER)
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        acct_id = uuid.uuid4()
+        pid = str(project.id)
+        db_session.add(
+            MaxPlanAccount(
+                id=acct_id,
+                user_id=_TEST_USER,
+                name="cap-one",
+                oauth_token="sk-ant-test-token",
+                enabled=True,
+                max_concurrent_tasks=1,
+                project_max_concurrent_tasks={pid: 1},
+                project_state={pid: {"daily_task_count": 1}},
+            )
+        )
+        # Historical runtime attribution on an ordinary QUEUED task must not
+        # count. The durable warm-pool marker on the leased task must count.
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.QUEUED,
+                llm_account_id=str(acct_id),
+                context={"llm_account_id": str(acct_id)},
+            )
+        )
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.QUEUED,
+                llm_account_id=str(acct_id),
+                context={
+                    "llm_account_id": str(acct_id),
+                    "_warm_pool_reservation_account_id": str(acct_id),
+                    "warm_pool_pin": True,
+                    "warm_target_vm_id": "agent-vm-restart-cap1",
+                },
+            )
+        )
+        await db_session.commit()
+
+        await load_max_plan_pool()
+
+        entry = _account_by_id[str(acct_id)]
+        assert entry["active_tasks"] == 1
+        assert entry["project_state"][pid]["active_tasks"] == 1
+        assert entry["project_state"][pid]["daily_task_count"] == 1
+
+        reject_reasons: list[str] = []
+        selected = await select_max_plan_account(
+            _TEST_USER,
+            project_id=pid,
+            reject_reasons=reject_reasons,
+        )
+        assert selected is None
+        assert any("concurrent cap (1) reached" in r for r in reject_reasons)
+
     # ── Test 1a: per-project active_tasks is zero-reconciled from the DB ─────
 
     @pytest.mark.asyncio
@@ -8495,28 +8564,122 @@ class TestWarmVMSkipProvision:
         )
 
     @pytest.mark.asyncio
-    async def test_pool_pin_unresponsive_clears_releases_and_resets_vm_id(
-        self, orch_warm_db, mocker
+    @pytest.mark.parametrize("launcher", [None, "member-user-999"])
+    async def test_execution_resources_always_use_project_owner(
+        self, orch_warm_db, mocker, launcher
+    ):
+        """Eligibility and dispatch never consult a task launcher's pool.
+
+        The same project-owner principal serves autonomous and member-launched
+        work. A member can have a healthy pool of their own without it becoming
+        eligible for project execution.
+        """
+
+        class _TrackingPools(dict):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.get_calls = []
+
+            def get(self, key, default=None):
+                self.get_calls.append(key)
+                return super().get(key, default)
+
+        owner_id = "project-owner-123"
+        pools = _TrackingPools(
+            {
+                owner_id: [{"id": "acct-owner"}],
+                "member-user-999": [{"id": "acct-member"}],
+            }
+        )
+        mocker.patch("app.max_plan_pool._max_plan_pools", new=pools)
+        mocker.patch(
+            "app.max_plan_pool._account_available_for_model",
+            return_value=True,
+        )
+        select_mock = mocker.patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new_callable=AsyncMock,
+            return_value=self._fake_selection("acct-owner"),
+        )
+        mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.warm_pool.try_pool_dispatch",
+            new_callable=AsyncMock,
+            return_value=None,
+        )
+
+        _shared_state.runtime_config["warm_pool_enabled"] = True
+        try:
+            async with orch_warm_db() as session:
+                project = make_project(name="Principal", user_id=owner_id)
+                session.add(project)
+                await session.commit()
+                await session.refresh(project)
+
+                task = make_task(
+                    project_id=project.id,
+                    status=TaskStatus.QUEUED,
+                    payloads=[{"type": "fix", "prompt": "x"}],
+                    context={},
+                    retry_after_until=self._naive_utcnow()
+                    + timedelta(minutes=5),
+                    launched_by_user_id=launcher,
+                )
+                session.add(task)
+                await session.commit()
+
+            await self._run_one_cycle(mocker)
+        finally:
+            _shared_state.runtime_config.pop("warm_pool_enabled", None)
+
+        assert owner_id in pools.get_calls
+        assert "member-user-999" not in pools.get_calls
+        assert select_mock.await_args.kwargs["user_id"] == owner_id
+
+    @pytest.mark.asyncio
+    async def test_pool_pin_unresponsive_abandons_and_defers_reselection(
+        self, orch_warm_db, mocker, reset_max_plan_pool
     ):
         """A POOL pin (warm_pool_pin in ctx) whose target VM is unresponsive must:
         release the leased PoolVm (mark_pool_vm_retiring), feed the POOL breaker
         (record_pool_claim_failure), NOT fire the continuity pin-clear metric,
-        and reset task.vm_instance_id so the cold fall-through mints a FRESH id
-        instead of colliding with the retiring pool VM's name."""
+        and end this iteration after the helper commit. The task may be selected
+        again only through a fresh lock next cycle; the stale ORM object must
+        never drive same-cycle account selection or cold provisioning."""
         from sqlmodel import select as _select
 
-        mocker.patch(
+        provision_mock = mocker.patch(
             "app.orchestrator.provision_agent_vm",
             new_callable=AsyncMock,
-            return_value=False,
+            side_effect=AssertionError(
+                "abandoned pool pin must not cold-provision in the same cycle"
+            ),
         )
-        retiring_spy = mocker.patch(
-            "app.warm_pool.mark_pool_vm_retiring", new_callable=AsyncMock
+        import app.warm_pool as _warm_pool
+        from app.max_plan_pool import reserve_max_plan_account
+        from app.models import PoolVm, PoolVmState
+        from app.warm_pool import WARM_POOL_RESERVATION_ACCOUNT_KEY
+
+        retiring_spy = mocker.spy(
+            _warm_pool, "mark_pool_vm_retiring"
         )
         pool_fail_spy = mocker.patch(
             "app.orchestrator._shared_state.record_pool_claim_failure"
         )
         clear_spy = mocker.patch("app.orchestrator._shared_state.record_warm_pin_clear")
+        # Any selector call proves the commit-unlocked stale ORM task fell
+        # through instead of returning to the outer loop.
+        selection_mock = mocker.patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new_callable=AsyncMock,
+            side_effect=AssertionError(
+                "abandoned pool pin must be reselected under lock next cycle"
+            ),
+        )
 
         # Ensure the pool breaker is NOT tripped by residue from other tests, so
         # the unresponsive-VM clear takes the vm_unresponsive path (not circuit_breaker).
@@ -8531,6 +8694,29 @@ class TestWarmVMSkipProvision:
                 await session.refresh(project)
 
                 target_vm = "agent-vm-pool-target-1"
+                account = {
+                    "id": "acct-pool-owned",
+                    "name": "Owned Pool Account",
+                    "provider": "anthropic",
+                    "auth_mode": "oauth",
+                    "model": "claude-opus-4-8",
+                    "oauth_token": "tok",
+                    "enabled": True,
+                    "runtime_ready": True,
+                    "active_tasks": 0,
+                    "daily_task_count": 0,
+                    "project_state": {},
+                    "disabled_models": {},
+                }
+                _max_plan_pools.setdefault(_TEST_USER, []).append(account)
+                _account_by_id[account["id"]] = account
+                assert await reserve_max_plan_account(
+                    account["id"],
+                    user_id=_TEST_USER,
+                    project_id=str(project.id),
+                    model="claude-opus-4-8",
+                    count_daily_task=True,
+                )
                 deadline = (_utcnow() + timedelta(seconds=240)).isoformat()
                 task = make_task(
                     project_id=project.id,
@@ -8543,12 +8729,27 @@ class TestWarmVMSkipProvision:
                         "warm_target_vm_id": target_vm,
                         "warm_handoff_deadline": deadline,
                         "warm_pool_pin": True,
+                        WARM_POOL_RESERVATION_ACCOUNT_KEY: account["id"],
                     },
                 )
                 session.add(task)
                 await session.commit()
                 await session.refresh(task)
                 task_id = task.id
+                member = await _warm_pool.register_pool_vm(
+                    session,
+                    vm_instance_id=target_vm,
+                    project_id=project.id,
+                    account_id=account["id"],
+                    provider="anthropic",
+                    auth_mode="oauth",
+                    model="claude-opus-4-8",
+                    state=PoolVmState.LEASED,
+                )
+                member.leased_task_id = task.id
+                member.lease_expires_at = _utcnow() + timedelta(seconds=240)
+                session.add(member)
+                await session.commit()
 
             # No heartbeat → unresponsive → reaches the pool-pin clear branch.
             _shared_state.vm_last_heartbeat.pop(target_vm, None)
@@ -8564,6 +8765,22 @@ class TestWarmVMSkipProvision:
         assert pool_fail_spy.call_args.args[0] == "vm_unresponsive"
         # Continuity pin-clear metric is suppressed for pool pins.
         assert not clear_spy.called
+        selection_mock.assert_not_awaited()
+        provision_mock.assert_not_awaited()
+        assert account["active_tasks"] == 0
+        assert account["daily_task_count"] == 0
+        assert account["project_state"][str(project.id)] == {
+            "active_tasks": 0,
+            "daily_task_count": 0,
+        }
+        assert [
+            mutation["delta"]
+            for mutation in account["_pending_usage_cap_mutations"]
+        ] == [1, -1]
+        assert [
+            mutation["project_delta"]
+            for mutation in account["_pending_usage_cap_mutations"]
+        ] == [1, -1]
 
         async with orch_warm_db() as verify:
             row = (
@@ -8575,10 +8792,24 @@ class TestWarmVMSkipProvision:
             ctx = row.context or {}
             assert "warm_target_vm_id" not in ctx
             assert "warm_pool_pin" not in ctx
-            # Load-bearing reset: a FRESH agent-vm- id, never the retiring pool
-            # VM's name (which would race the reaper's delete on a name clash).
-            assert row.vm_instance_id != target_vm
-            assert (row.vm_instance_id or "").startswith("agent-vm-")
+            assert WARM_POOL_RESERVATION_ACCOUNT_KEY not in ctx
+            member_row = (
+                (
+                    await verify.execute(
+                        _select(PoolVm).where(
+                            PoolVm.vm_instance_id == target_vm
+                        )
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            assert member_row is not None
+            assert member_row.state == PoolVmState.RETIRING
+            # Canonical abandon cleared the old binding, and no same-cycle cold
+            # dispatch wrote a replacement. A future cycle must reacquire it.
+            assert row.status == TaskStatus.QUEUED
+            assert row.vm_instance_id is None
 
     @pytest.mark.asyncio
     async def test_parked_retarget_unresponsive_clears_and_resets_vm_id(

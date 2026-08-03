@@ -133,6 +133,41 @@ async def test_boot_heartbeat_promotes_provisioning_member_then_leases_warm(
         await db_session.commit()
         task_id = task.id
 
+        from app import max_plan_pool as max_plan_pool_module
+        from app.max_plan_pool import reserve_max_plan_account
+
+        account = {
+            "id": acct,
+            "user_id": project.user_id,
+            "name": acct,
+            "enabled": True,
+            "oauth_token": "tok",
+            "provider": provider,
+            "auth_mode": "oauth",
+            "model": model,
+            "active_tasks": 0,
+            "daily_task_count": 0,
+            "project_state": {},
+            "disabled_models": {},
+        }
+        mocker.patch.object(
+            max_plan_pool_module,
+            "_max_plan_pools",
+            {project.user_id: [account]},
+        )
+        mocker.patch.object(
+            max_plan_pool_module,
+            "_account_by_id",
+            {acct: account},
+        )
+        assert await reserve_max_plan_account(
+            acct,
+            user_id=project.user_id,
+            project_id=str(project.id),
+            model=model,
+            count_daily_task=True,
+        )
+
         async with TestingSessionLocal() as s:
             task_in_s = await s.get(Task, task_id)
             leased = await try_pool_dispatch(
@@ -141,6 +176,7 @@ async def test_boot_heartbeat_promotes_provisioning_member_then_leases_warm(
                 required_provider=provider,
                 required_model=model,
                 required_account=acct,
+                reserved_account_id=acct,
             )
             assert leased is not None and leased.vm_instance_id == pool_vm_id
             assert leased.state == PoolVmState.LEASED

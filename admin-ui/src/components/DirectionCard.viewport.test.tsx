@@ -105,6 +105,7 @@ const stagedDirection: Direction = {
 };
 
 const noopProps = {
+  readOnly: false,
   statusKey: 'active',
   activeItems: [richDirection],
   editingId: null,

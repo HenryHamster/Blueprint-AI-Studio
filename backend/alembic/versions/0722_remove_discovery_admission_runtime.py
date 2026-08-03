@@ -1,7 +1,7 @@
 """Remove descendant discovery admission accounting.
 
-Revision ID: 0721
-Revises: 0720
+Revision ID: 0722
+Revises: 0721
 Create Date: 2026-08-02
 
 Discovery cycles remain as provenance and review cohorts. Ordinary descendants
@@ -16,8 +16,8 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 
-revision = "0721"
-down_revision = "0720"
+revision = "0722"
+down_revision = "0721"
 branch_labels = None
 depends_on = None
 

@@ -23,6 +23,8 @@ interface UseLogViewerDeps {
   realtimeWsEnabled?: boolean;
   /** Current durable Strategic read-model snapshot, populated by App. */
   strategicReadModelRef?: React.MutableRefObject<StrategicStateResponse | null>;
+  canViewProject: boolean;
+  isAdmin?: boolean;
 }
 
 /** Live state captured from a strategic_cycle_started event. */
@@ -195,6 +197,8 @@ export function useLogViewer({
   selectedProjectId,
   realtimeWsEnabled = true,
   strategicReadModelRef,
+  canViewProject,
+  isAdmin = false,
 }: UseLogViewerDeps) {
   const [logTask, setLogTask] = useState<Task | null>(null);
   const [logLines, setLogLines] = useState<string[]>([]);
@@ -298,6 +302,7 @@ export function useLogViewer({
   const trackedTaskIdsRef = useRef<Set<string>>(trackedTaskIds);
   const logTaskRef = useRef<Task | null>(null);
   const selectedProjectIdRef = useRef<string | null | undefined>(selectedProjectId);
+  const canViewProjectRef = useRef(canViewProject);
   // Keep a ref to the current project_id for WS connections opened for tracking
   const trackingProjectIdRef = useRef<string | null>(null);
   // Tracked tasks that currently justify a foreground project WebSocket.
@@ -308,9 +313,11 @@ export function useLogViewer({
   // Sync refs
   useEffect(() => { trackedTaskIdsRef.current = trackedTaskIds; }, [trackedTaskIds]);
   useEffect(() => { logTaskRef.current = logTask; }, [logTask]);
-  useEffect(() => { selectedProjectIdRef.current = selectedProjectId; }, [selectedProjectId]);
+  selectedProjectIdRef.current = selectedProjectId;
+  canViewProjectRef.current = canViewProject;
 
   const refreshGatedTaskTypes = useCallback(async () => {
+    if (!isAdmin) return;
     const seq = ++gatedTypesRefreshSeqRef.current;
     try {
       const res = await fetch(`${API_BASE_URL}/api/admin/failing-task-types`, {
@@ -331,7 +338,11 @@ export function useLogViewer({
     } catch {
       // Preserve the current banner state if the snapshot probe fails.
     }
-  }, []);
+  }, [isAdmin]);
+
+  useEffect(() => {
+    if (!isAdmin) setGatedTypesMap(new Map());
+  }, [isAdmin]);
 
   // Clear wsDisconnected banner when task reaches a terminal state
   useEffect(() => {
@@ -441,7 +452,7 @@ export function useLogViewer({
 
   const restoreSelectedProjectStream = useCallback((reason: string) => {
     const selectedProjectIdForRestore = selectedProjectIdRef.current;
-    if (!realtimeWsEnabled || !selectedProjectIdForRestore) {
+    if (!realtimeWsEnabled || !canViewProjectRef.current || !selectedProjectIdForRestore) {
       closeCurrentWs(reason);
       return;
     }
@@ -519,6 +530,7 @@ export function useLogViewer({
 
   // Shared WS message handler — dispatches to log drawer AND tracked tasks
   const handleWsMessage = useCallback((event: MessageEvent) => {
+    if (!canViewProjectRef.current) return;
     try {
       const msg = JSON.parse(event.data);
       const envelopeProjectId = selectedProjectIdRef.current ?? trackingProjectIdRef.current;
@@ -746,15 +758,19 @@ export function useLogViewer({
   }, [appendTrackLog, hasActiveTrackedTasks, hasForegroundLogTask, refreshGatedTaskTypes, restoreSelectedProjectStream, setDeployState, fetchTasksRef, fetchDirectionsRef, refreshStrategicReadModel, refreshMessages, refreshMessagesRef, refreshAlerts, refreshFleetRunnersRef]);
 
   const connectWs = useCallback(async (projectId: string) => {
+    if (!canViewProjectRef.current) return;
     if (hasActiveWsForProject(projectId)) return;
     intentionallyClosedProjectRef.current = null;
     trackingProjectIdRef.current = projectId;
     wsConnectingProjectRef.current = projectId;
     try {
+      const headers = await authHeaders();
+      if (!canViewProjectRef.current || trackingProjectIdRef.current !== projectId || wsConnectingProjectRef.current !== projectId) return;
       const ticketRes = await fetch(`${API_BASE_URL}/api/projects/${projectId}/ws-ticket`, {
         method: 'POST',
-        headers: await authHeaders(),
+        headers,
       });
+      if (!canViewProjectRef.current) return;
       if (!ticketRes.ok) {
         if (wsConnectingProjectRef.current === projectId) wsConnectingProjectRef.current = null;
         setLogsConnecting(false);
@@ -762,7 +778,7 @@ export function useLogViewer({
         return;
       }
       const { ticket } = await ticketRes.json();
-      if (trackingProjectIdRef.current !== projectId || wsConnectingProjectRef.current !== projectId) {
+      if (!canViewProjectRef.current || trackingProjectIdRef.current !== projectId || wsConnectingProjectRef.current !== projectId) {
         return;
       }
 
@@ -790,6 +806,10 @@ export function useLogViewer({
       ws.onopen = () => {
         const isReconnect = establishedWsProjectsRef.current.has(projectId);
         establishedWsProjectsRef.current.add(projectId);
+        if (!canViewProjectRef.current || trackingProjectIdRef.current !== projectId || wsRef.current !== ws) {
+          ws.close(1000, 'Project access revoked');
+          return;
+        }
         ws.send(JSON.stringify({ ticket }));
         wsReconnectAttemptRef.current = 0;
         setLogLines(prev => [...prev, '[Connected to live log stream]']);
@@ -848,6 +868,7 @@ export function useLogViewer({
       ws.onmessage = handleWsMessage;
 
       ws.onerror = (e) => {
+        if (!canViewProjectRef.current) return;
         if (trackingProjectIdRef.current !== projectId) return;
         console.error('[WS] error:', e);
         setLogLines(prev => [...prev, `[WebSocket error — check browser console (F12)]`]);
@@ -857,6 +878,7 @@ export function useLogViewer({
 
       ws.onclose = (e) => {
         clearConnectionHeartbeat();
+        if (!canViewProjectRef.current) return;
         if (trackingProjectIdRef.current !== projectId) return;
         setLogLines(prev => [...prev, `[Stream disconnected: code=${e.code} reason=${e.reason || 'none'}]`]);
         setWsConnected(false);
@@ -894,6 +916,7 @@ export function useLogViewer({
       };
     } catch (err) {
       if (wsConnectingProjectRef.current === projectId) wsConnectingProjectRef.current = null;
+      if (!canViewProjectRef.current || trackingProjectIdRef.current !== projectId) return;
       setLogsConnecting(false);
       setLogLines(prev => [...prev, `[Connection error: ${err}]`]);
     }
@@ -904,6 +927,15 @@ export function useLogViewer({
 
   useEffect(() => {
     const hasForegroundConsumers = hasActiveTrackedTasks() || hasForegroundLogTask();
+    if (!canViewProject) {
+      trackingProjectIdRef.current = null;
+      wsConnectingProjectRef.current = null;
+      closeCurrentWs('Project access revoked');
+      setLogsConnecting(false);
+      setWsDisconnected(false);
+      setWsDisconnectReason(null);
+      return;
+    }
     if (!realtimeWsEnabled || !selectedProjectId) {
       if (!hasActiveTrackedTasks() && !hasForegroundLogTask()) {
         trackingProjectIdRef.current = null;
@@ -925,9 +957,10 @@ export function useLogViewer({
     closeCurrentWs('Project changed');
     wsReconnectAttemptRef.current = 0;
     void connectWs(selectedProjectId);
-  }, [closeCurrentWs, connectWs, hasActiveTrackedTasks, hasActiveWsForProject, hasForegroundLogTask, realtimeWsEnabled, selectedProjectId]);
+  }, [canViewProject, closeCurrentWs, connectWs, hasActiveTrackedTasks, hasActiveWsForProject, hasForegroundLogTask, realtimeWsEnabled, selectedProjectId]);
 
   const handleViewLogs = useCallback((task: Task) => {
+    if (!canViewProjectRef.current) return;
     // Update drawer state immediately (non-destructive)
     logTaskRef.current = task;
     setLogTask(task);
@@ -974,6 +1007,7 @@ export function useLogViewer({
 
   // --- Track / Untrack ---
   const trackTask = useCallback((task: Task) => {
+    if (!canViewProjectRef.current) return;
     const isTerminalTask = isTerminalTaskStatus(task.status);
     const isStreamingTask = isLogStreamTaskStatus(task.status);
     setTrackedTaskIds(prev => {

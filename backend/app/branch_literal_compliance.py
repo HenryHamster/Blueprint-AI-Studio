@@ -198,11 +198,11 @@ SURFACE_CONFIGS: dict[Surface, BranchLiteralSurfaceConfig] = {
             ),
             BranchLiteralAllowEntry(
                 path="components/ProjectBuildConfigSection.tsx",
-                line=683,
+                line=688,
                 pattern="fallback-blueprint",
                 rationale=(
-                    "Display-only fallback inside a sample; user-typed "
-                    "taskBranchNamespace is preferred."
+                    "Display-only example prefers the user-entered taskBranchNamespace; "
+                    "blueprint is shown only when that display value is empty."
                 ),
             ),
         ),

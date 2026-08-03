@@ -16,6 +16,7 @@ import os
 import uuid
 import httpx
 import logging
+import re
 from datetime import timedelta
 from sqlalchemy.orm import aliased
 
@@ -4082,14 +4083,30 @@ async def _get_installation_token_for_user(user_id: str, session: AsyncSession) 
 
 
 @router.get("/github/repos")
+@limiter.limit("10/minute")
 async def list_github_repos(
+    request: Request,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
+    """List onboarding repos the caller can write and the App can reach.
+
+    Platform admins retain the legacy stored-installation behavior. Ordinary
+    users use the linked OAuth/PAT identity intersected with every App
+    installation visible to that identity; an App token alone never proves the
+    caller may onboard a repository.
     """
-    Lists repositories accessible via the current user's GitHub App installation.
-    Returns a sorted list of {full_name, default_branch} objects.
-    """
+    if current_user.get("role") != "admin":
+        from app.github_onboarding import list_onboarding_repositories
+
+        repos, installation_count = await list_onboarding_repositories(
+            session, current_user["user_id"]
+        )
+        return {
+            "repositories": repos,
+            "installation_count": installation_count,
+        }
+
     token = await _get_installation_token_for_user(current_user["user_id"], session)
 
     headers = {
@@ -4126,18 +4143,56 @@ async def list_github_repos(
     return {"repositories": repos}
 
 
+_MANUAL_GITHUB_REPO_RE = re.compile(
+    r"^(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,38}))/(?P<repo>[A-Za-z0-9_.-]+)$"
+)
+
+
+def _parse_manual_github_repo(value: str) -> tuple[str, str]:
+    match = _MANUAL_GITHUB_REPO_RE.fullmatch(value.strip())
+    if match is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Repository must use the exact 'owner/repo' format.",
+        )
+    return match.group("owner"), match.group("repo")
+
+
 @router.get("/github/branches")
+@limiter.limit("20/minute")
 async def list_github_branches(
-    repo: str = Query(..., pattern=r"^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$"),
+    request: Request,
+    repo: str = Query(...),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
+    """List branches after caller authorization and App reachability checks.
+
+    The exact-repository path intentionally remains available for safe manual
+    repo input even when a large installation's discovery result is paginated.
     """
-    Lists branches for a specific repository accessible via the user's GitHub App installation.
-    Query param: repo=owner/repo
-    Returns a sorted list of branch names.
-    """
-    token = await _get_installation_token_for_user(current_user["user_id"], session)
+    owner, repo_name = _parse_manual_github_repo(repo)
+    repo = f"{owner}/{repo_name}"
+    if current_user.get("role") == "admin":
+        token = await _get_installation_token_for_user(
+            current_user["user_id"], session
+        )
+    else:
+        from app.github import get_repo_installation_token
+        from app.github_onboarding import require_caller_repo_push_access
+
+        await require_caller_repo_push_access(
+            session, current_user, owner, repo_name
+        )
+        token = await get_repo_installation_token(owner, repo_name)
+        if not token:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Your GitHub authorization is valid, but the Blueprint GitHub App "
+                    "is not installed for this repository."
+                ),
+            )
 
     headers = {
         "Authorization": f"Bearer {token}",

@@ -21,7 +21,6 @@ from app.broadcast import broadcast_to_project
 from app.models import (
     Alert,
     Project,
-    ProjectMember,
     ProjectMessage,
     MessageHandlingState,
     MessageSurface,
@@ -33,8 +32,7 @@ from app.models import (
 )
 from app.auth import get_current_user
 from app.shared_state import limiter
-from app.admin import (
-    _ROLE_LEVEL,
+from app.admin_helpers import (
     _get_user_project,
     _get_user_project_with_role,
     _member_project_ids,
@@ -501,22 +499,16 @@ async def dismiss_alert(
     alert = await session.get(Alert, uuid.UUID(alert_id))
     if not alert:
         raise HTTPException(status_code=404, detail="Alert not found")
-    # Verify alert belongs to user's project (via membership) with member+
-    # role (viewers are read-only and may not mutate alert state)
-    member = (
-        await session.execute(
-            select(ProjectMember).where(
-                ProjectMember.project_id == alert.project_id,
-                ProjectMember.user_id == current_user["user_id"],
-            )
+    # Route the membership and role floor through the shared fail-closed
+    # authority. Preserve this endpoint's resource-hiding 404 wording.
+    try:
+        await _get_user_project_with_role(
+            alert.project_id, current_user["user_id"], session, "member"
         )
-    ).scalar_one_or_none()
-    if not member:
-        raise HTTPException(status_code=404, detail="Alert not found")
-    if _ROLE_LEVEL.get(member.role, 0) < _ROLE_LEVEL["member"]:
-        raise HTTPException(
-            status_code=403, detail="Requires member role on this project"
-        )
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            raise HTTPException(status_code=404, detail="Alert not found") from None
+        raise
     alert.dismissed_at = _utcnow()
     session.add(alert)
     await session.commit()
@@ -555,20 +547,14 @@ async def acknowledge_alert(
     alert = await session.get(Alert, uuid.UUID(alert_id))
     if not alert:
         raise HTTPException(status_code=404, detail="Alert not found")
-    member = (
-        await session.execute(
-            select(ProjectMember).where(
-                ProjectMember.project_id == alert.project_id,
-                ProjectMember.user_id == current_user["user_id"],
-            )
+    try:
+        await _get_user_project_with_role(
+            alert.project_id, current_user["user_id"], session, "member"
         )
-    ).scalar_one_or_none()
-    if not member:
-        raise HTTPException(status_code=404, detail="Alert not found")
-    if _ROLE_LEVEL.get(member.role, 0) < _ROLE_LEVEL["member"]:
-        raise HTTPException(
-            status_code=403, detail="Requires member role on this project"
-        )
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            raise HTTPException(status_code=404, detail="Alert not found") from None
+        raise
     if alert.acknowledged_at is None:
         alert.acknowledged_at = _utcnow()
         session.add(alert)

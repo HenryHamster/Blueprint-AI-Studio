@@ -1,7 +1,15 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { DirectionsPanel } from './DirectionsPanel';
+import type { ComponentProps } from 'react';
+import { DirectionsPanel as DirectionsPanelComponent } from './DirectionsPanel';
+
+// These tests exercise owner/member mutation controls. DirectionsPanel now
+// fails closed when role information is omitted, so make that capability
+// explicit instead of relying on the old editable default.
+function DirectionsPanel(props: ComponentProps<typeof DirectionsPanelComponent>) {
+  return <DirectionsPanelComponent readOnly={false} {...props} />;
+}
 
 vi.mock('../api', async () => {
   const { createApiMock } = await import('../test/api-mock-complete');

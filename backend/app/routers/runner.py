@@ -69,6 +69,7 @@ from app.runner_pull_skip import (
     stamp_skip_reason,
 )
 from app.database import get_session
+from app.execution_principal import resolve_project_execution_principal
 from app.models import Alert, AlertSeverity, ComputeJob, ComputeJobFile, ComputeJobStatus, LocalRunner, Project, RunnerHeartbeatSnapshot, Task, TaskStatus, _utcnow
 from app.runner_decline import (
     DECLINE_ESCALATION_THRESHOLD as _DECLINE_ESCALATION_THRESHOLD,
@@ -989,11 +990,12 @@ async def _resolve_pool_credentials_for_dispatch(
             _resolve_provider_materials,
         )
 
-        # Resolve the billing user: launcher pays; fall back to project owner.
-        dispatch_user_id = (
-            task.launched_by_user_id
-            if task.launched_by_user_id
-            else project.user_id
+        # Local claim is an execution-resource boundary just like cloud
+        # dispatch: the project's owner pool supplies credentials and capacity.
+        dispatch_user_id = await resolve_project_execution_principal(
+            session,
+            task.project_id,
+            project_user_id=project.user_id,
         )
 
         # Local runners resolve credentials at claim time rather than through

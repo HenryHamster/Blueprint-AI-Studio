@@ -127,6 +127,19 @@ class _GitHubPATInstallRequest(BaseModel):
     pat: str = Field(..., min_length=10)
 
 
+@router.get("/status")
+@limiter.limit("30/minute")
+async def get_github_onboarding_status(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the caller's linked GitHub/App facts without settings or secrets."""
+    from app.github_onboarding import github_onboarding_status
+
+    return await github_onboarding_status(session, current_user["user_id"])
+
+
 @router.post("/pat")
 @limiter.limit("5/minute")
 async def register_github_pat(
@@ -203,7 +216,10 @@ async def github_oauth_authorize(
     admin_url = default_admin_url
     if redirect_uri is not None and redirect_uri != "":
         candidate = _canonical_ui_origin(redirect_uri, allow_local_http=True)
-        if candidate is None or candidate not in _allowed_admin_origins(default_admin_url):
+        if (
+            candidate is None
+            or candidate not in _allowed_admin_origins(default_admin_url)
+        ):
             raise HTTPException(
                 status_code=400, detail="Invalid redirect_uri: origin not in allowlist"
             )
@@ -283,8 +299,34 @@ async def github_oauth_callback(
         token_data = await exchange_oauth_code(code, redirect_uri=callback_uri)
         user_token = token_data["access_token"]
 
-        # Get the GitHub user's profile to confirm identity
-        await get_github_user(user_token)
+        # Verify and persist caller identity/token before App installation
+        # discovery. A linked user with no installation is a valid, useful state
+        # that the status endpoint and install redirect must be able to represent.
+        github_user = await get_github_user(user_token)
+        account_name = github_user.get("login")
+        if not isinstance(account_name, str) or not account_name:
+            raise ValueError("GitHub profile did not include a login")
+
+        oauth_secret_name = await store_user_secret(
+            firebase_user_id, "github-oauth", user_token
+        )
+        stmt = select(UserIntegration).where(
+            UserIntegration.user_id == firebase_user_id
+        )
+        integration = (await session.execute(stmt)).scalars().first()
+        if integration:
+            integration.github_installation_id = None
+            integration.github_account_name = account_name
+            integration.github_oauth_token = encrypt_field(oauth_secret_name)
+            integration.updated_at = _utcnow()
+        else:
+            integration = UserIntegration(
+                user_id=firebase_user_id,
+                github_account_name=account_name,
+                github_oauth_token=encrypt_field(oauth_secret_name),
+            )
+        session.add(integration)
+        await session.commit()
 
         # Discover which of this App's installations the user can access
         installations = await get_user_installations(user_token)
@@ -322,39 +364,13 @@ async def github_oauth_callback(
         # stored installation_id is a fallback, not the authority.
         installation = installations[0]
         installation_id = str(installation["id"])
-        all_account_names = [inst["account"]["login"] for inst in installations]
-        account_name = ", ".join(all_account_names)
-
-        # Save to UserIntegration
-        stmt = select(UserIntegration).where(
-            UserIntegration.user_id == firebase_user_id
-        )
-        integration = (await session.execute(stmt)).scalars().first()
-
-        # Retain a caller-scoped credential separately from the App
-        # installation ID. The latter identifies an installation but cannot
-        # establish that this user may write an individual repository.
-        oauth_secret_name = await store_user_secret(
-            firebase_user_id, "github-oauth", user_token
-        )
-
-        if integration:
-            integration.github_installation_id = installation_id
-            integration.github_account_name = account_name
-            integration.github_oauth_token = encrypt_field(oauth_secret_name)
-            integration.updated_at = _utcnow()
-        else:
-            integration = UserIntegration(
-                user_id=firebase_user_id,
-                github_installation_id=installation_id,
-                github_account_name=account_name,
-                github_oauth_token=encrypt_field(oauth_secret_name),
-            )
+        integration.github_installation_id = installation_id
+        integration.updated_at = _utcnow()
 
         session.add(integration)
         await session.commit()
 
-        display_name = urllib.parse.quote(all_account_names[0])
+        display_name = urllib.parse.quote(account_name)
         return RedirectResponse(url=f"{admin_url}?github_connected={display_name}")
 
     except Exception as e:

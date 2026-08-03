@@ -60,6 +60,7 @@ describe('Strategic reconnect projection', () => {
       selectedProjectId: null,
       realtimeWsEnabled: false,
       strategicReadModelRef,
+      canViewProject: true,
     }));
 
     act(() => {

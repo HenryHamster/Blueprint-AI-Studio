@@ -3,6 +3,7 @@ import type { SettingsSectionRouterProps } from '../components/SettingsSectionRo
 import type { RuntimeSection, RuntimeSettingsSection } from '../components/OperatorWorkspaces';
 import type { useAppState } from '../useAppState';
 import type { Project } from '../types/project';
+import { resolveAccess } from '../accessControl';
 
 type AppState = ReturnType<typeof useAppState>;
 
@@ -14,8 +15,6 @@ interface UseSettingsRouterPropsOptions {
   setRuntimeSection: (section: RuntimeSection) => void;
   setRuntimeConfigSection: (section: RuntimeSettingsSection) => void;
   onToggleSettings: () => void;
-  showProjectMembers: boolean;
-  setShowProjectMembers: (updater: boolean | ((prev: boolean) => boolean)) => void;
   selectedProject: Project | null;
 }
 
@@ -27,12 +26,10 @@ export function useSettingsRouterProps({
   setRuntimeSection,
   setRuntimeConfigSection,
   onToggleSettings,
-  showProjectMembers,
-  setShowProjectMembers,
   selectedProject,
 }: UseSettingsRouterPropsOptions): Omit<SettingsSectionRouterProps, 'activeSection'> {
   return useMemo(() => ({
-    isAdmin: s.userRole === 'admin',
+    isAdmin: resolveAccess(s.userRole, selectedProject?.my_role).isPlatformAdmin,
     onNavigateToSection: (section: string) => {
       if (section === 'notifications') {
         setRuntimeSection('settings');
@@ -128,9 +125,13 @@ export function useSettingsRouterProps({
     onUpdateAccountCaps: s.updateAccountCaps,
     showUserManagement: s.showUserManagement,
     onToggleUserManagement: () => s.setShowUserManagement(prev => !prev),
-    showProjectMembers,
-    onToggleProjectMembers: () => setShowProjectMembers(prev => !prev),
-    selectedProjectMyRole: selectedProject?.my_role ?? null,
+    projectMembers: s.projectMembers,
+    projectMembersProjectId: s.projectMembersProjectId,
+    onLoadProjectMembers: s.fetchProjectMembers,
+    onActivateProjectMembers: s.activateProjectMembers,
+    onAddProjectMember: s.addProjectMember,
+    onUpdateProjectMemberRole: s.updateProjectMemberRole,
+    onRemoveProjectMember: s.removeProjectMember,
     newAccountName: s.newAccountName,
     setNewAccountName: s.setNewAccountName,
     newAccountProvider: s.newAccountProvider,
@@ -289,7 +290,13 @@ export function useSettingsRouterProps({
     s.updateAccountCaps,
     s.showUserManagement,
     s.setShowUserManagement,
-    showProjectMembers,
+    s.projectMembers,
+    s.projectMembersProjectId,
+    s.fetchProjectMembers,
+    s.activateProjectMembers,
+    s.addProjectMember,
+    s.updateProjectMemberRole,
+    s.removeProjectMember,
     selectedProject?.my_role,
     s.newAccountName,
     s.setNewAccountName,
@@ -366,6 +373,5 @@ export function useSettingsRouterProps({
     onHealthCheckUrlsInputChange,
     setRuntimeSection,
     setRuntimeConfigSection,
-    setShowProjectMembers,
   ]);
 }

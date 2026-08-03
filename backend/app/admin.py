@@ -95,11 +95,13 @@ from app.task_direction_refs import first_task_direction_id
 from app.task_movement import build_task_movement_explanation
 from app.compute import _capture_serial_for_vm, get_vm_zone, get_vm_status
 from app.admin_helpers import (  # noqa: F401
+    PROJECT_WRITE_ROLES,
     _ROLE_LEVEL,
     _user_project_ids,
     _member_project_ids,
     _resolve_repo_project_for_write,
     _get_user_project,
+    _get_user_project_role,
     _get_user_project_with_role,
     _get_user_task,
     _get_user_task_with_role,
@@ -1368,7 +1370,7 @@ async def bulk_action_tasks(
     if valid_map:
         member_project_ids = select(ProjectMember.project_id).where(
             ProjectMember.user_id == current_user["user_id"],
-            ProjectMember.role.in_(["member", "owner"]),
+            ProjectMember.role.in_(PROJECT_WRITE_ROLES),
         )
         fetched = {
             task.id: task
@@ -1991,7 +1993,7 @@ async def get_task(
         raise HTTPException(status_code=404, detail="Task not found")
 
     task = await _get_user_task_with_role(
-        tid, current_user["user_id"], session, "member"
+        tid, current_user["user_id"], session, "viewer"
     )
 
     # Fetch all artifacts for this task (all types, not just last per type)

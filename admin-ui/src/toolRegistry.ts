@@ -4,6 +4,8 @@ import type { ProjectTool } from './api/projectTools';
 export interface ToolComponentProps {
   projectId: string;
   tool: ProjectTool;
+  /** Viewer-safe rendering: content remains visible but no writes or handoffs. */
+  readOnly: boolean;
 }
 
 type ToolComponent = ComponentType<ToolComponentProps>;

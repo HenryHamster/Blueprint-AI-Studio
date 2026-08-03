@@ -2,7 +2,7 @@ import { afterEach, describe, test, vi, expect } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { waitFor } from '@testing-library/react';
-import { MessagesPanel, type MessagesPanelProps } from './MessagesPanel';
+import { MessagesPanel as MessagesPanelComponent, type MessagesPanelProps } from './MessagesPanel';
 import type { ProjectMessage } from './MessageBubble';
 import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt, stressStrings } from '../test/viewport';
 import type { StrategicStateResponse } from '../strategicStateApi';
@@ -10,6 +10,14 @@ import type { StrategicStateResponse } from '../strategicStateApi';
 // in the browser viewport environment, preventing the Suspense fallback from hiding
 // the message content during DOM queries.
 import './MarkdownContentInner';
+
+type MessagesPanelViewportProps = Omit<MessagesPanelProps, 'canOperateProject'> & {
+  canOperateProject?: boolean;
+};
+
+function MessagesPanel(props: MessagesPanelViewportProps) {
+  return <MessagesPanelComponent canOperateProject={true} {...props} />;
+}
 
 // React patches the input `value` setter on its prototype to track controlled-input
 // state. Assigning `input.value = 'x'` then dispatching an event won't trigger React's

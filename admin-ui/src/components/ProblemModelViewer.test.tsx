@@ -73,6 +73,9 @@ function makeProblemModel(overrides: Partial<ProblemModel> = {}): ProblemModel {
 
 const noop = () => {};
 const defaultProps = {
+  // These callback/proof tests model an authorized project operator. The
+  // component intentionally defaults to read-only when capability is unknown.
+  readOnly: false,
   projectId: 'proj-test-1',
   addToast: noop,
   onUpdated: noop,

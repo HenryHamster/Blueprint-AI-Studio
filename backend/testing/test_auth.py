@@ -1,17 +1,23 @@
 """Tests for backend/app/auth.py — email-verification enforcement."""
 
+import asyncio
+import os
+
 import pytest
 from datetime import timedelta
 from unittest.mock import patch, AsyncMock, MagicMock
 from httpx import AsyncClient, ASGITransport
+from fastapi import HTTPException
 from fastapi.security import HTTPAuthorizationCredentials
 from sqlalchemy.exc import SQLAlchemyError
 from sqlmodel import select
 
 from app.main import app
-from app.models import AllowedUser, _utcnow
+from app.models import AllowedUser, Project, ProjectMember, _utcnow
+from app.admin_helpers import pending_project_member_user_id
 from app.auth import (
     get_current_user,
+    _persist_first_signin_claim_critical,
     _persist_auth_metadata_best_effort,
     _LAST_LOGIN_UPDATE_INTERVAL,
 )
@@ -245,11 +251,70 @@ class TestLastLoginThrottleAndBestEffort:
         assert row.last_login_at is not None
 
     @pytest.mark.asyncio
+    async def test_first_signin_claims_pending_and_merges_duplicate_strongest_role(
+        self, db_session
+    ):
+        email = "invited@example.com"
+        allowed = AllowedUser(email=email, role="invited")
+        claimed_project = Project(name="Pending only", user_id="other-owner")
+        duplicate_project = Project(name="Pending and real", user_id="other-owner")
+        db_session.add_all([allowed, claimed_project, duplicate_project])
+        await db_session.commit()
+        pending_id = pending_project_member_user_id(allowed.id)
+        claimed = ProjectMember(
+            project_id=claimed_project.id, user_id=pending_id, role="member"
+        )
+        pending_duplicate = ProjectMember(
+            project_id=duplicate_project.id, user_id=pending_id, role="owner"
+        )
+        real_duplicate = ProjectMember(
+            project_id=duplicate_project.id, user_id="claimed-uid", role="viewer"
+        )
+        db_session.add_all([claimed, pending_duplicate, real_duplicate])
+        await db_session.commit()
+        claimed_member_id = claimed.id
+        real_member_id = real_duplicate.id
+
+        decoded = _make_decoded_token(email=email, uid="claimed-uid", name=None)
+        with patch("app.auth.firebase_auth.verify_id_token", return_value=decoded):
+            result = await get_current_user(credentials=_creds(), session=db_session)
+
+        assert result["user_id"] == "claimed-uid"
+        assert result["role"] == "user"
+        await db_session.refresh(allowed)
+        assert allowed.firebase_uid == "claimed-uid"
+        assert allowed.role == "user"
+        claimed_rows = (
+            await db_session.execute(
+                select(ProjectMember).where(
+                    ProjectMember.project_id == claimed_project.id
+                )
+            )
+        ).scalars().all()
+        assert len(claimed_rows) == 1
+        assert claimed_rows[0].id == claimed_member_id
+        assert claimed_rows[0].user_id == "claimed-uid"
+        assert claimed_rows[0].role == "member"
+        merged_rows = (
+            await db_session.execute(
+                select(ProjectMember).where(
+                    ProjectMember.project_id == duplicate_project.id
+                )
+            )
+        ).scalars().all()
+        assert len(merged_rows) == 1
+        assert merged_rows[0].id == real_member_id
+        assert merged_rows[0].user_id == "claimed-uid"
+        assert merged_rows[0].role == "owner"
+
+    @pytest.mark.asyncio
     async def test_persist_contention_does_not_fail_auth(self, db_session):
         """The core outage fix: a DB error while persisting metadata degrades —
         auth still returns the user/role instead of 500-ing the request."""
         email = "degrade@example.com"
-        db_session.add(AllowedUser(email=email, role="admin"))
+        db_session.add(
+            AllowedUser(email=email, firebase_uid="uid-3", role="admin")
+        )
         await db_session.commit()
 
         decoded = _make_decoded_token(email=email, uid="uid-3", name=None)
@@ -265,6 +330,201 @@ class TestLastLoginThrottleAndBestEffort:
 
         assert result["role"] == "admin"
         assert result["email"] == email
+
+    @pytest.mark.asyncio
+    async def test_invited_claim_commit_failure_returns_503_and_rolls_back_access(
+        self, db_session
+    ):
+        email = "degraded-invite@example.com"
+        allowed = AllowedUser(email=email, role="invited")
+        project = Project(name="Critical claim", user_id="other-owner")
+        db_session.add_all([allowed, project])
+        await db_session.commit()
+        pending_id = pending_project_member_user_id(allowed.id)
+        pending = ProjectMember(
+            project_id=project.id, user_id=pending_id, role="member"
+        )
+        db_session.add(pending)
+        await db_session.commit()
+        allowed_id = allowed.id
+        pending_member_id = pending.id
+
+        decoded = _make_decoded_token(email=email, uid="degraded-invite-uid", name=None)
+        with (
+            patch("app.auth.firebase_auth.verify_id_token", return_value=decoded),
+            patch.object(
+                db_session,
+                "commit",
+                side_effect=SQLAlchemyError("simulated lock timeout"),
+            ),
+            pytest.raises(HTTPException) as exc_info,
+        ):
+            await get_current_user(credentials=_creds(), session=db_session)
+
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.headers == {"Retry-After": "1"}
+        # The default SQLite harness disables ORM expiry suite-wide, so
+        # ``expire_all`` could leave the pre-rollback identity-map objects in
+        # place and make this assertion vacuous. Detach them and force SELECTs.
+        db_session.expunge_all()
+        persisted = await db_session.get(AllowedUser, allowed_id)
+        persisted_member = await db_session.get(ProjectMember, pending_member_id)
+        assert persisted is not None
+        assert persisted.firebase_uid is None
+        assert persisted.role == "invited"
+        assert persisted_member is not None
+        assert persisted_member.user_id == pending_id
+
+    @pytest.mark.asyncio
+    async def test_claim_commit_failure_never_reaches_protected_route(
+        self, client, db_session
+    ):
+        email = "route-claim-failure@example.com"
+        allowed = AllowedUser(email=email, role="admin")
+        db_session.add(allowed)
+        await db_session.commit()
+        saved = app.dependency_overrides.pop(get_current_user, None)
+        decoded = _make_decoded_token(email=email, uid="route-claim-uid", name=None)
+        try:
+            with (
+                patch("app.auth.firebase_auth.verify_id_token", return_value=decoded),
+                patch(
+                    "sqlalchemy.ext.asyncio.AsyncSession.commit",
+                    new_callable=AsyncMock,
+                    side_effect=SQLAlchemyError("simulated critical commit failure"),
+                ),
+            ):
+                response = await client.get(
+                    "/api/admin/users",
+                    headers={"Authorization": "Bearer fake-firebase-token"},
+                )
+        finally:
+            if saved is not None:
+                app.dependency_overrides[get_current_user] = saved
+
+        assert response.status_code == 503
+        assert response.headers["Retry-After"] == "1"
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        os.getenv("USE_TEST_POSTGRES", "").lower() != "true",
+        reason="concurrent UID claim serialization requires PostgreSQL",
+    )
+    async def test_concurrent_different_uid_claim_loser_is_denied_for_admin_row(
+        self, db_session
+    ):
+        from conftest import TestingSessionLocal
+
+        allowed = AllowedUser(email="admin-race@example.com", role="admin")
+        db_session.add(allowed)
+        await db_session.commit()
+        allowed_id = allowed.id
+
+        async def claim(uid: str):
+            async with TestingSessionLocal() as session:
+                try:
+                    result = await _persist_first_signin_claim_critical(
+                        session, allowed_id, uid
+                    )
+                    return ("ok", uid, result.role)
+                except HTTPException as exc:
+                    return ("denied", uid, exc.status_code)
+
+        results = await asyncio.gather(claim("race-uid-a"), claim("race-uid-b"))
+
+        assert sorted(result[0] for result in results) == ["denied", "ok"]
+        winner = next(result for result in results if result[0] == "ok")
+        loser = next(result for result in results if result[0] == "denied")
+        assert winner[2] == "admin"
+        assert loser[2] == 403
+        db_session.expire_all()
+        persisted = await db_session.get(AllowedUser, allowed_id)
+        assert persisted is not None
+        assert persisted.firebase_uid == winner[1]
+        assert persisted.role == "admin"
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        os.getenv("USE_TEST_POSTGRES", "").lower() != "true",
+        reason="concurrent UID claim serialization requires PostgreSQL",
+    )
+    async def test_concurrent_same_uid_claim_is_idempotent(self, db_session):
+        from conftest import TestingSessionLocal
+
+        allowed = AllowedUser(email="same-uid-race@example.com", role="invited")
+        db_session.add(allowed)
+        await db_session.commit()
+        allowed_id = allowed.id
+
+        async def claim():
+            async with TestingSessionLocal() as session:
+                result = await _persist_first_signin_claim_critical(
+                    session, allowed_id, "same-race-uid"
+                )
+                return result.role
+
+        assert await asyncio.gather(claim(), claim()) == ["user", "user"]
+        db_session.expire_all()
+        persisted = await db_session.get(AllowedUser, allowed_id)
+        assert persisted is not None
+        assert persisted.firebase_uid == "same-race-uid"
+        assert persisted.role == "user"
+
+    @pytest.mark.asyncio
+    async def test_case_variant_rows_prefer_current_uid_binding(self, db_session):
+        db_session.add_all(
+            [
+                AllowedUser(
+                    email="Bound@Example.com",
+                    firebase_uid="current-uid",
+                    role="admin",
+                ),
+                AllowedUser(
+                    email="bound@example.com",
+                    firebase_uid="other-uid",
+                    role="user",
+                ),
+            ]
+        )
+        await db_session.commit()
+
+        decoded = _make_decoded_token(
+            email="BOUND@example.com", uid="current-uid", name=None
+        )
+        with patch("app.auth.firebase_auth.verify_id_token", return_value=decoded):
+            result = await get_current_user(credentials=_creds(), session=db_session)
+
+        assert result["role"] == "admin"
+
+    @pytest.mark.asyncio
+    async def test_case_variant_distinct_bindings_fail_closed(self, db_session):
+        db_session.add_all(
+            [
+                AllowedUser(
+                    email="Ambiguous@Example.com",
+                    firebase_uid="first-uid",
+                    role="admin",
+                ),
+                AllowedUser(
+                    email="ambiguous@example.com",
+                    firebase_uid="second-uid",
+                    role="user",
+                ),
+            ]
+        )
+        await db_session.commit()
+
+        decoded = _make_decoded_token(
+            email="AMBIGUOUS@example.com", uid="unrelated-uid", name=None
+        )
+        with (
+            patch("app.auth.firebase_auth.verify_id_token", return_value=decoded),
+            pytest.raises(HTTPException) as exc_info,
+        ):
+            await get_current_user(credentials=_creds(), session=db_session)
+
+        assert exc_info.value.status_code == 409
+        assert "Conflicting allowlist" in exc_info.value.detail
 
     @pytest.mark.asyncio
     async def test_best_effort_helper_swallows_db_error_and_rolls_back(self):

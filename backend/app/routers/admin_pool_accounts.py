@@ -601,7 +601,7 @@ async def get_max_plan_accounts(
 @router.get("/max-plan-accounts/health")
 async def get_account_health_summary(
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_admin),
     cache: DigestCache = Depends(get_digest_cache),
 ):
     """Per-account health summary: state, 24h completions/RL events, health score,
@@ -788,7 +788,7 @@ async def _compute_account_health_summary(
 @router.get("/max-plan-accounts/provider-model-breakdown")
 async def get_provider_model_breakdown(
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_admin),
     cache: DigestCache = Depends(get_digest_cache),
     expand_accounts: bool = Query(False),
     project_id: uuid.UUID | None = Query(None),
@@ -857,7 +857,7 @@ async def _compute_provider_model_breakdown(
 async def get_project_pool_usage(
     project_id: uuid.UUID = Query(...),
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_admin),
 ):
     """Per-account pool consumption for a single project.
 
@@ -893,7 +893,7 @@ async def get_project_pool_usage(
 @router.get("/pool-accounts/project-summary")
 async def get_project_pool_summary(
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_admin),
 ):
     """Pool-wide per-project consumption summary for all of the user's projects.
 

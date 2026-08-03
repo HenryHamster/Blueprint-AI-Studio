@@ -1,7 +1,8 @@
 import { describe, test, expect, vi, afterEach, beforeEach } from 'vitest';
 import { render, waitFor, act, fireEvent, within } from '@testing-library/react';
 import type { ComputeJob, ComputeJobsListResponse } from '../api';
-import { ComputeJobsPanel, CompactJobsTable } from './ComputeJobsPanel';
+import type { ComponentProps } from 'react';
+import { ComputeJobsPanel as ComputeJobsPanelComponent, CompactJobsTable } from './ComputeJobsPanel';
 import {
   isComputeJobActive,
   computeJobTerminalLabel,
@@ -15,6 +16,14 @@ import {
   fmtDuration,
 } from './ComputeJobsPanel.utils';
 import type { ComputeRpcDiagnostic } from '../api';
+
+type ComputeJobsPanelTestProps = Omit<ComponentProps<typeof ComputeJobsPanelComponent>, 'readOnly'> & {
+  readOnly?: boolean;
+};
+
+function ComputeJobsPanel(props: ComputeJobsPanelTestProps) {
+  return <ComputeJobsPanelComponent readOnly={false} {...props} />;
+}
 
 const fetchComputeJobs = vi.fn();
 const killComputeJob = vi.fn();
@@ -850,6 +859,70 @@ describe('ComputeJobsPanel render + kill', () => {
     // Clear persisted ask state between tests to prevent cross-test contamination
     localStorage.removeItem('blueprint-admin:compute-ask-state:proj-1');
     localStorage.removeItem('blueprint-admin:compute-ask-state:test-proj-persist');
+  });
+
+  test('read-only mode retains job results while hiding all mutation actions', async () => {
+    const active = makeJob({ id: 'job-active', task_id: 'task-active', task_title: 'active result' });
+    const terminal = makeJob({
+      id: 'job-terminal',
+      task_id: 'task-terminal',
+      task_title: 'terminal result',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1,
+      completed_at: new Date().toISOString(),
+      launch_params: { command: 'python experiment.py' },
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([active, terminal]));
+    fetchHeldComputeExperiments.mockResolvedValue([{
+      id: 'task-held-readonly',
+      title: 'held result',
+      status: 'QUEUED',
+      requires_approval: true,
+      payloads: [{ type: 'compute_experiment', spend_cap_usd: 5 }],
+      created_at: new Date().toISOString(),
+    }]);
+    const { findByText, queryByText, queryByTestId } = render(
+      <ComputeJobsPanel
+        projectId="proj-1"
+        readOnly
+        onLaunchCompute={vi.fn()}
+        onCloneExperiment={vi.fn()}
+        onApproveExperiment={vi.fn(async () => {})}
+        onDismissExperiment={vi.fn(async () => {})}
+      />,
+    );
+
+    await findByText('active result');
+    await findByText('terminal result');
+    await findByText(/held result/);
+    expect(queryByText('Launch experiment')).toBeNull();
+    expect(queryByText('Kill')).toBeNull();
+    expect(queryByText('Run analysis')).toBeNull();
+    expect(queryByText('Re-run')).toBeNull();
+    expect(queryByTestId('clone-to-form')).toBeNull();
+    expect(queryByTestId('compute-ask-section')).toBeNull();
+    expect(queryByTestId('held-experiment-approve')).toBeNull();
+    expect(queryByTestId('held-experiment-dismiss')).toBeNull();
+    expect(killComputeJob).not.toHaveBeenCalled();
+    expect(analyzeComputeJob).not.toHaveBeenCalled();
+    expect(rerunComputeExperiment).not.toHaveBeenCalled();
+    expect(askComputeJob).not.toHaveBeenCalled();
+  });
+
+  test('closes a pending kill confirmation when access is downgraded', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([makeJob()]));
+    const { findByText, findByTestId, queryByTestId, rerender } = render(
+      <ComputeJobsPanel projectId="proj-1" readOnly={false} />,
+    );
+
+    const killButton = await findByText('Kill');
+    await act(async () => { killButton.click(); });
+    expect(await findByTestId('confirm-dialog-confirm')).toBeInTheDocument();
+
+    rerender(<ComputeJobsPanel projectId="proj-1" readOnly />);
+    await waitFor(() => expect(queryByTestId('confirm-dialog-confirm')).not.toBeInTheDocument());
+    expect(killComputeJob).not.toHaveBeenCalled();
   });
 
   test('renders budget bar and task title for an active job', async () => {

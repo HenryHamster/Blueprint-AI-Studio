@@ -69,6 +69,8 @@ interface StrategicContextRailProps {
   addToast?: (message: string, type: 'success' | 'error' | 'info') => void;
   /** Project whose whiteboard/canvas the strategic sidebar surfaces. */
   projectId?: string | null;
+  /** Whether the caller may mutate project-scoped tools. Unknown fails closed. */
+  canOperateProject?: boolean;
 }
 
 function formatCost(value: number | undefined): string {
@@ -887,6 +889,7 @@ export const StrategicContextRail = memo(function StrategicContextRail({
   onConfirmationResolved,
   addToast,
   projectId = null,
+  canOperateProject = false,
 }: StrategicContextRailProps) {
   const activeCycle = state?.strategic.active_cycle ?? null;
   const localRunner = state?.runtime?.local_runner ?? null;
@@ -1268,7 +1271,7 @@ export const StrategicContextRail = memo(function StrategicContextRail({
         <ShaFreshnessBlock shaFreshness={shaFreshness} />
       </WorkbenchPanel>
 
-      <WhiteboardRailSection projectId={projectId} />
+      <WhiteboardRailSection projectId={projectId} readOnly={!canOperateProject} />
 
       <TaskFocusBlock
         focus={state?.tasks.focus ?? null}

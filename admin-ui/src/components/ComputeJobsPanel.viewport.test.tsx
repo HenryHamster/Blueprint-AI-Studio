@@ -387,7 +387,16 @@ vi.mock('../api', async (importOriginal) => {
   };
 });
 
-import { ComputeJobsPanel } from './ComputeJobsPanel';
+import type { ComponentProps } from 'react';
+import { ComputeJobsPanel as ComputeJobsPanelComponent } from './ComputeJobsPanel';
+
+type ComputeJobsPanelTestProps = Omit<ComponentProps<typeof ComputeJobsPanelComponent>, 'readOnly'> & {
+  readOnly?: boolean;
+};
+
+function ComputeJobsPanel(props: ComputeJobsPanelTestProps) {
+  return <ComputeJobsPanelComponent readOnly={false} {...props} />;
+}
 
 describe('ComputeJobsPanel — viewport regression', () => {
   let root: Root | null = null;

@@ -1,7 +1,9 @@
-import { lazy, Suspense } from 'react';
+import { lazy, Suspense, useEffect } from 'react';
 import { Users } from 'lucide-react';
 import type { NotificationConfig } from './SettingsNotificationsSection';
 import { Skeleton } from './DashboardMetricCardsPrimitives';
+import { resolveAccess, type ProjectRole } from '../accessControl';
+import { ProjectMembers } from './ProjectMembers';
 
 const SettingsAdvancedSection = lazy(() =>
   import('./SettingsAdvancedSection').then(m => ({ default: m.SettingsAdvancedSection })),
@@ -62,6 +64,7 @@ import type {
   ProjectResourceEnvelopeResponse,
   ResourceEnvelopeConfig,
   OnboardingProof,
+  ProjectMemberEntry,
 } from '../types/project';
 import type { UserLaunchableTaskType } from '../taskCapabilities';
 import type { ViewMode } from '../hooks/useViewPreferences';
@@ -205,9 +208,13 @@ export interface SettingsSectionRouterProps {
   ) => void;
   showUserManagement: boolean;
   onToggleUserManagement: () => void;
-  showProjectMembers: boolean;
-  onToggleProjectMembers: () => void;
-  selectedProjectMyRole: string | null;
+  projectMembers: ProjectMemberEntry[];
+  projectMembersProjectId: string | null;
+  onLoadProjectMembers: (projectId: string) => void | Promise<void>;
+  onActivateProjectMembers: (projectId: string | null) => void;
+  onAddProjectMember: (projectId: string, email: string, role: string) => Promise<void>;
+  onUpdateProjectMemberRole: (projectId: string, memberId: string, role: string) => Promise<void>;
+  onRemoveProjectMember: (projectId: string, memberId: string) => Promise<void>;
   newAccountName: string;
   setNewAccountName: (value: string) => void;
   newAccountProvider: ProviderName;
@@ -273,7 +280,7 @@ export interface SettingsSectionRouterProps {
   selectedProjectOwner: string | null;
   selectedProjectRepo: string | null;
   selectedProjectIsSelfRepo?: boolean;
-  selectedProjectRole?: 'owner' | 'member' | 'viewer' | null;
+  selectedProjectRole?: ProjectRole;
   selectedProjectOnboardingProof?: OnboardingProof | null;
   buildConfig: BuildConfig | null;
   onUpdateBuildConfig: (config: BuildConfig) => Promise<void>;
@@ -295,6 +302,50 @@ export interface SettingsSectionRouterProps {
   onUpdatePromotionTarget: (branch: string | null) => Promise<void>;
 }
 
+function ProjectMembersAccessPanel(props: Pick<SettingsSectionRouterProps,
+  | 'selectedProjectId'
+  | 'selectedProjectRole'
+  | 'projectMembers'
+  | 'projectMembersProjectId'
+  | 'onLoadProjectMembers'
+  | 'onActivateProjectMembers'
+  | 'onAddProjectMember'
+  | 'onUpdateProjectMemberRole'
+  | 'onRemoveProjectMember'
+>) {
+  const {
+    onActivateProjectMembers,
+    onLoadProjectMembers,
+    selectedProjectId: projectId,
+    selectedProjectRole,
+  } = props;
+  const isOwner = selectedProjectRole === 'owner';
+
+  useEffect(() => {
+    if (!projectId || !isOwner) {
+      onActivateProjectMembers(null);
+      return;
+    }
+    void onLoadProjectMembers(projectId);
+    return () => onActivateProjectMembers(null);
+  }, [isOwner, onActivateProjectMembers, onLoadProjectMembers, projectId]);
+
+  if (!projectId || !isOwner) return null;
+
+  return (
+    <ProjectMembers
+      key={projectId}
+      projectId={projectId}
+      members={props.projectMembersProjectId === projectId ? props.projectMembers : []}
+      myRole="owner"
+      canManageMembers
+      onAdd={(email, role) => props.onAddProjectMember(projectId, email, role)}
+      onUpdateRole={(memberId, role) => props.onUpdateProjectMemberRole(projectId, memberId, role)}
+      onRemove={(memberId) => props.onRemoveProjectMember(projectId, memberId)}
+    />
+  );
+}
+
 /**
  * Renders the body of the currently-active settings section.
  *
@@ -303,6 +354,7 @@ export interface SettingsSectionRouterProps {
  * sub-component. Runtime and Project now provide the surrounding navigation.
  */
 export function SettingsSectionRouter(props: SettingsSectionRouterProps) {
+  const projectAccess = resolveAccess(undefined, props.selectedProjectRole);
   const closeExternalPanelHost = () => {
     const shouldClose = props.hostKind
       ? props.hostKind === 'modal'
@@ -503,25 +555,10 @@ export function SettingsSectionRouter(props: SettingsSectionRouterProps) {
               </button>
             </div>
           )}
-          {props.selectedProjectId && (props.selectedProjectMyRole === 'owner' || props.isAdmin) && (
-            <div>
-              <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-1">Project Members</h3>
-              <p className="text-xs text-neutral-500 mb-3">Control who has access to this project and their roles.</p>
-              <button
-                data-testid="toggle-project-members"
-                onClick={() => { props.onToggleProjectMembers(); closeExternalPanelHost(); }}
-                className={`flex items-center gap-2 min-h-[44px] text-xs py-2 px-4 rounded-lg transition-colors border ${
-                  props.showProjectMembers
-                    ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400'
-                    : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border-neutral-700'
-                }`}
-              >
-                <Users className="w-3.5 h-3.5" />
-                {props.showProjectMembers ? 'Close Project Members' : 'Manage Project Members'}
-              </button>
-            </div>
+          {props.selectedProjectId && projectAccess.canManageProject && (
+            <ProjectMembersAccessPanel {...props} />
           )}
-          {!props.isAdmin && !(props.selectedProjectId && props.selectedProjectMyRole === 'owner') && (
+          {!props.isAdmin && !(props.selectedProjectId && projectAccess.canManageProject) && (
             <p className="text-xs text-neutral-500">No access management options are available for your current role.</p>
           )}
         </div>
@@ -555,6 +592,7 @@ export function SettingsSectionRouter(props: SettingsSectionRouterProps) {
             onDetect={props.onDetectBuildConfig}
             detectAvailable={Boolean(props.selectedProjectOwner && props.selectedProjectRepo)}
             projectId={props.selectedProjectId}
+            canSave={projectAccess.canManageProject}
           />
         </Suspense>
       );
@@ -563,7 +601,7 @@ export function SettingsSectionRouter(props: SettingsSectionRouterProps) {
         <Suspense fallback={<SectionSkeleton />}>
           <ProjectAlertDomainsSection
             projectId={props.selectedProjectId}
-            canSave={props.selectedProjectRole === 'owner'}
+            canSave={projectAccess.canManageProject}
           />
         </Suspense>
       );
@@ -572,7 +610,7 @@ export function SettingsSectionRouter(props: SettingsSectionRouterProps) {
         <Suspense fallback={<SectionSkeleton />}>
           <ProjectAutoReviewSection
             config={props.autoReviewConfig}
-            canSave={props.selectedProjectRole === 'owner'}
+            canSave={projectAccess.canManageProject}
             onSave={props.onUpdateAutoReviewConfig}
           />
         </Suspense>
@@ -586,7 +624,7 @@ export function SettingsSectionRouter(props: SettingsSectionRouterProps) {
             data={props.resourceEnvelopeData}
             loading={props.resourceEnvelopeLoading}
             error={props.resourceEnvelopeError}
-            canSave={props.selectedProjectRole === 'owner'}
+            canSave={projectAccess.canManageProject}
             onSave={props.onUpdateResourceEnvelope}
           />
         </Suspense>
@@ -602,6 +640,7 @@ export function SettingsSectionRouter(props: SettingsSectionRouterProps) {
             onSave={props.onUpdateAutoRemediationConfig}
             integrationBranch={props.integrationBranchData?.integration_branch}
             promotionTarget={props.promotionTargetData?.promotion_target}
+            canSave={projectAccess.canManageProject}
           />
         </Suspense>
       );
@@ -613,6 +652,7 @@ export function SettingsSectionRouter(props: SettingsSectionRouterProps) {
             githubRepo={props.selectedProjectRepo}
             config={props.issueImplementationConfig}
             onSave={props.onUpdateIssueImplementationConfig}
+            canSave={projectAccess.canManageProject}
           />
         </Suspense>
       );
@@ -624,7 +664,7 @@ export function SettingsSectionRouter(props: SettingsSectionRouterProps) {
             onSaveIntegrationBranch={props.onUpdateIntegrationBranch}
             promotionTargetData={props.promotionTargetData}
             onSavePromotionTarget={props.onUpdatePromotionTarget}
-            canSave={props.selectedProjectRole === 'owner'}
+            canSave={projectAccess.canManageProject}
           />
         </Suspense>
       );

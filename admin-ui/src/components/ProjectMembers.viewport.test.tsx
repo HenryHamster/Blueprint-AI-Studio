@@ -50,6 +50,7 @@ describe('ProjectMembers — viewport regression', () => {
             projectId="proj-1"
             members={[]}
             myRole="owner"
+            canManageMembers
             onAdd={noop}
             onUpdateRole={noop}
             onRemove={noop}
@@ -72,6 +73,7 @@ describe('ProjectMembers — viewport regression', () => {
             projectId="proj-1"
             members={sampleMembers}
             myRole="owner"
+            canManageMembers
             onAdd={noop}
             onUpdateRole={noop}
             onRemove={noop}
@@ -94,6 +96,7 @@ describe('ProjectMembers — viewport regression', () => {
             projectId="proj-1"
             members={sampleMembers}
             myRole="member"
+            canManageMembers={false}
             onAdd={noop}
             onUpdateRole={noop}
             onRemove={noop}

@@ -50,6 +50,7 @@ function FailureClassBreakdown({ tasks }: { tasks: Task[] }) {
 
 interface SortableCardProps {
   task: Task;
+  readOnly: boolean;
   maxRetries: number;
   actionLoadingMap: Record<string, string>;
   selectionMode: boolean;
@@ -81,6 +82,7 @@ interface SortableCardProps {
 
 export function SortableCard({
   task,
+  readOnly = true,
   maxRetries,
   actionLoadingMap,
   selectionMode,
@@ -130,7 +132,7 @@ export function SortableCard({
       style={style}
       className={`relative group ${isOverlay ? 'shadow-2xl ring-1 ring-amber-500/50 rounded-xl' : ''}`}
     >
-      {selectionMode && (
+      {!readOnly && selectionMode && (
         <div className="absolute top-2 left-2 z-10">
           <input
             type="checkbox"
@@ -147,15 +149,16 @@ export function SortableCard({
           />
         </div>
       )}
-      <div
+      {!readOnly && <div
         className="absolute top-1/2 -translate-y-1/2 -left-0.5 z-10 opacity-0 group-hover:opacity-100 transition-opacity cursor-grab active:cursor-grabbing touch-none p-0.5"
         {...attributes}
         {...listeners}
       >
         <GripVertical className="w-3.5 h-3.5 text-neutral-600 hover:text-neutral-400" />
-      </div>
+      </div>}
       <div className={selectionMode ? 'pl-6' : ''}>
         <TaskCard
+          readOnly={readOnly}
           ref={cardRef}
           task={task}
           maxRetries={maxRetries}
@@ -298,6 +301,7 @@ export function ColumnArchiveButton({
 
 interface KanbanColumnProps {
   col: KanbanColumnConfig;
+  readOnly: boolean;
   colIdx: number;
   columnTasks: Task[];
   loading: boolean;
@@ -339,6 +343,7 @@ interface KanbanColumnProps {
 
 export function KanbanColumn({
   col,
+  readOnly = true,
   colIdx,
   columnTasks,
   loading,
@@ -393,6 +398,7 @@ export function KanbanColumn({
       <SortableContext items={visibleTaskIds} strategy={verticalListSortingStrategy}>
         {visibleTasks.map((task, cardIdx) => (
           <SortableCard
+            readOnly={readOnly}
             key={task.id}
             task={task}
             maxRetries={maxRetries}
@@ -488,7 +494,7 @@ export function KanbanColumn({
           <span title={`Sorted: ${SORT_LABELS[sortBy]}`} className="text-neutral-600 flex items-center">
             <ArrowDownUp className="w-3 h-3" />
           </span>
-          {isArchivable && columnTasks.length > 0 && (
+          {!readOnly && isArchivable && columnTasks.length > 0 && (
             <ColumnArchiveButton
               taskIds={taskIds}
               columnLabel={col.label}
@@ -513,7 +519,7 @@ export function KanbanColumn({
                 <h2 className={`text-ui-md font-bold uppercase tracking-widest ${col.id === 'EVALUATING' ? 'text-amber-400' : 'text-neutral-400'}`}>{col.label}</h2>
               </div>
               <div className="flex items-center gap-1.5">
-                {selectionMode && columnTasks.length > 0 && (
+                {!readOnly && selectionMode && columnTasks.length > 0 && (
                   <ColumnSelectCheckbox
                     columnTasks={columnTasks}
                     selectedTaskIds={selectedTaskIds}
@@ -526,7 +532,7 @@ export function KanbanColumn({
                 <span className="text-ui-sm bg-neutral-800 text-neutral-300 px-2 py-0.5 rounded-full font-medium border border-neutral-700">
                   {columnTasks.length}
                 </span>
-                {isArchivable && columnTasks.length > 0 && (
+                {!readOnly && isArchivable && columnTasks.length > 0 && (
                   <ColumnArchiveButton
                     taskIds={taskIds}
                     columnLabel={col.label}

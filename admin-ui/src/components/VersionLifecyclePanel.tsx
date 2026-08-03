@@ -134,6 +134,10 @@ interface VersionLifecyclePanelProps {
   lastSuccessfulRefreshAt?: string | null;
   refreshing?: boolean;
   agentServingShas?: AgentServingShasResponse | null;
+  /** Preserve lifecycle evidence while suppressing every project mutation. */
+  readOnly: boolean;
+  canManageProject: boolean;
+  canManagePlatform: boolean;
 }
 
 interface LocalDialogConfig {
@@ -142,9 +146,10 @@ interface LocalDialogConfig {
   confirmLabel?: string;
   attestationInput?: { label: string; placeholder?: string };
   onConfirm: (reason?: string) => void;
+  requiredAccess?: 'operate' | 'manage-project' | 'manage-platform';
 }
 
-export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, userRole, refreshError, lastSuccessfulRefreshAt, refreshing = false, agentServingShas }: VersionLifecyclePanelProps) {
+export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, refreshError, lastSuccessfulRefreshAt, refreshing = false, agentServingShas, readOnly = true, canManageProject = false, canManagePlatform = false }: VersionLifecyclePanelProps) {
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [actionMsg, setActionMsg] = useState<string | null>(null);
   const [localDialog, setLocalDialog] = useState<LocalDialogConfig | null>(null);
@@ -183,6 +188,20 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
   useEffect(() => {
     setPromotionEnabledOverride(null);
   }, [data?.promotion_enabled]);
+  useEffect(() => {
+    const dialogAllowed = !localDialog
+      || (localDialog.requiredAccess === 'manage-platform'
+        ? canManagePlatform
+        : localDialog.requiredAccess === 'manage-project'
+          ? canManageProject
+          : !readOnly);
+    if (!dialogAllowed) setLocalDialog(null);
+    if (readOnly) {
+      setEditingGoal(false);
+      setCuttingVersion(false);
+      setHotfixPanelOpen(false);
+    }
+  }, [canManagePlatform, canManageProject, localDialog, readOnly]);
 
   if (loading) return null;
   if (!data || (!data.current_version && data.recent_versions.length === 0)) {
@@ -220,7 +239,6 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
   // version after promotion, or a recent promoted one) can be cleared once the
   // deploy is verified or attested live. The backend endpoint is project-scoped
   // and targets the latest promoted deploy_failed version.
-  const isAdmin = userRole === 'admin';
   // The clear lever is backed by a project-scoped endpoint that still targets
   // the latest promoted version latched to the scalar serving_status field.
   // Keep this predicate on that same backend-owned latch; aggregate-only
@@ -230,7 +248,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
     || recent.some(v => (v.serving?.status ?? v.serving_status) === 'deploy_failed');
 
   const handleSetPhase = async (phase: 'build' | 'stabilize') => {
-    if (!projectId) return;
+    if (readOnly || !projectId) return;
     setActionLoading('phase');
     setActionMsg(null);
     try {
@@ -251,7 +269,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
   };
 
   const handleSetGoal = async () => {
-    if (!projectId) return;
+    if (readOnly || !projectId) return;
     setActionLoading('goal');
     setActionMsg(null);
     try {
@@ -275,7 +293,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
   };
 
   const handleQualify = async () => {
-    if (!projectId) return;
+    if (readOnly || !projectId) return;
     setActionLoading('qualify');
     setActionMsg(null);
     try {
@@ -290,6 +308,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
   };
 
   const handleTogglePromotionEnabled = () => {
+    if (readOnly || !canManagePlatform) return;
     const nextValue = !optimisticPromotionEnabled;
     const doAction = async () => {
       setActionLoading('promotion');
@@ -312,6 +331,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
         message: 'Enable live promotion for ALL PROJECTS? Passing qualify runs will push to main fleet-wide.',
         confirmLabel: 'Enable',
         onConfirm: () => { setLocalDialog(null); doAction(); },
+        requiredAccess: 'manage-platform',
       });
     } else {
       doAction();
@@ -319,7 +339,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
   };
 
   const handleSetProjectPromotion = (enabled: boolean | null) => {
-    if (!projectId) return;
+    if (readOnly || !canManageProject || !projectId) return;
     const doAction = async () => {
       setActionLoading('project-promotion');
       setActionMsg(null);
@@ -339,6 +359,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
         message: 'Arm live promotion for THIS project only? Passing qualify runs will push this project to main.',
         confirmLabel: 'Arm',
         onConfirm: () => { setLocalDialog(null); doAction(); },
+        requiredAccess: 'manage-project',
       });
     } else {
       doAction();
@@ -346,7 +367,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
   };
 
   const handleCutVersion = () => {
-    if (!projectId || !cv) return;
+    if (readOnly || !projectId || !cv) return;
     const activating = stagedActivatedByCut(data?.staged_directions ?? [], cv.version_number);
     const inFlight = cv.in_flight_task_count ?? 0;
     const qualState: QualificationState | null = cv.qualification_state ?? null;
@@ -389,6 +410,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
           setActionLoading(null);
         }
       },
+      requiredAccess: 'operate',
     });
   };
 
@@ -397,7 +419,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
   // independently observed serving. If it refuses (live SHA unobservable), show
   // an attestation-reason dialog and retry the operator-attested force path.
   const handleClearDeployFailed = () => {
-    if (!projectId) return;
+    if (readOnly || !canManagePlatform || !projectId) return;
     setLocalDialog({
       title: 'Clear deploy-failed?',
       message: 'Clear the stale deploy-failed serving state for the promoted version?\n\nThe deploy must be independently confirmed serving, or you will be asked to attest it is live.',
@@ -442,13 +464,15 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                 setActionLoading(null);
               }
             },
+            requiredAccess: 'manage-platform',
           });
         }
       },
+      requiredAccess: 'manage-platform',
     });
   };
 
-  const handleReinstate = projectId
+  const handleReinstate = projectId && !readOnly
     ? async (criterionKey: string) => {
         try {
           await reinstateAcceptanceCriterion(projectId, criterionKey);
@@ -459,7 +483,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
       }
     : undefined;
 
-  const handleAttest = projectId
+  const handleAttest = projectId && !readOnly
     ? (criterionKey: string) => {
         setLocalDialog({
           title: 'Attest criterion',
@@ -484,11 +508,12 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
               setActionLoading(null);
             }
           },
+          requiredAccess: 'operate',
         });
       }
     : undefined;
 
-  const handleLinkDirection = projectId
+  const handleLinkDirection = projectId && !readOnly
     ? (criterionKey: string) => {
         setLocalDialog({
           title: 'Link criterion to direction',
@@ -513,6 +538,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
               setActionLoading(null);
             }
           },
+          requiredAccess: 'operate',
         });
       }
     : undefined;
@@ -532,7 +558,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                   <span className={`text-ui-sm font-semibold px-1.5 py-0.5 rounded border ${optimisticPromotionEnabled ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : 'bg-neutral-500/10 border-neutral-500/30 text-neutral-400'}`} title="Fleet-wide setting (all projects)">
                     {optimisticPromotionEnabled ? 'LIVE' : 'DRY-RUN'}
                   </span>
-                  {projectId && userRole === 'admin' && (
+                  {projectId && canManagePlatform && !readOnly && (
                     <button
                       onClick={handleTogglePromotionEnabled}
                       disabled={actionLoading !== null}
@@ -552,7 +578,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                     <span className={`text-ui-sm font-semibold px-1.5 py-0.5 rounded border ${data.promotion_enabled_effective ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : 'bg-neutral-500/10 border-neutral-500/30 text-neutral-400'}`} title="Effective promotion mode for THIS project">
                       {data.promotion_enabled_effective ? 'LIVE' : 'DRY-RUN'}
                     </span>
-                    {projectId && userRole === 'admin' && (
+                    {projectId && canManageProject && !readOnly && (
                       <>
                         <button
                           onClick={() => handleSetProjectPromotion(true)}
@@ -633,7 +659,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                 qualificationState={cv.qualification_state?.state}
               />
             )}
-            {editingGoal && projectId ? (
+            {!readOnly && editingGoal && projectId ? (
               <div className="flex flex-col gap-1.5">
                 <textarea
                   value={goalInput}
@@ -685,7 +711,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                     <p className="text-ui-sm text-neutral-400" title={cv.live_current_focus}>
                       <span className="text-neutral-600">Live focus: </span>{cv.live_current_focus}
                     </p>
-                    {projectId && (
+                    {projectId && !readOnly && (
                       <button
                         onClick={() => {
                           setGoalInput(cv.live_current_focus || '');
@@ -700,7 +726,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                     )}
                   </div>
                 )}
-                {projectId && (
+                {projectId && !readOnly && (
                   <button
                     onClick={() => setEditingGoal(true)}
                     disabled={actionLoading !== null}
@@ -711,7 +737,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                   </button>
                 )}
               </div>
-            ) : projectId ? (
+            ) : projectId && !readOnly ? (
               <button
                 onClick={() => setEditingGoal(true)}
                 disabled={actionLoading !== null}
@@ -869,7 +895,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                     )}
                   </div>
                 )}
-                {cv.last_qualification.is_permanent_gate_incapacity && projectId && (
+                {cv.last_qualification.is_permanent_gate_incapacity && projectId && !readOnly && (
                   <div className="mt-1 pl-2 border-l-2 border-red-500/40 space-y-2" data-testid="hotfix-remediation-panel">
                     <p className="text-ui-sm text-red-400 font-medium">
                       Permanent gate incapacity — the release is held by a structural gate failure.
@@ -1033,7 +1059,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                 )}
               </div>
             )}
-            {projectId && (
+            {projectId && !readOnly && (
               <div data-testid="phase-controls" className="flex flex-wrap items-center gap-2 pt-1">
                 {cv.phase === 'build' ? (
                   <button
@@ -1118,7 +1144,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                     Cut/Abandon
                   </button>
                 )}
-                {isAdmin && hasDeployFailed && (
+                {canManagePlatform && !readOnly && hasDeployFailed && (
                   <button
                     data-testid="clear-deploy-failed"
                     onClick={handleClearDeployFailed}
@@ -1244,7 +1270,18 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
           message={localDialog.message}
           confirmLabel={localDialog.confirmLabel}
           attestationInput={localDialog.attestationInput}
-          onConfirm={localDialog.onConfirm}
+          onConfirm={(reason) => {
+            const allowed = localDialog.requiredAccess === 'manage-platform'
+              ? canManagePlatform
+              : localDialog.requiredAccess === 'manage-project'
+                ? canManageProject
+                : !readOnly;
+            if (!allowed) {
+              setLocalDialog(null);
+              return;
+            }
+            localDialog.onConfirm(reason);
+          }}
           onCancel={() => setLocalDialog(null)}
         />
       )}

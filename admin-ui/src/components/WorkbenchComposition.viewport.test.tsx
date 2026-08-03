@@ -285,6 +285,7 @@ function makeHeaderProps() {
     needsAttentionCount: 1,
     onOpenNewTaskModal: noop,
     onOpenSettings: noop,
+    canManagePlatform: true,
     onSignOut: noop,
     userEmail: 'operator@example.com',
     wsRef: { current: null },
@@ -388,6 +389,7 @@ describe('WorkbenchComposition viewport regression', () => {
               <WorkbenchSplit
                 main={(
                   <MessagesPanel
+                    canOperateProject={true}
                     selectedProjectId="project-123"
                     addToast={() => {}}
                     onMessageCountChange={() => {}}

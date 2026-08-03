@@ -163,7 +163,13 @@ async def _drain_project_pool(
     live_members = [m for m in members if m.state in LIVE_POOL_STATES]
     drained = 0
     for member in live_members:
-        if await retire_and_delete_pool_vm(session, member, reason=reason, force=True):
+        if await retire_and_delete_pool_vm(
+            session,
+            member,
+            reason=reason,
+            force=True,
+            abandon_leased_handoff=True,
+        ):
             drained += 1
     logger.info(
         "[WARM-POOL] operator %s project=%s by user=%s drained=%d of %d live",

@@ -30,6 +30,7 @@ function makeTask(overrides: Partial<Task> = {}): Task {
 
 const noop = () => {};
 const defaultProps = {
+  readOnly: false,
   onApprove: noop,
   onRequestChanges: noop,
   onCancel: noop,

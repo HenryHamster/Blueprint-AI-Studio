@@ -1,9 +1,18 @@
 import { afterEach, describe, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
-import { TaskDetailDrawer } from './TaskDetailDrawer';
+import type { ComponentProps } from 'react';
+import { TaskDetailDrawer as TaskDetailDrawerComponent } from './TaskDetailDrawer';
 import type { Task } from '../types/task';
 import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
+
+type TaskDetailDrawerViewportProps = Omit<ComponentProps<typeof TaskDetailDrawerComponent>, 'canOperateProject'> & {
+  canOperateProject?: boolean;
+};
+
+function TaskDetailDrawer(props: TaskDetailDrawerViewportProps) {
+  return <TaskDetailDrawerComponent canOperateProject={true} {...props} />;
+}
 
 // Stub firebase before any module that transitively imports it.
 // Browser-mode vitest validates ESM exports statically, so the mock must

@@ -19,7 +19,6 @@ from urllib.parse import quote
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
-from sqlmodel import select
 
 from app.database import get_session
 from app.shared_state import limiter
@@ -31,7 +30,6 @@ from app.models import (
     MessageHandlingState,
     MessageSurface,
     MessageType,
-    UserIntegration,
 )
 from app.project_message_creation import lock_project_and_next_message_sequence
 from app.auth import get_current_user
@@ -51,69 +49,18 @@ router = APIRouter(
 async def _require_caller_github_push_access(
     session: AsyncSession, current_user: dict, owner: str, repo: str
 ) -> None:
-    """Fail closed unless a non-admin caller can push to the requested repo.
-
-    An App installation token represents the App's access, not the current
-    Blueprint user's GitHub authority. This check intentionally happens before
-    that token is minted, using only a caller-scoped OAuth token (or registered
-    fine-grained PAT) from ``UserIntegration``.
-    """
-    if current_user.get("role") == "admin":
-        return
-
-    integration = (
-        await session.execute(
-            select(UserIntegration).where(
-                UserIntegration.user_id == current_user["user_id"]
-            )
-        )
-    ).scalars().first()
-    if not integration or not (
-        integration.github_oauth_token or integration.github_pat
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Link your GitHub account or ask an admin to onboard this repository.",
-        )
+    """Compatibility wrapper around the shared onboarding authorization check."""
+    from app.github_onboarding import require_caller_repo_push_access
 
     try:
-        from app.field_encryption import decrypt_field
-        from app.github import _github_request
-        from app.secrets_manager import get_user_secret
-
-        secret_ref = decrypt_field(
-            integration.github_oauth_token or integration.github_pat
-        )
-        if not secret_ref:
-            raise ValueError("linked GitHub credential reference is empty")
-        user_token = await get_user_secret(secret_ref)
-        response = await _github_request(
-            "GET",
-            f"https://api.github.com/repos/{owner}/{repo}",
-            {
-                "Authorization": f"Bearer {user_token}",
-                "Accept": "application/vnd.github.v3+json",
-                "X-GitHub-Api-Version": "2022-11-28",
-            },
-        )
-        if response.status_code != 200:
-            raise ValueError(f"GitHub repository access check returned {response.status_code}")
-        permissions = response.json().get("permissions") or {}
-        if not (permissions.get("push") or permissions.get("admin")):
-            raise PermissionError("GitHub credential lacks push permission")
-    except HTTPException:
+        await require_caller_repo_push_access(session, current_user, owner, repo)
+    except HTTPException as exc:
+        if exc.status_code == status.HTTP_400_BAD_REQUEST:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Link your GitHub account or ask an admin to onboard this repository.",
+            ) from exc
         raise
-    except Exception as exc:
-        # Do not expose GitHub response details and never proceed on a network,
-        # token, response-shape, or permission failure.
-        logger.warning(
-            "[ONBOARD] GitHub push-access check denied %s for %s/%s: %s",
-            current_user.get("user_id"), owner, repo, exc,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="GitHub push access is required to onboard this repository.",
-        ) from exc
 
 
 def _derive_task_branch_namespace(github_repo: str) -> str:
@@ -992,14 +939,24 @@ async def onboard_project(
     non-admin ownership. The allowlist itself remains the access boundary.
 
     Flow:
-    1. Create the Project row in DEPLOYING state.
-    2. Add the caller as owner via ProjectMember.
-    3. Attempt GitHub-based build-config detection.
-    4. Seed ``task_branch_namespace`` from the repo name when missing.
-    5. Apply any caller-provided build_config_override on top of detection.
-    6. Validate against ``BuildConfig`` and store the validated shape when
-       possible, or the raw detected dict if validation fails.
+    1. Authorize the caller and resolve the GitHub App installation.
+    2. Ensure an empty repository has a real default branch, then attempt
+       GitHub-based build-config detection.
+    3. Seed ``task_branch_namespace``, apply caller overrides, and validate the
+       resulting ``BuildConfig`` shape.
+    4. Return immediately for preview-only requests.
+    5. Create the Project in DEPLOYING state, add the caller as owner, seed its
+       safe defaults/intent, and best-effort enqueue the first bootstrap task.
     """
+
+    # warm_pool_target_size mutates deployment-global runtime configuration and
+    # seeds paid compute. Reject it before GitHub calls, repository writes, or a
+    # Project row can be created. Ordinary users may still onboard normally.
+    if payload.warm_pool_target_size is not None and current_user.get("role") != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only a platform admin may configure or seed the warm pool during onboarding.",
+        )
 
     token = None
     from app.github import (
@@ -1021,7 +978,10 @@ async def onboard_project(
         )
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="No installation token available — cannot detect default branch.",
+            detail=(
+                "Your GitHub authorization is valid, but the Blueprint GitHub App "
+                "is not installed for this repository."
+            ),
         )
 
     try:
@@ -1144,6 +1104,11 @@ async def onboard_project(
         status=ProjectStatus.DEPLOYING,
         github_owner=payload.github_owner,
         github_repo=payload.github_repo,
+        # Onboarding is an explicit operator handoff: bootstrap the repository
+        # once below, but do not start recurring autonomous work until the
+        # owner deliberately enables it. Keep the model default unchanged for
+        # legacy/direct construction paths.
+        autonomous_enabled=False,
     )
     session.add(project)
     await session.flush()  # Get project.id before membership insert

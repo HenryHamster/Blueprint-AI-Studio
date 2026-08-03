@@ -371,6 +371,8 @@ function strategicRefreshFromReadModel(
 export type MessagesPanelVariant = 'modal' | 'page';
 export interface MessagesPanelProps {
   selectedProjectId: string | null;
+  /** Whether this user may perform project-scoped mutations. */
+  canOperateProject: boolean;
   githubRepo?: string | null;
   defaultBranch?: string;
   onClose?: () => void;
@@ -501,12 +503,12 @@ function makePendingPreviewUrl(file: File): string | null {
   }
   return null;
 }
-export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, realtimeRefreshSignal, realtimeCanonicalMessage, realtimeCanonicalRefetchRequired, strategicPollEpoch, contextPackage, strategicState, strategicWorkbenchState, targetMessage, onTargetMessageHandled, onStrategicStateRefresh, onStrategicInteraction, onOpenStrategicContextWorkspace, onOpenCommandPalette, onOpenStrategicContextCommands, onStrategicRefresh, strategicSessionTranscript, alerts, onDismissAlert, onDismissAllAlerts, onViewAlertTask }: MessagesPanelProps) {
+export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, canOperateProject = false, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, realtimeRefreshSignal, realtimeCanonicalMessage, realtimeCanonicalRefetchRequired, strategicPollEpoch, contextPackage, strategicState, strategicWorkbenchState, targetMessage, onTargetMessageHandled, onStrategicStateRefresh, onStrategicInteraction, onOpenStrategicContextWorkspace, onOpenCommandPalette, onOpenStrategicContextCommands, onStrategicRefresh, strategicSessionTranscript, alerts, onDismissAlert, onDismissAllAlerts, onViewAlertTask }: MessagesPanelProps) {
   const resolvedVariant = variant ?? (onClose ? 'modal' : 'page');
   const resolvedFilterChrome = filterChrome ?? (resolvedVariant === 'page' ? 'compact' : 'full');
   const resolvedShowCloseButton = showCloseButton ?? (resolvedVariant !== 'page' && Boolean(onClose));
   const conversationMode = resolvedFilterChrome === 'minimal';
-  const strategicCall = useStrategicCall(conversationMode ? selectedProjectId : null);
+  const strategicCall = useStrategicCall(conversationMode && canOperateProject ? selectedProjectId : null);
   const strategicCallEnabled = Boolean(
     strategicCall.call
     && !['ended', 'failed', 'expired'].includes(strategicCall.call.status),
@@ -520,9 +522,12 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   const strategicAttentionRef = useRef(strategicAttention);
   // eslint-disable-next-line react-hooks/refs
   strategicAttentionRef.current = strategicAttention;
+  const canOperateProjectRef = useRef(canOperateProject);
+  // eslint-disable-next-line react-hooks/refs
+  canOperateProjectRef.current = canOperateProject;
   const refreshStrategicState = onStrategicStateRefresh ?? onStrategicRefresh;
   const recordStrategicInteraction = useCallback(() => {
-    if (!onStrategicInteraction) return;
+    if (!canOperateProjectRef.current || !onStrategicInteraction) return;
     Promise.resolve(onStrategicInteraction()).catch(() => {});
   }, [onStrategicInteraction]);
   const selectedProjectIdRef = useRef(selectedProjectId);
@@ -1326,11 +1331,11 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   }, [selectedProjectId]);
   const pendingAttachmentSendKey = conversationSend.identity ?? optimisticSend?.key ?? null;
   useEffect(() => {
-    if (!currentActorUserId || !selectedProjectId) return;
+    if (!canOperateProject || !currentActorUserId || !selectedProjectId) return;
     void retryPendingAttachmentCleanups(currentActorUserId, selectedProjectId).catch(() => undefined);
-  }, [currentActorUserId, selectedProjectId]);
+  }, [canOperateProject, currentActorUserId, selectedProjectId]);
   useEffect(() => {
-    if (!conversationMode || !currentActorUserId || !selectedProjectId || !pendingAttachmentSendKey) return;
+    if (!canOperateProject || !conversationMode || !currentActorUserId || !selectedProjectId || !pendingAttachmentSendKey) return;
     const actorUserId = currentActorUserId;
     const projectId = selectedProjectId;
     const sendKey = pendingAttachmentSendKey;
@@ -1407,6 +1412,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       }
     };
   }, [
+    canOperateProject,
     conversationMode,
     conversationSend.identity,
     currentActorUserId,
@@ -1417,7 +1423,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   // Retain a canonical wake receipt while the message is merely pending. Clear
   // it only when handling advances to claim/reply/supersession.
   useEffect(() => {
-    if (!optimisticSend) return;
+    if (!canOperateProject || !optimisticSend) return;
     const landed = conversationMessages.find(m => messageHasClientIdentity(m, optimisticSend.key));
     // eslint-disable-next-line react-hooks/set-state-in-effect
     if (landed && ['claimed', 'responded', 'superseded'].includes(landed.handling_state ?? '')) {
@@ -1426,10 +1432,10 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         void clearStoredPendingAttachments(currentActorUserId, selectedProjectId, optimisticSend.key);
       }
     }
-  }, [conversationMessages, optimisticSend]);
+  }, [canOperateProject, conversationMessages, optimisticSend]);
   const restoredSendRecoveryRef = useRef<Set<string>>(new Set());
   useEffect(() => {
-    if (!conversationMode || !currentActorUserId || !selectedProjectId || !optimisticSend || !conversationSend.restored) return;
+    if (!canOperateProject || !conversationMode || !currentActorUserId || !selectedProjectId || !optimisticSend || !conversationSend.restored) return;
     const recoveryKeys = restoredSendRecoveryRef.current, recoveryKey = `${currentActorUserId}:${selectedProjectId}:${optimisticSend.key}`;
     if (recoveryKeys.has(recoveryKey)) return;
     recoveryKeys.add(recoveryKey);
@@ -1464,7 +1470,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         if (!cancelled && selectedProjectIdRef.current === selectedProjectId && currentActorUserIdRef.current === currentActorUserId && optimisticSend.state === 'sending') conversationSend.transition('needs_retry');
       });
     return () => { cancelled = true; if (!settled) recoveryKeys.delete(recoveryKey); };
-  }, [clearSubmittedComposerDraft, conversationMode, currentActorUserId, optimisticSend, resetComposerIntent, selectedProjectId]);
+  }, [canOperateProject, clearSubmittedComposerDraft, conversationMode, currentActorUserId, optimisticSend, resetComposerIntent, selectedProjectId]);
   const showStrategicStatusStrip = conversationMode && Boolean(
     strategistActive
       || strategicRefresh
@@ -1843,7 +1849,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
   }
   function beginAttachmentMutation() {
-    if (submittingGuardRef.current.active || attachmentMutationGuardRef.current.active || uploading || sendState === 'needs_retry' || !selectedProjectId) return null;
+    if (!canOperateProject || submittingGuardRef.current.active || attachmentMutationGuardRef.current.active || uploading || sendState === 'needs_retry' || !selectedProjectId) return null;
     const scope = { actorUserId: currentActorUserId, projectId: selectedProjectId };
     attachmentMutationGenerationRef.current += 1;
     const owner = attachmentMutationGuardRef.current.begin(scope.actorUserId, scope.projectId);
@@ -2001,11 +2007,13 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     }
   }
   async function handleSubmit() {
+    if (!canOperateProjectRef.current) return;
     const submitProjectId = selectedProjectId;
     const submitActorUserId = currentActorUserId;
     const submitReplyTo = replyTo ? { ...replyTo } : null;
     const submitStillCurrent = () => (
-      selectedProjectIdRef.current === submitProjectId
+      canOperateProjectRef.current
+      && selectedProjectIdRef.current === submitProjectId
       && currentActorUserIdRef.current === submitActorUserId
     );
     const submittedContent = newContent.trim();
@@ -2040,6 +2048,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
           addToast('Remove attachments before answering a question', 'error');
           return;
         }
+        if (!submitStillCurrent()) return;
         const workbenchContext = buildMessageWorkbenchContext(currentStrategicState, strategicWorkbenchState);
         const res = await apiFetch(`${API_BASE_URL}/api/admin/messages/${submitReplyTo.id}`, {
           method: 'PATCH',
@@ -2151,6 +2160,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
           recordStrategicInteraction();
           return;
         }
+        if (!submitStillCurrent()) return;
       }
       const retainedUploads = isRetry ? retainedPayloadAttachments : [];
       const uploadedAttachments: MessageAttachment[] = [...retainedUploads];
@@ -2161,6 +2171,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         setUploading(true);
         try {
           const batch = await uploadConversationAttachments(submitProjectId, attachmentsForSubmit);
+          if (!submitStillCurrent()) return;
           uploadedAttachments.push(...batch.uploaded);
           contextAttachments.push(...batch.visible);
         } catch (error) {
@@ -2231,6 +2242,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         // A retry reached here only after the identity lookup proved absence.
         let data;
         try {
+          if (!submitStillCurrent()) return;
           data = await createStrategicSessionMessage(submitProjectId, payload);
         } catch (error) {
           const staleAttachmentReceipt = isRetry
@@ -2240,6 +2252,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
             && /attachment upload/i.test(error.message);
           if (!staleAttachmentReceipt || !submitActorUserId) throw error;
           const durableAttachments = await listStoredPendingAttachments(submitActorUserId, submitProjectId, sendIdentity);
+          if (!submitStillCurrent()) return;
           if (durableAttachments.length === 0) {
             if (submitStillCurrent()) addToast('Attachment upload expired and the local file is unavailable. Abandon this pending send to continue.', 'error');
             throw error;
@@ -2249,10 +2262,12 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
               ? [deleteMessageAttachmentUpload(submitProjectId, attachment.attachment_id)]
               : []
           )));
+          if (!submitStillCurrent()) return;
           setUploading(true);
           let recovered;
           try {
             recovered = await uploadConversationAttachments(submitProjectId, durableAttachments);
+            if (!submitStillCurrent()) return;
           } catch (recoveryError) {
             attachmentUploadFailed = true;
             throw recoveryError;
@@ -2268,6 +2283,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
             artifact_refs: artifactRefs,
           };
           conversationSend.replace({ ...pendingSend, context: recoveredContext, payload });
+          if (!submitStillCurrent()) return;
           data = await createStrategicSessionMessage(submitProjectId, payload);
         }
         const recoveredReceipt = data.message ? null : await findStrategicMessageByClientIdentity(submitProjectId, sendIdentity);
@@ -2340,6 +2356,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         recordStrategicInteraction();
         return;
       }
+      if (!submitStillCurrent()) return;
       const res = await apiFetch(`${API_BASE_URL}/api/admin/messages`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -2419,7 +2436,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   // harmless. Clears the local pending marker immediately, then refetches to
   // confirm the badge cleared.
   async function handleCancelStrategicRefresh() {
-    if (!selectedProjectId || cancellingRefresh) return;
+    if (!canOperateProject || !selectedProjectId || cancellingRefresh) return;
     setCancellingRefresh(true);
     try {
       const res = await apiFetch(`${API_BASE_URL}/api/admin/projects/${encodeURIComponent(selectedProjectId)}/cancel-strategic-refresh`, { method: 'POST' });
@@ -2437,6 +2454,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   }
 
   const handleDelete = useCallback(async (msgId: string) => {
+    if (!canOperateProject) return;
     setDeletingIds(prev => new Set(prev).add(msgId));
     try {
       const res = await apiFetch(`${API_BASE_URL}/api/admin/messages/${msgId}`, { method: 'DELETE' });
@@ -2447,10 +2465,10 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     } finally {
       setDeletingIds(prev => { const next = new Set(prev); next.delete(msgId); return next; });
     }
-  }, [fetchMessages]);
+  }, [canOperateProject, fetchMessages]);
 
   async function handleCreateDirection(msg: ProjectMessage, silent = false): Promise<boolean> {
-    if (!selectedProjectId) return false;
+    if (!canOperateProject || !selectedProjectId) return false;
     setCreatingDirectionIds(prev => new Set(prev).add(msg.id));
     try {
       const text = msg.content.slice(0, 2000);
@@ -2492,12 +2510,13 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   }
 
   const handleOpenConvertModal = useCallback((msg: ProjectMessage) => {
+    if (!canOperateProject) return;
     convertFormRef.current.seedFromMessage(msg.content);
     setPendingConvertMsg(msg);
-  }, []);
+  }, [canOperateProject]);
 
   async function handleSubmitConvertForm() {
-    if (!selectedProjectId || !pendingConvertMsg || !convertForm.newText.trim()) return;
+    if (!canOperateProject || !selectedProjectId || !pendingConvertMsg || !convertForm.newText.trim()) return;
     setConvertSubmitting(true);
     const msg = pendingConvertMsg;
     try {
@@ -2547,7 +2566,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   }
 
   const handleCreateInvestigation = useCallback(async (msg: ProjectMessage): Promise<boolean> => {
-    if (!selectedProjectId || !githubRepo) return false;
+    if (!canOperateProject || !selectedProjectId || !githubRepo) return false;
     setInvestigatingIds(prev => new Set(prev).add(msg.id));
     try {
       const lines = msg.content.split('\n');
@@ -2578,11 +2597,12 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     } finally {
       setInvestigatingIds(prev => { const next = new Set(prev); next.delete(msg.id); return next; });
     }
-  }, [selectedProjectId, githubRepo, defaultBranch]);
+  }, [canOperateProject, selectedProjectId, githubRepo, defaultBranch]);
 
   const KEEP_RESOLVED = 20;
 
   async function handleBulkDeleteResolved() {
+    if (!canOperateProject) return;
     // Keep the 20 most recent resolved, delete the rest
     const sorted = [...resolvedMessages].sort((a, b) => {
       const ta = a.created_at ? parseTimestamp(a.created_at).getTime() : 0;
@@ -2606,14 +2626,16 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   }
 
   const toggleSelect = useCallback((msgId: string) => {
+    if (!canOperateProject) return;
     setSelectedIds(prev => {
       const next = new Set(prev);
       if (next.has(msgId)) next.delete(msgId); else next.add(msgId);
       return next;
     });
-  }, []);
+  }, [canOperateProject]);
 
   async function handleBatchCreateDirections() {
+    if (!canOperateProject) return;
     const msgs = openFeedbackMessages.filter(m => selectedIds.has(m.id));
     if (msgs.length === 0) return;
     setBatchCreating(true);
@@ -2636,16 +2658,17 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   const onStartInvestigate = useCallback((msgId: string) => setInvestigatingId(msgId), []);
   const onCancelInvestigate = useCallback(() => setInvestigatingId(null), []);
   const onReply = useCallback((replyTo: { id: string; content: string; from: string; message_type: string; status: string }) => {
+    if (!canOperateProject) return;
     setReplyTo(replyTo);
     const captured = captureCurrentDraftRefs();
     setDraftSourceRefs(captured.sourceRefs);
     setDraftArtifactRefs(captured.artifactRefs);
     persistComposerEnvelope({ replyTo, sourceRefs: captured.sourceRefs, artifactRefs: captured.artifactRefs });
     textareaRef.current?.focus();
-  }, [captureCurrentDraftRefs, persistComposerEnvelope]);
+  }, [canOperateProject, captureCurrentDraftRefs, persistComposerEnvelope]);
 
   const bubbleProps = useMemo(() => ({
-    actionMode: conversationMode ? 'reply-only' as const : 'full' as const,
+    actionMode: canOperateProject ? (conversationMode ? 'reply-only' as const : 'full' as const) : 'none' as const,
     deletingIds,
     creatingDirectionIds,
     investigatingId,
@@ -2663,6 +2686,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     onOpenStrategicContext: conversationMode ? (onOpenStrategicContextWorkspace ?? onOpenStrategicContextCommands) : undefined,
     currentActorUserId: auth.currentUser?.uid ?? null,
   }), [
+    canOperateProject,
     conversationMode,
     deletingIds,
     creatingDirectionIds,
@@ -2704,9 +2728,10 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   }, []);
 
   const handleToggleSelectMode = useCallback(() => {
+    if (!canOperateProject) return;
     if (selectMode) { setSelectMode(false); setSelectedIds(new Set()); }
     else { setSelectMode(true); setSelectedIds(new Set(openFeedbackMessages.map(m => m.id))); }
-  }, [selectMode, openFeedbackMessages]);
+  }, [canOperateProject, selectMode, openFeedbackMessages]);
 
   const handleOpenMutedPrefs = useCallback(() => {
     setShowPrefsPanel(true);
@@ -2856,7 +2881,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         criticalOnly={criticalOnly}
         showOnlyNew={showOnlyNew}
         selectMode={selectMode}
-        openFeedbackCount={openFeedbackMessages.length}
+        openFeedbackCount={canOperateProject ? openFeedbackMessages.length : 0}
         muteActive={muteActive}
         muteWindow={muteWindow}
         onSetMuteWindow={setMuteWindowPersisted}
@@ -2906,6 +2931,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
             onDismissAll={onDismissAllAlerts}
             onViewTask={onViewAlertTask}
             projectId={selectedProjectId ?? undefined}
+            canMutate={canOperateProject}
           />
         </div>
       )}
@@ -2951,7 +2977,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       {showStrategistChip && (
         <div className="px-4 md:px-6 py-2 border-b border-neutral-800 flex items-center gap-2 shrink-0">
           <StrategistStatusChip status={strategistStatus} />
-          {strategicRefresh?.requested_at && (
+          {canOperateProject && strategicRefresh?.requested_at && (
             <button
               type="button"
               onClick={() => { void handleCancelStrategicRefresh(); }}
@@ -3039,6 +3065,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
                   }
                 };
                 const handleAccept = async () => {
+                  if (!canOperateProject) return;
                   const projectId = item.ref?.project_id ?? selectedProjectId;
                   const pendingId = item.ref?.id ?? item.id;
                   if (!projectId) return;
@@ -3052,6 +3079,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
                   }
                 };
                 const handleDismiss = async () => {
+                  if (!canOperateProject) return;
                   const projectId = item.ref?.project_id ?? selectedProjectId;
                   const pendingId = item.ref?.id ?? item.id;
                   if (!projectId) return;
@@ -3065,6 +3093,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
                   }
                 };
                 const handleAck = () => {
+                  if (!canOperateProject) return;
                   // Client-side dismiss: removes the item from the strip for this session.
                   // No server-side effect — the item reappears if still needs_operator after
                   // the next attention poll. Driven by lifecycle.acknowledgeable=true.
@@ -3103,7 +3132,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
                           </span>
                         )}
                       </button>
-                      {isAcknowledgeable && (
+                      {canOperateProject && isAcknowledgeable && (
                         /* eslint-disable-next-line viewport/min-touch-target */
                         <button
                           type="button"
@@ -3116,7 +3145,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
                         </button>
                       )}
                     </div>
-                    {isExpanded && (
+                    {canOperateProject && isExpanded && (
                       <div className="flex gap-1.5 pl-1" data-testid="confirmation-chip-actions">
                         {/* eslint-disable-next-line viewport/min-touch-target */}
                         <button
@@ -3244,7 +3273,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       />
 
       {/* Batch action bar */}
-      {!conversationMode && selectMode && selectedIds.size > 0 && (
+      {canOperateProject && !conversationMode && selectMode && selectedIds.size > 0 && (
         <MessagesBatchActionBar
           selectedCount={selectedIds.size}
           batchCreating={batchCreating}
@@ -3253,7 +3282,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       )}
 
       {/* Convert-to-direction modal */}
-      {!conversationMode && pendingConvertMsg && (
+      {canOperateProject && !conversationMode && pendingConvertMsg && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" role="dialog" aria-modal="true" aria-label="Create direction from message">
           <div className="bg-neutral-950 border border-neutral-800 rounded-lg shadow-xl w-full max-w-lg mx-4 flex flex-col max-h-[90vh]">
             <div className="px-5 py-3 border-b border-neutral-800 flex items-center justify-between shrink-0">
@@ -3298,7 +3327,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       )}
 
       {/* Compose area — bottom, chat-style */}
-      {conversationMode && (
+      {canOperateProject && conversationMode && (
         <StrategicCallMode
           enabled={strategicCallEnabled}
           connectionState={strategicCall.connectionState}
@@ -3314,7 +3343,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
           onEnableAudio={() => { void strategicCall.enableAudio(); }}
         />
       )}
-      <MessagesComposer
+      {canOperateProject && <MessagesComposer
         textareaRef={textareaRef}
         newType={effectiveNewType}
         newContent={newContent}
@@ -3355,7 +3384,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
           : undefined}
         onOpenStrategicContext={conversationMode ? (onOpenStrategicContextWorkspace ?? onOpenStrategicContextCommands) : undefined}
         onOpenCommandPalette={conversationMode ? openMessageCommandSurface : undefined}
-      />
+      />}
     </div>
   );
 });

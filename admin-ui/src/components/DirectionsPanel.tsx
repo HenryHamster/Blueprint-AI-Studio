@@ -215,6 +215,8 @@ export function DirectionsPanel({
   showHeaderTitle = true,
   showCycleControls = true,
   showInternalTabs = true,
+  readOnly = true,
+  canManageGlobalSettings = false,
 }: {
   addToast: (message: string, type: 'success' | 'error' | 'info') => void;
   onViewFindings?: (directionId: string) => void;
@@ -231,6 +233,8 @@ export function DirectionsPanel({
   showHeaderTitle?: boolean;
   showCycleControls?: boolean;
   showInternalTabs?: boolean;
+  readOnly?: boolean;
+  canManageGlobalSettings?: boolean;
 }) {
   // Active tab
   const [uncontrolledActiveTab, setUncontrolledActiveTab] = useState<DirectionsTab>('directions');
@@ -250,7 +254,13 @@ export function DirectionsPanel({
   const [categoryFilter, setCategoryFilter] = useState<DirectionCategoryFilter>('all');
 
   // All data state + API handlers (+ form / autonomous-config sub-hooks)
-  const data = useDirectionsData({ selectedProjectId, addToast, fetchDirectionsRef });
+  const data = useDirectionsData({
+    selectedProjectId,
+    addToast,
+    fetchDirectionsRef,
+    canOperateProject: !readOnly,
+    canManageGlobalSettings,
+  });
   const { form, config } = data;
 
   function handleSpawnDirection(gapId: string, gapName: string) {
@@ -306,7 +316,7 @@ export function DirectionsPanel({
           runningUpdate={data.runningUpdate}
           triggerCycle={data.triggerCycle}
           showTitle={showHeaderTitle}
-          showCycleControls={showCycleControls}
+          showCycleControls={showCycleControls && !readOnly}
           showTabs={showInternalTabs}
         />
         {showStrategistChip && (
@@ -326,7 +336,7 @@ export function DirectionsPanel({
                 <p className="text-xs text-neutral-500 leading-relaxed">
                   Active directions guide the research agent. Only Active directions are included in new tasks.
                 </p>
-                <AutonomousConfigSection
+                {canManageGlobalSettings && !readOnly && <AutonomousConfigSection
                   configCooldownHours={config.configCooldownHours}
                   setConfigCooldownHours={config.setConfigCooldownHours}
                   configProductiveCooldownMinutes={config.configProductiveCooldownMinutes}
@@ -366,11 +376,11 @@ export function DirectionsPanel({
                   savingConfigField={config.savingConfigField}
                   saveConfigField={config.saveConfigField}
                   clearResidualFingerprints={config.clearResidualFingerprints}
-                />
+                />}
               </>
             )}
           </div>
-          {selectedProjectId && (
+          {selectedProjectId && !readOnly && (
             <>
               <div className={`px-5 py-2 shrink-0 ${!formExpanded ? 'border-b border-neutral-800' : ''}`}>
                 <button
@@ -443,6 +453,7 @@ export function DirectionsPanel({
             onViewFindings={onViewFindings}
             onViewKnowledge={onViewKnowledge}
             onNavigateToTask={onNavigateToTask}
+            readOnly={readOnly}
           />
           </div>
           </>)}
@@ -455,8 +466,9 @@ export function DirectionsPanel({
                 currentVersion={data.currentVersion}
                 addToast={addToast}
                 onUpdated={data.setProblemModel}
-                onSpawnDirection={handleSpawnDirection}
-                onLinkDirection={data.linkDirectionToGap}
+                onSpawnDirection={readOnly ? undefined : handleSpawnDirection}
+                onLinkDirection={readOnly ? undefined : data.linkDirectionToGap}
+                readOnly={readOnly}
                 directions={data.directions
                   .filter(d => d.status === 'active')
                   .map(d => ({ id: d.id, text: d.text }))}
@@ -473,6 +485,7 @@ export function DirectionsPanel({
                 addToast={addToast}
                 onAcknowledged={() => { data.setRunningUpdateAckAt(new Date().toISOString()); }}
                 onEdited={(newBody) => { data.setRunningUpdate(newBody); }}
+                readOnly={readOnly}
               />
             </div>
           )}

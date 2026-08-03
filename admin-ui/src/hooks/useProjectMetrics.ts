@@ -39,6 +39,7 @@ export function useProjectMetrics(
   selectedProjectId: string | null,
   windowHours: number,
   selectedSrCategory: string,
+  isAdmin: boolean,
 ): UseProjectMetricsResult {
   const [measurementData, setMeasurementData] = useState<MediumScopeMeasurement | null>(null);
   const [scopeBaselines, setScopeBaselines] = useState<ScopeBaselinesResponse | null>(null);
@@ -60,7 +61,7 @@ export function useProjectMetrics(
   // stale data from the previous selection never bleeds into the new view
   // (React "adjust state during rendering" pattern —
   // https://react.dev/learn/you-might-not-need-an-effect#adjusting-some-state-when-a-prop-changes).
-  const scopeKey = `${selectedProjectId}:${windowHours}:${selectedSrCategory}`;
+  const scopeKey = `${selectedProjectId}:${windowHours}:${selectedSrCategory}:${isAdmin}`;
   const [lastResetKey, setLastResetKey] = useState(scopeKey);
   if (lastResetKey !== scopeKey) {
     setLastResetKey(scopeKey);
@@ -87,18 +88,21 @@ export function useProjectMetrics(
     if (selectedProjectId) {
       fetches.push(
         (async () => {
+          if (!isAdmin) return;
           try {
             const res = await apiFetch(`/api/admin/medium-scope-measurement?project_id=${encodeURIComponent(selectedProjectId)}&lookback_days=90`);
             if (!signal.aborted && res.ok) setMeasurementData(await res.json());
           } catch { /* silent */ }
         })(),
         (async () => {
+          if (!isAdmin) return;
           try {
             const res = await apiFetch(`/api/admin/scope-baselines?project_id=${encodeURIComponent(selectedProjectId)}&lookback_days=30`);
             if (!signal.aborted && res.ok) setScopeBaselines(await res.json());
           } catch { /* silent */ }
         })(),
         (async () => {
+          if (!isAdmin) return;
           try {
             const res = await apiFetch(`/api/admin/max-plan-accounts/health`);
             if (!signal.aborted && res.ok) {
@@ -119,12 +123,14 @@ export function useProjectMetrics(
           } catch { /* silent */ }
         })(),
         (async () => {
+          if (!isAdmin) return;
           try {
             const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/sr-blind-spots`);
             if (!signal.aborted && res.ok) setBlindSpots(await res.json());
           } catch { /* silent */ }
         })(),
         (async () => {
+          if (!isAdmin) return;
           try {
             const params = new URLSearchParams();
             if (selectedSrCategory) params.set('category', selectedSrCategory);
@@ -139,6 +145,7 @@ export function useProjectMetrics(
           } catch { /* silent */ }
         })(),
         (async () => {
+          if (!isAdmin) return;
           try {
             const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/direction-sr-breakdown`);
             if (!signal.aborted && res.ok) setDirectionSrBreakdown(await res.json());
@@ -163,6 +170,7 @@ export function useProjectMetrics(
 
     fetches.push(
       (async () => {
+        if (!isAdmin) return;
         try {
           const url = selectedProjectId
             ? `/api/admin/task-duration-stats?project_id=${encodeURIComponent(selectedProjectId)}`
@@ -172,6 +180,7 @@ export function useProjectMetrics(
         } catch { /* silent */ }
       })(),
       (async () => {
+        if (!isAdmin) return;
         try {
           const url = selectedProjectId
             ? `/api/admin/health-overview?project_id=${encodeURIComponent(selectedProjectId)}&lookback_hours=${windowHours}`
@@ -186,6 +195,7 @@ export function useProjectMetrics(
         }
       })(),
       (async () => {
+        if (!isAdmin) return;
         try {
           const data = await fetchFleetUtilization();
           if (!signal.aborted) setFleetUtilization(data);
@@ -196,7 +206,7 @@ export function useProjectMetrics(
     );
 
     await Promise.allSettled(fetches);
-  }, { intervalMs: DEFAULT_POLL_MS, deps: [selectedProjectId, windowHours, selectedSrCategory] });
+  }, { intervalMs: DEFAULT_POLL_MS, deps: [selectedProjectId, windowHours, selectedSrCategory, isAdmin] });
 
   return {
     measurementData,

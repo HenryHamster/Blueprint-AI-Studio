@@ -100,6 +100,7 @@ describe('ConsoleHome — viewport regression', () => {
         tasks={TASKS}
         onViewTask={() => {}}
         onShowAnalytics={() => {}}
+        isAdmin={true}
       />,
     );
   }

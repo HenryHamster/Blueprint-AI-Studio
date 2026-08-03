@@ -48,6 +48,7 @@ const trackedLogs: TrackLogEntry[] = [
 function workspaceProps(): PipelineWorkspaceProps {
   const tasks = [trackedTask, queuedTask, blockedTask];
   return {
+    canOperateProject: true,
     surface: {
       pipelineSection: 'flow',
       onPipelineSectionChange: () => {},

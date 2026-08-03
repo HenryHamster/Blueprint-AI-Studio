@@ -1338,8 +1338,11 @@ def test_discovery_admission_removal_0721_is_the_expected_schema_head():
     index_repair = (
         versions_dir / "0720_repair_direction_status_staged_index.py"
     ).read_text()
+    invited_role = (
+        versions_dir / "0721_allow_invited_alloweduser_role.py"
+    ).read_text()
     admission_removal = (
-        versions_dir / "0721_remove_discovery_admission_runtime.py"
+        versions_dir / "0722_remove_discovery_admission_runtime.py"
     ).read_text()
     assert parse_revision_identifiers(operability) == ("0708", "0707")
     assert parse_revision_identifiers(claims) == ("0709", "0708")
@@ -1354,7 +1357,8 @@ def test_discovery_admission_removal_0721_is_the_expected_schema_head():
     assert parse_revision_identifiers(timezone_columns) == ("0718", "0717")
     assert parse_revision_identifiers(constraint_validation) == ("0719", "0718")
     assert parse_revision_identifiers(index_repair) == ("0720", "0719")
-    assert parse_revision_identifiers(admission_removal) == ("0721", "0720")
+    assert parse_revision_identifiers(invited_role) == ("0721", "0720")
+    assert parse_revision_identifiers(admission_removal) == ("0722", "0721")
     assert "chk_discoverycycle_verdict" in admission_removal
     assert "('advance','park','stop','ask_operator')" in admission_removal
     assert "LEGACY_INCONCLUSIVE_REQUEUED" in admission_removal
@@ -1363,7 +1367,7 @@ def test_discovery_admission_removal_0721_is_the_expected_schema_head():
 
     from app.main import EXPECTED_SCHEMA_REVISION
 
-    assert EXPECTED_SCHEMA_REVISION == "0721", (
-        f"Expected EXPECTED_SCHEMA_REVISION == '0721', got {EXPECTED_SCHEMA_REVISION!r}. "
+    assert EXPECTED_SCHEMA_REVISION == "0722", (
+        f"Expected EXPECTED_SCHEMA_REVISION == '0722', got {EXPECTED_SCHEMA_REVISION!r}. "
         "Bump EXPECTED_SCHEMA_REVISION in backend/app/main.py."
     )

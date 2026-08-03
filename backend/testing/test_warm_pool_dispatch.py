@@ -12,17 +12,23 @@ Covers the four guarantees the task calls out:
 The hook is inert when ``warm_pool_enabled`` is False (default).
 """
 
+import asyncio
+
 import pytest
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.auth import create_vm_scoped_token
 from app.models import PoolVm, PoolVmState, Project, Task, TaskStatus
 from app.warm_pool import (
     WARM_POOL_PIN_KEY,
+    WARM_POOL_RESERVATION_ACCOUNT_KEY,
+    abandon_pool_dispatch,
     register_pool_vm,
     try_pool_dispatch,
 )
 import app.shared_state as shared_state
+from testing.conftest import USE_POSTGRES
 
 
 async def _make_project(db_session, name="Pool Dispatch"):
@@ -83,8 +89,10 @@ async def _dispatch(
     task,
     *,
     provider="anthropic",
+    auth_mode=None,
     model="claude-opus-4-8",
     account="acct-1",
+    reservation_account=None,
     excluded=None,
 ):
     """Call try_pool_dispatch with a RESOLVED LLM identity, mirroring how the
@@ -95,8 +103,10 @@ async def _dispatch(
         db_session,
         task,
         required_provider=provider,
+        required_auth_mode=auth_mode,
         required_model=model,
         required_account=account,
+        reserved_account_id=reservation_account,
         excluded_account_ids=excluded,
     )
 
@@ -125,11 +135,18 @@ def warm_pool_retarget_on():
     shared_state.warm_pool_suppressed_until = None
 
 
-def _seed_account(account_id, *, provider="anthropic", auth_mode="api_key"):
+def _seed_account(
+    account_id,
+    *,
+    provider="anthropic",
+    auth_mode="api_key",
+    user_id="test-user-pool-dispatch",
+    max_concurrent_tasks=None,
+):
     """Seed an LLM account into the in-memory pool so the claim path can build a
     credential re-target manifest for it. Returns the account dict (so a test can
     assert on its active_tasks). Caller must clean up via _clear_accounts."""
-    from app.max_plan_pool import _account_by_id
+    from app.max_plan_pool import _account_by_id, _max_plan_pools
 
     acct = {
         "id": account_id,
@@ -140,16 +157,25 @@ def _seed_account(account_id, *, provider="anthropic", auth_mode="api_key"):
         "oauth_token": None,
         "claude_config_json": None,
         "provider_metadata": {},
+        "enabled": True,
+        "runtime_ready": True,
+        "model": "claude-opus-4-8",
         "active_tasks": 0,
+        "daily_task_count": 0,
+        "max_concurrent_tasks": max_concurrent_tasks,
+        "project_state": {},
+        "disabled_models": {},
     }
     _account_by_id[account_id] = acct
+    _max_plan_pools.setdefault(user_id, []).append(acct)
     return acct
 
 
 def _clear_accounts():
-    from app.max_plan_pool import _account_by_id
+    from app.max_plan_pool import _account_by_id, _max_plan_pools
 
     _account_by_id.clear()
+    _max_plan_pools.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -338,37 +364,765 @@ async def test_next_role_claims_pool_pin_with_warm_pool_origin(
     await _make_idle_member(
         db_session, project, vm_instance_id="vm-claim", account_id="acct-7"
     )
-    task = await _make_queued_task(db_session, project, model="claude-opus-4-8")
+    account = _seed_account("acct-7", user_id=project.user_id)
+    try:
+        task = await _make_queued_task(
+            db_session, project, model="claude-opus-4-8"
+        )
 
-    # Orchestrator dispatch hook: lease + pin.
-    leased = await _dispatch(db_session, task, account="acct-7")
+        # This direct seam has no orchestrator-owned marker, so claim must
+        # exact-reserve the concrete boot account before it can run.
+        leased = await _dispatch(db_session, task, account="acct-7")
+        await db_session.commit()
+        assert leased is not None
+
+        tok = create_vm_scoped_token("vm-claim", str(project.id))
+        resp = await client.post(
+            "/api/agent/next-role",
+            json={"vm_instance_id": "vm-claim"},
+            headers={"X-Agent-Token": tok},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["action"] == "claim"
+        assert body["task_id"] == str(task.id)
+        assert body["warm_start"] is True
+        assert body.get("agent_token")
+
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.IN_PROGRESS
+        assert task.vm_warm_start is True
+        timing = (task.context or {}).get("_timing") or {}
+        assert timing.get("warm_start") is True
+        assert timing.get("warm_claim_origin") == "warm_pool"
+        assert (task.context or {}).get("llm_account_id") == "acct-7"
+        assert account["active_tasks"] == 1
+        assert account["daily_task_count"] == 1
+    finally:
+        _clear_accounts()
+
+
+@pytest.mark.asyncio
+async def test_pool_claim_consumes_transferred_reservation_once_at_cap_one(
+    db_session, client, warm_pool_on
+):
+    """The orchestrator's selected slot transfers with a pool lease.
+
+    At max_concurrent=1, /next-role must accept that already-owned slot instead
+    of trying to reserve it a second time and declining. Completion releases the
+    active counters exactly once while retaining the one daily task charge.
+    """
+    from app.max_plan_pool import reserve_max_plan_account
+
+    project = await _make_project(db_session, name="Pool Reservation Transfer")
+    await _make_idle_member(
+        db_session,
+        project,
+        vm_instance_id="vm-transfer-one",
+        account_id="acct-transfer-one",
+    )
+    account = _seed_account(
+        "acct-transfer-one",
+        user_id=project.user_id,
+        max_concurrent_tasks=1,
+    )
+    try:
+        task = await _make_queued_task(db_session, project)
+
+        # Mirrors select_llm_runtime_for_task in the orchestrator immediately
+        # before try_pool_dispatch: one global/project active + daily charge.
+        assert await reserve_max_plan_account(
+            account["id"],
+            user_id=project.user_id,
+            project_id=str(project.id),
+            model="claude-opus-4-8",
+            count_daily_task=True,
+        )
+        mutations_after_select = list(account["_pending_usage_cap_mutations"])
+        assert account["active_tasks"] == 1
+        assert account["daily_task_count"] == 1
+
+        leased = await _dispatch(
+            db_session,
+            task,
+            account=account["id"],
+            reservation_account=account["id"],
+        )
+        await db_session.commit()
+        assert leased is not None
+
+        pool_token = create_vm_scoped_token("vm-transfer-one", str(project.id))
+        claim = await client.post(
+            "/api/agent/next-role",
+            json={"vm_instance_id": "vm-transfer-one"},
+            headers={"X-Agent-Token": pool_token},
+        )
+        assert claim.status_code == 200, claim.text
+        # Finalization neither rejected at cap=1 nor charged a second task.
+        assert account["active_tasks"] == 1
+        assert account["daily_task_count"] == 1
+        assert account["project_state"][str(project.id)] == {
+            "active_tasks": 1,
+            "daily_task_count": 1,
+        }
+        assert account["_pending_usage_cap_mutations"] == mutations_after_select
+
+        completion = await client.post(
+            "/api/agent/status",
+            json={
+                "task_id": str(task.id),
+                "status": "COMPLETED",
+                "artifact_type": "ERROR_LOG",
+                "logs": "done",
+            },
+            headers={"X-Agent-Token": claim.json()["agent_token"]},
+        )
+        assert completion.status_code == 200, completion.text
+        assert account["active_tasks"] == 0
+        assert account["daily_task_count"] == 1
+        assert account["project_state"][str(project.id)] == {
+            "active_tasks": 0,
+            "daily_task_count": 1,
+        }
+        # Completion releases concurrency only; the durable daily charge remains
+        # one +1 mutation from the original orchestrator selection.
+        assert account["_pending_usage_cap_mutations"] == mutations_after_select
+        await db_session.refresh(leased)
+        assert leased.state == PoolVmState.IDLE
+    finally:
+        _clear_accounts()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason="requires two independent transactions and real row locks",
+)
+async def test_forced_drain_racing_next_role_claim_commit_preserves_running_owner(
+    db_session, client, warm_pool_on, monkeypatch, mocker
+):
+    """When /next-role owns Task first, drain must not undo its committed claim."""
+    import app.routers.agent_warm_continuity as continuity
+    import app.warm_pool as warm_pool
+    from app.max_plan_pool import reserve_max_plan_account
+    from app.warm_pool_maintainer import retire_and_delete_pool_vm
+
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    project = await _make_project(db_session, name="Claim wins forced-drain race")
+    vm_id = "vm-claim-wins-drain"
+    member = await _make_idle_member(
+        db_session, project, vm_instance_id=vm_id, account_id="acct-claim-wins"
+    )
+    member_id = member.id
+    account = _seed_account(
+        "acct-claim-wins", user_id=project.user_id, max_concurrent_tasks=1
+    )
+    try:
+        task = await _make_queued_task(db_session, project)
+        assert await reserve_max_plan_account(
+            account["id"],
+            user_id=project.user_id,
+            project_id=str(project.id),
+            model="claude-opus-4-8",
+            count_daily_task=True,
+        )
+        assert await _dispatch(
+            db_session,
+            task,
+            account=account["id"],
+            reservation_account=account["id"],
+        )
+        await db_session.commit()
+
+        claim_holds_task = asyncio.Event()
+        allow_claim_commit = asyncio.Event()
+        drain_reached_abandon = asyncio.Event()
+        real_finalize = continuity._finalize_warm_claim
+        real_abandon = warm_pool.abandon_pool_dispatch
+
+        async def paused_finalize(session, claimed_task, *args, **kwargs):
+            # The endpoint's selector already owns Task FOR UPDATE here.
+            claim_holds_task.set()
+            await allow_claim_commit.wait()
+            return await real_finalize(session, claimed_task, *args, **kwargs)
+
+        async def observed_abandon(*args, **kwargs):
+            # retire_and_delete_pool_vm has landed its uncommitted PoolVm CAS;
+            # the real helper will now wait for the claimant's Task lock.
+            drain_reached_abandon.set()
+            return await real_abandon(*args, **kwargs)
+
+        monkeypatch.setattr(continuity, "_finalize_warm_claim", paused_finalize)
+        monkeypatch.setattr(warm_pool, "abandon_pool_dispatch", observed_abandon)
+        session_factory = async_sessionmaker(
+            bind=db_session.bind, expire_on_commit=False
+        )
+
+        async def force_drain():
+            async with session_factory() as drain_session:
+                drain_member = await drain_session.get(PoolVm, member_id)
+                assert drain_member is not None
+                return await retire_and_delete_pool_vm(
+                    drain_session,
+                    drain_member,
+                    reason="operator_drain",
+                    force=True,
+                    abandon_leased_handoff=True,
+                )
+
+        token = create_vm_scoped_token(vm_id, str(project.id))
+        claim_future = asyncio.create_task(
+            client.post(
+                "/api/agent/next-role",
+                json={"vm_instance_id": vm_id},
+                headers={"X-Agent-Token": token},
+            )
+        )
+        await asyncio.wait_for(claim_holds_task.wait(), timeout=5)
+        drain_future = asyncio.create_task(force_drain())
+        await asyncio.wait_for(drain_reached_abandon.wait(), timeout=5)
+        allow_claim_commit.set()
+        claim, drained = await asyncio.gather(claim_future, drain_future)
+
+        assert claim.status_code == 200, claim.text
+        assert drained is True
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.IN_PROGRESS
+        assert task.vm_instance_id == vm_id
+        assert (task.context or {}).get("warm_target_vm_id") == vm_id
+        assert (task.context or {}).get(WARM_POOL_RESERVATION_ACCOUNT_KEY) is None
+        assert account["active_tasks"] == 1
+        assert account["daily_task_count"] == 1
+        assert account["project_state"][str(project.id)] == {
+            "active_tasks": 1,
+            "daily_task_count": 1,
+        }
+        assert await db_session.get(PoolVm, member_id, populate_existing=True) is None
+    finally:
+        _clear_accounts()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason="requires two independent transactions and real row locks",
+)
+async def test_forced_drain_task_lock_makes_racing_next_role_decline_and_release(
+    db_session, client, warm_pool_on, monkeypatch, mocker
+):
+    """When drain owns Task first, /next-role cannot claim the cleared handoff."""
+    from app.max_plan_pool import reserve_max_plan_account
+    from app.warm_pool_maintainer import retire_and_delete_pool_vm
+
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    project = await _make_project(db_session, name="Drain wins next-role race")
+    vm_id = "vm-drain-wins-claim"
+    member = await _make_idle_member(
+        db_session, project, vm_instance_id=vm_id, account_id="acct-drain-wins"
+    )
+    member_id = member.id
+    account = _seed_account(
+        "acct-drain-wins", user_id=project.user_id, max_concurrent_tasks=1
+    )
+    try:
+        task = await _make_queued_task(db_session, project)
+        assert await reserve_max_plan_account(
+            account["id"],
+            user_id=project.user_id,
+            project_id=str(project.id),
+            model="claude-opus-4-8",
+            count_daily_task=True,
+        )
+        assert await _dispatch(
+            db_session,
+            task,
+            account=account["id"],
+            reservation_account=account["id"],
+        )
+        await db_session.commit()
+
+        task_locked = asyncio.Event()
+        allow_abandon_cleanup = asyncio.Event()
+        session_factory = async_sessionmaker(
+            bind=db_session.bind, expire_on_commit=False
+        )
+
+        async def force_drain():
+            async with session_factory() as drain_session:
+                drain_member = await drain_session.get(PoolVm, member_id)
+                assert drain_member is not None
+                real_execute = drain_session.execute
+                observed_task_lock = False
+
+                async def observed_execute(statement, *args, **kwargs):
+                    nonlocal observed_task_lock
+                    result = await real_execute(statement, *args, **kwargs)
+                    if (
+                        not observed_task_lock
+                        and getattr(statement, "_for_update_arg", None) is not None
+                    ):
+                        observed_task_lock = True
+                        task_locked.set()
+                        await allow_abandon_cleanup.wait()
+                    return result
+
+                monkeypatch.setattr(drain_session, "execute", observed_execute)
+                return await retire_and_delete_pool_vm(
+                    drain_session,
+                    drain_member,
+                    reason="operator_drain",
+                    force=True,
+                    abandon_leased_handoff=True,
+                )
+
+        drain_future = asyncio.create_task(force_drain())
+        await asyncio.wait_for(task_locked.wait(), timeout=5)
+        token = create_vm_scoped_token(vm_id, str(project.id))
+        claim_future = asyncio.create_task(
+            client.post(
+                "/api/agent/next-role",
+                json={"vm_instance_id": vm_id},
+                headers={"X-Agent-Token": token},
+            )
+        )
+        # Ensure the claimant overlaps the held lock. It either SKIP LOCKEDs or
+        # waits and re-reads the tuple after the abandon commit; both must decline.
+        await asyncio.sleep(0)
+        allow_abandon_cleanup.set()
+        claim, drained = await asyncio.gather(claim_future, drain_future)
+
+        assert claim.status_code == 204, claim.text
+        assert drained is True
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.QUEUED
+        assert task.vm_instance_id is None
+        assert (task.context or {}).get("warm_target_vm_id") is None
+        assert (task.context or {}).get(WARM_POOL_PIN_KEY) is None
+        assert (task.context or {}).get(WARM_POOL_RESERVATION_ACCOUNT_KEY) is None
+        assert account["active_tasks"] == 0
+        assert account["daily_task_count"] == 0
+        assert account["project_state"][str(project.id)] == {
+            "active_tasks": 0,
+            "daily_task_count": 0,
+        }
+        assert await db_session.get(PoolVm, member_id, populate_existing=True) is None
+    finally:
+        _clear_accounts()
+
+
+@pytest.mark.asyncio
+async def test_pr_fence_rereads_reservation_after_lock_reorder(
+    db_session, client, warm_pool_on, monkeypatch
+):
+    """A concurrent abandon during PR lock reorder cannot transfer a stale slot."""
+    from app.max_plan_pool import reserve_max_plan_account
+    from app.review_claim_fence import PrClaimFenceDecision
+
+    project = await _make_project(db_session, name="PR reservation reread")
+    member = await _make_idle_member(
+        db_session,
+        project,
+        vm_instance_id="vm-pr-marker-race",
+        account_id="acct-pr-marker-race",
+    )
+    account = _seed_account(
+        "acct-pr-marker-race",
+        user_id=project.user_id,
+        max_concurrent_tasks=1,
+    )
+    try:
+        task = await _make_queued_task(db_session, project)
+        task.payloads = [
+            {
+                "type": "review",
+                "prompt": "review",
+                "base_branch": "automain",
+                "pr_number": 77,
+            }
+        ]
+        db_session.add(task)
+        await db_session.commit()
+        assert await reserve_max_plan_account(
+            account["id"],
+            user_id=project.user_id,
+            project_id=str(project.id),
+            model="claude-opus-4-8",
+            count_daily_task=True,
+        )
+        assert await _dispatch(
+            db_session,
+            task,
+            account=account["id"],
+            reservation_account=account["id"],
+        )
+        await db_session.commit()
+
+        async def _abandon_during_pr_lock(session, *, task_id, **_kwargs):
+            # _finalize_warm_claim committed the selector lock immediately
+            # before this call. Simulate the competing cleanup transaction in
+            # that exact window, then return an otherwise-allowed fence result.
+            await abandon_pool_dispatch(
+                session,
+                task_id=task_id,
+                vm_instance_id="vm-pr-marker-race",
+                reason="test_pr_lock_interleaving",
+            )
+            refreshed = await session.get(Task, task_id)
+            assert refreshed is not None
+            await session.refresh(refreshed)
+            return PrClaimFenceDecision(
+                applies=True,
+                allowed=True,
+                task=refreshed,
+                reason="allowed after interleaving",
+            )
+
+        monkeypatch.setattr(
+            "app.review_claim_fence.lock_pr_task_for_execution",
+            _abandon_during_pr_lock,
+        )
+        tok = create_vm_scoped_token("vm-pr-marker-race", str(project.id))
+        response = await client.post(
+            "/api/agent/next-role",
+            json={"vm_instance_id": "vm-pr-marker-race"},
+            headers={"X-Agent-Token": tok},
+        )
+
+        assert response.status_code == 204, response.text
+        await db_session.refresh(task)
+        await db_session.refresh(member)
+        assert task.status == TaskStatus.QUEUED
+        assert task.vm_instance_id is None
+        assert (task.context or {}).get(WARM_POOL_PIN_KEY) is None
+        assert (
+            task.context or {}
+        ).get(WARM_POOL_RESERVATION_ACCOUNT_KEY) is None
+        assert member.state == PoolVmState.RETIRING
+        assert account["active_tasks"] == 0
+        assert account["daily_task_count"] == 0
+        assert [
+            m["delta"] for m in account["_pending_usage_cap_mutations"]
+        ] == [1, -1]
+    finally:
+        _clear_accounts()
+
+
+@pytest.mark.asyncio
+async def test_pr_fence_detects_markerless_abandon_during_lock_reorder(
+    db_session, client, warm_pool_on, monkeypatch
+):
+    """Markerless pool ownership still includes its pin and VM binding."""
+    from app.review_claim_fence import PrClaimFenceDecision
+
+    project = await _make_project(db_session, name="PR markerless abandon")
+    member = await _make_idle_member(
+        db_session,
+        project,
+        vm_instance_id="vm-pr-markerless-race",
+        account_id="acct-pr-markerless-race",
+    )
+    account = _seed_account(
+        "acct-pr-markerless-race",
+        user_id=project.user_id,
+        max_concurrent_tasks=1,
+    )
+    try:
+        task = await _make_queued_task(db_session, project)
+        task.payloads = [
+            {"type": "review", "prompt": "review", "pr_number": 78}
+        ]
+        db_session.add(task)
+        await db_session.commit()
+        assert await _dispatch(db_session, task, account=account["id"])
+        await db_session.commit()
+        assert (
+            task.context or {}
+        ).get(WARM_POOL_RESERVATION_ACCOUNT_KEY) is None
+
+        async def _abandon_markerless(session, *, task_id, **_kwargs):
+            await abandon_pool_dispatch(
+                session,
+                task_id=task_id,
+                vm_instance_id="vm-pr-markerless-race",
+                reason="test_markerless_pr_interleaving",
+            )
+            refreshed = await session.get(Task, task_id, populate_existing=True)
+            return PrClaimFenceDecision(
+                applies=True,
+                allowed=True,
+                task=refreshed,
+                reason="allowed after markerless abandon",
+            )
+
+        monkeypatch.setattr(
+            "app.review_claim_fence.lock_pr_task_for_execution",
+            _abandon_markerless,
+        )
+        token = create_vm_scoped_token(
+            "vm-pr-markerless-race", str(project.id)
+        )
+        response = await client.post(
+            "/api/agent/next-role",
+            json={"vm_instance_id": "vm-pr-markerless-race"},
+            headers={"X-Agent-Token": token},
+        )
+
+        assert response.status_code == 204, response.text
+        await db_session.refresh(task)
+        await db_session.refresh(member)
+        assert task.status == TaskStatus.QUEUED
+        assert task.vm_instance_id is None
+        assert (task.context or {}).get(WARM_POOL_PIN_KEY) is None
+        assert member.state == PoolVmState.RETIRING
+        assert account["active_tasks"] == 0
+        assert account["daily_task_count"] == 0
+    finally:
+        _clear_accounts()
+
+
+@pytest.mark.asyncio
+async def test_pr_fence_same_account_new_vm_repin_is_left_untouched(
+    db_session, client, warm_pool_on, monkeypatch
+):
+    """The account marker alone cannot authorize cleanup of a newer lease."""
+    from app.max_plan_pool import reserve_max_plan_account
+    from app.review_claim_fence import PrClaimFenceDecision
+
+    project = await _make_project(db_session, name="PR same-account repin")
+    old_member = await _make_idle_member(
+        db_session,
+        project,
+        vm_instance_id="vm-pr-repin-old",
+        account_id="acct-pr-repin",
+    )
+    new_member = await _make_idle_member(
+        db_session,
+        project,
+        vm_instance_id="vm-pr-repin-new",
+        account_id="acct-pr-repin",
+    )
+    account = _seed_account(
+        "acct-pr-repin", user_id=project.user_id, max_concurrent_tasks=1
+    )
+    try:
+        task = await _make_queued_task(db_session, project)
+        task.payloads = [
+            {"type": "review", "prompt": "review", "pr_number": 79}
+        ]
+        db_session.add(task)
+        await db_session.commit()
+        assert await reserve_max_plan_account(
+            account["id"],
+            user_id=project.user_id,
+            project_id=str(project.id),
+            model="claude-opus-4-8",
+            count_daily_task=True,
+        )
+        assert await _dispatch(
+            db_session,
+            task,
+            account=account["id"],
+            reservation_account=account["id"],
+        )
+        await db_session.commit()
+        assert task.vm_instance_id == old_member.vm_instance_id
+
+        async def _repin_during_pr_lock(session, *, task_id, **_kwargs):
+            await abandon_pool_dispatch(
+                session,
+                task_id=task_id,
+                vm_instance_id=old_member.vm_instance_id,
+                reason="test_same_account_repin",
+            )
+            refreshed = await session.get(Task, task_id, populate_existing=True)
+            assert refreshed is not None
+            assert await reserve_max_plan_account(
+                account["id"],
+                user_id=project.user_id,
+                project_id=str(project.id),
+                model="claude-opus-4-8",
+                count_daily_task=True,
+            )
+            leased = await _dispatch(
+                session,
+                refreshed,
+                account=account["id"],
+                reservation_account=account["id"],
+            )
+            assert leased is not None
+            assert leased.vm_instance_id == new_member.vm_instance_id
+            await session.commit()
+            return PrClaimFenceDecision(
+                applies=True,
+                allowed=True,
+                task=refreshed,
+                reason="allowed after newer repin",
+            )
+
+        monkeypatch.setattr(
+            "app.review_claim_fence.lock_pr_task_for_execution",
+            _repin_during_pr_lock,
+        )
+        old_token = create_vm_scoped_token(old_member.vm_instance_id, str(project.id))
+        response = await client.post(
+            "/api/agent/next-role",
+            json={"vm_instance_id": old_member.vm_instance_id},
+            headers={"X-Agent-Token": old_token},
+        )
+
+        assert response.status_code == 204, response.text
+        await db_session.refresh(task)
+        await db_session.refresh(old_member)
+        await db_session.refresh(new_member)
+        assert old_member.state == PoolVmState.RETIRING
+        assert new_member.state == PoolVmState.LEASED
+        assert new_member.leased_task_id == task.id
+        assert task.status == TaskStatus.QUEUED
+        assert task.vm_instance_id == new_member.vm_instance_id
+        assert (task.context or {}).get(WARM_POOL_PIN_KEY) is True
+        assert (task.context or {}).get("warm_target_vm_id") == new_member.vm_instance_id
+        assert (
+            task.context or {}
+        ).get(WARM_POOL_RESERVATION_ACCOUNT_KEY) == account["id"]
+        assert account["active_tasks"] == 1
+        assert account["daily_task_count"] == 1
+        assert [
+            mutation["delta"]
+            for mutation in account["_pending_usage_cap_mutations"]
+        ] == [1, -1, 1]
+    finally:
+        _clear_accounts()
+
+
+@pytest.mark.asyncio
+async def test_accountless_pool_lease_is_abandoned_before_claim(
+    db_session, client, warm_pool_on
+):
+    """A wildcard lease with no boot or selected account cannot run uncharged."""
+    project = await _make_project(db_session, name="Accountless Pool Lease")
+    member = await _make_idle_member(
+        db_session,
+        project,
+        vm_instance_id="vm-accountless",
+        account_id=None,
+    )
+    task = await _make_queued_task(db_session, project)
+
+    leased = await _dispatch(db_session, task, account=None)
     await db_session.commit()
     assert leased is not None
 
-    # Agent on the pool VM polls /next-role with its VM-scoped token (no prior
-    # task — it is a taskless pool boot).
-    tok = create_vm_scoped_token("vm-claim", str(project.id))
+    tok = create_vm_scoped_token("vm-accountless", str(project.id))
     resp = await client.post(
         "/api/agent/next-role",
-        json={"vm_instance_id": "vm-claim"},
+        json={"vm_instance_id": "vm-accountless"},
         headers={"X-Agent-Token": tok},
     )
-    assert resp.status_code == 200, resp.text
-    body = resp.json()
-    assert body["action"] == "claim"
-    assert body["task_id"] == str(task.id)
-    assert body["warm_start"] is True
-    assert body.get("agent_token")  # fresh task-scoped token returned to the agent
 
-    # Task transitioned warm with the pool-specific origin.
+    assert resp.status_code == 204, resp.text
     await db_session.refresh(task)
-    assert task.status == TaskStatus.IN_PROGRESS
-    assert task.vm_warm_start is True
-    timing = (task.context or {}).get("_timing") or {}
-    assert timing.get("warm_start") is True
-    assert timing.get("warm_claim_origin") == "warm_pool"
-    # Boot-account attribution preserved on the claimed task.
-    assert (task.context or {}).get("llm_account_id") == "acct-7"
+    await db_session.refresh(member)
+    assert task.status == TaskStatus.QUEUED
+    assert task.vm_instance_id is None
+    assert (task.context or {}).get(WARM_POOL_PIN_KEY) is None
+    assert member.state == PoolVmState.RETIRING
+
+
+@pytest.mark.asyncio
+async def test_finalize_error_abandon_is_idempotent_after_successful_release(
+    db_session, client, warm_pool_on, monkeypatch
+):
+    """After the release succeeds, re-entry cannot stage a second decrement."""
+    from app.max_plan_pool import reserve_max_plan_account
+
+    project = await _make_project(db_session, name="Interrupted Pool Finalize")
+    member = await _make_idle_member(
+        db_session,
+        project,
+        vm_instance_id="vm-finalize-error",
+        account_id="acct-finalize-error",
+    )
+    account = _seed_account(
+        "acct-finalize-error",
+        user_id=project.user_id,
+        max_concurrent_tasks=1,
+    )
+    try:
+        task = await _make_queued_task(db_session, project)
+        assert await reserve_max_plan_account(
+            account["id"],
+            user_id=project.user_id,
+            project_id=str(project.id),
+            model="claude-opus-4-8",
+            count_daily_task=True,
+        )
+        leased = await _dispatch(
+            db_session,
+            task,
+            account=account["id"],
+            reservation_account=account["id"],
+        )
+        await db_session.commit()
+        assert leased is not None
+        assert (task.context or {})[WARM_POOL_RESERVATION_ACCOUNT_KEY] == account["id"]
+        assert account["active_tasks"] == 1
+        assert account["daily_task_count"] == 1
+        assert account["project_state"][str(project.id)] == {
+            "active_tasks": 1,
+            "daily_task_count": 1,
+        }
+
+        def _fail_token_mint(**_kwargs):
+            raise RuntimeError("simulated mint interruption")
+
+        monkeypatch.setattr(
+            "app.routers.agent_warm_continuity.create_agent_token",
+            _fail_token_mint,
+        )
+        tok = create_vm_scoped_token("vm-finalize-error", str(project.id))
+        resp = await client.post(
+            "/api/agent/next-role",
+            json={"vm_instance_id": "vm-finalize-error"},
+            headers={"X-Agent-Token": tok},
+        )
+
+        assert resp.status_code == 500, resp.text
+        await db_session.refresh(task)
+        await db_session.refresh(member)
+        assert task.status == TaskStatus.QUEUED
+        assert task.vm_instance_id is None
+        assert (task.context or {}).get(WARM_POOL_PIN_KEY) is None
+        assert (
+            task.context or {}
+        ).get(WARM_POOL_RESERVATION_ACCOUNT_KEY) is None
+        assert member.state == PoolVmState.RETIRING
+        assert account["active_tasks"] == 0
+        assert account["daily_task_count"] == 0
+        assert account["project_state"][str(project.id)] == {
+            "active_tasks": 0,
+            "daily_task_count": 0,
+        }
+        mutations_after_cleanup = list(account["_pending_usage_cap_mutations"])
+        assert [item["delta"] for item in mutations_after_cleanup] == [1, -1]
+        assert [item["project_delta"] for item in mutations_after_cleanup] == [1, -1]
+
+        # Re-entry observes no durable marker and therefore stages no duplicate
+        # release or daily rollback.
+        assert await abandon_pool_dispatch(
+            db_session,
+            task_id=task.id,
+            vm_instance_id="vm-finalize-error",
+            reason="repeat_test_cleanup",
+        ) is None
+        assert account["active_tasks"] == 0
+        assert account["daily_task_count"] == 0
+        assert account["project_state"][str(project.id)] == {
+            "active_tasks": 0,
+            "daily_task_count": 0,
+        }
+        assert account["_pending_usage_cap_mutations"] == mutations_after_cleanup
+    finally:
+        _clear_accounts()
 
 
 @pytest.mark.asyncio
@@ -524,6 +1278,32 @@ async def test_account_mismatch_not_leased_when_retarget_disabled(
 
 
 @pytest.mark.asyncio
+async def test_auth_mode_mismatch_not_leased_when_retarget_disabled(
+    db_session, warm_pool_on
+):
+    """Strict leases match auth mode as well as account/provider/model."""
+    project = await _make_project(db_session, name="Strict Auth Mode")
+    await _make_idle_member(
+        db_session,
+        project,
+        vm_instance_id="vm-strict-auth",
+        account_id="acct-same",
+        auth_mode="oauth",
+    )
+    task = await _make_queued_task(db_session, project)
+
+    leased = await _dispatch(
+        db_session,
+        task,
+        account="acct-same",
+        auth_mode="api_key",
+    )
+
+    assert leased is None
+    assert task.vm_instance_id is None
+
+
+@pytest.mark.asyncio
 async def test_account_mismatch_leased_and_pinned_to_resolved_account(
     db_session, warm_pool_retarget_on
 ):
@@ -622,7 +1402,21 @@ async def test_next_role_emits_retarget_manifest_on_account_mismatch(
     run_acct = _seed_account("acct-run")
     try:
         task = await _make_queued_task(db_session, project, model="claude-opus-4-8")
-        leased = await _dispatch(db_session, task, account="acct-run")
+        from app.max_plan_pool import reserve_max_plan_account
+
+        assert await reserve_max_plan_account(
+            run_acct["id"],
+            user_id=project.user_id,
+            project_id=str(project.id),
+            model="claude-opus-4-8",
+            count_daily_task=True,
+        )
+        leased = await _dispatch(
+            db_session,
+            task,
+            account="acct-run",
+            reservation_account="acct-run",
+        )
         await db_session.commit()
         assert leased is not None
 
@@ -652,6 +1446,113 @@ async def test_next_role_emits_retarget_manifest_on_account_mismatch(
         timing = (task.context or {}).get("_timing") or {}
         assert timing.get("warm_claim_origin") == "warm_pool"
         assert (task.context or {}).get("llm_account_id") == "acct-run"
+    finally:
+        _clear_accounts()
+
+
+@pytest.mark.asyncio
+async def test_next_role_emits_manifest_on_auth_mode_only_mismatch(
+    db_session, client, warm_pool_retarget_on
+):
+    """A relaxed lease cannot silently retain a different frozen auth mode."""
+    from app.max_plan_pool import reserve_max_plan_account
+
+    project = await _make_project(db_session, name="RT Auth Mode Claim")
+    await _make_idle_member(
+        db_session,
+        project,
+        vm_instance_id="vm-rt-auth",
+        account_id="acct-auth",
+        auth_mode="oauth",
+    )
+    run_acct = _seed_account(
+        "acct-auth",
+        auth_mode="api_key",
+        user_id=project.user_id,
+    )
+    try:
+        task = await _make_queued_task(db_session, project)
+        assert await reserve_max_plan_account(
+            run_acct["id"],
+            user_id=project.user_id,
+            project_id=str(project.id),
+            model="claude-opus-4-8",
+            count_daily_task=True,
+        )
+        leased = await _dispatch(
+            db_session,
+            task,
+            account=run_acct["id"],
+            auth_mode="api_key",
+            reservation_account=run_acct["id"],
+        )
+        await db_session.commit()
+        assert leased is not None
+
+        tok = create_vm_scoped_token("vm-rt-auth", str(project.id))
+        resp = await client.post(
+            "/api/agent/next-role",
+            json={"vm_instance_id": "vm-rt-auth"},
+            headers={"X-Agent-Token": tok},
+        )
+
+        assert resp.status_code == 200, resp.text
+        manifest = resp.json().get("secret_manifest")
+        assert manifest is not None
+        assert manifest["env"]["AUTH_MODE"] == "api_key"
+        assert not manifest["metadata"].get("credential_refresh_only")
+    finally:
+        _clear_accounts()
+
+
+@pytest.mark.asyncio
+async def test_next_role_materializes_concrete_account_when_boot_identity_unknown(
+    db_session, client, warm_pool_retarget_on
+):
+    """An accountless boot row plus a concrete run account requires a manifest.
+
+    Continuing without one would execute on an unknown ambient credential even
+    though accounting was charged to the selected account.
+    """
+    from app.max_plan_pool import reserve_max_plan_account
+
+    project = await _make_project(db_session, name="RT Unknown Boot Identity")
+    await _make_idle_member(
+        db_session,
+        project,
+        vm_instance_id="vm-unknown-boot",
+        account_id=None,
+    )
+    run_acct = _seed_account("acct-concrete", user_id=project.user_id)
+    try:
+        task = await _make_queued_task(db_session, project)
+        assert await reserve_max_plan_account(
+            run_acct["id"],
+            user_id=project.user_id,
+            project_id=str(project.id),
+            model="claude-opus-4-8",
+            count_daily_task=True,
+        )
+        leased = await _dispatch(
+            db_session,
+            task,
+            account=run_acct["id"],
+            reservation_account=run_acct["id"],
+        )
+        await db_session.commit()
+        assert leased is not None
+
+        tok = create_vm_scoped_token("vm-unknown-boot", str(project.id))
+        resp = await client.post(
+            "/api/agent/next-role",
+            json={"vm_instance_id": "vm-unknown-boot"},
+            headers={"X-Agent-Token": tok},
+        )
+
+        assert resp.status_code == 200, resp.text
+        manifest = resp.json().get("secret_manifest")
+        assert manifest is not None
+        assert "secret-acct-concrete" in manifest["env"].values()
     finally:
         _clear_accounts()
 

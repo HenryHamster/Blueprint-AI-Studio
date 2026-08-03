@@ -153,7 +153,7 @@ describe('WhiteboardTool — autosave loop + conflict data-loss + save-status', 
     document.body.appendChild(host);
     const r = createRoot(host);
     root = r;
-    await act(async () => { r.render(<WhiteboardTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
+    await act(async () => { r.render(<WhiteboardTool projectId="proj-a" tool={SAMPLE_TOOL} readOnly={false} />); });
     await act(async () => { await Promise.resolve(); await Promise.resolve(); });
     if (!host) throw new Error('host not mounted');
     return host;
