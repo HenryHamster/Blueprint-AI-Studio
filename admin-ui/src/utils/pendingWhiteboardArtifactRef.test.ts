@@ -147,6 +147,14 @@ describe('pending Whiteboard ArtifactRef operation', () => {
   test('persists an exponential next retry so repeated Resume clicks stay below 30/minute', async () => {
     const pending = operation();
     persistPendingWhiteboardArtifactOperation(pending);
+    const now = pending.updated_at;
+    // Advance one millisecond per sample. The retry deadline and updated_at
+    // must still share one scheduling instant rather than racing two clocks.
+    vi.spyOn(Date, 'now')
+      .mockReturnValueOnce(now)
+      .mockReturnValueOnce(now + 1)
+      .mockReturnValueOnce(now + 2)
+      .mockReturnValueOnce(now + 3);
     const request = vi.fn().mockRejectedValue(new TypeError('network unavailable'));
     const waits: number[] = [];
 

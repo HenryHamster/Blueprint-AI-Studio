@@ -753,14 +753,43 @@ def _stop_unit_container(
         remaining = _container_record(container_id)
         if remaining is not None:
             _validate_managed_container(container, remaining, allowed_images)
-            _run(
-                ["/usr/bin/docker", "container", "rm", "--force", container_id],
-                timeout=30,
+            # A successful stop of an AutoRemove container can return just
+            # before dockerd finishes deleting it.  During that interval the
+            # container is still inspectable, but a second removal fails with
+            # "removal ... is already in progress".  Let the terminal-state
+            # gate below observe Docker's original removal instead.  Force
+            # removal is only a fallback when stop itself failed and the exact
+            # captured managed container is still present.
+            stop_diagnostic = (stop.stderr or stop.stdout).lower()
+            removal_in_progress = (
+                "removal of container" in stop_diagnostic
+                and "already in progress" in stop_diagnostic
             )
-        elif stop.returncode != 0 and "No such container" not in (
-            stop.stderr or stop.stdout
-        ):
-            raise RuntimeError(f"failed to stop managed container {container_id}")
+            state = remaining.get("State")
+            if not isinstance(state, dict) or not isinstance(
+                state.get("Running"), bool
+            ):
+                raise RuntimeError(f"ambiguous state for managed container {container}")
+            if (
+                stop.returncode != 0
+                and state["Running"]
+                and not removal_in_progress
+            ):
+                remove = _run(
+                    ["/usr/bin/docker", "container", "rm", "--force", container_id],
+                    timeout=30,
+                    check=False,
+                )
+                if remove.returncode != 0:
+                    remove_diagnostic = (remove.stderr or remove.stdout).lower()
+                    benign_remove_race = "no such container" in remove_diagnostic or (
+                        "removal of container" in remove_diagnostic
+                        and "already in progress" in remove_diagnostic
+                    )
+                    if not benign_remove_race:
+                        raise RuntimeError(
+                            f"failed to remove managed container {container_id}"
+                        )
     _wait_unit_stopped(unit, container, container_id)
 
 

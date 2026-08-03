@@ -220,13 +220,14 @@ async function settle(
         response.retry_after_ms,
         Math.min(2_500 * (2 ** Math.max(0, operation.attempt_count - 1)), 30_000),
       );
+      const retryScheduledAt = Date.now();
       operation = {
         ...operation,
         promotion_intent_id: response.promotion_intent_id,
         retry_after_ms: response.retry_after_ms,
-        next_retry_at: Date.now() + retryDelayMs,
+        next_retry_at: retryScheduledAt + retryDelayMs,
         last_error: undefined,
-        updated_at: Date.now(),
+        updated_at: retryScheduledAt,
       };
       persistPendingWhiteboardArtifactOperation(operation);
     } catch (cause) {
@@ -235,11 +236,12 @@ async function settle(
         operation.retry_after_ms ?? 0,
         Math.min(2_500 * (2 ** Math.max(0, operation.attempt_count - 1)), 30_000),
       );
+      const retryScheduledAt = Date.now();
       operation = {
         ...operation,
         last_error: cause instanceof Error ? cause.message : 'Whiteboard preparation failed.',
-        next_retry_at: Date.now() + retryDelayMs,
-        updated_at: Date.now(),
+        next_retry_at: retryScheduledAt + retryDelayMs,
+        updated_at: retryScheduledAt,
       };
       if (!isRetryable(cause)) {
         operation = { ...operation, state: 'terminal' };
