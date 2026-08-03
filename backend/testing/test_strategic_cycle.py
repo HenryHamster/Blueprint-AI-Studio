@@ -6,9 +6,12 @@ real table.
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import asynccontextmanager
 from datetime import timedelta
 
 import pytest
+from fastapi import BackgroundTasks, HTTPException
 from sqlmodel import select
 
 from app import pause_clock, strategic_cycle, vision_merge
@@ -1036,6 +1039,89 @@ async def test_reconcile_terminal_task_never_regresses_phase1_after_phase2_start
     assert reconciled is None
     assert cycle.outcome == strategic_cycle.OUTCOME_PHASE2_RUNNING
     assert cycle.phase2_completed_at is None
+
+
+@pytest.mark.asyncio
+async def test_admin_cancel_is_serialized_against_completed_continuation(
+    db_session, mocker
+):
+    """An admin cancel cannot overwrite a continuation that just completed.
+
+    SQLite does not enforce PostgreSQL row locks, so this test supplies the same
+    canonical pair-lock boundary with an asyncio lock and controls both sides
+    of the race explicitly. The production admin mutation must wait for the
+    continuation, re-read COMPLETED + pending, and fence the stale cancel.
+    """
+    project = await _make_project(db_session, name="terminal race")
+    task = Task(
+        project_id=project.id,
+        title="strategic continuation",
+        status=TaskStatus.COMPLETED,
+        post_commit_pending=True,
+        payloads=[{"type": "strategic_review", "prompt": "review"}],
+        context={"_post_commit_pending_meta": {"generation_token": "g1"}},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    cycle = StrategicCycle(
+        id="sc-admin-cancel-race",
+        project_id=project.id,
+        outcome=strategic_cycle.OUTCOME_PHASE2_RUNNING,
+        phase1_started_at=_utcnow(),
+        phase2_started_at=_utcnow(),
+        phase2_task_id=task.id,
+    )
+    db_session.add(cycle)
+    await db_session.commit()
+
+    pair_lock = asyncio.Lock()
+    continuation_holding_lock = asyncio.Event()
+    release_continuation = asyncio.Event()
+
+    @asynccontextmanager
+    async def controlled_pair_lock(session, project_id, task_id, **_kwargs):
+        await pair_lock.acquire()
+        try:
+            yield (await session.get(Project, project_id), await session.get(Task, task_id))
+        finally:
+            pair_lock.release()
+
+    mocker.patch("app.task_locking.lock_project_then_task", controlled_pair_lock)
+
+    async def complete_continuation():
+        async with controlled_pair_lock(db_session, project.id, task.id):
+            continuation_holding_lock.set()
+            await release_continuation.wait()
+            task.status = TaskStatus.COMPLETED
+            cycle.outcome = strategic_cycle.OUTCOME_COMPLETED
+            await db_session.commit()
+
+    continuation = asyncio.create_task(complete_continuation())
+    await continuation_holding_lock.wait()
+
+    from app.admin_task_mutations import modify_task_apply
+
+    admin_cancel = asyncio.create_task(
+        modify_task_apply(
+            task,
+            {"status": TaskStatus.CANCELLED.value},
+            BackgroundTasks(),
+            db_session,
+        )
+    )
+    await asyncio.sleep(0)
+    assert not admin_cancel.done()
+
+    release_continuation.set()
+    await continuation
+    with pytest.raises(HTTPException) as exc_info:
+        await admin_cancel
+    assert exc_info.value.status_code == 409
+
+    await db_session.refresh(task)
+    await db_session.refresh(cycle)
+    assert task.status == TaskStatus.COMPLETED
+    assert cycle.outcome == strategic_cycle.OUTCOME_COMPLETED
 
 
 @pytest.mark.asyncio

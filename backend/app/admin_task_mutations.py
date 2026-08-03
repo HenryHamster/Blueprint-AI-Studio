@@ -413,6 +413,19 @@ async def _apply_status_mutation(
         task.archived = False
         changes["archived"] = False
 
+    if (
+        new_status in (TaskStatus.FAILED, TaskStatus.CANCELLED)
+        and task.status == TaskStatus.COMPLETED
+        and task.post_commit_pending
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Cannot terminalize a COMPLETED task while its post-commit "
+                "continuation is pending; wait for completion recovery"
+            ),
+        )
+
     if requeue_guidance is not None:
         updated_payloads = [dict(item) for item in task.payloads]
         materialize_operator_retry_guidance(updated_payloads[0], requeue_guidance)
@@ -1667,9 +1680,33 @@ async def modify_task_apply(
     """
     changes: Dict[str, Any] = {}
 
-    await _apply_status_mutation(
-        task, payload, background_tasks, session, force_kill, changes
-    )
+    terminal_statuses = {
+        TaskStatus.FAILED.value,
+        TaskStatus.CANCELLED.value,
+    }
+    if payload.get("status") in terminal_statuses:
+        # The continuation and the administrative terminal writer must share
+        # the canonical Project -> Task lock order. Re-read under that pair so
+        # a stale route snapshot cannot cancel a COMPLETED task whose
+        # post-commit continuation is still authoritative.
+        from app.task_locking import lock_project_then_task
+
+        task_project_id = task.project_id
+        task_id = task.id
+        session.expire(task)
+        async with lock_project_then_task(
+            session, task_project_id, task_id, skip_locked=False
+        ) as (_locked_project, locked_task):
+            if locked_task is None:
+                raise HTTPException(status_code=404, detail="Task not found")
+            task = locked_task
+            await _apply_status_mutation(
+                task, payload, background_tasks, session, force_kill, changes
+            )
+    else:
+        await _apply_status_mutation(
+            task, payload, background_tasks, session, force_kill, changes
+        )
     await _apply_approval_mutation(task, payload, session, changes)
     await _apply_simple_mutations(task, payload, changes)
     await _apply_depends_on_mutation(task, payload, session, changes)

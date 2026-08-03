@@ -180,7 +180,7 @@ async def reconcile_terminal_task(
             select(StrategicCycle).where(
                 StrategicCycle.project_id == task.project_id,
                 or_(phase1_match, phase2_match),
-            )
+            ).with_for_update()
         )
     ).scalars().first()
     if cycle is None:

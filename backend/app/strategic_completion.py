@@ -57,7 +57,6 @@ from app.message_audience import stamp_message_audience
 from app.project_message_creation import build_project_message
 from app.project_message_projection import message_event_payload
 from app.shared_state import runtime_config as _runtime_config
-from app.task_capabilities import strategic_phase_for
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -329,15 +328,15 @@ async def _record_strategic_task_failure(
     *,
     project: Project | None = None,
 ) -> None:
-    """Record a FAILED strategic task in the circuit breaker and cycle history.
+    """Record a FAILED strategic task in the circuit breaker.
 
     Called from _process_post_commit when a design_doc_update or strategic_review
     task terminates with FAILED status (VM crash, timeout, etc.).
 
     Commit semantics (R5-W5 audit MED-1):
     -----------------------------------
-    This function does NOT commit. It mutates ``project.vision`` and (when a
-    cycle id is present) the StrategicCycle row, then ``session.add(project)``.
+    This function does NOT commit. It mutates ``project.vision`` and then
+    ``session.add(project)``.
     The caller is expected to commit. ``_process_post_commit`` in
     ``task_lifecycle.py`` batches several mutations from a single terminal
     transition (dependent unblock, strategic-failure increment, research-failure
@@ -428,24 +427,6 @@ async def _record_strategic_task_failure(
     vision["_strategic_failures_at"] = _utcnow().isoformat()
     project.vision = vision
     flag_modified(project, "vision")
-    # Audit W2: cycle history is in the StrategicCycle table.
-    cycle_id = task.strategic_cycle_id or (task.context or {}).get("strategic_cycle_id")
-    if cycle_id:
-        task_type = task.first_payload.get("type", "")
-        failed_phase = strategic_phase_for(task_type) or "phase2"
-        failure_category = task.first_payload.get("failure_category", "")
-        outcome_override = (
-            strategic_cycle.OUTCOME_THINKER_ARTIFACTS_MISSING
-            if failure_category == "strategic_thinker_artifacts_missing"
-            else None
-        )
-        await strategic_cycle.mark_failure(
-            session,
-            cycle_id,
-            phase=failed_phase,
-            reason=(task.latest_status_message or "task failed")[:200],
-            outcome_override=outcome_override,
-        )
     session.add(project)
     logger.warning(
         f"[STRATEGIC] {task.first_payload.get('type')} task {task.id} FAILED "

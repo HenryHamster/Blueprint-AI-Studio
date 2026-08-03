@@ -1544,7 +1544,7 @@ async def _process_post_commit(
         # Uses the same session (not a separate one) to avoid self-deadlock: a second
         # session scanning the task table would block on the FOR UPDATE lock held by
         # this session, causing a hang in Postgres (asyncio is single-threaded).
-        if payload.status == TaskStatus.FAILED:
+        if task.status == TaskStatus.FAILED:
             try:
                 dep_stmt = select(Task).where(
                     Task.project_id == task.project_id,
@@ -1573,10 +1573,11 @@ async def _process_post_commit(
                     exc_info=True,
                 )
 
-            # Record strategic task failures for the circuit breaker and cycle history
-            if task.first_payload.get("type") in (
-                "design_doc_update",
-                "strategic_review",
+            # Record strategic task failures for circuit-breaker accounting.
+            if (
+                task.status == TaskStatus.FAILED
+                and task.first_payload.get("type")
+                in ("design_doc_update", "strategic_review")
             ):
                 try:
                     # Round 3 C3 + C4: the canonical pair-lock acquired at the
@@ -6771,10 +6772,13 @@ async def _process_post_commit(
             )
         else:
             _peek_strategic_type = task.first_payload.get("type", "")
-            if _peek_strategic_type in (
-                "design_doc_update",
-                "strategic_review",
-            ) and payload.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
+            if (
+                task.status in (TaskStatus.FAILED, TaskStatus.CANCELLED)
+                and _peek_strategic_type in (
+                    "design_doc_update",
+                    "strategic_review",
+                )
+            ):
                 from app.strategic_events import emit_strategic_cycle_completed
 
                 await emit_strategic_cycle_completed(
@@ -6785,9 +6789,7 @@ async def _process_post_commit(
                     or (task.context or {}).get("strategic_cycle_id"),
                     phase_state="failed",
                     completion={
-                        "status": getattr(
-                            payload.status, "value", str(payload.status)
-                        ),
+                        "status": getattr(task.status, "value", str(task.status)),
                         "status_message": task.latest_status_message,
                     },
                 )

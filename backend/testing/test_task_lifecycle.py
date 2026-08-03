@@ -8079,6 +8079,59 @@ async def test_completed_strategic_handler_failure_reconciles_cycle_immediately(
     assert emit_kwargs["completion"]["status"] == "FAILED"
 
 
+@pytest.mark.asyncio
+async def test_pending_marker_late_failed_payload_cannot_regress_completed_phase1(
+    tl_db, mocker
+):
+    """A late FAILED payload must not run the legacy strategic cycle writer.
+
+    The persisted task is COMPLETED and its continuation is pending while the
+    cycle has already advanced to phase 2. This uses a real strategic phase-1
+    task type so the old task-type-derived writer is exercised rather than
+    bypassed by a research fixture.
+    """
+    session, factory = tl_db
+    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
+    emit = mocker.patch(
+        "app.strategic_events.emit_strategic_cycle_completed", new_callable=AsyncMock
+    )
+    project = await _make_project(session)
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="design_doc_update",
+        status=TaskStatus.COMPLETED,
+        context={
+            "_post_commit_pending_meta": {"generation_token": "continuation-1"}
+        },
+    )
+    task.post_commit_pending = True
+    session.add(task)
+    cycle = StrategicCycle(
+        id="sc-late-failed-payload",
+        project_id=project.id,
+        outcome="phase2_running",
+        phase1_task_id=task.id,
+        phase1_started_at=_utcnow(),
+        phase1_completed_at=_utcnow(),
+        phase2_started_at=_utcnow(),
+    )
+    session.add(cycle)
+    await session.commit()
+
+    payload = AgentStatusPayload(task_id=task.id, status=TaskStatus.FAILED)
+    result = await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    assert result["status"] == "received"
+    await session.refresh(cycle)
+    await session.refresh(task)
+    await session.refresh(project)
+    assert cycle.outcome == "phase2_running"
+    assert task.status == TaskStatus.COMPLETED
+    assert "_strategic_failures" not in (project.vision or {})
+    emit.assert_not_awaited()
+
+
 # ── QP6: main-branch auto-approve gate uses the strict tested helper ──────────
 #
 # Before QP6 the live main-branch auto-approve path in _process_post_commit was

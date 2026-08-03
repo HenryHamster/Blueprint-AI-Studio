@@ -1777,9 +1777,9 @@ class TestRecordStrategicTaskFailure:
         datetime.fromisoformat(ts)
 
     @pytest.mark.asyncio
-    async def test_updates_cycle_history_for_strategic_review(self, strat_fail_db):
-        # Audit W2: cycle history is a real table now. Insert a StrategicCycle
-        # row and verify _record_strategic_task_failure flips its outcome.
+    async def test_does_not_mutate_cycle_for_strategic_review(self, strat_fail_db):
+        # Cycle state is owned by linkage-aware reconciliation, not this
+        # circuit-breaker accounting helper.
         from app import strategic_cycle as sc
         from app.models import StrategicCycle
 
@@ -1809,12 +1809,12 @@ class TestRecordStrategicTaskFailure:
         await _record_strategic_task_failure(task, strat_fail_db)
         await strat_fail_db.commit()
         await strat_fail_db.refresh(cycle)
-        assert cycle.outcome == sc.OUTCOME_FAILED_PHASE2
-        assert cycle.phase2_completed_at is not None
-        assert cycle.failure_reason and "Claude API timeout" in cycle.failure_reason
+        assert cycle.outcome == sc.OUTCOME_PHASE2_RUNNING
+        assert cycle.phase2_completed_at is None
+        assert cycle.failure_reason is None
 
     @pytest.mark.asyncio
-    async def test_updates_cycle_history_for_design_doc_update(self, strat_fail_db):
+    async def test_does_not_mutate_cycle_for_design_doc_update(self, strat_fail_db):
         from app import strategic_cycle as sc
         from app.models import StrategicCycle
 
@@ -1842,9 +1842,9 @@ class TestRecordStrategicTaskFailure:
         await _record_strategic_task_failure(task, strat_fail_db)
         await strat_fail_db.commit()
         await strat_fail_db.refresh(cycle)
-        assert cycle.outcome == sc.OUTCOME_FAILED_PHASE1
-        assert cycle.phase1_completed_at is not None
-        assert cycle.failure_reason and "VM crash" in cycle.failure_reason
+        assert cycle.outcome == sc.OUTCOME_PHASE1_RUNNING
+        assert cycle.phase1_completed_at is None
+        assert cycle.failure_reason is None
 
     @pytest.mark.asyncio
     async def test_no_cycle_id_skips_cycle_history_update(self, strat_fail_db):
@@ -1893,9 +1893,7 @@ class TestRecordStrategicTaskFailure:
         )
         await _record_strategic_task_failure(task, strat_fail_db)
 
-        history = project.vision.get("_strategic_cycle_history", [])
-        entry = next((e for e in history if e.get("cycle_id") == cycle_id), None)
-        assert len(entry.get("error", "")) <= 200
+        assert project.vision.get("_strategic_failures") == 1
 
     @pytest.mark.asyncio
     async def test_no_op_when_project_not_found(self, strat_fail_db):
@@ -2002,8 +2000,8 @@ class TestThinkerArtifactsMissingOutcome:
         await strat_fail_db.commit()
         await strat_fail_db.refresh(cycle)
 
-        assert cycle.outcome == sc.OUTCOME_THINKER_ARTIFACTS_MISSING
-        assert cycle.outcome not in sc.ACTIVE_OUTCOMES
+        assert cycle.outcome == sc.OUTCOME_PHASE2_RUNNING
+        assert cycle.outcome in sc.ACTIVE_OUTCOMES
 
     @pytest.mark.asyncio
     async def test_generic_phase2_failure_still_uses_failed_phase2(self, strat_fail_db):
@@ -2041,7 +2039,7 @@ class TestThinkerArtifactsMissingOutcome:
         await strat_fail_db.commit()
         await strat_fail_db.refresh(cycle)
 
-        assert cycle.outcome == sc.OUTCOME_FAILED_PHASE2
+        assert cycle.outcome == sc.OUTCOME_PHASE2_RUNNING
 
 
 # ── vision-lock discipline on failure paths ──────────────────────────────────
