@@ -9,6 +9,15 @@ export const COST_PER_VM_HR = 0.067;
 /** Maximum character count for operator/user-authored strategic chat messages. Must match MESSAGE_CONTENT_MAX in backend/app/models.py. */
 export const MESSAGE_CONTENT_MAX = 20000;
 
+/** Read Blueprint's canonical error envelope while retaining legacy detail responses. */
+export function apiErrorMessage(payload: unknown, fallback: string): string {
+  if (!payload || typeof payload !== 'object') return fallback;
+  const body = payload as { error?: { message?: unknown }; detail?: unknown };
+  if (typeof body.error?.message === 'string' && body.error.message.trim()) return body.error.message;
+  if (typeof body.detail === 'string' && body.detail.trim()) return body.detail;
+  return fallback;
+}
+
 /**
  * Generate Firebase authentication headers for API requests.
  * @returns Promise resolving to headers object with Authorization (Bearer token) and Content-Type
@@ -35,6 +44,31 @@ export async function authGet(url: string) {
 // shared promise settles, so the map cannot grow without bound.
 const inFlightRequests = new Map<string, Promise<Response>>();
 
+function abortError(signal?: AbortSignal): Error {
+  if (signal?.reason instanceof Error) return signal.reason;
+  return new DOMException('The operation was aborted', 'AbortError');
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw abortError(signal);
+}
+
+function abortableDelay(milliseconds: number, signal?: AbortSignal): Promise<void> {
+  throwIfAborted(signal);
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, milliseconds);
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      reject(abortError(signal));
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
 /**
  * Fetch wrapper with auth headers and retry for transient Cloud Run errors.
  * Cloud Run 502/503 responses bypass FastAPI middleware and lack CORS headers,
@@ -52,7 +86,11 @@ export async function apiFetch(
   signal?: AbortSignal,
   dedup = true
 ): Promise<Response> {
+  // A cancelled scoped read must not even begin token acquisition. Check again
+  // after auth because Firebase token resolution itself is not abortable.
+  throwIfAborted(signal);
   const headers = await authHeaders();
+  throwIfAborted(signal);
   const fullUrl = url.startsWith('http') ? url : `${API_BASE_URL}${url}`;
   const mergedOptions = { ...options, headers: { ...headers, ...options?.headers } };
 
@@ -74,6 +112,7 @@ export async function apiFetch(
   }
 
   const attemptFetch = async () => {
+    throwIfAborted(signal);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeout);
     // Forward external abort to the internal timeout controller so both
@@ -105,9 +144,9 @@ export async function apiFetch(
         if (res.ok || res.status < 500) return res;
       } catch (e) {
         // Never retry on external abort — the caller already moved on.
-        if (i === maxAttempts || (e instanceof Error && e.name === 'AbortError')) throw e;
+        if (i === maxAttempts || signal?.aborted || (e instanceof Error && e.name === 'AbortError')) throw e;
       }
-      await new Promise(r => setTimeout(r, 1000 * (i + 1)));
+      await abortableDelay(1000 * (i + 1), signal);
     }
     return attemptFetch();
   })();

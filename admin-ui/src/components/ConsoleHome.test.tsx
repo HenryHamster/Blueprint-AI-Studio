@@ -51,6 +51,7 @@ function renderHome(props: Partial<React.ComponentProps<typeof ConsoleHome>> = {
       tasks={TASKS}
       onViewTask={() => {}}
       onShowAnalytics={() => {}}
+      isAdmin={true}
       {...props}
     />,
   );

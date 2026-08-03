@@ -1023,9 +1023,11 @@ interface ComputeJobsPanelProps {
   onApproveExperiment?: (taskId: string) => Promise<void>;
   onDismissExperiment?: (taskId: string) => Promise<void>;
   onNavigateToKnowledge?: (documentId: string) => void;
+  /** Keep compute results visible while suppressing every state-changing action. */
+  readOnly: boolean;
 }
 
-export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute, onCloneExperiment, onApproveExperiment, onDismissExperiment, onNavigateToKnowledge }: ComputeJobsPanelProps) {
+export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute, onCloneExperiment, onApproveExperiment, onDismissExperiment, onNavigateToKnowledge, readOnly = true }: ComputeJobsPanelProps) {
   const [jobs, setJobs] = useState<ComputeJob[]>([]);
   const [heldExperiments, setHeldExperiments] = useState<HeldComputeExperiment[]>([]);
   const [awaitingHolds, setAwaitingHolds] = useState<AwaitingLocalRunnerHold[]>([]);
@@ -1050,6 +1052,12 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
     error: string | null;
     result?: { id: string; status?: string; requires_approval?: boolean };
   } | null>(null);
+
+  useEffect(() => {
+    if (!readOnly) return;
+    setPendingKill(null);
+    setRerunState(null);
+  }, [readOnly]);
   const [analysisFeedback, setAnalysisFeedback] = useState<Record<string, { kind: 'running' | 'upgraded' | 'analysis_unavailable' | 'error'; message: string }>>({});
   const [analysisDocs, setAnalysisDocs] = useState<Record<string, KnowledgeDocument>>({});
   const [knowledgeDocs, setKnowledgeDocs] = useState<Record<string, KnowledgeDocument>>({});
@@ -1255,13 +1263,15 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
 
   const handleKill = useCallback(
     (job: ComputeJob) => {
+      if (readOnly) return;
       setPendingKill(job);
     },
-    [],
+    [readOnly],
   );
 
   const executeKill = useCallback(
     async (job: ComputeJob) => {
+      if (readOnly) return;
       setPendingKill(null);
       setKillingId(job.id);
       try {
@@ -1274,11 +1284,12 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
         setKillingId(null);
       }
     },
-    [],
+    [readOnly],
   );
 
   const handleAnalyze = useCallback(
     async (job: ComputeJob) => {
+      if (readOnly) return;
       setAnalyzingId(job.id);
       setAnalysisFeedback((prev) => ({
         ...prev,
@@ -1322,11 +1333,11 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
         await load();
       }
     },
-    [load, projectId],
+    [load, projectId, readOnly],
   );
 
   const handleRerunOpen = useCallback((job: ComputeJob) => {
-    if (!job.task_id) return;
+    if (readOnly || !job.task_id) return;
     setRerunState({
       jobId: job.id,
       taskId: job.task_id,
@@ -1341,10 +1352,10 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
       submitting: false,
       error: null,
     });
-  }, []);
+  }, [readOnly]);
 
   const handleRerunSubmit = useCallback(async () => {
-    if (!rerunState) return;
+    if (readOnly || !rerunState) return;
     setRerunState((prev) => prev ? { ...prev, submitting: true, error: null } : prev);
     try {
       const body: { success_criterion?: { metric: string; operator: ComputeSuccessOperator; threshold: number }; spend_cap_usd?: number; deadline_seconds?: number } = {};
@@ -1363,9 +1374,10 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
     } catch (e) {
       setRerunState((prev) => prev ? { ...prev, submitting: false, error: e instanceof Error ? e.message : 'Re-run failed' } : prev);
     }
-  }, [rerunState, load]);
+  }, [rerunState, load, readOnly]);
 
   const handleAsk = useCallback(async (jobId: string) => {
+    if (readOnly) return;
     const q = (askState[jobId]?.question ?? '').trim();
     if (!q) return;
     const prevThread = askState[jobId]?.thread ?? [];
@@ -1389,7 +1401,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
         [jobId]: { ...(prev[jobId] ?? { question: q, submitting: false, thread: [], error: null }), submitting: false, error: e instanceof Error ? e.message : 'Ask failed' },
       }));
     }
-  }, [askState, setAskState]);
+  }, [askState, setAskState, readOnly]);
 
   if (!projectId) {
     return (
@@ -1411,7 +1423,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
             view-mode toggle exceed a 375px viewport on one line — let the
             controls wrap under the title instead of overflowing horizontally. */}
         <div className="flex flex-wrap items-center justify-end gap-2 min-w-0">
-          {onLaunchCompute && (
+          {!readOnly && onLaunchCompute && (
             <button
               type="button"
               onClick={onLaunchCompute}
@@ -1539,8 +1551,8 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
 
       <HeldExperimentsSection
         experiments={heldExperiments}
-        onApprove={onApproveExperiment}
-        onDismiss={onDismissExperiment}
+        onApprove={readOnly ? undefined : onApproveExperiment}
+        onDismiss={readOnly ? undefined : onDismissExperiment}
       />
 
       <SweepKnowledgeGroupsSection sweepGroups={sweepGroups} onNavigateToKnowledge={onNavigateToKnowledge} />
@@ -2038,7 +2050,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                   )}
                 </div>
                 <div className="flex items-center gap-2 shrink-0">
-                  {!active && (
+                  {!readOnly && !active && (
                     <>
                       <button
                         onClick={() => void handleAnalyze(job)}
@@ -2172,7 +2184,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                       )}
                     </>
                   )}
-                  {active && (
+                  {!readOnly && active && (
                     <button
                       onClick={() => void handleKill(job)}
                       disabled={killingId === job.id}
@@ -2806,6 +2818,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                   return { label: 'evidence', value: c };
                 };
 
+                if (readOnly) return null;
                 return (
                   <div className="mt-1.5" data-testid="compute-ask-section">
                     <form
@@ -2978,7 +2991,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
         </div>
       )}
 
-      {pendingKill && (
+      {!readOnly && pendingKill && (
         <ConfirmDialog
           title="Kill compute job"
           message={`Kill compute job for "${pendingKill.task_title ?? pendingKill.id}"? This stops the running VM immediately.`}

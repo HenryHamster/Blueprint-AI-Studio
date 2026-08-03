@@ -1,11 +1,15 @@
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
-import { act } from 'react';
+import { act, type ComponentProps } from 'react';
 import { screen } from '@testing-library/react';
-import { DashboardHome } from './DashboardHome';
+import { DashboardHome as DashboardHomeComponent } from './DashboardHome';
 import { expectNoOverflowAt, expectNoTextTruncationAt, expectMinTouchTargetAt } from '../test/viewport';
 import { apiFetch } from '../api';
 import type { Task } from '../types/task';
+
+function DashboardHome(props: ComponentProps<typeof DashboardHomeComponent>) {
+  return <DashboardHomeComponent {...props} userRole={props.userRole ?? 'admin'} />;
+}
 
 const now = Date.now();
 // 'task-abc' matches the task_id in the mocked /digest recent_completions payload.

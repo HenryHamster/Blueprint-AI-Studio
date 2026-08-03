@@ -2,8 +2,14 @@ import { afterEach, describe, test, vi, expect } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { OrchestratorHealthBar } from '../components/OrchestratorHealthBar';
-import { MessagesPanel } from '../components/MessagesPanel';
+import { MessagesPanel as MessagesPanelComponent, type MessagesPanelProps } from '../components/MessagesPanel';
+
 import { expectNoOverflowAt } from './viewport';
+
+type MessagesPanelTestProps = Omit<MessagesPanelProps, 'canOperateProject'> & { canOperateProject?: boolean };
+function MessagesPanel(props: MessagesPanelTestProps) {
+  return <MessagesPanelComponent canOperateProject={true} {...props} />;
+}
 
 vi.mock('../firebase', () => ({
   auth: { currentUser: null, onAuthStateChanged: () => () => {} },

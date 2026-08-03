@@ -2583,6 +2583,7 @@ async def _spawn_resident_strategic_task(
     project: Project,
     runner_id: str | None,
     *,
+    operator_user_id: str,
     session_id: str,
     worker_generation: int = 1,
     exam_ledger: str | None = None,
@@ -2656,6 +2657,7 @@ async def _spawn_resident_strategic_task(
         # pre-building it at spawn time is unnecessary — the born-context flags +
         # runner pin still ride in via ``extra_context``.
         resident_minimal=True,
+        launched_by_user_id=str(operator_user_id),
     )
     # Recover ONLY the task born from this exact session/generation claim. A
     # cadence task can appear after the pre-claim adoption hint and make the
@@ -3742,6 +3744,7 @@ async def start_resident_session(
                 ) as locked_task:
                     if _task_is_adoptable(locked_task):
                         task = locked_task
+                        task.launched_by_user_id = str(operator_user_id)
                         _stamp_resident_context(
                             task,
                             session_id=session_id,
@@ -3806,6 +3809,7 @@ async def start_resident_session(
                 session,
                 project,
                 effective_runner_id,
+                operator_user_id=str(operator_user_id),
                 session_id=session_id,
                 worker_generation=worker_generation,
                 exam_ledger=carried_exam_ledger,

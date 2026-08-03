@@ -7,54 +7,74 @@ function accessProps(overrides: Partial<SettingsSectionRouterProps> = {}): Setti
     activeSection: 'access',
     isAdmin: true,
     selectedProjectId: 'project-1',
-    selectedProjectMyRole: 'owner',
+    selectedProjectRole: 'owner',
     showUserManagement: false,
     onToggleUserManagement: vi.fn(),
-    showProjectMembers: false,
-    onToggleProjectMembers: vi.fn(),
+    projectMembers: [],
+    projectMembersProjectId: 'project-1',
+    onLoadProjectMembers: vi.fn(),
+    onActivateProjectMembers: vi.fn(),
+    onAddProjectMember: vi.fn(),
+    onUpdateProjectMemberRole: vi.fn(),
+    onRemoveProjectMember: vi.fn(),
     onToggleSettings: vi.fn(),
     ...overrides,
   } as SettingsSectionRouterProps;
 }
 
 describe('SettingsSectionRouter access actions', () => {
-  test('closes the legacy modal host by default when opening project members', () => {
-    const onToggleProjectMembers = vi.fn();
-    const onToggleSettings = vi.fn();
+  test('embeds project member management in Access and loads the selected project', () => {
+    const onLoadProjectMembers = vi.fn();
 
     render(
       <SettingsSectionRouter
-        {...accessProps({ onToggleProjectMembers, onToggleSettings })}
+        {...accessProps({ onLoadProjectMembers })}
       />,
     );
 
-    fireEvent.click(screen.getByTestId('toggle-project-members'));
-
-    expect(onToggleProjectMembers).toHaveBeenCalledOnce();
-    expect(onToggleSettings).toHaveBeenCalledOnce();
+    expect(screen.getByRole('heading', { name: 'Project Members' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Invite' })).toBeInTheDocument();
+    expect(onLoadProjectMembers).toHaveBeenCalledWith('project-1');
   });
 
-  test('uses explicit modal host close callback when provided', () => {
-    const onToggleProjectMembers = vi.fn();
-    const onToggleSettings = vi.fn();
-    const onCloseHost = vi.fn();
+  test('deactivates project member state when leaving Access', () => {
+    const onActivateProjectMembers = vi.fn();
 
-    render(
+    const { unmount } = render(
+      <SettingsSectionRouter
+        {...accessProps({ onActivateProjectMembers })}
+      />,
+    );
+
+    unmount();
+
+    expect(onActivateProjectMembers).toHaveBeenCalledWith(null);
+  });
+
+  test('resets invitation state when the selected project changes', () => {
+    const onLoadProjectMembers = vi.fn();
+    const { rerender } = render(
+      <SettingsSectionRouter
+        {...accessProps({ onLoadProjectMembers })}
+      />,
+    );
+
+    fireEvent.change(screen.getByPlaceholderText('user@example.com'), {
+      target: { value: 'project-one@example.com' },
+    });
+
+    rerender(
       <SettingsSectionRouter
         {...accessProps({
-          hostKind: 'modal',
-          onCloseHost,
-          onToggleProjectMembers,
-          onToggleSettings,
+          selectedProjectId: 'project-2',
+          projectMembersProjectId: 'project-2',
+          onLoadProjectMembers,
         })}
       />,
     );
 
-    fireEvent.click(screen.getByTestId('toggle-project-members'));
-
-    expect(onToggleProjectMembers).toHaveBeenCalledOnce();
-    expect(onCloseHost).toHaveBeenCalledOnce();
-    expect(onToggleSettings).not.toHaveBeenCalled();
+    expect(screen.getByPlaceholderText('user@example.com')).toHaveValue('');
+    expect(onLoadProjectMembers).toHaveBeenLastCalledWith('project-2');
   });
 
   test('keeps explicit workspace hosts open when opening user management', () => {
@@ -84,21 +104,38 @@ describe('SettingsSectionRouter access actions', () => {
       />,
     );
 
-    expect(screen.queryByTestId('toggle-project-members')).toBeNull();
+    expect(screen.queryByRole('heading', { name: 'Project Members' })).toBeNull();
     expect(screen.getByRole('button', { name: 'Manage Users' })).toBeInTheDocument();
   });
 
   test('hides project member management for non-owner project members', () => {
+    const onLoadProjectMembers = vi.fn();
     render(
       <SettingsSectionRouter
         {...accessProps({
           isAdmin: false,
-          selectedProjectMyRole: 'member',
+          selectedProjectRole: 'member',
+          onLoadProjectMembers,
         })}
       />,
     );
 
-    expect(screen.queryByTestId('toggle-project-members')).toBeNull();
+    expect(screen.queryByRole('heading', { name: 'Project Members' })).toBeNull();
     expect(screen.getByText('No access management options are available for your current role.')).toBeInTheDocument();
+    expect(onLoadProjectMembers).not.toHaveBeenCalled();
+  });
+
+  test('does not let platform admin status substitute for project ownership', () => {
+    render(
+      <SettingsSectionRouter
+        {...accessProps({
+          isAdmin: true,
+          selectedProjectRole: 'member',
+        })}
+      />,
+    );
+
+    expect(screen.queryByRole('heading', { name: 'Project Members' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Manage Users' })).toBeInTheDocument();
   });
 });

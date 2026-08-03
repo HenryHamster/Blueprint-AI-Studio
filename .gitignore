@@ -42,6 +42,8 @@ backend/.testmondata*
 /fail
 /fetch
 /symbols
+/compute-image
+/artifacts
 /viewport-snapshot
 /viewport-live
 research-*.md

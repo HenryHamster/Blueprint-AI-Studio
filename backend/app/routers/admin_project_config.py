@@ -14,7 +14,7 @@ from typing import Dict, Any
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func
+from sqlalchemy import and_, case, func
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.orm import load_only
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,6 +24,7 @@ from pydantic import ValidationError
 from app.database import get_session
 from app.models import (
     DeploymentState,
+    LocalRunner,
     Task,
     TaskStatus,
     _utcnow,
@@ -34,6 +35,9 @@ from app.vm_cost_rates import (
 )
 from app.auth import get_current_user, require_admin
 from app.admin import _get_user_project_with_role
+from app.max_plan_pool import get_project_account_usage
+from app.runner_project_binding import runner_allowed_for_project
+from app.runner_health_monitors import _get_liveness_seconds
 from app.resource_envelope import (
     assess_ceiling_gate_trustworthiness,
     get_project_recent_spend_usd,
@@ -1334,6 +1338,121 @@ async def update_staging_branch_prefixes_config(
 # ---------------------------------------------------------------------------
 # Resource-envelope config endpoints
 # ---------------------------------------------------------------------------
+
+
+def _sum_enabled_account_cap(
+    usage: list[dict[str, Any]], field: str
+) -> int | None:
+    """Sum an owner-pool cap without pretending an unbounded pool is bounded."""
+    enabled = [entry for entry in usage if entry.get("enabled", True)]
+    if not enabled or any(entry.get(field) is None for entry in enabled):
+        return None
+    return sum(int(entry[field]) for entry in enabled)
+
+
+def _account_resource_summary(usage: list[dict[str, Any]]) -> dict[str, int | None]:
+    """Reduce sensitive account rows to a viewer-safe project aggregate."""
+    enabled = [entry for entry in usage if entry.get("enabled", True)]
+    enabled_below_cap = 0
+    at_cap = 0
+    for entry in enabled:
+        global_daily_cap = entry.get("global_daily_task_cap")
+        global_concurrent_cap = entry.get("global_max_concurrent_tasks")
+        at_global_daily_cap = global_daily_cap is not None and int(
+            entry.get("global_daily_task_count") or 0
+        ) >= int(global_daily_cap)
+        at_global_concurrent_cap = global_concurrent_cap is not None and int(
+            entry.get("global_active_tasks") or 0
+        ) >= int(global_concurrent_cap)
+        entry_at_cap = bool(entry.get("at_project_cap")) or (
+            at_global_daily_cap or at_global_concurrent_cap
+        )
+        if entry_at_cap:
+            at_cap += 1
+        else:
+            enabled_below_cap += 1
+
+    return {
+        "total": len(usage),
+        "enabled": len(enabled),
+        # This is intentionally NOT named "available": model-specific runtime
+        # readiness/cooldowns are resolved only during task dispatch. This
+        # aggregate makes the narrower, side-effect-free claim that an enabled
+        # owner account is below its configured numeric caps.
+        "enabled_below_cap": enabled_below_cap,
+        "at_cap": at_cap,
+        "project_active_tasks": sum(
+            int(entry.get("project_active_tasks") or 0) for entry in usage
+        ),
+        "project_daily_task_count": sum(
+            int(entry.get("project_daily_task_count") or 0) for entry in usage
+        ),
+        "project_daily_task_cap": _sum_enabled_account_cap(
+            usage, "project_daily_task_cap"
+        ),
+        "project_max_concurrent_tasks": _sum_enabled_account_cap(
+            usage, "project_max_concurrent_tasks"
+        ),
+    }
+
+
+@router.get("/projects/{project_id}/resource-summary")
+async def get_project_resource_summary(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return viewer-safe aggregate execution capacity for a project."""
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "viewer"
+    )
+
+    # Execution capacity belongs to the project owner, regardless of which
+    # member launches work or reads this projection.
+    account_usage = get_project_account_usage(str(project.id), project.user_id)
+    runner_liveness_cutoff = _utcnow() - timedelta(
+        seconds=_get_liveness_seconds()
+    )
+    runner_counts = (
+        await session.execute(
+            select(
+                func.count(LocalRunner.id).label("total"),
+                func.sum(
+                    case(
+                        (
+                            and_(
+                                LocalRunner.status == "active",
+                                LocalRunner.last_seen_at.is_not(None),
+                                LocalRunner.last_seen_at >= runner_liveness_cutoff,
+                            ),
+                            1,
+                        ),
+                        else_=0,
+                    )
+                ).label("online"),
+            ).where(
+                runner_allowed_for_project(project_id),
+                LocalRunner.status != "deleted",
+            )
+        )
+    ).one()
+    runner_total = int(runner_counts.total or 0)
+    runner_online = int(runner_counts.online or 0)
+
+    return {
+        "project_id": str(project.id),
+        "policy": {
+            "execution_resources": "project owner",
+            "attribution": "launcher",
+            "managed_by": "owner",
+        },
+        "accounts": _account_resource_summary(account_usage),
+        "runners": {
+            "total": runner_total,
+            "online": runner_online,
+            "offline": runner_total - runner_online,
+        },
+    }
 
 
 @router.get("/projects/{project_id}/resource-envelope")

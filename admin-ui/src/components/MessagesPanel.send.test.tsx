@@ -2,12 +2,18 @@ import { describe, test, expect, vi, afterEach, beforeEach } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { fireEvent, waitFor } from '@testing-library/react';
-import { MessagesPanel, type MessagesPanelProps } from './MessagesPanel';
+import { MessagesPanel as MessagesPanelComponent, type MessagesPanelProps } from './MessagesPanel';
+
 import type { ProjectMessage } from './MessageBubble';
 import { armingToastCopy, armingHintCopy, type ArmingOutcome } from './messageArming';
 import { auth } from '../firebase';
 import { loadComposerDraft } from '../utils/conversationDraftState';
 import type { StrategicStateResponse } from '../strategicStateApi';
+
+type MessagesPanelTestProps = Omit<MessagesPanelProps, 'canOperateProject'> & { canOperateProject?: boolean };
+function MessagesPanel(props: MessagesPanelTestProps) {
+  return <MessagesPanelComponent canOperateProject={true} {...props} />;
+}
 
 // Full replacement (NOT a partial mock): the real `../firebase` calls
 // initializeApp()/getAuth() at module load, which we must not run in jsdom.
@@ -1178,6 +1184,69 @@ describe('MessagesPanel attachment integration', () => {
     await waitFor(() => {
       expect(el.textContent).toContain('test.txt');
     });
+  });
+
+  test('a downgrade while attachment upload is in flight performs no durable message write', async () => {
+    let resolveUpload: (response: Response) => void = () => {};
+    const uploadResponse = new Promise<Response>(resolve => { resolveUpload = resolve; });
+    const fallbackFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn((url: RequestInfo | URL, init?: RequestInit) => {
+      if (String(url) === 'https://storage.googleapis.com/signed-upload') return uploadResponse;
+      return fallbackFetch(url, init);
+    }) as typeof globalThis.fetch;
+    const durableMessageWrites: string[] = [];
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (urlStr.includes('/strategic-conversation') && method === 'GET') {
+        return new Response(JSON.stringify({ conversation: { limit: 100, has_more: false, items: [] } }), { status: 200 });
+      }
+      if (urlStr.includes('/attachment-upload-url') && method === 'POST') {
+        return new Response(JSON.stringify({
+          upload_url: 'https://storage.googleapis.com/signed-upload',
+          download_url: 'https://storage.googleapis.com/signed-download',
+          storage_uri: 'gs://bucket/revoked-upload',
+          attachment_id: 'revoked-upload',
+          size_bytes: JSON.parse(String((init as RequestInit).body)).size_bytes,
+        }), { status: 200 });
+      }
+      if ((urlStr.includes('/strategic-session/messages') || /\/api\/admin\/messages(?:\?|$)/.test(urlStr)) && method === 'POST') {
+        durableMessageWrites.push(urlStr);
+      }
+      return new Response(JSON.stringify({ messages: [] }), { status: 200 });
+    });
+    const el = await renderPanel(vi.fn(), { filterChrome: 'minimal', canOperateProject: true });
+    await attachFile(el, 'revoked.txt', 'private bytes', 'text/plain');
+    fireEvent.change(el.querySelector('textarea')!, { target: { value: 'Do not commit after downgrade' } });
+    fireEvent.click(el.querySelector('button[aria-label="Send message"]')!);
+    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalledWith(
+      'https://storage.googleapis.com/signed-upload',
+      expect.anything(),
+    ));
+
+    await act(async () => {
+      root!.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          canOperateProject={false}
+          filterChrome="minimal"
+          onClose={() => {}}
+          addToast={vi.fn() as never}
+          onMessageCountChange={() => {}}
+        />,
+      );
+    });
+    await act(async () => {
+      resolveUpload(new Response(null, { status: 200 }));
+      await uploadResponse;
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(durableMessageWrites).toEqual([]);
   });
 
   test('failed add retains a pre-existing identity owned by text and reply context', async () => {

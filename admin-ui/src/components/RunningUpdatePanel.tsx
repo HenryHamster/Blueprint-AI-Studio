@@ -6,6 +6,7 @@ import { MarkdownContent } from './MarkdownContent';
 import type { RunningUpdateReconciliation } from '../types';
 
 interface RunningUpdatePanelProps {
+  readOnly?: boolean;
   projectId: string;
   document: string | null;
   acknowledgedAt: string | null;
@@ -17,6 +18,7 @@ interface RunningUpdatePanelProps {
 }
 
 export default function RunningUpdatePanel({
+  readOnly = true,
   projectId,
   document,
   acknowledgedAt,
@@ -36,6 +38,7 @@ export default function RunningUpdatePanel({
   const showReconciledBadge = operatorWins > 0;
 
   function startEditing() {
+    if (readOnly) return;
     setDraft(document ?? '');
     setEditing(true);
   }
@@ -46,7 +49,7 @@ export default function RunningUpdatePanel({
   }
 
   const handleSave = useCallback(async () => {
-    if (saving) return;
+    if (readOnly || saving) return;
     setSaving(true);
     try {
       const res = await apiFetch(
@@ -78,10 +81,10 @@ export default function RunningUpdatePanel({
     } finally {
       setSaving(false);
     }
-  }, [projectId, draft, document, saving, addToast, onEdited]);
+  }, [projectId, draft, document, readOnly, saving, addToast, onEdited]);
 
   const handleAcknowledge = useCallback(async () => {
-    if (acknowledging) return;
+    if (readOnly || acknowledging) return;
     setAcknowledging(true);
     try {
       const res = await apiFetch(
@@ -100,7 +103,7 @@ export default function RunningUpdatePanel({
     } finally {
       setAcknowledging(false);
     }
-  }, [projectId, acknowledging, addToast, onAcknowledged]);
+  }, [projectId, readOnly, acknowledging, addToast, onAcknowledged]);
 
   return (
     <div className="flex flex-col h-full">
@@ -146,7 +149,7 @@ export default function RunningUpdatePanel({
             </div>
           )}
         </div>
-        <div className="shrink-0 flex items-center gap-2">
+        {!readOnly && <div className="shrink-0 flex items-center gap-2">
           {!editing && (
             <button
               type="button"
@@ -166,12 +169,12 @@ export default function RunningUpdatePanel({
             <Check size={12} />
             {acknowledging ? 'Acknowledging…' : 'Acknowledge'}
           </button>
-        </div>
+        </div>}
       </div>
 
       {/* Document */}
       <div className="flex-1 overflow-y-auto custom-scrollbar px-4 py-3">
-        {editing && (
+        {!readOnly && editing && (
           <div className="flex flex-col gap-3">
             <textarea
               value={draft}
@@ -202,7 +205,7 @@ export default function RunningUpdatePanel({
             </div>
           </div>
         )}
-        {!editing && !hasContent && (
+        {(!editing || readOnly) && !hasContent && (
           <div className="text-center py-12 text-neutral-500 text-sm">
             <p>No running update yet.</p>
             <p className="text-xs mt-1 text-neutral-600">
@@ -210,7 +213,7 @@ export default function RunningUpdatePanel({
             </p>
           </div>
         )}
-        {!editing && hasContent && document && (
+        {(!editing || readOnly) && hasContent && document && (
           <div className="prose-sm max-w-none">
             <MarkdownContent content={document} />
           </div>

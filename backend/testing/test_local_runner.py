@@ -2738,6 +2738,7 @@ class TestRunnerEndpoints:
             status=TaskStatus.PROVISIONING,
             vm_instance_id=f"runner:{runner.id}",
             context={"runner_target_id": str(runner.id)},
+            launched_by_user_id="member-user-999",
         )
         db_session.add(task_instance)
         await db_session.commit()
@@ -2757,12 +2758,13 @@ class TestRunnerEndpoints:
             settings={},
         )
 
+        select_mock = AsyncMock(return_value=mock_selection)
         with patch(
             "app.shared_state.runtime_config",
             new={"provider_selection_mode": "exclusive"},
         ), patch(
             "app.max_plan_pool.select_llm_runtime_for_task",
-            new=AsyncMock(return_value=mock_selection),
+            new=select_mock,
         ):
             resp = await client.post(
                 "/api/runner/next-task",
@@ -2779,6 +2781,9 @@ class TestRunnerEndpoints:
         env = creds["env"]
         assert env.get("PROVIDER") == "anthropic"
         assert env.get("AUTH_MODE") == "oauth"
+        # The member remains task attribution only. Local claim credentials
+        # always come from the project owner's execution-resource pool.
+        assert select_mock.await_args.kwargs["user_id"] == project.user_id
         # Provider-specific secret should be present in the llm_env.
         assert env.get("CLAUDE_CODE_OAUTH_TOKEN") == "sk-ant-test-token"
 

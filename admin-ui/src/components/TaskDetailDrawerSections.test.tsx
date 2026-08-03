@@ -1,6 +1,6 @@
 import { act } from 'react';
-import { createRoot } from 'react-dom/client';
-import { describe, expect, test, vi } from 'vitest';
+import { createRoot, type Root } from 'react-dom/client';
+import { afterAll, afterEach, beforeAll, describe, expect, test, vi } from 'vitest';
 import {
   TaskComputeJobsSection,
   ResearchOriginSection,
@@ -36,6 +36,14 @@ vi.mock('../firebase', () => ({
   getIdToken: vi.fn(async () => 'test-token'),
   getIdTokenAfterAuthRestore: vi.fn(async () => 'test-token'),
   onAuthChange: vi.fn(() => () => {}),
+}));
+
+// These section tests verify when fetched document content is surfaced, not
+// the independently-covered lazy Markdown renderer. Keeping this boundary
+// synchronous avoids making the fetch-state assertion depend on code-split
+// module scheduling under the full Vitest suite.
+vi.mock('./MarkdownContent', () => ({
+  MarkdownContent: ({ content }: { content: string }) => <div>{content}</div>,
 }));
 
 vi.mock('../api', async () => {
@@ -79,10 +87,32 @@ function makeTask(overrides: Partial<Task> = {}): Task {
 // Render helper
 // ---------------------------------------------------------------------------
 
+const mountedRoots: Array<{ host: HTMLElement; root: Root }> = [];
+const reactActEnvironment = globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean };
+const previousActEnvironment = reactActEnvironment.IS_REACT_ACT_ENVIRONMENT;
+
+beforeAll(() => {
+  reactActEnvironment.IS_REACT_ACT_ENVIRONMENT = true;
+});
+
+afterEach(() => {
+  const mounted = mountedRoots.splice(0);
+  act(() => {
+    mounted.forEach(({ root }) => root.unmount());
+  });
+  mounted.forEach(({ host }) => host.remove());
+  vi.clearAllMocks();
+});
+
+afterAll(() => {
+  reactActEnvironment.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
+});
+
 function render(element: React.ReactElement): HTMLElement {
   const host = document.createElement('div');
   document.body.appendChild(host);
   const root = createRoot(host);
+  mountedRoots.push({ host, root });
   act(() => { root.render(element); });
   return host;
 }
@@ -385,7 +415,9 @@ describe('KnowledgeDocumentSection', () => {
     const btn = host.querySelector('button');
     expect(btn).not.toBeNull();
     expect(host.textContent).toContain('View document');
-    act(() => { btn!.click(); });
+    act(() => {
+      btn!.click();
+    });
     await act(async () => {
       resolveDocument({ id: 'doc-body', body: 'Document body content' });
       await fullDocument;

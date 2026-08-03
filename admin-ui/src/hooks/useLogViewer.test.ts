@@ -43,6 +43,8 @@ function setup(options: {
   selectedProjectId?: string | null;
   realtimeWsEnabled?: boolean;
   strategicReadModelRef?: MutableRefObject<StrategicStateResponse | null>;
+  canViewProject?: boolean;
+  isAdmin?: boolean;
 } = {}) {
   return renderHook(() => {
     const fetchTasksRef = useRef<() => void>(vi.fn());
@@ -63,6 +65,8 @@ function setup(options: {
       selectedProjectId: options.selectedProjectId,
       realtimeWsEnabled: options.realtimeWsEnabled,
       strategicReadModelRef: options.strategicReadModelRef,
+      canViewProject: options.canViewProject ?? true,
+      isAdmin: options.isAdmin ?? true,
     });
     return { lv, fetchTasksRef, fetchDirectionsRef, refreshStrategicReadModelRef, refreshMessagesRef, fetchAlertsRef, refreshFleetRunnersRef };
   });
@@ -211,6 +215,24 @@ describe('useLogViewer strategist events', () => {
     expect(refreshMessages).toHaveBeenCalledTimes(1);
   });
 
+  it('does not fetch global failing-task-types for non-admin websocket activity', async () => {
+    setup({ selectedProjectId: 'proj-live', isAdmin: false });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const ws = MockWebSocket.instances[0];
+    act(() => { ws.onopen?.({}); });
+    act(() => {
+      ws.emit({ event: 'type_throttle', data: { project_id: 'proj-live', type: 'create' } });
+      ws.emit({ event: 'type_unthrottle', data: { project_id: 'proj-live', type: 'create' } });
+    });
+    await act(async () => { await Promise.resolve(); });
+
+    expect(failingTaskTypesFetchCount).toBe(0);
+  });
+
   it('reconciles a canonical message projection immediately instead of waiting for the debounce', async () => {
     const { result } = setup({ selectedProjectId: 'proj-live' });
     await act(async () => {
@@ -317,6 +339,7 @@ describe('useLogViewer strategist events', () => {
           refreshMessagesRef,
           selectedProjectId: 'proj-live',
           realtimeWsEnabled: enabled,
+          canViewProject: true,
         });
       },
       { initialProps: { enabled: false } },
@@ -362,6 +385,59 @@ describe('useLogViewer strategist events', () => {
     expect(result.current.lv.wsConnected).toBe(true);
   });
 
+  it('closes a tracked project stream and ignores late events after view access is revoked', async () => {
+    const { result, rerender } = renderHook(
+      ({ canViewProject }: { canViewProject: boolean }) => {
+        const fetchTasksRef = useRef<() => void>(vi.fn());
+        const fetchDirectionsRef = useRef<() => void>(vi.fn());
+        const refreshMessagesRef = useRef<() => void>(vi.fn());
+        const setDeployState = vi.fn();
+        const lv = useLogViewer({
+          fetchTasksRef,
+          setDeployState,
+          fetchDirectionsRef,
+          refreshMessagesRef,
+          selectedProjectId: 'proj-live',
+          canViewProject,
+        });
+        return { lv, fetchTasksRef, fetchDirectionsRef, refreshMessagesRef };
+      },
+      { initialProps: { canViewProject: true } },
+    );
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const ws = MockWebSocket.instances[0];
+    act(() => { ws.onopen?.({}); });
+    act(() => {
+      result.current.lv.trackTask({ id: 'task-1', project_id: 'proj-live', status: 'IN_PROGRESS', title: 'T' } as never);
+    });
+    const fetchTasks = result.current.fetchTasksRef.current as ReturnType<typeof vi.fn>;
+    const fetchDirections = result.current.fetchDirectionsRef.current as ReturnType<typeof vi.fn>;
+    const refreshMessages = result.current.refreshMessagesRef.current as ReturnType<typeof vi.fn>;
+    fetchTasks.mockClear();
+    fetchDirections.mockClear();
+    refreshMessages.mockClear();
+    const ticketRequestsBeforeRevocation = fetchSpy.mock.calls.filter(([url]) => String(url).includes('/ws-ticket')).length;
+
+    act(() => { rerender({ canViewProject: false }); });
+    expect(ws.close).toHaveBeenCalled();
+    act(() => {
+      ws.emit({ event: 'task_updated', data: { task_id: 'task-1', status: 'COMPLETED' } });
+      ws.emit({ event: 'strategic_message_created', data: { project_id: 'proj-live' } });
+      ws.onclose?.({ code: 1006, reason: 'late network close' });
+      vi.advanceTimersByTime(35_000);
+    });
+
+    expect(fetchTasks).not.toHaveBeenCalled();
+    expect(fetchDirections).not.toHaveBeenCalled();
+    expect(refreshMessages).not.toHaveBeenCalled();
+    expect(MockWebSocket.instances).toHaveLength(1);
+    expect(fetchSpy.mock.calls.filter(([url]) => String(url).includes('/ws-ticket'))).toHaveLength(ticketRequestsBeforeRevocation);
+  });
+
   it('does not close a tracked task stream when the selected project changes', async () => {
     const { result, rerender } = renderHook(
       ({ pid }: { pid: string | null }) => {
@@ -369,7 +445,7 @@ describe('useLogViewer strategist events', () => {
         const fetchDirectionsRef = useRef<() => void>(vi.fn());
         const refreshMessagesRef = useRef<() => void>(vi.fn());
         const setDeployState = vi.fn();
-        const lv = useLogViewer({ fetchTasksRef, setDeployState, fetchDirectionsRef, refreshMessagesRef, selectedProjectId: pid });
+        const lv = useLogViewer({ fetchTasksRef, setDeployState, fetchDirectionsRef, refreshMessagesRef, selectedProjectId: pid, canViewProject: true, isAdmin: true });
         return { lv };
       },
       { initialProps: { pid: 'projA' as string | null } },
@@ -399,7 +475,7 @@ describe('useLogViewer strategist events', () => {
         const fetchDirectionsRef = useRef<() => void>(vi.fn());
         const refreshMessagesRef = useRef<() => void>(vi.fn());
         const setDeployState = vi.fn();
-        const lv = useLogViewer({ fetchTasksRef, setDeployState, fetchDirectionsRef, refreshMessagesRef, selectedProjectId: pid });
+        const lv = useLogViewer({ fetchTasksRef, setDeployState, fetchDirectionsRef, refreshMessagesRef, selectedProjectId: pid, canViewProject: true });
         return { lv };
       },
       { initialProps: { pid: 'projA' as string | null } },
@@ -478,6 +554,7 @@ describe('useLogViewer strategist events', () => {
           refreshMessagesRef,
           selectedProjectId: 'projB',
           realtimeWsEnabled: enabled,
+          canViewProject: true,
         });
         return { lv };
       },
@@ -526,6 +603,7 @@ describe('useLogViewer strategist events', () => {
           refreshMessagesRef,
           selectedProjectId: 'projB',
           realtimeWsEnabled: enabled,
+          canViewProject: true,
         });
         return { lv };
       },
@@ -565,7 +643,7 @@ describe('useLogViewer strategist events', () => {
         const fetchDirectionsRef = useRef<() => void>(vi.fn());
         const refreshMessagesRef = useRef<() => void>(vi.fn());
         const setDeployState = vi.fn();
-        const lv = useLogViewer({ fetchTasksRef, setDeployState, fetchDirectionsRef, refreshMessagesRef, selectedProjectId: pid });
+        const lv = useLogViewer({ fetchTasksRef, setDeployState, fetchDirectionsRef, refreshMessagesRef, selectedProjectId: pid, canViewProject: true });
         return { lv };
       },
       { initialProps: { pid: 'projA' as string | null } },
@@ -777,7 +855,7 @@ describe('useLogViewer strategist events', () => {
         const fetchDirectionsRef = useRef<() => void>(vi.fn());
         const refreshMessagesRef = useRef<() => void>(vi.fn());
         const setDeployState = vi.fn();
-        return useLogViewer({ fetchTasksRef, setDeployState, fetchDirectionsRef, refreshMessagesRef, selectedProjectId: pid });
+        return useLogViewer({ fetchTasksRef, setDeployState, fetchDirectionsRef, refreshMessagesRef, selectedProjectId: pid, canViewProject: true });
       },
       { initialProps: { pid: 'projA' as string | null } },
     );
@@ -1143,7 +1221,7 @@ describe('useLogViewer strategist events', () => {
         const fetchTasksRef = useRef<() => void>(vi.fn());
         const fetchDirectionsRef = useRef<() => void>(vi.fn());
         const setDeployState = vi.fn();
-        const lv = useLogViewer({ fetchTasksRef, setDeployState, fetchDirectionsRef, selectedProjectId: pid });
+        const lv = useLogViewer({ fetchTasksRef, setDeployState, fetchDirectionsRef, selectedProjectId: pid, canViewProject: true });
         return { lv, fetchDirectionsRef };
       },
       { initialProps: { pid: 'projA' as string | null } },
@@ -1406,7 +1484,7 @@ describe('useLogViewer strategist events', () => {
         const fetchDirectionsRef = useRef<() => void>(vi.fn());
         const refreshMessagesRef = useRef<() => void>(vi.fn());
         const setDeployState = vi.fn();
-        const lv = useLogViewer({ fetchTasksRef, setDeployState, fetchDirectionsRef, refreshMessagesRef, selectedProjectId: pid });
+        const lv = useLogViewer({ fetchTasksRef, setDeployState, fetchDirectionsRef, refreshMessagesRef, selectedProjectId: pid, canViewProject: true, isAdmin: true });
         return { lv };
       },
       { initialProps: { pid: 'projA' as string | null } },

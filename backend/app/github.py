@@ -13,6 +13,7 @@ Client lifecycle is managed by app.lifecycle (init on startup, close on shutdown
 
 import asyncio
 import contextlib
+import hashlib
 import random
 import re as _re
 from datetime import datetime
@@ -41,12 +42,13 @@ GITHUB_CLIENT_SECRET = os.getenv("GITHUB_CLIENT_SECRET")
 _github_client: httpx.AsyncClient | None = None
 
 # Single-flight read coalescing: concurrent bodyless GETs to the identical URL
-# share ONE in-flight request (keyed by ("GET", url)) instead of each hitting
+# share ONE in-flight request (keyed by URL and a one-way credential identity)
+# instead of each hitting
 # GitHub. Safe for every read — a coalesced waiter never sees anything staler
 # than a live request would. Collapses the ~50-VM fan-out that hammers a shared
 # ref (e.g. every rollup parent reading automain's tip in the same sweep), a
 # dominant install-token-budget drain.
-_inflight_reads: dict[tuple[str, str], "asyncio.Future[httpx.Response]"] = {}
+_inflight_reads: dict[tuple[str, str, str], "asyncio.Future[httpx.Response]"] = {}
 
 # File-content cache: memoizes get_file_text_at_ref results by
 # (owner, repo, ref, path) for a short TTL, but only when ``ref`` is a full
@@ -423,6 +425,25 @@ def _synthetic_rate_limited_response(bucket: dict) -> httpx.Response:
     )
 
 
+def is_github_rate_limited_response(response: httpx.Response) -> bool:
+    """Recognize GitHub primary/secondary limits without conflating permission 403s."""
+
+    return response.status_code == 429 or (
+        response.status_code == 403
+        and (
+            response.headers.get("X-RateLimit-Remaining") == "0"
+            or response.headers.get("Retry-After") is not None
+        )
+    )
+
+
+def _github_auth_fingerprint(headers: dict | None) -> str:
+    """Return a non-reversible single-flight identity; never retain the credential."""
+
+    authorization = (headers or {}).get("Authorization", "")
+    return hashlib.sha256(authorization.encode("utf-8")).hexdigest()
+
+
 async def _github_request(
     method: str,
     url: str,
@@ -453,7 +474,9 @@ async def _github_request(
         return await _github_request_uncoalesced(
             method, url, headers, max_retries, project_id, consumer=consumer, **kwargs
         )
-    key = ("GET", url)
+    # The same URL can return different repository sets and permissions for two
+    # user/App credentials. Coalesce only within one credential identity.
+    key = ("GET", url, _github_auth_fingerprint(headers))
     existing = _inflight_reads.get(key)
     if existing is not None:
         import app.shared_state as _ss
@@ -520,13 +543,7 @@ async def _github_request_uncoalesced(
             # exhaustion (5,000 req/hr) and 429 for secondary/search limits.
             # Secondary abuse limits return 403 + Retry-After WITHOUT
             # X-RateLimit-Remaining: 0, so also treat 403 + Retry-After as retriable.
-            is_rate_limited = response.status_code == 429 or (
-                response.status_code == 403
-                and (
-                    response.headers.get("X-RateLimit-Remaining") == "0"
-                    or response.headers.get("Retry-After") is not None
-                )
-            )
+            is_rate_limited = is_github_rate_limited_response(response)
             if is_rate_limited and attempt < max_retries - 1:
                 retry_after = response.headers.get("Retry-After")
                 reset_ts = response.headers.get("X-RateLimit-Reset")

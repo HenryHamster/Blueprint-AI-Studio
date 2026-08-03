@@ -1160,9 +1160,17 @@ def _all_accounts() -> List[Dict[str, Any]]:
 
 async def load_max_plan_pool():
     """Load Max plan accounts from database into per-user pools on startup.
-    Reconciles active_tasks from DB by counting tasks currently PROVISIONING/IN_PROGRESS."""
+    Reconcile active slots from durable task state.
+
+    PROVISIONING/IN_PROGRESS tasks own their normal runtime-account slot.  A
+    QUEUED task owns a slot only while it carries the warm-pool reservation
+    marker written in the same transaction as its pool lease.  Including that
+    marker is important on restart: rebuilding the in-memory pool must not make
+    a handed-off-but-not-yet-claimed slot available a second time.
+    """
     from sqlmodel import select as sql_select
     from app.models import MaxPlanAccount, Project, Task, TaskStatus
+    from app.warm_pool import WARM_POOL_RESERVATION_ACCOUNT_KEY
 
     async with AsyncSessionLocal() as session:
         result = await session.execute(sql_select(MaxPlanAccount))
@@ -1175,13 +1183,20 @@ async def load_max_plan_pool():
             for p in (await session.execute(sql_select(Project.id))).scalars().all()
         }
 
-        # Count actually active tasks per account to reconcile after restarts
+        # Count actually active tasks plus durable QUEUED warm-pool handoffs to
+        # reconcile after restarts/rebuilds.
         active_tasks = (
             (
                 await session.execute(
                     sql_select(Task).where(
                         Task.status.in_(
                             [TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]
+                        )
+                        | (
+                            (Task.status == TaskStatus.QUEUED)
+                            & Task.context[
+                                WARM_POOL_RESERVATION_ACCOUNT_KEY
+                            ].as_string().isnot(None)
                         )
                     )
                 )
@@ -1192,7 +1207,17 @@ async def load_max_plan_pool():
         active_per_account: Dict[str, int] = {}
         active_per_account_project: Dict[str, Dict[str, int]] = {}
         for t in active_tasks:
-            acct_id = get_task_llm_account_id(t)
+            if t.status == TaskStatus.QUEUED:
+                # The SQL predicate bounds the rebuild to marker-bearing queued
+                # rows. Keep this check as a defensive guard against malformed
+                # JSON or future query changes.
+                from app.warm_pool import pool_reservation_account_id
+
+                acct_id = pool_reservation_account_id(t)
+                if not acct_id:
+                    continue
+            else:
+                acct_id = get_task_llm_account_id(t)
             if acct_id:
                 active_per_account[acct_id] = active_per_account.get(acct_id, 0) + 1
                 # Per-project reconciliation: count active tasks per (account, project).
@@ -5187,21 +5212,31 @@ async def release_max_plan_account(
                     account.pop("runtime_secret", None)
 
 
-async def reserve_max_plan_account(account_id: str) -> bool:
-    """Increment active tasks for an account when a task starts.
+async def reserve_max_plan_account(
+    account_id: str,
+    *,
+    user_id: str | None = None,
+    project_id: str | None = None,
+    model: str | None = None,
+    blacklist: List[str] | None = None,
+    count_daily_task: bool = False,
+) -> bool:
+    """Atomically gate and reserve a known account for warm task reuse.
 
     Mirror of ``release_max_plan_account``: a warm-reuse claim runs a task on
     the VM's boot LLM account but never goes through ``select_max_plan_account``
-    (which is the only other place that pre-increments ``active_tasks``). Without
-    this reservation the boot account's concurrency count stays too low until the
-    orchestrator's next per-cycle reconciliation re-bases it from the DB — a
-    sub-cycle window in which the account's caps can be silently overrun. The
-    reconciliation overwrites ``active_tasks`` from the DB each cycle, so this
-    in-memory bump is never double-counted; it only closes that window.
+    (the normal cap gate and counter acquisition). This exact-account variant
+    applies the same blacklist, health/cooldown, project-cap, and global-cap
+    primitives under the same pool lock before incrementing counters.
+
+    ``count_daily_task=True`` makes a fresh warm role equivalent to an ordinary
+    selected task: global and project daily counters advance together with the
+    concurrency counters. An abandoned claim must then call
+    ``release_max_plan_account(..., revert_daily_task_count=True)``.
 
     No-op (returns False) when the account is absent from the pool (e.g. local /
-    test VMs with no real boot account), so callers can reserve unconditionally.
-    Acquires ``_max_plan_pool_lock``.
+    test VMs with no real boot account) or is not currently eligible. Acquires
+    ``_max_plan_pool_lock``.
     """
     if not account_id:
         return False
@@ -5209,7 +5244,41 @@ async def reserve_max_plan_account(account_id: str) -> bool:
         account = _account_by_id.get(str(account_id))
         if account is None:
             return False
+        if user_id is not None and not any(
+            str(candidate.get("id")) == str(account_id)
+            for candidate in _max_plan_pools.get(user_id, [])
+        ):
+            return False
+        if blacklist and str(account_id) in blacklist:
+            return False
+        now = _utcnow()
+        if _daily_reset_if_elapsed(account, now):
+            _pending_cap_persists.add(str(account_id))
+        if _project_at_cap(account, project_id) or _account_at_cap(account):
+            return False
+        state = _account_state_for_model(account, model, now)
+        if state != "healthy" and not (
+            state == "probing" and int(account.get("active_tasks") or 0) == 0
+        ):
+            return False
         account["active_tasks"] = int(account.get("active_tasks") or 0) + 1
+        if count_daily_task:
+            account["daily_task_count"] = (
+                int(account.get("daily_task_count") or 0) + 1
+            )
+        if project_id:
+            project_state = account.setdefault("project_state", {}).setdefault(
+                project_id, {}
+            )
+            project_state["active_tasks"] = (
+                int(project_state.get("active_tasks") or 0) + 1
+            )
+            if count_daily_task:
+                project_state["daily_task_count"] = (
+                    int(project_state.get("daily_task_count") or 0) + 1
+                )
+        if count_daily_task:
+            _stage_usage_delta(account, 1, project_id)
         return True
 
 

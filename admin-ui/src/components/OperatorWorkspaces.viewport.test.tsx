@@ -45,7 +45,6 @@ function projectProps() {
     settingsRouterProps: {} as never,
     addToast: vi.fn(),
     onOpenProjectManagement: vi.fn(),
-    onOpenProjectMembers: vi.fn(),
     onViewFindings: vi.fn(),
     onViewKnowledge: vi.fn(),
     onNavigateToTask: vi.fn(),

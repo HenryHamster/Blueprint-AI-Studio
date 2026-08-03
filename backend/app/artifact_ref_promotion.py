@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlmodel import select
 
 from app.database import AsyncSessionLocal
+from app.admin_helpers import PROJECT_WRITE_ROLES
 from app.models import (
     ArtifactRef,
     ArtifactRefPromotionIntent,
@@ -101,7 +102,7 @@ async def prepare_artifact_ref_promotion_intent(
             select(ProjectMember).where(
                 ProjectMember.project_id == project_id,
                 ProjectMember.user_id == actor_user_id,
-                ProjectMember.role.in_(["member", "owner"]),
+                ProjectMember.role.in_(PROJECT_WRITE_ROLES),
             ).with_for_update()
         )
     ).scalar_one_or_none()
@@ -346,7 +347,7 @@ async def reconcile_one_artifact_ref_promotion(
                 select(ProjectMember).where(
                     ProjectMember.project_id == project_id,
                     ProjectMember.user_id == identity.actor_user_id,
-                    ProjectMember.role.in_(["member", "owner"]),
+                    ProjectMember.role.in_(PROJECT_WRITE_ROLES),
                 ).with_for_update()
             )
         ).scalar_one_or_none()

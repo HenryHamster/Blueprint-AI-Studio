@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { renderHook, act, cleanup } from '@testing-library/react';
 import { useTasksState } from './useTasksState';
 import type { Task } from '../types/task';
+import { authGet } from '../api';
 
 vi.mock('../api', async () => {
   const { createApiMock } = await import('../test/api-mock-complete');
@@ -50,6 +51,7 @@ function makeDeps(overrides: Partial<Parameters<typeof useTasksState>[0]> = {}):
     fetchTasksRef: { current: vi.fn() },
     prevTasksRef: { current: [] },
     selectedProjectId: null,
+    canOperateProject: true,
     directionFilter: null,
     ...overrides,
   };
@@ -75,6 +77,72 @@ describe('useTasksState — task mutation error handling', () => {
     cleanup();
     vi.unstubAllGlobals();
     vi.clearAllMocks();
+  });
+
+  it('keeps every task mutation inert after an operator is downgraded to viewer', async () => {
+    const deps = makeDeps({
+      canOperateProject: true,
+      selectedProjectId: 'project-1',
+      selectedTaskIds: new Set(['task-1']),
+    });
+    const { result, rerender } = renderHook(
+      ({ canOperateProject }) => useTasksState({ ...deps, canOperateProject }),
+      { initialProps: { canOperateProject: true } },
+    );
+    const staleRetryCallback = result.current.handleRetry;
+    rerender({ canOperateProject: false });
+    vi.clearAllMocks();
+
+    await act(async () => {
+      await result.current.handleApprove('task-1');
+      await result.current.handleRequestChanges('task-1', 'feedback');
+      await result.current.handleCancel('task-1');
+      await result.current.handleRetry('task-1');
+      await result.current.handleEditPrompt('task-1', 'new prompt');
+      await result.current.handleDismiss('task-1');
+      await result.current.handleArchiveTask('task-1');
+      await result.current.handleUnarchiveTask('task-1');
+      await result.current.handleBulkArchive('terminal');
+      await result.current.handleBulkAction('retry', ['task-1']);
+      await result.current.handleBulkArchiveSelected();
+      await result.current.handleBulkArchiveColumn(['task-1']);
+      await result.current.handleResetIterationCap('task-1');
+      await result.current.handleTriggerRollup('task-1');
+      await result.current.handleBulkCancel(['task-1']);
+      await staleRetryCallback('task-1');
+    });
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(deps.fetchArchiveTasks).not.toHaveBeenCalled();
+    expect(deps.addToast).not.toHaveBeenCalled();
+    expect(deps.setConfirmDialog).not.toHaveBeenCalled();
+  });
+
+  it('does not repopulate tasks from an in-flight response after project scope changes', async () => {
+    let resolveRequest: (response: Response) => void = () => {};
+    const pendingResponse = new Promise<Response>(resolve => { resolveRequest = resolve; });
+    vi.mocked(authGet).mockReturnValueOnce(pendingResponse);
+    const deps = makeDeps({ selectedProjectId: 'project-1' });
+    const { result, rerender } = renderHook(
+      ({ projectId }) => useTasksState({ ...deps, selectedProjectId: projectId }),
+      { initialProps: { projectId: 'project-1' as string | null } },
+    );
+
+    let pendingFetch: Promise<void> = Promise.resolve();
+    act(() => { pendingFetch = result.current.fetchTasks(); });
+    rerender({ projectId: 'project-2' });
+    await act(async () => {
+      resolveRequest({
+        ok: true,
+        json: vi.fn().mockResolvedValue({ tasks: [makeTask({ id: 'project-1-secret' })], total: 1 }),
+      } as unknown as Response);
+      await pendingFetch;
+    });
+
+    expect(result.current.tasks).toEqual([]);
+    expect(result.current.totalTasks).toBe(0);
+    expect(deps.prevTasksRef.current).toEqual([]);
+    expect(deps.addMetricsPoint).not.toHaveBeenCalled();
   });
 
   // --- handleRetry ---

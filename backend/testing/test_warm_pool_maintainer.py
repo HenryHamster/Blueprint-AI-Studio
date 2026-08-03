@@ -18,7 +18,9 @@ from datetime import timedelta
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from sqlalchemy import update
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import async_sessionmaker
 from sqlmodel import select
 
 import app.shared_state as _shared_state
@@ -59,7 +61,7 @@ from app.warm_pool_maintainer import (
     sweep_idle_pool_vms,
     sweep_stranded_lanes,
 )
-from testing.conftest import TestingSessionLocal, USE_POSTGRES
+from testing.conftest import USE_POSTGRES
 
 
 class _NoCloseSession:
@@ -2077,6 +2079,99 @@ async def test_reaper_uses_durable_pool_liveness_and_reclaims_expired_queued_lea
 
 
 @pytest.mark.asyncio
+async def test_reaper_orphan_cleanup_reverts_owned_pool_reservation_once(
+    db_session, warm_pool_on, mocker
+):
+    """Maintainer reclaim owns pin, lease, and reservation abandonment together."""
+    from app.max_plan_pool import reserve_max_plan_account
+    from app.warm_pool import (
+        WARM_POOL_PIN_KEY,
+        WARM_POOL_RESERVATION_ACCOUNT_KEY,
+    )
+
+    mocker.patch(
+        "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
+    )
+    mocker.patch("app.compute.get_stale_image_vms", return_value=[])
+    _runtime_config["warm_pool_heartbeat_stale_seconds"] = 300
+    project = await _make_project(db_session, name="Owned Orphan Reservation")
+
+    async with _PoolAccounts(
+        [
+            {
+                "id": "acct-owned-orphan",
+                "model": "claude-opus-4-8",
+                "daily_task_count": 0,
+                "project_state": {},
+                "disabled_models": {},
+            }
+        ]
+    ) as accounts:
+        account = accounts[0]
+        assert await reserve_max_plan_account(
+            account["id"],
+            user_id=project.user_id,
+            project_id=str(project.id),
+            model="claude-opus-4-8",
+            count_daily_task=True,
+        )
+        task = Task(
+            project_id=project.id,
+            title="owned orphan pin",
+            payloads=[{"type": "create", "prompt": "x"}],
+            status=TaskStatus.QUEUED,
+            context={
+                "warm_target_vm_id": "agent-vm-owned-orphan",
+                WARM_POOL_PIN_KEY: True,
+                WARM_POOL_RESERVATION_ACCOUNT_KEY: account["id"],
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        member = await _register(
+            db_session,
+            project,
+            "agent-vm-owned-orphan",
+            PoolVmState.LEASED,
+            account_id=account["id"],
+        )
+        member.leased_task_id = task.id
+        member.lease_expires_at = _utcnow() - timedelta(seconds=10)
+        member.last_heartbeat_at = _utcnow() - timedelta(seconds=600)
+        db_session.add(member)
+        await db_session.commit()
+
+        assert await sweep_idle_pool_vms(
+            db_session, _utcnow(), runtime_config=_runtime_config
+        ) == 1
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.QUEUED
+        assert task.vm_instance_id is None
+        assert (task.context or {}).get(WARM_POOL_PIN_KEY) is None
+        assert (
+            task.context or {}
+        ).get(WARM_POOL_RESERVATION_ACCOUNT_KEY) is None
+        assert account["active_tasks"] == 0
+        assert account["daily_task_count"] == 0
+        assert account["project_state"][str(project.id)] == {
+            "active_tasks": 0,
+            "daily_task_count": 0,
+        }
+        mutations = list(account["_pending_usage_cap_mutations"])
+        assert [item["delta"] for item in mutations] == [1, -1]
+        assert [item["project_delta"] for item in mutations] == [1, -1]
+
+        # The reclaimed row is gone; another sweep cannot release the marker
+        # again because the first cleanup committed its removal.
+        assert await sweep_idle_pool_vms(
+            db_session, _utcnow(), runtime_config=_runtime_config
+        ) == 0
+        assert account["_pending_usage_cap_mutations"] == mutations
+
+
+@pytest.mark.asyncio
 async def test_default_provision_fn_honors_requested_account(
     db_session, warm_pool_on, mocker
 ):
@@ -2815,9 +2910,12 @@ async def test_clear_lane_warm_workspace_if_matching_member_is_atomic_against_ra
     await db_session.refresh(lane)
 
     original_execute = db_session.execute
+    racing_session_factory = async_sessionmaker(
+        bind=db_session.bind, expire_on_commit=False
+    )
 
     async def raced_execute(statement, *args, **kwargs):
-        async with TestingSessionLocal() as racing_session:
+        async with racing_session_factory() as racing_session:
             racing_lane = await racing_session.get(ImprovementLane, lane.id)
             racing_lane.workspace_state = "WARM_RESERVED"
             racing_lane.workspace_vm_instance_id = "agent-vm-race-new"
@@ -3721,6 +3819,9 @@ async def test_expired_reservation_sweep_skips_concurrently_leased_member(
         racing_task_id = uuid.uuid4()
         original_execute = db_session.execute
         race_committed = False
+        fresh_session_factory = async_sessionmaker(
+            bind=db_session.bind, expire_on_commit=False
+        )
 
         async def _execute_with_concurrent_lease(*args, **kwargs):
             nonlocal race_committed
@@ -3735,7 +3836,7 @@ async def test_expired_reservation_sweep_skips_concurrently_leased_member(
                 and "for update" not in statement_text
             ):
                 race_committed = True
-                async with TestingSessionLocal() as fresh_session:
+                async with fresh_session_factory() as fresh_session:
                     leased = await lease_idle_pool_vm(
                         fresh_session,
                         project_id=project.id,
@@ -4085,17 +4186,65 @@ async def test_drain_tears_down_leased_member(db_session, warm_pool_on, mocker):
     _runtime_config["warm_pool_enabled"] = True
 
     project = await _make_project(db_session)
-    member = await _register(
-        db_session, project, "agent-vm-leased-drain", PoolVmState.LEASED
-    )
-    member_id = member.id
+    vm_id = "agent-vm-leased-drain"
+    pid = str(project.id)
+    async with _PoolAccounts(
+        [
+            {
+                "id": "acct-global-drain",
+                "active_tasks": 1,
+                "daily_task_count": 1,
+                "project_state": {
+                    pid: {"active_tasks": 1, "daily_task_count": 1}
+                },
+            }
+        ]
+    ) as accounts:
+        account = accounts[0]
+        task = await _make_task_for_account(db_session, project, account["id"])
+        task.vm_instance_id = vm_id
+        task.context = {
+            **(task.context or {}),
+            "warm_target_vm_id": vm_id,
+            "warm_pool_pin": True,
+            "warm_handoff_deadline": "2099-01-01T00:00:00",
+            "_warm_pool_reservation_account_id": account["id"],
+        }
+        member = await _register(
+            db_session,
+            project,
+            vm_id,
+            PoolVmState.LEASED,
+            account_id=account["id"],
+        )
+        member.leased_task_id = task.id
+        db_session.add_all([task, member])
+        await db_session.commit()
+        member_id = member.id
 
-    retired = await _wpm.drain_global_warm_pool(
-        session_factory=_factory_for(db_session)
-    )
-    assert retired == 1, f"expected 1 retired, got {retired}"
-    mock_del.assert_awaited_once()
-    assert await db_session.get(PoolVm, member_id) is None
+        retired = await _wpm.drain_global_warm_pool(
+            session_factory=_factory_for(db_session)
+        )
+        assert retired == 1, f"expected 1 retired, got {retired}"
+        mock_del.assert_awaited_once()
+        assert await db_session.get(PoolVm, member_id) is None
+        await db_session.refresh(task)
+        assert task.vm_instance_id is None
+        assert (task.context or {}).get("warm_pool_pin") is None
+        assert (task.context or {}).get("warm_target_vm_id") is None
+        assert (
+            task.context or {}
+        ).get("_warm_pool_reservation_account_id") is None
+        assert account["active_tasks"] == 0
+        assert account["daily_task_count"] == 0
+        assert account["project_state"][pid] == {
+            "active_tasks": 0,
+            "daily_task_count": 0,
+        }
+        assert [
+            (m["delta"], m["project_delta"])
+            for m in account["_pending_usage_cap_mutations"]
+        ] == [(-1, -1)]
 
 
 @pytest.mark.asyncio
@@ -4109,16 +4258,319 @@ async def test_drain_project_pool_operator_drain_retires_leased_member(
     mocker.patch("app.compute.get_stale_image_vms", return_value=[])
 
     project = await _make_project(db_session)
-    member = await _register(
-        db_session, project, "agent-vm-leased-opdr", PoolVmState.LEASED
-    )
-    member_id = member.id
+    vm_id = "agent-vm-leased-opdr"
+    pid = str(project.id)
+    async with _PoolAccounts(
+        [
+            {
+                "id": "acct-project-drain",
+                "active_tasks": 1,
+                "daily_task_count": 1,
+                "project_state": {
+                    pid: {"active_tasks": 1, "daily_task_count": 1}
+                },
+            }
+        ]
+    ) as accounts:
+        account = accounts[0]
+        task = await _make_task_for_account(db_session, project, account["id"])
+        task.vm_instance_id = vm_id
+        task.context = {
+            **(task.context or {}),
+            "warm_target_vm_id": vm_id,
+            "warm_pool_pin": True,
+            "warm_handoff_deadline": "2099-01-01T00:00:00",
+            "_warm_pool_reservation_account_id": account["id"],
+        }
+        member = await _register(
+            db_session,
+            project,
+            vm_id,
+            PoolVmState.LEASED,
+            account_id=account["id"],
+        )
+        member.leased_task_id = task.id
+        db_session.add_all([task, member])
+        await db_session.commit()
+        member_id = member.id
 
-    drained = await _drain_project_pool(
-        db_session, project.id, "u-test", reason="operator_drain"
+        drained = await _drain_project_pool(
+            db_session, project.id, "u-test", reason="operator_drain"
+        )
+        assert drained == 1, f"expected 1 drained, got {drained}"
+        assert await db_session.get(PoolVm, member_id) is None
+        await db_session.refresh(task)
+        assert task.vm_instance_id is None
+        assert (task.context or {}).get("warm_pool_pin") is None
+        assert (task.context or {}).get("warm_target_vm_id") is None
+        assert (
+            task.context or {}
+        ).get("_warm_pool_reservation_account_id") is None
+        assert account["active_tasks"] == 0
+        assert account["daily_task_count"] == 0
+        assert account["project_state"][pid] == {
+            "active_tasks": 0,
+            "daily_task_count": 0,
+        }
+        assert [
+            (m["delta"], m["project_delta"])
+            for m in account["_pending_usage_cap_mutations"]
+        ] == [(-1, -1)]
+
+
+@pytest.mark.asyncio
+async def test_forced_drain_idle_scan_uses_current_leased_task_from_cas(
+    db_session, warm_pool_on, mocker
+):
+    """An IDLE scan that races a lease must abandon the newly-current task."""
+    from app.max_plan_pool import reserve_max_plan_account
+
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    project = await _make_project(db_session, name="Forced drain IDLE lease race")
+    vm_id = "agent-vm-drain-idle-race"
+    stale_member = await _register(
+        db_session, project, vm_id, PoolVmState.IDLE, account_id="acct-idle-race"
     )
-    assert drained == 1, f"expected 1 drained, got {drained}"
-    assert await db_session.get(PoolVm, member_id) is None
+    member_id = stale_member.id
+    pid = str(project.id)
+
+    async with _PoolAccounts(
+        [
+            {
+                "id": "acct-idle-race",
+                "daily_task_count": 0,
+                "project_state": {},
+                "disabled_models": {},
+            }
+        ]
+    ) as accounts:
+        account = accounts[0]
+        assert await reserve_max_plan_account(
+            account["id"],
+            user_id=project.user_id,
+            project_id=pid,
+            model="claude-opus-4-8",
+            count_daily_task=True,
+        )
+        task = await _make_task_for_account(db_session, project, account["id"])
+        task.vm_instance_id = vm_id
+        task.context = {
+            **(task.context or {}),
+            "warm_target_vm_id": vm_id,
+            "warm_pool_pin": True,
+            "_warm_pool_reservation_account_id": account["id"],
+        }
+        db_session.add(task)
+        await db_session.commit()
+
+        # Simulate a peer's committed lease with a Core UPDATE that deliberately
+        # does not synchronize this session's already-scanned ORM member.
+        await db_session.execute(
+            update(PoolVm)
+            .where(PoolVm.id == member_id)
+            .values(
+                state=PoolVmState.LEASED,
+                leased_task_id=task.id,
+                lease_expires_at=_utcnow() + timedelta(seconds=240),
+                idle_since=None,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        await db_session.commit()
+        assert stale_member.state == PoolVmState.IDLE
+
+        assert await retire_and_delete_pool_vm(
+            db_session,
+            stale_member,
+            reason="operator_drain",
+            force=True,
+            abandon_leased_handoff=True,
+        )
+        await db_session.refresh(task)
+        assert await db_session.get(PoolVm, member_id) is None
+        assert task.vm_instance_id is None
+        assert (task.context or {}).get("warm_pool_pin") is None
+        assert (
+            task.context or {}
+        ).get("_warm_pool_reservation_account_id") is None
+        assert account["active_tasks"] == 0
+        assert account["daily_task_count"] == 0
+        assert account["project_state"][pid] == {
+            "active_tasks": 0,
+            "daily_task_count": 0,
+        }
+
+
+@pytest.mark.asyncio
+async def test_forced_drain_released_task_a_released_to_task_b_uses_cas_owner(
+    db_session, warm_pool_on, mocker
+):
+    """A stale A lease scan must abandon current task B, never stale task A."""
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    project = await _make_project(db_session, name="Forced drain A to B race")
+    vm_id = "agent-vm-drain-a-b-race"
+    pid = str(project.id)
+
+    async with _PoolAccounts(
+        [
+            {
+                "id": "acct-drain-a",
+                "active_tasks": 1,
+                "daily_task_count": 1,
+                "project_state": {
+                    pid: {"active_tasks": 1, "daily_task_count": 1}
+                },
+            },
+            {
+                "id": "acct-drain-b",
+                "active_tasks": 1,
+                "daily_task_count": 1,
+                "project_state": {
+                    pid: {"active_tasks": 1, "daily_task_count": 1}
+                },
+            },
+        ]
+    ) as accounts:
+        account_a, account_b = accounts
+        task_a = await _make_task_for_account(
+            db_session, project, account_a["id"]
+        )
+        task_b = await _make_task_for_account(
+            db_session, project, account_b["id"]
+        )
+        for task, account in ((task_a, account_a), (task_b, account_b)):
+            task.vm_instance_id = vm_id
+            task.context = {
+                **(task.context or {}),
+                "warm_target_vm_id": vm_id,
+                "warm_pool_pin": True,
+                "_warm_pool_reservation_account_id": account["id"],
+            }
+        stale_member = await _register(
+            db_session,
+            project,
+            vm_id,
+            PoolVmState.LEASED,
+            account_id=account_a["id"],
+        )
+        stale_member.leased_task_id = task_a.id
+        db_session.add_all([task_a, task_b, stale_member])
+        await db_session.commit()
+        member_id = stale_member.id
+
+        await db_session.execute(
+            update(PoolVm)
+            .where(PoolVm.id == member_id)
+            .values(
+                leased_task_id=task_b.id,
+                account_id=account_b["id"],
+                lease_expires_at=_utcnow() + timedelta(seconds=240),
+            )
+            .execution_options(synchronize_session=False)
+        )
+        await db_session.commit()
+        assert stale_member.leased_task_id == task_a.id
+
+        assert await retire_and_delete_pool_vm(
+            db_session,
+            stale_member,
+            reason="operator_drain",
+            force=True,
+            abandon_leased_handoff=True,
+        )
+        await db_session.refresh(task_a)
+        await db_session.refresh(task_b)
+        assert await db_session.get(PoolVm, member_id) is None
+
+        # The stale task A ownership is untouched; the CAS-returned current task
+        # B is the one canonically abandoned and released.
+        assert (task_a.context or {}).get("warm_pool_pin") is True
+        assert (
+            task_a.context or {}
+        ).get("_warm_pool_reservation_account_id") == account_a["id"]
+        assert account_a["active_tasks"] == 1
+        assert account_a["daily_task_count"] == 1
+        assert task_b.vm_instance_id is None
+        assert (task_b.context or {}).get("warm_pool_pin") is None
+        assert (
+            task_b.context or {}
+        ).get("_warm_pool_reservation_account_id") is None
+        assert account_b["active_tasks"] == 0
+        assert account_b["daily_task_count"] == 0
+        assert account_b["project_state"][pid] == {
+            "active_tasks": 0,
+            "daily_task_count": 0,
+        }
+
+
+@pytest.mark.asyncio
+async def test_forced_drain_does_not_unclaim_already_in_progress_task(
+    db_session, warm_pool_on, mocker
+):
+    """A claim committed before the drain's Task lock owns task/account state."""
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    project = await _make_project(db_session, name="Forced drain after claim")
+    vm_id = "agent-vm-drain-after-claim"
+    pid = str(project.id)
+
+    async with _PoolAccounts(
+        [
+            {
+                "id": "acct-drain-after-claim",
+                "active_tasks": 1,
+                "daily_task_count": 1,
+                "project_state": {
+                    pid: {"active_tasks": 1, "daily_task_count": 1}
+                },
+            }
+        ]
+    ) as accounts:
+        account = accounts[0]
+        task = await _make_task_for_account(db_session, project, account["id"])
+        task.status = TaskStatus.IN_PROGRESS
+        task.vm_instance_id = vm_id
+        task.context = {
+            **(task.context or {}),
+            "warm_target_vm_id": vm_id,
+            "warm_pool_pin": True,
+            # Deliberately retain the marker to prove status ownership alone
+            # prevents a stale drain from releasing the running task's slot.
+            "_warm_pool_reservation_account_id": account["id"],
+        }
+        member = await _register(
+            db_session,
+            project,
+            vm_id,
+            PoolVmState.LEASED,
+            account_id=account["id"],
+        )
+        member.leased_task_id = task.id
+        db_session.add_all([task, member])
+        await db_session.commit()
+        member_id = member.id
+
+        assert await retire_and_delete_pool_vm(
+            db_session,
+            member,
+            reason="operator_drain",
+            force=True,
+            abandon_leased_handoff=True,
+        )
+        await db_session.refresh(task)
+        assert await db_session.get(PoolVm, member_id) is None
+        assert task.status == TaskStatus.IN_PROGRESS
+        assert task.vm_instance_id == vm_id
+        assert (task.context or {}).get("warm_target_vm_id") == vm_id
+        assert (task.context or {}).get("warm_pool_pin") is True
+        assert (
+            task.context or {}
+        ).get("_warm_pool_reservation_account_id") == account["id"]
+        assert account["active_tasks"] == 1
+        assert account["daily_task_count"] == 1
+        assert account["project_state"][pid] == {
+            "active_tasks": 1,
+            "daily_task_count": 1,
+        }
 
 
 @pytest.mark.asyncio

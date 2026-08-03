@@ -36,9 +36,9 @@ import { normalizePrimaryTab, resolvePrimaryTabTarget, type PrimaryTab } from '.
 import { defaultComputeExperimentForm } from './hooks/useTaskModal';
 import type { SortBy } from './components/KanbanBoard';
 import { ACTIVE_PIPELINE_STATUSES, CANCELLABLE_STATUSES, COLUMNS, SORT_KEY, TERMINAL_STATUSES } from './appWorkbenchConstants';
+import { refreshAndSelectProject } from './utils/projectSelection';
 import { Pagination } from './components/Pagination';
 const UserManagement = lazy(() => import('./components/UserManagement').then(m => ({ default: m.UserManagement })));
-const ProjectMembers = lazy(() => import('./components/ProjectMembers').then(m => ({ default: m.ProjectMembers })));
 const MessagesPanel = lazy(() => import('./components/MessagesPanel').then(m => ({ default: m.MessagesPanel })));
 const ActivityFeed = lazy(() => import('./components/ActivityFeed'));
 const StrategicContextWorkspace = lazy(() => import('./components/StrategicContextWorkspace').then(m => ({ default: m.StrategicContextWorkspace })));
@@ -73,8 +73,10 @@ import { parseTimestamp } from './utils/time';
 import { matchesStatusFilter } from './utils/statusFilter';
 import { pipelineTaskIdForAttentionItem } from './utils/strategicAttention';
 import { STATUS_OPTIONS } from './constants';
+import { resolveAccess } from './accessControl';
 import { reportUiLoadTiming } from './uiLoadTiming';
 import { resolveCompletionToastKind, resolveCompletionToastMessage } from './utils/completionToastKind';
+import { shouldResumeNewProjectAfterGitHubOAuth } from './utils/newProjectOAuthResume';
 
 type PipelineDirectionOption = { id: string; text: string };
 const PIPELINE_SECTION_ORDER: readonly PipelineSection[] = ['flow', 'board', 'archive'];
@@ -346,7 +348,8 @@ export default function App() {
     deps: [selectedProjectId, messagesPanelOpen, s.user?.email],
   });
   // New project modal
-  const [showNewProjectModal, setShowNewProjectModal] = useState(false);
+  const [resumeNewProjectFromGitHub] = useState(shouldResumeNewProjectAfterGitHubOAuth);
+  const [showNewProjectModal, setShowNewProjectModal] = useState(resumeNewProjectFromGitHub);
   const [showProjectManagement, setShowProjectManagement] = useState(false);
   const [setupProjectId, setSetupProjectId] = useState<string | null>(null);
   const setupProject = useMemo(() => {
@@ -356,8 +359,6 @@ export default function App() {
     return { id: p.id, owner: p.github_owner, repo: p.github_repo };
   }, [setupProjectId, s.projects]);
   const [showActivityFeed, setShowActivityFeed] = useState(false);
-  // Project members panel
-  const [showProjectMembers, setShowProjectMembers] = useState(false);
   const selectedProject = useMemo(
     () => s.projects.find(p => p.id === s.selectedProjectId) ?? null,
     [s.projects, s.selectedProjectId],
@@ -388,7 +389,7 @@ export default function App() {
   // the header AutonomousStatus and the command's own label stay in sync.
   const toggleSelectedProjectAutonomy = useCallback(async () => {
     const pid = s.selectedProjectId;
-    if (!pid) return;
+    if (!pid || !s.selectedProjectAccess.canManageProject) return;
     const next = !(selectedProject?.autonomous_enabled ?? false);
     try {
       const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(pid)}/autonomous`, {
@@ -402,13 +403,6 @@ export default function App() {
       s.addToast('Failed to toggle autonomous mode', 'error');
     }
   }, [s, selectedProject]);
-  // Fetch project members when panel opens or project changes
-  const { fetchProjectMembers } = s;
-  useEffect(() => {
-    if (showProjectMembers && selectedProjectId) {
-      fetchProjectMembers(selectedProjectId);
-    }
-  }, [showProjectMembers, selectedProjectId, fetchProjectMembers]);
   const handleViewTask = useCallback((taskId: string) => {
     const task = s.tasks.find(t => t.id === taskId);
     if (task) handleOpenTaskDetails(task);
@@ -507,6 +501,7 @@ export default function App() {
   } = useStrategicSession({
     selectedProjectId, addToast: s.addToast, strategicReadModel,
     strategicLiveness: strategicLiveness.data,
+    canOperateProject: s.selectedProjectAccess.canOperateProject,
   });
   const setStrategicInteractionMode = useCallback((mode: StrategicInteractionMode) => {
     persistStrategicWorkbench({ interaction_mode: mode, active_surface: 'strategic' });
@@ -784,25 +779,28 @@ export default function App() {
     });
   }, [addToast]);
   const handleArchiveGroup = useCallback((taskIds: string[]) => {
+    if (!s.selectedProjectAccess.canOperateProject) return;
     s.setConfirmDialog({
       title: 'Archive this group?',
       message: `This will archive ${taskIds.length} task${taskIds.length !== 1 ? 's' : ''} (parent + children). They can be viewed and unarchived from the Archive view.`,
       confirmLabel: 'Archive group',
       onConfirm: () => s.handleBulkArchiveColumn(taskIds),
     });
-  }, [s.setConfirmDialog, s.handleBulkArchiveColumn]);
+  }, [s.selectedProjectAccess.canOperateProject, s.setConfirmDialog, s.handleBulkArchiveColumn]);
   const handleBoardCtrlClick = useCallback((taskId: string) => {
+    if (!s.selectedProjectAccess.canOperateProject) return;
     if (!s.selectionMode) s.setSelectionMode(true);
     s.toggleTaskSelection(taskId);
-  }, [s.selectionMode, s.setSelectionMode, s.toggleTaskSelection]);
+  }, [s.selectedProjectAccess.canOperateProject, s.selectionMode, s.setSelectionMode, s.toggleTaskSelection]);
   const handleBoardArchiveColumn = useCallback((taskIds: string[], columnLabel: string) => {
+    if (!s.selectedProjectAccess.canOperateProject) return;
     s.setConfirmDialog({
       title: `Archive all ${columnLabel} tasks?`,
       message: `This will archive ${taskIds.length} task${taskIds.length !== 1 ? 's' : ''} in the ${columnLabel} column. They can be viewed and unarchived from the Archive view.`,
       confirmLabel: `Archive ${columnLabel}`,
       onConfirm: () => s.handleBulkArchiveColumn(taskIds),
     });
-  }, [s.setConfirmDialog, s.handleBulkArchiveColumn]);
+  }, [s.selectedProjectAccess.canOperateProject, s.setConfirmDialog, s.handleBulkArchiveColumn]);
   const handleBoardDirectionClick = useCallback((dirId: string) => {
     setResearchBrowserDirectionId(dirId);
     s.setShowResearchBrowser(true);
@@ -819,8 +817,6 @@ export default function App() {
     setRuntimeSection,
     setRuntimeConfigSection,
     onToggleSettings: ignoreEmbeddedSettingsClose,
-    showProjectMembers,
-    setShowProjectMembers,
     selectedProject,
   });
 
@@ -944,6 +940,7 @@ export default function App() {
     maxPlanAccountCount: s.maxPlanAccounts.length,
     apiHealthy: s.apiHealthy,
     isAdmin: s.userRole === 'admin',
+    projectRole: selectedProject?.my_role,
     problemModelRevision: strategicReadModel.data?.problem_model.revision,
     hasDesignDoc: strategicReadModel.data?.design.has_design_doc,
     designRevision: strategicReadModel.data?.design.revision,
@@ -971,7 +968,7 @@ export default function App() {
       void strategicReadModel.refresh();
     },
     openProjectManagement: () => setShowProjectManagement(true),
-    openProjectMembers: () => setShowProjectMembers(true),
+    openProjectMembers: () => openProjectManageWorkspace('access'),
     openPreviousWorkbenchSubtab,
     openNextWorkbenchSubtab,
   });
@@ -980,8 +977,7 @@ export default function App() {
     s.confirmDialog ||
     showNewProjectModal ||
     setupProjectId ||
-    showProjectManagement ||
-    showProjectMembers,
+    showProjectManagement,
   );
   const operatorShortcutBlocked = Boolean(
     modalShortcutBlocked ||
@@ -1026,13 +1022,15 @@ export default function App() {
       >
         Refresh
       </button>
-      <button
-        type="button"
-        onClick={s.openNewTaskModal}
-        className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/70 px-3 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100 sm:min-h-9"
-      >
-        New task
-      </button>
+      {s.selectedProjectAccess.canOperateProject && (
+        <button
+          type="button"
+          onClick={s.openNewTaskModal}
+          className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/70 px-3 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100 sm:min-h-9"
+        >
+          New task
+        </button>
+      )}
     </>
   );
 
@@ -1057,7 +1055,7 @@ export default function App() {
           directions={directions}
           inputRef={searchInputRef}
         />
-        {s.viewMode === 'kanban' && (
+        {s.selectedProjectAccess.canOperateProject && s.viewMode === 'kanban' && (
           <SingleSelectDropdown
             options={[
               { label: 'Newest first', value: 'newest' },
@@ -1189,6 +1187,7 @@ export default function App() {
         needsAttentionCount={pipelineAttentionCount}
         onOpenNewTaskModal={s.openNewTaskModal}
         onOpenSettings={() => openRuntimeSettings('general')}
+        canManagePlatform={s.userRole === 'admin'}
         onNewProject={() => setShowNewProjectModal(true)}
         onManageProjects={() => setShowProjectManagement(true)}
         onSignOut={() => { void signOut(); }}
@@ -1229,21 +1228,6 @@ export default function App() {
         onOpenMessageTarget={strategicMessageTarget.open}
       />
       </Suspense>
-      {showProjectMembers && s.selectedProjectId && selectedProject && (() => {
-        const projectId = s.selectedProjectId;
-        return (
-        <Suspense fallback={null}>
-        <ProjectMembers
-          projectId={projectId}
-          members={s.projectMembers}
-          myRole={selectedProject.my_role || 'viewer'}
-          onAdd={(email, role) => s.addProjectMember(projectId, email, role)}
-          onUpdateRole={(memberId, role) => s.updateProjectMemberRole(projectId, memberId, role)}
-          onRemove={(memberId) => s.removeProjectMember(projectId, memberId)}
-        />
-        </Suspense>
-        );
-      })()}
       <VersionMismatchBanner />
       <Suspense fallback={null}>{s.userRole === 'admin' && <NullBranchDiagnosticsPanel onConfigure={handleConfigureBranchProject} />}</Suspense>
       {s.error && (
@@ -1339,6 +1323,7 @@ export default function App() {
               <Suspense fallback={<WorkspaceSkeleton />}>
               <MessagesPanel
                 selectedProjectId={s.selectedProjectId}
+                canOperateProject={s.selectedProjectAccess.canOperateProject}
                 githubRepo={selectedProject ? `${selectedProject.github_owner}/${selectedProject.github_repo}` : undefined}
                 defaultBranch={s.promotionTargetData?.promotion_target || s.integrationBranchData?.integration_branch || undefined}
                 variant="page"
@@ -1382,6 +1367,7 @@ export default function App() {
               <Suspense fallback={<WorkspaceSkeleton />}>
               <StrategicContextRail
                 projectId={s.selectedProjectId}
+                canOperateProject={s.selectedProjectAccess.canOperateProject}
                 state={strategicReadModel.data ?? null}
                 loading={strategicReadModel.loading}
                 error={strategicReadModel.error}
@@ -1393,13 +1379,13 @@ export default function App() {
                 onOpenRuntimeHealth={() => openStrategicContextTarget({ surface: 'runtime', section: 'health' })}
                 onOpenRuntimeDevices={() => openStrategicContextTarget({ surface: 'runtime', section: 'devices' })}
                 onOpenRuntimeCompute={() => openStrategicContextTarget({ surface: 'runtime', section: 'compute' })}
-                onOpenAccounts={openRuntimeAccounts}
+                onOpenAccounts={s.userRole === 'admin' ? openRuntimeAccounts : undefined}
                 onOpenSpend={openRuntimeAnalytics}
                 onOpenContextWorkspace={openStrategicContextWorkspace}
                 onOpenTask={handleViewTaskById}
                 onOpenMessages={strategicMessageTarget.open}
                 onOpenTarget={openStrategicContextTarget}
-                accountSpend={strategicAccountSpend}
+                accountSpend={s.userRole === 'admin' ? strategicAccountSpend : null}
                 onConfirmationResolved={() => { void strategicReadModel.refresh(); }}
                 addToast={s.addToast}
               />
@@ -1428,7 +1414,6 @@ export default function App() {
             cycleProgress={s.cycleProgress}
             lastCycleCompletion={s.lastCycleCompletion}
             onOpenProjectManagement={() => setShowProjectManagement(true)}
-            onOpenProjectMembers={() => setShowProjectMembers(true)}
             onViewFindings={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }}
             onViewKnowledge={(dirId) => { setKnowledgeBrowserDirectionId(dirId); s.setShowKnowledgeBrowser(true); }}
             onNavigateToTask={handleViewTaskById}
@@ -1497,6 +1482,7 @@ export default function App() {
       ) : (
         <Suspense fallback={<WorkspaceSkeleton />}>
         <PipelineWorkspace
+          canOperateProject={s.selectedProjectAccess.canOperateProject}
           surface={{
             pipelineSection,
             onPipelineSectionChange: setPipelineSection,
@@ -1655,7 +1641,7 @@ export default function App() {
         )}
       />
 
-      {s.showNewTaskModal && (
+      {s.selectedProjectAccess.canOperateProject && s.showNewTaskModal && (
         <Suspense fallback={null}>
         <NewTaskModal
           newTaskRepo={s.newTaskRepo}
@@ -1717,11 +1703,12 @@ export default function App() {
         <Suspense fallback={null}>
         <NewProjectModal
           onClose={() => { setShowNewProjectModal(false); setSetupProjectId(null); }}
-          onSuccess={() => {
+          onSuccess={(projectId) => {
             // Refresh project list but keep modal open so the setup guide is visible
-            s.fetchProjects();
+            void refreshAndSelectProject(projectId, s.fetchProjects, s.setSelectedProjectId);
           }}
           setupProject={setupProject}
+          resumeFromGitHub={resumeNewProjectFromGitHub}
         />
         </Suspense>
       )}
@@ -1731,6 +1718,7 @@ export default function App() {
         <ProjectManagementModal
           projects={s.projects}
           selectedProjectId={s.selectedProjectId}
+          canManageProject={(project) => resolveAccess(s.userRole, project.my_role).canManageProject}
           onNewProject={() => setShowNewProjectModal(true)}
           onRefreshProjects={s.fetchProjects}
           onSelectProject={s.setSelectedProjectId}
@@ -1776,6 +1764,7 @@ export default function App() {
         <ErrorBoundary level="panel">
         <Suspense fallback={null}>
         <TaskDetailDrawer
+          canOperateProject={s.selectedProjectAccess.canOperateProject}
           task={s.logTask}
           tasks={s.tasks}
           logLines={s.logLines}
@@ -1803,7 +1792,7 @@ export default function App() {
       )}
 
       <Suspense fallback={null}>
-      {s.selectionMode && s.selectedTaskIds.size > 0 && (
+      {s.selectedProjectAccess.canOperateProject && s.selectionMode && s.selectedTaskIds.size > 0 && (
         <BulkActionBar
           selectedCount={s.selectedTaskIds.size}
           approvableTasks={approvableTasks}

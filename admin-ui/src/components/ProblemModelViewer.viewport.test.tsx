@@ -146,6 +146,7 @@ const defaultProps = {
   projectId: 'proj-test-1',
   addToast: noop,
   onUpdated: noop,
+  readOnly: false,
 };
 
 describe('ProblemModelViewer — viewport regression', () => {

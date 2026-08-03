@@ -27,8 +27,21 @@ import { useProjectConfig } from './hooks/useProjectConfig';
 import { resolveTaskCapabilities } from './taskCapabilities';
 import { isEditableShortcutEvent } from './hooks/keyboardTargets';
 import type { StrategicStateResponse } from './strategicStateApi';
+import { resolveAccess } from './accessControl';
+import { clearGitHubOAuthCallbackQuery, clearNewProjectOAuthResume } from './utils/newProjectOAuthResume';
 
 export type { DeployState } from './types/settings';
+
+export function effectiveSelectedProjectId(
+  persistedProjectId: string | null,
+  projectsLoaded: boolean,
+  projectsFetchError: string | null,
+  canViewProject: boolean,
+): string | null {
+  return projectsLoaded && !projectsFetchError && canViewProject
+    ? persistedProjectId
+    : null;
+}
 
 /**
  * useAppState is a THIN FACADE: it composes the per-domain hooks
@@ -100,6 +113,7 @@ function useShallowMemo<T extends Record<string, unknown>>(value: T): T {
 export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, refreshFleetRunnersRef, strategicReadModelRef }: UseAppStateOptions = {}) {
   // ── Composed hooks ──────────────────────────────────────────────────────
   const { user, authLoading, userRole, accessDenied, error, setError } = useAuth();
+  const platformAccess = resolveAccess(userRole, undefined);
   const { toasts, addToast, dismissToast } = useToasts();
   const { viewMode, setViewMode, compactMode, setCompactMode, columnPrefs, setColumnPrefs, defaultTaskType, setDefaultTaskType } = useViewPreferences();
   const { metricsHistory, cumulativeCost, cumulativeVmHours, metricsWindow, setMetricsWindow, addMetricsPoint } = useMetrics();
@@ -127,9 +141,43 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
   const prevTasksRef = useRef<Task[]>([]);
 
   // Moved before useDeploymentState so it can be passed as a parameter
-  const [selectedProjectId, setSelectedProjectId] = usePersistedState<string | null>('selectedProject', null);
-  // Keep the ref in sync so useTaskModal can read the current project id without
-  // being a dependency of every effect that references selectedProjectId.
+  const [persistedSelectedProjectId, setSelectedProjectId] = usePersistedState<string | null>('selectedProject', null);
+
+  // Project membership is the existing source of truth for project-scoped
+  // Runtime reads. Keep it available before the deployment hook so global
+  // admin health and project diagnostics can be gated independently.
+  const {
+    projects, setProjects, projectsFetchError, projectsLoaded,
+    fetchProjects, handlePauseAllAutonomous, handleClearWaveDeps,
+  } = useProjectsState(
+    addToast,
+    fetchTasksRef,
+  );
+  const selectedProjectAccess = resolveAccess(
+    userRole,
+    projects.find(project => project.id === persistedSelectedProjectId)?.my_role,
+  );
+  // A persisted selection is only safe to use as a request key after the
+  // authoritative membership list has loaded successfully and still contains
+  // it. Until then every project-scoped hook/poller receives null.
+  const selectedProjectId = effectiveSelectedProjectId(
+    persistedSelectedProjectId,
+    projectsLoaded,
+    projectsFetchError,
+    selectedProjectAccess.canViewProject,
+  );
+
+  useEffect(() => {
+    if (
+      !projectsLoaded
+      || projectsFetchError
+      || !persistedSelectedProjectId
+      || projects.some(project => project.id === persistedSelectedProjectId)
+    ) return;
+    setSelectedProjectId(null);
+  }, [projects, projectsFetchError, projectsLoaded, persistedSelectedProjectId, setSelectedProjectId]);
+
+  // Keep the task launcher on the same validated identity used by reads.
   useEffect(() => { selectedProjectIdRef.current = selectedProjectId; }, [selectedProjectId]);
 
   const {
@@ -162,7 +210,10 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
     handleRollback, handleMarkStable, handleRepairState,
     failedRollback,
     zoneHealth, orchestratorHealth, detailedHealth, diagnostics,
-  } = useDeploymentState(addToast, user, fetchTasksRef, selectedProjectId, runtimeTabVisited);
+  } = useDeploymentState(addToast, user, fetchTasksRef, selectedProjectId, runtimeTabVisited, {
+    isPlatformAdmin: platformAccess.isPlatformAdmin,
+    canViewProject: selectedProjectAccess.canViewProject,
+  });
 
   const {
     logTask, logLines, logsConnecting, wsDisconnected, wsDisconnectReason,
@@ -188,6 +239,8 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
     selectedProjectId,
     realtimeWsEnabled: !authLoading && Boolean(user),
     strategicReadModelRef,
+    canViewProject: selectedProjectAccess.canViewProject,
+    isAdmin: platformAccess.isPlatformAdmin,
   });
 
   const [researchFeed, setResearchFeed] = useState<Task[]>([]);
@@ -278,7 +331,7 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
   } = useUserManagement(showUserManagement);
 
   const {
-    projectMembers, fetchProjectMembers, addProjectMember, updateProjectMemberRole, removeProjectMember,
+    projectMembers, projectMembersProjectId, activateProjectMembers, fetchProjectMembers, addProjectMember, updateProjectMemberRole, removeProjectMember,
   } = useProjectMembers();
 
   // ── Notification preferences ─────────────────────────────────────────────
@@ -292,11 +345,6 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
   } = useNotificationPrefs();
 
   // ── Projects domain ──────────────────────────────────────────────────────
-  const {
-    projects, setProjects, projectsFetchError, projectsLoaded,
-    fetchProjects, handlePauseAllAutonomous, handleClearWaveDeps,
-  } = useProjectsState(addToast, fetchTasksRef);
-
   // ── Alerts domain ────────────────────────────────────────────────────────
   const { alerts, fetchAlerts, dismissAlert, dismissAllAlerts } = useAlertsState(addToast, selectedProjectId);
   fetchAlertsRef.current = fetchAlerts;
@@ -322,9 +370,36 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
     fetchArchiveTasks,
     selectedTaskIds, setSelectedTaskIds, setSelectionMode, setConfirmDialog,
     fetchTasksRef, prevTasksRef,
-    selectedProjectId, directionFilter,
+    selectedProjectId, canOperateProject: selectedProjectAccess.canOperateProject, directionFilter,
   });
   fetchCountsRef.current = fetchCounts;
+
+  // Project-scoped callbacks can outlive the surface that created them (for
+  // example a bulk confirmation opened immediately before switching projects).
+  // Tear down those closures whenever scope or operate capability changes.
+  const projectTransientScopeRef = useRef({
+    projectId: selectedProjectId,
+    canOperate: selectedProjectAccess.canOperateProject,
+  });
+  useEffect(() => {
+    const previous = projectTransientScopeRef.current;
+    const canOperate = selectedProjectAccess.canOperateProject;
+    if (previous.projectId === selectedProjectId && previous.canOperate === canOperate) return;
+    projectTransientScopeRef.current = { projectId: selectedProjectId, canOperate };
+    setSelectedTaskIds(new Set());
+    setSelectionMode(false);
+    setConfirmDialog(null);
+    closeLogViewer();
+    setShowNewTaskModal(false);
+  }, [
+    selectedProjectId,
+    selectedProjectAccess.canOperateProject,
+    closeLogViewer,
+    setConfirmDialog,
+    setSelectedTaskIds,
+    setSelectionMode,
+    setShowNewTaskModal,
+  ]);
 
   // ── Project-scoped config domain ─────────────────────────────────────────
   const {
@@ -431,7 +506,7 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
     if (connected) {
       setError(null);
       setGithubAccount(connected);
-      window.history.replaceState({}, '', window.location.pathname);
+      clearGitHubOAuthCallbackQuery();
     } else if (ghError) {
       const messages: Record<string, string> = {
         state_expired: 'GitHub OAuth expired — try again',
@@ -440,7 +515,8 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
         failed: 'GitHub connection failed — try again',
       };
       setError(messages[ghError] || `GitHub error: ${ghError}`);
-      window.history.replaceState({}, '', window.location.pathname);
+      clearNewProjectOAuthResume();
+      clearGitHubOAuthCallbackQuery();
     }
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -460,13 +536,15 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
 
   // Leading fetches on mount / user change — kicks off the initial load.
   useEffect(() => {
-    if (!user) return;
-    fetchSettings();
-    fetchMaxPlanAccounts();
+    if (!user || userRole === null) return;
+    if (platformAccess.canReadPlatformSettings) {
+      fetchSettings();
+      fetchMaxPlanAccounts();
+    }
     fetchProjects();
     fetchAlerts();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [user]);
+  }, [user, userRole]);
 
   // Coordinated polling on the shared, visibility-aware clock. Project list
   // refreshes every 60s; tasks+alerts refresh on the configured cadence
@@ -518,7 +596,7 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
 
       switch (e.key) {
         case 'r':
-          if (selectionMode && selectedTaskIds.size > 0) {
+          if (selectedProjectAccess.canOperateProject && selectionMode && selectedTaskIds.size > 0) {
             e.preventDefault();
             const failed = tasks.filter(t => selectedTaskIds.has(t.id) && t.status === 'FAILED');
             if (failed.length > 0) {
@@ -536,7 +614,7 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
           }
           break;
         case 'Delete':
-          if (selectionMode && selectedTaskIds.size > 0) {
+          if (selectedProjectAccess.canOperateProject && selectionMode && selectedTaskIds.size > 0) {
             e.preventDefault();
             const cancellable = tasks.filter(t => selectedTaskIds.has(t.id) && ['QUEUED', 'IN_PROGRESS', 'PROVISIONING', 'EVALUATING'].includes(t.status));
             if (cancellable.length > 0) {
@@ -563,7 +641,7 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showNewTaskModal, logTask, showResearchBrowser, showActivityFeed, showArchive, selectionMode, selectedTaskIds, tasks]);
+  }, [showNewTaskModal, logTask, showResearchBrowser, showActivityFeed, showArchive, selectionMode, selectedTaskIds, tasks, selectedProjectAccess.canOperateProject]);
 
   // ── Cross-domain glue handlers ────────────────────────────────────────────
 
@@ -583,12 +661,13 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
   }, [addToast]);
 
   const refreshSettings = useCallback(() => {
+    if (!platformAccess.canReadPlatformSettings) return;
     fetchSettings();
     // Refresh the authoritative roster every time settings are entered so a
     // just-added/edited account is always present without waiting on the heavy
     // settings payload.
     fetchMaxPlanAccounts();
-  }, [fetchSettings, fetchMaxPlanAccounts]);
+  }, [platformAccess.canReadPlatformSettings, fetchSettings, fetchMaxPlanAccounts]);
 
   const handleUpdateBuildConfig = useCallback(async (config: import('./types/project').BuildConfig) => {
     if (!selectedProjectId) return;
@@ -628,7 +707,7 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
 
   return useShallowMemo({
     // Auth
-    user, authLoading, userRole, accessDenied, error, setError,
+    user, authLoading, userRole, selectedProjectAccess, accessDenied, error, setError,
     // Tasks
     tasks, totalTasks, globalActiveCount, globalEvaluatingCount, globalQueuedCount,
     scopedActiveCount, scopedEvaluatingCount, scopedQueuedCount,
@@ -784,6 +863,6 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
     allowedUsers, showUserManagement, setShowUserManagement,
     addAllowedUser, updateAllowedUserRole, removeAllowedUser,
     // Project members
-    projectMembers, fetchProjectMembers, addProjectMember, updateProjectMemberRole, removeProjectMember,
+    projectMembers, projectMembersProjectId, activateProjectMembers, fetchProjectMembers, addProjectMember, updateProjectMemberRole, removeProjectMember,
   });
 }

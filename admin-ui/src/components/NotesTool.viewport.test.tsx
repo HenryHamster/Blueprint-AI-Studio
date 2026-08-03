@@ -74,7 +74,7 @@ describe('NotesTool — viewport regression', () => {
       document.body.appendChild(host);
       const r = createRoot(host);
       root = r;
-      await act(async () => { r.render(<NotesTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
+      await act(async () => { r.render(<NotesTool projectId="proj-a" tool={SAMPLE_TOOL} readOnly={false} />); });
       await act(async () => { await new Promise(resolve => setTimeout(resolve, 100)); });
     });
     if (!host) throw new Error('host not mounted');
@@ -96,7 +96,7 @@ describe('NotesTool — viewport regression', () => {
       document.body.appendChild(host);
       const r = createRoot(host);
       root = r;
-      await act(async () => { r.render(<NotesTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
+      await act(async () => { r.render(<NotesTool projectId="proj-a" tool={SAMPLE_TOOL} readOnly={false} />); });
       await act(async () => { await new Promise(resolve => setTimeout(resolve, 100)); });
     });
     if (!host) throw new Error('host not mounted');
@@ -117,7 +117,7 @@ describe('NotesTool — viewport regression', () => {
     document.body.appendChild(host);
     const r = createRoot(host);
     root = r;
-    await act(async () => { r.render(<NotesTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
+    await act(async () => { r.render(<NotesTool projectId="proj-a" tool={SAMPLE_TOOL} readOnly={false} />); });
     if (!host) throw new Error('host not mounted');
     expect(host.textContent).toContain('Loading notes');
     await act(async () => {
@@ -138,7 +138,7 @@ describe('NotesTool — viewport regression', () => {
     document.body.appendChild(host);
     const r = createRoot(host);
     root = r;
-    await act(async () => { r.render(<NotesTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
+    await act(async () => { r.render(<NotesTool projectId="proj-a" tool={SAMPLE_TOOL} readOnly={false} />); });
     await act(async () => { await vi.runAllTimersAsync(); });
     if (!host) throw new Error('host not mounted');
     const textarea = host.querySelector('textarea') as HTMLTextAreaElement | null;
@@ -165,7 +165,7 @@ describe('NotesTool — viewport regression', () => {
     document.body.appendChild(host);
     const r = createRoot(host);
     root = r;
-    await act(async () => { r.render(<NotesTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
+    await act(async () => { r.render(<NotesTool projectId="proj-a" tool={SAMPLE_TOOL} readOnly={false} />); });
     await act(async () => { await new Promise(resolve => setTimeout(resolve, 100)); });
     if (!host) throw new Error('host not mounted');
 
@@ -198,7 +198,7 @@ describe('NotesTool — viewport regression', () => {
     document.body.appendChild(host);
     const r = createRoot(host);
     root = r;
-    await act(async () => { r.render(<NotesTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
+    await act(async () => { r.render(<NotesTool projectId="proj-a" tool={SAMPLE_TOOL} readOnly={false} />); });
     await act(async () => { await vi.runAllTimersAsync(); });
     if (!host) throw new Error('host not mounted');
     expect(host.textContent).toContain('Network error');
@@ -225,7 +225,7 @@ describe('NotesTool — viewport regression', () => {
     document.body.appendChild(host);
     const r = createRoot(host);
     root = r;
-    await act(async () => { r.render(<NotesTool projectId="proj-a" tool={SAMPLE_TOOL} />); });
+    await act(async () => { r.render(<NotesTool projectId="proj-a" tool={SAMPLE_TOOL} readOnly={false} />); });
     await act(async () => { await vi.runAllTimersAsync(); });
 
     if (!host) throw new Error('host not mounted');

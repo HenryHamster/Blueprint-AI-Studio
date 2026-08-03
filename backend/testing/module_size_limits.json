@@ -122,7 +122,7 @@
     "recovery_sidecar.py": 400,
     "release_version.py": 2050,
     "ci_resolution.py": 2100,
-    "routers/admin_project_config.py": 1800,
+    "routers/admin_project_config.py": 2000,
     "compute_backends.py": 6200,
     "direction_lifecycle.py": 2200,
     "routers/admin_notifications.py": 2150,
@@ -159,7 +159,8 @@
     "storage.py": 1750,
     "strategic_resident_session.py": 6850,
     "release_qualifier_audit.py": 1800,
-    "conversation_coordinator.py": 1900
+    "conversation_coordinator.py": 1900,
+    "routers/agent_warm_continuity.py": 1700
   },
   "agent": {
     "index.ts": 4600,
@@ -383,7 +384,7 @@
     "test_admin_routers__messages.py": 5250,
     "test_admin_routers__version_lifecycle.py": 4800,
     "test_admin_routers__runners.py": 1600,
-    "test_admin_routers__users.py": 750,
+    "test_admin_routers__users.py": 1000,
     "test_compute__experiments.py": 1600,
     "test_release_qualifier__retry_episode_cap.py": 750,
     "test_compute_park_wake.py": 2000,
@@ -391,6 +392,7 @@
     "test_conversational_workday_protection.py": 1800,
     "test_admin_routers__projects.py": 4100,
     "test_admin_routers__strategic_directions.py": 2200,
-    "test_strategic_session_messages.py": 1950
+    "test_strategic_session_messages.py": 1950,
+    "test_warm_pool_dispatch.py": 2100
   }
 }

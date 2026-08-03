@@ -1,10 +1,17 @@
 /* eslint-disable react-hooks/set-state-in-effect */
 import { useState, useEffect } from 'react';
-import { X, GitBranch, Loader2, CheckCircle, Plus, Search, ArrowRight, Wrench, Zap, Tag, AlertTriangle } from 'lucide-react';
+import { X, GitBranch, Loader2, CheckCircle, Plus, Search, ArrowRight, Wrench, Zap, Tag, AlertTriangle, Github } from 'lucide-react';
 import { onboardProject, previewOnboardProject, authGet, apiFetch, API_BASE_URL } from '../api';
+import { apiErrorMessage } from '../api/core';
 import type { BuildConfig, BuildConfigDirectory, AutoRemediationConfig, MergeVerificationVerdict } from '../types/project';
 import type { ProblemModelPatch } from '../types';
 import { MergeVerificationBanner } from './MergeVerificationBanner';
+import { useGitHubConnection } from '../hooks/useGitHubConnection';
+import {
+  clearNewProjectOAuthResume,
+  readNewProjectOAuthResume,
+  saveNewProjectOAuthResume,
+} from '../utils/newProjectOAuthResume';
 
 interface IssueImplementationConfig {
   enabled: boolean;
@@ -42,6 +49,8 @@ interface NewProjectModalProps {
   onSuccess: (projectId: string) => void;
   /** When provided, skip the wizard and show the setup guide for an existing project. */
   setupProject?: SetupProject;
+  /** Restore the narrow, credential-free form snapshot saved before GitHub OAuth. */
+  resumeFromGitHub?: boolean;
 }
 
 function parseRepoInput(input: string): { owner: string; repo: string } | null {
@@ -112,7 +121,10 @@ function deriveMergeVerificationVerdict(config: BuildConfig | null): MergeVerifi
 }
 
 function installErrorBannerContent(error: string, owner?: string, repo?: string) {
-  if (!error.includes('installation token')) return null;
+  const normalized = error.toLowerCase();
+  const isInstallationError = normalized.includes('installation token')
+    || (normalized.includes('github app') && normalized.includes('not installed'));
+  if (!isInstallationError) return null;
   const repoRef = owner && repo ? `${owner}/${repo}` : 'the target repository';
   return (
     <>
@@ -124,17 +136,19 @@ function installErrorBannerContent(error: string, owner?: string, repo?: string)
 
 const STEP_LABELS: Record<string, string> = { repo: 'Repository', config: 'Confirm', success: 'Created' };
 
-export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProjectModalProps) {
+export function NewProjectModal({ onClose, onSuccess, setupProject, resumeFromGitHub = false }: NewProjectModalProps) {
+  const [oauthResume] = useState(() => resumeFromGitHub ? readNewProjectOAuthResume() : null);
+  const githubConnection = useGitHubConnection(!setupProject);
   const [step, setStep] = useState<Step>(setupProject ? 'success' : 'repo');
-  const [repoInput, setRepoInput] = useState('');
-  const [projectName, setProjectName] = useState('');
-  const [goal, setGoal] = useState('');
-  const [projectType, setProjectType] = useState('');
-  const [users, setUsers] = useState('');
-  const [team, setTeam] = useState('');
-  const [deployCadence, setDeployCadence] = useState('');
-  const [notes, setNotes] = useState('');
-  const [constraints, setConstraints] = useState<string[]>(['']);
+  const [repoInput, setRepoInput] = useState(oauthResume?.repoInput ?? '');
+  const [projectName, setProjectName] = useState(oauthResume?.projectName ?? '');
+  const [goal, setGoal] = useState(oauthResume?.goal ?? '');
+  const [projectType, setProjectType] = useState(oauthResume?.projectType ?? '');
+  const [users, setUsers] = useState(oauthResume?.users ?? '');
+  const [team, setTeam] = useState(oauthResume?.team ?? '');
+  const [deployCadence, setDeployCadence] = useState(oauthResume?.deployCadence ?? '');
+  const [notes, setNotes] = useState(oauthResume?.notes ?? '');
+  const [constraints, setConstraints] = useState<string[]>(oauthResume?.constraints ?? ['']);
   const [repoError, setRepoError] = useState('');
   const [submitError, setSubmitError] = useState('');
   const [createdProjectId, setCreatedProjectId] = useState(setupProject?.id ?? '');
@@ -146,8 +160,8 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
 
   // Repo picker state
   const [detectedDefaultBranch, setDetectedDefaultBranch] = useState('');
-  const [previewDefaultBranch, setPreviewDefaultBranch] = useState('');
-  const [promotionTargetInput, setPromotionTargetInput] = useState('');
+  const [previewDefaultBranch, setPreviewDefaultBranch] = useState(oauthResume?.previewDefaultBranch ?? '');
+  const [promotionTargetInput, setPromotionTargetInput] = useState(oauthResume?.promotionTargetInput ?? '');
 
   // Feature configs for the post-install setup guide
   const [autoRemediationConfig, setAutoRemediationConfig] = useState<AutoRemediationConfig | null>(null);
@@ -162,11 +176,21 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
   const [repoOptions, setRepoOptions] = useState<RepoOption[]>([]);
   const [repoLoading, setRepoLoading] = useState(false);
   const [repoFetchError, setRepoFetchError] = useState<string | null>(null);
-  const [useManualRepo, setUseManualRepo] = useState(false);
-  const [repoFilter, setRepoFilter] = useState('');
+  const [useManualRepo, setUseManualRepo] = useState(oauthResume?.useManualRepo ?? false);
+  const [repoFilter, setRepoFilter] = useState(oauthResume?.repoFilter ?? '');
+
+  useEffect(() => {
+    if (oauthResume) clearNewProjectOAuthResume();
+  }, [oauthResume]);
 
   useEffect(() => {
     let cancelled = false;
+    if (setupProject || githubConnection.loading || !githubConnection.status?.identity_linked) {
+      setRepoLoading(false);
+      setRepoOptions([]);
+      setRepoFetchError(null);
+      return () => { cancelled = true; };
+    }
     setRepoLoading(true);
     setRepoFetchError(null);
     authGet(`${API_BASE_URL}/api/admin/github/repos`)
@@ -174,11 +198,13 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
         if (cancelled) return;
         if (!res.ok) {
           const errData = await res.json().catch(() => ({}));
-          setRepoFetchError(errData?.detail || 'Failed to load repositories');
+          if (cancelled) return;
+          setRepoFetchError(apiErrorMessage(errData, 'Failed to load repositories'));
           setUseManualRepo(true);
           return;
         }
         const data = await res.json();
+        if (cancelled) return;
         const repos: RepoOption[] = data.repositories || [];
         setRepoOptions(repos);
         if (repos.length === 0) {
@@ -195,7 +221,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
         if (!cancelled) setRepoLoading(false);
       });
     return () => { cancelled = true; };
-  }, []);
+  }, [setupProject, githubConnection.loading, githubConnection.status?.identity_linked]);
 
   // When opened in setup-guide mode for an existing project, load its feature configs
   useEffect(() => {
@@ -223,7 +249,37 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
   const effectiveVerdict = previewVerdict ?? detectedVerdict;
   const effectiveDefaultBranch = detectedDefaultBranch || previewDefaultBranch;
 
+  const handleGitHubConnect = () => {
+    void githubConnection.connect(() => {
+      saveNewProjectOAuthResume({
+        version: 1,
+        repoInput,
+        projectName,
+        goal,
+        projectType,
+        users,
+        team,
+        deployCadence,
+        notes,
+        constraints,
+        promotionTargetInput,
+        useManualRepo,
+        repoFilter,
+        previewDefaultBranch,
+      });
+    });
+  };
+
+  const handleClose = () => {
+    clearNewProjectOAuthResume();
+    onClose();
+  };
+
   const handleRepoNext = async () => {
+    if (githubConnection.loading || !githubConnection.status?.identity_linked) {
+      setRepoError('Connect your GitHub account before previewing this repository.');
+      return;
+    }
     if (!parsed) {
       setRepoError('Enter a valid GitHub repo as "owner/repo" or a full GitHub URL.');
       return;
@@ -297,6 +353,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
       setDetectedVerdict(data.merge_verification_verdict ?? null);
       setDetectedDefaultBranch((data as Record<string, unknown>).default_branch as string || '');
       setStep('success');
+      clearNewProjectOAuthResume();
       onSuccess(projectId);
 
       // Load feature configs for the setup guide — optional, never undoes the success step
@@ -421,7 +478,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
             <Plus className="w-4 h-4 text-neutral-400" />
             {setupProject ? 'Project Setup' : 'New Project'}
           </h2>
-          <button onClick={onClose} className="min-h-[44px] min-w-[44px] flex items-center justify-center -mr-2 text-neutral-500 hover:text-neutral-300 transition-colors">
+          <button onClick={handleClose} className="min-h-[44px] min-w-[44px] flex items-center justify-center -mr-2 text-neutral-500 hover:text-neutral-300 transition-colors">
             <X className="w-4 h-4" />
           </button>
         </div>
@@ -456,6 +513,59 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
           {step === 'repo' && (
             <div>
               <div className="mb-4">
+                <div className="mb-4 rounded-lg border border-neutral-800 bg-neutral-950/70 p-3">
+                  <div className="flex items-start gap-2.5">
+                    <Github className="mt-0.5 h-4 w-4 shrink-0 text-neutral-400" />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <p className="text-xs font-semibold text-neutral-200">Your GitHub authorization</p>
+                        {githubConnection.loading ? (
+                          <span className="text-ui-sm text-neutral-500">Checking…</span>
+                        ) : githubConnection.status?.identity_linked ? (
+                          <span className="rounded-full border border-emerald-500/20 bg-emerald-500/10 px-1.5 py-0.5 text-ui-sm text-emerald-400">
+                            Connected{githubConnection.status.account_name ? ` as ${githubConnection.status.account_name}` : ''}
+                          </span>
+                        ) : (
+                          <span className="rounded-full border border-amber-500/20 bg-amber-500/10 px-1.5 py-0.5 text-ui-sm text-amber-400">Not connected</span>
+                        )}
+                      </div>
+                      <p className="mt-1 text-ui-sm leading-relaxed text-neutral-500">
+                        Connect your account so Blueprint can verify that you personally have push or admin access. Separately, the Blueprint GitHub App must be installed with access to this repository so agents can work on it.
+                      </p>
+                      {!githubConnection.loading && !githubConnection.status?.identity_linked && (
+                        <button
+                          type="button"
+                          onClick={handleGitHubConnect}
+                          disabled={githubConnection.connecting}
+                          className="mt-2 inline-flex min-h-[44px] items-center gap-1.5 rounded border border-neutral-700 bg-neutral-800 px-3 py-2 text-xs font-medium text-neutral-200 transition-colors hover:bg-neutral-700 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          {githubConnection.connecting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Github className="h-3.5 w-3.5" />}
+                          Connect GitHub
+                        </button>
+                      )}
+                      {githubConnection.error && (
+                        <p className="mt-1 text-ui-sm text-amber-500">{githubConnection.error}</p>
+                      )}
+                      {!githubConnection.loading && githubConnection.status && !githubConnection.status.app_configured && (
+                        <p className="mt-1 text-ui-sm text-amber-500">The Blueprint GitHub App is not configured on this server. Ask an administrator to configure it before onboarding repositories.</p>
+                      )}
+                      {githubConnection.status?.identity_linked && githubConnection.status.app_configured && !githubConnection.status.app_installation_reachable && (
+                        <div className="mt-2">
+                          <p className="text-ui-sm text-amber-500">Your GitHub identity is connected, but the Blueprint GitHub App has no repository installation you can access yet.</p>
+                          <button
+                            type="button"
+                            onClick={handleGitHubConnect}
+                            disabled={githubConnection.connecting}
+                            className="mt-2 inline-flex min-h-[44px] items-center gap-1.5 rounded border border-neutral-700 bg-neutral-800 px-3 py-2 text-xs font-medium text-neutral-200 transition-colors hover:bg-neutral-700 disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            {githubConnection.connecting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Github className="h-3.5 w-3.5" />}
+                            Install Blueprint App
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
                 <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-2">
                   GitHub Repository
                 </label>
@@ -521,7 +631,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                   </div>
                 ) : (
                   <div>
-                    {repoFetchError && !useManualRepo && (
+                    {repoFetchError && (
                       <p className="text-ui-sm text-amber-500 mb-1">{repoFetchError}</p>
                     )}
                     <input
@@ -691,7 +801,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
               <div className="flex justify-end gap-2">
                 <button
                   type="button"
-                  onClick={onClose}
+                  onClick={handleClose}
                   className="px-4 py-1.5 min-h-[44px] sm:min-h-0 text-xs text-neutral-400 font-medium hover:bg-neutral-800 rounded transition-colors"
                 >
                   Cancel
@@ -699,7 +809,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                 <button
                   type="button"
                   onClick={() => { void handleRepoNext(); }}
-                  disabled={!repoInput.trim()}
+                  disabled={!repoInput.trim() || githubConnection.loading || !githubConnection.status?.identity_linked}
                   className="px-4 py-1.5 min-h-[44px] sm:min-h-0 bg-white text-neutral-950 text-xs font-semibold hover:bg-neutral-200 rounded transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                 >
                   Continue
@@ -918,7 +1028,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                 <div className="flex gap-2">
                   <button
                     type="button"
-                    onClick={onClose}
+                    onClick={handleClose}
                     disabled={step === 'submitting'}
                     className="px-4 py-1.5 min-h-[44px] sm:min-h-0 text-xs text-neutral-400 font-medium hover:bg-neutral-800 rounded transition-colors disabled:opacity-40"
                   >
@@ -1134,7 +1244,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                 <ul className="space-y-1.5 text-ui-md text-neutral-400">
                   <li className="flex items-start gap-2">
                     <ArrowRight className="w-3 h-3 text-neutral-600 mt-0.5 shrink-0" />
-                    <span>Open a PR and Blueprint will automatically review it in the Checks tab</span>
+                    <span>Eligible PRs can be reviewed after you enable Auto-Review in project settings; webhook admission and project limits still apply</span>
                   </li>
                   {autoRemediationConfig?.enabled && detectedDefaultBranch && (
                     <li className="flex items-start gap-2">
@@ -1158,7 +1268,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
               <div className="flex justify-end">
                 <button
                   type="button"
-                  onClick={onClose}
+                  onClick={handleClose}
                   className="px-4 py-1.5 min-h-[44px] sm:min-h-0 bg-white text-neutral-950 text-xs font-semibold hover:bg-neutral-200 rounded transition-colors"
                 >
                   Done

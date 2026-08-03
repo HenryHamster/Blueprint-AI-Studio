@@ -18,15 +18,16 @@ import { getToolComponent } from '../toolRegistry';
 import { WorkbenchPanel } from './WorkbenchLayout';
 import { ProjectToolIframe } from './ProjectToolIframe';
 import { loadHiddenManifestSlugs, saveHiddenManifestSlugs } from './projectToolHidden';
+import { resolveAccess } from '../accessControl';
 
 interface Props {
   projectId: string;
   /**
    * The caller's role on this project. Owner-only management controls
    * (add / seed / configure / rename / enable-disable / remove) are hidden
-   * for non-owners so members never see buttons that only 403. When omitted
-   * (e.g. legacy call sites, tests) the caller is treated as an owner; the
-   * backend still enforces the owner requirement on every mutation.
+   * for non-owners so members never see buttons that only 403. Omitted or
+   * still-loading roles fail closed; the backend independently enforces the
+   * owner requirement on every mutation.
    */
   myRole?: 'owner' | 'member' | 'viewer';
 }
@@ -89,8 +90,14 @@ function coerceConfigValue(raw: string, type: string | undefined): unknown {
 }
 
 export function ProjectToolHost({ projectId, myRole }: Props) {
-  // UI gating only — the backend independently enforces owner on every mutation.
-  const isOwner = myRole === undefined || myRole === 'owner';
+  // UI gating only — the backend independently enforces each role floor.
+  const access = resolveAccess(undefined, myRole);
+  const isOwner = access.canManageProject;
+  const canOperate = access.canOperateProject;
+  const isOwnerRef = useRef(isOwner);
+  useLayoutEffect(() => {
+    isOwnerRef.current = isOwner;
+  }, [isOwner]);
   const [state, setState] = useState<FetchState>({ status: 'loading', projectId });
   // Async mutations outlive a project switch. Keep the current identity in a
   // ref so their continuations can discard state intended for the old project.
@@ -155,6 +162,27 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
   const [configuringProjectId, setConfiguringProjectId] = useState<string | null>(null);
   const [configDraft, setConfigDraft] = useState<ConfigDraft | null>(null);
   const [savingConfig, setSavingConfig] = useState(false);
+
+  // A role can change while an owner-only form or delete confirmation is open.
+  // Reset that render-local state synchronously when ownership is lost, using
+  // React's conditional state-adjustment pattern. Mutation handlers also use
+  // isOwnerRef as a second boundary against stale DOM nodes and continuations.
+  const [previousIsOwner, setPreviousIsOwner] = useState(isOwner);
+  if (previousIsOwner !== isOwner) {
+    setPreviousIsOwner(isOwner);
+    if (!isOwner) {
+      setShowAddForm(false);
+      setAddFormProjectId(null);
+      setConfiguringId(null);
+      setConfiguringProjectId(null);
+      setConfigDraft(null);
+      setPendingDeleteId(null);
+      setActionError(null);
+      setActionErrorProjectId(null);
+      setLastCreatedSlug(null);
+      setLastCreatedSlugProjectId(null);
+    }
+  }
 
   const isCurrentProject = (requestedProjectId: string) =>
     currentProjectIdRef.current === requestedProjectId;
@@ -279,6 +307,7 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
   // Lazy-load tool kinds (shared by the Add form and per-tool Configure panel).
   // Returns the loaded kinds, or [] on failure.
   async function ensureToolKinds(requestedProjectId = projectId): Promise<ToolKindConfig[]> {
+    if (!isOwnerRef.current) return [];
     if (toolKinds !== null) return toolKinds;
     setLoadingKinds(true);
     setLoadingKindsProjectId(requestedProjectId);
@@ -296,6 +325,7 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
   }
 
   async function handleOpenAddForm() {
+    if (!isOwnerRef.current) return;
     const requestedProjectId = projectId;
     setShowAddForm(true);
     setAddFormProjectId(requestedProjectId);
@@ -305,7 +335,7 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
     setLastCreatedSlugProjectId(requestedProjectId);
     setNewTitle('');
     const kinds = await ensureToolKinds(requestedProjectId);
-    if (isCurrentProject(requestedProjectId) && !selectedKind && kinds.length > 0) setSelectedKind(kinds[0].kind);
+    if (isOwnerRef.current && isCurrentProject(requestedProjectId) && !selectedKind && kinds.length > 0) setSelectedKind(kinds[0].kind);
   }
 
   // Look up the config schema (JSON-Schema `properties`) declared for a kind.
@@ -317,6 +347,7 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
   }
 
   async function handleOpenConfigure(tool: ProjectTool) {
+    if (!isOwnerRef.current) return;
     const requestedProjectId = projectId;
     clearActionError(requestedProjectId);
     if (configuringId === tool.id && configuringProjectId === requestedProjectId) {
@@ -327,7 +358,7 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
       return;
     }
     await ensureToolKinds(requestedProjectId);
-    if (!isCurrentProject(requestedProjectId)) return;
+    if (!isOwnerRef.current || !isCurrentProject(requestedProjectId)) return;
     // Seed the draft config from the tool's existing config, stringifying
     // values so every schema field is editable as text.
     const existing = tool.config ?? {};
@@ -341,6 +372,7 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
   }
 
   async function handleSaveConfig(tool: ProjectTool) {
+    if (!isOwnerRef.current) return;
     const requestedProjectId = projectId;
     if (!configDraft) return;
     const title = configDraft.title.trim();
@@ -375,6 +407,7 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
   }
 
   async function handleCreate() {
+    if (!isOwnerRef.current) return;
     const requestedProjectId = projectId;
     if (!selectedKind || !newTitle.trim()) return;
     setCreating(true);
@@ -396,6 +429,7 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
   }
 
   async function handleDelete(toolId: string) {
+    if (!isOwnerRef.current) return;
     const requestedProjectId = projectId;
     setDeletingId(toolId);
     setActionProjectId(requestedProjectId);
@@ -412,6 +446,7 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
   }
 
   async function handleToggleEnabled(tool: ProjectTool) {
+    if (!isOwnerRef.current) return;
     const requestedProjectId = projectId;
     setTogglingId(tool.id);
     setActionProjectId(requestedProjectId);
@@ -428,6 +463,7 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
   }
 
   async function handleSeed() {
+    if (!isOwnerRef.current) return;
     const requestedProjectId = projectId;
     setSeeding(true);
     setActionProjectId(requestedProjectId);
@@ -444,6 +480,7 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
   }
 
   async function handleCheckDrift() {
+    if (!isOwnerRef.current) return;
     const requestedProjectId = projectId;
     setDriftLoading(true);
     setActionProjectId(requestedProjectId);
@@ -614,7 +651,7 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
 
   // Owner-only inline rename + schema-driven config editor.
   function renderConfigPanel(tool: ProjectTool): ReactNode {
-    if (configuringId !== tool.id || configuringProjectId !== projectId || !configDraft) return null;
+    if (!isOwner || configuringId !== tool.id || configuringProjectId !== projectId || !configDraft) return null;
     const schemaProps = schemaPropsForKind(tool.kind);
     return (
       <div className="workbench-card space-y-3 rounded-md border p-3">
@@ -673,7 +710,7 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
   }
 
   function renderAddForm() {
-    if (!showAddForm || addFormProjectId !== projectId) return null;
+    if (!isOwner || !showAddForm || addFormProjectId !== projectId) return null;
     return (
       <div className="workbench-card space-y-3 rounded-md border p-3">
         {loadingKinds && loadingKindsProjectId === projectId ? (
@@ -825,7 +862,7 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
                   }
                 >
                   {tool.enabled ? (
-                    <ToolComponent projectId={projectId} tool={tool} />
+                    <ToolComponent projectId={projectId} tool={tool} readOnly={!canOperate} />
                   ) : (
                     <p className="py-8 text-center text-xs text-neutral-500">
                       This tool is disabled. Enable it to use it.
@@ -935,7 +972,7 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
                 return (
                   <div key={tool.id} className="min-w-0 space-y-1.5">
                     <WorkbenchPanel title={tool.title} meta={<span className="inline-flex items-center gap-1 rounded border border-neutral-600 px-1.5 py-0.5 text-ui-sm font-medium uppercase tracking-wider text-neutral-400">{tool.placement}</span>}>
-                      <ToolComponent projectId={projectId} tool={tool} />
+                      <ToolComponent projectId={projectId} tool={tool} readOnly={!canOperate} />
                     </WorkbenchPanel>
                     {isOwner && (
                       <div className="flex items-center gap-2 px-1">

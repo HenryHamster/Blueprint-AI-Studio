@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, test, vi } from 'vitest';
 
 vi.mock('./core', () => ({
   API_BASE_URL: '',
+  apiErrorMessage: vi.fn((_payload: unknown, fallback: string) => fallback),
   apiFetch: vi.fn(),
   COST_PER_VM_HR: 0.067,
   MESSAGE_CONTENT_MAX: 20000,

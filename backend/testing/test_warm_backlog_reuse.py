@@ -1031,6 +1031,62 @@ async def test_retarget_claim_omits_manifest_when_account_matches(
 
 
 @pytest.mark.asyncio
+async def test_accountless_retarget_selection_falls_back_to_exact_boot_reservation(
+    client: AsyncClient, db_session, mocker
+):
+    """Attempting retarget without acquiring an account is not a retarget.
+
+    The claim must still pass through the owner boot-account gate/stamp rather
+    than bypassing accounting on the VM's frozen credentials.
+    """
+    _patch_broadcast(mocker)
+    boot_acct = _pool_account("acct-boot")
+    _seed_pool(mocker, [boot_acct])
+
+    async def _accountless_retarget(
+        _session, _task, _vm_instance_id, _vm_boot, ctx, _task_type
+    ):
+        return None, ctx, None
+
+    mocker.patch(
+        "app.routers.agent_warm_continuity._resolve_retarget",
+        side_effect=_accountless_retarget,
+    )
+    with _FlagGuard(backlog=True, retarget=True):
+        project = await _make_project(db_session)
+        vm_id = "agent-vm-retarget-accountless"
+        prior = await _make_backlog_task(
+            db_session,
+            project.id,
+            status=TaskStatus.COMPLETED,
+            vm_instance_id=vm_id,
+            account_id="acct-boot",
+            provider="anthropic",
+            context={"scope": "small", "llm_auth_mode": "oauth"},
+        )
+        backlog = await _make_backlog_task(db_session, project.id)
+
+        token = create_agent_token(
+            str(prior.id), vm_id, task_type="create", project_id=str(project.id)
+        )
+        resp = await client.post(
+            "/api/agent/next-role",
+            json={"vm_instance_id": vm_id, "prior_task_id": str(prior.id)},
+            headers={"x-agent-token": token},
+        )
+        assert resp.status_code == 200, resp.text
+        assert boot_acct["active_tasks"] == 1
+        assert boot_acct["daily_task_count"] == 1
+        assert boot_acct["project_state"][str(project.id)] == {
+            "active_tasks": 1,
+            "daily_task_count": 1,
+        }
+        db_session.expire(backlog)
+        await db_session.refresh(backlog)
+        assert (backlog.context or {}).get("llm_account_id") == "acct-boot"
+
+
+@pytest.mark.asyncio
 async def test_retarget_releases_slot_on_finalize_failure(
     client: AsyncClient, db_session, mocker
 ):
@@ -1067,26 +1123,40 @@ async def test_retarget_releases_slot_on_finalize_failure(
         assert resp.status_code == 500
         # Acquired slot was released — net zero.
         assert retarget_acct["active_tasks"] == 0
+        assert retarget_acct["daily_task_count"] == 0
+        project_state = retarget_acct["project_state"][str(project.id)]
+        assert project_state["active_tasks"] == 0
+        assert project_state["daily_task_count"] == 0
         db_session.expire(backlog)
         await db_session.refresh(backlog)
         assert backlog.status == TaskStatus.QUEUED
 
 
 @pytest.mark.asyncio
-async def test_retarget_scopes_pool_to_launcher_not_project_owner(
-    client: AsyncClient, db_session, mocker
+@pytest.mark.parametrize("member_has_pool", [False, True])
+async def test_retarget_scopes_member_launched_work_to_project_owner(
+    client: AsyncClient, db_session, mocker, member_has_pool
 ):
-    """A user-launched backlog task (launcher != project owner) must re-target
-    against the LAUNCHER's account pool, mirroring cold dispatch (the launcher
-    pays). Resolving against the project owner would mis-attribute cost and, when
-    the owner's pool has no match, strand the task on the VM's boot creds."""
+    """Warm retarget always uses the project owner's execution resources.
+
+    The member's pool is irrelevant whether it is absent or has a healthy
+    account of its own; ``launched_by_user_id`` remains audit attribution.
+    """
     _patch_broadcast(mocker)
-    # Pool belongs to the LAUNCHER, not the project owner ("test-user-123").
-    launcher_acct = _pool_account("acct-launcher", user_id="launcher-user-999")
-    _seed_pool(mocker, [launcher_acct], user_id="launcher-user-999")
+    import app.max_plan_pool as pool
+
+    owner_acct = _pool_account("acct-owner")
+    member_acct = _pool_account("acct-member", user_id="member-user-999")
+    pools = {"test-user-123": [owner_acct]}
+    accounts = {owner_acct["id"]: owner_acct}
+    if member_has_pool:
+        pools["member-user-999"] = [member_acct]
+        accounts[member_acct["id"]] = member_acct
+    mocker.patch.object(pool, "_max_plan_pools", pools)
+    mocker.patch.object(pool, "_account_by_id", accounts)
     with _FlagGuard(backlog=True, retarget=True):
         project = await _make_project(db_session)
-        vm_id = "agent-vm-retarget-launcher"
+        vm_id = "agent-vm-retarget-owner"
         prior = await _make_backlog_task(
             db_session,
             project.id,
@@ -1096,7 +1166,7 @@ async def test_retarget_scopes_pool_to_launcher_not_project_owner(
             provider="anthropic",
         )
         backlog = await _make_backlog_task(
-            db_session, project.id, launched_by_user_id="launcher-user-999"
+            db_session, project.id, launched_by_user_id="member-user-999"
         )
 
         token = create_agent_token(
@@ -1111,12 +1181,174 @@ async def test_retarget_scopes_pool_to_launcher_not_project_owner(
         body = resp.json()
         assert body["action"] == "claim"
         manifest = body.get("secret_manifest")
-        assert manifest is not None, "expected manifest from launcher's pool account"
-        # Slot acquired against the launcher's account and stamped onto the task.
-        assert launcher_acct["active_tasks"] == 1
+        assert manifest is not None, "expected manifest from project owner's account"
+        assert owner_acct["active_tasks"] == 1
+        assert member_acct["active_tasks"] == 0
         db_session.expire(backlog)
         await db_session.refresh(backlog)
-        assert (backlog.context or {}).get("llm_account_id") == "acct-launcher"
+        assert (backlog.context or {}).get("llm_account_id") == "acct-owner"
+
+
+@pytest.mark.asyncio
+async def test_default_warm_reuse_reserves_owner_account_and_project_counters(
+    client: AsyncClient, db_session, mocker
+):
+    """The non-retarget warm path uses the same task-cap accounting as selection."""
+    _patch_broadcast(mocker)
+    boot_acct = _pool_account("acct-warm-owner")
+    _seed_pool(mocker, [boot_acct])
+    with _FlagGuard(backlog=True, retarget=False):
+        project = await _make_project(db_session)
+        vm_id = "agent-vm-owner-accounting"
+        prior = await _make_backlog_task(
+            db_session,
+            project.id,
+            status=TaskStatus.COMPLETED,
+            vm_instance_id=vm_id,
+            account_id=boot_acct["id"],
+            provider="anthropic",
+            model="claude-sonnet-4",
+            context={"scope": "small", "llm_auth_mode": "oauth"},
+        )
+        backlog = await _make_backlog_task(db_session, project.id)
+        token = create_agent_token(
+            str(prior.id), vm_id, task_type="create", project_id=str(project.id)
+        )
+
+        response = await client.post(
+            "/api/agent/next-role",
+            json={"vm_instance_id": vm_id, "prior_task_id": str(prior.id)},
+            headers={"x-agent-token": token},
+        )
+
+    assert response.status_code == 200, response.text
+    assert boot_acct["active_tasks"] == 1
+    assert boot_acct["daily_task_count"] == 1
+    assert boot_acct["project_state"][str(project.id)] == {
+        "active_tasks": 1,
+        "daily_task_count": 1,
+    }
+    await db_session.refresh(backlog)
+    assert backlog.llm_account_id == boot_acct["id"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cap_state",
+    [
+        {"daily_task_cap": 1, "daily_task_count": 1},
+        {"max_concurrent_tasks": 1, "active_tasks": 1},
+        {
+            "project_daily_task_cap": "project",
+            "project_daily_task_count": 1,
+        },
+        {
+            "project_max_concurrent_tasks": "project",
+            "project_active_tasks": 1,
+        },
+    ],
+)
+async def test_default_warm_reuse_defers_at_global_or_project_cap(
+    client: AsyncClient, db_session, mocker, cap_state
+):
+    _patch_broadcast(mocker)
+    boot_acct = _pool_account("acct-warm-capped")
+    _seed_pool(mocker, [boot_acct])
+    with _FlagGuard(backlog=True, retarget=False):
+        project = await _make_project(db_session)
+        project_id = str(project.id)
+        if cap_state.get("project_daily_task_cap"):
+            boot_acct["project_daily_task_cap"] = {project_id: 1}
+            boot_acct["project_state"] = {
+                project_id: {"active_tasks": 0, "daily_task_count": 1}
+            }
+        elif cap_state.get("project_max_concurrent_tasks"):
+            boot_acct["project_max_concurrent_tasks"] = {project_id: 1}
+            boot_acct["project_state"] = {
+                project_id: {"active_tasks": 1, "daily_task_count": 0}
+            }
+        else:
+            boot_acct.update(cap_state)
+        before = {
+            "active": boot_acct["active_tasks"],
+            "daily": boot_acct["daily_task_count"],
+            "project": dict((boot_acct.get("project_state") or {}).get(project_id, {})),
+        }
+        vm_id = "agent-vm-capped-account"
+        prior = await _make_backlog_task(
+            db_session,
+            project.id,
+            status=TaskStatus.COMPLETED,
+            vm_instance_id=vm_id,
+            account_id=boot_acct["id"],
+            provider="anthropic",
+        )
+        backlog = await _make_backlog_task(db_session, project.id)
+        token = create_agent_token(
+            str(prior.id), vm_id, task_type="create", project_id=project_id
+        )
+
+        response = await client.post(
+            "/api/agent/next-role",
+            json={"vm_instance_id": vm_id, "prior_task_id": str(prior.id)},
+            headers={"x-agent-token": token},
+        )
+
+    assert response.status_code == 204, response.text
+    assert boot_acct["active_tasks"] == before["active"]
+    assert boot_acct["daily_task_count"] == before["daily"]
+    assert (boot_acct.get("project_state") or {}).get(project_id, {}) == before["project"]
+    db_session.expire(backlog)
+    await db_session.refresh(backlog)
+    assert backlog.status == TaskStatus.QUEUED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("member_owned,blacklisted", [(False, True), (True, False)])
+async def test_default_warm_reuse_rejects_blacklisted_or_non_owner_boot_account(
+    client: AsyncClient, db_session, mocker, member_owned, blacklisted
+):
+    _patch_broadcast(mocker)
+    import app.max_plan_pool as pool
+
+    account_user_id = "member-user-999" if member_owned else "test-user-123"
+    boot_account = _pool_account("acct-warm-rejected", user_id=account_user_id)
+    mocker.patch.object(pool, "_max_plan_pools", {account_user_id: [boot_account]})
+    mocker.patch.object(pool, "_account_by_id", {boot_account["id"]: boot_account})
+    with _FlagGuard(backlog=True, retarget=False):
+        project = await _make_project(db_session)
+        vm_id = "agent-vm-member-boot"
+        prior = await _make_backlog_task(
+            db_session,
+            project.id,
+            status=TaskStatus.COMPLETED,
+            vm_instance_id=vm_id,
+            account_id=boot_account["id"],
+            provider="anthropic",
+        )
+        backlog = await _make_backlog_task(
+            db_session,
+            project.id,
+            context={
+                "scope": "small",
+                "blacklisted_accounts": [boot_account["id"]] if blacklisted else [],
+            },
+        )
+        token = create_agent_token(
+            str(prior.id), vm_id, task_type="create", project_id=str(project.id)
+        )
+        response = await client.post(
+            "/api/agent/next-role",
+            json={"vm_instance_id": vm_id, "prior_task_id": str(prior.id)},
+            headers={"x-agent-token": token},
+        )
+
+    assert response.status_code == 204, response.text
+    assert boot_account["active_tasks"] == 0
+    assert boot_account["daily_task_count"] == 0
+    db_session.expire(backlog)
+    await db_session.refresh(backlog)
+    assert backlog.status == TaskStatus.QUEUED
 
 
 @pytest.mark.asyncio

@@ -18,6 +18,7 @@ import type {
 import type { CapabilityProofRecord, EvidenceRef } from '../types/problemModel';
 
 interface ProblemModelViewerProps {
+  readOnly?: boolean;
   projectId: string;
   problemModel: ProblemModel;
   selfReflectionLog?: SelfReflectionEntry[];
@@ -437,6 +438,7 @@ function SelfReflectionCard({ entry }: { entry: SelfReflectionEntry }) {
 }
 
 export default function ProblemModelViewer({
+  readOnly = true,
   projectId,
   problemModel,
   selfReflectionLog = [],
@@ -500,6 +502,7 @@ export default function ProblemModelViewer({
   // optimistically flip its `proof_exempt` in the local model so the coverage
   // meter (which recomputes from `proof_exempt`) updates without a refetch.
   async function handleToggleExempt(capability: Capability, nextExempt: boolean) {
+    if (readOnly) return;
     try {
       if (nextExempt) {
         await grantCapabilityProofExemption(projectId, capability.name);
@@ -540,14 +543,14 @@ export default function ProblemModelViewer({
             {lastUpdatedBy && <span>by {lastUpdatedBy}</span>}
           </div>
         </div>
-        <button
+        {!readOnly && <button
           type="button"
           onClick={() => setShowEditor(true)}
           className="shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md border border-neutral-700 bg-neutral-800/50 text-neutral-300 hover:bg-neutral-800 hover:text-neutral-100 transition"
         >
           <Pencil size={11} />
           Edit intent
-        </button>
+        </button>}
       </div>
 
       <div className="flex-1 overflow-y-auto custom-scrollbar px-4 py-4 space-y-2">
@@ -703,7 +706,10 @@ export default function ProblemModelViewer({
                     <div className="divide-y divide-neutral-800/70 border border-neutral-800/70 rounded-md">
                       {caps.map((c, i) => (
                         <div key={i} className="px-2">
-                          <CapabilityBar capability={c} onToggleExempt={handleToggleExempt} />
+                          <CapabilityBar
+                            capability={c}
+                            onToggleExempt={readOnly ? undefined : handleToggleExempt}
+                          />
                         </div>
                       ))}
                     </div>
@@ -723,8 +729,8 @@ export default function ProblemModelViewer({
                 <GapCard
                   key={g.id ?? `gap-${i}`}
                   gap={g}
-                  onSpawnDirection={onSpawnDirection}
-                  onLinkDirection={onLinkDirection}
+                  onSpawnDirection={readOnly ? undefined : onSpawnDirection}
+                  onLinkDirection={readOnly ? undefined : onLinkDirection}
                   directions={directions}
                 />
               ))}
@@ -783,7 +789,7 @@ export default function ProblemModelViewer({
         )}
       </div>
 
-      {showEditor && (
+      {!readOnly && showEditor && (
         <ProblemModelEditor
           projectId={projectId}
           problemModel={problemModel}

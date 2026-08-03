@@ -28,6 +28,15 @@ from firebase_admin import auth as firebase_auth
 
 from app.database import get_session, resolve_dialect_name
 from app.models import AllowedUser, LocalRunner, _utcnow
+from app.admin_helpers import (
+    AllowedUserBoundToDifferentUID,
+    claim_pending_project_memberships,
+)
+from app.allowed_users import (
+    AllowedUserEmailConflict,
+    normalize_allowed_user_email,
+    resolve_allowed_user_by_email,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -461,12 +470,15 @@ _AUTH_METADATA_LOCK_TIMEOUT = "1s"
 
 
 async def _persist_auth_metadata_best_effort(
-    session: AsyncSession, allowed_user: AllowedUser
+    session: AsyncSession,
+    allowed_user: AllowedUser,
 ) -> None:
     """Commit non-critical AllowedUser session metadata, degrading on contention.
 
-    ``last_login_at`` / ``display_name`` / first-sign-in ``firebase_uid`` linking
-    are all non-critical. Previously they were written and committed on EVERY
+    ``last_login_at`` / ``display_name`` are non-critical. First-sign-in UID and
+    invitation claiming is deliberately excluded: authentication cannot proceed
+    until that identity/access transition commits. Previously metadata was
+    written and committed on EVERY
     authenticated request, which made ``get_current_user`` a write on the auth
     hot path: when the DB was contended (a lock-wedged ``task`` row + connection
     pool starvation, incident 2026-06-04) this commit timed out and 500'd EVERY
@@ -505,6 +517,48 @@ async def _persist_auth_metadata_best_effort(
             logger.exception(
                 "[AUTH] rollback after failed metadata persist also failed"
             )
+
+
+async def _persist_first_signin_claim_critical(
+    session: AsyncSession,
+    allowed_user_id: uuid.UUID,
+    firebase_uid: str,
+) -> AllowedUser:
+    """Commit the UID binding and every pending membership before authenticating."""
+
+    try:
+        if resolve_dialect_name(session) == "postgresql":
+            await session.execute(
+                text(f"SET LOCAL lock_timeout = '{_AUTH_METADATA_LOCK_TIMEOUT}'")
+            )
+        allowed_user = await claim_pending_project_memberships(
+            session, allowed_user_id, firebase_uid
+        )
+        await session.commit()
+        return allowed_user
+    except AllowedUserBoundToDifferentUID:
+        try:
+            await session.rollback()
+        except SQLAlchemyError:
+            logger.exception("[AUTH] rollback after competing UID claim failed")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This allowlist entry is already linked to another account.",
+        ) from None
+    except SQLAlchemyError:
+        logger.warning(
+            "[AUTH] critical first-signin claim failed; authentication denied",
+            exc_info=True,
+        )
+        try:
+            await session.rollback()
+        except SQLAlchemyError:
+            logger.exception("[AUTH] rollback after failed first-signin claim failed")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Account access is still being claimed. Retry shortly.",
+            headers={"Retry-After": "1"},
+        ) from None
 
 
 async def get_current_user(
@@ -592,7 +646,7 @@ async def get_current_user(
         ) from e
 
     uid = decoded_token.get("uid")
-    email = decoded_token.get("email")
+    raw_email = decoded_token.get("email")
 
     if not decoded_token.get("email_verified", False):
         raise HTTPException(
@@ -600,11 +654,27 @@ async def get_current_user(
             detail="Email address must be verified.",
         )
 
+    try:
+        email = normalize_allowed_user_email(raw_email)
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Verified account has no valid email address.",
+        ) from None
+
     # Look up user in AllowedUser table
-    result = await session.execute(
-        select(AllowedUser).where(AllowedUser.email == email)
-    )
-    allowed_user = result.scalar_one_or_none()
+    try:
+        allowed_user = await resolve_allowed_user_by_email(
+            session, email, firebase_uid=uid
+        )
+    except AllowedUserEmailConflict:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Conflicting allowlist records exist for this email. "
+                "Contact an administrator."
+            ),
+        ) from None
 
     if not allowed_user:
         raise HTTPException(
@@ -617,11 +687,17 @@ async def get_current_user(
     # authenticated request, so an unconditional write+commit here turns any DB
     # contention into a total auth/UI outage (incident 2026-06-04). The common
     # request changes nothing and skips the write entirely.
-    needs_persist = False
-    # Link Firebase UID on first sign-in
+    # Link Firebase UID on first sign-in and claim all email-addressed project
+    # invitations in one critical transaction. The helper locks AllowedUser, which
+    # makes concurrent first-login requests idempotent and also merges any
+    # pre-existing real+pending membership pair without downgrading its role.
+    # No principal is returned until the UID, memberships, and role commit.
     if not allowed_user.firebase_uid:
-        allowed_user.firebase_uid = uid
-        needs_persist = True
+        allowed_user = await _persist_first_signin_claim_critical(
+            session, allowed_user.id, uid
+        )
+
+    needs_persist = False
     # Update display name from Firebase if available
     display_name = decoded_token.get("name")
     if display_name and allowed_user.display_name != display_name:

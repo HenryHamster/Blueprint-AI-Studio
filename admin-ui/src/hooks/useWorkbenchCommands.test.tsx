@@ -142,6 +142,7 @@ function Harness(overrides: Partial<Parameters<typeof useWorkbenchCommands>[0]> 
     maxPlanAccountCount: 5,
     apiHealthy: true,
     isAdmin: true,
+    projectRole: 'owner',
     problemModelRevision: 7,
     hasDesignDoc: true,
     designRevision: 8,
@@ -1964,14 +1965,115 @@ describe('useWorkbenchCommands', () => {
     expect(captured.find(command => command.id === 'runtime.analytics')?.disabled).toBeFalsy();
   });
 
-  test('disables admin-only runtime settings commands for non-admin users', () => {
+  test('hides admin-only runtime controls from non-admin users', () => {
     mount({ isAdmin: false });
 
-    expect(captured.find(command => command.id === 'runtime.settings.deploy')?.disabled).toBe(true);
-    expect(captured.find(command => command.id === 'runtime.settings.provider-routing')?.disabled).toBe(true);
-    expect(captured.find(command => command.id === 'runtime.settings.provider-settings')?.disabled).toBe(true);
-    expect(captured.find(command => command.id === 'runtime.settings.notifications')?.disabled).toBeFalsy();
-    expect(captured.find(command => command.id === 'runtime.settings.advanced')?.disabled).toBeFalsy();
+    expect(captured.find(command => command.id === 'runtime.analytics')).toBeUndefined();
+    expect(captured.find(command => command.id === 'runtime.accounts')).toBeUndefined();
+    expect(captured.filter(command => command.id.startsWith('runtime.settings'))).toHaveLength(0);
+  });
+
+  test('viewer commands remain directly inert even when invoked outside palette disabled handling', () => {
+    const markStrategicChecked = vi.fn();
+    const switchStrategicInteractionMode = vi.fn();
+    const updateStrategicSessionRefs = vi.fn();
+    const openNewTaskModal = vi.fn();
+    const commands: StrategicWorkSessionCommand[] = [{
+      id: 'attention.messages.mark_seen',
+      label: 'Mark messages seen',
+      group: 'attention',
+      priority: 'normal',
+      enabled: true,
+      target: {
+        surface: 'messages',
+        project_id: 'project-1',
+        action: 'mark_seen',
+      },
+      mutation: {
+        method: 'PUT',
+        path: '/api/admin/messages/last-seen',
+        body: { project_id: 'project-1', timestamp: 1_782_912_000_000 },
+      },
+    }];
+
+    const sharedOverrides = {
+      strategicState: { work_session: { commands } } as StrategicStateResponse,
+      markStrategicChecked,
+      switchStrategicInteractionMode,
+      updateStrategicSessionRefs,
+      openNewTaskModal,
+    };
+    mount({ projectRole: 'owner', ...sharedOverrides });
+    const staleMutationCommand = captured.find(item => item.id === 'attention.messages.mark_seen');
+    act(() => {
+      root?.render(<Harness projectRole="viewer" {...sharedOverrides} />);
+    });
+
+    const mutationCommand = captured.find(item => item.id === 'attention.messages.mark_seen');
+    const checkInCommand = captured.find(item => item.id === 'strategic.check_in.mark');
+    const modeCommand = captured.find(item => item.id === 'strategic.mode.continuous');
+    const newTaskCommand = captured.find(item => item.id === 'task.new');
+    expect(mutationCommand?.disabled).toBe(true);
+    expect(checkInCommand?.disabled).toBe(true);
+    expect(modeCommand?.disabled).toBe(true);
+    expect(newTaskCommand?.disabled).toBe(true);
+
+    mutationCommand?.run();
+    staleMutationCommand?.run();
+    checkInCommand?.run();
+    modeCommand?.run();
+    newTaskCommand?.run();
+
+    expect(apiFetchMock).not.toHaveBeenCalled();
+    expect(markStrategicChecked).not.toHaveBeenCalled();
+    expect(switchStrategicInteractionMode).not.toHaveBeenCalled();
+    expect(updateStrategicSessionRefs).not.toHaveBeenCalled();
+    expect(openNewTaskModal).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    { label: 'owner', projectRole: 'owner' as const, disabled: false },
+    { label: 'member', projectRole: 'member' as const, disabled: true },
+    { label: 'viewer', projectRole: 'viewer' as const, disabled: true },
+    { label: 'unknown', projectRole: undefined, disabled: true },
+  ])('applies the owner-only project command matrix for $label', ({ projectRole, disabled }) => {
+    mount({ isAdmin: true, projectRole, toggleAutonomousMode: vi.fn() });
+
+    const ownerOnlyCommandIds = [
+      'project.autonomy.toggle',
+      'project.manage',
+      'project.build',
+      'project.branches',
+      'project.review',
+      'project.resources',
+      'project.remediation',
+      'project.issue_implementation',
+      'project.alert_domains',
+      'project.access',
+      'project.members',
+    ];
+    ownerOnlyCommandIds.forEach(commandId => {
+      expect(captured.find(entry => entry.id === commandId)?.disabled, commandId).toBe(disabled);
+    });
+    expect(captured.find(entry => entry.id === 'runtime.settings.deploy')?.disabled).toBe(false);
+  });
+
+  test.each([
+    { projectRole: 'owner' as const, disabled: false },
+    { projectRole: 'member' as const, disabled: false },
+    { projectRole: 'viewer' as const, disabled: true },
+    { projectRole: undefined, disabled: true },
+  ])('gates New task to project operators for $projectRole', ({ projectRole, disabled }) => {
+    mount({ projectRole });
+    expect(captured.find(command => command.id === 'task.new')?.disabled).toBe(disabled);
+  });
+
+  test('omitted admin state fails closed while authorization is unavailable', () => {
+    mount({ isAdmin: undefined });
+
+    expect(captured.find(command => command.id === 'runtime.analytics')).toBeUndefined();
+    expect(captured.find(command => command.id === 'runtime.accounts')).toBeUndefined();
+    expect(captured.filter(command => command.id.startsWith('runtime.settings'))).toHaveLength(0);
   });
 
   test('disables Strategic mode commands while saving without blocking navigation commands', () => {

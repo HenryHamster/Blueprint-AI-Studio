@@ -1,8 +1,17 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { TaskCard, FAILURE_CLASS_CONFIG } from './TaskCard';
+import type { ComponentProps } from 'react';
+import { TaskCard as TaskCardComponent, FAILURE_CLASS_CONFIG } from './TaskCard';
 import type { Task } from '../types/task';
+
+type TaskCardTestProps = Omit<ComponentProps<typeof TaskCardComponent>, 'readOnly'> & {
+  readOnly?: boolean;
+};
+
+function TaskCard(props: TaskCardTestProps) {
+  return <TaskCardComponent readOnly={false} {...props} />;
+}
 
 vi.mock('../api', () => ({
   authGet: vi.fn(() => Promise.resolve({ json: () => Promise.resolve({ stats: {} }) })),
@@ -33,6 +42,55 @@ const baseProps = {
   onArchive: vi.fn(),
   onViewLogs: vi.fn(),
 };
+
+describe('TaskCard viewer access', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('keeps details readable while suppressing project actions and selection callbacks', async () => {
+    const user = userEvent.setup();
+    const task = makeTask({ status: 'QUEUED', requires_approval: true });
+    render(<TaskCard task={task} readOnly selectionMode {...baseProps} />);
+
+    expect(screen.queryByText('Approve & Merge')).toBeNull();
+    expect(screen.queryByText('Request Changes')).toBeNull();
+    expect(screen.queryByTitle('Approve')).toBeNull();
+    const card = screen.getByRole('article');
+    fireEvent.click(card, { ctrlKey: true });
+    card.focus();
+    await user.keyboard(' ');
+    expect(baseProps.onApprove).not.toHaveBeenCalled();
+    expect(baseProps.onCancel).not.toHaveBeenCalled();
+    expect(baseProps.onViewLogs).toHaveBeenCalledOnce();
+  });
+
+  it('fails closed when readOnly is undefined at runtime', () => {
+    const task = makeTask({ status: 'QUEUED', requires_approval: true });
+    render(<TaskCardComponent task={task} readOnly={undefined as never} selectionMode {...baseProps} />);
+
+    expect(screen.getByText('Test Task')).toBeInTheDocument();
+    expect(screen.queryByRole('checkbox')).toBeNull();
+    expect(screen.queryByText('Approve & Merge')).toBeNull();
+    expect(screen.queryByText('Request Changes')).toBeNull();
+  });
+
+  it('cancels pending destructive confirmation timers when access downgrades', () => {
+    vi.useFakeTimers();
+    const onArchive = vi.fn();
+    const task = makeTask({ status: 'COMPLETED' });
+    const { rerender } = render(
+      <TaskCard task={task} readOnly={false} {...baseProps} onArchive={onArchive} />,
+    );
+    const baselineTimers = vi.getTimerCount();
+    fireEvent.click(screen.getByTitle(/Archive — moves this task/));
+    expect(vi.getTimerCount()).toBeGreaterThan(baselineTimers);
+
+    rerender(<TaskCard task={task} readOnly {...baseProps} onArchive={onArchive} />);
+    expect(vi.getTimerCount()).toBe(baselineTimers);
+    vi.advanceTimersByTime(5_000);
+    expect(onArchive).not.toHaveBeenCalled();
+    vi.useRealTimers();
+  });
+});
 
 describe('TaskCard SR badge', () => {
   beforeEach(() => {

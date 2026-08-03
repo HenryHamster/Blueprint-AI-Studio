@@ -1,26 +1,41 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useRef } from 'react';
 import { API_BASE_URL, authGet, apiFetch } from '../api';
-
-export type ProjectMemberEntry = {
-  id: string;
-  user_id: string;
-  email?: string;
-  role: 'owner' | 'member' | 'viewer';
-  created_at: string | null;
-};
+import type { ProjectMemberEntry } from '../types/project';
 
 export function useProjectMembers() {
   const [projectMembers, setProjectMembers] = useState<ProjectMemberEntry[]>([]);
+  const [projectMembersProjectId, setProjectMembersProjectId] = useState<string | null>(null);
+  const activeProjectIdRef = useRef<string | null>(null);
+  const requestGenerationRef = useRef(0);
+
+  const activateProjectMembers = useCallback((projectId: string | null) => {
+    if (activeProjectIdRef.current === projectId) return;
+    activeProjectIdRef.current = projectId;
+    requestGenerationRef.current += 1;
+    setProjectMembersProjectId(projectId);
+    setProjectMembers([]);
+  }, []);
 
   const fetchProjectMembers = useCallback(async (projectId: string) => {
+    activateProjectMembers(projectId);
+    const generation = ++requestGenerationRef.current;
     try {
       const res = await authGet(`${API_BASE_URL}/api/admin/projects/${projectId}/members?limit=500`);
-      if (res.ok) {
+      if (
+        res.ok
+        && activeProjectIdRef.current === projectId
+        && requestGenerationRef.current === generation
+      ) {
         const data = await res.json();
-        setProjectMembers(Array.isArray(data) ? data : data.members ?? []);
+        if (
+          activeProjectIdRef.current === projectId
+          && requestGenerationRef.current === generation
+        ) {
+          setProjectMembers(Array.isArray(data) ? data : data.members ?? []);
+        }
       }
     } catch { /* ignore */ }
-  }, []);
+  }, [activateProjectMembers]);
 
   const addProjectMember = useCallback(async (projectId: string, email: string, role: string) => {
     const res = await apiFetch(`${API_BASE_URL}/api/admin/projects/${projectId}/members`, {
@@ -30,7 +45,7 @@ export function useProjectMembers() {
       const data = await res.json().catch(() => ({ error: { message: res.statusText } }));
       throw new Error(data.error?.message || data.detail || 'Failed to add member');
     }
-    await fetchProjectMembers(projectId);
+    if (activeProjectIdRef.current === projectId) await fetchProjectMembers(projectId);
   }, [fetchProjectMembers]);
 
   const updateProjectMemberRole = useCallback(async (projectId: string, memberId: string, role: string) => {
@@ -41,7 +56,7 @@ export function useProjectMembers() {
       const data = await res.json().catch(() => ({ error: { message: res.statusText } }));
       throw new Error(data.error?.message || data.detail || 'Failed to update role');
     }
-    await fetchProjectMembers(projectId);
+    if (activeProjectIdRef.current === projectId) await fetchProjectMembers(projectId);
   }, [fetchProjectMembers]);
 
   const removeProjectMember = useCallback(async (projectId: string, memberId: string) => {
@@ -52,8 +67,16 @@ export function useProjectMembers() {
       const data = await res.json().catch(() => ({ error: { message: res.statusText } }));
       throw new Error(data.error?.message || data.detail || 'Failed to remove member');
     }
-    await fetchProjectMembers(projectId);
+    if (activeProjectIdRef.current === projectId) await fetchProjectMembers(projectId);
   }, [fetchProjectMembers]);
 
-  return { projectMembers, fetchProjectMembers, addProjectMember, updateProjectMemberRole, removeProjectMember };
+  return {
+    projectMembers,
+    projectMembersProjectId,
+    activateProjectMembers,
+    fetchProjectMembers,
+    addProjectMember,
+    updateProjectMemberRole,
+    removeProjectMember,
+  };
 }

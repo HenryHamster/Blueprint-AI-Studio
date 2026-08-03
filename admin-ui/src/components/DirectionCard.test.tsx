@@ -16,6 +16,10 @@ function makeDirection(overrides: Partial<Direction> = {}): Direction {
 
 function makeProps(direction: Direction, statusKey = 'active') {
   return {
+    // This legacy fixture exercises operator controls. DirectionCard now fails
+    // closed when capability is omitted, so make the intended member/owner
+    // context explicit; read-only behavior is covered through DirectionsPanel.
+    readOnly: false,
     direction,
     statusKey,
     activeItems: [direction],

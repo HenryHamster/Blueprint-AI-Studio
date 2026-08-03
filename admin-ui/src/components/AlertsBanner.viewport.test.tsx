@@ -1,9 +1,17 @@
 import { afterEach, describe, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
-import { act } from 'react';
-import { AlertsBanner } from './AlertsBanner';
+import { act, type ComponentProps } from 'react';
+import { AlertsBanner as AlertsBannerComponent } from './AlertsBanner';
 import type { Alert } from '../types/alert';
 import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
+
+type AlertsBannerTestProps = Omit<ComponentProps<typeof AlertsBannerComponent>, 'canMutate'> & {
+  canMutate?: boolean;
+};
+
+function AlertsBanner(props: AlertsBannerTestProps) {
+  return <AlertsBannerComponent canMutate={true} {...props} />;
+}
 
 // AlertsBanner imports `apiFetch` from '../api', which transitively pulls in
 // firebase. We don't pass projectId in this test (so the fetch path never

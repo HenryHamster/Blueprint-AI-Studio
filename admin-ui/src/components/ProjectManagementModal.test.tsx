@@ -47,6 +47,7 @@ function render(ui: React.ReactElement) {
 const defaultProps = {
   projects: [makeProject()],
   selectedProjectId: null,
+  canManageProject: () => true,
   onNewProject: vi.fn(),
   onRefreshProjects: vi.fn(),
   onSelectProject: vi.fn(),
@@ -189,6 +190,30 @@ describe('ProjectManagementModal', () => {
     await act(async () => { newBtn.click(); });
     expect(onClose).toHaveBeenCalled();
     expect(onNewProject).toHaveBeenCalled();
+  });
+
+  test.each(['member', 'viewer'] as const)('hides owner-only controls for a %s while keeping New Project', async (role) => {
+    const el = render(
+      <ProjectManagementModal
+        {...defaultProps}
+        projects={[makeProject({ my_role: role })]}
+        canManageProject={() => false}
+      />,
+    );
+    await act(async () => {});
+
+    expect(el.querySelector('[data-testid="reset-btn-proj-1"]')).toBeNull();
+    expect(el.querySelector('[data-testid="archive-btn-proj-1"]')).toBeNull();
+    expect(el.querySelector('[data-testid="delete-btn-proj-1"]')).toBeNull();
+    expect(Array.from(el.querySelectorAll('button')).some(button => button.textContent?.includes('New Project'))).toBe(true);
+  });
+
+  test('unknown access fails closed for owner-only controls', async () => {
+    const el = render(<ProjectManagementModal {...defaultProps} canManageProject={() => false} />);
+    await act(async () => {});
+    expect(el.querySelector('[data-testid="reset-btn-proj-1"]')).toBeNull();
+    expect(el.querySelector('[data-testid="archive-btn-proj-1"]')).toBeNull();
+    expect(el.querySelector('[data-testid="delete-btn-proj-1"]')).toBeNull();
   });
 
   test('shows error message when archiveProject fails', async () => {

@@ -106,7 +106,7 @@ describe('FleetRunnersPanel — viewport regression', () => {
     const r = createRoot(host);
     root = r;
     await act(async () => {
-      r.render(<FleetRunnersPanel projectId="proj-canary" />);
+      r.render(<FleetRunnersPanel projectId="proj-canary" readOnly={false} />);
     });
     // resolve the async fetch effect
     await act(async () => {});
@@ -158,7 +158,7 @@ describe('FleetRunnersPanel — enroll-dialog viewport walkthrough', () => {
     const r = createRoot(host);
     root = r;
     await act(async () => {
-      r.render(<FleetRunnersPanel projectId="proj-canary" />);
+      r.render(<FleetRunnersPanel projectId="proj-canary" readOnly={false} />);
     });
     await act(async () => {});
     // Open the enroll dialog.

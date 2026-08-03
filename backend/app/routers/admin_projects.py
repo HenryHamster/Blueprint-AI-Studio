@@ -32,7 +32,9 @@ from app.models import (
 )
 from app.auth import get_current_user
 from app.admin import (
+    PROJECT_WRITE_ROLES,
     _get_user_project,
+    _get_user_project_role,
     _get_user_project_with_role,
     _member_project_ids,
     _user_project_ids,
@@ -565,16 +567,12 @@ async def update_project(
         project_id, current_user["user_id"], session, "member"
     )
 
-    # Fetch the caller's actual role so we can gate owner-only fields.
-    caller_member = (
-        await session.execute(
-            select(ProjectMember).where(
-                ProjectMember.project_id == project_id,
-                ProjectMember.user_id == current_user["user_id"],
-            )
-        )
-    ).scalar_one_or_none()
-    caller_role = caller_member.role if caller_member else "member"
+    # Resolve through the shared fail-closed role authority. Membership cannot
+    # disappear or become corrupt between the member+ check and owner-only gate
+    # and silently fall back to a writable role.
+    caller_role = await _get_user_project_role(
+        project_id, current_user["user_id"], session
+    )
 
     if caller_role != "owner" and any(
         getattr(payload, f) is not None for f in _OWNER_ONLY_UPDATE_FIELDS
@@ -1725,7 +1723,7 @@ async def pause_all_autonomous(
                 .select_from(ProjectMember)
                 .where(
                     ProjectMember.user_id == current_user["user_id"],
-                    ProjectMember.role.in_(["member", "owner"]),
+                    ProjectMember.role.in_(PROJECT_WRITE_ROLES),
                 )
             )
         )

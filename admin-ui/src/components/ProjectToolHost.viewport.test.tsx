@@ -184,7 +184,7 @@ describe('ProjectToolHost — viewport regression', () => {
     document.body.appendChild(host);
     const r = createRoot(host);
     root = r;
-    await act(async () => { r.render(<ProjectToolHost projectId="proj-a" />); });
+    await act(async () => { r.render(<ProjectToolHost projectId="proj-a" myRole="owner" />); });
     await act(async () => await new Promise(resolve => setTimeout(resolve, 50)));
     if (!host) throw new Error('host not mounted');
     // The disabled tool's live component body is NOT mounted…
@@ -216,7 +216,7 @@ describe('ProjectToolHost — viewport regression', () => {
     document.body.appendChild(host);
     const r = createRoot(host);
     root = r;
-    await act(async () => { r.render(<ProjectToolHost projectId="proj-a" />); });
+    await act(async () => { r.render(<ProjectToolHost projectId="proj-a" myRole="owner" />); });
     await act(async () => await new Promise(resolve => setTimeout(resolve, 50)));
     if (!host) throw new Error('host not mounted');
     // The disabled tool is not hidden — it shows under a "Disabled" section.
@@ -244,7 +244,7 @@ describe('ProjectToolHost — viewport regression', () => {
     document.body.appendChild(host);
     const r = createRoot(host);
     root = r;
-    await act(async () => { r.render(<ProjectToolHost projectId="proj-a" />); });
+    await act(async () => { r.render(<ProjectToolHost projectId="proj-a" myRole="owner" />); });
     await act(async () => await new Promise(resolve => setTimeout(resolve, 50)));
     if (!host) throw new Error('host not mounted');
     expect(host.textContent).not.toContain('No tools registered');
@@ -492,7 +492,7 @@ const SAMPLE_TOOLS: FetchProjectToolsResult = TOOLS_RESULT;
       document.body.appendChild(host);
       const r = createRoot(host);
       root = r;
-      await act(async () => { r.render(<ProjectToolHost projectId="proj-notes" />); });
+      await act(async () => { r.render(<ProjectToolHost projectId="proj-notes" myRole="owner" />); });
       await act(async () => await new Promise(resolve => setTimeout(resolve, 100)));
     });
     if (!host) throw new Error('host not mounted');

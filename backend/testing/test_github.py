@@ -5060,6 +5060,43 @@ async def test_singleflight_distinct_urls_not_coalesced(mocker):
 
 
 @pytest.mark.asyncio
+async def test_singleflight_same_url_distinct_credentials_not_coalesced(mocker):
+    """User/install credentials must never share an authorization-sensitive read."""
+    import app.github as github
+
+    github._inflight_reads.clear()
+    calls = []
+
+    async def _fake(method, url, headers, max_retries=3, project_id=None, **kw):
+        calls.append(headers["Authorization"])
+        await asyncio.sleep(0.01)
+        return MockResponse(200, json_data={"auth": headers["Authorization"]})
+
+    mocker.patch.object(github, "_github_request_uncoalesced", _fake)
+    first_task = asyncio.create_task(
+        github._github_request(
+            "GET", "https://api.github.com/user/repos", {"Authorization": "Bearer caller-a"}
+        )
+    )
+    second_task = asyncio.create_task(
+        github._github_request(
+            "GET", "https://api.github.com/user/repos", {"Authorization": "Bearer install-b"}
+        )
+    )
+    await asyncio.sleep(0)
+    assert len(github._inflight_reads) == 2
+    assert all(
+        "caller-a" not in part and "install-b" not in part
+        for key in github._inflight_reads
+        for part in key
+    )
+    first, second = await asyncio.gather(first_task, second_task)
+    assert calls == ["Bearer caller-a", "Bearer install-b"]
+    assert first.json()["auth"] == "Bearer caller-a"
+    assert second.json()["auth"] == "Bearer install-b"
+
+
+@pytest.mark.asyncio
 async def test_singleflight_non_get_not_coalesced(mocker):
     """Mutating methods (and body-carrying GETs) are never coalesced."""
     import app.github as github

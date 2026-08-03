@@ -1010,6 +1010,7 @@ async def test_start_adopts_task_and_liveness_heartbeat_preserves_lease(db_sessi
         "claude-warm-stream-json:phase0-v1"
     )
     assert refreshed_task.first_payload["typed_fast_models"]["anthropic"]
+    assert refreshed_task.launched_by_user_id == TEST_USER_ID
 
     project = await db_session.get(Project, project.id)
     progress = await renew_resident_session_lease(
@@ -1033,6 +1034,32 @@ async def test_start_adopts_task_and_liveness_heartbeat_preserves_lease(db_sessi
     )
     assert liveness["authority_held"] is True
     assert liveness["leased_until"] == lease
+
+
+@pytest.mark.asyncio
+async def test_member_started_resident_spawn_persists_launcher(db_session, monkeypatch):
+    """A fresh Workday task uses owner resources but retains its member launcher."""
+    monkeypatch.setenv("CALL_FOREGROUND_QUALIFICATION", "claude-warm-stream-json:phase0-v1")
+    project = await _make_project(db_session)
+    member_user_id = "resident-member-launcher"
+    db_session.add(
+        ProjectMember(project_id=project.id, user_id=member_user_id, role="member")
+    )
+    await db_session.commit()
+    runner = await _make_runner(db_session, project)
+
+    started = await unwrap(start_project_strategic_resident_session)(
+        request=None,
+        project_id=project.id,
+        payload=StrategicResidentSessionStart(runner_id=str(runner.id)),
+        session=db_session,
+        current_user={"user_id": member_user_id},
+    )
+
+    task = await db_session.get(Task, uuid.UUID(started["session"]["task_id"]))
+    assert task is not None
+    assert task.launched_by_user_id == member_user_id
+    assert task.context["_resident_session"] is True
 
 
 @pytest.mark.asyncio

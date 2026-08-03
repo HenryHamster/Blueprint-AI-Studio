@@ -5242,6 +5242,7 @@ async def _finalize_strategic_review_spawn(
     extra_context: dict[str, Any] | None,
     operator_steered: bool,
     steering_excerpt: str | None,
+    launched_by_user_id: str | None = None,
     runner_pin_id: str | None = None,
     integrity_conflict_counts: dict[str, int] | None = None,
     expected_legacy_generation: int | None = None,
@@ -5384,6 +5385,7 @@ async def _finalize_strategic_review_spawn(
         status=born_status,
         vm_provisioned_at=born_vm_provisioned_at,
         created_by="ORCHESTRATOR",
+        launched_by_user_id=launched_by_user_id,
         context=task_context,
         strategic_cycle_id=cycle_id,
     )
@@ -5455,6 +5457,7 @@ async def _spawn_strategic_review(
     resident_minimal: bool = False,
     runner_pin_id: str | None = None,
     *,
+    launched_by_user_id: str | None = None,
     apply_spawn_budget_guard: bool = False,
     expected_legacy_generation: int | None = None,
 ) -> bool:
@@ -5765,6 +5768,7 @@ async def _spawn_strategic_review(
             extra_context=extra_context,
             operator_steered=operator_steered,
             steering_excerpt=steering_excerpt,
+            launched_by_user_id=launched_by_user_id,
             # Born PROVISIONING + pinned to the operator's runner (only the resident
             # spawn path passes this; cadence spawns leave it None → QUEUED as before)
             # so POST /api/runner/next-task claims it directly.
@@ -7800,6 +7804,7 @@ async def _spawn_strategic_review(
         extra_context=extra_context,
         operator_steered=operator_steered,
         steering_excerpt=steering_excerpt,
+        launched_by_user_id=launched_by_user_id,
         integrity_conflict_counts=_integrity_counts,
         expected_legacy_generation=expected_legacy_generation,
     )

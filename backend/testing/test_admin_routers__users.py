@@ -8,6 +8,8 @@
 Split from test_admin_routers.py. Covers AllowedUser CRUD, ProjectMember CRUD,
 and the null-branch-config diagnostics endpoint."""
 
+import asyncio
+import os
 import uuid
 from unittest.mock import AsyncMock, patch
 
@@ -22,6 +24,7 @@ from app.models import (
     ProjectMember,
 )
 from app.auth import get_current_user, require_admin
+from app.admin_helpers import pending_project_member_user_id
 
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -121,6 +124,13 @@ class TestAddUser:
         assert data["email"] == "newuser@example.com"
         assert data["role"] == "user"
         assert "id" in data
+
+        normalized = await client.post(
+            "/api/admin/users",
+            json={"email": "  Mixed.Case@Example.COM ", "role": "user"},
+        )
+        assert normalized.status_code == 201
+        assert normalized.json()["email"] == "mixed.case@example.com"
 
     @pytest.mark.asyncio
     async def test_add_user_duplicate_email_returns_409(
@@ -224,6 +234,40 @@ class TestRemoveUser:
         assert resp.status_code == 400
         assert "own" in resp.json()["error"]["message"]
 
+    @pytest.mark.asyncio
+    async def test_remove_user_cleans_all_pending_synthetic_memberships(
+        self, client: AsyncClient, db_session
+    ):
+        first_project = await _make_project(db_session, name="First cleanup")
+        second_project = await _make_project(db_session, name="Second cleanup")
+        invited = AllowedUser(email="cleanup@example.com", role="invited")
+        db_session.add(invited)
+        await db_session.commit()
+        pending_id = pending_project_member_user_id(invited.id)
+        db_session.add_all(
+            [
+                ProjectMember(
+                    project_id=first_project.id, user_id=pending_id, role="member"
+                ),
+                ProjectMember(
+                    project_id=second_project.id, user_id=pending_id, role="viewer"
+                ),
+            ]
+        )
+        await db_session.commit()
+        invited_id = invited.id
+
+        response = await client.delete(f"/api/admin/users/{invited_id}")
+        assert response.status_code == 200
+        db_session.expire_all()
+        assert await db_session.get(AllowedUser, invited_id) is None
+        leftovers = (
+            await db_session.execute(
+                select(ProjectMember).where(ProjectMember.user_id == pending_id)
+            )
+        ).scalars().all()
+        assert leftovers == []
+
 
 class TestProjectMembers:
     @pytest.mark.asyncio
@@ -321,23 +365,37 @@ class TestProjectMembers:
         assert data["role"] == "member"
 
     @pytest.mark.asyncio
-    async def test_add_project_member_user_not_in_system_returns_404(
+    async def test_add_project_member_new_email_creates_pending_invitation(
         self, client: AsyncClient, db_session
     ):
-        """Email not in AllowedUser table returns 404."""
+        """An owner can invite a normalized email before its first login."""
         project = await _make_project(db_session)
 
         resp = await client.post(
             f"/api/admin/projects/{project.id}/members",
-            json={"email": "ghost@example.com", "role": "member"},
+            json={"email": "  Ghost@Example.COM ", "role": "member"},
         )
-        assert resp.status_code == 404
+        assert resp.status_code == 201
+        assert resp.json()["email"] == "ghost@example.com"
+        assert resp.json()["status"] == "pending"
+        assert resp.json()["user_id"] is None
+
+        allowed = (
+            await db_session.execute(
+                select(AllowedUser).where(AllowedUser.email == "ghost@example.com")
+            )
+        ).scalar_one()
+        assert allowed.role == "invited"
+        assert allowed.firebase_uid is None
+        member = await db_session.get(ProjectMember, uuid.UUID(resp.json()["id"]))
+        assert member is not None
+        assert member.user_id == f"allowed-user:{allowed.id}"
 
     @pytest.mark.asyncio
-    async def test_add_project_member_duplicate_returns_409(
+    async def test_add_project_member_duplicate_is_idempotent(
         self, client: AsyncClient, db_session
     ):
-        """Adding an already-existing member returns 409."""
+        """Repeating the same linked invite returns the existing membership."""
         project = await _make_project(db_session)
         target = AllowedUser(
             email="already@example.com", firebase_uid="already-uid", role="user"
@@ -353,7 +411,63 @@ class TestProjectMembers:
             f"/api/admin/projects/{project.id}/members",
             json={"email": "already@example.com", "role": "member"},
         )
-        assert resp.status_code == 409
+        assert resp.status_code == 201
+        assert resp.json()["id"] == str(existing.id)
+        assert resp.json()["status"] == "active"
+        rows = (
+            await db_session.execute(
+                select(ProjectMember).where(
+                    ProjectMember.project_id == project.id,
+                    ProjectMember.user_id == "already-uid",
+                )
+            )
+        ).scalars().all()
+        assert len(rows) == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        os.getenv("USE_TEST_POSTGRES", "").lower() != "true",
+        reason="concurrent invitation uniqueness requires PostgreSQL",
+    )
+    async def test_concurrent_same_email_invites_are_idempotent(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        url = f"/api/admin/projects/{project.id}/members"
+        first, second = await asyncio.gather(
+            client.post(
+                url,
+                json={"email": "race-invite@example.com", "role": "viewer"},
+            ),
+            client.post(
+                url,
+                json={"email": "RACE-INVITE@example.com", "role": "member"},
+            ),
+        )
+        assert first.status_code == 201
+        assert second.status_code == 201
+        assert first.json()["id"] == second.json()["id"]
+        assert first.json()["status"] == second.json()["status"] == "pending"
+
+        allowed_rows = (
+            await db_session.execute(
+                select(AllowedUser).where(
+                    AllowedUser.email == "race-invite@example.com"
+                )
+            )
+        ).scalars().all()
+        assert len(allowed_rows) == 1
+        member_rows = (
+            await db_session.execute(
+                select(ProjectMember).where(
+                    ProjectMember.project_id == project.id,
+                    ProjectMember.user_id
+                    == pending_project_member_user_id(allowed_rows[0].id),
+                )
+            )
+        ).scalars().all()
+        assert len(member_rows) == 1
+        assert member_rows[0].role == "member"
 
     @pytest.mark.asyncio
     async def test_add_project_member_invalid_role_returns_422(
@@ -391,6 +505,211 @@ class TestProjectMembers:
         )
         assert resp.status_code == 200
         assert resp.json()["role"] == "viewer"
+
+    @pytest.mark.asyncio
+    async def test_pending_member_lists_updates_and_deletes_by_stable_member_id(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        invited = await client.post(
+            f"/api/admin/projects/{project.id}/members",
+            json={"email": "pending@example.com", "role": "member"},
+        )
+        assert invited.status_code == 201
+        member_id = invited.json()["id"]
+
+        listed = await client.get(f"/api/admin/projects/{project.id}/members")
+        pending = next(item for item in listed.json()["members"] if item["id"] == member_id)
+        assert pending == {
+            **pending,
+            "email": "pending@example.com",
+            "role": "member",
+            "status": "pending",
+            "user_id": None,
+        }
+        assert "allowed-user:" not in str(listed.json())
+
+        updated = await client.patch(
+            f"/api/admin/projects/{project.id}/members/{member_id}",
+            json={"role": "viewer"},
+        )
+        assert updated.status_code == 200
+        assert updated.json()["id"] == member_id
+        assert updated.json()["email"] == "pending@example.com"
+        assert updated.json()["status"] == "pending"
+        assert updated.json()["user_id"] is None
+        assert updated.json()["role"] == "viewer"
+
+        removed = await client.delete(
+            f"/api/admin/projects/{project.id}/members/{member_id}"
+        )
+        assert removed.status_code == 200
+        assert await db_session.get(ProjectMember, uuid.UUID(member_id)) is None
+
+    @pytest.mark.asyncio
+    async def test_cancelling_last_invite_removes_only_invitation_owned_allowlist(
+        self, client: AsyncClient, db_session
+    ):
+        first_project = await _make_project(db_session, name="First")
+        second_project = await _make_project(db_session, name="Second")
+        first = await client.post(
+            f"/api/admin/projects/{first_project.id}/members",
+            json={"email": "multi@example.com", "role": "member"},
+        )
+        second = await client.post(
+            f"/api/admin/projects/{second_project.id}/members",
+            json={"email": "MULTI@example.com", "role": "viewer"},
+        )
+        allowed = (
+            await db_session.execute(
+                select(AllowedUser).where(AllowedUser.email == "multi@example.com")
+            )
+        ).scalar_one()
+        assert allowed.role == "invited"
+        allowed_id = allowed.id
+
+        removed_first = await client.delete(
+            f"/api/admin/projects/{first_project.id}/members/{first.json()['id']}"
+        )
+        assert removed_first.status_code == 200
+        assert await db_session.get(AllowedUser, allowed.id) is not None
+
+        removed_second = await client.delete(
+            f"/api/admin/projects/{second_project.id}/members/{second.json()['id']}"
+        )
+        assert removed_second.status_code == 200
+        db_session.expire_all()
+        assert await db_session.get(AllowedUser, allowed_id) is None
+
+    @pytest.mark.asyncio
+    async def test_cancelling_invite_preserves_manual_allowlist_row(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        manual = AllowedUser(email="manual@example.com", role="user")
+        db_session.add(manual)
+        await db_session.commit()
+        invited = await client.post(
+            f"/api/admin/projects/{project.id}/members",
+            json={"email": "MANUAL@example.com", "role": "member"},
+        )
+
+        removed = await client.delete(
+            f"/api/admin/projects/{project.id}/members/{invited.json()['id']}"
+        )
+        assert removed.status_code == 200
+        preserved = await db_session.get(AllowedUser, manual.id)
+        assert preserved is not None
+        assert preserved.role == "user"
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_case_variant_invite_fails_closed(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        db_session.add_all(
+            [
+                AllowedUser(
+                    email="Conflict@Example.com",
+                    firebase_uid="first-uid",
+                    role="user",
+                ),
+                AllowedUser(
+                    email="conflict@example.com",
+                    firebase_uid="second-uid",
+                    role="user",
+                ),
+            ]
+        )
+        await db_session.commit()
+
+        response = await client.post(
+            f"/api/admin/projects/{project.id}/members",
+            json={"email": "CONFLICT@example.com", "role": "member"},
+        )
+        assert response.status_code == 409
+        memberships = (
+            await db_session.execute(
+                select(ProjectMember).where(ProjectMember.project_id == project.id)
+            )
+        ).scalars().all()
+        assert len(memberships) == 1  # the owner only
+
+    @pytest.mark.asyncio
+    async def test_orphan_pending_member_lists_without_exposing_synthetic_id(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        orphan = ProjectMember(
+            project_id=project.id,
+            user_id=pending_project_member_user_id(uuid.uuid4()),
+            role="viewer",
+        )
+        db_session.add(orphan)
+        await db_session.commit()
+
+        listed = await client.get(f"/api/admin/projects/{project.id}/members")
+        row = next(item for item in listed.json()["members"] if item["id"] == str(orphan.id))
+        assert row["status"] == "pending"
+        assert row["email"] is None
+        assert row["user_id"] is None
+        assert "allowed-user:" not in str(listed.json())
+
+    @pytest.mark.asyncio
+    async def test_unrelated_user_cannot_invite_or_mutate_pending_member(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        invited = await client.post(
+            f"/api/admin/projects/{project.id}/members",
+            json={"email": "protected-pending@example.com", "role": "member"},
+        )
+        member_id = invited.json()["id"]
+        saved_override = app.dependency_overrides.get(get_current_user)
+
+        async def unrelated_user():
+            return {
+                "user_id": "unrelated-uid",
+                "email": "unrelated@example.com",
+                "role": "user",
+            }
+
+        app.dependency_overrides[get_current_user] = unrelated_user
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as raw_client:
+                create = await raw_client.post(
+                    f"/api/admin/projects/{project.id}/members",
+                    json={"email": "must-not-exist@example.com", "role": "member"},
+                )
+                update = await raw_client.patch(
+                    f"/api/admin/projects/{project.id}/members/{member_id}",
+                    json={"role": "viewer"},
+                )
+                remove = await raw_client.delete(
+                    f"/api/admin/projects/{project.id}/members/{member_id}"
+                )
+        finally:
+            if saved_override is None:
+                app.dependency_overrides.pop(get_current_user, None)
+            else:
+                app.dependency_overrides[get_current_user] = saved_override
+
+        assert create.status_code in (403, 404)
+        assert update.status_code in (403, 404)
+        assert remove.status_code in (403, 404)
+        protected = await db_session.get(ProjectMember, uuid.UUID(member_id))
+        assert protected is not None
+        assert protected.role == "member"
+        forbidden = (
+            await db_session.execute(
+                select(AllowedUser).where(
+                    AllowedUser.email == "must-not-exist@example.com"
+                )
+            )
+        ).scalar_one_or_none()
+        assert forbidden is None
 
     @pytest.mark.asyncio
     async def test_update_owner_role_returns_400(self, client: AsyncClient, db_session):

@@ -13,6 +13,7 @@ import type { DeployState, OrchestratorHealth } from '../types/settings';
 import type { Task } from '../types/task';
 import type { Project } from '../types/project';
 import type { PrimaryTab } from '../hooks/useUIState';
+import type { ProjectRole } from '../accessControl';
 
 export interface HeaderBarProps {
   tasks: Task[];
@@ -28,6 +29,8 @@ export interface HeaderBarProps {
   activeAlerts?: number;
   onOpenNewTaskModal: () => void;
   onOpenSettings: () => void;
+  /** Deployment-global runtime controls are platform-admin only. */
+  canManagePlatform: boolean;
   /** Sign out the active account only. */
   onSignOut: () => void;
   onNewProject?: () => void;
@@ -142,6 +145,10 @@ export const PrimaryTabNav = memo(function PrimaryTabNav({
 
 
 export const HeaderBar = memo(function HeaderBar(props: HeaderBarProps) {
+  const projectRoles = useMemo<Record<string, ProjectRole>>(
+    () => Object.fromEntries(props.projects.map(project => [project.id, project.my_role ?? null])),
+    [props.projects],
+  );
   const {
     tasks,
     onRefresh,
@@ -305,13 +312,15 @@ export const HeaderBar = memo(function HeaderBar(props: HeaderBarProps) {
             </button>
           </div>
 
-          <button
-            onClick={onOpenSettings}
-            title="Runtime settings"
-            className="hidden h-7 w-7 items-center justify-center rounded border border-workbench-border/80 bg-workbench-control text-neutral-400 transition-colors hover:bg-workbench-layer hover:text-neutral-100 md:inline-flex"
-          >
-            <Settings className="h-3.5 w-3.5" />
-          </button>
+          {props.canManagePlatform && (
+            <button
+              onClick={onOpenSettings}
+              title="Runtime settings"
+              className="hidden h-7 w-7 items-center justify-center rounded border border-workbench-border/80 bg-workbench-control text-neutral-400 transition-colors hover:bg-workbench-layer hover:text-neutral-100 md:inline-flex"
+            >
+              <Settings className="h-3.5 w-3.5" />
+            </button>
+          )}
           <AccountMenu
             variant="desktop"
             accounts={props.accounts ?? []}
@@ -333,6 +342,7 @@ export const HeaderBar = memo(function HeaderBar(props: HeaderBarProps) {
               onRefreshTasks={onRefresh}
               wsRef={wsRef}
               pauseReason={props.deployState?.reason ?? null}
+              projectRoles={projectRoles}
             />
           </div>
 
@@ -400,13 +410,15 @@ export const HeaderBar = memo(function HeaderBar(props: HeaderBarProps) {
                   <span className={`h-2 w-2 rounded-full shrink-0 ${healthDotColor}`} />
                   <span>{healthExpanded ? 'Hide health panel' : 'Health panel'}</span>
                 </button>
-                <button
-                  onClick={() => { onOpenSettings(); setShowMobileMenu(false); }}
-                  className="w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left text-neutral-300 hover:bg-neutral-800"
-                >
-                  <Settings className="w-4 h-4 shrink-0" />
-                  <span>Runtime settings</span>
-                </button>
+                {props.canManagePlatform && (
+                  <button
+                    onClick={() => { onOpenSettings(); setShowMobileMenu(false); }}
+                    className="w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left text-neutral-300 hover:bg-neutral-800"
+                  >
+                    <Settings className="w-4 h-4 shrink-0" />
+                    <span>Runtime settings</span>
+                  </button>
+                )}
                 <AccountMenu
                   variant="mobile"
                   accounts={props.accounts ?? []}

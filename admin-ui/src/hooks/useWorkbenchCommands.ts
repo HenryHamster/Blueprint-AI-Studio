@@ -1,4 +1,5 @@
-import { useMemo, useState } from 'react';
+/* eslint-disable react-hooks/refs */
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { WorkbenchCommand } from '../components/CommandPalette';
 import type { ProjectManageSection, ProjectSection, RuntimeSection, RuntimeSettingsSection } from '../components/OperatorWorkspaces';
 import { SETTINGS_SECTION_HOMES } from '../components/OperatorWorkspaceSections';
@@ -27,6 +28,7 @@ import { removeStrategicSelectedRef, upsertStrategicSelectedRef, type StrategicS
 import { normalizeWorkbenchRefetchSurfaces, normalizeWorkbenchTarget } from '../types/workbenchTargets';
 import type { PrimaryTab } from './useUIState';
 import type { ViewMode } from './useViewPreferences';
+import { resolveAccess, type ProjectRole } from '../accessControl';
 
 export type PipelineSection = 'flow' | 'board' | 'archive';
 type StrategicContextTarget = StrategicContextPackageDrilldown['target'];
@@ -59,6 +61,7 @@ interface UseWorkbenchCommandsOptions {
   maxPlanAccountCount: number;
   apiHealthy: boolean;
   isAdmin?: boolean;
+  projectRole?: ProjectRole;
   problemModelRevision?: number | null;
   hasDesignDoc?: boolean;
   designRevision?: number | null;
@@ -497,7 +500,8 @@ export function useWorkbenchCommands({
   visibleQueuedCount,
   maxPlanAccountCount,
   apiHealthy,
-  isAdmin = true,
+  isAdmin = false,
+  projectRole,
   problemModelRevision,
   hasDesignDoc,
   designRevision,
@@ -534,6 +538,11 @@ export function useWorkbenchCommands({
   openNextWorkbenchSubtab,
 }: UseWorkbenchCommandsOptions): WorkbenchCommand[] {
   const [workSessionCommandStatuses, setWorkSessionCommandStatuses] = useState<Record<string, WorkSessionCommandRunStatus>>({});
+  const projectAccess = resolveAccess(undefined, projectRole);
+  const canOperateProjectRef = useRef(projectAccess.canOperateProject);
+  useEffect(() => {
+    canOperateProjectRef.current = projectAccess.canOperateProject;
+  }, [projectAccess.canOperateProject]);
 
   return useMemo(() => {
     const projectDisabled = !selectedProjectId;
@@ -586,6 +595,7 @@ export function useWorkbenchCommands({
       closePalette();
     };
     const setStrategicModeAndOpenChat = (mode: StrategicInteractionMode) => {
+      if (!canOperateProjectRef.current) return;
       switchStrategicInteractionMode?.(mode);
       closePalette();
     };
@@ -730,6 +740,12 @@ export function useWorkbenchCommands({
     const commandHasAllowedMutation = (command: StrategicWorkSessionCommand): boolean => (
       hasAllowedWorkSessionMutation(command, selectedProjectId)
     );
+    const commandRequiresOperate = (command: StrategicWorkSessionCommand): boolean => (
+      commandHasAllowedMutation(command)
+      || command.id === 'session.check_in'
+      || command.id.startsWith('session.mode.')
+      || command.id === 'session.clear_selected_refs'
+    );
     const workSessionCommandCanRoute = (command: StrategicWorkSessionCommand): boolean => {
       if (commandHasAllowedMutation(command)) return true;
       if (command.id === 'session.check_in') return Boolean(markStrategicChecked);
@@ -766,7 +782,12 @@ export function useWorkbenchCommands({
       ) ?? undefined;
     };
     const runWorkSessionCommandMutation = (command: StrategicWorkSessionCommand): boolean => {
-      if (!selectedProjectId || !commandHasAllowedMutation(command) || !command.mutation) return false;
+      if (
+        !canOperateProjectRef.current
+        || !selectedProjectId
+        || !commandHasAllowedMutation(command)
+        || !command.mutation
+      ) return false;
 
       setWorkSessionCommandStatuses(prev => ({
         ...prev,
@@ -854,6 +875,7 @@ export function useWorkbenchCommands({
       const mode = strategicModeFromCommandId(command.id);
       const runStatus = workSessionCommandStatuses[workSessionCommandStatusKey(selectedProjectId, command.id)];
       const disabled = projectDisabled
+        || (commandRequiresOperate(command) && !projectAccess.canOperateProject)
         || !command.enabled
         || !routeable
         || runStatus?.state === 'pending'
@@ -914,10 +936,12 @@ export function useWorkbenchCommands({
       };
     });
     const keepContextRef = (ref: StrategicSelectedRef) => {
+      if (!canOperateProjectRef.current) return;
       updateStrategicSessionRefs?.(refs => upsertStrategicSelectedRef(refs, ref));
       closePalette();
     };
     const removeContextRef = (ref: Pick<StrategicSelectedRef, 'kind' | 'id'>) => {
+      if (!canOperateProjectRef.current) return;
       updateStrategicSessionRefs?.(refs => removeStrategicSelectedRef(refs, ref));
       closePalette();
     };
@@ -952,7 +976,7 @@ export function useWorkbenchCommands({
           section: 'Context',
           detail,
           keywords: ['strategic', 'context', selected ? 'remove' : 'keep', source.ref.kind, source.label],
-          disabled: projectDisabled || savingStrategicWorkbench,
+          disabled: projectDisabled || !projectAccess.canOperateProject || savingStrategicWorkbench,
           run: selected ? () => removeContextRef(source.ref) : () => keepContextRef(source.ref),
         });
       }
@@ -1189,8 +1213,11 @@ export function useWorkbenchCommands({
         section: 'Strategic',
         detail: strategicCheckInDetail,
         keywords: ['check-in', 'check in', 'checked', 'daily', 'status', 'since last', 'strategic'],
-        disabled: projectDisabled || checkingInStrategicSession,
-        run: () => runAndClose(markStrategicChecked),
+        disabled: projectDisabled || !projectAccess.canOperateProject || checkingInStrategicSession,
+        run: () => {
+          if (!canOperateProjectRef.current) return;
+          runAndClose(markStrategicChecked);
+        },
       }] : []),
       ...(switchStrategicInteractionMode
         ? strategicModeCommands.filter(command => !workSessionCommandModes.has(command.mode)).map((command): WorkbenchCommand => ({
@@ -1199,7 +1226,7 @@ export function useWorkbenchCommands({
             section: 'Strategic',
             detail: command.mode === strategicInteractionMode ? 'Current mode' : command.detail,
             keywords: ['mode', 'session', 'interaction', 'strategic', ...command.keywords],
-            disabled: projectDisabled || savingStrategicWorkbench || command.mode === strategicInteractionMode,
+            disabled: projectDisabled || !projectAccess.canOperateProject || savingStrategicWorkbench || command.mode === strategicInteractionMode,
             run: command.mode === strategicInteractionMode ? closePalette : () => setStrategicModeAndOpenChat(command.mode),
           }))
         : []),
@@ -1318,7 +1345,7 @@ export function useWorkbenchCommands({
         section: 'Project',
         detail: autonomousEnabled ? 'On — turn off' : 'Off — turn on',
         keywords: ['autonomous', 'autonomy', 'auto', 'pause', 'resume', 'enable', 'disable', 'toggle', 'mode'],
-        disabled: projectDisabled || !toggleAutonomousMode,
+        disabled: projectDisabled || !projectAccess.canManageProject || !toggleAutonomousMode,
         run: toggleAutonomousMode
           ? () => runAndClose(toggleAutonomousMode)
           : closePalette,
@@ -1347,7 +1374,7 @@ export function useWorkbenchCommands({
         section: 'Project',
         detail: 'Repo, members, policy',
         keywords: ['settings', 'members', 'repo'],
-        disabled: projectDisabled,
+        disabled: projectDisabled || !projectAccess.canManageProject,
         run: () => openProjectManageSection('overview'),
       },
       {
@@ -1356,7 +1383,7 @@ export function useWorkbenchCommands({
         section: 'Project',
         detail: 'Detection, test, install commands',
         keywords: ['settings', 'build', 'test', 'install', 'commands'],
-        disabled: projectDisabled,
+        disabled: projectDisabled || !projectAccess.canManageProject,
         run: () => openSettingsSectionHome('build-config'),
       },
       {
@@ -1365,7 +1392,7 @@ export function useWorkbenchCommands({
         section: 'Project',
         detail: 'Integration and promotion targets',
         keywords: ['settings', 'branches', 'integration', 'promotion'],
-        disabled: projectDisabled,
+        disabled: projectDisabled || !projectAccess.canManageProject,
         run: () => openSettingsSectionHome('branches'),
       },
       {
@@ -1374,7 +1401,7 @@ export function useWorkbenchCommands({
         section: 'Project',
         detail: 'Review gates and autonomous decisions',
         keywords: ['settings', 'review', 'auto-review', 'approval', 'gates'],
-        disabled: projectDisabled,
+        disabled: projectDisabled || !projectAccess.canManageProject,
         run: () => openSettingsSectionHome('auto-review'),
       },
       {
@@ -1383,7 +1410,7 @@ export function useWorkbenchCommands({
         section: 'Project',
         detail: 'Runtime and budget envelope',
         keywords: ['settings', 'resources', 'budget', 'runtime', 'envelope'],
-        disabled: projectDisabled,
+        disabled: projectDisabled || !projectAccess.canManageProject,
         run: () => openSettingsSectionHome('resource-envelope'),
       },
       {
@@ -1392,7 +1419,7 @@ export function useWorkbenchCommands({
         section: 'Project',
         detail: 'Failure recovery behavior',
         keywords: ['settings', 'remediation', 'recovery', 'failure', 'auto-remediation'],
-        disabled: projectDisabled,
+        disabled: projectDisabled || !projectAccess.canManageProject,
         run: () => openSettingsSectionHome('auto-remediation'),
       },
       {
@@ -1401,7 +1428,7 @@ export function useWorkbenchCommands({
         section: 'Project',
         detail: 'Issue implementation policy',
         keywords: ['settings', 'issues', 'implementation', 'github', 'policy'],
-        disabled: projectDisabled,
+        disabled: projectDisabled || !projectAccess.canManageProject,
         run: () => openSettingsSectionHome('issue-implementation'),
       },
       {
@@ -1410,7 +1437,7 @@ export function useWorkbenchCommands({
         section: 'Project',
         detail: 'Project alert routing',
         keywords: ['settings', 'alerts', 'domains', 'routing', 'notifications'],
-        disabled: projectDisabled,
+        disabled: projectDisabled || !projectAccess.canManageProject,
         run: () => openSettingsSectionHome('alert-domains'),
       },
       {
@@ -1419,7 +1446,7 @@ export function useWorkbenchCommands({
         section: 'Project',
         detail: 'Roles and project access policy',
         keywords: ['settings', 'access', 'members', 'roles', 'users'],
-        disabled: projectDisabled,
+        disabled: projectDisabled || !projectAccess.canManageProject,
         run: () => openSettingsSectionHome('access'),
       },
       {
@@ -1428,7 +1455,7 @@ export function useWorkbenchCommands({
         section: 'Project',
         detail: 'Access',
         keywords: ['access', 'team', 'users'],
-        disabled: projectDisabled,
+        disabled: projectDisabled || !projectAccess.canManageProject,
         run: () => runAndClose(openProjectMembers),
       },
       {
@@ -1591,13 +1618,21 @@ export function useWorkbenchCommands({
         detail: selectedProjectRepoLabel ?? 'No project selected',
         keywords: ['new', 'launch'],
         shortcut: 'N',
-        disabled: projectDisabled,
+        disabled: projectDisabled || !projectAccess.canOperateProject,
         run: () => {
+          if (!canOperateProjectRef.current) return;
           openNewTaskModal();
           closePalette();
         },
       },
-    ];
+    ].filter(command => (
+      isAdmin
+      || (
+        command.id !== 'runtime.analytics'
+        && command.id !== 'runtime.accounts'
+        && !command.id.startsWith('runtime.settings')
+      )
+    ));
   }, [
     apiHealthy,
     autonomousEnabled,
@@ -1620,6 +1655,8 @@ export function useWorkbenchCommands({
     openPreviousWorkbenchSubtab,
     openNextWorkbenchSubtab,
     problemModelRevision,
+    projectAccess.canManageProject,
+    projectAccess.canOperateProject,
     refreshSettings,
     refreshWorkbench,
     savingStrategicWorkbench,

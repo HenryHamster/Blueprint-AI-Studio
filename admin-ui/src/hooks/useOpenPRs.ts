@@ -36,7 +36,7 @@ function applyResponse(
   setStale(false);
 }
 
-export function useOpenPRs(selectedProjectId: string | null): UseOpenPRsResult {
+export function useOpenPRs(selectedProjectId: string | null, enabled: boolean): UseOpenPRsResult {
   const [openPRs, setOpenPRs] = useState<OpenPR[]>([]);
   const [openPRsStale, setOpenPRsStale] = useState(false);
   const [openPRsDegraded, setOpenPRsDegraded] = useState(false);
@@ -48,9 +48,10 @@ export function useOpenPRs(selectedProjectId: string | null): UseOpenPRsResult {
   // Reset PR state synchronously during render on project switch so stale data
   // never bleeds into the new project's view (React "adjust state during rendering"
   // pattern — https://react.dev/learn/you-might-not-need-an-effect#adjusting-some-state-when-a-prop-changes).
-  const [lastProjectId, setLastProjectId] = useState(selectedProjectId);
-  if (lastProjectId !== selectedProjectId) {
-    setLastProjectId(selectedProjectId);
+  const scopeKey = `${selectedProjectId}:${enabled}`;
+  const [lastScopeKey, setLastScopeKey] = useState(scopeKey);
+  if (lastScopeKey !== scopeKey) {
+    setLastScopeKey(scopeKey);
     setOpenPRs([]);
     setOpenPRsStale(false);
     setOpenPRsDegraded(false);
@@ -75,10 +76,10 @@ export function useOpenPRs(selectedProjectId: string | null): UseOpenPRsResult {
         setOpenPRsDegraded(false);
       }
     }
-  }, { intervalMs: DEFAULT_POLL_MS, deps: [selectedProjectId] });
+  }, { intervalMs: DEFAULT_POLL_MS, enabled, deps: [selectedProjectId] });
 
   const fetchOpenPRs = useCallback(async () => {
-    if (!selectedProjectId) return;
+    if (!enabled || !selectedProjectId) return;
     const requestId = ++requestIdRef.current;
     setOpenPRsRefreshing(true);
     try {
@@ -94,7 +95,7 @@ export function useOpenPRs(selectedProjectId: string | null): UseOpenPRsResult {
     finally {
       if (requestId === requestIdRef.current) setOpenPRsRefreshing(false);
     }
-  }, [selectedProjectId]);
+  }, [enabled, selectedProjectId]);
 
   return {
     openPRs,

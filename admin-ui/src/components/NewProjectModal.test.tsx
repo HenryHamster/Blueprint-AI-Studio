@@ -37,16 +37,226 @@ const mocks = vi.hoisted(() => ({
     }
     return new Response('{}', { status: 200 });
   }),
+  authGetMock: vi.fn(async (url: string) => {
+    if (url.includes('/api/github/status')) {
+      return new Response(JSON.stringify({
+        identity_linked: true,
+        credential_kind: 'oauth',
+        account_name: 'octocat',
+        app_configured: true,
+        app_installation_linked: true,
+        app_installation_reachable: true,
+        installation_count: 1,
+      }), { status: 200 });
+    }
+    return new Response(JSON.stringify({ repositories: [] }), { status: 200 });
+  }),
 }));
 
 vi.mock('../api', async () => {
   const { createApiMock } = await import('../test/api-mock-complete');
   return createApiMock({
     apiFetch: mocks.apiFetchMock,
-    authGet: vi.fn(async () => new Response(JSON.stringify({ repositories: [] }), { status: 200 })),
+    authGet: mocks.authGetMock,
     previewOnboardProject: mocks.previewOnboardProjectMock,
     onboardProject: mocks.onboardProjectMock,
     API_BASE_URL: 'http://localhost:3000',
+  });
+});
+
+beforeEach(() => {
+  window.sessionStorage.clear();
+  window.history.replaceState({}, '', '/');
+  mocks.previewOnboardProjectMock.mockClear();
+  mocks.onboardProjectMock.mockClear();
+  mocks.apiFetchMock.mockClear();
+  mocks.authGetMock.mockClear();
+  mocks.authGetMock.mockImplementation(async (url: string) => {
+    if (url.includes('/api/github/status')) {
+      return new Response(JSON.stringify({
+        identity_linked: true,
+        credential_kind: 'oauth',
+        account_name: 'octocat',
+        app_configured: true,
+        app_installation_linked: true,
+        app_installation_reachable: true,
+        installation_count: 1,
+      }), { status: 200 });
+    }
+    return new Response(JSON.stringify({ repositories: [] }), { status: 200 });
+  });
+});
+
+describe('NewProjectModal GitHub authorization', () => {
+  it('shows manual repository entry but blocks preview until GitHub identity is linked', async () => {
+    mocks.authGetMock.mockImplementation(async (url: string) => {
+      if (url.includes('/api/github/status')) {
+        return new Response(JSON.stringify({
+          identity_linked: false,
+          credential_kind: null,
+          account_name: null,
+          app_configured: true,
+          app_installation_linked: false,
+          app_installation_reachable: false,
+          installation_count: 0,
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ repositories: [] }), { status: 200 });
+    });
+
+    render(<NewProjectModal onClose={vi.fn()} onSuccess={vi.fn()} />);
+
+    expect(await screen.findByRole('button', { name: 'Connect GitHub' })).toBeInTheDocument();
+    const repoInput = screen.getByPlaceholderText('owner/repo or https://github.com/owner/repo');
+    expect(repoInput).toBeInTheDocument();
+    expect(screen.getByText(/personally have push or admin access/)).toBeInTheDocument();
+    expect(screen.getByText(/GitHub App must be installed with access/)).toBeInTheDocument();
+    expect(mocks.authGetMock).toHaveBeenCalledWith('http://localhost:3000/api/github/status');
+    expect(mocks.authGetMock).not.toHaveBeenCalledWith('http://localhost:3000/api/admin/github/repos');
+
+    fireEvent.change(repoInput, { target: { value: 'acme/platform' } });
+    expect(screen.getByRole('button', { name: 'Continue' })).toBeDisabled();
+    fireEvent.keyDown(repoInput, { key: 'Enter' });
+    expect(await screen.findByText('Connect your GitHub account before previewing this repository.')).toBeInTheDocument();
+    expect(mocks.previewOnboardProjectMock).not.toHaveBeenCalled();
+  });
+
+  it('renders the connected account from user-scoped status', async () => {
+    render(<NewProjectModal onClose={vi.fn()} onSuccess={vi.fn()} />);
+
+    expect(await screen.findByText('Connected as octocat')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Connect GitHub' })).not.toBeInTheDocument();
+    await waitFor(() => expect(mocks.authGetMock).toHaveBeenCalledWith('http://localhost:3000/api/admin/github/repos'));
+  });
+
+  it('restores the in-progress form after the GitHub OAuth return', async () => {
+    window.history.replaceState({}, '', '/?github_connected=octocat');
+    window.sessionStorage.setItem('blueprint:new-project:github-oauth-resume:v1', JSON.stringify({
+      version: 1,
+      repoInput: 'acme/platform',
+      projectName: 'Platform',
+      goal: 'Ship safely',
+      projectType: 'product',
+      users: 'internal teams',
+      team: 'three engineers',
+      deployCadence: 'weekly',
+      notes: 'No Friday deploys',
+      constraints: ['Do not edit production secrets'],
+      promotionTargetInput: 'main',
+      useManualRepo: true,
+      repoFilter: '',
+      previewDefaultBranch: 'main',
+    }));
+
+    render(<NewProjectModal onClose={vi.fn()} onSuccess={vi.fn()} resumeFromGitHub />);
+
+    expect(await screen.findByText('Connected as octocat')).toBeInTheDocument();
+    expect(screen.getByDisplayValue('acme/platform')).toBeInTheDocument();
+    expect(screen.getByDisplayValue('Platform')).toBeInTheDocument();
+    expect(screen.getByDisplayValue('Ship safely')).toBeInTheDocument();
+    expect(screen.getByDisplayValue('Do not edit production secrets')).toBeInTheDocument();
+    expect(window.sessionStorage.getItem('blueprint:new-project:github-oauth-resume:v1')).toBeNull();
+  });
+
+  it('starts current-user OAuth from the existing authorize endpoint and keeps useful errors', async () => {
+    mocks.authGetMock.mockImplementation(async (url: string) => {
+      if (url.includes('/api/github/status')) {
+        return new Response(JSON.stringify({ identity_linked: false, app_configured: true }), { status: 200 });
+      }
+      if (url.includes('/api/github/oauth/authorize')) {
+        return new Response(JSON.stringify({ error: { message: 'GitHub OAuth is not configured' } }), { status: 503 });
+      }
+      return new Response(JSON.stringify({ repositories: [] }), { status: 200 });
+    });
+
+    render(<NewProjectModal onClose={vi.fn()} onSuccess={vi.fn()} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Connect GitHub' }));
+
+    expect(await screen.findByText('GitHub OAuth is not configured')).toBeInTheDocument();
+    expect(mocks.authGetMock).toHaveBeenCalledWith(
+      'http://localhost:3000/api/github/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A3000',
+    );
+  });
+
+  it('offers to resume App installation for a linked identity and surfaces authorize errors', async () => {
+    mocks.authGetMock.mockImplementation(async (url: string) => {
+      if (url.includes('/api/github/status')) {
+        return new Response(JSON.stringify({
+          identity_linked: true,
+          credential_kind: 'oauth',
+          account_name: 'octocat',
+          app_configured: true,
+          app_installation_linked: false,
+          app_installation_reachable: false,
+          installation_count: 0,
+        }), { status: 200 });
+      }
+      if (url.includes('/api/github/oauth/authorize')) {
+        return new Response(JSON.stringify({ error: { message: 'Could not resume GitHub App installation' } }), { status: 503 });
+      }
+      return new Response(JSON.stringify({ repositories: [] }), { status: 200 });
+    });
+
+    render(<NewProjectModal onClose={vi.fn()} onSuccess={vi.fn()} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Install Blueprint App' }));
+
+    expect(await screen.findByText('Could not resume GitHub App installation')).toBeInTheDocument();
+    expect(mocks.authGetMock).toHaveBeenCalledWith(
+      'http://localhost:3000/api/github/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A3000',
+    );
+  });
+
+  it('shows administrator guidance instead of an installation warning when the App is unconfigured', async () => {
+    mocks.authGetMock.mockImplementation(async (url: string) => {
+      if (url.includes('/api/github/status')) {
+        return new Response(JSON.stringify({
+          identity_linked: true,
+          credential_kind: 'oauth',
+          account_name: 'octocat',
+          app_configured: false,
+          app_installation_linked: false,
+          app_installation_reachable: false,
+          installation_count: 0,
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ repositories: [] }), { status: 200 });
+    });
+
+    render(<NewProjectModal onClose={vi.fn()} onSuccess={vi.fn()} />);
+
+    expect(await screen.findByText(/GitHub App is not configured on this server/)).toBeInTheDocument();
+    expect(screen.queryByText(/has no repository installation/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Install Blueprint App' })).not.toBeInTheDocument();
+  });
+
+  it('keeps existing-project setup mode independent of GitHub connection and repository discovery', async () => {
+    render(
+      <NewProjectModal
+        onClose={vi.fn()}
+        onSuccess={vi.fn()}
+        setupProject={{ id: 'existing-project', owner: 'acme', repo: 'platform' }}
+      />,
+    );
+
+    expect(await screen.findByText('Project Setup')).toBeInTheDocument();
+    expect(screen.getByText('Project created')).toBeInTheDocument();
+    expect(mocks.authGetMock).not.toHaveBeenCalled();
+  });
+
+  it('preserves Blueprint repo-discovery errors while falling back to manual entry', async () => {
+    mocks.authGetMock.mockImplementation(async (url: string) => {
+      if (url.includes('/api/github/status')) {
+        return new Response(JSON.stringify({ identity_linked: true, credential_kind: 'oauth', app_configured: true }), { status: 200 });
+      }
+      return new Response(JSON.stringify({
+        error: { message: 'Blueprint GitHub App is not installed for this GitHub identity.' },
+      }), { status: 422 });
+    });
+
+    render(<NewProjectModal onClose={vi.fn()} onSuccess={vi.fn()} />);
+
+    expect(await screen.findByText('Blueprint GitHub App is not installed for this GitHub identity.')).toBeInTheDocument();
+    expect(screen.getByPlaceholderText('owner/repo or https://github.com/owner/repo')).toBeInTheDocument();
   });
 });
 
@@ -277,10 +487,10 @@ describe('NewProjectModal installation error banner', () => {
     });
   });
 
-  it('renders actionable message and preserves raw error on preview failure when error contains "installation token"', async () => {
+  it('renders actionable message and preserves the current App-install error on preview failure', async () => {
     const user = userEvent.setup();
     mocks.previewOnboardProjectMock.mockRejectedValue(
-      new Error('No installation token available -- cannot detect default branch.')
+      new Error('Your GitHub authorization is valid, but the Blueprint GitHub App is not installed for this repository.')
     );
     render(<NewProjectModal onClose={vi.fn()} onSuccess={vi.fn()} />);
     const repoInput = await screen.findByPlaceholderText('owner/repo or https://github.com/owner/repo');
@@ -290,13 +500,13 @@ describe('NewProjectModal installation error banner', () => {
     // Custom actionable message replaces the raw error (includes repo reference)
     await screen.findByText(/Blueprint GitHub App isn't installed on acme\/platform/);
     // Raw backend error is preserved as secondary text (with reduced opacity)
-    expect(screen.getByText(/No installation token available/)).toBeInTheDocument();
+    expect(screen.getByText(/Your GitHub authorization is valid/)).toBeInTheDocument();
   });
 
-  it('renders actionable message and preserves raw error on submit failure when error contains "installation token"', async () => {
+  it('renders actionable message and preserves the current App-install error on submit failure', async () => {
     const user = userEvent.setup();
     mocks.onboardProjectMock.mockRejectedValue(
-      new Error('No installation token available -- cannot detect default branch.')
+      new Error('Your GitHub authorization is valid, but the Blueprint GitHub App is not installed for this repository.')
     );
     render(<NewProjectModal onClose={vi.fn()} onSuccess={vi.fn()} />);
     const repoInput = await screen.findByPlaceholderText('owner/repo or https://github.com/owner/repo');
@@ -308,7 +518,7 @@ describe('NewProjectModal installation error banner', () => {
     // Custom actionable message replaces the raw error (includes repo reference)
     await screen.findByText(/Blueprint GitHub App isn't installed on acme\/platform/);
     // Raw backend error is preserved as secondary text
-    expect(screen.getByText(/No installation token available/)).toBeInTheDocument();
+    expect(screen.getByText(/Your GitHub authorization is valid/)).toBeInTheDocument();
   });
 
   it('renders raw error unchanged for errors that do not contain "installation token"', async () => {
