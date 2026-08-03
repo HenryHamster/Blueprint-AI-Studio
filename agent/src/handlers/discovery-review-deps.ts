@@ -6,28 +6,19 @@
  * prompt module APIs with partial mocks.
  */
 export {
-  WORKSPACE,
-  git,
   persistAndPostStatus,
-  resolveBaseBranch,
-  runClaudeCode,
+  runIsolatedTextOnlyMemory,
   sanitize,
   sendHeartbeatSync,
   sendLog,
   setCurrentPromptFingerprint,
   strVal,
-  validateBranchName,
 } from '../index.js';
-export { prepareWorkspaceForRole } from '../workspacePrep.js';
-export { preparePacketOnlyWorkspace } from './discovery-review-workspace.js';
 export {
-  DEFAULT_TOOL_GUIDANCE,
-  buildContextPrefix,
-  computePromptFingerprint,
-  configureAgentPermissions,
-  readClaudeMd,
-} from '../prompt.js';
-export { providerAutoInjectsClaudeMd } from '../providers/runners.js';
+  cleanupPacketOnlyWorkspace,
+  preparePacketOnlyWorkspace,
+} from './discovery-review-workspace.js';
+export { computePromptFingerprint } from '../prompt.js';
 export {
   buildPromptSizeTelemetry,
   setPromptSizeTelemetry,

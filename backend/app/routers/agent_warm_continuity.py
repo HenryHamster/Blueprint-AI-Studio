@@ -42,9 +42,6 @@ from app.capability_execution_fence import (
 )
 from app.claim_analytics import stamp_warm_claim_timing
 from app.database import get_session, resolve_dialect_name
-from app.discovery_admission import (
-    authorize_discovery_task_execution,
-)
 from app.models import Task, TaskStatus, _utcnow
 from app.routers.agent import verify_agent_token
 from app.shared_state import limiter
@@ -661,44 +658,6 @@ async def _finalize_warm_claim(
             task.id,
             vm_instance_id,
             ", ".join(n["ref"] for n in _fence_blocking),
-        )
-        return Response(status_code=204)
-    # Warm claims bypass the cold orchestrator, so enforce the same centralized
-    # discovery authority immediately before QUEUED -> IN_PROGRESS. This also
-    # repairs descendants whose constructor omitted discovery_cycle_id.
-    _discovery_authority = await authorize_discovery_task_execution(
-        session,
-        task=task,
-    )
-    if not _discovery_authority.allowed:
-        from app.warm_pool import release_pool_vm
-
-        clear_warm_dispatch_pin(task)
-        await release_pool_vm(
-            session, vm_instance_id, owning_task_id=task.id
-        )
-        if _discovery_authority.terminal_denial:
-            task.status = TaskStatus.CANCELLED
-            task.completed_at = _utcnow()
-            task.latest_status_message = (
-                "Cancelled by discovery admission: "
-                f"{_discovery_authority.reason}"
-            )
-        else:
-            task.latest_status_message = (
-                "Waiting for discovery execution slot: "
-                f"{_discovery_authority.reason}"
-            )
-        session.add(task)
-        await session.commit()
-        logger.warning(
-            "[NEXT-ROLE][discovery-authority] Declining warm claim (%s) for "
-            "task %s on vm %s: %s%s",
-            origin,
-            task.id,
-            vm_instance_id,
-            _discovery_authority.reason,
-            " (cancelled)" if _discovery_authority.terminal_denial else "",
         )
         return Response(status_code=204)
     from app.compute import VM_PROVISIONING_MODEL

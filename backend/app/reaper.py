@@ -78,10 +78,7 @@ from app.failure_classification import (
     _persist_stuck_call_reclassification,
 )
 from app.retry_budget import append_failure_class_history
-from app.task_blocked import (
-    mark_task_for_fresh_execution_attempt,
-    reset_task_for_fresh_attempt,
-)
+from app.task_blocked import reset_task_for_fresh_attempt
 from app.time_utils import (
     _utcnow,
     clear_retry_after,
@@ -1518,7 +1515,6 @@ async def reaper_service():
                             da_ctx.pop("failure_class", None)
                             da_ctx.pop("dead_auth_matched_pattern", None)
                             task.context = da_ctx
-                            mark_task_for_fresh_execution_attempt(task)
                             # Keep the promoted column in sync (D2 over-fetch fix).
                             task.llm_account_id = None
                             clear_retry_after(task)
@@ -1565,7 +1561,6 @@ async def reaper_service():
                             # don't carry provision budget into the next dispatch.
                             rl_ctx.pop("provision_failures", None)
                             task.context = rl_ctx
-                            mark_task_for_fresh_execution_attempt(task)
                             # Keep the promoted column in sync (D2 over-fetch fix).
                             task.llm_account_id = None
                             clear_retry_after(task)

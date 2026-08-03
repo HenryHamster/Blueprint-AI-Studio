@@ -97,29 +97,11 @@ class DiscoveryCycle(SQLModel, table=True):
         ),
         CheckConstraint(
             "verdict IS NULL OR verdict IN "
-            "('renew','pivot','expand','branch','fallback_pending','park','stop',"
-            "'ask_operator','inconclusive')",
+            "('advance','park','stop','ask_operator')",
             name="chk_discoverycycle_verdict",
         ),
         CheckConstraint("generation >= 1", name="chk_discoverycycle_generation"),
         CheckConstraint("revision >= 0", name="chk_discoverycycle_revision"),
-        CheckConstraint(
-            "task_credit_limit IS NULL OR task_credit_limit > 0",
-            name="chk_discoverycycle_task_credit_limit",
-        ),
-        CheckConstraint(
-            "attempt_credit_limit IS NULL OR attempt_credit_limit > 0",
-            name="chk_discoverycycle_attempt_credit_limit",
-        ),
-        CheckConstraint(
-            "concurrency_limit IS NULL OR concurrency_limit > 0",
-            name="chk_discoverycycle_concurrency_limit",
-        ),
-        CheckConstraint(
-            "reserved_task_credits >= 0 AND consumed_task_credits >= 0 "
-            "AND reserved_attempt_credits >= 0 AND consumed_attempt_credits >= 0",
-            name="chk_discoverycycle_credit_counts",
-        ),
         CheckConstraint(
             "mechanism_fingerprint IS NULL OR length(mechanism_fingerprint) = 64",
             name="chk_discoverycycle_mechanism_fingerprint",
@@ -193,34 +175,6 @@ class DiscoveryCycle(SQLModel, table=True):
         ),
     )
 
-    task_credit_limit: int | None = Field(
-        default=None,
-        sa_column=Column(Integer, nullable=True),
-    )
-    attempt_credit_limit: int | None = Field(
-        default=None,
-        sa_column=Column(Integer, nullable=True),
-    )
-    concurrency_limit: int | None = Field(
-        default=None,
-        sa_column=Column(Integer, nullable=True),
-    )
-    reserved_task_credits: int = Field(
-        default=0,
-        sa_column=Column(Integer, nullable=False, server_default=text("0")),
-    )
-    consumed_task_credits: int = Field(
-        default=0,
-        sa_column=Column(Integer, nullable=False, server_default=text("0")),
-    )
-    reserved_attempt_credits: int = Field(
-        default=0,
-        sa_column=Column(Integer, nullable=False, server_default=text("0")),
-    )
-    consumed_attempt_credits: int = Field(
-        default=0,
-        sa_column=Column(Integer, nullable=False, server_default=text("0")),
-    )
     deadline_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
@@ -334,107 +288,5 @@ class DiscoveryEvidenceItem(SQLModel, table=True):
             NaiveUTCDateTime,
             nullable=False,
             server_default=func.now(),
-        ),
-    )
-
-
-class DiscoveryAdmission(SQLModel, table=True):
-    """Idempotent credit reservation for one cycle-scoped unit of work.
-
-    A caller-selected ``admission_key`` makes retries converge on the same
-    ledger row. The service updates ``state`` as the reservation is consumed
-    or released; rows themselves remain as the durable accounting trail.
-    """
-
-    __tablename__ = "discoveryadmission"
-    __table_args__ = (
-        UniqueConstraint(
-            "cycle_id",
-            "admission_key",
-            name="uq_discoveryadmission_cycle_key",
-        ),
-        Index(
-            "ix_discoveryadmission_cycle_state_created",
-            "cycle_id",
-            "state",
-            "created_at",
-        ),
-        Index("ix_discoveryadmission_task_id", "task_id"),
-        Index(
-            "ix_discoveryadmission_spawn_request_id",
-            "spawn_request_id",
-        ),
-        CheckConstraint(
-            "admission_kind IN ('logical_task','attempt')",
-            name="chk_discoveryadmission_kind",
-        ),
-        CheckConstraint(
-            "state IN ('reserved','consumed','released')",
-            name="chk_discoveryadmission_state",
-        ),
-        CheckConstraint("units > 0", name="chk_discoveryadmission_units"),
-        CheckConstraint(
-            "length(admission_key) > 0",
-            name="chk_discoveryadmission_key_nonempty",
-        ),
-    )
-
-    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
-    cycle_id: uuid.UUID = Field(
-        sa_column=Column(
-            GUID(),
-            ForeignKey("discoverycycle.id", ondelete="CASCADE"),
-            nullable=False,
-        )
-    )
-    admission_key: str = Field(sa_column=Column(String(512), nullable=False))
-    admission_kind: str = Field(sa_column=Column(String(24), nullable=False))
-    task_id: uuid.UUID | None = Field(
-        default=None,
-        sa_column=Column(
-            GUID(),
-            ForeignKey("task.id", ondelete="SET NULL"),
-            nullable=True,
-        ),
-    )
-    spawn_request_id: uuid.UUID | None = Field(
-        default=None,
-        sa_column=Column(
-            GUID(),
-            ForeignKey("strategicspawnrequest.id", ondelete="SET NULL"),
-            nullable=True,
-        ),
-    )
-    units: int = Field(
-        default=1,
-        sa_column=Column(Integer, nullable=False, server_default=text("1")),
-    )
-    state: str = Field(
-        default="reserved",
-        sa_column=Column(
-            String(24),
-            nullable=False,
-            server_default=text("'reserved'"),
-        ),
-    )
-    admission_metadata: Dict[str, Any] = Field(
-        default_factory=dict,
-        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
-    )
-    created_at: datetime = Field(
-        default_factory=_utcnow,
-        sa_column=Column(
-            NaiveUTCDateTime,
-            nullable=False,
-            server_default=func.now(),
-        ),
-    )
-    updated_at: datetime = Field(
-        default_factory=_utcnow,
-        sa_column=Column(
-            NaiveUTCDateTime,
-            nullable=False,
-            server_default=func.now(),
-            onupdate=_utcnow,
         ),
     )

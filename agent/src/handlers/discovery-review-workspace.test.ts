@@ -1,36 +1,44 @@
-import fs from 'fs';
-import os from 'os';
-import path from 'path';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { preparePacketOnlyWorkspace } from './discovery-review-workspace.js';
+import {
+  cleanupPacketOnlyWorkspace,
+  preparePacketOnlyWorkspace,
+} from './discovery-review-workspace.js';
 
-const workspaces: string[] = [];
+const scratchRoot = path.resolve(
+  path.join(os.tmpdir(), 'blueprint-discovery-review'),
+);
 
-afterEach(() => {
-  for (const workspace of workspaces.splice(0)) {
-    fs.rmSync(workspace, { recursive: true, force: true });
-  }
-});
+describe('packet-only discovery workspace', () => {
+  const created: string[] = [];
 
-describe('preparePacketOnlyWorkspace', () => {
-  it('removes a stale checkout while preserving the workspace mountpoint', () => {
-    const workspace = fs.mkdtempSync(
-      path.join(os.tmpdir(), 'discovery-review-packet-'),
-    );
-    workspaces.push(workspace);
-    fs.mkdirSync(path.join(workspace, '.git'));
-    fs.writeFileSync(path.join(workspace, 'stale-source.ts'), 'stale');
-
-    preparePacketOnlyWorkspace(workspace);
-
-    expect(fs.existsSync(workspace)).toBe(true);
-    expect(fs.readdirSync(workspace)).toEqual([]);
+  afterEach(() => {
+    for (const workspace of created.splice(0)) {
+      fs.rmSync(workspace, { recursive: true, force: true });
+    }
   });
 
-  it('refuses to clear a filesystem root', () => {
+  it('creates and cleans only a task-scoped scratch directory', () => {
+    const workspace = preparePacketOnlyWorkspace('task/../../unsafe');
+    created.push(workspace);
+
+    expect(workspace.startsWith(`${scratchRoot}${path.sep}`)).toBe(true);
+    expect(fs.statSync(workspace).isDirectory()).toBe(true);
+    fs.writeFileSync(path.join(workspace, 'receipt.json'), '{}');
+
+    cleanupPacketOnlyWorkspace(workspace);
+    expect(fs.existsSync(workspace)).toBe(false);
+  });
+
+  it('refuses to clean a path outside its owned scratch root', () => {
     expect(() => {
-      preparePacketOnlyWorkspace(path.parse(process.cwd()).root);
-    }).toThrow(/unsafe packet-only workspace path/);
+      cleanupPacketOnlyWorkspace(os.tmpdir());
+    }).toThrow(
+      'refusing to clear an unsafe packet-only workspace path',
+    );
   });
 });

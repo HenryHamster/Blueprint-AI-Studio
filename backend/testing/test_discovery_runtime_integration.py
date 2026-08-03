@@ -7,13 +7,10 @@ import uuid
 
 import pytest
 from sqlalchemy.exc import IntegrityError
-from sqlmodel import select
 
 from app.models import (
-    DiscoveryAdmission,
     DiscoveryCycle,
     Project,
-    StrategicSpawnRequest,
     Task,
     TaskStatus,
 )
@@ -41,31 +38,23 @@ def test_research_spawn_only_absorbs_the_known_direction_claim_collision():
     assert _is_research_claim_integrity_error(unrelated) is False
 
 
-def test_cold_and_warm_execution_boundaries_use_discovery_authority_backstop():
-    """Every path that flips queued work toward execution shares one fence."""
+def test_cold_and_warm_execution_boundaries_do_not_use_discovery_authority():
+    """Discovery lineage must not strand already-admitted execution work."""
 
     from app import orchestrator
     from app.routers import agent_warm_continuity
 
-    helper_name = "authorize_discovery_task_execution"
     cold_source = inspect.getsource(orchestrator.orchestrator_worker)
-    assert cold_source.count(helper_name) >= 2
-    final_claim = cold_source.rfind(helper_name)
-    provisioning = cold_source.find(
-        "task.status = TaskStatus.PROVISIONING",
-        final_claim,
-    )
-    claim_commit = cold_source.find("await session.commit()", provisioning)
-    assert final_claim < provisioning < claim_commit
-    assert "session.rollback()" not in cold_source[final_claim:claim_commit]
-    assert "recompute_launch_staleness" not in cold_source[final_claim:provisioning]
-    assert helper_name in inspect.getsource(
-        agent_warm_continuity._finalize_warm_claim
-    )
+    warm_source = inspect.getsource(agent_warm_continuity._finalize_warm_claim)
+    assert "authorize_discovery_task_execution" not in cold_source
+    assert "reserve_discovery_admission" not in cold_source
+    assert "authorize_discovery_task_execution" not in warm_source
+    assert "discovery_admission_denied" not in cold_source
+    assert "discovery_admission_denied" not in warm_source
 
 
-def test_all_fresh_execution_retry_families_stamp_a_dispatch_incarnation():
-    """Canonical resets plus low-level recovery bypasses cannot escape charging."""
+def test_fresh_execution_retries_do_not_stamp_discovery_accounting():
+    """Retry policy is independent from discovery provenance."""
 
     from app import (
         blocked_task_unblock_sweeps,
@@ -77,33 +66,19 @@ def test_all_fresh_execution_retry_families_stamp_a_dispatch_incarnation():
     )
 
     reset_source = inspect.getsource(task_blocked.reset_task_for_fresh_attempt)
-    assert "mark_task_for_fresh_execution_attempt(task)" in reset_source
+    assert "_fresh_attempt_started_at" in reset_source
+    assert "_discovery_attempt_ordinal" not in reset_source
 
-    # Replacement clones do not call the same-row reset helper, but carry the
-    # same canonical incarnation marker into the common dispatch fence.
     clone_source = inspect.getsource(task_lifecycle_requeue._requeue_parent_task)
-    assert '"_discovery_attempt_ordinal": 1' in clone_source
+    assert "_discovery_attempt_ordinal" not in clone_source
     assert "reserve_discovery_admission" not in clone_source
-
-    # Provision recovery and the reaper's provider-specific fast paths retain
-    # bespoke context cleanup, so they explicitly stamp after that cleanup.
-    assert "mark_task_for_fresh_execution_attempt(fresh_t)" in inspect.getsource(
-        orchestrator.orchestrator_worker
-    )
-    reaper_source = inspect.getsource(reaper.reaper_service)
-    assert reaper_source.count("mark_task_for_fresh_execution_attempt(task)") >= 2
-    assert "mark_task_for_fresh_execution_attempt(_t)" in inspect.getsource(
-        reaper_infra_recovery.run_infra_recovery_and_hold_maintenance
-    )
-    blocked_source = inspect.getsource(
-        blocked_task_unblock_sweeps.sweep_unblock_blocked_tasks
-    )
-    assert blocked_source.count(
-        "mark_task_for_fresh_execution_attempt(task)"
-    ) >= 4
-    assert "mark_task_for_fresh_execution_attempt(task)" in inspect.getsource(
-        blocked_task_unblock_sweeps._apply_needs_disposition
-    )
+    for module in (
+        blocked_task_unblock_sweeps,
+        orchestrator,
+        reaper,
+        reaper_infra_recovery,
+    ):
+        assert "mark_task_for_fresh_execution_attempt" not in inspect.getsource(module)
 
 
 def test_autonomous_direction_research_bootstraps_and_attaches_cycle():
@@ -126,8 +101,6 @@ async def _cycle_owner(db_session, *, state: str = "open"):
         direction_key="direction-a",
         outcome_kind="mixed",
         state=state,
-        task_credit_limit=4,
-        attempt_credit_limit=2,
     )
     db_session.add(cycle)
     await db_session.flush()
@@ -157,7 +130,7 @@ def _spec() -> dict:
 
 
 @pytest.mark.asyncio
-async def test_strategic_spawn_reserves_once_and_propagates_cycle(db_session):
+async def test_strategic_spawn_propagates_cycle_without_execution_gate(db_session):
     project, cycle, owner = await _cycle_owner(db_session)
 
     first = await submit_strategic_spawn(
@@ -185,64 +158,35 @@ async def test_strategic_spawn_reserves_once_and_propagates_cycle(db_session):
     assert replay.replayed is True
     assert replay.task.id == first.task.id
 
-    admissions = (
-        (
-            await db_session.execute(
-                select(DiscoveryAdmission).where(
-                    DiscoveryAdmission.cycle_id == cycle.id
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-    assert len(admissions) == 1
-    assert admissions[0].state == "consumed"
-    assert admissions[0].task_id == first.task.id
     await db_session.refresh(cycle)
-    assert cycle.reserved_task_credits == 0
-    assert cycle.consumed_task_credits == 1
+    assert not hasattr(cycle, "reserved_task_credits")
+    assert not hasattr(cycle, "consumed_task_credits")
 
 
 @pytest.mark.asyncio
-async def test_closed_cycle_rejects_new_strategic_intent(db_session):
+async def test_closed_cycle_lineage_does_not_block_closure_spawn(db_session):
     project, cycle, owner = await _cycle_owner(
         db_session,
         state="admission_closed",
     )
     project_id = project.id
-    cycle_id = cycle.id
-    owner_id = owner.id
+    submission = await submit_strategic_spawn(
+        db_session,
+        project_id=project_id,
+        parent_task_id=owner.id,
+        task_type="create",
+        specification=_spec(),
+        idempotency_key="closure-work",
+        direction_id="direction-a",
+    )
 
-    with pytest.raises(ValueError, match="cycle_not_admitting"):
-        await submit_strategic_spawn(
-            db_session,
-            project_id=project_id,
-            parent_task_id=owner_id,
-            task_type="create",
-            specification=_spec(),
-            idempotency_key="too-late",
-            direction_id="direction-a",
-        )
-
-    assert (
-        await db_session.execute(
-            select(StrategicSpawnRequest).where(
-                StrategicSpawnRequest.parent_task_id == owner_id
-            )
-        )
-    ).scalar_one_or_none() is None
-    assert (
-        await db_session.execute(
-            select(DiscoveryAdmission).where(
-                DiscoveryAdmission.cycle_id == cycle_id
-            )
-        )
-    ).scalar_one_or_none() is None
+    assert submission.task is not None
+    assert submission.task.discovery_cycle_id == cycle.id
+    assert submission.request.discovery_cycle_id == cycle.id
 
 
 @pytest.mark.asyncio
-async def test_cancelling_deferred_spawn_releases_reserved_credit(db_session):
+async def test_cancelling_deferred_spawn_preserves_cycle_provenance(db_session):
     project, cycle, owner = await _cycle_owner(db_session)
     submission = await submit_strategic_spawn(
         db_session,
@@ -270,8 +214,6 @@ async def test_cancelling_deferred_spawn_releases_reserved_credit(db_session):
         burst_cap=1,
     )
     assert deferred.request.state == "deferred"
-    await db_session.refresh(cycle)
-    assert cycle.reserved_task_credits == 1
 
     await cancel_deferred_spawn_request(
         db_session,
@@ -281,12 +223,5 @@ async def test_cancelling_deferred_spawn_releases_reserved_credit(db_session):
     await db_session.commit()
     await db_session.refresh(cycle)
 
-    assert cycle.reserved_task_credits == 0
-    admission = (
-        await db_session.execute(
-            select(DiscoveryAdmission).where(
-                DiscoveryAdmission.spawn_request_id == deferred.request.id
-            )
-        )
-    ).scalar_one()
-    assert admission.state == "released"
+    assert deferred.request.state == "cancelled"
+    assert deferred.request.discovery_cycle_id == cycle.id

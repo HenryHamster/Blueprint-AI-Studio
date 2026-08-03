@@ -252,6 +252,51 @@
         "internal_reason": null
     },
     {
+        "op": "resolve_discovery",
+        "alias": "resolve-discovery",
+        "description": "Resolve the exact discovery cycle and revision named by an operator event by continuing with a complete next bet, parking it, or closing it.",
+        "cli": true,
+        "prompt": true,
+        "internal_reason": null,
+        "input": {
+            "kind": "json",
+            "required": [
+                "direction_id",
+                "cycle_id",
+                "cycle_revision",
+                "action"
+            ],
+            "fields": [
+                "direction_id",
+                "cycle_id",
+                "cycle_revision",
+                "action",
+                "next_bet",
+                "note"
+            ],
+            "example": {
+                "direction_id": "d-pipeline-reliability",
+                "cycle_id": "123e4567-e89b-42d3-a456-426614174000",
+                "cycle_revision": 4,
+                "action": "continue",
+                "next_bet": {
+                    "mode": "measure",
+                    "claim": "The repaired scheduler dispatches one useful research parent.",
+                    "decision_question": "Does one autonomous cycle complete without intervention?",
+                    "success_evidence": "A cycle receipt records a completed parent and decision.",
+                    "retirement_condition": "One sound cycle succeeds or two sound cycles fail."
+                },
+                "note": "Continue with the bounded measurement proposed in the operator reply."
+            },
+            "notes": [
+                "Use the exact cycle_id and cycle_revision from the discovery operator event; stale revisions are rejected.",
+                "Use action=continue with a complete next_bet to resume that evidence-pending, parked, or operator-blocked discovery cycle.",
+                "Use action=park to pause pending stronger evidence or action=close to stop the direction; omit next_bet for either.",
+                "An identical replay is idempotent; changing any field after resolution is rejected."
+            ]
+        }
+    },
+    {
         "op": "create_message",
         "alias": "create-message",
         "description": "Post a message to the operator (available to all agent types).",

@@ -2733,14 +2733,17 @@ async def test_heartbeat_handled_ids_only_affect_own_session(db_session, monkeyp
         project_id=project.id,
         message_type=MessageType.NOTE,
         from_type="system",
-        content="Promoted v7 is serving the expected SHA.",
+        content="Discovery direction is parked pending a reproducible result.",
         status="open",
         resident_session_id=None,
         context={
             "audience": "strategist-internal",
-            "event_type": "release.serving_confirmed",
+            "event_type": "discovery.direction_parked",
             "resident_wake_barrier": True,
-            "served_sha": "abc123",
+            "cycle_id": "11111111-1111-1111-1111-111111111111",
+            "cycle_revision": 7,
+            "direction_key": "bounded-research-bet",
+            "resume_condition": "A reproducible result is recorded.",
         },
     )
     db_session.add_all(
@@ -2761,13 +2764,16 @@ async def test_heartbeat_handled_ids_only_affect_own_session(db_session, monkeyp
     assert initial["fired_barriers"] == [
         {
             "id": str(wake_barrier.id),
-            "event_type": "release.serving_confirmed",
-            "summary": "Promoted v7 is serving the expected SHA.",
+            "event_type": "discovery.direction_parked",
+            "summary": "Discovery direction is parked pending a reproducible result.",
             "created_at": wake_barrier.created_at.isoformat(),
             "task_id": None,
             "context": {
-                "event_type": "release.serving_confirmed",
-                "served_sha": "abc123",
+                "event_type": "discovery.direction_parked",
+                "cycle_id": "11111111-1111-1111-1111-111111111111",
+                "cycle_revision": 7,
+                "direction_key": "bounded-research-bet",
+                "resume_condition": "A reproducible result is recorded.",
             },
         }
     ]

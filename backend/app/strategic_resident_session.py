@@ -294,6 +294,7 @@ _RESIDENT_WAKE_BARRIER_CONTEXT_KEYS = (
     "event_type",
     "receipt_kind",
     "cycle_id",
+    "cycle_revision",
     "review_task_id",
     "direction_key",
     "verdict",
@@ -308,6 +309,7 @@ _RESIDENT_WAKE_BARRIER_CONTEXT_KEYS = (
     "serving_status",
     "served_sha",
     "reason",
+    "resume_condition",
 )
 
 # Only settled StrategicCycle transitions are actionable to a standing
@@ -4746,7 +4748,6 @@ async def renew_resident_session_lease(
     stop_requested = bool(blob.get("stop_requested"))
     status = blob.get("status") or STATUS_ACTIVE
     now = _utcnow()
-    now_iso = now.isoformat()
 
     # READ-ONLY work-state signal for the agent's state-gated pacing. Computed
     # once, up front, from cheap aggregate queries; additive to every return

@@ -597,7 +597,7 @@ otherwise).
 ```json
 {
   "task_id": "uuid",
-  "op": "set_vision | create_direction | update_direction | retire_direction | stage_direction | approve_direction | reject_direction | activate_direction | create_message | resolve_message | spawn_task | cancel_task | watch_task | ack_watch | cancel_watch | dispose_completion_debt | consume_knowledge_followup | dismiss_knowledge_followup | set_problem_model | patch_problem_model | replace_problem_model | set_running_update | reflect | pending_confirm | resolve_pending_confirm | set_retirement_critiques | set_evidence_progress | set_acceptance_criteria | record_finding_resolution | set_memory | set_session_summary | consume_knowledge | dismiss_knowledge | request_qualification",
+  "op": "set_vision | create_direction | update_direction | retire_direction | stage_direction | approve_direction | reject_direction | activate_direction | resolve_discovery | create_message | resolve_message | spawn_task | cancel_task | watch_task | ack_watch | cancel_watch | dispose_completion_debt | consume_knowledge_followup | dismiss_knowledge_followup | set_problem_model | patch_problem_model | replace_problem_model | set_running_update | reflect | pending_confirm | resolve_pending_confirm | set_retirement_critiques | set_evidence_progress | set_acceptance_criteria | record_finding_resolution | set_memory | set_session_summary | consume_knowledge | dismiss_knowledge | request_qualification",
   "data": { }
 }
 ```
@@ -609,6 +609,11 @@ truncated). Notable behaviors:
 - `create_direction` requires `text`, `success_evidence`, and
   `retirement_condition`; returns `409` if the active-direction cap
   (`max_active_directions`, default 5) is reached.
+- `resolve_discovery` resolves the exact `cycle_id` and `cycle_revision` named
+  by a discovery operator event for `direction_id`. `action=continue` requires
+  a complete `next_bet`; `action=park` pauses pending stronger evidence and
+  `action=close` stops the direction, with both omitting `next_bet`. Stale or
+  conflicting resolutions are rejected while an identical replay is idempotent.
 - `spawn_task` durably dispatches `research`, `web_research`, `design`, `plan`,
   `compute_experiment`, `create`, `refactor`, or `qa` directly. `fix` is also
   accepted when `pr_number` and `branch` are supplied. Direction association is

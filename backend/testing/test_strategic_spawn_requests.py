@@ -10,17 +10,12 @@ from sqlmodel import select
 
 from app.models import (
     CompletionDebtEntry,
-    DiscoveryAdmission,
     DiscoveryCycle,
     Project,
     StrategicSpawnRequest,
     StrategicWatch,
     Task,
     TaskStatus,
-)
-from app.discovery_admission import (
-    release_discovery_admission,
-    reserve_discovery_admission,
 )
 from app.strategic_spawn_requests import (
     MAX_DRAIN_PER_PASS,
@@ -531,9 +526,6 @@ async def test_review_cancellation_cannot_commit_orphan_from_stale_drain(db_sess
         project_id=project.id,
         direction_key=f"stale-drain-{uuid.uuid4().hex}",
         outcome_kind="mixed",
-        task_credit_limit=4,
-        attempt_credit_limit=2,
-        concurrency_limit=1,
     )
     db_session.add(cycle)
     await db_session.flush()
@@ -551,14 +543,6 @@ async def test_review_cancellation_cannot_commit_orphan_from_stale_drain(db_sess
     )
     db_session.add(request)
     await db_session.flush()
-    admission_key = f"strategic-spawn:{owner.id}:{request_key}"
-    reserved = await reserve_discovery_admission(
-        db_session,
-        cycle_id=cycle.id,
-        admission_key=admission_key,
-        spawn_request_id=request.id,
-    )
-    assert reserved.allowed is True
     request_id = request.id
     cycle_id = cycle.id
     await db_session.commit()
@@ -567,9 +551,8 @@ async def test_review_cancellation_cannot_commit_orphan_from_stale_drain(db_sess
         stale_request = await stale_drain.get(StrategicSpawnRequest, request_id)
         assert stale_request is not None
 
-        # Review wins the cycle lock after the drain selected its candidate but
-        # before dispatch revalidated authority. It releases the reservation,
-        # cancels the intent, and freezes the cycle in one transaction.
+        # Review wins after the drain selected its candidate, cancels the
+        # durable intent, and freezes the evidence cohort in one transaction.
         async with TestingSessionLocal() as review:
             locked_cycle = (
                 await review.execute(
@@ -585,11 +568,6 @@ async def test_review_cancellation_cannot_commit_orphan_from_stale_drain(db_sess
                     .with_for_update()
                 )
             ).scalar_one()
-            assert await release_discovery_admission(
-                review,
-                cycle_id=cycle_id,
-                admission_key=admission_key,
-            )
             locked_request.state = "cancelled"
             locked_request.admission_reason = "discovery_cycle_review_boundary"
             locked_request.not_before = None
@@ -616,9 +594,6 @@ async def test_review_cancellation_cannot_commit_orphan_from_stale_drain(db_sess
             )
         )
     ).scalar_one_or_none() is None
-    admission = await db_session.get(DiscoveryAdmission, reserved.admission_id)
-    await db_session.refresh(admission)
-    assert admission.state == "released"
 
 
 @pytest.mark.asyncio

@@ -451,7 +451,6 @@ def _discovery_review_payload() -> dict:
         "intent_snapshot": {"goal": "Prove the interaction is useful."},
         "bet_snapshot": {"mechanism": "Paired level construction."},
         "outcome_kind": "experiential",
-        "phase": "demonstrate",
         "evidence_packet": [
             {
                 "evidence_id": "22222222-2222-4222-8222-222222222222",
@@ -465,9 +464,8 @@ def _discovery_review_payload() -> dict:
             }
         ],
         "packet_checksum": "b" * 64,
-        "candidate_sha": "c" * 40,
         "mechanism_fingerprint": "d" * 64,
-        "review_round": 1,
+        "effort": "medium",
     }
 
 
@@ -486,9 +484,7 @@ def test_discovery_review_payload_strict_contract_round_trips():
         ("cycle_id", "not-a-uuid"),
         ("expected_revision", -1),
         ("outcome_kind", "theoretical"),
-        ("phase", "explore_forever"),
         ("packet_checksum", "short"),
-        ("review_round", 3),
     ],
 )
 def test_discovery_review_payload_rejects_invalid_contract(field, value):
@@ -506,7 +502,6 @@ def test_discovery_review_payload_rejects_invalid_contract(field, value):
         "intent_snapshot",
         "bet_snapshot",
         "outcome_kind",
-        "phase",
         "evidence_packet",
         "packet_checksum",
     ],
@@ -523,10 +518,26 @@ def test_discovery_review_payload_rejects_unknown_evidence_fields():
     assert "extra_forbidden" in _invalid(payload)
 
 
-def test_discovery_review_payload_allows_empty_evidence_for_inconclusive_review():
+def test_discovery_review_payload_allows_empty_semantic_packet_before_dispatch_gate():
     payload = _discovery_review_payload()
     payload["evidence_packet"] = []
     assert _valid(payload)["evidence_packet"] == []
+
+
+@pytest.mark.parametrize(
+    "legacy_field",
+    [
+        "phase",
+        "candidate_sha",
+        "review_round",
+        "prior_review_task_id",
+        "confirmation_proposal",
+    ],
+)
+def test_discovery_review_payload_rejects_removed_confirmation_fields(legacy_field):
+    payload = _discovery_review_payload()
+    payload[legacy_field] = "legacy"
+    assert "extra_forbidden" in _invalid(payload)
 
 
 @pytest.mark.parametrize(

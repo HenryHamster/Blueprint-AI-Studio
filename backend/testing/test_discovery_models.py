@@ -1,8 +1,8 @@
 """Persistence contracts for bounded discovery-review cycles.
 
 These tests intentionally exercise both ORM defaults and database constraints.
-The latter are important because discovery admission and review completion can
-race across backend workers; application-only validation is not authoritative.
+The latter keep discovery provenance and review state authoritative across
+backend workers.
 """
 
 from __future__ import annotations
@@ -99,13 +99,6 @@ async def test_discovery_cycle_defaults_and_snapshot_round_trip(db_session):
     assert loaded.candidate_sha is None
     assert loaded.source_research_task_id is None
     assert loaded.review_task_id is None
-    assert loaded.task_credit_limit is None
-    assert loaded.attempt_credit_limit is None
-    assert loaded.concurrency_limit is None
-    assert loaded.reserved_task_credits == 0
-    assert loaded.consumed_task_credits == 0
-    assert loaded.reserved_attempt_credits == 0
-    assert loaded.consumed_attempt_credits == 0
     assert loaded.deadline_at is None
     assert loaded.verdict is None
     assert loaded.review_result is None
@@ -137,7 +130,7 @@ async def test_next_generation_is_allowed_after_prior_cycle_is_reviewed(db_sessi
         project.id,
         generation=1,
         state="reviewed",
-        verdict="renew",
+        verdict="advance",
         review_result={"observed": "A real but still narrow effect."},
     )
     db_session.add(first)
@@ -177,22 +170,34 @@ async def test_review_blocked_cycle_still_owns_live_direction_slot(db_session):
         await db_session.commit()
 
 
+@pytest.mark.parametrize("verdict", ["advance", "park", "stop", "ask_operator"])
+@pytest.mark.asyncio
+async def test_discovery_cycle_accepts_controller_action_verdicts(
+    db_session,
+    verdict,
+):
+    project = _project()
+    db_session.add(project)
+    await db_session.flush()
+    db_session.add(
+        _cycle(
+            project.id,
+            state="reviewed",
+            verdict=verdict,
+        )
+    )
+    await db_session.commit()
+
+
 @pytest.mark.parametrize(
     ("overrides", "constraint_name"),
     [
         ({"outcome_kind": "deterministic"}, "chk_discoverycycle_outcome_kind"),
         ({"phase": "planning"}, "chk_discoverycycle_phase"),
         ({"state": "paused"}, "chk_discoverycycle_state"),
-        ({"verdict": "approved"}, "chk_discoverycycle_verdict"),
+        ({"verdict": "renew"}, "chk_discoverycycle_verdict"),
         ({"generation": 0}, "chk_discoverycycle_generation"),
         ({"revision": -1}, "chk_discoverycycle_revision"),
-        ({"task_credit_limit": 0}, "chk_discoverycycle_task_credit_limit"),
-        ({"attempt_credit_limit": 0}, "chk_discoverycycle_attempt_credit_limit"),
-        ({"concurrency_limit": 0}, "chk_discoverycycle_concurrency_limit"),
-        ({"reserved_task_credits": -1}, "chk_discoverycycle_credit_counts"),
-        ({"consumed_task_credits": -1}, "chk_discoverycycle_credit_counts"),
-        ({"reserved_attempt_credits": -1}, "chk_discoverycycle_credit_counts"),
-        ({"consumed_attempt_credits": -1}, "chk_discoverycycle_credit_counts"),
         (
             {"mechanism_fingerprint": "not-a-sha256"},
             "chk_discoverycycle_mechanism_fingerprint",
@@ -200,7 +205,7 @@ async def test_review_blocked_cycle_still_owns_live_direction_slot(db_session):
     ],
 )
 @pytest.mark.asyncio
-async def test_discovery_cycle_rejects_invalid_vocabulary_and_counters(
+async def test_discovery_cycle_rejects_invalid_vocabulary(
     db_session,
     overrides,
     constraint_name,

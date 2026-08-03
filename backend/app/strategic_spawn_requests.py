@@ -100,13 +100,6 @@ def strategic_work_idempotency_key(
     return f"strategic-direct:{hashlib.sha256(identity).hexdigest()}"
 
 
-def _discovery_admission_key(
-    parent_task_id: uuid.UUID,
-    idempotency_key: str,
-) -> str:
-    return f"strategic-spawn:{parent_task_id}:{idempotency_key}"
-
-
 @dataclass(frozen=True)
 class SpawnSubmission:
     request: StrategicSpawnRequest
@@ -162,37 +155,6 @@ async def _dispatch_request(
     *,
     request: StrategicSpawnRequest,
 ) -> tuple[Task, str | None]:
-    admission_key: str | None = None
-    if request.discovery_cycle_id is not None:
-        from app.discovery_admission import reserve_discovery_admission
-
-        # Immediate submission may have enriched the request policy snapshot
-        # after the initial reservation flush. Persist only this row before the
-        # authoritative refresh below so those local fields are not discarded.
-        await session.flush([request])
-        cycle_id = request.discovery_cycle_id
-        # Discovery review takes these locks in cycle -> request order before it
-        # releases reservations and cancels overdue intent. Match that order and
-        # refresh the request under lock so a drain which selected the row just
-        # before review cannot dispatch from its stale in-memory state.
-        await session.execute(
-            select(DiscoveryCycle)
-            .where(DiscoveryCycle.id == cycle_id)
-            .with_for_update()
-        )
-        locked_request = (
-            await session.execute(
-                select(StrategicSpawnRequest)
-                .where(StrategicSpawnRequest.id == request.id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
-        ).scalar_one_or_none()
-        if locked_request is None:
-            raise ValueError("strategic spawn request disappeared during dispatch")
-        if locked_request.discovery_cycle_id != cycle_id:
-            raise ValueError("strategic spawn request changed discovery cycle")
-        request = locked_request
     if request.task_id is not None:
         existing = await session.get(Task, request.task_id)
         if existing is not None:
@@ -205,26 +167,6 @@ async def _dispatch_request(
         raise ValueError(
             f"strategic spawn request is no longer dispatchable ({request.state})"
         )
-    if request.discovery_cycle_id is not None:
-        admission_key = _discovery_admission_key(
-            request.parent_task_id,
-            request.idempotency_key,
-        )
-        # Revalidate the durable reservation before inserting a Task. The cycle
-        # lock remains held through the eventual request/admission transition,
-        # so review cannot release or finalize the envelope between this check
-        # and consumption.
-        decision = await reserve_discovery_admission(
-            session,
-            cycle_id=request.discovery_cycle_id,
-            admission_key=admission_key,
-            spawn_request_id=request.id,
-        )
-        if not decision.allowed:
-            raise ValueError(
-                f"discovery admission denied during dispatch: {decision.reason}"
-            )
-
     task = _task_from_specification(
         project_id=request.project_id,
         specification=dict(request.specification or {}),
@@ -240,38 +182,14 @@ async def _dispatch_request(
     )
     session.add(task)
     await session.flush()
-    if request.discovery_cycle_id is not None:
-        from app.discovery_admission import (
-            consume_discovery_admission,
-            reserve_discovery_admission,
-        )
-
-        assert admission_key is not None
-        # The cycle and request locks make this binding/consume pair
-        # infallible with respect to concurrent review: review cannot release
-        # or finalize either row until this transaction commits.
-        decision = await reserve_discovery_admission(
-            session,
-            cycle_id=request.discovery_cycle_id,
-            admission_key=admission_key,
-            task_id=task.id,
-            spawn_request_id=request.id,
-        )
-        if not decision.allowed:
-            raise ValueError(
-                f"discovery admission denied while binding task: {decision.reason}"
-            )
-        if not await consume_discovery_admission(
-            session,
-            cycle_id=request.discovery_cycle_id,
-            admission_key=admission_key,
-        ):
-            raise RuntimeError("discovery admission could not be consumed")
-        if request.task_type in {"research", "web_research"}:
-            cycle = await session.get(DiscoveryCycle, request.discovery_cycle_id)
-            if cycle is not None and cycle.source_research_task_id is None:
-                cycle.source_research_task_id = task.id
-                session.add(cycle)
+    if (
+        request.discovery_cycle_id is not None
+        and request.task_type in {"research", "web_research"}
+    ):
+        cycle = await session.get(DiscoveryCycle, request.discovery_cycle_id)
+        if cycle is not None and cycle.source_research_task_id is None:
+            cycle.source_research_task_id = task.id
+            session.add(cycle)
 
     request.task_id = task.id
     request.state = "dispatched"
@@ -629,10 +547,7 @@ async def submit_strategic_spawn(
     )
     session.add(request)
     await session.flush()
-    from app.discovery_admission import (
-        reserve_discovery_admission,
-        resolve_discovery_cycle_lineage,
-    )
+    from app.discovery_admission import resolve_discovery_cycle_lineage
 
     request.discovery_cycle_id = discovery_cycle_id
     if request.discovery_cycle_id is None:
@@ -640,26 +555,6 @@ async def submit_strategic_spawn(
             session,
             parent_task_id=parent_task_id,
         )
-    if request.discovery_cycle_id is not None:
-        decision = await reserve_discovery_admission(
-            session,
-            cycle_id=request.discovery_cycle_id,
-            admission_key=_discovery_admission_key(
-                parent_task_id,
-                normalized_key,
-            ),
-            spawn_request_id=request.id,
-            metadata={"source": "strategic_spawn_request"},
-        )
-        if not decision.allowed:
-            await session.rollback()
-            raise ValueError(f"discovery admission denied: {decision.reason}")
-        request.policy_snapshot = {
-            **(request.policy_snapshot or {}),
-            "discovery_admission_reason": decision.reason,
-        }
-        session.add(request)
-
     budget_guard = await _budget_guard_for_request(
         session,
         task_type=task_type,
@@ -877,17 +772,6 @@ async def cancel_deferred_spawn_request(
         request.admission_reason = "cancelled_by_strategic"
         request.not_before = None
         session.add(request)
-        if request.discovery_cycle_id is not None:
-            from app.discovery_admission import release_discovery_admission
-
-            await release_discovery_admission(
-                session,
-                cycle_id=request.discovery_cycle_id,
-                admission_key=_discovery_admission_key(
-                    request.parent_task_id,
-                    request.idempotency_key,
-                ),
-            )
     elif request.state not in {"cancelled", "rejected"}:
         raise ValueError("only a deferred spawn request can be cancelled")
     return request

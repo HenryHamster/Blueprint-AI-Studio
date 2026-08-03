@@ -62,9 +62,6 @@ from app.task_capabilities import (
     CLOUD_RUN_CANDIDATE_TASK_TYPES,
 )
 from app.database import AsyncSessionLocal
-from app.discovery_admission import (
-    authorize_discovery_task_execution,
-)
 from app.models import (
     DeploymentState,
     Project,
@@ -114,10 +111,7 @@ from app.shared_state import (
     sync_runtime_config_from_state as _sync_runtime_config_from_state,
 )
 from app.task_locking import task_lock
-from app.task_blocked import (
-    mark_task_for_fresh_execution_attempt,
-    strip_fresh_attempt_context,
-)
+from app.task_blocked import strip_fresh_attempt_context
 from app.capability_execution_fence import (
     block_task_for_capability_proof,
     evaluate_execution_authority_block,
@@ -1636,7 +1630,6 @@ async def orchestrator_worker():
                         if serial_log:
                             requeue_ctx["last_serial_log"] = serial_log
                         fresh_t.context = clear_task_llm_runtime_context(requeue_ctx)
-                        mark_task_for_fresh_execution_attempt(fresh_t)
                         # Keep the promoted column in sync (D2 over-fetch fix).
                         fresh_t.llm_account_id = None
                         session.add(fresh_t)
@@ -3402,47 +3395,6 @@ async def orchestrator_worker():
                                 },
                             )
                             continue
-                        # Central discovery-authority backstop: repair missed
-                        # lineage through ancestry, late-admit idempotently, and
-                        # validate immediately before any runner/account/VM
-                        # claim. Already admitted work drains after closure.
-                        _discovery_authority = (
-                            await authorize_discovery_task_execution(
-                                session,
-                                task=task,
-                            )
-                        )
-                        if not _discovery_authority.allowed:
-                            if _discovery_authority.terminal_denial:
-                                task.status = TaskStatus.CANCELLED
-                                task.completed_at = _utcnow()
-                                task.latest_status_message = (
-                                    "Cancelled by discovery admission: "
-                                    f"{_discovery_authority.reason}"
-                                )
-                                session.add(task)
-                                await session.commit()
-                                logger.warning(
-                                    "[ORCHESTRATOR] Cancelled task %s before "
-                                    "dispatch: discovery authority permanently "
-                                    "denied (%s)",
-                                    task.id,
-                                    _discovery_authority.reason,
-                                )
-                            else:
-                                task.latest_status_message = (
-                                    "Waiting for discovery execution slot: "
-                                    f"{_discovery_authority.reason}"
-                                )
-                                session.add(task)
-                                await session.commit()
-                                logger.info(
-                                    "[ORCHESTRATOR] Deferred task %s before "
-                                    "dispatch: discovery authority denied (%s)",
-                                    task.id,
-                                    _discovery_authority.reason,
-                                )
-                            continue
                         # vm_instance_id read via __dict__ after the strategic
                         # path call. _hold_strategic_local_runner_task's
                         # no-change branch calls session.rollback(), which
@@ -4463,59 +4415,6 @@ async def orchestrator_worker():
                             from sqlalchemy.orm.attributes import flag_modified
 
                             flag_modified(task, "context")
-                        # Re-check discovery concurrency at the actual cold
-                        # execution claim. The earlier authority backstop runs
-                        # before routing so denied work never acquires scarce
-                        # resources, but intervening rollback/routing paths can
-                        # release its cycle lock. This second check holds that
-                        # lock through QUEUED -> PROVISIONING and the commit
-                        # below, serializing parallel cold workers.
-                        _discovery_claim = (
-                            await authorize_discovery_task_execution(
-                                session,
-                                task=task,
-                            )
-                        )
-                        if not _discovery_claim.allowed:
-                            task.llm_account_id = None
-                            if _discovery_claim.terminal_denial:
-                                task.status = TaskStatus.CANCELLED
-                                task.completed_at = _utcnow()
-                                task.latest_status_message = (
-                                    "Cancelled by discovery admission: "
-                                    f"{_discovery_claim.reason}"
-                                )
-                            else:
-                                task.latest_status_message = (
-                                    "Waiting for discovery execution slot: "
-                                    f"{_discovery_claim.reason}"
-                                )
-                            session.add(task)
-                            await session.commit()
-                            if account_id:
-                                await release_max_plan_account(
-                                    account_id,
-                                    revert_daily_task_count=True,
-                                    project_id=(
-                                        str(task.project_id)
-                                        if task.project_id
-                                        else None
-                                    ),
-                                )
-                            _iter_preclaimed_account_id = None
-                            _iter_preclaimed_project_id = None
-                            logger.info(
-                                "[ORCHESTRATOR] Discovery authority changed before "
-                                "cold claim for task %s: %s%s",
-                                task.id,
-                                _discovery_claim.reason,
-                                (
-                                    " (cancelled)"
-                                    if _discovery_claim.terminal_denial
-                                    else ""
-                                ),
-                            )
-                            continue
                         # A dispatch that reaches the PROVISIONING commit resets
                         # the contained-crash counter (persisted by that commit;
                         # rolled back with everything else if prep still crashes

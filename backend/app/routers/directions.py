@@ -75,7 +75,9 @@ DIRECTION_CONTEXT_FIELD_MAX = 500
 
 
 class DiscoveryResolutionPayload(BaseModel):
-    action: str = Field(pattern=r"^(continue|close)$")
+    cycle_id: uuid.UUID
+    cycle_revision: int = Field(ge=0)
+    action: str = Field(pattern=r"^(continue|park|close)$")
     next_bet: dict[str, Any] | None = None
     note: str | None = Field(default=None, max_length=2000)
 
@@ -1595,17 +1597,29 @@ async def resolve_direction_discovery_cycle(
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
-    from app.discovery_review import resolve_discovery_cycle
+    # Canonical write order is Project -> Cycle. SKIP LOCKED turns a competing
+    # completion into an explicit retry instead of a Cycle -> Project deadlock.
+    await lock_project_or_429(session, project_id)
+    from app.discovery_review import DiscoveryCycleBusy, resolve_discovery_cycle
 
     try:
         resolved = await resolve_discovery_cycle(
             session,
             project_id=project_id,
             direction_key=direction_id,
+            cycle_id=payload.cycle_id,
+            cycle_revision=payload.cycle_revision,
             action=payload.action,
             next_bet=payload.next_bet,
             note=payload.note,
+            skip_locked=True,
         )
+    except DiscoveryCycleBusy as exc:
+        raise HTTPException(
+            status_code=429,
+            detail=str(exc),
+            headers={"Retry-After": "2"},
+        ) from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     await session.commit()
