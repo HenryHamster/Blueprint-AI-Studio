@@ -1,46 +1,32 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('./discovery-review-deps.js', () => {
-  return {
-    DEFAULT_TOOL_GUIDANCE: '',
-    WORKSPACE: '/tmp/discovery-review-test',
-    buildContextPrefix: vi.fn().mockReturnValue(''),
-    buildPromptSizeTelemetry: vi.fn().mockReturnValue({
-      prompt_size_bytes: 0,
-      prompt_section_count: 0,
-      prompt_section_sizes: {},
-    }),
-    computePromptFingerprint: vi.fn().mockReturnValue('discovery-review-fp'),
-    configureAgentPermissions: vi.fn().mockReturnValue([
-      'Write',
-      'Edit',
-      'NotebookEdit',
-    ]),
-    git: vi.fn(),
-    persistAndPostStatus: vi.fn(),
-    preparePacketOnlyWorkspace: vi.fn(),
-    prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined),
-    providerAutoInjectsClaudeMd: vi.fn().mockReturnValue(false),
-    readClaudeMd: vi.fn().mockReturnValue(''),
-    resolveBaseBranch: vi.fn().mockReturnValue('automain'),
-    runClaudeCode: vi.fn(),
-    sanitize: vi.fn((value: string) => value),
-    sendHeartbeatSync: vi.fn(),
-    sendLog: vi.fn(),
-    setCurrentPromptFingerprint: vi.fn(),
-    setPromptSizeTelemetry: vi.fn(),
-    strVal: vi.fn((value: unknown, fallback: string = ''): string =>
-      typeof value === 'string' ? value : fallback),
-    validateBranchName: vi.fn((value: string) => value),
-  };
-});
+vi.mock('./discovery-review-deps.js', () => ({
+  buildPromptSizeTelemetry: vi.fn().mockReturnValue({
+    prompt_size_bytes: 0,
+    prompt_section_count: 0,
+    prompt_section_sizes: {},
+  }),
+  cleanupPacketOnlyWorkspace: vi.fn(),
+  computePromptFingerprint: vi.fn().mockReturnValue('discovery-review-fp'),
+  persistAndPostStatus: vi.fn(),
+  preparePacketOnlyWorkspace: vi.fn().mockReturnValue(
+    '/tmp/blueprint-discovery-review/task',
+  ),
+  runIsolatedTextOnlyMemory: vi.fn(),
+  sanitize: vi.fn((value: string) => value),
+  sendHeartbeatSync: vi.fn(),
+  sendLog: vi.fn(),
+  setCurrentPromptFingerprint: vi.fn(),
+  setPromptSizeTelemetry: vi.fn(),
+  strVal: vi.fn((value: unknown, fallback: string = ''): string =>
+    typeof value === 'string' ? value : fallback),
+}));
 
 import {
-  git,
+  cleanupPacketOnlyWorkspace,
   persistAndPostStatus,
   preparePacketOnlyWorkspace,
-  prepareWorkspaceForRole,
-  runClaudeCode,
+  runIsolatedTextOnlyMemory,
 } from './discovery-review-deps.js';
 import {
   buildDiscoveryReviewPrompt,
@@ -51,7 +37,6 @@ import {
 
 const CYCLE_ID = '123e4567-e89b-42d3-a456-426614174000';
 const EVIDENCE_ID = '123e4567-e89b-42d3-a456-426614174001';
-const CANDIDATE_SHA = 'a'.repeat(40);
 
 function payload(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -61,42 +46,40 @@ function payload(overrides: Record<string, unknown> = {}): Record<string, unknow
     direction_key: 'd-useful-product',
     intent_snapshot: { goal: 'demonstrate user value' },
     bet_snapshot: { claim: 'the interaction is useful' },
-    outcome_kind: 'mixed',
-    phase: 'demonstrate',
     evidence_packet: [{
       evidence_id: EVIDENCE_ID,
-      semantic_role: 'result',
-      source_kind: 'artifact',
+      semantic_role: 'parent_outcome',
+      source_kind: 'server_receipt',
       checksum: 'b'.repeat(64),
     }],
+    evidence_packet_manifest: { required_evidence_omitted: false },
     packet_checksum: 'c'.repeat(64),
-    candidate_sha: CANDIDATE_SHA,
-    mechanism_fingerprint: 'd'.repeat(64),
-    review_round: 1,
-    prior_review_task_id: null,
+    // Legacy backend fields are deliberately ignored by the packet-only agent.
+    candidate_sha: 'a'.repeat(40),
+    review_round: 2,
+    confirmation_proposal: { action: 'stop' },
     ...overrides,
   };
 }
 
-function validResult(
+function validAdvance(
   overrides: Record<string, unknown> = {},
 ): Record<string, unknown> {
   return {
     cycle_id: CYCLE_ID,
     reviewed_revision: 4,
-    verdict: 'expand',
-    confidence: 0.82,
-    decision_summary: 'The bounded demonstration supports expansion.',
-    goal_progress_assessment: 'The result demonstrates the frozen outcome.',
+    action: 'advance',
+    summary: 'The exact cohort receipt supports one bounded measurement bet.',
     evidence_citations: [EVIDENCE_ID],
-    contradictions: [],
-    next_bet: { claim: 'test the interaction with more users' },
-    recommended_phase: 'productize',
-    recommended_limits: {
-      task_credit_limit: 3,
-      attempt_credit_limit: 5,
-      concurrency_limit: 2,
+    next_bet: {
+      mode: 'measure',
+      claim: 'The interaction reduces time to a verified result.',
+      decision_question: 'Does median completion time fall below ten minutes?',
+      success_evidence: 'A pinned experiment receipt reports median time below ten minutes.',
+      retirement_condition: 'Two sound runs miss the threshold or one sound run meets it.',
     },
+    park_reason: null,
+    resume_condition: null,
     operator_question: null,
     ...overrides,
   };
@@ -107,91 +90,142 @@ const validationContext = {
   expectedRevision: 4,
   evidenceIds: new Set([EVIDENCE_ID]),
   evidenceCount: 1,
+  decisionReceiptIds: new Set([EVIDENCE_ID]),
   requiredEvidenceOmitted: false,
 };
 
-describe('discovery review verdict contract', () => {
+describe('research outcome decision contract', () => {
   it('accepts only the exact evidence-bound schema', () => {
     expect(
-      validateDiscoveryReviewShape(validResult(), validationContext),
+      validateDiscoveryReviewShape(validAdvance(), validationContext),
     ).toEqual({ ok: true });
     expect(
       validateDiscoveryReviewShape(
-        validResult({ extra: true }),
+        validAdvance({ extra: true }),
         validationContext,
       ).ok,
     ).toBe(false);
     expect(
       validateDiscoveryReviewShape(
-        validResult({ evidence_citations: ['unknown-id'] }),
+        validAdvance({ action: 'inconclusive' }),
         validationContext,
       ).ok,
     ).toBe(false);
     expect(
       validateDiscoveryReviewShape(
-        validResult({ confidence: 1.1 }),
-        validationContext,
-      ).ok,
-    ).toBe(false);
-    expect(
-      validateDiscoveryReviewShape(
-        validResult({ next_bet: { blob: 'x'.repeat(9_000) } }),
+        validAdvance({ evidence_citations: ['unknown-id'] }),
         validationContext,
       ).ok,
     ).toBe(false);
   });
 
-  it('fails closed on unsupported empty-packet verdicts', () => {
+  it('requires a complete, bounded next bet for advance', () => {
+    expect(
+      validateDiscoveryReviewShape(
+        validAdvance({ next_bet: { mode: 'measure', claim: 'partial' } }),
+        validationContext,
+      ).ok,
+    ).toBe(false);
+    expect(
+      validateDiscoveryReviewShape(
+        validAdvance({
+          next_bet: {
+            ...(validAdvance().next_bet as Record<string, unknown>),
+            mode: 'release',
+          },
+        }),
+        validationContext,
+      ).ok,
+    ).toBe(false);
+    expect(
+      validateDiscoveryReviewShape(
+        validAdvance({ park_reason: 'also park' }),
+        validationContext,
+      ).ok,
+    ).toBe(false);
+  });
+
+  it('requires binding actions to cite the current parent outcome receipt', () => {
+    expect(
+      validateDiscoveryReviewShape(
+        validAdvance(),
+        { ...validationContext, decisionReceiptIds: new Set<string>() },
+      ).ok,
+    ).toBe(false);
+  });
+
+  it('requires park reason and a concrete resume condition', () => {
+    const parked = validAdvance({
+      action: 'park',
+      next_bet: null,
+      park_reason: 'The current approach has no decision-bearing evidence.',
+      resume_condition: 'Resume when the dependency exposes a stable API.',
+    });
+    expect(validateDiscoveryReviewShape(parked, validationContext)).toEqual({
+      ok: true,
+    });
+    expect(
+      validateDiscoveryReviewShape(
+        { ...parked, resume_condition: null },
+        validationContext,
+      ).ok,
+    ).toBe(false);
+  });
+
+  it('requires stop to carry no competing action payload', () => {
+    const stopped = validAdvance({
+      action: 'stop',
+      next_bet: null,
+    });
+    expect(validateDiscoveryReviewShape(stopped, validationContext)).toEqual({
+      ok: true,
+    });
+    expect(
+      validateDiscoveryReviewShape(
+        { ...stopped, operator_question: 'Stop?' },
+        validationContext,
+      ).ok,
+    ).toBe(false);
+  });
+
+  it('turns empty or incomplete evidence into a concrete operator question', () => {
+    const askOperator = validAdvance({
+      action: 'ask_operator',
+      evidence_citations: [],
+      next_bet: null,
+      operator_question: 'Should this direction wait for a live experiment receipt?',
+    });
     const emptyContext = {
       ...validationContext,
       evidenceIds: new Set<string>(),
       evidenceCount: 0,
     };
     expect(
-      validateDiscoveryReviewShape(
-        validResult({ evidence_citations: [] }),
-        emptyContext,
-      ).ok,
-    ).toBe(false);
-    expect(
-      validateDiscoveryReviewShape(
-        validResult({
-          verdict: 'inconclusive',
-          evidence_citations: [],
-          next_bet: null,
-        }),
-        emptyContext,
-      ),
+      validateDiscoveryReviewShape(askOperator, emptyContext),
     ).toEqual({ ok: true });
-  });
-
-  it('fails closed on binding verdicts when required evidence was omitted', () => {
     expect(
       validateDiscoveryReviewShape(
-        validResult(),
+        validAdvance(),
         { ...validationContext, requiredEvidenceOmitted: true },
       ).ok,
     ).toBe(false);
-  });
-
-  it('requires exact cycle identity and a question for ask_operator', () => {
     expect(
       validateDiscoveryReviewShape(
-        validResult({ cycle_id: '123e4567-e89b-42d3-a456-426614174099' }),
-        validationContext,
-      ).ok,
-    ).toBe(false);
-    expect(
-      validateDiscoveryReviewShape(
-        validResult({ verdict: 'ask_operator', operator_question: null }),
-        validationContext,
+        { ...askOperator, operator_question: null },
+        emptyContext,
       ).ok,
     ).toBe(false);
   });
 
-  it('forces identity from the frozen payload during normalization', () => {
+  it('requires exact cycle identity and forces it during normalization', () => {
+    expect(
+      validateDiscoveryReviewShape(
+        validAdvance({ cycle_id: '123e4567-e89b-42d3-a456-426614174099' }),
+        validationContext,
+      ).ok,
+    ).toBe(false);
     const normalized = normalizeDiscoveryReviewResult(
-      validResult({
+      validAdvance({
         cycle_id: '123e4567-e89b-42d3-a456-426614174099',
         reviewed_revision: 999,
       }),
@@ -203,99 +237,111 @@ describe('discovery review verdict contract', () => {
   });
 });
 
-describe('discovery review prompt and handler', () => {
+describe('packet-only decision prompt and handler', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    vi.mocked(git).mockImplementation(args => {
-      if (args[0] === 'rev-parse') return CANDIDATE_SHA;
-      return '';
-    });
+    vi.mocked(preparePacketOnlyWorkspace).mockReturnValue(
+      '/tmp/blueprint-discovery-review/task',
+    );
   });
 
-  it('pins the decision and exposes only packet evidence IDs', () => {
-    const prompt = buildDiscoveryReviewPrompt(
-      payload(),
-      {},
-      CANDIDATE_SHA,
-    );
-    expect(prompt).toContain(CANDIDATE_SHA);
+  it('contains only the frozen decision packet and total action vocabulary', () => {
+    const prompt = buildDiscoveryReviewPrompt(payload());
     expect(prompt).toContain(EVIDENCE_ID);
     expect(prompt).toContain('only IDs allowed in evidence_citations');
-    expect(prompt).toContain('not another research turn');
-    expect(prompt).toContain('Output ONLY one JSON object');
+    expect(prompt).toContain('advance|park|stop|ask_operator');
+    expect(prompt).toContain('There is no inconclusive or null action');
+    expect(prompt).toContain('not inspect a repository');
+    expect(prompt).not.toContain('a'.repeat(40));
+    expect(prompt).not.toContain('confirmation_proposal');
+    expect(prompt).not.toContain('recommended_phase');
+    expect(prompt).not.toContain('recommended_limits');
   });
 
-  it('bounds decision snapshots even when the prompt helper is called directly', () => {
+  it('bounds decision snapshots when the prompt helper is called directly', () => {
     const prompt = buildDiscoveryReviewPrompt(
       payload({ intent_snapshot: { goal: 'x'.repeat(20_000) } }),
-      {},
-      CANDIDATE_SHA,
     );
-
     expect(prompt).toContain('"local_guard": true');
     expect(prompt).not.toContain('x'.repeat(9_000));
-    expect(prompt.length).toBeLessThan(18_000);
+    expect(prompt.length).toBeLessThan(30_000);
   });
 
-  it('uses the resolved lower-tier model and effort for an ordinary review', async () => {
-    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+  it('uses one configurable routine model route in isolated text-only memory', async () => {
+    vi.mocked(runIsolatedTextOnlyMemory).mockResolvedValueOnce({
       exitCode: 0,
-      allOutput: JSON.stringify(validResult()),
-      lastResultText: JSON.stringify(validResult()),
+      allOutput: JSON.stringify(validAdvance()),
+      lastResultText: JSON.stringify(validAdvance()),
     });
     const statusRef = { value: '' };
 
     await handleDiscoveryReview(
       'task-routine-tier',
-      payload({ effort: 'medium' }),
+      payload(),
       {},
-      'token',
-      'owner',
-      'repo',
+      'unused-token',
+      'unused-owner',
+      'unused-repo',
       null,
       statusRef,
       'gpt-5.6-terra',
       'medium',
     );
 
-    expect(runClaudeCode).toHaveBeenCalledOnce();
-    expect(runClaudeCode).toHaveBeenCalledWith(
+    expect(preparePacketOnlyWorkspace).toHaveBeenCalledWith('task-routine-tier');
+    expect(runIsolatedTextOnlyMemory).toHaveBeenCalledOnce();
+    expect(runIsolatedTextOnlyMemory).toHaveBeenCalledWith(
       expect.any(String),
       null,
       statusRef,
       'gpt-5.6-terra',
       'medium',
-      ['Write', 'Edit', 'NotebookEdit'],
+      {
+        cwd: '/tmp/blueprint-discovery-review/task',
+        timeoutMs: 300_000,
+        maxOutputBytes: 200_000,
+      },
+    );
+    expect(cleanupPacketOnlyWorkspace).toHaveBeenCalledWith(
+      '/tmp/blueprint-discovery-review/task',
     );
   });
 
-  it('makes confirmation disagreement an explicit operator handoff', () => {
-    const prompt = buildDiscoveryReviewPrompt(
-      payload({
-        review_round: 2,
-        effort: 'max',
-        prior_review_task_id: '123e4567-e89b-42d3-a456-426614174099',
-        confirmation_proposal: {
-          verdict: 'expand',
-          next_bet: { claim: 'expand the bounded bet' },
-          recommended_phase: 'productize',
-          recommended_limits: {
-            task_credit_limit: 3,
-            attempt_credit_limit: 5,
-            concurrency_limit: 2,
-          },
-        },
-      }),
+  it('defaults the routine effort to medium without a confirmation branch', async () => {
+    vi.mocked(runIsolatedTextOnlyMemory).mockResolvedValueOnce({
+      exitCode: 0,
+      allOutput: JSON.stringify(validAdvance()),
+      lastResultText: JSON.stringify(validAdvance()),
+    });
+    const statusRef = { value: '' };
+
+    await handleDiscoveryReview(
+      'task-default-tier',
+      payload(),
       {},
-      CANDIDATE_SHA,
+      'unused-token',
+      'unused-owner',
+      'unused-repo',
+      null,
+      statusRef,
     );
 
-    expect(prompt).toMatch(/fail\s+closed/);
-    expect(prompt).toContain('operator for adjudication');
+    expect(runIsolatedTextOnlyMemory).toHaveBeenCalledWith(
+      expect.any(String),
+      null,
+      statusRef,
+      undefined,
+      'medium',
+      {
+        cwd: '/tmp/blueprint-discovery-review/task',
+        timeoutMs: 300_000,
+        maxOutputBytes: 200_000,
+      },
+    );
   });
 
-  it('performs one structured repair and persists the repaired verdict', async () => {
-    vi.mocked(runClaudeCode)
+  it('performs one structured repair and persists the repaired action', async () => {
+    vi.mocked(runIsolatedTextOnlyMemory)
       .mockResolvedValueOnce({
         exitCode: 0,
         allOutput: 'not json',
@@ -303,56 +349,52 @@ describe('discovery review prompt and handler', () => {
       })
       .mockResolvedValueOnce({
         exitCode: 0,
-        allOutput: JSON.stringify(validResult()),
-        lastResultText: JSON.stringify(validResult()),
+        allOutput: JSON.stringify(validAdvance()),
+        lastResultText: JSON.stringify(validAdvance()),
       });
 
     await handleDiscoveryReview(
-      'task-1',
+      'task-repair',
       payload(),
       {},
-      'token',
-      'owner',
-      'repo',
+      'unused-token',
+      'unused-owner',
+      'unused-repo',
       null,
       { value: '' },
     );
 
-    expect(prepareWorkspaceForRole).toHaveBeenCalledWith(
-      expect.objectContaining({ depth: 1 }),
-    );
-    expect(git).toHaveBeenCalledWith([
-      'fetch',
-      '--depth=1',
-      '--no-tags',
-      'origin',
-      CANDIDATE_SHA,
-    ]);
-    expect(runClaudeCode).toHaveBeenCalledTimes(2);
+    expect(preparePacketOnlyWorkspace).toHaveBeenCalledOnce();
+    expect(runIsolatedTextOnlyMemory).toHaveBeenCalledTimes(2);
+    const repairPrompt = vi.mocked(runIsolatedTextOnlyMemory).mock.calls[1]?.[0];
+    expect(repairPrompt).toContain('demonstrate user value');
+    expect(repairPrompt).toContain(EVIDENCE_ID);
+    expect(repairPrompt).toContain('Re-evaluate the same frozen packet above');
     expect(persistAndPostStatus).toHaveBeenLastCalledWith(
-      'task-1',
+      'task-repair',
       expect.objectContaining({
         status: 'COMPLETED',
         artifact_type: 'DISCOVERY_REVIEW',
       }),
     );
+    const persisted = vi.mocked(persistAndPostStatus).mock.calls.at(-1)?.[1];
+    expect(persisted?.logs).toContain('"action":"advance"');
   });
 
-  it('rejects an oversized server snapshot before preparing a workspace', async () => {
+  it('rejects an oversized contract before preparing the packet workspace', async () => {
     await handleDiscoveryReview(
       'task-oversized-contract',
       payload({ intent_snapshot: { goal: 'x'.repeat(20_000) } }),
       {},
-      'token',
-      'owner',
-      'repo',
+      'unused-token',
+      'unused-owner',
+      'unused-repo',
       null,
       { value: '' },
     );
 
-    expect(prepareWorkspaceForRole).not.toHaveBeenCalled();
     expect(preparePacketOnlyWorkspace).not.toHaveBeenCalled();
-    expect(runClaudeCode).not.toHaveBeenCalled();
+    expect(runIsolatedTextOnlyMemory).not.toHaveBeenCalled();
     expect(persistAndPostStatus).toHaveBeenLastCalledWith(
       'task-oversized-contract',
       expect.objectContaining({
@@ -363,67 +405,33 @@ describe('discovery review prompt and handler', () => {
   });
 
   it('fails closed after one unsuccessful repair', async () => {
-    vi.mocked(runClaudeCode).mockResolvedValue({
+    vi.mocked(runIsolatedTextOnlyMemory).mockResolvedValue({
       exitCode: 0,
       allOutput: 'still not json',
       lastResultText: 'still not json',
     });
 
     await handleDiscoveryReview(
-      'task-2',
-      payload({ candidate_sha: null }),
+      'task-invalid',
+      payload(),
       {},
-      'token',
-      'owner',
-      'repo',
+      'unused-token',
+      'unused-owner',
+      'unused-repo',
       null,
       { value: '' },
     );
 
-    expect(prepareWorkspaceForRole).not.toHaveBeenCalled();
-    expect(preparePacketOnlyWorkspace).toHaveBeenCalledWith(
-      '/tmp/discovery-review-test',
-    );
-    expect(runClaudeCode).toHaveBeenCalledTimes(2);
+    expect(runIsolatedTextOnlyMemory).toHaveBeenCalledTimes(2);
     expect(persistAndPostStatus).toHaveBeenLastCalledWith(
-      'task-2',
+      'task-invalid',
       expect.objectContaining({
         status: 'FAILED',
         failure_category: 'discovery_review_unparseable',
       }),
     );
-  });
-
-  it('rejects a verdict when shell access modified the pinned checkout', async () => {
-    vi.mocked(git).mockImplementation(args => {
-      if (args[0] === 'rev-parse') return CANDIDATE_SHA;
-      if (args[0] === 'status') return ' M src/product.ts';
-      return '';
-    });
-    vi.mocked(runClaudeCode).mockResolvedValue({
-      exitCode: 0,
-      allOutput: JSON.stringify(validResult()),
-      lastResultText: JSON.stringify(validResult()),
-    });
-
-    await handleDiscoveryReview(
-      'task-dirty',
-      payload(),
-      {},
-      'token',
-      'owner',
-      'repo',
-      null,
-      { value: '' },
-    );
-
-    expect(runClaudeCode).toHaveBeenCalledTimes(1);
-    expect(persistAndPostStatus).toHaveBeenLastCalledWith(
-      'task-dirty',
-      expect.objectContaining({
-        status: 'FAILED',
-        failure_category: 'discovery_review_workspace_modified',
-      }),
+    expect(cleanupPacketOnlyWorkspace).toHaveBeenCalledWith(
+      '/tmp/blueprint-discovery-review/task',
     );
   });
 });

@@ -203,6 +203,7 @@ STRATEGIC_AGENT_OPS: frozenset[str] = frozenset({
     "approve_direction",
     "reject_direction",
     "activate_direction",
+    "resolve_discovery",
     "create_message",
     "resolve_message",
     "spawn_task",
@@ -3098,6 +3099,82 @@ async def strategic_operation(
         )
         return _resp(
             {"status": "ok", "op": "activate_direction", "direction_id": dir_id}
+        )
+
+    elif payload.op == "resolve_discovery":
+        direction_id = str(data.get("direction_id") or "").strip()
+        cycle_id = str(data.get("cycle_id") or "").strip()
+        cycle_revision = data.get("cycle_revision")
+        action = str(data.get("action") or "").strip().lower()
+        if not direction_id:
+            raise HTTPException(status_code=400, detail="direction_id required")
+        try:
+            parsed_cycle_id = uuid.UUID(cycle_id)
+        except (TypeError, ValueError, AttributeError):
+            raise HTTPException(status_code=400, detail="cycle_id must be a UUID") from None
+        if isinstance(cycle_revision, bool) or not isinstance(cycle_revision, int):
+            raise HTTPException(status_code=400, detail="cycle_revision must be an integer")
+        if action not in {"continue", "park", "close"}:
+            raise HTTPException(
+                status_code=400, detail="action must be continue, park, or close"
+            )
+        next_bet = data.get("next_bet")
+        if action == "continue" and not isinstance(next_bet, dict):
+            raise HTTPException(
+                status_code=400,
+                detail="continue requires a complete next_bet object",
+            )
+        if action in {"park", "close"} and next_bet is not None:
+            raise HTTPException(
+                status_code=400, detail=f"{action} must not include next_bet"
+            )
+        note = _cap_str(data.get("note", ""), 2_000, "note", warnings) or None
+
+        from app.discovery_review import DiscoveryCycleBusy, resolve_discovery_cycle
+
+        try:
+            resolved = await resolve_discovery_cycle(
+                session,
+                project_id=project.id,
+                direction_key=direction_id,
+                cycle_id=parsed_cycle_id,
+                cycle_revision=cycle_revision,
+                action=action,
+                next_bet=next_bet,
+                note=note,
+                authority_task=task,
+                # strategic_operation already owns Project then Task. Never
+                # wait here on a Cycle held by completion's Cycle -> Project
+                # transition; return retryable contention and release Project.
+                skip_locked=True,
+            )
+        except DiscoveryCycleBusy as exc:
+            raise HTTPException(
+                status_code=429,
+                detail=str(exc),
+                headers={"Retry-After": "2"},
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        await _emit_updated(
+            STRATEGIC_KIND_DIRECTIONS,
+            changed_direction_ids=[direction_id],
+            changed_count=1,
+        )
+        return _resp(
+            {
+                "status": "ok",
+                "op": "resolve_discovery",
+                "direction_id": direction_id,
+                "action": action,
+                "cycle_id": str(resolved.id),
+                "generation": resolved.generation,
+            }
         )
 
     elif payload.op == "create_message":

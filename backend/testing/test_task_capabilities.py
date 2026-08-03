@@ -171,6 +171,10 @@ def test_discovery_review_is_a_normal_fail_closed_review_task():
     assert cap.output_kind == "verdict"
     assert cap.evaluation == "structured-verdict"
     assert cap.completion_handler == "discovery_review"
+    assert cap.provider_configurable is False
+    assert cap.allowed_providers == frozenset({"anthropic"})
+    assert cap.requires_code is False
+    assert cap.workspace_requirement == "none"
     assert cap.user_launchable is False
     assert cap.strategist_dispatch == "disabled"
     assert cap.periodic_eligible is False

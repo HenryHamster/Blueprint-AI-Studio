@@ -67,7 +67,6 @@ from app.release_models import (  # noqa: F401
     VersionAcceptanceCriterion,
 )
 from app.discovery_models import (  # noqa: F401
-    DiscoveryAdmission,
     DiscoveryCycle,
     DiscoveryEvidenceItem,
 )
@@ -5778,7 +5777,15 @@ def _dual_write_strategic_memory_receipts_from_canonical_orm_writers(
 
     from sqlalchemy import inspect as _sa_inspect
 
+    flush_scope = (
+        None
+        if instances is None
+        else {id(instance) for instance in instances}
+    )
+
     for instance in list(session.new):
+        if flush_scope is not None and id(instance) not in flush_scope:
+            continue
         if not isinstance(instance, ProjectMessage):
             continue
         values = instance.__dict__
@@ -5827,6 +5834,8 @@ def _dual_write_strategic_memory_receipts_from_canonical_orm_writers(
         )
 
     for instance in list(session.dirty):
+        if flush_scope is not None and id(instance) not in flush_scope:
+            continue
         if not isinstance(instance, Project):
             continue
         inspected = _sa_inspect(instance)

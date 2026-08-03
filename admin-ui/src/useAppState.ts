@@ -26,6 +26,7 @@ import { useAlertsState } from './hooks/useAlertsState';
 import { useProjectConfig } from './hooks/useProjectConfig';
 import { resolveTaskCapabilities } from './taskCapabilities';
 import { isEditableShortcutEvent } from './hooks/keyboardTargets';
+import type { StrategicStateResponse } from './strategicStateApi';
 import { resolveAccess } from './accessControl';
 import { clearGitHubOAuthCallbackQuery, clearNewProjectOAuthResume } from './utils/newProjectOAuthResume';
 
@@ -57,6 +58,7 @@ interface UseAppStateOptions {
   refreshStrategicReadModelRef?: MutableRefObject<() => void>;
   refreshMessagesRef?: MutableRefObject<(message?: ProjectMessage, canonicalRefetchRequired?: boolean) => void>;
   refreshFleetRunnersRef?: MutableRefObject<() => void>;
+  strategicReadModelRef?: MutableRefObject<StrategicStateResponse | null>;
 }
 
 function useShallowMemo<T extends Record<string, unknown>>(value: T): T {
@@ -108,7 +110,7 @@ function useShallowMemo<T extends Record<string, unknown>>(value: T): T {
   }, [value]);
 }
 
-export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, refreshFleetRunnersRef }: UseAppStateOptions = {}) {
+export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, refreshFleetRunnersRef, strategicReadModelRef }: UseAppStateOptions = {}) {
   // ── Composed hooks ──────────────────────────────────────────────────────
   const { user, authLoading, userRole, accessDenied, error, setError } = useAuth();
   const platformAccess = resolveAccess(userRole, undefined);
@@ -223,6 +225,7 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
     strategistActive,
     cycleProgress,
     lastCycleCompletion,
+    projectStrategicState,
     strategicSessionTranscript,
     trackedTaskIds, trackedLogs, trackTask, untrackTask, untrackAll,
   } = useLogViewer({
@@ -235,6 +238,7 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
     refreshFleetRunnersRef,
     selectedProjectId,
     realtimeWsEnabled: !authLoading && Boolean(user),
+    strategicReadModelRef,
     canViewProject: selectedProjectAccess.canViewProject,
     isAdmin: platformAccess.isPlatformAdmin,
   });
@@ -822,6 +826,7 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
     // Directions
     showDirections, setShowDirections,
     fetchDirectionsRef, strategistActive, cycleProgress, lastCycleCompletion,
+    projectStrategicState,
     // Metrics
     showMetrics, setShowMetrics, metricsHistory, cumulativeCost, cumulativeVmHours, metricsWindow, setMetricsWindow,
     // Archive

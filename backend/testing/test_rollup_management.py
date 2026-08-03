@@ -1697,7 +1697,7 @@ async def test_admin_rollup_hotfix_to_promotion_target_merges(cleanup_db, mocker
         },
     )
     mocker.patch(
-        "app.admin_task_mutations._maybe_spawn_rollup_smoketest", new_callable=AsyncMock
+        "app.admin_task_approvals._maybe_spawn_rollup_smoketest", new_callable=AsyncMock
     )
 
     project = await _make_distinct_branch_project(cleanup_db)

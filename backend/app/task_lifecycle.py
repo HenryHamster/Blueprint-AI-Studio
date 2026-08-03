@@ -47,7 +47,6 @@ from app.task_capabilities import (
     STRATEGIC_TASK_TYPES,
     WRITE_TASK_TYPES,
     get_task_capability,
-    strategic_phase_for,
 )
 from app.json_extract import scan_balanced_json_objects
 from app.task_blocked import reset_task_for_fresh_attempt
@@ -1545,7 +1544,7 @@ async def _process_post_commit(
         # Uses the same session (not a separate one) to avoid self-deadlock: a second
         # session scanning the task table would block on the FOR UPDATE lock held by
         # this session, causing a hang in Postgres (asyncio is single-threaded).
-        if payload.status == TaskStatus.FAILED:
+        if task.status == TaskStatus.FAILED:
             try:
                 dep_stmt = select(Task).where(
                     Task.project_id == task.project_id,
@@ -1574,10 +1573,11 @@ async def _process_post_commit(
                     exc_info=True,
                 )
 
-            # Record strategic task failures for the circuit breaker and cycle history
-            if task.first_payload.get("type") in (
-                "design_doc_update",
-                "strategic_review",
+            # Record strategic task failures for circuit-breaker accounting.
+            if (
+                task.status == TaskStatus.FAILED
+                and task.first_payload.get("type")
+                in ("design_doc_update", "strategic_review")
             ):
                 try:
                     # Round 3 C3 + C4: the canonical pair-lock acquired at the
@@ -6651,53 +6651,39 @@ async def _process_post_commit(
                     if task is None:
                         return {"status": "accepted"}
 
-        # Audit W2 (D2/D4): backstop for the synchronous strategic chain.
-        # If a strategic task (design_doc_update or strategic_review) reached
-        # a terminal status but the completion handlers above failed to update
-        # the StrategicCycle row, the cycle would stay "phase*_running"
-        # forever and the stalled-cycle reaper would have to clean it up
-        # later. Catch it here while the task lifecycle still has context.
+        # Backstop for terminal strategic phases.  The canonical domain helper
+        # derives the actual phase from the cycle/task linkage, so delayed
+        # phase-1 delivery cannot regress a cycle already running phase 2.
+        _reconciled_completion_event: dict | None = None
         try:
-            cycle_id = task.strategic_cycle_id or (task.context or {}).get(
-                "strategic_cycle_id"
-            )
-            if cycle_id and payload.status in (
-                TaskStatus.COMPLETED,
-                TaskStatus.FAILED,
-                TaskStatus.CANCELLED,
-            ):
+            # The completion handler recovery above can terminalize a task as
+            # FAILED even when the agent payload reported COMPLETED. Reconcile
+            # from the current persisted task status so that handler failures
+            # close their linked strategic phase immediately instead of waiting
+            # for the stalled-cycle reaper.
+            if task.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
                 from app import strategic_cycle
 
-                cycle_row = await strategic_cycle.get(session, cycle_id)
-                task_type = task.first_payload.get("type", "")
-                failed_phase = strategic_phase_for(task_type) or "phase2"
-                # Only backstop when the cycle is still stuck in THIS task's OWN
-                # phase — i.e. the completion handler genuinely failed to advance
-                # it. A successful phase-1 (design_doc_update) chains phase-2 and
-                # leaves the cycle in phase2_running; that is success, not a stall,
-                # and must NOT be marked failed_phase1. Marking it failed inflated
-                # _strategic_failures toward the circuit breaker and polluted the
-                # success metric — the source of the false "strategic review
-                # complete … but FAILED" reports. (The genuine catch — a task that
-                # went terminal while its OWN phase's running outcome never
-                # advanced — is preserved.)
-                _stuck_outcomes = {
-                    "phase1": {
-                        strategic_cycle.OUTCOME_IN_PROGRESS,
-                        strategic_cycle.OUTCOME_PHASE1_RUNNING,
-                    },
-                    "phase2": {strategic_cycle.OUTCOME_PHASE2_RUNNING},
-                }.get(failed_phase, frozenset())
-                if cycle_row is not None and cycle_row.outcome in _stuck_outcomes:
+                reconciled_cycle = await strategic_cycle.reconcile_terminal_task(
+                    session, task, source="agent_status_lifecycle"
+                )
+                if reconciled_cycle is not None:
                     logger.warning(
-                        f"[STRATEGIC] Task {task.id} ({task_type}) reached {payload.status} "
-                        f"but cycle {cycle_id} still in {cycle_row.outcome} — backstop marking failed_{failed_phase}"
+                        "[STRATEGIC] Reconciled terminal task %s (%s) to cycle %s",
+                        task.id,
+                        payload.status,
+                        reconciled_cycle.id,
                     )
-                    await strategic_cycle.mark_failure(
-                        session,
-                        cycle_id,
-                        phase=failed_phase,
-                        reason=f"lifecycle_backstop: task {task.id} terminal in {payload.status} without completion-handler cycle update",
+                    # Snapshot BEFORE the commit expires the rows; the emit is
+                    # post-commit below. Driving the strategist-indicator event
+                    # from the reconciled cycle (not payload.status) is what
+                    # keeps durable cycle state and the connected UI in sync
+                    # when the agent payload said COMPLETED but the completion
+                    # handler recovery terminalized the task as FAILED.
+                    _reconciled_completion_event = (
+                        strategic_cycle.terminal_completion_event(
+                            reconciled_cycle, task
+                        )
                     )
                     await session.commit()
         except Exception as _bk_exc:
@@ -6705,6 +6691,11 @@ async def _process_post_commit(
                 f"[STRATEGIC] Lifecycle backstop failed for task {task_id}: {_bk_exc!r}",
                 exc_info=True,
             )
+            # The reconciliation (and/or its commit) did not land — drop the
+            # snapshot so we never broadcast a completion for a cycle whose
+            # terminalization was rolled back. The payload-keyed fallback below
+            # still runs, and the stalled-cycle reaper converges the residue.
+            _reconciled_completion_event = None
             # C1: strategic_cycle.mark_failure + the commit inside the backstop
             # can raise (lock contention / DB error), leaving the session
             # aborted. Roll back so the final commit below does not raise
@@ -6764,25 +6755,44 @@ async def _process_post_commit(
         # here. COMPLETED is deliberately excluded — the completion handlers own
         # that emit, and a COMPLETED design_doc_update that chained to Phase 2
         # must keep the cycle active.
-        _peek_strategic_type = task.first_payload.get("type", "")
-        if _peek_strategic_type in (
-            "design_doc_update",
-            "strategic_review",
-        ) and payload.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
-            from app.strategic_events import emit_strategic_cycle_completed
+        #
+        # When the backstop above actually terminalized a cycle, that reconciled
+        # result is authoritative: it carries the real phase (from the cycle/task
+        # linkage, so a late phase-1 delivery cannot mislabel a phase-2 cycle)
+        # and the resulting terminal outcome, and it fires even when the agent
+        # payload reported COMPLETED (handler-recovery failures). The
+        # payload-keyed branch stays as the fallback for tasks with no
+        # reconcilable cycle row (already-terminal or legacy cycles), so a
+        # strategic task that fails still clears the indicator.
+        if _reconciled_completion_event is not None:
+            from app import strategic_cycle as _strategic_cycle_emit
 
-            await emit_strategic_cycle_completed(
-                task.project_id,
-                task.id,
-                1 if _peek_strategic_type == "design_doc_update" else 2,
-                cycle_id=task.strategic_cycle_id
-                or (task.context or {}).get("strategic_cycle_id"),
-                phase_state="failed",
-                completion={
-                    "status": getattr(payload.status, "value", str(payload.status)),
-                    "status_message": task.latest_status_message,
-                },
+            await _strategic_cycle_emit.emit_terminal_completion_events(
+                [_reconciled_completion_event]
             )
+        else:
+            _peek_strategic_type = task.first_payload.get("type", "")
+            if (
+                task.status in (TaskStatus.FAILED, TaskStatus.CANCELLED)
+                and _peek_strategic_type in (
+                    "design_doc_update",
+                    "strategic_review",
+                )
+            ):
+                from app.strategic_events import emit_strategic_cycle_completed
+
+                await emit_strategic_cycle_completed(
+                    task.project_id,
+                    task.id,
+                    1 if _peek_strategic_type == "design_doc_update" else 2,
+                    cycle_id=task.strategic_cycle_id
+                    or (task.context or {}).get("strategic_cycle_id"),
+                    phase_state="failed",
+                    completion={
+                        "status": getattr(task.status, "value", str(task.status)),
+                        "status_message": task.latest_status_message,
+                    },
+                )
 
         return {
             "status": "received",

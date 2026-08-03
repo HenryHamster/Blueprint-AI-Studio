@@ -696,7 +696,7 @@ describe('park directives and warm continuation', () => {
     expect(performWarmRetarget).not.toHaveBeenCalled();
   });
 
-  it('does not reset or reuse the repository for a workspace:none warm claim', async () => {
+  it('does not reset or reuse the repository for a discovery-review warm claim', async () => {
     process.env.TASK_ID = 'task-prior';
     process.env.VM_INSTANCE_ID = 'vm-memory-worker';
     const resetForNextRole = vi.fn();
@@ -709,8 +709,8 @@ describe('park directives and warm continuation', () => {
     }, {
       pollForNextRole: () => Promise.resolve({
         action: 'claim',
-        taskId: 'memory-consolidation-task',
-        agentToken: 'rotated-memory-jwt',
+        taskId: 'discovery-review-task',
+        agentToken: 'rotated-discovery-jwt',
         workspaceRequirement: 'none',
       }),
       resetForNextRole,

@@ -153,19 +153,21 @@ Stored in `runtime_config` (admin UI Settings):
 
 ### Discovery Review Cycles
 
-Cycle lineage, credit and concurrency limits, and the review freeze are always
-enforced. There is no shadow admission path.
+Cycle lineage and the review freeze are always enforced. Descendant credits do
+not gate execution, and there is no shadow admission path.
 
-The first `discovery_review` pass runs at `medium` effort. Routine `renew` or
-`inconclusive` decisions resolve in that cheap pass. A consequential `pivot`,
-`expand`, `branch`, `fallback_pending`, `park`, or `stop` proposal queues one
-independent `max`-effort confirmation. `ask_operator` already identifies a
-decision boundary, so it wakes the supported Resident directly. Matching
-continuation decisions may open a successor cycle, but reviewer-selected task,
-attempt, and concurrency limits may only stay level or decrease; increases
-require Strategic/operator authority. A confirmed halt, blocked review, or
-disagreement also wakes the Resident with an exact internal receipt. The Resident
-does not run a duplicate discovery review.
+Once every cohort task and its post-commit processing have settled, exactly one
+packet-only `discovery_review` runs at `medium` effort. It returns one of
+`advance`, `park`, `stop`, or `ask_operator`; there is no independent
+confirmation fan-out. The packet contains a bounded parent outcome receipt with
+compact semantic coverage and checksums for detailed bodies omitted from the
+packet. Binding decisions must cite that exact receipt and are revalidated
+against current cycle, cohort, and the frozen active-direction authority before
+application. `advance` atomically records a bounded successor and a deferred
+Strategic spawn request. `park`, `stop`, missing evidence, stale authority, or a
+failed decision never cancel parallel work. Only actual operator boundaries and
+failed-closed states wake the Resident with the exact cycle revision and
+resolution context; the Resident does not run a duplicate discovery review.
 
 ---
 

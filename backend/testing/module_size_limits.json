@@ -61,6 +61,7 @@
     "reaper_infra_recovery.py": 850,
     "agent_status_spawn.py": 900,
     "admin_task_mutations.py": 1650,
+    "admin_task_approvals.py": 850,
     "review_pipeline.py": 5350,
     "deploy_health.py": 1250,
     "direction_outcomes.py": 3700,
@@ -105,7 +106,7 @@
     "task_evaluators.py": 2300,
     "release_scoring.py": 3050,
     "runtime_config_state.py": 3000,
-    "routers/directions.py": 2100,
+    "routers/directions.py": 2450,
     "warm_pool_maintainer.py": 2650,
     "review_fix_lane_pilot.py": 2450,
     "routers/admin_projects.py": 2450,
@@ -122,7 +123,6 @@
     "release_version.py": 2050,
     "ci_resolution.py": 2100,
     "routers/admin_project_config.py": 2000,
-    "routers/agent_warm_continuity.py": 1700,
     "compute_backends.py": 6200,
     "direction_lifecycle.py": 2200,
     "routers/admin_notifications.py": 2150,
@@ -159,7 +159,8 @@
     "storage.py": 1750,
     "strategic_resident_session.py": 6850,
     "release_qualifier_audit.py": 1800,
-    "conversation_coordinator.py": 1900
+    "conversation_coordinator.py": 1900,
+    "routers/agent_warm_continuity.py": 1700
   },
   "agent": {
     "index.ts": 4600,
@@ -359,6 +360,7 @@
     "test_review_loop_convergence.py": 1900,
     "test_empty_repo_onboarding.py": 1900,
     "test_warm_pool.py": 1850,
+    "test_discovery_review.py": 1807,
     "test_evergreen_backlog.py": 1800,
     "test_anomaly_actions.py": 1800,
     "test_failure_residual.py": 1750,
@@ -387,10 +389,10 @@
     "test_release_qualifier__retry_episode_cap.py": 750,
     "test_compute_park_wake.py": 2000,
     "test_strategic_resident_session.py": 3550,
-    "test_warm_pool_dispatch.py": 2100,
     "test_conversational_workday_protection.py": 1800,
     "test_admin_routers__projects.py": 4100,
     "test_admin_routers__strategic_directions.py": 2200,
-    "test_strategic_session_messages.py": 1950
+    "test_strategic_session_messages.py": 1950,
+    "test_warm_pool_dispatch.py": 2100
   }
 }

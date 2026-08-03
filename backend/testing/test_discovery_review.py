@@ -1,24 +1,25 @@
-"""Focused contracts for the durable discovery-review boundary."""
+"""Focused contracts for the single-pass discovery decision boundary."""
 
 from __future__ import annotations
 
 from datetime import timedelta
-import json
 import uuid
 
 import pytest
 from sqlmodel import select
 
-import app.discovery_review as discovery_review
 import app.discovery_review_packet as discovery_review_packet
+import app.strategic_spawn_requests as strategic_spawn_requests
 from app.discovery_admission import (
-    authorize_discovery_task_execution,
-    reserve_discovery_admission,
+    DiscoveryCycleUnavailable,
+    ensure_discovery_cycle_for_research,
 )
 from app.discovery_review import (
     DiscoveryReviewResultError,
+    block_failed_discovery_review,
     complete_discovery_review,
     maybe_close_and_spawn_discovery_review,
+    parse_discovery_review_result,
     resolve_discovery_cycle,
     sweep_discovery_reviews,
 )
@@ -26,9 +27,8 @@ from app.findings_index import FINALIZED_RESEARCH_FINDINGS_KEY
 from app.models import (
     Artifact,
     ArtifactType,
-    DiscoveryAdmission,
     DiscoveryCycle,
-    DiscoveryEvidenceItem,
+    KnowledgeDocument,
     Project,
     ProjectMessage,
     StrategicSpawnRequest,
@@ -38,53 +38,58 @@ from app.models import (
 from app.time_utils import _utcnow
 
 
-def test_task_snapshot_excludes_unfinalized_research_findings():
-    task = Task(
-        project_id=uuid.uuid4(),
-        title="Research source",
-        payloads=[{"type": "research"}],
-        status=TaskStatus.COMPLETED,
-        created_by="ORCHESTRATOR",
-        plan_output=[{"title": "Rejected raw claim"}],
-        context={},
-    )
+def _next_bet(*, claim: str = "Try the bounded mechanism") -> dict[str, str]:
+    return {
+        "mode": "build",
+        "claim": claim,
+        "decision_question": "Does the mechanism improve the target outcome?",
+        "success_evidence": "A measured probe improves the target outcome.",
+        "retirement_condition": "Retire after two probes without improvement.",
+    }
 
-    unfinalized = discovery_review_packet._task_snapshot(task)
-    assert json.loads(unfinalized["plan_output_excerpt"]) == []
 
-    task.context = {FINALIZED_RESEARCH_FINDINGS_KEY: True}
-    finalized = discovery_review_packet._task_snapshot(task)
-    assert json.loads(finalized["plan_output_excerpt"]) == [
-        {"title": "Rejected raw claim"}
-    ]
+async def _no_budget_guard(*_args, **_kwargs):
+    return None
 
 
 async def _cycle_with_source(
     db_session,
     *,
-    project: Project | None = None,
     source_status: TaskStatus = TaskStatus.COMPLETED,
     state: str = "open",
+    generation: int = 1,
     deadline_at=None,
 ):
-    if project is None:
-        project = Project(
-            name=f"discovery-review-{uuid.uuid4().hex[:8]}",
-            user_id="discovery-review-test",
-        )
-        db_session.add(project)
-        await db_session.flush()
+    direction_key = f"d-{uuid.uuid4().hex[:8]}"
+    direction = {
+        "id": direction_key,
+        "text": "Prove the bounded mechanism",
+        "status": "active",
+        "context": {
+            "success_evidence": "The probe improves the target outcome.",
+            "retirement_condition": "Retire after two failed probes.",
+            "implementation_constraints": "Reuse the current runtime.",
+        },
+    }
+    project = Project(
+        name=f"discovery-review-{uuid.uuid4().hex[:8]}",
+        user_id="discovery-review-test",
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.flush()
     cycle = DiscoveryCycle(
         project_id=project.id,
-        direction_key=f"d-{uuid.uuid4().hex[:8]}",
+        direction_key=direction_key,
+        generation=generation,
         outcome_kind="mixed",
         state=state,
         deadline_at=deadline_at,
         intent_snapshot={"goal": "prove useful behavior"},
-        bet_snapshot={"hypothesis": "the mechanism helps"},
-        task_credit_limit=8,
-        attempt_credit_limit=4,
-        concurrency_limit=2,
+        bet_snapshot={
+            "hypothesis": "the mechanism helps",
+            "direction": direction,
+        },
     )
     db_session.add(cycle)
     await db_session.flush()
@@ -96,6 +101,7 @@ async def _cycle_with_source(
         status=source_status,
         created_by="ORCHESTRATOR",
         plan_output={"findings": []},
+        context={FINALIZED_RESEARCH_FINDINGS_KEY: True},
     )
     db_session.add(source)
     await db_session.flush()
@@ -105,73 +111,182 @@ async def _cycle_with_source(
     return project, cycle, source
 
 
-def _valid_result(cycle, review_task, evidence_ids, **overrides):
+def _evidence_ids(review: Task) -> list[str]:
+    return [
+        str(item["evidence_id"])
+        for item in review.first_payload["evidence_packet"]
+        if item.get("evidence_id")
+    ]
+
+
+def _result(cycle: DiscoveryCycle, review: Task, *, action: str = "advance"):
     result = {
         "cycle_id": str(cycle.id),
-        "reviewed_revision": review_task.first_payload["expected_revision"],
-        "verdict": "renew",
-        "confidence": 0.82,
-        "decision_summary": "The bounded evidence supports one more probe.",
-        "goal_progress_assessment": "The mechanism produced measurable progress.",
-        "evidence_citations": [str(value) for value in evidence_ids],
-        "contradictions": [],
-        "next_bet": dict(cycle.bet_snapshot or {}),
-        "recommended_phase": cycle.phase,
-        "recommended_limits": {
-            "task_credit_limit": None,
-            "attempt_credit_limit": None,
-            "concurrency_limit": None,
-        },
+        "reviewed_revision": review.first_payload["expected_revision"],
+        "action": action,
+        "summary": f"Evidence supports {action}.",
+        "evidence_citations": _evidence_ids(review),
+        "next_bet": None,
+        "park_reason": None,
+        "resume_condition": None,
         "operator_question": None,
     }
-    result.update(overrides)
+    if action == "advance":
+        result["next_bet"] = _next_bet()
+    elif action == "park":
+        result["park_reason"] = "The external benchmark is not yet available."
+        result["resume_condition"] = "Resume when the benchmark is published."
+    elif action == "ask_operator":
+        result["evidence_citations"] = []
+        result["operator_question"] = "Which product constraint should dominate?"
     return result
 
 
 @pytest.mark.asyncio
-async def test_terminal_zero_finding_source_spawns_one_root_review(db_session):
+async def test_semantic_receipt_excludes_unfinalized_research_findings(db_session):
+    _, cycle, source = await _cycle_with_source(db_session)
+    source.plan_output = [{"title": "Rejected raw claim"}]
+    source.context = {}
+    db_session.add(source)
+    await db_session.flush()
+
+    packet, _, _, _, _, _ = await discovery_review_packet.build_discovery_review_packet(
+        db_session, cycle
+    )
+    outcome = next(item for item in packet if item["semantic_role"] == "parent_outcome")
+    assert outcome["evidence_metadata"]["snapshot"]["research_findings"] == []
+
+
+@pytest.mark.asyncio
+async def test_semantic_receipt_includes_all_parallel_research_outcomes(db_session):
+    project, cycle, source = await _cycle_with_source(db_session)
+    parallel = Task(
+        project_id=project.id,
+        discovery_cycle_id=cycle.id,
+        parent_task_id=source.id,
+        title="Parallel research",
+        payloads=[{"type": "research"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        plan_output=[{"title": "Parallel finding", "evidence": "receipt"}],
+        context={FINALIZED_RESEARCH_FINDINGS_KEY: True},
+    )
+    db_session.add(parallel)
+    await db_session.flush()
+    web_research = Task(
+        project_id=project.id,
+        discovery_cycle_id=cycle.id,
+        parent_task_id=source.id,
+        title="Parallel web research",
+        payloads=[{"type": "web_research"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(web_research)
+    await db_session.flush()
+    document = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=web_research.id,
+        source_kind="web_research",
+        title="Parallel external result",
+        summary="The external result changes the bounded next decision.",
+        body="# Result\n\nDurable research evidence.",
+        topic="parallel-discovery",
+        source_citations=[{"url": "https://example.com/result"}],
+        forward_quality_verdict={"passed": True},
+    )
+    db_session.add(document)
+    await db_session.flush()
+
+    packet, _, _, _, _, _ = await discovery_review_packet.build_discovery_review_packet(
+        db_session, cycle
+    )
+    outcome = next(item for item in packet if item["semantic_role"] == "parent_outcome")
+    snapshot = outcome["evidence_metadata"]["snapshot"]
+
+    assert any(
+        item["source_task_id"] == str(parallel.id)
+        and item["finding"]["title"] == "Parallel finding"
+        for item in snapshot["research_findings"]
+    )
+    assert len(snapshot["knowledge_outcomes"]) == 1
+    knowledge_outcome = snapshot["knowledge_outcomes"][0]
+    assert knowledge_outcome["document_id"] == str(document.id)
+    assert knowledge_outcome["source_task_id"] == str(web_research.id)
+    assert knowledge_outcome["source_kind"] == "web_research"
+    assert knowledge_outcome["title"] == "Parallel external result"
+    assert knowledge_outcome["summary"] == (
+        "The external result changes the bounded next decision."
+    )
+    assert "bounded next decision" in knowledge_outcome["semantic_summary"]
+
+
+@pytest.mark.asyncio
+async def test_terminal_source_spawns_exactly_one_medium_decision(db_session):
     _, cycle, _ = await _cycle_with_source(db_session)
 
     first = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
-    second = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    replay = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
 
     assert first.spawned is True
-    assert second.spawned is False
-    assert second.task_id == first.task_id
+    assert replay.spawned is False
+    assert replay.task_id == first.task_id
     review = await db_session.get(Task, first.task_id)
     assert review is not None
     assert review.parent_task_id is None
     assert review.discovery_cycle_id == cycle.id
     assert review.first_payload["type"] == "discovery_review"
-    assert cycle.state == "reviewing"
-    assert cycle.review_task_id == review.id
-
-
-@pytest.mark.asyncio
-async def test_paused_project_defers_ready_review_until_unpaused(db_session):
-    project, cycle, _ = await _cycle_with_source(db_session)
-    project.paused = True
-    db_session.add(project)
-    await db_session.flush()
-
-    paused = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
-
-    assert paused.spawned is False
-    assert paused.ready is True
-    assert paused.reason == "project_paused"
-    assert cycle.state == "review_pending"
-    assert cycle.review_task_id is None
-
-    project.paused = False
-    db_session.add(project)
-    await db_session.flush()
-    resumed = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
-    assert resumed.spawned is True
+    assert review.first_payload["effort"] == "medium"
+    assert review.first_payload["provider_preference"] == ["anthropic"]
+    assert "review_round" not in review.first_payload
+    assert "confirmation_proposal" not in review.first_payload
     assert cycle.state == "reviewing"
 
 
 @pytest.mark.asyncio
-async def test_active_cohort_closes_admission_but_does_not_strand_work(db_session):
+async def test_parallel_cohort_over_twelve_tasks_still_gets_one_decision(db_session):
+    _, cycle, source = await _cycle_with_source(db_session)
+    for index in range(20):
+        db_session.add(
+            Task(
+                project_id=source.project_id,
+                discovery_cycle_id=cycle.id,
+                parent_task_id=source.id,
+                title=f"Research child {index}",
+                payloads=[{"type": "research"}],
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                latest_status_message="done",
+            )
+        )
+    await db_session.flush()
+
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    review = await db_session.get(Task, spawned.task_id)
+
+    assert spawned.spawned is True
+    assert review.first_payload["evidence_packet_manifest"]["task_count"] == 21
+    assert [
+        item["semantic_role"] for item in review.first_payload["evidence_packet"]
+    ] == ["packet_manifest", "parent_outcome"]
+    review_tasks = list(
+        (
+            await db_session.execute(
+                select(Task).where(Task.discovery_cycle_id == cycle.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [
+        task.id
+        for task in review_tasks
+        if task.first_payload.get("type") == "discovery_review"
+    ] == [review.id]
+
+
+@pytest.mark.asyncio
+async def test_active_cohort_waits_without_cancelling_parallel_work(db_session):
     _, cycle, source = await _cycle_with_source(db_session)
     active = Task(
         project_id=source.project_id,
@@ -185,1305 +300,1408 @@ async def test_active_cohort_closes_admission_but_does_not_strand_work(db_sessio
     db_session.add(active)
     await db_session.flush()
 
-    result = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
-
-    assert result.spawned is False
-    assert result.reason == "cohort_active"
-    assert cycle.state == "review_pending"
+    waiting = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    assert waiting.reason == "cohort_active"
+    assert waiting.spawned is False
     assert active.status == TaskStatus.IN_PROGRESS
 
-    # PARKED is shelved rather than live cohort work and must not hold the
-    # review boundary forever once all runnable work has drained.
-    active.status = TaskStatus.PARKED
+    active.status = TaskStatus.COMPLETED
+    active.context = {"landed_on_integration": True, "merge_commit_sha": "a" * 40}
     db_session.add(active)
     await db_session.flush()
-    result = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
-    assert result.spawned is True
+    assert (await maybe_close_and_spawn_discovery_review(db_session, cycle.id)).spawned
 
 
 @pytest.mark.asyncio
-async def test_blocked_cohort_drains_after_deadline_grace_as_incomplete_evidence(
-    db_session,
-):
-    deadline = _utcnow() - timedelta(hours=1)
-    _, cycle, source = await _cycle_with_source(
-        db_session,
-        deadline_at=deadline,
-    )
-    blocked = Task(
+async def test_post_commit_materialization_must_settle_before_review(db_session):
+    _, cycle, source = await _cycle_with_source(db_session)
+    source.post_commit_pending = True
+    db_session.add(source)
+    await db_session.flush()
+
+    waiting = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    assert waiting.reason == "source_research_post_commit_pending"
+    assert waiting.spawned is False
+
+    source.post_commit_pending = False
+    materializing = Task(
         project_id=source.project_id,
         discovery_cycle_id=cycle.id,
         parent_task_id=source.id,
-        title="Blocked experiment",
-        payloads=[{"type": "create"}],
-        status=TaskStatus.BLOCKED,
+        title="Materializing parallel findings",
+        payloads=[{"type": "research"}],
+        status=TaskStatus.COMPLETED,
+        post_commit_pending=True,
         created_by="ORCHESTRATOR",
-        latest_status_message="Waiting for unavailable upstream evidence.",
     )
-    db_session.add(blocked)
+    db_session.add_all([source, materializing])
     await db_session.flush()
 
-    within_grace = await maybe_close_and_spawn_discovery_review(
-        db_session,
-        cycle.id,
-        now=deadline + timedelta(minutes=90),
-    )
-    assert within_grace.spawned is False
-    assert within_grace.reason == "cohort_blocked_in_grace"
-    assert blocked.status == TaskStatus.BLOCKED
+    waiting = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    assert waiting.reason == "cohort_post_commit_pending"
+    assert waiting.spawned is False
 
-    after_grace = await maybe_close_and_spawn_discovery_review(
-        db_session,
-        cycle.id,
-        now=deadline + timedelta(hours=2, seconds=1),
-    )
-    assert after_grace.spawned is True
-    assert blocked.status == TaskStatus.BLOCKED
-    review = await db_session.get(Task, after_grace.task_id)
-    manifest = review.first_payload["evidence_packet_manifest"]
-    assert manifest["incomplete"] is True
-    assert manifest["required_evidence_omitted"] is False
-    assert manifest["overdue_blocked"] == {
-        "count": 1,
-        "included_task_ids": [str(blocked.id)],
-    }
-    assert "overdue_blocked_tasks" in manifest["incomplete_reasons"]
-    blocked_packet_item = next(
-        entry
-        for entry in review.first_payload["evidence_packet"]
-        if entry.get("source_id") == str(blocked.id)
-    )
-    assert (
-        blocked_packet_item["evidence_metadata"]["snapshot"]["status"]
-        == TaskStatus.BLOCKED.value
-    )
+    materializing.post_commit_pending = False
+    db_session.add(materializing)
+    await db_session.flush()
+    assert (await maybe_close_and_spawn_discovery_review(db_session, cycle.id)).spawned
 
 
 @pytest.mark.asyncio
-async def test_overdue_deferred_spawn_is_cancelled_and_releases_reserved_credit(
+async def test_missing_delivery_receipt_stays_evidence_pending_without_agent_cost(
     db_session,
 ):
-    deadline = _utcnow() + timedelta(hours=1)
-    project, cycle, source = await _cycle_with_source(
-        db_session,
-        deadline_at=deadline,
+    _, cycle, source = await _cycle_with_source(db_session)
+    db_session.add(
+        Task(
+            project_id=source.project_id,
+            discovery_cycle_id=cycle.id,
+            parent_task_id=source.id,
+            title="Unconfirmed write",
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            context={"pr_number": 123},
+        )
     )
-    request = StrategicSpawnRequest(
-        project_id=project.id,
-        parent_task_id=source.id,
-        discovery_cycle_id=cycle.id,
-        idempotency_key=f"deferred-{uuid.uuid4().hex}",
-        task_type="create",
-        specification={"title": "Deferred experiment"},
-        specification_hash="a" * 64,
-        state="deferred",
-        not_before=_utcnow() - timedelta(minutes=1),
-    )
-    db_session.add(request)
     await db_session.flush()
-    reservation = await reserve_discovery_admission(
-        db_session,
-        cycle_id=cycle.id,
-        admission_key=f"spawn-request:{request.id}",
-        spawn_request_id=request.id,
-    )
-    assert reservation.allowed is True
-    assert cycle.reserved_task_credits == 1
 
-    cycle.deadline_at = _utcnow() - timedelta(hours=3)
-    db_session.add(cycle)
-    await db_session.flush()
-    result = await maybe_close_and_spawn_discovery_review(
+    first_checked = _utcnow()
+    pending = await maybe_close_and_spawn_discovery_review(
+        db_session, cycle.id, now=first_checked
+    )
+
+    assert pending.spawned is False
+    assert pending.reason == "evidence_pending"
+    assert cycle.state == "review_pending"
+    assert cycle.review_result["status"] == "EVIDENCE_PENDING"
+    reviews = list(
+        (
+            await db_session.execute(
+                select(Task).where(Task.discovery_cycle_id == cycle.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert all(task.first_payload.get("type") != "discovery_review" for task in reviews)
+
+    escalated = await maybe_close_and_spawn_discovery_review(
         db_session,
         cycle.id,
-        now=_utcnow(),
+        now=first_checked + timedelta(hours=2, seconds=1),
     )
+    assert escalated.reason == "evidence_pending_escalated"
+    await db_session.flush()
+    project_messages = list(
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == cycle.project_id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    operator_message = next(
+        message
+        for message in project_messages
+        if message.context["event_type"] == "discovery.operator_question"
+    )
+    assert operator_message.context["audience"] == "operator-action-needed"
+    assert operator_message.context["cycle_id"] == str(cycle.id)
+    assert operator_message.context["cycle_revision"] == cycle.revision
 
-    assert result.spawned is True
-    await db_session.refresh(request)
-    assert request.state == "cancelled"
-    assert request.admission_reason == "discovery_cycle_review_boundary"
-    assert request.not_before is None
-    admission = await db_session.get(DiscoveryAdmission, reservation.admission_id)
-    assert admission.state == "released"
-    assert cycle.reserved_task_credits == 0
-    review = await db_session.get(Task, result.task_id)
-    manifest = review.first_payload["evidence_packet_manifest"]
-    assert manifest["overdue_spawn_requests"] == {"count": 1}
-    assert manifest["required_evidence_omitted"] is True
-    assert "overdue_deferred_spawn_requests" in manifest["incomplete_reasons"]
+    successor = await resolve_discovery_cycle(
+        db_session,
+        project_id=cycle.project_id,
+        direction_key=cycle.direction_key,
+        cycle_id=operator_message.context["cycle_id"],
+        cycle_revision=operator_message.context["cycle_revision"],
+        action="continue",
+        next_bet=_next_bet(claim="Repair delivery evidence with a bounded follow-up"),
+        note="Resident selected a bounded recovery path.",
+    )
+    assert successor.state == "open"
+    assert cycle.verdict == "advance"
 
 
 @pytest.mark.asyncio
-async def test_packet_and_artifact_authority_are_cycle_isolated(db_session):
-    project, cycle, source = await _cycle_with_source(db_session)
-    artifact = Artifact(
-        task_id=source.id,
-        artifact_type=ArtifactType.RESEARCH_FINDINGS,
-        storage_uri=f"gs://test/{source.id}/findings.json",
-        logs='[{"finding":"supported"}]',
+async def test_candidate_sha_is_not_accepted_as_exact_landed_identity(db_session):
+    _, cycle, source = await _cycle_with_source(db_session)
+    db_session.add(
+        Task(
+            project_id=source.project_id,
+            discovery_cycle_id=cycle.id,
+            parent_task_id=source.id,
+            title="Write with only a candidate SHA",
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            context={
+                "landed_on_integration": True,
+                "candidate_sha": "b" * 40,
+            },
+        )
     )
-    db_session.add(artifact)
+    await db_session.flush()
 
-    _, other_cycle, other_source = await _cycle_with_source(
-        db_session, project=project
+    pending = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    assert pending.reason == "evidence_pending"
+    assert any(
+        "lacks exact commit identity" in reason
+        for reason in cycle.review_result["missing_required_evidence"]
     )
-    other_artifact = Artifact(
-        task_id=other_source.id,
-        artifact_type=ArtifactType.RESEARCH_FINDINGS,
-        storage_uri=f"gs://test/{other_source.id}/other.json",
-        logs='[{"finding":"must not leak"}]',
+
+
+@pytest.mark.asyncio
+async def test_abundant_semantic_evidence_is_bounded_without_stranding(db_session):
+    project, cycle, source = await _cycle_with_source(db_session)
+    source.plan_output = [
+        {"title": f"Finding {index}", "evidence": "x" * 50}
+        for index in range(12)
+    ]
+    source.context = {FINALIZED_RESEARCH_FINDINGS_KEY: True}
+    parallel = Task(
+        project_id=project.id,
+        discovery_cycle_id=cycle.id,
+        parent_task_id=source.id,
+        title="Parallel contradictory research",
+        payloads=[{"type": "research"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        plan_output=[
+            {
+                "title": "Contradicting omitted finding",
+                "evidence": "The parallel result reverses the source conclusion.",
+            }
+        ],
+        context={FINALIZED_RESEARCH_FINDINGS_KEY: True},
     )
-    db_session.add(other_artifact)
+    db_session.add_all([source, parallel])
+    document_base = _utcnow()
+    db_session.add_all(
+        [
+            KnowledgeDocument(
+                project_id=project.id,
+                source_task_id=source.id,
+                source_kind="research",
+                title=f"Knowledge outcome {index}",
+                summary=(
+                    "Contradicting earliest knowledge outcome"
+                    if index == 0
+                    else f"Bounded semantic outcome {index}"
+                ),
+                body=f"# Outcome {index}",
+                topic="bounded-discovery",
+                source_citations=[],
+                forward_quality_verdict={"passed": True},
+                created_at=document_base + timedelta(microseconds=index),
+            )
+            for index in range(13)
+        ]
+    )
     await db_session.flush()
 
     spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    assert spawned.spawned is True
     review = await db_session.get(Task, spawned.task_id)
-    packet = review.first_payload["evidence_packet"]
-    source_ids = {entry.get("source_id") for entry in packet}
-    authorized = {
-        pointer["artifact_id"]
-        for pointer in review.context["artifact_prerequisites"]
-    }
+    outcome = next(
+        item
+        for item in review.first_payload["evidence_packet"]
+        if item["semantic_role"] == "parent_outcome"
+    )
+    snapshot = outcome["evidence_metadata"]["snapshot"]
+    assert len(snapshot["research_findings"]) == 6
+    assert len(snapshot["knowledge_outcomes"]) == 6
+    assert snapshot["missing_required_evidence"] == []
+    research_coverage = snapshot["evidence_coverage"]["research_findings"]
+    assert research_coverage["included_count"] == 6
+    assert research_coverage["omitted_count"] == 7
+    assert research_coverage["total_count"] == 13
+    assert len(research_coverage["full_set_checksum"]) == 64
+    assert any(
+        "reverses the source conclusion" in item["semantic_excerpt"]
+        and item["source_task_id"] == str(parallel.id)
+        for item in research_coverage["omitted_semantic_index"]
+    )
+    assert "reverses the source conclusion" in research_coverage["full_semantic_digest"]
+    assert research_coverage["semantic_digest_complete"] is True
+    knowledge_coverage = snapshot["evidence_coverage"]["knowledge_outcomes"]
+    assert knowledge_coverage["included_count"] == 6
+    assert knowledge_coverage["omitted_count"] == 7
+    assert knowledge_coverage["total_count"] == 13
+    assert len(knowledge_coverage["full_set_checksum"]) == 64
+    assert "Contradicting earliest knowledge outcome" in knowledge_coverage[
+        "omitted_semantic_index"
+    ][0]["semantic_excerpt"]
 
-    assert str(source.id) in source_ids
-    assert str(artifact.id) in source_ids
-    assert str(other_source.id) not in source_ids
-    assert str(other_artifact.id) not in source_ids
-    assert authorized == {str(artifact.id)}
-    assert len(review.first_payload["packet_checksum"]) == 64
-    assert (
-        await db_session.execute(
-            select(DiscoveryEvidenceItem).where(
-                DiscoveryEvidenceItem.cycle_id == cycle.id
+
+def test_semantic_overflow_index_is_bounded_and_samples_stable_range():
+    values = [
+        {
+            "source_task_id": str(uuid.uuid4()),
+            "finding": {"title": f"Outcome {index}"},
+        }
+        for index in range(100)
+    ]
+    coverage = discovery_review_packet._bounded_collection_coverage(
+        values,
+        values[:12],
+        omitted=values[12:],
+        selection="first_12_in_stable_task_order",
+    )
+
+    assert coverage["semantic_index_total_count"] == 88
+    assert coverage["semantic_index_included_count"] == 3
+    assert [
+        item["semantic_excerpt"] for item in coverage["omitted_semantic_index"]
+    ] == ["Outcome 12", "Outcome 56", "Outcome 99"]
+
+    contradiction_values = []
+    for index in range(10):
+        finding = {
+            "title": f"Experiment outcome {index}",
+            "evidence": "CONTRADICTION" if index == 5 else "support",
+            "risk": "high" if index == 5 else "low",
+        }
+        contradiction_values.append(
+            {
+                "source_task_id": str(uuid.uuid4()),
+                "finding": finding,
+                "semantic_summary": discovery_review_packet._canonical_semantic_value(
+                    finding
+                ),
+            }
+        )
+    contradiction_coverage = discovery_review_packet._bounded_collection_coverage(
+        contradiction_values,
+        [],
+        omitted=contradiction_values,
+        selection="none",
+    )
+    assert contradiction_coverage["semantic_digest_complete"] is True
+    assert "CONTRADICTION" in contradiction_coverage["full_semantic_digest"]
+
+    project_id = uuid.uuid4()
+    verification_values = [
+        discovery_review_packet._verification_summary(
+            Task(
+                project_id=project_id,
+                title=f"QA {index}",
+                payloads=[{"type": "qa"}],
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                latest_status_message="Verification completed",
+                context={
+                    "acceptance_verdict": {
+                        "a_detail": "x" * 700 if index == 2 else "",
+                        "summary": "REJECT: critical regression"
+                        if index == 2
+                        else "PASS"
+                    },
+                    "acceptance_evidence_result": {"probe": f"qa-{index}"},
+                },
             )
         )
-    ).scalars().all()
-    assert other_cycle.review_task_id is None
+        for index in range(10)
+    ]
+    verification_coverage = discovery_review_packet._bounded_collection_coverage(
+        verification_values,
+        verification_values[-6:],
+        omitted=verification_values[:-6],
+        selection="latest_6_in_stable_task_order",
+    )
+    assert verification_coverage["semantic_digest_complete"] is True
+    assert "REJECT: critical regression" in verification_coverage[
+        "full_semantic_digest"
+    ]
+
+
+def test_receipt_budget_includes_stored_metadata_wrapper():
+    receipt = {
+        "payload": "x"
+        * (discovery_review_packet.DISCOVERY_REVIEW_EVIDENCE_METADATA_CHARS - 30)
+    }
+    assert len(discovery_review_packet._canonical_json(receipt)) <= (
+        discovery_review_packet.DISCOVERY_REVIEW_EVIDENCE_METADATA_CHARS
+    )
+    assert discovery_review_packet._receipt_fits_evidence_metadata(receipt) is False
 
 
 @pytest.mark.asyncio
-async def test_packet_limits_preserve_source_and_outcome_and_restrict_verdict(
-    db_session,
-    monkeypatch,
-):
-    monkeypatch.setattr(discovery_review_packet, "DISCOVERY_REVIEW_MAX_TASKS", 2)
-    monkeypatch.setattr(
-        discovery_review_packet, "DISCOVERY_REVIEW_MAX_ARTIFACTS", 1
-    )
+async def test_landed_outcomes_are_bounded_without_stranding(db_session):
     project, cycle, source = await _cycle_with_source(db_session)
-    extra_completed = Task(
+    db_session.add_all(
+        [
+            Task(
+                project_id=project.id,
+                discovery_cycle_id=cycle.id,
+                parent_task_id=source.id,
+                title=f"Landed write {index}",
+                payloads=[{"type": "create"}],
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                context={
+                    "landed_on_integration": True,
+                    "merge_commit_sha": f"{index + 1:040x}",
+                },
+            )
+            for index in range(20)
+        ]
+    )
+    await db_session.flush()
+
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    assert spawned.spawned is True
+    review = await db_session.get(Task, spawned.task_id)
+    outcome = next(
+        item
+        for item in review.first_payload["evidence_packet"]
+        if item["semantic_role"] == "parent_outcome"
+    )
+    assert "evidence_metadata_truncated" not in outcome
+    snapshot = outcome["evidence_metadata"]["snapshot"]
+    assert len(snapshot["landed_outcomes"]) == 4
+    coverage = snapshot["evidence_coverage"]["landed_outcomes"]
+    assert coverage["total_count"] == 20
+    assert coverage["omitted_count"] == 16
+    assert coverage["semantic_index_included_count"] == 3
+    assert snapshot["missing_required_evidence"] == []
+
+
+@pytest.mark.asyncio
+async def test_landed_outcome_preserves_every_artifact_semantic(db_session):
+    project, cycle, source = await _cycle_with_source(db_session)
+    landed_task = Task(
         project_id=project.id,
         discovery_cycle_id=cycle.id,
         parent_task_id=source.id,
-        title="Completed outcome",
+        title="Landed write with artifact history",
         payloads=[{"type": "create"}],
         status=TaskStatus.COMPLETED,
         created_by="ORCHESTRATOR",
+        context={
+            "landed_on_integration": True,
+            "merge_commit_sha": "a" * 40,
+        },
     )
-    failed = Task(
-        project_id=project.id,
-        discovery_cycle_id=cycle.id,
-        parent_task_id=source.id,
-        title="Failed outcome",
-        payloads=[{"type": "create"}],
-        status=TaskStatus.FAILED,
-        created_by="ORCHESTRATOR",
-    )
-    db_session.add(extra_completed)
-    db_session.add(failed)
+    db_session.add(landed_task)
     await db_session.flush()
-    for logical_key in ("first", "second"):
+    db_session.add_all(
+        [
+            Artifact(
+                task_id=landed_task.id,
+                artifact_type=ArtifactType.RESEARCH_FINDINGS,
+                logical_key=f"landed-artifact-{index}",
+                storage_uri=f"gs://bucket/landed-{index}.json",
+                logs=(
+                    "REJECT: oldest artifact exposes a critical failure"
+                    if index == 0
+                    else f"artifact {index} passed"
+                ),
+            )
+            for index in range(5)
+        ]
+    )
+    await db_session.flush()
+
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    assert spawned.spawned is True
+    review = await db_session.get(Task, spawned.task_id)
+    outcome = next(
+        item
+        for item in review.first_payload["evidence_packet"]
+        if item["semantic_role"] == "parent_outcome"
+    )
+    landed = outcome["evidence_metadata"]["snapshot"]["landed_outcomes"][0]
+    assert len(landed["artifacts"]) == 5
+    assert "oldest artifact exposes a critical failure" in landed["artifacts"][0][
+        "semantic_summary"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_long_complete_evidence_shrinks_to_total_packet_budget(db_session):
+    project, cycle, source = await _cycle_with_source(db_session)
+    document_base = _utcnow()
+    db_session.add_all(
+        [
+            KnowledgeDocument(
+                project_id=project.id,
+                source_task_id=source.id,
+                source_kind="research",
+                title=f"Long outcome {index}",
+                summary=f"Outcome {index}: " + ("evidence " * 260),
+                body="# Full durable result",
+                topic="bounded-discovery",
+                source_citations=[],
+                forward_quality_verdict={"passed": True},
+                created_at=document_base + timedelta(microseconds=index),
+            )
+            for index in range(12)
+        ]
+    )
+    await db_session.flush()
+
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    assert spawned.spawned is True
+    review = await db_session.get(Task, spawned.task_id)
+    outcome = next(
+        item
+        for item in review.first_payload["evidence_packet"]
+        if item["semantic_role"] == "parent_outcome"
+    )
+    snapshot = outcome["evidence_metadata"]["snapshot"]
+    assert snapshot["missing_required_evidence"] == []
+    assert len(discovery_review_packet._canonical_json(snapshot)) <= (
+        discovery_review_packet.DISCOVERY_REVIEW_EVIDENCE_METADATA_CHARS
+    )
+    assert all(len(item["summary"]) <= 500 for item in snapshot["knowledge_outcomes"])
+    manifest = review.first_payload["evidence_packet_manifest"]
+    assert manifest["binding_decision_allowed"] is False
+    assert manifest["required_evidence_omitted"] is True
+    with pytest.raises(DiscoveryReviewResultError, match="incomplete packet semantics"):
+        await complete_discovery_review(
+            db_session,
+            task=review,
+            raw_result=_result(cycle, review),
+        )
+
+
+@pytest.mark.asyncio
+async def test_included_knowledge_preserves_full_authored_semantics(db_session):
+    project, cycle, source = await _cycle_with_source(db_session)
+    decisive_tail = "REJECT: hidden regression after display prefix"
+    db_session.add(
+        KnowledgeDocument(
+            project_id=project.id,
+            source_task_id=source.id,
+            source_kind="research",
+            title="Full authored outcome",
+            summary=("x" * 700) + decisive_tail,
+            body="# Durable result",
+            topic="semantic-completeness",
+            source_citations=[],
+            forward_quality_verdict={"passed": True},
+        )
+    )
+    await db_session.flush()
+
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    assert spawned.spawned is True
+    review = await db_session.get(Task, spawned.task_id)
+    outcome = next(
+        item
+        for item in review.first_payload["evidence_packet"]
+        if item["semantic_role"] == "parent_outcome"
+    )
+    document = outcome["evidence_metadata"]["snapshot"]["knowledge_outcomes"][0]
+    assert len(document["summary"]) == 500
+    assert decisive_tail in document["semantic_summary"]
+
+
+@pytest.mark.asyncio
+async def test_mixed_large_receipt_compacts_instead_of_waiting_for_evidence(db_session):
+    project, cycle, source = await _cycle_with_source(db_session)
+    source.plan_output = [
+        {"title": f"Research {index}", "evidence": "r" * 2_000}
+        for index in range(6)
+    ]
+    source.context = {FINALIZED_RESEARCH_FINDINGS_KEY: True}
+    tasks = []
+    for index in range(4):
+        tasks.append(
+            Task(
+                project_id=project.id,
+                discovery_cycle_id=cycle.id,
+                parent_task_id=source.id,
+                title=f"Landed write {index}",
+                payloads=[{"type": "create"}],
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                context={
+                    "landed_on_integration": True,
+                    "merge_commit_sha": f"{index + 1:040x}",
+                },
+            )
+        )
+    for index in range(6):
+        tasks.append(
+            Task(
+                project_id=project.id,
+                discovery_cycle_id=cycle.id,
+                parent_task_id=source.id,
+                title=f"Compute experiment {index}",
+                payloads=[{"type": "compute_experiment"}],
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                context={
+                    "acceptance_verdict": {"summary": "v" * 4_000},
+                    "acceptance_evidence_result": {"summary": "e" * 4_000},
+                },
+            )
+        )
+    db_session.add_all([source, *tasks])
+    await db_session.flush()
+    long_uri = "gs://bucket/" + ("u" * 990)
+    for task in tasks[:4]:
+        db_session.add_all(
+            [
+                Artifact(
+                    task_id=task.id,
+                    artifact_type=ArtifactType.RESEARCH_FINDINGS,
+                    logical_key=f"{artifact_index}-" + ("k" * 230),
+                    storage_uri=long_uri,
+                    pr_url="https://example.test/" + ("p" * 970),
+                )
+                for artifact_index in range(4)
+            ]
+        )
+    for index, task in enumerate(tasks[4:]):
         db_session.add(
             Artifact(
-                task_id=source.id,
-                artifact_type=ArtifactType.RESEARCH_FINDINGS,
-                logical_key=logical_key,
-                storage_uri=f"gs://test/{source.id}/{logical_key}.json",
-                logs=f'{{"artifact":"{logical_key}"}}',
+                task_id=task.id,
+                artifact_type=ArtifactType.COMPUTE_RESULT,
+                logical_key=f"compute-{index}-" + ("k" * 220),
+                storage_uri=long_uri,
+                pr_url="https://example.test/" + ("p" * 970),
             )
         )
     await db_session.flush()
 
     spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    assert spawned.spawned is True
+    assert spawned.reason == "spawned"
     review = await db_session.get(Task, spawned.task_id)
-    manifest = review.first_payload["evidence_packet_manifest"]
-    task_source_ids = {
-        entry["source_id"]
-        for entry in review.first_payload["evidence_packet"]
-        if entry.get("source_kind") == "task"
+    outcome = next(
+        item
+        for item in review.first_payload["evidence_packet"]
+        if item["semantic_role"] == "parent_outcome"
+    )
+    assert "evidence_metadata_truncated" not in outcome
+    snapshot = outcome["evidence_metadata"]["snapshot"]
+    assert snapshot["receipt_compacted_to_budget"] is True
+    assert snapshot["missing_required_evidence"] == []
+    assert len(discovery_review_packet._canonical_json(snapshot)) <= (
+        discovery_review_packet.DISCOVERY_REVIEW_EVIDENCE_METADATA_CHARS
+    )
+
+
+def test_parser_requires_one_exact_total_action():
+    cycle_id = str(uuid.uuid4())
+    base = {
+        "cycle_id": cycle_id,
+        "reviewed_revision": 2,
+        "action": "advance",
+        "summary": "Advance on the evidence.",
+        "evidence_citations": [str(uuid.uuid4())],
+        "next_bet": _next_bet(),
+        "park_reason": None,
+        "resume_condition": None,
+        "operator_question": None,
     }
-
-    assert str(source.id) in task_source_ids
-    assert str(failed.id) in task_source_ids
-    assert str(extra_completed.id) not in task_source_ids
-    assert manifest["tasks"] == {"total": 3, "included": 2, "omitted": 1}
-    assert manifest["artifacts"] == {
-        "total": 2,
-        "required_total": 2,
-        "included": 1,
-        "omitted": 1,
-        "omitted_required": 1,
-        "omitted_optional": 0,
-    }
-    assert manifest["required_evidence_omitted"] is True
-    assert manifest["incomplete"] is True
-    assert {"task_limit", "artifact_limit"} <= set(
-        manifest["incomplete_reasons"]
-    )
-
-    evidence_ids = [
-        entry["evidence_id"]
-        for entry in review.first_payload["evidence_packet"]
-        if entry.get("evidence_id")
-    ]
-    with pytest.raises(
-        DiscoveryReviewResultError,
-        match="incomplete packet permits only",
-    ):
-        await complete_discovery_review(
-            db_session,
-            task=review,
-            raw_result=_valid_result(cycle, review, evidence_ids),
-        )
-    assert cycle.state == "review_blocked"
+    assert parse_discovery_review_result(base)["action"] == "advance"
+    with pytest.raises(DiscoveryReviewResultError, match="exactly"):
+        parse_discovery_review_result({**base, "review_round": 2})
+    with pytest.raises(DiscoveryReviewResultError, match="invalid"):
+        parse_discovery_review_result({**base, "action": "inconclusive"})
+    with pytest.raises(DiscoveryReviewResultError, match="evidence citations"):
+        parse_discovery_review_result({**base, "evidence_citations": []})
 
 
 @pytest.mark.asyncio
-async def test_redundant_artifact_history_is_optional_not_missing_evidence(
-    db_session,
-    monkeypatch,
-):
-    monkeypatch.setattr(
-        discovery_review_packet, "DISCOVERY_REVIEW_MAX_ARTIFACTS", 1
-    )
+async def test_decision_is_invalidated_if_cohort_changes_after_packet(db_session):
     _, cycle, source = await _cycle_with_source(db_session)
-    now = _utcnow()
-    older = Artifact(
-        task_id=source.id,
-        artifact_type=ArtifactType.RESEARCH_FINDINGS,
-        logical_key="bounded-result",
-        storage_uri=f"gs://test/{source.id}/older.json",
-        logs='{"result":"superseded"}',
-        created_at=now - timedelta(minutes=1),
-    )
-    newest = Artifact(
-        task_id=source.id,
-        artifact_type=ArtifactType.RESEARCH_FINDINGS,
-        logical_key="bounded-result",
-        storage_uri=f"gs://test/{source.id}/newest.json",
-        logs='{"result":"authoritative"}',
-        created_at=now,
-    )
-    db_session.add(older)
-    db_session.add(newest)
-    await db_session.flush()
-
     spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
     review = await db_session.get(Task, spawned.task_id)
-    manifest = review.first_payload["evidence_packet_manifest"]
-    artifact_entries = [
-        entry
-        for entry in review.first_payload["evidence_packet"]
-        if entry.get("source_kind") == "artifact"
-    ]
-
-    assert [entry["source_id"] for entry in artifact_entries] == [str(newest.id)]
-    assert manifest["artifacts"] == {
-        "total": 2,
-        "required_total": 1,
-        "included": 1,
-        "omitted": 1,
-        "omitted_required": 0,
-        "omitted_optional": 1,
-    }
-    assert manifest["required_evidence_omitted"] is False
-    assert manifest["incomplete"] is True
-    assert "artifact_redundancy_deduplicated" in manifest["incomplete_reasons"]
-
-    await complete_discovery_review(
-        db_session,
-        task=review,
-        raw_result=_valid_result(
-            cycle,
-            review,
-            [entry["evidence_id"] for entry in review.first_payload["evidence_packet"]],
-        ),
-    )
-    assert cycle.state == "reviewed"
-
-
-@pytest.mark.asyncio
-async def test_artifact_selection_prioritizes_outcome_over_repo_pointer(
-    db_session,
-    monkeypatch,
-):
-    monkeypatch.setattr(
-        discovery_review_packet, "DISCOVERY_REVIEW_MAX_ARTIFACTS", 1
-    )
-    _, cycle, source = await _cycle_with_source(db_session)
-    now = _utcnow()
-    outcome = Artifact(
-        task_id=source.id,
-        artifact_type=ArtifactType.RESEARCH_FINDINGS,
-        logical_key="outcome",
-        logs='{"result":"supported"}',
-        created_at=now - timedelta(minutes=1),
-    )
-    repo_pointer = Artifact(
-        task_id=source.id,
-        artifact_type=ArtifactType.GIT_COMMIT,
-        logical_key="implementation",
-        commit_hash="a" * 40,
-        created_at=now,
-    )
-    db_session.add(outcome)
-    db_session.add(repo_pointer)
-    await db_session.flush()
-
-    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
-    review = await db_session.get(Task, spawned.task_id)
-    artifact_entries = [
-        entry
-        for entry in review.first_payload["evidence_packet"]
-        if entry.get("source_kind") == "artifact"
-    ]
-
-    assert [entry["source_id"] for entry in artifact_entries] == [str(outcome.id)]
-    assert (
-        review.first_payload["evidence_packet_manifest"]["artifacts"][
-            "omitted_required"
-        ]
-        == 1
-    )
-
-
-@pytest.mark.asyncio
-async def test_packet_bounds_oversized_task_text_and_legacy_metadata(db_session):
-    _, cycle, source = await _cycle_with_source(db_session)
-    source.title = "T" * 10_000
-    source.description = "D" * 20_000
-    oversized = DiscoveryEvidenceItem(
-        cycle_id=cycle.id,
-        semantic_role="external_observation",
-        source_kind="external",
-        source_id="oversized-metadata",
-        checksum="a" * 64,
-        content_type="application/json",
-        evidence_metadata={"blob": "x" * 100_000},
-        dedupe_key="external:oversized-metadata",
-    )
-    db_session.add(source)
-    db_session.add(oversized)
-    await db_session.flush()
-
-    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
-    review = await db_session.get(Task, spawned.task_id)
-    packet = review.first_payload["evidence_packet"]
-    manifest = review.first_payload["evidence_packet_manifest"]
-    source_entry = next(
-        entry for entry in packet if entry.get("source_id") == str(source.id)
-    )
-    source_snapshot = source_entry["evidence_metadata"]["snapshot"]
-    oversized_entry = next(
-        entry
-        for entry in packet
-        if entry.get("source_id") == "oversized-metadata"
-    )
-
-    assert (
-        len(source_snapshot["title"])
-        == discovery_review_packet.DISCOVERY_REVIEW_TASK_TITLE_CHARS
-    )
-    assert (
-        len(source_snapshot["description"])
-        == discovery_review_packet.DISCOVERY_REVIEW_TASK_DESCRIPTION_CHARS
-    )
-    assert oversized_entry["evidence_metadata_truncated"] is True
-    assert oversized_entry["evidence_metadata"]["truncated"] is True
-    assert (
-        len(oversized_entry["evidence_metadata"]["excerpt"])
-        == discovery_review_packet.DISCOVERY_REVIEW_EVIDENCE_METADATA_CHARS
-    )
-    assert len(json.dumps(packet)) < 20_000
-    assert manifest["required_evidence_omitted"] is True
-    assert "evidence_metadata_truncated" in manifest["incomplete_reasons"]
-
-    evidence_ids = [entry["evidence_id"] for entry in packet]
-    with pytest.raises(
-        DiscoveryReviewResultError,
-        match="incomplete packet permits only",
-    ):
-        await complete_discovery_review(
-            db_session,
-            task=review,
-            raw_result=_valid_result(cycle, review, evidence_ids),
-        )
-
-
-@pytest.mark.asyncio
-async def test_oversized_decision_snapshot_is_bounded_and_fails_closed(db_session):
-    _, cycle, _ = await _cycle_with_source(db_session)
-    cycle.intent_snapshot = {"goal": "x" * 50_000}
-    db_session.add(cycle)
-    await db_session.flush()
-
-    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
-    review = await db_session.get(Task, spawned.task_id)
-    payload = review.first_payload
-    manifest = payload["evidence_packet_manifest"]
-
-    assert payload["intent_snapshot"]["snapshot_truncated"] is True
-    assert len(payload["intent_snapshot"]["excerpt"]) == (
-        discovery_review_packet.DISCOVERY_REVIEW_DECISION_SNAPSHOT_CHARS
-    )
-    assert len(json.dumps(payload["intent_snapshot"])) < 9_000
-    assert manifest["decision_snapshots"]["intent"]["truncated"] is True
-    assert manifest["required_evidence_omitted"] is True
-    assert "intent_snapshot_truncated" in manifest["incomplete_reasons"]
-
-    with pytest.raises(
-        DiscoveryReviewResultError,
-        match="incomplete packet permits only",
-    ):
-        await complete_discovery_review(
-            db_session,
-            task=review,
-            raw_result=_valid_result(
-                cycle,
-                review,
-                [
-                    entry["evidence_id"]
-                    for entry in payload["evidence_packet"]
-                ],
-            ),
-        )
-
-
-@pytest.mark.asyncio
-async def test_incomplete_limited_packet_allows_inconclusive(db_session, monkeypatch):
-    monkeypatch.setattr(discovery_review_packet, "DISCOVERY_REVIEW_MAX_TASKS", 1)
-    _, cycle, source = await _cycle_with_source(db_session)
-    omitted = Task(
+    result = _result(cycle, review)
+    review.status = TaskStatus.COMPLETED
+    late_materialization = Task(
         project_id=source.project_id,
         discovery_cycle_id=cycle.id,
         parent_task_id=source.id,
-        title="Omitted outcome",
-        payloads=[{"type": "create"}],
+        title="Late materialized finding",
+        payloads=[{"type": "research"}],
         status=TaskStatus.COMPLETED,
+        post_commit_pending=True,
         created_by="ORCHESTRATOR",
     )
-    db_session.add(omitted)
+    db_session.add_all([review, late_materialization])
     await db_session.flush()
 
-    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
-    review = await db_session.get(Task, spawned.task_id)
-    evidence_ids = [
-        entry["evidence_id"]
-        for entry in review.first_payload["evidence_packet"]
-        if entry.get("evidence_id")
-    ]
-    result = _valid_result(
-        cycle,
-        review,
-        evidence_ids,
-        verdict="inconclusive",
-    )
-
-    await complete_discovery_review(
+    invalidated = await complete_discovery_review(
         db_session,
         task=review,
         raw_result=result,
     )
+    assert invalidated.id == cycle.id
+    assert cycle.state == "review_pending"
+    assert cycle.review_task_id is None
+    assert cycle.review_result == {
+        "status": "REVIEW_PACKET_INVALIDATED",
+        "reason": "cohort_post_commit_pending",
+        "stale_review_task_id": str(review.id),
+    }
 
-    assert cycle.state == "reviewed"
-    assert cycle.verdict == "inconclusive"
+    late_materialization.post_commit_pending = False
+    db_session.add(late_materialization)
+    await db_session.flush()
+    replacement = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    assert replacement.spawned is True
+    assert replacement.task_id != review.id
 
 
 @pytest.mark.asyncio
-async def test_review_control_task_is_authorized_without_descendant_charge(db_session):
+async def test_binding_action_must_cite_parent_outcome_not_only_manifest(db_session):
     _, cycle, _ = await _cycle_with_source(db_session)
     spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
     review = await db_session.get(Task, spawned.task_id)
-
-    decision = await authorize_discovery_task_execution(
-        db_session,
-        task=review,
+    manifest_id = next(
+        item["evidence_id"]
+        for item in review.first_payload["evidence_packet"]
+        if item["semantic_role"] == "packet_manifest"
     )
+    result = _result(cycle, review)
+    result["evidence_citations"] = [manifest_id]
 
-    assert decision.allowed is True
-    assert decision.reason == "discovery_review_control_task"
-    assert decision.details == {"charged": False}
-    assert cycle.consumed_task_credits == 0
+    with pytest.raises(DiscoveryReviewResultError, match="parent outcome"):
+        await complete_discovery_review(db_session, task=review, raw_result=result)
+    assert cycle.state == "review_blocked"
 
 
 @pytest.mark.asyncio
-async def test_valid_result_transitions_and_notifies_without_resident(db_session):
-    _, cycle, _ = await _cycle_with_source(db_session)
-    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
-    review = await db_session.get(Task, spawned.task_id)
-    evidence_ids = [
-        row
-        for row in (
-            await db_session.execute(
-                select(DiscoveryEvidenceItem.id).where(
-                    DiscoveryEvidenceItem.cycle_id == cycle.id
-                )
-            )
-        )
-        .scalars()
-        .all()
-    ]
-
-    await complete_discovery_review(
-        db_session,
-        task=review,
-        raw_result=json.dumps(_valid_result(cycle, review, evidence_ids)),
-    )
-    await db_session.flush()
-
-    assert cycle.state == "reviewed"
-    assert cycle.verdict == "renew"
-    successor = (
-        await db_session.execute(
-            select(DiscoveryCycle).where(
-                DiscoveryCycle.project_id == cycle.project_id,
-                DiscoveryCycle.direction_key == cycle.direction_key,
-                DiscoveryCycle.generation == cycle.generation + 1,
-            )
-        )
-    ).scalar_one()
-    assert successor.state == "open"
-    assert successor.source_research_task_id is None
-    assert successor.phase == cycle.phase
-    assert successor.bet_snapshot == cycle.bet_snapshot
-    assert successor.task_credit_limit == cycle.task_credit_limit
-    message = (
-        await db_session.execute(
-            select(ProjectMessage).where(
-                ProjectMessage.project_id == cycle.project_id,
-                ProjectMessage.from_task_id == review.id,
-            )
-        )
-    ).scalar_one()
-    assert message.status == "open"
-    assert message.context["event_type"] == "discovery.review_completed"
-    assert message.context["cycle_id"] == str(cycle.id)
-    assert message.context["next_cycle_id"] == str(successor.id)
-    assert message.context["review_result"]["next_bet"] == successor.bet_snapshot
-    assert "resident_wake_barrier" not in message.context
-
-
-@pytest.mark.asyncio
-async def test_automatic_successor_keeps_frozen_direction_proof_contract(db_session):
-    _, cycle, _ = await _cycle_with_source(db_session, state="reviewed")
-    frozen_direction = {
-        "id": cycle.direction_key,
-        "text": "Prove the bounded mechanism",
-        "context": {
-            "success_evidence": "The probe improves the target outcome.",
-            "retirement_condition": "Retire after two probes without improvement.",
-            "implementation_constraints": "Reuse the current runtime.",
-        },
-    }
-    cycle.bet_snapshot = {
-        "direction": frozen_direction,
-        "hypothesis": "the first mechanism helps",
-    }
-    await db_session.flush()
-
-    successor = await discovery_review._create_successor_cycle(
-        db_session,
-        cycle=cycle,
-        result={
-            "next_bet": {"hypothesis": "a narrower mechanism helps"},
-            "recommended_phase": cycle.phase,
-            "recommended_limits": {
-                "task_credit_limit": None,
-                "attempt_credit_limit": None,
-                "concurrency_limit": None,
-            },
-        },
-        now=_utcnow(),
-    )
-
-    assert successor.bet_snapshot == {
-        "direction": frozen_direction,
-        "hypothesis": "a narrower mechanism helps",
-    }
-    assert successor.mechanism_fingerprint == discovery_review._checksum(
-        successor.bet_snapshot
-    )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("verdict", "delta_kind", "expected_reason"),
-    [
-        ("renew", "next_bet", "next_bet"),
-        ("inconclusive", "phase", "phase"),
-        ("renew", "limits", "task_credit_limit"),
-    ],
-)
-async def test_routine_label_cannot_hide_consequential_state_delta(
-    db_session,
-    verdict,
-    delta_kind,
-    expected_reason,
+async def test_advance_atomically_creates_successor_and_dispatch_request(
+    db_session, monkeypatch
 ):
-    _, cycle, _ = await _cycle_with_source(db_session)
+    _, cycle, _ = await _cycle_with_source(db_session, generation=99)
     spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
-    first_review = await db_session.get(Task, spawned.task_id)
-    evidence_ids = [
-        entry["evidence_id"]
-        for entry in first_review.first_payload["evidence_packet"]
-    ]
-    overrides = {"verdict": verdict}
-    if delta_kind == "next_bet":
-        overrides["next_bet"] = {"hypothesis": "materially different bet"}
-    elif delta_kind == "phase":
-        overrides["recommended_phase"] = "demonstrate"
-    else:
-        overrides["recommended_limits"] = {
-            "task_credit_limit": cycle.task_credit_limit - 1,
-            "attempt_credit_limit": None,
-            "concurrency_limit": None,
-        }
+    review = await db_session.get(Task, spawned.task_id)
 
-    await complete_discovery_review(
+    completed = await complete_discovery_review(
         db_session,
-        task=first_review,
-        raw_result=_valid_result(
-            cycle,
-            first_review,
-            evidence_ids,
-            **overrides,
-        ),
-    )
-    confirmation = await db_session.get(Task, cycle.review_task_id)
-
-    assert confirmation.id != first_review.id
-    assert confirmation.first_payload["review_round"] == 2
-    assert confirmation.first_payload["effort"] == "max"
-    assert expected_reason in cycle.review_result.get("confirmation_reasons", [])
-
-    await complete_discovery_review(
-        db_session,
-        task=confirmation,
-        raw_result=_valid_result(
-            cycle,
-            confirmation,
-            evidence_ids,
-            **overrides,
-        ),
+        task=review,
+        raw_result=_result(cycle, review),
     )
     await db_session.flush()
-    message = (
-        await db_session.execute(
-            select(ProjectMessage).where(
-                ProjectMessage.from_task_id == confirmation.id
-            )
-        )
-    ).scalar_one()
+
+    assert completed.id == cycle.id
     assert cycle.state == "reviewed"
-    assert message.context["resident_wake_barrier"] is True
+    assert cycle.verdict == "advance"
+    successor = await db_session.get(
+        DiscoveryCycle, uuid.UUID(cycle.review_result["next_cycle_id"])
+    )
+    request = await db_session.get(
+        StrategicSpawnRequest,
+        uuid.UUID(cycle.review_result["successor_spawn_request_id"]),
+    )
+    assert successor is not None
+    assert successor.state == "open"
+    assert successor.generation == 100
+    assert successor.bet_snapshot["direction"]["context"] == cycle.bet_snapshot[
+        "direction"
+    ]["context"]
+    assert request is not None
+    assert request.state == "deferred"
+    assert request.not_before is not None
+    assert request.discovery_cycle_id == successor.id
+    assert request.parent_task_id == review.id
+    assert request.specification["task"]["payloads"][0]["type"] == "research"
+
+    monkeypatch.setattr(
+        strategic_spawn_requests,
+        "_budget_guard_for_request",
+        _no_budget_guard,
+    )
+    drained = await strategic_spawn_requests.drain_deferred_spawn_requests(
+        db_session,
+        project_id=cycle.project_id,
+    )
+    assert [item.id for item in drained] == [request.id]
+    assert request.state == "dispatched"
+    source_task = await db_session.get(Task, request.task_id)
+    assert source_task is not None
+    assert source_task.discovery_cycle_id == successor.id
+    assert successor.source_research_task_id == source_task.id
 
 
 @pytest.mark.asyncio
-async def test_consequential_verdict_requires_matching_independent_review(db_session):
-    _, cycle, _ = await _cycle_with_source(db_session)
-    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
-    first_review = await db_session.get(Task, spawned.task_id)
-    assert first_review.first_payload["effort"] == "medium"
-    evidence_ids = list(
-        (
-            await db_session.execute(
-                select(DiscoveryEvidenceItem.id).where(
-                    DiscoveryEvidenceItem.cycle_id == cycle.id
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-
-    await complete_discovery_review(
-        db_session,
-        task=first_review,
-        raw_result=_valid_result(
-            cycle,
-            first_review,
-            evidence_ids,
-            verdict="pivot",
-            next_bet={"hypothesis": "try the paired constructor mechanism"},
-        ),
-    )
-    confirmation = await db_session.get(Task, cycle.review_task_id)
-
-    assert confirmation.id != first_review.id
-    assert confirmation.first_payload["review_round"] == 2
-    assert confirmation.first_payload["effort"] == "max"
-    assert confirmation.first_payload["prior_review_task_id"] == str(first_review.id)
-    assert confirmation.first_payload["confirmation_proposal"]["verdict"] == "pivot"
-    assert cycle.state == "reviewing"
-    assert cycle.verdict is None
-
-    await complete_discovery_review(
-        db_session,
-        task=confirmation,
-        raw_result=_valid_result(
-            cycle,
-            confirmation,
-            evidence_ids,
-            verdict="pivot",
-            next_bet={"hypothesis": "try the paired constructor mechanism"},
-        ),
-    )
-
-    cycle_tasks = (
-        await db_session.execute(
-            select(Task).where(Task.discovery_cycle_id == cycle.id)
-        )
-    ).scalars().all()
-    review_efforts = sorted(
-        candidate.first_payload["effort"]
-        for candidate in cycle_tasks
-        if candidate.first_payload.get("type") == "discovery_review"
-    )
-    assert review_efforts == ["max", "medium"]
-
-    assert cycle.state == "reviewed"
-    assert cycle.verdict == "pivot"
-    successor = (
-        await db_session.execute(
-            select(DiscoveryCycle).where(
-                DiscoveryCycle.project_id == cycle.project_id,
-                DiscoveryCycle.direction_key == cycle.direction_key,
-                DiscoveryCycle.generation == 2,
-            )
-        )
-    ).scalar_one()
-    assert successor.bet_snapshot == {
-        "hypothesis": "try the paired constructor mechanism"
-    }
-    await db_session.flush()
-    message = (
-        await db_session.execute(
-            select(ProjectMessage).where(
-                ProjectMessage.from_task_id == confirmation.id
-            )
-        )
-    ).scalar_one()
-    assert message.context["event_type"] == "discovery.review_completed"
-    assert message.context["resident_wake_barrier"] is True
-    assert message.context["policy_status"] == "continued"
-
-
-@pytest.mark.asyncio
-async def test_pause_between_reviews_defers_frontier_confirmation(db_session):
+@pytest.mark.parametrize("action", ["park", "stop"])
+async def test_park_and_stop_are_terminal_decisions_without_successors(
+    db_session, action
+):
     project, cycle, _ = await _cycle_with_source(db_session)
     spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
-    first_review = await db_session.get(Task, spawned.task_id)
-    evidence_ids = list(
-        (
-            await db_session.execute(
-                select(DiscoveryEvidenceItem.id).where(
-                    DiscoveryEvidenceItem.cycle_id == cycle.id
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-    project.paused = True
-    db_session.add(project)
-    await db_session.flush()
+    review = await db_session.get(Task, spawned.task_id)
 
     await complete_discovery_review(
         db_session,
-        task=first_review,
-        raw_result=_valid_result(
-            cycle,
-            first_review,
-            evidence_ids,
-            verdict="pivot",
-        ),
+        task=review,
+        raw_result=_result(cycle, review, action=action),
     )
-
-    assert cycle.state == "review_pending"
-    assert cycle.review_task_id == first_review.id
-    assert cycle.review_result["confirmation_deferred"] == "project_paused"
-    paused = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
-    assert paused.spawned is False
-    assert paused.reason == "project_paused"
-
-    project.paused = False
-    db_session.add(project)
     await db_session.flush()
-    resumed = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
-    confirmation = await db_session.get(Task, resumed.task_id)
-    assert resumed.reason == "confirmation_spawned"
-    assert confirmation.id != first_review.id
-    assert confirmation.first_payload["review_round"] == 2
-    assert confirmation.first_payload["effort"] == "max"
-    assert cycle.state == "reviewing"
+    await db_session.refresh(project)
+
+    assert cycle.state == "reviewed"
+    assert cycle.verdict == action
+    assert "next_cycle_id" not in cycle.review_result
+    direction = next(item for item in project.directions if item["id"] == cycle.direction_key)
+    if action == "park":
+        assert direction["status"] == "paused"
+        assert direction["discovery_resume_condition"]
+    else:
+        assert direction["status"] == "retired"
+        assert direction["retirement_outcome"] == "stopped"
 
 
 @pytest.mark.asyncio
-async def test_disagreeing_confirmation_wakes_resident_without_continuing(
-    db_session,
+@pytest.mark.parametrize("action", ["advance", "park", "stop"])
+async def test_binding_decision_rejects_staged_direction_authority(
+    db_session, action
 ):
-    _, cycle, _ = await _cycle_with_source(db_session)
-    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
-    first_review = await db_session.get(Task, spawned.task_id)
-    evidence_ids = list(
-        (
-            await db_session.execute(
-                select(DiscoveryEvidenceItem.id).where(
-                    DiscoveryEvidenceItem.cycle_id == cycle.id
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-    await complete_discovery_review(
-        db_session,
-        task=first_review,
-        raw_result=_valid_result(
-            cycle,
-            first_review,
-            evidence_ids,
-            verdict="expand",
-        ),
-    )
-    confirmation = await db_session.get(Task, cycle.review_task_id)
-
-    await complete_discovery_review(
-        db_session,
-        task=confirmation,
-        raw_result=_valid_result(
-            cycle,
-            confirmation,
-            evidence_ids,
-            verdict="pivot",
-        ),
-    )
-    await db_session.flush()
-
-    assert cycle.state == "review_blocked"
-    assert cycle.verdict == "ask_operator"
-    assert cycle.review_result["error"] == "independent reviews disagree"
-    message = (
-        await db_session.execute(
-            select(ProjectMessage).where(
-                ProjectMessage.from_task_id == confirmation.id
-            )
-        )
-    ).scalar_one()
-    assert message.context["event_type"] == "discovery.review_completed"
-    assert message.context["resident_wake_barrier"] is True
-    assert message.context["policy_status"] == "resident_adjudication_required"
-
-
-@pytest.mark.asyncio
-async def test_generation_cap_prevents_unbounded_autonomous_renewal(db_session):
-    _, cycle, _ = await _cycle_with_source(db_session)
-    cycle.generation = discovery_review.MAX_AUTONOMOUS_DISCOVERY_GENERATIONS
-    await db_session.flush()
+    project, cycle, _ = await _cycle_with_source(db_session)
     spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
     review = await db_session.get(Task, spawned.task_id)
-    evidence_ids = list(
-        (
-            await db_session.execute(
-                select(DiscoveryEvidenceItem.id).where(
-                    DiscoveryEvidenceItem.cycle_id == cycle.id
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-
-    await complete_discovery_review(
-        db_session,
-        task=review,
-        raw_result=_valid_result(cycle, review, evidence_ids),
-    )
-    await db_session.flush()
-
-    successors = (
-        await db_session.execute(
-            select(DiscoveryCycle).where(
-                DiscoveryCycle.project_id == cycle.project_id,
-                DiscoveryCycle.direction_key == cycle.direction_key,
-                DiscoveryCycle.generation > cycle.generation,
-            )
-        )
-    ).scalars().all()
-    assert successors == []
-    message = (
-        await db_session.execute(
-            select(ProjectMessage).where(ProjectMessage.from_task_id == review.id)
-        )
-    ).scalar_one()
-    assert message.context["event_type"] == "discovery.review_completed"
-    assert message.context["resident_wake_barrier"] is True
-    assert (
-        message.context["policy_status"]
-        == "autonomous_generation_cap_reached"
-    )
-
-
-@pytest.mark.asyncio
-async def test_stop_verdict_is_confirmed_then_wakes_resident(db_session):
-    _, cycle, _ = await _cycle_with_source(db_session)
-    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
-    review = await db_session.get(Task, spawned.task_id)
-    evidence_ids = list(
-        (
-            await db_session.execute(
-                select(DiscoveryEvidenceItem.id).where(
-                    DiscoveryEvidenceItem.cycle_id == cycle.id
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-
-    await complete_discovery_review(
-        db_session,
-        task=review,
-        raw_result=_valid_result(
-            cycle,
-            review,
-            evidence_ids,
-            verdict="stop",
-            next_bet=None,
-        ),
-    )
-    confirmation = await db_session.get(Task, cycle.review_task_id)
-    assert confirmation.id != review.id
-    assert confirmation.first_payload["effort"] == "max"
-    await complete_discovery_review(
-        db_session,
-        task=confirmation,
-        raw_result=_valid_result(
-            cycle,
-            confirmation,
-            evidence_ids,
-            verdict="stop",
-            next_bet=None,
-        ),
-    )
-    await db_session.flush()
-
-    message = (
-        await db_session.execute(
-            select(ProjectMessage).where(
-                ProjectMessage.from_task_id == confirmation.id
-            )
-        )
-    ).scalar_one()
-    assert cycle.state == "reviewed"
-    assert message.context["event_type"] == "discovery.review_completed"
-    assert message.context["resident_wake_barrier"] is True
-    assert message.context["policy_status"] == "resident_review_required"
-
-
-@pytest.mark.asyncio
-async def test_ask_operator_wakes_resident_without_confirmation(db_session):
-    _, cycle, _ = await _cycle_with_source(db_session)
-    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
-    review = await db_session.get(Task, spawned.task_id)
-
-    await complete_discovery_review(
-        db_session,
-        task=review,
-        raw_result=_valid_result(
-            cycle,
-            review,
-            [],
-            verdict="ask_operator",
-            next_bet=None,
-            operator_question="Should this direction be retired?",
-        ),
-    )
-    await db_session.flush()
-
-    cycle_tasks = list(
-        (
-            await db_session.execute(
-                select(Task).where(Task.discovery_cycle_id == cycle.id)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    message = (
-        await db_session.execute(
-            select(ProjectMessage).where(ProjectMessage.from_task_id == review.id)
-        )
-    ).scalar_one()
-    review_tasks = [
-        task
-        for task in cycle_tasks
-        if task.first_payload.get("type") == "discovery_review"
+    project.directions = [
+        {**direction, "status": "staged"}
+        if direction["id"] == cycle.direction_key
+        else direction
+        for direction in project.directions
     ]
-    assert [task.id for task in review_tasks] == [review.id]
-    assert cycle.state == "reviewed"
-    assert cycle.verdict == "ask_operator"
-    assert message.context["resident_wake_barrier"] is True
-    assert message.context["policy_status"] == "resident_review_required"
+    db_session.add(project)
+    await db_session.flush()
 
-
-@pytest.mark.asyncio
-async def test_expand_cannot_increase_limits_or_spawn_confirmation(db_session):
-    _, cycle, _ = await _cycle_with_source(db_session)
-    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
-    review = await db_session.get(Task, spawned.task_id)
-    evidence_ids = [
-        entry["evidence_id"]
-        for entry in review.first_payload["evidence_packet"]
-        if entry.get("evidence_id")
-    ]
-    result = _valid_result(
-        cycle,
-        review,
-        evidence_ids,
-        verdict="expand",
-        recommended_limits={
-            "task_credit_limit": cycle.task_credit_limit + 1,
-            "attempt_credit_limit": cycle.attempt_credit_limit,
-            "concurrency_limit": cycle.concurrency_limit,
-        },
-    )
-
-    with pytest.raises(
-        DiscoveryReviewResultError,
-        match="cannot increase autonomously",
-    ):
+    with pytest.raises(DiscoveryReviewResultError, match="changed to staged"):
         await complete_discovery_review(
             db_session,
             task=review,
-            raw_result=result,
+            raw_result=_result(cycle, review, action=action),
         )
 
-    cycle_tasks = list(
+    assert cycle.state == "review_blocked"
+    assert cycle.review_result["status"] == "DECISION_FAILED"
+    assert "next_cycle_id" not in cycle.review_result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["advance", "park", "stop"])
+async def test_binding_decision_rejects_edited_active_direction_authority(
+    db_session, action
+):
+    project, cycle, _ = await _cycle_with_source(db_session)
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    review = await db_session.get(Task, spawned.task_id)
+    project.directions = [
+        {**direction, "text": "Strategic replaced the active direction"}
+        if direction["id"] == cycle.direction_key
+        else direction
+        for direction in project.directions
+    ]
+    db_session.add(project)
+    await db_session.flush()
+
+    with pytest.raises(DiscoveryReviewResultError, match="authority changed"):
+        await complete_discovery_review(
+            db_session,
+            task=review,
+            raw_result=_result(cycle, review, action=action),
+        )
+
+    assert cycle.state == "review_blocked"
+    assert cycle.review_result["status"] == "DECISION_FAILED"
+
+
+@pytest.mark.asyncio
+async def test_ask_operator_wakes_resident_and_does_not_spawn_more_review(db_session):
+    _, cycle, _ = await _cycle_with_source(db_session)
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    review = await db_session.get(Task, spawned.task_id)
+
+    await complete_discovery_review(
+        db_session,
+        task=review,
+        raw_result=_result(cycle, review, action="ask_operator"),
+    )
+    await db_session.flush()
+
+    assert cycle.state == "reviewed"
+    assert cycle.verdict == "ask_operator"
+    messages = list(
         (
             await db_session.execute(
-                select(Task).where(Task.discovery_cycle_id == cycle.id)
+                select(ProjectMessage).where(ProjectMessage.from_task_id == review.id)
             )
         )
         .scalars()
         .all()
     )
-    review_tasks = [
-        task
-        for task in cycle_tasks
-        if task.first_payload.get("type") == "discovery_review"
-    ]
-    assert cycle.state == "review_blocked"
-    assert cycle.review_task_id == review.id
-    assert [task.id for task in review_tasks] == [review.id]
+    assert len(messages) == 2
+    operator_message = next(
+        message
+        for message in messages
+        if message.context["event_type"] == "discovery.operator_question"
+    )
+    assert operator_message.context["resident_wake_barrier"] is True
+    assert operator_message.context["policy_status"] == "ask_operator"
+    assert operator_message.context["audience"] == "operator-action-needed"
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("source_state", ["reviewed", "review_blocked"])
-async def test_operator_can_resume_halted_cycle_without_resident(
-    db_session,
-    source_state,
-):
-    project, cycle, _ = await _cycle_with_source(
-        db_session,
-        state=source_state,
+async def test_invalid_or_failed_decision_blocks_visibly(db_session):
+    _, cycle, _ = await _cycle_with_source(db_session)
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    review = await db_session.get(Task, spawned.task_id)
+    bad = _result(cycle, review)
+    bad["reviewed_revision"] += 1
+
+    with pytest.raises(DiscoveryReviewResultError, match="reviewed_revision"):
+        await complete_discovery_review(db_session, task=review, raw_result=bad)
+    assert cycle.state == "review_blocked"
+    assert cycle.review_result["status"] == "DECISION_FAILED"
+
+    _, second_cycle, _ = await _cycle_with_source(db_session)
+    second_spawn = await maybe_close_and_spawn_discovery_review(
+        db_session, second_cycle.id
     )
-    frozen_direction = {
-        "id": cycle.direction_key,
-        "text": "Prove the bounded mechanism",
-        "context": {
-            "success_evidence": "The probe improves the target outcome.",
-            "retirement_condition": "Retire after two probes without improvement.",
-            "implementation_constraints": "Reuse the current runtime.",
-        },
-    }
-    cycle.bet_snapshot = {
-        "direction": frozen_direction,
-        "hypothesis": "the mechanism helps",
-    }
-    cycle.verdict = "ask_operator"
+    second_review = await db_session.get(Task, second_spawn.task_id)
+    assert await block_failed_discovery_review(
+        db_session, task=second_review, reason="provider retries exhausted"
+    )
+    assert second_cycle.state == "review_blocked"
+    assert second_cycle.review_result["error"] == "provider retries exhausted"
+
+
+@pytest.mark.asyncio
+async def test_unapplicable_direction_decision_blocks_instead_of_half_applying(
+    db_session,
+):
+    project, cycle, _ = await _cycle_with_source(db_session)
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    review = await db_session.get(Task, spawned.task_id)
+    project.directions = []
+    db_session.add(project)
     await db_session.flush()
 
-    proposed_bet = {
-        "hypothesis": "operator-selected bounded alternative",
-        "direction": {
-            "id": "rewritten-direction",
-            "context": {
-                "success_evidence": "A rewritten success threshold.",
-                "retirement_condition": "Never retire.",
-            },
-        },
-    }
+    with pytest.raises(DiscoveryReviewResultError, match="missing from project"):
+        await complete_discovery_review(
+            db_session,
+            task=review,
+            raw_result=_result(cycle, review, action="stop"),
+        )
+
+    assert cycle.state == "review_blocked"
+    assert cycle.verdict is None
+    assert cycle.review_result["status"] == "DECISION_FAILED"
+
+
+@pytest.mark.asyncio
+async def test_advance_revalidates_current_direction_authority(db_session):
+    project, cycle, _ = await _cycle_with_source(db_session)
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    review = await db_session.get(Task, spawned.task_id)
+    directions = list(project.directions)
+    directions[0] = {**directions[0], "status": "retired"}
+    project.directions = directions
+    db_session.add(project)
+    await db_session.flush()
+
+    with pytest.raises(DiscoveryReviewResultError, match="authority changed"):
+        await complete_discovery_review(
+            db_session,
+            task=review,
+            raw_result=_result(cycle, review),
+        )
+    assert cycle.state == "review_blocked"
+    requests = list(
+        (
+            await db_session.execute(
+                select(StrategicSpawnRequest).where(
+                    StrategicSpawnRequest.discovery_cycle_id == cycle.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert requests == []
+
+
+@pytest.mark.asyncio
+async def test_park_revalidates_current_direction_authority(db_session):
+    project, cycle, _ = await _cycle_with_source(db_session)
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    review = await db_session.get(Task, spawned.task_id)
+    directions = list(project.directions)
+    directions[0] = {**directions[0], "status": "retired"}
+    project.directions = directions
+    db_session.add(project)
+    await db_session.flush()
+
+    with pytest.raises(DiscoveryReviewResultError, match="authority changed"):
+        await complete_discovery_review(
+            db_session,
+            task=review,
+            raw_result=_result(cycle, review, action="park"),
+        )
+    await db_session.refresh(project)
+    direction = next(item for item in project.directions if item["id"] == cycle.direction_key)
+    assert direction["status"] == "retired"
+    assert cycle.state == "review_blocked"
+
+
+@pytest.mark.asyncio
+async def test_operator_can_close_an_automatically_parked_cycle(db_session):
+    project, cycle, _ = await _cycle_with_source(db_session)
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    review = await db_session.get(Task, spawned.task_id)
+    await complete_discovery_review(
+        db_session,
+        task=review,
+        raw_result=_result(cycle, review, action="park"),
+    )
+    expected_revision = cycle.revision
+
+    closed = await resolve_discovery_cycle(
+        db_session,
+        project_id=project.id,
+        direction_key=cycle.direction_key,
+        cycle_id=cycle.id,
+        cycle_revision=expected_revision,
+        action="close",
+        note="The operator is retiring the parked direction.",
+    )
+    await db_session.flush()
+    await db_session.refresh(project)
+
+    assert closed.id == cycle.id
+    assert cycle.verdict == "stop"
+    direction = next(
+        item for item in project.directions if item["id"] == cycle.direction_key
+    )
+    assert direction["status"] == "retired"
+
+
+@pytest.mark.asyncio
+async def test_operator_continue_uses_same_atomic_successor_contract(db_session):
+    project, cycle, _ = await _cycle_with_source(db_session)
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    review = await db_session.get(Task, spawned.task_id)
+    await complete_discovery_review(
+        db_session,
+        task=review,
+        raw_result=_result(cycle, review, action="ask_operator"),
+    )
+    expected_revision = cycle.revision
+    selected_bet = _next_bet(claim="Try the operator-selected bounded alternative")
+    selected_note = "Prefer the lab-compatible path."
+    project.directions = [
+        {**direction, "text": "Operator-refined active direction"}
+        if direction["id"] == cycle.direction_key
+        else direction
+        for direction in project.directions
+    ]
+    db_session.add(project)
+    await db_session.flush()
 
     successor = await resolve_discovery_cycle(
         db_session,
         project_id=project.id,
         direction_key=cycle.direction_key,
+        cycle_id=cycle.id,
+        cycle_revision=expected_revision,
         action="continue",
-        next_bet=proposed_bet,
-        note="Use the paired construction path.",
+        next_bet=selected_bet,
+        note=selected_note,
     )
+    await db_session.flush()
 
-    assert successor.state == "open"
-    assert successor.generation == cycle.generation + 1
-    assert successor.bet_snapshot == {
-        "direction": frozen_direction,
-        "hypothesis": "operator-selected bounded alternative",
-    }
-    assert cycle.state == "superseded"
+    assert cycle.verdict == "advance"
     assert cycle.review_result["operator_resolution"]["action"] == "continue"
-
+    request = await db_session.get(
+        StrategicSpawnRequest,
+        uuid.UUID(cycle.review_result["successor_spawn_request_id"]),
+    )
+    assert request is not None
+    assert request.discovery_cycle_id == successor.id
+    assert successor.bet_snapshot["direction"]["text"] == (
+        "Operator-refined active direction"
+    )
     replay = await resolve_discovery_cycle(
         db_session,
         project_id=project.id,
         direction_key=cycle.direction_key,
+        cycle_id=cycle.id,
+        cycle_revision=expected_revision,
         action="continue",
-        next_bet=proposed_bet,
-        note="Repeated request.",
+        next_bet=selected_bet,
+        note=selected_note,
     )
     assert replay.id == successor.id
+    with pytest.raises(ValueError, match="conflicting"):
+        await resolve_discovery_cycle(
+            db_session,
+            project_id=project.id,
+            direction_key=cycle.direction_key,
+            cycle_id=cycle.id,
+            cycle_revision=expected_revision,
+            action="continue",
+            next_bet=_next_bet(claim="A different replay must not mutate authority"),
+            note=selected_note,
+        )
 
 
 @pytest.mark.asyncio
-async def test_corrupt_confirmation_state_fails_closed(db_session):
-    _, cycle, _ = await _cycle_with_source(db_session)
+async def test_resident_can_resolve_discovery_through_strategic_op(
+    db_session, mocker
+):
+    from httpx import ASGITransport, AsyncClient
+
+    from app.database import get_session
+    from app.main import app
+    from app.routers.agent import verify_agent_token
+
+    project, cycle, _ = await _cycle_with_source(db_session)
     spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
-    first_review = await db_session.get(Task, spawned.task_id)
-    evidence_ids = list(
-        (
-            await db_session.execute(
-                select(DiscoveryEvidenceItem.id).where(
-                    DiscoveryEvidenceItem.cycle_id == cycle.id
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
+    review = await db_session.get(Task, spawned.task_id)
     await complete_discovery_review(
         db_session,
-        task=first_review,
-        raw_result=_valid_result(
-            cycle,
-            first_review,
-            evidence_ids,
-            verdict="pivot",
-        ),
+        task=review,
+        raw_result=_result(cycle, review, action="ask_operator"),
     )
-    confirmation = await db_session.get(Task, cycle.review_task_id)
-    cycle.review_result = {}
-    await db_session.flush()
+    expected_revision = cycle.revision
+    resident = Task(
+        project_id=project.id,
+        task_type="strategic_review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "strategic_review"}],
+    )
+    db_session.add(resident)
+    await db_session.commit()
 
-    with pytest.raises(
-        DiscoveryReviewResultError,
-        match="no durable first-review",
-    ):
-        await complete_discovery_review(
-            db_session,
-            task=confirmation,
-            raw_result=_valid_result(
-                cycle,
-                confirmation,
-                evidence_ids,
-                verdict="pivot",
-            ),
-        )
+    async def override_session():
+        yield db_session
 
-    assert cycle.state == "review_blocked"
+    app.dependency_overrides[get_session] = override_session
+    app.dependency_overrides[verify_agent_token] = lambda: {
+        "sub": str(resident.id),
+        "task_type": "strategic_review",
+    }
+    mocker.patch("app.routers.admin_agent_ops.emit_strategic_updated")
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            headers={"Authorization": "Bearer test-token"},
+        ) as client:
+            response = await client.post(
+                "/api/agent/strategic",
+                json={
+                    "task_id": str(resident.id),
+                    "op": "resolve_discovery",
+                    "data": {
+                        "direction_id": cycle.direction_key,
+                        "cycle_id": str(cycle.id),
+                        "cycle_revision": expected_revision,
+                        "action": "continue",
+                        "next_bet": _next_bet(claim="Run the operator-selected bet"),
+                        "note": "Use the lab-compatible path.",
+                    },
+                },
+            )
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(verify_agent_token, None)
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["op"] == "resolve_discovery"
+    assert body["action"] == "continue"
+    await db_session.refresh(cycle)
+    assert cycle.verdict == "advance"
+    assert cycle.review_result["successor_spawn_request_id"]
 
 
 @pytest.mark.asyncio
-async def test_stale_revision_fails_closed_as_review_blocked(db_session):
-    _, cycle, _ = await _cycle_with_source(db_session)
+async def test_operator_can_resume_a_parked_direction(db_session):
+    project, cycle, _ = await _cycle_with_source(db_session)
     spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
     review = await db_session.get(Task, spawned.task_id)
-    evidence_ids = list(
-        (
-            await db_session.execute(
-                select(DiscoveryEvidenceItem.id).where(
-                    DiscoveryEvidenceItem.cycle_id == cycle.id
+    await complete_discovery_review(
+        db_session,
+        task=review,
+        raw_result=_result(cycle, review, action="park"),
+    )
+    expected_revision = cycle.revision
+    await db_session.flush()
+    parked_message = next(
+        message
+        for message in (
+            (
+                await db_session.execute(
+                    select(ProjectMessage).where(
+                        ProjectMessage.project_id == project.id,
+                        ProjectMessage.from_task_id == review.id,
+                    )
                 )
             )
+            .scalars()
+            .all()
         )
-        .scalars()
-        .all()
+        if message.context["event_type"] == "discovery.direction_parked"
     )
-    stale = _valid_result(
-        cycle,
-        review,
-        evidence_ids,
-        reviewed_revision=review.first_payload["expected_revision"] - 1,
+    assert parked_message.context["resident_wake_barrier"] is True
+    assert parked_message.context["cycle_revision"] == expected_revision
+
+    successor = await resolve_discovery_cycle(
+        db_session,
+        project_id=project.id,
+        direction_key=cycle.direction_key,
+        cycle_id=cycle.id,
+        cycle_revision=expected_revision,
+        action="continue",
+        next_bet=_next_bet(claim="Resume after the dependency arrived"),
+        note="The recorded resume condition is now satisfied.",
     )
+    await db_session.flush()
+    await db_session.refresh(project)
 
-    with pytest.raises(DiscoveryReviewResultError, match="reviewed_revision"):
-        await complete_discovery_review(
-            db_session,
-            task=review,
-            raw_result=stale,
-        )
-
-    assert cycle.state == "review_blocked"
-    assert cycle.verdict is None
-    assert "reviewed_revision" in cycle.review_result["error"]
+    direction = next(item for item in project.directions if item["id"] == cycle.direction_key)
+    assert direction["status"] == "active"
+    assert "discovery_resume_condition" not in direction
+    assert successor.state == "open"
+    assert cycle.verdict == "advance"
 
 
 @pytest.mark.asyncio
-async def test_server_owned_candidate_sha_mismatch_fails_closed(db_session):
-    _, cycle, _ = await _cycle_with_source(db_session)
-    cycle.candidate_sha = "a" * 40
+async def test_legacy_requestless_successor_requires_one_explicit_next_bet(db_session):
+    project, predecessor, source = await _cycle_with_source(db_session)
+    predecessor.state = "reviewed"
+    predecessor.verdict = "advance"
+    predecessor.review_task_id = source.id
+    predecessor.review_result = {"action": "advance"}
+    successor = DiscoveryCycle(
+        project_id=project.id,
+        direction_key=predecessor.direction_key,
+        generation=predecessor.generation + 1,
+        outcome_kind="mixed",
+        state="open",
+        intent_snapshot={"goal": "legacy continuation"},
+        bet_snapshot={"hypothesis": "legacy free-form continuation"},
+    )
+    db_session.add(predecessor)
+    db_session.add(successor)
+    await db_session.flush()
+
+    reconciled = await maybe_close_and_spawn_discovery_review(db_session, successor.id)
+    await db_session.flush()
+
+    assert reconciled.reason == "legacy_successor_needs_next_bet"
+    assert successor.state == "reviewed"
+    assert successor.verdict == "ask_operator"
+    assert successor.review_result["status"] == "LEGACY_SUCCESSOR_NEEDS_NEXT_BET"
+    message = next(
+        message
+        for message in (
+            (
+                await db_session.execute(
+                    select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if message.context["event_type"] == "discovery.operator_question"
+    )
+    assert message.context["cycle_id"] == str(successor.id)
+    assert message.context["cycle_revision"] == successor.revision
+
+    replacement = await resolve_discovery_cycle(
+        db_session,
+        project_id=project.id,
+        direction_key=successor.direction_key,
+        cycle_id=successor.id,
+        cycle_revision=successor.revision,
+        action="continue",
+        next_bet=_next_bet(claim="Replace the legacy continuation explicitly"),
+        note="Recovered once after controller migration.",
+    )
+    assert replacement.generation == successor.generation + 1
+    assert successor.verdict == "advance"
+
+
+@pytest.mark.asyncio
+async def test_sweep_surfaces_legacy_advisory_disposition_once(db_session):
+    project, cycle, source = await _cycle_with_source(db_session, state="reviewed")
+    cycle.verdict = "ask_operator"
+    cycle.review_task_id = source.id
+    cycle.review_result = {
+        "status": "LEGACY_DISPOSITION_REQUIRES_RESOLUTION",
+        "legacy_advisory_verdict": "park",
+    }
     db_session.add(cycle)
     await db_session.flush()
-    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
-    review = await db_session.get(Task, spawned.task_id)
-    evidence_ids = list(
+
+    assert await sweep_discovery_reviews(db_session, limit=10) == 1
+    await db_session.refresh(cycle)
+    assert cycle.review_result["status"] == "LEGACY_DISPOSITION_AWAITING_RESOLUTION"
+    messages = list(
         (
             await db_session.execute(
-                select(DiscoveryEvidenceItem.id).where(
-                    DiscoveryEvidenceItem.cycle_id == cycle.id
-                )
+                select(ProjectMessage).where(ProjectMessage.project_id == project.id)
             )
         )
         .scalars()
         .all()
     )
-    tampered = dict(review.first_payload)
-    tampered["candidate_sha"] = "b" * 40
-    review.payloads = [tampered]
-    db_session.add(review)
-    await db_session.flush()
+    question = next(
+        message
+        for message in messages
+        if message.context["event_type"] == "discovery.operator_question"
+    )
+    assert question.context["cycle_id"] == str(cycle.id)
+    assert question.context["cycle_revision"] == cycle.revision
+    assert question.context["legacy_advisory_verdict"] == "park"
 
-    with pytest.raises(DiscoveryReviewResultError, match="candidate_sha"):
-        await complete_discovery_review(
-            db_session,
-            task=review,
-            raw_result=_valid_result(cycle, review, evidence_ids),
-        )
-
-    assert cycle.state == "review_blocked"
-    assert cycle.verdict is None
+    assert await sweep_discovery_reviews(db_session, limit=10) == 0
 
 
 @pytest.mark.asyncio
-async def test_sweep_closes_expired_cycle_and_repairs_missed_trigger(db_session):
-    _, cycle, _ = await _cycle_with_source(
+async def test_legacy_advance_cycle_can_restart_but_explicit_dispositions_block(
+    db_session,
+):
+    project, cycle, _ = await _cycle_with_source(db_session, state="reviewed")
+    cycle.verdict = "advance"
+    await db_session.flush()
+    direction = project.directions[0]
+
+    restarted = await ensure_discovery_cycle_for_research(
         db_session,
-        deadline_at=_utcnow() - timedelta(minutes=1),
+        project=project,
+        direction_key=cycle.direction_key,
+        direction=direction,
     )
+    assert restarted is not None
+    assert restarted.generation == cycle.generation + 1
 
-    changed = await sweep_discovery_reviews(db_session, _utcnow())
+    restarted.state = "reviewed"
+    restarted.verdict = "ask_operator"
+    await db_session.flush()
+    with pytest.raises(DiscoveryCycleUnavailable, match="awaiting policy resolution"):
+        await ensure_discovery_cycle_for_research(
+            db_session,
+            project=project,
+            direction_key=cycle.direction_key,
+            direction=direction,
+        )
 
-    assert changed == 1
-    await db_session.refresh(cycle)
+
+@pytest.mark.asyncio
+async def test_sweep_repairs_missed_terminal_trigger(db_session):
+    _, cycle, _ = await _cycle_with_source(
+        db_session, deadline_at=_utcnow() - timedelta(minutes=1)
+    )
+    changed = await sweep_discovery_reviews(db_session, limit=10)
+    assert changed >= 1
     assert cycle.state == "reviewing"
-    assert cycle.review_task_id is not None
+
+
+@pytest.mark.asyncio
+async def test_sweep_requeues_terminal_legacy_review_and_blocks_cancelled_current(
+    db_session,
+):
+    _, legacy_cycle, _ = await _cycle_with_source(db_session)
+    legacy_spawn = await maybe_close_and_spawn_discovery_review(
+        db_session, legacy_cycle.id
+    )
+    legacy_task = await db_session.get(Task, legacy_spawn.task_id)
+    legacy_task.payloads = [{**legacy_task.first_payload, "review_round": 2}]
+    legacy_task.status = TaskStatus.COMPLETED
+    legacy_cycle.state = "review_pending"
+    db_session.add(legacy_task)
+    db_session.add(legacy_cycle)
+    await db_session.flush()
+
+    replacement = await maybe_close_and_spawn_discovery_review(
+        db_session, legacy_cycle.id
+    )
+    assert replacement.spawned is True
+    assert replacement.task_id != legacy_task.id
+
+    _, current_cycle, _ = await _cycle_with_source(db_session)
+    current_spawn = await maybe_close_and_spawn_discovery_review(
+        db_session, current_cycle.id
+    )
+    current_task = await db_session.get(Task, current_spawn.task_id)
+    current_task.status = TaskStatus.CANCELLED
+    db_session.add(current_task)
+    await db_session.flush()
+
+    blocked = await maybe_close_and_spawn_discovery_review(
+        db_session, current_cycle.id
+    )
+    assert blocked.reason == "review_blocked"
+    assert current_cycle.state == "review_blocked"
+
+
+@pytest.mark.asyncio
+async def test_deadline_never_cancels_pending_descendant_intent(db_session):
+    _, cycle, source = await _cycle_with_source(
+        db_session,
+        deadline_at=_utcnow() - timedelta(days=2),
+    )
+    request = StrategicSpawnRequest(
+        project_id=cycle.project_id,
+        parent_task_id=source.id,
+        idempotency_key=f"pending-{uuid.uuid4()}",
+        task_type="create",
+        specification={
+            "task": {
+                "title": "Pending closure work",
+                "payloads": [{"type": "create"}],
+            }
+        },
+        specification_hash="a" * 64,
+        direction_id=cycle.direction_key,
+        discovery_cycle_id=cycle.id,
+        state="deferred",
+        not_before=_utcnow() - timedelta(days=1),
+    )
+    db_session.add(request)
+    await db_session.flush()
+
+    waiting = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    assert waiting.reason == "spawn_requests_pending"
+    assert request.state == "deferred"
+
+
+@pytest.mark.asyncio
+async def test_missing_source_is_structural_evidence_gap(db_session):
+    project = Project(
+        name=f"discovery-missing-source-{uuid.uuid4().hex[:8]}",
+        user_id="discovery-review-test",
+    )
+    db_session.add(project)
+    await db_session.flush()
+    cycle = DiscoveryCycle(
+        project_id=project.id,
+        direction_key="missing-source",
+        outcome_kind="mixed",
+        intent_snapshot={},
+        bet_snapshot={},
+    )
+    db_session.add(cycle)
+    await db_session.flush()
+
+    result = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    await db_session.flush()
+
+    assert result.reason == "evidence_pending_escalated"
+    assert cycle.state == "review_pending"
+    assert cycle.review_result["status"] == "EVIDENCE_PENDING"
+    message = (
+        await db_session.execute(
+            select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+        )
+    ).scalar_one()
+    assert message.context["resident_wake_barrier"] is True

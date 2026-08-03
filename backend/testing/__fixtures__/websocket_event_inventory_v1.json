@@ -8,12 +8,12 @@
       "event": "task_updated",
       "event_expression": null,
       "event_is_literal": true,
-      "lineno": 638,
+      "lineno": 337,
       "notes": "",
       "occurrence": 1,
       "payload_arg_kind": "dict:status,task_id",
       "scope": "_maybe_spawn_rollup_smoketest",
-      "source_path": "backend/app/admin_task_mutations.py",
+      "source_path": "backend/app/admin_task_approvals.py",
       "workbench_action": null,
       "workbench_resource": null
     },
@@ -2354,6 +2354,22 @@
       "workbench_resource": null
     },
     {
+      "callee": "emit_strategic_cycle_completed",
+      "canonical_callee": "emit_strategic_cycle_completed",
+      "classification": "strategic_v1_helper",
+      "event": "strategic_cycle_completed",
+      "event_expression": null,
+      "event_is_literal": true,
+      "lineno": 700,
+      "notes": "",
+      "occurrence": 1,
+      "payload_arg_kind": "none",
+      "scope": "sweep_stalled_strategic_cycles",
+      "source_path": "backend/app/reaper_sweeps.py",
+      "workbench_action": null,
+      "workbench_resource": null
+    },
+    {
       "callee": "_bcast",
       "canonical_callee": "broadcast_to_project",
       "classification": "legacy_project_event",
@@ -4658,6 +4674,22 @@
       "workbench_resource": null
     },
     {
+      "callee": "emit_strategic_cycle_completed",
+      "canonical_callee": "emit_strategic_cycle_completed",
+      "classification": "strategic_v1_helper",
+      "event": "strategic_cycle_completed",
+      "event_expression": null,
+      "event_is_literal": true,
+      "lineno": 245,
+      "notes": "",
+      "occurrence": 1,
+      "payload_arg_kind": "none",
+      "scope": "emit_terminal_completion_events",
+      "source_path": "backend/app/strategic_cycle.py",
+      "workbench_action": null,
+      "workbench_resource": null
+    },
+    {
       "callee": "broadcast_to_project",
       "canonical_callee": "broadcast_to_project",
       "classification": "strategic_v1_emitter",
@@ -5381,12 +5413,12 @@
   "schema_version": 1,
   "summary": {
     "legacy_global_event": 16,
-    "legacy_project_event": 221,
+    "legacy_project_event": 219,
     "legacy_review_required": 27,
     "message_v1_payload": 26,
     "raw_websocket_control": 3,
     "strategic_v1_emitter": 4,
-    "strategic_v1_helper": 21,
+    "strategic_v1_helper": 23,
     "transport": 5,
     "workbench_v1_emitter": 1,
     "workbench_v1_helper": 14

@@ -394,6 +394,14 @@ def _cycle_summary(
         return None
     metadata = cycle.cycle_metadata or {}
     has_active_task = _is_live_strategic_task(active_task)
+    terminal_disposition = metadata.get(
+        strategic_cycle.CYCLE_META_TERMINAL_DISPOSITION
+    )
+    if terminal_disposition not in {
+        strategic_cycle.TERMINAL_DISPOSITION_CANCELLED,
+        strategic_cycle.TERMINAL_DISPOSITION_FAILED,
+    }:
+        terminal_disposition = None
     return {
         "id": cycle.id,
         "outcome": cycle.outcome,
@@ -420,6 +428,7 @@ def _cycle_summary(
         ),
         "summary_text": _compact_text(cycle.summary_text, max_chars=300),
         "failure_reason": _compact_text(cycle.failure_reason, max_chars=240),
+        "terminal_disposition": terminal_disposition,
         "directions_created": cycle.directions_created,
         "directions_retired": cycle.directions_retired,
         "tasks_spawned": cycle.tasks_spawned,

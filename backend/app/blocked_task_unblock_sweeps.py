@@ -16,7 +16,6 @@ from sqlmodel import select
 from app import pause_clock
 from app.gate_revalidation import GATE_REVALIDATION_QUERY_MARKERS
 from app.models import DeploymentState, Task, TaskStatus
-from app.task_blocked import mark_task_for_fresh_execution_attempt
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -1181,7 +1180,6 @@ async def _apply_needs_disposition(
     direction_id = (task.context or {}).get("direction_id")
     edged = _wire_edges(task, edges)
     _clear_blocked_fields(task, preserve_first_blocked=False)
-    mark_task_for_fresh_execution_attempt(task)
     task.status = TaskStatus.QUEUED
     if edged:
         message = "Unblocked — all needs resolved into dependency edges, requeued"
@@ -1456,7 +1454,6 @@ async def sweep_unblock_blocked_tasks(
                 from sqlalchemy.orm.attributes import flag_modified
 
                 _clear_blocked_fields(task, preserve_first_blocked=False)
-                mark_task_for_fresh_execution_attempt(task)
                 task.status = TaskStatus.QUEUED
                 if _gs.get("green_at_head"):
                     task.latest_status_message = (
@@ -1557,7 +1554,6 @@ async def sweep_unblock_blocked_tasks(
                 )
                 if state == "clear":
                     _clear_blocked_fields(task, preserve_first_blocked=False)
-                    mark_task_for_fresh_execution_attempt(task)
                     task.status = TaskStatus.QUEUED
                     task.latest_status_message = (
                         "Unblocked — transient conflict cleared, requeued"
@@ -1668,7 +1664,6 @@ async def sweep_unblock_blocked_tasks(
             # already crossed the deadline and was escalated above. A genuine
             # dependency/parent clear resets all, including the onset.
             _clear_blocked_fields(task, preserve_first_blocked=is_optimistic_conflict)
-            mark_task_for_fresh_execution_attempt(task)
             task.status = TaskStatus.QUEUED
             task.latest_status_message = "Unblocked — requeued for dispatch"
             flag_modified(task, "context")
@@ -1760,7 +1755,6 @@ async def sweep_unblock_blocked_tasks(
                 # on a genuine dependency clear), so the budget and evidence
                 # timestamp keep accumulating across re-blocks.
                 _clear_blocked_fields(task, preserve_first_blocked=True)
-                mark_task_for_fresh_execution_attempt(task)
                 task.status = TaskStatus.QUEUED
                 task.latest_status_message = (
                     f"Unblocked — optimistic infra-precondition retry "

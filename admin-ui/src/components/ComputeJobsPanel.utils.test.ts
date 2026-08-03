@@ -40,7 +40,7 @@ describe('computeJobTerminalLabel', () => {
     expect(computeJobTerminalLabel(fullJob({
       outcome: 'SUCCESS',
       experiment_status: 'CRITERION_NOT_MET',
-    }))).toBe('Criterion not met');
+    } as ComputeJob))).toBe('Criterion not met');
   });
 });
 

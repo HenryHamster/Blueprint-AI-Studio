@@ -422,8 +422,8 @@ def test_changes_requested_override_is_limited_to_explicit_operator_lanes():
                 )
 
     assert overrides == {
-        ("admin_task_mutations.py", "_submit_human_rollup_merge"),
-        ("admin_task_mutations.py", "_submit_human_critical_merge"),
+        ("admin_task_approvals.py", "_submit_human_rollup_merge"),
+        ("admin_task_approvals.py", "_submit_human_critical_merge"),
     }
 
 @pytest.mark.asyncio

@@ -61,23 +61,20 @@ from app.problem_model import (
     reconcile_gap_staffing_raw_result,
     reconcile_gaps_for_retired_directions,
 )
+from app.routers.admin_discovery_cycles import router as discovery_cycles_router
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/api/admin", tags=["directions"], dependencies=[Depends(get_current_user)]
 )
+router.include_router(discovery_cycles_router)
 
 
 DIRECTION_TEXT_MAX = 2000
 COMPLETION_CRITERIA_MAX = 500
 DIRECTION_CONTEXT_FIELD_MAX = 500
 
-
-class DiscoveryResolutionPayload(BaseModel):
-    action: str = Field(pattern=r"^(continue|close)$")
-    next_bet: dict[str, Any] | None = None
-    note: str | None = Field(default=None, max_length=2000)
 
 # Module-level cache for per-direction metric enrichment. The four computation
 # functions (_compute_direction_quality_score, _compute_lifetime_generalized_outcome_state,
@@ -1580,41 +1577,6 @@ async def decide_churn_retirement(
     if outcome.get("status") == "noop":
         resp["reason"] = "No pending churn-retirement recommendation"
     return resp
-
-
-@router.post(
-    "/projects/{project_id}/directions/{direction_id}/discovery-resolution"
-)
-async def resolve_direction_discovery_cycle(
-    project_id: uuid.UUID,
-    direction_id: str,
-    payload: DiscoveryResolutionPayload,
-    session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user),
-):
-    await _get_user_project_with_role(
-        project_id, current_user["user_id"], session, "member"
-    )
-    from app.discovery_review import resolve_discovery_cycle
-
-    try:
-        resolved = await resolve_discovery_cycle(
-            session,
-            project_id=project_id,
-            direction_key=direction_id,
-            action=payload.action,
-            next_bet=payload.next_bet,
-            note=payload.note,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    await session.commit()
-    return {
-        "status": "resolved",
-        "action": payload.action,
-        "cycle_id": str(resolved.id),
-        "generation": resolved.generation,
-    }
 
 
 @router.post("/projects/{project_id}/directions/{direction_id}/research")

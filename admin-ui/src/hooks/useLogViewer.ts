@@ -4,6 +4,7 @@ import type { DeployState } from '../types/settings';
 import type { StrategicChallengeSummary } from '../types/digest';
 import type { FailingTaskTypeEntry, FailingTaskTypes } from '../types/diagnostics';
 import type { ProjectMessage } from '../types/messages';
+import type { StrategicStateResponse, StrategicStateCycle } from '../strategicStateApi';
 import {
   workbenchMessageMatchesProject,
   workbenchRefetchSurfacesFromMessage,
@@ -20,6 +21,8 @@ interface UseLogViewerDeps {
   refreshFleetRunnersRef?: React.MutableRefObject<() => void>;
   selectedProjectId?: string | null;
   realtimeWsEnabled?: boolean;
+  /** Current durable Strategic read-model snapshot, populated by App. */
+  strategicReadModelRef?: React.MutableRefObject<StrategicStateResponse | null>;
   canViewProject: boolean;
   isAdmin?: boolean;
 }
@@ -37,6 +40,7 @@ export interface StrategicCycleProgress {
 
 /** Outcome captured from a strategic_cycle_completed event's completion sub-object. */
 export interface StrategicCycleCompletion {
+  cycle_id?: string;
   status?: string;
   created_count?: number;
   retired_count?: number;
@@ -54,6 +58,52 @@ export interface StrategicCycleCompletion {
   // carried a challenge record (the backend omits it otherwise). The handler
   // passes msg.data.completion verbatim, so no handler change is needed.
   strategic_judgment_challenge?: StrategicChallengeSummary;
+}
+
+function strategicCycleIsActive(cycle: StrategicStateCycle | null | undefined): cycle is StrategicStateCycle {
+  return Boolean(cycle?.has_active_task && !cycle.stale);
+}
+
+function strategicCycleProgressFromDurableState(cycle: StrategicStateCycle): StrategicCycleProgress {
+  const phaseNumber = cycle.phase2_task_id ? 2 : 1;
+  return {
+    task_id: cycle.phase2_task_id ?? cycle.phase1_task_id ?? '',
+    cycle_id: cycle.id,
+    phase_number: phaseNumber,
+    phase_label: phaseNumber === 2 ? 'Strategic review' : 'Architecture review',
+    phase_state: cycle.outcome,
+  };
+}
+
+function strategicCycleCompletionFromDurableState(cycle: StrategicStateCycle): StrategicCycleCompletion {
+  const outcome = cycle.outcome.toLowerCase();
+  const disposition = cycle.terminal_disposition?.toLowerCase();
+  const status = disposition === 'cancelled'
+    ? 'CANCELLED'
+    : disposition === 'failed'
+      ? 'FAILED'
+      : outcome === 'completed'
+        ? 'completed'
+        : outcome.includes('cancel')
+          ? 'CANCELLED'
+          : 'FAILED';
+  return {
+    cycle_id: cycle.id,
+    status,
+    created_count: cycle.directions_created,
+    retired_count: cycle.directions_retired,
+    tasks_spawned: cycle.tasks_spawned,
+    problem_model_changed: cycle.problem_model_changed,
+    running_update_changed: cycle.running_update_changed,
+    directions_changed: Boolean(
+      cycle.directions_created
+      || cycle.directions_retired
+      || cycle.problem_model_changed
+      || cycle.running_update_changed,
+    ),
+    status_message: cycle.summary_text ?? undefined,
+    failure_reason: cycle.failure_reason ?? undefined,
+  };
 }
 
 /** One strategic-session transcript delta, from a `strategic_session` event. */
@@ -146,6 +196,7 @@ export function useLogViewer({
   refreshFleetRunnersRef,
   selectedProjectId,
   realtimeWsEnabled = true,
+  strategicReadModelRef,
   canViewProject,
   isAdmin = false,
 }: UseLogViewerDeps) {
@@ -165,6 +216,68 @@ export function useLogViewer({
   const [lastCycleCompletion, setLastCycleCompletion] = useState<StrategicCycleCompletion | null>(null);
   // Live strategic-session transcript buffer, appended from strategic_session events.
   const [strategicSessionTranscript, setStrategicSessionTranscript] = useState<StrategicSessionDelta[]>([]);
+  // Keep the latest known cycle identity so delayed completion frames from an
+  // older cycle cannot overwrite newer activity or its durable receipt.
+  const currentCycleIdRef = useRef<string | null>(null);
+  const projectStrategicState = useCallback((state: StrategicStateResponse | null) => {
+    if (!state || (
+      selectedProjectIdRef.current != null
+      && state.project_id !== selectedProjectIdRef.current
+    )) return;
+    const activeCycle = state.strategic.active_cycle;
+    if (strategicCycleIsActive(activeCycle)) {
+      currentCycleIdRef.current = activeCycle.id;
+      setStrategistActive(true);
+      setCycleProgress(previous => {
+        const next = strategicCycleProgressFromDurableState(activeCycle);
+        // Keep only live steering metadata while refreshing the durable
+        // phase/task identity. The durable read model is authoritative for
+        // every cycle and phase field, and does not carry the excerpt.
+        if (!previous || previous.cycle_id !== next.cycle_id) return next;
+        return {
+          ...next,
+          ...(previous.steering_origin !== undefined
+            ? { steering_origin: previous.steering_origin }
+            : {}),
+          ...(previous.steering_excerpt !== undefined
+            ? { steering_excerpt: previous.steering_excerpt }
+            : {}),
+        };
+      });
+      setLastCycleCompletion(previous => (
+        previous?.cycle_id && previous.cycle_id !== activeCycle.id ? null : previous
+      ));
+      return;
+    }
+
+    setStrategistActive(false);
+    setCycleProgress(null);
+    const latestCycle = state.strategic.latest_cycle;
+    currentCycleIdRef.current = latestCycle?.id ?? null;
+    if (!latestCycle) return;
+    const durableCompletion = strategicCycleCompletionFromDurableState(latestCycle);
+    setLastCycleCompletion(previous => {
+      if (!previous || previous.cycle_id !== durableCompletion.cycle_id) return durableCompletion;
+
+      // The durable cycle is authoritative for status and every field it
+      // exposes. Preserve only receipt details that the read model cannot
+      // represent, such as the live challenge summary and direction ids.
+      return {
+        ...durableCompletion,
+        ...(previous.staged_count !== undefined ? { staged_count: previous.staged_count } : {}),
+        ...(previous.updated_count !== undefined ? { updated_count: previous.updated_count } : {}),
+        ...(previous.created_direction_ids !== undefined
+          ? { created_direction_ids: previous.created_direction_ids }
+          : {}),
+        ...(previous.retired_direction_ids !== undefined
+          ? { retired_direction_ids: previous.retired_direction_ids }
+          : {}),
+        ...(previous.strategic_judgment_challenge !== undefined
+          ? { strategic_judgment_challenge: previous.strategic_judgment_challenge }
+          : {}),
+      };
+    });
+  }, []);
   const gatedTypesRefreshSeqRef = useRef(0);
   const [ceilingDeferredProjectIds, setCeilingDeferredProjectIds] = useState<Set<string>>(new Set());
   const pipelineThrottleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -172,6 +285,7 @@ export function useLogViewer({
   const wsConnectingProjectRef = useRef<string | null>(null);
   const intentionallyClosedProjectRef = useRef<string | null>(null);
   const wsReconnectAttemptRef = useRef<number>(0);
+  const establishedWsProjectsRef = useRef<Set<string>>(new Set());
   const wsReconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const fetchTasksDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const fetchDirectionsDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -246,6 +360,7 @@ export function useLogViewer({
     setStrategistActive(false);
     setCycleProgress(null);
     setLastCycleCompletion(null);
+    currentCycleIdRef.current = null;
     // The transcript is a per-project live buffer; a fresh project starts empty
     // and the strategic session re-streams its own strategic_session deltas.
     setStrategicSessionTranscript([]);
@@ -587,9 +702,10 @@ export function useLogViewer({
         }
         return;
       }
-      if (msg.event === 'strategic_updated' || refetchSurfaces.has('directions')) {
-        refetchDirections();
-      } else if (msg.event === 'strategic_cycle_started') {
+      if (msg.event === 'strategic_cycle_started') {
+        currentCycleIdRef.current = typeof msg.data?.cycle_id === 'string'
+          ? msg.data.cycle_id
+          : null;
         setStrategistActive(true);
         setLastCycleCompletion(null); // clear previous receipt when new cycle begins
         setCycleProgress({
@@ -602,11 +718,38 @@ export function useLogViewer({
           steering_excerpt: msg.data?.steering_excerpt,
         });
       } else if (msg.event === 'strategic_cycle_completed') {
-        setStrategistActive(false);
-        setCycleProgress(null);
-        if (msg.data?.completion && typeof msg.data.completion === 'object') {
-          setLastCycleCompletion(msg.data.completion as StrategicCycleCompletion);
+        const completionCycleId = typeof msg.data?.cycle_id === 'string'
+          ? msg.data.cycle_id
+          : undefined;
+        const isStaleCompletion = Boolean(
+          completionCycleId
+          && currentCycleIdRef.current
+          && completionCycleId !== currentCycleIdRef.current,
+        );
+        if (!isStaleCompletion) {
+          setStrategistActive(false);
+          setCycleProgress(null);
+          if (msg.data?.completion && typeof msg.data.completion === 'object') {
+            const completion = {
+              ...(msg.data.completion as StrategicCycleCompletion),
+              cycle_id: completionCycleId,
+            };
+            setLastCycleCompletion(previous => (
+              completion.cycle_id && previous?.cycle_id === completion.cycle_id
+                ? previous
+                : completion
+            ));
+          }
         }
+      }
+      // Handle lifecycle state above before the canonical envelope's directions
+      // surface schedules the shared refresh. Legacy completion events still
+      // refresh directions even without a refetch surface.
+      if (
+        msg.event === 'strategic_updated'
+        || msg.event === 'strategic_cycle_completed'
+        || refetchSurfaces.has('directions')
+      ) {
         refetchDirections();
       }
     } catch {
@@ -661,6 +804,8 @@ export function useLogViewer({
       };
 
       ws.onopen = () => {
+        const isReconnect = establishedWsProjectsRef.current.has(projectId);
+        establishedWsProjectsRef.current.add(projectId);
         if (!canViewProjectRef.current || trackingProjectIdRef.current !== projectId || wsRef.current !== ws) {
           ws.close(1000, 'Project access revoked');
           return;
@@ -672,12 +817,18 @@ export function useLogViewer({
         setLogsConnecting(false);
         setWsDisconnected(false);
         wasConnected = true;
-        // Client-side safety net: clear any stale "strategist working" state on
-        // (re)connect. If a strategic_cycle_completed was dropped while the WS
-        // was down, the indicator would otherwise stick on; a fresh cycle will
-        // re-emit strategic_cycle_started.
-        setStrategistActive(false);
-        setCycleProgress(null);
+        // Project the durable snapshot before the async refresh lands. This
+        // both preserves an active cycle and repairs a dropped completion.
+        if (strategicReadModelRef) {
+          projectStrategicState(strategicReadModelRef.current);
+        } else {
+          // Isolated consumers without the durable model retain the original
+          // conservative reset; production App always supplies the ref.
+          setStrategistActive(false);
+          setCycleProgress(null);
+          currentCycleIdRef.current = null;
+        }
+        if (isReconnect) refreshStrategicReadModel();
         // Add system log for all tracked tasks
         for (const tid of trackedTaskIdsRef.current) {
           appendTrackLog(tid, 'system', 'Stream connected');
@@ -769,7 +920,7 @@ export function useLogViewer({
       setLogsConnecting(false);
       setLogLines(prev => [...prev, `[Connection error: ${err}]`]);
     }
-  }, [handleWsMessage, appendTrackLog, fetchTasksRef, hasActiveWsForProject, refreshGatedTaskTypes, refreshMessagesRef]);
+  }, [handleWsMessage, appendTrackLog, fetchTasksRef, hasActiveWsForProject, refreshGatedTaskTypes, refreshMessagesRef, projectStrategicState, refreshStrategicReadModel, strategicReadModelRef]);
 
   // Keep connectWsRef in sync so the online listener can call the latest version
   useEffect(() => { connectWsRef.current = connectWs; }, [connectWs]);
@@ -927,6 +1078,7 @@ export function useLogViewer({
     strategistActive,
     cycleProgress,
     lastCycleCompletion,
+    projectStrategicState,
     // Strategic-session live transcript (appended from strategic_session events).
     strategicSessionTranscript,
     clearStrategicSessionTranscript: () => setStrategicSessionTranscript([]),

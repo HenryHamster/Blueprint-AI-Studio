@@ -1,8 +1,8 @@
-"""Bounded evidence-packet construction for discovery review.
+"""Semantic outcome-receipt construction for discovery decisions.
 
-This module snapshots cycle tasks and artifacts, records their durable evidence
-ledger entries, and builds the bounded model packet. Discovery decisions and
-cycle state transitions remain in :mod:`app.discovery_review`.
+The decision controller consumes one bounded parent-level receipt rather than a
+bag of child task rows.  Parallel fan-out therefore changes receipt counters,
+not whether the controller is allowed to decide.
 """
 
 from __future__ import annotations
@@ -13,37 +13,57 @@ import json
 from typing import Any, Mapping
 import uuid
 
-from sqlalchemy import String, case, cast, func
 from sqlmodel import select
 
 from app.findings_index import finalized_research_findings
+from app.landed_signal import has_landed_signal
 from app.models import (
     Artifact,
     ArtifactType,
     DiscoveryCycle,
     DiscoveryEvidenceItem,
-    StrategicSpawnRequest,
+    KnowledgeDocument,
     Task,
     TaskStatus,
 )
+from app.task_capabilities import WRITE_TASK_TYPES
 from app.time_utils import _utcnow
 
 
-DISCOVERY_REVIEW_PACKET_VERSION = 1
-DISCOVERY_REVIEW_MAX_TASKS = 12
-DISCOVERY_REVIEW_MAX_ARTIFACTS = 8
+DISCOVERY_REVIEW_PACKET_VERSION = 2
 DISCOVERY_REVIEW_MAX_PACKET_ITEMS = 24
-DISCOVERY_REVIEW_METADATA_EXCERPT_CHARS = 1_500
-DISCOVERY_REVIEW_EVIDENCE_METADATA_CHARS = 4_000
+DISCOVERY_REVIEW_EVIDENCE_METADATA_CHARS = 32_000
 DISCOVERY_REVIEW_DECISION_SNAPSHOT_CHARS = 8_000
-DISCOVERY_REVIEW_TASK_TITLE_CHARS = 300
-DISCOVERY_REVIEW_TASK_DESCRIPTION_CHARS = 800
 DISCOVERY_REVIEW_URI_CHARS = 1_000
 DISCOVERY_REVIEW_BLOCKED_GRACE = timedelta(hours=2)
+DISCOVERY_REVIEW_SEMANTIC_INDEX_ITEMS = 3
+DISCOVERY_REVIEW_SEMANTIC_DIGEST_CHARS = 2_000
+DISCOVERY_REVIEW_RESEARCH_DETAILS = 6
+DISCOVERY_REVIEW_KNOWLEDGE_DETAILS = 6
+DISCOVERY_REVIEW_LANDED_OUTCOMES = 4
+DISCOVERY_REVIEW_EXPERIMENT_DETAILS = 6
+DISCOVERY_REVIEW_VERIFICATION_DETAILS = 6
 
-_NON_OUTCOME_ARTIFACT_TYPES = (
-    ArtifactType.GIT_COMMIT,
-    ArtifactType.PULL_REQUEST,
+_VERIFICATION_TASK_TYPES = frozenset(
+    {
+        "review",
+        "qa",
+        "smoketest",
+        "verify_tests",
+        "perf",
+        "security_audit",
+        "compute_experiment",
+        "walkthrough_e2e",
+    }
+)
+_EXPERIMENT_ARTIFACT_TYPES = frozenset(
+    {
+        ArtifactType.COMPUTE_RESULT.value,
+        ArtifactType.PERF_REPORT.value,
+        ArtifactType.SMOKETEST_RESULT.value,
+        ArtifactType.WALKTHROUGH_E2E_RESULT.value,
+        ArtifactType.WALKTHROUGH_E2E_REPORT.value,
+    }
 )
 
 
@@ -71,38 +91,7 @@ def _checksum(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
 
-def _bounded_json_excerpt(value: Any) -> tuple[str, bool]:
-    rendered = _canonical_json(value)
-    if len(rendered) <= DISCOVERY_REVIEW_METADATA_EXCERPT_CHARS:
-        return rendered, False
-    return rendered[:DISCOVERY_REVIEW_METADATA_EXCERPT_CHARS], True
-
-
-def _bounded_text(value: Any, limit: int) -> str | None:
-    if value is None:
-        return None
-    return str(value)[:limit]
-
-
-def _bounded_evidence_metadata(value: Any) -> tuple[Any, bool]:
-    rendered = _canonical_json(value or {})
-    if len(rendered) <= DISCOVERY_REVIEW_EVIDENCE_METADATA_CHARS:
-        return json.loads(rendered), False
-    return (
-        {
-            "excerpt": rendered[:DISCOVERY_REVIEW_EVIDENCE_METADATA_CHARS],
-            "original_checksum": hashlib.sha256(
-                rendered.encode("utf-8")
-            ).hexdigest(),
-            "truncated": True,
-        },
-        True,
-    )
-
-
 def _bounded_decision_snapshot(value: Any) -> tuple[dict[str, Any], bool]:
-    """Keep task payloads bounded without pretending an excerpt is complete."""
-
     rendered = _canonical_json(value or {})
     if len(rendered) <= DISCOVERY_REVIEW_DECISION_SNAPSHOT_CHARS:
         decoded = json.loads(rendered)
@@ -119,72 +108,268 @@ def _bounded_decision_snapshot(value: Any) -> tuple[dict[str, Any], bool]:
     )
 
 
-def _task_snapshot(task: Task) -> dict[str, Any]:
-    task_type = str(task.first_payload.get("type") or "")
-    # Research plan_output is a resumable pre-gate buffer until completion
-    # stamps its authoritative survivor set. Discovery review is a truth
-    # consumer, so failed/unfinalized raw findings must never enter its packet.
-    plan_output = (
-        finalized_research_findings(task)
-        if task_type == "research"
-        else task.plan_output
+def _bounded_metadata(value: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
+    rendered = _canonical_json(value)
+    if len(rendered) <= DISCOVERY_REVIEW_EVIDENCE_METADATA_CHARS:
+        return json.loads(rendered), False
+    return (
+        {
+            "excerpt": rendered[:DISCOVERY_REVIEW_EVIDENCE_METADATA_CHARS],
+            "original_checksum": _checksum(value),
+            "truncated": True,
+        },
+        True,
     )
-    plan_excerpt, plan_truncated = _bounded_json_excerpt(plan_output)
-    context = task.context or {}
-    context_projection = {
-        key: context.get(key)
-        for key in (
-            "direction_id",
-            "research_task_id",
-            "acceptance_verdict",
-            "acceptance_evidence_result",
-            "failure_category",
-            "failure_class",
-            "pr_merged",
-            "landed_on_integration",
-            "rollup_pr_number",
-            "capacity_degraded",
-            "research_surviving_findings",
+
+
+def _receipt_fits_evidence_metadata(snapshot: Mapping[str, Any]) -> bool:
+    return (
+        len(
+            _canonical_json(
+                {
+                    "packet_version": DISCOVERY_REVIEW_PACKET_VERSION,
+                    "snapshot": snapshot,
+                }
+            )
         )
-        if key in context
-    }
+        <= DISCOVERY_REVIEW_EVIDENCE_METADATA_CHARS
+    )
+
+
+def _bounded_json_value(value: Any, *, max_chars: int) -> Any:
+    rendered = _canonical_json(value)
+    if len(rendered) <= max_chars:
+        return json.loads(rendered)
     return {
-        "id": str(task.id),
-        "type": task_type,
-        "title": _bounded_text(task.title, DISCOVERY_REVIEW_TASK_TITLE_CHARS),
-        "description": _bounded_text(
-            task.description,
-            DISCOVERY_REVIEW_TASK_DESCRIPTION_CHARS,
+        "semantic_excerpt": " ".join(rendered.split())[:max_chars],
+        "original_checksum": _checksum(value),
+        "truncated": True,
+    }
+
+
+def _bounded_missing_reasons(values: list[str]) -> list[str]:
+    unique = list(dict.fromkeys(str(value)[:500] for value in values if str(value)))
+    if len(unique) <= 20:
+        return unique
+    omitted = unique[20:]
+    return [
+        *unique[:20],
+        (
+            f"{len(omitted)} additional missing-evidence reason(s); "
+            f"checksum={_checksum(omitted)}"
         ),
-        "status": str(_enum_value(task.status)),
-        "attempt_count": int(task.attempt_count or 0),
-        "parent_task_id": str(task.parent_task_id) if task.parent_task_id else None,
-        "created_by": task.created_by,
-        "latest_status_message": (task.latest_status_message or "")[:1_000],
-        "context": context_projection,
-        "plan_output_excerpt": plan_excerpt,
-        "plan_output_truncated": plan_truncated,
-    }
+    ]
 
 
-def _artifact_snapshot(artifact: Artifact) -> dict[str, Any]:
-    logs_excerpt, logs_truncated = _bounded_json_excerpt(artifact.logs)
+def _canonical_semantic_value(value: Any) -> str:
+    rendered = (
+        str(value)
+        if isinstance(value, (str, int, float, bool))
+        else _canonical_json(value)
+    )
+    return " ".join(rendered.split())
+
+
+def _task_type(task: Task) -> str:
+    return str(task.first_payload.get("type") or "")
+
+
+def _pr_number(task: Task) -> int | str | None:
+    context = task.context or {}
+    review_loop = context.get("review_loop")
+    if isinstance(review_loop, Mapping) and review_loop.get("pr_number") is not None:
+        return review_loop.get("pr_number")
+    for source in (context, task.first_payload):
+        for key in ("rollup_pr_number", "pr_number"):
+            if source.get(key) is not None:
+                return source.get(key)
+    return None
+
+
+def _merge_sha(task: Task) -> str | None:
+    context = task.context or {}
+    for source in (context, task.first_payload):
+        for key in (
+            "merge_commit_sha",
+            "merged_sha",
+            "deployed_commit_sha",
+            "serving_commit_sha",
+        ):
+            value = str(source.get(key) or "").strip()
+            if value:
+                return value[:64]
+    return None
+
+
+def _artifact_type(artifact: Artifact) -> str:
+    return str(_enum_value(artifact.artifact_type))
+
+
+def _artifact_semantic_projection(artifact: Artifact) -> dict[str, Any]:
     return {
-        "id": str(artifact.id),
+        "artifact_id": str(artifact.id),
         "task_id": str(artifact.task_id),
-        "artifact_type": str(_enum_value(artifact.artifact_type)),
-        "logical_key": _bounded_text(artifact.logical_key, 500),
+        "type": _artifact_type(artifact),
+        "logical_key": artifact.logical_key,
         "commit_hash": artifact.commit_hash,
-        "repo_url": _bounded_text(artifact.repo_url, DISCOVERY_REVIEW_URI_CHARS),
-        "pr_url": _bounded_text(artifact.pr_url, DISCOVERY_REVIEW_URI_CHARS),
-        "storage_uri": _bounded_text(
-            artifact.storage_uri,
-            DISCOVERY_REVIEW_URI_CHARS,
+        "repo_url": artifact.repo_url,
+        "pr_url": artifact.pr_url,
+        "storage_uri": artifact.storage_uri,
+        "logs": artifact.logs,
+    }
+
+
+def _compact_artifact(artifact: Artifact) -> dict[str, Any]:
+    return {
+        "artifact_id": str(artifact.id),
+        "task_id": str(artifact.task_id),
+        "type": _artifact_type(artifact),
+        "logical_key": str(artifact.logical_key or "")[:300] or None,
+        "commit_hash": artifact.commit_hash,
+        "pr_url": str(artifact.pr_url or "")[:DISCOVERY_REVIEW_URI_CHARS] or None,
+        "storage_uri": str(artifact.storage_uri or "")[:DISCOVERY_REVIEW_URI_CHARS]
+        or None,
+        "semantic_summary": _canonical_semantic_value(
+            _artifact_semantic_projection(artifact)
         ),
-        "iteration": artifact.iteration,
-        "created_at": artifact.created_at,
-        "logs_excerpt": logs_excerpt,
-        "logs_truncated": logs_truncated,
+    }
+
+
+def _verification_summary(task: Task) -> dict[str, Any]:
+    context = task.context or {}
+    raw_acceptance_verdict = context.get("acceptance_verdict")
+    raw_acceptance_evidence = context.get("acceptance_evidence_result")
+    acceptance_verdict = _bounded_json_value(
+        raw_acceptance_verdict, max_chars=500
+    )
+    acceptance_evidence = _bounded_json_value(
+        raw_acceptance_evidence, max_chars=500
+    )
+    failure_category = str(context.get("failure_category") or "")[:240] or None
+    latest_status = str(task.latest_status_message or "")[:800] or None
+    semantic_projection = {
+        key: value
+        for key, value in {
+            "acceptance_verdict": raw_acceptance_verdict,
+            "acceptance_evidence_result": raw_acceptance_evidence,
+            "failure_category": context.get("failure_category"),
+            "latest_status": task.latest_status_message,
+        }.items()
+        if value is not None and value != ""
+    }
+    summary = {
+        "task_id": str(task.id),
+        "type": _task_type(task),
+        "status": str(_enum_value(task.status)),
+        "acceptance_verdict": acceptance_verdict,
+        "acceptance_evidence_result": acceptance_evidence,
+        "failure_category": failure_category,
+        "latest_status": latest_status,
+    }
+    if semantic_projection:
+        summary["semantic_summary"] = _canonical_semantic_value(
+            semantic_projection
+        )
+    return summary
+
+
+def _semantic_text(value: Mapping[str, Any]) -> str:
+    finding = value.get("finding")
+    semantic_source = (
+        value
+        if value.get("semantic_summary") is not None
+        else finding
+        if isinstance(finding, Mapping)
+        else value
+    )
+    candidates = [
+        semantic_source.get(key)
+        for key in (
+            "semantic_summary",
+            "conclusion",
+            "summary",
+            "verdict",
+            "result",
+            "evidence",
+            "latest_status",
+            "description",
+            "title",
+            "finding",
+        )
+        if semantic_source.get(key) is not None
+    ]
+    excerpt_source = candidates[0] if candidates else semantic_source
+    return _canonical_semantic_value(excerpt_source)
+
+
+def _semantic_excerpt(value: Mapping[str, Any], *, max_chars: int) -> str:
+    return _semantic_text(value)[:max_chars]
+
+
+def _bounded_collection_coverage(
+    values: list[dict[str, Any]],
+    included: list[dict[str, Any]],
+    *,
+    omitted: list[dict[str, Any]],
+    selection: str,
+) -> dict[str, Any]:
+    """Keep semantic coverage for omitted bodies without treating it as absence."""
+
+    if len(omitted) <= DISCOVERY_REVIEW_SEMANTIC_INDEX_ITEMS:
+        sampled_indices = list(range(len(omitted)))
+    elif DISCOVERY_REVIEW_SEMANTIC_INDEX_ITEMS == 1:
+        sampled_indices = [len(omitted) - 1]
+    else:
+        last = len(omitted) - 1
+        sampled_indices = [
+            round(index * last / (DISCOVERY_REVIEW_SEMANTIC_INDEX_ITEMS - 1))
+            for index in range(DISCOVERY_REVIEW_SEMANTIC_INDEX_ITEMS)
+        ]
+    sampled_omitted = [omitted[index] for index in sampled_indices]
+    omitted_semantic_index = []
+    for ordinal, value in zip(sampled_indices, sampled_omitted):
+        provenance = {
+            key: str(value[key])[:240]
+            for key in (
+                "source_task_id",
+                "document_id",
+                "task_id",
+                "artifact_id",
+                "source_kind",
+                "task_type",
+                "type",
+                "status",
+            )
+            if value.get(key) is not None
+        }
+        omitted_semantic_index.append(
+            {
+                "ordinal": ordinal,
+                "item_checksum": _checksum(value),
+                "semantic_excerpt": _semantic_excerpt(value, max_chars=240),
+                **provenance,
+            }
+        )
+    full_semantic_digest = "\n".join(_semantic_text(value) for value in omitted)
+    semantic_digest_complete = (
+        len(full_semantic_digest) <= DISCOVERY_REVIEW_SEMANTIC_DIGEST_CHARS
+    )
+    semantic_digest = full_semantic_digest[:DISCOVERY_REVIEW_SEMANTIC_DIGEST_CHARS]
+    return {
+        "total_count": len(values),
+        "included_count": len(included),
+        "omitted_count": max(0, len(values) - len(included)),
+        "selection": selection,
+        "full_set_checksum": _checksum(values),
+        "omitted_semantic_index": omitted_semantic_index,
+        "semantic_index_total_count": len(omitted),
+        "semantic_index_included_count": len(sampled_omitted),
+        "semantic_index_selection": "evenly_spaced_stable_order",
+        "full_semantic_digest": semantic_digest,
+        "semantic_digest_item_count": len(omitted),
+        "semantic_digest_source_chars": len(full_semantic_digest),
+        "semantic_digest_complete": semantic_digest_complete,
+        "semantic_digest_order": "stable_collection_order",
     }
 
 
@@ -196,7 +381,6 @@ async def _get_or_add_evidence(
     semantic_role: str,
     source_kind: str,
     source_id: str,
-    source_uri: str | None,
     content_type: str,
     head_sha: str | None,
     snapshot: Mapping[str, Any],
@@ -211,21 +395,17 @@ async def _get_or_add_evidence(
     ).scalar_one_or_none()
     if existing is not None:
         return existing
-
     item = DiscoveryEvidenceItem(
         cycle_id=cycle.id,
         semantic_role=semantic_role,
         source_kind=source_kind,
         source_id=source_id,
-        source_uri=source_uri,
         checksum=_checksum(snapshot),
         content_type=content_type,
         head_sha=head_sha,
         mechanism_fingerprint=cycle.mechanism_fingerprint,
         evidence_metadata={
             "packet_version": DISCOVERY_REVIEW_PACKET_VERSION,
-            # Round-trip through the canonical encoder so UUID/datetime/Enum
-            # values become JSON-safe before reaching the JSONB bind processor.
             "snapshot": json.loads(_canonical_json(snapshot)),
         },
         dedupe_key=dedupe_key,
@@ -235,31 +415,24 @@ async def _get_or_add_evidence(
     return item
 
 
-def _evidence_projection(
-    item: DiscoveryEvidenceItem,
-    *,
-    artifact_id: str | None = None,
-) -> dict[str, Any]:
-    evidence_metadata, evidence_metadata_truncated = (
-        _bounded_evidence_metadata(item.evidence_metadata)
-    )
-    projection: dict[str, Any] = {
+def _evidence_projection(item: DiscoveryEvidenceItem) -> dict[str, Any]:
+    metadata, truncated = _bounded_metadata(item.evidence_metadata or {})
+    result = {
         "evidence_id": str(item.id),
         "semantic_role": item.semantic_role,
         "source_kind": item.source_kind,
         "checksum": item.checksum,
         "source_id": item.source_id,
-        "source_uri": _bounded_text(item.source_uri, DISCOVERY_REVIEW_URI_CHARS),
+        "source_uri": str(item.source_uri or "")[:DISCOVERY_REVIEW_URI_CHARS]
+        or None,
         "content_type": item.content_type,
         "head_sha": item.head_sha,
         "mechanism_fingerprint": item.mechanism_fingerprint,
-        "evidence_metadata": evidence_metadata,
+        "evidence_metadata": metadata,
     }
-    if evidence_metadata_truncated:
-        projection["evidence_metadata_truncated"] = True
-    if artifact_id is not None:
-        projection["artifact_id"] = artifact_id
-    return projection
+    if truncated:
+        result["evidence_metadata_truncated"] = True
+    return result
 
 
 async def build_discovery_review_packet(
@@ -275,466 +448,398 @@ async def build_discovery_review_packet(
     dict[str, Any],
     dict[str, Any],
 ]:
-    """Build and ledger a bounded, cycle-isolated evidence packet.
-
-    The caller must hold the cycle row lock.  Quiescence is checked separately
-    over the full task set; the bounds here limit only what is sent to the model.
-    """
+    """Build one bounded semantic receipt for the settled research parent."""
 
     now = now or _utcnow()
     bounded_intent, intent_truncated = _bounded_decision_snapshot(
         cycle.intent_snapshot
     )
     bounded_bet, bet_truncated = _bounded_decision_snapshot(cycle.bet_snapshot)
-    task_scope = [
-        Task.discovery_cycle_id == cycle.id,
-        (
-            Task.id != cycle.review_task_id
-            if cycle.review_task_id is not None
-            else True
-        ),
-    ]
-    total_tasks = int(
+    tasks = list(
         (
             await session.execute(
-                select(func.count(Task.id)).where(*task_scope)
-            )
-        ).scalar_one()
-        or 0
-    )
-    task_packet_limit = min(
-        DISCOVERY_REVIEW_MAX_TASKS,
-        max(0, DISCOVERY_REVIEW_MAX_PACKET_ITEMS - 1),
-    )
-
-    # Reserve slots for the source and one representative of every outcome
-    # state before filling chronologically. This prevents a large successful
-    # cohort from pushing the source or rarer failures out of the bounded packet.
-    tasks: list[Task] = []
-    selected_task_ids: set[uuid.UUID] = set()
-
-    async def add_task(task: Task | None) -> None:
-        if task is None or task.id in selected_task_ids:
-            return
-        if len(tasks) >= task_packet_limit:
-            return
-        tasks.append(task)
-        selected_task_ids.add(task.id)
-
-    if cycle.source_research_task_id is not None:
-        await add_task(
-            (
-                await session.execute(
-                    select(Task).where(
-                        *task_scope,
-                        Task.id == cycle.source_research_task_id,
-                    )
+                select(Task)
+                .where(
+                    Task.discovery_cycle_id == cycle.id,
+                    Task.id != cycle.review_task_id
+                    if cycle.review_task_id is not None
+                    else True,
                 )
-            ).scalar_one_or_none()
-        )
-    for status in (
-        TaskStatus.COMPLETED,
-        TaskStatus.FAILED,
-        TaskStatus.CANCELLED,
-        TaskStatus.PARKED,
-        TaskStatus.BLOCKED,
-    ):
-        await add_task(
-            (
-                await session.execute(
-                    select(Task)
-                    .where(*task_scope, Task.status == status)
-                    .order_by(Task.created_at.asc(), Task.id.asc())
-                    .limit(1)
-                )
-            ).scalar_one_or_none()
-        )
-
-    remaining_slots = task_packet_limit - len(tasks)
-    if remaining_slots:
-        filler = list(
-            (
-                await session.execute(
-                    select(Task)
-                    .where(
-                        *task_scope,
-                        (
-                            Task.id.notin_(selected_task_ids)
-                            if selected_task_ids
-                            else True
-                        ),
-                    )
-                    .order_by(Task.created_at.asc(), Task.id.asc())
-                    .limit(remaining_slots)
-                )
-            )
-            .scalars()
-            .all()
-        )
-        for task in filler:
-            await add_task(task)
-
-    total_artifacts = int(
-        (
-            await session.execute(
-                select(func.count(Artifact.id))
-                .select_from(Artifact)
-                .join(Task, Artifact.task_id == Task.id)
-                .where(*task_scope)
-            )
-        ).scalar_one()
-        or 0
-    )
-    artifact_packet_limit = min(
-        DISCOVERY_REVIEW_MAX_ARTIFACTS,
-        max(0, DISCOVERY_REVIEW_MAX_PACKET_ITEMS - 1 - len(tasks)),
-    )
-    # A producer may update the same logical artifact many times. Only its
-    # newest version is decision-bearing; older versions are optional history,
-    # not missing required evidence. Artifacts without a stable logical key are
-    # deliberately unique so unrelated outcomes cannot be collapsed silently.
-    artifact_group_key = func.coalesce(
-        func.nullif(Artifact.logical_key, ""),
-        cast(Artifact.id, String),
-    )
-    ranked_artifacts = (
-        select(
-            Artifact.id.label("artifact_id"),
-            func.row_number()
-            .over(
-                partition_by=(
-                    Artifact.task_id,
-                    Artifact.artifact_type,
-                    artifact_group_key,
-                ),
-                order_by=(Artifact.created_at.desc(), Artifact.id.desc()),
-            )
-            .label("group_rank"),
-        )
-        .join(Task, Artifact.task_id == Task.id)
-        .where(*task_scope)
-        .subquery()
-    )
-    required_artifact_total = int(
-        (
-            await session.execute(
-                select(func.count())
-                .select_from(ranked_artifacts)
-                .where(ranked_artifacts.c.group_rank == 1)
-            )
-        ).scalar_one()
-        or 0
-    )
-    artifacts = list(
-        (
-            await session.execute(
-                select(Artifact)
-                .join(
-                    ranked_artifacts,
-                    ranked_artifacts.c.artifact_id == Artifact.id,
-                )
-                .where(ranked_artifacts.c.group_rank == 1)
-                .order_by(
-                    case(
-                        (
-                            Artifact.artifact_type.in_(
-                                _NON_OUTCOME_ARTIFACT_TYPES
-                            ),
-                            1,
-                        ),
-                        else_=0,
-                    ),
-                    Artifact.created_at.desc(),
-                    Artifact.id.desc(),
-                )
-                .limit(artifact_packet_limit)
+                .order_by(Task.created_at.asc(), Task.id.asc())
             )
         )
         .scalars()
         .all()
     )
-
-    task_evidence: list[DiscoveryEvidenceItem] = []
-    for task in tasks:
-        snapshot = _task_snapshot(task)
-        role = (
-            "source_research"
-            if task.id == cycle.source_research_task_id
-            else "cohort_task"
-        )
-        task_evidence.append(
-            await _get_or_add_evidence(
-                session,
-                cycle=cycle,
-                dedupe_key=f"task:{task.id}:terminal:v1",
-                semantic_role=role,
-                source_kind="task",
-                source_id=str(task.id),
-                source_uri=None,
-                content_type="application/vnd.blueprint.task+json",
-                head_sha=cycle.candidate_sha,
-                snapshot=snapshot,
+    source = next(
+        (task for task in tasks if task.id == cycle.source_research_task_id), None
+    )
+    task_ids = [task.id for task in tasks]
+    artifacts = (
+        list(
+            (
+                await session.execute(
+                    select(Artifact)
+                    .where(Artifact.task_id.in_(task_ids))
+                    .order_by(Artifact.created_at.asc(), Artifact.id.asc())
+                )
             )
+            .scalars()
+            .all()
         )
-
-    artifact_prerequisites: list[dict[str, Any]] = []
-    artifact_evidence: list[DiscoveryEvidenceItem] = []
+        if task_ids
+        else []
+    )
+    artifacts_by_task: dict[uuid.UUID, list[Artifact]] = {}
     for artifact in artifacts:
-        snapshot = _artifact_snapshot(artifact)
-        artifact_evidence.append(
-            await _get_or_add_evidence(
-                session,
-                cycle=cycle,
-                dedupe_key=f"artifact:{artifact.id}:v1",
-                semantic_role="outcome_artifact",
-                source_kind="artifact",
-                source_id=str(artifact.id),
-                source_uri=artifact.storage_uri or artifact.pr_url,
-                content_type=f"application/vnd.blueprint.artifact.{str(_enum_value(artifact.artifact_type)).lower()}+json",
-                head_sha=artifact.commit_hash or cycle.candidate_sha,
-                snapshot=snapshot,
+        artifacts_by_task.setdefault(artifact.task_id, []).append(artifact)
+    knowledge_documents = (
+        list(
+            (
+                await session.execute(
+                    select(KnowledgeDocument)
+                    .where(KnowledgeDocument.source_task_id.in_(task_ids))
+                    .order_by(KnowledgeDocument.created_at.asc(), KnowledgeDocument.id.asc())
+                )
             )
+            .scalars()
+            .all()
         )
-        if artifact.storage_uri:
-            artifact_prerequisites.append(
+        if task_ids
+        else []
+    )
+
+    landed: list[dict[str, Any]] = []
+    missing: list[str] = []
+    if intent_truncated:
+        missing.append("intent authority exceeds the bounded decision contract")
+    if bet_truncated:
+        missing.append("bet authority exceeds the bounded decision contract")
+    if source is None:
+        missing.append("source research parent is missing from the discovery cohort")
+    for task in tasks:
+        task_type = _task_type(task)
+        is_source_parent = task.id == cycle.source_research_task_id
+        if (
+            task_type not in WRITE_TASK_TYPES
+            and not is_source_parent
+        ) or task.status != TaskStatus.COMPLETED:
+            continue
+        task_artifacts = artifacts_by_task.get(task.id, [])
+        commit_hash = _merge_sha(task)
+        pr_number = _pr_number(task)
+        landed_signal = has_landed_signal(task)
+        if pr_number is not None and not landed_signal:
+            missing.append(
+                f"delivery task {task.id} has PR {pr_number} without landed receipt"
+            )
+        if landed_signal and not commit_hash:
+            missing.append(f"landed write task {task.id} lacks exact commit identity")
+        if landed_signal:
+            landed.append(
                 {
-                    "artifact_id": str(artifact.id),
-                    "artifact_type": str(_enum_value(artifact.artifact_type)),
-                    "logical_key": _bounded_text(artifact.logical_key, 500),
-                    "source_task_id": str(artifact.task_id),
-                    "storage_uri": _bounded_text(
-                        artifact.storage_uri,
-                        DISCOVERY_REVIEW_URI_CHARS,
-                    ),
+                    "task_id": str(task.id),
+                    "task_type": task_type,
+                    "pr_number": pr_number,
+                    "merge_commit_sha": commit_hash,
+                    "artifacts": [
+                        _compact_artifact(artifact) for artifact in task_artifacts
+                    ],
                 }
             )
 
-    overdue_blocked_ids = [
-        str(task.id)
-        for task in tasks
-        if task.status == TaskStatus.BLOCKED
-        and cycle.deadline_at is not None
-        and now >= cycle.deadline_at + DISCOVERY_REVIEW_BLOCKED_GRACE
+    experiments = [
+        _compact_artifact(artifact)
+        for artifact in artifacts
+        if _artifact_type(artifact) in _EXPERIMENT_ARTIFACT_TYPES
     ]
-    overdue_blocked_count = 0
-    if (
-        cycle.deadline_at is not None
-        and now >= cycle.deadline_at + DISCOVERY_REVIEW_BLOCKED_GRACE
-    ):
-        overdue_blocked_count = int(
-            (
-                await session.execute(
-                    select(func.count(Task.id)).where(
-                        *task_scope,
-                        Task.status == TaskStatus.BLOCKED,
-                    )
-                )
-            ).scalar_one()
-            or 0
-        )
-    overdue_spawn_request_count = 0
-    if (
-        cycle.deadline_at is not None
-        and now >= cycle.deadline_at + DISCOVERY_REVIEW_BLOCKED_GRACE
-    ):
-        overdue_spawn_request_count = int(
-            (
-                await session.execute(
-                    select(func.count(StrategicSpawnRequest.id)).where(
-                        StrategicSpawnRequest.discovery_cycle_id == cycle.id,
-                        StrategicSpawnRequest.state.in_({"accepted", "deferred"}),
-                        StrategicSpawnRequest.task_id.is_(None),
-                    )
-                )
-            ).scalar_one()
-            or 0
-        )
-    omitted_tasks = max(0, total_tasks - len(tasks))
-    omitted_artifacts = max(0, total_artifacts - len(artifacts))
-    omitted_required_artifacts = max(
-        0, required_artifact_total - len(artifacts)
-    )
-    omitted_optional_artifacts = max(
-        0, total_artifacts - required_artifact_total
-    )
-    required_evidence_omitted = bool(
-        omitted_tasks
-        or omitted_required_artifacts
-        or overdue_spawn_request_count
-        or intent_truncated
-        or bet_truncated
-    )
-    manifest: dict[str, Any] = {
-        "version": DISCOVERY_REVIEW_PACKET_VERSION,
-        "tasks": {
-            "total": total_tasks,
-            "included": len(tasks),
-            "omitted": omitted_tasks,
-        },
-        "artifacts": {
-            "total": total_artifacts,
-            "required_total": required_artifact_total,
-            "included": len(artifacts),
-            "omitted": omitted_artifacts,
-            "omitted_required": omitted_required_artifacts,
-            "omitted_optional": omitted_optional_artifacts,
-        },
-        "decision_snapshots": {
-            "intent": {
-                "checksum": _checksum(cycle.intent_snapshot or {}),
-                "truncated": intent_truncated,
-            },
-            "bet": {
-                "checksum": _checksum(cycle.bet_snapshot or {}),
-                "truncated": bet_truncated,
-            },
-        },
-        "overdue_blocked": {
-            "count": overdue_blocked_count,
-            "included_task_ids": overdue_blocked_ids,
-        },
-        "overdue_spawn_requests": {"count": overdue_spawn_request_count},
-        "required_evidence_omitted": required_evidence_omitted,
-        "incomplete": bool(
-            required_evidence_omitted
-            or overdue_blocked_count
-            or omitted_optional_artifacts
-        ),
-        "incomplete_reasons": [
-            reason
-            for condition, reason in (
-                (bool(omitted_tasks), "task_limit"),
-                (bool(omitted_required_artifacts), "artifact_limit"),
-                (
-                    bool(omitted_optional_artifacts),
-                    "artifact_redundancy_deduplicated",
-                ),
-                (intent_truncated, "intent_snapshot_truncated"),
-                (bet_truncated, "bet_snapshot_truncated"),
-                (bool(overdue_blocked_count), "overdue_blocked_tasks"),
-                (
-                    bool(overdue_spawn_request_count),
-                    "overdue_deferred_spawn_requests",
-                ),
+    missing.extend(
+        f"compute experiment {task.id} lacks COMPUTE_RESULT receipt"
+        for task in tasks
+        if (
+            _task_type(task) == "compute_experiment"
+            and task.status == TaskStatus.COMPLETED
+            and not any(
+                artifact.task_id == task.id
+                for artifact in artifacts
+                if _artifact_type(artifact) == ArtifactType.COMPUTE_RESULT.value
             )
-            if condition
-        ],
+        )
+    )
+
+    timestamps = [task.created_at for task in tasks if task.created_at is not None]
+    endpoints = [
+        task.completed_at or task.updated_at
+        for task in tasks
+        if (task.completed_at or task.updated_at) is not None
+    ]
+    elapsed_seconds = None
+    if timestamps and endpoints:
+        elapsed_seconds = max(0.0, (max(endpoints) - min(timestamps)).total_seconds())
+    total_cost = sum(float(task.estimated_cost_usd or 0.0) for task in tasks)
+    research_findings = [
+        {
+            "source_task_id": str(task.id),
+            "task_type": _task_type(task),
+            "finding": _bounded_json_value(finding, max_chars=700),
+            "semantic_summary": _canonical_semantic_value(finding),
+            "finding_checksum": _checksum(finding),
+        }
+        for task in tasks
+        for finding in finalized_research_findings(task)
+    ]
+    knowledge_outcomes = [
+        {
+            "document_id": str(document.id),
+            "source_task_id": str(document.source_task_id)
+            if document.source_task_id
+            else None,
+            "source_kind": str(document.source_kind),
+            "title": str(document.title or "")[:240],
+            "summary": str(document.summary or "")[:500],
+            "topic": str(document.topic or "")[:240] or None,
+            "citations": _bounded_json_value(
+                list(document.source_citations or [])[:12], max_chars=500
+            ),
+            "semantic_summary": _canonical_semantic_value(
+                {
+                    "title": document.title,
+                    "summary": document.summary,
+                    "topic": document.topic,
+                    "source_citations": document.source_citations,
+                }
+            ),
+        }
+        for document in knowledge_documents
+    ]
+    verification_summaries = [
+        _verification_summary(task)
+        for task in tasks
+        if _task_type(task) in _VERIFICATION_TASK_TYPES
+    ]
+    included_research_findings = research_findings[
+        :DISCOVERY_REVIEW_RESEARCH_DETAILS
+    ]
+    included_knowledge_outcomes = knowledge_outcomes[
+        -DISCOVERY_REVIEW_KNOWLEDGE_DETAILS:
+    ]
+    included_landed = landed[-DISCOVERY_REVIEW_LANDED_OUTCOMES:]
+    included_experiments = experiments[-DISCOVERY_REVIEW_EXPERIMENT_DETAILS:]
+    included_verification_summaries = verification_summaries[
+        -DISCOVERY_REVIEW_VERIFICATION_DETAILS:
+    ]
+    source_parent = {
+        "task_id": str(source.id) if source else None,
+        "title": str(source.title or "")[:500] if source else None,
+        "status": str(_enum_value(source.status)) if source else None,
+        "latest_status": str(source.latest_status_message or "")[:1_000]
+        if source
+        else None,
     }
-    pre_manifest_ledger_total = int(
+    execution = {
+        "task_count": len(tasks),
+        "retry_count": sum(int(task.attempt_count or 0) for task in tasks),
+        "failed_count": sum(task.status == TaskStatus.FAILED for task in tasks),
+        "cancelled_count": sum(task.status == TaskStatus.CANCELLED for task in tasks),
+        "elapsed_seconds": round(elapsed_seconds, 3)
+        if elapsed_seconds is not None
+        else None,
+        "estimated_cost_usd": round(total_cost, 6),
+    }
+    evidence_coverage = {
+        "research_findings": _bounded_collection_coverage(
+            research_findings,
+            included_research_findings,
+            omitted=research_findings[DISCOVERY_REVIEW_RESEARCH_DETAILS:],
+            selection="first_6_in_stable_task_order",
+        ),
+        "knowledge_outcomes": _bounded_collection_coverage(
+            knowledge_outcomes,
+            included_knowledge_outcomes,
+            omitted=knowledge_outcomes[:-DISCOVERY_REVIEW_KNOWLEDGE_DETAILS]
+            if len(knowledge_outcomes) > DISCOVERY_REVIEW_KNOWLEDGE_DETAILS
+            else [],
+            selection="latest_6_in_stable_document_order",
+        ),
+        "landed_outcomes": _bounded_collection_coverage(
+            landed,
+            included_landed,
+            omitted=landed[:-DISCOVERY_REVIEW_LANDED_OUTCOMES]
+            if len(landed) > DISCOVERY_REVIEW_LANDED_OUTCOMES
+            else [],
+            selection="latest_4_in_stable_task_order",
+        ),
+        "experiment_outcomes": _bounded_collection_coverage(
+            experiments,
+            included_experiments,
+            omitted=experiments[:-DISCOVERY_REVIEW_EXPERIMENT_DETAILS]
+            if len(experiments) > DISCOVERY_REVIEW_EXPERIMENT_DETAILS
+            else [],
+            selection="latest_6_in_stable_artifact_order",
+        ),
+        "verification_summaries": _bounded_collection_coverage(
+            verification_summaries,
+            included_verification_summaries,
+            omitted=verification_summaries[:-DISCOVERY_REVIEW_VERIFICATION_DETAILS]
+            if len(verification_summaries) > DISCOVERY_REVIEW_VERIFICATION_DETAILS
+            else [],
+            selection="latest_6_in_stable_task_order",
+        ),
+    }
+    incomplete_collections = [
+        name
+        for name, coverage in evidence_coverage.items()
+        if not coverage["semantic_digest_complete"]
+    ]
+    binding_action_blockers = (
+        [
+            "complete authored semantic coverage exceeds the bounded decision "
+            f"packet for: {', '.join(incomplete_collections)}"
+        ]
+        if incomplete_collections
+        else []
+    )
+    missing_reasons = _bounded_missing_reasons(missing)
+    receipt = {
+        "source_parent": source_parent,
+        "research_findings": included_research_findings,
+        "knowledge_outcomes": included_knowledge_outcomes,
+        "landed_outcomes": included_landed,
+        "experiment_outcomes": included_experiments,
+        "verification_summaries": included_verification_summaries,
+        "evidence_coverage": evidence_coverage,
+        "execution": execution,
+        "missing_required_evidence": missing_reasons,
+        "binding_action_blockers": binding_action_blockers,
+        "binding_decision_allowed": not binding_action_blockers,
+    }
+    if not _receipt_fits_evidence_metadata(receipt):
+        # Detail-rich receipts may exceed the fixed controller budget even when
+        # every outcome exists. Rebuild from zero details: coverage counts,
+        # checksums, sampled provenance, and complete authored semantic digests
+        # then determine whether an autonomous binding action remains safe.
+        compact_collections = {
+            "research_findings": research_findings,
+            "knowledge_outcomes": knowledge_outcomes,
+            "landed_outcomes": landed,
+            "experiment_outcomes": experiments,
+            "verification_summaries": verification_summaries,
+        }
+        evidence_coverage = {
+            name: _bounded_collection_coverage(
+                values,
+                [],
+                omitted=values,
+                selection="details_removed_to_fit_total_packet_budget",
+            )
+            for name, values in compact_collections.items()
+        }
+        incomplete_collections = [
+            name
+            for name, coverage in evidence_coverage.items()
+            if not coverage["semantic_digest_complete"]
+        ]
+        binding_action_blockers = (
+            [
+                "complete authored semantic coverage exceeds the bounded decision "
+                f"packet for: {', '.join(incomplete_collections)}"
+            ]
+            if incomplete_collections
+            else []
+        )
+        receipt = {
+            "source_parent": source_parent,
+            "research_findings": [],
+            "knowledge_outcomes": [],
+            "landed_outcomes": [],
+            "experiment_outcomes": [],
+            "verification_summaries": [],
+            "evidence_coverage": evidence_coverage,
+            "execution": execution,
+            "missing_required_evidence": missing_reasons,
+            "binding_action_blockers": binding_action_blockers,
+            "binding_decision_allowed": not binding_action_blockers,
+            "receipt_compacted_to_budget": True,
+        }
+    if not _receipt_fits_evidence_metadata(receipt):
+        # Pathological cardinality can also overflow the compact semantic
+        # indexes. Preserve exact counts/checksums, forbid binding action, and
+        # still dispatch one operator-question decision instead of stranding
+        # the completed cohort behind an impossible evidence wait.
+        for coverage in evidence_coverage.values():
+            coverage["omitted_semantic_index"] = []
+            coverage["semantic_index_included_count"] = 0
+            coverage["full_semantic_digest"] = ""
+            coverage["semantic_digest_complete"] = False
+        binding_action_blockers = [
+            "complete authored semantic coverage cannot fit the bounded decision packet"
+        ]
+        receipt.update(
+            {
+                "evidence_coverage": evidence_coverage,
+                "binding_action_blockers": binding_action_blockers,
+                "binding_decision_allowed": False,
+                "receipt_compacted_to_budget": True,
+            }
+        )
+    landed_sha = next(
         (
-            await session.execute(
-                select(func.count(DiscoveryEvidenceItem.id)).where(
-                    DiscoveryEvidenceItem.cycle_id == cycle.id
-                )
-            )
-        ).scalar_one()
-        or 0
+            str(item.get("merge_commit_sha"))
+            for item in reversed(landed)
+            if item.get("merge_commit_sha")
+        ),
+        None,
     )
-    manifest["ledger"] = {
-        "total": pre_manifest_ledger_total + 1,
-        "included": min(
-            pre_manifest_ledger_total + 1,
-            DISCOVERY_REVIEW_MAX_PACKET_ITEMS,
-        ),
-        "omitted": max(
-            0,
-            pre_manifest_ledger_total + 1 - DISCOVERY_REVIEW_MAX_PACKET_ITEMS,
-        ),
+    outcome_item = await _get_or_add_evidence(
+        session,
+        cycle=cycle,
+        dedupe_key=f"parent-outcome:v2:{_checksum(receipt)}",
+        semantic_role="parent_outcome",
+        source_kind="research_parent",
+        source_id=str(cycle.source_research_task_id),
+        content_type="application/vnd.blueprint.discovery-outcome+json",
+        head_sha=landed_sha,
+        snapshot=receipt,
+    )
+    manifest = {
+        "version": DISCOVERY_REVIEW_PACKET_VERSION,
+        "source_research_task_id": str(cycle.source_research_task_id),
+        "task_count": len(tasks),
+        "artifact_count": len(artifacts),
+        "semantic_receipt_checksum": outcome_item.checksum,
+        "exact_landed_sha": landed_sha,
+        "missing_required_evidence": missing_reasons,
+        "binding_action_blockers": binding_action_blockers,
+        "binding_decision_allowed": not binding_action_blockers,
+        "required_evidence_omitted": bool(missing_reasons or binding_action_blockers),
+        "intent_snapshot_truncated": intent_truncated,
+        "bet_snapshot_truncated": bet_truncated,
     }
-    if manifest["ledger"]["omitted"]:
-        manifest["incomplete"] = True
-        manifest["required_evidence_omitted"] = True
-        manifest["incomplete_reasons"].append("ledger_packet_limit")
     manifest_item = await _get_or_add_evidence(
         session,
         cycle=cycle,
-        dedupe_key="packet-manifest:v1",
+        dedupe_key=f"packet-manifest:v2:{_checksum(manifest)}",
         semantic_role="packet_manifest",
         source_kind="server_ledger",
         source_id=str(cycle.id),
-        source_uri=None,
         content_type="application/vnd.blueprint.discovery-review-manifest+json",
-        head_sha=cycle.candidate_sha,
+        head_sha=landed_sha,
         snapshot=manifest,
     )
-
-    # Re-read the ledger as the packet authority so evidence captured before
-    # this boundary (for example an experiment or experiential observation)
-    # is not lost merely because it was not represented by a legacy Artifact
-    # row. Stable creation order plus the hard bound keeps prompt size fixed.
-    priority_items = [manifest_item, *task_evidence, *artifact_evidence]
-    priority_ids = {item.id for item in priority_items}
-    remaining_packet_slots = max(
-        0, DISCOVERY_REVIEW_MAX_PACKET_ITEMS - len(priority_items)
-    )
-    ledger_items = priority_items[:DISCOVERY_REVIEW_MAX_PACKET_ITEMS]
-    if remaining_packet_slots:
-        ledger_items.extend(
-            list(
-                (
-                    await session.execute(
-                        select(DiscoveryEvidenceItem)
-                        .where(
-                            DiscoveryEvidenceItem.cycle_id == cycle.id,
-                            DiscoveryEvidenceItem.id.notin_(priority_ids),
-                        )
-                        .order_by(
-                            DiscoveryEvidenceItem.created_at.asc(),
-                            DiscoveryEvidenceItem.id.asc(),
-                        )
-                        .limit(remaining_packet_slots)
-                    )
-                )
-                .scalars()
-                .all()
-            )
-        )
-    artifact_ids = {str(artifact.id) for artifact in artifacts}
     packet = [
-        _evidence_projection(
-            item,
-            artifact_id=(
-                item.source_id
-                if item.source_kind == "artifact"
-                and item.source_id in artifact_ids
-                else None
-            ),
-        )
-        for item in ledger_items
+        _evidence_projection(item)
+        for item in [manifest_item, outcome_item]
     ]
-    if any(entry.get("evidence_metadata_truncated") for entry in packet):
-        manifest["incomplete"] = True
-        manifest["required_evidence_omitted"] = True
-        if "evidence_metadata_truncated" not in manifest["incomplete_reasons"]:
-            manifest["incomplete_reasons"].append("evidence_metadata_truncated")
-        # Keep the durable manifest item and its packet projection aligned with
-        # the fail-closed payload manifest after discovering oversized legacy
-        # evidence. This is the sole mutable ledger row: it describes the packet
-        # boundary itself rather than source evidence.
-        manifest_item.checksum = _checksum(manifest)
-        manifest_item.evidence_metadata = {
-            "packet_version": DISCOVERY_REVIEW_PACKET_VERSION,
-            "snapshot": json.loads(_canonical_json(manifest)),
-        }
-        session.add(manifest_item)
-        packet = [
-            (
-                _evidence_projection(manifest_item)
-                if entry.get("evidence_id") == str(manifest_item.id)
-                else entry
-            )
-            for entry in packet
-        ]
-    allowed_artifact_ids = {
-        str(entry["artifact_id"])
-        for entry in packet
-        if entry.get("artifact_id")
-    }
     artifact_prerequisites = [
-        pointer
-        for pointer in artifact_prerequisites
-        if pointer["artifact_id"] in allowed_artifact_ids
-    ]
+        {
+            "artifact_id": str(artifact.id),
+            "artifact_type": _artifact_type(artifact),
+            "source_task_id": str(artifact.task_id),
+            "storage_uri": str(artifact.storage_uri)[:DISCOVERY_REVIEW_URI_CHARS],
+        }
+        for artifact in artifacts
+        if artifact.storage_uri
+    ][:12]
     return (
         packet,
         _checksum(packet),

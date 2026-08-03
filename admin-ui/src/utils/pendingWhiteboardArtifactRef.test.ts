@@ -65,7 +65,16 @@ describe('pending Whiteboard ArtifactRef operation', () => {
       },
       { state: 'ready', artifact_ref: ARTIFACT_REF },
     ];
-    const request = vi.fn().mockImplementation(async () => responses.shift());
+    const request = vi.fn<(
+      projectId: string,
+      toolId: string,
+      revision: number,
+      renderedImage: typeof pending.rendered_image,
+    ) => Promise<ResidentToolArtifactCreateResponse>>(async () => {
+      const response = responses.shift();
+      if (!response) throw new Error('Expected a queued artifact-ref response.');
+      return response;
+    });
     const wait = vi.fn(async (delayMs: number) => {
       void delayMs;
     });

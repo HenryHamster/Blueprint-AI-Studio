@@ -189,7 +189,8 @@ def test_fix_adds_cap_for_uncapped_file_at_policy_value(tmp_path):
 
     data = json.loads(_read(jp))
     # New cap added, sized at exactly the canonical policy headroom.
-    assert data["backend"]["huge.py"] == bump_size_limit(1600)
+    assert csl.recommended_cap_for_line_count(1600) == bump_size_limit(1600)
+    assert data["backend"]["huge.py"] == csl.recommended_cap_for_line_count(1600)
     # The pre-existing entry is untouched.
     assert data["backend"]["ok.py"] == 100
     # And re-running check now passes.
@@ -359,7 +360,7 @@ def test_chronic_offender_not_silently_fixed(tmp_path, capsys, mocker):
     # The JSON cap must NOT have been bumped — the file stays at 1600.
     import json
 
-    data = json.loads(open(jp).read())
+    data = json.loads(_read(jp))
     assert data["backend"]["chronic.py"] == 1600, (
         f"Chronic offender cap should not be bumped; got {data['backend']['chronic.py']}"
     )
@@ -379,7 +380,7 @@ def test_first_time_breach_still_bumped_normally(tmp_path, mocker):
 
     import json
 
-    data = json.loads(open(jp).read())
+    data = json.loads(_read(jp))
     assert data["backend"]["new.py"] == bump_size_limit(1720)
 
 
@@ -399,7 +400,7 @@ def test_fix_chronic_git_unavailable_degrades_to_routine(tmp_path, mocker):
 
     import json
 
-    data = json.loads(open(jp).read())
+    data = json.loads(_read(jp))
     assert data["backend"]["big.py"] == bump_size_limit(1720)
 
 
@@ -433,7 +434,7 @@ def test_force_chronic_flag_overrides_chronic_gate(tmp_path, capsys, mocker):
     import json
 
     out = capsys.readouterr().out
-    data = json.loads(open(jp).read())
+    data = json.loads(_read(jp))
     assert data["backend"]["chronic.py"] == bump_size_limit(1720)
     # Should label it as operator-approved, not a silent bump.
     assert "chronic" in out.lower()

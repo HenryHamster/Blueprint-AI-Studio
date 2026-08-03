@@ -21,7 +21,6 @@ from app.broadcast import broadcast_to_project
 from app.models import (
     Alert,
     Project,
-    ProjectMember,
     ProjectMessage,
     MessageHandlingState,
     MessageSurface,

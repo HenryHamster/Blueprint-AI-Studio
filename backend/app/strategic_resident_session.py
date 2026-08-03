@@ -294,6 +294,7 @@ _RESIDENT_WAKE_BARRIER_CONTEXT_KEYS = (
     "event_type",
     "receipt_kind",
     "cycle_id",
+    "cycle_revision",
     "review_task_id",
     "direction_key",
     "verdict",
@@ -308,6 +309,7 @@ _RESIDENT_WAKE_BARRIER_CONTEXT_KEYS = (
     "serving_status",
     "served_sha",
     "reason",
+    "resume_condition",
 )
 
 # Only settled StrategicCycle transitions are actionable to a standing
@@ -2344,6 +2346,7 @@ async def _release_start_claim(
     factory = session_factory or AsyncSessionLocal
     try:
         async with factory() as session:
+            completion_events = []
 
             def _clear(vision: dict[str, Any]) -> None:
                 current = read_resident_session(vision)
@@ -2376,7 +2379,18 @@ async def _release_start_claim(
                             "cancelling orphaned strategic_review task"
                         )
                         session.add(task)
+                        completion_event = await _reconcile_resident_terminal_task(
+                            session,
+                            task,
+                            source="resident_start_compensation",
+                        )
+                        if completion_event is not None:
+                            completion_events.append(completion_event)
             await session.commit()
+        if completion_events:
+            from app import strategic_cycle
+
+            await strategic_cycle.emit_terminal_completion_events(completion_events)
     except Exception:
         # Compensation is best-effort — it must never mask the original start
         # failure the caller is about to re-raise.
@@ -3951,6 +3965,23 @@ async def _run_resident_completion_on_stop(
                     task_id,
                 )
                 return
+            from app import strategic_cycle
+
+            completion_event = await _reconcile_resident_terminal_task(
+                fresh_session,
+                task,
+                source=(
+                    "resident_worker_supersession"
+                    if (task.context or {}).get("_resident_superseded") is True
+                    else "resident_operator_stop"
+                ),
+            )
+            if completion_event is not None:
+                await fresh_session.commit()
+                await strategic_cycle.emit_terminal_completion_events(
+                    [completion_event]
+                )
+                await fresh_session.refresh(task)
             from app.strategic_completion import (
                 QUALIFY_REQUEST_CONTEXT_KEY,
                 VERSION_PHASE_DECISION_CONTEXT_KEY,
@@ -4008,7 +4039,11 @@ async def _run_resident_completion_on_stop(
                 return
 
             await _handle_strategic_completion(
-                task, "", fresh_session, project=locked_project
+                task,
+                "",
+                fresh_session,
+                project=locked_project,
+                preserve_terminal_cycle_disposition=completion_event is not None,
             )
     except Exception:
         logger.warning(
@@ -4016,6 +4051,28 @@ async def _run_resident_completion_on_stop(
             task_id,
             exc_info=True,
         )
+
+
+async def _reconcile_resident_terminal_task(
+    session: AsyncSession,
+    task: Task,
+    *,
+    source: str,
+) -> dict[str, Any] | None:
+    """Reconcile a Resident cancellation and snapshot its post-commit receipt.
+
+    The caller commits before emitting the returned event.
+    """
+    from app import strategic_cycle
+
+    reconciled = await strategic_cycle.reconcile_terminal_task(
+        session,
+        task,
+        source=source,
+    )
+    if reconciled is None:
+        return None
+    return strategic_cycle.terminal_completion_event(reconciled, task)
 
 
 async def stop_resident_session(
@@ -4750,7 +4807,6 @@ async def renew_resident_session_lease(
     stop_requested = bool(blob.get("stop_requested"))
     status = blob.get("status") or STATUS_ACTIVE
     now = _utcnow()
-    now_iso = now.isoformat()
 
     # READ-ONLY work-state signal for the agent's state-gated pacing. Computed
     # once, up front, from cheap aggregate queries; additive to every return

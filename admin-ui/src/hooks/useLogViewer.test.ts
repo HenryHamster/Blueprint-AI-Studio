@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
-import { useRef } from 'react';
+import { useRef, type MutableRefObject } from 'react';
 import { useLogViewer } from './useLogViewer';
+import type { StrategicStateCycle, StrategicStateResponse } from '../strategicStateApi';
 
 vi.mock('../api', () => ({
   authHeaders: vi.fn().mockResolvedValue({ Authorization: 'Bearer ***' }),
@@ -38,7 +39,13 @@ class MockWebSocket {
 let fetchSpy: ReturnType<typeof vi.fn>;
 let failingTaskTypesFetchCount = 0;
 
-function setup(options: { selectedProjectId?: string | null; realtimeWsEnabled?: boolean; canViewProject?: boolean; isAdmin?: boolean } = {}) {
+function setup(options: {
+  selectedProjectId?: string | null;
+  realtimeWsEnabled?: boolean;
+  strategicReadModelRef?: MutableRefObject<StrategicStateResponse | null>;
+  canViewProject?: boolean;
+  isAdmin?: boolean;
+} = {}) {
   return renderHook(() => {
     const fetchTasksRef = useRef<() => void>(vi.fn());
     const fetchDirectionsRef = useRef<() => void>(vi.fn());
@@ -57,11 +64,52 @@ function setup(options: { selectedProjectId?: string | null; realtimeWsEnabled?:
       refreshFleetRunnersRef,
       selectedProjectId: options.selectedProjectId,
       realtimeWsEnabled: options.realtimeWsEnabled,
+      strategicReadModelRef: options.strategicReadModelRef,
       canViewProject: options.canViewProject ?? true,
       isAdmin: options.isAdmin ?? true,
     });
     return { lv, fetchTasksRef, fetchDirectionsRef, refreshStrategicReadModelRef, refreshMessagesRef, fetchAlertsRef, refreshFleetRunnersRef };
   });
+}
+
+function makeCycle(overrides: Partial<StrategicStateCycle> = {}): StrategicStateCycle {
+  return {
+    id: 'cycle-reconnect',
+    outcome: 'phase1_running',
+    has_active_task: true,
+    stale: false,
+    phase1_task_id: 'phase-1',
+    phase2_task_id: null,
+    phase1_started_at: null,
+    phase1_completed_at: null,
+    phase2_started_at: null,
+    phase2_completed_at: null,
+    summary_text: null,
+    failure_reason: null,
+    directions_created: 0,
+    directions_retired: 0,
+    tasks_spawned: 0,
+    vision_updated: false,
+    problem_model_changed: false,
+    running_update_changed: false,
+    ...overrides,
+  };
+}
+
+function makeStrategicState(
+  active_cycle: StrategicStateCycle | null,
+  latest_cycle: StrategicStateCycle | null,
+): StrategicStateResponse {
+  return {
+    project_id: 'proj1',
+    strategic: {
+      active_cycle,
+      active_task: null,
+      active_phase: null,
+      latest_cycle,
+      refresh: { pending: null },
+    },
+  } as StrategicStateResponse;
 }
 
 describe('useLogViewer strategist events', () => {
@@ -1072,6 +1120,101 @@ describe('useLogViewer strategist events', () => {
     expect(result.current.lv.strategistActive).toBe(false);
   });
 
+  it('uses the durable phase after reconnect while retaining only live steering metadata', async () => {
+    const strategicReadModelRef = {
+      current: makeStrategicState(makeCycle(), null),
+    };
+    const { result } = setup({ selectedProjectId: 'proj1', strategicReadModelRef });
+    const ws = await connect(result);
+
+    act(() => {
+      ws.emit({
+        event: 'strategic_cycle_started',
+        data: {
+          task_id: 'phase-1',
+          cycle_id: 'cycle-reconnect',
+          phase_number: 1,
+          phase_label: 'Architecture review',
+          phase_state: 'phase1_running',
+          steering_origin: 'operator',
+          steering_excerpt: 'Keep this steering context',
+        },
+      });
+    });
+
+    strategicReadModelRef.current = makeStrategicState(makeCycle({
+      outcome: 'phase2_running',
+      phase2_task_id: 'phase-2',
+    }), null);
+    act(() => { ws.onopen?.({}); });
+
+    expect(result.current.lv.cycleProgress).toMatchObject({
+      cycle_id: 'cycle-reconnect',
+      task_id: 'phase-2',
+      phase_number: 2,
+      phase_label: 'Strategic review',
+      phase_state: 'phase2_running',
+      steering_origin: 'operator',
+      steering_excerpt: 'Keep this steering context',
+    });
+  });
+
+  it('replaces a same-cycle deferred receipt with durable failure and retains only unavailable live details', async () => {
+    const strategicReadModelRef = {
+      current: makeStrategicState(makeCycle(), null),
+    };
+    const { result } = setup({ selectedProjectId: 'proj1', strategicReadModelRef });
+    const ws = await connect(result);
+
+    act(() => {
+      ws.emit({
+        event: 'strategic_cycle_started',
+        data: { task_id: 'phase-1', cycle_id: 'cycle-reconnect', phase_number: 1 },
+      });
+      ws.emit({
+        event: 'strategic_cycle_completed',
+        data: {
+          cycle_id: 'cycle-reconnect',
+          completion: {
+            status: 'deferred',
+            created_count: 3,
+            strategic_judgment_challenge: {
+              mode: 'ok',
+              verdict: 'warned',
+              warned_count: 1,
+              blocked_count: 0,
+            },
+          },
+        },
+      });
+    });
+
+    strategicReadModelRef.current = makeStrategicState(null, makeCycle({
+      outcome: 'failed_phase2',
+      has_active_task: false,
+      summary_text: 'Durable phase-two failure',
+      failure_reason: 'phase-two spawn failed',
+    }));
+    act(() => { ws.onopen?.({}); });
+
+    expect(result.current.lv.lastCycleCompletion).toMatchObject({
+      status: 'FAILED',
+      created_count: 0,
+      status_message: 'Durable phase-two failure',
+      failure_reason: 'phase-two spawn failed',
+      strategic_judgment_challenge: {
+        mode: 'ok',
+        verdict: 'warned',
+        warned_count: 1,
+        blocked_count: 0,
+      },
+    });
+    expect(result.current.lv.lastCycleCompletion).not.toMatchObject({
+      status: 'deferred',
+      created_count: 3,
+    });
+  });
+
   it('resets strategistActive to false when the selected project changes', async () => {
     const { result, rerender } = renderHook(
       ({ pid }: { pid: string | null }) => {
@@ -1215,14 +1358,24 @@ describe('useLogViewer strategist events', () => {
     // No completion yet.
     expect(result.current.lv.lastCycleCompletion).toBeNull();
 
-    // Emit completion with an outcome summary.
+    // Emit the full canonical v1 completion envelope the backend sends. Its
+    // directions refetch surface must not prevent this lifecycle event from
+    // clearing the active state and recording its receipt.
     act(() => {
       ws.emit({
         event: 'strategic_cycle_completed',
         data: {
+          schema_version: 1,
+          project_id: 'proj1',
+          resource: 'strategic_cycle',
+          action: 'completed',
+          refetch: { surfaces: ['strategic_session', 'directions'] },
           task_id: 'task-1',
           cycle_id: 'cycle-42',
           phase: 2,
+          phase_number: 2,
+          phase_label: 'Strategic review',
+          phase_state: 'cycle_done',
           completion: {
             status: 'completed',
             created_count: 2,
@@ -1241,6 +1394,12 @@ describe('useLogViewer strategist events', () => {
               warned_count: 1,
               blocked_count: 0,
             },
+          },
+          strategic: {
+            kind: 'cycle',
+            task_id: 'task-1',
+            phase: 2,
+            cycle_id: 'cycle-42',
           },
         },
       });

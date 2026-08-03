@@ -55,6 +55,42 @@ async def test_canonical_project_message_flush_writes_pending_source_receipt(db_
 
 
 @pytest.mark.asyncio
+async def test_partial_project_flush_defers_unscoped_message_receipt(db_session):
+    project = Project(name="partial flush source", user_id="source-test-user")
+    db_session.add(project)
+    await db_session.flush()
+    message = ProjectMessage(
+        project_id=project.id,
+        sequence=1,
+        surface=MessageSurface.CONVERSATION,
+        from_type="system",
+        content="pending canonical event",
+    )
+    db_session.add(message)
+    project.directions = [{"id": "d-one", "text": "One", "status": "active"}]
+
+    # Direction locking deliberately flushes only Project. Global ORM listeners
+    # must not stage receipts for unrelated pending instances during that flush.
+    await db_session.flush([project])
+    assert not any(
+        isinstance(instance, StrategicMemorySource)
+        and instance.source_key == str(message.id)
+        for instance in db_session.new
+    )
+
+    await db_session.flush()
+    source = (
+        await db_session.scalars(
+            select(StrategicMemorySource).where(
+                StrategicMemorySource.project_id == project.id,
+                StrategicMemorySource.source_key == str(message.id),
+            )
+        )
+    ).one()
+    assert source.source_sequence == 1
+
+
+@pytest.mark.asyncio
 async def test_problem_model_receipts_use_monotonic_authority_generation_not_payload_hash(db_session):
     project = Project(name="problem source", user_id="source-test-user")
     db_session.add(project)

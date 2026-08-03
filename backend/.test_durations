@@ -13686,7 +13686,6 @@
   "testing/test_reaper.py::test_step6_requires_approval_sets_likely_cause": 0.45146117900185345,
   "testing/test_reaper.py::test_step6_tier1_info_alert_fires_past_threshold": 0.8855199529989477,
   "testing/test_reaper.py::test_step6_tier2_warning_skips_tier1_when_age_exceeds_3x": 0.4593403160015441,
-  "testing/test_reaper.py::test_step7_stalled_cycle_already_terminal_task_untouched": 0.47762522400080343,
   "testing/test_reaper.py::test_step7_stalled_cycle_broadcasts_after_commit": 0.9519221780010412,
   "testing/test_reaper.py::test_step7_stalled_cycle_cancels_linked_phase1_task": 0.47156861899748037,
   "testing/test_reaper.py::test_step7_stalled_cycle_cancels_linked_phase2_task": 0.4841175010024017,

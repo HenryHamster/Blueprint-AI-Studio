@@ -593,6 +593,7 @@ async def lock_project_then_task(
         # FOR NO KEY UPDATE — see project_lock: serializes project-row writers
         # without blocking FK child-row inserts (FOR KEY SHARE). PK never changes.
         .with_for_update(skip_locked=skip_locked, key_share=True)
+        .execution_options(populate_existing=True)
     )
     try:
         project_result = await asyncio.wait_for(
@@ -615,7 +616,10 @@ async def lock_project_then_task(
         yield (None, None)
         return
     task_stmt = (
-        select(Task).where(Task.id == task_id).with_for_update(skip_locked=skip_locked)
+        select(Task)
+        .where(Task.id == task_id)
+        .with_for_update(skip_locked=skip_locked)
+        .execution_options(populate_existing=True)
     )
     try:
         task_result = await asyncio.wait_for(

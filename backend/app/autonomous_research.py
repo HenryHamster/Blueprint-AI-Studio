@@ -34,6 +34,7 @@ from app.payload_schemas import (
     _MAX_PAYLOAD_BYTES,
 )
 import app.shared_state as _shared_state
+from app import strategic_cycle
 from app.shared_state import (
     get_project_integration_branch as _get_project_integration_branch,
     runtime_config as _runtime_config,
@@ -1568,7 +1569,9 @@ async def _spawn_research_task_inner(
                     session,
                     apply_spawn_budget_guard=True,
                     expected_legacy_generation=legacy_generation,
-                    cycle_id=pending_sr.get("cycle_id"),
+                    cycle_id=await strategic_cycle.active_cycle_id_for_retry(
+                        session, pending_sr.get("cycle_id")
+                    ),
                     operator_steered=bool(pending_sr.get("operator_steered")),
                     steering_excerpt=pending_sr.get("steering_excerpt"),
                     preferred_runner_target_id=pending_sr.get(
@@ -2950,10 +2953,8 @@ async def _spawn_research_task_inner(
                 continue
 
         from app.discovery_admission import (
-            consume_discovery_admission,
             DiscoveryCycleUnavailable,
             ensure_discovery_cycle_for_research,
-            reserve_discovery_admission,
         )
 
         _discovery_cycle = None
@@ -3040,25 +3041,6 @@ async def _spawn_research_task_inner(
         await session.flush()
         try:
             async with session.begin_nested():
-                _discovery_admission_key = (
-                    f"autonomous-research:{new_task.idempotency_key}"
-                )
-                if _discovery_cycle_id is not None:
-                    _discovery_decision = await reserve_discovery_admission(
-                        session,
-                        cycle_id=_discovery_cycle_id,
-                        admission_key=_discovery_admission_key,
-                        metadata={"source": "autonomous_research"},
-                    )
-                    if not _discovery_decision.allowed:
-                        logger.info(
-                            "[AUTONOMOUS] Discovery admission denied for project %s "
-                            "direction %s: %s",
-                            project.id,
-                            current_dir_id,
-                            _discovery_decision.reason,
-                        )
-                        continue
                 session.add(new_task)
                 session.add(history)
                 await session.flush()
@@ -3069,25 +3051,6 @@ async def _spawn_research_task_inner(
                     ):
                         _discovery_cycle.source_research_task_id = new_task.id
                         session.add(_discovery_cycle)
-                    _bound_decision = await reserve_discovery_admission(
-                        session,
-                        cycle_id=_discovery_cycle_id,
-                        admission_key=_discovery_admission_key,
-                        task_id=new_task.id,
-                    )
-                    if not _bound_decision.allowed:
-                        raise RuntimeError(
-                            "discovery admission binding failed: "
-                            f"{_bound_decision.reason}"
-                        )
-                    if not await consume_discovery_admission(
-                        session,
-                        cycle_id=_discovery_cycle_id,
-                        admission_key=_discovery_admission_key,
-                    ):
-                        raise RuntimeError(
-                            "discovery admission could not be consumed"
-                        )
         except IntegrityError as exc:
             if not _is_research_claim_integrity_error(exc):
                 raise

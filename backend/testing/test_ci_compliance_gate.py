@@ -1131,48 +1131,51 @@ def test_cap_bump_resolves_reaper_sweeps_breach():
 
 
 def test_cap_bump_resolves_admin_task_mutations_breach():
-    """After bumping caps via check_size_limits --fix, admin_task_mutations.py must
-    be within its new cap on the real file tree.
+    """The approval extraction restores the original mutation ceiling.
 
-    This is the breach the 2026-07-17 ci-compliance remediation targets: automain
-    HEAD 46bb84f6 reported backend/admin_task_mutations.py at 1426 lines over its old
-    cap of 1350. The fix bumps that cap to 1650 in module_size_limits.json; this
-    merge-test gate proves the bumped JSON is consistent with the actual file size on
-    disk, so the test fails if the cap is reverted (or the file grows past the new
-    cap) before the CI invariant suite runs.
+    Both the facade and its canonical approval module are checked against the
+    real file tree, so this merge-test gate catches a cap-only workaround or a
+    future re-growth of either implementation.
     """
     json_path = os.path.join(os.path.dirname(__file__), "module_size_limits.json")
     data = csl.load_limits(json_path)
     backend_caps = data.get("backend", {})
-
-    target_rel = "admin_task_mutations.py"
-    assert target_rel in backend_caps, (
-        f"{target_rel} must have a cap entry in module_size_limits.json"
-    )
-    assert backend_caps[target_rel] >= 1650, (
-        f"{target_rel} cap must be at least 1650 (bumped from old 1350 cap); "
-        f"got {backend_caps[target_rel]}"
-    )
 
     backend_root = os.path.normpath(
         os.path.join(os.path.dirname(__file__), "..", "app")
     )
     assert os.path.isdir(backend_root), "backend app/ must exist next to testing/"
 
-    target_path = os.path.join(backend_root, target_rel)
-    assert os.path.isfile(target_path), f"{target_path} must exist on disk"
+    expected_caps = {"admin_task_mutations.py": 1650}
+    for target_rel, expected_cap in expected_caps.items():
+        assert backend_caps.get(target_rel) == expected_cap, (
+            f"{target_rel} must use its principled cap {expected_cap}; "
+            f"got {backend_caps.get(target_rel)}"
+        )
+        target_path = os.path.join(backend_root, target_rel)
+        assert os.path.isfile(target_path), f"{target_path} must exist on disk"
+        actual_count = csl.count_lines(target_path)
+        result = csl.classify_size_record(
+            target_rel, actual_count, expected_cap, "backend", with_verdict=False
+        )
+        assert not result["breach"], (
+            f"{target_rel} has {actual_count} lines which exceeds its cap of "
+            f"{expected_cap}. Run `python3 backend/testing/check_size_limits.py "
+            "--fix` and commit the updated module_size_limits.json."
+        )
 
-    actual_count = csl.count_lines(target_path)
-    cap = backend_caps[target_rel]
-    result = csl.classify_size_record(
-        target_rel, actual_count, cap, "backend", with_verdict=False
+    approval_rel = "admin_task_approvals.py"
+    approval_path = os.path.join(backend_root, approval_rel)
+    assert os.path.isfile(approval_path), f"{approval_path} must exist on disk"
+    approval_count = csl.count_lines(approval_path)
+    approval_cap = csl.recommended_cap_for_line_count(approval_count)
+    assert backend_caps.get(approval_rel) == approval_cap, (
+        f"{approval_rel} must use its principled cap {approval_cap}; "
+        f"got {backend_caps.get(approval_rel)}"
     )
-
-    assert not result["breach"], (
-        f"{target_rel} has {actual_count} lines which exceeds its cap of {cap}. "
-        "Run `python3 backend/testing/check_size_limits.py --fix` and commit "
-        "the updated module_size_limits.json."
-    )
+    assert not csl.classify_size_record(
+        approval_rel, approval_count, approval_cap, "backend", with_verdict=False
+    )["breach"]
 
 
 def test_cap_bump_resolves_metrics_integrity_sweep_breach():

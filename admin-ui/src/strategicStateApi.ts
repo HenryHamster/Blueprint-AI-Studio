@@ -16,6 +16,7 @@ export interface StrategicStateCycle {
   phase2_completed_at: string | null;
   summary_text?: string | null;
   failure_reason?: string | null;
+  terminal_disposition?: 'cancelled' | 'failed' | null;
   directions_created: number;
   directions_retired: number;
   tasks_spawned: number;

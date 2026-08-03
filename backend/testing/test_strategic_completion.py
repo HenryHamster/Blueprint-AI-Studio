@@ -1777,9 +1777,9 @@ class TestRecordStrategicTaskFailure:
         datetime.fromisoformat(ts)
 
     @pytest.mark.asyncio
-    async def test_updates_cycle_history_for_strategic_review(self, strat_fail_db):
-        # Audit W2: cycle history is a real table now. Insert a StrategicCycle
-        # row and verify _record_strategic_task_failure flips its outcome.
+    async def test_does_not_mutate_cycle_for_strategic_review(self, strat_fail_db):
+        # Cycle state is owned by linkage-aware reconciliation, not this
+        # circuit-breaker accounting helper.
         from app import strategic_cycle as sc
         from app.models import StrategicCycle
 
@@ -1809,12 +1809,12 @@ class TestRecordStrategicTaskFailure:
         await _record_strategic_task_failure(task, strat_fail_db)
         await strat_fail_db.commit()
         await strat_fail_db.refresh(cycle)
-        assert cycle.outcome == sc.OUTCOME_FAILED_PHASE2
-        assert cycle.phase2_completed_at is not None
-        assert cycle.failure_reason and "Claude API timeout" in cycle.failure_reason
+        assert cycle.outcome == sc.OUTCOME_PHASE2_RUNNING
+        assert cycle.phase2_completed_at is None
+        assert cycle.failure_reason is None
 
     @pytest.mark.asyncio
-    async def test_updates_cycle_history_for_design_doc_update(self, strat_fail_db):
+    async def test_does_not_mutate_cycle_for_design_doc_update(self, strat_fail_db):
         from app import strategic_cycle as sc
         from app.models import StrategicCycle
 
@@ -1842,9 +1842,9 @@ class TestRecordStrategicTaskFailure:
         await _record_strategic_task_failure(task, strat_fail_db)
         await strat_fail_db.commit()
         await strat_fail_db.refresh(cycle)
-        assert cycle.outcome == sc.OUTCOME_FAILED_PHASE1
-        assert cycle.phase1_completed_at is not None
-        assert cycle.failure_reason and "VM crash" in cycle.failure_reason
+        assert cycle.outcome == sc.OUTCOME_PHASE1_RUNNING
+        assert cycle.phase1_completed_at is None
+        assert cycle.failure_reason is None
 
     @pytest.mark.asyncio
     async def test_no_cycle_id_skips_cycle_history_update(self, strat_fail_db):
@@ -1893,9 +1893,7 @@ class TestRecordStrategicTaskFailure:
         )
         await _record_strategic_task_failure(task, strat_fail_db)
 
-        history = project.vision.get("_strategic_cycle_history", [])
-        entry = next((e for e in history if e.get("cycle_id") == cycle_id), None)
-        assert len(entry.get("error", "")) <= 200
+        assert project.vision.get("_strategic_failures") == 1
 
     @pytest.mark.asyncio
     async def test_no_op_when_project_not_found(self, strat_fail_db):
@@ -2002,8 +2000,8 @@ class TestThinkerArtifactsMissingOutcome:
         await strat_fail_db.commit()
         await strat_fail_db.refresh(cycle)
 
-        assert cycle.outcome == sc.OUTCOME_THINKER_ARTIFACTS_MISSING
-        assert cycle.outcome not in sc.ACTIVE_OUTCOMES
+        assert cycle.outcome == sc.OUTCOME_PHASE2_RUNNING
+        assert cycle.outcome in sc.ACTIVE_OUTCOMES
 
     @pytest.mark.asyncio
     async def test_generic_phase2_failure_still_uses_failed_phase2(self, strat_fail_db):
@@ -2041,7 +2039,7 @@ class TestThinkerArtifactsMissingOutcome:
         await strat_fail_db.commit()
         await strat_fail_db.refresh(cycle)
 
-        assert cycle.outcome == sc.OUTCOME_FAILED_PHASE2
+        assert cycle.outcome == sc.OUTCOME_PHASE2_RUNNING
 
 
 # ── vision-lock discipline on failure paths ──────────────────────────────────
@@ -15039,6 +15037,15 @@ class TestDesignDocCompletionStrategistEvent:
         task = await _make_failure_task(
             strat_fail_db, project, task_type="design_doc_update"
         )
+        cycle = StrategicCycle(
+            id="sc-deferred-spawn",
+            project_id=project.id,
+            phase1_task_id=task.id,
+            outcome="phase1_running",
+        )
+        task.strategic_cycle_id = cycle.id
+        strat_fail_db.add(cycle)
+        await strat_fail_db.commit()
 
         # Phase-2 spawn deferred (active strategic task exists).
         mocker.patch(
@@ -15052,8 +15059,20 @@ class TestDesignDocCompletionStrategistEvent:
 
         emit.assert_awaited_once()
         assert emit.await_args.args == (project.id, task.id, 1)
-        assert emit.await_args.kwargs["phase_state"] == "deferred"
-        assert emit.await_args.kwargs["completion"]["status"] == "deferred"
+        assert emit.await_args.kwargs["cycle_id"] == cycle.id
+        assert (
+            emit.await_args.kwargs["phase_state"]
+            == "failed_phase2_spawn"
+        )
+        assert emit.await_args.kwargs["completion"]["status"] == "failed"
+        await strat_fail_db.refresh(cycle)
+        assert cycle.outcome == "failed_phase2_spawn"
+        assert cycle.outcome not in {
+            "in_progress",
+            "phase1_running",
+            "phase1_done",
+            "phase2_running",
+        }
 
     @pytest.mark.asyncio
     async def test_emits_completed_when_phase2_spawn_raises(
@@ -15069,6 +15088,15 @@ class TestDesignDocCompletionStrategistEvent:
         task = await _make_failure_task(
             strat_fail_db, project, task_type="design_doc_update"
         )
+        cycle = StrategicCycle(
+            id="sc-exception-spawn",
+            project_id=project.id,
+            phase1_task_id=task.id,
+            outcome="phase1_running",
+        )
+        task.strategic_cycle_id = cycle.id
+        strat_fail_db.add(cycle)
+        await strat_fail_db.commit()
 
         mocker.patch(
             "app.strategic_spawning._spawn_strategic_review",
@@ -15082,11 +15110,86 @@ class TestDesignDocCompletionStrategistEvent:
 
         emit.assert_awaited_once()
         assert emit.await_args.args == (project.id, task.id, 1)
-        assert emit.await_args.kwargs["phase_state"] == "deferred"
-        assert emit.await_args.kwargs["completion"]["status"] == "deferred"
+        assert emit.await_args.kwargs["phase_state"] == "failed"
+        assert emit.await_args.kwargs["completion"]["status"] == "failed"
+        assert emit.await_args.kwargs["completion"]["failure_reason"] == "spawn boom"
         assert (
             "FAILED to spawn" in emit.await_args.kwargs["completion"]["status_message"]
         )
+        await strat_fail_db.refresh(cycle)
+        assert cycle.outcome == "failed_phase2_spawn"
+        from app.strategic_state_read_model import _cycle_summary
+
+        assert _cycle_summary(cycle, active_task=None)["outcome"] == "failed_phase2_spawn"
+
+    @pytest.mark.asyncio
+    async def test_terminal_cycle_retry_race_is_rejected_before_phase2_insert(
+        self, strat_fail_db, mocker
+    ):
+        from unittest.mock import AsyncMock
+        from app import strategic_cycle
+        from app.strategic_spawning import _finalize_strategic_review_spawn
+
+        project = Project(name="P", user_id="u1", vision={"purpose": "test"})
+        strat_fail_db.add(project)
+        await strat_fail_db.commit()
+        await strat_fail_db.refresh(project)
+        project_id = project.id
+        cycle = await strategic_cycle.create(strat_fail_db, project_id=project_id)
+        await strat_fail_db.commit()
+        assert (
+            await strategic_cycle.active_cycle_id_for_retry(strat_fail_db, cycle.id)
+            == cycle.id
+        )
+        await strategic_cycle.mark_failure(
+            strat_fail_db,
+            cycle.id,
+            phase="phase2_spawn",
+            reason="terminal before retry finalize",
+        )
+        await strat_fail_db.commit()
+        assert (
+            await strategic_cycle.active_cycle_id_for_retry(strat_fail_db, cycle.id)
+            is None
+        )
+
+        mocker.patch(
+            "app.autonomous_research._try_research_spawn_advisory_lock",
+            new=AsyncMock(return_value=True),
+        )
+        mocker.patch(
+            "app.task_lifecycle._has_active_strategic_task",
+            new=AsyncMock(return_value=False),
+        )
+
+        assert (
+            await _finalize_strategic_review_spawn(
+                strat_fail_db,
+                project_id=project_id,
+                project_name=project.name,
+                payload={"type": "strategic_review"},
+                cycle_id=cycle.id,
+                strategy_only=False,
+                base_vision={},
+                base_problem_model={},
+                base_running_update="",
+                local_runner_intent={},
+                preferred_runner_target_id=None,
+                extra_context=None,
+                operator_steered=False,
+                steering_excerpt=None,
+            )
+            is False
+        )
+        await strat_fail_db.refresh(cycle)
+        assert cycle.outcome == strategic_cycle.OUTCOME_FAILED_PHASE2_SPAWN
+        assert cycle.phase2_task_id is None
+        tasks = (
+            (await strat_fail_db.execute(select(Task).where(Task.project_id == project_id)))
+            .scalars()
+            .all()
+        )
+        assert tasks == []
 
     @pytest.mark.asyncio
     async def test_phase2_raise_writes_retry_marker_even_when_task_expired(

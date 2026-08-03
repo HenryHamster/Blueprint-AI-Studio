@@ -344,11 +344,15 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         "Discovery Review",
         "read_only",
         default_category="strategic",
+        provider_configurable=False,
+        allowed_providers=frozenset({"anthropic"}),
         description=(
             "Judge a bounded discovery cycle against its frozen bet and evidence."
         ),
         run_shape="single_agent",
         output_kind="verdict",
+        requires_code=False,
+        workspace_requirement="none",
         evaluation_strategy="review_only",
         cost_ceiling_usd=4.0,
         completion_handler="discovery_review",

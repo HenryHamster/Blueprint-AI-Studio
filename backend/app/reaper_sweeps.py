@@ -476,7 +476,9 @@ async def sweep_stalled_strategic_cycles(
         StrategicCycle,
     )
     from app.broadcast import broadcast_to_project as _bcast
+    from app.strategic_events import emit_strategic_cycle_completed
     from app.strategic_runtime_work import task_is_strategic_local_runner_hold
+    from app.task_locking import project_lock, task_lock
 
     # Pause-aware: a cycle whose completion handler simply could not run while
     # the pipeline was paused must not be force-terminated as "stalled". Passing
@@ -484,12 +486,86 @@ async def sweep_stalled_strategic_cycles(
     from app.models import DeploymentState
 
     _deploy_state = await session.get(DeploymentState, 1)
+    # Converge old residue first: a linked task that is already FAILED or
+    # CANCELLED is a terminal lifecycle fact, not an age-based stall.  This
+    # must run while paused too; only the time-based path below is pause-aware.
+    terminal_phase_tasks = (
+        await strategic_cycle.terminal_phase_tasks_requiring_reconciliation(session)
+    )
+    reconciled_terminal_cycles = 0
+    # Snapshot the completion events BEFORE the commit expires the rows. These
+    # cycles are removed from the stalled population below, so this pass owns
+    # the strategic_cycle_completed broadcast the stalled path would otherwise
+    # have fired — without it the operator's "Strategist working…" indicator
+    # would stick on against a terminal cycle.
+    terminal_tasks_by_project: dict[object, list] = {}
+    for terminal_task in terminal_phase_tasks:
+        terminal_tasks_by_project.setdefault(terminal_task.project_id, []).append(
+            terminal_task
+        )
+    for project_id in sorted(terminal_tasks_by_project, key=str):
+        project_completion_events: list[dict] = []
+        async with project_lock(session, project_id, skip_locked=True) as locked_project:
+            if locked_project is None:
+                logger.info(
+                    "[REAPER] Deferring terminal Strategic residue for contended "
+                    "project %s",
+                    project_id,
+                )
+                continue
+            for terminal_task in sorted(
+                terminal_tasks_by_project[project_id], key=lambda task: str(task.id)
+            ):
+                # Discovery is deliberately unlocked and returns candidates only.
+                # Re-lock and reload each task before reconciling so a concurrent
+                # requeue or lifecycle writer cannot turn stale residue into a
+                # false terminal cycle.
+                async with task_lock(
+                    session, terminal_task.id, skip_locked=True
+                ) as locked_task:
+                    if locked_task is None:
+                        logger.info(
+                            "[REAPER] Deferring terminal Strategic residue for "
+                            "contended task %s",
+                            terminal_task.id,
+                        )
+                        continue
+                    if (
+                        locked_task.project_id != locked_project.id
+                        or locked_task.status
+                        not in (TaskStatus.FAILED, TaskStatus.CANCELLED)
+                    ):
+                        continue
+                    reconciled = await strategic_cycle.reconcile_terminal_task(
+                        session, locked_task, source="stalled_cycle_reaper"
+                    )
+                    if reconciled is not None:
+                        reconciled_terminal_cycles += 1
+                        project_completion_events.append(
+                            strategic_cycle.terminal_completion_event(
+                                reconciled, locked_task
+                            )
+                        )
+            # Release the Project/Task locks even when every candidate was
+            # contended or became non-terminal after discovery.
+            await session.commit()
+        if project_completion_events:
+            await strategic_cycle.emit_terminal_completion_events(
+                project_completion_events
+            )
+    if reconciled_terminal_cycles:
+        logger.info(
+            "[REAPER] Reconciled %s already-terminal strategic phase task(s)",
+            reconciled_terminal_cycles,
+        )
+
     stalled = await strategic_cycle.find_stalled(session, deploy_state=_deploy_state)
     _step7_now = _utcnow()
     if not stalled:
         return 0
     actually_stalled: list = []
     pending_broadcasts: list[tuple[str, dict]] = []
+    pending_completion_events: list[tuple[str, str, int, str, dict]] = []
 
     # Lock the owning projects (then cycles, then tasks) without locking the
     # broad discovery scan. These bounded statements follow the canonical
@@ -637,6 +713,24 @@ async def sweep_stalled_strategic_cycles(
             )
         session.add(c)
         actually_stalled.append(c)
+        if linked_task_id is not None:
+            phase_number = 1 if stalled_phase == "phase1" else 2
+            pending_completion_events.append(
+                (
+                    str(c.project_id),
+                    str(linked_task_id),
+                    phase_number,
+                    str(c.id),
+                    {
+                        "status": "failed",
+                        "status_message": (
+                            f"reaper declared strategic cycle stalled in "
+                            f"{stalled_phase} after >3h"
+                        ),
+                        "failure_reason": c.failure_reason,
+                    },
+                )
+            )
         try:
             alert = Alert(
                 project_id=c.project_id,
@@ -674,6 +768,25 @@ async def sweep_stalled_strategic_cycles(
                 logger.warning(
                     f"[REAPER] Stalled-cycle alert broadcast failed for "
                     f"{payload.get('alert_id')}: {_bcast_err}"
+                )
+        for project_id, task_id, phase, cycle_id, completion in pending_completion_events:
+            try:
+                await emit_strategic_cycle_completed(
+                    project_id,
+                    task_id,
+                    phase,
+                    cycle_id=cycle_id,
+                    phase_state=(
+                        strategic_cycle.OUTCOME_STALLED_PHASE1
+                        if phase == 1
+                        else strategic_cycle.OUTCOME_STALLED_PHASE2
+                    ),
+                    completion=completion,
+                )
+            except Exception as _bcast_err:  # noqa: PERF203, BLE001
+                logger.warning(
+                    f"[REAPER] Stalled-cycle completion broadcast failed for "
+                    f"cycle {cycle_id}: {_bcast_err}"
                 )
         logger.info(
             f"[REAPER] Marked {len(actually_stalled)} strategic cycle(s) stalled"

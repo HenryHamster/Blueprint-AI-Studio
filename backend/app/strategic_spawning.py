@@ -36,6 +36,7 @@ from app.knowledge_query import build_knowledge_index, build_compute_sweep_group
 from app.models import (
     Task,
     Project,
+    StrategicCycle,
     TaskHistory,
     TaskStatus,
     MessageType,
@@ -5300,6 +5301,34 @@ async def _finalize_strategic_review_spawn(
             "[STRATEGIC] Aborting strategic review spawn for project %s — a "
             "strategic task appeared during the payload build",
             project_id,
+        )
+        return False
+
+    # A pending retry may race with the completion handler that terminalized
+    # its original architecture cycle. Lock and recheck the row immediately
+    # before INSERT so this retry cannot reanimate a terminal cycle by calling
+    # mark_phase1_completed(..., phase2_task_id=...). Strategy-only retries have
+    # no row yet and are intentionally allowed to create a fresh cycle below.
+    existing_cycle = (
+        (
+            await session.execute(
+                select(StrategicCycle)
+                .where(StrategicCycle.id == cycle_id)
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .first()
+        if cycle_id
+        else None
+    )
+    if existing_cycle is not None and existing_cycle.outcome not in strategic_cycle.ACTIVE_OUTCOMES:
+        await session.rollback()
+        logger.warning(
+            "[STRATEGIC] Aborting strategic review spawn for project %s — "
+            "cycle %s became terminal during retry",
+            project_id,
+            cycle_id,
         )
         return False
 

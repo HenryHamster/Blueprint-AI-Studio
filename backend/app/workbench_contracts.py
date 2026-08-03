@@ -172,6 +172,7 @@ WEBSOCKET_EMITTER_INVENTORY = {
         "backend/app/routers/projects.py",
     ),
     "legacy_compatibility": (
+        "backend/app/admin_task_approvals.py",
         "backend/app/admin_task_mutations.py",
         "backend/app/agent_status_spawn.py",
         "backend/app/routers/agent_strategic_messages.py",

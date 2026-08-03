@@ -6,9 +6,12 @@ real table.
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import asynccontextmanager
 from datetime import timedelta
 
 import pytest
+from fastapi import BackgroundTasks, HTTPException
 from sqlmodel import select
 
 from app import pause_clock, strategic_cycle, vision_merge
@@ -927,6 +930,213 @@ async def test_mark_failure_phase2_spawn_records_outcome(db_session):
     assert updated.failure_reason == "spawn raised: VM limit reached"
     assert updated.phase1_completed_at is not None
     assert updated.outcome not in strategic_cycle.ACTIVE_OUTCOMES
+
+
+@pytest.mark.asyncio
+async def test_reconcile_terminal_task_reconciles_linked_phase_and_is_idempotent(
+    db_session,
+):
+    """A task's cycle linkage, not its payload, selects the failed phase."""
+    project = await _make_project(db_session)
+    phase1_task = Task(
+        project_id=project.id,
+        title="cancelled phase one",
+        status=TaskStatus.CANCELLED,
+        payloads=[{"type": "unrelated_type"}],
+    )
+    phase2_task = Task(
+        project_id=project.id,
+        title="failed phase two",
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "unrelated_type"}],
+    )
+    db_session.add_all([phase1_task, phase2_task])
+    await db_session.commit()
+
+    await strategic_cycle.create(
+        db_session, project_id=project.id, phase1_task_id=phase1_task.id
+    )
+    phase2_cycle = StrategicCycle(
+        id="sc-terminal-phase2",
+        project_id=project.id,
+        outcome=strategic_cycle.OUTCOME_PHASE2_RUNNING,
+        phase1_started_at=_utcnow(),
+        phase2_started_at=_utcnow(),
+        phase2_task_id=phase2_task.id,
+    )
+    db_session.add(phase2_cycle)
+    await db_session.commit()
+
+    reconciled_phase1 = await strategic_cycle.reconcile_terminal_task(
+        db_session, phase1_task, source="test_single_cancel"
+    )
+    reconciled_phase2 = await strategic_cycle.reconcile_terminal_task(
+        db_session, phase2_task, source="test_bulk_failure"
+    )
+    await db_session.commit()
+
+    persisted_phase1 = await strategic_cycle.get(db_session, reconciled_phase1.id)
+    persisted_phase2 = await strategic_cycle.get(db_session, reconciled_phase2.id)
+    assert persisted_phase1.cycle_metadata[
+        strategic_cycle.CYCLE_META_TERMINAL_DISPOSITION
+    ] == strategic_cycle.TERMINAL_DISPOSITION_CANCELLED
+    assert persisted_phase2.cycle_metadata[
+        strategic_cycle.CYCLE_META_TERMINAL_DISPOSITION
+    ] == strategic_cycle.TERMINAL_DISPOSITION_FAILED
+
+    assert reconciled_phase1 is not None
+    assert reconciled_phase1.outcome == strategic_cycle.OUTCOME_FAILED_PHASE1
+    assert reconciled_phase1.phase1_completed_at is not None
+    assert reconciled_phase1.failure_reason == (
+        f"terminal_task_reconciliation: source=test_single_cancel "
+        f"task_id={phase1_task.id} status=CANCELLED"
+    )
+    assert reconciled_phase1.cycle_metadata[
+        strategic_cycle.CYCLE_META_TERMINAL_DISPOSITION
+    ] == strategic_cycle.TERMINAL_DISPOSITION_CANCELLED
+    assert reconciled_phase2 is not None
+    assert reconciled_phase2.outcome == strategic_cycle.OUTCOME_FAILED_PHASE2
+    assert reconciled_phase2.phase2_completed_at is not None
+    assert reconciled_phase2.failure_reason == (
+        f"terminal_task_reconciliation: source=test_bulk_failure "
+        f"task_id={phase2_task.id} status=FAILED"
+    )
+    assert reconciled_phase2.cycle_metadata[
+        strategic_cycle.CYCLE_META_TERMINAL_DISPOSITION
+    ] == strategic_cycle.TERMINAL_DISPOSITION_FAILED
+
+    original_reason = reconciled_phase1.failure_reason
+    assert (
+        await strategic_cycle.reconcile_terminal_task(
+            db_session, phase1_task, source="duplicate_delivery"
+        )
+        is None
+    )
+    assert reconciled_phase1.failure_reason == original_reason
+
+
+@pytest.mark.asyncio
+async def test_reconcile_terminal_task_never_regresses_phase1_after_phase2_started(
+    db_session,
+):
+    project = await _make_project(db_session)
+    phase1_task = Task(
+        project_id=project.id,
+        title="late phase one failure",
+        status=TaskStatus.CANCELLED,
+        payloads=[{"type": "design_doc_update"}],
+    )
+    phase2_task = Task(
+        project_id=project.id,
+        title="active phase two",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "strategic_review"}],
+    )
+    db_session.add_all([phase1_task, phase2_task])
+    await db_session.commit()
+    cycle = StrategicCycle(
+        id="sc-phase2-protected",
+        project_id=project.id,
+        outcome=strategic_cycle.OUTCOME_PHASE2_RUNNING,
+        phase1_task_id=phase1_task.id,
+        phase2_task_id=phase2_task.id,
+        phase1_started_at=_utcnow(),
+        phase1_completed_at=_utcnow(),
+        phase2_started_at=_utcnow(),
+    )
+    db_session.add(cycle)
+    await db_session.commit()
+
+    reconciled = await strategic_cycle.reconcile_terminal_task(
+        db_session, phase1_task, source="late_agent_status"
+    )
+
+    assert reconciled is None
+    assert cycle.outcome == strategic_cycle.OUTCOME_PHASE2_RUNNING
+    assert cycle.phase2_completed_at is None
+
+
+@pytest.mark.asyncio
+async def test_admin_cancel_is_serialized_against_completed_continuation(
+    db_session, mocker
+):
+    """An admin cancel cannot overwrite a continuation that just completed.
+
+    SQLite does not enforce PostgreSQL row locks, so this test supplies the same
+    canonical pair-lock boundary with an asyncio lock and controls both sides
+    of the race explicitly. The production admin mutation must wait for the
+    continuation, re-read COMPLETED + pending, and fence the stale cancel.
+    """
+    project = await _make_project(db_session, name="terminal race")
+    task = Task(
+        project_id=project.id,
+        title="strategic continuation",
+        status=TaskStatus.COMPLETED,
+        post_commit_pending=True,
+        payloads=[{"type": "strategic_review", "prompt": "review"}],
+        context={"_post_commit_pending_meta": {"generation_token": "g1"}},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    cycle = StrategicCycle(
+        id="sc-admin-cancel-race",
+        project_id=project.id,
+        outcome=strategic_cycle.OUTCOME_PHASE2_RUNNING,
+        phase1_started_at=_utcnow(),
+        phase2_started_at=_utcnow(),
+        phase2_task_id=task.id,
+    )
+    db_session.add(cycle)
+    await db_session.commit()
+
+    pair_lock = asyncio.Lock()
+    continuation_holding_lock = asyncio.Event()
+    release_continuation = asyncio.Event()
+
+    @asynccontextmanager
+    async def controlled_pair_lock(session, project_id, task_id, **_kwargs):
+        await pair_lock.acquire()
+        try:
+            yield (await session.get(Project, project_id), await session.get(Task, task_id))
+        finally:
+            pair_lock.release()
+
+    mocker.patch("app.task_locking.lock_project_then_task", controlled_pair_lock)
+
+    async def complete_continuation():
+        async with controlled_pair_lock(db_session, project.id, task.id):
+            continuation_holding_lock.set()
+            await release_continuation.wait()
+            task.status = TaskStatus.COMPLETED
+            cycle.outcome = strategic_cycle.OUTCOME_COMPLETED
+            await db_session.commit()
+
+    continuation = asyncio.create_task(complete_continuation())
+    await continuation_holding_lock.wait()
+
+    from app.admin_task_mutations import modify_task_apply
+
+    admin_cancel = asyncio.create_task(
+        modify_task_apply(
+            task,
+            {"status": TaskStatus.CANCELLED.value},
+            BackgroundTasks(),
+            db_session,
+        )
+    )
+    await asyncio.sleep(0)
+    assert not admin_cancel.done()
+
+    release_continuation.set()
+    await continuation
+    with pytest.raises(HTTPException) as exc_info:
+        await admin_cancel
+    assert exc_info.value.status_code == 409
+
+    await db_session.refresh(task)
+    await db_session.refresh(cycle)
+    assert task.status == TaskStatus.COMPLETED
+    assert cycle.outcome == strategic_cycle.OUTCOME_COMPLETED
 
 
 @pytest.mark.asyncio

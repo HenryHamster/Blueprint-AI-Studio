@@ -58,6 +58,17 @@ def _bump_size_limit(current_size: int) -> int:
     return bump_size_limit(current_size)
 
 
+def recommended_cap_for_line_count(current_size: int) -> int:
+    """Return the canonical cap for a newly tracked source file.
+
+    Keeping the uncapped-file path behind this named policy boundary makes the
+    cap chosen for a newly extracted module explicit and directly testable.
+    It intentionally delegates to the same bump policy used for existing
+    breaches, so adding a cap cannot create a second headroom rule.
+    """
+    return _bump_size_limit(current_size)
+
+
 def _classify_breach(
     module_key: str,
     current_size: int,
@@ -477,8 +488,10 @@ def main(argv: list[str] | None = None) -> int:
             continue
         suffixes, is_excluded = _SECTION_SCAN[section]
         caps = data.get(section) or {}
-        for rec in scan_uncapped_section(root, caps, suffixes, is_excluded):
-            uncapped.append((section, rec))
+        uncapped.extend(
+            (section, rec)
+            for rec in scan_uncapped_section(root, caps, suffixes, is_excluded)
+        )
 
     if args.fix:
         if not breaches and not uncapped:
@@ -520,7 +533,7 @@ def main(argv: list[str] | None = None) -> int:
         for section, rec in uncapped:
             # Uncapped files have no bump history to check — they are new to the
             # tracking system, so they cannot be chronic offenders yet.
-            new_cap = _bump_size_limit(rec["count"])
+            new_cap = recommended_cap_for_line_count(rec["count"])
             data.setdefault(section, {})[rec["rel"]] = new_cap
             print(
                 f"[add]  {section}/{rec['rel']}: {rec['count']} lines — "

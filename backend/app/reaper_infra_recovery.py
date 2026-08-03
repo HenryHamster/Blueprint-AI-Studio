@@ -27,7 +27,6 @@ from app.shared_state import (
     external_health as _external_health,
     runtime_config as _runtime_config,
 )
-from app.task_blocked import mark_task_for_fresh_execution_attempt
 from app.time_utils import RETRY_AFTER_MAX_MINUTES, _utcnow, clear_retry_after
 
 logger = logging.getLogger(__name__)
@@ -448,7 +447,6 @@ async def run_infra_recovery_and_hold_maintenance(
             _t.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
             _t.last_heartbeat = None
             _t.started_at = None
-            mark_task_for_fresh_execution_attempt(_t)
             _t.latest_status_message = (
                 f"Auto-resurrected after infrastructure recovery (was: {_fail_cat})"
             )

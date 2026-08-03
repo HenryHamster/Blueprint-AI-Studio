@@ -1148,6 +1148,183 @@ async def _bulk_retry_one_task(
         return old_vm
 
 
+async def _bulk_cancel_task(
+    session: AsyncSession,
+    *,
+    task_id: uuid.UUID,
+    project_id: uuid.UUID,
+) -> str | None:
+    """Cancel one task under the canonical project/task ownership fence.
+
+    Returns the existing per-item terminal-state error, or ``None`` after a
+    successful cancellation. The operation owns the parent/child locks through
+    reconciliation, event snapshotting, and commit; post-commit cleanup remains
+    outside that database transaction.
+    """
+    from app import strategic_cycle
+    from app.task_locking import lock_project_then_task
+
+    terminal_statuses = {
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+    }
+
+    # Keep the Project lock through every child Task lock, reconciliation,
+    # completion-event snapshot, and commit. Continuations use this same
+    # Project -> Task order, so a stale bulk request cannot overwrite a
+    # completion that wins the ownership boundary.
+    async with lock_project_then_task(
+        session,
+        project_id,
+        task_id,
+        skip_locked=False,
+    ) as (_project, task):
+        if task is None:
+            return "Task not found"
+        if task.status in terminal_statuses:
+            return f"Task already in terminal state {task.status}"
+
+        child_ids = (
+            (
+                await session.execute(
+                    select(Task.id)
+                    .where(
+                        Task.project_id == project_id,
+                        Task.parent_task_id == task.id,
+                        Task.status.in_(CANCEL_CASCADE_CHILD_STATUSES),
+                    )
+                    .order_by(Task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        active_children = []
+        for child_id in child_ids:
+            # Re-read every cascade target after the parent/project fence. The
+            # sorted IDs make the multi-task lock acquisition deterministic.
+            async with lock_project_then_task(
+                session,
+                project_id,
+                child_id,
+                skip_locked=False,
+            ) as (_child_project, child):
+                if child is not None and child.status in CANCEL_CASCADE_CHILD_STATUSES:
+                    active_children.append(child)
+
+        # Save VM and account info before commit so cleanup does not depend on
+        # expired ORM attributes.
+        parent_vm_id = task.vm_instance_id
+        parent_acct_id = (task.context or {}).get("max_plan_account_id")
+        child_vm_info = [
+            (
+                child.vm_instance_id,
+                (child.context or {}).get("max_plan_account_id"),
+                str(child.project_id) if child.project_id else None,
+            )
+            for child in active_children
+        ]
+
+        task.status = TaskStatus.CANCELLED
+        if task.vm_provisioned_at:
+            task.vm_stopped_at = _utcnow()
+        task.requires_approval = False
+
+        # Close any PR the cancelled task opened. Without this, the PR sits
+        # open and blocks the parent's rollup gate.
+        from app.task_lifecycle import close_orphan_pr_if_any
+
+        await close_orphan_pr_if_any(task, session, reason="admin_bulk_cancel")
+
+        # Suppress low-priority tasks with finding_hash for 180 days.
+        if task.context and task.context.get("finding_hash"):
+            task_priority = task.priority if task.priority is not None else 50
+            if task_priority == 0:
+                suppress_until = (_utcnow() + timedelta(days=180)).isoformat()
+                task.context = {
+                    **task.context,
+                    "suppress_until": suppress_until,
+                }
+                flag_modified(task, "context")
+
+        history = TaskHistory(
+            task_id=task.id,
+            action="MODIFIED",
+            details={
+                "changes": {"status": "CANCELLED"},
+                "modified_by": "BULK_ACTION",
+            },
+        )
+        session.add(task)
+        session.add(history)
+
+        for child in active_children:
+            child.status = TaskStatus.CANCELLED
+            if child.vm_provisioned_at:
+                child.vm_stopped_at = _utcnow()
+            child.requires_approval = False
+            session.add(child)
+        for child in active_children:
+            await close_orphan_pr_if_any(
+                child, session, reason="admin_bulk_cancel_cascade"
+            )
+
+        # Snapshot completion events before commit, while all rows are still
+        # under this one ownership boundary; emit only after commit.
+        strategic_completion_events = []
+        reconciled = await strategic_cycle.reconcile_terminal_task(
+            session, task, source="admin_bulk_cancel"
+        )
+        if reconciled is not None:
+            strategic_completion_events.append(
+                strategic_cycle.terminal_completion_event(reconciled, task)
+            )
+        for child in active_children:
+            reconciled_child = await strategic_cycle.reconcile_terminal_task(
+                session, child, source="admin_bulk_cancel_cascade"
+            )
+            if reconciled_child is not None:
+                strategic_completion_events.append(
+                    strategic_cycle.terminal_completion_event(reconciled_child, child)
+                )
+
+        await session.commit()
+
+        await strategic_cycle.emit_terminal_completion_events(strategic_completion_events)
+
+        # Delete VMs using values saved before commit.
+        from app.vm_lifecycle import _ensure_vm_deleted
+        from app.max_plan_pool import release_max_plan_account
+
+        if parent_vm_id:
+            await _ensure_vm_deleted(parent_vm_id, reason="admin_bulk_cancel")
+            if parent_acct_id:
+                await release_max_plan_account(
+                    parent_acct_id,
+                    project_id=str(project_id) if project_id else None,
+                )
+
+        for child_vm_id, child_acct_id, child_project_id in child_vm_info:
+            if child_vm_id:
+                await _ensure_vm_deleted(
+                    child_vm_id, reason="parent_bulk_cancelled"
+                )
+            if child_acct_id:
+                await release_max_plan_account(
+                    child_acct_id,
+                    project_id=child_project_id,
+                )
+
+        if active_children:
+            logger.info(
+                "[ADMIN] Bulk cancel cascaded to %s children of task %s",
+                len(active_children),
+                task.id,
+            )
+    return None
+
+
 @router.post("/tasks/bulk-action")
 @limiter.limit("60/minute")
 async def bulk_action_tasks(
@@ -1211,24 +1388,6 @@ async def bulk_action_tasks(
     else:
         fetched = {}
 
-    # ── Phase 1.5: batch-prefetch children for cancel cascade ───────────────
-    # Pre-fetch all active children for cancel actions in a single query so
-    # the per-task cancel loop does not issue one child query per parent task.
-    # The dict maps parent_task_id → list[Task] and is built before any
-    # commits, so the loaded objects are fresh (no session-expiry lazy loads).
-    from collections import defaultdict as _defaultdict
-
-    _cancel_children_by_parent: dict[uuid.UUID, list] = _defaultdict(list)
-    if body.action == "cancel" and valid_map:
-        _child_result = await session.execute(
-            select(Task).where(
-                Task.parent_task_id.in_(list(valid_map.values())),
-                Task.status.in_(CANCEL_CASCADE_CHILD_STATUSES),
-            )
-        )
-        for _child in _child_result.scalars().all():
-            _cancel_children_by_parent[_child.parent_task_id].append(_child)
-
     # Pre-fetch which retry parent-type tasks have children (single query).
     # Passed into _bulk_retry_one_task to skip its per-task child query.
     _retry_parent_has_children: dict[uuid.UUID, bool] = {}
@@ -1261,15 +1420,14 @@ async def bulk_action_tasks(
     # _requeue_parent_task and their per-task commits already release locks
     # immediately.
     # A per-item rollback (in the except handlers below) expires EVERY ORM object
-    # in `fetched` / `_cancel_children_by_parent` regardless of expire_on_commit;
-    # once that happens, subsequent iterations must re-fetch fresh or their reads
-    # fire a sync lazy-load -> MissingGreenlet (caught, but it cascades every
-    # remaining item to a spurious "error"). `_batch_dirty` flips on first rollback.
+    # in `fetched` regardless of expire_on_commit; once that happens, subsequent
+    # iterations must re-fetch fresh or their reads fire a sync lazy-load ->
+    # MissingGreenlet (caught, but it cascades every remaining item to a spurious
+    # "error"). `_batch_dirty` flips on first rollback.
     # Populated on first rollback: batch-fetched replacements for the expired
     # ORM objects, avoiding per-iteration session.get (PERF finding M-P6).
     _batch_dirty = False
     _stale_task_map: dict[uuid.UUID, Task] = {}
-    _stale_children_map: dict[uuid.UUID, list[Task]] = {}
     for raw_id in body.task_ids:
         if raw_id not in valid_map:
             continue  # already reported as invalid
@@ -1373,133 +1531,20 @@ async def bulk_action_tasks(
                 await session.commit()
 
             elif body.action == "cancel":
-                terminal_statuses = {
-                    TaskStatus.COMPLETED,
-                    TaskStatus.FAILED,
-                    TaskStatus.CANCELLED,
-                }
-                if task.status in terminal_statuses:
+                terminal_error = await _bulk_cancel_task(
+                    session,
+                    task_id=task.id,
+                    project_id=task.project_id,
+                )
+                if terminal_error is not None:
                     results.append(
                         {
                             "task_id": raw_id,
                             "status": "error",
-                            "error": f"Task already in terminal state {task.status}",
+                            "error": terminal_error,
                         }
                     )
                     continue
-
-                # Use pre-fetched children (batch query before loop, no N+1).
-                # If a prior item rolled back, the prefetch is expired — re-fetch
-                # fresh children in one batch query instead of per-parent queries.
-                if _batch_dirty:
-                    _parent_ids = list(valid_map.values())
-                    _fresh_children = (
-                        await session.execute(
-                            select(Task).where(
-                                Task.parent_task_id.in_(_parent_ids),
-                                Task.status.in_(CANCEL_CASCADE_CHILD_STATUSES),
-                            )
-                        )
-                    ).scalars().all()
-                    _stale_children_map = _defaultdict(list)
-                    for _child in _fresh_children:
-                        _stale_children_map[_child.parent_task_id].append(_child)
-                    active_children = _stale_children_map.get(task.id, [])
-                else:
-                    active_children = _cancel_children_by_parent.get(task.id, [])
-
-                # Save VM and account info before any commit so we can access
-                # them after session.commit() expires ORM object attributes.
-                parent_vm_id = task.vm_instance_id
-                parent_acct_id = (task.context or {}).get("max_plan_account_id")
-                child_vm_info = [
-                    (
-                        child.vm_instance_id,
-                        (child.context or {}).get("max_plan_account_id"),
-                        str(child.project_id) if child.project_id else None,
-                    )
-                    for child in active_children
-                ]
-
-                task.status = TaskStatus.CANCELLED
-                if task.vm_provisioned_at:
-                    task.vm_stopped_at = _utcnow()
-                task.requires_approval = False
-
-                # Close any PR the cancelled task opened. Without this, the
-                # PR sits open and blocks the parent's rollup gate. See
-                # c56fa118 / PR #5983 incident (2026-05-26).
-                from app.task_lifecycle import close_orphan_pr_if_any
-
-                await close_orphan_pr_if_any(task, session, reason="admin_bulk_cancel")
-
-                # Suppress low-priority tasks with finding_hash for 180 days
-                if task.context and task.context.get("finding_hash"):
-                    task_priority = task.priority if task.priority is not None else 50
-                    if task_priority == 0:
-                        suppress_until = (_utcnow() + timedelta(days=180)).isoformat()
-                        task.context = {
-                            **task.context,
-                            "suppress_until": suppress_until,
-                        }
-                        flag_modified(task, "context")
-
-                history = TaskHistory(
-                    task_id=task.id,
-                    action="MODIFIED",
-                    details={
-                        "changes": {"status": "CANCELLED"},
-                        "modified_by": "BULK_ACTION",
-                    },
-                )
-                session.add(task)
-                session.add(history)
-
-                # Cascade cancellation to active children while objects are
-                # still fresh (before commit expires them).
-                for child in active_children:
-                    child.status = TaskStatus.CANCELLED
-                    if child.vm_provisioned_at:
-                        child.vm_stopped_at = _utcnow()
-                    child.requires_approval = False
-                    session.add(child)
-                # Close orphan PRs on each cascaded child too. Done before
-                # commit so the GitHub call is grouped with the cancel.
-                for child in active_children:
-                    await close_orphan_pr_if_any(
-                        child, session, reason="admin_bulk_cancel_cascade"
-                    )
-
-                await session.commit()
-
-                # Delete VMs using values saved before commit (avoids lazy
-                # loads on expired ORM objects).
-                from app.vm_lifecycle import _ensure_vm_deleted
-                from app.max_plan_pool import release_max_plan_account
-
-                if parent_vm_id:
-                    await _ensure_vm_deleted(parent_vm_id, reason="admin_bulk_cancel")
-                    if parent_acct_id:
-                        await release_max_plan_account(
-                            parent_acct_id,
-                            project_id=str(task.project_id) if task.project_id else None,
-                        )
-
-                for child_vm_id, child_acct_id, child_project_id in child_vm_info:
-                    if child_vm_id:
-                        await _ensure_vm_deleted(
-                            child_vm_id, reason="parent_bulk_cancelled"
-                        )
-                    if child_acct_id:
-                        await release_max_plan_account(
-                            child_acct_id,
-                            project_id=child_project_id,
-                        )
-
-                if active_children:
-                    logger.info(
-                        f"[ADMIN] Bulk cancel cascaded to {len(active_children)} children of task {task.id}"
-                    )
 
             results.append({"task_id": raw_id, "status": "ok"})
         except HTTPException as e:
