@@ -51,6 +51,8 @@ _LIVE_SOURCE_REHEARSAL_EXPORT = _SCRIPT_DIR / "live_source_rehearsal_export.py"
 _LOCAL_API_SERVICE = _SCRIPT_DIR / "local_api_service.py"
 _LOCAL_WORKER_SERVICE = _SCRIPT_DIR / "local_worker_service.py"
 _TAILSCALE_FUNNEL_SERVICE = _SCRIPT_DIR / "tailscale_funnel_service.py"
+_LOCAL_APP_RELEASE = _SCRIPT_DIR / "local_app_release.py"
+_FRONTEND_RELEASE_MANIFEST = _SCRIPT_DIR / "frontend_release_manifest.py"
 _USER_TEMPLATE = _SCRIPT_DIR / "blueprint-node.service"
 _SYSTEM_TEMPLATE = _SCRIPT_DIR / "blueprint-node-system.service"
 _EDGE_USER_TEMPLATE = _SCRIPT_DIR / "blueprint-edge.service"
@@ -81,6 +83,8 @@ _LOCAL_CONTROL_PLANE_SCRIPT_SOURCES = (
     _LOCAL_API_SERVICE,
     _LOCAL_WORKER_SERVICE,
     _TAILSCALE_FUNNEL_SERVICE,
+    _LOCAL_APP_RELEASE,
+    _FRONTEND_RELEASE_MANIFEST,
 )
 
 
@@ -1064,6 +1068,8 @@ def _service_role_env_text(
     if missing:
         raise ValueError(f"{role} configuration missing: {', '.join(sorted(missing))}")
     unexpected = set(values) - required
+    if role == "api":
+        unexpected.discard("BLUEPRINT_API_DEPLOY_SHA")
     if unexpected:
         raise ValueError(f"{role} configuration has unsupported keys")
     for key, value in values.items():

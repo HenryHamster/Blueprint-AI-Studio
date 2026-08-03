@@ -30,7 +30,10 @@ class PlanValidationTests(unittest.TestCase):
 
     def test_plan_rejects_unsafe_paths_and_resource_values(self):
         for path in ("relative", "/tmp/../root", "/tmp/has space"):
-            with self.subTest(path=path), self.assertRaisesRegex(ValueError, "state_root"):
+            with (
+                self.subTest(path=path),
+                self.assertRaisesRegex(ValueError, "state_root"),
+            ):
                 gav.build_plan(state_root=path)
         with self.assertRaisesRegex(ValueError, "cpus"):
             gav.build_plan(state_root="/safe", cpus=1)
@@ -48,7 +51,10 @@ class PlanValidationTests(unittest.TestCase):
             "ssh-ed25519 AAAA $(touch /tmp/pwn)",
             "ssh-ed25519 AAAA comment:bad",
         ):
-            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "SSH public key"):
+            with (
+                self.subTest(key=key),
+                self.assertRaisesRegex(ValueError, "SSH public key"),
+            ):
                 gav.validate_ssh_public_key(key)
 
 
@@ -92,7 +98,9 @@ class AssetSecurityTests(unittest.TestCase):
         installer = (Path(__file__).parent / "install-github-actions-vm.sh").read_text(
             encoding="utf-8"
         )
-        render_seed = installer.split("render_seed() {", 1)[1].split("create_overlay() {", 1)[0]
+        render_seed = installer.split("render_seed() {", 1)[1].split(
+            "create_overlay() {", 1
+        )[0]
         self.assertIn("--read-only", render_seed)
         self.assertIn("--tmpfs /tmp:rw,nosuid,nodev,noexec,size=16m", render_seed)
         self.assertIn("--entrypoint /usr/bin/cloud-localds", render_seed)
@@ -104,7 +112,7 @@ class AssetSecurityTests(unittest.TestCase):
         start = installer.split("start() {", 1)[1].split("status() {", 1)[0]
         self.assertIn("attempt <= 50", start)
         self.assertIn("sleep 0.1", start)
-        self.assertIn('firewall_ready=true', start)
+        self.assertIn("firewall_ready=true", start)
         self.assertIn('[[ "$firewall_ready" != "true" ]]', start)
 
     def test_qemu_safely_shares_the_firewall_network_namespace(self):
@@ -182,7 +190,9 @@ class AssetSecurityTests(unittest.TestCase):
 
     def test_each_runner_gets_a_dedicated_guest_docker_daemon(self):
         dockerd = (ASSET_DIR / "blueprint-dockerd@.service").read_text(encoding="utf-8")
-        runner = (ASSET_DIR / "blueprint-github-actions@.service").read_text(encoding="utf-8")
+        runner = (ASSET_DIR / "blueprint-github-actions@.service").read_text(
+            encoding="utf-8"
+        )
         network = (ASSET_DIR / "prepare-runner-network.sh").read_text(encoding="utf-8")
         self.assertIn("/run/blueprint-actions/%i/docker.sock", dockerd)
         self.assertIn("--data-root=/var/lib/blueprint-actions/docker-%i", dockerd)
@@ -195,14 +205,16 @@ class AssetSecurityTests(unittest.TestCase):
         self.assertIn("net.ipv6.conf.all.disable_ipv6=1", network)
         self.assertIn("blueprint-dockerd@%i.service", runner)
         self.assertIn("blueprint-runner-network@%i.service", runner)
-        self.assertIn("DOCKER_HOST=unix:///run/blueprint-actions/%i/docker.sock", runner)
+        self.assertIn(
+            "DOCKER_HOST=unix:///run/blueprint-actions/%i/docker.sock", runner
+        )
 
     def test_runner_registration_preflights_all_docker_daemons(self):
         installer = (ASSET_DIR / "install-runners.sh").read_text(encoding="utf-8")
         daemon_preflight = installer.index('systemctl enable --now "blueprint-dockerd@')
         runner_registration = installer.index('"$runner_root/config.sh"')
         self.assertLess(daemon_preflight, runner_registration)
-        self.assertIn('info >/dev/null 2>&1', installer)
+        self.assertIn("info >/dev/null 2>&1", installer)
         self.assertIn('[[ "$daemon_ready" == "true" ]]', installer)
         self.assertIn('if [[ -f "$runner_root/.runner"', installer)
         self.assertIn('["agentName"]', installer)
@@ -227,11 +239,11 @@ class AssetSecurityTests(unittest.TestCase):
         workflow = (
             Path(__file__).parents[1] / ".github" / "workflows" / "ci.yml"
         ).read_text(encoding="utf-8")
-        viewport = workflow.split(
-            "- name: Viewport tests (browser mode)", 1
-        )[1].split("- name: Upload viewport failure screenshots", 1)[0]
+        viewport = workflow.split("- name: Viewport tests (browser mode)", 1)[1].split(
+            "- name: Upload viewport failure screenshots", 1
+        )[0]
         self.assertIn(
-            'node -p "require(\'playwright-core/package.json\').version"',
+            "node -p \"require('playwright-core/package.json').version\"",
             viewport,
         )
         self.assertIn(
@@ -254,8 +266,8 @@ class AssetSecurityTests(unittest.TestCase):
             self.assertIn(hardening, viewport)
         for lifecycle_guard in (
             "--filter label=com.blueprint.ci=viewport",
-            'trap cleanup_viewport EXIT INT TERM',
-            'timeout --signal=TERM --kill-after=30s 20m',
+            "trap cleanup_viewport EXIT INT TERM",
+            "timeout --signal=TERM --kill-after=30s 20m",
             "--label com.blueprint.ci=viewport",
             'docker rm -f "$container_name"',
             'node_root="$(dirname "$(dirname "$(command -v node)")")"',
@@ -383,8 +395,8 @@ class AssetSecurityTests(unittest.TestCase):
                 'printf "%s\\n" "Failed to fetch dynamically imported module: test" '
                 '"Cannot connect to the iframe." '
                 '"Vitest caught 1 unhandled error during the test run."; '
-                'exit 1; '
-                'fi; '
+                "exit 1; "
+                "fi; "
                 'printf "attempt\\n" >> "$ATTEMPT_LOG"'
             )
             self.assertEqual(
@@ -425,26 +437,32 @@ class AssetSecurityTests(unittest.TestCase):
             self.assertEqual(responsive_timeout.returncode, 124)
             self.assertIn("timed out; retrying once", responsive_timeout.stderr)
             self.assertEqual(docker_log.read_text(encoding="utf-8").count("rm -f"), 1)
-            self.assertEqual(attempt_log.read_text(encoding="utf-8").count("attempt"), 2)
+            self.assertEqual(
+                attempt_log.read_text(encoding="utf-8").count("attempt"), 2
+            )
 
             docker_log.unlink()
             attempt_log.unlink()
             timeout_then_success = run(
                 'if [[ ! -e "$ATTEMPT_LOG" ]]; then touch "$ATTEMPT_LOG"; sleep 2; fi'
             )
-            self.assertEqual(timeout_then_success.returncode, 0, timeout_then_success.stderr)
+            self.assertEqual(
+                timeout_then_success.returncode, 0, timeout_then_success.stderr
+            )
             self.assertIn("timed out; retrying once", timeout_then_success.stderr)
             self.assertEqual(docker_log.read_text(encoding="utf-8").count("rm -f"), 1)
 
             docker_log.unlink()
             attempt_log.unlink()
             hard_timeout = run(
-                'echo attempt >> "$ATTEMPT_LOG"; trap \'\' TERM; sleep 2'
+                "echo attempt >> \"$ATTEMPT_LOG\"; trap '' TERM; sleep 2"
             )
             self.assertIn(hard_timeout.returncode, (124, 137))
             self.assertIn("timed out; retrying once", hard_timeout.stderr)
             self.assertEqual(docker_log.read_text(encoding="utf-8").count("rm -f"), 1)
-            self.assertEqual(attempt_log.read_text(encoding="utf-8").count("attempt"), 2)
+            self.assertEqual(
+                attempt_log.read_text(encoding="utf-8").count("attempt"), 2
+            )
 
     def test_backend_scrubs_cross_run_postgres_leftovers(self):
         workflow = (
@@ -483,6 +501,37 @@ class AssetSecurityTests(unittest.TestCase):
         self.assertIn("--concurrency 120", deploy)
         self.assertNotIn("--min-instances 1", deploy)
         self.assertNotIn("--max-instances 12", deploy)
+
+    def test_deploy_keeps_production_host_and_credentials_out_of_build_steps(self):
+        workflow = (
+            Path(__file__).parents[1] / ".github" / "workflows" / "deploy.yml"
+        ).read_text(encoding="utf-8")
+        detect = workflow.split("  detect:", 1)[1].split(
+            "  build-frontend-artifact:", 1
+        )[0]
+        self.assertIn("runs-on: ubuntu-latest", detect)
+        self.assertNotIn("self-hosted", detect)
+        self.assertIn(
+            "dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36",
+            detect,
+        )
+
+        same_origin_build = workflow.split("  build-frontend-artifact:", 1)[1].split(
+            "  build-backend:", 1
+        )[0]
+        self.assertNotIn("id-token: write", same_origin_build)
+        self.assertNotIn("google-github-actions/auth", same_origin_build)
+
+        firebase_build = workflow.split("  build-firebase-frontend:", 1)[1].split(
+            "  deploy-frontend:", 1
+        )[0]
+        self.assertNotIn("id-token: write", firebase_build)
+        self.assertNotIn("google-github-actions/auth", firebase_build)
+
+        firebase_deploy = workflow.split("  deploy-frontend:", 1)[1]
+        self.assertIn("id-token: write", firebase_deploy)
+        self.assertIn("actions/download-artifact@v4", firebase_deploy)
+        self.assertIn("--verify admin-ui/dist", firebase_deploy)
 
 
 if __name__ == "__main__":

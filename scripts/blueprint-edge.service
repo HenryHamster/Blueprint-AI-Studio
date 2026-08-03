@@ -1,6 +1,6 @@
 [Unit]
 Description=Blueprint node role: edge
-BindsTo=blueprint-api.service
+Wants=blueprint-api.service
 After=blueprint-api.service
 
 [Service]

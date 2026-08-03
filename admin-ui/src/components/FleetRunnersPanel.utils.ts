@@ -73,7 +73,7 @@ export interface RunnerSetupSnippetCommands {
  * enroll snippet omits --url entirely (the launcher already defaults to it);
  * only a non-prod backend needs the explicit override.
  */
-export const DEFAULT_ORCHESTRATOR_URL = 'https://blueprint-orchestrator-mmtfi5aysa-uc.a.run.app';
+export const DEFAULT_ORCHESTRATOR_URL = 'https://hamsterwheel.tail552e05.ts.net';
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
