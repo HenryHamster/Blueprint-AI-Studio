@@ -1444,26 +1444,33 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
       || !capabilities.has('--mcp-config')
       || !capabilities.has('--strict-mcp-config')
       || !capabilities.has('--allowedTools')
-      || !capabilities.has('--max-turns')
     )) {
       throw new TextOnlyProviderUnavailableError(
         runner.provider,
         'cli_cannot_prove_toolless_strict_mcp_turn_cap',
       );
     }
+    // --max-turns was removed from Claude Code as of 2.1.x. A toolless turn
+    // cannot extend itself (no tool results to continue on) and the wrapper's
+    // wall-clock timeout still bounds the process, so the turn cap is required
+    // only when the installed CLI can express it.
+    const cliSupportsMaxTurns = capabilities?.has('--max-turns') ?? false;
     const compatibleArgs = stripUnsupportedClaudeOptionalArgs(runCommand.args, capabilities);
     if (isolatedTextOnly && (
       !compatibleArgs.includes('--tools')
       || !compatibleArgs.includes('--mcp-config')
       || !compatibleArgs.includes('--strict-mcp-config')
       || !compatibleArgs.includes('--allowedTools')
-      || !compatibleArgs.includes('--max-turns')
+      || (cliSupportsMaxTurns && !compatibleArgs.includes('--max-turns'))
       || compatibleArgs.includes('--dangerously-skip-permissions')
     )) {
       throw new TextOnlyProviderUnavailableError(
         runner.provider,
         'tool_or_turn_boundary_removed_by_compatibility_filter',
       );
+    }
+    if (isolatedTextOnly && !cliSupportsMaxTurns) {
+      sendLog(ws, '[preflight] Claude CLI has no --max-turns; toolless turn proceeds under timeout bound only\n');
     }
     const removedPartialMessages = partialMessageProgressAvailable
       && !compatibleArgs.includes(CLAUDE_PARTIAL_MESSAGES_FLAG);
