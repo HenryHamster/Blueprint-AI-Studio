@@ -7818,9 +7818,9 @@ class ServiceCredential(SQLModel, table=True):
     """
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
-    name: str = Field(
-        sa_column=Column(String(64), nullable=False, unique=True, index=True)
-    )
+    # unique=True already backs lookups with a unique index (uq_servicecredential_name
+    # in migration 0723); index=True would demand a second, redundant ix_ index.
+    name: str = Field(sa_column=Column(String(64), nullable=False, unique=True))
     description: str | None = Field(
         default=None, sa_column=Column(String(255), nullable=True)
     )
@@ -7828,9 +7828,7 @@ class ServiceCredential(SQLModel, table=True):
         sa_column=Column(String(128), nullable=False, index=True)
     )
     # SHA256 hex digest of the secret token (never the plaintext).
-    token_hash: str = Field(
-        sa_column=Column(String(64), nullable=False, unique=True, index=True)
-    )
+    token_hash: str = Field(sa_column=Column(String(64), nullable=False, unique=True))
     # First characters of the plaintext (e.g. "bpsc_Ab12Cd34") for display/identification.
     token_prefix: str = Field(sa_column=Column(String(16), nullable=False))
     scopes: List[str] = Field(
