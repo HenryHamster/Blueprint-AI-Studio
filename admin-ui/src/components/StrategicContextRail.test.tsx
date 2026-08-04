@@ -2296,6 +2296,128 @@ describe('StrategicContextRail', () => {
     expect(host.textContent).not.toContain('Cycle cancelled');
   });
 
+  test('accepts a same-cycle live cancellation while durable active state is stale', () => {
+    const state: StrategicStateResponse = {
+      ...STATE,
+      strategic: {
+        ...STATE.strategic,
+        active_cycle: { ...STATE.strategic.active_cycle!, id: 'cycle-cancelled', has_active_task: true },
+        latest_cycle: { ...STATE.strategic.latest_cycle!, id: 'cycle-before', summary_text: 'Older success' },
+        refresh: { ...STATE.strategic.refresh, pending: null },
+      },
+    };
+    const { host } = mount({
+      state,
+      lastCycleCompletion: {
+        cycle_id: 'cycle-cancelled',
+        status: 'CANCELLED',
+        failure_reason: 'Cancelled by operator while reconnecting',
+      },
+    });
+
+    expect(host.textContent).toContain('Cycle cancelled');
+    expect(host.textContent).toContain('Cancelled by operator while reconnecting');
+    expect(host.textContent).not.toContain('Cycle running');
+  });
+
+  test('accepts a same-cycle live failure over stale durable active and latest state', () => {
+    const state: StrategicStateResponse = {
+      ...STATE,
+      strategic: {
+        ...STATE.strategic,
+        active_cycle: { ...STATE.strategic.active_cycle!, id: 'cycle-failed', has_active_task: true },
+        latest_cycle: { ...STATE.strategic.latest_cycle!, id: 'cycle-before', summary_text: 'Older success' },
+        refresh: { ...STATE.strategic.refresh, pending: null },
+      },
+    };
+    const { host } = mount({
+      state,
+      lastCycleCompletion: {
+        cycle_id: 'cycle-failed',
+        status: 'FAILED',
+        failure_reason: 'Live failure after the durable refresh lagged',
+      },
+    });
+
+    expect(host.textContent).toContain('Cycle failed');
+    expect(host.textContent).toContain('Live failure after the durable refresh lagged');
+    expect(host.textContent).not.toContain('Cycle running');
+  });
+
+  test('preserves a different newer active cycle from an older completion', () => {
+    const state: StrategicStateResponse = {
+      ...STATE,
+      strategic: {
+        ...STATE.strategic,
+        active_cycle: { ...STATE.strategic.active_cycle!, id: 'cycle-new', has_active_task: true },
+        latest_cycle: { ...STATE.strategic.latest_cycle!, id: 'cycle-old', outcome: 'failed_phase1' },
+        refresh: { ...STATE.strategic.refresh, pending: null },
+      },
+    };
+    const { host } = mount({
+      state,
+      lastCycleCompletion: { cycle_id: 'cycle-old', status: 'FAILED', failure_reason: 'Old completion' },
+    });
+
+    expect(host.textContent).toContain('Strategic review');
+    expect(host.textContent).not.toContain('Cycle failed');
+  });
+
+  test('uses the accepted live completion when durable latest identifies another cycle', () => {
+    const state: StrategicStateResponse = {
+      ...STATE,
+      strategic: {
+        ...STATE.strategic,
+        active_cycle: null,
+        active_task: null,
+        active_phase: null,
+        latest_cycle: {
+          ...STATE.strategic.latest_cycle!,
+          id: 'cycle-durable-old',
+          outcome: 'completed',
+          summary_text: 'Durable success from another cycle',
+        },
+        refresh: { ...STATE.strategic.refresh, pending: null },
+      },
+    };
+    const { host } = mount({
+      state,
+      lastCycleCompletion: {
+        cycle_id: 'cycle-live-new',
+        status: 'FAILED',
+        failure_reason: 'Accepted live failure',
+      },
+    });
+
+    expect(host.textContent).toContain('Cycle failed');
+    expect(host.textContent).toContain('Accepted live failure');
+    expect(host.textContent).not.toContain('Durable success from another cycle');
+  });
+
+  test.each([
+    ['completed', 'Cycle complete'],
+    ['failed', 'Cycle failed'],
+    ['cancelled', 'Cycle cancelled'],
+  ])('keeps a pending operator steer ahead of a live %s completion', (status, terminalLabel) => {
+    const state: StrategicStateResponse = {
+      ...STATE,
+      strategic: {
+        ...STATE.strategic,
+        active_cycle: null,
+        active_task: null,
+        active_phase: null,
+        refresh: STATE.strategic.refresh,
+      },
+    };
+    const { host } = mount({
+      state,
+      lastCycleCompletion: { cycle_id: 'cycle-live', status },
+    });
+
+    expect(host.textContent).toContain('Steer queued');
+    expect(host.textContent).not.toContain(terminalLabel);
+  });
+
   test('keeps clear attention state quiet', () => {
     const clearState: StrategicStateResponse = {
       ...STATE,

@@ -5,8 +5,9 @@ import type { PendingConfirmation, PendingConfirmationType } from '../types';
 import { PendingConfirmationList } from './ProblemModelAttention';
 import type { StrategicCycleCompletion, StrategicCycleProgress } from '../hooks/useLogViewer';
 import {
-  strategicCycleTerminalDisposition,
+  strategicCycleIsWorking,
   strategicCycleTerminalLabel,
+  strategicCycleTerminalProjection,
   type StrategicCycleTerminalDisposition,
 } from '../hooks/useStrategistStatus';
 import type {
@@ -918,10 +919,9 @@ export const StrategicContextRail = memo(function StrategicContextRail({
   const operatorSteerQueued = Boolean(
     pendingSteer && (pendingSteer.origin === 'operator' || (pendingSteer.operator_count ?? 0) > 0),
   );
-  const isWorking = !staleCycle && (strategistActive || Boolean(activeCycle?.has_active_task));
-  const terminalDisposition: StrategicCycleTerminalDisposition | null =
-    strategicCycleTerminalDisposition(latestCycle?.terminal_disposition ?? latestCycle?.outcome)
-    ?? strategicCycleTerminalDisposition(lastCycleCompletion?.status);
+  const isWorking = !staleCycle && strategicCycleIsWorking({ strategistActive, activeCycle, lastCycleCompletion });
+  const terminalProjection = strategicCycleTerminalProjection({ latestCycle, lastCycleCompletion });
+  const terminalDisposition: StrategicCycleTerminalDisposition | null = terminalProjection.disposition;
   const statusTone = isWorking
     ? 'bg-cyan-400'
     : pendingSteer
@@ -987,11 +987,7 @@ export const StrategicContextRail = memo(function StrategicContextRail({
     : pendingSteer?.excerpt
       ? pendingSteer.excerpt
       : terminalDisposition
-        ? latestCycle?.failure_reason
-          ?? lastCycleCompletion?.failure_reason
-          ?? latestCycle?.summary_text
-          ?? lastCycleCompletion?.status_message
-          ?? 'No active Strategic cycle'
+        ? terminalProjection.detail ?? 'No active Strategic cycle'
         : latestCycle?.summary_text ?? lastCycleCompletion?.status_message ?? 'No active Strategic cycle';
   const localRunnerStatus = localRunner ? localRunnerTone(localRunner) : null;
   const showRuntimeWork = runtimeWorkHasSignal(runtimeWork);
