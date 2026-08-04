@@ -293,8 +293,30 @@ async def _validate_rollup_migration_chain(
         and (rev := _filename_revision_prefix(f.get("filename", ""))) is not None
         and rev in existing_revisions_on_target
     }
+    # Validate the candidate's post-merge tree, not target HEAD plus additions.
+    # A reconciliation PR legitimately removes/renames the integration-side
+    # collision and adds the deployed identity plus a rechained successor.  If
+    # the removed basename remains in ``existing_filenames`` here, the guard
+    # falsely sees both old and replacement 0721 revisions and blocks the fix.
+    removed_target_basenames = {
+        f.get("previous_filename", "").rsplit("/", 1)[-1]
+        if f.get("status") == "renamed"
+        else f.get("filename", "").rsplit("/", 1)[-1]
+        for f in files
+        if (
+            f.get("status") == "removed"
+            and _touches_alembic_versions(f.get("filename", ""))
+        )
+        or (
+            f.get("status") == "renamed"
+            and _touches_alembic_versions(f.get("previous_filename", ""))
+        )
+    }
+    effective_existing_filenames = [
+        fn for fn in existing_filenames if fn not in removed_target_basenames
+    ]
     reason = validate_combined_migration_chain(
-        existing_filenames,
+        effective_existing_filenames,
         added_sources,
         inplace_modified_revisions=inplace_modified_revisions,
     )
@@ -312,7 +334,7 @@ async def _validate_rollup_migration_chain(
     # Uses only data already fetched (no extra I/O), so it can't add a new
     # fail-safe surface to the shared guard.
     divergences = find_content_divergent_revisions(
-        existing_filenames, list(added_sources.keys())
+        effective_existing_filenames, list(added_sources.keys())
     )
     if divergences:
         return (

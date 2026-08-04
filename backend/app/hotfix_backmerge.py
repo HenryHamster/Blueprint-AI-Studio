@@ -1827,7 +1827,13 @@ async def _handle_migration_block(
         )
         return
 
-    already_open = await _resolution_task_already_open(session, project_id)
+    already_open = await _resolution_task_already_open(
+        session,
+        project_id,
+        token=gh_token,
+        owner=owner,
+        repo=repo,
+    )
     if periodic and already_open:
         logger.info(
             "[BACKMERGE] back-merge migration block for project %s — a remediation "

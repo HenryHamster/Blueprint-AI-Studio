@@ -614,17 +614,17 @@ Only request qualification from the **stabilize** phase — it is ignored in **b
 
 **Three distinct version-authoring concepts — keep them separate:**
 - \`intent.purpose\` = enduring PROJECT north star, operator-owned, spans all versions — never change it here.
-- \`version.goal\` = THIS version's frozen objective — a derivative of purpose, authored once per version.
+- \`version.goal\` = THIS version's current objective — revise it when evidence shows it is infeasible, circular, stale, or badly scoped.
 - \`intent.current_focus\` = live "working on now" status — NOT the goal, advances across cycles.
 
-**Authoring the version goal (when none is set):**
-If the open version has no Goal shown above, you may propose one by emitting a \`new_version_goal\` field as a top-level sibling in your Section 6 problem_model update:
+**Authoring or revising the version goal:**
+If the open version has no Goal, or current delivery capability/evidence makes the existing goal infeasible or badly scoped, emit a \`new_version_goal\` field as a top-level sibling in your Section 6 problem_model update:
 \`\`\`json
 {
   "new_version_goal": "One concise sentence stating what this version is for."
 }
 \`\`\`
-Only emit \`new_version_goal\` when the Goal is currently unset — once authored, the goal is frozen and a re-emit is silently ignored. Keep it under 500 characters and avoid placeholder or generic text. \`new_version_goal\` is independent of \`version_phase_decision\` and \`qualify_request\` — you may emit any combination.`);
+Keep it under 500 characters and avoid placeholder or generic text. Omit it when the existing goal remains sound. When promotion or serving evidence is unavailable, revise/split the goal or park/replace the owning direction rather than commissioning impossible work. Use ordinary \`spawn-task\` authority for any useful implementation, research, design, QA, or compute work; do not invent a special release-repair lane. \`new_version_goal\` is independent of \`version_phase_decision\` and \`qualify_request\` — you may emit any combination.`);
 
   return parts.join('\n');
 }

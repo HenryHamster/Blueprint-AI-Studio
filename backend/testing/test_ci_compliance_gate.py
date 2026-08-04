@@ -278,7 +278,7 @@ async def test_noncompliant_qualify_request_is_blocked_and_spawns_cap_bump(
         new=mocker.AsyncMock(return_value={"status": "spawned"}),
     )
 
-    await _apply_qualify_request(
+    refresh_required = await _apply_qualify_request(
         {"reason": "ready"},
         agent_task,
         project,
@@ -300,12 +300,10 @@ async def test_noncompliant_qualify_request_is_blocked_and_spawns_cap_bump(
         for task in tasks
         if (task.context or {}).get("spawned_by") == "ci_compliance_cap_bump_gate"
     ]
-    assert len(cap_bump_tasks) == 1
-    assert cap_bump_tasks[0].status == TaskStatus.QUEUED
-    assert cap_bump_tasks[0].context["head_sha"] == _HEAD_SHA
-    assert "python3 backend/testing/check_size_limits.py --fix" in cap_bump_tasks[
-        0
-    ].first_payload["prompt"]
+    # Qualification reports the blocker to Strategic; it does not hard-code a
+    # release-specific repair task. Strategic retains normal task-spawning
+    # authority and can choose the appropriate repair from this evidence.
+    assert cap_bump_tasks == []
 
     # Observability: the CI-compliance block is recorded durably on the version
     # row (queryable via the strategic payload / version fetch), not just logged.
@@ -314,8 +312,9 @@ async def test_noncompliant_qualify_request_is_blocked_and_spawns_cap_bump(
     blocked_trace = version.last_qualification["qualify_request_blocked"]
     assert blocked_trace["blocker"] == "ci_compliance"
     assert blocked_trace["head_sha"] == _HEAD_SHA
-    assert blocked_trace["cap_bump_task"] == str(cap_bump_tasks[0].id)
+    assert blocked_trace["repair_task"] is None
     assert "qualify_request_blocked_at" in version.last_qualification
+    assert refresh_required is True
 
 
 def test_cap_bump_resolves_orchestrator_runner_dispatch_breach():

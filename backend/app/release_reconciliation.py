@@ -52,7 +52,6 @@ from app.release_promotion import (
     _resolve_github_with_session,
 )
 from app.release_promotion_pending import (
-    _LEGACY_NATIVE_PROMOTION_PENDING_KEYS,
     _MANAGED_CHECK_WAIT_SNAPSHOT_DETAIL_LIMIT,
     _PROMOTION_PENDING_ABSENT,
     _PROMOTION_PENDING_CLAIM,
@@ -62,7 +61,6 @@ from app.release_promotion_pending import (
     _classify_405_message,
     _increment_pending_transient_red_count,
     _managed_check_wait_snapshot,
-    _normalize_legacy_promotion_pending,
     _parse_promotion_pending_time,
     _persist_managed_check_wait_snapshot,
     _promotion_pending_fallback_enabled_at,
@@ -698,168 +696,6 @@ async def _reconcile_if_not_promoted_but_pr_merged(
             return False
 
 
-async def _reconcile_if_ci_unresolved_now_green(
-    version_id: uuid.UUID,
-    *,
-    session_factory=None,
-) -> bool:
-    """Re-qualify a quiescent not_promoted/ci_unresolved version once CI is green.
-
-    ``ci_unresolved`` means the prior finalization saw pending or absent CI, not
-    a settled quality failure.  If automain still points at that exact candidate
-    SHA and CI later resolves green, re-run qualification on the same candidate.
-    When automain has advanced, the existing stale-not-promoted re-drive owns the
-    fresh-SHA path.
-
-    Returns True iff a new qualification was spawned.
-    """
-    factory = session_factory or AsyncSessionLocal
-    async with factory() as session:
-        try:
-            version: release_version.ReleaseVersion | None = (
-                (
-                    await session.execute(
-                        select(release_version.ReleaseVersion)
-                        .where(release_version.ReleaseVersion.id == version_id)
-                        .with_for_update()
-                    )
-                )
-                .scalars()
-                .first()
-            )
-            if version is None:
-                return False
-            if version.status != "open" or version.phase != "stabilize":
-                return False
-            qual = version.last_qualification or {}
-            if qual.get("status") != "not_promoted":
-                return False
-            if qual.get("blocker") != "ci_unresolved":
-                return False
-            candidate_sha: str | None = qual.get("candidate_sha")
-            if not candidate_sha:
-                return False
-
-            project = await session.get(Project, version.project_id)
-            if project is None:
-                return False
-            integration_branch, _promotion_target = _lts_branch_names(project)
-
-            try:
-                await session.commit()
-            except Exception:
-                logger.exception(
-                    "[RELEASE_QUALIFIER] reconcile ci_unresolved_now_green: "
-                    "failed to release row lock for v%d — skipping",
-                    version.version_number,
-                )
-                try:
-                    await session.rollback()
-                except Exception:
-                    logger.exception(
-                        "[RELEASE_QUALIFIER] reconcile ci_unresolved_now_green: "
-                        "rollback failed for v%d after commit error",
-                        version.version_number,
-                    )
-                return False
-
-            resolved = await _resolve_github_with_session(session, project)
-            if resolved is None:
-                logger.warning(
-                    "[RELEASE_QUALIFIER] reconcile ci_unresolved_now_green: "
-                    "no GitHub credentials for v%d — skipping",
-                    version.version_number,
-                )
-                return False
-            token, owner, repo = resolved
-
-            try:
-                automain_sha = await github.get_branch_sha(
-                    token,
-                    owner,
-                    repo,
-                    integration_branch,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "[RELEASE_QUALIFIER] reconcile ci_unresolved_now_green: "
-                    "could not resolve %s HEAD SHA for v%d (%s) — skipping",
-                    integration_branch,
-                    version.version_number,
-                    exc,
-                )
-                return False
-            if automain_sha != candidate_sha:
-                return False
-
-            from app import release_qualifier as _rq_mod
-
-            ci_resolution = await _rq_mod._resolve_candidate_ci(
-                token,
-                owner,
-                repo,
-                candidate_sha,
-                project_id=str(version.project_id),
-            )
-            if ci_resolution.get("state") == _CI_NO_CHECKS:
-                # Integration-branch candidates structurally carry no check-runs
-                # when the CI workflow's automain trigger has been removed.
-                # Annotate with topology and proceed if CI is not required
-                # (topology-relaxed no_checks), mirroring _ci_required_for_finalize.
-                ci_resolution = (
-                    await _rq_mod._annotate_absent_ci_integration_topology(
-                        token=token,
-                        owner=owner,
-                        repo=repo,
-                        project=project,
-                        candidate_sha=candidate_sha,
-                        ci_resolution=ci_resolution,
-                    )
-                )
-                if _rq_mod._ci_required_for_finalize(project, ci_resolution):
-                    return False
-            elif ci_resolution.get("state") != _CI_GREEN or not ci_resolution.get(
-                "ci_green"
-            ):
-                return False
-
-            logger.info(
-                "[RELEASE_QUALIFIER] reconcile ci_unresolved_now_green: "
-                "candidate %s for v%d now has green CI or topology-relaxed "
-                "no_checks on unchanged automain — spawning fresh qualification",
-                candidate_sha[:8],
-                version.version_number,
-            )
-            result = await _rq_mod.run_qualification(
-                session,
-                version.project_id,
-                version,
-                requested_probes=(version.last_qualification or {}).get(
-                    "requested_probes"
-                ),
-            )
-            if result and result.get("status") == "spawned":
-                await session.commit()
-                return True
-            await session.rollback()
-            return False
-        except Exception:
-            logger.exception(
-                "[RELEASE_QUALIFIER] reconcile ci_unresolved_now_green: "
-                "unexpected error for version %s",
-                version_id,
-            )
-            try:
-                await session.rollback()
-            except Exception:
-                logger.exception(
-                    "[RELEASE_QUALIFIER] reconcile ci_unresolved_now_green: "
-                    "rollback failed for version %s after unexpected error",
-                    version_id,
-                )
-            return False
-
-
 def promotion_ci_selfheal_enabled(project: Project) -> bool:
     """Whether the engine self-heals THIS project's release-promotion CI failures.
 
@@ -948,16 +784,17 @@ async def _harvest_promotion_ci_failures(
         # Before spawning a code-fix task, check whether the promotion CI failure
         # is a transient infrastructure flake (npm registry unreachable,
         # Docker Hub rate-limit, Playwright install failure, setup-step only).
-        # If so, skip the fix spawn and immediately re-qualify (which opens a fresh
-        # promotion PR with fresh CI) — a code change cannot fix an infra flake,
-        # and spawning a doomed agent wastes a retry slot.
+        # If so, skip the fix spawn and hand the new delivery decision to
+        # Strategic — a code change cannot fix an infra flake, and spawning a
+        # doomed repair agent wastes a retry slot.
         #
         # NOTE: by the time this harvest runs, _cleanup_managed_check_wait_failure_
         # artifacts has already closed the promotion PR and deleted the release
         # branch.  Re-running the dead workflow via rerun_failed_jobs is useless;
-        # instead, schedule a new qualification run directly so a fresh release
-        # branch and promotion PR are created.  The Z circuit breaker in
-        # _redrive_promotion_failed_qualification caps total re-qualify attempts.
+        # instead, arm the coalesced Strategic refresh marker from this terminal
+        # promotion-failure edge. The harvest is invoked for the failure event,
+        # not from a standing-state sweep, and the marker is single-slot, so this
+        # cannot accumulate repeated wakes for persistent state.
         try:
             from app.github import get_repo_installation_token, get_check_runs_cached
             from app.failure_classification import _is_ci_infra_flake_log
@@ -980,59 +817,38 @@ async def _harvest_promotion_ci_failures(
                     )
                     logger.info(
                         "[RELEASE_QUALIFIER] promotion-CI harvest: v%d CI failure "
-                        "is an infrastructure flake (%s) — scheduling fresh "
-                        "re-qualification (new promotion PR) and skipping fix "
+                        "is an infrastructure flake (%s) — requesting a Strategic "
+                        "delivery decision and skipping fix "
                         "spawn (source %s)",
                         version_number,
                         _flake_reason,
                         ci_source_sha[:8],
                     )
-                    # Trigger a fresh qualification immediately so the version
-                    # gets a new promotion PR rather than waiting for the next
-                    # sweep cycle.  "promotion_failed" is not a conclusive
-                    # verdict status so run_qualification proceeds even if the
-                    # candidate SHA has not changed.  Best-effort; the Z
-                    # re-driver in sweep_stuck_qualifications is the fallback.
+                    # This is an edge-triggered semantic wake, not another
+                    # scheduler-owned qualification decision. The marker
+                    # coalesces with any already-pending Strategic refresh.
                     try:
-                        from app import release_qualifier as _rq_mod
                         from app.database import AsyncSessionLocal as _ASL
+                        from app.strategic_trigger import request_strategic_refresh
 
                         async with _ASL() as _rq_session:
-                            _rq_version = await _rq_session.get(
-                                release_version.ReleaseVersion, version_id
+                            _refresh_armed = await request_strategic_refresh(
+                                _rq_session,
+                                project_id,
+                                (
+                                    "promotion_ci_infra_flake:"
+                                    f"v{version_number}:{ci_source_sha[:12]}"
+                                ),
                             )
-                            if _rq_version is not None:
-                                _rq_result = await _rq_mod.run_qualification(
-                                    _rq_session,
-                                    project_id,
-                                    _rq_version,
-                                    requested_probes=(
-                                        _rq_version.last_qualification or {}
-                                    ).get("requested_probes"),
-                                )
-                                if _rq_result and _rq_result.get("status") == "spawned":
-                                    await _rq_session.commit()
-                                    logger.info(
-                                        "[RELEASE_QUALIFIER] promotion-CI harvest: "
-                                        "v%d infra-flake re-qualify spawned (%s)",
-                                        version_number,
-                                        _flake_reason,
-                                    )
-                                else:
-                                    await _rq_session.rollback()
-                                    logger.info(
-                                        "[RELEASE_QUALIFIER] promotion-CI harvest: "
-                                        "v%d infra-flake re-qualify deferred "
-                                        "(run_qualification status=%s) — Z "
-                                        "re-driver will retry next sweep",
-                                        version_number,
-                                        _rq_result.get("status") if _rq_result else None,
-                                    )
+                            if _refresh_armed:
+                                await _rq_session.commit()
+                            else:
+                                await _rq_session.rollback()
                     except Exception:
                         logger.warning(
                             "[RELEASE_QUALIFIER] promotion-CI harvest: v%d "
-                            "infra-flake re-qualify attempt failed — Z re-driver "
-                            "will retry next sweep",
+                            "Strategic refresh request failed; normal cadence "
+                            "remains the backstop",
                             version_number,
                             exc_info=True,
                         )

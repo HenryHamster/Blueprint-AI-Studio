@@ -16,7 +16,7 @@ import {
   mergePendingOperatorDecisionReview, advancePendingOperatorDecisionReview,
   retainPendingOperatorDecisionReview, MAX_REVIEW_ATTEMPTS,
   classifyOperatorDecisionReview,
-  openFoundLeads, classifyTickOutcome, shouldRunAutonomousTurn,
+  openFoundLeads, classifyTickOutcome, shouldRunAutonomousTurn, explorationWakeProjection,
   AUTONOMOUS_EXPLORATION_INTERVAL_MS,
   serializeLedger, restoreLedger, refreshSurfaceCatalog,
   EXAM_RECORDS_CAP, EXAM_NOTE_CAP, EXAM_LEDGER_MAX_BYTES,
@@ -41,7 +41,7 @@ describe('residentConfig', () => {
     expect(c.messagePollMs).toBe(750); // backend-budgeted fast pickup default
     expect(c.turnTimeoutMs).toBe(120_000);
     expect(c.autonomousEnabled).toBe(true);
-    expect(c.explorationIntervalMs).toBe(14_400_000);
+    expect(c.explorationIntervalMs).toBe(86_400_000);
     expect(c.autonomousTurnTimeoutMs).toBe(300_000);
     expect(c.maxOpsPerTurn).toBe(3);
     expect(c.compactionThresholdTokens).toBeUndefined(); // model-derived by default
@@ -106,6 +106,14 @@ describe('residentConfig', () => {
     });
     // exploration interval (5s) is below idle_tick (30s) — clamp to idle_tick
     expect(c.explorationIntervalMs).toBe(30_000);
+  });
+
+  it('preserves zero as the disabled unchanged-state exploration sentinel', () => {
+    const c = residentConfig({
+      strategic_session_idle_tick_seconds: 30,
+      strategic_session_exploration_interval_seconds: 0,
+    });
+    expect(c.explorationIntervalMs).toBe(0);
   });
 
   it('disables autonomous work in monitor mode', () => {
@@ -2566,6 +2574,20 @@ describe('shouldRunAutonomousTurn (state-gated pacing)', () => {
     expect(shouldRunAutonomousTurn({ ...base, msSinceLastAutonomousTurn: AUTONOMOUS_EXPLORATION_INTERVAL_MS - 1 })).toBe(false);
   });
 
+  it('does not fire unchanged-state exploration when the interval is disabled', () => {
+    expect(shouldRunAutonomousTurn({
+      ...base,
+      explorationIntervalMs: 0,
+      msSinceLastAutonomousTurn: AUTONOMOUS_EXPLORATION_INTERVAL_MS * 10,
+    })).toBe(false);
+    expect(shouldRunAutonomousTurn({
+      ...base,
+      explorationIntervalMs: 0,
+      currentWorkStateRev: 'r2',
+      lastTurnWorkStateRev: 'r1',
+    })).toBe(true);
+  });
+
   it('degrades to sparse exploration pacing when work_state_rev is absent (older backend)', () => {
     // No rev signal + exploration interval not elapsed + no other trigger → do NOT fire.
     expect(shouldRunAutonomousTurn({ ...base, currentWorkStateRev: undefined, msSinceLastAutonomousTurn: 10 })).toBe(false);
@@ -2599,6 +2621,22 @@ describe('shouldRunAutonomousTurn (state-gated pacing)', () => {
       lastTurnWorkStateRev: revAfterOwnOp, // baseline is stale vs external change
       msSinceLastAutonomousTurn: 0,
     })).toBe(true);
+  });
+});
+
+describe('explorationWakeProjection', () => {
+  it('has no scheduled review when unchanged-state exploration is disabled', () => {
+    expect(explorationWakeProjection(1_000, 0, false, 5_000)).toEqual({
+      nextReviewAt: null,
+      nextReview: 'on an actionable state change',
+    });
+  });
+
+  it('retains the scheduled projection for enabled exploration', () => {
+    expect(explorationWakeProjection(1_000, 60_000, false, 1_000)).toEqual({
+      nextReviewAt: new Date(61_000).toISOString(),
+      nextReview: '~1min',
+    });
   });
 });
 

@@ -5474,7 +5474,9 @@ async def test_process_post_commit_review_approve_merge_held_on_dual_head(
     spawn_mock.assert_awaited_once()
     assert spawn_mock.await_args.kwargs.get("fix_reason") == "migration_guard"
     await session.refresh(review_task)
-    assert review_task.status == TaskStatus.COMPLETED
+    # The source PR remains the delivery owner until the exact replacement
+    # head lands; dispatching a fix must not make an unlanded PR look complete.
+    assert review_task.status == TaskStatus.EVALUATING
     rl = (review_task.context or {}).get("review_loop", {})
     assert rl.get("ci_waiting") is False
     assert rl.get("ci_passed") is False

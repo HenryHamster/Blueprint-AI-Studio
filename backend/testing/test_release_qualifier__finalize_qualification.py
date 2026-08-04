@@ -1159,6 +1159,44 @@ async def test_required_children_terminal_waits_for_challenge_task(db_session):
 
 
 @pytest.mark.asyncio
+async def test_required_children_terminal_waits_for_fresh_holistic_audit_with_reused_facts(
+    db_session,
+):
+    """A fresh holistic child remains authoritative over reused code facts."""
+    project, version = await _make_project_and_version(db_session)
+    attempt_id = uuid.uuid4()
+    audit_task = Task(
+        project_id=project.id,
+        title="fresh holistic release audit",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        vm_instance_id="vm-fresh-holistic",
+        status=TaskStatus.QUEUED,
+        context={"qualification_attempt_id": str(attempt_id)},
+    )
+    db_session.add(audit_task)
+    await db_session.flush()
+    version.last_qualification = {
+        "status": "pending",
+        "qualification_attempt_id": str(attempt_id),
+        "audit_task_id": str(audit_task.id),
+        "resolved_dimensions": {
+            "audit": {"status": "passed", "sub_score": 0.9},
+            "test_erosion": {"status": "passed", "sub_score": 1.0},
+        },
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    assert await rq._required_children_terminal(db_session, version) is False
+
+    audit_task.status = TaskStatus.COMPLETED
+    db_session.add(audit_task)
+    await db_session.commit()
+
+    assert await rq._required_children_terminal(db_session, version) is True
+
+
+@pytest.mark.asyncio
 async def test_finalize_dry_run_when_promotion_disabled(db_session, mocker):
     """A high-confidence candidate is NOT promoted while promotion_enabled is
     False — the composite is recorded as a dry-run and the version stays open."""
@@ -1980,14 +2018,42 @@ async def test_finalize_blocks_on_migration_apply_drift(db_session, mocker):
     assert "computejob" in lq["migration_apply_safety_detail"]
 
 
+def _stamp_current_goal_contract(project, version) -> None:
+    """Complete legacy pending fixtures with the decision contract at launch."""
+    qual = dict(version.last_qualification or {})
+    policy = rq._load_policy(project)
+    capability_mode = str(
+        rq._runtime_config.get("capability_proof_gate_mode", "off") or "off"
+    ).strip().lower()
+    qual.update(
+        {
+            "version_goal": version.goal or "",
+            "promotion_policy_snapshot": policy,
+            "capability_proof_mode": capability_mode,
+            "requested_probes": qual.get("requested_probes") or [],
+            "contract_fingerprint": rq._qualification_contract_fingerprint(
+                version.goal or "",
+                str(qual.get("rubric_fingerprint") or ""),
+                promotion_policy=policy,
+                capability_proof_mode=capability_mode,
+                env_preflight_enabled=bool(
+                    qual.get("env_preflight_enabled", False)
+                ),
+                requested_probes=qual.get("requested_probes") or [],
+            ),
+        }
+    )
+    version.last_qualification = qual
+
+
 @pytest.mark.asyncio
-async def test_finalize_cannot_promote_without_merge_grade_pass(db_session, mocker):
-    """The blind merge-grade artifact blocks only when its gate is armed.
+async def test_finalize_consumes_holistic_audit_goal_grade(db_session, mocker):
+    """The holistic release audit owns the goal-grade promotion contract.
 
     Four scenarios prove the artifact is still unskippable, while the
     merge-grade miss gate remains default-off:
       (a) a FAILING merge-grade -> promote proceeds while the gate is unarmed.
-      (b) the required merge-grade artifact MISSING -> held (infra_failure),
+      (b) the required holistic goal grade MISSING -> held (infra_failure),
           NOT promoted (the gate cannot be skipped).
       (c) a PASSING merge-grade with everything else green -> promote proceeds.
       (d) a FAILING merge-grade -> not_promoted when the gate is armed.
@@ -2011,7 +2077,7 @@ async def test_finalize_cannot_promote_without_merge_grade_pass(db_session, mock
     }
     goal = "Deliver the blind merge-grade qualification gate on stabilize->qualify"
 
-    # --- (a) FAILING merge-grade, unarmed threshold (default 0.0) -> promote proceeds
+    # --- (a) FAILING holistic grade, unarmed threshold -> promote proceeds
     # merge_grade_block_threshold is not set here (defaults to 0.0), so the gate
     # is not armed and a failing merge grade does NOT block promotion.
     project_a, version_a = await _make_project_and_version(db_session)
@@ -2019,17 +2085,16 @@ async def test_finalize_cannot_promote_without_merge_grade_pass(db_session, mock
         db_session,
         project_a,
         version_a,
-        audit_logs=clean_audit,
-        smoke_logs=clean_smoke,
-        version_goal=goal,
-        seed_merge_grade=True,
-        merge_grade_logs={
+        audit_logs={
+            **clean_audit,
             "covers_goal": False,
             "coverage_score": 0.1,
             "biggest_gap": "The gate was never wired into compute_composite.",
-            "candidate_sha": "feed" * 10,
         },
+        smoke_logs=clean_smoke,
+        version_goal=goal,
     )
+    _stamp_current_goal_contract(project_a, version_a)
     promote_a = mocker.patch(
         "app.release_qualifier.promote",
         new=AsyncMock(return_value={"status": "promoted"}),
@@ -2040,7 +2105,7 @@ async def test_finalize_cannot_promote_without_merge_grade_pass(db_session, mock
     promote_a.assert_called_once()
     assert result_a == {"status": "promoted"}
 
-    # --- (b) MISSING merge-grade artifact -> infra hold, cannot be skipped --
+    # --- (b) MISSING goal grade in the holistic report -> infra hold --------
     project_b, version_b = await _make_project_and_version(db_session)
     await _seed_qualification_children(
         db_session,
@@ -2049,9 +2114,8 @@ async def test_finalize_cannot_promote_without_merge_grade_pass(db_session, mock
         audit_logs=clean_audit,
         smoke_logs=clean_smoke,
         version_goal=goal,
-        seed_merge_grade=True,
-        merge_grade_logs=None,  # child ran but emitted no usable artifact
     )
+    _stamp_current_goal_contract(project_b, version_b)
     promote_b = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
     result_b = await rq._finalize_qualification(db_session, version_b)
     await db_session.commit()
@@ -2063,23 +2127,22 @@ async def test_finalize_cannot_promote_without_merge_grade_pass(db_session, mock
     assert version_b.phase == "stabilize"
     assert version_b.status == "open"
 
-    # --- (c) PASSING merge-grade -> promote proceeds as before --------------
+    # --- (c) PASSING holistic goal grade -> promote proceeds ----------------
     project_c, version_c = await _make_project_and_version(db_session)
     await _seed_qualification_children(
         db_session,
         project_c,
         version_c,
-        audit_logs=clean_audit,
-        smoke_logs=clean_smoke,
-        version_goal=goal,
-        seed_merge_grade=True,
-        merge_grade_logs={
+        audit_logs={
+            **clean_audit,
             "covers_goal": True,
             "coverage_score": 0.95,
             "biggest_gap": "Minor: docs could mention the env override.",
-            "candidate_sha": "feed" * 10,
         },
+        smoke_logs=clean_smoke,
+        version_goal=goal,
     )
+    _stamp_current_goal_contract(project_c, version_c)
     promote_c = mocker.patch(
         "app.release_qualifier.promote",
         new=AsyncMock(return_value={"status": "promoted"}),
@@ -2090,7 +2153,7 @@ async def test_finalize_cannot_promote_without_merge_grade_pass(db_session, mock
     promote_c.assert_called_once()
     assert result_c == {"status": "promoted"}
 
-    # --- (d) FAILING merge-grade + armed threshold -> hard blocker ----------
+    # --- (d) FAILING holistic goal grade + armed threshold -> hard blocker --
     mocker.patch.dict(
         shared_state.runtime_config,
         {"promotion_enabled": True, "merge_grade_block_threshold": 0.1},
@@ -2104,17 +2167,16 @@ async def test_finalize_cannot_promote_without_merge_grade_pass(db_session, mock
         db_session,
         project_d,
         version_d,
-        audit_logs=clean_audit,
-        smoke_logs=clean_smoke,
-        version_goal=goal,
-        seed_merge_grade=True,
-        merge_grade_logs={
+        audit_logs={
+            **clean_audit,
             "covers_goal": False,
             "coverage_score": 0.1,
             "biggest_gap": "The merged work still misses the stated goal.",
-            "candidate_sha": "feed" * 10,
         },
+        smoke_logs=clean_smoke,
+        version_goal=goal,
     )
+    _stamp_current_goal_contract(project_d, version_d)
     promote_d = mocker.patch(
         "app.release_qualifier.promote",
         new=AsyncMock(return_value={"status": "promoted"}),
@@ -2131,7 +2193,7 @@ async def test_finalize_cannot_promote_without_merge_grade_pass(db_session, mock
 
 
 @pytest.mark.asyncio
-async def test_finalize_merge_grade_suppressed_for_prior_superseded_version(
+async def test_finalize_holistic_goal_grade_suppressed_for_prior_superseded_version(
     db_session, mocker
 ):
     """Already-promoted exemption: when the previous qualification was
@@ -2171,11 +2233,11 @@ async def test_finalize_merge_grade_suppressed_for_prior_superseded_version(
         "tests": [{"name": "a", "status": "pass"}],
         "suites": {"startup": {"passed": True}},
     }
-    failing_merge_grade = {
+    failing_holistic_audit = {
+        **clean_audit,
         "covers_goal": False,
         "coverage_score": 0.05,
         "biggest_gap": "Stabilization-only tail commits; feature content already on main.",
-        "candidate_sha": "feed" * 10,
     }
     goal = "Deliver the already-promoted merge-grade exemption"
 
@@ -2185,12 +2247,11 @@ async def test_finalize_merge_grade_suppressed_for_prior_superseded_version(
         db_session,
         project_a,
         version_a,
-        audit_logs=clean_audit,
+        audit_logs=failing_holistic_audit,
         smoke_logs=clean_smoke,
         version_goal=goal,
-        seed_merge_grade=True,
-        merge_grade_logs=failing_merge_grade,
     )
+    _stamp_current_goal_contract(project_a, version_a)
     # Stamp prior_superseded=True directly on last_qualification (simulates
     # run_qualification carrying forward the qualification_superseded blocker).
     version_a.last_qualification = {
@@ -2219,12 +2280,11 @@ async def test_finalize_merge_grade_suppressed_for_prior_superseded_version(
         db_session,
         project_b,
         version_b,
-        audit_logs=clean_audit,
+        audit_logs=failing_holistic_audit,
         smoke_logs=clean_smoke,
         version_goal=goal,
-        seed_merge_grade=True,
-        merge_grade_logs=failing_merge_grade,
     )
+    _stamp_current_goal_contract(project_b, version_b)
     # Do NOT set prior_superseded — version_b is a never-promoted fresh version.
     promote_b = mocker.patch(
         "app.release_qualifier.promote",
@@ -2242,7 +2302,7 @@ async def test_finalize_merge_grade_suppressed_for_prior_superseded_version(
 
 
 @pytest.mark.asyncio
-async def test_finalize_merge_grade_exempts_candidate_already_on_main(
+async def test_finalize_holistic_goal_grade_exempts_candidate_already_on_main(
     db_session, mocker
 ):
     """Finding 0: an armed + failing merge-grade must NOT wedge a candidate that
@@ -2278,11 +2338,11 @@ async def test_finalize_merge_grade_exempts_candidate_already_on_main(
         "tests": [{"name": "a", "status": "pass"}],
         "suites": {"startup": {"passed": True}},
     }
-    failing_merge_grade = {
+    failing_holistic_audit = {
+        **clean_audit,
         "covers_goal": False,
         "coverage_score": 0.05,
         "biggest_gap": "Feature content already merged straight to main.",
-        "candidate_sha": "feed" * 10,
     }
     goal = "Deliver the already-on-main merge-grade exemption"
 
@@ -2293,12 +2353,11 @@ async def test_finalize_merge_grade_exempts_candidate_already_on_main(
         db_session,
         project_a,
         version_a,
-        audit_logs=clean_audit,
+        audit_logs=failing_holistic_audit,
         smoke_logs=clean_smoke,
         version_goal=goal,
-        seed_merge_grade=True,
-        merge_grade_logs=failing_merge_grade,
     )
+    _stamp_current_goal_contract(project_a, version_a)
     promote_a = mocker.patch(
         "app.release_qualifier.promote",
         new=AsyncMock(return_value={"status": "promoted"}),
@@ -2321,12 +2380,11 @@ async def test_finalize_merge_grade_exempts_candidate_already_on_main(
         db_session,
         project_b,
         version_b,
-        audit_logs=clean_audit,
+        audit_logs=failing_holistic_audit,
         smoke_logs=clean_smoke,
         version_goal=goal,
-        seed_merge_grade=True,
-        merge_grade_logs=failing_merge_grade,
     )
+    _stamp_current_goal_contract(project_b, version_b)
     promote_b = mocker.patch(
         "app.release_qualifier.promote",
         new=AsyncMock(return_value={"status": "promoted"}),

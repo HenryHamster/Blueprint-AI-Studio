@@ -1312,6 +1312,41 @@ async def test_backmerge_migration_block_dedupes_resolver(db_session, mocker):
     assert len(resolvers) == 1
 
 
+async def test_migration_block_dedup_consults_terminal_resolver_pr(
+    db_session, mocker
+):
+    """Migration blocks pass GitHub identity into the durable resolver dedup."""
+    project = await _make_project(db_session)
+    dedup = mocker.patch(
+        "app.hotfix_backmerge._resolution_task_already_open",
+        new=AsyncMock(return_value=True),
+    )
+
+    await hb._handle_migration_block(
+        db_session,
+        project.id,
+        204,
+        "https://github.com/acme/widget/pull/204",
+        None,
+        "periodic reconciliation",
+        reason="duplicate revision 0721",
+        periodic=True,
+        project=project,
+        gh_token="token",
+        owner="acme",
+        repo="widget",
+    )
+
+    dedup.assert_awaited_once_with(
+        db_session,
+        project.id,
+        token="token",
+        owner="acme",
+        repo="widget",
+    )
+    assert await _tasks_for(db_session, project.id) == []
+
+
 # ===========================================================================
 # Dual-head block routes to resolver — never pushes to live integration branch
 # ===========================================================================

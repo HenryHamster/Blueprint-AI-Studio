@@ -90,7 +90,9 @@ async def spawn_migration_guard_fix_task(
     guard_reason: str | None,
     review_loop: dict | None = None,
     context_snapshot: dict | None = None,
-    complete_source_on_fix_spawn: bool = True,
+    gh_token: str = "",
+    owner: str = "",
+    repo: str = "",
 ) -> tuple[Task | None, bool]:
     """Spawn a targeted fix for a deterministic Alembic guard block.
 
@@ -103,14 +105,97 @@ async def spawn_migration_guard_fix_task(
         _spawn_pipeline_task,
         build_migration_guard_fix_prompt,
     )
-    from app.rollup_state import _is_rollup_parent_awaiting_merge
-
+    from app.task_locking import acquire_pr_spawn_lock
     source_context = dict(
         context_snapshot if context_snapshot is not None else (task.context or {})
     )
     loop = dict(review_loop or source_context.get("review_loop") or {})
     task_id = task.id
     project_id = task.project_id
+
+    # Resolve and admit fixes under the same per-PR transaction lock used by the
+    # generic review pipeline.  Otherwise a moved PR can race this live lookup
+    # and the active-task dedup below, admitting a fix for an obsolete target.
+    await acquire_pr_spawn_lock(session, project_id, pr_number)
+
+    # A fix is a code-writing execution owner. Bind it to the exact live PR
+    # base/head that justified the spawn so review_claim_fence can reject a
+    # stale claimant before it writes. When GitHub credentials are available,
+    # the live PR is authoritative: never let a cached review_target override
+    # it (or conceal a failed/closed live lookup).
+    source_target = loop.get("review_target")
+    fix_target: dict[str, str | int] | None = None
+    if gh_token and owner and repo:
+        try:
+            from app import github
+
+            live_pr = await github.get_pull_request(
+                gh_token, owner, repo, pr_number, project_id=str(project_id)
+            )
+            state = str(live_pr.get("state") or "").lower()
+            base_sha = str((live_pr.get("base") or {}).get("sha") or "")
+            head_sha = str((live_pr.get("head") or {}).get("sha") or "")
+            if state == "open" and not live_pr.get("merged") and base_sha and head_sha:
+                fix_target = {
+                    "project_id": str(project_id),
+                    "pr_number": int(pr_number),
+                    "base_sha": base_sha,
+                    "head_sha": head_sha,
+                }
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[CI] PR #%s migration-fix target lookup failed: %s",
+                pr_number,
+                exc,
+            )
+    elif isinstance(source_target, dict):
+        target_project = str(source_target.get("project_id") or "")
+        try:
+            target_pr = int(source_target.get("pr_number") or 0)
+        except (TypeError, ValueError):
+            target_pr = 0
+        base_sha = str(source_target.get("base_sha") or "")
+        head_sha = str(source_target.get("head_sha") or "")
+        if (
+            target_project == str(project_id)
+            and target_pr == int(pr_number)
+            and base_sha
+            and head_sha
+        ):
+            fix_target = {
+                "project_id": str(project_id),
+                "pr_number": int(pr_number),
+                "base_sha": base_sha,
+                "head_sha": head_sha,
+            }
+
+    if fix_target is None:
+        _write_context = dict(source_context)
+        _write_loop = dict(loop)
+        # A deferred retry must not retain an old fix id: the CI monitor treats
+        # ci_fix_spawned as a terminal skip latch and would never call us again.
+        # Keep review_approved=False and the other revoked-authority fields;
+        # only forget identifiers that no longer prove current-target work.
+        _write_loop.pop("migration_guard_fix_spawned", None)
+        _write_loop.pop("ci_fix_spawned", None)
+        _write_loop.update(
+            {
+                "ci_waiting": True,
+                "ci_passed": True,
+                "pr_number": int(pr_number),
+                "migration_guard_state": MIGRATION_GUARD_STATE_FIX_DEFERRED,
+                "migration_guard_reason": str(guard_reason or "")[:2000],
+            }
+        )
+        task.context = {**_write_context, "review_loop": _write_loop}
+        flag_modified(task, "context")
+        task.status = TaskStatus.EVALUATING
+        task.latest_status_message = (
+            f"PR #{pr_number} Alembic guard blocked; exact fix target is "
+            "unavailable, retrying without dispatch"
+        )[:500]
+        session.add(task)
+        return None, False
 
     def _write_block_state(
         state: str,
@@ -124,6 +209,11 @@ async def spawn_migration_guard_fix_task(
         loop["ci_passed"] = ci_passed
         loop["migration_guard_state"] = state
         loop["migration_guard_reason"] = str(guard_reason or "")[:2000]
+        if state == MIGRATION_GUARD_STATE_FIX_DEFERRED:
+            # See the target-unavailable path above. A stale id here prevents
+            # the CI monitor from ever retrying after the old-target fix exits.
+            loop.pop("migration_guard_fix_spawned", None)
+            loop.pop("ci_fix_spawned", None)
         if fix_task_id is not None:
             loop["migration_guard_fix_spawned"] = str(fix_task_id)
             # Compatibility with existing CI-monitor skip/backstop paths.
@@ -193,22 +283,37 @@ async def spawn_migration_guard_fix_task(
         .scalars()
         .all()
     )
-    existing_fix = next(
-        (
-            t
-            for t in active_tasks
-            if t.id != task_id and t.first_payload.get("type") == "fix"
-        ),
-        None,
-    )
+    active_fixes = [
+        t
+        for t in active_tasks
+        if t.id != task_id and t.first_payload.get("type") == "fix"
+    ]
+
+    def _matches_fix_target(candidate: Task) -> bool:
+        candidate_target = (candidate.context or {}).get("review_loop", {}).get(
+            "fix_target"
+        )
+        if not isinstance(candidate_target, dict):
+            return False
+        try:
+            candidate_pr = int(candidate_target.get("pr_number") or 0)
+        except (TypeError, ValueError):
+            return False
+        return (
+            str(candidate_target.get("project_id") or "")
+            == str(fix_target["project_id"])
+            and candidate_pr == int(fix_target["pr_number"])
+            and str(candidate_target.get("base_sha") or "")
+            == str(fix_target["base_sha"])
+            and str(candidate_target.get("head_sha") or "")
+            == str(fix_target["head_sha"])
+        )
+
+    existing_fix = next((t for t in active_fixes if _matches_fix_target(t)), None)
     if existing_fix is not None:
         _write_block_state(
             MIGRATION_GUARD_STATE_FIX_SPAWNED, fix_task_id=existing_fix.id
         )
-        if complete_source_on_fix_spawn and not _is_rollup_parent_awaiting_merge(
-            source_context
-        ):
-            task.status = TaskStatus.COMPLETED
         task.latest_status_message = (
             f"PR #{pr_number} Alembic guard blocked; migration fix already "
             f"active -> {existing_fix.id}"
@@ -218,6 +323,44 @@ async def spawn_migration_guard_fix_task(
         # authority transition durable before handing control back to callers.
         await session.commit()
         return existing_fix, False
+
+    stale_fixes = [t for t in active_fixes if not _matches_fix_target(t)]
+    unsafe_stale_fixes = [
+        t for t in stale_fixes if t.status != TaskStatus.QUEUED
+    ]
+    if unsafe_stale_fixes:
+        _write_block_state(
+            MIGRATION_GUARD_STATE_FIX_DEFERRED,
+            ci_waiting=True,
+            ci_passed=True,
+        )
+        stale_ids = ", ".join(str(t.id)[:8] for t in unsafe_stale_fixes)
+        task.latest_status_message = (
+            f"PR #{pr_number} moved while migration fix {stale_ids} is active; "
+            "waiting to dispatch a fix for the current target"
+        )[:500]
+        session.add(task)
+        return None, False
+
+    # A queued fix has not claimed a runner and is safe to supersede. Preserve
+    # its immutable fix_target for auditability; cancelling it keeps the generic
+    # spawner's target-unaware dedup from stranding the replacement.
+    if stale_fixes:
+        from app.failure_classification import ADMIN_CANCEL, persist_failure_category
+
+        for stale_fix in stale_fixes:
+            stale_context = dict(stale_fix.context or {})
+            stale_context["failure_detail"] = "superseded_by_moved_pr_target"
+            stale_fix.context = stale_context
+            flag_modified(stale_fix, "context")
+            stale_fix.status = TaskStatus.CANCELLED
+            stale_fix.latest_status_message = (
+                f"Superseded before claim: PR #{pr_number} moved to "
+                f"{fix_target['head_sha']}"
+            )[:500]
+            persist_failure_category(stale_fix, ADMIN_CANCEL)
+            session.add(stale_fix)
+        await session.flush()
 
     fix_prompt = build_migration_guard_fix_prompt(
         pr_number=pr_number,
@@ -234,14 +377,11 @@ async def spawn_migration_guard_fix_task(
         fix_prompt=fix_prompt,
         original_task_id=original_task_id,
         fix_reason=MIGRATION_GUARD_FIX_REASON,
+        fix_target=fix_target,
         suppress_warm_handoff=True,
     )
     if fix_task is not None:
         _write_block_state(MIGRATION_GUARD_STATE_FIX_SPAWNED, fix_task_id=fix_task.id)
-        if complete_source_on_fix_spawn and not _is_rollup_parent_awaiting_merge(
-            source_context
-        ):
-            task.status = TaskStatus.COMPLETED
         task.latest_status_message = (
             f"PR #{pr_number} Alembic guard blocked — spawned migration fix "
             f"-> {fix_task.id}"

@@ -20,13 +20,30 @@ import sqlalchemy.exc
 from sqlalchemy import func
 from sqlmodel import select
 
-from app.models import CriterionEvidence, Direction, VersionAcceptanceCriterion
+from app.landed_signal import landed_signal_predicate
+from app.models import (
+    CriterionEvidence,
+    Direction,
+    Task,
+    TaskStatus,
+    VersionAcceptanceCriterion,
+)
 from app.time_utils import _coerce_naive_utc, _utcnow
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
+
+# Process-local edge detector for the deployed acceptance-window reconciler.
+# A false-zero result writes no evidence by design, so evidence idempotency alone
+# cannot keep the minute-level release sweep from rebuilding the full task window.
+# The latest landed-task timestamp plus the target criterion ids is a cheap state
+# fingerprint: each worker scans a stable unresolved window at most once, while a
+# new/updated landed task or criterion-set change immediately re-arms recomputation.
+_acceptance_window_recompute_state: dict[
+    uuid.UUID, tuple[tuple[str, ...], datetime | None]
+] = {}
 
 CRITERION_RELEASE_VERSION_CONTEXT_KEY = "criterion_release_version_id"
 
@@ -3035,7 +3052,7 @@ async def record_acceptance_window_coverage_evidence(
 
     **DEPLOYED-SIDE CONSTRAINT**: this function executes inside the deployed
     orchestrator process at the deployed (main) SHA, called from
-    ``release_qualifier_sweep._reconcile_if_criterion_coverage_now_complete``.
+    Strategic's next qualification decision.
     A bug fix to this minting logic that lands on automain is INERT until the
     fix is itself promoted and deployed.  The operator hotfix-deploy channel
     (``POST /projects/{id}/promote/hotfix``, gated by
@@ -3045,27 +3062,66 @@ async def record_acceptance_window_coverage_evidence(
     try:
         from app import release_qualifier
 
-        aggregate = await release_qualifier._compute_acceptance_window_aggregate(
-            session, version
-        )
-        write_total = int(aggregate.get("acceptance_window_write_total") or 0)
-        verified = int(aggregate.get("acceptance_window_verified") or 0)
-        if write_total <= 0 or verified <= 0:
-            logger.info(
-                "record_acceptance_window_coverage_evidence: false-zero window — "
-                "recording nothing (version_id=%s write_total=%d verified=%d)",
-                getattr(version, "id", None),
-                write_total,
-                verified,
-            )
-            return 0
-
+        # Eligibility and idempotency are cheap indexed reads. Perform them
+        # before scanning the version's full landed-task window so a stable
+        # evidence row does not create recurring work on every reaper cycle.
         targets = await _resolve_acceptance_window_criteria(session, version)
         if not targets:
             logger.info(
                 "record_acceptance_window_coverage_evidence: no active criterion "
                 "names the acceptance-window metric on version %s — recording nothing",
                 getattr(version, "id", None),
+            )
+            return 0
+
+        source_id = f"acceptance_window_recompute:v{version.version_number}"
+        target_ids = [c.id for c in targets]
+        ev_result = await session.execute(
+            select(CriterionEvidence).where(
+                CriterionEvidence.criterion_id.in_(target_ids),
+                CriterionEvidence.source_kind == ACCEPTANCE_WINDOW_EVIDENCE_KIND,
+                CriterionEvidence.source_id == source_id,
+            )
+        )
+        already_present = {ev.criterion_id for ev in ev_result.scalars().all()}
+        if len(already_present) == len(target_ids):
+            return 0
+
+        latest_landed_updated_at = (
+            await session.execute(
+                select(func.max(Task.updated_at)).where(
+                    Task.project_id == version.project_id,
+                    Task.status == TaskStatus.COMPLETED,
+                    landed_signal_predicate(session),
+                    Task.updated_at >= version.opened_at,
+                )
+            )
+        ).scalar_one_or_none()
+        state_fingerprint = (
+            tuple(sorted(str(criterion_id) for criterion_id in target_ids)),
+            latest_landed_updated_at,
+        )
+        version_id = version.id
+        if _acceptance_window_recompute_state.get(version_id) == state_fingerprint:
+            return 0
+
+        aggregate = await release_qualifier._compute_acceptance_window_aggregate(
+            session, version
+        )
+        write_total = int(aggregate.get("acceptance_window_write_total") or 0)
+        verified = int(aggregate.get("acceptance_window_verified") or 0)
+        if write_total <= 0 or verified <= 0:
+            # Cache only the intentional no-write outcome. A coverable window
+            # relies on durable evidence idempotency instead: caching before its
+            # transaction commits could let a transient insert/commit failure
+            # suppress every retry until some unrelated landed-state change.
+            _acceptance_window_recompute_state[version_id] = state_fingerprint
+            logger.info(
+                "record_acceptance_window_coverage_evidence: false-zero window — "
+                "recording nothing (version_id=%s write_total=%d verified=%d)",
+                getattr(version, "id", None),
+                write_total,
+                verified,
             )
             return 0
 
@@ -3082,22 +3138,6 @@ async def record_acceptance_window_coverage_evidence(
         }
         # Stable per-version source_id so the dedup unique index makes repeated
         # reconcile/qualify sweeps a no-op (idempotency contract).
-        source_id = f"acceptance_window_recompute:v{version.version_number}"
-
-        # Batch-load the already-present recompute rows to skip duplicates without
-        # an N+1 probe per criterion.
-        target_ids = [c.id for c in targets]
-        already_present: set[uuid.UUID] = set()
-        ev_result = await session.execute(
-            select(CriterionEvidence).where(
-                CriterionEvidence.criterion_id.in_(target_ids),
-                CriterionEvidence.source_kind == ACCEPTANCE_WINDOW_EVIDENCE_KIND,
-                CriterionEvidence.source_id == source_id,
-            )
-        )
-        for ev in ev_result.scalars().all():
-            already_present.add(ev.criterion_id)
-
         recorded = 0
         for crit in targets:
             if crit.id in already_present:

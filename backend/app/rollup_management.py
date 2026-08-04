@@ -90,6 +90,7 @@ from app.shared_state import (
     get_project_task_branch_namespace as _get_project_task_branch_namespace,
 )
 from app.task_locking import with_directions_locked
+from app.ci_merge_helpers import effective_pr_number
 
 logger = logging.getLogger(__name__)
 
@@ -1497,8 +1498,22 @@ async def _check_and_trigger_rollup(
         if (c.first_payload).get("type", "create") in ROLLUP_TYPES
     ]
 
-    # Guard: if all children are review/fix types (none in ROLLUP_TYPES), mark parent COMPLETED
+    # A parent that owns an unlanded PR is still the delivery owner even when
+    # all of its children are review/fix helpers.  The old shortcut completed
+    # it here, erasing ownership before the PR landed and allowing recovery
+    # loops to commission the same logical repair again.
     if not children and all_children:
+        parent_pr = effective_pr_number(parent)
+        parent_ctx = parent.context or {}
+        if parent_pr and not parent_ctx.get("pr_merged"):
+            parent.status = TaskStatus.EVALUATING
+            parent.latest_status_message = (
+                f"PR #{parent_pr} remains delivery-owned; pipeline children are "
+                "terminal but the PR has not landed"
+            )[:500]
+            session.add(parent)
+            await session.commit()
+            return
         parent.status = TaskStatus.COMPLETED
         parent.context = _clear_rollup_transient_state(parent.context)
         parent.latest_status_message = (

@@ -32,6 +32,7 @@ from app.models import (
     TaskStatus,
 )
 from app.payload_schemas import PayloadTooLargeError, validate_internal_payload
+from app.qualification_dimensions import LEDGER_DIMENSION_KEYS
 from app.release_promotion import _lts_branch_names, _record_qualification_verdict
 from app.runtime_config_state import resolve_project_promotion_enabled
 from app.shared_state import runtime_config as _runtime_config
@@ -54,6 +55,24 @@ _INFRA_ATTEMPT_HISTORY_LIMIT = 5
 # asyncio only holds weak references to scheduled tasks, so without this a
 # webhook coroutine could be garbage-collected mid-flight (RUF006).
 _INFRA_WEBHOOK_TASKS: set[asyncio.Task[Any]] = set()
+
+_TERMINAL_STATUSES: frozenset[TaskStatus] = frozenset(
+    {
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+        TaskStatus.BLOCKED,
+    }
+)
+
+
+def _coerce_attempt_id(value: Any) -> uuid.UUID | None:
+    if value is None:
+        return None
+    try:
+        return uuid.UUID(str(value))
+    except (ValueError, TypeError, AttributeError):
+        return None
 
 
 def _bounded_infra_history(value: Any) -> list[dict[str, Any]]:
@@ -308,8 +327,10 @@ async def _spawn_release_audit_task(
     qualification_attempt_id: uuid.UUID | str,
     audit_base_sha: str | None = None,
     version_goal: str | None = None,
+    categories: list[dict[str, Any]] | None = None,
+    rubric_fingerprint: str | None = None,
 ) -> Task:
-    """Create + queue a ``release_audit`` task for the qualifier."""
+    """Create the qualifier's single holistic final-review task."""
     payload: dict[str, Any] = {
         "type": "release_audit",
         "base_branch": base_branch,
@@ -323,6 +344,8 @@ async def _spawn_release_audit_task(
     }
     if version_goal:
         payload["version_goal"] = version_goal
+    payload["categories"] = list(categories or [])
+    payload["rubric_fingerprint"] = rubric_fingerprint
     if audit_base_sha:
         # A hint, not an assertion: the agent verifies ancestry/range
         # resolvability and falls back to base_branch...candidate_sha if stale.
@@ -345,10 +368,10 @@ async def _spawn_release_audit_task(
 
     task = Task(
         project_id=project_id,
-        title=f"Release audit: {base_branch}...{candidate_sha[:8]} diff",
+        title=f"Release review: {base_branch}...{candidate_sha[:8]} candidate",
         description=(
-            f"Differential audit of {diff_range} against base_branch "
-            f"standards for the release qualifier"
+            f"Holistic quality and goal review of {diff_range} against the "
+            f"release contract"
         ),
         payloads=[payload],
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
@@ -372,6 +395,7 @@ async def _spawn_release_audit_task(
                 "task_type": "release_audit",
                 "diff_range": diff_range,
                 "audit_base_sha": audit_base_sha,
+                "rubric_fingerprint": rubric_fingerprint,
                 "release_version_id": str(version_id),
                 "qualification_attempt_id": str(qualification_attempt_id),
             },
@@ -1431,3 +1455,143 @@ def get_latest_qualification_audit_findings(
     if not isinstance(findings, list):
         return []
     return [finding for finding in findings if isinstance(finding, dict)]
+
+
+async def required_children_terminal(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+) -> bool:
+    """Return whether every active qualifier child is terminal.
+
+    Retired smoke children are deliberately ignored. Ledger-backed dimensions
+    carried into the active attempt do not require a new child.
+    """
+    qual = version.last_qualification or {}
+    resolved_dims: dict[str, dict[str, Any]] = {
+        dim: fact
+        for dim, fact in (qual.get("resolved_dimensions") or {}).items()
+        if dim in LEDGER_DIMENSION_KEYS
+    }
+    audit_resolved = "audit" in resolved_dims and "test_erosion" in resolved_dims
+    merge_grade_resolved = "merge_grade" in resolved_dims
+
+    audit_task_id_raw = qual.get("audit_task_id")
+    challenge_task_id_raw = qual.get("challenge_task_id")
+    merge_grade_task_id_raw = qual.get("merge_grade_task_id")
+    walkthrough_requested = "walkthrough_e2e" in set(
+        qual.get("requested_probes") or []
+    )
+    walkthrough_task_id_raw = qual.get("walkthrough_e2e_task_id")
+    challenge_required = bool(challenge_task_id_raw)
+    merge_grade_required = bool(merge_grade_task_id_raw)
+    # A present audit child is authoritative even when older code-quality facts
+    # were carried forward. Contract drift deliberately spawns one fresh
+    # holistic audit while retaining those facts for provenance; finalization
+    # must wait for that child to finish.
+    audit_required = bool(audit_task_id_raw) or not audit_resolved
+
+    if not audit_task_id_raw and not audit_resolved:
+        logger.warning(
+            "[RELEASE_QUALIFIER] finalize-gate: version v%d has pending "
+            "qualification but no audit child or resolved audit facts",
+            version.version_number,
+        )
+        return False
+
+    try:
+        audit_task_id = _coerce_attempt_id(audit_task_id_raw)
+        challenge_task_id = (
+            _coerce_attempt_id(challenge_task_id_raw) if challenge_required else None
+        )
+        merge_grade_task_id = (
+            _coerce_attempt_id(merge_grade_task_id_raw)
+            if merge_grade_required
+            else None
+        )
+        walkthrough_task_id = (
+            _coerce_attempt_id(walkthrough_task_id_raw)
+            if walkthrough_requested and walkthrough_task_id_raw
+            else None
+        )
+        if audit_task_id_raw is not None and audit_task_id is None:
+            raise ValueError("invalid audit task id")
+        if challenge_required and challenge_task_id is None:
+            raise ValueError("invalid challenge task id")
+        if merge_grade_required and merge_grade_task_id is None:
+            raise ValueError("invalid merge-grade task id")
+        if walkthrough_requested and walkthrough_task_id_raw and walkthrough_task_id is None:
+            raise ValueError("invalid walkthrough task id")
+    except (ValueError, TypeError, AttributeError):
+        logger.warning(
+            "[RELEASE_QUALIFIER] finalize-gate: version v%d has unparseable "
+            "active child task ids (audit=%r challenge=%r merge_grade=%r "
+            "walkthrough=%r) -- not ready",
+            version.version_number,
+            audit_task_id_raw,
+            challenge_task_id_raw,
+            merge_grade_task_id_raw,
+            walkthrough_task_id_raw,
+        )
+        return False
+
+    audit_task = await session.get(Task, audit_task_id) if audit_task_id else None
+    challenge_task = (
+        await session.get(Task, challenge_task_id) if challenge_task_id else None
+    )
+    merge_grade_task = (
+        await session.get(Task, merge_grade_task_id) if merge_grade_task_id else None
+    )
+    walkthrough_task = (
+        await session.get(Task, walkthrough_task_id) if walkthrough_task_id else None
+    )
+
+    active_attempt_id = _coerce_attempt_id(qual.get("qualification_attempt_id"))
+    if active_attempt_id is not None:
+        for leg, task in (
+            ("audit", audit_task),
+            ("challenge", challenge_task),
+            ("merge_grade", merge_grade_task),
+            ("walkthrough_e2e", walkthrough_task),
+        ):
+            if task is None:
+                continue
+            child_attempt_id = _coerce_attempt_id(
+                (task.context or {}).get("qualification_attempt_id")
+            )
+            if child_attempt_id != active_attempt_id:
+                logger.warning(
+                    "[RELEASE_QUALIFIER] finalize-gate: v%d %s child %s belongs "
+                    "to attempt %s, active attempt is %s -- not ready",
+                    version.version_number,
+                    leg,
+                    task.id,
+                    child_attempt_id,
+                    active_attempt_id,
+                )
+                return False
+
+    if (
+        (audit_required and audit_task is None)
+        or (challenge_required and challenge_task is None)
+        or (merge_grade_required and not merge_grade_resolved and merge_grade_task is None)
+        or (walkthrough_requested and walkthrough_task is None)
+    ):
+        return False
+
+    active_children = (
+        (audit_required, audit_task),
+        (challenge_required, challenge_task),
+        (merge_grade_required and not merge_grade_resolved, merge_grade_task),
+        (walkthrough_requested, walkthrough_task),
+    )
+    if any(
+        required and task is not None and task.status not in _TERMINAL_STATUSES
+        for required, task in active_children
+    ):
+        return False
+
+    logger.info(
+        "[RELEASE_QUALIFIER] finalize-gate: active children terminal for v%d",
+        version.version_number,
+    )
+    return True

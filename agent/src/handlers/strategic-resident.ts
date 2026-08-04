@@ -47,7 +47,7 @@ import {
   classifyOperatorDecisionReview, mergePendingOperatorDecisionReview,
   retainPendingOperatorDecisionReview, advancePendingOperatorDecisionReview, MAX_REVIEW_ATTEMPTS,
   shouldRunAutonomousTurn, actionableFiredWatchRevision, wakeBarrierRevision,
-  hasPendingOwnedWork,
+  hasPendingOwnedWork, explorationWakeProjection,
   EXAM_RECORDS_CAP, FOCUS_LIST_SIZE,
   serializeLedger, restoreLedger, refreshSurfaceCatalog,
   compactionThreshold, formatDirectionGroundingText, buildCompactionCheckpoint,
@@ -4769,15 +4769,15 @@ export async function handleStrategicResident(
           ? Number.POSITIVE_INFINITY : Date.now() - lastAutonomousTurnAt,
         explorationIntervalMs: cfg.explorationIntervalMs,
       })) {
-        const nextReviewAt = ownedWorkPending
-          ? null
-          : lastAutonomousTurnAt === 0
-          ? new Date().toISOString()
-          : new Date(lastAutonomousTurnAt + cfg.explorationIntervalMs).toISOString();
+        const wakeProjection = explorationWakeProjection(
+          lastAutonomousTurnAt,
+          cfg.explorationIntervalMs,
+          ownedWorkPending,
+        );
         setResidentActivity(
           'waiting',
           'Watching for task, project, or operator movement',
-          nextReviewAt,
+          wakeProjection.nextReviewAt,
         );
         if (livenessHeartbeatDue()) {
           const hb = await livenessHeartbeat();
@@ -4788,16 +4788,11 @@ export async function handleStrategicResident(
           if (msSinceWatching >= cfg.idleTickMs * 2) {
             const rawInFlight = hb?.work_state_summary?.in_flight;
             const inFlight = typeof rawInFlight === 'number' ? rawInFlight : null;
-            const msUntilExploration = lastAutonomousTurnAt === 0
-              ? 0
-              : Math.max(0, cfg.explorationIntervalMs - (Date.now() - lastAutonomousTurnAt));
-            const nextReview = ownedWorkPending
-              ? 'on an actionable state change'
-              : msUntilExploration < 60_000
-              ? 'soon'
-              : `~${Math.round(msUntilExploration / 60_000)}min`;
             const taskNote = inFlight !== null ? `${inFlight} task${inFlight === 1 ? '' : 's'} in flight; ` : '';
-            streamer.status(`watching — ${taskNote}next review ${nextReview} or on state change`);
+            streamer.status(
+              `watching — ${taskNote}next review ${wakeProjection.nextReview}`
+              + (wakeProjection.nextReviewAt ? ' or on state change' : ''),
+            );
             lastWatchingEmitAt = Date.now();
           }
         }

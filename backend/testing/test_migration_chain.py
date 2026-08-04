@@ -721,6 +721,43 @@ async def test_enforce_guard_clean_chain_allows_merge_with_promotion_target():
     assert ok is True and reason is None
 
 
+async def test_enforce_guard_allows_valid_replacement_and_rechained_successor():
+    """The guard validates the post-merge tree when a repair replaces a collision."""
+    from app.rollup_migration_validation import enforce_premerge_migration_guard
+
+    deployed_source = _migration_src("0721", "0720").rstrip("\n")
+    files = [
+        {
+            "filename": "backend/alembic/versions/0721_discovery_controller.py",
+            "status": "removed",
+        },
+        _migration_file(
+            "backend/alembic/versions/0721_local_release.py", "0721", "0720"
+        ),
+        _migration_file(
+            "backend/alembic/versions/0722_discovery_controller.py", "0722", "0721"
+        ),
+    ]
+
+    def _versions(_token, _owner, _repo, ref):
+        if ref == "main":
+            return ["0720_direction.py", "0721_local_release.py"]
+        return ["0720_direction.py", "0721_discovery_controller.py"]
+
+    with (
+        patch("app.github.get_pr_files", return_value=files),
+        patch("app.github.list_versions_at_ref", side_effect=_versions),
+        patch(
+            "app.github.get_file_text_at_ref", return_value=deployed_source
+        ),
+    ):
+        ok, reason = await enforce_premerge_migration_guard(
+            "t", "o", "r", 1, "automain", promotion_target="main"
+        )
+
+    assert ok is True, reason
+
+
 async def test_enforce_guard_promotion_target_fetch_error_defers():
     """A fetch failure for the promotion target is fail-safe: returns (False, reason)."""
     from app.rollup_migration_validation import enforce_premerge_migration_guard

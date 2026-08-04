@@ -786,7 +786,7 @@ async def get_settings(
             "strategic_session_turn_timeout_seconds", 120
         ),
         "strategic_session_exploration_interval_seconds": _runtime_config.get(
-            "strategic_session_exploration_interval_seconds", 14_400
+            "strategic_session_exploration_interval_seconds", 86_400
         ),
         "strategic_session_max_ops_per_turn": _runtime_config.get(
             "strategic_session_max_ops_per_turn", 3
@@ -944,7 +944,7 @@ async def get_settings(
             "architecture_review_frequency", 3
         ),
         "strategic_max_interval_minutes": _runtime_config.get(
-            "strategic_max_interval_minutes", 180
+            "strategic_max_interval_minutes", 1_440
         ),
         "max_active_directions": _runtime_config.get("max_active_directions", 10),
         "webhook_url_configured": bool(os.getenv("PIPELINE_WEBHOOK_URL")),
@@ -1726,17 +1726,14 @@ async def _apply_settings(
     # so a live session can never be reaped mid-turn; ceiling 7200s / 2h so an
     # operator can NEVER reintroduce a >12h local-pin wall); the idle tick and
     # turn timeout bound the session loop cadence; sparse exploration is a
-    # model-call fallback rather than liveness; the unattended cap bounds total
-    # autonomous lifetime (ceiling 8h, still well under a 12h wall).
+    # model-call fallback rather than liveness and is validated separately so
+    # 0 can disable it without admitting sub-hour churn; the unattended cap
+    # bounds total autonomous lifetime (ceiling 8h, still well under a 12h wall).
     for _key, _lo, _hi in (
         ("strategic_continuation_ttl_seconds", 60, 7_200),
         ("strategic_local_hold_timeout_seconds", 60, 7_200),
         ("strategic_session_idle_tick_seconds", 1, 300),
         ("strategic_session_turn_timeout_seconds", 10, 3_600),
-        # Sparse unchanged-state exploration: 1h..24h. State, watch, operator,
-        # follow-up, and first-turn wakes bypass this interval; the 4h default
-        # prevents routine idleness from becoming an upper-tier model tax.
-        ("strategic_session_exploration_interval_seconds", 3_600, 86_400),
         # Soft per-turn op cap: 1..20. Advisory prompt hint only; the hard
         # per-op spawn/retire gates are unaffected.
         ("strategic_session_max_ops_per_turn", 1, 20),
@@ -1758,6 +1755,34 @@ async def _apply_settings(
                     detail=f"{_key} must be between {_lo} and {_hi}",
                 )
             _runtime_config[_key] = _val
+    if "strategic_session_exploration_interval_seconds" in payload:
+        try:
+            _exploration_interval = int(
+                payload["strategic_session_exploration_interval_seconds"]
+            )
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "strategic_session_exploration_interval_seconds must be a number"
+                ),
+            )
+        # Match strategic_max_interval_minutes's one-week policy window while
+        # retaining the anti-churn floor for enabled exploration. Semantic,
+        # watch, operator, follow-up, and first-turn wakes bypass this interval.
+        if _exploration_interval != 0 and not (
+            3_600 <= _exploration_interval <= 604_800
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "strategic_session_exploration_interval_seconds must be 0 "
+                    "(disabled) or between 3600 and 604800 (1 hour to 1 week)"
+                ),
+            )
+        _runtime_config["strategic_session_exploration_interval_seconds"] = (
+            _exploration_interval
+        )
     if "max_total_research_per_project" in payload:
         try:
             val = int(payload["max_total_research_per_project"])
@@ -3516,7 +3541,7 @@ async def _apply_settings(
                         "architecture_review_frequency", 3
                     ),
                     "strategic_max_interval_minutes": _runtime_config.get(
-                        "strategic_max_interval_minutes", 180
+                        "strategic_max_interval_minutes", 1_440
                     ),
                     "max_active_directions": _runtime_config.get(
                         "max_active_directions", 10
@@ -3877,7 +3902,7 @@ async def _apply_settings(
                     ),
                     "strategic_session_exploration_interval_seconds": int(
                         _runtime_config.get(
-                            "strategic_session_exploration_interval_seconds", 14_400
+                            "strategic_session_exploration_interval_seconds", 86_400
                         )
                     ),
                     "strategic_session_max_ops_per_turn": int(

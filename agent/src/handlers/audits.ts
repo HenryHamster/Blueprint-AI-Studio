@@ -885,8 +885,18 @@ export async function handleReleaseAudit(
   const versionGoal = typeof payload.version_goal === 'string' && payload.version_goal.length > 0
     ? payload.version_goal
     : null;
+  const categories = Array.isArray(payload.categories)
+    ? payload.categories.filter((row): row is { category_key: string; text: string } => (
+        !!row && typeof row === 'object'
+        && typeof (row as Record<string, unknown>).category_key === 'string'
+        && typeof (row as Record<string, unknown>).text === 'string'
+      ))
+    : [];
+  const categoryContractSection = categories.length > 0
+    ? `\nAssess each acceptance category below against the same pinned candidate diff. Emit one \`category_verdicts\` entry for every supplied key, with \`status\` (\`met\` | \`partial\` | \`not_met\`), a concrete \`gap\` (null when met), and diff-grounded \`citations\` (file paths or commit/PR references). Also emit \`residual_uncaptured_gap\` for any important goal gap not represented by a category, else null.\n\nAcceptance categories:\n${categories.map((row) => `- ${row.category_key}: ${row.text}`).join('\n')}\n`
+    : '';
   const versionGoalSection = versionGoal
-    ? `\n## Version Goal\n\n${versionGoal}\n\nIn addition to the standard quality checks below, assess whether this diff plausibly delivers the version's strategic goal stated above. Add a \`goal_alignment\` object to your JSON output with:\n- \`state\` (string): one of \`"aligned"\` (diff plausibly delivers the goal), \`"shortfall"\` (diff falls short), or \`"not_applicable"\` (goal cannot be assessed from this diff).\n- \`assessed_grade\` (float 0.0–1.0): degree of alignment (1.0 = fully aligned, 0.0 = no alignment).\n- \`biggest_gap\` (string or null): one sentence describing the most significant gap if state is \`"shortfall"\`; null otherwise.\n- \`reasoning_summary\` (string): 1–3 sentences explaining the assessment, citing specific files or patterns from the diff.\n\nThis is an ADDITIONAL field alongside the required \`audit_score\`, \`test_erosion\`, and \`findings\` fields — it does not replace them.\n\n`
+    ? `\n## Version Goal\n\n${versionGoal}\n\nIn addition to the standard quality checks below, assess whether this diff plausibly delivers the version's strategic goal stated above. Emit \`covers_goal\` (boolean), \`coverage_score\` (float 0.0–1.0), \`biggest_gap\` (string or null), and \`goal_alignment\` with \`state\` (\`aligned\` | \`shortfall\` | \`not_applicable\`), \`assessed_grade\`, \`biggest_gap\`, and a diff-grounded \`reasoning_summary\`. These fields are additional to \`audit_score\`, \`test_erosion\`, and \`findings\`.\n${categoryContractSection}\n`
     : '';
 
   const buildConfig = resolveBuildConfig(task);
@@ -922,6 +932,11 @@ ${versionGoalSection}
 \`\`\`json
 {
   "audit_score": 0.85,
+  "covers_goal": true,
+  "coverage_score": 0.92,
+  "biggest_gap": null,
+  "category_verdicts": [],
+  "residual_uncaptured_gap": null,
   "test_erosion": {
     "deleted_test_files": [],
     "assertion_delta": 12,
@@ -1074,8 +1089,8 @@ Rules:
       requiredKeys: ['audit_score', 'findings'],
       schemaLabel: 'release_audit',
       first: { exitCode, allOutput, lastResultText },
-      reopenPrompt: `${priorAnalysisSection}Your prior release audit response did not end with a parseable JSON report object.
-Output ONLY the JSON object now — with top-level "audit_score", "test_erosion", and "findings". Each finding must include "severity", "summary", "file", and "verification_note". No markdown, no code fences, no prose.`,
+      reopenPrompt: `${priorAnalysisSection}Your prior release review response did not end with a parseable JSON report object.
+Output ONLY the JSON object now — with top-level "audit_score", "test_erosion", and "findings".${versionGoal ? ' Also include "covers_goal", "coverage_score", "biggest_gap", "category_verdicts", and "residual_uncaptured_gap" from the requested holistic goal review.' : ''} Each finding must include "severity", "summary", "file", and "verification_note". No markdown, no code fences, no prose.`,
       ws,
       statusRef,
       model,

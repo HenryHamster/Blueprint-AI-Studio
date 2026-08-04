@@ -509,7 +509,7 @@ class TestNotificationConfigSettings:
         strategic_local_hold_timeout_seconds (900),
         strategic_session_idle_tick_seconds (5),
         strategic_session_turn_timeout_seconds (120),
-        strategic_session_exploration_interval_seconds (14400),
+        strategic_session_exploration_interval_seconds (86400),
         strategic_session_max_unattended_seconds (7200).
 
         Note: the legacy ``strategic_session_enabled`` feature flag was retired
@@ -521,7 +521,7 @@ class TestNotificationConfigSettings:
         assert data["strategic_local_hold_timeout_seconds"] == 900
         assert data["strategic_session_idle_tick_seconds"] == 5
         assert data["strategic_session_turn_timeout_seconds"] == 120
-        assert data["strategic_session_exploration_interval_seconds"] == 14_400
+        assert data["strategic_session_exploration_interval_seconds"] == 86_400
         assert data["strategic_session_max_unattended_seconds"] == 7200
 
         # Integer knobs round-trip and clamp to their documented ranges.
@@ -545,6 +545,23 @@ class TestNotificationConfigSettings:
         assert data["strategic_session_exploration_interval_seconds"] == 21_600
         assert data["strategic_session_max_unattended_seconds"] == 7200
 
+        # Exploration alone supports an explicit disabled sentinel and a wider
+        # one-week ceiling; semantic/operator/watch wakes remain unaffected.
+        disabled = await client.patch(
+            "/api/admin/settings",
+            json={"strategic_session_exploration_interval_seconds": 0},
+        )
+        assert disabled.status_code == 200, disabled.text
+        data = (await client.get("/api/admin/settings")).json()
+        assert data["strategic_session_exploration_interval_seconds"] == 0
+        weekly = await client.patch(
+            "/api/admin/settings",
+            json={"strategic_session_exploration_interval_seconds": 604_800},
+        )
+        assert weekly.status_code == 200, weekly.text
+        data = (await client.get("/api/admin/settings")).json()
+        assert data["strategic_session_exploration_interval_seconds"] == 604_800
+
         # Out-of-range / non-numeric are rejected. The continuation TTL and
         # local-hold timeout ceilings are lowered to 7200s (2h) so an operator
         # can never reintroduce a >12h local-pin wall.
@@ -555,8 +572,8 @@ class TestNotificationConfigSettings:
             ("strategic_local_hold_timeout_seconds", 43_200),  # > 7200 ceiling
             ("strategic_session_idle_tick_seconds", 0),  # < 1
             ("strategic_session_turn_timeout_seconds", 99999),  # > 3600
-            ("strategic_session_exploration_interval_seconds", 3_599),  # < 1h
-            ("strategic_session_exploration_interval_seconds", 86_401),  # > 24h
+            ("strategic_session_exploration_interval_seconds", 1),  # nonzero < 1h
+            ("strategic_session_exploration_interval_seconds", 604_801),  # > 1 week
             ("strategic_session_min_tick_seconds", 600),  # retired ambiguous key
             ("strategic_session_max_unattended_seconds", 30),  # < 60
             ("strategic_session_max_unattended_seconds", 99999),  # > 28800

@@ -819,12 +819,18 @@ runtime_config: Dict = {
     "direction_outcome_progress_stall_run": 6,
     "direction_outcome_progress_history_max": 20,
     "strategic_research_frequency": 6,  # Every Nth research cycle is a strategic vision review
-    # Wall-clock backstop for strategic cycles: if it has been this long since the
+    # Sparse wall-clock exploration backstop for strategic cycles: if it has been this long since the
     # last strategic_review/design_doc_update task was created (regardless of
     # outcome), force a strategic spawn. Decouples steering frequency from research
     # spawn rate so narrowing direction count does not throttle the agent's own
     # decision cadence. 0 disables the fallback. Cooldown still gates duplicates.
-    "strategic_max_interval_minutes": 180,
+    # Semantic refreshes still wake Strategic immediately. The default is daily
+    # so unchanged state does not buy a full upper-tier cycle every few hours.
+    "strategic_max_interval_minutes": 1_440,
+    # Resident unchanged-state model turn. Semantic state/watch/operator wakes
+    # bypass this interval, so daily exploration preserves autonomy without a
+    # fixed four-hour model tax.
+    "strategic_session_exploration_interval_seconds": 86_400,
     # Gate mode for the strategic evidence-progress challenge. Three values:
     #   "enforce"  — fail-closed (default, current behavior): a suppressing
     #                evidence-progress verdict is ignored when the challenge did

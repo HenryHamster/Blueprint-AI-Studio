@@ -1237,7 +1237,7 @@ async def _spawn_research_task_inner(
     # last strategic being 2h+ old, because both directions were busy.
     if not force_strategic and strategic_failures < 3:
         strategic_max_interval = _runtime_config.get(
-            "strategic_max_interval_minutes", 180
+            "strategic_max_interval_minutes", 1_440
         )
         if strategic_max_interval > 0:
             from sqlalchemy import func as _backstop_func
@@ -1270,7 +1270,7 @@ async def _spawn_research_task_inner(
         # cycle), request a coalesced strategic coverage refresh so the
         # strategist can explicitly reconsider a held direction.
         # The strategist may clear refractory_until on a direction to bypass.
-        # The 180-min wall-clock backstop above remains the safety net.
+        # The configurable sparse wall-clock backstop above remains the safety net.
         _any_refractory = any(
             _direction_in_refractory(d, now)
             for d in (project.directions or [])

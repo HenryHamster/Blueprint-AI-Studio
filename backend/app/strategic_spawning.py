@@ -44,6 +44,7 @@ from app.models import (
     SystemMaturity,
 )
 from app.deploy_identity import (
+    deploy_repo_identity,
     project_is_deploy_repo,
     project_matches_deploy_identity,
 )
@@ -72,6 +73,10 @@ from app.autonomous_spawn_budget import (
     compute_autonomous_spawn_budget_snapshot,
 )
 from app.release_version import QUALIFICATION_STATE_VOCAB
+from app.runtime_config_state import (
+    promotion_enabled_by_project_map,
+    resolve_project_promotion_enabled,
+)
 from app.capability_demand import (
     fetch_missing_demand_for_spawn,
     missing_demand_prompt_hint,
@@ -5683,7 +5688,7 @@ async def _spawn_strategic_review(
             ),
             "strategic_session_exploration_interval_seconds": int(
                 _runtime_config.get(
-                    "strategic_session_exploration_interval_seconds", 14_400
+                    "strategic_session_exploration_interval_seconds", 86_400
                 )
             ),
             "strategic_session_max_ops_per_turn": int(
@@ -6271,10 +6276,14 @@ async def _spawn_strategic_review(
             _rolled_back_from_sha: str | None = None
             _rollback_count: int = 0
             _rollback_reason: str | None = None
+            _deploy_identity = deploy_repo_identity()
+            _deploy_identity_match = project_matches_deploy_identity(
+                project, _deploy_identity
+            )
             # De-gated from project.is_self_repo to the deploy-level identity:
             # the strategist gets positive serving evidence wherever the live
             # DeploymentState actually corresponds to the project's repo.
-            if project_matches_deploy_identity(project):
+            if _deploy_identity_match:
                 try:
                     _ds = await session.get(DeploymentState, 1)
                     if _ds is not None:
@@ -6321,6 +6330,19 @@ async def _spawn_strategic_review(
             _deployment_state_block = {
                 "integration_branch": _integration_branch,
                 "promotion_target": _promotion_target,
+                "promotion_enabled": resolve_project_promotion_enabled(project.id),
+                "promotion_enabled_source": (
+                    "project_override"
+                    if str(project.id) in promotion_enabled_by_project_map()
+                    else "fleet_default"
+                ),
+                "deploy_identity": (
+                    "/".join(_deploy_identity) if _deploy_identity else None
+                ),
+                "deploy_identity_matches_project": _deploy_identity_match,
+                "deployment_state_available": bool(
+                    _deploy_identity_match and _deploy_status is not None
+                ),
                 "deployed_sha": (_deployed_sha or "")[:12] or None,
                 "deployed_revision": _deployed_revision,
                 "deploy_status": _deploy_status,
@@ -6357,12 +6379,57 @@ async def _spawn_strategic_review(
                 "open_status": _open_version.status if _open_version else None,
                 "tasks_merged_unpromoted": _tasks_merged_unpromoted,
                 "automain_ahead_of_main": _automain_ahead,
+                "open_serving_status": (
+                    _open_aggregate["serving_status"]
+                    if _open_version is not None
+                    else None
+                ),
+                "open_serving_sha": (
+                    next(
+                        (
+                            artifact.get("served_identifier")
+                            for artifact in _open_artifacts
+                            if artifact.get("serving_status") == "serving_confirmed"
+                            and artifact.get("served_identifier")
+                        ),
+                        _open_version.served_sha,
+                    )
+                    if _open_version is not None
+                    else None
+                ),
+                "open_serving_gap": (
+                    summarize_required_artifact_gap(_open_artifacts)
+                    if _open_version is not None
+                    else None
+                ),
                 **(
                     {"undeployed_directions": _undeployed_dirs}
                     if _undeployed_dirs
                     else {}
                 ),
             }
+            _delivery_line = (
+                "Delivery capability (authoritative policy/state): "
+                f"promotion_enabled={_deployment_state_block['promotion_enabled']}; "
+                f"promotion_source={_deployment_state_block['promotion_enabled_source']}; "
+                f"deploy_identity={_deployment_state_block['deploy_identity']!r}; "
+                "deploy_identity_matches_project="
+                f"{_deployment_state_block['deploy_identity_matches_project']}; "
+                "deployment_state_available="
+                f"{_deployment_state_block['deployment_state_available']}; "
+                f"open_serving_status={_deployment_state_block['open_serving_status']!r}; "
+                f"open_serving_sha={_deployment_state_block['open_serving_sha']!r}; "
+                f"open_serving_gap={_deployment_state_block['open_serving_gap']!r}. "
+                "Treat unavailable delivery evidence as a reason to revise, split, "
+                "replace, or park an infeasible version goal—not as a reason to "
+                "manufacture implementation work. Use normal directions and "
+                "spawn-task authority for whatever work is actually warranted."
+            )
+            prompt_suffix = (
+                f"{prompt_suffix}\n{_delivery_line}"
+                if prompt_suffix
+                else _delivery_line
+            )
             # Grounded deploy line — only when there is genuinely un-promoted
             # work. Self-contained (does not depend on the general deploy-model
             # framing) so it lands value independently: it points the agent at
@@ -6625,8 +6692,9 @@ async def _spawn_strategic_review(
         _setup_actions: list[str] = []
         if _cur_goal:
             _setup_actions.append(
-                f"use v{_cur_n}'s existing `version_phase.goal` as the frozen "
-                "objective; leave the stored version goal unchanged this cycle"
+                f"review v{_cur_n}'s existing `version_phase.goal` against current "
+                "evidence; keep it if sound, or output `new_version_goal` to revise "
+                "it when infeasible, circular, stale, or badly scoped"
             )
         else:
             _setup_actions.append(
@@ -6636,7 +6704,7 @@ async def _spawn_strategic_review(
             _setup_actions.append(
                 f"output `new_version_goal` — a 1-3 sentence concrete, "
                 f"outcome-framed objective for v{_cur_n} (this is stored as "
-                "the frozen version goal the blind merge-grade will score "
+                "the version goal the independent grade will score "
                 "merged diffs against; write it as a DELIVERABLE statement, "
                 "not a status line)"
             )
@@ -7178,16 +7246,15 @@ async def _spawn_strategic_review(
                         f"v{_open_version.version_number} has been in the stabilize "
                         f"phase for {_stab_age_days} day(s) with {_stab_merged} merged "
                         f"task(s) without making progress toward qualification. "
-                        f"The FIRST qualification now fires AUTOMATICALLY once "
-                        f"criterion coverage is complete — qualify_request is no "
-                        f"longer required to start it. Check "
+                        f"Qualification is a Strategic/operator-owned decision; it "
+                        f"does NOT start automatically. Check "
                         f"version_phase.qualification_trigger_state: if it is "
                         f"'blocked' the summary/reason tells you what to resolve "
-                        f"(e.g. coverage N/M) to let the trigger arm. "
-                        f"qualify_request only ACCELERATES the first qualification "
-                        f"(fires it before the next sweep) or re-drives after a "
-                        f"conclusive verdict — emit one to fire sooner, but "
-                        f"resolving the blocker is what actually unsticks the stall."
+                        f"(e.g. coverage N/M). Once the evidence says the candidate "
+                        f"is ready, YOU must emit qualify_request to start the "
+                        f"qualification. If it remains blocked, use ordinary "
+                        f"direction/task authority for warranted work instead of "
+                        f"re-requesting an audit that cannot pass."
                     )
                     prompt_suffix = (
                         f"{prompt_suffix}\n{_stab_stall_hint}"

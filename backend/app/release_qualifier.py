@@ -27,7 +27,7 @@ import os
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Collection
 
 from sqlalchemy import func as sa_func
 from sqlalchemy import select, update
@@ -102,7 +102,6 @@ from app.release_promotion import (
     promote,
 )
 from app.release_reconciliation import (
-    _reconcile_if_ci_unresolved_now_green,  # noqa: F401 — re-exported for back-compat
     _reconcile_if_deploy_failed_recovered,  # noqa: F401 — re-exported for back-compat
     _reconcile_if_not_promoted_but_pr_merged,  # noqa: F401 — re-exported for back-compat
     _reconcile_if_promotion_failed_landed,  # noqa: F401 — re-exported for back-compat
@@ -127,6 +126,7 @@ from app.release_qualifier_audit import (
     get_latest_release_audit_challenge,  # noqa: F401 — re-exported for callers/tests
     get_latest_release_audit_report,  # noqa: F401 — re-exported for callers/tests
     resolve_lifecycle_audit_evidence,  # noqa: F401 — re-exported for callers/tests
+    required_children_terminal as _required_children_terminal,
 )
 from app.ci_resolution import (
     _CI_GREEN,
@@ -208,11 +208,6 @@ from app.release_qualifier_sweep import (
     _force_finalize_sweep_crash_loop,  # noqa: F401 — re-exported for tests
     _force_finalize_timed_out_qualification,
     _parse_started_at,
-    _fire_initial_qualification_if_coverage_complete,  # noqa: F401 — re-exported for tests
-    _reconcile_if_criterion_coverage_now_complete,  # noqa: F401 — re-exported for tests
-    _redrive_deferred_unsynced_qualification,  # noqa: F401 — re-exported for tests
-    _redrive_dry_run_candidate,  # noqa: F401 — re-exported for tests
-    _redrive_not_promoted_qualification,  # noqa: F401 — re-exported for tests
     _reconcile_hotfix_audit_trail,  # noqa: F401
     sweep_stuck_qualifications,  # noqa: F401 — re-exported for reaper + tests
 )
@@ -397,6 +392,57 @@ def _rubric_fingerprint(snapshot: list[dict[str, str]]) -> str:
         _canonicalize_rubric(snapshot),
         ensure_ascii=False,
         separators=(",", ":"),
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+def _qualification_contract_fingerprint(
+    version_goal: str,
+    rubric_fingerprint: str,
+    *,
+    promotion_policy: dict[str, Any] | None = None,
+    capability_proof_mode: str = "off",
+    env_preflight_enabled: bool = False,
+    requested_probes: Collection[str] | None = None,
+) -> str:
+    """Bind reusable goal evidence to the exact launch-time contract."""
+    policy = promotion_policy or {}
+    raw_weights = policy.get("weights")
+    normalized_weights = {
+        str(key): float(value)
+        for key, value in sorted(
+            (raw_weights.items() if isinstance(raw_weights, dict) else [])
+        )
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+    }
+    raw_threshold = policy.get("threshold")
+    encoded = json.dumps(
+        {
+            "version_goal": " ".join(str(version_goal or "").split()),
+            "rubric_fingerprint": str(rubric_fingerprint or ""),
+            "promotion_policy": {
+                "threshold": (
+                    float(raw_threshold)
+                    if isinstance(raw_threshold, (int, float))
+                    and not isinstance(raw_threshold, bool)
+                    else None
+                ),
+                "weights": normalized_weights,
+            },
+            "capability_proof_mode": str(capability_proof_mode or "off")
+            .strip()
+            .lower(),
+            "env_preflight_enabled": bool(env_preflight_enabled),
+            "requested_probes": sorted(
+                {
+                    str(probe).strip()
+                    for probe in (requested_probes or [])
+                    if str(probe).strip()
+                }
+            ),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
     )
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -982,6 +1028,8 @@ def _audit_dimension_detail(
     findings_meta: dict[str, Any],
     audit_missing_reason: str | None,
     audit_scope: Any,
+    holistic_review: dict[str, Any] | None = None,
+    holistic_contract_fingerprint: str | None = None,
 ) -> dict[str, Any]:
     """Build the durable, complete per-path audit fact payload."""
     return {
@@ -1000,6 +1048,8 @@ def _audit_dimension_detail(
         ),
         "audit_missing_reason": audit_missing_reason,
         "audit_scope": audit_scope,
+        "holistic_review": holistic_review,
+        "holistic_contract_fingerprint": holistic_contract_fingerprint,
     }
 
 def _incremental_audit_base_sha(
@@ -2270,6 +2320,7 @@ async def run_qualification(
     retry_episode: int = 0,
     retry_episode_cap: int | None = None,
     requested_probes: list[str] | tuple[str, ...] | set[str] | None = None,
+    explicit_request: bool = False,
 ) -> dict[str, Any]:
     """Kick off qualification for the open release ``version``.
 
@@ -2321,8 +2372,8 @@ async def run_qualification(
          in ``_finalize_qualification`` applies it as a hard blocker.
       4. Lock the ``ReleaseVersion`` row, then re-check the in-flight /
          cached-verdict guards under the lock.
-      5. Spawn the active audit and merge-grade children, plus only the product
-         probes explicitly selected by the qualification requester. Their
+      5. Spawn one holistic final review, plus only the product probes
+         explicitly selected by the qualification requester. Their
          payloads carry the exact ``candidate_sha`` so every gate evaluates the
          snapshotted tree rather than a later integration-branch head.
       6. Stamp ``version.last_qualification = {status: "pending", ...}`` and
@@ -2372,6 +2423,71 @@ async def run_qualification(
             version.phase,
         )
         return {"status": "wrong_phase"}
+
+    # Fresh qualification is an ownership decision, not a branch-head side
+    # effect.  Strategic's qualify_request and the operator endpoint pass this
+    # explicitly; sweeps/reconcilers pass False and may only continue an
+    # already-requested attempt by carrying its immutable attempt id.
+    if not explicit_request and continued_attempt_id is None:
+        logger.info(
+            "[RELEASE_QUALIFIER] v%d ignored automatic fresh qualification; "
+            "Strategic or an operator must request a candidate review",
+            version.version_number,
+        )
+        return {"status": "explicit_request_required"}
+
+    # Promotion policy is a cheap capability fact.  A disabled project must not
+    # burn a release audit merely to rediscover that delivery is unavailable.
+    # Lock the version before recording that blocker: an already-running
+    # qualification or managed promotion owns last_qualification and must never
+    # be overwritten by a concurrent configuration observation.
+    if not resolve_project_promotion_enabled(project_id):
+        locked_version = (
+            (
+                await session.execute(
+                    select(release_version.ReleaseVersion)
+                    .where(release_version.ReleaseVersion.id == version.id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if locked_version is None:
+            return {"status": "version_not_found"}
+        version = locked_version
+        if version.phase != "stabilize":
+            return {"status": "wrong_phase"}
+        if await _qualification_in_flight(session, version):
+            return {"status": "already_pending"}
+        from app.qualification_state_resolver import resolve_newest_qualification_verdict
+
+        latest_verdict = await resolve_newest_qualification_verdict(session, version)
+        promotion_pending = _promotion_pending_result(
+            version, latest_verdict=latest_verdict
+        )
+        if promotion_pending is not None:
+            return promotion_pending
+        blocked_at = _utcnow().isoformat()
+        version.last_qualification = {
+            **(version.last_qualification or {}),
+            "status": "external_blocker",
+            "blocker": "promotion_disabled",
+            "blocker_class": "external_delivery",
+            "detail": (
+                "Promotion is disabled for this project; qualification was not "
+                "started and no review agents were spawned."
+            ),
+            "requested_at": blocked_at,
+        }
+        flag_modified(version, "last_qualification")
+        session.add(version)
+        return {
+            "status": "external_blocker",
+            "blocker": "promotion_disabled",
+            "blocker_class": "external_delivery",
+        }
 
     # Cheap pre-lock in-flight check (no I/O — pure DB reads).  This is a
     # best-effort fast path so the common case (a re-emitted qualify_request
@@ -2749,6 +2865,46 @@ async def run_qualification(
         )
         return _promo
 
+    # Snapshot the live decision contract while the version row is locked.
+    # Candidate code facts may remain reusable across goal edits, but a cached
+    # holistic verdict is valid only for this exact goal + rubric pair.
+    version_goal = (version.goal or "").strip()
+    _merge_grade_goal_usable = bool(version_goal) and not is_contentless_goal(
+        version_goal
+    )
+    rubric_snapshot, rubric_lifecycle_snapshot = (
+        await _snapshot_qualification_rubric(session, version)
+    )
+    rubric_provenance = _rubric_provenance(
+        rubric_snapshot,
+        source="qualification_launch",
+        qualification_attempt_id=str(attempt_id),
+    )
+    rubric_fingerprint = rubric_provenance["fingerprint"]
+    _spawn_policy_snapshot = _load_policy(project)
+    _spawn_capability_proof_mode = str(
+        _runtime_config.get("capability_proof_gate_mode", "off") or "off"
+    ).strip().lower()
+    _env_preflight_build = (project.build_config or {}).get(
+        "env_preflight_enabled"
+    )
+    if _env_preflight_build is not None:
+        env_preflight_enabled = bool(_env_preflight_build)
+    elif _runtime_config.get("env_preflight_enabled") is not None:
+        env_preflight_enabled = bool(_runtime_config.get("env_preflight_enabled"))
+    else:
+        env_preflight_enabled = bool(
+            _spawn_policy_snapshot.get("env_preflight_enabled", False)
+        )
+    contract_fingerprint = _qualification_contract_fingerprint(
+        version_goal,
+        rubric_fingerprint,
+        promotion_policy=_spawn_policy_snapshot,
+        capability_proof_mode=_spawn_capability_proof_mode,
+        env_preflight_enabled=env_preflight_enabled,
+        requested_probes=effective_requested_probes,
+    )
+
     # Guard 3 (under the lock): a conclusive qualification verdict
     # (promoted/not_promoted/dry_run) for this candidate commit has been reached
     # and automain has not advanced. A conclusive verdict is settled and
@@ -2886,6 +3042,7 @@ async def run_qualification(
         and not ci_unresolved_recovered_same_sha
         and not criterion_coverage_recovered_same_sha
         and not legacy_smoke_tainted_verdict
+        and prior_qual.get("contract_fingerprint") == contract_fingerprint
         and _qualification_probe_contract_is_reusable(
             prior_qual, effective_requested_probes
         )
@@ -2976,15 +3133,6 @@ async def run_qualification(
     # against the flag state in force when the run STARTED, not a value that
     # flipped mid-run.  When False the judge is fully inert (no boot_prereq_missing
     # blocker, no env_preflight sub_score, default promotion behaviour unchanged).
-    _env_preflight_build = (project.build_config or {}).get("env_preflight_enabled")
-    if _env_preflight_build is not None:
-        env_preflight_enabled = bool(_env_preflight_build)
-    elif _runtime_config.get("env_preflight_enabled") is not None:
-        env_preflight_enabled = bool(_runtime_config.get("env_preflight_enabled"))
-    else:
-        env_preflight_enabled = bool(
-            _load_policy(project).get("env_preflight_enabled", False)
-        )
     audit_task_id: str | None = None
     challenge_task_id: str | None = None
     audit_challenge_task_id: str | None = None
@@ -2999,23 +3147,6 @@ async def run_qualification(
     # contentless placeholder (e.g. "test", "n/a") there is nothing to grade
     # against, so no child is spawned and the finalize gate is a no-op PASS (see
     # _finalize_qualification).  Contentless == empty for this purpose.
-    version_goal = (version.goal or "").strip()
-    _merge_grade_goal_usable = bool(version_goal) and not is_contentless_goal(version_goal)
-    # Freeze the exact ordered acceptance contract BEFORE consulting reusable
-    # facts or spawning the blind grader.
-    rubric_snapshot, rubric_lifecycle_snapshot = await _snapshot_qualification_rubric(
-        session, version
-    )
-    # An acceptance rubric and every fact derived from it belong to this exact
-    # launch, not just to a version or candidate SHA.  Use the durable attempt
-    # UUID established at the start of this run so finalization, task payloads,
-    # and ledger provenance all share one identity.
-    rubric_provenance = _rubric_provenance(
-        rubric_snapshot,
-        source="qualification_launch",
-        qualification_attempt_id=str(attempt_id),
-    )
-    rubric_fingerprint = rubric_provenance["fingerprint"]
     # Cross-SHA audit reuse is keyed by the audit dimension's own durable
     # per-path surface identity, not by the mutable last_qualification blob.
     # A byte-identical surface copies the resolved audit/test facts to this
@@ -3196,6 +3327,22 @@ async def run_qualification(
         )
         resolved_dims.pop("audit", None)
         resolved_dims.pop("test_erosion", None)
+    _reused_audit_detail = resolved_dims.get("audit", {}).get("detail")
+    _holistic_contract_required = _merge_grade_goal_usable or bool(rubric_snapshot)
+    _holistic_contract_reusable = not _holistic_contract_required or (
+        isinstance(_reused_audit_detail, dict)
+        and _reused_audit_detail.get("holistic_contract_fingerprint")
+        == contract_fingerprint
+    )
+    if not _holistic_contract_reusable:
+        logger.info(
+            "[RELEASE_QUALIFIER] v%d candidate %s refusing holistic audit "
+            "reuse because the goal/rubric contract changed; retaining its "
+            "code-quality and test facts",
+            version.version_number,
+            candidate_sha[:8],
+        )
+        resolved_dims.pop("challenge", None)
     await _mark_dimensions_reused_by_attempt(
         session,
         [row for dim, row in prior_dim_results.items() if dim in resolved_dims],
@@ -3281,17 +3428,14 @@ async def run_qualification(
                 "detail": _pre_mi_detail,
                 "qualification_attempt_id": str(attempt_id),
             }
-    # A child task is needed only when NOT ALL of its produced dimensions are
-    # already resolved. Audit task → {audit, test_erosion}; merge-grade task →
-    # {merge_grade}.
+    # The one holistic review owns code quality, test erosion, goal alignment,
+    # and acceptance-category evidence.  There is no parallel merge-grade leg.
     _audit_needed = not (
         "audit" in resolved_dims and "test_erosion" in resolved_dims
-    )
+    ) or not _holistic_contract_reusable
     # The walkthrough_e2e child is an opt-in decision-bearing product probe.
     _walkthrough_e2e_needed = walkthrough_e2e_requested
-    _merge_grade_needed = (
-        _merge_grade_goal_usable and "merge_grade" not in resolved_dims
-    )
+    _merge_grade_needed = False
     incremental_audit_base_sha = _incremental_audit_base_sha(
         prior_qual,
         candidate_sha,
@@ -3321,10 +3465,6 @@ async def run_qualification(
     # the first child-spawn await so a mid-flight operator/config change cannot
     # compose children spawned under one contract with a verdict computed under
     # another.  Legacy records that predate the freeze fall back to live values.
-    _spawn_policy_snapshot = _load_policy(project)
-    _spawn_capability_proof_mode = str(
-        _runtime_config.get("capability_proof_gate_mode", "off") or "off"
-    ).strip().lower()
     try:
         if _audit_needed:
             audit_task = await _spawn_release_audit_task(
@@ -3337,33 +3477,14 @@ async def run_qualification(
                 qualification_attempt_id=attempt_id,
                 audit_base_sha=incremental_audit_base_sha,
                 version_goal=version.goal,
-            )
-            audit_task_id = str(audit_task.id)
-        if _merge_grade_needed:
-            merged_pr_numbers = await _merged_pr_numbers_for_version(session, version)
-            # Goal-verification redesign: the merge-grade agent grades the merged
-            # diff per ACTIVE acceptance-criterion CATEGORY, so pass the rubric
-            # (stable ``criterion_key`` + text) into the payload.  The agent keys
-            # its per-category verdicts back on these keys.
-            _mg_categories = [
-                {"category_key": c.get("criterion_key"), "text": c.get("text")}
-                for c in rubric_snapshot
-                if c.get("criterion_key")
-            ]
-            merge_grade_task = await _spawn_release_merge_grade_task(
-                session,
-                project_id,
-                version_id=version.id,
-                base_branch=promotion_target,
-                diff_range=diff_range,
-                candidate_sha=candidate_sha,
-                qualification_attempt_id=attempt_id,
-                version_goal=version_goal,
-                merged_pr_numbers=merged_pr_numbers,
-                categories=_mg_categories,
+                categories=[
+                    {"category_key": c.get("criterion_key"), "text": c.get("text")}
+                    for c in rubric_snapshot
+                    if c.get("criterion_key")
+                ],
                 rubric_fingerprint=rubric_fingerprint,
             )
-            merge_grade_task_id = str(merge_grade_task.id)
+            audit_task_id = str(audit_task.id)
         if _walkthrough_e2e_needed:
             walkthrough_e2e_task = await _spawn_qualifier_walkthrough_task(
                 session,
@@ -3473,6 +3594,7 @@ async def run_qualification(
         "merge_grade_task_id": merge_grade_task_id,
         "rubric_snapshot": rubric_snapshot,
         "rubric_fingerprint": rubric_fingerprint,
+        "contract_fingerprint": contract_fingerprint,
         "rubric_lifecycle_snapshot": rubric_lifecycle_snapshot,
         "rubric_provenance": rubric_provenance,
         "prior_infra_streak": prior_infra_streak,
@@ -4496,45 +4618,6 @@ async def _guard_ci_unresolved_promotion_pending(
         "managed_check_wait": True,
     }
 
-async def _merged_pr_numbers_for_version(
-    session: AsyncSession,
-    version_obj: release_version.ReleaseVersion,
-) -> list[int]:
-    """Return the PR numbers merged into this version's acceptance window.
-
-    Reuses the SAME landed-merge predicate the blind merge-grade path uses
-    (``landed_signal_predicate`` + the version's opened_at window) so the blind
-    merge-grade child grades exactly the diffs that landed in this version.
-    Pure DB read — no GitHub I/O; the agent fetches each PR's diff itself.
-
-    Blind by construction: this discovers merged PRs from the task ledger only;
-    it never reads ``Project.running_update``.  Returns a sorted, de-duplicated
-    list; empty when the version has no opened_at or no landed merges yet.
-    """
-    if version_obj.opened_at is None:
-        return []
-    rows = (
-        (
-            await session.execute(
-                select(Task).where(
-                    Task.project_id == version_obj.project_id,
-                    Task.status == TaskStatus.COMPLETED,
-                    landed_signal_predicate(session),
-                    Task.updated_at >= version_obj.opened_at,
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-    pr_numbers: list[int] = []
-    for task in rows:
-        if release_version._task_completed_at(task) < version_obj.opened_at:
-            continue
-        pn = (task.first_payload or {}).get("pr_number")
-        if isinstance(pn, int) and pn > 0 and pn not in pr_numbers:
-            pr_numbers.append(pn)
-    return sorted(pr_numbers)
 
 async def _candidate_already_on_main_at_finalize(
     session: AsyncSession,
@@ -5224,6 +5307,10 @@ async def _dual_write_dimension_results(
                 findings_meta=base_record,
                 audit_missing_reason=base_record.get("audit_missing_reason"),
                 audit_scope=base_record.get("audit_scope"),
+                holistic_review=base_record.get("holistic_review"),
+                holistic_contract_fingerprint=base_record.get(
+                    "contract_fingerprint"
+                ),
             ),
             "producing_task_id": base_record.get("audit_task_id"),
         },
@@ -5476,6 +5563,7 @@ async def _record_rubric_provenance_outcome(
     rubric_drift: dict[str, Any] | None = None,
     provenance_error: str | None = None,
     policy: dict[str, Any] | None = None,
+    blocker: str | None = None,
 ) -> dict[str, Any]:
     """Hold an attempt whose launched acceptance contract cannot finalize."""
     finalized_at = _utcnow().isoformat()
@@ -5488,7 +5576,7 @@ async def _record_rubric_provenance_outcome(
         "qualification_attempt_id": qual.get("qualification_attempt_id"),
         "confidence": 0.0,
         "sub_scores": {},
-        "blocker": status,
+        "blocker": blocker or status,
         "threshold": (policy or {}).get("threshold"),
         "started_at": qual.get("started_at"),
         "finalized_at": finalized_at,
@@ -5507,6 +5595,8 @@ async def _record_rubric_provenance_outcome(
         "rubric_provenance": rubric_provenance,
         "rubric_drift": rubric_drift,
         "rubric_provenance_error": provenance_error,
+        "version_goal": qual.get("version_goal"),
+        "contract_fingerprint": qual.get("contract_fingerprint"),
         # Deliberately absent: this attempt never gates on live categories and
         # never fabricates verdicts for categories outside its launched rubric.
         "category_verdicts": None,
@@ -5528,10 +5618,15 @@ async def _record_rubric_provenance_outcome(
         version,
         "stabilize",
         reasoning=(
-            f"qualification v{version.version_number}: acceptance rubric changed "
-            "while the blind grade was in flight; launch a fresh grade"
-            if status == "rubric_changed"
-            else f"qualification v{version.version_number}: launched rubric provenance unknown"
+            f"qualification v{version.version_number}: goal/rubric decision "
+            "contract was superseded while review was in flight"
+            if blocker == "qualification_contract_superseded"
+            else (
+                f"qualification v{version.version_number}: acceptance rubric changed "
+                "while the blind grade was in flight; launch a fresh grade"
+                if status == "rubric_changed"
+                else f"qualification v{version.version_number}: launched rubric provenance unknown"
+            )
         ),
     )
     session.add(version)
@@ -5546,24 +5641,34 @@ async def _record_rubric_provenance_outcome(
     await _notify_operator(
         session,
         version,
-        "release_rubric_changed" if status == "rubric_changed" else "release_rubric_unknown",
         (
-            f"v{version.version_number} was not promoted because its acceptance "
-            "rubric changed while the blind merge-grade was in flight. A fresh "
-            "grade will use the new rubric."
+            "release_rubric_changed"
             if status == "rubric_changed"
-            else f"v{version.version_number} was held because the pending grade's "
-            "rubric provenance could not be reconstructed. A fresh grade is required."
+            else "release_rubric_unknown"
+        ),
+        (
+            f"v{version.version_number} was not promoted because its goal/rubric "
+            "decision contract changed while review was in flight. Strategic can "
+            "decide whether to request a fresh qualification."
+            if blocker == "qualification_contract_superseded"
+            else (
+                f"v{version.version_number} was not promoted because its acceptance "
+                "rubric changed while the blind merge-grade was in flight. A fresh "
+                "grade will use the new rubric."
+                if status == "rubric_changed"
+                else f"v{version.version_number} was held because the pending grade's "
+                "rubric provenance could not be reconstructed. A fresh grade is required."
+            )
         ),
         extra={
-            "blocker": status,
+            "blocker": blocker or status,
             "rubric_drift": rubric_drift,
             "rubric_provenance_error": provenance_error,
         },
     )
     return {
         "status": status,
-        "blocker": status,
+        "blocker": blocker or status,
         "rubric_drift": rubric_drift,
         "rubric_provenance_error": provenance_error,
     }
@@ -5758,6 +5863,47 @@ async def _finalize_qualification(
             rubric_provenance=rubric_provenance,
             rubric_drift=rubric_drift,
             policy=policy,
+        )
+
+    live_goal = (version.goal or "").strip()
+    live_contract_fingerprint = _qualification_contract_fingerprint(
+        live_goal,
+        _rubric_fingerprint(live_rubric),
+        promotion_policy=qual.get("promotion_policy_snapshot"),
+        capability_proof_mode=str(qual.get("capability_proof_mode") or "off"),
+        env_preflight_enabled=bool(qual.get("env_preflight_enabled", False)),
+        requested_probes=qual.get("requested_probes") or [],
+    )
+    launched_contract_fingerprint = qual.get("contract_fingerprint") or (
+        _qualification_contract_fingerprint(
+            str(qual.get("version_goal") or ""),
+            str(qual.get("rubric_fingerprint") or ""),
+            promotion_policy=qual.get("promotion_policy_snapshot"),
+            capability_proof_mode=str(qual.get("capability_proof_mode") or "off"),
+            env_preflight_enabled=bool(qual.get("env_preflight_enabled", False)),
+            requested_probes=qual.get("requested_probes") or [],
+        )
+    )
+    if live_contract_fingerprint != launched_contract_fingerprint:
+        logger.info(
+            "[RELEASE_QUALIFIER] v%d candidate %s goal/rubric contract changed "
+            "while review was in flight; marking the attempt superseded",
+            version.version_number,
+            (candidate_sha or "")[:8],
+        )
+        return await _record_rubric_provenance_outcome(
+            session,
+            version,
+            qual,
+            status="rubric_changed",
+            rubric_provenance=rubric_provenance,
+            rubric_drift={
+                "launched_contract_fingerprint": launched_contract_fingerprint,
+                "live_contract_fingerprint": live_contract_fingerprint,
+                "goal_changed": live_goal != str(qual.get("version_goal") or "").strip(),
+            },
+            policy=policy,
+            blocker="qualification_contract_superseded",
         )
 
     # --- Infra-failure detection: check required child terminal statuses ------
@@ -6281,7 +6427,32 @@ async def _finalize_qualification(
             session, version, _prior_delta_sha, "test_erosion"
         )
     if _audit_and_erosion_resolved:
-        audit_report = None
+        audit_report: dict[str, Any] | None = None
+        # A fresh holistic child may accompany reused code-quality/test facts
+        # when only the goal/rubric contract changed. Its report supplies goal
+        # and category evidence; the durable dimension facts below remain the
+        # source of truth for code quality and test erosion.
+        if audit_task_id:
+            try:
+                audit_report = await _latest_artifact_logs(
+                    session,
+                    uuid.UUID(str(audit_task_id)),
+                    ArtifactType.RELEASE_AUDIT_REPORT,
+                )
+            except (ValueError, TypeError):
+                logger.warning(
+                    "[RELEASE_QUALIFIER] invalid audit_task_id %s on version v%d",
+                    audit_task_id,
+                    version.version_number,
+                )
+            if (
+                audit_report is None
+                and _audit_task_obj is not None
+                and _audit_task_obj.status == TaskStatus.COMPLETED
+            ):
+                return await _handle_infra_failure(
+                    session, version, qual, "holistic_review_report_missing"
+                )
         audit_score = resolved_dims["audit"].get("sub_score")
         test_erosion_score = resolved_dims["test_erosion"].get("sub_score")
         _resolved_audit_detail_raw = resolved_dims["audit"].get("detail")
@@ -6421,6 +6592,8 @@ async def _finalize_qualification(
             findings_meta=_audit_findings_carry_meta(audit_report),
             audit_missing_reason=audit_missing_reason,
             audit_scope=(audit_report or {}).get("audit_scope"),
+            holistic_review=audit_report if isinstance(audit_report, dict) else None,
+            holistic_contract_fingerprint=qual.get("contract_fingerprint"),
         ),
         producing_task_id=audit_task_id,
         audited_surface_hash=qual.get("candidate_diff_hash"),
@@ -6494,6 +6667,10 @@ async def _finalize_qualification(
     if (
             bool(qual.get("audit_challenge_spawn_pending"))
             and not challenge_task_id
+            # A second opinion is exceptional: only verified, deductible
+            # consequential findings justify another LLM review.  A clean or
+            # low-severity primary review finalizes without a challenger.
+            and bool(primary_findings)
             and _audit_task_matches_candidate(_audit_task_obj, candidate_sha)
         ):
         audit_payload = (
@@ -7235,6 +7412,8 @@ async def _finalize_qualification(
                     **_excluded_findings_meta,
                 },
                 audit_missing_reason=audit_missing_reason,
+                holistic_review=audit_report if isinstance(audit_report, dict) else None,
+                holistic_contract_fingerprint=qual.get("contract_fingerprint"),
                 audit_scope=(audit_report or {}).get("audit_scope"),
             ),
             producing_task_id=audit_task_id,
@@ -7409,6 +7588,9 @@ async def _finalize_qualification(
         for c in launched_rubric
         if c.get("criterion_key")
     ]
+    _merge_grade_goal_usable = bool(_frozen_version_goal) and not is_contentless_goal(
+        _frozen_version_goal
+    )
 
     # --- Blind merge-grade artifact validation (dir d-c0fe439f) -------------
     # An uninvested release_merge_grade agent graded the merged diffs against the
@@ -7448,20 +7630,20 @@ async def _finalize_qualification(
             "blocked": False,
             "detail": None,
         }
-    if merge_grade_task_id and "merge_grade" not in resolved_dims:
-        merge_grade_artifact: dict[str, Any] | None = None
-        try:
-            merge_grade_artifact = await _latest_artifact_logs(
-                session,
-                uuid.UUID(str(merge_grade_task_id)),
-                ArtifactType.RELEASE_MERGE_GRADE,
+    if _merge_grade_goal_usable and "merge_grade" not in resolved_dims:
+        # The primary release review is holistic.  It supplies both defect/test
+        # evidence and the formerly separate blind merge-grade contract, so one
+        # candidate decision consumes one LLM task rather than a fixed fan-out.
+        merge_grade_artifact: dict[str, Any] | None = (
+            audit_report
+            if isinstance(audit_report, dict)
+            else (
+                _resolved_audit_detail.get("holistic_review")
+                if _resolved_audit_detail.get("holistic_contract_fingerprint")
+                == qual.get("contract_fingerprint")
+                else None
             )
-        except (ValueError, TypeError):
-            logger.warning(
-                "[RELEASE_QUALIFIER] invalid merge_grade_task_id %s on version v%d",
-                merge_grade_task_id,
-                version.version_number,
-            )
+        )
         # v2 machine tier: only gather the (bounded) verified-merge test evidence
         # when there is an ACTIVE rubric to grade categories against — otherwise
         # the per-category grade (and thus the tier) is never computed.
@@ -7489,9 +7671,9 @@ async def _finalize_qualification(
         # skipped or waved through, exactly like the other active legs.
         if merge_grade_cert["status"] == "unparseable":
             label = (
-                "merge_grade_report_missing"
+                "holistic_review_report_missing"
                 if merge_grade_artifact is None
-                else "merge_grade_report_unparseable"
+                else "holistic_review_goal_grade_unparseable"
             )
             return await _handle_infra_failure(session, version, qual, label)
         # The grader produced a usable holistic verdict but CANNOT emit the
@@ -7567,7 +7749,7 @@ async def _finalize_qualification(
         }
     # Eagerly persist merge_grade to the per-dimension ledger so a later-gate
     # infra failure does not discard the result before _dual_write_dimension_results.
-    if merge_grade_task_id or "merge_grade" in resolved_dims:
+    if _merge_grade_goal_usable or "merge_grade" in resolved_dims:
         _mg_cert_status = merge_grade_cert.get("status", "not_applicable")
         if _mg_cert_status == "pass":
             _mg_ledger_status = "passed"
@@ -7583,7 +7765,7 @@ async def _finalize_qualification(
             status=_mg_ledger_status,
             sub_score=_mg_coverage if isinstance(_mg_coverage, (int, float)) and not isinstance(_mg_coverage, bool) else None,
             detail=merge_grade_cert,
-            producing_task_id=merge_grade_task_id,
+            producing_task_id=audit_task_id or merge_grade_task_id,
             origin_attempt_id=attempt_id,
         )
 
@@ -7964,6 +8146,16 @@ async def _finalize_qualification(
         "walkthrough_e2e_task_id": walkthrough_e2e_task_id,
         "walkthrough_e2e_result": walkthrough_e2e_result,
         "audit_findings": audit_findings,
+        "holistic_review": (
+            audit_report
+            if isinstance(audit_report, dict)
+            else (
+                _resolved_audit_detail.get("holistic_review")
+                if _resolved_audit_detail.get("holistic_contract_fingerprint")
+                == qual.get("contract_fingerprint")
+                else None
+            )
+        ),
         # Agent-authored, backend-preserved explanation of delta selection or
         # full fallback. Kept schema-free and shaped for later dimension detail.
         "audit_scope": (
@@ -8031,6 +8223,8 @@ async def _finalize_qualification(
         "qualification_attempt_id": qual.get("qualification_attempt_id"),
         "rubric_snapshot": launched_rubric,
         "rubric_fingerprint": rubric_provenance.get("fingerprint"),
+        "contract_fingerprint": qual.get("contract_fingerprint"),
+        "version_goal": qual.get("version_goal"),
         "rubric_provenance": rubric_provenance,
         "rubric_drift": None,
         # Goal-verification redesign: the per-category verdicts + residual that
@@ -8403,184 +8597,6 @@ async def _finalize_qualification(
 # maybe_finalize_qualification — task-completion hook (coordination glue).
 # ---------------------------------------------------------------------------
 
-async def _required_children_terminal(
-    session: AsyncSession,
-    version: release_version.ReleaseVersion,
-) -> bool:
-    """Return True iff every active qualifier child of ``version`` is terminal.
-
-    Qualifier VM smoke is retired. Archival ``smoketest_task_id`` and
-    ``smoketest_enabled`` values are deliberately ignored: they are neither
-    loaded nor attempt-matched and can never delay or fail a current finalize.
-    Dimensions carried forward by the active ledger do not require a child.
-    """
-    qual = version.last_qualification or {}
-    resolved_dims: dict[str, dict[str, Any]] = {
-        dim: fact
-        for dim, fact in (qual.get("resolved_dimensions") or {}).items()
-        if dim in LEDGER_DIMENSION_KEYS
-    }
-    audit_resolved = "audit" in resolved_dims and "test_erosion" in resolved_dims
-    merge_grade_resolved = "merge_grade" in resolved_dims
-
-    audit_task_id_raw = qual.get("audit_task_id")
-    challenge_task_id_raw = qual.get("challenge_task_id")
-    challenge_required = bool(challenge_task_id_raw)
-    merge_grade_task_id_raw = qual.get("merge_grade_task_id")
-    merge_grade_required = bool(merge_grade_task_id_raw)
-    walkthrough_requested = "walkthrough_e2e" in set(
-        qual.get("requested_probes") or []
-    )
-    walkthrough_task_id_raw = qual.get("walkthrough_e2e_task_id")
-
-    if not audit_task_id_raw and not audit_resolved:
-        logger.warning(
-            "[RELEASE_QUALIFIER] finalize-gate: version v%d has pending "
-            "qualification but no audit child or resolved audit facts",
-            version.version_number,
-        )
-        return False
-
-    try:
-        audit_task_id = (
-            uuid.UUID(str(audit_task_id_raw))
-            if audit_task_id_raw is not None
-            else None
-        )
-        challenge_task_id = (
-            uuid.UUID(str(challenge_task_id_raw)) if challenge_required else None
-        )
-        merge_grade_task_id = (
-            uuid.UUID(str(merge_grade_task_id_raw)) if merge_grade_required else None
-        )
-        walkthrough_task_id = (
-            uuid.UUID(str(walkthrough_task_id_raw))
-            if walkthrough_requested and walkthrough_task_id_raw
-            else None
-        )
-    except (ValueError, TypeError, AttributeError):
-        logger.warning(
-            "[RELEASE_QUALIFIER] finalize-gate: version v%d has unparseable "
-            "active child task ids (audit=%r challenge=%r merge_grade=%r "
-            "walkthrough=%r) — "
-            "not ready",
-            version.version_number,
-            audit_task_id_raw,
-            challenge_task_id_raw,
-            merge_grade_task_id_raw,
-            walkthrough_task_id_raw,
-        )
-        return False
-
-    audit_task: Task | None = (
-        await session.get(Task, audit_task_id)
-        if audit_task_id is not None
-        else None
-    )
-    challenge_task: Task | None = (
-        await session.get(Task, challenge_task_id)
-        if challenge_task_id is not None
-        else None
-    )
-    merge_grade_task: Task | None = (
-        await session.get(Task, merge_grade_task_id)
-        if merge_grade_task_id is not None
-        else None
-    )
-    walkthrough_task: Task | None = (
-        await session.get(Task, walkthrough_task_id)
-        if walkthrough_task_id is not None
-        else None
-    )
-
-    # Strict attempt matching applies only to active children. Legacy smoke
-    # children may belong to any historical attempt without blocking finalize.
-    active_attempt_id = _coerce_qualification_attempt_id(
-        qual.get("qualification_attempt_id")
-    )
-    if active_attempt_id is not None:
-        for leg, task in (
-            ("audit", audit_task),
-            ("challenge", challenge_task),
-            ("merge_grade", merge_grade_task),
-            ("walkthrough_e2e", walkthrough_task),
-        ):
-            if task is None:
-                continue
-            child_attempt_id = _coerce_qualification_attempt_id(
-                (task.context or {}).get("qualification_attempt_id")
-            )
-            if child_attempt_id != active_attempt_id:
-                logger.warning(
-                    "[RELEASE_QUALIFIER] finalize-gate: v%d %s child %s belongs "
-                    "to attempt %s, active attempt is %s -- not ready",
-                    version.version_number,
-                    leg,
-                    task.id,
-                    child_attempt_id,
-                    active_attempt_id,
-                )
-                return False
-
-    if (
-        (not audit_resolved and audit_task is None)
-        or (challenge_required and challenge_task is None)
-        or (
-            merge_grade_required
-            and not merge_grade_resolved
-            and merge_grade_task is None
-        )
-        or (walkthrough_requested and walkthrough_task is None)
-    ):
-        logger.debug(
-            "[RELEASE_QUALIFIER] finalize-gate: version v%d required active "
-            "child tasks not yet persisted — not ready",
-            version.version_number,
-        )
-        return False
-
-    if (
-        (
-            not audit_resolved
-            and audit_task is not None
-            and audit_task.status not in _TERMINAL_STATUSES
-        )
-        or (
-            challenge_required
-            and challenge_task is not None
-            and challenge_task.status not in _TERMINAL_STATUSES
-        )
-        or (
-            merge_grade_required
-            and not merge_grade_resolved
-            and merge_grade_task is not None
-            and merge_grade_task.status not in _TERMINAL_STATUSES
-        )
-        or (
-            walkthrough_requested
-            and walkthrough_task is not None
-            and walkthrough_task.status not in _TERMINAL_STATUSES
-        )
-    ):
-        return False
-
-    logger.info(
-        "[RELEASE_QUALIFIER] finalize-gate: active children terminal for "
-        "version v%d (audit=%s/%s challenge=%s merge_grade=%s walkthrough=%s)",
-        version.version_number,
-        audit_task.id if audit_task is not None else "resolved",
-        audit_task.status if audit_task is not None else "N/A",
-        f"{challenge_task.id}/{challenge_task.status}"
-        if challenge_task is not None
-        else "not_spawned",
-        f"{merge_grade_task.id}/{merge_grade_task.status}"
-        if merge_grade_task is not None
-        else ("resolved" if merge_grade_resolved else "not_spawned"),
-        f"{walkthrough_task.id}/{walkthrough_task.status}"
-        if walkthrough_task is not None
-        else "not_requested",
-    )
-    return True
 async def _maybe_reconcile_after_promotion_conflict(
     version_id: uuid.UUID,
     result: dict[str, Any] | None,

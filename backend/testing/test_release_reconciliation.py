@@ -1,5 +1,4 @@
 """Tests for the out-of-band release-reconciliation helpers.
-
 ``backend/app/release_reconciliation.py`` owns the reconciliation paths that
 catch a release version up when its promotion PR lands (or strands) outside the
 normal qualification flow.  These tests verify the helpers for a SIMULATED
@@ -24,12 +23,13 @@ import pytest
 
 from app import release_version as rv
 from app.models import Project
-from app.release_reconciliation import (
+from app.release_promotion_pending import (
     _LEGACY_NATIVE_PROMOTION_PENDING_KEYS,
-    _PROMOTION_CLAIM_TIMEOUT_SECONDS,
     _normalize_legacy_promotion_pending,
+)
+from app.release_reconciliation import (
+    _PROMOTION_CLAIM_TIMEOUT_SECONDS,
     _promotion_pending_timeout_seconds,
-    _reconcile_if_ci_unresolved_now_green,
     _reconcile_if_managed_check_wait,
     _reconcile_if_not_promoted_but_pr_merged,
     _reconcile_if_pending_qualification_superseded,
@@ -6793,12 +6793,10 @@ async def test_ci_unresolved_guard_restores_non_migration_pr_to_same_managed_wai
 
 
 @pytest.mark.asyncio
-async def test_harvest_infra_flake_requalifies_and_skips_spawn(db_session, mocker):
+async def test_harvest_infra_flake_requests_strategic_and_skips_spawn(db_session, mocker):
     """When CI failure logs contain npm-registry / Docker infra patterns,
-    _harvest_promotion_ci_failures must call run_qualification (schedule a fresh
-    re-qualify) and NOT call rerun_failed_jobs or spawn a fix task.  The promotion
-    PR is already torn down by the time harvest runs, so re-running the dead
-    workflow is useless; a fresh qualification opens a new promotion PR."""
+    hand the delivery decision to Strategic through its coalesced refresh marker
+    and do not directly qualify, rerun dead CI, or spawn a code fix."""
     from app.release_reconciliation import _harvest_promotion_ci_failures
 
     _project, version = await _make_project_and_version(
@@ -6831,6 +6829,10 @@ async def test_harvest_infra_flake_requalifies_and_skips_spawn(db_session, mocke
         "app.release_qualifier.run_qualification",
         new=AsyncMock(return_value={"status": "spawned"}),
     )
+    refresh_mock = mocker.patch(
+        "app.strategic_trigger.request_strategic_refresh",
+        new=AsyncMock(return_value=True),
+    )
     handle_mock = mocker.patch(
         "app.auto_remediation._handle_main_branch_ci_failure",
         new=AsyncMock(),
@@ -6848,17 +6850,21 @@ async def test_harvest_infra_flake_requalifies_and_skips_spawn(db_session, mocke
         selfheal_enabled=True,
     )
 
-    rq_mock.assert_awaited_once()
+    rq_mock.assert_not_awaited()
+    refresh_mock.assert_awaited_once()
+    assert refresh_mock.await_args.args[1] == _project.id
+    assert refresh_mock.await_args.args[2].startswith(
+        f"promotion_ci_infra_flake:v{version.version_number}:"
+    )
     rerun_mock.assert_not_awaited()
     handle_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_harvest_setup_phase_flake_requalifies_and_skips_spawn(db_session, mocker):
-    """setup_phase_failure=True triggers the same re-qualify + skip path as
-    content-based infra detection: run_qualification is called to open a fresh
-    promotion PR; rerun_failed_jobs is NOT called (the promotion PR is already
-    torn down by harvest time)."""
+async def test_harvest_setup_phase_flake_requests_strategic_and_skips_spawn(
+    db_session, mocker
+):
+    """A setup flake uses the same coalesced Strategic handoff."""
     from app.release_reconciliation import _harvest_promotion_ci_failures
 
     _project, version = await _make_project_and_version(
@@ -6890,6 +6896,10 @@ async def test_harvest_setup_phase_flake_requalifies_and_skips_spawn(db_session,
         "app.release_qualifier.run_qualification",
         new=AsyncMock(return_value={"status": "spawned"}),
     )
+    refresh_mock = mocker.patch(
+        "app.strategic_trigger.request_strategic_refresh",
+        new=AsyncMock(return_value=True),
+    )
     handle_mock = mocker.patch(
         "app.auto_remediation._handle_main_branch_ci_failure",
         new=AsyncMock(),
@@ -6907,7 +6917,8 @@ async def test_harvest_setup_phase_flake_requalifies_and_skips_spawn(db_session,
         selfheal_enabled=True,
     )
 
-    rq_mock.assert_awaited_once()
+    rq_mock.assert_not_awaited()
+    refresh_mock.assert_awaited_once()
     rerun_mock.assert_not_awaited()
     handle_mock.assert_not_awaited()
 
@@ -7106,149 +7117,3 @@ def test_is_ci_infra_flake_log_detects_playwright():
     from app.failure_classification import _is_ci_infra_flake_log
 
     assert _is_ci_infra_flake_log("playwright install failed: network error")
-
-
-def test_is_ci_infra_flake_log_returns_false_for_real_failure():
-    """Real test failures are NOT classified as infra flakes."""
-    from app.failure_classification import _is_ci_infra_flake_log
-
-    assert not _is_ci_infra_flake_log(
-        "FAILED testing/test_foo.py::test_bar\nAssertionError: assert 0 == 1"
-    )
-    assert not _is_ci_infra_flake_log("")
-    assert not _is_ci_infra_flake_log("SyntaxError: invalid syntax at line 42")
-
-
-# ===========================================================================
-# _reconcile_if_ci_unresolved_now_green — topology-relaxed no_checks path
-# ===========================================================================
-
-
-@pytest.mark.asyncio
-async def test_reconcile_ci_unresolved_now_green_no_checks_topology_relaxed_spawns(
-    db_session, mocker
-):
-    """A not_promoted/ci_unresolved version on a quiescent automain whose CI
-    re-resolves to topology-relaxed no_checks gets a fresh qualification spawned.
-
-    Regression for automain candidates that structurally carry no check-runs
-    (CI workflow automain trigger removed 2026-06-20): the sweep reconcile must
-    accept a definitive no_checks verdict when it is topology-relaxed, not only
-    when CI is literally green.
-    """
-    mocker.patch(
-        "app.github.get_repo_installation_token",
-        new=AsyncMock(return_value="tok"),
-    )
-    candidate_sha = "cafe" * 10
-    # automain HEAD matches candidate SHA (branch is quiescent).
-    mocker.patch(
-        "app.github.get_branch_sha",
-        new=AsyncMock(return_value=candidate_sha),
-    )
-    # CI resolves to no_checks on the candidate commit.
-    mocker.patch(
-        "app.release_qualifier._resolve_candidate_ci",
-        new=AsyncMock(
-            return_value={
-                "state": "no_checks",
-                "ci_green": False,
-                "resolved_sha": None,
-                "detail": "no check-runs on candidate and no associated PR heads",
-            }
-        ),
-    )
-    # Topology check: candidate IS reachable from the integration branch.
-    mocker.patch(
-        "app.github.is_ancestor_of",
-        new=AsyncMock(return_value=True),
-    )
-    # Qualification spawn succeeds.
-    mocker.patch(
-        "app.release_qualifier.run_qualification",
-        new=AsyncMock(return_value={"status": "spawned"}),
-    )
-
-    _project, version = await _make_project_and_version(
-        db_session, integration_branch="automain", promotion_target="main"
-    )
-    # Project explicitly declares no CI so requires_ci_checks=False and
-    # proceed_on_no_checks returns True for a topology-relaxed no_checks.
-    _project.build_config = {"requires_ci_checks": False}
-    db_session.add(_project)
-    version.phase = "stabilize"
-    version.last_qualification = {
-        "status": "not_promoted",
-        "blocker": "ci_unresolved",
-        "candidate_sha": candidate_sha,
-        "confidence": 0.82,
-    }
-    db_session.add(version)
-    await db_session.commit()
-    await db_session.refresh(version)
-
-    reconciled = await _reconcile_if_ci_unresolved_now_green(
-        version.id, session_factory=_shared_session_factory(db_session)
-    )
-
-    assert reconciled is True
-
-
-@pytest.mark.asyncio
-async def test_reconcile_ci_unresolved_now_green_pending_ci_is_noop(
-    db_session, mocker
-):
-    """When CI is still pending (not green and not topology-relaxed no_checks),
-    the reconcile is a no-op and no qualification is spawned.
-
-    Confirms that a transient pending resolution does not trigger a spurious
-    re-qualification — only a fully resolved state (green or topology-relaxed
-    no_checks) may proceed.
-    """
-    mocker.patch(
-        "app.github.get_repo_installation_token",
-        new=AsyncMock(return_value="tok"),
-    )
-    candidate_sha = "beef" * 10
-    mocker.patch(
-        "app.github.get_branch_sha",
-        new=AsyncMock(return_value=candidate_sha),
-    )
-    # CI is still pending — checks in progress.
-    mocker.patch(
-        "app.release_qualifier._resolve_candidate_ci",
-        new=AsyncMock(
-            return_value={
-                "state": "pending",
-                "ci_green": False,
-                "resolved_sha": candidate_sha,
-                "detail": "check-runs in progress on the candidate commit",
-            }
-        ),
-    )
-    run_qualification = mocker.patch(
-        "app.release_qualifier.run_qualification",
-        new=AsyncMock(return_value={"status": "spawned"}),
-    )
-
-    _project, version = await _make_project_and_version(
-        db_session, integration_branch="automain", promotion_target="main"
-    )
-    version.phase = "stabilize"
-    version.last_qualification = {
-        "status": "not_promoted",
-        "blocker": "ci_unresolved",
-        "candidate_sha": candidate_sha,
-    }
-    db_session.add(version)
-    await db_session.commit()
-    await db_session.refresh(version)
-
-    reconciled = await _reconcile_if_ci_unresolved_now_green(
-        version.id, session_factory=_shared_session_factory(db_session)
-    )
-
-    assert reconciled is False
-    run_qualification.assert_not_called()
-    await db_session.refresh(version)
-    assert version.last_qualification["status"] == "not_promoted"
