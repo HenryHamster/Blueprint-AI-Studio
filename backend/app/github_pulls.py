@@ -486,8 +486,19 @@ async def get_pull_request(
     repo: str,
     pr_number: int,
     project_id: str | None = None,
+    live_base: bool = True,
 ) -> dict:
-    """Fetches PR details."""
+    """Fetches PR details.
+
+    ``live_base=True`` (default) replaces ``base.sha`` on OPEN PRs with the
+    base branch's current tip. GitHub freezes ``pull.base.sha`` at PR-creation
+    time, but every pipeline consumer treats it as the live comparison target —
+    reviewers fetch the real branch, so comparing their reported base against
+    the frozen snapshot declared every review of a moved-base PR permanently
+    stale and respawned exact-target reviews forever. Closed/merged PRs keep
+    the stored snapshot (the ref may be gone, and no staleness decision hangs
+    on them); resolution failures also fall back to the snapshot.
+    """
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github.v3+json",
@@ -555,7 +566,67 @@ async def get_pull_request(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get PR #{pr_number}",
         )
-    return response.json()
+    pr_data = response.json()
+    if (
+        live_base
+        and isinstance(pr_data, dict)
+        and str(pr_data.get("state") or "").lower() == "open"
+        and not pr_data.get("merged")
+    ):
+        base = pr_data.get("base") or {}
+        base_ref = str(base.get("ref") or "")
+        if base_ref:
+            try:
+                live_sha = await get_branch_head_sha(
+                    token, owner, repo, base_ref, project_id=project_id
+                )
+            except Exception:  # noqa: BLE001
+                live_sha = ""
+            if live_sha:
+                pr_data["base"] = {**base, "sha": live_sha}
+    return pr_data
+
+
+async def get_branch_head_sha(
+    token: str,
+    owner: str,
+    repo: str,
+    branch: str,
+    project_id: str | None = None,
+) -> str:
+    """Live tip SHA of ``branch`` via the Git ref API.
+
+    ``pull.base.sha`` is a snapshot frozen when the PR was created and never
+    tracks the base branch afterwards, so any "is this verdict current?"
+    comparison must resolve the branch head itself. Returns "" when the ref
+    cannot be resolved (deleted branch, transient failure) — callers fall back
+    to whatever provenance they already hold.
+    """
+    from urllib.parse import quote
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    response = await _github_request(
+        "GET",
+        f"https://api.github.com/repos/{owner}/{repo}/git/ref/heads/"
+        f"{quote(branch, safe='')}",
+        headers,
+        project_id=project_id,
+    )
+    if response.status_code != 200:
+        logger.warning(
+            "Failed to resolve live head of %s/%s@%s: HTTP %s",
+            owner,
+            repo,
+            branch,
+            response.status_code,
+        )
+        return ""
+    sha = ((response.json() or {}).get("object") or {}).get("sha")
+    return str(sha) if isinstance(sha, str) else ""
 
 
 async def get_pull_request_review_decision(
