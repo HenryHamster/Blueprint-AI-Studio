@@ -22,7 +22,35 @@ export interface UseStrategistStatusInput {
   lastFiredAt?: string | null;
 }
 
-const ERROR_STATUSES = new Set(['error', 'failed', 'failure', 'aborted', 'timeout', 'timed_out']);
+const ERROR_STATUSES = new Set(['error', 'failed', 'failure', 'aborted', 'timeout', 'timed_out', 'cancelled', 'canceled']);
+
+export type StrategicCycleTerminalDisposition = 'completed' | 'failed' | 'cancelled';
+
+export function strategicCycleTerminalDisposition(
+  status?: string | null,
+): StrategicCycleTerminalDisposition | null {
+  const normalized = status?.toLowerCase() ?? '';
+  if (normalized === 'cancelled' || normalized === 'canceled' || normalized.includes('cancel')) {
+    return 'cancelled';
+  }
+  if (
+    normalized === 'failed'
+    || normalized.includes('fail')
+    || ['error', 'failure', 'aborted', 'timeout', 'timed_out'].includes(normalized)
+  ) {
+    return 'failed';
+  }
+  if (normalized === 'completed' || normalized === 'ok' || normalized === 'success' || normalized === 'succeeded') {
+    return 'completed';
+  }
+  return null;
+}
+
+export function strategicCycleTerminalLabel(disposition: StrategicCycleTerminalDisposition): string {
+  if (disposition === 'cancelled') return 'Cycle cancelled';
+  if (disposition === 'failed') return 'Cycle failed';
+  return 'Cycle complete';
+}
 
 export function useStrategistStatus({
   strategistActive,
@@ -61,12 +89,15 @@ export function useStrategistStatus({
     // Completion receipt: last cycle finished
     if (lastCycleCompletion) {
       const status = lastCycleCompletion.status?.toLowerCase() ?? '';
-      const isError = Boolean(status) && ERROR_STATUSES.has(status);
-      const label = isError
-        ? `Cycle ${lastCycleCompletion.status ?? 'error'}`
-        : 'Cycle complete';
+      const terminalDisposition = strategicCycleTerminalDisposition(status);
+      const isError = Boolean(status) && (ERROR_STATUSES.has(status) || terminalDisposition === 'failed');
+      const label = terminalDisposition
+        ? strategicCycleTerminalLabel(terminalDisposition)
+        : isError
+          ? `Cycle ${status}`
+          : 'Cycle complete';
       return {
-        phase: isError ? 'error' : 'done',
+        phase: isError || terminalDisposition === 'cancelled' ? 'error' : 'done',
         label,
         detail: lastCycleCompletion.failure_reason ?? lastCycleCompletion.status_message ?? null,
         activityKind: null,

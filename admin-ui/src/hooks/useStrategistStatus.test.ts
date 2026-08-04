@@ -66,11 +66,23 @@ describe('useStrategistStatus', () => {
     expect(result.current.label).toBe('Cycle complete');
   });
 
+  it('returns an explicit cancelled terminal status', () => {
+    const { result } = renderHook(() =>
+      useStrategistStatus({ lastCycleCompletion: { status: 'CANCELLED', failure_reason: 'Stopped by operator' } }),
+    );
+
+    expect(result.current.phase).toBe('error');
+    expect(result.current.label).toBe('Cycle cancelled');
+    expect(result.current.label).not.toBe('Cycle complete');
+    expect(result.current.detail).toBe('Stopped by operator');
+  });
+
   it('returns error when lastCycleCompletion has error status', () => {
     const { result } = renderHook(() =>
       useStrategistStatus({ lastCycleCompletion: { status: 'error', failure_reason: 'oops' } }),
     );
     expect(result.current.phase).toBe('error');
+    expect(result.current.label).toBe('Cycle failed');
     expect(result.current.detail).toBe('oops');
   });
 
@@ -91,5 +103,18 @@ describe('useStrategistStatus', () => {
     );
     expect(result.current.phase).toBe('busy');
     expect(result.current.source).toBe('cycle_progress');
+  });
+
+  it('pending steer takes priority over a terminal completion', () => {
+    const { result } = renderHook(() =>
+      useStrategistStatus({
+        pendingRefreshAt: '2026-07-21T10:00:00Z',
+        lastCycleCompletion: { status: 'CANCELLED' },
+      }),
+    );
+
+    expect(result.current.phase).toBe('busy');
+    expect(result.current.source).toBe('pending_steer');
+    expect(result.current.label).toBe('Strategic cycle pending');
   });
 });

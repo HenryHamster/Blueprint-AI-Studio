@@ -2224,6 +2224,78 @@ describe('StrategicContextRail', () => {
     expect(host.textContent).not.toContain('Steer queued');
   });
 
+  test.each([
+    ['failed', 'failed_phase1', 'Cycle failed', 'Strategic review failed'],
+    ['cancelled', 'failed_phase1', 'Cycle cancelled', 'Cancelled by operator'],
+  ])('shows the latest %s cycle disposition instead of Idle', (_name, outcome, label, detail) => {
+    const terminalState: StrategicStateResponse = {
+      ...STATE,
+      strategic: {
+        ...STATE.strategic,
+        active_cycle: null,
+        active_task: null,
+        active_phase: null,
+        latest_cycle: {
+          ...STATE.strategic.latest_cycle!,
+          outcome,
+          terminal_disposition: _name as 'failed' | 'cancelled',
+          summary_text: 'Terminal Strategic cycle',
+          failure_reason: detail,
+        },
+        refresh: {
+          ...STATE.strategic.refresh,
+          pending: null,
+        },
+      },
+    };
+    const { host } = mount({ state: terminalState });
+
+    expect(host.textContent).toContain(label);
+    expect(host.textContent).toContain(detail);
+    expect(host.textContent).not.toContain('Idle');
+  });
+
+  test('keeps a successful latest cycle visibly successful', () => {
+    const successfulState: StrategicStateResponse = {
+      ...STATE,
+      strategic: {
+        ...STATE.strategic,
+        active_cycle: null,
+        active_task: null,
+        active_phase: null,
+        refresh: {
+          ...STATE.strategic.refresh,
+          pending: null,
+        },
+      },
+    };
+    const { host } = mount({ state: successfulState });
+
+    expect(host.textContent).toContain('Cycle complete');
+    expect(host.textContent).not.toContain('Idle');
+  });
+
+  test('keeps a pending operator steer ahead of a latest terminal disposition', () => {
+    const pendingState: StrategicStateResponse = {
+      ...STATE,
+      strategic: {
+        ...STATE.strategic,
+        active_cycle: null,
+        active_task: null,
+        active_phase: null,
+        latest_cycle: {
+          ...STATE.strategic.latest_cycle!,
+          outcome: 'failed_phase1',
+          terminal_disposition: 'cancelled',
+        },
+      },
+    };
+    const { host } = mount({ state: pendingState });
+
+    expect(host.textContent).toContain('Steer queued');
+    expect(host.textContent).not.toContain('Cycle cancelled');
+  });
+
   test('keeps clear attention state quiet', () => {
     const clearState: StrategicStateResponse = {
       ...STATE,

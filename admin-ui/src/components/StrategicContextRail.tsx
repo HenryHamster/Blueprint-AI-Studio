@@ -4,6 +4,11 @@ import { acceptPendingConfirmation, dismissPendingConfirmation } from '../api';
 import type { PendingConfirmation, PendingConfirmationType } from '../types';
 import { PendingConfirmationList } from './ProblemModelAttention';
 import type { StrategicCycleCompletion, StrategicCycleProgress } from '../hooks/useLogViewer';
+import {
+  strategicCycleTerminalDisposition,
+  strategicCycleTerminalLabel,
+  type StrategicCycleTerminalDisposition,
+} from '../hooks/useStrategistStatus';
 import type {
   StrategicAccountSpendStatus,
   StrategicContextPackageDescriptor,
@@ -914,7 +919,18 @@ export const StrategicContextRail = memo(function StrategicContextRail({
     pendingSteer && (pendingSteer.origin === 'operator' || (pendingSteer.operator_count ?? 0) > 0),
   );
   const isWorking = !staleCycle && (strategistActive || Boolean(activeCycle?.has_active_task));
-  const statusTone = isWorking ? 'bg-cyan-400' : pendingSteer ? 'bg-amber-300' : 'bg-neutral-600';
+  const terminalDisposition: StrategicCycleTerminalDisposition | null =
+    strategicCycleTerminalDisposition(latestCycle?.terminal_disposition ?? latestCycle?.outcome)
+    ?? strategicCycleTerminalDisposition(lastCycleCompletion?.status);
+  const statusTone = isWorking
+    ? 'bg-cyan-400'
+    : pendingSteer
+      ? 'bg-amber-300'
+      : terminalDisposition === 'failed' || terminalDisposition === 'cancelled'
+        ? 'bg-red-400'
+        : terminalDisposition === 'completed'
+          ? 'bg-emerald-400'
+          : 'bg-neutral-600';
   const formatTimestampAsOf = (timestamp?: string | null): string => {
     if (!timestamp) return '';
     try {
@@ -961,14 +977,22 @@ export const StrategicContextRail = memo(function StrategicContextRail({
       ? operatorSteerQueued
         ? 'Steer queued'
         : 'Refresh queued'
-      : 'Idle';
+      : terminalDisposition
+        ? strategicCycleTerminalLabel(terminalDisposition)
+        : 'Idle';
   const statusDetail = isWorking
     ? (state?.strategic.active_task?.title ?? state?.strategic.active_task?.task_type ?? 'Cycle running')
     : staleCycle
       ? 'A prior Strategic cycle still has an active marker, but no live Strategic task is attached.'
     : pendingSteer?.excerpt
       ? pendingSteer.excerpt
-      : latestCycle?.summary_text ?? lastCycleCompletion?.status_message ?? 'No active Strategic cycle';
+      : terminalDisposition
+        ? latestCycle?.failure_reason
+          ?? lastCycleCompletion?.failure_reason
+          ?? latestCycle?.summary_text
+          ?? lastCycleCompletion?.status_message
+          ?? 'No active Strategic cycle'
+        : latestCycle?.summary_text ?? lastCycleCompletion?.status_message ?? 'No active Strategic cycle';
   const localRunnerStatus = localRunner ? localRunnerTone(localRunner) : null;
   const showRuntimeWork = runtimeWorkHasSignal(runtimeWork);
   const runtimeWorkStatus = showRuntimeWork ? runtimeWorkTone(runtimeWork) : null;
