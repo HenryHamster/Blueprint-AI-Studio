@@ -27,6 +27,7 @@ scripts/*release*.py text eol=lf
 # Actions VM installers and guest systemd assets are transferred as executable
 # deployment artifacts. Archive/check-out behavior must not introduce CRLF.
 scripts/install-github-actions-vm.sh text eol=lf
+scripts/migrate-container-storage.sh text eol=lf
 scripts/github-actions-vm/*.sh text eol=lf
 scripts/github-actions-vm/*.service text eol=lf
 scripts/github-actions-vm/*.timer text eol=lf
