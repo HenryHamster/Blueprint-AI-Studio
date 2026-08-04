@@ -23,13 +23,16 @@ from datetime import timedelta
 
 import pytest
 from httpx import AsyncClient, ASGITransport
+from sqlalchemy import inspect
 from sqlmodel import select
+from starlette.requests import Request
 
 from app.auth import get_current_user, get_current_user_optional, require_admin
 from app.main import app
 from app.models import Project, ProjectMember, ServiceCredential, _utcnow
 from app.service_credentials import (
     TOKEN_PREFIX,
+    authenticate_service_token,
     hash_service_token,
     mint_service_token,
 )
@@ -437,6 +440,39 @@ async def test_last_used_tracking_populated_after_successful_call(
     assert refreshed.last_used_at is not None
     assert refreshed.last_used_path is not None
     assert "operator-attention" in refreshed.last_used_path
+
+
+@pytest.mark.asyncio
+async def test_authentication_survives_failed_last_used_telemetry_commit(
+    db_session, monkeypatch, real_orm_expiry
+):
+    """A telemetry rollback must not invalidate an otherwise valid principal."""
+    cred, token = await _seed_credential(db_session, name="observer-telemetry-failure")
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/api/admin/projects/00000000-0000-0000-0000-000000000000/diagnostics",
+            "query_string": b"",
+            "headers": [],
+        }
+    )
+
+    async def commit_then_fail():
+        await db_session.flush()
+        raise RuntimeError("telemetry commit failure")
+
+    monkeypatch.setattr(db_session, "commit", commit_then_fail)
+
+    principal = await authenticate_service_token(token, db_session, request)
+
+    assert inspect(cred).expired, "rollback must exercise real ORM expiry semantics"
+    assert principal == {
+        "user_id": "service:test-observer",
+        "email": "observer-telemetry-failure@service.blueprint.local",
+        "role": "user",
+        "service_credential": "observer-telemetry-failure",
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -2301,7 +2301,12 @@ describe('StrategicContextRail', () => {
       ...STATE,
       strategic: {
         ...STATE.strategic,
-        active_cycle: { ...STATE.strategic.active_cycle!, id: 'cycle-cancelled', has_active_task: true },
+        active_cycle: {
+          ...STATE.strategic.active_cycle!,
+          id: 'cycle-cancelled',
+          has_active_task: true,
+          stale: true,
+        },
         latest_cycle: { ...STATE.strategic.latest_cycle!, id: 'cycle-before', summary_text: 'Older success' },
         refresh: { ...STATE.strategic.refresh, pending: null },
       },
@@ -2325,7 +2330,12 @@ describe('StrategicContextRail', () => {
       ...STATE,
       strategic: {
         ...STATE.strategic,
-        active_cycle: { ...STATE.strategic.active_cycle!, id: 'cycle-failed', has_active_task: true },
+        active_cycle: {
+          ...STATE.strategic.active_cycle!,
+          id: 'cycle-failed',
+          has_active_task: true,
+          stale: true,
+        },
         latest_cycle: { ...STATE.strategic.latest_cycle!, id: 'cycle-before', summary_text: 'Older success' },
         refresh: { ...STATE.strategic.refresh, pending: null },
       },
@@ -2342,6 +2352,35 @@ describe('StrategicContextRail', () => {
     expect(host.textContent).toContain('Cycle failed');
     expect(host.textContent).toContain('Live failure after the durable refresh lagged');
     expect(host.textContent).not.toContain('Cycle running');
+  });
+
+  test('keeps stale state when a completion belongs to a different active cycle', () => {
+    const state: StrategicStateResponse = {
+      ...STATE,
+      strategic: {
+        ...STATE.strategic,
+        active_cycle: {
+          ...STATE.strategic.active_cycle!,
+          id: 'cycle-current',
+          has_active_task: false,
+          stale: true,
+        },
+        active_task: null,
+        refresh: { ...STATE.strategic.refresh, pending: null },
+      },
+    };
+    const { host } = mount({
+      state,
+      lastCycleCompletion: {
+        cycle_id: 'cycle-previous',
+        status: 'CANCELLED',
+        failure_reason: 'Previous cycle was cancelled',
+      },
+    });
+
+    expect(host.textContent).toContain('Cycle stale');
+    expect(host.textContent).toContain('no live Strategic task');
+    expect(host.textContent).not.toContain('Cycle cancelled');
   });
 
   test('preserves a different newer active cycle from an older completion', () => {

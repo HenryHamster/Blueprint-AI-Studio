@@ -6,6 +6,7 @@ import { PendingConfirmationList } from './ProblemModelAttention';
 import type { StrategicCycleCompletion, StrategicCycleProgress } from '../hooks/useLogViewer';
 import {
   strategicCycleIsWorking,
+  strategicCycleCompletionMatchesCycle,
   strategicCycleTerminalLabel,
   strategicCycleTerminalProjection,
   type StrategicCycleTerminalDisposition,
@@ -914,7 +915,9 @@ export const StrategicContextRail = memo(function StrategicContextRail({
     () => attention?.items.filter(item => item.kind !== 'confirmation').slice(0, 2) ?? [],
     [attention?.items],
   );
-  const staleCycle = Boolean(activeCycle?.stale);
+  const staleCycle = Boolean(
+    activeCycle?.stale && !strategicCycleCompletionMatchesCycle(lastCycleCompletion, activeCycle),
+  );
   const shaFreshness = state?.sha_freshness ?? null;
   const operatorSteerQueued = Boolean(
     pendingSteer && (pendingSteer.origin === 'operator' || (pendingSteer.operator_count ?? 0) > 0),

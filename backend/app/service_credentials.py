@@ -142,6 +142,10 @@ async def authenticate_service_token(
             detail="Endpoint not permitted for this service credential",
         )
 
+    # Rollback expires ORM instances. Snapshot the identity fields before the
+    # best-effort telemetry write so a failed commit cannot break auth itself.
+    principal_user_id = cred.principal_user_id
+    credential_name = cred.name
     now = _utcnow()
     if cred.last_used_at is None or (now - cred.last_used_at) >= _LAST_USED_UPDATE_INTERVAL:
         try:
@@ -157,8 +161,8 @@ async def authenticate_service_token(
     # Role is ALWAYS "user" — a service credential must never satisfy
     # require_admin, regardless of what scopes it was minted with.
     return {
-        "user_id": cred.principal_user_id,
-        "email": f"{cred.name}@service.blueprint.local",
+        "user_id": principal_user_id,
+        "email": f"{credential_name}@service.blueprint.local",
         "role": "user",
-        "service_credential": cred.name,
+        "service_credential": credential_name,
     }
