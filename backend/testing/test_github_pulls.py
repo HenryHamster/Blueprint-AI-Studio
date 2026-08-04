@@ -920,3 +920,122 @@ async def test_get_pr_404_still_raises_404(mocker):
         await github_pulls.get_pull_request("ghs_token", "owner", "repo", 42)
 
     assert exc_info.value.status_code == 404
+
+
+# ``pull.base.sha`` is frozen at PR-creation time, but every staleness guard,
+# admission check, and claim fence compares reviewer-reported bases (fetched
+# live) against it. Once the base branch moved, that mismatch respawned
+# exact-target reviews forever (NeurIPS PR #1209, 2026-08-04: one full review
+# burned every ~3 minutes). ``get_pull_request`` therefore resolves the live
+# branch tip for open PRs.
+
+
+def _open_pr(base_sha="f" * 40, base_ref="automain", head_sha="a" * 40) -> dict:
+    return {
+        "number": 42,
+        "state": "open",
+        "merged": False,
+        "base": {"ref": base_ref, "sha": base_sha},
+        "head": {"sha": head_sha},
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_pull_request_replaces_frozen_base_sha_with_live_tip(mocker):
+    from app import github_pulls
+
+    live_tip = "1" * 40
+    mock_request = mocker.patch(
+        "app.github._github_request",
+        new=mocker.AsyncMock(
+            side_effect=[
+                MockResponse(200, _open_pr(base_sha="f" * 40)),
+                MockResponse(200, {"object": {"sha": live_tip, "type": "commit"}}),
+            ]
+        ),
+    )
+
+    result = await github_pulls.get_pull_request("ghs_token", "owner", "repo", 42)
+
+    assert result["base"]["sha"] == live_tip
+    assert mock_request.call_count == 2
+    ref_url = mock_request.call_args_list[1].args[1]
+    assert "/git/ref/heads/automain" in ref_url
+
+
+@pytest.mark.asyncio
+async def test_get_pull_request_keeps_snapshot_when_ref_lookup_fails(mocker):
+    from app import github_pulls
+
+    frozen = "f" * 40
+    mocker.patch(
+        "app.github._github_request",
+        new=mocker.AsyncMock(
+            side_effect=[
+                MockResponse(200, _open_pr(base_sha=frozen)),
+                MockResponse(404, {}, text="Not Found"),
+            ]
+        ),
+    )
+
+    result = await github_pulls.get_pull_request("ghs_token", "owner", "repo", 42)
+
+    assert result["base"]["sha"] == frozen
+
+
+@pytest.mark.asyncio
+async def test_get_pull_request_closed_pr_skips_live_base_lookup(mocker):
+    """Closed/merged PRs keep the stored snapshot — the ref may be deleted and
+    no staleness decision hangs on them."""
+    from app import github_pulls
+
+    frozen = "f" * 40
+    closed = _open_pr(base_sha=frozen)
+    closed["state"] = "closed"
+    mock_request = mocker.patch(
+        "app.github._github_request",
+        new=mocker.AsyncMock(return_value=MockResponse(200, closed)),
+    )
+
+    result = await github_pulls.get_pull_request("ghs_token", "owner", "repo", 42)
+
+    assert result["base"]["sha"] == frozen
+    assert mock_request.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_get_pull_request_live_base_opt_out(mocker):
+    from app import github_pulls
+
+    frozen = "f" * 40
+    mock_request = mocker.patch(
+        "app.github._github_request",
+        new=mocker.AsyncMock(return_value=MockResponse(200, _open_pr(base_sha=frozen))),
+    )
+
+    result = await github_pulls.get_pull_request(
+        "ghs_token", "owner", "repo", 42, live_base=False
+    )
+
+    assert result["base"]["sha"] == frozen
+    assert mock_request.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_get_branch_head_sha_resolves_and_encodes_slash_refs(mocker):
+    from app import github_pulls
+
+    tip = "2" * 40
+    mock_request = mocker.patch(
+        "app.github._github_request",
+        new=mocker.AsyncMock(
+            return_value=MockResponse(200, {"object": {"sha": tip, "type": "commit"}})
+        ),
+    )
+
+    result = await github_pulls.get_branch_head_sha(
+        "ghs_token", "owner", "repo", "research/b7c8df4f"
+    )
+
+    assert result == tip
+    assert "/git/ref/heads/research%2Fb7c8df4f" in mock_request.call_args.args[1]
