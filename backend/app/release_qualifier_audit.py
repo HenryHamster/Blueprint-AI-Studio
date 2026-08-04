@@ -34,6 +34,14 @@ from app.models import (
 from app.payload_schemas import PayloadTooLargeError, validate_internal_payload
 from app.qualification_dimensions import LEDGER_DIMENSION_KEYS
 from app.release_promotion import _lts_branch_names, _record_qualification_verdict
+from app.runner_eligibility import (
+    RunnerDispatchSnapshot,
+    _runner_accepting_new_work,
+    _runner_active_task_count,
+    _runner_agent_available,
+    _runner_at_capacity,
+    _runner_handles_task_type,
+)
 from app.runtime_config_state import resolve_project_promotion_enabled
 from app.shared_state import runtime_config as _runtime_config
 from app.task_capabilities import (
@@ -506,6 +514,110 @@ async def _spawn_release_audit_challenge_task(
     return task
 
 
+_WALKTHROUGH_E2E_TASK_TYPE = "walkthrough_e2e"
+
+
+class QualifierWalkthroughSiteUnavailableError(RuntimeError):
+    """Raised (fail-closed) when no live, project-allowed runner can execute the
+    qualify-time ``walkthrough_e2e`` candidate-stack walkthrough.
+
+    ``run_qualification`` catches the spawn exception and records a
+    ``spawn_failed`` ``last_qualification`` with ``detail`` set to the precise
+    execution-site reason, so a misconfigured fleet surfaces immediately instead
+    of wasting task-retry cycles on an execution site that can never boot the
+    candidate stack (docker compose + Playwright/Chromium).
+    """
+
+
+def _walkthrough_e2e_site_eligible(runner: object) -> bool:
+    """Whether a runner proves the candidate-stack walkthrough execution site.
+
+    The candidate stack (``CandidateStackController``) boots via ``docker compose``
+    and drives a Playwright/Chromium harness, so the site must prove BOTH the
+    Docker runtime AND the Chromium harness:
+
+    * ``isolation_backends.docker_usable is True`` — the heartbeat-proven
+      ``docker info`` capability (reported by ``capabilities_inventory``); rejects
+      ordinary bwrap-only and podman/apptainer-only boxes.
+    * ``playwright_chromium_usable is True`` — the operator-set Chromium/Playwright
+      capability, the canonical browser gate used by ``_select_eligible_runner``
+      with ``requires_browser=True``.
+
+    A thin-docker box (Docker runtime but no Chromium harness) or a box that never
+    declared ``walkthrough_e2e`` task coverage is rejected.
+    """
+    caps = getattr(runner, "capabilities", None) or {}
+    backends = caps.get("isolation_backends")
+    docker_ok = isinstance(backends, dict) and backends.get("docker_usable") is True
+    chromium_ok = caps.get("playwright_chromium_usable") is True
+    return docker_ok and chromium_ok
+
+
+async def _select_walkthrough_e2e_execution_site(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> tuple[RunnerDispatchSnapshot | None, str]:
+    """Resolve the live, project-allowed runner for the qualify-time walkthrough.
+
+    Reuses the canonical runner-eligibility contracts — task-type coverage
+    (``_runner_handles_task_type``), agent availability (``_runner_agent_available``),
+    accepting-new-work (``_runner_accepting_new_work``), capacity
+    (``_runner_at_capacity``), and the container-runtime/site gate
+    (:func:`_walkthrough_e2e_site_eligible``) — over the canonical live-runner
+    cache (:func:`app.orchestrator_runner_dispatch._load_active_runners_cache`).
+    Selection is deterministic: least effective load, then lowest runner id.
+
+    Returns ``(runner, "")`` when a site exists, else ``(None, reason)`` where
+    ``reason`` names the precise execution-site gap so the fail-closed record is
+    actionable.
+    """
+    # Imported lazily: ``app.orchestrator_runner_dispatch`` transitively imports
+    # ``app.routers.admin_runners`` (via ``strategic_runtime_work``) and that
+    # router chain reaches back to ``app.release_qualifier`` → this module, so a
+    # top-level import here would be a load-time cycle. By the time this helper
+    # runs, both modules are fully initialized.
+    from app.orchestrator_runner_dispatch import _load_active_runners_cache
+
+    active_runners_cache = await _load_active_runners_cache(session)
+    candidates = active_runners_cache.get(project_id) or []
+    if not candidates:
+        return None, "no live project-allowed runner is registered"
+    handles_type = [
+        r
+        for r in candidates
+        if _runner_handles_task_type(r, _WALKTHROUGH_E2E_TASK_TYPE)
+    ]
+    if not handles_type:
+        return (
+            None,
+            "no live project-allowed runner covers task type walkthrough_e2e",
+        )
+    base_eligible = [
+        r
+        for r in handles_type
+        if _runner_accepting_new_work(r)
+        and _runner_agent_available(r)
+        and not _runner_at_capacity(r, 0, _WALKTHROUGH_E2E_TASK_TYPE)
+    ]
+    if not base_eligible:
+        return (
+            None,
+            "walkthrough_e2e runners are draining, agent-unavailable, or at capacity",
+        )
+    site_eligible = [r for r in base_eligible if _walkthrough_e2e_site_eligible(r)]
+    if not site_eligible:
+        return (
+            None,
+            "no eligible walkthrough_e2e runner proves the candidate-stack site "
+            "(isolation_backends.docker_usable and playwright_chromium_usable)",
+        )
+    selected = min(
+        site_eligible,
+        key=lambda r: (_runner_active_task_count(r), str(r.id)),
+    )
+    return selected, ""
+
+
 async def _spawn_qualifier_walkthrough_task(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -514,13 +626,33 @@ async def _spawn_qualifier_walkthrough_task(
     candidate_sha: str,
     qualification_attempt_id: uuid.UUID | str,
 ) -> Task:
-    """Create + queue a qualify-time ``walkthrough_e2e`` task on the candidate commit."""
+    """Create + dispatch a qualify-time ``walkthrough_e2e`` task on the candidate.
+
+    Resolves a verified container-capable execution site at spawn time and pins
+    the task to it AT BIRTH (``vm_instance_id='runner:{id}'`` +
+    ``context['runner_target_id']`` + PROVISIONING + ``vm_provisioned_at``, with
+    ``started_at`` NULL so the runner stamps it on pull) — mirroring the
+    orchestrator's own pin contract (``_try_runner_dispatch``) and the
+    strategic-spawn pin-at-birth path. When no eligible site exists the spawn
+    FAILS CLOSED (raises :class:`QualifierWalkthroughSiteUnavailableError`) before
+    any task row is created, so the caller records a ``spawn_failed``
+    qualification with the precise execution-site reason instead of queueing a
+    child that can never boot the candidate stack.
+    """
     execution_site = execution_site_for_task_type(TaskType.walkthrough_e2e)
     if execution_site != DIRECT_PACKER_GCE_EXECUTION_SITE:
         raise RuntimeError(
             "walkthrough_e2e qualifier spawn requires the registry-declared "
             f"execution site {DIRECT_PACKER_GCE_EXECUTION_SITE!r}; "
             f"got {execution_site!r}"
+        )
+    runner, site_reason = await _select_walkthrough_e2e_execution_site(
+        session, project_id
+    )
+    if runner is None:
+        raise QualifierWalkthroughSiteUnavailableError(
+            f"cannot dispatch qualifier walkthrough_e2e for candidate "
+            f"{candidate_sha[:8]}: {site_reason}"
         )
     project = await session.get(Project, project_id)
     integration_branch, _promotion_target = _lts_branch_names(project)
@@ -542,8 +674,9 @@ async def _spawn_qualifier_walkthrough_task(
             f"Qualify-time live-stack walkthrough of release candidate {candidate_sha}"
         ),
         payloads=[payload],
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-        status=TaskStatus.QUEUED,
+        vm_instance_id=f"runner:{runner.id}",
+        status=TaskStatus.PROVISIONING,
+        vm_provisioned_at=_utcnow(),
         created_by="ORCHESTRATOR",
         context={
             "release_version_id": str(version_id),
@@ -551,6 +684,8 @@ async def _spawn_qualifier_walkthrough_task(
             "candidate_sha": candidate_sha,
             "qualification_attempt_id": str(qualification_attempt_id),
             "execution_site": execution_site,
+            "runner_target_id": str(runner.id),
+            "runner_hostname": runner.hostname,
         },
     )
     session.add(task)
@@ -566,6 +701,7 @@ async def _spawn_qualifier_walkthrough_task(
                 "execution_site": execution_site,
                 "release_version_id": str(version_id),
                 "qualification_attempt_id": str(qualification_attempt_id),
+                "runner_target_id": str(runner.id),
             },
         )
     )

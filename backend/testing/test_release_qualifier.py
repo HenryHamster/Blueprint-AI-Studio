@@ -11,9 +11,12 @@
 """Domain slice: run_qualification — walkthrough_e2e evidence-child spawn.
 
 Split from test_release_qualifier.py. Covers run_qualification's optional
-walkthrough_e2e child: exactly one QUEUED decision-bearing child pinned to the
-candidate SHA + attempt id when explicitly requested, and no child by default."""
+walkthrough_e2e child: exactly one PROVISIONING decision-bearing child pinned
+at birth to the verified container-capable runner + candidate SHA + attempt id."""
 from _release_qualifier_testhelpers import *  # noqa: F403
+
+from app.models import LocalRunner
+from app.time_utils import _utcnow
 
 
 def test_walkthrough_execution_site_is_registry_declared():
@@ -257,13 +260,10 @@ async def test_same_sha_contract_change_spawns_fresh_holistic_review(
 async def test_run_qualification_spawns_walkthrough_e2e_when_enabled(
     db_session, mocker
 ):
-    """An explicit walkthrough probe request spawns exactly ONE
-    QUEUED walkthrough_e2e child pinned to the candidate SHA + the qualification
-    attempt id, and a same-attempt re-drive does NOT spawn a duplicate.
-
-    The walkthrough child is flagged ``qualifier_walkthrough_e2e`` (so a failed
-    run cascades no fix task) and is a required child for this attempt's
-    in-flight/finalize gate."""
+    """An explicit walkthrough probe request spawns exactly ONE PROVISIONING
+    walkthrough_e2e child pinned AT BIRTH to the verified container-capable
+    project runner (candidate SHA + attempt id); a same-attempt re-drive does
+    NOT spawn a duplicate."""
     from app import shared_state
 
     shared_state.runtime_config["smoketest_enabled"] = False
@@ -272,19 +272,22 @@ async def test_run_qualification_spawns_walkthrough_e2e_when_enabled(
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
 
+    # A live runner proving the candidate-stack site (docker info + Compose +
+    # Chromium) so run_qualification pins the walkthrough child to it.
+    capable_runner = LocalRunner(
+        project_id=project.id, token_hash="x" * 64, status="active",
+        last_seen_at=_utcnow(),
+        capabilities={"task_types": "all", "max_concurrent": 2,
+                      "isolation_backends": {"docker_usable": True},
+                      "playwright_chromium_usable": True},
+    )
+    db_session.add(capable_runner)
+    await db_session.commit()
+
     candidate = "wa1c0e2e" * 5  # 40-char placeholder SHA
-    mocker.patch(
-        "app.github.get_repo_installation_token",
-        new=AsyncMock(return_value="gh-token"),
-    )
-    mocker.patch(
-        "app.github.get_branch_sha",
-        new=AsyncMock(return_value=candidate),
-    )
-    mocker.patch(
-        "app.github.get_check_runs_cached",
-        new=AsyncMock(return_value={"conclusion": "success"}),
-    )
+    mocker.patch("app.github.get_repo_installation_token", new=AsyncMock(return_value="gh-token"))
+    mocker.patch("app.github.get_branch_sha", new=AsyncMock(return_value=candidate))
+    mocker.patch("app.github.get_check_runs_cached", new=AsyncMock(return_value={"conclusion": "success"}))
 
     result = await rq.run_qualification(
         db_session,
@@ -305,8 +308,6 @@ async def test_run_qualification_spawns_walkthrough_e2e_when_enabled(
     assert version.last_qualification["requested_probes"] == ["walkthrough_e2e"]
     assert version.last_qualification["walkthrough_e2e_task_id"] == walk_task_id
 
-    # Exactly one walkthrough_e2e task, QUEUED, pinned to the candidate SHA and
-    # the qualification attempt id.
     from sqlmodel import select as _sqlmodel_select
 
     project_tasks = (
@@ -326,7 +327,10 @@ async def test_run_qualification_spawns_walkthrough_e2e_when_enabled(
     assert len(walk_tasks) == 1
     walk = walk_tasks[0]
     assert str(walk.id) == walk_task_id
-    assert walk.status == TaskStatus.QUEUED
+    assert walk.status == TaskStatus.PROVISIONING
+    assert walk.vm_instance_id == f"runner:{capable_runner.id}"
+    assert walk.vm_provisioned_at is not None
+    assert walk.started_at is None
     assert walk.created_by == "ORCHESTRATOR"
     assert walk.first_payload["type"] == "walkthrough_e2e"
     assert walk.first_payload["candidate_sha"] == candidate
@@ -334,6 +338,7 @@ async def test_run_qualification_spawns_walkthrough_e2e_when_enabled(
     assert walk.first_payload["base_branch"] == "automain"
     # Qualifier marker prevents ordinary task-fix cascades.
     assert walk.context["qualifier_walkthrough_e2e"] is True
+    assert walk.context["runner_target_id"] == str(capable_runner.id)
     assert walk.context["candidate_sha"] == candidate
     assert walk.context["qualification_attempt_id"] == attempt_id
     assert walk.context["release_version_id"] == str(version.id)
@@ -355,18 +360,9 @@ async def test_run_qualification_skips_walkthrough_e2e_when_disabled(
     project, version = await _make_project_and_version(db_session, phase="stabilize")
 
     candidate = "de1e7ed0" * 5  # 40-char placeholder SHA
-    mocker.patch(
-        "app.github.get_repo_installation_token",
-        new=AsyncMock(return_value="gh-token"),
-    )
-    mocker.patch(
-        "app.github.get_branch_sha",
-        new=AsyncMock(return_value=candidate),
-    )
-    mocker.patch(
-        "app.github.get_check_runs_cached",
-        new=AsyncMock(return_value={"conclusion": "success"}),
-    )
+    mocker.patch("app.github.get_repo_installation_token", new=AsyncMock(return_value="gh-token"))
+    mocker.patch("app.github.get_branch_sha", new=AsyncMock(return_value=candidate))
+    mocker.patch("app.github.get_check_runs_cached", new=AsyncMock(return_value={"conclusion": "success"}))
 
     result = await rq.run_qualification(
         db_session, project.id, version, explicit_request=True
@@ -589,7 +585,7 @@ async def test_requested_walkthrough_is_a_required_terminal_child():
 async def test_walkthrough_e2e_lane_records_registered_criterion_evidence(
     db_session, mocker
 ):
-    """End-to-end: the wired walkthrough_e2e lane spawns a QUEUED child pinned to
+    """End-to-end: the walkthrough_e2e lane spawns a PROVISIONING child pinned to
     the candidate SHA, ingests PASS results as covered-tier CriterionEvidence rows
     for all three registered keys (c-dfdc9d82, c-f52fd975, c-5214996f), and
     surfaces a loud Alert for any phantom/drifted key while writing no evidence
@@ -597,8 +593,8 @@ async def test_walkthrough_e2e_lane_records_registered_criterion_evidence(
 
     Properties verified:
       1. ACTIVE VersionAcceptanceCriterion rows for the three registered keys.
-      2. run_qualification spawns exactly one QUEUED walkthrough_e2e child pinned
-         to the candidate SHA + qualification attempt id.
+      2. run_qualification spawns exactly one PROVISIONING walkthrough_e2e child
+         pinned to the verified runner + candidate SHA + qualification attempt id.
       3-4. record_walkthrough_e2e_evidence writes covered-tier CriterionEvidence
            rows (source_kind=walkthrough_e2e) for each registered key; no unmatched
            alert when all keys resolve.
@@ -621,6 +617,16 @@ async def test_walkthrough_e2e_lane_records_registered_criterion_evidence(
 
     # PROPERTY 1: project + open version; register the three emitted keys as ACTIVE criteria.
     project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    capable_runner = LocalRunner(
+        project_id=project.id, token_hash="x" * 64, status="active",
+        last_seen_at=_utcnow(),
+        capabilities={"task_types": "all", "max_concurrent": 2,
+                      "isolation_backends": {"docker_usable": True},
+                      "playwright_chromium_usable": True},
+    )
+    db_session.add(capable_runner)
+    await db_session.commit()
 
     REGISTERED_KEYS = ["c-dfdc9d82", "c-f52fd975", "c-5214996f"]
     for key in REGISTERED_KEYS:
@@ -653,20 +659,11 @@ async def test_walkthrough_e2e_lane_records_registered_criterion_evidence(
 
     candidate = "c0de1234" * 5  # deterministic 40-char SHA
 
-    mocker.patch(
-        "app.github.get_repo_installation_token",
-        new=AsyncMock(return_value="gh-token"),
-    )
-    mocker.patch(
-        "app.github.get_branch_sha",
-        new=AsyncMock(return_value=candidate),
-    )
-    mocker.patch(
-        "app.github.get_check_runs_cached",
-        new=AsyncMock(return_value={"conclusion": "success"}),
-    )
+    mocker.patch("app.github.get_repo_installation_token", new=AsyncMock(return_value="gh-token"))
+    mocker.patch("app.github.get_branch_sha", new=AsyncMock(return_value=candidate))
+    mocker.patch("app.github.get_check_runs_cached", new=AsyncMock(return_value={"conclusion": "success"}))
 
-    # PROPERTY 2: run_qualification spawns exactly one QUEUED walkthrough_e2e child.
+    # PROPERTY 2: run_qualification spawns exactly one PROVISIONING walkthrough_e2e child.
     result = await rq.run_qualification(
         db_session,
         project.id,
@@ -702,7 +699,9 @@ async def test_walkthrough_e2e_lane_records_registered_criterion_evidence(
     assert len(walk_tasks) == 1
     walk = walk_tasks[0]
     assert str(walk.id) == walk_task_id
-    assert walk.status == TaskStatus.QUEUED
+    assert walk.status == TaskStatus.PROVISIONING
+    assert walk.vm_instance_id == f"runner:{capable_runner.id}"
+    assert walk.context["runner_target_id"] == str(capable_runner.id)
     assert walk.first_payload["candidate_sha"] == candidate
     assert walk.first_payload["qualification_attempt_id"] == attempt_id
 
@@ -819,3 +818,51 @@ async def test_walkthrough_e2e_lane_records_registered_criterion_evidence(
     assert phantom_source_ids == [], (
         f"Phantom key must not write any CriterionEvidence rows; found: {phantom_source_ids}"
     )
+
+
+@pytest.mark.asyncio
+async def test_walkthrough_e2e_site_gate_rejects_unproven_runners(db_session):
+    """Fail-closed site gate + deterministic low-id pin for the walkthrough child."""
+    from app.release_qualifier_audit import (
+        QualifierWalkthroughSiteUnavailableError,
+        _spawn_qualifier_walkthrough_task,
+    )
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    def add_runner(runner_id, caps):
+        db_session.add(LocalRunner(
+            id=runner_id, project_id=project.id, token_hash="x" * 64,
+            status="active", last_seen_at=_utcnow(), capabilities=caps))
+
+    base = {"task_types": "all", "max_concurrent": 2}
+    add_runner(uuid.uuid4(), {**base, "isolation_backends": {"bwrap_usable": True}})
+    add_runner(uuid.uuid4(), {**base, "isolation_backends": {"docker_usable": True}})
+    await db_session.commit()
+
+    with pytest.raises(QualifierWalkthroughSiteUnavailableError,
+                       match="candidate-stack site"):
+        await _spawn_qualifier_walkthrough_task(
+            db_session, project.id, version_id=version.id,
+            candidate_sha="f011c10se" * 5,
+            qualification_attempt_id=uuid.uuid4(),
+        )
+
+    low_id = uuid.UUID("00000000-0000-0000-0000-0000000000aa")
+    site_caps = {**base, "isolation_backends": {"docker_usable": True},
+                 "playwright_chromium_usable": True}
+    add_runner(low_id, site_caps)
+    add_runner(uuid.UUID("00000000-0000-0000-0000-0000000000bb"), site_caps)
+    await db_session.commit()
+
+    pinned = await _spawn_qualifier_walkthrough_task(
+        db_session, project.id, version_id=version.id,
+        candidate_sha="f011c10se" * 5,
+        qualification_attempt_id=uuid.uuid4(),
+    )
+    assert pinned.status == TaskStatus.PROVISIONING
+    assert pinned.vm_instance_id == f"runner:{low_id}"
+    assert pinned.context["runner_target_id"] == str(low_id)
+    assert pinned.vm_provisioned_at is not None
+    assert pinned.started_at is None
+    assert pinned.context["qualifier_walkthrough_e2e"] is True
