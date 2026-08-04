@@ -81,6 +81,8 @@ class ContainerStorageMigrationContractTests(unittest.TestCase):
 
     def test_stop_checks_real_containerd_shims_and_namespaces(self):
         self.assertIn("containerd-shim(-[^[:space:]]*)?", TEXT)
+        self.assertIn("(^|/)qemu-system-x86_64([[:space:]]|$)", TEXT)
+        self.assertNotIn("pgrep --exact qemu-system-x86_64", TEXT)
         self.assertIn("assert_containerd_namespaces_supported", TEXT)
         self.assertIn("unreviewed non-Docker containerd namespace", TEXT)
         self.assertIn("Docker container scopes remained after stop", TEXT)

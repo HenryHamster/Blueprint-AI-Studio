@@ -8215,7 +8215,11 @@ class TestWarmVMSkipProvision:
             alerts = (
                 (
                     await verify.execute(
-                        _select(Alert).where(Alert.project_id == project_id)
+                        _select(Alert).where(
+                            Alert.project_id == project_id,
+                            Alert.event_type == "task.failed",
+                            Alert.task_id == prereq.id,
+                        )
                     )
                 )
                 .scalars()

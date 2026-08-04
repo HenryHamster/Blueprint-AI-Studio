@@ -6921,6 +6921,14 @@ async def test_finalize_non_absent_candidate_ci_blocks_under_relaxed_no_checks_p
 
     _project, version = await _seed_relaxed_ci_clean_qualification(db_session)
     promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+    # Pending/red CI is the contract under test. The merge-grade exemption is
+    # a separate fail-closed GitHub ancestry check and must not perform live I/O
+    # against the fixture repository.
+    mocker.patch.object(
+        rq,
+        "_candidate_already_on_main_at_finalize",
+        new=AsyncMock(return_value=False),
+    )
 
     result = await rq._finalize_qualification(
         db_session,
