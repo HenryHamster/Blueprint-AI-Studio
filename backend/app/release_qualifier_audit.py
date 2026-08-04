@@ -36,6 +36,11 @@ from app.qualification_dimensions import LEDGER_DIMENSION_KEYS
 from app.release_promotion import _lts_branch_names, _record_qualification_verdict
 from app.runtime_config_state import resolve_project_promotion_enabled
 from app.shared_state import runtime_config as _runtime_config
+from app.task_capabilities import (
+    DIRECT_PACKER_GCE_EXECUTION_SITE,
+    TaskType,
+    execution_site_for_task_type,
+)
 from app.time_utils import _utcnow
 from app.json_extract import async_json_loads
 from app.deployed_sha import get_serving_sha
@@ -510,6 +515,13 @@ async def _spawn_qualifier_walkthrough_task(
     qualification_attempt_id: uuid.UUID | str,
 ) -> Task:
     """Create + queue a qualify-time ``walkthrough_e2e`` task on the candidate commit."""
+    execution_site = execution_site_for_task_type(TaskType.walkthrough_e2e)
+    if execution_site != DIRECT_PACKER_GCE_EXECUTION_SITE:
+        raise RuntimeError(
+            "walkthrough_e2e qualifier spawn requires the registry-declared "
+            f"execution site {DIRECT_PACKER_GCE_EXECUTION_SITE!r}; "
+            f"got {execution_site!r}"
+        )
     project = await session.get(Project, project_id)
     integration_branch, _promotion_target = _lts_branch_names(project)
     payload: dict[str, Any] = {
@@ -538,6 +550,7 @@ async def _spawn_qualifier_walkthrough_task(
             "qualifier_walkthrough_e2e": True,
             "candidate_sha": candidate_sha,
             "qualification_attempt_id": str(qualification_attempt_id),
+            "execution_site": execution_site,
         },
     )
     session.add(task)
@@ -550,6 +563,7 @@ async def _spawn_qualifier_walkthrough_task(
                 "spawned_by": "RELEASE_QUALIFIER",
                 "task_type": "walkthrough_e2e",
                 "qualifier_walkthrough_e2e": True,
+                "execution_site": execution_site,
                 "release_version_id": str(version_id),
                 "qualification_attempt_id": str(qualification_attempt_id),
             },

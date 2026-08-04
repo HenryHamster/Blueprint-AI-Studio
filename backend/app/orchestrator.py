@@ -38,6 +38,7 @@ from typing import Dict, Tuple
 
 from sqlalchemy import func as _func, inspect as sa_inspect
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.orm import load_only
 from sqlmodel import select
 
@@ -60,6 +61,8 @@ from app.compute_cloud_run import (
 from app.task_capabilities import (
     AGENT_EXECUTED_TASK_TYPES,
     CLOUD_RUN_CANDIDATE_TASK_TYPES,
+    DIRECT_PACKER_GCE_EXECUTION_SITE,
+    execution_site_for_task_type,
 )
 from app.database import AsyncSessionLocal
 from app.execution_principal import resolve_project_execution_principal
@@ -3347,6 +3350,13 @@ async def orchestrator_worker():
                         )
                         if task is None:
                             continue
+                        _task_type_for_dispatch = str(
+                            (task.first_payload or {}).get("type") or ""
+                        )
+                        _direct_packer_gce_dispatch = (
+                            execution_site_for_task_type(_task_type_for_dispatch)
+                            == DIRECT_PACKER_GCE_EXECUTION_SITE
+                        )
                         if task.requires_approval:
                             await session.rollback()
                             continue
@@ -3482,11 +3492,14 @@ async def orchestrator_worker():
                         # no runner is registered this returns False and every
                         # existing dispatch path runs exactly as before. No
                         # LOCAL_MODE flag is involved.
-                        if await _try_runner_dispatch(
-                            session,
-                            task,
-                            _active_runners_cache,
-                            _runner_pins_this_cycle,
+                        if (
+                            not _direct_packer_gce_dispatch
+                            and await _try_runner_dispatch(
+                                session,
+                                task,
+                                _active_runners_cache,
+                                _runner_pins_this_cycle,
+                            )
                         ):
                             _cycle_dispatched += 1
                             continue
@@ -3531,7 +3544,29 @@ async def orchestrator_worker():
                         # fall-through mints a FRESH id instead of re-creating a GCP
                         # instance with a stale parked-VM name (name-collision hazard).
                         _is_parked_retarget = bool(_warm_ctx.get("parked_for_retarget"))
-                        if _warm_target_vm_id:
+                        if _direct_packer_gce_dispatch and _warm_target_vm_id:
+                            # A stale warm/pool pin must not survive onto the
+                            # direct site.  Clear it before the cold provision
+                            # mints the dedicated VM name, otherwise a prior
+                            # pooled VM id could be reused accidentally.
+                            _warm_ctx = {
+                                key: value
+                                for key, value in _warm_ctx.items()
+                                if key
+                                not in {
+                                    "warm_target_vm_id",
+                                    "warm_target_pr",
+                                    "warm_handoff_deadline",
+                                    "warm_pool_pin",
+                                    "parked_for_retarget",
+                                    "park_deadline",
+                                }
+                            }
+                            task.context = _warm_ctx
+                            task.vm_instance_id = None
+                            flag_modified(task, "context")
+                            _warm_target_vm_id = None
+                        if _warm_target_vm_id and not _direct_packer_gce_dispatch:
                             _warm_deadline_iso = _warm_ctx.get("warm_handoff_deadline")
                             _warm_expired = False
                             if _warm_deadline_iso:
@@ -3799,6 +3834,7 @@ async def orchestrator_worker():
                         )
                         _is_cloud_run_dispatch = (
                             _task_type_dispatch in _effective_cr_types_dispatch
+                            and not _direct_packer_gce_dispatch
                         )
                         if (
                             not _warm_target_vm_id
@@ -3806,6 +3842,7 @@ async def orchestrator_worker():
                             and is_warm_pool_enabled()
                             and runtime_selection is not None
                             and not _is_cloud_run_dispatch
+                            and not _direct_packer_gce_dispatch
                         ):
                             _leased_member = await try_pool_dispatch(
                                 session,

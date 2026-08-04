@@ -16,6 +16,36 @@ candidate SHA + attempt id when explicitly requested, and no child by default.""
 from _release_qualifier_testhelpers import *  # noqa: F403
 
 
+def test_walkthrough_execution_site_is_registry_declared():
+    from app.task_capabilities import (
+        DIRECT_PACKER_GCE_EXECUTION_SITE,
+        TaskType,
+        execution_site_for_task_type,
+    )
+
+    assert (
+        execution_site_for_task_type(TaskType.walkthrough_e2e)
+        == DIRECT_PACKER_GCE_EXECUTION_SITE
+    )
+
+
+@pytest.mark.asyncio
+async def test_walkthrough_spawn_fails_closed_on_execution_site_drift(mocker):
+    mocker.patch(
+        "app.release_qualifier_audit.execution_site_for_task_type",
+        return_value="default",
+    )
+
+    with pytest.raises(RuntimeError, match="requires the registry-declared"):
+        await rq._spawn_qualifier_walkthrough_task(
+            object(),
+            uuid.uuid4(),
+            version_id=uuid.uuid4(),
+            candidate_sha="a" * 40,
+            qualification_attempt_id=uuid.uuid4(),
+        )
+
+
 def test_qualification_contract_fingerprint_tracks_goal_and_categories():
     empty_rubric = rq._rubric_fingerprint([])
     category_rubric = rq._rubric_fingerprint(
@@ -307,6 +337,7 @@ async def test_run_qualification_spawns_walkthrough_e2e_when_enabled(
     assert walk.context["candidate_sha"] == candidate
     assert walk.context["qualification_attempt_id"] == attempt_id
     assert walk.context["release_version_id"] == str(version.id)
+    assert walk.context["execution_site"] == "direct_packer_gce"
 
 
 @pytest.mark.asyncio

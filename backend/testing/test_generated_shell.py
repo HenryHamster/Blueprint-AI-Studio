@@ -964,7 +964,7 @@ def test_agent_dockerfile_pins_and_starts_codex_native_binary():
     assert "npm install -g --include=optional" in dockerfile
     assert 'codex --version' in dockerfile
     assert 'test "${codex_version}" = "${CODEX_VERSION}"' in dockerfile
-    assert "ARG CLAUDE_CODE_VERSION=2.1.197" in dockerfile
+    assert "ARG CLAUDE_CODE_VERSION=2.1.219" in dockerfile
     assert 'claude --version' in dockerfile
     assert 'test "${claude_version}" = "${CLAUDE_CODE_VERSION}"' in dockerfile
 
@@ -1565,7 +1565,6 @@ class TestPackerMemoLifecycleContract:
         hcl = _read_packer_hcl()
         for sentinel in (
             "PACKER_MEMO_SMOKE_OK",
-            "PACKER_MEMO_INVESTIGATION_OK",
             "./src/handlers/memo-bake-smoke-reopen.ts",
         ):
             assert sentinel in hcl, (
@@ -1864,6 +1863,14 @@ class TestPackerBackendDepsBake:
                 f"agent.pkr.hcl must emit {sentinel} after a successful deps bake."
             )
 
+    def test_walkthrough_site_smokes_host_docker_compose_as_agent(self):
+        """The qualifier image must prove the exact host stack prerequisites."""
+        hcl = _read_packer_hcl()
+        assert "docker-compose-v2" in hcl
+        assert "sudo -u agent -H bash -lc 'docker info" in hcl
+        assert "sudo -u agent -H bash -lc 'docker compose version" in hcl
+        assert "PACKER_AGENT_DOCKER_INFO_OK" in hcl
+        assert "PACKER_AGENT_DOCKER_COMPOSE_OK" in hcl
 
 class TestProjectVerificationRuntimeContract:
     """The heavy GCE boundary earns readiness from live agent-user probes."""

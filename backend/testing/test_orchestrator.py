@@ -1031,6 +1031,46 @@ async def test_visual_evidence_task_falls_through_without_runner_proof(db_sessio
     assert (task.context or {}).get("runner_target_id") is None
 
 
+@pytest.mark.asyncio
+async def test_walkthrough_dispatch_never_claims_a_registered_runner(db_session):
+    from app.orchestrator_runner_dispatch import (
+        RunnerDispatchSnapshot,
+        _try_runner_dispatch,
+    )
+
+    project = make_project(name="walkthrough-placement", user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "walkthrough_e2e"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    capable_runner = RunnerDispatchSnapshot(
+        uuid.uuid4(),
+        project.id,
+        {
+            "task_types": "all",
+            "max_concurrent": 1,
+            "agent_available": True,
+            "playwright_chromium_usable": True,
+            "isolation_backends": {"docker_usable": True},
+        },
+    )
+
+    dispatched = await _try_runner_dispatch(
+        db_session, task, {project.id: [capable_runner]}, {}
+    )
+
+    assert dispatched is False
+    assert task.status == TaskStatus.QUEUED
+    assert (task.context or {}).get("runner_target_id") is None
+
+
 # ── Container-capability gating in runner dispatch ─────────────────────────────
 
 

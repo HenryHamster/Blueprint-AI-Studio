@@ -93,7 +93,7 @@ build {
       "sudo apt-get update || (sudo sed -i 's|http://archive.ubuntu.com|http://us.archive.ubuntu.com|g' /etc/apt/sources.list && sudo apt-get update) || (sudo sed -i 's|http://us.archive.ubuntu.com|http://mirrors.edge.kernel.org|g' /etc/apt/sources.list && sudo apt-get update)",
       "sudo apt-get install -y curl git wget gnupg",
       "curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -",
-      "sudo apt-get install -y nodejs docker.io",
+      "sudo apt-get install -y nodejs docker.io docker-compose-v2",
       "# Point every npm invocation (build-time globals + npm ci below, and the",
       "# agent's task-time npm ci) at a single shared cache dir that we pre-warm",
       "# and bake into the image, so cold VMs hit cache instead of re-downloading.",
@@ -314,7 +314,11 @@ build {
       "# Run as the agent user (-H sets HOME=/home/agent) from an agent-owned CWD:",
       "# npx spawns a child process, and as the agent user it cannot reach",
       "# /home/packer (the provisioner's default CWD), so that spawn fails EACCES.",
-      "sudo -u agent -H bash -c 'cd /opt/agent && npx --yes playwright@1.59.1 install --with-deps chromium'"
+      "sudo -u agent -H bash -c 'cd /opt/agent && npx --yes playwright@1.59.1 install --with-deps chromium'",
+      "# CandidateStackController uses the HOST daemon before its browser harness starts.",
+      "# Prove the exact production agent user can reach Docker and Compose in the baked image.",
+      "sudo -u agent -H bash -lc 'docker info >/dev/null && echo PACKER_AGENT_DOCKER_INFO_OK'",
+      "sudo -u agent -H bash -lc 'docker compose version >/dev/null && echo PACKER_AGENT_DOCKER_COMPOSE_OK'"
     ]
   }
 

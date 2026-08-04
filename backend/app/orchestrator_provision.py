@@ -60,7 +60,11 @@ from app.models import (
     with_task_attempt_banking,
 )
 from app.shared_state import runtime_config as _runtime_config
-from app.task_capabilities import CLOUD_RUN_CANDIDATE_TASK_TYPES
+from app.task_capabilities import (
+    CLOUD_RUN_CANDIDATE_TASK_TYPES,
+    DIRECT_PACKER_GCE_EXECUTION_SITE,
+    execution_site_for_task_type,
+)
 from app.time_utils import _utcnow, set_retry_after
 from app.resource_envelope import resolve_project_execution_placement_policy
 
@@ -320,8 +324,12 @@ async def provision_and_handle(
         _effective_cr_types = (
             CLOUD_RUN_CANDIDATE_TASK_TYPES & _cr_allowlist
         )
+        _direct_packer_gce_dispatch = (
+            execution_site_for_task_type(t_type)
+            == DIRECT_PACKER_GCE_EXECUTION_SITE
+        )
         success = False
-        if t_type in _effective_cr_types:
+        if t_type in _effective_cr_types and not _direct_packer_gce_dispatch:
             # Stamp the Cloud Run sentinel machine type
             # so cost attribution and teardown skips work.
             async with _orch.AsyncSessionLocal() as _cr_stamp_session:

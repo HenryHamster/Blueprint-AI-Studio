@@ -70,7 +70,11 @@ from app.stall_alert_diagnostics import (
     _STALL_TITLE_PREFIX,
     _format_stall_alert,
 )
-from app.task_capabilities import STRATEGIC_TASK_TYPES
+from app.task_capabilities import (
+    DIRECT_PACKER_GCE_EXECUTION_SITE,
+    STRATEGIC_TASK_TYPES,
+    execution_site_for_task_type,
+)
 from app.time_utils import _utcnow
 from app.workbench_events import (
     SURFACE_RUNTIME,
@@ -767,6 +771,13 @@ async def _try_runner_dispatch(
         return False
     payload = task.first_payload or {}
     task_type = payload.get("type", "")
+    # ``walkthrough_e2e`` is qualified only on the single-tenant Packer GCE
+    # image, whose host Docker daemon is required before the candidate stack
+    # can boot.  Do not let a live runner claim it merely because it advertises
+    # a generic agent/browser capability; the registry site contract is the
+    # dispatch authority.
+    if execution_site_for_task_type(task_type) == DIRECT_PACKER_GCE_EXECUTION_SITE:
+        return False
     project = (
         await session.get(Project, task.project_id)
         if _task_is_authoring(task_type)
