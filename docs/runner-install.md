@@ -238,7 +238,46 @@ you can open a second terminal and run `update` while the runner keeps working.
 
 ---
 
-## 6. View logs
+## 6. Place container storage on the data filesystem
+
+GPU and compute images can be tens of gigabytes. Docker's containerd image
+store is separate from `DockerRootDir`, so changing only Docker's `data-root`
+does not necessarily move image layers. On a runner with a small OS filesystem
+and a large local data filesystem, keep both `/var/lib/docker` and
+`/var/lib/containerd` on the data filesystem.
+
+For an existing Linux host, use the phased migration helper:
+
+```bash
+sudo install -d -m 0700 -o root -g root /var/lib/blueprint/bootstrap
+sudo install -m 0700 -o root -g root scripts/migrate-container-storage.sh \
+  /var/lib/blueprint/bootstrap/migrate-container-storage.sh
+sudo /var/lib/blueprint/bootstrap/migrate-container-storage.sh prepare
+# Stop the user runner and confirm no GitHub Actions job is active.
+systemctl --user stop blueprint-runner.service
+sudo /var/lib/blueprint/bootstrap/migrate-container-storage.sh cutover
+sudo /var/lib/blueprint/bootstrap/migrate-container-storage.sh verify
+# After a planned reboot, verify the boot-time mounts and move the retained
+# root backups onto the data filesystem to release the OS-volume blocks.
+sudo /var/lib/blueprint/bootstrap/migrate-container-storage.sh verify
+sudo /var/lib/blueprint/bootstrap/migrate-container-storage.sh cleanup
+```
+
+The helper defaults to `/srv/data/blueprint-system/container-runtime`. It
+pre-copies while Docker remains online, final-syncs only after every writer is
+stopped, installs fail-closed systemd bind mounts for both stores, retains the
+root-backed directories for rollback, and refuses cleanup until a later boot
+has passed `verify`. The `verify` phase restarts an Actions VM that was running
+at `prepare` time only after all storage and application-health checks pass;
+restart the user runner separately after verification succeeds.
+
+Do not use a network, FUSE, or removable filesystem for container state. The
+destination and every ancestor must be root-owned and not group/world writable.
+Do not delete the retained root backups before a successful reboot check.
+
+---
+
+## 7. View logs
 
 ```bash
 # Live tail
@@ -253,7 +292,7 @@ journalctl --user -u blueprint-runner.service -b
 
 ---
 
-## 7. Verify the runner is healthy
+## 8. Verify the runner is healthy
 
 ```bash
 # Run the built-in preflight check (no work claimed)
@@ -304,7 +343,7 @@ heartbeat advertises the repaired CLI. `--check` itself performs no download.
 
 ---
 
-## 8. Re-enrollment
+## 9. Re-enrollment
 
 If the runner token is revoked or lost and you cannot recover it from
 `~/.blueprint/runner_token`, re-enroll via the admin UI: open the **Runtime**
