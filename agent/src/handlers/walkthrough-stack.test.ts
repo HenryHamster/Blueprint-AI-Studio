@@ -78,3 +78,114 @@ describe('CandidateStackController', () => {
     expect(vi.mocked(execFileSync).mock.calls.length).toBe(before);
   });
 });
+
+// ── Runner-side supervisor protocol ─────────────────────────────────────────
+// The agent sandbox has no docker socket on local runners; when the runner
+// advertises a stack supervisor (supervisor.json written before spawn), boot()
+// must go through the file protocol and never touch docker itself.
+
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+
+function protoWorkspace(): { ws: string; proto: string } {
+  const ws = mkdtempSync(path.join(os.tmpdir(), 'wt-stack-proto-'));
+  const proto = path.join(ws, '.walkthrough-stack');
+  mkdirSync(proto, { recursive: true });
+  writeFileSync(path.join(proto, 'supervisor.json'), JSON.stringify({ version: 1 }));
+  return { ws, proto };
+}
+
+describe('runner-side supervisor protocol', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('writes request.json with the stack secrets and adopts the responded ports', async () => {
+    const { ws, proto } = protoWorkspace();
+    const c = new CandidateStackController({
+      workspace: ws,
+      candidateSha: SHA,
+      adminToken: 'tok-0123456789',
+      bootTimeoutMs: 4_000,
+      bootFrontend: false,
+    });
+
+    // Play the runner: answer the request as soon as it appears.
+    const responder = (async () => {
+      const requestPath = path.join(proto, 'request.json');
+      for (let i = 0; i < 200 && !existsSync(requestPath); i++) {
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      const req = JSON.parse(readFileSync(requestPath, 'utf-8')) as Record<string, string>;
+      expect(req.candidate_sha).toBe(SHA);
+      expect(req.admin_token).toBe('tok-0123456789');
+      expect(req.pg_password).toMatch(/^wt-pg-[0-9a-f]{16}$/);
+      expect(req.agent_jwt_secret).toMatch(/^[0-9a-f]{48}$/);
+      writeFileSync(
+        path.join(proto, 'response.json'),
+        JSON.stringify({ status: 'ok', backend_port: 18123, db_port: 15123 }),
+      );
+    })();
+
+    // The stack "boots" per the protocol, then the health probe hits
+    // 127.0.0.1:18123 where nothing listens — boot fails closed THERE, which
+    // proves the supervisor leg completed and the ports were adopted.
+    await expect(c.boot()).rejects.toThrow(/health check never returned 200/);
+    await responder;
+    expect(c.backendUrl).toBe('http://127.0.0.1:18123');
+    expect(c.databaseUrl).toContain('@127.0.0.1:15123/');
+    // The agent never invoked docker on this path.
+    expect(vi.mocked(execFileSync).mock.calls.filter((call) => call[0] === 'docker')).toHaveLength(0);
+  }, 20_000);
+
+  it('fails closed on a supervisor error response without touching docker', async () => {
+    const { ws, proto } = protoWorkspace();
+    writeFileSync(
+      path.join(proto, 'response.json'),
+      JSON.stringify({ status: 'error', detail: 'docker daemon unreachable' }),
+    );
+    const c = new CandidateStackController({
+      workspace: ws,
+      candidateSha: SHA,
+      adminToken: 'tok-0123456789',
+      bootTimeoutMs: 8_000,
+    });
+    await expect(c.boot()).rejects.toThrow(/docker daemon unreachable/);
+    expect(vi.mocked(execFileSync).mock.calls.filter((call) => call[0] === 'docker')).toHaveLength(0);
+  });
+
+  it('teardown in runner mode signals teardown.json instead of compose down', async () => {
+    const { ws, proto } = protoWorkspace();
+    writeFileSync(
+      path.join(proto, 'response.json'),
+      JSON.stringify({ status: 'ok', backend_port: 18124, db_port: 15124 }),
+    );
+    const c = new CandidateStackController({
+      workspace: ws,
+      candidateSha: SHA,
+      adminToken: 'tok-0123456789',
+      bootTimeoutMs: 2_000,
+      bootFrontend: false,
+    });
+    await expect(c.boot()).rejects.toThrow(/health check/); // ports adopted, backend absent
+    await expect(c.teardown()).resolves.toBeUndefined();
+    expect(existsSync(path.join(proto, 'teardown.json'))).toBe(true);
+    // No compose down was issued on the runner-managed path.
+    const composeCalls = vi
+      .mocked(execFileSync)
+      .mock.calls.filter((call) => JSON.stringify(call[1] ?? []).includes('compose'));
+    expect(composeCalls).toHaveLength(0);
+  }, 20_000);
+
+  it('falls back to the legacy in-sandbox path when no supervisor marker exists', async () => {
+    const ws = mkdtempSync(path.join(os.tmpdir(), 'wt-stack-legacy-'));
+    const c = new CandidateStackController({
+      workspace: ws,
+      candidateSha: SHA,
+      adminToken: 'tok',
+      bootTimeoutMs: 0, // deadline already passed → DB readiness loop cannot succeed
+    });
+    await expect(c.boot()).rejects.toThrow(/postgres did not become ready/);
+    // Legacy path DID reach for docker compose.
+    expect(vi.mocked(execFileSync).mock.calls.some((call) => call[0] === 'docker')).toBe(true);
+  });
+});

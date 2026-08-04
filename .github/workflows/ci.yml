@@ -713,6 +713,7 @@ jobs:
             ${{ steps.deps.outputs.image }} \
             python -m pytest \
               test_runner_isolation.py \
+              test_walkthrough_stack.py \
               test_blueprint_node.py \
               test_local_api_service.py \
               test_local_control_plane_services.py \

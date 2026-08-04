@@ -25,6 +25,7 @@
 
 import { execFileSync, spawn, type ChildProcess } from 'child_process';
 import { randomBytes } from 'crypto';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs';
 import * as path from 'path';
 
 export interface CandidateStack {
@@ -63,8 +64,23 @@ export interface CandidateStackOptions {
   bootFrontend?: boolean;
 }
 
-const DEFAULT_BOOT_TIMEOUT_MS = 8 * 60_000;
+// 20 min: a runner-side boot on a cold image cache pays a postgres pull plus a
+// full backend pip-install docker build before the first health probe can pass.
+const DEFAULT_BOOT_TIMEOUT_MS = 20 * 60_000;
 const HEALTH_POLL_INTERVAL_MS = 3_000;
+
+/**
+ * File protocol with a runner-side stack supervisor (scripts/walkthrough_stack.py).
+ *
+ * The agent sandbox deliberately has no docker socket, so on local runners the
+ * RUNNER boots the candidate stack. The runner advertises itself by writing
+ * `supervisor.json` into this directory BEFORE the agent spawns; the agent then
+ * writes `request.json` (candidate SHA + throwaway stack secrets), polls
+ * `response.json` for the loopback ports, and writes `teardown.json` when done.
+ * Without the marker the legacy in-sandbox `docker compose` path runs unchanged
+ * (agent VMs with a real docker daemon).
+ */
+const STACK_PROTOCOL_DIR = '.walkthrough-stack';
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -94,6 +110,8 @@ export class CandidateStackController {
   private composeUp = false;
   private frontendProc: ChildProcess | null = null;
   private tornDown = false;
+  /** Loopback ports returned by a runner-side supervisor (null → legacy path). */
+  private runnerPorts: { backend: number; db: number } | null = null;
 
   constructor(options: CandidateStackOptions) {
     const adminToken = options.adminToken || `wt-admin-${randomBytes(12).toString('hex')}`;
@@ -137,7 +155,7 @@ export class CandidateStackController {
   }
 
   get backendUrl(): string {
-    return `http://127.0.0.1:${this.opts.backendPort}`;
+    return `http://127.0.0.1:${this.runnerPorts?.backend ?? this.opts.backendPort}`;
   }
 
   get frontendUrl(): string {
@@ -145,7 +163,17 @@ export class CandidateStackController {
   }
 
   get databaseUrl(): string {
-    return `postgresql+asyncpg://postgres:${this.childEnv.POSTGRES_PASSWORD}@127.0.0.1:${this.opts.dbPort}/postgres`;
+    const dbPort = this.runnerPorts?.db ?? this.opts.dbPort;
+    return `postgresql+asyncpg://postgres:${this.childEnv.POSTGRES_PASSWORD}@127.0.0.1:${dbPort}/postgres`;
+  }
+
+  private get protocolDir(): string {
+    return path.join(this.opts.workspace, STACK_PROTOCOL_DIR);
+  }
+
+  /** Whether a runner-side stack supervisor advertised itself for this task. */
+  runnerSupervisorAvailable(): boolean {
+    return existsSync(path.join(this.protocolDir, 'supervisor.json'));
   }
 
   private compose(args: string[], timeoutMs: number): string {
@@ -165,26 +193,34 @@ export class CandidateStackController {
     const deadline = Date.now() + this.opts.bootTimeoutMs;
     const log = this.opts.log;
 
-    // 1. Build the candidate image and bring up the DB first so migrations can
-    //    run before the app performs its startup schema check.
-    log(`Building candidate image + starting postgres (compose project ${this.composeProject})...\n`);
-    this.composeUp = true; // mark BEFORE up so a mid-build failure is still torn down
-    this.compose(['up', '-d', '--build', 'db'], Math.max(60_000, deadline - Date.now()));
+    if (this.runnerSupervisorAvailable()) {
+      // Local runner: the sandbox has no docker socket; the runner-side
+      // supervisor boots the fixed-shape stack and hands back loopback ports.
+      log('Runner-side stack supervisor detected — requesting candidate stack boot...\n');
+      await this.bootViaRunnerSupervisor(deadline);
+    } else {
+      // Legacy path (agent VMs with a real docker daemon): boot in-process.
+      // 1. Build the candidate image and bring up the DB first so migrations
+      //    can run before the app performs its startup schema check.
+      log(`Building candidate image + starting postgres (compose project ${this.composeProject})...\n`);
+      this.composeUp = true; // mark BEFORE up so a mid-build failure is still torn down
+      this.compose(['up', '-d', '--build', 'db'], Math.max(60_000, deadline - Date.now()));
 
-    // 2. Wait for postgres to accept connections.
-    await this.waitForDb(deadline);
+      // 2. Wait for postgres to accept connections.
+      await this.waitForDb(deadline);
 
-    // 3. Apply migrations to head in a one-off container (the app is not up yet,
-    //    so there is no racing schema check). alembic.ini lives at /app.
-    log('Applying alembic migrations to head against the candidate DB...\n');
-    this.compose(
-      ['run', '--rm', '--no-deps', 'app', 'alembic', 'upgrade', 'head'],
-      Math.max(60_000, deadline - Date.now()),
-    );
+      // 3. Apply migrations to head in a one-off container (the app is not up
+      //    yet, so there is no racing schema check). alembic.ini lives at /app.
+      log('Applying alembic migrations to head against the candidate DB...\n');
+      this.compose(
+        ['run', '--rm', '--no-deps', 'app', 'alembic', 'upgrade', 'head'],
+        Math.max(60_000, deadline - Date.now()),
+      );
 
-    // 4. Start the app now that the schema is at head.
-    log('Starting candidate backend...\n');
-    this.compose(['up', '-d', 'app'], Math.max(60_000, deadline - Date.now()));
+      // 4. Start the app now that the schema is at head.
+      log('Starting candidate backend...\n');
+      this.compose(['up', '-d', 'app'], Math.max(60_000, deadline - Date.now()));
+    }
 
     // 5. Health-check the candidate backend, then read the SHA it serves.
     await this.waitForBackendHealth(deadline);
@@ -213,6 +249,57 @@ export class CandidateStackController {
       databaseUrl: this.databaseUrl,
       exercisedEngineSha,
     };
+  }
+
+  /**
+   * Ask the runner-side supervisor to boot the stack, then adopt the loopback
+   * ports it publishes. The sandbox shares the host network namespace, so
+   * 127.0.0.1:<port> reaches the containers directly. Throws (fail-closed) on
+   * an error response or when no response lands before the deadline.
+   */
+  private async bootViaRunnerSupervisor(deadline: number): Promise<void> {
+    mkdirSync(this.protocolDir, { recursive: true });
+    const request = {
+      version: 1,
+      candidate_sha: this.opts.candidateSha,
+      admin_token: this.opts.adminToken,
+      pg_password: this.childEnv.POSTGRES_PASSWORD || '',
+      agent_jwt_secret: this.childEnv.AGENT_JWT_SECRET || '',
+      ws_ticket_secret: this.childEnv.WS_TICKET_SECRET || '',
+      // Parity with the legacy compose env: the candidate backend receives the
+      // same key the sandbox itself was vended (may be empty).
+      anthropic_api_key: process.env.ANTHROPIC_API_KEY || '',
+    };
+    const requestPath = path.join(this.protocolDir, 'request.json');
+    writeFileSync(`${requestPath}.tmp`, JSON.stringify(request));
+    renameSync(`${requestPath}.tmp`, requestPath);
+
+    const responsePath = path.join(this.protocolDir, 'response.json');
+    while (Date.now() < deadline) {
+      if (existsSync(responsePath)) {
+        let parsed: { status?: unknown; detail?: unknown; backend_port?: unknown; db_port?: unknown };
+        try {
+          parsed = JSON.parse(readFileSync(responsePath, 'utf-8')) as typeof parsed;
+        } catch {
+          // Torn read of an in-flight atomic replace — retry next poll.
+          await sleep(HEALTH_POLL_INTERVAL_MS);
+          continue;
+        }
+        if (parsed.status === 'ok') {
+          const backend = Number(parsed.backend_port);
+          const db = Number(parsed.db_port);
+          if (!Number.isInteger(backend) || !Number.isInteger(db)) {
+            throw new Error('runner stack supervisor returned malformed ports');
+          }
+          this.runnerPorts = { backend, db };
+          return;
+        }
+        const detail = typeof parsed.detail === 'string' && parsed.detail ? parsed.detail : 'no detail';
+        throw new Error(`runner stack supervisor reported boot failure: ${detail}`);
+      }
+      await sleep(HEALTH_POLL_INTERVAL_MS);
+    }
+    throw new Error('runner-side stack boot never completed before the deadline (no supervisor response)');
   }
 
   private async waitForDb(deadline: number): Promise<void> {
@@ -311,6 +398,21 @@ export class CandidateStackController {
         /* best effort */
       }
       this.frontendProc = null;
+    }
+
+    if (this.runnerPorts !== null) {
+      // Runner-managed stack: signal early teardown; the supervisor also
+      // always tears down when this agent process exits (belt and braces).
+      try {
+        log('Signalling runner-side candidate stack teardown...\n');
+        writeFileSync(
+          path.join(this.protocolDir, 'teardown.json'),
+          JSON.stringify({ requested_at: new Date().toISOString() }),
+        );
+      } catch (e) {
+        log(`[warn] could not signal runner-side teardown (runner reaps on exit): ${e instanceof Error ? e.message : String(e)}\n`);
+      }
+      this.runnerPorts = null;
     }
 
     if (this.composeUp) {
