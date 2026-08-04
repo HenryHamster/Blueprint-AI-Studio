@@ -925,6 +925,9 @@ export const StrategicContextRail = memo(function StrategicContextRail({
   const isWorking = !staleCycle && strategicCycleIsWorking({ strategistActive, activeCycle, lastCycleCompletion });
   const terminalProjection = strategicCycleTerminalProjection({ latestCycle, lastCycleCompletion });
   const terminalDisposition: StrategicCycleTerminalDisposition | null = terminalProjection.disposition;
+  const sameCycleTerminal = Boolean(
+    terminalDisposition && strategicCycleCompletionMatchesCycle(lastCycleCompletion, activeCycle),
+  );
   const statusTone = isWorking
     ? 'bg-cyan-400'
     : pendingSteer
@@ -974,7 +977,7 @@ export const StrategicContextRail = memo(function StrategicContextRail({
   })();
   const statusLabel = isWorking
     ? (cycleProgress?.phase_label ?? phaseLabel(state?.strategic.active_phase))
-    : staleCycle
+    : staleCycle && !sameCycleTerminal
       ? staleCycleLabel
     : pendingSteer
       ? operatorSteerQueued
@@ -985,7 +988,7 @@ export const StrategicContextRail = memo(function StrategicContextRail({
         : 'Idle';
   const statusDetail = isWorking
     ? (state?.strategic.active_task?.title ?? state?.strategic.active_task?.task_type ?? 'Cycle running')
-    : staleCycle
+    : staleCycle && !sameCycleTerminal
       ? 'A prior Strategic cycle still has an active marker, but no live Strategic task is attached.'
     : pendingSteer?.excerpt
       ? pendingSteer.excerpt
