@@ -1565,10 +1565,13 @@ def do_update(
     Steps:
       1. ``git fetch origin`` — get latest refs (non-fatal: None if not a repo).
       2. Read the local HEAD (``git rev-parse HEAD``).
-      3. Read the upstream tracking ref (``git rev-parse @{u}``).
+      3. Read the upstream tracking ref (``git rev-parse @{u}``). A detached
+         deployment checkout explicitly fetches and verifies
+         ``refs/remotes/origin/main``.
       4. If local == tracked  → nothing to do (exit 0).
       5. If local is ahead/diverged → warn and abort (can't fast-forward safely).
-      6. ``git merge --ff-only @{u}`` — fast-forward to upstream.
+      6. ``git merge --ff-only <upstream>`` — fast-forward to upstream while
+         preserving detached checkouts as detached.
       7. ``git diff --name-only <old-head>..HEAD`` — list changed files.
       8. If any ``package-lock.json`` is among the changed files, run ``npm ci``
          in the containing directory (only that lockfile's project).
@@ -1591,11 +1594,66 @@ def do_update(
         return 1
     old_head = head_result.stdout.strip()
 
-    # Step 3: upstream tracking ref
+    branch_result = _git(
+        ["rev-parse", "--abbrev-ref", "HEAD"], cwd=repo_root, _run=_run
+    )
+    branch = (
+        branch_result.stdout.strip()
+        if branch_result is not None and branch_result.returncode == 0
+        else ""
+    )
+
+    # Step 3: upstream tracking ref. Release/install flows may intentionally
+    # leave this checkout detached. In that case only, use the just-fetched,
+    # explicit production branch rather than draining forever because @{u}
+    # cannot exist on a detached HEAD. Use a fully-qualified ref and an exact
+    # no-tags refspec so a local short-name collision or custom fetch refspec
+    # cannot redirect this privileged updater.
+    upstream_ref = "@{u}"
     upstream_result = _git(["rev-parse", "@{u}"], cwd=repo_root, _run=_run)
     if upstream_result is None or upstream_result.returncode != 0:
-        print("ERROR: no upstream tracking branch configured. Push first, then update.", file=sys.stderr, flush=True)
-        return 1
+        if branch != "HEAD":
+            print(
+                "ERROR: no upstream tracking branch configured. Push first, then update.",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 1
+        upstream_ref = "refs/remotes/origin/main"
+        detached_fetch = _git(
+            [
+                "fetch",
+                "--no-tags",
+                "origin",
+                "+refs/heads/main:refs/remotes/origin/main",
+            ],
+            cwd=repo_root,
+            _run=_run,
+        )
+        if detached_fetch is None or detached_fetch.returncode != 0:
+            print(
+                "ERROR: detached checkout could not fetch origin main exactly.",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 1
+        upstream_result = _git(
+            ["rev-parse", "--verify", f"{upstream_ref}^{{commit}}"],
+            cwd=repo_root,
+            _run=_run,
+        )
+        if upstream_result is None or upstream_result.returncode != 0:
+            print(
+                "ERROR: detached checkout cannot resolve fetched origin main as a commit.",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 1
+        print(
+            "[blueprint-runner] detached deployment checkout — "
+            "using the exact fetched origin main commit for a verified fast-forward.",
+            flush=True,
+        )
     upstream_sha = upstream_result.stdout.strip()
 
     if old_head == upstream_sha:
@@ -1624,11 +1682,10 @@ def do_update(
             return 1
 
     # Step 5: fast-forward
-    branch_result = _git(['rev-parse', '--abbrev-ref', 'HEAD'], cwd=repo_root, _run=_run)
-    branch = branch_result.stdout.strip() if branch_result else "current branch"
-    print(f"[blueprint-runner] pulling {branch}: "
+    branch_label = branch or "current branch"
+    print(f"[blueprint-runner] pulling {branch_label}: "
           f"{old_head[:10]}..{upstream_sha[:10]}", flush=True)
-    merge = _git(["merge", "--ff-only", "@{u}"], cwd=repo_root, _run=_run)
+    merge = _git(["merge", "--ff-only", upstream_ref], cwd=repo_root, _run=_run)
     if merge is None or merge.returncode != 0:
         stderr = (merge.stderr if merge else "") or ""
         print(f"ERROR: fast-forward merge failed:\n{stderr}", file=sys.stderr, flush=True)

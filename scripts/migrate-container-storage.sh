@@ -332,7 +332,8 @@ stop_writers() {
   ! pgrep --exact containerd >/dev/null || die "containerd remained after stop"
   ! pgrep --full '(^|/)containerd-shim(-[^[:space:]]*)?([[:space:]]|$)' >/dev/null \
     || die "containerd shims remained after stop"
-  ! pgrep --exact qemu-system-x86_64 >/dev/null || die "Actions QEMU remained after stop"
+  ! pgrep --full '(^|/)qemu-system-x86_64([[:space:]]|$)' >/dev/null \
+    || die "Actions QEMU remained after stop"
   [[ -z "$(systemctl list-units --state=running --no-legend 'docker-*.scope')" ]] \
     || die "Docker container scopes remained after stop"
   assert_no_nested_mounts "$DOCKER_SOURCE"
@@ -412,7 +413,8 @@ rollback_internal() {
   ! pgrep --exact containerd >/dev/null || die "containerd remained before rollback"
   ! pgrep --full '(^|/)containerd-shim(-[^[:space:]]*)?([[:space:]]|$)' >/dev/null \
     || die "containerd shims remained before rollback"
-  ! pgrep --exact qemu-system-x86_64 >/dev/null || die "Actions QEMU remained before rollback"
+  ! pgrep --full '(^|/)qemu-system-x86_64([[:space:]]|$)' >/dev/null \
+    || die "Actions QEMU remained before rollback"
   [[ -z "$(systemctl list-units --state=running --no-legend 'docker-*.scope')" ]] \
     || die "Docker container scopes remained before rollback"
   systemctl disable var-lib-docker.mount var-lib-containerd.mount 2>/dev/null || true

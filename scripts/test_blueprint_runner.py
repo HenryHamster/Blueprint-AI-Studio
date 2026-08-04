@@ -1358,6 +1358,8 @@ class UpdateCommandTests(unittest.TestCase):
             joined = " ".join(argv) if isinstance(argv, (list, tuple)) else ""
             if "fetch" in joined and "origin" in joined:
                 return MagicMock(returncode=0, stdout="", stderr="")
+            if "rev-parse" in joined and "--abbrev-ref" in joined:
+                return MagicMock(returncode=0, stdout="main\n", stderr="")
             if "rev-parse" in joined and "HEAD" in joined and "@{u}" not in joined:
                 return MagicMock(returncode=0, stdout="a" * 40, stderr="")
             if "rev-parse" in joined and "@{u}" in joined:
@@ -1366,6 +1368,72 @@ class UpdateCommandTests(unittest.TestCase):
 
         rc = br.do_update(_run=fake_run)
         self.assertEqual(rc, 1)
+
+    def test_update_detached_checkout_fast_forwards_origin_main(self):
+        """A behind detached deployment checkout updates without a branch upstream."""
+        local = "a" * 40
+        upstream = "b" * 40
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(list(argv))
+            args = list(argv)[1:]
+            if args == ["fetch", "origin"]:
+                return MagicMock(returncode=0, stdout="", stderr="")
+            if args == ["rev-parse", "HEAD"]:
+                return MagicMock(returncode=0, stdout=local, stderr="")
+            if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return MagicMock(returncode=0, stdout="HEAD\n", stderr="")
+            if args == ["rev-parse", "@{u}"]:
+                return MagicMock(returncode=1, stdout="", stderr="detached")
+            if args == [
+                "fetch",
+                "--no-tags",
+                "origin",
+                "+refs/heads/main:refs/remotes/origin/main",
+            ]:
+                return MagicMock(returncode=0, stdout="", stderr="")
+            if args == [
+                "rev-parse",
+                "--verify",
+                "refs/remotes/origin/main^{commit}",
+            ]:
+                return MagicMock(returncode=0, stdout=upstream, stderr="")
+            if args == ["merge-base", local, upstream]:
+                return MagicMock(returncode=0, stdout=local, stderr="")
+            if args == [
+                "merge",
+                "--ff-only",
+                "refs/remotes/origin/main",
+            ]:
+                return MagicMock(returncode=0, stdout="Fast-forward\n", stderr="")
+            if args == ["diff", "--name-only", f"{local}..HEAD"]:
+                return MagicMock(returncode=0, stdout="", stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch.object(br, "_restart_runner_service", return_value=True):
+            rc = br.do_update(_run=fake_run)
+
+        self.assertEqual(rc, 0)
+        self.assertIn(
+            [
+                "git",
+                "fetch",
+                "--no-tags",
+                "origin",
+                "+refs/heads/main:refs/remotes/origin/main",
+            ],
+            calls,
+        )
+        self.assertIn(
+            [
+                "git",
+                "merge",
+                "--ff-only",
+                "refs/remotes/origin/main",
+            ],
+            calls,
+        )
 
     def test_update_merge_failure_returns_1(self):
         """When git merge --ff-only fails, do_update returns 1."""

@@ -46,6 +46,7 @@ import json
 import uuid
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 from sqlalchemy import func as sa_func
 from sqlalchemy import select
@@ -370,6 +371,26 @@ def _qualifier_ci_resolves_green(mocker, monkeypatch):
         "MIGRATION_APPLY_SCRATCH_DATABASE_URL",
         "postgresql+asyncpg://scratch-user@localhost/scratch-control",
     )
+    # Qualifier fixtures use acme/widget and a synthetic token. Any GitHub
+    # helper not explicitly mocked by the test must fail closed immediately,
+    # never escape to the real network and consume the per-test timeout in
+    # transport retries. Tests of a particular HTTP outcome re-patch this seam
+    # in their body, after this autouse fixture.
+    blocked_github_response = httpx.Response(
+        401,
+        json={"message": "GitHub network disabled in qualifier tests"},
+        request=httpx.Request("GET", "https://api.github.invalid/test-blocked"),
+    )
+    mocker.patch(
+        "app.github._github_request",
+        new=AsyncMock(return_value=blocked_github_response),
+    )
+    # Finalization may retire archival child VMs or trigger orphan inventory as
+    # an incidental side effect. Keep qualifier tests outside the real GCE SDK;
+    # compute-specific tests own these boundaries and qualifier tests can
+    # re-patch them when the interaction itself is under test.
+    mocker.patch("app.compute._list_vms_in_zone", return_value=[])
+    mocker.patch("app.compute._delete_gcp", new=AsyncMock(return_value=True))
     mocker.patch(
         "app.github.get_repo_installation_token",
         new=AsyncMock(return_value="gh-token"),
