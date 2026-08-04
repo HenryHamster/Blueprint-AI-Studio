@@ -152,6 +152,7 @@ from datetime import datetime, timedelta, timezone
 
 import runner_isolation as iso
 import blueprint_runner as br
+import walkthrough_stack as wts
 
 
 # ── Configuration ────────────────────────────────────────────────────────────
@@ -8051,6 +8052,27 @@ def _spawn_agent_task(
     if plan.declined:
         return _decline(plan.decline_reason or "sandbox plan declined")
 
+    # walkthrough_e2e: the agent sandbox has (deliberately) no docker socket,
+    # so the runner answers the stack-boot itself via a file protocol over the
+    # workspace bind (scripts/walkthrough_stack.py). The marker must exist
+    # BEFORE the agent starts so its boot-mode decision is deterministic. Any
+    # failure here degrades silently: no marker → the agent uses its legacy
+    # in-sandbox docker path, which is exactly today's behavior.
+    stack_supervisor = None
+    if task_type == "walkthrough_e2e" and caps.docker_usable:
+        try:
+            stack_supervisor = wts.WalkthroughStackSupervisor(
+                workspace=workspace, task_id=task_id
+            )
+            stack_supervisor.write_marker()
+        except Exception as exc:  # noqa: BLE001 — supervisor is optional
+            print(
+                f"[runner] walkthrough stack supervisor unavailable for task "
+                f"{task_id} (agent falls back to in-sandbox docker): {exc}",
+                flush=True,
+            )
+            stack_supervisor = None
+
     # Open a per-task log file to persist the agent's stdout/stderr output
     # on disk (best-effort - a write failure must never prevent the task from
     # running).  The reader thread below tees output to both this log file and
@@ -8118,6 +8140,13 @@ def _spawn_agent_task(
         # backend + container_name to issue `docker stop` for the docker backend
         # (bwrap → container_name None → group-signal only). Mirrors compute.
         agent_teardown[task_id] = (plan.backend, plan.container_name)
+    if stack_supervisor is not None:
+        threading.Thread(
+            target=stack_supervisor.run,
+            args=(proc,),
+            name=f"walkthrough-stack-{task_id[:8]}",
+            daemon=True,
+        ).start()
     print(
         f"[START] task_id={task_id} type={task_type} vm={vm_instance_id} "
         f"workspace={workspace} pid={proc.pid} sandbox={plan.backend}"
