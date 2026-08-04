@@ -42,8 +42,10 @@ See also:
     subcommands.
 """
 import argparse
+import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -5489,6 +5491,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_settings_set.add_argument("--yes", action="store_true",
                                 help="Skip the confirmation prompt (for scripting).")
 
+    # deploy
+    p_deploy = sub.add_parser(
+        "deploy", parents=[common],
+        help="Activate the newest CI-built main release on the local control plane.")
+    p_deploy.add_argument(
+        "--sha", help="Deploy the release built from this commit (prefix ok); "
+                      "default is the newest successful main build.")
+    p_deploy.add_argument(
+        "--host", default="hamsterwheel",
+        help="SSH host running the control plane (default: hamsterwheel).")
+    p_deploy.add_argument("--dry-run", action="store_true",
+                          help="Show what would be deployed without deploying.")
+    p_deploy.add_argument("--yes", action="store_true",
+                          help="Skip the confirmation prompt (for scripting).")
+
     # envelope
     p_envelope = sub.add_parser(
         "envelope", parents=[common],
@@ -5764,6 +5781,101 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+_DEPLOY_REPO = "HenryHamster/BlueprintAIStudio"
+_DEPLOY_WORKFLOW = "Deploy Blueprint"
+_DEPLOY_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_DEPLOY_REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _gh(*gh_args: str) -> str:
+    """Run gh and return stdout, mapping failure to APIError for main()."""
+    proc = subprocess.run(
+        ["gh", *gh_args], capture_output=True, text=True
+    )
+    if proc.returncode != 0:
+        print(f"ERROR: gh {' '.join(gh_args[:3])}... failed: {proc.stderr.strip()[:400]}")
+        raise APIError(proc.returncode, proc.stderr.strip()[:400])
+    return proc.stdout
+
+
+def cmd_deploy(args: argparse.Namespace) -> None:
+    """Activate the newest CI-built main release on the local control plane.
+
+    Chain: find the newest successful "Deploy Blueprint" run on main (or the
+    run for --sha), download its integrity-checked local-app-release manifest,
+    then invoke the root-owned zero-argument-trust shim on the control-plane
+    host over SSH. The shim (scripts/blueprint_release.py, installed as
+    /usr/local/sbin/blueprint-release) re-validates both values against strict
+    regexes, pins the registry/repository, and the immutable release tool
+    re-verifies digest, revision label, and health with automatic rollback —
+    so this client is a convenience, not a trust boundary.
+    """
+    runs = json.loads(_gh(
+        "run", "list", "--repo", _DEPLOY_REPO, "--workflow", _DEPLOY_WORKFLOW,
+        "--branch", "main", "--limit", "15",
+        "--json", "databaseId,headSha,status,conclusion,createdAt",
+    ))
+    wanted_sha = (args.sha or "").lower() or None
+    run = next(
+        (
+            r for r in runs
+            if r.get("status") == "completed" and r.get("conclusion") == "success"
+            and (wanted_sha is None or r.get("headSha", "").startswith(wanted_sha))
+        ),
+        None,
+    )
+    if run is None:
+        print("ERROR: no successful Deploy Blueprint run found"
+              + (f" for sha {wanted_sha}" if wanted_sha else "") + ".")
+        raise APIError(1, "no successful deploy run")
+    sha = run["headSha"]
+    with tempfile.TemporaryDirectory() as tmp:
+        _gh(
+            "run", "download", str(run["databaseId"]), "--repo", _DEPLOY_REPO,
+            "-n", f"local-app-release-{sha}", "-D", tmp,
+        )
+        manifest_path = os.path.join(tmp, "local-app-release.json")
+        checksum_path = manifest_path + ".sha256"
+        with open(manifest_path, "rb") as fh:
+            manifest_bytes = fh.read()
+        with open(checksum_path, encoding="utf-8") as fh:
+            expected_digest = fh.read().split()[0]
+        actual_digest = hashlib.sha256(manifest_bytes).hexdigest()
+        if actual_digest != expected_digest:
+            print("ERROR: manifest checksum mismatch — refusing to deploy.")
+            raise APIError(1, "manifest checksum mismatch")
+        manifest = json.loads(manifest_bytes)
+    image_ref = manifest.get("image_ref", "")
+    revision = manifest.get("revision", "")
+    digest = image_ref.rsplit("@", 1)[-1]
+    if not _DEPLOY_DIGEST_RE.fullmatch(digest) or not _DEPLOY_REVISION_RE.fullmatch(revision):
+        print("ERROR: manifest digest/revision failed validation — refusing to deploy.")
+        raise APIError(1, "manifest validation failed")
+
+    print("=== LOCAL CONTROL-PLANE DEPLOY ===")
+    print(f"  Host:      {args.host}")
+    print(f"  Revision:  {revision}")
+    print(f"  Image:     ...@{digest[:19]}...")
+    print(f"  Built:     {run.get('createdAt', '?')} (run {run['databaseId']})")
+    if args.dry_run:
+        print("  (dry run — nothing deployed)")
+        return
+    if not args.yes:
+        answer = input("Activate this release? [y/N] ").strip().lower()
+        if answer not in ("y", "yes"):
+            print("Aborted.")
+            return
+    proc = subprocess.run([
+        "ssh", "-t", args.host,
+        "sudo", "/usr/local/sbin/blueprint-release", digest, revision,
+    ])
+    if proc.returncode != 0:
+        print(f"ERROR: release exited {proc.returncode} — the release tool "
+              "rolls back failed activations; inspect its receipt on the host.")
+        raise APIError(proc.returncode, "release failed")
+    print("Release activated. Runners self-update on their next heartbeat.")
+
+
 _DISPATCH = {
     "projects": cmd_projects,
     "status": cmd_status,
@@ -5792,6 +5904,7 @@ _DISPATCH = {
     "playbook": cmd_playbook,
     "knowledge": cmd_knowledge,
     "compute": cmd_compute,
+    "deploy": cmd_deploy,
 }
 
 
