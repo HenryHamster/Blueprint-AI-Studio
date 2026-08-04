@@ -6,6 +6,8 @@ export interface Toast {
   id: string;
   message: string;
   type: 'success' | 'error' | 'info';
+  /** When true the toast stays until dismissed instead of auto-hiding after 4s. */
+  persistent?: boolean;
 }
 
 const styles: Record<Toast['type'], string> = {
@@ -19,9 +21,9 @@ const toastCounterRef = { current: 0 };
 export function useToasts() {
   const [toasts, setToasts] = useState<Toast[]>([]);
 
-  const addToast = useCallback((message: string, type: Toast['type'] = 'info') => {
+  const addToast = useCallback((message: string, type: Toast['type'] = 'info', persistent = false) => {
     const id = `toast-${++toastCounterRef.current}`;
-    setToasts(prev => [...prev, { id, message, type }]);
+    setToasts(prev => [...prev, { id, message, type, persistent }]);
   }, []);
 
   const dismissToast = useCallback((id: string) => {
@@ -52,13 +54,15 @@ function ToastItem({ toast, onDismiss }: { toast: Toast; onDismiss: (id: string)
   useEffect(() => {
     requestAnimationFrame(() => setVisible(true));
 
-    autoDismissRef.current = setTimeout(startExit, 4000);
+    if (!toast.persistent) {
+      autoDismissRef.current = setTimeout(startExit, 4000);
+    }
 
     return () => {
       if (autoDismissRef.current) clearTimeout(autoDismissRef.current);
       if (exitTimeoutRef.current) clearTimeout(exitTimeoutRef.current);
     };
-  }, [startExit]);
+  }, [startExit, toast.persistent]);
 
   return (
     <div

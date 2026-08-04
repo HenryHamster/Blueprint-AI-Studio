@@ -1311,7 +1311,7 @@ describe('MessagesPanel chrome modes', () => {
     expect(el.querySelector('button[title="Delete"]')).not.toBeNull();
   });
 
-  test('minimal chat hides cycle completion receipt banner chrome', async () => {
+  test('minimal chat renders durable cycle completion receipt without count chrome', async () => {
     const el = await renderPanel({
       filterChrome: 'minimal',
       lastCycleCompletion: {
@@ -1323,10 +1323,26 @@ describe('MessagesPanel chrome modes', () => {
     });
 
     const text = el.textContent ?? '';
-    expect(text).not.toContain('Cycle complete');
+    expect(text).toContain('Cycle complete');
     expect(text).not.toContain('+2 directions');
     expect(text).not.toContain('1 task spawned');
     expect(text).not.toContain('running update written');
+  });
+
+  test('minimal chat renders durable cancellation and failure receipts', async () => {
+    const cancelled = await renderPanel({
+      filterChrome: 'minimal',
+      lastCycleCompletion: { status: 'cancelled', failure_reason: 'Operator stopped the cycle' },
+    });
+    expect(cancelled.textContent).toContain('Cycle cancelled');
+    expect(cancelled.textContent).toContain('Operator stopped the cycle');
+
+    const failed = await renderPanel({
+      filterChrome: 'minimal',
+      lastCycleCompletion: { status: 'failed', failure_reason: 'Execution site unavailable' },
+    });
+    expect(failed.textContent).toContain('Cycle failed');
+    expect(failed.textContent).toContain('Execution site unavailable');
   });
 
   test('minimal chat hides leaked batch action state after switching from full chrome', async () => {

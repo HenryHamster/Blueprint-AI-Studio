@@ -135,6 +135,42 @@ def _infra_backoff_seconds(same_signature_streak: int) -> int:
     return _INFRA_BACKOFF_SCHEDULE[idx]
 
 
+def _walkthrough_execution_site_changed(qual: dict | None) -> bool:
+    """True when a capped WALKTHROUGH_e2e infra failure was recorded by an
+    engine revision that is no longer serving.
+
+    The walkthrough product probe's infra failures are execution-site failures
+    (candidate-stack boot, Docker/Compose/Chromium availability on the runner).
+    A deploy that changes the walkthrough dispatch capability (e.g. the
+    supported-site repair) lands under a NEW serving engine sha, so a capped
+    record whose ``engine_sha`` differs from the current serving sha means the
+    repair may have taken effect.  The redrive uses this to re-arm the cap
+    exactly once.  Non-walkthrough legs have no site dependency and never
+    re-arm; a record with no detectable engine change fails closed (no re-arm).
+    """
+    if not isinstance(qual, dict):
+        return False
+    error = str(qual.get("error") or "")
+    signature = str(qual.get("infra_failure_signature") or "")
+    if not (
+        error.startswith("walkthrough_e2e")
+        or signature.startswith("walkthrough_e2e")
+    ):
+        return False
+    last_engine_sha = qual.get("engine_sha")
+    if not last_engine_sha:
+        for _entry in reversed(qual.get("infra_attempt_history") or []):
+            if isinstance(_entry, dict) and _entry.get("engine_sha"):
+                last_engine_sha = _entry.get("engine_sha")
+                break
+    if not last_engine_sha:
+        return False
+    from app.deployed_sha import get_serving_sha  # noqa: PLC0415
+
+    current = get_serving_sha()
+    return bool(current) and last_engine_sha != current
+
+
 _RUBRIC_REDRIVE_STATUSES: frozenset[str] = frozenset(
     {"rubric_changed", "rubric_provenance_unknown"}
 )
@@ -366,52 +402,75 @@ async def _redrive_infra_failure_qualification(
             _episode_cap = int(qual.get("retry_episode_cap") or 0)
             if _episode_cap > 0 and _episode >= _episode_cap:
                 effective_streak = _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS
+        # One-shot re-arm for a capped WALKTHROUGH infra failure once the
+        # execution-site capability changed.  The walkthrough probe's failures
+        # are execution-site failures (candidate-stack boot, Docker/Compose/
+        # Chromium availability on the runner).  When the engine revision that
+        # recorded the streak is no longer serving, the supported-site repair
+        # may have taken effect — give the newly-dispatched site EXACTLY ONE
+        # genuine attempt before the cap re-applies.  A re-arm attempt that
+        # fails again re-caps (the streak carries forward under the NEW engine
+        # sha), so the cap is never silently circumvented forever.
+        _rearm_after_site_change = (
+            effective_streak >= _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS
+            and _walkthrough_execution_site_changed(qual)
+        )
         if effective_streak >= _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS:
-            # Raise an operator Alert (once) so the cap is visible.  Guard
-            # against duplicate alerts with a flag on last_qualification.
-            if not qual.get("infra_failure_loop_escalated"):
-                # The Alert model has no JSON ``extra`` column, so structured
-                # evidence must live in a persisted field (``message``) to survive
-                # readback — a prior ``extra={...}`` kwarg was silently dropped.
-                # Surface the failing dimension and infra-failure signature so an
-                # operator can see WHICH gate is looping and WHY.
-                _failing_dim_label = _failing_dim or "unknown"
-                _signature = qual.get("infra_failure_signature") or "unavailable"
-                _last_error = qual.get("error") or "unavailable"
-                alert = Alert(
-                    project_id=version.project_id,
-                    severity=AlertSeverity.ERROR,
-                    title=(
-                        f"Release v{version.version_number} infra-failure "
-                        f"re-drive loop halted"
-                    ),
-                    message=(
-                        f"Release v{version.version_number} has failed "
-                        f"{effective_streak} consecutive infra-failure "
-                        f"re-drive(s) in the '{_failing_dim_label}' dimension "
-                        f"(failure signature: {_signature}; last error: "
-                        f"{_last_error}) — autonomous re-qualification halted. "
-                        f"Human review required."
-                    ),
-                    event_type="release.qualification_crash_loop",
-                )
-                redrive_session.add(alert)
-                version.last_qualification = {
-                    **qual,
-                    "infra_failure_loop_escalated": True,
-                }
-                flag_modified(version, "last_qualification")
-                redrive_session.add(version)
-                await redrive_session.commit()
+            if _rearm_after_site_change:
                 logger.warning(
-                    "[RELEASE_QUALIFIER] sweep: v%d consecutive_infra_errors=%d "
-                    "reached cap=%d — raised operator Alert and halted "
-                    "auto-requalify",
+                    "[RELEASE_QUALIFIER] sweep: v%d capped walkthrough "
+                    "infra-failure re-armed once after execution-site "
+                    "capability change (record engine_sha=%s no longer serving)",
                     version.version_number,
-                    effective_streak,
-                    _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS,
+                    str(qual.get("engine_sha") or "?")[:12],
                 )
-            return False
+                effective_streak = 0
+            else:
+                # Raise an operator Alert (once) so the cap is visible.  Guard
+                # against duplicate alerts with a flag on last_qualification.
+                if not qual.get("infra_failure_loop_escalated"):
+                    # The Alert model has no JSON ``extra`` column, so structured
+                    # evidence must live in a persisted field (``message``) to survive
+                    # readback — a prior ``extra={...}`` kwarg was silently dropped.
+                    # Surface the failing dimension and infra-failure signature so an
+                    # operator can see WHICH gate is looping and WHY.
+                    _failing_dim_label = _failing_dim or "unknown"
+                    _signature = qual.get("infra_failure_signature") or "unavailable"
+                    _last_error = qual.get("error") or "unavailable"
+                    alert = Alert(
+                        project_id=version.project_id,
+                        severity=AlertSeverity.ERROR,
+                        title=(
+                            f"Release v{version.version_number} infra-failure "
+                            f"re-drive loop halted"
+                        ),
+                        message=(
+                            f"Release v{version.version_number} has failed "
+                            f"{effective_streak} consecutive infra-failure "
+                            f"re-drive(s) in the '{_failing_dim_label}' dimension "
+                            f"(failure signature: {_signature}; last error: "
+                            f"{_last_error}) — autonomous re-qualification halted. "
+                            f"Human review required."
+                        ),
+                        event_type="release.qualification_crash_loop",
+                    )
+                    redrive_session.add(alert)
+                    version.last_qualification = {
+                        **qual,
+                        "infra_failure_loop_escalated": True,
+                    }
+                    flag_modified(version, "last_qualification")
+                    redrive_session.add(version)
+                    await redrive_session.commit()
+                    logger.warning(
+                        "[RELEASE_QUALIFIER] sweep: v%d consecutive_infra_errors=%d "
+                        "reached cap=%d — raised operator Alert and halted "
+                        "auto-requalify",
+                        version.version_number,
+                        effective_streak,
+                        _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS,
+                    )
+                return False
         # Time-based backoff keyed on candidate-agnostic same-(signature,
         # engine_sha) streak.  Unlike ``consecutive_infra_errors`` (which resets
         # when the candidate SHA advances), this streak counts trailing
@@ -419,6 +478,8 @@ async def _redrive_infra_failure_qualification(
         # the current engine_sha — so a persistent infra condition that survives
         # multiple automain promotions is still rate-limited.  Resets naturally
         # when the signature or engine_sha changes (the trailing run breaks).
+        # A re-armed walkthrough skips the stale same-engine streak (the site
+        # changed, so the old attempts' backoff must not delay the new site).
         _cur_sig = qual.get("infra_failure_signature")
         _cur_eng = qual.get("engine_sha")
         _attempt_history = [
@@ -427,7 +488,7 @@ async def _redrive_infra_failure_qualification(
             if isinstance(row, dict)
         ]
         _same_sig_streak = 0
-        if not _legacy_smoke_failure:
+        if not _legacy_smoke_failure and not _rearm_after_site_change:
             for _entry in reversed(_attempt_history):
                 if (
                     _entry.get("signature") == _cur_sig
