@@ -1021,15 +1021,10 @@ def test_acceptance_evidence_minting_is_deployed_side():
 
     sweep_source = inspect.getsource(release_qualifier_sweep)
 
-    for fn_name in (
-        "record_acceptance_window_coverage_evidence",
-        "backfill_direction_merge_evidence",
-    ):
-        assert fn_name in sweep_source, (
-            f"release_qualifier_sweep.py must invoke {fn_name} — acceptance evidence "
-            "is minted deployed-side so fixes to minting logic require a promotion "
-            "to take effect (architectural constraint; operator must be aware)"
-        )
+    assert "record_acceptance_window_coverage_evidence" in sweep_source, (
+        "release_qualifier_sweep.py must invoke acceptance-window evidence minting "
+        "deployed-side without also making a qualification decision"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -3055,39 +3050,6 @@ def test_get_fernet_returns_none_for_malformed_key(monkeypatch):
 
 
 # e11 — auto_qualification_triggers knob controls only the generic trigger sweep
-# --------------------------------------------------------------------------- #
-
-
-def test_infra_failure_redrive_is_independent_of_auto_qualification_triggers_knob():
-    """Bespoke infra_failure and deferred_unsynced re-drivers must NOT check the
-    auto_qualification_triggers runtime-config knob.
-
-    Finding e11 / Finding 9 claim: the auto_qualification_triggers knob controls
-    only the generic trigger sweep (sweep_auto_qualification_triggers), not the
-    bespoke loops (_redrive_infra_failure_qualification and
-    _redrive_deferred_unsynced_qualification).  If the bespoke re-drivers checked
-    the knob they could stall forever when the knob is 'observe' or 'off'.
-    """
-    import inspect
-    from app.release_qualifier_redrive import (
-        _redrive_infra_failure_qualification,
-        _redrive_deferred_unsynced_qualification,
-    )
-
-    for fn in (_redrive_infra_failure_qualification, _redrive_deferred_unsynced_qualification):
-        source = inspect.getsource(fn)
-        assert "auto_qualification_triggers" not in source, (
-            f"{fn.__name__} must NOT check auto_qualification_triggers — "
-            "the bespoke re-drivers run unconditionally; only the generic "
-            "sweep_auto_qualification_triggers function respects the knob"
-        )
-        assert "get_auto_qualification_triggers_mode" not in source, (
-            f"{fn.__name__} must NOT call get_auto_qualification_triggers_mode() — "
-            "bespoke re-drivers are not gated by the observe/on/off policy"
-        )
-
-
-# e16 — _MIN_INFRA_ERROR_STREAK == 3
 # --------------------------------------------------------------------------- #
 
 
@@ -5287,10 +5249,6 @@ def test_f20_18_acceptance_evidence_minting_runs_deployed_side():
         "record_acceptance_window_coverage_evidence must be imported/called in "
         "release_qualifier_sweep.py (deployed-side) — not in the sandboxed migration "
         "subprocess or smoketest child"
-    )
-    assert "backfill_direction_merge_evidence" in sweep_source or "backfill_unverified_merge_evidence" in sweep_source, (
-        "Merge-evidence backfill must run in release_qualifier_sweep.py (deployed-side) — "
-        "any fix to backfill logic is inert until the fix itself is promoted"
     )
     # The sandboxed subprocess runner must NOT be where minting happens.
     gate_source = (

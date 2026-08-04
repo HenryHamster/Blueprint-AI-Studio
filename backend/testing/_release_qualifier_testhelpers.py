@@ -644,6 +644,10 @@ async def _seed_qualification_children(
         db_session, version
     )
     rubric_fingerprint = rq._rubric_fingerprint(rubric_snapshot)
+    promotion_policy = rq._load_policy(project)
+    # This generic fixture models the ordinary non-preflight path. Tests for the
+    # optional preflight gate explicitly opt in and restamp the frozen contract.
+    env_preflight_enabled = False
     if merge_grade_task is not None:
         merge_grade_task.payloads = [
             {
@@ -662,7 +666,7 @@ async def _seed_qualification_children(
         "candidate_sha": _candidate_sha,
         "ci_green": ci_green,
         "smoketest_enabled": True,
-        "env_preflight_enabled": False,
+        "env_preflight_enabled": env_preflight_enabled,
         "started_at": "2026-05-19T00:00:00",
         "audit_task_id": str(audit_task.id),
         "smoketest_task_id": str(smoke_task.id),
@@ -671,6 +675,22 @@ async def _seed_qualification_children(
         "rubric_snapshot": rubric_snapshot,
         "rubric_fingerprint": rubric_fingerprint,
         "rubric_lifecycle_snapshot": rubric_lifecycle,
+        "version_goal": version.goal or "",
+        "promotion_policy_snapshot": promotion_policy,
+        "capability_proof_mode": rq._runtime_config.get(
+            "capability_proof_gate_mode", "off"
+        ),
+        "contract_fingerprint": rq._qualification_contract_fingerprint(
+            version.goal or "",
+            rubric_fingerprint,
+            promotion_policy=promotion_policy,
+            capability_proof_mode=rq._runtime_config.get(
+                "capability_proof_gate_mode", "off"
+            ),
+            env_preflight_enabled=env_preflight_enabled,
+            requested_probes=[],
+        ),
+        "requested_probes": [],
     }
     db_session.add(version)
     await db_session.commit()
@@ -723,6 +743,7 @@ async def _add_version_criterion(
             "rubric_fingerprint": fingerprint,
             "rubric_lifecycle_snapshot": lifecycle,
         }
+        qual = _with_current_qualification_contract(project, version, qual)
         merge_grade_id = qual.get("merge_grade_task_id")
         if merge_grade_id:
             merge_grade_task = await db_session.get(Task, uuid.UUID(str(merge_grade_id)))
@@ -743,6 +764,46 @@ async def _add_version_criterion(
         await db_session.commit()
         await db_session.refresh(version)
     return criterion
+
+
+def _with_current_qualification_contract(project, version, record=None):
+    """Return a pending qualification record with a self-consistent contract.
+
+    Tests that intentionally model spawn-time settings must update the contract
+    fingerprint alongside those frozen fields; otherwise finalize correctly
+    treats the fixture mutation as mid-flight contract drift.
+    """
+    qual = dict(record if record is not None else (version.last_qualification or {}))
+    rubric_snapshot = qual.get("rubric_snapshot") or []
+    rubric_fingerprint = rq._rubric_fingerprint(rubric_snapshot)
+    policy = qual.get("promotion_policy_snapshot")
+    if not isinstance(policy, dict):
+        policy = rq._load_policy(project)
+    capability_mode = str(
+        qual.get("capability_proof_mode")
+        or rq._runtime_config.get("capability_proof_gate_mode", "off")
+        or "off"
+    ).strip().lower()
+    version_goal = str(qual.get("version_goal", version.goal or ""))
+    requested_probes = list(qual.get("requested_probes") or [])
+    env_preflight_enabled = bool(qual.get("env_preflight_enabled", False))
+    return {
+        **qual,
+        "rubric_fingerprint": rubric_fingerprint,
+        "version_goal": version_goal,
+        "promotion_policy_snapshot": policy,
+        "capability_proof_mode": capability_mode,
+        "env_preflight_enabled": env_preflight_enabled,
+        "requested_probes": requested_probes,
+        "contract_fingerprint": rq._qualification_contract_fingerprint(
+            version_goal,
+            rubric_fingerprint,
+            promotion_policy=policy,
+            capability_proof_mode=capability_mode,
+            env_preflight_enabled=env_preflight_enabled,
+            requested_probes=requested_probes,
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2016,6 +2077,7 @@ __all__ = [
     '_promotion_failed_record',
     '_seed_qualification_children',
     '_add_version_criterion',
+    '_with_current_qualification_contract',
     '_LEDGER_SHA_A',
     '_LEDGER_SHA_B',
     '_seed_dimension_row',

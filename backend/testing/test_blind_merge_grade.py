@@ -1,16 +1,14 @@
-"""Tests for the task-spawned blind merge-grade qualification gate.
+"""Tests for holistic goal grading and the bounded legacy drain.
 
-The inline blind_merge_grade module was removed (#11716); goal-coverage grading
-is now performed by a spawned ``release_merge_grade`` agent task.  These tests
-cover the current implementation:
+Current qualifications obtain goal/category grading from the single holistic
+``release_audit`` task. The separate ``release_merge_grade`` spawn helper is
+retained only to drain or retry legacy attempts that already own that child.
+These tests cover:
 
   * ``evaluate_merge_grade`` pure-function semantics — pass / fail /
     not_applicable / unparseable — the four status values the gate produces.
-  * ``_spawn_release_merge_grade_task`` — payload shape and blindness contract.
-  * ``merge_grade_task_id`` recording in ``run_qualification`` — spawned when
-    goal is usable, skipped when goal is empty/contentless.
-  * ``_finalize_qualification`` gate decisions — block on fail, hold on missing
-    artifact, pass on covering grade.
+  * ``_spawn_release_merge_grade_task`` — legacy-drain payload and blindness.
+  * New attempts do not create a legacy merge-grade child when no grade applies.
 """
 
 from __future__ import annotations
@@ -32,6 +30,11 @@ from app.models import (
     Task,
     TaskStatus,
 )
+
+
+@pytest.fixture(autouse=True)
+def _authorized_qualification_has_a_delivery_target(monkeypatch):
+    monkeypatch.setattr(rq, "resolve_project_promotion_enabled", lambda _id: True)
 
 
 # ---------------------------------------------------------------------------
@@ -364,39 +367,6 @@ async def test_spawn_merge_grade_task_creates_queued_task(db_session):
 
 
 @pytest.mark.asyncio
-async def test_run_qualification_spawns_merge_grade_when_goal_usable(
-    db_session, mocker
-):
-    """A usable version goal causes run_qualification to spawn a merge_grade child
-    and record its id in last_qualification."""
-    project, version = await _make_project_and_version(db_session, phase="stabilize")
-    version.goal = _GOOD_GOAL
-    db_session.add(version)
-    await db_session.commit()
-
-    candidate = "cafe" * 10
-    mocker.patch("app.github.get_branch_sha", new=AsyncMock(return_value=candidate))
-
-    result = await rq.run_qualification(db_session, project.id, version)
-    await db_session.commit()
-
-    assert result["status"] == "spawned"
-    assert result.get("merge_grade_task_id"), (
-        "merge_grade_task_id must be non-None when version.goal is usable"
-    )
-    await db_session.refresh(version)
-    assert version.last_qualification["merge_grade_task_id"] is not None
-
-    tasks = (
-        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
-        .scalars()
-        .all()
-    )
-    types = [(t.first_payload or {}).get("type") for t in tasks]
-    assert "release_merge_grade" in types
-
-
-@pytest.mark.asyncio
 async def test_run_qualification_skips_merge_grade_when_goal_empty(db_session, mocker):
     """An empty goal causes run_qualification to skip the merge_grade child."""
     project, version = await _make_project_and_version(db_session, phase="stabilize")
@@ -405,7 +375,9 @@ async def test_run_qualification_skips_merge_grade_when_goal_empty(db_session, m
     candidate = "dead" * 10
     mocker.patch("app.github.get_branch_sha", new=AsyncMock(return_value=candidate))
 
-    result = await rq.run_qualification(db_session, project.id, version)
+    result = await rq.run_qualification(
+        db_session, project.id, version, explicit_request=True
+    )
     await db_session.commit()
 
     assert result["status"] == "spawned"
@@ -418,191 +390,3 @@ async def test_run_qualification_skips_merge_grade_when_goal_empty(db_session, m
     )
     types = [(t.first_payload or {}).get("type") for t in tasks]
     assert "release_merge_grade" not in types
-
-
-# ===========================================================================
-# _finalize_qualification — gate decisions (block / hold / pass)
-# ===========================================================================
-
-
-@pytest.mark.asyncio
-async def test_finalize_blocks_failing_merge_grade(db_session, mocker):
-    """A failing merge-grade verdict blocks promotion when the gate is armed."""
-    from app import shared_state
-
-    shared_state.runtime_config["promotion_enabled"] = True
-    # The merge-grade gate honours merge_grade_block_threshold (default 0.0 = off
-    # since #12457 / 74055c4f2); arm it so a failing grade actually blocks — this
-    # is the test's stated premise ("when the gate is armed").
-    mocker.patch.dict(
-        shared_state.runtime_config, {"merge_grade_block_threshold": 1.0}
-    )
-    # The armed + failing path consults the already-on-main ancestry exemption
-    # (finding 0); this candidate is NOT on the promotion target, so pin
-    # is_ancestor_of=False to keep the block load-bearing and the test hermetic.
-    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
-    promote_mock = mocker.patch(
-        "app.release_qualifier.promote",
-        new=AsyncMock(return_value={"status": "promoted", "confidence": 0.99}),
-    )
-
-    project, version = await _make_project_and_version(db_session)
-    await _seed_for_finalize(
-        db_session,
-        project,
-        version,
-        merge_grade_logs={
-            "covers_goal": False,
-            "coverage_score": 0.1,
-            "biggest_gap": "The gate was never wired into compute_composite.",
-            "candidate_sha": "feed" * 10,
-        },
-    )
-
-    _pre_gates = {
-        "ci_green": True,
-        "ci_resolution": {"state": "green", "resolved_sha": "feed" * 10, "detail": "test"},
-        "migration_verdict": "ok",
-        "migration_detail": None,
-        "apply_verdict": "ok",
-        "apply_detail": None,
-    }
-    result = await rq._finalize_qualification(db_session, version, _pre_gates=_pre_gates)
-    await db_session.commit()
-
-    assert result["status"] == "not_promoted"
-    assert result["blocker"] == "merge_grade_misses"
-    promote_mock.assert_not_awaited()
-    lq = version.last_qualification
-    assert lq["merge_grade_status"] == "fail"
-    assert lq["blocker"] == "merge_grade_misses"
-
-
-@pytest.mark.asyncio
-async def test_finalize_holds_when_merge_grade_artifact_missing(db_session, mocker):
-    """A merge_grade child that completed with NO artifact routes to infra_failure
-    (hold) — the gate cannot be silently skipped."""
-    from app import shared_state
-
-    shared_state.runtime_config["promotion_enabled"] = True
-    promote_mock = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
-
-    project, version = await _make_project_and_version(db_session)
-    # seed_merge_grade=True but merge_grade_logs=None → COMPLETED child, no artifact.
-    await _seed_for_finalize(
-        db_session,
-        project,
-        version,
-        seed_merge_grade=True,
-        merge_grade_logs=None,
-    )
-
-    _pre_gates = {
-        "ci_green": True,
-        "ci_resolution": {"state": "green", "resolved_sha": "feed" * 10, "detail": "test"},
-        "migration_verdict": "ok",
-        "migration_detail": None,
-        "apply_verdict": "ok",
-        "apply_detail": None,
-    }
-    result = await rq._finalize_qualification(db_session, version, _pre_gates=_pre_gates)
-    await db_session.commit()
-
-    assert result["status"] == "infra_failure", (
-        f"expected infra_failure when artifact absent; got {result['status']!r}"
-    )
-    promote_mock.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_finalize_passes_on_covering_merge_grade(db_session, mocker):
-    """A PASSING merge-grade verdict does not block: the composite reaches the
-    promote threshold and the gate status is 'pass'.
-
-    Uses promotion_enabled=False (dry-run) so _finalize_qualification writes the
-    final last_qualification before returning — the mocked promote() path would
-    not write it.
-    """
-    from app import shared_state
-
-    shared_state.runtime_config["promotion_enabled"] = False  # dry-run path writes lq
-    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
-
-    project, version = await _make_project_and_version(db_session)
-    await _seed_for_finalize(
-        db_session,
-        project,
-        version,
-        merge_grade_logs={
-            "covers_goal": True,
-            "coverage_score": 0.95,
-            "biggest_gap": None,
-        },
-    )
-
-    _pre_gates = {
-        "ci_green": True,
-        "ci_resolution": {"state": "green", "resolved_sha": "feed" * 10, "detail": "test"},
-        "migration_verdict": "ok",
-        "migration_detail": None,
-        "apply_verdict": "ok",
-        "apply_detail": None,
-    }
-    result = await rq._finalize_qualification(db_session, version, _pre_gates=_pre_gates)
-    await db_session.commit()
-
-    # Dry-run: would-promote path, no hard block.
-    assert result["status"] == "dry_run", (
-        f"expected dry_run (would promote); got {result['status']!r}"
-    )
-    assert result.get("would_promote") is True
-
-    await db_session.refresh(version)
-    lq = version.last_qualification
-    # Merge-grade gate must be pass — not a blocker.
-    assert lq.get("merge_grade_status") == "pass"
-    assert lq.get("blocker") is None
-
-
-@pytest.mark.asyncio
-async def test_finalize_not_applicable_when_no_merge_grade_task(db_session, mocker):
-    """When merge_grade_task_id is None (empty goal at spawn time), the gate is
-    a no-op PASS: finalize reaches dry_run / promote without a merge-grade block.
-
-    Uses promotion_enabled=False (dry-run) so last_qualification is written back
-    with merge_grade_status='not_applicable'.
-    """
-    from app import shared_state
-
-    shared_state.runtime_config["promotion_enabled"] = False  # dry-run path writes lq
-    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
-
-    project, version = await _make_project_and_version(db_session)
-    # seed_merge_grade=False → no merge_grade child, merge_grade_task_id=None.
-    await _seed_for_finalize(
-        db_session,
-        project,
-        version,
-        seed_merge_grade=False,
-        merge_grade_logs=None,
-        goal="",
-    )
-
-    _pre_gates = {
-        "ci_green": True,
-        "ci_resolution": {"state": "green", "resolved_sha": "feed" * 10, "detail": "test"},
-        "migration_verdict": "ok",
-        "migration_detail": None,
-        "apply_verdict": "ok",
-        "apply_detail": None,
-    }
-    result = await rq._finalize_qualification(db_session, version, _pre_gates=_pre_gates)
-    await db_session.commit()
-
-    assert result["status"] == "dry_run", (
-        f"absent merge_grade_task_id should not block; got {result['status']!r}"
-    )
-    await db_session.refresh(version)
-    lq = version.last_qualification
-    # Gate is not_applicable when no task was spawned.
-    assert lq.get("merge_grade_status") == "not_applicable"

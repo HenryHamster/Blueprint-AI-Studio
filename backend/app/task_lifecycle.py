@@ -2195,7 +2195,9 @@ async def _process_post_commit(
                                     guard_reason=_dh_reason,
                                     review_loop=_dh_loop,
                                     context_snapshot=dict(task.context or {}),
-                                    complete_source_on_fix_spawn=False,
+                                    gh_token=gh_token,
+                                    owner=owner,
+                                    repo=repo,
                                 )
                                 session.add(task)
                                 await session.commit()
@@ -4279,7 +4281,9 @@ async def _process_post_commit(
                                     guard_reason=_dh_reason,
                                     review_loop=_dh_loop,
                                     context_snapshot=dict(task.context or {}),
-                                    complete_source_on_fix_spawn=True,
+                                    gh_token=gh_token,
+                                    owner=owner,
+                                    repo=repo,
                                 )
                                 session.add(task)
                                 await session.commit()

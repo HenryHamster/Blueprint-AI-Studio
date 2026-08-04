@@ -340,7 +340,7 @@ export function buildStagedDirectionsText(
  * Resolve the resident loop's timing knobs from the strategic payload the
  * backend ships (runtime settings surfaced onto the payload). Defaults: 5s idle
  * (heartbeat) tick, 1.5s inbound-message poll (fast operator pickup), 120s
- * operator response-progress target, 4h unchanged-state exploration fallback,
+ * operator response-progress target, daily unchanged-state exploration fallback,
  * 300s autonomous stall budget, 3 ops/turn. The response-progress target is deliberately
  * non-destructive: a slow but healthy reply must remain usable.
  */
@@ -353,7 +353,7 @@ export function residentConfig(payload: Record<string, unknown>): ResidentConfig
   const turnTimeoutSec = num(payload.strategic_session_turn_timeout_seconds, 120);
   const explorationIntervalSec = num(
     payload.strategic_session_exploration_interval_seconds,
-    14_400,
+    86_400,
   );
   const autonomousTurnTimeoutSec = num(payload.strategic_session_autonomous_turn_timeout_seconds, 300);
   const maxOpsPerTurn = Math.max(1, Math.round(num(payload.strategic_session_max_ops_per_turn, 3)));
@@ -379,12 +379,12 @@ export function residentConfig(payload: Record<string, unknown>): ResidentConfig
     messagePollMs: Math.min(idleTickMs, Math.max(750, Math.round(messagePollSec * 1000))),
     turnTimeoutMs: Math.max(15_000, Math.round(turnTimeoutSec * 1000)),
     autonomousEnabled,
-    // The exploration fallback cannot be checked more frequently than the loop
-    // itself. Event/state/operator wakes remain immediate regardless of this knob.
-    explorationIntervalMs: Math.max(
-      idleTickMs,
-      Math.round(explorationIntervalSec * 1000),
-    ),
+    // Zero disables only unchanged-state exploration. Event/state/operator
+    // wakes and the first orientation turn remain immediate. Positive values
+    // cannot be checked more frequently than the loop itself.
+    explorationIntervalMs: explorationIntervalSec <= 0
+      ? 0
+      : Math.max(idleTickMs, Math.round(explorationIntervalSec * 1000)),
     autonomousTurnTimeoutMs: Math.max(15_000, Math.round(autonomousTurnTimeoutSec * 1000)),
     maxOpsPerTurn,
     compactionThresholdTokens,
@@ -1879,9 +1879,9 @@ export function admitDecisionEntry(
 /** Default number of focus surfaces surfaced in the prompt each tick. */
 export const FOCUS_LIST_SIZE = 3;
 /** Default interval for a deliberately sparse model-driven exploration turn when
- * no semantic event has arrived. Four hours keeps autonomous discovery available
+ * no semantic event has arrived. Daily keeps autonomous discovery available
  * without turning ordinary Resident idleness into a fixed upper-tier tax. */
-export const AUTONOMOUS_EXPLORATION_INTERVAL_MS = 14_400_000;
+export const AUTONOMOUS_EXPLORATION_INTERVAL_MS = 86_400_000;
 export const EXAM_NOTE_CAP = 240;
 /**
  * Byte budget for the serialized exam ledger. Must stay below the backend's
@@ -2439,7 +2439,30 @@ export function shouldRunAutonomousTurn(state: AutonomousTurnGateState): boolean
   if (state.ownedWorkPending) return false;
   const explorationInterval = state.explorationIntervalMs
     ?? AUTONOMOUS_EXPLORATION_INTERVAL_MS;
+  if (explorationInterval <= 0) return false;
   return state.msSinceLastAutonomousTurn >= explorationInterval;
+}
+
+/** Operator-facing projection for the next unchanged-state exploration wake. */
+export function explorationWakeProjection(
+  lastAutonomousTurnAt: number,
+  explorationIntervalMs: number,
+  ownedWorkPending: boolean,
+  nowMs = Date.now(),
+): { nextReviewAt: string | null; nextReview: string } {
+  if (ownedWorkPending || explorationIntervalMs <= 0) {
+    return { nextReviewAt: null, nextReview: 'on an actionable state change' };
+  }
+  const nextReviewMs = lastAutonomousTurnAt === 0
+    ? nowMs
+    : lastAutonomousTurnAt + explorationIntervalMs;
+  const msUntilExploration = Math.max(0, nextReviewMs - nowMs);
+  return {
+    nextReviewAt: new Date(nextReviewMs).toISOString(),
+    nextReview: msUntilExploration < 60_000
+      ? 'soon'
+      : `~${Math.round(msUntilExploration / 60_000)}min`,
+  };
 }
 
 /** Stable, order-independent identity for the actionable watch receipts in one

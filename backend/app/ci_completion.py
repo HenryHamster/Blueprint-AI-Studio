@@ -383,7 +383,9 @@ async def _attempt_merge_with_retry_and_escalation(
                 guard_reason=_hold_reason,
                 review_loop=ci_loop,
                 context_snapshot=dict(task.context or {}),
-                complete_source_on_fix_spawn=True,
+                gh_token=gh_token,
+                owner=owner,
+                repo=repo,
             )
             session.add(task)
             return False

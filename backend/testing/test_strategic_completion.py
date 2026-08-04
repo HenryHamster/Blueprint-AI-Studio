@@ -10084,6 +10084,70 @@ async def test_qualify_request_failure_recorded_on_release_version(
     assert "injected failure" in lq["qualify_request_error"]
 
 
+@pytest.mark.asyncio
+async def test_ci_blocker_commits_before_isolated_strategic_refresh(mocker):
+    """The refresh transaction cannot roll back the durable blocker write."""
+    import uuid
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from app.strategic_completion import _apply_qualify_request_post_commit
+
+    events: list[str] = []
+    project_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    project = SimpleNamespace(id=project_id)
+    task = SimpleNamespace(id=task_id)
+
+    first = AsyncMock()
+    first.get.side_effect = [project, task]
+    first.commit.side_effect = lambda: events.append("blocker_committed")
+    second = AsyncMock()
+    second.commit.side_effect = lambda: events.append("refresh_committed")
+
+    class _SessionContext:
+        def __init__(self, session):
+            self.session = session
+
+        async def __aenter__(self):
+            return self.session
+
+        async def __aexit__(self, *_args):
+            return False
+
+    factory = mocker.Mock(
+        side_effect=[_SessionContext(first), _SessionContext(second)]
+    )
+    apply_request = mocker.patch(
+        "app.strategic_completion._apply_qualify_request",
+        new=AsyncMock(return_value=True),
+    )
+
+    async def _arm(*_args, **kwargs):
+        assert events == ["blocker_committed"]
+        assert kwargs["skip_locked"] is False
+        events.append("refresh_armed")
+        return True
+
+    arm_refresh = mocker.patch(
+        "app.strategic_trigger.request_strategic_refresh", side_effect=_arm
+    )
+
+    await _apply_qualify_request_post_commit(
+        {"reason": "ready"},
+        task_id=task_id,
+        project_id=project_id,
+        path="test",
+        session_factory=factory,
+    )
+
+    apply_request.assert_awaited_once()
+    arm_refresh.assert_awaited_once()
+    first.rollback.assert_not_awaited()
+    second.commit.assert_awaited_once()
+    assert events == ["blocker_committed", "refresh_armed", "refresh_committed"]
+
+
 # ── new_acceptance_criteria transport / fallback ─────────────────────────────
 
 
@@ -17658,7 +17722,8 @@ async def test_strategist_can_correct_already_set_version_goal(db_session):
 
     A strategist-set goal (goal_editor_info startswith "[strategist:") is NOT
     frozen — a subsequent strategic task can correct a mis-authored goal.
-    Operator-set goals remain frozen.
+    Operator provenance is preserved in history, but does not hard-lock a
+    version goal that current delivery evidence shows must be corrected.
     """
     from app.strategic_completion import _apply_new_version_goal
     from app import release_version as rv
@@ -17705,7 +17770,8 @@ async def test_strategist_can_correct_already_set_version_goal(db_session):
     )
     assert version.goal_editor_info == f"[strategist:{str(task.id)[:8]}]"
 
-    # Operator-set goals must remain frozen to the strategist.
+    # Strategic may also correct an operator-authored version goal; provenance
+    # makes the handoff auditable without turning a stale goal into a deadlock.
     rv.set_version_goal(version, "operator override", editor_id="op@example.com", source="operator")
     db_session.add(version)
     await db_session.commit()
@@ -17718,9 +17784,8 @@ async def test_strategist_can_correct_already_set_version_goal(db_session):
     await db_session.commit()
     await db_session.refresh(version)
 
-    assert version.goal == "operator override", (
-        f"Operator goal must not be overridden by strategist; got {version.goal!r}"
-    )
+    assert version.goal == "strategist attempt to override operator"
+    assert version.goal_editor_info == f"[strategist:{str(task.id)[:8]}]"
 
 
 # ===========================================================================
@@ -17821,9 +17886,8 @@ async def test_apply_new_version_goal_logs_info_when_no_open_version(db_session,
 
 
 @pytest.mark.asyncio
-async def test_apply_new_version_goal_logs_info_when_operator_goal_frozen(db_session, caplog):
-    """When the open version has an operator-set goal, _apply_new_version_goal
-    must log at INFO level (not debug) so the skip is visible in standard logs."""
+async def test_apply_new_version_goal_revises_operator_authored_goal(db_session, caplog):
+    """Prior provenance is retained in the log but does not freeze the goal."""
     import logging
     from app.strategic_completion import _apply_new_version_goal
     from app import release_version as rv
@@ -17856,18 +17920,24 @@ async def test_apply_new_version_goal_logs_info_when_operator_goal_frozen(db_ses
 
     with caplog.at_level(logging.INFO, logger="app.strategic_completion"):
         await _apply_new_version_goal(
-            "Strategist attempt that must be rejected.",
+            "Strategist correction grounded in current delivery capabilities.",
             task, project, db_session, path="test",
         )
 
     assert any(
-        "operator goals are frozen to strategist" in record.message and record.levelno == logging.INFO
+        "correcting open version" in record.message
+        and "[operator:op@example.com]" in record.message
+        and record.levelno == logging.INFO
         for record in caplog.records
-    ), f"Expected INFO-level frozen-goal log; got: {[r.message for r in caplog.records]}"
+    ), f"Expected INFO-level correction log; got: {[r.message for r in caplog.records]}"
 
-    # Goal must remain unchanged
+    # _apply_new_version_goal participates in the caller's transaction; commit
+    # that transaction before reloading the row from the database.
+    await db_session.commit()
     await db_session.refresh(version)
-    assert version.goal == "operator choice"
+    assert version.goal == "Strategist correction grounded in current delivery capabilities."
+    assert version.goal_editor_info is not None
+    assert version.goal_editor_info.startswith("[strategist:")
 
 
 # ── _compute_model_gc_telemetry ───────────────────────────────────────────────
@@ -18717,11 +18787,14 @@ async def test_handle_strategic_completion_sets_new_version_goal(db_session, moc
 
 
 @pytest.mark.asyncio
-async def test_handle_strategic_completion_skips_new_version_goal_when_operator_set(
+async def test_handle_strategic_completion_can_revise_existing_operator_version_goal(
     db_session, mocker
 ):
-    """Operator-set goals are frozen to the strategist — new_version_goal from
-    a strategic cycle must not overwrite a goal that an operator authored."""
+    """Strategic can revise a system-written goal regardless of provenance.
+
+    Provenance remains visible on the resulting goal, but it is not a lock that
+    can deadlock a version around an infeasible objective.
+    """
     from unittest.mock import AsyncMock
 
     from app import release_version as rv
@@ -18767,14 +18840,15 @@ async def test_handle_strategic_completion_skips_new_version_goal_when_operator_
     await db_session.commit()
     await db_session.refresh(task)
 
-    logs = json.dumps({"new_version_goal": "strategist attempt that must be ignored"})
+    revised_goal = "Deliver an exact-head candidate that can be verified before deployment."
+    logs = json.dumps({"new_version_goal": revised_goal})
 
     await _handle_strategic_completion(task, logs, db_session)
     await db_session.refresh(version)
 
-    assert version.goal == "operator-chosen goal", (
-        f"Operator goal must not be overridden by strategist; got {version.goal!r}"
-    )
+    assert version.goal == revised_goal
+    assert version.goal_editor_info is not None
+    assert version.goal_editor_info.startswith("[strategist:")
 
 
 @pytest.mark.asyncio

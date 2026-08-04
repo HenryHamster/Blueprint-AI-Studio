@@ -204,6 +204,30 @@ async def test_rollup_does_not_credit_childless_plan_without_pr(cleanup_db):
     assert child_ids == [child.id], "no rollup/consolidation child may be spawned"
 
 
+@pytest.mark.asyncio
+async def test_pipeline_only_children_do_not_complete_unlanded_pr_owner(cleanup_db):
+    """Terminal review/fix helpers are not evidence that their parent's PR landed."""
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    review = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="review",
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+    )
+    await cleanup_db.commit()
+
+    await _check_and_trigger_rollup(review, cleanup_db)
+
+    await cleanup_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING
+    assert not (parent.context or {}).get("pr_merged")
+    assert "has not landed" in (parent.latest_status_message or "")
+
+
 def test_post_commit_locked_preserves_lock_scope():
     from app.task_lifecycle import PostCommitLocked
 

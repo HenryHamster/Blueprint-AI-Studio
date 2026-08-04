@@ -687,10 +687,10 @@ describe('buildThinkerPrompt', () => {
     expect(prompt).toContain('top level');
     // Must note it does not persist in the stored model
     expect(prompt).toContain('does not persist in the stored model');
-    // Must explain when to write it (only when goal is unset)
-    expect(prompt).toContain('goal is currently unset');
-    // Must note that once set, it is frozen (skip if already set)
-    expect(prompt).toContain('frozen once set');
+    // Must explain both initial authoring and evidence-based revision.
+    expect(prompt).toContain('goal is unset OR');
+    expect(prompt).toContain('infeasible, circular, stale, or badly scoped');
+    expect(prompt).toContain('normal `spawn-task` operations');
     // Must specify the character limit
     expect(prompt).toContain('500 characters');
     // Must steer toward substantive/directional goals (operator requirement)

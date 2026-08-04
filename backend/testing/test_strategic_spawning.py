@@ -8188,6 +8188,9 @@ async def test_stabilize_stall_hint_fires_for_old_stabilize_version(
         f"Expected STALLED nudge in prompt_suffix; got: {suffix}"
     )
     assert "stabilize" in suffix.lower()
+    assert "does NOT start automatically" in suffix
+    assert "YOU must emit qualify_request" in suffix
+    assert "fires AUTOMATICALLY" not in suffix
 
     vp = payload.get("version_phase")
     assert vp is not None
@@ -9704,7 +9707,8 @@ async def test_post_promote_handoff_respects_existing_fresh_goal(
     assert "Version handoff" in suffix
     assert fresh_goal in suffix or vp.get("goal") == fresh_goal
     assert "goal field on v2 is null" not in suffix
-    assert "new_version_goal" not in suffix
+    assert "review v2's existing `version_phase.goal`" in suffix
+    assert "keep it if sound" in suffix
 
 
 @pytest.mark.asyncio
@@ -10904,6 +10908,12 @@ async def test_deployment_state_block_in_payload_when_split(db_session, mocker):
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
+    from app.runtime_config_state import runtime_config
+
+    mocker.patch.dict(
+        runtime_config,
+        {"promotion_enabled": True, "promotion_enabled_by_project": {str(project.id): False}},
+    )
 
     now = _utcnow_naive()
     db_session.add(
@@ -10963,6 +10973,16 @@ async def test_deployment_state_block_in_payload_when_split(db_session, mocker):
     assert ds is not None, "deployment_state block missing under an LTS split"
     assert ds["integration_branch"] == "automain"
     assert ds["promotion_target"] == "main"
+    assert ds["promotion_enabled"] is False
+    assert ds["promotion_enabled_source"] == "project_override"
+    assert ds["deploy_identity"] == "acme/widget"
+    assert ds["deploy_identity_matches_project"] is True
+    assert ds["deployment_state_available"] is True
+    # A build-phase version has not entered promotion yet, so it has no serving
+    # observation rather than a failed/unconfirmed serving observation.
+    assert ds["open_serving_status"] is None
+    assert "promotion_enabled=False" in payload.get("prompt_suffix", "")
+    assert "revise, split, replace, or park" in payload.get("prompt_suffix", "")
     assert ds["deployed_sha"] == "deadbeefcafe"  # DeploymentState.current_sha, 12-char
     assert ds["deploy_status"] == "STABLE"
     assert ds["promoted_version"] == 1

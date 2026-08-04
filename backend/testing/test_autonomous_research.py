@@ -984,7 +984,7 @@ async def test_all_paused_directions_still_get_strategic_via_backstop(
     await db_session.commit()
     await db_session.refresh(project)
 
-    # A prior strategic task older than strategic_max_interval (180min) so the
+    # A prior strategic task older than the daily strategic_max_interval so the
     # wall-clock backstop promotes force_strategic=True.
     stale_strategic = Task(
         project_id=project.id,
@@ -992,7 +992,7 @@ async def test_all_paused_directions_still_get_strategic_via_backstop(
         payloads=[{"type": "design_doc_update", "base_branch": "main"}],
         status=TaskStatus.COMPLETED,
         created_by="ORCHESTRATOR",
-        created_at=_utcnow() - timedelta(minutes=200),
+        created_at=_utcnow() - timedelta(minutes=1_500),
     )
     db_session.add(stale_strategic)
     await db_session.commit()
@@ -1050,7 +1050,7 @@ async def test_strategic_spawn_skipped_when_advisory_lock_held(db_session, mocke
         payloads=[{"type": "design_doc_update", "base_branch": "main"}],
         status=TaskStatus.COMPLETED,
         created_by="ORCHESTRATOR",
-        created_at=_utcnow() - timedelta(minutes=200),
+        created_at=_utcnow() - timedelta(minutes=1_500),
     )
     db_session.add(stale_strategic)
     await db_session.commit()
@@ -1094,7 +1094,7 @@ async def test_architecture_cycle_triggers_on_first_cycle_with_empty_design_doc(
     await db_session.commit()
     await db_session.refresh(project)
 
-    # A prior strategic task older than strategic_max_interval (180min) so the
+    # A prior strategic task older than the daily strategic_max_interval so the
     # wall-clock backstop promotes force_strategic=True, which triggers the strategic
     # spawn regardless of the modulo counter.
     stale_strategic = Task(
@@ -1103,7 +1103,7 @@ async def test_architecture_cycle_triggers_on_first_cycle_with_empty_design_doc(
         payloads=[{"type": "design_doc_update", "base_branch": "main"}],
         status=TaskStatus.COMPLETED,
         created_by="ORCHESTRATOR",
-        created_at=_utcnow() - timedelta(minutes=200),
+        created_at=_utcnow() - timedelta(minutes=1_500),
     )
     db_session.add(stale_strategic)
     await db_session.commit()
@@ -13064,6 +13064,12 @@ async def test_strategic_max_interval_backstop_fires_when_stale(db_session, mock
         "app.strategic_spawning._spawn_design_doc_update",
         new=AsyncMock(return_value=True),
     )
+    # Exercise the configurable three-hour backstop explicitly. The production
+    # default is intentionally daily, so a four-hour-old cycle is not stale
+    # unless this installation selects the shorter cadence.
+    mocker.patch.dict(
+        _shared_state.runtime_config, {"strategic_max_interval_minutes": 180}
+    )
 
     project = Project(
         name="Backstop Fires Project",
@@ -13157,6 +13163,9 @@ async def test_strategic_max_interval_backstop_fires_when_all_directions_busy(
     mocker.patch(
         "app.strategic_spawning._spawn_design_doc_update",
         new=AsyncMock(return_value=True),
+    )
+    mocker.patch.dict(
+        _shared_state.runtime_config, {"strategic_max_interval_minutes": 180}
     )
 
     dir_id = "d-busybackstop01"
@@ -16701,7 +16710,7 @@ async def test_zero_eligible_directions_triggers_strategic_refresh(db_session, m
     the coalescing mechanism so the strategist can replenish the portfolio.
 
     The strategist may explicitly re-open held directions by clearing
-    refractory_until; the 180-min wall-clock backstop remains the safety net.
+    refractory_until; the configurable sparse wall-clock backstop remains the safety net.
     """
     request_strategic_refresh_mock = mocker.patch(
         "app.strategic_trigger.request_strategic_refresh",

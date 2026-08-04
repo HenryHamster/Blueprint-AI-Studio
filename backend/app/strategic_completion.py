@@ -1161,7 +1161,7 @@ async def _apply_new_version_goal(
     session: AsyncSession,
     *,
     path: str,
-) -> None:
+) -> bool:
     """Apply an optional ``new_version_goal`` from the strategic agent.
 
     ``goal`` is the raw value from either:
@@ -1170,15 +1170,13 @@ async def _apply_new_version_goal(
 
     When valid, sets the goal with ``source='strategist'`` and ``session.add``s
     the row — the caller's surrounding ``await session.commit()`` persists it.
-    A strategist-set goal may be corrected by a subsequent strategist call;
-    only operator-set goals (``goal_editor_info`` starts with ``'[operator:'``)
-    are frozen against strategist overwrite.
+    Strategic may correct any system-written version goal when evidence shows
+    it is infeasible or badly scoped; ``goal_editor_info`` retains provenance.
 
     Silently no-ops when:
       - ``goal`` is None / not a non-empty string
       - ``is_contentless_goal`` returns True
       - The project has no open ``ReleaseVersion``
-      - The open version has an operator-set goal (operator goals are frozen to strategist)
 
     All errors are logged and swallowed — a bad or absent goal must never
     block vision/direction writes.
@@ -1208,22 +1206,13 @@ async def _apply_new_version_goal(
             )
             return
         if _open_ver.goal is not None:
-            _ei = _open_ver.goal_editor_info or ""
-            if _ei.startswith("[operator:"):
-                logger.info(
-                    "[STRATEGIC] Task %s (%s path): open version v%d has an operator-set goal "
-                    "— skipping new_version_goal (operator goals are frozen to strategist)",
-                    task.id,
-                    path,
-                    _open_ver.version_number,
-                )
-                return
             logger.info(
-                "[STRATEGIC] Task %s (%s path): open version v%d has a non-operator goal "
-                "— allowing strategist correction",
+                "[STRATEGIC] Task %s (%s path): correcting open version v%d goal "
+                "(prior provenance=%s)",
                 task.id,
                 path,
                 _open_ver.version_number,
+                _open_ver.goal_editor_info,
             )
         _set_version_goal(
             _open_ver,
@@ -1446,15 +1435,18 @@ async def _apply_qualify_request(
     by CI-compliance violations, and calls ``release_qualifier.run_qualification``
     (which snapshots the candidate SHA + spawns the active qualifier children;
     the caller's surrounding commit persists its version-row writes). When
-    CI-compliance blocks qualification, the cap-bump remediation task is spawned
-    before returning.
+    CI-compliance blocks qualification, durable blocker evidence is recorded and
+    the durable blocker is staged and ``True`` is returned. The post-commit
+    wrapper then arms a coalesced Strategic refresh in a separate transaction,
+    after blocker durability is established. Strategic uses its ordinary task
+    authority to choose any repair; this path never hard-codes one.
 
     Silently no-ops when ``request`` is None/not a dict, there is no open
     ``ReleaseVersion``, or that version is not in ``stabilize``. All errors are
     logged and swallowed — a bad or absent request must never block the write.
     """
     if not request or not isinstance(request, dict):
-        return
+        return False
     reason_raw = request.get("reason")
     reason = reason_raw.strip() or None if isinstance(reason_raw, str) else None
     try:
@@ -1466,9 +1458,9 @@ async def _apply_qualify_request(
             path,
             exc,
         )
-        return
+        return False
     if normalized_request is None:
-        return
+        return False
     reason = normalized_request["reason"] or None
     requested_probes = normalized_request["probes"]
     # Initialised outside the try so the except clause can record a durable
@@ -1487,7 +1479,7 @@ async def _apply_qualify_request(
                 path,
                 project.id,
             )
-            return
+            return False
         if open_ver.phase != "stabilize":
             logger.info(
                 "[STRATEGIC] Task %s (%s path): qualify_request for project %s "
@@ -1498,11 +1490,10 @@ async def _apply_qualify_request(
                 open_ver.version_number,
                 open_ver.phase,
             )
-            return
+            return False
         try:
             from app import ci_compliance as _ci_compliance
             from app.strategic_spawning import (
-                _maybe_spawn_ci_compliance_cap_bump_fix,
                 ci_compliance_qualify_gate,
             )
 
@@ -1512,41 +1503,40 @@ async def _apply_qualify_request(
             if status.get("status") == "success":
                 gate = ci_compliance_qualify_gate(project, status.get("head_sha"))
                 if gate.get("blocked"):
-                    spawned = await _maybe_spawn_ci_compliance_cap_bump_fix(
-                        session, project, gate
-                    )
                     logger.info(
                         "[STRATEGIC] Task %s (%s path): qualify_request for "
                         "project %s version v%d blocked by CI-compliance "
-                        "violations=%s head=%s cap_bump_task=%s (reason=%r)",
+                        "violations=%s head=%s; returning evidence to Strategic "
+                        "without spawning a release-specific repair (reason=%r)",
                         task.id,
                         path,
                         project.id,
                         open_ver.version_number,
                         gate.get("violation_count", 0),
                         gate.get("head_sha"),
-                        getattr(spawned, "id", None),
                         reason,
                     )
                     # Record the CI-compliance block durably on the version row
                     # so the resident strategist can see WHY a requested
-                    # qualification never started. This path only spawns a
-                    # cap-bump task + logs today, leaving last_qualification null —
-                    # indistinguishable from "never requested" without log access.
+                    # qualification never started. The previous path only
+                    # spawned a cap-bump task and logged, leaving
+                    # last_qualification null and therefore indistinguishable
+                    # from "never requested" without log access.
                     # Merged under a dedicated key (like the qualify_request_error
                     # trace on the failure path below) so it never overwrites a
                     # prior verdict's "status" and cannot perturb
-                    # run_qualification's cached-verdict guard.
+                    # run_qualification's cached-verdict guard. Strategic sees
+                    # the actionable evidence on its next state-change wake and
+                    # may use its ordinary task authority to choose a repair.
                     try:
                         open_ver.last_qualification = {
                             **(open_ver.last_qualification or {}),
                             "qualify_request_blocked": {
                                 "blocker": "ci_compliance",
+                                "blocker_class": "actionable",
                                 "violation_count": gate.get("violation_count", 0),
                                 "head_sha": gate.get("head_sha"),
-                                "cap_bump_task": (
-                                    str(spawned.id) if spawned is not None else None
-                                ),
+                                "repair_task": None,
                             },
                             "qualify_request_blocked_at": _utcnow().isoformat(),
                         }
@@ -1555,11 +1545,12 @@ async def _apply_qualify_request(
                     except Exception:
                         logger.exception(
                             "[STRATEGIC] Task %s (%s path): failed to record "
-                            "qualify_request CI-compliance block on ReleaseVersion",
+                            "qualify_request CI-compliance block",
                             task.id,
                             path,
                         )
-                    return
+                        return False
+                    return True
             else:
                 logger.info(
                     "[STRATEGIC] Task %s (%s path): CI-compliance status "
@@ -1583,6 +1574,7 @@ async def _apply_qualify_request(
             project.id,
             open_ver,
             requested_probes=requested_probes,
+            explicit_request=True,
         )
         logger.info(
             "[STRATEGIC] Task %s (%s path): qualify_request ran qualification "
@@ -1624,6 +1616,7 @@ async def _apply_qualify_request(
                     task.id,
                     path,
                 )
+    return False
 
 
 def _extract_rationale_from_notes(direction: dict | None, prefix: str) -> str | None:
@@ -3966,13 +3959,16 @@ async def _apply_qualify_request_post_commit(
     from app.database import AsyncSessionLocal
 
     factory = session_factory or AsyncSessionLocal
+    refresh_required = False
     try:
         async with factory() as fresh:
             project = await fresh.get(Project, project_id)
             task = await fresh.get(Task, task_id)
             if project is None or task is None:
                 return
-            await _apply_qualify_request(request, task, project, fresh, path=path)
+            refresh_required = await _apply_qualify_request(
+                request, task, project, fresh, path=path
+            )
             await fresh.commit()
     except Exception:  # noqa: BLE001
         logger.warning(
@@ -3984,6 +3980,41 @@ async def _apply_qualify_request_post_commit(
             path,
             exc_info=True,
         )
+        return
+
+    if refresh_required:
+        # Keep refresh arming isolated from blocker persistence. The trigger's
+        # bounded lock-retry path may roll its transaction back on contention or
+        # DB failure; running it in a fresh session means that can never erase
+        # the already-committed ReleaseVersion evidence above.
+        try:
+            from app.strategic_trigger import request_strategic_refresh
+
+            async with factory() as refresh_session:
+                armed = await request_strategic_refresh(
+                    refresh_session,
+                    project_id,
+                    "qualification blocked by actionable CI compliance evidence",
+                    skip_locked=False,
+                )
+                if armed:
+                    await refresh_session.commit()
+                else:
+                    await refresh_session.rollback()
+            if not armed:
+                logger.warning(
+                    "[STRATEGIC_COMPLETION] CI-compliance blocker committed but "
+                    "Strategic refresh could not be armed for project %s; the "
+                    "cadence backstop remains available",
+                    project_id,
+                )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[STRATEGIC_COMPLETION] CI-compliance blocker committed but "
+                "isolated Strategic refresh failed for project %s",
+                project_id,
+                exc_info=True,
+            )
 
 
 async def _maybe_retry_workday_auto_start(

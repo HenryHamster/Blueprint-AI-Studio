@@ -440,62 +440,6 @@ class TestPromotionCiGreenGate:
         assert gate["gate_state"] == "unavailable"
 
     @pytest.mark.asyncio
-    async def test_promotion_ci_green_gate_defers_when_suite_not_green(
-        self, db_session, mocker
-    ):
-        """Named acceptance test: a non-green integration-HEAD CI run makes the
-        promotion_failed re-driver DEFER — it returns False without calling
-        run_qualification, so no audit and no circuit-breaker attempt are burned.
-
-        Exercises the real production code end-to-end: compute_promotion_ci_green_gate
-        (release_readiness) resolves a FAILED ci.yml run for the integration HEAD,
-        and _redrive_promotion_failed_qualification (release_qualifier_redrive) reads
-        that non-green verdict and defers.
-        """
-        from app.release_qualifier_sweep import (
-            _redrive_promotion_failed_qualification,
-        )
-
-        project, version = await _make_project_and_version(db_session)
-        version.last_qualification = {
-            "status": "promotion_failed",
-            "candidate_sha": "abc123def456",
-            "error": "required_check_failed",
-            "promotion_failure_count": 1,
-        }
-        db_session.add(version)
-        await db_session.commit()
-        await db_session.refresh(version)
-
-        # Remediation window clear → readiness ready; the ONLY thing that should
-        # stop the re-drive is the not-green CI gate.
-        mocker.patch(
-            "app.release_readiness.compute_requalification_readiness",
-            new=AsyncMock(return_value={"requalification_ready": True}),
-        )
-        # Real gate runs against these mocked github helpers → a FAILED run.
-        _patch_gate_github(
-            mocker,
-            run={"run_id": 99, "status": "completed", "conclusion": "failure"},
-            head_sha="abc123def456",
-        )
-        run_qual = mocker.patch(
-            "app.release_qualifier.run_qualification",
-            new=AsyncMock(return_value={"status": "spawned"}),
-        )
-
-        @contextlib.asynccontextmanager
-        async def _factory():
-            yield db_session
-
-        result = await _redrive_promotion_failed_qualification(
-            version.id, session_factory=_factory
-        )
-
-        assert result is False
-        run_qual.assert_not_awaited()
-
-    @pytest.mark.asyncio
     async def test_unresolvable_head_sha_maps_to_unavailable(
         self, db_session, mocker
     ):

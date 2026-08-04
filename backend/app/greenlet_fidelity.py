@@ -118,7 +118,6 @@ ROLLBACK_FLOW_ALLOWLIST: frozenset[str] = frozenset({
     # version.id at L1364 is accessed after rollback of fire_session (a scoped
     # sub-session); version is bound to the outer session's identity map so
     # fire_session.rollback() does not expire it.
-    "release_qualifier_sweep.py::_run_auto_qualification_trigger_for_version",
     # existing.id at L1219 is read after IntegrityError rollback at L1213;
     # existing is immediately re-fetched via _get_active_pipeline_task_by_key
     # (which issues session.execute internally) before the .id read; scanner

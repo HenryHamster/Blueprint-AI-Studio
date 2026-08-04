@@ -16,6 +16,213 @@ candidate SHA + attempt id when explicitly requested, and no child by default.""
 from _release_qualifier_testhelpers import *  # noqa: F403
 
 
+def test_qualification_contract_fingerprint_tracks_goal_and_categories():
+    empty_rubric = rq._rubric_fingerprint([])
+    category_rubric = rq._rubric_fingerprint(
+        [{"criterion_key": "ship", "text": "Ship the feature"}]
+    )
+    baseline = rq._qualification_contract_fingerprint("Ship safely", empty_rubric)
+
+    assert baseline == rq._qualification_contract_fingerprint(
+        "  Ship   safely  ", empty_rubric
+    )
+    assert baseline != rq._qualification_contract_fingerprint(
+        "Ship quickly", empty_rubric
+    )
+    assert baseline != rq._qualification_contract_fingerprint(
+        "Ship safely", category_rubric
+    )
+    assert baseline != rq._qualification_contract_fingerprint(
+        "Ship safely",
+        empty_rubric,
+        promotion_policy={"threshold": 0.91, "weights": {"audit": 1.0}},
+    )
+    assert baseline != rq._qualification_contract_fingerprint(
+        "Ship safely", empty_rubric, capability_proof_mode="enforce"
+    )
+    assert rq._qualification_contract_fingerprint(
+        "Ship safely", empty_rubric, requested_probes=["walkthrough", "smoke"]
+    ) == rq._qualification_contract_fingerprint(
+        "Ship safely", empty_rubric, requested_probes=["smoke", "walkthrough"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_promotion_disabled_does_not_overwrite_pending_qualification(
+    db_session, mocker
+):
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    pending = {
+        "status": "pending",
+        "qualification_attempt_id": str(uuid.uuid4()),
+        "candidate_sha": "pending0" * 5,
+    }
+    version.last_qualification = pending
+    db_session.add(version)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.release_qualifier.resolve_project_promotion_enabled",
+        return_value=False,
+    )
+    mocker.patch(
+        "app.release_qualifier._qualification_in_flight",
+        new=AsyncMock(return_value=True),
+    )
+
+    result = await rq.run_qualification(
+        db_session, project.id, version, explicit_request=True
+    )
+
+    assert result == {"status": "already_pending"}
+    await db_session.refresh(version)
+    assert version.last_qualification == pending
+
+
+@pytest.mark.asyncio
+async def test_pending_goal_change_supersedes_attempt_before_promotion(
+    db_session, mocker
+):
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    launched_goal = "Ship the original goal"
+    launched_rubric = []
+    rubric_fingerprint = rq._rubric_fingerprint(launched_rubric)
+    policy_snapshot = {"threshold": 0.8, "weights": {}}
+    version.goal = "Ship the revised goal"
+    version.last_qualification = {
+        "status": "pending",
+        "qualification_attempt_id": str(uuid.uuid4()),
+        "candidate_sha": "contract" * 5,
+        "version_goal": launched_goal,
+        "rubric_snapshot": launched_rubric,
+        "rubric_fingerprint": rubric_fingerprint,
+        "rubric_lifecycle_snapshot": [],
+        "rubric_provenance": rq._rubric_provenance(
+            launched_rubric,
+            source="qualification_launch",
+            qualification_attempt_id=None,
+        ),
+        "contract_fingerprint": rq._qualification_contract_fingerprint(
+            launched_goal,
+            rubric_fingerprint,
+            promotion_policy=policy_snapshot,
+        ),
+        "promotion_policy_snapshot": policy_snapshot,
+        "capability_proof_mode": "off",
+        "env_preflight_enabled": False,
+        "requested_probes": [],
+        "started_at": "2026-08-03T00:00:00+00:00",
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+    result = await rq._finalize_qualification(
+        db_session,
+        version,
+        _pre_gates={
+            "ci_green": True,
+            "ci_resolution": {"state": "green", "resolved_sha": "contract" * 5},
+        },
+    )
+
+    assert result["status"] == "rubric_changed"
+    assert result["blocker"] == "qualification_contract_superseded"
+    promote_spy.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "contract_change", ["goal", "category", "policy_threshold", "capability_mode"]
+)
+@pytest.mark.asyncio
+async def test_same_sha_contract_change_spawns_fresh_holistic_review(
+    db_session, mocker, contract_change
+):
+    from app import shared_state
+
+    mocker.patch.dict(
+        shared_state.runtime_config,
+        {
+            "promotion_enabled": True,
+            "capability_proof_gate_mode": "off",
+            "env_preflight_enabled": False,
+        },
+        clear=False,
+    )
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    candidate = "newcontract" * 4
+    launched_goal = "Ship the original outcome"
+    launched_rubric = []
+    launched_rubric_fingerprint = rq._rubric_fingerprint(launched_rubric)
+    launched_policy = rq._load_policy(project)
+    launched_contract = rq._qualification_contract_fingerprint(
+        launched_goal,
+        launched_rubric_fingerprint,
+        promotion_policy=launched_policy,
+        capability_proof_mode="off",
+        env_preflight_enabled=False,
+        requested_probes=[],
+    )
+    version.goal = launched_goal
+    version.last_qualification = {
+        "status": "dry_run",
+        "candidate_sha": candidate,
+        "requested_probes": [],
+        "version_goal": launched_goal,
+        "rubric_snapshot": launched_rubric,
+        "rubric_fingerprint": launched_rubric_fingerprint,
+        "contract_fingerprint": launched_contract,
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    if contract_change == "goal":
+        version.goal = "Ship the revised outcome"
+        db_session.add(version)
+        await db_session.commit()
+    elif contract_change == "category":
+        await _add_version_criterion(
+            db_session,
+            project,
+            version,
+            key="new-category",
+            text="Prove the newly required outcome",
+        )
+    elif contract_change == "policy_threshold":
+        old_threshold = float(launched_policy["threshold"])
+        changed_threshold = 0.95 if old_threshold != 0.95 else 0.9
+        project.build_config = {
+            **(project.build_config or {}),
+            "promotion_threshold": changed_threshold,
+        }
+        db_session.add(project)
+        await db_session.commit()
+    else:
+        shared_state.runtime_config["capability_proof_gate_mode"] = "enforce"
+
+    mocker.patch(
+        "app.github.get_repo_installation_token", new=AsyncMock(return_value="gh-token")
+    )
+    mocker.patch("app.github.get_branch_sha", new=AsyncMock(return_value=candidate))
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"conclusion": "success"}),
+    )
+
+    result = await rq.run_qualification(
+        db_session, project.id, version, explicit_request=True
+    )
+    await db_session.commit()
+
+    assert result["status"] == "spawned"
+    assert result["audit_task_id"] is not None
+    await db_session.refresh(version)
+    assert version.last_qualification["contract_fingerprint"] != launched_contract
+
+
 @pytest.mark.asyncio
 async def test_run_qualification_spawns_walkthrough_e2e_when_enabled(
     db_session, mocker
@@ -31,6 +238,7 @@ async def test_run_qualification_spawns_walkthrough_e2e_when_enabled(
 
     shared_state.runtime_config["smoketest_enabled"] = False
     shared_state.runtime_config["env_preflight_enabled"] = False
+    shared_state.runtime_config["promotion_enabled"] = True
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
 
@@ -53,6 +261,7 @@ async def test_run_qualification_spawns_walkthrough_e2e_when_enabled(
         project.id,
         version,
         requested_probes=["walkthrough_e2e"],
+        explicit_request=True,
     )
     await db_session.commit()
 
@@ -110,6 +319,7 @@ async def test_run_qualification_skips_walkthrough_e2e_when_disabled(
 
     shared_state.runtime_config["smoketest_enabled"] = False
     shared_state.runtime_config["env_preflight_enabled"] = False
+    shared_state.runtime_config["promotion_enabled"] = True
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
 
@@ -127,7 +337,9 @@ async def test_run_qualification_skips_walkthrough_e2e_when_disabled(
         new=AsyncMock(return_value={"conclusion": "success"}),
     )
 
-    result = await rq.run_qualification(db_session, project.id, version)
+    result = await rq.run_qualification(
+        db_session, project.id, version, explicit_request=True
+    )
     await db_session.commit()
 
     assert result["status"] == "spawned"
@@ -374,6 +586,7 @@ async def test_walkthrough_e2e_lane_records_registered_criterion_evidence(
 
     shared_state.runtime_config["smoketest_enabled"] = False
     shared_state.runtime_config["env_preflight_enabled"] = False
+    shared_state.runtime_config["promotion_enabled"] = True
 
     # PROPERTY 1: project + open version; register the three emitted keys as ACTIVE criteria.
     project, version = await _make_project_and_version(db_session, phase="stabilize")
@@ -428,6 +641,7 @@ async def test_walkthrough_e2e_lane_records_registered_criterion_evidence(
         project.id,
         version,
         requested_probes=["walkthrough_e2e"],
+        explicit_request=True,
     )
     await db_session.commit()
 

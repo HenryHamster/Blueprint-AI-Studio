@@ -3634,12 +3634,37 @@ async def test_merge_dual_head_migration_spawns_guard_fix(db_session, mocker):
         AsyncMock(return_value=_DUAL_HEAD_DIFF),
     )
     mocker.patch(
+        "app.github.get_pull_request",
+        AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "base": {"sha": "test-base-42", "ref": "main"},
+                "head": {
+                    "sha": "test-head-42",
+                    "ref": "blueprint/test-branch",
+                },
+            }
+        ),
+    )
+    mocker.patch(
         "app.github.list_versions_at_ref",
         AsyncMock(return_value=["0001_init.py", "0002_existing.py"]),
     )
     merge_mock = mocker.patch(
         "app.github.merge_pull_request",
         AsyncMock(return_value={"merged": True}),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "base": {"sha": "base-42", "ref": "automain"},
+                "head": {"sha": "head-42", "ref": "blueprint/test-branch"},
+            }
+        ),
     )
     fake_fix = type("FT", (), {"id": uuid.uuid4()})()
     spawn_mock = mocker.patch(
@@ -3664,9 +3689,15 @@ async def test_merge_dual_head_migration_spawns_guard_fix(db_session, mocker):
     merge_mock.assert_not_called()
     spawn_mock.assert_awaited_once()
     assert spawn_mock.await_args.kwargs.get("fix_reason") == "migration_guard"
+    assert spawn_mock.await_args.kwargs.get("fix_target") == {
+        "project_id": str(project.id),
+        "pr_number": 42,
+        "base_sha": "base-42",
+        "head_sha": "head-42",
+    }
     assert spawn_mock.await_args.kwargs.get("suppress_warm_handoff") is True
     assert "0002" in (spawn_mock.await_args.kwargs.get("fix_prompt") or "")
-    assert task.status == TaskStatus.COMPLETED
+    assert task.status == TaskStatus.EVALUATING
     review_loop = (task.context or {}).get("review_loop", {})
     assert review_loop.get("ci_waiting") is False
     assert review_loop.get("ci_passed") is False
@@ -3684,6 +3715,20 @@ async def test_merge_dual_head_fix_spawn_defer_retries_ci_wait(db_session, mocke
     from app.review_pipeline import SPAWN_REASON_DEFERRED, SPAWN_REASON_KEY
 
     mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch(
+        "app.github.get_pull_request",
+        AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "base": {"sha": "test-base-42", "ref": "main"},
+                "head": {
+                    "sha": "test-head-42",
+                    "ref": "blueprint/test-branch",
+                },
+            }
+        ),
+    )
     mocker.patch(
         "app.github.get_pr_files",
         AsyncMock(
@@ -3745,6 +3790,253 @@ async def test_merge_dual_head_fix_spawn_defer_retries_ci_wait(db_session, mocke
     assert review_loop.get("migration_guard_state") == "fix_deferred"
     assert review_loop.get("migration_guard_fix_spawned") is None
     assert "spawn was deferred" in (task.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_migration_guard_moved_pr_replaces_queued_stale_fix(db_session, mocker):
+    """A moved PR replaces an unclaimed stale fix without retargeting it."""
+    from app.migration_guard_recovery import spawn_migration_guard_fix_task
+
+    project = Project(name="migration fix immutable target", user_id="test-user")
+    db_session.add(project)
+    await db_session.flush()
+    source = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={
+            "review_target": {
+                "project_id": str(project.id),
+                "pr_number": 42,
+                "base_sha": "old-base",
+                "head_sha": "old-head",
+            }
+        },
+    )
+    old_target = {
+        "project_id": str(project.id),
+        "pr_number": 42,
+        "base_sha": "old-base",
+        "head_sha": "old-head",
+    }
+    active_fix = Task(
+        project_id=project.id,
+        title="existing migration fix",
+        payloads=[{"type": "fix", "pr_number": 42}],
+        status=TaskStatus.QUEUED,
+        context={
+            "review_loop": {
+                "pr_number": 42,
+                "branch": "blueprint/test-branch",
+                "base_branch": "automain",
+                "fix_target": old_target,
+            }
+        },
+    )
+    db_session.add(active_fix)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.github.get_pull_request",
+        AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "base": {"sha": "new-base", "ref": "automain"},
+                "head": {"sha": "new-head", "ref": "blueprint/test-branch"},
+            }
+        ),
+    )
+    replacement = Task(
+        project_id=project.id,
+        title="replacement migration fix",
+        payloads=[{"type": "fix", "pr_number": 42}],
+        status=TaskStatus.QUEUED,
+    )
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        AsyncMock(return_value=(replacement, True)),
+    )
+
+    spawned, created = await spawn_migration_guard_fix_task(
+        source,
+        db_session,
+        pr_number=42,
+        branch="blueprint/test-branch",
+        base_branch="automain",
+        guard_reason="duplicate revision",
+        review_loop=(source.context or {}).get("review_loop"),
+        gh_token="fake-token",
+        owner="owner",
+        repo="repo",
+    )
+
+    assert spawned is replacement
+    assert created is True
+    spawn_mock.assert_awaited_once()
+    assert spawn_mock.await_args.kwargs["fix_target"] == {
+        "project_id": str(project.id),
+        "pr_number": 42,
+        "base_sha": "new-base",
+        "head_sha": "new-head",
+    }
+    await db_session.refresh(active_fix)
+    assert (active_fix.context or {})["review_loop"]["fix_target"] == old_target
+    assert active_fix.status == TaskStatus.CANCELLED
+    assert (active_fix.context or {}).get("failure_detail") == (
+        "superseded_by_moved_pr_target"
+    )
+    assert source.status == TaskStatus.EVALUATING
+
+
+@pytest.mark.asyncio
+async def test_migration_guard_moved_pr_retries_after_running_stale_fix_finishes(
+    db_session, mocker
+):
+    """A running old-target fix defers without leaving a permanent skip latch."""
+    from app.migration_guard_recovery import spawn_migration_guard_fix_task
+
+    project = Project(name="migration running stale target", user_id="test-user")
+    db_session.add(project)
+    await db_session.flush()
+    old_target = {
+        "project_id": str(project.id),
+        "pr_number": 42,
+        "base_sha": "old-base",
+        "head_sha": "old-head",
+    }
+    source = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={
+            "review_target": old_target,
+            "review_approved": False,
+            "ci_fix_spawned": "old-fix-id",
+            "migration_guard_fix_spawned": "old-fix-id",
+        },
+    )
+    old_fix = Task(
+        project_id=project.id,
+        title="running old-target migration fix",
+        payloads=[{"type": "fix", "pr_number": 42}],
+        status=TaskStatus.IN_PROGRESS,
+        context={"review_loop": {"fix_target": old_target}},
+    )
+    db_session.add(old_fix)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.github.get_pull_request",
+        AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "base": {"sha": "new-base", "ref": "automain"},
+                "head": {"sha": "new-head", "ref": "blueprint/test-branch"},
+            }
+        ),
+    )
+    replacement = Task(
+        project_id=project.id,
+        title="current-target migration fix",
+        payloads=[{"type": "fix", "pr_number": 42}],
+        status=TaskStatus.QUEUED,
+    )
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        AsyncMock(return_value=(replacement, True)),
+    )
+
+    deferred, created = await spawn_migration_guard_fix_task(
+        source,
+        db_session,
+        pr_number=42,
+        branch="blueprint/test-branch",
+        base_branch="automain",
+        guard_reason="duplicate revision",
+        review_loop=(source.context or {}).get("review_loop"),
+        gh_token="fake-token",
+        owner="owner",
+        repo="repo",
+    )
+
+    assert deferred is None and created is False
+    spawn_mock.assert_not_awaited()
+    deferred_loop = (source.context or {})["review_loop"]
+    assert deferred_loop["migration_guard_state"] == "fix_deferred"
+    assert deferred_loop["review_approved"] is False
+    assert "ci_fix_spawned" not in deferred_loop
+    assert "migration_guard_fix_spawned" not in deferred_loop
+
+    old_fix.status = TaskStatus.COMPLETED
+    db_session.add(old_fix)
+    await db_session.commit()
+
+    spawned, created = await spawn_migration_guard_fix_task(
+        source,
+        db_session,
+        pr_number=42,
+        branch="blueprint/test-branch",
+        base_branch="automain",
+        guard_reason="duplicate revision",
+        review_loop=(source.context or {}).get("review_loop"),
+        gh_token="fake-token",
+        owner="owner",
+        repo="repo",
+    )
+
+    assert spawned is replacement and created is True
+    assert spawn_mock.await_args.kwargs["fix_target"]["head_sha"] == "new-head"
+
+
+@pytest.mark.asyncio
+async def test_migration_guard_target_lookup_defer_clears_stale_fix_latches(
+    db_session, mocker
+):
+    """A failed live lookup remains retryable while merge authority stays revoked."""
+    from app.migration_guard_recovery import spawn_migration_guard_fix_task
+
+    project = Project(name="migration target lookup retry", user_id="test-user")
+    db_session.add(project)
+    await db_session.flush()
+    source = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={
+            "review_approved": False,
+            "ci_fix_spawned": "stale-fix-id",
+            "migration_guard_fix_spawned": "stale-fix-id",
+        },
+    )
+    await db_session.commit()
+    mocker.patch(
+        "app.github.get_pull_request",
+        AsyncMock(side_effect=RuntimeError("temporary GitHub failure")),
+    )
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task", new=AsyncMock()
+    )
+
+    fix, created = await spawn_migration_guard_fix_task(
+        source,
+        db_session,
+        pr_number=42,
+        branch="blueprint/test-branch",
+        base_branch="automain",
+        guard_reason="duplicate revision",
+        review_loop=(source.context or {}).get("review_loop"),
+        gh_token="fake-token",
+        owner="owner",
+        repo="repo",
+    )
+
+    assert fix is None and created is False
+    spawn_mock.assert_not_awaited()
+    loop = (source.context or {})["review_loop"]
+    assert loop["migration_guard_state"] == "fix_deferred"
+    assert loop["ci_waiting"] is True
+    assert loop["review_approved"] is False
+    assert "ci_fix_spawned" not in loop
+    assert "migration_guard_fix_spawned" not in loop
 
 
 @pytest.mark.asyncio

@@ -443,8 +443,12 @@
       "path": "agent/src/handlers/strategic-resident-lib.test.ts",
       "reason": "Covers strategic-resident-lib.ts — the core utility library for the conversational Workday resident session (config knobs, message cursor, dedup, content blocks, bootstrap/autonomous prompts, compaction checkpoint, exam ledger, operator-decision review, decisions register, surface catalog, tick-verdict parsing, and frame coalescer). These 242 it() cases and one it.each block are the deepest unit-level coverage of the resident session logic; deleting or emptying this file would leave all resident-lib primitives entirely untested.",
       "test_ids": [
+        "does not fire unchanged-state exploration when the interval is disabled",
+        "has no scheduled review when unchanged-state exploration is disabled",
+        "retains the scheduled projection for enabled exploration",
         "uses contract defaults when the payload omits the knobs",
         "reads the payload knobs (seconds → ms)",
+        "preserves zero as the disabled unchanged-state exploration sentinel",
         "keeps canned acknowledgements disabled regardless of stale payload settings",
         "clamps to safe minimums",
         "never polls slower than the idle heartbeat tick",

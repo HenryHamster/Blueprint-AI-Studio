@@ -6429,8 +6429,9 @@ async def test_acceptance_window_recompute_covers_via_direction_mapping(db_sessi
 
 
 @pytest.mark.asyncio
-async def test_acceptance_window_recompute_nothing_when_verified_zero(db_session):
-    """False zero: write_total > 0 but verified == 0 → records NOTHING, stays uncovered."""
+async def test_acceptance_window_recompute_nothing_when_verified_zero(db_session, mocker):
+    """A stable false zero is not rescanned, but a new merge re-arms it."""
+    from app import release_qualifier as rq
     from app import release_version as rv
 
     project = await _make_project(db_session, "AcceptanceWindowFalseZero")
@@ -6452,11 +6453,27 @@ async def test_acceptance_window_recompute_nothing_when_verified_zero(db_session
     )
     await db_session.commit()
 
-    recorded = await ac.record_acceptance_window_coverage_evidence(db_session, version)
-    assert recorded == 0, "Must record nothing when verified == 0 (false zero)"
+    aggregate_spy = mocker.spy(rq, "_compute_acceptance_window_aggregate")
+    first = await ac.record_acceptance_window_coverage_evidence(db_session, version)
+    second = await ac.record_acceptance_window_coverage_evidence(db_session, version)
+    assert first == 0, "Must record nothing when verified == 0 (false zero)"
+    assert second == 0
+    assert aggregate_spy.await_count == 1, "Stable false zero must not rescan each sweep"
     summary = await ac.get_version_coverage_summary(db_session, version.id)
     assert summary["uncovered"] == 1
     assert summary["covered"] == 0
+
+    db_session.add(
+        _make_inferred_cochange_task(
+            project,
+            version,
+            changed_files=["testing/test_later.py", "app/later.py"],
+            seconds=2,
+        )
+    )
+    await db_session.commit()
+    assert await ac.record_acceptance_window_coverage_evidence(db_session, version) == 1
+    assert aggregate_spy.await_count == 2, "A newly landed task must re-arm recomputation"
 
 
 @pytest.mark.asyncio
@@ -6526,8 +6543,9 @@ async def test_acceptance_window_recompute_does_not_over_cover(db_session):
 
 
 @pytest.mark.asyncio
-async def test_acceptance_window_recompute_is_idempotent(db_session):
-    """Running the recorder twice records at most one row (stable per-version source_id)."""
+async def test_acceptance_window_recompute_is_idempotent(db_session, mocker):
+    """A stable row avoids both duplicate writes and a second aggregate scan."""
+    from app import release_qualifier as rq
     from app import release_version as rv
 
     project = await _make_project(db_session, "AcceptanceWindowIdempotent")
@@ -6548,10 +6566,12 @@ async def test_acceptance_window_recompute_is_idempotent(db_session):
     )
     await db_session.commit()
 
+    aggregate_spy = mocker.spy(rq, "_compute_acceptance_window_aggregate")
     first = await ac.record_acceptance_window_coverage_evidence(db_session, version)
     second = await ac.record_acceptance_window_coverage_evidence(db_session, version)
     assert first == 1
     assert second == 0, "Second run must be idempotent (0 new rows)"
+    assert aggregate_spy.await_count == 1
     assert len(await ac.get_evidence_for_criterion(db_session, criterion.id)) == 1
 
 

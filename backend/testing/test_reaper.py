@@ -5426,6 +5426,24 @@ async def test_get_reaper_stats_reports_recent_age_after_cycle(
 # ── Step 9: finalize release qualifications stuck "pending" ────────────────
 
 
+def _empty_qualification_contract() -> dict:
+    """Launch-time contract fields for synthetic pending qualification rows."""
+    from app.release_qualifier import (
+        _qualification_contract_fingerprint,
+        _rubric_fingerprint,
+    )
+
+    rubric_fingerprint = _rubric_fingerprint([])
+    return {
+        "rubric_snapshot": [],
+        "rubric_fingerprint": rubric_fingerprint,
+        "contract_fingerprint": _qualification_contract_fingerprint(
+            "", rubric_fingerprint
+        ),
+        "version_goal": "",
+    }
+
+
 @pytest.mark.asyncio
 async def test_step9_sweep_finalizes_qualification_stuck_pending_after_reaper_kill(
     reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
@@ -5472,9 +5490,10 @@ async def test_step9_sweep_finalizes_qualification_stuck_pending_after_reaper_ki
         await reaper_db.commit()
         await reaper_db.refresh(version)
 
-        # Both qualifier children FAILED — exactly what a reaper kill leaves
-        # behind. vm_instance_id is None so the active-task sweep ignores them
-        # (FAILED is already non-active; this is belt-and-suspenders).
+        # Active audit plus a legacy smoke child are both FAILED — an upgraded
+        # deployment must drain that historical shape without making smoke a
+        # current qualification gate. vm_instance_id is None so the active-task
+        # sweep ignores them.
         audit_task = Task(
             project_id=project.id,
             title="Release audit: main...automain diff",
@@ -5514,7 +5533,7 @@ async def test_step9_sweep_finalizes_qualification_stuck_pending_after_reaper_ki
             "started_at": _now_for_seed().isoformat(),
             "audit_task_id": str(audit_task.id),
             "smoketest_task_id": str(smoke_task.id),
-            "rubric_snapshot": [],
+            **_empty_qualification_contract(),
         }
         reaper_db.add(version)
         await reaper_db.commit()
@@ -5626,7 +5645,7 @@ async def test_step9_sweep_skips_qualification_with_running_child(
             "audit_task_id": str(audit_task.id),
             "challenge_task_id": str(challenge_task.id),
             "audit_challenge_task_id": str(challenge_task.id),
-            "rubric_snapshot": [],
+            **_empty_qualification_contract(),
         }
         reaper_db.add(version)
         await reaper_db.commit()
@@ -5664,7 +5683,7 @@ async def test_step9_sweep_skips_qualification_with_running_child(
             "ci_green": False,
             "started_at": _now_for_seed().isoformat(),
             "audit_task_id": str(control_audit.id),
-            "rubric_snapshot": [],
+            **_empty_qualification_contract(),
         }
         reaper_db.add(control_version)
         await reaper_db.commit()

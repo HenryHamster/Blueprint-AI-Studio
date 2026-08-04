@@ -383,7 +383,11 @@ On **every** \`create-direction\` and \`update-direction\` call, emit a \`recomm
 - **Before opening a direction:** recon the area it touches so the direction targets the right work, not a symptom or an already-addressed problem.
 - **Before spawning a task:** confirm you understand the section it changes so the task prompt is grounded, not speculative.
 
-**The convergence guardrail:** every audit ends in a decision — a goal, a direction, or a concrete task. Reconnaissance that produces no commitment is drift, not diligence. If a cycle's audit yields no committed next step, that is a failure to converge — NOT "keeping watch." This line separates audit-first from the idle/observe drift failure mode the prompt already warns against.
+**The convergence guardrail:** every audit ends in a disposition: change course,
+commission concrete work, or explicitly preserve the current state because no
+valuable move is supported by the evidence. A sparse exploration wake is not an
+obligation to manufacture work. Repeated reconnaissance of unchanged evidence
+without either a move or an explicit no-change judgment is drift.
 
 **Model-size hygiene (soft).** The "Problem-model size" section above reports weight. Healthy: **<=12 active gaps / <=20 capabilities / <=8 active friction** — dimension >=1.5x = \`growing\`, >=2x = \`large\`, >=3x = \`oversized\`. When \`large\`/\`oversized\`, close resolved entries before opening new ones (**never a hard cap**). A model you can't read in one pass is one you can't defend.
 
@@ -550,25 +554,21 @@ When describing changes in prose, be precise: "opening gap g-xxx (from user_mess
 
 Before finishing, write /tmp/research_progress_${p.taskId}.md ${READ_ONLY_BASH_WRITE_NOTE} — a concise markdown summary (≤3000 chars) capturing the model changes proposed, gaps opening/closing, and moves. This is a breadcrumb for retry agents if this task fails — lets a retry pick up from your analysis rather than redoing it from scratch.
 
-## 7. Version goal (conditional — only when unset)
+## 7. Version goal (author or revise when warranted)
 
 **Three distinct concepts — keep them separate:**
 - \`intent.purpose\` = enduring PROJECT north star, operator-owned, spans all versions. Never touch this.
-- \`version.goal\` = THIS version's frozen objective — a derivative of purpose, authored once per version.
+- \`version.goal\` = THIS version's current objective — a derivative of purpose that you may correct when evidence shows it is infeasible, circular, stale, or badly scoped.
 - \`intent.current_focus\` = live "working on now" status — NOT the goal, advances across cycles.
 
-**Version goal (only when the Goal shown in Version Phase is unset):**
+Include a \`new_version_goal\` key at the **top level** of your problem_model JSON (a peer of \`intent\`, \`context\`, \`constraints\`, etc.) when the goal is unset OR when current delivery capabilities/evidence show the existing goal must be revised, split, or replaced. Single line, under 500 characters. The backend lifts this field before ProblemModel validation and applies it — it does not persist in the stored model.
 
-**Skip if the version already has a goal** — the goal is frozen once set; re-emitting is a non-fatal no-op.
-
-**Only when the goal is currently unset:** include a \`new_version_goal\` key at the **top level** of your problem_model JSON (a peer of \`intent\`, \`context\`, \`constraints\`, etc.) with the objective text as its value. Single line, under 500 characters. The backend lifts this field before ProblemModel validation and applies it — it does not persist in the stored model.
-
-The goal must be SUBSTANTIVE and DIRECTIONAL — a concrete deliverable statement that orients a new contributor reading it cold. It becomes the frozen scoring target for every merge in this version.
+The goal must be SUBSTANTIVE and DIRECTIONAL — a concrete deliverable statement that orients a new contributor reading it cold. It is the scoring target for the version until evidence warrants a correction.
 
 Bad: "Fix CI, improve quality, pass audit." — feature list / status echo, rejected by the contentless-goal guard.
 Good: a concrete deliverable paired with a measurable success bar a new contributor could verify cold — outcome-framed, not a feature list or status echo.
 
-Omit the \`new_version_goal\` key entirely if the goal is already set.
+Omit \`new_version_goal\` when the existing goal remains sound. If it demands evidence the project cannot currently produce (for example promotion is disabled or no serving/deploy identity is available), do not loop on impossible work: revise/split the goal to an achievable candidate outcome, or park/replace the owning direction using your normal portfolio authority. Use normal \`spawn-task\` operations for work you judge useful; there is no special release-repair lane or fixed task count.
 
 ## 8. Acceptance criteria (conditional — author only when warranted)
 

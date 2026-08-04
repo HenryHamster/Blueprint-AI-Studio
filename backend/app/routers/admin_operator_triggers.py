@@ -298,7 +298,7 @@ async def trigger_qualify(
         )
 
     result = await release_qualifier.run_qualification(
-        session, project_id, open_version
+        session, project_id, open_version, explicit_request=True
     )
     await session.commit()
     # Promotion check-wait: the audit passed and a managed promotion is pending.

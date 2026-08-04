@@ -1741,6 +1741,7 @@ async def _spawn_pipeline_task(
     target_verified_by_backend: bool = False,
     delta_base_sha: str = "",
     review_target: dict[str, str | int] | None = None,
+    fix_target: dict[str, str | int] | None = None,
     suppress_warm_handoff: bool = False,
     attempt: int = 0,
 ) -> tuple[Task | None, bool]:
@@ -1868,6 +1869,15 @@ async def _spawn_pipeline_task(
             pr_number=pr_number,
         )
         if task_type == "review"
+        else None
+    )
+    requested_fix_target = (
+        _normalized_review_target(
+            fix_target,
+            project_id=source_task.project_id,
+            pr_number=pr_number,
+        )
+        if task_type == "fix"
         else None
     )
 
@@ -3985,6 +3995,11 @@ async def _spawn_pipeline_task(
         **(
             {"review_target": requested_review_target}
             if task_type == "review" and requested_review_target is not None
+            else {}
+        ),
+        **(
+            {"fix_target": requested_fix_target}
+            if task_type == "fix" and requested_fix_target is not None
             else {}
         ),
         **({"churn_detections": churn_detections} if churn_detections else {}),
