@@ -54,8 +54,15 @@ jobs:
         if: github.event_name == 'push'
         with:
           filters: |
+            # agent/** and scripts/** are runner-executed code: runners only
+            # self-update when the deployed backend image's advertised SHA
+            # moves, so an agent-only merge must still produce a new image or
+            # the fix has no rollout vehicle (see 2026-08-04 --max-turns
+            # hotfix, PR #16647).
             backend:
               - 'backend/**'
+              - 'agent/**'
+              - 'scripts/**'
             frontend:
               - 'admin-ui/**'
               - 'package.json'
