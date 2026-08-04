@@ -23,3 +23,10 @@ scripts/blueprint-livekit-system.service text eol=lf
 # Local release bootstrap files are transferred from developer worktrees and
 # executed directly on Linux. CRLF corrupts their env/python shebangs.
 scripts/*release*.py text eol=lf
+
+# Actions VM installers and guest systemd assets are transferred as executable
+# deployment artifacts. Archive/check-out behavior must not introduce CRLF.
+scripts/install-github-actions-vm.sh text eol=lf
+scripts/github-actions-vm/*.sh text eol=lf
+scripts/github-actions-vm/*.service text eol=lf
+scripts/github-actions-vm/*.timer text eol=lf
