@@ -95,6 +95,17 @@ class RenderTests(unittest.TestCase):
 
 
 class AssetSecurityTests(unittest.TestCase):
+    def test_actions_vm_deployment_assets_use_lf(self):
+        deployment_assets = [
+            Path(__file__).parent / "install-github-actions-vm.sh",
+            *ASSET_DIR.glob("*.sh"),
+            *ASSET_DIR.glob("*.service"),
+            *ASSET_DIR.glob("*.timer"),
+        ]
+        self.assertTrue(deployment_assets)
+        for asset in deployment_assets:
+            self.assertNotIn(b"\r", asset.read_bytes(), asset)
+
     def _volume_gc_harness(self, temporary: str, *, freezer_state: str) -> tuple[dict[str, str], Path, Path]:
         root = Path(temporary)
         state_root = root / "state"
@@ -415,7 +426,10 @@ class AssetSecurityTests(unittest.TestCase):
         self.assertIn('NoNewPrivileges=yes', service)
         self.assertIn('ProtectSystem=strict', service)
         self.assertIn('CapabilityBoundingSet=', service)
-        self.assertIn('RuntimeMaxSec=5min', service)
+        self.assertIn('RuntimeDirectory=blueprint-actions-volume-gc', service)
+        self.assertIn('RuntimeDirectoryMode=0700', service)
+        self.assertIn('RuntimeDirectoryPreserve=yes', service)
+        self.assertNotIn('RuntimeMaxSec=', service)
         self.assertIn(
             'ExecStopPost=/usr/local/lib/blueprint/github-actions-vm/thaw-owned-runners.sh',
             service,
@@ -436,6 +450,20 @@ class AssetSecurityTests(unittest.TestCase):
         self.assertIn('install-volume-maintenance.sh', install)
         self.assertIn('/run/blueprint-actions-volume-gc-install', install)
         self.assertIn('--no-same-permissions', install)
+        self.assertNotIn('/blueprint-actions-volume-gc-install/*', install)
+        chown_command = install.split('sudo chown -h root:root ', 1)[1].split(
+            ' && sudo bash', 1
+        )[0]
+        for asset in (
+            'prune-runner-volumes.sh',
+            'thaw-owned-runners.sh',
+            'blueprint-actions-volume-gc.service',
+            'blueprint-actions-volume-gc.timer',
+            'install-volume-maintenance.sh',
+        ):
+            self.assertIn(
+                f'/run/blueprint-actions-volume-gc-install/{asset}', chown_command
+            )
         self.assertNotIn(
             '--directory /usr/local/lib/blueprint/github-actions-vm', install
         )
