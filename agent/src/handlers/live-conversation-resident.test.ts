@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -48,17 +48,27 @@ describe('live conversation coordinator', () => {
   });
 
   it('revokes in-memory call authority when a previously fresh lease expires', () => {
-    const parsed = parseCallLeaseProjection({
-      ...lease,
-      expires_at: new Date(Date.now() + 20).toISOString(),
-    });
-    expect(parsed).not.toBeNull();
-    expect(callLeaseIsPubliclyActive(parsed)).toBe(true);
-    const expired = { ...parsed!, expiresAt: new Date(Date.now() - 1).toISOString() };
-    expect(callLeaseIsPubliclyActive(expired)).toBe(false);
-    const coordinator = new CallCoordinatorState();
-    coordinator.updateLease(expired);
-    expect(() => coordinator.beginPublicTurn('message-1')).toThrow('no active call lease');
+    // Use fake timers so the active→expired transition is deterministic and not
+    // dependent on wall-clock execution speed (the previous 20ms margin was flaky).
+    const frozenNow = 1_700_000_000_000;
+    vi.useFakeTimers();
+    vi.setSystemTime(frozenNow);
+    try {
+      const parsed = parseCallLeaseProjection({
+        ...lease,
+        expires_at: new Date(frozenNow + 60_000).toISOString(),
+      });
+      expect(parsed).not.toBeNull();
+      expect(callLeaseIsPubliclyActive(parsed)).toBe(true);
+      // Advance frozen time past the lease expiry — same object now reads as stale.
+      vi.setSystemTime(frozenNow + 120_000);
+      expect(callLeaseIsPubliclyActive(parsed)).toBe(false);
+      const coordinator = new CallCoordinatorState();
+      coordinator.updateLease(parsed);
+      expect(() => coordinator.beginPublicTurn('message-1')).toThrow('no active call lease');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('retains the short-lived transport projection without exposing it to model state', () => {
@@ -122,14 +132,14 @@ describe('live conversation coordinator', () => {
           isAlive: () => true,
           close: () => undefined,
           onEvent: () => undefined,
-          sendTurn: async () => {
+          sendTurn: () => {
             if (starts > 1) {
-              const receipt = JSON.parse(fs.readFileSync(env.CALL_TURN_RECEIPT_PATH, 'utf8'));
+              const receipt = JSON.parse(fs.readFileSync(env.CALL_TURN_RECEIPT_PATH, 'utf8')) as Record<string, unknown>;
               fs.writeFileSync(path.join(env.CALL_LOCAL_STAGE_DIR, 'complete-test.json'), JSON.stringify({
                 receipt, spoken_text: 'Fenced completion.', durable: true,
               }));
             }
-            return result;
+            return Promise.resolve(result);
           },
         } as unknown as import('../providers/resident-session.js').ResidentSession;
       },
@@ -167,30 +177,30 @@ describe('live conversation coordinator', () => {
           isAlive: () => true,
           close: () => undefined,
           onEvent: () => undefined,
-          sendTurn: async () => {
+          sendTurn: () => {
             turnCalls += 1;
             if (turnCalls === 1) {
-              const receipt = JSON.parse(fs.readFileSync(env.CALL_TURN_RECEIPT_PATH, 'utf8'));
+              const receipt = JSON.parse(fs.readFileSync(env.CALL_TURN_RECEIPT_PATH, 'utf8')) as Record<string, unknown>;
               fs.mkdirSync(env.CALL_LOCAL_STAGE_DIR, { recursive: true });
               fs.writeFileSync(path.join(env.CALL_LOCAL_STAGE_DIR, 'complete-early-a.json'), JSON.stringify({
                 receipt, spoken_text: 'Abandoned A completion.', durable: true,
               }));
-              return { interrupted: true, timedOut: false };
+              return Promise.resolve({ interrupted: true, timedOut: false });
             }
             // B's receipt is installed now. Simulate A's still-alive MCP call
             // completing late, before B writes its own accepted completion.
             const staleLaunch = launches[0];
-            const staleReceipt = JSON.parse(fs.readFileSync(staleLaunch.receiptPath, 'utf8'));
+            const staleReceipt = JSON.parse(fs.readFileSync(staleLaunch.receiptPath, 'utf8')) as Record<string, unknown>;
             fs.mkdirSync(staleLaunch.stageDir, { recursive: true });
             fs.writeFileSync(path.join(staleLaunch.stageDir, 'complete-00-late-a.json'), JSON.stringify({
               receipt: staleReceipt, spoken_text: 'Stale A completion.', durable: true,
             }));
-            const currentReceipt = JSON.parse(fs.readFileSync(env.CALL_TURN_RECEIPT_PATH, 'utf8'));
+            const currentReceipt = JSON.parse(fs.readFileSync(env.CALL_TURN_RECEIPT_PATH, 'utf8')) as Record<string, unknown>;
             fs.mkdirSync(env.CALL_LOCAL_STAGE_DIR, { recursive: true });
             fs.writeFileSync(path.join(env.CALL_LOCAL_STAGE_DIR, 'complete-10-current-b.json'), JSON.stringify({
               receipt: currentReceipt, spoken_text: 'Current B completion.', durable: true,
             }));
-            return { interrupted: false, timedOut: false };
+            return Promise.resolve({ interrupted: false, timedOut: false });
           },
         } as unknown as import('../providers/resident-session.js').ResidentSession;
       },
