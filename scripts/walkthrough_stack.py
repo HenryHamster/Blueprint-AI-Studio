@@ -80,6 +80,21 @@ def _proto_dir(workspace: str) -> str:
     return os.path.join(workspace, PROTOCOL_DIR)
 
 
+def sandbox_proto_dir(sandbox_workspace: str) -> str:
+    """The protocol dir as the AGENT sees it inside the sandbox.
+
+    The bwrap workspace bind maps the host workspace to ``sandbox_workspace``
+    (e.g. ``/workspace``) and the agent's own WORKSPACE is a SUBDIRECTORY of
+    that mount (``/workspace/agent``), so the marker sits one level ABOVE the
+    agent's workspace, at the bind root. This function is the single shared
+    contract: the runner writes marker files at ``_proto_dir(workspace)`` (host
+    side) and passes ``sandbox_proto_dir(sandbox_workspace)`` to the agent so
+    its probe lands on the same path — never a second, independently-joined
+    string on the far side of the sandbox boundary.
+    """
+    return os.path.join(sandbox_workspace, PROTOCOL_DIR)
+
+
 def _atomic_write_json(path: str, payload: dict) -> None:
     tmp = f"{path}.tmp"
     with open(tmp, "w", encoding="utf-8") as fh:

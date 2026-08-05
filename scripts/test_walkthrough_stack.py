@@ -234,6 +234,49 @@ class TestSupervisorLoop(unittest.TestCase):
         self.assertLess(time.monotonic() - start, 5)
 
 
+class TestProtocolDirContract(unittest.TestCase):
+    """The single shared probe contract: the write location (host side) and the
+    probe location (sandbox side) derive from the SAME constant, so the two
+    sides of the sandbox boundary can never disagree about where the marker is."""
+
+    def test_write_location_is_proto_dir_under_the_host_workspace(self):
+        ws = "/tmp/blueprint-agent-workspaces/task-abc"
+        self.assertEqual(wts._proto_dir(ws), os.path.join(ws, wts.PROTOCOL_DIR))
+
+    def test_sandbox_probe_location_derives_from_the_same_constant(self):
+        # The bwrap workspace bind maps the host workspace to /workspace; the
+        # marker sits at that bind root, one level ABOVE the agent's workspace.
+        self.assertEqual(
+            wts.sandbox_proto_dir("/workspace"),
+            os.path.join("/workspace", wts.PROTOCOL_DIR),
+        )
+
+    def test_both_sides_share_the_same_relative_dir_name(self):
+        # The runner writes at _proto_dir(<host workspace>) and hands the agent
+        # sandbox_proto_dir(<sandbox mount>): the two paths differ only in the
+        # bind root, never in the protocol dir name itself.
+        self.assertEqual(
+            os.path.basename(wts._proto_dir("/tmp/ws")),
+            os.path.basename(wts.sandbox_proto_dir("/workspace")),
+        )
+
+    def test_write_marker_lands_exactly_at_proto_dir(self):
+        tmp = tempfile.mkdtemp()
+        sup = wts.WalkthroughStackSupervisor(
+            workspace=tmp,
+            task_id="t1",
+            run=lambda argv, *, timeout, check=True, env=None: subprocess.CompletedProcess(argv, 0, stdout="", stderr=""),
+            log=lambda m: None,
+        )
+        sup.write_marker()
+        self.assertTrue(
+            os.path.exists(os.path.join(tmp, wts.PROTOCOL_DIR, "supervisor.json"))
+        )
+        self.assertFalse(
+            os.path.exists(os.path.join(tmp, "agent", wts.PROTOCOL_DIR, "supervisor.json"))
+        )
+
+
 class TestGcStaleStacks(unittest.TestCase):
     def test_gc_removes_listed_stale_containers_once(self):
         wts._gc_ran = False

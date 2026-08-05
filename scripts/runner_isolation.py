@@ -173,6 +173,10 @@ _AGENT_IDENTITY_ENV_KEYS: frozenset[str] = frozenset(
         "BLUEPRINT_PRE_CLAIM_RESIDENT_SESSION",
         "AGENT_WORKSPACE",
         "HOME",
+        # Sandbox-side protocol dir for the walkthrough_e2e stack supervisor.
+        # Non-secret; tells the agent WHERE the runner writes the supervisor
+        # marker so its probe and the runner's write are one contract.
+        "WALKTHROUGH_STACK_DIR",
     }
 )
 _AGENT_INJECTED_ENV_ALLOWLIST: frozenset[str] = frozenset(

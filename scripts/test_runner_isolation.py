@@ -919,6 +919,24 @@ class TestAgentPlan(unittest.TestCase):
         self.assertIn("--chdir", plan.argv)
         self.assertEqual(plan.argv[plan.argv.index("--chdir") + 1], "/workspace")
 
+    def test_walkthrough_stack_dir_rides_the_injected_env(self):
+        # WALKTHROUGH_STACK_DIR is a runner-set identity value (the sandbox-side
+        # protocol dir the agent must probe); it must survive the allowlist into
+        # the bwrap env so the probe and the runner's write are one contract.
+        plan = iso.plan_agent_execution(
+            caps=_caps(bwrap_path="/usr/bin/bwrap", userns_ok=True),
+            agent_binary=["node", "/opt/agent/dist/index.js"],
+            workspace_host="/tmp/ws/t1",
+            injected_env={
+                "AGENT_SECRET_TOKEN": "jwt",
+                "TASK_ID": "t1",
+                "WALKTHROUGH_STACK_DIR": "/workspace/.walkthrough-stack",
+            },
+            source_env={"PATH": "/usr/bin"},
+        )
+        self.assertFalse(plan.declined)
+        self.assertEqual(plan.env["WALKTHROUGH_STACK_DIR"], "/workspace/.walkthrough-stack")
+
     def test_agent_plan_docker_backend(self):
         plan = iso.plan_agent_execution(
             caps=_caps(docker_usable=True),

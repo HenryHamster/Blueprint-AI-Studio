@@ -31,7 +31,12 @@ describe('deriveComposeProject', () => {
 });
 
 describe('CandidateStackController', () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // The runner injects this env; a stray value must not leak into unrelated
+    // controller constructions.
+    delete process.env.WALKTHROUGH_STACK_DIR;
+  });
 
   it('exposes URLs and a DB URL derived from the configured ports', () => {
     const c = new CandidateStackController({
@@ -103,6 +108,7 @@ describe('runner-side supervisor protocol', () => {
     const { ws, proto } = protoWorkspace();
     const c = new CandidateStackController({
       workspace: ws,
+      walkthroughStackDir: proto,
       candidateSha: SHA,
       adminToken: 'tok-0123456789',
       bootTimeoutMs: 4_000,
@@ -150,6 +156,7 @@ describe('runner-side supervisor protocol', () => {
     );
     const c = new CandidateStackController({
       workspace: ws,
+      walkthroughStackDir: proto,
       candidateSha: SHA,
       adminToken: 'tok-0123456789',
       bootTimeoutMs: 8_000,
@@ -166,6 +173,7 @@ describe('runner-side supervisor protocol', () => {
     );
     const c = new CandidateStackController({
       workspace: ws,
+      walkthroughStackDir: proto,
       candidateSha: SHA,
       adminToken: 'tok-0123456789',
       bootTimeoutMs: 2_000,
@@ -183,14 +191,118 @@ describe('runner-side supervisor protocol', () => {
 
   it('falls back to the legacy in-sandbox path when no supervisor marker exists', async () => {
     const ws = mkdtempSync(path.join(os.tmpdir(), 'wt-stack-legacy-'));
+    const logs: string[] = [];
     const c = new CandidateStackController({
       workspace: ws,
       candidateSha: SHA,
       adminToken: 'tok',
       bootTimeoutMs: 0, // deadline already passed → DB readiness loop cannot succeed
+      log: (m) => logs.push(m),
     });
     await expect(c.boot()).rejects.toThrow(/postgres did not become ready/);
     // Legacy path DID reach for docker compose.
     expect(vi.mocked(execFileSync).mock.calls.some((call) => call[0] === 'docker')).toBe(true);
+    // No protocol dir was passed → the legacy default is logged, not silent.
+    expect(logs.some((m) => m.includes('using the in-sandbox docker compose path'))).toBe(true);
+  });
+});
+
+// ── Single probe contract (the regression this module exists for) ──────────
+// The runner writes the supervisor marker at the workspace bind ROOT (one level
+// ABOVE the agent's own workspace) and passes that sandbox-side path to the
+// agent explicitly. The probe must resolve EXACTLY that path — never a join
+// against the agent's workspace, which silently misses the marker.
+
+describe('runner-side supervisor probe path contract', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('probes the runner-passed protocol dir verbatim and writes the request there', async () => {
+    // Simulate the bwrap layout: the agent's workspace (repo checkout) and the
+    // runner-side protocol dir are DIFFERENT directories — the marker sits at
+    // the workspace bind root, one level above the agent's workspace.
+    const base = mkdtempSync(path.join(os.tmpdir(), 'wt-stack-layout-'));
+    const agentWorkspace = path.join(base, 'agent'); // the checkout root (/workspace/agent)
+    const runnerProtoDir = path.join(base, '.walkthrough-stack'); // the bind root (/workspace/.walkthrough-stack)
+    mkdirSync(agentWorkspace, { recursive: true });
+    mkdirSync(runnerProtoDir, { recursive: true });
+    writeFileSync(path.join(runnerProtoDir, 'supervisor.json'), JSON.stringify({ version: 1 }));
+
+    const c = new CandidateStackController({
+      workspace: agentWorkspace,
+      walkthroughStackDir: runnerProtoDir,
+      candidateSha: SHA,
+      adminToken: 'tok-0123456789',
+      bootTimeoutMs: 4_000,
+      bootFrontend: false,
+    });
+
+    const responder = (async () => {
+      const requestPath = path.join(runnerProtoDir, 'request.json');
+      for (let i = 0; i < 200 && !existsSync(requestPath); i++) {
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      // The request landed in the RUNNER-PASSED protocol dir — not a join under
+      // the agent's own workspace.
+      expect(requestPath.startsWith(path.join(agentWorkspace, '.walkthrough-stack'))).toBe(false);
+      expect(existsSync(path.join(agentWorkspace, '.walkthrough-stack', 'request.json'))).toBe(false);
+      const req = JSON.parse(readFileSync(requestPath, 'utf-8')) as Record<string, string>;
+      expect(req.candidate_sha).toBe(SHA);
+      writeFileSync(
+        path.join(runnerProtoDir, 'response.json'),
+        JSON.stringify({ status: 'ok', backend_port: 18223, db_port: 15223 }),
+      );
+    })();
+
+    await expect(c.boot()).rejects.toThrow(/health check never returned 200/);
+    await responder;
+    expect(c.backendUrl).toBe('http://127.0.0.1:18223');
+    expect(c.databaseUrl).toContain('@127.0.0.1:15223/');
+    // The agent never invoked docker on the supervisor path.
+    expect(vi.mocked(execFileSync).mock.calls.filter((call) => call[0] === 'docker')).toHaveLength(0);
+  }, 20_000);
+
+  it('does NOT detect a marker left at the legacy workspace-relative location', async () => {
+    // A marker at <workspace>/.walkthrough-stack (the OLD probe derivation) must
+    // be invisible: the probe resolves only the runner-passed protocol dir, so
+    // the disagreement cannot be reintroduced by re-joining onto the workspace.
+    const base = mkdtempSync(path.join(os.tmpdir(), 'wt-stack-stale-'));
+    const agentWorkspace = path.join(base, 'agent');
+    const runnerProtoDir = path.join(base, '.walkthrough-stack');
+    mkdirSync(agentWorkspace, { recursive: true });
+    mkdirSync(path.join(agentWorkspace, '.walkthrough-stack'), { recursive: true });
+    writeFileSync(path.join(agentWorkspace, '.walkthrough-stack', 'supervisor.json'), JSON.stringify({ version: 1 }));
+
+    const logs: string[] = [];
+    const c = new CandidateStackController({
+      workspace: agentWorkspace,
+      walkthroughStackDir: runnerProtoDir,
+      candidateSha: SHA,
+      adminToken: 'tok',
+      bootTimeoutMs: 0, // fail fast on the legacy DB-readiness loop
+      log: (m) => logs.push(m),
+    });
+    expect(c.runnerSupervisorAvailable()).toBe(false);
+    await expect(c.boot()).rejects.toThrow(/postgres did not become ready/);
+    // Legacy path DID reach for docker compose.
+    expect(vi.mocked(execFileSync).mock.calls.some((call) => call[0] === 'docker')).toBe(true);
+    // The protocol dir was passed but the marker is absent → visible warning.
+    expect(logs.some((m) => m.includes('No runner-side stack supervisor marker'))).toBe(true);
+  });
+
+  it('logs a visible degradation when the protocol dir is passed but the marker is absent', async () => {
+    const base = mkdtempSync(path.join(os.tmpdir(), 'wt-stack-degrade-'));
+    const runnerProtoDir = path.join(base, '.walkthrough-stack');
+    mkdirSync(runnerProtoDir, { recursive: true }); // dir exists, but no supervisor.json
+    const logs: string[] = [];
+    const c = new CandidateStackController({
+      workspace: base,
+      walkthroughStackDir: runnerProtoDir,
+      candidateSha: SHA,
+      adminToken: 'tok',
+      bootTimeoutMs: 0,
+      log: (m) => logs.push(m),
+    });
+    await expect(c.boot()).rejects.toThrow(/postgres did not become ready/);
+    expect(logs.some((m) => m.includes('No runner-side stack supervisor marker'))).toBe(true);
   });
 });

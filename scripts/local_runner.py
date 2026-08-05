@@ -8040,6 +8040,21 @@ def _spawn_agent_task(
         injected_env["BLUEPRINT_PRE_CLAIM_RESIDENT_SESSION"] = "1"
     if project_id:
         injected_env["PROJECT_ID"] = project_id
+    # walkthrough_e2e: the agent sandbox has (deliberately) no docker socket, so
+    # the runner answers the stack-boot itself via a file protocol over the
+    # workspace bind (scripts/walkthrough_stack.py). The protocol dir as the
+    # AGENT sees it is derived here from the shared constants and passed
+    # EXPLICITLY in the env so the agent's probe and the runner's write are ONE
+    # contract: the marker sits at the workspace bind ROOT, while the agent's
+    # own WORKSPACE is a subdirectory of that mount — so a workspace-relative
+    # probe would silently miss it. The marker file is written after the plan is
+    # accepted (below); the env var tells the agent WHERE to look, so a marker
+    # genuinely absent there is a visible, logged degradation, not a silent
+    # path mismatch.
+    stack_protocol_dir_sandbox = None
+    if task_type == "walkthrough_e2e" and caps.docker_usable:
+        stack_protocol_dir_sandbox = wts.sandbox_proto_dir(iso.SANDBOX_WORKSPACE)
+        injected_env["WALKTHROUGH_STACK_DIR"] = stack_protocol_dir_sandbox
     plan = iso.plan_agent_execution(
         caps=caps,
         agent_binary=agent_binary,
@@ -8052,14 +8067,14 @@ def _spawn_agent_task(
     if plan.declined:
         return _decline(plan.decline_reason or "sandbox plan declined")
 
-    # walkthrough_e2e: the agent sandbox has (deliberately) no docker socket,
-    # so the runner answers the stack-boot itself via a file protocol over the
-    # workspace bind (scripts/walkthrough_stack.py). The marker must exist
-    # BEFORE the agent starts so its boot-mode decision is deterministic. Any
-    # failure here degrades silently: no marker → the agent uses its legacy
-    # in-sandbox docker path, which is exactly today's behavior.
+    # Write the supervisor marker now that the plan is accepted: it must exist
+    # BEFORE the agent starts so its boot-mode decision is deterministic. The
+    # probe path was already handed to the agent via WALKTHROUGH_STACK_DIR (see
+    # the injected-env block above), so a marker that fails to appear there is
+    # surfaced as a visible, logged degradation by the agent — never a silent
+    # fallback to the in-sandbox docker path it was built to replace.
     stack_supervisor = None
-    if task_type == "walkthrough_e2e" and caps.docker_usable:
+    if stack_protocol_dir_sandbox is not None:
         try:
             stack_supervisor = wts.WalkthroughStackSupervisor(
                 workspace=workspace, task_id=task_id
@@ -8068,7 +8083,8 @@ def _spawn_agent_task(
         except Exception as exc:  # noqa: BLE001 — supervisor is optional
             print(
                 f"[runner] walkthrough stack supervisor unavailable for task "
-                f"{task_id} (agent falls back to in-sandbox docker): {exc}",
+                f"{task_id} (agent will log the missing marker and fall back "
+                f"to in-sandbox docker): {exc}",
                 flush=True,
             )
             stack_supervisor = None
