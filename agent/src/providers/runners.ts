@@ -8,7 +8,7 @@ import { getCheckRunawayStatus, isCheckInvocation, recordCheckOutcome } from '..
 import {
   CHECK_RUNAWAY_CONSECUTIVE_FAILURES, CHECK_RUNAWAY_MIN_INVOCATIONS, CLAUDE_RESULT_GRACE_MS,
   CLAUDE_STREAM_STALL_MS, LLM_NO_PROGRESS_STALL_MS, LOG_TAIL_BYTES,
-  MAX_CLAUDE_CHECK_INVOCATIONS, MAX_OUTPUT_BYTES,
+  MAX_CLAUDE_CHECK_INVOCATIONS, MAX_OUTPUT_BYTES, OUTPUT_TAIL_AFTER_CAP_BYTES,
   PROCESS_KILL_GRACE_MS, STDERR_TAIL_BYTES, TOOL_USE_STALL_TIMEOUT_MS,
   WORKFLOW_TOOL_STALL_TIMEOUT_MS, isWorkflowToolName,
   WITHIN_CHUNK_YIELD_LINES, WITHIN_CHUNK_YIELD_MS, claudeTimeoutForEffort,
@@ -1333,6 +1333,11 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
     ? buildIsolatedTextOnlyMemoryCommand(runner, prompt, model, effort, isolatedTextOnly)
     : runner.buildRunCommand(prompt, model, effort, disallowedTools);
   let allOutput = '';
+  // Set once the raw stream passes the byte cap in a (non-isolated) structured
+  // mode: allOutput freezes at the cap and subsequent chunks land in this
+  // rolling tail, which is re-joined to allOutput after the child exits.
+  let allOutputTail = '';
+  let allOutputTailMode = false;
   let lastResultText = '';
   let stderrBuffer = '';
   // Structured-run-report tracking (see ProviderRunErrorReport). Fed by every
@@ -1585,7 +1590,20 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
     };
     const enforceOutputLimit = () => {
       const outputLimit = isolatedTextOnly?.maxOutputBytes ?? MAX_OUTPUT_BYTES;
-      if (Buffer.byteLength(allOutput, 'utf8') < outputLimit || flags.outputLimited || !processGroupStillOwned()) return;
+      if (Buffer.byteLength(allOutput, 'utf8') < outputLimit || flags.outputLimited || allOutputTailMode || !processGroupStillOwned()) return;
+      // Structured stream modes wrap every token in a JSON event envelope, so
+      // raw bytes overstate model output by 20-100x — passing the cap
+      // mid-task is normal for a fast provider, not runaway. Keep the run
+      // alive and degrade to bounded-tail buffering; runaway remains bounded
+      // by the stall/no-progress watchdogs and the run timeout. Isolated
+      // receipt runs keep the hard kill: their tiny caps ARE the contract.
+      const structuredStream = !isolatedTextOnly
+        && (runCommand.outputMode === 'claude-stream-json' || runCommand.outputMode === 'codex-jsonl');
+      if (structuredStream) {
+        allOutputTailMode = true;
+        sendLog(ws, `\n[OUTPUT_LIMIT] ${runCommand.displayName} raw stream passed ${outputLimit} bytes — structured mode, run continues; buffering tail only.\n`);
+        return;
+      }
       flags.outputLimited = true;
       sendLog(ws, `\n[OUTPUT_LIMIT] ${runCommand.displayName} exceeded ${outputLimit} output bytes; terminating text-only run.\n`);
       const pid = originalPid;
@@ -2211,12 +2229,16 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
         statusRef.lastProgressAt = Date.now();
       }
       const text = data.toString();
-      allOutput = appendWithinByteLimit(
-        allOutput,
-        text,
-        isolatedTextOnly?.maxOutputBytes ?? MAX_OUTPUT_BYTES,
-      );
-      enforceOutputLimit();
+      if (allOutputTailMode) {
+        allOutputTail = appendBoundedTail(allOutputTail, text, OUTPUT_TAIL_AFTER_CAP_BYTES);
+      } else {
+        allOutput = appendWithinByteLimit(
+          allOutput,
+          text,
+          isolatedTextOnly?.maxOutputBytes ?? MAX_OUTPUT_BYTES,
+        );
+        enforceOutputLimit();
+      }
       if (runCommand.outputMode === 'claude-stream-json') {
         pendingJsonChunks.push(text);
         drainJsonChunks().catch((e: unknown) => {
@@ -2241,12 +2263,16 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
 
     child.stderr.on('data', (data: Buffer) => {
       const text = sanitize(data.toString());
-      allOutput = appendWithinByteLimit(
-        allOutput,
-        text,
-        isolatedTextOnly?.maxOutputBytes ?? MAX_OUTPUT_BYTES,
-      );
-      enforceOutputLimit();
+      if (allOutputTailMode) {
+        allOutputTail = appendBoundedTail(allOutputTail, text, OUTPUT_TAIL_AFTER_CAP_BYTES);
+      } else {
+        allOutput = appendWithinByteLimit(
+          allOutput,
+          text,
+          isolatedTextOnly?.maxOutputBytes ?? MAX_OUTPUT_BYTES,
+        );
+        enforceOutputLimit();
+      }
       stderrBuffer = appendBoundedTail(stderrBuffer, text, STDERR_TAIL_BYTES);
       sendLog(ws, `[stderr] ${text}`);
     });
@@ -2269,6 +2295,14 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
         }
       } catch (e) {
         sendLog(ws, `[runtime] final drain error: ${String(e)}\n`);
+      }
+      if (allOutputTailMode) {
+        // Re-join so post-exit consumers (rate-limit matching, marker regex
+        // scans) see the true end of the stream, not the pre-cap head. Reset
+        // the mode so a second resolve path cannot double-append.
+        allOutput = `${allOutput}\n[OUTPUT_LIMIT] middle of raw stream omitted (structured-mode byte cap); tail follows:\n${allOutputTail}`;
+        allOutputTailMode = false;
+        allOutputTail = '';
       }
       resolve(resolveValue);
     };

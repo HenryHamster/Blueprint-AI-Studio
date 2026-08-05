@@ -337,6 +337,14 @@ export function isWorkflowToolName(name: string | undefined): boolean {
 // Claude Code runner
 export const CLAUDE_TIMEOUT_MS = 4 * 60 * 60 * 1000;
 export const MAX_OUTPUT_BYTES = 10_000_000;
+// Structured stream modes (claude-stream-json / codex-jsonl) wrap every token
+// in a JSON event envelope, so raw stream bytes overstate model output by
+// 20-100x — a fast provider legitimately passes MAX_OUTPUT_BYTES mid-task
+// (deepseek-v4-flash: ~57 turns / ~25k output tokens hit 10MB in 5 minutes).
+// Past the cap those runs keep only a rolling tail of this size instead of
+// being killed; runaway is still bounded by the stall/no-progress watchdogs
+// and the run timeout.
+export const OUTPUT_TAIL_AFTER_CAP_BYTES = 2_000_000;
 
 // Stream-json drain: bound event-loop blocking inside drainJsonChunks. Yield
 // after every WITHIN_CHUNK_YIELD_LINES parsed lines OR every WITHIN_CHUNK_YIELD_MS
