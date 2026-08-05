@@ -120,10 +120,11 @@ describe('runner-side supervisor protocol', () => {
       expect(req.admin_token).toBe('tok-0123456789');
       expect(req.pg_password).toMatch(/^wt-pg-[0-9a-f]{16}$/);
       expect(req.agent_jwt_secret).toMatch(/^[0-9a-f]{48}$/);
-      if (process.platform !== 'win32') {
-        // The request carries stack secrets — owner-only, per runner convention.
-        expect(statSync(requestPath).mode & 0o777).toBe(0o600);
-      }
+      // The request carries stack secrets — owner-only, per runner convention.
+      // Asserted unconditionally: a mode leak is exactly the regression this
+      // test exists to catch, and POSIX modes are meaningful on every platform
+      // the agent suite runs on (Linux/macOS CI).
+      expect(statSync(requestPath).mode & 0o777).toBe(0o600);
       writeFileSync(
         path.join(proto, 'response.json'),
         JSON.stringify({ status: 'ok', backend_port: 18123, db_port: 15123 }),
