@@ -4981,6 +4981,57 @@ class TestTriggerQualify:
         resp = await client.post(f"/api/admin/projects/{project.id}/qualify")
         assert resp.status_code == 404
 
+    @pytest.mark.asyncio
+    async def test_qualify_forwards_requested_probes(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """The operator endpoint forwards ``probes`` to run_qualification —
+        the only lever besides Strategic's qualify_request that can select the
+        walkthrough_e2e live-evidence lane."""
+        from app import release_qualifier
+
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id, phase="stabilize")
+
+        seen: dict = {}
+
+        async def fake_run_qualification(session, project_id, version, **kwargs):
+            seen.update(kwargs)
+            return {"status": "spawned"}
+
+        monkeypatch.setattr(
+            release_qualifier, "run_qualification", fake_run_qualification
+        )
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/qualify",
+            json={"probes": ["walkthrough_e2e"]},
+        )
+        assert resp.status_code == 200
+        assert seen["requested_probes"] == ["walkthrough_e2e"]
+        assert seen["explicit_request"] is True
+
+        # Omitting the body keeps the legacy probe-less contract.
+        seen.clear()
+        resp = await client.post(f"/api/admin/projects/{project.id}/qualify")
+        assert resp.status_code == 200
+        assert seen["requested_probes"] is None
+
+    @pytest.mark.asyncio
+    async def test_qualify_invalid_probe_returns_422(
+        self, client: AsyncClient, db_session
+    ):
+        """An unsupported probe name surfaces as a 422 (from the qualifier's
+        own validation), never a silent probe-less qualification."""
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id, phase="stabilize")
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/qualify",
+            json={"probes": ["not_a_probe"]},
+        )
+        assert resp.status_code == 422
+        assert "unsupported qualification probe" in resp.text
+
 
 class TestClearWaveDeps:
     @pytest.mark.asyncio

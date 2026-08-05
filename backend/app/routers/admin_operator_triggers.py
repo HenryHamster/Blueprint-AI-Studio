@@ -273,9 +273,14 @@ async def trigger_self_audit(
     }
 
 
+class _TriggerQualifyRequest(BaseModel):
+    probes: list[str] | None = None
+
+
 @router.post("/projects/{project_id}/qualify")
 async def trigger_qualify(
     project_id: uuid.UUID,
+    body: _TriggerQualifyRequest | None = None,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -285,6 +290,12 @@ async def trigger_qualify(
     Phase 4 dry-run calibration window).  Resolves the current open
     ``ReleaseVersion``, runs ``release_qualifier.run_qualification``, and
     returns its result dict.  Returns 404 when there is no open version.
+
+    ``probes`` selects optional product probes (e.g. ``["walkthrough_e2e"]``)
+    for this qualification, mirroring Strategic's ``qualify_request`` — without
+    it the operator lever cannot exercise the live-evidence lane at all.
+    Validation is owned by ``_normalize_qualification_probes``; an invalid
+    selection surfaces as a 422 instead of a silent probe-less run.
     """
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
@@ -298,8 +309,17 @@ async def trigger_qualify(
         )
 
     result = await release_qualifier.run_qualification(
-        session, project_id, open_version, explicit_request=True
+        session,
+        project_id,
+        open_version,
+        requested_probes=body.probes if body is not None else None,
+        explicit_request=True,
     )
+    if result.get("status") == "invalid_requested_probes":
+        raise HTTPException(
+            status_code=422,
+            detail=result.get("detail") or "invalid requested_probes",
+        )
     await session.commit()
     # Promotion check-wait: the audit passed and a managed promotion is pending.
     # Re-qualifying would spawn a fresh heavy qualifier child set
