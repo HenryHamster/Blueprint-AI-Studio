@@ -1461,14 +1461,18 @@ def task_counts_toward_review_cap(task: Task) -> bool:
 
     Excluded tasks remain VISIBLE as waste/drilldown rows in diagnostics; they
     are only omitted from the cap-counted iteration total.
+
+    Uses the INFRA analytics superset (INFRA_ANALYTICS_CLASSES) so an
+    UNPLACEABLE_EXECUTION_SITE task — which likewise never ran a review — is
+    excluded too.
     """
-    from app.failure_classification import INFRA_CLASSES
+    from app.failure_classification import INFRA_ANALYTICS_CLASSES
 
     if getattr(task, "archived", False):
         return False
     if task.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
         fc = (task.context or {}).get("failure_category")
-        if fc in INFRA_CLASSES:
+        if fc in INFRA_ANALYTICS_CLASSES:
             return False
     return not (task.context or {}).get("_review_stale_head")
 

@@ -131,8 +131,12 @@ StrategicPhase = Literal["phase1", "phase2"]
 #       compute_experiment task runs here). The closed vocabulary keeps the
 #       shape declarable without requiring a new enum value later.
 RunShape = Literal["single_agent", "workflow", "experiment_loop"]
-ExecutionSite = Literal["default", "direct_packer_gce", "local_runner"]
-DIRECT_PACKER_GCE_EXECUTION_SITE: ExecutionSite = "direct_packer_gce"
+# The only declared execution sites today: the generic ``default`` matrix and the
+# qualifier's live-local-runner walkthrough site. The former direct-Packer-GCE
+# site was retired when walkthrough_e2e moved to local-runner dispatch (no task
+# type declares it), so it is removed from the vocabulary rather than left as
+# unreachable dead code.
+ExecutionSite = Literal["default", "local_runner"]
 # The qualifier's live-local-runner walkthrough site: a heartbeat-proven
 # candidate-stack execution site (docker info + Compose + Chromium) selected and
 # pinned at birth by the qualifier, never routed by generic dispatch.

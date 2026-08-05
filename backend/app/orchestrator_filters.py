@@ -25,7 +25,6 @@ from app.models import Task, TaskStatus
 from app.shared_state import is_direction_held, DEFAULT_TASK_SCOPE
 from app.time_utils import _utcnow
 from app.task_capabilities import (
-    DIRECT_PACKER_GCE_EXECUTION_SITE,
     READ_ONLY_TASK_TYPES,
     execution_site_for_task_type,
 )
@@ -1816,8 +1815,7 @@ def unplaceable_execution_site_reason(task_type: str) -> str | None:
     generically placeable.
 
     Generic dispatch routes only the ``default`` site (and unknown types, which
-    conservatively resolve to the default matrix).  The direct-Packer-GCE site is
-    also placeable by the generic cold-GCE path.  Every OTHER declared site
+    conservatively resolve to the default matrix).  Every other declared site
     (today only the qualifier's live-local-runner ``walkthrough_e2e`` site) is a
     hard routing contract generic dispatch cannot honour: such a task is pinned
     at birth by its site owner (the qualifier resolves a site-proven runner
@@ -1827,17 +1825,13 @@ def unplaceable_execution_site_reason(task_type: str) -> str | None:
     cycle) forever.
     """
     site = execution_site_for_task_type(task_type)
-    if (
-        site is None
-        or site == "default"
-        or site == DIRECT_PACKER_GCE_EXECUTION_SITE
-    ):
+    if site is None or site == "default":
         return None
     return (
         f"declared execution site {site!r} for task type {task_type!r} has no "
-        "eligible runner: generic dispatch serves only the 'default' and "
-        "'direct_packer_gce' sites, and a QUEUED task cannot be re-pinned to a "
-        "site-proven runner. Terminating instead of holding QUEUED forever"
+        "eligible runner: generic dispatch serves only the 'default' site, and a "
+        "QUEUED task cannot be re-pinned to a site-proven runner. Terminating "
+        "instead of holding QUEUED forever"
     )
 
 

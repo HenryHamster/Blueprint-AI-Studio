@@ -783,6 +783,21 @@ INFRA_CLASSES: frozenset[str] = frozenset(
     }
 )
 
+# Analytics superset of INFRA_CLASSES.  Consumers that bucket failures into
+# infra vs code-defect for ANALYTICS (direction health, streaks, success rates,
+# lane waste, review-cap counting) gate on a membership set; INFRA_CLASSES
+# deliberately EXCLUDES UNPLACEABLE_EXECUTION_SITE because the resurrection
+# sweep (reaper_infra_recovery Step 5) flips only INFRA_CLASSES members back to
+# QUEUED and an unplaceable task is terminal.  But for analytics bucketing an
+# unplaceable task is a routing/platform condition, not a code defect — taxonomy
+# routes it to TAXONOMY_INFRA_RELATED — so it belongs in the infra bucket.
+# This explicit superset names that membership once instead of re-deriving it at
+# every call site.  Consumers that gate on INFRA_CLASSES for RESURRECTION /
+# transient-retry semantics must keep using INFRA_CLASSES.
+INFRA_ANALYTICS_CLASSES: frozenset[str] = INFRA_CLASSES | {
+    UNPLACEABLE_EXECUTION_SITE,
+}
+
 # Cause frozensets for adversarial grader non-response routing.  Each set
 # names the cause categories (from classify_grader_nonresponse_cause) that
 # map to a specific retry strategy.  Defined here so research_completion.py
