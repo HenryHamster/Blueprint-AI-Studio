@@ -261,6 +261,13 @@ class Capabilities:
     # Probed once per heartbeat; appended to the capabilities JSONB so the
     # orchestrator can filter pool LLM runtimes to clis the runner actually has.
     llm_clis: dict = field(default_factory=dict)
+    # Playwright-managed Chromium browser present on the host — the browser the
+    # qualify-time walkthrough harness drives. Mirrors the repo's existing
+    # chromium-usable signal (scripts/viewport-snapshot.sh). Probed once per
+    # heartbeat; surfaced in the isolation_backends inventory so the qualifier's
+    # walkthrough site gate admits only a host proven for Chromium, and fails
+    # closed when unprovable (absent browser is never defaulted to True).
+    playwright_chromium_usable: bool = False
 
     # ── Derived predicates ──
     @property
@@ -851,6 +858,27 @@ def probe_container_llm_clis(
     return result
 
 
+def probe_playwright_chromium() -> bool:
+    """True when the host has a Playwright-managed Chromium browser build.
+
+    Mirrors the project's existing chromium-usable signal
+    (``scripts/viewport-snapshot.sh``): the Playwright browsers cache contains a
+    ``chromium-*`` directory. A missing cache is unprovable → False (fail-closed:
+    a host that cannot serve Chromium to the walkthrough harness never claims the
+    candidate-stack site).
+    """
+    cache = os.path.expanduser(os.path.join("~", ".cache", "ms-playwright"))
+    try:
+        if not os.path.isdir(cache):
+            return False
+        return any(
+            name.startswith("chromium-") and os.path.isdir(os.path.join(cache, name))
+            for name in os.listdir(cache)
+        )
+    except OSError:
+        return False
+
+
 def detect_capabilities() -> Capabilities:
     """Probe the host once. Every probe is non-fatal (absent tool → unusable)."""
     bwrap_path = _which("bwrap")
@@ -867,6 +895,7 @@ def detect_capabilities() -> Capabilities:
     # Apptainer and could crash before launch.
     enroot_path = None
     systemd_run_path = probe_systemd_run()
+    playwright_chromium_usable = probe_playwright_chromium()
     gpu_indices, gpu_names = detect_gpus()
 
     notes: list[str] = []
@@ -885,6 +914,7 @@ def detect_capabilities() -> Capabilities:
         apptainer_path=apptainer_path,
         enroot_path=enroot_path,
         systemd_run_path=systemd_run_path,
+        playwright_chromium_usable=playwright_chromium_usable,
         gpu_indices=gpu_indices,
         gpu_names=gpu_names,
         notes=tuple(notes),
@@ -1080,6 +1110,9 @@ def capabilities_inventory(caps: Capabilities) -> dict[str, bool]:
         "apptainer_ok": bool(caps.apptainer_path),
         "enroot_ok": False,
         "systemd_run_ok": bool(caps.systemd_run_path),
+        # Runner-emitted Chromium proof for the qualify-time walkthrough site gate
+        # (the host's Playwright browser cache). Fail-closed: absent → False.
+        "playwright_chromium_usable": caps.playwright_chromium_usable,
     }
 
 

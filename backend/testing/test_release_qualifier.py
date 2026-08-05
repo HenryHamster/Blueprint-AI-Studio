@@ -32,23 +32,6 @@ def test_walkthrough_execution_site_is_registry_declared():
     )
 
 
-@pytest.mark.asyncio
-async def test_walkthrough_spawn_fails_closed_on_execution_site_drift(mocker):
-    mocker.patch(
-        "app.release_qualifier_audit.execution_site_for_task_type",
-        return_value="default",
-    )
-
-    with pytest.raises(RuntimeError, match="requires the registry-declared"):
-        await rq._spawn_qualifier_walkthrough_task(
-            object(),
-            uuid.uuid4(),
-            version_id=uuid.uuid4(),
-            candidate_sha="a" * 40,
-            qualification_attempt_id=uuid.uuid4(),
-        )
-
-
 def test_qualification_contract_fingerprint_tracks_goal_and_categories():
     empty_rubric = rq._rubric_fingerprint([])
     category_rubric = rq._rubric_fingerprint(
@@ -278,8 +261,8 @@ async def test_run_qualification_spawns_walkthrough_e2e_when_enabled(
         project_id=project.id, token_hash="x" * 64, status="active",
         last_seen_at=_utcnow(),
         capabilities={"task_types": "all", "max_concurrent": 2,
-                      "isolation_backends": {"docker_usable": True},
-                      "playwright_chromium_usable": True},
+                      "isolation_backends": {"docker_usable": True,
+                                             "playwright_chromium_usable": True}},
     )
     db_session.add(capable_runner)
     await db_session.commit()
@@ -342,7 +325,7 @@ async def test_run_qualification_spawns_walkthrough_e2e_when_enabled(
     assert walk.context["candidate_sha"] == candidate
     assert walk.context["qualification_attempt_id"] == attempt_id
     assert walk.context["release_version_id"] == str(version.id)
-    assert walk.context["execution_site"] == "direct_packer_gce"
+    assert walk.context["execution_site"] == "local_runner"
 
 
 @pytest.mark.asyncio
@@ -622,8 +605,8 @@ async def test_walkthrough_e2e_lane_records_registered_criterion_evidence(
         project_id=project.id, token_hash="x" * 64, status="active",
         last_seen_at=_utcnow(),
         capabilities={"task_types": "all", "max_concurrent": 2,
-                      "isolation_backends": {"docker_usable": True},
-                      "playwright_chromium_usable": True},
+                      "isolation_backends": {"docker_usable": True,
+                                             "playwright_chromium_usable": True}},
     )
     db_session.add(capable_runner)
     await db_session.commit()
@@ -838,6 +821,12 @@ async def test_walkthrough_e2e_site_gate_rejects_unproven_runners(db_session):
     base = {"task_types": "all", "max_concurrent": 2}
     add_runner(uuid.uuid4(), {**base, "isolation_backends": {"bwrap_usable": True}})
     add_runner(uuid.uuid4(), {**base, "isolation_backends": {"docker_usable": True}})
+    # A docker box whose chromium claim is only operator-stamped at the TOP level
+    # (never emitted by the runner's own inventory) is NOT a proven site: the
+    # runner-emitted capability must live in isolation_backends, so this fails
+    # closed just like a thin-docker box.
+    add_runner(uuid.uuid4(), {**base, "isolation_backends": {"docker_usable": True},
+                              "playwright_chromium_usable": True})
     await db_session.commit()
 
     with pytest.raises(QualifierWalkthroughSiteUnavailableError,
@@ -849,8 +838,9 @@ async def test_walkthrough_e2e_site_gate_rejects_unproven_runners(db_session):
         )
 
     low_id = uuid.UUID("00000000-0000-0000-0000-0000000000aa")
-    site_caps = {**base, "isolation_backends": {"docker_usable": True},
-                 "playwright_chromium_usable": True}
+    site_caps = {**base,
+                 "isolation_backends": {"docker_usable": True,
+                                        "playwright_chromium_usable": True}}
     add_runner(low_id, site_caps)
     add_runner(uuid.UUID("00000000-0000-0000-0000-0000000000bb"), site_caps)
     await db_session.commit()
@@ -866,3 +856,99 @@ async def test_walkthrough_e2e_site_gate_rejects_unproven_runners(db_session):
     assert pinned.vm_provisioned_at is not None
     assert pinned.started_at is None
     assert pinned.context["qualifier_walkthrough_e2e"] is True
+
+
+def test_walkthrough_site_gate_reads_runner_emitted_chromium_only():
+    """The walkthrough site gate is satisfiable ONLY through the capability the
+    runner's own inventory emits (``isolation_backends.playwright_chromium_usable``),
+    never through an operator top-level claim, and never defaulted to True.
+
+    DEFECT-B regression: the gate must not silently admit a thin-docker box
+    because a missing capability defaults to True (default-off-is-guilty).
+    """
+    from types import SimpleNamespace
+
+    from app.release_qualifier_audit import _walkthrough_e2e_site_eligible
+
+    def snap(caps):
+        return SimpleNamespace(capabilities=caps)
+
+    base = {"task_types": "all", "max_concurrent": 2}
+    # Runner-emitted proof (nested isolation_backends, the heartbeat inventory
+    # location) → eligible.
+    assert _walkthrough_e2e_site_eligible(
+        snap({**base, "isolation_backends": {"docker_usable": True,
+                                             "playwright_chromium_usable": True}})
+    )
+    # Operator top-level claim only (never emitted by the runner inventory) →
+    # NOT eligible.
+    assert not _walkthrough_e2e_site_eligible(
+        snap({**base, "isolation_backends": {"docker_usable": True},
+              "playwright_chromium_usable": True})
+    )
+    # Thin-docker (no chromium at all) → NOT eligible.
+    assert not _walkthrough_e2e_site_eligible(
+        snap({**base, "isolation_backends": {"docker_usable": True}})
+    )
+    # bwrap-only → NOT eligible.
+    assert not _walkthrough_e2e_site_eligible(
+        snap({**base, "isolation_backends": {"bwrap_usable": True}})
+    )
+    # Missing capabilities → NOT eligible.
+    assert not _walkthrough_e2e_site_eligible(snap(None))
+    assert not _walkthrough_e2e_site_eligible(snap({}))
+
+
+@pytest.mark.asyncio
+async def test_walkthrough_spawn_records_live_runner_site_not_registry_declaration(
+    db_session,
+):
+    """The walkthrough spawn's supported execution site is the LIVE LOCAL RUNNER.
+
+    The registry still declares walkthrough_e2e as DIRECT_PACKER_GCE (the
+    fail-closed sentinel that keeps generic dispatch from claiming the type), but
+    the qualifier path dispatches to a proven local runner and records the ACTUAL
+    site label. This is the DEFECT-A regression: assert (registry site) and
+    dispatch (live runner) can never disagree again — the function never requires
+    the registry site to equal the dispatch site, and the context never echoes the
+    registry declaration.
+    """
+    from app.release_qualifier_audit import (
+        _WALKTHROUGH_E2E_EXECUTION_SITE,
+        _spawn_qualifier_walkthrough_task,
+    )
+    from app.task_capabilities import (
+        DIRECT_PACKER_GCE_EXECUTION_SITE,
+        TaskType,
+        execution_site_for_task_type,
+    )
+
+    # The fail-closed registry sentinel is unchanged.
+    assert (
+        execution_site_for_task_type(TaskType.walkthrough_e2e)
+        == DIRECT_PACKER_GCE_EXECUTION_SITE
+    )
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    capable_runner = LocalRunner(
+        project_id=project.id, token_hash="x" * 64, status="active",
+        last_seen_at=_utcnow(),
+        capabilities={"task_types": "all", "max_concurrent": 2,
+                      "isolation_backends": {"docker_usable": True,
+                                             "playwright_chromium_usable": True}},
+    )
+    db_session.add(capable_runner)
+    await db_session.commit()
+
+    pinned = await _spawn_qualifier_walkthrough_task(
+        db_session, project.id, version_id=version.id,
+        candidate_sha="f011c10se" * 5,
+        qualification_attempt_id=uuid.uuid4(),
+    )
+    assert pinned.status == TaskStatus.PROVISIONING
+    assert pinned.vm_instance_id == f"runner:{capable_runner.id}"
+    assert pinned.context["runner_target_id"] == str(capable_runner.id)
+    # The recorded site is the ACTUAL dispatch target (live local runner), never
+    # the registry's DIRECT_PACKER_GCE sentinel.
+    assert pinned.context["execution_site"] == _WALKTHROUGH_E2E_EXECUTION_SITE
+    assert _WALKTHROUGH_E2E_EXECUTION_SITE == "local_runner"

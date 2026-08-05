@@ -44,11 +44,6 @@ from app.runner_eligibility import (
 )
 from app.runtime_config_state import resolve_project_promotion_enabled
 from app.shared_state import runtime_config as _runtime_config
-from app.task_capabilities import (
-    DIRECT_PACKER_GCE_EXECUTION_SITE,
-    TaskType,
-    execution_site_for_task_type,
-)
 from app.time_utils import _utcnow
 from app.json_extract import async_json_loads
 from app.deployed_sha import get_serving_sha
@@ -516,6 +511,14 @@ async def _spawn_release_audit_challenge_task(
 
 _WALKTHROUGH_E2E_TASK_TYPE = "walkthrough_e2e"
 
+# The supported walkthrough_e2e execution site: a LIVE LOCAL RUNNER proven for
+# the candidate-stack site (docker info + Compose + Chromium), pinned at birth.
+# The registry still declares walkthrough_e2e as DIRECT_PACKER_GCE so generic
+# dispatch keeps refusing live-runner claims (fail-closed); this qualifier path
+# is the only permitted placement, so the task's execution_site label records the
+# ACTUAL dispatch target rather than the registry's fail-closed sentinel.
+_WALKTHROUGH_E2E_EXECUTION_SITE = "local_runner"
+
 
 class QualifierWalkthroughSiteUnavailableError(RuntimeError):
     """Raised (fail-closed) when no live, project-allowed runner can execute the
@@ -539,17 +542,24 @@ def _walkthrough_e2e_site_eligible(runner: object) -> bool:
     * ``isolation_backends.docker_usable is True`` — the heartbeat-proven
       ``docker info`` capability (reported by ``capabilities_inventory``); rejects
       ordinary bwrap-only and podman/apptainer-only boxes.
-    * ``playwright_chromium_usable is True`` — the operator-set Chromium/Playwright
-      capability, the canonical browser gate used by ``_select_eligible_runner``
-      with ``requires_browser=True``.
+    * ``isolation_backends.playwright_chromium_usable is True`` — the
+      heartbeat-proven Chromium capability (reported by ``capabilities_inventory``
+      from the host's Playwright browser cache); rejects thin-docker boxes that
+      cannot drive the walkthrough browser.
 
-    A thin-docker box (Docker runtime but no Chromium harness) or a box that never
-    declared ``walkthrough_e2e`` task coverage is rejected.
+    Both capabilities are read from the runner's OWN inventory (the nested
+    ``isolation_backends`` map the heartbeat emits) — a key that is only
+    operator-claimed at the top level, or defaulted/missing, is unprovable and
+    fails closed. A thin-docker box (Docker runtime but no Chromium harness) or a
+    box that never declared ``walkthrough_e2e`` task coverage is rejected.
     """
     caps = getattr(runner, "capabilities", None) or {}
     backends = caps.get("isolation_backends")
     docker_ok = isinstance(backends, dict) and backends.get("docker_usable") is True
-    chromium_ok = caps.get("playwright_chromium_usable") is True
+    chromium_ok = (
+        isinstance(backends, dict)
+        and backends.get("playwright_chromium_usable") is True
+    )
     return docker_ok and chromium_ok
 
 
@@ -628,24 +638,21 @@ async def _spawn_qualifier_walkthrough_task(
 ) -> Task:
     """Create + dispatch a qualify-time ``walkthrough_e2e`` task on the candidate.
 
-    Resolves a verified container-capable execution site at spawn time and pins
-    the task to it AT BIRTH (``vm_instance_id='runner:{id}'`` +
-    ``context['runner_target_id']`` + PROVISIONING + ``vm_provisioned_at``, with
-    ``started_at`` NULL so the runner stamps it on pull) — mirroring the
-    orchestrator's own pin contract (``_try_runner_dispatch``) and the
-    strategic-spawn pin-at-birth path. When no eligible site exists the spawn
-    FAILS CLOSED (raises :class:`QualifierWalkthroughSiteUnavailableError`) before
-    any task row is created, so the caller records a ``spawn_failed``
-    qualification with the precise execution-site reason instead of queueing a
-    child that can never boot the candidate stack.
+    The supported execution site is a LIVE LOCAL RUNNER (not a GCE VM): this
+    resolves a runner proven for the candidate-stack site (docker info + Compose
+    + Chromium via :func:`_walkthrough_e2e_site_eligible`) and pins the task to
+    it AT BIRTH (``vm_instance_id='runner:{id}'`` + ``context['runner_target_id']``
+    + PROVISIONING + ``vm_provisioned_at``, with ``started_at`` NULL so the runner
+    stamps it on pull) — mirroring the orchestrator's own pin contract
+    (``_try_runner_dispatch``) and the strategic-spawn pin-at-birth path. The
+    task's ``execution_site`` context label records the actual dispatch target
+    (:data:`_WALKTHROUGH_E2E_EXECUTION_SITE`), NOT the registry declaration.
+    When no eligible site exists the spawn FAILS CLOSED (raises
+    :class:`QualifierWalkthroughSiteUnavailableError`) before any task row is
+    created, so the caller records a ``spawn_failed`` qualification with the
+    precise execution-site reason instead of queueing a child that can never boot
+    the candidate stack.
     """
-    execution_site = execution_site_for_task_type(TaskType.walkthrough_e2e)
-    if execution_site != DIRECT_PACKER_GCE_EXECUTION_SITE:
-        raise RuntimeError(
-            "walkthrough_e2e qualifier spawn requires the registry-declared "
-            f"execution site {DIRECT_PACKER_GCE_EXECUTION_SITE!r}; "
-            f"got {execution_site!r}"
-        )
     runner, site_reason = await _select_walkthrough_e2e_execution_site(
         session, project_id
     )
@@ -683,7 +690,7 @@ async def _spawn_qualifier_walkthrough_task(
             "qualifier_walkthrough_e2e": True,
             "candidate_sha": candidate_sha,
             "qualification_attempt_id": str(qualification_attempt_id),
-            "execution_site": execution_site,
+            "execution_site": _WALKTHROUGH_E2E_EXECUTION_SITE,
             "runner_target_id": str(runner.id),
             "runner_hostname": runner.hostname,
         },
@@ -698,7 +705,7 @@ async def _spawn_qualifier_walkthrough_task(
                 "spawned_by": "RELEASE_QUALIFIER",
                 "task_type": "walkthrough_e2e",
                 "qualifier_walkthrough_e2e": True,
-                "execution_site": execution_site,
+                "execution_site": _WALKTHROUGH_E2E_EXECUTION_SITE,
                 "release_version_id": str(version_id),
                 "qualification_attempt_id": str(qualification_attempt_id),
                 "runner_target_id": str(runner.id),

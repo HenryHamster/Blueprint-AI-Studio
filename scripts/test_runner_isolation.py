@@ -1503,6 +1503,7 @@ class TestCapabilitiesInventory(unittest.TestCase):
         "apptainer_ok",
         "enroot_ok",
         "systemd_run_ok",
+        "playwright_chromium_usable",
     }
 
     def test_all_flags_true(self):
@@ -1515,6 +1516,7 @@ class TestCapabilitiesInventory(unittest.TestCase):
             apptainer_path="/usr/bin/apptainer",
             enroot_path="/usr/bin/enroot",
             systemd_run_path="/usr/bin/systemd-run",
+            playwright_chromium_usable=True,
         )
         inv = iso.capabilities_inventory(caps)
         self.assertTrue(all(value for key, value in inv.items() if key != "enroot_ok"))
@@ -1556,6 +1558,21 @@ class TestCapabilitiesInventory(unittest.TestCase):
         self.assertEqual(set(reloaded), self._EXPECTED_KEYS)
         for value in reloaded.values():
             self.assertIsInstance(value, bool)
+
+    def test_playwright_chromium_usable_reflects_caps(self):
+        # Default-off-is-guilty: absent → False (never defaulted to True).
+        self.assertFalse(iso.capabilities_inventory(_caps())["playwright_chromium_usable"])
+        inv = iso.capabilities_inventory(_caps(playwright_chromium_usable=True))
+        self.assertTrue(inv["playwright_chromium_usable"])
+
+    def test_probe_playwright_chromium_detects_browser_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(iso.os.path, "expanduser", return_value=tmp):
+                # No Playwright browser cache → unprovable → False (fail-closed).
+                self.assertFalse(iso.probe_playwright_chromium())
+                chromium_dir = os.path.join(tmp, "chromium-1254.0")
+                os.makedirs(chromium_dir)
+                self.assertTrue(iso.probe_playwright_chromium())
 
 
 # ── LLM CLI probe ────────────────────────────────────────────────────────────
