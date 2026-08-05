@@ -1621,8 +1621,6 @@ async def _qualification_in_flight(
         required_keys.append("challenge_task_id")
     if qual.get("merge_grade_task_id"):
         required_keys.append("merge_grade_task_id")
-    if "walkthrough_e2e" in set(qual.get("requested_probes") or []):
-        required_keys.append("walkthrough_e2e_task_id")
     child_ids: list[uuid.UUID] = []
     parse_failed = False
     for key in required_keys:
@@ -1634,14 +1632,34 @@ async def _qualification_in_flight(
             child_ids.append(uuid.UUID(str(raw)))
         except (ValueError, AttributeError):
             parse_failed = True
+    # The walkthrough_e2e probe is optional and decision-bearing: a MISSING,
+    # unparseable, or deleted child is NOT in-flight work — the finalize path
+    # resolves an absent requested probe as a hard walkthrough_e2e_failed
+    # blocker, so there is nothing live left to wait for.  Only a present,
+    # parseable child id joins the required set (a live running probe still
+    # blocks re-entry); a deleted walkthrough row is skipped in the missing-row
+    # check below for the same reason.
+    walkthrough_child_id: uuid.UUID | None = None
+    if "walkthrough_e2e" in set(qual.get("requested_probes") or []):
+        _wt_raw = qual.get("walkthrough_e2e_task_id")
+        if _wt_raw:
+            try:
+                walkthrough_child_id = uuid.UUID(str(_wt_raw))
+                child_ids.append(walkthrough_child_id)
+            except (ValueError, AttributeError):
+                pass
     if parse_failed:
         return True
     rows = (
         await session.execute(select(Task.id, Task.status).where(Task.id.in_(child_ids)))
     ).all()
     found_ids = {row.id for row in rows}
-    if any(task_id not in found_ids for task_id in child_ids):
-        return True
+    for task_id in child_ids:
+        if task_id == walkthrough_child_id:
+            # A deleted walkthrough row cannot be in-flight work.
+            continue
+        if task_id not in found_ids:
+            return True
     return any(row.status not in _TERMINAL_STATUSES for row in rows)
 
 def _promotion_pending_result(
@@ -3632,9 +3650,19 @@ async def run_qualification(
             exc,
             exc_info=True,
         )
+        # Stamp the serving engine sha on the spawn_failed record so the
+        # error-redrive sweep can detect a later execution-site capability
+        # change: release_qualifier_redrive._walkthrough_execution_site_changed
+        # compares this against the current serving sha to re-arm a capped
+        # walkthrough spawn_failed exactly once after a deploy.  Lazy import
+        # mirrors the redrive module's idiom (app.deployed_sha is a lightweight
+        # env-reader; no load-order coupling here).
+        from app.deployed_sha import get_serving_sha  # noqa: PLC0415
+
         version.last_qualification = {
             "status": "error",
             "error": "spawn_failed",
+            "engine_sha": get_serving_sha(),
             "detail": str(exc)[:300],
             "candidate_sha": candidate_sha,
             "ci_green": ci_green,

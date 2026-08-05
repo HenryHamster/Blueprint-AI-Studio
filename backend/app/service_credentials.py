@@ -24,9 +24,11 @@ import secrets
 from datetime import timedelta
 
 from fastapi import HTTPException, Request, status
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
+from app.database import resolve_dialect_name
 from app.models import ServiceCredential
 from app.time_utils import _utcnow
 
@@ -41,6 +43,12 @@ TOKEN_PREFIX = "bpsc_"
 # single authenticated request from a hot machine consumer (e.g. an observer
 # polling loop) — mirrors the throttle pattern in app.auth's login metadata.
 _LAST_USED_UPDATE_INTERVAL = timedelta(seconds=60)
+
+# Short, per-statement lock timeout for the best-effort last-used write so it
+# fails fast instead of blocking the auth hot path on a contended row (the
+# global default is 30s). On timeout we degrade — skip the write — rather than
+# 500. Mirrors app.auth's _AUTH_METADATA_LOCK_TIMEOUT (incident 2026-06-04).
+_LAST_USED_LOCK_TIMEOUT = "1s"
 
 
 def mint_service_token() -> str:
@@ -160,6 +168,18 @@ async def authenticate_service_token(
     now = _utcnow()
     if cred.last_used_at is None or (now - cred.last_used_at) >= _LAST_USED_UPDATE_INTERVAL:
         try:
+            # Fail fast rather than parking a pooled connection on a contended
+            # row: the last_used write is cosmetic telemetry and must not hold
+            # the auth hot path up to the 30s default lock_timeout. Mirrors the
+            # admin-login metadata write in app.auth (incident 2026-06-04). SET
+            # LOCAL is Postgres-only and asyncpg cannot bind a parameter into it,
+            # so gate on the dialect and inline the literal; SQLite and other
+            # test dialects have no lock_timeout GUC, so skipping it there keeps
+            # the best-effort write working under tests.
+            if resolve_dialect_name(session) == "postgresql":
+                await session.execute(
+                    text(f"SET LOCAL lock_timeout = '{_LAST_USED_LOCK_TIMEOUT}'")
+                )
             cred.last_used_at = now
             cred.last_used_path = request.url.path[:255]
             session.add(cred)

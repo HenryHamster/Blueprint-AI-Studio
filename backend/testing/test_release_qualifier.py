@@ -909,6 +909,100 @@ async def test_finalize_unknown_criteria_probe_contained_and_preserves_verdict(
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "walkthrough_child_shape",
+    [
+        pytest.param("absent_id", id="absent_task_id"),
+        pytest.param("deleted_row", id="deleted_task_row"),
+    ],
+)
+async def test_pending_with_missing_walkthrough_task_finalizes(
+    db_session, walkthrough_child_shape
+):
+    """A pending qualification that requested the walkthrough_e2e probe but has
+    NO walkthrough child (walkthrough_e2e_task_id absent / the row was deleted)
+    is not in-flight work: the reaper sweep's finalize path processes it as a
+    hard walkthrough_e2e_failed blocker instead of stranding the version in
+    pending until the 6h qualification_timeout backstop.
+
+    Regression for the stranded-pending hazard: both guards used to treat the
+    missing child as non-terminal — _qualification_in_flight reported a live
+    child (blocking re-entry) and required_children_terminal reported not-ready
+    (blocking the sweep finalize path).  The version then sat pending with zero
+    in-flight work until the wall-clock timeout mislabeled it an infra failure.
+    """
+    import uuid
+
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    # The stranded shape: walkthrough_e2e requested but the child never
+    # materialized — either the task id is absent from the record (never
+    # spawned) or the id points at a task row that no longer exists.  Restamp
+    # the frozen contract so finalize does not treat the fixture mutation as
+    # mid-flight rubric drift, and freshen started_at so the 6h timeout
+    # backstop does NOT fire first.
+    wt_task_id = (
+        None
+        if walkthrough_child_shape == "absent_id"
+        else str(uuid.uuid4())  # present id, but no matching Task row
+    )
+    version.last_qualification = _with_current_qualification_contract(
+        project,
+        version,
+        {
+            **(version.last_qualification or {}),
+            "started_at": _utcnow().isoformat(),
+            "requested_probes": ["walkthrough_e2e"],
+            "walkthrough_e2e_task_id": wt_task_id,
+        },
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Both guards must agree there is no in-flight work left to wait for.
+    assert not await rq._qualification_in_flight(db_session, version)
+    assert await rq._required_children_terminal(db_session, version)
+
+    # The sweep's finalize path (audit-H5 per-version dedicated session) must
+    # finalize the stranded pending record rather than skip it.
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    assert count == 1
+    await db_session.refresh(version)
+    lq = version.last_qualification
+    assert lq["status"] == "not_promoted"
+    assert lq["blocker"] == "walkthrough_e2e_failed"
+    assert lq["walkthrough_e2e_result"]["status"] == "failed"
+    assert lq["walkthrough_e2e_result"]["reason"] == "walkthrough_e2e_task_missing"
+
+
 def test_walkthrough_probe_contract_is_strict_and_cache_safe():
     with pytest.raises(ValueError, match="unsupported"):
         rq._normalize_qualification_probes(["made_up_probe"])
@@ -1511,6 +1605,8 @@ async def test_walkthrough_site_failure_leaves_no_queued_release_audit_child(
     # Chromium), so the walkthrough spawn fails closed before the release_audit
     # child is allocated.
     candidate = "deadbeef" * 5  # 40-char placeholder SHA
+    stamped_engine = "f" * 40
+    mocker.patch("app.deployed_sha.get_serving_sha", return_value=stamped_engine)
     mocker.patch(
         "app.github.get_repo_installation_token",
         new=AsyncMock(return_value="gh-token"),
@@ -1536,6 +1632,9 @@ async def test_walkthrough_site_failure_leaves_no_queued_release_audit_child(
     assert version.last_qualification["error"] == "spawn_failed"
     assert version.last_qualification.get("audit_task_id") is None
     assert version.last_qualification.get("walkthrough_e2e_task_id") is None
+    # The spawn_failed record stamps the serving engine sha so the error-redrive
+    # site-change re-arm has a baseline to compare against a later deploy.
+    assert version.last_qualification.get("engine_sha") == stamped_engine
 
     # No QUEUED release_audit child may survive the failed dispatch.
     project_tasks = (
@@ -1652,3 +1751,90 @@ async def test_audit_child_not_orphaned_when_probe_spawn_fails(db_session, mocke
     ]
     assert len(walk_children) == 1
     assert walk_children[0].status == TaskStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_spawn_failed_redriven_on_site_change(db_session, mocker):
+    """A CAPPED walkthrough_e2e spawn_failed re-arms EXACTLY once when the
+    execution-site capability changed — the engine revision that recorded the
+    failure is no longer serving — so the newly-available dispatch site gets one
+    genuine attempt before the cap re-applies.
+
+    This is the acceptance evidence for the fix: a fleet that temporarily has no
+    site-proven runner parks a walkthrough qualification at spawn_failed, and the
+    error-redrive sweep previously skipped it (``spawn_failed`` was absent from
+    ``_TRANSIENT_ERROR_CODES``).  Adding it to the transient codes makes the
+    version re-drivable; the engine-sha re-arm mirrors the infra-failure path so
+    a CAPPED spawn_failed can still resume once after a deploy (every deploy
+    stamps a new ``DEPLOY_SHA``, so a record whose ``engine_sha`` differs from
+    the current serving sha means the site situation may have changed).  The
+    re-arm is one-shot: once a fresh capped failure is recorded under the
+    CURRENT engine, the cap re-applies and halts again.
+    """
+    from app.release_qualifier_redrive import (
+        _MAX_ERROR_REDRIVE_ATTEMPTS,
+        _redrive_error_qualification,
+    )
+
+    old_engine = "a" * 40
+    new_engine = "b" * 40
+    mocker.patch("app.deployed_sha.get_serving_sha", return_value=new_engine)
+
+    _project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "error",
+        "error": "spawn_failed",
+        "detail": (
+            "cannot dispatch qualifier walkthrough_e2e for candidate "
+            "ca11face...: no live project-allowed runner is registered"
+        ),
+        "candidate_sha": "ca11face" * 5,
+        "engine_sha": old_engine,
+        "requested_probes": ["walkthrough_e2e"],
+        "error_redrive_count": _MAX_ERROR_REDRIVE_ATTEMPTS,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mock_run_qual = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=mocker.AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    result = await _redrive_error_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert result is True, (
+        "capped walkthrough spawn_failed must re-arm once after the "
+        "execution-site capability change (record engine no longer serving)"
+    )
+    mock_run_qual.assert_called_once()
+
+    # ONE-SHOT: after a fresh capped failure recorded under the CURRENT serving
+    # engine, the re-arm must NOT fire again — the cap re-applies and halts.
+    await db_session.refresh(version)
+    version.last_qualification = {
+        "status": "error",
+        "error": "spawn_failed",
+        "detail": (
+            "cannot dispatch qualifier walkthrough_e2e for candidate "
+            "ca11face...: no live project-allowed runner is registered"
+        ),
+        "candidate_sha": "ca11face" * 5,
+        "engine_sha": new_engine,
+        "requested_probes": ["walkthrough_e2e"],
+        "error_redrive_count": _MAX_ERROR_REDRIVE_ATTEMPTS,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    result_again = await _redrive_error_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert result_again is False, (
+        "capped walkthrough spawn_failed must NOT re-arm a second time once "
+        "the record's engine matches the current serving engine"
+    )
+    assert mock_run_qual.call_count == 1

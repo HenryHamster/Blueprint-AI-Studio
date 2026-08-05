@@ -4905,6 +4905,88 @@ async def test_walkthrough_infra_failure_cap_holds_without_site_change(db_sessio
 
 
 @pytest.mark.asyncio
+async def test_walkthrough_spawn_failed_below_cap_is_redriven(db_session, mocker):
+    """A walkthrough spawn_failed BELOW the error-redrive cap is re-driven by
+    the sweep even when the engine that recorded it is still serving — the
+    execution-site outage may have already cleared (a site-proven runner came
+    online), and the bounded re-drive costs one attempt."""
+    from app.release_qualifier_redrive import _redrive_error_qualification
+
+    same_engine = "c" * 40
+    mocker.patch("app.deployed_sha.get_serving_sha", return_value=same_engine)
+
+    _project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "error",
+        "error": "spawn_failed",
+        "detail": "cannot dispatch qualifier walkthrough_e2e: no eligible runner",
+        "candidate_sha": "beefcafe" * 5,
+        "engine_sha": same_engine,
+        "requested_probes": ["walkthrough_e2e"],
+        "error_redrive_count": 1,  # below _MAX_ERROR_REDRIVE_ATTEMPTS
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mock_run_qual = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=mocker.AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    result = await _redrive_error_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert result is True, (
+        "walkthrough spawn_failed below cap must re-drive regardless of site "
+        "change — the outage may have already cleared"
+    )
+    mock_run_qual.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_walkthrough_spawn_failed_cap_holds_without_site_change(db_session, mocker):
+    """A CAPPED walkthrough spawn_failed does NOT re-arm when the engine that
+    recorded it is still serving — the site-change re-arm only fires when a
+    deploy landed a NEW serving engine sha (no capability change, no re-arm)."""
+    from app.release_qualifier_redrive import (
+        _MAX_ERROR_REDRIVE_ATTEMPTS,
+        _redrive_error_qualification,
+    )
+
+    same_engine = "d" * 40
+    mocker.patch("app.deployed_sha.get_serving_sha", return_value=same_engine)
+
+    _project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "error",
+        "error": "spawn_failed",
+        "detail": "cannot dispatch qualifier walkthrough_e2e: no eligible runner",
+        "candidate_sha": "f00dcafe" * 5,
+        "engine_sha": same_engine,
+        "requested_probes": ["walkthrough_e2e"],
+        "error_redrive_count": _MAX_ERROR_REDRIVE_ATTEMPTS,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mock_run_qual = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=mocker.AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    result = await _redrive_error_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert result is False, (
+        "capped walkthrough spawn_failed with the SAME engine still serving "
+        "must halt (cap holds — no re-arm)"
+    )
+    mock_run_qual.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_calcification_not_fired_below_attempt_threshold(db_session):
     """Fewer than _MIN_CALCIFICATION_ATTEMPTS hard-blocker failures do not
     trigger an alert — the stall may still be transient."""

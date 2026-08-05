@@ -1739,9 +1739,15 @@ async def required_children_terminal(
         (audit_required and audit_task is None)
         or (challenge_required and challenge_task is None)
         or (merge_grade_required and not merge_grade_resolved and merge_grade_task is None)
-        or (walkthrough_requested and walkthrough_task is None)
     ):
         return False
+    # A MISSING walkthrough_e2e child (absent task id, or the row was deleted)
+    # is deliberately NOT a non-terminal condition: there is no live child to
+    # wait for, and _finalize_qualification resolves an absent requested probe
+    # as a hard walkthrough_e2e_failed blocker (reason walkthrough_e2e_task_missing).
+    # Treating it as missing-and-terminal lets the sweep's finalize path process
+    # the qualification instead of stranding it in pending until the 6h timeout.
+    # A PRESENT, non-terminal walkthrough child still blocks below.
 
     active_children = (
         (audit_required, audit_task),

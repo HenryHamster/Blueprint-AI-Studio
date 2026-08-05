@@ -20,6 +20,7 @@ Two auth postures are exercised:
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import timedelta
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from httpx import AsyncClient, ASGITransport
@@ -335,7 +336,7 @@ async def test_service_credential_never_satisfies_require_admin(
     role is always "user", and the endpoint is outside observer:read's
     per-project allowlist regardless."""
     monkeypatch.delenv("ADMIN_API_KEY", raising=False)
-    cred, token = await _seed_credential(db_session, name="observer-never-admin")
+    _cred, token = await _seed_credential(db_session, name="observer-never-admin")
 
     async with _real_auth_client() as rc:
         resp = await rc.get("/api/admin/diagnostics", headers=_auth_header(token))
@@ -490,6 +491,85 @@ async def test_last_used_tracking_populated_after_successful_call(
     assert refreshed.last_used_at is not None
     assert refreshed.last_used_path is not None
     assert "operator-attention" in refreshed.last_used_path
+
+
+@pytest.mark.asyncio
+async def test_last_used_telemetry_issues_short_lock_timeout_literal_on_postgres(
+    db_session,
+):
+    """Regression (2026-06-04 incident class): the last_used telemetry commit on
+    the service-credential auth hot path must run behind a short per-statement
+    lock_timeout — exactly like the admin-login metadata write in app.auth — so
+    a contended row cannot block every machine-token request up to the 30s
+    default. The timeout must be inlined as a literal (asyncpg cannot bind a
+    parameter into SET LOCAL) and issued only on Postgres."""
+    cred, token = await _seed_credential(db_session, name="observer-lock-timeout")
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/api/admin/projects/00000000-0000-0000-0000-000000000000/diagnostics",
+            "query_string": b"",
+            "headers": [],
+        }
+    )
+    result = MagicMock()
+    result.scalars.return_value.first.return_value = cred
+    session = MagicMock()
+    session.execute = AsyncMock(return_value=result)
+    session.add = MagicMock()
+    session.commit = AsyncMock()
+    session.rollback = AsyncMock()
+
+    with patch("app.service_credentials.resolve_dialect_name", return_value="postgresql"):
+        principal = await authenticate_service_token(token, session, request)
+
+    set_local_calls = [
+        call.args[0]
+        for call in session.execute.call_args_list
+        if "SET LOCAL" in str(call.args[0])
+    ]
+    assert set_local_calls, "expected a SET LOCAL lock_timeout on Postgres"
+    stmt = set_local_calls[0]
+    assert "'1s'" in str(stmt.text)
+    assert ":t" not in str(stmt.text) and "$1" not in str(stmt.text)
+    for call in session.execute.call_args_list:
+        assert len(call.args) == 1, "SET LOCAL must carry no bind params"
+    session.commit.assert_awaited_once()
+    assert principal["user_id"] == cred.principal_user_id
+
+
+@pytest.mark.asyncio
+async def test_last_used_telemetry_skips_lock_timeout_on_non_postgres(db_session):
+    """On SQLite (and other test dialects) there is no lock_timeout GUC, so the
+    SET LOCAL is skipped entirely — the telemetry write still commits and auth
+    still resolves the principal."""
+    cred, token = await _seed_credential(db_session, name="observer-lock-sqlite")
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/api/admin/projects/00000000-0000-0000-0000-000000000000/diagnostics",
+            "query_string": b"",
+            "headers": [],
+        }
+    )
+    result = MagicMock()
+    result.scalars.return_value.first.return_value = cred
+    session = MagicMock()
+    session.execute = AsyncMock(return_value=result)
+    session.add = MagicMock()
+    session.commit = AsyncMock()
+    session.rollback = AsyncMock()
+
+    with patch("app.service_credentials.resolve_dialect_name", return_value="sqlite"):
+        principal = await authenticate_service_token(token, session, request)
+
+    assert not any(
+        "SET LOCAL" in str(call.args[0]) for call in session.execute.call_args_list
+    ), "SET LOCAL must not be issued on non-Postgres dialects"
+    session.commit.assert_awaited_once()
+    assert principal["user_id"] == cred.principal_user_id
 
 
 @pytest.mark.asyncio

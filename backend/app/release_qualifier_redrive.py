@@ -94,9 +94,12 @@ async def _maybe_dispatch_ci_preflight(session, version, head_sha: str | None) -
 
 
 # Maximum number of sweep-driven re-entries for a ``status=error`` version.
-# A single transient GitHub outage (sha_error, no_credentials) should clear on
-# the next sweep; a persistent failure is an operator issue.  Cap at 5 so a
-# permanently broken credential path does not retry forever.
+# A single transient GitHub outage (sha_error, no_credentials) or a walkthrough
+# execution-site outage (spawn_failed) should clear on the next sweep; a
+# persistent failure is an operator issue.  Cap at 5 so a permanently broken
+# credential path does not retry forever (a capped walkthrough spawn_failed can
+# still re-arm once per execution-site capability change — see
+# ``_redrive_error_qualification``).
 _MAX_ERROR_REDRIVE_ATTEMPTS = 5
 
 # Maximum number of sweep-driven re-entries for a ``status=infra_failure`` version.
@@ -135,27 +138,48 @@ def _infra_backoff_seconds(same_signature_streak: int) -> int:
     return _INFRA_BACKOFF_SCHEDULE[idx]
 
 
-def _walkthrough_execution_site_changed(qual: dict | None) -> bool:
-    """True when a capped WALKTHROUGH_e2e infra failure was recorded by an
-    engine revision that is no longer serving.
+def _is_walkthrough_qualification(qual: dict | None) -> bool:
+    """True when a qualification record belongs to the walkthrough_e2e probe leg.
 
-    The walkthrough product probe's infra failures are execution-site failures
+    A walkthrough infra failure carries a ``walkthrough_e2e``-prefixed ``error``
+    or ``infra_failure_signature``.  A walkthrough ``spawn_failed`` record
+    carries NO signature (the probe never spawned — the site check failed
+    first); there the probe is named in ``requested_probes`` instead.
+    """
+    if not isinstance(qual, dict):
+        return False
+    error = str(qual.get("error") or "")
+    if error.startswith("walkthrough_e2e"):
+        return True
+    signature = str(qual.get("infra_failure_signature") or "")
+    if signature.startswith("walkthrough_e2e"):
+        return True
+    if error == "spawn_failed":
+        probes = qual.get("requested_probes")
+        if isinstance(probes, (list, tuple, set, frozenset)) and (
+            "walkthrough_e2e" in probes
+        ):
+            return True
+    return False
+
+
+def _walkthrough_execution_site_changed(qual: dict | None) -> bool:
+    """True when a capped WALKTHROUGH_e2e failure was recorded by an engine
+    revision that is no longer serving.
+
+    The walkthrough product probe's failures are execution-site failures
     (candidate-stack boot, Docker/Compose/Chromium availability on the runner).
     A deploy that changes the walkthrough dispatch capability (e.g. the
     supported-site repair) lands under a NEW serving engine sha, so a capped
     record whose ``engine_sha`` differs from the current serving sha means the
     repair may have taken effect.  The redrive uses this to re-arm the cap
-    exactly once.  Non-walkthrough legs have no site dependency and never
-    re-arm; a record with no detectable engine change fails closed (no re-arm).
+    exactly once.  Applies to both walkthrough infra-failure records (signature
+    prefix) and walkthrough ``spawn_failed`` records (probe named in
+    ``requested_probes``).  Non-walkthrough legs have no site dependency and
+    never re-arm; a record with no detectable engine change fails closed (no
+    re-arm).
     """
-    if not isinstance(qual, dict):
-        return False
-    error = str(qual.get("error") or "")
-    signature = str(qual.get("infra_failure_signature") or "")
-    if not (
-        error.startswith("walkthrough_e2e")
-        or signature.startswith("walkthrough_e2e")
-    ):
+    if not _is_walkthrough_qualification(qual):
         return False
     last_engine_sha = qual.get("engine_sha")
     if not last_engine_sha:
@@ -177,7 +201,19 @@ _RUBRIC_REDRIVE_STATUSES: frozenset[str] = frozenset(
 
 # Transient error codes the sweep is allowed to re-drive.  Permanent errors
 # (e.g. project misconfiguration) should not be blindly retried.
-_TRANSIENT_ERROR_CODES: frozenset[str] = frozenset({"sha_error", "no_credentials"})
+#
+# ``spawn_failed`` is transient because its most common cause is a
+# WALKTHROUGH_e2e execution-site outage — no live runner proved the
+# candidate-stack site (docker info + Compose + Chromium) at spawn time, a
+# fleet condition that clears when a site-proven runner comes online or a
+# supported-site repair deploys.  The re-drive is still bounded by
+# ``_MAX_ERROR_REDRIVE_ATTEMPTS``, and a CAPPED walkthrough spawn_failed
+# re-arms exactly once per execution-site capability change (see
+# ``_redrive_error_qualification``), so a genuinely permanent spawn defect
+# cannot retry forever.
+_TRANSIENT_ERROR_CODES: frozenset[str] = frozenset(
+    {"sha_error", "no_credentials", "spawn_failed"}
+)
 
 
 _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS = 3
@@ -198,16 +234,26 @@ async def _redrive_error_qualification(
 ) -> bool:
     """Re-enter the qualifier for a ``status=error`` version caused by a transient failure.
 
-    A single transient GitHub outage (``sha_error``, ``no_credentials``) records
-    ``last_qualification.status == "error"`` and parks the version indefinitely
-    because nothing schedules a retry — neither the strategist (which reads
-    a standing ``error`` state as settled) nor any other sweep loop.
+    A single transient GitHub outage (``sha_error``, ``no_credentials``) or a
+    walkthrough execution-site outage (``spawn_failed`` — no live runner proved
+    the candidate-stack site at spawn time) records ``last_qualification.status
+    == "error"`` and parks the version indefinitely because nothing schedules a
+    retry — neither the strategist (which reads a standing ``error`` state as
+    settled) nor any other sweep loop.
 
     This re-driver fires for open, stabilize-phase versions whose
     ``last_qualification.status == "error"`` AND whose ``error`` code is in
     ``_TRANSIENT_ERROR_CODES`` AND whose ``last_qualification["error_redrive_count"]``
     is below ``_MAX_ERROR_REDRIVE_ATTEMPTS``.  The attempt cap prevents a
-    permanently broken credential path from retrying forever.
+    permanently broken path from retrying forever.
+
+    A CAPPED walkthrough ``spawn_failed`` re-arms exactly once when the
+    execution-site capability changed (the engine revision that recorded the
+    record is no longer serving), mirroring the infra-failure re-arm in
+    ``_redrive_infra_failure_qualification``: a fleet that had no site-proven
+    runner gets one genuine attempt under the newly-deployed dispatch site before
+    the cap re-applies.  Non-walkthrough ``spawn_failed`` records and the GitHub
+    outage codes never re-arm — their cap is final.
 
     The cap is tracked in ``last_qualification["error_redrive_count"]`` (a
     per-error-episode counter), NOT in the lifetime ``qualification_attempts``
@@ -246,7 +292,32 @@ async def _redrive_error_qualification(
         # blocked from transient-error re-drives on its very first error episode.
         error_redrive_count = qual.get("error_redrive_count", 0)
         if error_redrive_count >= _MAX_ERROR_REDRIVE_ATTEMPTS:
-            return False
+            # One-shot re-arm for a CAPPED walkthrough spawn_failed once the
+            # execution-site capability changed.  A spawn_failed that never had
+            # a site-proven runner is an execution-site failure (docker info +
+            # Compose + Chromium unavailable on the fleet at spawn time).  When
+            # the engine revision that recorded it is no longer serving, a
+            # supported-site repair or newly-online runner may have taken effect
+            # — give the re-drive EXACTLY ONE genuine attempt before the cap
+            # re-applies.  The re-arm is one-shot: the re-drive writes a fresh
+            # spawn_failed under the CURRENT engine sha, so the next cap check
+            # (after the counter accumulates again) sees no engine change and
+            # halts.  Non-walkthrough errors never re-arm — their cap is final.
+            _rearm_after_site_change = (
+                qual.get("error") == "spawn_failed"
+                and _walkthrough_execution_site_changed(qual)
+            )
+            if _rearm_after_site_change:
+                logger.warning(
+                    "[RELEASE_QUALIFIER] sweep: v%d capped walkthrough "
+                    "spawn_failed re-armed once after execution-site capability "
+                    "change (record engine_sha=%s no longer serving)",
+                    version.version_number,
+                    str(qual.get("engine_sha") or "?")[:12],
+                )
+                error_redrive_count = 0
+            else:
+                return False
         result = await release_qualifier.run_qualification(
             redrive_session,
             version.project_id,
