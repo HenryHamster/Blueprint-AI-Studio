@@ -84,7 +84,7 @@ describe('CandidateStackController', () => {
 // advertises a stack supervisor (supervisor.json written before spawn), boot()
 // must go through the file protocol and never touch docker itself.
 
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, statSync } from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 
@@ -120,6 +120,10 @@ describe('runner-side supervisor protocol', () => {
       expect(req.admin_token).toBe('tok-0123456789');
       expect(req.pg_password).toMatch(/^wt-pg-[0-9a-f]{16}$/);
       expect(req.agent_jwt_secret).toMatch(/^[0-9a-f]{48}$/);
+      if (process.platform !== 'win32') {
+        // The request carries stack secrets — owner-only, per runner convention.
+        expect(statSync(requestPath).mode & 0o777).toBe(0o600);
+      }
       writeFileSync(
         path.join(proto, 'response.json'),
         JSON.stringify({ status: 'ok', backend_port: 18123, db_port: 15123 }),
