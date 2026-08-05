@@ -62,6 +62,27 @@ describe('CandidateStackController', () => {
     await expect(c.boot()).rejects.toThrow(/postgres did not become ready/);
   });
 
+  it('boot() installs clone dependencies (npm ci) at the workspace root', async () => {
+    const ws = mkdtempSync(path.join(os.tmpdir(), 'wt-stack-npmci-'));
+    const logs: string[] = [];
+    const c = new CandidateStackController({
+      workspace: ws,
+      candidateSha: SHA,
+      adminToken: 'tok',
+      bootTimeoutMs: 0, // deadline already passed → the DB-readiness loop cannot succeed
+      log: (m) => logs.push(m),
+    });
+    await expect(c.boot()).rejects.toThrow();
+    // The depth-1 clone ships no node_modules; boot must run npm ci at the
+    // workspace ROOT (both the root playwright dep and admin-ui workspace deps).
+    const npmCiCalls = vi
+      .mocked(execFileSync)
+      .mock.calls.filter((call) => call[0] === 'npm' && call[1]?.[0] === 'ci');
+    expect(npmCiCalls.length).toBeGreaterThan(0);
+    expect(npmCiCalls[0][2]).toMatchObject({ cwd: ws });
+    expect(logs.some((m) => m.includes('npm ci'))).toBe(true);
+  });
+
   it('teardown() is idempotent and never throws even when compose down errors', async () => {
     const c = new CandidateStackController({
       workspace: '/tmp/workspace',

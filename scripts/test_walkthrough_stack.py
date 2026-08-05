@@ -120,7 +120,11 @@ class TestBootArgvShape(unittest.TestCase):
         self.assertIn(wts._DB_IMAGE, joined[1])
         self.assertIn(f"127.0.0.1:{db_port}:5432", joined[1])
         self.assertIn("docker build -t", joined[2])
-        self.assertTrue(joined[2].endswith(os.path.join(self.tmp, "backend")))
+        # The runner's workspace is the bind ROOT; the candidate checkout (and
+        # its backend/) lives in the agent subdirectory. Asserting the true
+        # layout catches a regression to the non-existent <root>/backend.
+        self.assertTrue(joined[2].endswith(os.path.join(self.tmp, "agent", "backend")))
+        self.assertFalse(joined[2].endswith(os.path.join(self.tmp, "backend")))
         self.assertIn("pg_isready", joined[3])
         self.assertIn("alembic upgrade head", joined[4])
         self.assertIn(f"127.0.0.1:{backend_port}:8080", joined[5])
@@ -131,6 +135,22 @@ class TestBootArgvShape(unittest.TestCase):
         # No shell is involved anywhere: every element is a plain token.
         for call in self.runner.calls:
             self.assertNotIn(";", " ".join(call[:2]))
+
+    def test_pick_free_ports_returns_distinct_ports(self):
+        # Regression: backend and db must never share a port. The helper holds
+        # every probe socket until ALL ports are allocated, so two back-to-back
+        # allocations cannot observe the same ephemeral port (the old
+        # single-port helper could return the same port twice).
+        ports = wts.pick_free_ports(2)
+        self.assertEqual(len(ports), 2)
+        self.assertNotEqual(ports[0], ports[1])
+        ports = wts.pick_free_ports(5)
+        self.assertEqual(len(set(ports)), 5)
+
+    def test_boot_publishes_distinct_backend_and_db_ports(self):
+        clean, _ = wts.validate_request(_request())
+        backend_port, db_port = self.sup._boot(clean)
+        self.assertNotEqual(backend_port, db_port)
 
     def test_container_names_derive_from_task_id_only(self):
         self.assertTrue(self.sup.db_name.startswith("bp-wt-task123a"))

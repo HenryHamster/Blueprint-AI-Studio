@@ -906,12 +906,15 @@ def test_select_eligible_runner_requires_explicit_browser_proof():
     incapable = RunnerDispatchSnapshot(
         uuid.uuid4(), project_id, {"task_types": "all"}
     )
+    # The heartbeat writes the browser capability NESTED under
+    # isolation_backends (capabilities_inventory in scripts/runner_isolation.py).
+    # Only that nested flag earns the browser gate.
     capable = RunnerDispatchSnapshot(
         id=uuid.uuid4(),
         project_id=project_id,
         capabilities={
             "task_types": "all",
-            "playwright_chromium_usable": True,
+            "isolation_backends": {"playwright_chromium_usable": True},
         },
     )
 
@@ -925,6 +928,29 @@ def test_select_eligible_runner_requires_explicit_browser_proof():
     )
     assert selected is not None
     assert selected.id == capable.id
+
+    # A TOP-LEVEL playwright_chromium_usable: True must NOT satisfy the gate:
+    # that key carries the live launch-probe contract (None until the first
+    # probe completes), so reading it made the browser gate unsatisfiable. The
+    # dispatcher reads the SAME nested key the heartbeat writes — proof of the
+    # single contract, not merely a passing bool.
+    top_level_only = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "playwright_chromium_usable": True,
+        },
+    )
+    not_selected = _select_eligible_runner(
+        {project_id: [incapable, top_level_only]},
+        project_id,
+        "salvage_bundle",
+        None,
+        {},
+        requires_browser=True,
+    )
+    assert not_selected is None
 
     legacy = _select_eligible_runner(
         {project_id: [incapable]}, project_id, "salvage_bundle", None, {}
@@ -1057,8 +1083,10 @@ async def test_walkthrough_dispatch_never_claims_a_registered_runner(db_session)
             "task_types": "all",
             "max_concurrent": 1,
             "agent_available": True,
-            "playwright_chromium_usable": True,
-            "isolation_backends": {"docker_usable": True},
+            "isolation_backends": {
+                "docker_usable": True,
+                "playwright_chromium_usable": True,
+            },
         },
     )
 

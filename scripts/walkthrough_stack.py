@@ -143,12 +143,28 @@ def validate_request(request: dict) -> tuple[dict | None, str]:
     return clean, ""
 
 
-def pick_free_port() -> int:
-    """A loopback TCP port that is free right now (small TOCTOU window is fine:
-    the subsequent docker publish fails loudly and the boot error surfaces)."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
+def pick_free_ports(count: int) -> list[int]:
+    """Return ``count`` distinct free loopback TCP ports.
+
+    Holds every probe socket open until ALL ``count`` ports are allocated so the
+    OS cannot hand the same ephemeral port to two back-to-back probes (the old
+    single-port helper could return the SAME port for backend and db, so the
+    second ``docker run`` publish would collide). Sockets are closed before the
+    caller publishes the ports to docker — the small TOCTOU window after release
+    is fine: a publish failure fails loudly and surfaces the boot error.
+    """
+    sockets: list[socket.socket] = []
+    ports: list[int] = []
+    try:
+        for _ in range(count):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.bind(("127.0.0.1", 0))
+            sockets.append(sock)
+            ports.append(int(sock.getsockname()[1]))
+    finally:
+        for sock in sockets:
+            sock.close()
+    return ports
 
 
 def _sanitize_task_fragment(task_id: str) -> str:
@@ -320,8 +336,7 @@ class WalkthroughStackSupervisor:
     def _boot(self, req: dict[str, str]) -> tuple[int, int]:
         """Fixed-shape stack boot. Raises on any failure (agent fails closed)."""
         self._booted = True  # set BEFORE the first docker call so teardown covers partial boots
-        backend_port = pick_free_port()
-        db_port = pick_free_port()
+        backend_port, db_port = pick_free_ports(2)
         database_url = (
             f"postgresql+asyncpg://postgres:{req['pg_password']}@db:5432/postgres"
         )
@@ -344,8 +359,15 @@ class WalkthroughStackSupervisor:
             ],
             timeout=_DB_PULL_TIMEOUT_S,
         )
+        # The workspace passed by the runner is the per-task bind ROOT (the
+        # marker lives there); the candidate checkout lives at
+        # <workspace>/agent, so the backend build context is the agent
+        # subdirectory — never the bind root itself.
         self._run(
-            ["docker", "build", "-t", self.image, os.path.join(self.workspace, "backend")],
+            [
+                "docker", "build", "-t", self.image,
+                os.path.join(self.workspace, "agent", "backend"),
+            ],
             timeout=_BUILD_TIMEOUT_S,
         )
         self._wait_for_db()

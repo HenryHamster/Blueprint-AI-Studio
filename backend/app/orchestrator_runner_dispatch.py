@@ -388,6 +388,7 @@ from app.runner_eligibility import (  # noqa: F401
     _runner_agent_available,
     _runner_at_capacity,
     _runner_at_compute_capacity,
+    _runner_chromium_usable,
     _runner_container_image_storage,
     _runner_effective_workspace_disk_floor,
     _runner_gpu_capable,
@@ -1403,12 +1404,12 @@ def _select_eligible_runner(
             # Browser-required work is fail-safe: only a current, explicit runner
             # proof is accepted. Older runners omit this capability and therefore
             # fall through to the Packer-proven cloud image instead of claiming a
-            # task that will fail after Chromium bootstrap.
-            out = [
-                r
-                for r in out
-                if (r.capabilities or {}).get("playwright_chromium_usable") is True
-            ]
+            # task that will fail after Chromium bootstrap. Reads the NESTED
+            # isolation_backends.playwright_chromium_usable flag the heartbeat
+            # writes (always a plain bool) — the top-level key is the live
+            # chromium.launch() probe, None until it completes, so it can never
+            # satisfy a `is True` dispatch gate.
+            out = [r for r in out if _runner_chromium_usable(r)]
         if accelerator:
             # Trust VERIFIED GPU capability, not the bare self-reported has_gpu bool:
             # a mis-set flag would silently defeat this gate and win GPU jobs the

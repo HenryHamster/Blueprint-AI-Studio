@@ -668,6 +668,28 @@ class TestBwrapArgv(unittest.TestCase):
         self.assertEqual(argv[idx + 1], "/tmp/ws/task1")
         self.assertEqual(argv[idx + 2], "/workspace")
 
+    def test_playwright_cache_bound_readonly_into_sandbox_home(self):
+        with tempfile.TemporaryDirectory() as cache:
+            argv = self._argv(playwright_cache=cache)
+            joined = " ".join(argv)
+            # The cache lands exactly where Playwright reads it inside the
+            # sandbox ($HOME/.cache/ms-playwright) — NOT at its host path.
+            self.assertIn(f"--ro-bind-try {cache} /home/.cache/ms-playwright", joined)
+            # tmpfs /home is still present; the cache is layered read-only on top.
+            self.assertIn("--tmpfs /home", joined)
+
+    def test_playwright_cache_omitted_when_not_supplied(self):
+        # A compute sandbox (or a caller that did not opt into the browser bind)
+        # must not get the cache mount at all.
+        argv = self._argv()
+        self.assertNotIn("ms-playwright", " ".join(argv))
+
+    def test_playwright_cache_skipped_when_host_cache_absent(self):
+        # --ro-bind-try would skip a missing source; the builder omits the flag
+        # entirely when the host cache directory does not exist.
+        argv = self._argv(playwright_cache="/nonexistent/ms-playwright")
+        self.assertNotIn("ms-playwright", " ".join(argv))
+
     def test_gpu_nodes_dev_bound_after_dev(self):
         argv = self._argv(gpu_device_nodes_list=["/dev/nvidia0", "/dev/nvidiactl"])
         joined = " ".join(argv)
@@ -998,6 +1020,42 @@ class TestAgentPlan(unittest.TestCase):
         self.assertFalse(plan.declined)
         self.assertEqual(plan.backend, iso.BACKEND_BWRAP)
         self.assertIsNone(plan.container_name)
+
+    def test_agent_bwrap_plan_binds_playwright_cache_into_sandbox(self):
+        # The Chromium gate certifies the runner's host cache; the bwrap agent
+        # plan must expose THAT SAME cache (playwright_cache_dir) read-only at
+        # the sandbox path the walkthrough harness reads — so the admitted
+        # capability is true where it is consumed, not merely where it is probed.
+        with tempfile.TemporaryDirectory() as cache:
+            os.makedirs(os.path.join(cache, "chromium-1254.0"))
+            with mock.patch.object(iso.os.path, "expanduser", return_value=cache):
+                plan = iso.plan_agent_execution(
+                    caps=_caps(bwrap_path="/usr/bin/bwrap", userns_ok=True),
+                    agent_binary=["node", "/opt/agent/dist/index.js"],
+                    workspace_host="/tmp/ws/t1",
+                    injected_env={"AGENT_SECRET_TOKEN": "jwt", "TASK_ID": "t1"},
+                    source_env={"PATH": "/usr/bin"},
+                )
+            self.assertFalse(plan.declined)
+            self.assertEqual(plan.backend, iso.BACKEND_BWRAP)
+            joined = " ".join(plan.argv)
+            self.assertIn(f"--ro-bind-try {cache} /home/.cache/ms-playwright", joined)
+
+    def test_agent_bwrap_plan_without_host_cache_has_no_browser_bind(self):
+        # A host with no Playwright cache gets no browser bind: the gate is
+        # False (fail-closed) and the sandbox claims nothing it cannot serve.
+        with tempfile.TemporaryDirectory() as tmp:
+            empty = os.path.join(tmp, "no-ms-playwright-cache")
+            with mock.patch.object(iso.os.path, "expanduser", return_value=empty):
+                plan = iso.plan_agent_execution(
+                    caps=_caps(bwrap_path="/usr/bin/bwrap", userns_ok=True),
+                    agent_binary=["node", "/opt/agent/dist/index.js"],
+                    workspace_host="/tmp/ws/t1",
+                    injected_env={"AGENT_SECRET_TOKEN": "jwt", "TASK_ID": "t1"},
+                    source_env={"PATH": "/usr/bin"},
+                )
+            self.assertFalse(plan.declined)
+            self.assertNotIn("ms-playwright", " ".join(plan.argv))
 
     # ── per_task_creds (single credential code path) ────────────────────────
 

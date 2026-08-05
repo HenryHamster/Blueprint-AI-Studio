@@ -203,6 +203,24 @@ export class CandidateStackController {
   }
 
   /**
+   * Install the candidate clone's dependencies (npm ci) so the frontend dev
+   * server can start. The candidate is a depth-1 git clone — nothing else
+   * populates node_modules, so `npm run dev` in admin-ui would otherwise fail
+   * fast with no vite. Runs at the workspace root so BOTH the root `playwright`
+   * dependency and the `admin-ui` workspace dependencies install.
+   */
+  private installDependencies(deadline: number): void {
+    this.opts.log('Installing candidate clone dependencies (npm ci)...\n');
+    execFileSync('npm', ['ci'], {
+      cwd: this.opts.workspace,
+      env: this.childEnv,
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: Math.max(120_000, deadline - Date.now()),
+    });
+  }
+
+  /**
    * Boot the full candidate stack. Throws on ANY failure so the caller fails
    * closed (posts no evidence). Guarantee: whether this resolves or rejects,
    * the caller must still call teardown().
@@ -210,6 +228,13 @@ export class CandidateStackController {
   async boot(): Promise<CandidateStack> {
     const deadline = Date.now() + this.opts.bootTimeoutMs;
     const log = this.opts.log;
+
+    if (this.opts.bootFrontend) {
+      // The candidate is a depth-1 clone with no node_modules; the frontend
+      // dev server cannot start without the root + admin-ui workspace deps
+      // installed, so install them up front as part of stack boot.
+      this.installDependencies(deadline);
+    }
 
     if (this.runnerSupervisorAvailable()) {
       // Local runner: the sandbox has no docker socket; the runner-side

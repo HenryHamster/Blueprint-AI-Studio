@@ -862,6 +862,19 @@ def probe_container_llm_clis(
     return result
 
 
+def playwright_cache_dir() -> str:
+    """The Playwright browser-cache path this runner serves to agent sandboxes.
+
+    Single source of truth shared by the capability probe
+    (:func:`probe_playwright_chromium`) and the bwrap builder
+    (:func:`build_bwrap_argv`): the path the gate certifies is EXACTLY the path
+    bound read-only into the agent sandbox at ``~/.cache/ms-playwright``, so the
+    admitted capability is true WHERE the walkthrough harness consumes Chromium
+    (inside the bwrap sandbox), not merely where it is measured (the runner host).
+    """
+    return os.path.expanduser(os.path.join("~", ".cache", "ms-playwright"))
+
+
 def probe_playwright_chromium() -> bool:
     """True when the host has a Playwright-managed Chromium browser build.
 
@@ -869,9 +882,11 @@ def probe_playwright_chromium() -> bool:
     (``scripts/viewport-snapshot.sh``): the Playwright browsers cache contains a
     ``chromium-*`` directory. A missing cache is unprovable → False (fail-closed:
     a host that cannot serve Chromium to the walkthrough harness never claims the
-    candidate-stack site).
+    candidate-stack site). The path probed is :func:`playwright_cache_dir` — the
+    same path :func:`build_bwrap_argv` mounts into the sandbox, so the claim the
+    gate accepts is the path the harness can actually reach.
     """
-    cache = os.path.expanduser(os.path.join("~", ".cache", "ms-playwright"))
+    cache = playwright_cache_dir()
     try:
         if not os.path.isdir(cache):
             return False
@@ -1335,13 +1350,18 @@ def build_bwrap_argv(
     tool_paths: list[str] | None = None,
     gpu_device_nodes_list: list[str] | None = None,
     extra_ro_libs: list[str] | None = None,
+    playwright_cache: str | None = None,
 ) -> list[str]:
     """Assemble a rootless bwrap invocation.
 
     Guarantees (asserted in tests):
       * Namespaces: user/ipc/pid/uts unshared, cgroup best-effort; --die-with-parent
         and --new-session so the whole tree dies with the runner and detaches TTY.
-      * Fresh tmpfs /home and /tmp — NO host $HOME is ever bound.
+      * Fresh tmpfs /home and /tmp — NO host $HOME is ever bound, EXCEPT the
+        Playwright browser cache when ``playwright_cache`` is supplied: that one
+        read-only subpath is layered onto the tmpfs home at the exact path the
+        walkthrough harness's ``chromium.launch()`` reads, so the runner-emitted
+        ``playwright_chromium_usable`` capability is true WHERE it is consumed.
       * Read-only minimal toolchain (/usr,/bin,/lib,... via --ro-bind-try) + the
         resolved tool paths; the per-task workspace bound RW at /workspace.
       * Network is NOT unshared (agent needs LLM + GitHub egress).
@@ -1366,6 +1386,19 @@ def build_bwrap_argv(
         "--tmpfs", "/tmp",
         "--tmpfs", SANDBOX_HOME,
     ]
+
+    # The walkthrough harness launches Playwright Chromium INSIDE the sandbox;
+    # the browser build lives in the runner's Playwright cache (the same path
+    # probe_playwright_chromium certifies). Bind it read-only at the sandbox
+    # HOME path Playwright reads so the admitted capability is true where the
+    # harness consumes it. --ro-bind-try layers onto the tmpfs /home above and
+    # skips a host that has no cache, so non-browser sandboxes are unchanged.
+    if playwright_cache and os.path.isdir(playwright_cache):
+        argv += [
+            "--ro-bind-try",
+            playwright_cache,
+            os.path.join(SANDBOX_HOME, ".cache", "ms-playwright"),
+        ]
 
     # Read-only toolchain / config. --ro-bind-try skips paths absent on this host.
     seen_src: set[str] = set()
@@ -1969,6 +2002,10 @@ def plan_agent_execution(
         workspace_host=workspace_host,
         ro_binds=ro_binds,
         tool_paths=tools,
+        # Expose the runner's Playwright browser cache read-only at the sandbox
+        # path the walkthrough harness reads (skipped when absent) so the
+        # chromium capability the gate admits is true where it is consumed.
+        playwright_cache=playwright_cache_dir(),
     )
     return ExecutionPlan(backend=backend, argv=argv, env=env)
 
