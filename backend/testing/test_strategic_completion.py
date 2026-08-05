@@ -14301,6 +14301,108 @@ async def test_fallback_update_direction_user_paused_reactivation_blocked(
 
 
 @pytest.mark.asyncio
+async def test_fallback_update_direction_persists_and_clears_criterion_keys(
+    db_session, mocker
+):
+    """Fallback update_direction must persist changes.criterion_keys onto the
+    direction blob and clear them again — mirroring the API update_direction path.
+
+    The strategist is now guided to keep criterion_keys in sync on update. If the
+    fallback parser silently dropped them, a direction whose acceptance scope
+    changed would keep stale (or lose its) criterion link, so its tasks would
+    write no CriterionEvidence rows even on proven acceptance verdicts."""
+    from app.strategic_completion import _handle_strategic_completion
+    from app import release_version as rv
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="FallbackCriterionUpdate",
+        user_id="u-fallback-criterion-update",
+        vision={"purpose": "test", "revision": 0},
+        directions=[
+            {
+                "id": "d-criterion-update",
+                "text": "Own acceptance evidence",
+                "status": "active",
+                "priority": "medium",
+                "research_history": [],
+                "notes": [],
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    criterion = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-fallback-update-map",
+        text="Fallback update mapped criterion",
+        created_by="test",
+    )
+    db_session.add(criterion)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 0}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # 1) Attach criterion_keys via update_direction. No vision in the logs: a
+    # vision-revision bump would flip api_was_used on the second call and make
+    # _handle_strategic_completion short-circuit before the fallback ops parser.
+    logs = json.dumps(
+        {
+            "direction_operations": [
+                {
+                    "op": "update_direction",
+                    "direction_id": "d-criterion-update",
+                    "changes": {"criterion_keys": [criterion.criterion_key]},
+                    "rationale": "attach acceptance criteria",
+                }
+            ],
+        }
+    )
+    await _handle_strategic_completion(task, logs, db_session)
+    await db_session.refresh(project)
+    updated = next(d for d in project.directions if d.get("id") == "d-criterion-update")
+    assert updated.get("criterion_keys") == [criterion.criterion_key], (
+        "fallback update_direction must persist changes.criterion_keys"
+    )
+    assert updated.get("criterion_release_version_id") == str(version.id)
+
+    # 2) Clear criterion_keys with an empty list (mirrors API clear semantics).
+    logs_clear = json.dumps(
+        {
+            "direction_operations": [
+                {
+                    "op": "update_direction",
+                    "direction_id": "d-criterion-update",
+                    "changes": {"criterion_keys": []},
+                    "rationale": "criteria moved elsewhere",
+                }
+            ],
+        }
+    )
+    await _handle_strategic_completion(task, logs_clear, db_session)
+    await db_session.refresh(project)
+    updated = next(d for d in project.directions if d.get("id") == "d-criterion-update")
+    assert updated.get("criterion_keys") == [], (
+        "fallback update_direction must clear criterion_keys on empty list"
+    )
+    assert "criterion_release_version_id" not in updated
+
+
+@pytest.mark.asyncio
 async def test_retirement_memo_dedup_guard(db_session, mocker):
     """No second retirement memo is spawned when one already exists within 90 days."""
     from unittest.mock import AsyncMock
