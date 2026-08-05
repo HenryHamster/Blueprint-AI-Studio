@@ -327,13 +327,18 @@ def _resolve_active_criterion_keys(rows: list[Any]) -> frozenset[str]:
     )
 
 
-async def _refuse_incompatible_product_probe(
+async def _drop_incompatible_product_probes(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
     requested_probes: frozenset[str],
-) -> dict[str, Any] | None:
-    """Return a refusal dict when a requested product probe cannot be satisfied
-    by the open version's ACTIVE rubric, else None.
+) -> tuple[frozenset[str], dict[str, Any] | None]:
+    """Drop product probes the open version's ACTIVE rubric cannot satisfy.
+
+    Returns ``(effective_probes, drop_info)``.  ``effective_probes`` is the
+    requested selection with every structurally-impossible probe removed;
+    ``drop_info`` is None when nothing was dropped, else a dict naming the
+    dropped probe, its canonical evidence keys, and the open rubric's active
+    keys.
 
     The walkthrough_e2e probe's evidence contract resolves to a hard-coded set
     of canonical criterion keys
@@ -342,26 +347,27 @@ async def _refuse_incompatible_product_probe(
     the version's rubric, so a probe whose canonical keys share no active
     criterion is structurally impossible: even a flawless run would fail
     (``walkthrough_e2e_report_unknown_criteria``) only AFTER a full
-    qualification was spent.  Refuse at request time with both key sets named —
-    this gate replaces the silent late blackout; it does not add a safety net.
+    qualification was spent.  The request-time gate therefore DROPS the probe
+    and lets the qualification continue with the remainder (probe-free when it
+    was the only probe) instead of refusing the whole qualification — an
+    incompatible probe must never silently prevent a qualification from
+    spawning at all.
     """
     if "walkthrough_e2e" not in requested_probes:
-        return None
+        return requested_probes, None
     rows = await get_criteria_for_version(session, version.id)
     active_keys = _resolve_active_criterion_keys(rows)
     walkthrough_keys = _WALKTHROUGH_E2E_EXPECTED_CANONICAL_EVIDENCE_KEYS
     if walkthrough_keys & active_keys:
-        return None
-    return {
-        "status": "invalid_requested_probes",
-        "detail": (
-            "qualification probe 'walkthrough_e2e' requires at least one of its "
-            f"canonical evidence keys {sorted(walkthrough_keys)} to be an ACTIVE "
-            f"acceptance criterion in the open version's rubric, but the open "
-            f"version's active criteria are {sorted(active_keys)} — refusing the "
-            "probe before any qualification work is spent"
-        ),
-    }
+        return requested_probes, None
+    return (
+        requested_probes - frozenset({"walkthrough_e2e"}),
+        {
+            "probe": "walkthrough_e2e",
+            "canonical_keys": sorted(walkthrough_keys),
+            "active_keys": sorted(active_keys),
+        },
+    )
 
 
 def _qualification_probe_contract_is_reusable(
@@ -2487,25 +2493,44 @@ async def run_qualification(
         )
         return {"status": "explicit_request_required"}
 
-    # Refuse a product probe the open version's ACTIVE rubric cannot satisfy
+    # Drop a product probe the open version's ACTIVE rubric cannot satisfy
     # BEFORE any qualification work (credential resolution, candidate SHA
     # resolution, locking, or child spawn) is spent.  The walkthrough_e2e
     # probe's canonical evidence keys are pinned to criteria the open rubric
     # must actually carry; when none of them is active the probe is structurally
     # impossible and would only fail (contained, but expensive) after a full
-    # qualification.  A readable early refusal replaces that late blackout.
-    _probe_refusal = await _refuse_incompatible_product_probe(
-        session, version, effective_requested_probes
-    )
-    if _probe_refusal is not None:
-        logger.info(
-            "[RELEASE_QUALIFIER] v%d refused product-probe selection %s before "
-            "spawning: %s",
-            version.version_number,
-            sorted(effective_requested_probes),
-            _probe_refusal["detail"],
+    # qualification.  Dropping it and continuing with the remainder — probe-free
+    # when it was the only probe — replaces both the old silent late blackout
+    # AND the request-time refusal that blocked the whole qualification.  The
+    # drop is recorded durably on the spawned record under the existing
+    # ``qualify_request_blocked`` / ``qualify_request_blocked_at`` keys so the
+    # strategist can see why the requested probe never ran.
+    effective_requested_probes, _probe_drop = (
+        await _drop_incompatible_product_probes(
+            session, version, effective_requested_probes
         )
-        return _probe_refusal
+    )
+    _probe_drop_record: dict[str, Any] | None = None
+    _probe_drop_blocked_at: str | None = None
+    if _probe_drop is not None:
+        _probe_drop_record = {
+            "blocker": "incompatible_probe",
+            "probe": _probe_drop["probe"],
+            "canonical_evidence_keys": _probe_drop["canonical_keys"],
+            "active_rubric_keys": _probe_drop["active_keys"],
+        }
+        _probe_drop_blocked_at = _utcnow().isoformat()
+        logger.info(
+            "[RELEASE_QUALIFIER] v%d dropped incompatible product probe '%s' "
+            "before spawning: canonical evidence keys %s share no ACTIVE "
+            "criterion in the open rubric (active keys %s) — continuing "
+            "probe-free with %s",
+            version.version_number,
+            _probe_drop["probe"],
+            _probe_drop["canonical_keys"],
+            _probe_drop["active_keys"],
+            sorted(effective_requested_probes),
+        )
 
     # Promotion policy is a cheap capability fact.  A disabled project must not
     # burn a release audit merely to rediscover that delivery is unavailable.
@@ -3005,6 +3030,15 @@ async def run_qualification(
                 "status": "invalid_requested_probes",
                 "detail": str(exc)[:200],
             }
+    if _probe_drop is not None:
+        # The under-lock re-normalization above re-derives a continued attempt's
+        # frozen probe selection from prior_qual, which would resurrect the
+        # probe this gate dropped at request time.  Re-apply the same drop — the
+        # incompatibility is a property of the open version's rubric, which
+        # cannot change mid-run.
+        effective_requested_probes = effective_requested_probes - frozenset(
+            {_probe_drop["probe"]}
+        )
     if continued_attempt_id is not None:
         projected_attempt_id = _coerce_qualification_attempt_id(
             prior_qual.get("qualification_attempt_id")
@@ -3686,6 +3720,13 @@ async def run_qualification(
         # Explicitly requested decision-bearing product probe. It is a required
         # child for this attempt and finalization consumes its same-SHA result.
         "requested_probes": sorted(effective_requested_probes),
+        # Durable record of a product probe dropped at request time because the
+        # open version's ACTIVE rubric shares no canonical evidence key with it
+        # (blocker="incompatible_probe").  None when no probe was dropped.  The
+        # strategist reads this alongside requested_probes to see why the
+        # requested probe never ran.
+        "qualify_request_blocked": _probe_drop_record,
+        "qualify_request_blocked_at": _probe_drop_blocked_at,
         "walkthrough_e2e_task_id": walkthrough_e2e_task_id,
         "merge_grade_task_id": merge_grade_task_id,
         "rubric_snapshot": rubric_snapshot,
@@ -5680,6 +5721,10 @@ async def _record_rubric_provenance_outcome(
         "smoketest_task_id": qual.get("smoketest_task_id"),
         "merge_grade_task_id": qual.get("merge_grade_task_id"),
         "requested_probes": qual.get("requested_probes") or [],
+        # Durable record of a product probe dropped at request time
+        # (blocker="incompatible_probe"), carried forward from the pending record.
+        "qualify_request_blocked": qual.get("qualify_request_blocked"),
+        "qualify_request_blocked_at": qual.get("qualify_request_blocked_at"),
         "walkthrough_e2e_task_id": qual.get("walkthrough_e2e_task_id"),
         "walkthrough_e2e_result": qual.get("walkthrough_e2e_result"),
         "rubric_snapshot": (
@@ -8262,6 +8307,11 @@ async def _finalize_qualification(
         "audit_challenge_spawn_error": qual.get("audit_challenge_spawn_error"),
         "smoketest_task_id": smoketest_task_id,
         "requested_probes": sorted(requested_probes),
+        # Durable record of a product probe dropped at request time
+        # (blocker="incompatible_probe"), carried forward from the pending record
+        # so the verdict keeps the drop trace.
+        "qualify_request_blocked": qual.get("qualify_request_blocked"),
+        "qualify_request_blocked_at": qual.get("qualify_request_blocked_at"),
         "walkthrough_e2e_task_id": walkthrough_e2e_task_id,
         "walkthrough_e2e_result": walkthrough_e2e_result,
         "audit_findings": audit_findings,

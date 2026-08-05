@@ -1198,6 +1198,11 @@ async def _handle_infra_failure(
         "audit_challenge_spawn_error": qual.get("audit_challenge_spawn_error"),
         "smoketest_task_id": qual.get("smoketest_task_id"),
         "requested_probes": qual.get("requested_probes") or [],
+        # Durable record of a product probe dropped at request time
+        # (blocker="incompatible_probe"), carried forward from the pending record
+        # so the infra-failure record keeps the drop trace for the re-drive.
+        "qualify_request_blocked": qual.get("qualify_request_blocked"),
+        "qualify_request_blocked_at": qual.get("qualify_request_blocked_at"),
         "walkthrough_e2e_task_id": qual.get("walkthrough_e2e_task_id"),
         "walkthrough_e2e_result": qual.get("walkthrough_e2e_result"),
     }
