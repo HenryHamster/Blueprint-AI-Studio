@@ -1241,6 +1241,17 @@ async def _bulk_cancel_task(
                 if cascade_task is not None:
                     cascade_targets[cascade_task.id] = cascade_task
 
+        # Drop cascade targets that reached a terminal state between the initial
+        # status-filtered ID query and the per-row re-lock above. A child that
+        # completed during the lock wait is re-read as COMPLETED here; without
+        # this filter it would be force-flipped to CANCELLED, overwriting a real
+        # terminal outcome.
+        cascade_targets = {
+            tid: t
+            for tid, t in cascade_targets.items()
+            if t.status not in terminal_statuses
+        }
+
         # Save VM and account info before commit so cleanup does not depend on
         # expired ORM attributes.
         parent_vm_id = task.vm_instance_id
