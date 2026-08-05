@@ -2351,8 +2351,12 @@ async def reaper_service():
                                 acct_id = get_task_llm_account_id(ctx) or "no account"
                                 gcp_error = provision_err or "no GCP error captured"
                                 gcp_error_short = gcp_error[:200]
-                                # Distinguish: VM created but agent died vs. GCP API failure
-                                if provision_zone and provision_zone != "unknown zone":
+                                # Distinguish: VM created but agent died vs. GCP API failure.
+                                # vm_provisioned_at is the fact that discriminates — it is set
+                                # exactly when the cloud created the VM. provision_zone is only
+                                # a label: a pre-claim death can leave it unresolved, so it must
+                                # not drive the classification.
+                                if task.vm_provisioned_at:
                                     label = "Agent startup failed"
                                     detail = f"VM created in {provision_zone} but agent never claimed task"
                                     if all_blocked:
