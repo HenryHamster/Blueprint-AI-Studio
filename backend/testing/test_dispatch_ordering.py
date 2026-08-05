@@ -517,7 +517,15 @@ async def test_requeued_non_generic_site_task_reaches_terminal_state(db_session)
         f"the terminal reason must name the execution site; got: "
         f"{task.latest_status_message!r}"
     )
-    assert (task.context or {}).get("failure_category") == "PROVISION_FAILURE"
+    from app.failure_classification import UNPLACEABLE_EXECUTION_SITE
+
+    assert (task.context or {}).get("failure_category") == (
+        UNPLACEABLE_EXECUTION_SITE
+    ), (
+        "an unplaceable non-generic-site task is a PERMANENT routing-contract "
+        "failure, not a transient PROVISION_FAILURE (which would be resurrected "
+        "onto the same dead-end QUEUED state forever)"
+    )
 
     # A later dispatch pass must not re-queue or re-warn: the seam keeps an
     # already-terminal task terminal (it has dropped out of the QUEUED window).

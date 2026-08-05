@@ -1834,9 +1834,10 @@ def unplaceable_execution_site_reason(task_type: str) -> str | None:
     ):
         return None
     return (
-        f"execution site {site!r} for task type {task_type!r} cannot be placed "
-        "by any dispatch path once the task is QUEUED; terminating instead of "
-        "holding QUEUED forever"
+        f"declared execution site {site!r} for task type {task_type!r} has no "
+        "eligible runner: generic dispatch serves only the 'default' and "
+        "'direct_packer_gce' sites, and a QUEUED task cannot be re-pinned to a "
+        "site-proven runner. Terminating instead of holding QUEUED forever"
     )
 
 
@@ -1850,6 +1851,13 @@ async def fail_unplaceable_non_generic_site_task(
     """Terminalize a QUEUED task whose registry execution site no dispatch path
     can place, carrying a readable reason that names the execution site.
 
+    The task is stamped UNPLACEABLE_EXECUTION_SITE — a TERMINAL, non-resurrectable
+    category (deliberately outside INFRA_CLASSES, so the reaper's Step 5
+    resurrection sweep never flips it back to QUEUED, where generic dispatch
+    would fail it closed again every cycle). The task never provisioned, so
+    PROVISION_FAILURE (5-min infra backoff + resurrection eligibility) would be
+    a lie about a permanent routing-contract violation.
+
     Returns True when the task was marked FAILED; False when the site is
     actually generically placeable (no reason to fail) or the terminal commit
     failed and was rolled back (the task stays QUEUED and retries next cycle).
@@ -1861,9 +1869,12 @@ async def fail_unplaceable_non_generic_site_task(
     if getattr(task, "vm_provisioned_at", None) is not None:
         task.vm_stopped_at = _utcnow()
     task.latest_status_message = reason
-    from app.failure_classification import persist_failure_category
+    from app.failure_classification import (
+        UNPLACEABLE_EXECUTION_SITE,
+        persist_failure_category,
+    )
 
-    persist_failure_category(task, "PROVISION_FAILURE")
+    persist_failure_category(task, UNPLACEABLE_EXECUTION_SITE)
     session.add(task)
     try:
         await session.commit()

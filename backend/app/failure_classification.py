@@ -303,6 +303,19 @@ COMPUTE_UNMEASURED_CRITERION = "compute_unmeasured_criterion"
 # substrate), so it routes to CODE_ERROR and burns the retry budget.
 COMPUTE_PREFLIGHT_SMOKE_FAILED = "compute_preflight_smoke_failed"
 
+# A QUEUED task whose registry-declared execution site no dispatch path can
+# place (e.g. the qualifier's live-local-runner ``walkthrough_e2e`` site once
+# the task has been requeued and its site-pinned runner is gone). This is a
+# PERMANENT routing-contract violation — the declared site and the runner
+# inventory disagree — NOT a transient provisioning blip: retrying or
+# resurrecting the task re-queues it into the same dead end every cycle. It is
+# a terminal class deliberately OUTSIDE INFRA_CLASSES so the resurrection sweep
+# (which flips only INFRA_CLASSES members back to QUEUED) never re-queues it,
+# and OUTSIDE CODE_ERROR's retry-budget semantics because the work never ran.
+# The failure_reason must name the declared execution site so the routing
+# mismatch is diagnosable without reading source.
+UNPLACEABLE_EXECUTION_SITE = "UNPLACEABLE_EXECUTION_SITE"
+
 
 def classify_compute_terminal_reason(
     terminal_reason: "str | None",
@@ -824,6 +837,7 @@ ALL_FAILURE_CLASSES: tuple[str, ...] = (
     PARK_WAKE_STRANDED,
     APPROVED_CAP_PR_CLOSED,
     ADMIN_CANCEL,
+    UNPLACEABLE_EXECUTION_SITE,
 )
 
 
@@ -884,6 +898,11 @@ def classify_failure_taxonomy(task: "Task") -> str:
     if base == SCOPE_OVERFLOW:
         return TAXONOMY_SCOPE_RELATED
     if base in INFRA_CLASSES:
+        return TAXONOMY_INFRA_RELATED
+    # UNPLACEABLE_EXECUTION_SITE is deliberately NOT in INFRA_CLASSES (so the
+    # resurrection sweep never re-queues it), but it is an infra/routing
+    # condition, not a code defect — keep it in the infra analytics bucket.
+    if base == UNPLACEABLE_EXECUTION_SITE:
         return TAXONOMY_INFRA_RELATED
     # Migration errors are code defects (the schema is wrong / migration missing),
     # not review-quality or scope issues — route to code_defect bucket directly.
@@ -1104,6 +1123,10 @@ _AGENT_CATEGORY_TO_CLASS: dict[str, str] = {
     # spawning agent and operator panels.
     "compute_unmeasured_criterion": CODE_ERROR,
     "compute_preflight_smoke_failed": CODE_ERROR,
+    # ``unplaceable_execution_site`` — orchestrator-emitted when a QUEUED task's
+    # registry-declared execution site has no eligible runner. Canonical terminal
+    # class outside INFRA_CLASSES so the resurrection sweep never re-queues it.
+    "unplaceable_execution_site": UNPLACEABLE_EXECUTION_SITE,
 }
 
 
@@ -1984,6 +2007,9 @@ _SEVERITY: dict[str, int] = {
     RATE_LIMIT: 1,
     SCOPE_OVERFLOW: 1,
     SCOPE_EMPTY: 1,
+    # A routing-contract failure, not a code defect — ranked with infra classes
+    # so worst_child_failure_category never escalates it to CODE_ERROR.
+    UNPLACEABLE_EXECUTION_SITE: 1,
 }
 
 

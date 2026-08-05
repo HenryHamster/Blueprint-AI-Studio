@@ -37,6 +37,7 @@ from app.failure_classification import (
     REPO_UNINITIALIZED,
     SCOPE_EMPTY,
     SCOPE_OVERFLOW,
+    UNPLACEABLE_EXECUTION_SITE,
     _external_api_subtype_from_message,
     _timeout_subtype_from_message,
     classify_external_api_subtype,
@@ -209,6 +210,103 @@ class TestApprovedCapPrClosedFailureClass:
 
         assert classify_failure(task) == APPROVED_CAP_PR_CLOSED
         assert classify_failure_taxonomy(task) == TAXONOMY_INFRA_RELATED
+
+
+class TestUnplaceableExecutionSiteClassification:
+    """An unplaceable non-generic-execution-site task is a PERMANENT
+    routing-contract failure — terminal and non-resurrectable, never the
+    transient PROVISION_FAILURE category."""
+
+    def test_registered_terminal_and_not_resurrectable(self):
+        from app.failure_classification import INFRA_CLASSES
+
+        assert UNPLACEABLE_EXECUTION_SITE == "UNPLACEABLE_EXECUTION_SITE"
+        assert UNPLACEABLE_EXECUTION_SITE in ALL_FAILURE_CLASSES
+        # The resurrection sweep (reaper_infra_recovery Step 5) flips only
+        # INFRA_CLASSES members back to QUEUED — staying outside the set is what
+        # makes this class non-resurrectable. PROVISION_FAILURE is inside it.
+        assert UNPLACEABLE_EXECUTION_SITE not in INFRA_CLASSES
+        assert UNPLACEABLE_EXECUTION_SITE != PROVISION_FAILURE
+
+    def test_classify_persisted_unplaceable_category(self):
+        task = _task(ctx={"failure_category": UNPLACEABLE_EXECUTION_SITE})
+
+        assert classify_failure(task) == UNPLACEABLE_EXECUTION_SITE
+        assert classify_failure_taxonomy(task) == TAXONOMY_INFRA_RELATED
+
+    def test_normalize_round_trips_unplaceable_category(self):
+        task = _task(ctx={"failure_category": UNPLACEABLE_EXECUTION_SITE})
+
+        assert normalize_agent_failure_category(
+            UNPLACEABLE_EXECUTION_SITE, task
+        ) == UNPLACEABLE_EXECUTION_SITE
+        assert normalize_agent_failure_category(
+            "unplaceable_execution_site", task
+        ) == UNPLACEABLE_EXECUTION_SITE
+
+
+@pytest.mark.asyncio
+async def test_unplaceable_non_generic_site_task_is_terminal_not_provision_failure(
+    db_session,
+):
+    """The dispatch seam terminalizes an unplaceable non-generic-site task with a
+    permanent category and that category is NOT eligible for the resurrection
+    sweep.
+
+    A walkthrough_e2e task that is QUEUED can never be re-placed (its execution
+    site is a live local runner pinned at birth; generic dispatch serves only
+    'default'/'direct_packer_gce'). Failing it closed with PROVISION_FAILURE
+    would mark a never-provisioned task as a transient provisioning blip and
+    hand it to the resurrection sweep, which re-queues it into the same dead
+    end every cycle. The category must instead be terminal and outside
+    INFRA_CLASSES.
+    """
+    from app.failure_classification import INFRA_CLASSES
+    from app.orchestrator_filters import fail_unplaceable_non_generic_site_task
+    from app.models import TaskStatus
+    from testing.factories import make_project, make_task
+
+    project = make_project(name="stranded-walkthrough", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "walkthrough_e2e"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    failed = await fail_unplaceable_non_generic_site_task(
+        db_session,
+        task,
+        task_type="walkthrough_e2e",
+    )
+    assert failed is True
+    await db_session.refresh(task)
+
+    # Terminal: the task must never sit QUEUED forever.
+    assert task.status == TaskStatus.FAILED
+
+    # The stamped category is the permanent routing-contract class, NOT the
+    # transient PROVISION_FAILURE that a never-provisioned task never earned.
+    category = (task.context or {}).get("failure_category")
+    assert category == UNPLACEABLE_EXECUTION_SITE
+    assert category != PROVISION_FAILURE
+
+    # Non-resurrectable: the resurrection sweep's eligibility gate is
+    # ``failure_category in INFRA_CLASSES`` (reaper_infra_recovery Step 5), and
+    # this category deliberately stays outside that set.
+    assert UNPLACEABLE_EXECUTION_SITE not in INFRA_CLASSES
+
+    # The operator-facing reason names the routing contradiction: the declared
+    # execution site versus the sites generic dispatch actually serves.
+    message = task.latest_status_message or ""
+    assert "local_runner" in message, f"must name the declared site: {message!r}"
+    assert "no eligible runner" in message, f"must state the contradiction: {message!r}"
 
 
 def _effort_timeout_task(subtype: str, *, effort: str = "medium") -> Task:
