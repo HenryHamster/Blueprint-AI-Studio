@@ -4044,13 +4044,15 @@ async def orchestrator_worker():
                         # creating a walkthrough_e2e child), so no path will ever
                         # re-place a QUEUED instance of it.  The old behaviour
                         # held it QUEUED with a warning on EVERY dispatch cycle
-                        # forever — and the qualifier's finalize treats a
-                        # non-terminal walkthrough child as
-                        # walkthrough_e2e_task_not_terminal, so the qualification
-                        # deadlocks with it.  Fail closed to a terminal state with
-                        # a readable reason naming the execution site instead;
-                        # the qualifier then treats the FAILED child as an
-                        # infra_failure and redrives a FRESH site-pinned child.
+                        # forever.  Fail closed to a terminal state with a
+                        # readable reason naming the execution site instead; the
+                        # qualifier's finalize then treats the FAILED (or
+                        # non-terminal) walkthrough child as an INFRA-SHAPED
+                        # probe failure — it holds the release as a non-conclusive
+                        # infra_failure via _handle_infra_failure rather than a
+                        # quality verdict, and the release-qualifier infra
+                        # re-driver re-runs the qualification and spawns a FRESH
+                        # site-pinned child.
                         if (
                             _non_generic_site_dispatch
                             and not _direct_packer_gce_dispatch

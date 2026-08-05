@@ -274,6 +274,16 @@ _SUPPORTED_QUALIFICATION_PROBES: frozenset[str] = frozenset({"walkthrough_e2e"})
 # for the registered meta criterion, so those two raw rows intentionally
 # collapse to one canonical evidence key.  No other raw or canonical duplicate
 # is part of the contract.
+#
+# THIS IS THE HARNESS OUTPUT CONTRACT, not the request-time evidence contract.
+# It pins exactly what the current v26-output harness writes, so the report
+# validator (_evaluate_walkthrough_e2e_report) and the canonical-key resolver
+# (_walkthrough_e2e_canonical_evidence_keys) can fail a malformed or truncated
+# report.  Which of these criteria a rubric can satisfy is resolved at request
+# time against the OPEN version's ACTIVE criteria — see
+# _resolve_walkthrough_e2e_evidence_contract — so a rubric that re-mints its
+# criteria under fresh keys is not silently refused just because the harness
+# still emits the legacy keys.
 _WALKTHROUGH_E2E_EXPECTED_RAW_RESULT_KEYS: frozenset[str] = frozenset(
     {
         "c-dfdc9d82",
@@ -287,6 +297,31 @@ _WALKTHROUGH_E2E_EXPECTED_CANONICAL_EVIDENCE_KEYS: frozenset[str] = frozenset(
 )
 _WALKTHROUGH_E2E_ALLOWED_CANONICAL_COLLISION: frozenset[str] = frozenset(
     {"c-workday-session-lifecycle", "c-5214996f"}
+)
+
+# Flows the live walkthrough harness can exercise against the candidate stack
+# (Runner Enrollment, Project Tools iframe subresource token, Conversational
+# Workday session lifecycle).  Each flow is matched against the OPEN version's
+# ACTIVE criterion texts so the probe's evidence contract stays version-agnostic:
+# a rubric that re-mints its criteria under fresh keys still resolves when a
+# criterion's text names the flow the harness drives.  Matching is a
+# case-insensitive substring — a criterion whose text mentions any marker for a
+# flow is walkthrough-provable for that flow.  This is deliberately coarse: the
+# request-time gate's only job is to refuse when the open rubric genuinely has
+# no criterion the probe could produce evidence for; the finalize-time report
+# gate re-validates the exact keys against the ACTIVE rubric.
+_WALKTHROUGH_E2E_FLOW_MARKERS: tuple[tuple[str, ...], ...] = (
+    ("runner enroll", "runner enrollment"),
+    ("iframe", "subresource token", "project tool"),
+    ("workday",),
+)
+
+# Legacy harness canonical keys — a rubric that carries these criteria verbatim
+# is still satisfiable by the current v26-output harness, so the resolution
+# treats them as walkthrough-provable for backward compatibility.  Kept separate
+# from the flow markers so the version-agnostic contract stays the primary path.
+_WALKTHROUGH_E2E_LEGACY_HARNESS_KEYS: frozenset[str] = frozenset(
+    {"c-dfdc9d82", "c-f52fd975", "c-5214996f"}
 )
 
 
@@ -327,6 +362,37 @@ def _resolve_active_criterion_keys(rows: list[Any]) -> frozenset[str]:
     )
 
 
+def _resolve_walkthrough_e2e_evidence_contract(
+    rows: list[Any],
+) -> frozenset[str]:
+    """Resolve the ACTIVE criteria the walkthrough_e2e probe can produce
+    evidence for in the open version's rubric.
+
+    A criterion is walkthrough-provable when its text names one of the flows the
+    live harness exercises (semantic scenario match against
+    ``_WALKTHROUGH_E2E_FLOW_MARKERS``) or it carries one of the harness's legacy
+    canonical keys (``_WALKTHROUGH_E2E_LEGACY_HARNESS_KEYS`` — a rubric that
+    reuses the v26 criteria verbatim).  Only ACTIVE criteria count: a retracted
+    or superseded criterion cannot earn evidence.  The request-time
+    compatibility gate reads this resolved contract so it refuses the probe only
+    when the open rubric genuinely has no criterion the live walkthrough could
+    produce evidence for, instead of pinning the decision to a retired version's
+    key set.
+    """
+    resolved: set[str] = set()
+    for row in rows:
+        if row.status != "active" or not row.criterion_key:
+            continue
+        text = str(row.text or "").lower()
+        if any(
+            marker in text
+            for flow_markers in _WALKTHROUGH_E2E_FLOW_MARKERS
+            for marker in flow_markers
+        ) or row.criterion_key in _WALKTHROUGH_E2E_LEGACY_HARNESS_KEYS:
+            resolved.add(row.criterion_key)
+    return frozenset(resolved)
+
+
 async def _drop_incompatible_product_probes(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -337,34 +403,40 @@ async def _drop_incompatible_product_probes(
     Returns ``(effective_probes, drop_info)``.  ``effective_probes`` is the
     requested selection with every structurally-impossible probe removed;
     ``drop_info`` is None when nothing was dropped, else a dict naming the
-    dropped probe, its canonical evidence keys, and the open rubric's active
+    dropped probe, its declared evidence keys, and the open rubric's active
     keys.
 
-    The walkthrough_e2e probe's evidence contract resolves to a hard-coded set
-    of canonical criterion keys
-    (``_WALKTHROUGH_E2E_EXPECTED_CANONICAL_EVIDENCE_KEYS``).  The finalize-time
-    active-key gate requires every resolved key to be an ACTIVE criterion in
-    the version's rubric, so a probe whose canonical keys share no active
-    criterion is structurally impossible: even a flawless run would fail
-    (``walkthrough_e2e_report_unknown_criteria``) only AFTER a full
-    qualification was spent.  The request-time gate therefore DROPS the probe
-    and lets the qualification continue with the remainder (probe-free when it
-    was the only probe) instead of refusing the whole qualification — an
-    incompatible probe must never silently prevent a qualification from
-    spawning at all.
+    The walkthrough_e2e probe's evidence contract is resolved at request time
+    against the OPEN version's ACTIVE criteria
+    (:func:`_resolve_walkthrough_e2e_evidence_contract`) rather than a
+    module-level constant naming one frozen rubric.  When the open rubric has
+    no ACTIVE criterion the probe could produce live-stack evidence for, even a
+    flawless run would still fail (``walkthrough_e2e_report_unknown_criteria``)
+    only AFTER a full qualification was spent.  The request-time gate therefore
+    DROPS the probe and lets the qualification continue with the remainder
+    (probe-free when it was the only probe) instead of refusing the whole
+    qualification — an incompatible probe must never silently prevent a
+    qualification from spawning at all.  A rubric that re-mints its walkthrough
+    criteria under fresh keys is NOT dropped: the resolved contract finds the
+    live criteria by scenario text, so the strategist guidance that requests the
+    probe to clear ``criterion_coverage_incomplete`` can actually take effect.
     """
     if "walkthrough_e2e" not in requested_probes:
         return requested_probes, None
     rows = await get_criteria_for_version(session, version.id)
     active_keys = _resolve_active_criterion_keys(rows)
-    walkthrough_keys = _WALKTHROUGH_E2E_EXPECTED_CANONICAL_EVIDENCE_KEYS
-    if walkthrough_keys & active_keys:
+    walkthrough_keys = _resolve_walkthrough_e2e_evidence_contract(rows)
+    if walkthrough_keys:
         return requested_probes, None
     return (
         requested_probes - frozenset({"walkthrough_e2e"}),
         {
             "probe": "walkthrough_e2e",
-            "canonical_keys": sorted(walkthrough_keys),
+            # Declared harness contract for observability only — the drop
+            # decision above read the RESOLVED contract (empty for this rubric).
+            "canonical_keys": sorted(
+                _WALKTHROUGH_E2E_EXPECTED_CANONICAL_EVIDENCE_KEYS
+            ),
             "active_keys": sorted(active_keys),
         },
     )
@@ -8140,16 +8212,24 @@ async def _finalize_qualification(
 
     # --- Explicit product probe: decision-bearing walkthrough --------------
     # Runs AFTER the release_audit report was read and AFTER the composite was
-    # composed, so a probe that was requested but did not pass fails ONLY its
-    # own dimension (walkthrough_e2e → promote=False /
-    # blocker=walkthrough_e2e_failed via _apply_walkthrough_decision below)
-    # instead of discarding the already-computed audit / challenge /
-    # merge-grade verdicts.  Every requested-but-not-passed outcome — a missing
-    # task, an invalid or unknown-criteria report, missing ingested evidence,
-    # or a genuine criterion failure — is folded into the walkthrough_e2e
-    # dimension as a hard blocker; none becomes a pass, warning, or skip.
-    # SAFETY UNCHANGED: a requested probe that did not pass still blocks
-    # promotion, only where the failure lands is different.
+    # composed, so a requested-but-not-passed probe fails ONLY its own dimension
+    # (walkthrough_e2e → promote=False / blocker=walkthrough_e2e_failed via
+    # _apply_walkthrough_decision below) instead of discarding the
+    # already-computed audit / challenge / merge-grade verdicts — which are
+    # already eager-written to the per-dimension ledger, so they survive an
+    # infra hold too.
+    #
+    # INFRA-SHAPED probe failures — a missing/invalid/non-terminal/infra-terminal
+    # child, an unparseable or provenance-broken report, duplicate or
+    # unknown-criteria report keys, or missing ingested evidence — route to
+    # _handle_infra_failure.  An agent-VM or clone failure in the probe must not
+    # be booked as a conclusive quality judgment against the candidate: the
+    # infra_failure record is non-conclusive and the release-qualifier re-driver
+    # re-runs the attempt (spawning a fresh site-pinned child).  A GENUINE
+    # criterion failure (report valid, every key resolves to an ACTIVE criterion,
+    # one or more criteria failed) stays a QUALITY verdict — promote=False,
+    # blocker=walkthrough_e2e_failed — folded into the walkthrough_e2e dimension
+    # alone.
     if "walkthrough_e2e" in requested_probes:
         _walkthrough_reason: str | None = None
         if not walkthrough_e2e_task_id:
@@ -8176,104 +8256,127 @@ async def _finalize_qualification(
                 elif _walkthrough_task_obj.status != TaskStatus.COMPLETED:
                     _walkthrough_reason = "walkthrough_e2e_task_not_terminal"
 
-        if _walkthrough_reason is None:
-            walkthrough_report = await _latest_artifact_logs(
-                session,
-                uuid.UUID(str(walkthrough_e2e_task_id)),
-                ArtifactType.WALKTHROUGH_E2E_REPORT,
-            )
-            walkthrough_e2e_result = _evaluate_walkthrough_e2e_report(
-                walkthrough_report, candidate_sha
-            )
-            if walkthrough_e2e_result.get("status") == "invalid":
-                _walkthrough_reason = (
-                    "walkthrough_e2e_report_"
-                    + str(walkthrough_e2e_result.get("reason") or "invalid")[:80]
-                )
-            else:
-                # The report may use supported legacy aliases, but every
-                # reported key must resolve to an ACTIVE criterion in the frozen
-                # version contract.  Unknown keys are malformed evidence, not a
-                # pass.
-                from app.acceptance_criteria import WALKTHROUGH_E2E_EVIDENCE_KIND
-
-                active_criterion_keys = _resolve_active_criterion_keys(
-                    live_criterion_rows
-                )
-                normalized_results = walkthrough_e2e_result.get("results") or []
-                try:
-                    resolved_report_keys = _walkthrough_e2e_canonical_evidence_keys(
-                        normalized_results
-                    )
-                except ValueError:
-                    _walkthrough_reason = (
-                        "walkthrough_e2e_report_duplicate_criteria"
-                    )
-                else:
-                    if resolved_report_keys - active_criterion_keys:
-                        _walkthrough_reason = (
-                            "walkthrough_e2e_report_unknown_criteria"
-                        )
-                    elif walkthrough_e2e_result.get("status") == "passed":
-                        # A passing probe may promote only after its
-                        # covered-tier evidence was durably ingested.  The agent
-                        # posts it before terminal status and the backend
-                        # completion handler is an idempotent backstop; this
-                        # read proves that seam instead of trusting a
-                        # best-effort HTTP call.
-                        active_criteria_by_key = {
-                            str(row.criterion_key): row
-                            for row in live_criterion_rows
-                            if row.status == "active" and row.criterion_key
-                        }
-                        expected_evidence = {
-                            f"walkthrough_e2e:{attempt_id}:{key}": active_criteria_by_key[
-                                key
-                            ].id
-                            for key in resolved_report_keys
-                        }
-                        observed_evidence = (
-                            await session.execute(
-                                select(CriterionEvidence).where(
-                                    CriterionEvidence.project_id
-                                    == version.project_id,
-                                    CriterionEvidence.source_kind
-                                    == WALKTHROUGH_E2E_EVIDENCE_KIND,
-                                    CriterionEvidence.source_id.in_(
-                                        set(expected_evidence)
-                                    ),
-                                )
-                            )
-                        ).scalars().all()
-                        observed_by_source: dict[
-                            str, list[CriterionEvidence]
-                        ] = {}
-                        for evidence in observed_evidence:
-                            if evidence.source_id:
-                                observed_by_source.setdefault(
-                                    evidence.source_id, []
-                                ).append(evidence)
-                        if any(
-                            len(observed_by_source.get(source_id, [])) != 1
-                            or observed_by_source[source_id][0].criterion_id
-                            != criterion_id
-                            for source_id, criterion_id
-                            in expected_evidence.items()
-                        ):
-                            _walkthrough_reason = (
-                                "walkthrough_e2e_evidence_missing"
-                            )
-
         if _walkthrough_reason is not None:
-            # A requested probe that did not pass is a FAILED walkthrough_e2e
-            # dimension (sub_score 0.0, promote=False, blocker
-            # walkthrough_e2e_failed) — not an infra blackout of the whole
-            # verdict.  The precise reason is preserved on the result for the
-            # operator; the dimension failure still hard-blocks promotion.
-            walkthrough_e2e_result = {
-                "status": "failed",
-                "reason": _walkthrough_reason,
+            # Infra-shaped probe failure: the walkthrough lane itself broke
+            # (missing/invalid/non-terminal/infra-terminal child), not the
+            # candidate.  Hold the release via the non-conclusive infra_failure
+            # path so the probe is re-driven rather than booked as a quality
+            # verdict.
+            return await _handle_infra_failure(
+                session,
+                version,
+                qual,
+                _walkthrough_reason,
+            )
+
+        walkthrough_report = await _latest_artifact_logs(
+            session,
+            uuid.UUID(str(walkthrough_e2e_task_id)),
+            ArtifactType.WALKTHROUGH_E2E_REPORT,
+        )
+        walkthrough_e2e_result = _evaluate_walkthrough_e2e_report(
+            walkthrough_report, candidate_sha
+        )
+        if walkthrough_e2e_result.get("status") == "invalid":
+            # The report is malformed or its provenance is broken — the harness
+            # did not produce usable evidence.  Infrastructure failure, not a
+            # quality finding.
+            return await _handle_infra_failure(
+                session,
+                version,
+                qual,
+                "walkthrough_e2e_report_"
+                + str(walkthrough_e2e_result.get("reason") or "invalid")[:80],
+            )
+        # The report may use supported legacy aliases, but every reported key
+        # must resolve to an ACTIVE criterion in the frozen version contract.
+        # Unknown keys are malformed evidence, not a pass.
+        from app.acceptance_criteria import WALKTHROUGH_E2E_EVIDENCE_KIND
+
+        active_criterion_keys = _resolve_active_criterion_keys(
+            live_criterion_rows
+        )
+        normalized_results = walkthrough_e2e_result.get("results") or []
+        try:
+            resolved_report_keys = _walkthrough_e2e_canonical_evidence_keys(
+                normalized_results
+            )
+        except ValueError:
+            # Structural schema defect in the report — not a quality finding.
+            return await _handle_infra_failure(
+                session,
+                version,
+                qual,
+                "walkthrough_e2e_report_duplicate_criteria",
+            )
+        if resolved_report_keys - active_criterion_keys:
+            # The report keys do not resolve to the open version's ACTIVE
+            # rubric — the harness posted against criteria this version does not
+            # carry.  Structural/provenance mismatch, not a quality finding.
+            return await _handle_infra_failure(
+                session,
+                version,
+                qual,
+                "walkthrough_e2e_report_unknown_criteria",
+            )
+        if walkthrough_e2e_result.get("status") == "passed":
+            # A passing probe may promote only after its covered-tier evidence
+            # was durably ingested.  The agent posts it before terminal status
+            # and the backend completion handler is an idempotent backstop; this
+            # read proves that seam instead of trusting a best-effort HTTP call.
+            active_criteria_by_key = {
+                str(row.criterion_key): row
+                for row in live_criterion_rows
+                if row.status == "active" and row.criterion_key
             }
+            expected_evidence = {
+                f"walkthrough_e2e:{attempt_id}:{key}": active_criteria_by_key[
+                    key
+                ].id
+                for key in resolved_report_keys
+            }
+            observed_evidence = (
+                await session.execute(
+                    select(CriterionEvidence).where(
+                        CriterionEvidence.project_id
+                        == version.project_id,
+                        CriterionEvidence.source_kind
+                        == WALKTHROUGH_E2E_EVIDENCE_KIND,
+                        CriterionEvidence.source_id.in_(
+                            set(expected_evidence)
+                        ),
+                    )
+                )
+            ).scalars().all()
+            observed_by_source: dict[str, list[CriterionEvidence]] = {}
+            for evidence in observed_evidence:
+                if evidence.source_id:
+                    observed_by_source.setdefault(
+                        evidence.source_id, []
+                    ).append(evidence)
+            if any(
+                len(observed_by_source.get(source_id, [])) != 1
+                or observed_by_source[source_id][0].criterion_id
+                != criterion_id
+                for source_id, criterion_id
+                in expected_evidence.items()
+            ):
+                # The probe passed but the covered-tier evidence never landed —
+                # the ingestion seam broke.  Infrastructure failure, not a
+                # quality finding: hold and re-drive so the evidence can land.
+                return await _handle_infra_failure(
+                    session,
+                    version,
+                    qual,
+                    "walkthrough_e2e_evidence_missing",
+                )
+        # A GENUINE criterion failure (report valid, every key resolves to an
+        # ACTIVE criterion, one or more criteria failed) is the only
+        # requested-but-not-passed outcome that is a QUALITY verdict.  It is
+        # folded into the walkthrough_e2e dimension as a hard blocker
+        # (promote=False / blocker=walkthrough_e2e_failed) by
+        # _apply_walkthrough_decision below; a passing probe folds in as a 1.0
+        # sub-score.
 
     # --- Acceptance-window counts (additive evidence, no score impact) -----
     # Reuses the same verified-prs-merged predicate from direction_outcomes so

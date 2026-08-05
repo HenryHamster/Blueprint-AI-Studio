@@ -681,6 +681,188 @@ async def test_compatible_walkthrough_probe_passes_through_unchanged(
     assert lq.get("qualify_request_blocked_at") is None
 
 
+@pytest.mark.asyncio
+async def test_walkthrough_probe_resolves_against_open_rubric_and_is_not_refused(
+    db_session, mocker
+):
+    """A walkthrough_e2e probe request against the OPEN version's rubric is NOT
+    refused when the rubric carries criteria the live harness can produce
+    evidence for — even though none of the harness's legacy v26 keys is present.
+
+    The evidence contract resolves scenario→criterion against the OPEN version's
+    ACTIVE criteria at request time (not a module-level constant naming one
+    frozen rubric), so a v27-style rubric whose criterion texts name the
+    walkthrough flows keeps the probe requestable.  Regression for audit finding
+    e597be25dd8ac5d9: the strategist guidance tells the strategist to request
+    walkthrough_e2e to clear a ``criterion_coverage_incomplete`` blocker, but the
+    request-time gate used to refuse it for any rubric whose keys do not include
+    the retired v26 canonical keys."""
+    from app import shared_state
+
+    shared_state.runtime_config["smoketest_enabled"] = False
+    shared_state.runtime_config["env_preflight_enabled"] = False
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    # v27-style rubric with FRESH keys whose texts describe the walkthrough flows
+    # the live harness exercises.  None of the harness's legacy v26 keys appears.
+    live_walkthrough_keys = []
+    for _text in (
+        "Prove runner enrollment on a live local runner",
+        "Project tools iframe subresource token flow works",
+        "Conversational Workday session lifecycle end to end",
+    ):
+        key = f"c-{uuid.uuid4().hex[:8]}"
+        live_walkthrough_keys.append(key)
+        await _add_version_criterion(
+            db_session,
+            project,
+            version,
+            key=key,
+            text=_text,
+        )
+
+    # The resolution maps the probe's flows to the OPEN rubric's ACTIVE criteria.
+    rows = await rq.get_criteria_for_version(db_session, version.id)
+    resolved = rq._resolve_walkthrough_e2e_evidence_contract(rows)
+    assert resolved == frozenset(live_walkthrough_keys)
+
+    # A live runner proving the candidate-stack site so run_qualification pins
+    # the walkthrough child to it.
+    capable_runner = LocalRunner(
+        project_id=project.id, token_hash="x" * 64, status="active",
+        last_seen_at=_utcnow(),
+        capabilities={"task_types": "all", "max_concurrent": 2,
+                      "isolation_backends": {"docker_usable": True,
+                                             "playwright_chromium_usable": True}},
+    )
+    db_session.add(capable_runner)
+    await db_session.commit()
+
+    candidate = "wa1c0e2e" * 5  # 40-char placeholder SHA
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch("app.github.get_branch_sha", new=AsyncMock(return_value=candidate))
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"conclusion": "success"}),
+    )
+
+    result = await rq.run_qualification(
+        db_session,
+        project.id,
+        version,
+        requested_probes=["walkthrough_e2e"],
+        explicit_request=True,
+    )
+    await db_session.commit()
+
+    # The probe is NOT refused: it passes through and the child spawns.
+    assert result["status"] == "spawned"
+    assert result["requested_probes"] == ["walkthrough_e2e"]
+    assert result["walkthrough_e2e_task_id"] is not None
+
+    await db_session.refresh(version)
+    lq = version.last_qualification
+    assert lq["requested_probes"] == ["walkthrough_e2e"]
+    assert lq["walkthrough_e2e_task_id"] == result["walkthrough_e2e_task_id"]
+    # Compatible probe → no drop record at all.
+    assert lq.get("qualify_request_blocked") is None
+    assert lq.get("qualify_request_blocked_at") is None
+
+
+@pytest.mark.asyncio
+async def test_finalize_infra_shaped_probe_failure_is_infra_failure_not_quality(
+    db_session, mocker
+):
+    """An infra-shaped walkthrough probe failure (the child task itself FAILED,
+    e.g. an agent-VM or clone failure) is classified as a non-conclusive
+    infra_failure — NOT a conclusive not_promoted quality verdict against the
+    candidate.
+
+    Regression for audit finding 4b795cc96f7e5633: moving the probe leg after
+    dimension composition reclassified every infra-shaped probe failure from a
+    re-driven infra_failure into a conclusive not_promoted QUALITY verdict.  The
+    restored contract routes infra-shaped failures to _handle_infra_failure so
+    the infra re-driver re-runs the attempt, while the eager-written audit fact
+    survives."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    # Compatible rubric so a request-time gate would keep the probe (this test
+    # exercises the FINALIZE classification, which runs regardless).
+    await _seed_walkthrough_compatible_rubric(db_session, project, version)
+
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    candidate_sha = version.last_qualification["candidate_sha"]
+    # An infra-terminal walkthrough child: the clone/stack-boot failure case the
+    # probe lane must never book as a quality judgment against the candidate.
+    walk_task = Task(
+        project_id=project.id,
+        title="walkthrough",
+        payloads=[{"type": "walkthrough_e2e", "base_branch": "automain"}],
+        vm_instance_id="vm-walkthrough",
+        status=TaskStatus.FAILED,
+        context={
+            "candidate_sha": candidate_sha,
+            "agent_failure_category_raw": "clone_failed",
+        },
+    )
+    db_session.add(walk_task)
+    await db_session.commit()
+    await db_session.refresh(walk_task)
+
+    qual = {
+        **(version.last_qualification or {}),
+        "requested_probes": ["walkthrough_e2e"],
+        "walkthrough_e2e_task_id": str(walk_task.id),
+    }
+    version.last_qualification = _with_current_qualification_contract(
+        project, version, qual
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    # Infra-shaped probe failure → non-conclusive infra_failure, NOT a quality
+    # not_promoted verdict.
+    assert result["status"] == "infra_failure"
+    assert result["error"].startswith("walkthrough_e2e_task_failed")
+
+    await db_session.refresh(version)
+    lq = version.last_qualification
+    assert lq["status"] == "infra_failure"
+    assert lq["error"].startswith("walkthrough_e2e_task_failed")
+    # The audit verdict survives via the eager-written per-dimension ledger.
+    assert lq["resolved_dimensions"]["audit"]["status"] == "passed"
+    assert lq["resolved_dimensions"]["audit"]["sub_score"] == pytest.approx(1.0)
+
+
 async def test_finalize_failed_walkthrough_probe_blocks_promotion_and_preserves_verdict(
     db_session, mocker
 ):
@@ -789,19 +971,20 @@ async def test_finalize_failed_walkthrough_probe_blocks_promotion_and_preserves_
     ]
 
 
-async def test_finalize_unknown_criteria_probe_contained_and_preserves_verdict(
+async def test_finalize_unknown_criteria_probe_is_infra_failure_preserves_verdict(
     db_session, mocker
 ):
-    """An infra-type probe failure (report keys not active in the version rubric)
-    is CONTAINED to the walkthrough_e2e dimension: it blocks promotion AND the
-    audit verdict survives.
+    """An infra-shaped probe failure (report keys not active in the version rubric)
+    is classified as a non-conclusive infra_failure — NOT booked as a quality
+    not_promoted verdict — while the eager-written audit fact survives.
 
-    This is the blast-radius regression: the probe evaluation used to run BEFORE
-    the release_audit report was read, and every probe exit routed to
-    _handle_infra_failure — discarding the already-computed audit/challenge/
-    merge-grade verdicts (three consecutive attempts reported audit='unavailable').
-    The probe leg now runs after dimension composition; even the unknown-criteria
-    case fails only its own dimension instead of blacking out the whole verdict."""
+    This is the restored infra-failure recovery contract: the probe lane itself
+    broke (the harness posted against criteria this version does not carry), so
+    it must be re-driven rather than recorded as a conclusive quality judgment
+    against the candidate.  The audit/challenge/merge-grade verdicts survive via
+    the per-dimension ledger (the probe leg runs AFTER dimension composition and
+    the eager writes), so the re-drive does not discard the already-computed
+    facts."""
     from app import shared_state
 
     shared_state.runtime_config["promotion_enabled"] = True
@@ -894,19 +1077,21 @@ async def test_finalize_unknown_criteria_probe_contained_and_preserves_verdict(
     result = await rq._finalize_qualification(db_session, version)
     await db_session.commit()
 
-    assert result["status"] == "not_promoted"
-    assert result["blocker"] == "walkthrough_e2e_failed"
+    # Infra-shaped probe failure → non-conclusive infra_failure, NOT a quality
+    # verdict against the candidate.
+    assert result["status"] == "infra_failure"
+    assert result["error"] == "walkthrough_e2e_report_unknown_criteria"
 
     await db_session.refresh(version)
     lq = version.last_qualification
-    # The audit verdict survives the probe-leg containment — the core regression.
-    assert lq["sub_scores"]["audit"] == pytest.approx(1.0)
-    assert lq["sub_scores"]["walkthrough_e2e"] == 0.0
-    assert lq["walkthrough_e2e_result"]["status"] == "failed"
-    assert (
-        lq["walkthrough_e2e_result"]["reason"]
-        == "walkthrough_e2e_report_unknown_criteria"
-    )
+    assert lq["status"] == "infra_failure"
+    assert lq["error"] == "walkthrough_e2e_report_unknown_criteria"
+    # The audit verdict survives via the eager-written per-dimension ledger —
+    # the core regression.  The infra record composes the resolved facts back in.
+    assert lq["resolved_dimensions"]["audit"]["status"] == "passed"
+    assert lq["resolved_dimensions"]["audit"]["sub_score"] == pytest.approx(1.0)
+    # The failing probe's child is carried on the infra record for re-drive.
+    assert lq["walkthrough_e2e_task_id"] == str(walk_task.id)
 
 
 @pytest.mark.asyncio
@@ -922,9 +1107,11 @@ async def test_pending_with_missing_walkthrough_task_finalizes(
 ):
     """A pending qualification that requested the walkthrough_e2e probe but has
     NO walkthrough child (walkthrough_e2e_task_id absent / the row was deleted)
-    is not in-flight work: the reaper sweep's finalize path processes it as a
-    hard walkthrough_e2e_failed blocker instead of stranding the version in
-    pending until the 6h qualification_timeout backstop.
+    is not in-flight work: the reaper sweep's finalize path classifies it as a
+    non-conclusive infra_failure (walkthrough_e2e_task_missing) instead of
+    stranding the version in pending until the 6h qualification_timeout
+    backstop.  A missing probe child is an infra-shaped probe failure, not a
+    quality judgment against the candidate — the infra re-driver re-runs it.
 
     Regression for the stranded-pending hazard: both guards used to treat the
     missing child as non-terminal — _qualification_in_flight reported a live
@@ -997,10 +1184,12 @@ async def test_pending_with_missing_walkthrough_task_finalizes(
     assert count == 1
     await db_session.refresh(version)
     lq = version.last_qualification
-    assert lq["status"] == "not_promoted"
-    assert lq["blocker"] == "walkthrough_e2e_failed"
-    assert lq["walkthrough_e2e_result"]["status"] == "failed"
-    assert lq["walkthrough_e2e_result"]["reason"] == "walkthrough_e2e_task_missing"
+    # Infra-shaped probe failure (missing child) → non-conclusive infra_failure,
+    # re-driven by the release-qualifier infra re-driver rather than booked as a
+    # quality verdict.
+    assert lq["status"] == "infra_failure"
+    assert lq["error"] == "walkthrough_e2e_task_missing"
+    assert lq["infra_failure_signature"].startswith("walkthrough_e2e")
 
 
 def test_walkthrough_probe_contract_is_strict_and_cache_safe():
