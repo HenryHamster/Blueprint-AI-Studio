@@ -271,7 +271,8 @@ export class CandidateStackController {
       anthropic_api_key: process.env.ANTHROPIC_API_KEY || '',
     };
     const requestPath = path.join(this.protocolDir, 'request.json');
-    writeFileSync(`${requestPath}.tmp`, JSON.stringify(request));
+    // 0600: the request carries stack secrets; rename preserves the mode.
+    writeFileSync(`${requestPath}.tmp`, JSON.stringify(request), { mode: 0o600 });
     renameSync(`${requestPath}.tmp`, requestPath);
 
     const responsePath = path.join(this.protocolDir, 'response.json');
