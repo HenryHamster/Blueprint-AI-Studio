@@ -24,7 +24,11 @@ from app.migration_path import is_migration_file
 from app.models import Task, TaskStatus
 from app.shared_state import is_direction_held, DEFAULT_TASK_SCOPE
 from app.time_utils import _utcnow
-from app.task_capabilities import READ_ONLY_TASK_TYPES
+from app.task_capabilities import (
+    DIRECT_PACKER_GCE_EXECUTION_SITE,
+    READ_ONLY_TASK_TYPES,
+    execution_site_for_task_type,
+)
 
 logger = logging.getLogger("blueprint")
 
@@ -1804,3 +1808,89 @@ def filter_failing_types(
     withheld_types = {types_by_id.get(task_id, "") for task_id in withheld_ids}
     kept = [task_id for task_id in eligible_ids if task_id not in withheld_ids]
     return kept, withheld_types
+
+
+def unplaceable_execution_site_reason(task_type: str) -> str | None:
+    """Return a legible terminal-failure reason when a QUEUED task of this type
+    can never be placed by any dispatch path, or None when the site is
+    generically placeable.
+
+    Generic dispatch routes only the ``default`` site (and unknown types, which
+    conservatively resolve to the default matrix).  The direct-Packer-GCE site is
+    also placeable by the generic cold-GCE path.  Every OTHER declared site
+    (today only the qualifier's live-local-runner ``walkthrough_e2e`` site) is a
+    hard routing contract generic dispatch cannot honour: such a task is pinned
+    at birth by its site owner (the qualifier resolves a site-proven runner
+    BEFORE creating the child), so any QUEUED instance of it is a stranded
+    requeue that no path will ever re-place.  Returning a reason lets the
+    dispatch loop fail it closed instead of holding it QUEUED (warning every
+    cycle) forever.
+    """
+    site = execution_site_for_task_type(task_type)
+    if (
+        site is None
+        or site == "default"
+        or site == DIRECT_PACKER_GCE_EXECUTION_SITE
+    ):
+        return None
+    return (
+        f"execution site {site!r} for task type {task_type!r} cannot be placed "
+        "by any dispatch path once the task is QUEUED; terminating instead of "
+        "holding QUEUED forever"
+    )
+
+
+async def fail_unplaceable_non_generic_site_task(
+    session,
+    task: Task,
+    *,
+    task_type: str,
+    broadcast_fn: Callable[..., Coroutine[Any, Any, None]] | None = None,
+) -> bool:
+    """Terminalize a QUEUED task whose registry execution site no dispatch path
+    can place, carrying a readable reason that names the execution site.
+
+    Returns True when the task was marked FAILED; False when the site is
+    actually generically placeable (no reason to fail) or the terminal commit
+    failed and was rolled back (the task stays QUEUED and retries next cycle).
+    """
+    reason = unplaceable_execution_site_reason(task_type)
+    if reason is None:
+        return False
+    task.status = TaskStatus.FAILED
+    if getattr(task, "vm_provisioned_at", None) is not None:
+        task.vm_stopped_at = _utcnow()
+    task.latest_status_message = reason
+    from app.failure_classification import persist_failure_category
+
+    persist_failure_category(task, "PROVISION_FAILURE")
+    session.add(task)
+    try:
+        await session.commit()
+    except Exception:
+        logger.exception(
+            "[DISPATCH] failed to commit terminal FAILED for unplaceable "
+            "non-generic-site task %s",
+            task.id,
+        )
+        await session.rollback()
+        return False
+    if broadcast_fn is not None:
+        try:
+            await broadcast_fn(
+                str(task.project_id),
+                "task_updated",
+                {
+                    "task_id": str(task.id),
+                    "status": "FAILED",
+                    "message": reason,
+                },
+            )
+        except Exception:
+            logger.debug(
+                "[DISPATCH] task_updated broadcast failed for unplaceable "
+                "non-generic-site task %s",
+                task.id,
+                exc_info=True,
+            )
+    return True

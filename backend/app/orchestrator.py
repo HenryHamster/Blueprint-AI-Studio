@@ -96,6 +96,8 @@ from app.orchestrator_filters import (
     filter_failing_types,
     _project_fairness_weight,
     collect_dep_uuids,
+    unplaceable_execution_site_reason,
+    fail_unplaceable_non_generic_site_task,
 )
 from app.stall_alert_diagnostics import (
     _compute_all_accounts_blocked_action,
@@ -4035,9 +4037,20 @@ async def orchestrator_worker():
                         # live-local-runner walkthrough site) cannot boot the
                         # candidate stack on a GCE VM, so cold-provisioning it would
                         # strand the task on a site it was never qualified for.
-                        # Hold it QUEUED instead — the qualifier's own site-proven
-                        # spawn / redrive places it — rather than silently falling
-                        # back to the default matrix.
+                        #
+                        # A QUEUED task here is a stranded requeue, not a fresh
+                        # placement: the site owner pins such tasks AT BIRTH
+                        # (the qualifier resolves a site-proven runner before
+                        # creating a walkthrough_e2e child), so no path will ever
+                        # re-place a QUEUED instance of it.  The old behaviour
+                        # held it QUEUED with a warning on EVERY dispatch cycle
+                        # forever — and the qualifier's finalize treats a
+                        # non-terminal walkthrough child as
+                        # walkthrough_e2e_task_not_terminal, so the qualification
+                        # deadlocks with it.  Fail closed to a terminal state with
+                        # a readable reason naming the execution site instead;
+                        # the qualifier then treats the FAILED child as an
+                        # infra_failure and redrives a FRESH site-pinned child.
                         if (
                             _non_generic_site_dispatch
                             and not _direct_packer_gce_dispatch
@@ -4045,7 +4058,7 @@ async def orchestrator_worker():
                             logger.warning(
                                 "[ORCHESTRATOR] Task %s has non-generic execution "
                                 "site %r that generic dispatch cannot route — "
-                                "holding QUEUED (fail-closed)",
+                                "failing closed to a terminal state",
                                 task.id,
                                 _execution_site_for_dispatch,
                             )
@@ -4060,19 +4073,30 @@ async def orchestrator_worker():
                                 )
                             _iter_preclaimed_account_id = None
                             _iter_preclaimed_project_id = None
-                            try:
-                                await session.commit()
+                            _site_failure_reason = (
+                                unplaceable_execution_site_reason(
+                                    _task_type_for_dispatch
+                                )
+                                or f"execution site {_execution_site_for_dispatch!r} "
+                                "cannot be placed by any dispatch path"
+                            )
+                            if await fail_unplaceable_non_generic_site_task(
+                                session,
+                                task,
+                                task_type=_task_type_for_dispatch,
+                                broadcast_fn=broadcast_to_project,
+                            ):
                                 if _pending_warm_pin_clear is not None:
                                     _shared_state.record_warm_pin_clear(
                                         *_pending_warm_pin_clear
                                     )
                                     _pending_warm_pin_clear = None
-                            except Exception:
-                                logger.exception(
-                                    "[ORCHESTRATOR] Failed to commit warm-pin clear "
-                                    f"while holding task {task.id} for non-generic site"
+                                logger.warning(
+                                    "[ORCHESTRATOR] Task %s failed closed on "
+                                    "unplaceable non-generic execution site: %s",
+                                    task.id,
+                                    _site_failure_reason,
                                 )
-                                await session.rollback()
                             continue
 
                         # Zone-exhaustion hold — the ONLY thing left below this
