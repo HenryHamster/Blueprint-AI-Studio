@@ -131,6 +131,12 @@ StrategicPhase = Literal["phase1", "phase2"]
 #       compute_experiment task runs here). The closed vocabulary keeps the
 #       shape declarable without requiring a new enum value later.
 RunShape = Literal["single_agent", "workflow", "experiment_loop"]
+ExecutionSite = Literal["default", "direct_packer_gce", "local_runner"]
+DIRECT_PACKER_GCE_EXECUTION_SITE: ExecutionSite = "direct_packer_gce"
+# The qualifier's live-local-runner walkthrough site: a heartbeat-proven
+# candidate-stack execution site (docker info + Compose + Chromium) selected and
+# pinned at birth by the qualifier, never routed by generic dispatch.
+LOCAL_RUNNER_EXECUTION_SITE: ExecutionSite = "local_runner"
 
 
 @dataclass(frozen=True)
@@ -163,6 +169,10 @@ class TaskCapability:
     requires_code: bool = True
     requires_web: bool = False
     requires_compute: bool = False
+    # Hard execution-site contract for task types whose runtime needs the
+    # baked, single-tenant Packer image.  The default keeps ordinary tasks on
+    # the existing runner/warm-pool/managed dispatch matrix.
+    execution_site: ExecutionSite = "default"
     # ``none`` is an explicit opt-out for narrow, task-JWT-scoped workers that
     # never clone or touch the project's repository. Any omitted/unknown value
     # remains repository-backed by default in the agent runtime.
@@ -776,6 +786,12 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         run_shape="single_agent",
         output_kind="verdict",
         requires_compute=True,
+        # The qualifier's walkthrough probe runs on a LIVE LOCAL RUNNER proven
+        # for the candidate-stack site (docker info + Compose + Chromium), pinned
+        # at birth.  Declaring the same site the qualifier pins keeps generic
+        # dispatch fail-closed (it does not route non-default sites) while making
+        # declaration, enforcement, and consumption share one vocabulary.
+        execution_site=LOCAL_RUNNER_EXECUTION_SITE,
         evaluation_strategy="metric",
         cost_ceiling_usd=4.0,
         completion_handler="walkthrough_e2e",
@@ -1128,6 +1144,31 @@ def run_shape_for(task_type: str | TaskType) -> str | None:
     return capability.run_shape if capability is not None else None
 
 
+def execution_site_for_task_type(task_type: str | TaskType) -> ExecutionSite | None:
+    """Return the registry-declared execution site for a task type.
+
+    Unknown types deliberately return ``None``.  Callers that require a
+    particular site must treat that as unsupported rather than guessing from
+    softer hints such as ``requires_browser`` or a container image field.
+    """
+    capability = get_task_capability(task_type)
+    return capability.execution_site if capability is not None else None
+
+
+def execution_site_is_generic_dispatchable(task_type: str | TaskType) -> bool:
+    """True when generic (non-qualifier) dispatch may route the task type through
+    the default runner/warm-pool/Cloud-Run/GCE matrix.
+
+    Only the ``default`` site — and unknown types, which conservatively resolve to
+    the default matrix — is generically dispatchable.  Any explicitly-declared
+    non-default site is a hard routing contract generic dispatch cannot satisfy
+    (e.g. the qualifier's live-local-runner walkthrough site), so dispatch callers
+    must fail closed rather than silently routing the task as ``default``.
+    """
+    site = execution_site_for_task_type(task_type)
+    return site is None or site == "default"
+
+
 def get_task_capability(task_type: str | TaskType) -> TaskCapability | None:
     """Return metadata for a known task type, or None for future/unknown types."""
     value = task_type.value if isinstance(task_type, TaskType) else task_type
@@ -1163,6 +1204,7 @@ def _capability_to_contract(capability: TaskCapability) -> dict[str, object]:
         "requires_code": capability.requires_code,
         "requires_web": capability.requires_web,
         "requires_compute": capability.requires_compute,
+        "execution_site": capability.execution_site,
         "workspace_requirement": capability.workspace_requirement,
     }
 
@@ -1257,6 +1299,7 @@ def _capability_to_catalog_entry(capability: TaskCapability) -> dict:
         "requires_code": capability.requires_code,
         "requires_web": capability.requires_web,
         "requires_compute": capability.requires_compute,
+        "execution_site": capability.execution_site,
         "workspace_requirement": capability.workspace_requirement,
         "evaluation_strategy": capability.evaluation_strategy,
         "cost_ceiling_usd": capability.cost_ceiling_usd,

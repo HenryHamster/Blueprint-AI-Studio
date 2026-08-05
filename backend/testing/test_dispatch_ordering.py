@@ -430,3 +430,148 @@ class TestFilterFailingTypes:
         tasks = [_task("gated", ttype="review"), _task("healthy", ttype="research")]
         kept, _ = filter_failing_types(["gated", "healthy"], tasks, {"review"})
         assert kept[:1] == ["healthy"]
+
+
+# ---------------------------------------------------------------------------
+# Requeued tasks with a non-generic execution site must reach a terminal state
+# ---------------------------------------------------------------------------
+#
+# A walkthrough_e2e task is pinned at birth to a site-proven local runner by
+# the qualifier.  If it is ever requeued (rate-limit / dead-auth / pull-skip),
+# generic dispatch cannot re-place it (orchestrator_runner_dispatch fails the
+# site closed), so it used to sit QUEUED forever with a warning every dispatch
+# cycle — and the qualifier's finalize treats that non-terminal child as
+# walkthrough_e2e_task_not_terminal, deadlocking the qualification.  These
+# tests pin the dispatch seam that now fails such a task closed to a terminal
+# state with a readable reason naming the execution site.
+
+
+def test_unplaceable_execution_site_reason_names_non_generic_site():
+    from app.orchestrator_filters import unplaceable_execution_site_reason
+
+    reason = unplaceable_execution_site_reason("walkthrough_e2e")
+    assert reason is not None, (
+        "a walkthrough_e2e task that is QUEUED can never be placed by generic "
+        "dispatch — the seam must return a terminal-failure reason"
+    )
+    assert "local_runner" in reason, (
+        f"the reason must name the execution site so the operator knows why the "
+        f"task failed; got: {reason!r}"
+    )
+    assert "walkthrough_e2e" in reason, (
+        f"the reason must name the task type; got: {reason!r}"
+    )
+
+
+def test_unplaceable_execution_site_reason_is_none_for_generic_sites():
+    from app.orchestrator_filters import unplaceable_execution_site_reason
+
+    for generic_type in ("create", "refactor", "review"):
+        assert unplaceable_execution_site_reason(generic_type) is None, (
+            f"generic task type {generic_type!r} must stay generically "
+            "dispatchable — no terminal-failure reason"
+        )
+    # Unknown types conservatively resolve to the default matrix too.
+    assert unplaceable_execution_site_reason("not_a_real_type") is None
+
+
+@pytest.mark.asyncio
+async def test_requeued_non_generic_site_task_reaches_terminal_state(db_session):
+    """A QUEUED walkthrough_e2e task is failed closed by the dispatch seam.
+
+    After the seam runs the task is FAILED (not QUEUED), so it drops out of the
+    QUEUED dispatch window and the per-cycle warning stops.  The message names
+    the execution site so the operator and the qualifier's finalize see exactly
+    why no path could place it.
+    """
+    from app.orchestrator_filters import fail_unplaceable_non_generic_site_task
+    from testing.factories import make_project, make_task
+    from app.models import TaskStatus
+
+    project = make_project(name="stranded-walkthrough", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "walkthrough_e2e"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    failed = await fail_unplaceable_non_generic_site_task(
+        db_session,
+        task,
+        task_type="walkthrough_e2e",
+    )
+    assert failed is True
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED, (
+        "the requeued non-generic-site task must reach a terminal state instead "
+        f"of staying QUEUED forever; status={task.status}"
+    )
+    assert "local_runner" in (task.latest_status_message or ""), (
+        f"the terminal reason must name the execution site; got: "
+        f"{task.latest_status_message!r}"
+    )
+    from app.failure_classification import UNPLACEABLE_EXECUTION_SITE
+
+    assert (task.context or {}).get("failure_category") == (
+        UNPLACEABLE_EXECUTION_SITE
+    ), (
+        "an unplaceable non-generic-site task is a PERMANENT routing-contract "
+        "failure, not a transient PROVISION_FAILURE (which would be resurrected "
+        "onto the same dead-end QUEUED state forever)"
+    )
+
+    # A later dispatch pass must not re-queue or re-warn: the seam keeps an
+    # already-terminal task terminal (it has dropped out of the QUEUED window).
+    failed_again = await fail_unplaceable_non_generic_site_task(
+        db_session,
+        task,
+        task_type="walkthrough_e2e",
+    )
+    assert failed_again is True
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED, (
+        "a second dispatch pass must leave the task terminal — it must not be "
+        f"re-admitted to the QUEUED dispatch window; status={task.status}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_non_generic_site_seam_leaves_generic_tasks_alone(db_session):
+    """The seam is a no-op for generically-placeable task types — it must never
+    terminalize ordinary QUEUED work."""
+    from app.orchestrator_filters import fail_unplaceable_non_generic_site_task
+    from testing.factories import make_project, make_task
+    from app.models import TaskStatus
+
+    project = make_project(name="ordinary-create", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "ordinary work"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    failed = await fail_unplaceable_non_generic_site_task(
+        db_session,
+        task,
+        task_type="create",
+    )
+    assert failed is False
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.QUEUED, (
+        "generic task types must be left for the normal dispatch matrix, not "
+        f"failed by the unplaceable-site seam; status={task.status}"
+    )

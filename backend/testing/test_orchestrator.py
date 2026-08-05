@@ -906,12 +906,15 @@ def test_select_eligible_runner_requires_explicit_browser_proof():
     incapable = RunnerDispatchSnapshot(
         uuid.uuid4(), project_id, {"task_types": "all"}
     )
+    # The heartbeat writes the browser capability NESTED under
+    # isolation_backends (capabilities_inventory in scripts/runner_isolation.py).
+    # Only that nested flag earns the browser gate.
     capable = RunnerDispatchSnapshot(
         id=uuid.uuid4(),
         project_id=project_id,
         capabilities={
             "task_types": "all",
-            "playwright_chromium_usable": True,
+            "isolation_backends": {"playwright_chromium_usable": True},
         },
     )
 
@@ -925,6 +928,29 @@ def test_select_eligible_runner_requires_explicit_browser_proof():
     )
     assert selected is not None
     assert selected.id == capable.id
+
+    # A TOP-LEVEL playwright_chromium_usable: True must NOT satisfy the gate:
+    # that key carries the live launch-probe contract (None until the first
+    # probe completes), so reading it made the browser gate unsatisfiable. The
+    # dispatcher reads the SAME nested key the heartbeat writes — proof of the
+    # single contract, not merely a passing bool.
+    top_level_only = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "playwright_chromium_usable": True,
+        },
+    )
+    not_selected = _select_eligible_runner(
+        {project_id: [incapable, top_level_only]},
+        project_id,
+        "salvage_bundle",
+        None,
+        {},
+        requires_browser=True,
+    )
+    assert not_selected is None
 
     legacy = _select_eligible_runner(
         {project_id: [incapable]}, project_id, "salvage_bundle", None, {}
@@ -1024,6 +1050,48 @@ async def test_visual_evidence_task_falls_through_without_runner_proof(db_sessio
 
     dispatched = await _try_runner_dispatch(
         db_session, task, {project.id: [incapable]}, {}
+    )
+
+    assert dispatched is False
+    assert task.status == TaskStatus.QUEUED
+    assert (task.context or {}).get("runner_target_id") is None
+
+
+@pytest.mark.asyncio
+async def test_walkthrough_dispatch_never_claims_a_registered_runner(db_session):
+    from app.orchestrator_runner_dispatch import (
+        RunnerDispatchSnapshot,
+        _try_runner_dispatch,
+    )
+
+    project = make_project(name="walkthrough-placement", user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "walkthrough_e2e"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    capable_runner = RunnerDispatchSnapshot(
+        uuid.uuid4(),
+        project.id,
+        {
+            "task_types": "all",
+            "max_concurrent": 1,
+            "agent_available": True,
+            "isolation_backends": {
+                "docker_usable": True,
+                "playwright_chromium_usable": True,
+            },
+        },
+    )
+
+    dispatched = await _try_runner_dispatch(
+        db_session, task, {project.id: [capable_runner]}, {}
     )
 
     assert dispatched is False
@@ -8814,6 +8882,109 @@ class TestWarmVMSkipProvision:
             # dispatch wrote a replacement. A future cycle must reacquire it.
             assert row.status == TaskStatus.QUEUED
             assert row.vm_instance_id is None
+
+    @pytest.mark.asyncio
+    async def test_direct_packer_pool_pin_releases_leased_pool_vm(
+        self, orch_warm_db, mocker, reset_max_plan_pool
+    ):
+        """A walkthrough_e2e task (direct-Packer execution site) carrying a stale
+        pool pin must clear the pin AND return the leased PoolVm to IDLE via
+        release_pool_vm. The member did not fail — the task type just cannot run
+        on a pool VM — so it must not linger LEASED (billing warm costs / blocking
+        replenishment) until the orphan-lease sweep retires it."""
+        from sqlmodel import select as _select
+
+        import app.warm_pool as _warm_pool
+        from app.models import PoolVm, PoolVmState
+
+        mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=False,
+        )
+        release_spy = mocker.spy(_warm_pool, "release_pool_vm")
+
+        _shared_state.runtime_config["warm_pool_enabled"] = True
+        try:
+            async with orch_warm_db() as session:
+                project = make_project(name="Direct-Packer-Pin", user_id=_TEST_USER)
+                session.add(project)
+                await session.commit()
+                await session.refresh(project)
+
+                target_vm = "agent-vm-direct-packer-pin-1"
+                deadline = (_utcnow() + timedelta(seconds=240)).isoformat()
+                task = make_task(
+                    project_id=project.id,
+                    # _pin_task_to_pool_vm stamps the pool VM's id onto the task;
+                    # the direct-Packer clear must reset it so the cold fall-through
+                    # mints a FRESH id (not a stale pooled-VM name collision).
+                    vm_instance_id=target_vm,
+                    status=TaskStatus.QUEUED,
+                    payloads=[{"type": "walkthrough_e2e", "prompt": "qualify"}],
+                    context={
+                        "warm_target_vm_id": target_vm,
+                        "warm_handoff_deadline": deadline,
+                        "warm_pool_pin": True,
+                    },
+                )
+                session.add(task)
+                await session.commit()
+                await session.refresh(task)
+                task_id = task.id
+                member = await _warm_pool.register_pool_vm(
+                    session,
+                    vm_instance_id=target_vm,
+                    project_id=project.id,
+                    account_id="acct-pool-owned",
+                    provider="anthropic",
+                    auth_mode="oauth",
+                    model="claude-opus-4-8",
+                    state=PoolVmState.LEASED,
+                )
+                member.leased_task_id = task.id
+                member.lease_expires_at = _utcnow() + timedelta(seconds=240)
+                session.add(member)
+                await session.commit()
+
+            await self._run_one_cycle(mocker)
+        finally:
+            _shared_state.runtime_config.pop("warm_pool_enabled", None)
+
+        # The direct-Packer clear returned the healthy leased member to IDLE.
+        release_spy.assert_awaited()
+        release_spy.assert_awaited_with(
+            mocker.ANY, target_vm, owning_task_id=task_id
+        )
+
+        async with orch_warm_db() as verify:
+            row = (
+                (await verify.execute(_select(Task).where(Task.id == task_id)))
+                .scalars()
+                .first()
+            )
+            assert row is not None
+            ctx = row.context or {}
+            assert "warm_target_vm_id" not in ctx
+            assert "warm_pool_pin" not in ctx
+            # vm_instance_id is either cleared or a FRESH id — never the stale
+            # pooled VM name that could race the reaper's teardown on GCP.
+            assert row.vm_instance_id != target_vm
+            member_row = (
+                (
+                    await verify.execute(
+                        _select(PoolVm).where(
+                            PoolVm.vm_instance_id == target_vm
+                        )
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            assert member_row is not None
+            assert member_row.state == PoolVmState.IDLE
+            assert member_row.leased_task_id is None
+            assert member_row.lease_expires_at is None
 
     @pytest.mark.asyncio
     async def test_parked_retarget_unresponsive_clears_and_resets_vm_id(

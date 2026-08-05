@@ -11,9 +11,74 @@
 """Domain slice: run_qualification — walkthrough_e2e evidence-child spawn.
 
 Split from test_release_qualifier.py. Covers run_qualification's optional
-walkthrough_e2e child: exactly one QUEUED decision-bearing child pinned to the
-candidate SHA + attempt id when explicitly requested, and no child by default."""
+walkthrough_e2e child: exactly one PROVISIONING decision-bearing child pinned
+at birth to the verified container-capable runner + candidate SHA + attempt id."""
 from _release_qualifier_testhelpers import *  # noqa: F403
+
+from app.models import LocalRunner
+from app.time_utils import _utcnow
+
+
+async def _seed_walkthrough_compatible_rubric(db_session, project, version):
+    """Seed the retired-v26 canonical keys so the walkthrough_e2e probe's
+    evidence contract intersects the open version's ACTIVE rubric (the
+    request-time compatibility gate in run_qualification)."""
+    for _wt_key in ("c-dfdc9d82", "c-f52fd975", "c-5214996f"):
+        await _add_version_criterion(
+            db_session,
+            project,
+            version,
+            key=_wt_key,
+            text=f"walkthrough {_wt_key}",
+        )
+
+
+def test_walkthrough_execution_site_is_registry_declared():
+    """The qualifier's walkthrough_e2e site is a legal ExecutionSite value AND
+    matches the registry declaration for the task type.
+
+    Declaration (task_capabilities registry), enforcement (dispatch), and
+    consumption (release_qualifier_audit) must share ONE typed ExecutionSite;
+    this is the assertion that prevents the registry/qualifier split from
+    recurring.
+    """
+    from typing import get_args
+
+    from app.release_qualifier_audit import _WALKTHROUGH_E2E_EXECUTION_SITE
+    from app.task_capabilities import (
+        ExecutionSite,
+        LOCAL_RUNNER_EXECUTION_SITE,
+        TaskType,
+        execution_site_for_task_type,
+    )
+
+    # The qualifier-pinned site is a legal value of the type that governs it.
+    assert _WALKTHROUGH_E2E_EXECUTION_SITE in get_args(ExecutionSite)
+    assert LOCAL_RUNNER_EXECUTION_SITE in get_args(ExecutionSite)
+    # The qualifier pins the same site the registry declares for the task type.
+    assert (
+        execution_site_for_task_type(TaskType.walkthrough_e2e)
+        == _WALKTHROUGH_E2E_EXECUTION_SITE
+        == LOCAL_RUNNER_EXECUTION_SITE
+    )
+
+
+def test_walkthrough_execution_site_is_not_generically_dispatchable():
+    """Generic dispatch fails closed for the walkthrough site.
+
+    A non-default execution site is a hard routing contract: generic dispatch
+    (runner pin / warm pool / Cloud Run / GCE) must refuse to route the task
+    rather than silently treating the site as ``default``.  Unknown task types
+    and default-site types stay on the default matrix.
+    """
+    from app.task_capabilities import (
+        TaskType,
+        execution_site_is_generic_dispatchable,
+    )
+
+    assert execution_site_is_generic_dispatchable(TaskType.walkthrough_e2e) is False
+    assert execution_site_is_generic_dispatchable(TaskType.create) is True
+    assert execution_site_is_generic_dispatchable("totally_unknown_type") is True
 
 
 def test_qualification_contract_fingerprint_tracks_goal_and_categories():
@@ -227,13 +292,10 @@ async def test_same_sha_contract_change_spawns_fresh_holistic_review(
 async def test_run_qualification_spawns_walkthrough_e2e_when_enabled(
     db_session, mocker
 ):
-    """An explicit walkthrough probe request spawns exactly ONE
-    QUEUED walkthrough_e2e child pinned to the candidate SHA + the qualification
-    attempt id, and a same-attempt re-drive does NOT spawn a duplicate.
-
-    The walkthrough child is flagged ``qualifier_walkthrough_e2e`` (so a failed
-    run cascades no fix task) and is a required child for this attempt's
-    in-flight/finalize gate."""
+    """An explicit walkthrough probe request spawns exactly ONE PROVISIONING
+    walkthrough_e2e child pinned AT BIRTH to the verified container-capable
+    project runner (candidate SHA + attempt id); a same-attempt re-drive does
+    NOT spawn a duplicate."""
     from app import shared_state
 
     shared_state.runtime_config["smoketest_enabled"] = False
@@ -242,19 +304,27 @@ async def test_run_qualification_spawns_walkthrough_e2e_when_enabled(
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
 
+    # The walkthrough_e2e probe's canonical evidence keys must intersect the
+    # open version's ACTIVE rubric (request-time compatibility gate) or the
+    # probe is refused before any child spawn.
+    await _seed_walkthrough_compatible_rubric(db_session, project, version)
+
+    # A live runner proving the candidate-stack site (docker info + Compose +
+    # Chromium) so run_qualification pins the walkthrough child to it.
+    capable_runner = LocalRunner(
+        project_id=project.id, token_hash="x" * 64, status="active",
+        last_seen_at=_utcnow(),
+        capabilities={"task_types": "all", "max_concurrent": 2,
+                      "isolation_backends": {"docker_usable": True,
+                                             "playwright_chromium_usable": True}},
+    )
+    db_session.add(capable_runner)
+    await db_session.commit()
+
     candidate = "wa1c0e2e" * 5  # 40-char placeholder SHA
-    mocker.patch(
-        "app.github.get_repo_installation_token",
-        new=AsyncMock(return_value="gh-token"),
-    )
-    mocker.patch(
-        "app.github.get_branch_sha",
-        new=AsyncMock(return_value=candidate),
-    )
-    mocker.patch(
-        "app.github.get_check_runs_cached",
-        new=AsyncMock(return_value={"conclusion": "success"}),
-    )
+    mocker.patch("app.github.get_repo_installation_token", new=AsyncMock(return_value="gh-token"))
+    mocker.patch("app.github.get_branch_sha", new=AsyncMock(return_value=candidate))
+    mocker.patch("app.github.get_check_runs_cached", new=AsyncMock(return_value={"conclusion": "success"}))
 
     result = await rq.run_qualification(
         db_session,
@@ -275,8 +345,6 @@ async def test_run_qualification_spawns_walkthrough_e2e_when_enabled(
     assert version.last_qualification["requested_probes"] == ["walkthrough_e2e"]
     assert version.last_qualification["walkthrough_e2e_task_id"] == walk_task_id
 
-    # Exactly one walkthrough_e2e task, QUEUED, pinned to the candidate SHA and
-    # the qualification attempt id.
     from sqlmodel import select as _sqlmodel_select
 
     project_tasks = (
@@ -296,7 +364,10 @@ async def test_run_qualification_spawns_walkthrough_e2e_when_enabled(
     assert len(walk_tasks) == 1
     walk = walk_tasks[0]
     assert str(walk.id) == walk_task_id
-    assert walk.status == TaskStatus.QUEUED
+    assert walk.status == TaskStatus.PROVISIONING
+    assert walk.vm_instance_id == f"runner:{capable_runner.id}"
+    assert walk.vm_provisioned_at is not None
+    assert walk.started_at is None
     assert walk.created_by == "ORCHESTRATOR"
     assert walk.first_payload["type"] == "walkthrough_e2e"
     assert walk.first_payload["candidate_sha"] == candidate
@@ -304,9 +375,11 @@ async def test_run_qualification_spawns_walkthrough_e2e_when_enabled(
     assert walk.first_payload["base_branch"] == "automain"
     # Qualifier marker prevents ordinary task-fix cascades.
     assert walk.context["qualifier_walkthrough_e2e"] is True
+    assert walk.context["runner_target_id"] == str(capable_runner.id)
     assert walk.context["candidate_sha"] == candidate
     assert walk.context["qualification_attempt_id"] == attempt_id
     assert walk.context["release_version_id"] == str(version.id)
+    assert walk.context["execution_site"] == "local_runner"
 
 
 @pytest.mark.asyncio
@@ -324,18 +397,9 @@ async def test_run_qualification_skips_walkthrough_e2e_when_disabled(
     project, version = await _make_project_and_version(db_session, phase="stabilize")
 
     candidate = "de1e7ed0" * 5  # 40-char placeholder SHA
-    mocker.patch(
-        "app.github.get_repo_installation_token",
-        new=AsyncMock(return_value="gh-token"),
-    )
-    mocker.patch(
-        "app.github.get_branch_sha",
-        new=AsyncMock(return_value=candidate),
-    )
-    mocker.patch(
-        "app.github.get_check_runs_cached",
-        new=AsyncMock(return_value={"conclusion": "success"}),
-    )
+    mocker.patch("app.github.get_repo_installation_token", new=AsyncMock(return_value="gh-token"))
+    mocker.patch("app.github.get_branch_sha", new=AsyncMock(return_value=candidate))
+    mocker.patch("app.github.get_check_runs_cached", new=AsyncMock(return_value={"conclusion": "success"}))
 
     result = await rq.run_qualification(
         db_session, project.id, version, explicit_request=True
@@ -367,6 +431,576 @@ async def test_run_qualification_skips_walkthrough_e2e_when_disabled(
         if (task.context or {}).get("qualifier_walkthrough_e2e") is True
     ]
     assert walk_tasks == []
+
+
+async def test_run_qualification_drops_incompatible_walkthrough_probe_and_spawns_probe_free(
+    db_session, mocker
+):
+    """A walkthrough_e2e probe request whose canonical evidence keys share NO
+    ACTIVE criterion with the open version's rubric is DROPPED (not refused):
+    the qualification still spawns, probe-free, and the drop is recorded
+    durably under ``qualify_request_blocked`` / ``qualify_request_blocked_at``.
+
+    The walkthrough evidence contract is pinned to the retired v26 criteria; a
+    rubric with zero overlap would only fail (contained, but expensive) after a
+    full qualification was spent.  The request-time gate therefore DROPS the
+    incompatible probe and continues — an incompatible probe must never prevent
+    the qualification from spawning at all."""
+    from app import shared_state
+
+    shared_state.runtime_config["smoketest_enabled"] = False
+    shared_state.runtime_config["env_preflight_enabled"] = False
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    # A v27-style rubric with NO overlap with the walkthrough canonical keys.
+    for _rubric_key in (
+        "c-28e29fc5",
+        "c-09e29209",
+        "c-13867029",
+        "c-635ee093",
+        "c-280480cf",
+    ):
+        await _add_version_criterion(
+            db_session,
+            project,
+            version,
+            key=_rubric_key,
+            text=f"criterion {_rubric_key}",
+        )
+
+    candidate = "de1e7ed0" * 5  # 40-char placeholder SHA
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch("app.github.get_branch_sha", new=AsyncMock(return_value=candidate))
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"conclusion": "success"}),
+    )
+
+    result = await rq.run_qualification(
+        db_session,
+        project.id,
+        version,
+        requested_probes=["walkthrough_e2e"],
+        explicit_request=True,
+    )
+    await db_session.commit()
+
+    # The qualification is NOT refused — it spawns probe-free.
+    assert result["status"] == "spawned"
+    assert result["requested_probes"] == []
+    assert result["walkthrough_e2e_task_id"] is None
+
+    await db_session.refresh(version)
+    lq = version.last_qualification
+    assert lq["status"] == "pending"
+    assert lq["requested_probes"] == []
+    assert lq["walkthrough_e2e_task_id"] is None
+    # The drop is recorded durably with the blocker + probe + BOTH key sets.
+    blocked = lq["qualify_request_blocked"]
+    assert blocked["blocker"] == "incompatible_probe"
+    assert blocked["probe"] == "walkthrough_e2e"
+    assert blocked["canonical_evidence_keys"] == sorted(
+        rq._WALKTHROUGH_E2E_EXPECTED_CANONICAL_EVIDENCE_KEYS
+    )
+    assert blocked["active_rubric_keys"] == sorted(
+        ["c-28e29fc5", "c-09e29209", "c-13867029", "c-635ee093", "c-280480cf"]
+    )
+    assert lq["qualify_request_blocked_at"]
+
+    # No walkthrough child was spawned for the dropped probe.
+    from sqlmodel import select as _sqlmodel_select
+
+    project_tasks = (
+        (
+            await db_session.execute(
+                _sqlmodel_select(Task).where(Task.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    walk_tasks = [
+        task
+        for task in project_tasks
+        if (task.context or {}).get("qualifier_walkthrough_e2e") is True
+    ]
+    assert walk_tasks == []
+
+
+async def test_redrive_infra_failure_drops_latched_incompatible_probe_and_spawns_probe_free(
+    db_session, mocker
+):
+    """A latched incompatible probe arriving on an infra-failure redrive is
+    dropped probe-free, and the redrive returns True (a real re-spawn) instead
+    of stalling with ``return False``.
+
+    The re-driver re-passes ``last_qualification.requested_probes`` verbatim;
+    when that latched walkthrough_e2e probe is structurally impossible for the
+    open version's rubric, run_qualification must drop it and spawn probe-free
+    so the redrive reaches a real verdict instead of freezing the streak."""
+    from app import shared_state
+
+    shared_state.runtime_config["smoketest_enabled"] = False
+    shared_state.runtime_config["env_preflight_enabled"] = False
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    # v27-style rubric with NO overlap → the latched probe is incompatible.
+    for _rubric_key in (
+        "c-28e29fc5",
+        "c-09e29209",
+        "c-13867029",
+        "c-635ee093",
+        "c-280480cf",
+    ):
+        await _add_version_criterion(
+            db_session,
+            project,
+            version,
+            key=_rubric_key,
+            text=f"criterion {_rubric_key}",
+        )
+
+    candidate = "de1e7ed0" * 5  # 40-char placeholder SHA
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch("app.github.get_branch_sha", new=AsyncMock(return_value=candidate))
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"conclusion": "success"}),
+    )
+
+    # A stranded infra_failure record that latched the incompatible probe.  It
+    # carries the original qualification_attempt_id (a real infra_failure record
+    # always does — _handle_infra_failure copies it from the pending record), so
+    # the redrive re-enters run_qualification as a continued attempt.
+    version.last_qualification = {
+        "status": "infra_failure",
+        "candidate_sha": candidate,
+        "qualification_attempt_id": str(uuid.uuid4()),
+        "error": "walkthrough_e2e_candidate_stack_boot_failure",
+        "infra_failure_signature": "walkthrough_e2e:boot_failure",
+        "consecutive_infra_errors": 1,
+        "requested_probes": ["walkthrough_e2e"],
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    from app.release_qualifier_redrive import _redrive_infra_failure_qualification
+
+    result = await _redrive_infra_failure_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert result is True, (
+        "redrive must re-spawn probe-free instead of stalling on the latched "
+        "incompatible probe"
+    )
+
+    await db_session.refresh(version)
+    lq = version.last_qualification
+    assert lq["status"] == "pending"
+    assert lq["requested_probes"] == []
+    assert lq["walkthrough_e2e_task_id"] is None
+    blocked = lq["qualify_request_blocked"]
+    assert blocked["blocker"] == "incompatible_probe"
+    assert blocked["probe"] == "walkthrough_e2e"
+    assert blocked["canonical_evidence_keys"] == sorted(
+        rq._WALKTHROUGH_E2E_EXPECTED_CANONICAL_EVIDENCE_KEYS
+    )
+    assert lq["qualify_request_blocked_at"]
+
+
+async def test_compatible_walkthrough_probe_passes_through_unchanged(
+    db_session, mocker
+):
+    """A walkthrough_e2e probe whose canonical keys ARE active in the open
+    version's rubric passes through unchanged: the probe is NOT dropped, no
+    qualify_request_blocked record is stamped, and the walkthrough child is
+    spawned.  Regression guard for the #16704 compatible-probe contract."""
+    from app import shared_state
+
+    shared_state.runtime_config["smoketest_enabled"] = False
+    shared_state.runtime_config["env_preflight_enabled"] = False
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    # The walkthrough_e2e probe's canonical evidence keys must intersect the
+    # open version's ACTIVE rubric (request-time compatibility gate) or the
+    # probe is dropped before any child spawn.
+    await _seed_walkthrough_compatible_rubric(db_session, project, version)
+
+    # A live runner proving the candidate-stack site (docker info + Compose +
+    # Chromium) so run_qualification pins the walkthrough child to it.
+    capable_runner = LocalRunner(
+        project_id=project.id, token_hash="x" * 64, status="active",
+        last_seen_at=_utcnow(),
+        capabilities={"task_types": "all", "max_concurrent": 2,
+                      "isolation_backends": {"docker_usable": True,
+                                             "playwright_chromium_usable": True}},
+    )
+    db_session.add(capable_runner)
+    await db_session.commit()
+
+    candidate = "wa1c0e2e" * 5  # 40-char placeholder SHA
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch("app.github.get_branch_sha", new=AsyncMock(return_value=candidate))
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"conclusion": "success"}),
+    )
+
+    result = await rq.run_qualification(
+        db_session,
+        project.id,
+        version,
+        requested_probes=["walkthrough_e2e"],
+        explicit_request=True,
+    )
+    await db_session.commit()
+
+    assert result["status"] == "spawned"
+    assert result["requested_probes"] == ["walkthrough_e2e"]
+    assert result["walkthrough_e2e_task_id"] is not None
+
+    await db_session.refresh(version)
+    lq = version.last_qualification
+    assert lq["requested_probes"] == ["walkthrough_e2e"]
+    assert lq["walkthrough_e2e_task_id"] == result["walkthrough_e2e_task_id"]
+    # Compatible probe → no drop record at all.
+    assert lq.get("qualify_request_blocked") is None
+    assert lq.get("qualify_request_blocked_at") is None
+
+
+async def test_finalize_failed_walkthrough_probe_blocks_promotion_and_preserves_verdict(
+    db_session, mocker
+):
+    """A requested walkthrough_e2e probe that FAILED blocks promotion while
+    preserving the already-computed audit verdict.
+
+    Regression for the probe-leg blast radius: the probe evaluation used to run
+    BEFORE the release_audit report was read, so any probe exit discarded the
+    whole verdict (three consecutive attempts reported audit='unavailable').  The
+    probe leg now runs AFTER dimension composition and a probe that did not pass
+    fails ONLY its own dimension — the audit sub-score survives alongside the
+    walkthrough_e2e=0.0 blocker."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    # Compatible rubric so the report keys resolve to ACTIVE criteria (the probe
+    # evaluation then reaches the genuine criterion-failure path).
+    await _seed_walkthrough_compatible_rubric(db_session, project, version)
+
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    candidate_sha = version.last_qualification["candidate_sha"]
+    walk_task = Task(
+        project_id=project.id,
+        title="walkthrough",
+        payloads=[{"type": "walkthrough_e2e", "base_branch": "automain"}],
+        vm_instance_id="vm-walkthrough",
+        status=TaskStatus.COMPLETED,
+        context={"candidate_sha": candidate_sha},
+    )
+    db_session.add(walk_task)
+    await db_session.flush()
+    db_session.add(
+        Artifact(
+            task_id=walk_task.id,
+            artifact_type=ArtifactType.WALKTHROUGH_E2E_REPORT,
+            logs=json.dumps(
+                {
+                    "git_sha": candidate_sha,
+                    "exercised_engine_sha": candidate_sha,
+                    "results": [
+                        {"criterion_key": "c-dfdc9d82", "passed": True},
+                        {"criterion_key": "c-f52fd975", "passed": False},
+                        {
+                            "criterion_key": "c-workday-session-lifecycle",
+                            "passed": True,
+                        },
+                        {"criterion_key": "c-5214996f", "passed": False},
+                    ],
+                }
+            ),
+        )
+    )
+    await db_session.commit()
+    await db_session.refresh(walk_task)
+
+    # Stamp the probe request + task id and re-compute the frozen contract so
+    # finalize does not treat the mutation as mid-flight rubric drift.
+    qual = {
+        **(version.last_qualification or {}),
+        "requested_probes": ["walkthrough_e2e"],
+        "walkthrough_e2e_task_id": str(walk_task.id),
+    }
+    version.last_qualification = _with_current_qualification_contract(
+        project, version, qual
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] == "not_promoted"
+    assert result["blocker"] == "walkthrough_e2e_failed"
+
+    await db_session.refresh(version)
+    lq = version.last_qualification
+    # The audit verdict is preserved alongside the walkthrough failure — the
+    # core regression: a probe failure no longer discards the computed audit.
+    assert lq["sub_scores"]["audit"] == pytest.approx(1.0)
+    assert lq["sub_scores"]["walkthrough_e2e"] == 0.0
+    assert lq["walkthrough_e2e_result"]["status"] == "failed"
+    assert lq["walkthrough_e2e_result"]["failed_criterion_keys"] == [
+        "c-f52fd975",
+        "c-5214996f",
+    ]
+
+
+async def test_finalize_unknown_criteria_probe_contained_and_preserves_verdict(
+    db_session, mocker
+):
+    """An infra-type probe failure (report keys not active in the version rubric)
+    is CONTAINED to the walkthrough_e2e dimension: it blocks promotion AND the
+    audit verdict survives.
+
+    This is the blast-radius regression: the probe evaluation used to run BEFORE
+    the release_audit report was read, and every probe exit routed to
+    _handle_infra_failure — discarding the already-computed audit/challenge/
+    merge-grade verdicts (three consecutive attempts reported audit='unavailable').
+    The probe leg now runs after dimension composition; even the unknown-criteria
+    case fails only its own dimension instead of blacking out the whole verdict."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    # A v27-style rubric — the walkthrough report's retired-v26 keys resolve to
+    # NO active criterion (unknown_criteria at finalize; refused at request time
+    # by the Change-B gate, but a legacy/redriven qual still reaches finalize).
+    for _rubric_key in (
+        "c-28e29fc5",
+        "c-09e29209",
+        "c-13867029",
+        "c-635ee093",
+        "c-280480cf",
+    ):
+        await _add_version_criterion(
+            db_session,
+            project,
+            version,
+            key=_rubric_key,
+            text=f"criterion {_rubric_key}",
+        )
+
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    candidate_sha = version.last_qualification["candidate_sha"]
+    walk_task = Task(
+        project_id=project.id,
+        title="walkthrough",
+        payloads=[{"type": "walkthrough_e2e", "base_branch": "automain"}],
+        vm_instance_id="vm-walkthrough",
+        status=TaskStatus.COMPLETED,
+        context={"candidate_sha": candidate_sha},
+    )
+    db_session.add(walk_task)
+    await db_session.flush()
+    db_session.add(
+        Artifact(
+            task_id=walk_task.id,
+            artifact_type=ArtifactType.WALKTHROUGH_E2E_REPORT,
+            logs=json.dumps(
+                {
+                    "git_sha": candidate_sha,
+                    "exercised_engine_sha": candidate_sha,
+                    "results": [
+                        {"criterion_key": "c-dfdc9d82", "passed": True},
+                        {"criterion_key": "c-f52fd975", "passed": True},
+                        {
+                            "criterion_key": "c-workday-session-lifecycle",
+                            "passed": True,
+                        },
+                        {"criterion_key": "c-5214996f", "passed": True},
+                    ],
+                }
+            ),
+        )
+    )
+    await db_session.commit()
+    await db_session.refresh(walk_task)
+
+    qual = {
+        **(version.last_qualification or {}),
+        "requested_probes": ["walkthrough_e2e"],
+        "walkthrough_e2e_task_id": str(walk_task.id),
+    }
+    version.last_qualification = _with_current_qualification_contract(
+        project, version, qual
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] == "not_promoted"
+    assert result["blocker"] == "walkthrough_e2e_failed"
+
+    await db_session.refresh(version)
+    lq = version.last_qualification
+    # The audit verdict survives the probe-leg containment — the core regression.
+    assert lq["sub_scores"]["audit"] == pytest.approx(1.0)
+    assert lq["sub_scores"]["walkthrough_e2e"] == 0.0
+    assert lq["walkthrough_e2e_result"]["status"] == "failed"
+    assert (
+        lq["walkthrough_e2e_result"]["reason"]
+        == "walkthrough_e2e_report_unknown_criteria"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "walkthrough_child_shape",
+    [
+        pytest.param("absent_id", id="absent_task_id"),
+        pytest.param("deleted_row", id="deleted_task_row"),
+    ],
+)
+async def test_pending_with_missing_walkthrough_task_finalizes(
+    db_session, walkthrough_child_shape
+):
+    """A pending qualification that requested the walkthrough_e2e probe but has
+    NO walkthrough child (walkthrough_e2e_task_id absent / the row was deleted)
+    is not in-flight work: the reaper sweep's finalize path processes it as a
+    hard walkthrough_e2e_failed blocker instead of stranding the version in
+    pending until the 6h qualification_timeout backstop.
+
+    Regression for the stranded-pending hazard: both guards used to treat the
+    missing child as non-terminal — _qualification_in_flight reported a live
+    child (blocking re-entry) and required_children_terminal reported not-ready
+    (blocking the sweep finalize path).  The version then sat pending with zero
+    in-flight work until the wall-clock timeout mislabeled it an infra failure.
+    """
+    import uuid
+
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    # The stranded shape: walkthrough_e2e requested but the child never
+    # materialized — either the task id is absent from the record (never
+    # spawned) or the id points at a task row that no longer exists.  Restamp
+    # the frozen contract so finalize does not treat the fixture mutation as
+    # mid-flight rubric drift, and freshen started_at so the 6h timeout
+    # backstop does NOT fire first.
+    wt_task_id = (
+        None
+        if walkthrough_child_shape == "absent_id"
+        else str(uuid.uuid4())  # present id, but no matching Task row
+    )
+    version.last_qualification = _with_current_qualification_contract(
+        project,
+        version,
+        {
+            **(version.last_qualification or {}),
+            "started_at": _utcnow().isoformat(),
+            "requested_probes": ["walkthrough_e2e"],
+            "walkthrough_e2e_task_id": wt_task_id,
+        },
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Both guards must agree there is no in-flight work left to wait for.
+    assert not await rq._qualification_in_flight(db_session, version)
+    assert await rq._required_children_terminal(db_session, version)
+
+    # The sweep's finalize path (audit-H5 per-version dedicated session) must
+    # finalize the stranded pending record rather than skip it.
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    assert count == 1
+    await db_session.refresh(version)
+    lq = version.last_qualification
+    assert lq["status"] == "not_promoted"
+    assert lq["blocker"] == "walkthrough_e2e_failed"
+    assert lq["walkthrough_e2e_result"]["status"] == "failed"
+    assert lq["walkthrough_e2e_result"]["reason"] == "walkthrough_e2e_task_missing"
 
 
 def test_walkthrough_probe_contract_is_strict_and_cache_safe():
@@ -558,7 +1192,7 @@ async def test_requested_walkthrough_is_a_required_terminal_child():
 async def test_walkthrough_e2e_lane_records_registered_criterion_evidence(
     db_session, mocker
 ):
-    """End-to-end: the wired walkthrough_e2e lane spawns a QUEUED child pinned to
+    """End-to-end: the walkthrough_e2e lane spawns a PROVISIONING child pinned to
     the candidate SHA, ingests PASS results as covered-tier CriterionEvidence rows
     for all three registered keys (c-dfdc9d82, c-f52fd975, c-5214996f), and
     surfaces a loud Alert for any phantom/drifted key while writing no evidence
@@ -566,8 +1200,8 @@ async def test_walkthrough_e2e_lane_records_registered_criterion_evidence(
 
     Properties verified:
       1. ACTIVE VersionAcceptanceCriterion rows for the three registered keys.
-      2. run_qualification spawns exactly one QUEUED walkthrough_e2e child pinned
-         to the candidate SHA + qualification attempt id.
+      2. run_qualification spawns exactly one PROVISIONING walkthrough_e2e child
+         pinned to the verified runner + candidate SHA + qualification attempt id.
       3-4. record_walkthrough_e2e_evidence writes covered-tier CriterionEvidence
            rows (source_kind=walkthrough_e2e) for each registered key; no unmatched
            alert when all keys resolve.
@@ -590,6 +1224,16 @@ async def test_walkthrough_e2e_lane_records_registered_criterion_evidence(
 
     # PROPERTY 1: project + open version; register the three emitted keys as ACTIVE criteria.
     project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    capable_runner = LocalRunner(
+        project_id=project.id, token_hash="x" * 64, status="active",
+        last_seen_at=_utcnow(),
+        capabilities={"task_types": "all", "max_concurrent": 2,
+                      "isolation_backends": {"docker_usable": True,
+                                             "playwright_chromium_usable": True}},
+    )
+    db_session.add(capable_runner)
+    await db_session.commit()
 
     REGISTERED_KEYS = ["c-dfdc9d82", "c-f52fd975", "c-5214996f"]
     for key in REGISTERED_KEYS:
@@ -622,20 +1266,11 @@ async def test_walkthrough_e2e_lane_records_registered_criterion_evidence(
 
     candidate = "c0de1234" * 5  # deterministic 40-char SHA
 
-    mocker.patch(
-        "app.github.get_repo_installation_token",
-        new=AsyncMock(return_value="gh-token"),
-    )
-    mocker.patch(
-        "app.github.get_branch_sha",
-        new=AsyncMock(return_value=candidate),
-    )
-    mocker.patch(
-        "app.github.get_check_runs_cached",
-        new=AsyncMock(return_value={"conclusion": "success"}),
-    )
+    mocker.patch("app.github.get_repo_installation_token", new=AsyncMock(return_value="gh-token"))
+    mocker.patch("app.github.get_branch_sha", new=AsyncMock(return_value=candidate))
+    mocker.patch("app.github.get_check_runs_cached", new=AsyncMock(return_value={"conclusion": "success"}))
 
-    # PROPERTY 2: run_qualification spawns exactly one QUEUED walkthrough_e2e child.
+    # PROPERTY 2: run_qualification spawns exactly one PROVISIONING walkthrough_e2e child.
     result = await rq.run_qualification(
         db_session,
         project.id,
@@ -671,7 +1306,9 @@ async def test_walkthrough_e2e_lane_records_registered_criterion_evidence(
     assert len(walk_tasks) == 1
     walk = walk_tasks[0]
     assert str(walk.id) == walk_task_id
-    assert walk.status == TaskStatus.QUEUED
+    assert walk.status == TaskStatus.PROVISIONING
+    assert walk.vm_instance_id == f"runner:{capable_runner.id}"
+    assert walk.context["runner_target_id"] == str(capable_runner.id)
     assert walk.first_payload["candidate_sha"] == candidate
     assert walk.first_payload["qualification_attempt_id"] == attempt_id
 
@@ -788,3 +1425,416 @@ async def test_walkthrough_e2e_lane_records_registered_criterion_evidence(
     assert phantom_source_ids == [], (
         f"Phantom key must not write any CriterionEvidence rows; found: {phantom_source_ids}"
     )
+
+
+@pytest.mark.asyncio
+async def test_walkthrough_e2e_site_gate_rejects_unproven_runners(db_session):
+    """Fail-closed site gate + deterministic low-id pin for the walkthrough child."""
+    from app.release_qualifier_audit import (
+        QualifierWalkthroughSiteUnavailableError,
+        _spawn_qualifier_walkthrough_task,
+    )
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    def add_runner(runner_id, caps):
+        db_session.add(LocalRunner(
+            id=runner_id, project_id=project.id, token_hash="x" * 64,
+            status="active", last_seen_at=_utcnow(), capabilities=caps))
+
+    base = {"task_types": "all", "max_concurrent": 2}
+    add_runner(uuid.uuid4(), {**base, "isolation_backends": {"bwrap_usable": True}})
+    add_runner(uuid.uuid4(), {**base, "isolation_backends": {"docker_usable": True}})
+    # A docker box whose chromium claim is only operator-stamped at the TOP level
+    # (never emitted by the runner's own inventory) is NOT a proven site: the
+    # runner-emitted capability must live in isolation_backends, so this fails
+    # closed just like a thin-docker box.
+    add_runner(uuid.uuid4(), {**base, "isolation_backends": {"docker_usable": True},
+                              "playwright_chromium_usable": True})
+    await db_session.commit()
+
+    with pytest.raises(QualifierWalkthroughSiteUnavailableError,
+                       match="candidate-stack site"):
+        await _spawn_qualifier_walkthrough_task(
+            db_session, project.id, version_id=version.id,
+            candidate_sha="f011c10se" * 5,
+            qualification_attempt_id=uuid.uuid4(),
+        )
+
+    low_id = uuid.UUID("00000000-0000-0000-0000-0000000000aa")
+    site_caps = {**base,
+                 "isolation_backends": {"docker_usable": True,
+                                        "playwright_chromium_usable": True}}
+    add_runner(low_id, site_caps)
+    add_runner(uuid.UUID("00000000-0000-0000-0000-0000000000bb"), site_caps)
+    await db_session.commit()
+
+    pinned = await _spawn_qualifier_walkthrough_task(
+        db_session, project.id, version_id=version.id,
+        candidate_sha="f011c10se" * 5,
+        qualification_attempt_id=uuid.uuid4(),
+    )
+    assert pinned.status == TaskStatus.PROVISIONING
+    assert pinned.vm_instance_id == f"runner:{low_id}"
+    assert pinned.context["runner_target_id"] == str(low_id)
+    assert pinned.vm_provisioned_at is not None
+    assert pinned.started_at is None
+    assert pinned.context["qualifier_walkthrough_e2e"] is True
+
+
+def test_walkthrough_site_gate_reads_runner_emitted_chromium_only():
+    """The walkthrough site gate is satisfiable ONLY through the capability the
+    runner's own inventory emits (``isolation_backends.playwright_chromium_usable``),
+    never through an operator top-level claim, and never defaulted to True.
+
+    DEFECT-B regression: the gate must not silently admit a thin-docker box
+    because a missing capability defaults to True (default-off-is-guilty).
+    """
+    from types import SimpleNamespace
+
+    from app.release_qualifier_audit import _walkthrough_e2e_site_eligible
+
+    def snap(caps):
+        return SimpleNamespace(capabilities=caps)
+
+    base = {"task_types": "all", "max_concurrent": 2}
+    # Runner-emitted proof (nested isolation_backends, the heartbeat inventory
+    # location) → eligible.
+    assert _walkthrough_e2e_site_eligible(
+        snap({**base, "isolation_backends": {"docker_usable": True,
+                                             "playwright_chromium_usable": True}})
+    )
+    # Operator top-level claim only (never emitted by the runner inventory) →
+    # NOT eligible.
+    assert not _walkthrough_e2e_site_eligible(
+        snap({**base, "isolation_backends": {"docker_usable": True},
+              "playwright_chromium_usable": True})
+    )
+    # Thin-docker (no chromium at all) → NOT eligible.
+    assert not _walkthrough_e2e_site_eligible(
+        snap({**base, "isolation_backends": {"docker_usable": True}})
+    )
+    # bwrap-only → NOT eligible.
+    assert not _walkthrough_e2e_site_eligible(
+        snap({**base, "isolation_backends": {"bwrap_usable": True}})
+    )
+    # Missing capabilities → NOT eligible.
+    assert not _walkthrough_e2e_site_eligible(snap(None))
+    assert not _walkthrough_e2e_site_eligible(snap({}))
+
+
+@pytest.mark.asyncio
+async def test_walkthrough_spawn_records_live_runner_site_matching_registry(
+    db_session,
+):
+    """The walkthrough spawn's execution site is the LIVE LOCAL RUNNER, recorded
+    with the SAME typed site the registry declares.
+
+    The registry and the qualifier's pin share one ExecutionSite value
+    (LOCAL_RUNNER_EXECUTION_SITE); the spawn records that exact site label on the
+    context. This regression keeps declaration, enforcement, and consumption from
+    diverging into a registry/qualifier vocabulary split again.
+    """
+    from app.release_qualifier_audit import (
+        _WALKTHROUGH_E2E_EXECUTION_SITE,
+        _spawn_qualifier_walkthrough_task,
+    )
+    from app.task_capabilities import (
+        LOCAL_RUNNER_EXECUTION_SITE,
+        TaskType,
+        execution_site_for_task_type,
+    )
+
+    # The registry declares the same typed site the qualifier pins.
+    assert (
+        execution_site_for_task_type(TaskType.walkthrough_e2e)
+        == _WALKTHROUGH_E2E_EXECUTION_SITE
+        == LOCAL_RUNNER_EXECUTION_SITE
+    )
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    capable_runner = LocalRunner(
+        project_id=project.id, token_hash="x" * 64, status="active",
+        last_seen_at=_utcnow(),
+        capabilities={"task_types": "all", "max_concurrent": 2,
+                      "isolation_backends": {"docker_usable": True,
+                                             "playwright_chromium_usable": True}},
+    )
+    db_session.add(capable_runner)
+    await db_session.commit()
+
+    pinned = await _spawn_qualifier_walkthrough_task(
+        db_session, project.id, version_id=version.id,
+        candidate_sha="f011c10se" * 5,
+        qualification_attempt_id=uuid.uuid4(),
+    )
+    assert pinned.status == TaskStatus.PROVISIONING
+    assert pinned.vm_instance_id == f"runner:{capable_runner.id}"
+    assert pinned.context["runner_target_id"] == str(capable_runner.id)
+    # The recorded site is the typed live-local-runner site the registry declares.
+    assert pinned.context["execution_site"] == _WALKTHROUGH_E2E_EXECUTION_SITE
+    assert _WALKTHROUGH_E2E_EXECUTION_SITE == LOCAL_RUNNER_EXECUTION_SITE
+
+
+@pytest.mark.asyncio
+async def test_walkthrough_site_failure_leaves_no_queued_release_audit_child(
+    db_session, mocker
+):
+    """A fail-closed walkthrough execution-site check must not orphan a QUEUED
+    release_audit child.
+
+    run_qualification spawns the walkthrough_e2e child BEFORE the release_audit
+    child. When no live runner proves the candidate-stack site, the walkthrough
+    spawn raises QualifierWalkthroughSiteUnavailableError before any child row
+    is allocated, so the spawn_failed record is written with zero surviving
+    release_audit children."""
+    from app import shared_state
+    from sqlmodel import select as _sqlmodel_select
+
+    shared_state.runtime_config["smoketest_enabled"] = False
+    shared_state.runtime_config["env_preflight_enabled"] = False
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    # Compatible rubric so the probe request passes the request-time gate and
+    # reaches the spawn (which then fails closed on the missing runner site).
+    await _seed_walkthrough_compatible_rubric(db_session, project, version)
+
+    # No live runner proves the candidate-stack site (docker info + Compose +
+    # Chromium), so the walkthrough spawn fails closed before the release_audit
+    # child is allocated.
+    candidate = "deadbeef" * 5  # 40-char placeholder SHA
+    stamped_engine = "f" * 40
+    mocker.patch("app.deployed_sha.get_serving_sha", return_value=stamped_engine)
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch("app.github.get_branch_sha", new=AsyncMock(return_value=candidate))
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"conclusion": "success"}),
+    )
+
+    result = await rq.run_qualification(
+        db_session,
+        project.id,
+        version,
+        requested_probes=["walkthrough_e2e"],
+        explicit_request=True,
+    )
+    await db_session.commit()
+
+    # Fail-closed: the site failure still blocks the qualification.
+    assert result["status"] == "spawn_failed"
+    await db_session.refresh(version)
+    assert version.last_qualification["error"] == "spawn_failed"
+    assert version.last_qualification.get("audit_task_id") is None
+    assert version.last_qualification.get("walkthrough_e2e_task_id") is None
+    # The spawn_failed record stamps the serving engine sha so the error-redrive
+    # site-change re-arm has a baseline to compare against a later deploy.
+    assert version.last_qualification.get("engine_sha") == stamped_engine
+
+    # No QUEUED release_audit child may survive the failed dispatch.
+    project_tasks = (
+        (
+            await db_session.execute(
+                _sqlmodel_select(Task).where(Task.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [
+        task
+        for task in project_tasks
+        if (task.first_payload or {}).get("type") == "release_audit"
+    ] == []
+
+
+@pytest.mark.asyncio
+async def test_audit_child_not_orphaned_when_probe_spawn_fails(db_session, mocker):
+    """A spawn failure after the walkthrough (probe) child is created must not
+    orphan a qualifier child.
+
+    run_qualification spawns the walkthrough_e2e (probe) child FIRST, then the
+    release_audit child.  When a later spawn fails, the already-created probe
+    child row must be cancelled with the attempt — the qualification is going
+    terminal as spawn_failed, so no child may linger in a non-terminal state
+    (QUEUED release_audit or PROVISIONING walkthrough_e2e).
+    """
+    from app import shared_state
+    from sqlmodel import select as _sqlmodel_select
+
+    shared_state.runtime_config["smoketest_enabled"] = False
+    shared_state.runtime_config["env_preflight_enabled"] = False
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    # Compatible rubric so the probe request passes the request-time gate and
+    # reaches the spawn (the audit spawn below then fails and must not orphan
+    # the already-allocated walkthrough child).
+    await _seed_walkthrough_compatible_rubric(db_session, project, version)
+
+    # A live runner proving the candidate-stack site so the walkthrough (probe)
+    # child spawn SUCCEEDS and its row is allocated before the audit spawn fails.
+    capable_runner = LocalRunner(
+        project_id=project.id, token_hash="x" * 64, status="active",
+        last_seen_at=_utcnow(),
+        capabilities={"task_types": "all", "max_concurrent": 2,
+                      "isolation_backends": {"docker_usable": True,
+                                             "playwright_chromium_usable": True}},
+    )
+    db_session.add(capable_runner)
+    await db_session.commit()
+
+    candidate = "c0ffee01" * 5  # 40-char placeholder SHA
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch("app.github.get_branch_sha", new=AsyncMock(return_value=candidate))
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"conclusion": "success"}),
+    )
+    # The probe child spawns first and succeeds; force the FOLLOWING audit spawn
+    # to fail so the already-allocated probe child would otherwise be orphaned.
+    mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(side_effect=RuntimeError("audit spawn boom")),
+    )
+
+    result = await rq.run_qualification(
+        db_session,
+        project.id,
+        version,
+        requested_probes=["walkthrough_e2e"],
+        explicit_request=True,
+    )
+    await db_session.commit()
+
+    # The spawn failure still blocks the qualification.
+    assert result["status"] == "spawn_failed"
+    await db_session.refresh(version)
+    assert version.last_qualification["error"] == "spawn_failed"
+    assert version.last_qualification.get("audit_task_id") is None
+    assert version.last_qualification.get("walkthrough_e2e_task_id") is None
+
+    project_tasks = (
+        (
+            await db_session.execute(
+                _sqlmodel_select(Task).where(Task.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    # No release_audit child may survive in QUEUED after the failed spawn.
+    assert [
+        task
+        for task in project_tasks
+        if (task.first_payload or {}).get("type") == "release_audit"
+        and task.status == TaskStatus.QUEUED
+    ] == []
+
+    # The walkthrough (probe) child was created before the audit spawn failed
+    # and must not be left orphaned in PROVISIONING — it is cancelled with the
+    # failing attempt.
+    walk_children = [
+        task
+        for task in project_tasks
+        if (task.context or {}).get("qualifier_walkthrough_e2e") is True
+    ]
+    assert len(walk_children) == 1
+    assert walk_children[0].status == TaskStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_spawn_failed_redriven_on_site_change(db_session, mocker):
+    """A CAPPED walkthrough_e2e spawn_failed re-arms EXACTLY once when the
+    execution-site capability changed — the engine revision that recorded the
+    failure is no longer serving — so the newly-available dispatch site gets one
+    genuine attempt before the cap re-applies.
+
+    This is the acceptance evidence for the fix: a fleet that temporarily has no
+    site-proven runner parks a walkthrough qualification at spawn_failed, and the
+    error-redrive sweep previously skipped it (``spawn_failed`` was absent from
+    ``_TRANSIENT_ERROR_CODES``).  Adding it to the transient codes makes the
+    version re-drivable; the engine-sha re-arm mirrors the infra-failure path so
+    a CAPPED spawn_failed can still resume once after a deploy (every deploy
+    stamps a new ``DEPLOY_SHA``, so a record whose ``engine_sha`` differs from
+    the current serving sha means the site situation may have changed).  The
+    re-arm is one-shot: once a fresh capped failure is recorded under the
+    CURRENT engine, the cap re-applies and halts again.
+    """
+    from app.release_qualifier_redrive import (
+        _MAX_ERROR_REDRIVE_ATTEMPTS,
+        _redrive_error_qualification,
+    )
+
+    old_engine = "a" * 40
+    new_engine = "b" * 40
+    mocker.patch("app.deployed_sha.get_serving_sha", return_value=new_engine)
+
+    _project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "error",
+        "error": "spawn_failed",
+        "detail": (
+            "cannot dispatch qualifier walkthrough_e2e for candidate "
+            "ca11face...: no live project-allowed runner is registered"
+        ),
+        "candidate_sha": "ca11face" * 5,
+        "engine_sha": old_engine,
+        "requested_probes": ["walkthrough_e2e"],
+        "error_redrive_count": _MAX_ERROR_REDRIVE_ATTEMPTS,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mock_run_qual = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=mocker.AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    result = await _redrive_error_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert result is True, (
+        "capped walkthrough spawn_failed must re-arm once after the "
+        "execution-site capability change (record engine no longer serving)"
+    )
+    mock_run_qual.assert_called_once()
+
+    # ONE-SHOT: after a fresh capped failure recorded under the CURRENT serving
+    # engine, the re-arm must NOT fire again — the cap re-applies and halts.
+    await db_session.refresh(version)
+    version.last_qualification = {
+        "status": "error",
+        "error": "spawn_failed",
+        "detail": (
+            "cannot dispatch qualifier walkthrough_e2e for candidate "
+            "ca11face...: no live project-allowed runner is registered"
+        ),
+        "candidate_sha": "ca11face" * 5,
+        "engine_sha": new_engine,
+        "requested_probes": ["walkthrough_e2e"],
+        "error_redrive_count": _MAX_ERROR_REDRIVE_ATTEMPTS,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    result_again = await _redrive_error_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert result_again is False, (
+        "capped walkthrough spawn_failed must NOT re-arm a second time once "
+        "the record's engine matches the current serving engine"
+    )
+    assert mock_run_qual.call_count == 1

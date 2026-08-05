@@ -1773,6 +1773,19 @@ async def agent_fetch_qualification(
             session, open_row.id, _lq.get("candidate_sha")
         )
         _readiness = await compute_requalification_readiness(session, project_id)
+        # Feed the PERSISTED infra-failure streak into the trigger resolver so a
+        # capped version reports "capped" (matching the redriver halt) instead of
+        # a misleading "armed".  Apply the same one-shot walkthrough execution-site
+        # re-arm the redriver uses: when the engine that recorded the capped
+        # streak is no longer serving, the next sweep WILL re-arm, so the read
+        # model reports it as armed rather than permanently capped.
+        _infra_streak = int(_lq.get("consecutive_infra_errors") or 0)
+        if _status == "infra_failure":
+            from app.release_qualifier_redrive import (  # noqa: PLC0415
+                _walkthrough_execution_site_changed,
+            )
+            if _walkthrough_execution_site_changed(_lq):
+                _infra_streak = 0
         qualification_trigger_state = explain_qualification_trigger(
             phase=open_row.phase or "",
             status=_status,
@@ -1787,6 +1800,7 @@ async def agent_fetch_qualification(
             blocker=_lq.get("blocker"),
             in_flight=_status == "pending",
             promotion_check_wait=bool(_lq.get("promotion_pending")),
+            consecutive_infra_errors=_infra_streak,
             last_attempt=_lq if _lq else None,
             knob=get_auto_qualification_triggers_mode(),
             evaluated_at=_utcnow().isoformat(),

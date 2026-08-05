@@ -2992,8 +2992,10 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
       )}
 
       {/* Cycle completion receipt — shown after a cycle finishes until the next one begins.
-          Summarises what changed: direction counts, running-update, problem-model. */}
-      {lastCycleCompletion && !strategistActive && !conversationMode && (
+          Summarises what changed: direction counts, running-update, problem-model. In
+          conversation (minimal) chat the rich count chrome is suppressed but the label and
+          terminal failure reason stay visible so the operator can verify the outcome inline. */}
+      {lastCycleCompletion && !strategistActive && (
         <div className={`px-4 md:px-6 py-2 border-b border-neutral-800 flex items-start gap-2 shrink-0 ${completionReceiptTone?.banner ?? 'bg-emerald-950/30'}`} role="status" aria-live="polite">
           <span className={`w-2 h-2 rounded-full mt-0.5 shrink-0 ${completionReceiptTone?.dot ?? 'bg-emerald-400'}`} aria-hidden="true" />
           <span className={`text-xs min-w-0 ${completionReceiptTone?.text ?? 'text-emerald-300'}`}>

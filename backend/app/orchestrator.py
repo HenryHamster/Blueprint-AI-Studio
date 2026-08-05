@@ -38,6 +38,7 @@ from typing import Dict, Tuple
 
 from sqlalchemy import func as _func, inspect as sa_inspect
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.orm import load_only
 from sqlmodel import select
 
@@ -60,6 +61,8 @@ from app.compute_cloud_run import (
 from app.task_capabilities import (
     AGENT_EXECUTED_TASK_TYPES,
     CLOUD_RUN_CANDIDATE_TASK_TYPES,
+    DIRECT_PACKER_GCE_EXECUTION_SITE,
+    execution_site_for_task_type,
 )
 from app.database import AsyncSessionLocal
 from app.execution_principal import resolve_project_execution_principal
@@ -93,6 +96,8 @@ from app.orchestrator_filters import (
     filter_failing_types,
     _project_fairness_weight,
     collect_dep_uuids,
+    unplaceable_execution_site_reason,
+    fail_unplaceable_non_generic_site_task,
 )
 from app.stall_alert_diagnostics import (
     _compute_all_accounts_blocked_action,
@@ -1228,6 +1233,7 @@ async def orchestrator_worker():
     from app.warm_pool import (
         abandon_pool_dispatch,
         is_warm_pool_enabled,
+        release_pool_vm,
         try_pool_dispatch,
     )
 
@@ -3347,6 +3353,26 @@ async def orchestrator_worker():
                         )
                         if task is None:
                             continue
+                        _task_type_for_dispatch = str(
+                            (task.first_payload or {}).get("type") or ""
+                        )
+                        _execution_site_for_dispatch = execution_site_for_task_type(
+                            _task_type_for_dispatch
+                        )
+                        # A non-default execution site is a hard routing contract:
+                        # the task skips the generic runner/warm-pool/Cloud-Run
+                        # matrix and is placed only by its declared site path.  The
+                        # direct-GCE site is provisioned cold; any OTHER non-default
+                        # site (e.g. the qualifier's live-local-runner walkthrough
+                        # site) is not generically routable and fails closed below.
+                        _non_generic_site_dispatch = (
+                            _execution_site_for_dispatch is not None
+                            and _execution_site_for_dispatch != "default"
+                        )
+                        _direct_packer_gce_dispatch = (
+                            _execution_site_for_dispatch
+                            == DIRECT_PACKER_GCE_EXECUTION_SITE
+                        )
                         if task.requires_approval:
                             await session.rollback()
                             continue
@@ -3482,11 +3508,14 @@ async def orchestrator_worker():
                         # no runner is registered this returns False and every
                         # existing dispatch path runs exactly as before. No
                         # LOCAL_MODE flag is involved.
-                        if await _try_runner_dispatch(
-                            session,
-                            task,
-                            _active_runners_cache,
-                            _runner_pins_this_cycle,
+                        if (
+                            not _non_generic_site_dispatch
+                            and await _try_runner_dispatch(
+                                session,
+                                task,
+                                _active_runners_cache,
+                                _runner_pins_this_cycle,
+                            )
                         ):
                             _cycle_dispatched += 1
                             continue
@@ -3531,7 +3560,41 @@ async def orchestrator_worker():
                         # fall-through mints a FRESH id instead of re-creating a GCP
                         # instance with a stale parked-VM name (name-collision hazard).
                         _is_parked_retarget = bool(_warm_ctx.get("parked_for_retarget"))
-                        if _warm_target_vm_id:
+                        if _non_generic_site_dispatch and _warm_target_vm_id:
+                            # A stale warm/pool pin must not survive onto a locked
+                            # site.  Clear it before the site's cold provision
+                            # mints the dedicated VM name, otherwise a prior
+                            # pooled VM id could be reused accidentally.
+                            _warm_ctx = {
+                                key: value
+                                for key, value in _warm_ctx.items()
+                                if key
+                                not in {
+                                    "warm_target_vm_id",
+                                    "warm_target_pr",
+                                    "warm_handoff_deadline",
+                                    "warm_pool_pin",
+                                    "parked_for_retarget",
+                                    "park_deadline",
+                                }
+                            }
+                            task.context = _warm_ctx
+                            task.vm_instance_id = None
+                            flag_modified(task, "context")
+                            if _is_pool_pin:
+                                # The pinned member did not fail — this task type
+                                # simply cannot run on a pool VM (it needs a direct
+                                # Packer site). Return the healthy LEASED member to
+                                # IDLE so another task can re-lease it, instead of
+                                # leaving it LEASED until the orphan-lease sweep
+                                # retires it (warm-cost billing + lost pool capacity).
+                                await release_pool_vm(
+                                    session,
+                                    _warm_target_vm_id,
+                                    owning_task_id=task.id,
+                                )
+                            _warm_target_vm_id = None
+                        if _warm_target_vm_id and not _non_generic_site_dispatch:
                             _warm_deadline_iso = _warm_ctx.get("warm_handoff_deadline")
                             _warm_expired = False
                             if _warm_deadline_iso:
@@ -3611,8 +3674,6 @@ async def orchestrator_worker():
                                 )
                             }
                             task.context = _new_ctx
-                            from sqlalchemy.orm.attributes import flag_modified
-
                             flag_modified(task, "context")
                             if _cb_suppressed:
                                 _clear_reason = "circuit_breaker"
@@ -3799,6 +3860,7 @@ async def orchestrator_worker():
                         )
                         _is_cloud_run_dispatch = (
                             _task_type_dispatch in _effective_cr_types_dispatch
+                            and not _non_generic_site_dispatch
                         )
                         if (
                             not _warm_target_vm_id
@@ -3806,6 +3868,7 @@ async def orchestrator_worker():
                             and is_warm_pool_enabled()
                             and runtime_selection is not None
                             and not _is_cloud_run_dispatch
+                            and not _non_generic_site_dispatch
                         ):
                             _leased_member = await try_pool_dispatch(
                                 session,
@@ -3962,6 +4025,78 @@ async def orchestrator_worker():
                             _iter_preclaimed_account_id = None
                             _iter_preclaimed_project_id = None
                             await session.rollback()
+                            continue
+
+                        # Fail-closed guard for a non-default execution site generic
+                        # dispatch cannot route.  Every generic path (fleet runner
+                        # pin, strategic/local-runner hold, warm continuity, warm
+                        # pool, Cloud Run) has already been skipped above for a
+                        # non-default site; the only thing left here is a COLD GCE
+                        # provision, which is the direct-Packer-GCE site's path.
+                        # Any OTHER non-default site (e.g. the qualifier's
+                        # live-local-runner walkthrough site) cannot boot the
+                        # candidate stack on a GCE VM, so cold-provisioning it would
+                        # strand the task on a site it was never qualified for.
+                        #
+                        # A QUEUED task here is a stranded requeue, not a fresh
+                        # placement: the site owner pins such tasks AT BIRTH
+                        # (the qualifier resolves a site-proven runner before
+                        # creating a walkthrough_e2e child), so no path will ever
+                        # re-place a QUEUED instance of it.  The old behaviour
+                        # held it QUEUED with a warning on EVERY dispatch cycle
+                        # forever — and the qualifier's finalize treats a
+                        # non-terminal walkthrough child as
+                        # walkthrough_e2e_task_not_terminal, so the qualification
+                        # deadlocks with it.  Fail closed to a terminal state with
+                        # a readable reason naming the execution site instead;
+                        # the qualifier then treats the FAILED child as an
+                        # infra_failure and redrives a FRESH site-pinned child.
+                        if (
+                            _non_generic_site_dispatch
+                            and not _direct_packer_gce_dispatch
+                        ):
+                            logger.warning(
+                                "[ORCHESTRATOR] Task %s has non-generic execution "
+                                "site %r that generic dispatch cannot route — "
+                                "failing closed to a terminal state",
+                                task.id,
+                                _execution_site_for_dispatch,
+                            )
+                            # Release the slot pre-reserved during runtime selection
+                            # (select_max_plan_account pre-increments active_tasks),
+                            # exactly as the zone-exhaustion hold below does.
+                            if runtime_selection and runtime_selection.account:
+                                await release_max_plan_account(
+                                    runtime_selection.account["id"],
+                                    revert_daily_task_count=True,
+                                    project_id=str(task.project_id) if task.project_id else None,
+                                )
+                            _iter_preclaimed_account_id = None
+                            _iter_preclaimed_project_id = None
+                            _site_failure_reason = (
+                                unplaceable_execution_site_reason(
+                                    _task_type_for_dispatch
+                                )
+                                or f"execution site {_execution_site_for_dispatch!r} "
+                                "cannot be placed by any dispatch path"
+                            )
+                            if await fail_unplaceable_non_generic_site_task(
+                                session,
+                                task,
+                                task_type=_task_type_for_dispatch,
+                                broadcast_fn=broadcast_to_project,
+                            ):
+                                if _pending_warm_pin_clear is not None:
+                                    _shared_state.record_warm_pin_clear(
+                                        *_pending_warm_pin_clear
+                                    )
+                                    _pending_warm_pin_clear = None
+                                logger.warning(
+                                    "[ORCHESTRATOR] Task %s failed closed on "
+                                    "unplaceable non-generic execution site: %s",
+                                    task.id,
+                                    _site_failure_reason,
+                                )
                             continue
 
                         # Zone-exhaustion hold — the ONLY thing left below this
@@ -4344,8 +4479,6 @@ async def orchestrator_worker():
                             model=runtime_model,
                             execution_mode=runtime_execution_mode,
                         ):
-                            from sqlalchemy.orm.attributes import flag_modified
-
                             flag_modified(task, "payloads")
                             session.add(task)
 
@@ -4408,8 +4541,6 @@ async def orchestrator_worker():
                         from app.research_completion import recompute_launch_staleness
 
                         if await recompute_launch_staleness(session, task):
-                            from sqlalchemy.orm.attributes import flag_modified
-
                             flag_modified(task, "context")
                         # A dispatch that reaches the PROVISIONING commit resets
                         # the contained-crash counter (persisted by that commit;

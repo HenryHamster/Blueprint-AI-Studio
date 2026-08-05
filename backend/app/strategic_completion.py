@@ -5610,6 +5610,70 @@ async def _handle_strategic_completion(
                         why or "challenge rejected this update_direction",
                     )
                     continue
+                # changes.criterion_keys — mirrors the API update_direction path in
+                # admin_agent_ops: validate the keys (list of non-empty strings),
+                # require an open version for non-empty keys, and reject dangling or
+                # inactive keys. Empty []/None clears the direction's criterion link.
+                criterion_keys_supplied = "criterion_keys" in changes
+                criterion_keys: list[str] = []
+                update_criterion_release_version_id = None
+                if criterion_keys_supplied:
+                    raw_criterion_keys = changes.get("criterion_keys")
+                    if not isinstance(raw_criterion_keys, list) or not all(
+                        isinstance(key, str) and key.strip()
+                        for key in raw_criterion_keys
+                    ):
+                        logger.warning(
+                            "[STRATEGIC] Task %s: skipped update_direction for %s — "
+                            "changes.criterion_keys must be a list of non-empty strings",
+                            task.id,
+                            dir_id,
+                        )
+                        continue
+                    criterion_keys = list(
+                        dict.fromkeys(key.strip() for key in raw_criterion_keys)
+                    )
+                    if criterion_keys:
+                        from app.direction_referential_guard import (
+                            check_criterion_key_write,
+                            load_version_criterion_key_sets,
+                        )
+                        from app.release_version import current_open_version
+
+                        criterion_version = await current_open_version(
+                            session, project.id
+                        )
+                        if criterion_version is None:
+                            logger.warning(
+                                "[STRATEGIC] Task %s: skipped update_direction for %s — "
+                                "criterion_keys require an open version",
+                                task.id,
+                                dir_id,
+                            )
+                            continue
+                        active_keys, inactive_keys = (
+                            await load_version_criterion_key_sets(
+                                session, project.id, criterion_version.id
+                            )
+                        )
+                        invalid_criterion_keys = [
+                            key
+                            for key in criterion_keys
+                            if check_criterion_key_write(
+                                key, active_keys, inactive_keys
+                            )[0]
+                            is not None
+                        ]
+                        if invalid_criterion_keys:
+                            logger.warning(
+                                "[STRATEGIC] Task %s: skipped update_direction for %s — "
+                                "invalid criterion_keys: %s",
+                                task.id,
+                                dir_id,
+                                invalid_criterion_keys,
+                            )
+                            continue
+                        update_criterion_release_version_id = criterion_version.id
                 for d in directions:
                     if d.get("id") == dir_id:
                         requested_status = changes.get("status")
@@ -5878,6 +5942,14 @@ async def _handle_strategic_completion(
                                 "Strategic review: recommended_mode=pause"
                             )
                             d["paused_at"] = _utcnow().isoformat()
+                        if criterion_keys_supplied:
+                            d["criterion_keys"] = criterion_keys
+                            if update_criterion_release_version_id is not None:
+                                d["criterion_release_version_id"] = str(
+                                    update_criterion_release_version_id
+                                )
+                            else:
+                                d.pop("criterion_release_version_id", None)
                         # Persist context-structured fields (same cap as CREATE path)
                         ctx = d.get("context") or {}
                         _old_se = ctx.get("success_evidence")
@@ -6563,6 +6635,14 @@ async def _handle_strategic_completion(
     # Update cycle history with final outcome
     # Audit W2: cycle outcome lives on the StrategicCycle row.
     cycle_id = task.strategic_cycle_id or (task.context or {}).get("strategic_cycle_id")
+    if not cycle_id:
+        # Legacy fallback task that never carried the cycle linkage (spawned
+        # before the strategic_cycle_id column/context, or a context-stripped
+        # replay): resolve the owning cycle from the task linkage so this
+        # completion still finalizes the row and broadcasts the real cycle id.
+        _linked_cycle = await strategic_cycle.get_by_task(session, task.id)
+        if _linked_cycle is not None:
+            cycle_id = _linked_cycle.id
     dirs_created = (
         creates_count if direction_ops and isinstance(direction_ops, list) else 0
     )

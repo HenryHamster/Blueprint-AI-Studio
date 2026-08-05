@@ -6430,6 +6430,51 @@ class TestDockerAgentBackend(unittest.TestCase):
         self.assertEqual(teardown, {})
         plan_mock.assert_not_called()
 
+    def test_walkthrough_e2e_writes_marker_and_passes_probe_dir(self):
+        """For walkthrough_e2e the runner writes the supervisor marker at the
+        host workspace bind root AND hands the agent the sandbox-side protocol
+        dir (WALKTHROUGH_STACK_DIR) derived from the same constant — so the two
+        sides of the sandbox boundary agree on ONE probe location."""
+        ws = "/tmp/ws"  # the _spawn helper's hardcoded per-task workspace
+        caps = iso.replace(_bwrap_caps(), docker_usable=True)
+        r = self._spawn(
+            backend=iso.BACKEND_BWRAP,
+            container_name=None,
+            agent_image=None,
+            agent_binary=["node", "/agent/dist/index.js"],
+            caps=caps,
+            task_type="walkthrough_e2e",
+        )
+        self.assertTrue(r["spawned"])
+        _, pkw = r["plan"].call_args
+        # The agent is told to probe the sandbox-side protocol dir (the marker
+        # sits at the workspace bind root, one level above the agent's WORKSPACE).
+        self.assertEqual(
+            pkw["injected_env"]["WALKTHROUGH_STACK_DIR"],
+            os.path.join(local_runner.iso.SANDBOX_WORKSPACE, local_runner.wts.PROTOCOL_DIR),
+        )
+        # The marker the agent probes was actually written at the host workspace
+        # bind root — the host-side image of that same sandbox path.
+        marker = os.path.join(ws, local_runner.wts.PROTOCOL_DIR, "supervisor.json")
+        self.assertTrue(os.path.exists(marker))
+        # The write is a test side effect on the shared /tmp/ws fixture path.
+        shutil.rmtree(os.path.join(ws, local_runner.wts.PROTOCOL_DIR), ignore_errors=True)
+
+    def test_non_walkthrough_task_gets_no_probe_dir(self):
+        """A non-walkthrough task must not receive the probe dir, so it cannot
+        accidentally route through a supervisor that does not exist."""
+        r = self._spawn(
+            backend=iso.BACKEND_BWRAP,
+            container_name=None,
+            agent_image=None,
+            agent_binary=["node", "/agent/dist/index.js"],
+            caps=iso.replace(_bwrap_caps(), docker_usable=True),
+            task_type="research",
+        )
+        self.assertTrue(r["spawned"])
+        _, pkw = r["plan"].call_args
+        self.assertNotIn("WALKTHROUGH_STACK_DIR", pkw["injected_env"])
+
     def test_notify_decline_posts_to_orchestrator(self):
         """_notify_decline POSTs the task_id to the decline-task endpoint."""
         from unittest.mock import patch

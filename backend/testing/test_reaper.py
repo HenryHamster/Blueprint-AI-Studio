@@ -1918,6 +1918,92 @@ async def test_reaper_terminal_persist_falls_back_to_started_at_when_no_heartbea
 
 
 @pytest.mark.asyncio
+async def test_provision_failure_message_agent_never_claimed_when_vm_provisioned_at_set(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """VM was created (vm_provisioned_at set) but the agent never claimed it —
+    the terminal PROVISION_FAILURE message must classify this as an
+    agent-startup failure, NOT as a GCP API failure, even when provision_zone
+    is absent.
+
+    Regression guard for the live case: the reap reason itself ("Silent
+    pre-claim death — 641s since VM provisioned, no heartbeat") proves the VM
+    booted, yet the message read "Provision failed ... GCP error: no GCP error
+    captured" because the zone was unresolved. The zone is only a label; the
+    cause discriminator is vm_provisioned_at.
+    """
+    mocker.patch("app.reaper.get_provision_error", return_value="")
+    mocker.patch("app.reaper.get_vm_zone", return_value=None)
+
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-provisioned-no-zone",
+        status=TaskStatus.PROVISIONING,
+        started_at=_utcnow() - timedelta(minutes=30),
+        vm_provisioned_at=_utcnow() - timedelta(minutes=7),
+        last_heartbeat=None,
+        # Exhaust the provision retry budget so the task terminal-fails this cycle.
+        context={"provision_failures": 99},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.FAILED, "task must reach the terminal-persist path"
+    msg = t.latest_status_message or ""
+    assert "Agent startup failed" in msg, (
+        "vm_provisioned_at set ⇒ the VM was created ⇒ the message must be "
+        f"classified as agent-never-claimed, got: {msg!r}"
+    )
+    assert "never claimed" in msg, f"message must name the unclaimed VM: {msg!r}"
+    assert "GCP error" not in msg, (
+        "a VM that was created must not be reported as a cloud API provisioning "
+        f"failure: {msg!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_provision_failure_message_gcp_api_failure_when_vm_never_provisioned(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """No vm_provisioned_at ⇒ the VM was never created ⇒ the terminal
+    PROVISION_FAILURE message must keep the genuine GCP-API-failure wording
+    even when a zone label happens to be present in context.
+    """
+    mocker.patch("app.reaper.get_provision_error", return_value="")
+    mocker.patch("app.reaper.get_vm_zone", return_value=None)
+
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-never-provisioned",
+        status=TaskStatus.PROVISIONING,
+        started_at=_utcnow() - timedelta(minutes=30),
+        last_heartbeat=None,
+        context={"provision_failures": 99, "provision_zone": "us-central1-a"},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.FAILED, "task must reach the terminal-persist path"
+    msg = t.latest_status_message or ""
+    assert "Provision failed" in msg, f"expected GCP-API-failure label, got: {msg!r}"
+    assert "GCP error" in msg, f"expected GCP error detail, got: {msg!r}"
+    assert "never claimed" not in msg, (
+        "no VM was ever provisioned, so the message must not claim one was "
+        f"created: {msg!r}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_reaper_enrichment_block_records_failure_class_from_initial_classification(
     reaper_db, stop_after_one_cycle, reaper_side_effects
 ):

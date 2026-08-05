@@ -111,6 +111,7 @@ from app.admin_task_mutations import (
     CANCEL_WAITING_DEPENDENT_STATUSES,
     _handle_rollup_pr_approval,
     _handle_task_pr_approval,
+    _mark_admin_cancelled,
     modify_task_apply,
 )
 from app.task_blocked import reset_task_for_fresh_attempt
@@ -1200,18 +1201,45 @@ async def _bulk_cancel_task(
             .scalars()
             .all()
         )
-        active_children = []
-        for child_id in child_ids:
-            # Re-read every cascade target after the parent/project fence. The
-            # sorted IDs make the multi-task lock acquisition deterministic.
+        # A bulk-cancelled prerequisite must also terminalize dependents that
+        # are still waiting to run, mirroring the single-task cancel path. Filter
+        # the project-scoped candidate set in Python because ``depends_on`` is
+        # JSONB in production and JSON in the SQLite test seam.
+        dependent_candidates = (
+            (
+                await session.execute(
+                    select(Task).where(
+                        Task.project_id == project_id,
+                        Task.status.in_(CANCEL_WAITING_DEPENDENT_STATUSES),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        cancellation_source_id = str(task.id)
+        waiting_dependent_id_set = {
+            candidate.id
+            for candidate in dependent_candidates
+            if cancellation_source_id
+            in {str(dep_id) for dep_id in (candidate.depends_on or [])}
+        }
+        # Re-read every cascade target (active children + waiting dependents)
+        # after the parent/project fence. The sorted IDs make the multi-task
+        # lock acquisition deterministic. Identity (child vs dependent) comes
+        # from the ID sets captured above, so a QUEUED dependent stays
+        # classified as a dependent for the provenance and status message.
+        cascade_ids = sorted(set(child_ids) | waiting_dependent_id_set)
+        cascade_targets: Dict[uuid.UUID, Task] = {}
+        for cascade_id in cascade_ids:
             async with lock_project_then_task(
                 session,
                 project_id,
-                child_id,
+                cascade_id,
                 skip_locked=False,
-            ) as (_child_project, child):
-                if child is not None and child.status in CANCEL_CASCADE_CHILD_STATUSES:
-                    active_children.append(child)
+            ) as (_cascade_project, cascade_task):
+                if cascade_task is not None:
+                    cascade_targets[cascade_task.id] = cascade_task
 
         # Save VM and account info before commit so cleanup does not depend on
         # expired ORM attributes.
@@ -1223,13 +1251,16 @@ async def _bulk_cancel_task(
                 (child.context or {}).get("max_plan_account_id"),
                 str(child.project_id) if child.project_id else None,
             )
-            for child in active_children
+            for child in cascade_targets.values()
         ]
 
         task.status = TaskStatus.CANCELLED
         if task.vm_provisioned_at:
             task.vm_stopped_at = _utcnow()
         task.requires_approval = False
+        # Persist operator-cancellation provenance so the bulk-cancelled task
+        # cannot be misclassified as an agent death after the request completes.
+        _mark_admin_cancelled(task)
 
         # Close any PR the cancelled task opened. Without this, the PR sits
         # open and blocks the parent's rollup gate.
@@ -1259,13 +1290,25 @@ async def _bulk_cancel_task(
         session.add(task)
         session.add(history)
 
-        for child in active_children:
+        for child in cascade_targets.values():
             child.status = TaskStatus.CANCELLED
             if child.vm_provisioned_at:
                 child.vm_stopped_at = _utcnow()
             child.requires_approval = False
+            _mark_admin_cancelled(
+                child,
+                cancelled_by_task_id=cancellation_source_id,
+            )
+            if child.id in waiting_dependent_id_set:
+                child.latest_status_message = (
+                    "Cancelled: dependency task administratively cancelled"
+                )
+            elif not child.latest_status_message:
+                child.latest_status_message = (
+                    "Cancelled: parent task administratively cancelled"
+                )
             session.add(child)
-        for child in active_children:
+        for child in cascade_targets.values():
             await close_orphan_pr_if_any(
                 child, session, reason="admin_bulk_cancel_cascade"
             )
@@ -1280,7 +1323,7 @@ async def _bulk_cancel_task(
             strategic_completion_events.append(
                 strategic_cycle.terminal_completion_event(reconciled, task)
             )
-        for child in active_children:
+        for child in cascade_targets.values():
             reconciled_child = await strategic_cycle.reconcile_terminal_task(
                 session, child, source="admin_bulk_cancel_cascade"
             )
@@ -1316,10 +1359,10 @@ async def _bulk_cancel_task(
                     project_id=child_project_id,
                 )
 
-        if active_children:
+        if cascade_targets:
             logger.info(
-                "[ADMIN] Bulk cancel cascaded to %s children of task %s",
-                len(active_children),
+                "[ADMIN] Bulk cancel cascaded to %s child/dependent task(s) of task %s",
+                len(cascade_targets),
                 task.id,
             )
     return None

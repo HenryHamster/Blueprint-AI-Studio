@@ -55,5 +55,9 @@ describe('App completion toast', () => {
     expect(appSource).toContain('resolveCompletionToastMessage');
     // The helper is imported from the canonical module
     expect(appSource).toContain("from './utils/completionToastKind'");
+    // Failure/cancellation toasts retain the terminal reason (never a bare message)
+    expect(appSource).toContain('cycleCompletion.failure_reason');
+    // Failure/cancellation toasts persist until dismissed; success stays transient
+    expect(appSource).toContain("addToast(message, toastKind, toastKind !== 'success')");
   });
 });

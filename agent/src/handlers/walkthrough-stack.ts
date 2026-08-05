@@ -46,6 +46,15 @@ export interface CandidateStackOptions {
   candidateSha: string;
   /** Admin token to configure on the stack; a throwaway one is generated when absent. */
   adminToken?: string;
+  /**
+   * Sandbox-side protocol directory of the runner-side stack supervisor
+   * (the runner's `WALKTHROUGH_STACK_DIR`). Passed EXPLICITLY — never derived
+   * by joining onto `workspace`: the marker sits at the workspace bind ROOT,
+   * while this process's workspace is a subdirectory of that mount. When
+   * absent, no runner-side supervisor is expected and the legacy in-sandbox
+   * docker compose path is used.
+   */
+  walkthroughStackDir?: string;
   /** Host port for the candidate backend (default 8080). */
   backendPort?: number;
   /** Host port for the candidate postgres (default 5432). */
@@ -74,13 +83,18 @@ const HEALTH_POLL_INTERVAL_MS = 3_000;
  *
  * The agent sandbox deliberately has no docker socket, so on local runners the
  * RUNNER boots the candidate stack. The runner advertises itself by writing
- * `supervisor.json` into this directory BEFORE the agent spawns; the agent then
- * writes `request.json` (candidate SHA + throwaway stack secrets), polls
- * `response.json` for the loopback ports, and writes `teardown.json` when done.
- * Without the marker the legacy in-sandbox `docker compose` path runs unchanged
- * (agent VMs with a real docker daemon).
+ * `supervisor.json` into the protocol directory BEFORE the agent spawns; the
+ * agent then writes `request.json` (candidate SHA + throwaway stack secrets),
+ * polls `response.json` for the loopback ports, and writes `teardown.json`
+ * when done. Without the marker the legacy in-sandbox `docker compose` path
+ * runs unchanged (agent VMs with a real docker daemon).
+ *
+ * The protocol directory is passed EXPLICITLY via `walkthroughStackDir` (the
+ * runner's `WALKTHROUGH_STACK_DIR` env): it lives at the workspace bind ROOT,
+ * one level above this process's workspace, so it must never be derived by
+ * joining onto `workspace` — a workspace-relative probe would silently miss
+ * the marker. A genuinely absent marker is a visible, logged degradation.
  */
-const STACK_PROTOCOL_DIR = '.walkthrough-stack';
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -98,9 +112,10 @@ export function deriveComposeProject(candidateSha: string): string {
 }
 
 export class CandidateStackController {
-  private readonly opts: Required<Omit<CandidateStackOptions, 'log' | 'adminToken'>> & {
+  private readonly opts: Required<Omit<CandidateStackOptions, 'log' | 'adminToken' | 'walkthroughStackDir'>> & {
     log: (msg: string) => void;
     adminToken: string;
+    walkthroughStackDir: string | undefined;
   };
 
   private readonly composeProject: string;
@@ -124,6 +139,7 @@ export class CandidateStackController {
       frontendPort: options.frontendPort ?? 3001,
       bootTimeoutMs: options.bootTimeoutMs ?? DEFAULT_BOOT_TIMEOUT_MS,
       bootFrontend: options.bootFrontend ?? true,
+      walkthroughStackDir: options.walkthroughStackDir ?? process.env.WALKTHROUGH_STACK_DIR,
       log: options.log ?? (() => {}),
     };
     this.composeProject = deriveComposeProject(this.opts.candidateSha);
@@ -132,12 +148,21 @@ export class CandidateStackController {
     // handles real GitHub/webhook traffic. `${VAR?}` in docker-compose.yml
     // errors only when a var is UNSET (empty is accepted), but we pass real
     // placeholder values so any at-import parsing in the app does not choke.
+    //
+    // GITHUB_PAT_ENCRYPTION_KEY is the one exception to "placeholder": migration
+    // 0609's _load_fernet() raises RuntimeError on an absent OR invalid key
+    // (unlike the `${VAR?}`-tolerant placeholders), and the app itself fails
+    // closed without one. So this is a genuine per-boot Fernet key — 32 random
+    // bytes, urlsafe-base64 with the `=` pad (43 chars + '=' = 44) — minted
+    // fresh so a stack re-boot never reuses a prior stack's key. This mirrors
+    // the runner-side supervisor's per-boot key exactly.
     this.childEnv = {
       ...process.env,
       COMPOSE_PROJECT_NAME: this.composeProject,
       POSTGRES_PASSWORD: `wt-pg-${randomBytes(8).toString('hex')}`,
       AGENT_JWT_SECRET: randomBytes(24).toString('hex'),
       WS_TICKET_SECRET: randomBytes(24).toString('hex'),
+      GITHUB_PAT_ENCRYPTION_KEY: randomBytes(32).toString('base64url') + '=',
       GITHUB_APP_ID: '0',
       GITHUB_PRIVATE_KEY: '',
       GITHUB_WEBHOOK_SECRET: 'walkthrough-local',
@@ -151,6 +176,15 @@ export class CandidateStackController {
       DEPLOY_SHA: this.opts.candidateSha,
       WALKTHROUGH_APP_PORT: String(this.opts.backendPort),
       WALKTHROUGH_DB_PORT: String(this.opts.dbPort),
+      // Playwright's browser download must never run during the boot's `npm ci`.
+      // Inside the bwrap sandbox ~/.cache/ms-playwright is a READ-ONLY bind of
+      // the runner's browser cache (runner_isolation.build_bwrap_argv), so any
+      // version drift between the candidate's playwright and the cached chromium
+      // would make the postinstall try to WRITE the read-only bind, failing npm
+      // ci and the whole stack boot. Skip the download; the harness still
+      // launches the bound cache's chromium at runtime (reading the cache is
+      // fine — that is exactly what the read-only mount is for).
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1',
     };
   }
 
@@ -167,13 +201,15 @@ export class CandidateStackController {
     return `postgresql+asyncpg://postgres:${this.childEnv.POSTGRES_PASSWORD}@127.0.0.1:${dbPort}/postgres`;
   }
 
-  private get protocolDir(): string {
-    return path.join(this.opts.workspace, STACK_PROTOCOL_DIR);
+  private get protocolDir(): string | undefined {
+    return this.opts.walkthroughStackDir;
   }
 
   /** Whether a runner-side stack supervisor advertised itself for this task. */
   runnerSupervisorAvailable(): boolean {
-    return existsSync(path.join(this.protocolDir, 'supervisor.json'));
+    const dir = this.protocolDir;
+    if (!dir) return false;
+    return existsSync(path.join(dir, 'supervisor.json'));
   }
 
   private compose(args: string[], timeoutMs: number): string {
@@ -185,6 +221,24 @@ export class CandidateStackController {
   }
 
   /**
+   * Install the candidate clone's dependencies (npm ci) so the frontend dev
+   * server can start. The candidate is a depth-1 git clone — nothing else
+   * populates node_modules, so `npm run dev` in admin-ui would otherwise fail
+   * fast with no vite. Runs at the workspace root so BOTH the root `playwright`
+   * dependency and the `admin-ui` workspace dependencies install.
+   */
+  private installDependencies(deadline: number): void {
+    this.opts.log('Installing candidate clone dependencies (npm ci)...\n');
+    execFileSync('npm', ['ci'], {
+      cwd: this.opts.workspace,
+      env: this.childEnv,
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: Math.max(120_000, deadline - Date.now()),
+    });
+  }
+
+  /**
    * Boot the full candidate stack. Throws on ANY failure so the caller fails
    * closed (posts no evidence). Guarantee: whether this resolves or rejects,
    * the caller must still call teardown().
@@ -193,12 +247,26 @@ export class CandidateStackController {
     const deadline = Date.now() + this.opts.bootTimeoutMs;
     const log = this.opts.log;
 
+    // The boot PATH is decided first; workspace-level npm ci is deferred to the
+    // optional frontend leg below (the runner-supervisor path carries the
+    // backend in containers and treats the frontend as optional).
     if (this.runnerSupervisorAvailable()) {
       // Local runner: the sandbox has no docker socket; the runner-side
       // supervisor boots the fixed-shape stack and hands back loopback ports.
       log('Runner-side stack supervisor detected — requesting candidate stack boot...\n');
       await this.bootViaRunnerSupervisor(deadline);
     } else {
+      const protocolDir = this.protocolDir;
+      // Visible degradation, never silent: when a supervisor protocol dir was
+      // provided (local-runner contract) but the marker is missing, that is a
+      // misconfiguration worth surfacing — the marker is what tells us the
+      // runner-side supervisor exists. Only when NO protocol dir was passed at
+      // all is the legacy path the expected (VM-with-docker) default.
+      log(
+        protocolDir
+          ? `[warn] No runner-side stack supervisor marker at ${protocolDir}/supervisor.json — falling back to the in-sandbox docker compose path. If this task runs on a local runner, the runner-side supervisor path is misconfigured.\n`
+          : 'No runner-side stack supervisor protocol dir was provided — using the in-sandbox docker compose path.\n',
+      );
       // Legacy path (agent VMs with a real docker daemon): boot in-process.
       // 1. Build the candidate image and bring up the DB first so migrations
       //    can run before the app performs its startup schema check.
@@ -239,6 +307,9 @@ export class CandidateStackController {
 
     // 7. Serve the candidate frontend (vite dev server proxied at the local backend).
     if (this.opts.bootFrontend) {
+      // npm ci deferred to this leg (backend already up); the runner-supervisor
+      // path never pays workspace-level npm ci unless a frontend is requested.
+      this.installDependencies(deadline);
       await this.bootFrontend(deadline);
     }
 
@@ -258,7 +329,11 @@ export class CandidateStackController {
    * an error response or when no response lands before the deadline.
    */
   private async bootViaRunnerSupervisor(deadline: number): Promise<void> {
-    mkdirSync(this.protocolDir, { recursive: true });
+    const protocolDir = this.protocolDir;
+    if (!protocolDir) {
+      throw new Error('runner stack supervisor protocol dir is not configured');
+    }
+    mkdirSync(protocolDir, { recursive: true });
     const request = {
       version: 1,
       candidate_sha: this.opts.candidateSha,
@@ -270,11 +345,12 @@ export class CandidateStackController {
       // same key the sandbox itself was vended (may be empty).
       anthropic_api_key: process.env.ANTHROPIC_API_KEY || '',
     };
-    const requestPath = path.join(this.protocolDir, 'request.json');
-    writeFileSync(`${requestPath}.tmp`, JSON.stringify(request));
+    const requestPath = path.join(protocolDir, 'request.json');
+    // 0600: the request carries stack secrets; rename preserves the mode.
+    writeFileSync(`${requestPath}.tmp`, JSON.stringify(request), { mode: 0o600 });
     renameSync(`${requestPath}.tmp`, requestPath);
 
-    const responsePath = path.join(this.protocolDir, 'response.json');
+    const responsePath = path.join(protocolDir, 'response.json');
     while (Date.now() < deadline) {
       if (existsSync(responsePath)) {
         let parsed: { status?: unknown; detail?: unknown; backend_port?: unknown; db_port?: unknown };
@@ -403,14 +479,17 @@ export class CandidateStackController {
     if (this.runnerPorts !== null) {
       // Runner-managed stack: signal early teardown; the supervisor also
       // always tears down when this agent process exits (belt and braces).
-      try {
-        log('Signalling runner-side candidate stack teardown...\n');
-        writeFileSync(
-          path.join(this.protocolDir, 'teardown.json'),
-          JSON.stringify({ requested_at: new Date().toISOString() }),
-        );
-      } catch (e) {
-        log(`[warn] could not signal runner-side teardown (runner reaps on exit): ${e instanceof Error ? e.message : String(e)}\n`);
+      const protocolDir = this.protocolDir;
+      if (protocolDir) {
+        try {
+          log('Signalling runner-side candidate stack teardown...\n');
+          writeFileSync(
+            path.join(protocolDir, 'teardown.json'),
+            JSON.stringify({ requested_at: new Date().toISOString() }),
+          );
+        } catch (e) {
+          log(`[warn] could not signal runner-side teardown (runner reaps on exit): ${e instanceof Error ? e.message : String(e)}\n`);
+        }
       }
       this.runnerPorts = null;
     }

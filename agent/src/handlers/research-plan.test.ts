@@ -1727,6 +1727,18 @@ describe('buildVersionPhaseSection', () => {
     expect(out).toContain('A real outcome.');
   });
 
+  it('ties coverage-blocked verdicts to the walkthrough_e2e probe exception', () => {
+    // Three identical criterion_coverage_incomplete verdicts on v27 showed the
+    // Thinker re-qualifying probe-less forever: nothing connected the blocker
+    // to the only live evidence lane that can clear it.
+    const out = buildVersionPhaseSection({
+      version_number: 27,
+      phase: 'stabilize',
+    });
+    expect(out).toContain('criterion_coverage_incomplete');
+    expect(out).toContain('"probes": ["walkthrough_e2e"]');
+  });
+
   it('returns empty string when versionPhase is undefined', () => {
     expect(buildVersionPhaseSection(undefined)).toBe('');
   });
@@ -2831,6 +2843,41 @@ describe('handlePlan / handleResearch task-specific prompt fingerprints', () => 
     const p = vi.mocked(runClaudeCode).mock.calls[0][0];
     const rubricHeadings = (p.match(/\*\*acceptance_evidence\*\*/g) || []).length;
     expect(rubricHeadings).toBe(1);
+  });
+
+  // ── acceptance_evidence is MANDATORY on implementation findings ──────────────
+  // The strategist prompt previously framed acceptance_evidence as
+  // "(OPTIONAL, additive — default null)", which produced 0% declaration
+  // coverage across write-merges. The shared rubric and both prompt surfaces now
+  // carry mandatory language: REQUIRED/MANDATORY on every PR-producing type.
+  it('acceptance evidence rubric must contain mandatory language not optional', () => {
+    expect(ACCEPTANCE_EVIDENCE_RUBRIC).toMatch(/MANDATORY/);
+    expect(ACCEPTANCE_EVIDENCE_RUBRIC).toMatch(/REQUIRED/);
+    expect(ACCEPTANCE_EVIDENCE_RUBRIC).toContain('not optional');
+  });
+
+  it('handleResearch prompt marks acceptance_evidence REQUIRED (not OPTIONAL) on implementation findings', async () => {
+    await handleResearch(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    // The old optional-with-default-null framing must be gone...
+    expect(p).not.toContain('**acceptance_evidence** (OPTIONAL');
+    // ...replaced by mandatory language naming the implementation finding types.
+    expect(p).toContain('**acceptance_evidence** (REQUIRED');
+    expect(p).toMatch(/MANDATORY on implementation findings/);
+    // The shared rubric embedded in the prompt carries the same mandatory framing.
+    expect(p).toContain('not optional');
+  });
+
+  it('handlePlan prompt marks acceptance_evidence REQUIRED (not OPTIONAL) on implementation subtasks', async () => {
+    await handlePlan(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    // The old optional framing must be gone from the plan subtask rule...
+    expect(p).not.toContain('acceptance_evidence (OPTIONAL');
+    // ...replaced by mandatory language scoped to create/refactor/migrate/qa.
+    expect(p).toContain('acceptance_evidence (REQUIRED');
+    expect(p).toMatch(/MANDATORY on implementation subtasks/);
+    // Knowledge-prerequisite and compute subtasks stay exempt.
+    expect(p).toMatch(/web_research, design.*compute_experiment are exempt/);
   });
 
   // ── prompt-cache prefix stability (research handler) ─────────────────────────

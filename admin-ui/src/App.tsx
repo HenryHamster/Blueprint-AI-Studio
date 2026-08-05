@@ -186,7 +186,13 @@ export default function App() {
     if (cycleCompletion === lastCycleCompletionToastRef.current) return;
     lastCycleCompletionToastRef.current = cycleCompletion;
     const toastKind = resolveCompletionToastKind(cycleCompletion.status);
-    addToast(resolveCompletionToastMessage(toastKind), toastKind);
+    const terminalDetail = cycleCompletion.failure_reason ?? cycleCompletion.status_message;
+    const message = toastKind !== 'success' && terminalDetail
+      ? `${resolveCompletionToastMessage(toastKind)}: ${terminalDetail}`
+      : resolveCompletionToastMessage(toastKind);
+    // Failure/cancellation receipts persist until dismissed so the operator can
+    // verify the terminal reason; success toasts stay transient.
+    addToast(message, toastKind, toastKind !== 'success');
   }, [cycleCompletion, addToast]);
   const [openMessageCount, setOpenMessageCount] = useState(0);
   const [newSinceLastVisit, setNewSinceLastVisit] = useState(0);

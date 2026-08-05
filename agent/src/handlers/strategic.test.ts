@@ -1301,6 +1301,44 @@ describe('handleStrategic executor prompt: atomic staged create-direction', () =
   });
 });
 
+describe('handleStrategic executor prompt: criterion_keys direction guidance', () => {
+  it('documents criterion_keys on create-direction and update-direction', async () => {
+    vi.mocked(runClaudeCode).mockClear();
+    vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
+      ok: true,
+      analysisText: 'analysis',
+    });
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: '',
+    });
+
+    const statusRef = { value: '' };
+    await handleStrategic(
+      'task-criterion-keys',
+      { project_name: 'Blueprint' },
+      {},
+      'tok',
+      'owner',
+      'repo',
+      null,
+      statusRef,
+    );
+
+    const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(executorPrompt).toBeDefined();
+    // create-direction example carries criterion_keys
+    expect(executorPrompt).toContain('criterion_keys');
+    expect(executorPrompt).toContain('"c-xxx"');
+    // update-direction changes block carries criterion_keys
+    expect(executorPrompt).toContain('"changes": {"priority": "...", "text": "...", "conflicts_with": [...], "recommended_mode": "audit", "success_evidence": "updated observable outcome (optional)", "retirement_condition": "updated measurable retirement condition (optional)", "criterion_keys": ["c-xxx"]}');
+    // Guidance explains why: directions without criterion_keys write no CriterionEvidence
+    expect(executorPrompt).toContain('CriterionEvidence');
+    expect(executorPrompt).toContain('never invent keys');
+  });
+});
+
 describe('handleStrategic strategic challenge gate', () => {
   beforeEach(() => {
     vi.mocked(runClaudeCode).mockClear();

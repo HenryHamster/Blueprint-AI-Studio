@@ -312,6 +312,22 @@ def _runner_has_container_capability(runner: LocalRunner | RunnerDispatchSnapsho
     return any(backends.get(key) for key in _CONTAINER_BACKEND_KEYS)
 
 
+def _runner_chromium_usable(runner: LocalRunner | RunnerDispatchSnapshot) -> bool:
+    """Whether a runner can serve Playwright Chromium to agent sandboxes.
+
+    Reads the NESTED ``isolation_backends.playwright_chromium_usable`` flag the
+    runner heartbeat writes (``capabilities_inventory`` in
+    ``scripts/runner_isolation.py``), where the heartbeat always writes a plain
+    bool, so the capability the dispatcher reads is the same one the heartbeat
+    emits.
+    """
+    caps = runner.capabilities or {}
+    backends = caps.get("isolation_backends")
+    if not isinstance(backends, dict):
+        return False
+    return backends.get("playwright_chromium_usable") is True
+
+
 def _runner_has_free_vram(
     runner: LocalRunner | RunnerDispatchSnapshot,
     required_mib: int,

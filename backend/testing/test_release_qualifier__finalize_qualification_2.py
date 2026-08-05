@@ -5037,11 +5037,13 @@ async def test_sweep_error_redrive_allows_versions_with_many_lifetime_attempts(
 @pytest.mark.asyncio
 async def test_sweep_does_not_redrive_non_transient_error(db_session, mocker):
     """A status=error version with an error code NOT in _TRANSIENT_ERROR_CODES
-    is not re-driven by the sweep — only transient errors are retried."""
+    is not re-driven by the sweep — only transient errors are retried.
+    (spawn_failed is now a transient error that re-drives walkthrough
+    execution-site outages, so the fixture uses a genuinely permanent error.)"""
     project, version = await _make_project_and_version(db_session, phase="stabilize")
     version.last_qualification = {
         "status": "error",
-        "error": "spawn_failed",  # not in _TRANSIENT_ERROR_CODES
+        "error": "missing_candidate_sha",  # not in _TRANSIENT_ERROR_CODES
         "started_at": "2026-07-05T10:00:00",
     }
     version.qualification_attempts = 1

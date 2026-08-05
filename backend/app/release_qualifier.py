@@ -313,6 +313,63 @@ def _normalize_qualification_probes(raw: Any) -> frozenset[str]:
     return frozenset(normalized)
 
 
+def _resolve_active_criterion_keys(rows: list[Any]) -> frozenset[str]:
+    """Resolve the ACTIVE criterion keys from a version's criterion rows.
+
+    Mirrors the finalize-time active-criterion resolution (live_criterion_rows
+    filtered to ``status == "active"``) so the request-time probe gate and the
+    finalize-time report-key gate read the rubric the same way.
+    """
+    return frozenset(
+        str(row.criterion_key)
+        for row in rows
+        if row.status == "active" and row.criterion_key
+    )
+
+
+async def _drop_incompatible_product_probes(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+    requested_probes: frozenset[str],
+) -> tuple[frozenset[str], dict[str, Any] | None]:
+    """Drop product probes the open version's ACTIVE rubric cannot satisfy.
+
+    Returns ``(effective_probes, drop_info)``.  ``effective_probes`` is the
+    requested selection with every structurally-impossible probe removed;
+    ``drop_info`` is None when nothing was dropped, else a dict naming the
+    dropped probe, its canonical evidence keys, and the open rubric's active
+    keys.
+
+    The walkthrough_e2e probe's evidence contract resolves to a hard-coded set
+    of canonical criterion keys
+    (``_WALKTHROUGH_E2E_EXPECTED_CANONICAL_EVIDENCE_KEYS``).  The finalize-time
+    active-key gate requires every resolved key to be an ACTIVE criterion in
+    the version's rubric, so a probe whose canonical keys share no active
+    criterion is structurally impossible: even a flawless run would fail
+    (``walkthrough_e2e_report_unknown_criteria``) only AFTER a full
+    qualification was spent.  The request-time gate therefore DROPS the probe
+    and lets the qualification continue with the remainder (probe-free when it
+    was the only probe) instead of refusing the whole qualification — an
+    incompatible probe must never silently prevent a qualification from
+    spawning at all.
+    """
+    if "walkthrough_e2e" not in requested_probes:
+        return requested_probes, None
+    rows = await get_criteria_for_version(session, version.id)
+    active_keys = _resolve_active_criterion_keys(rows)
+    walkthrough_keys = _WALKTHROUGH_E2E_EXPECTED_CANONICAL_EVIDENCE_KEYS
+    if walkthrough_keys & active_keys:
+        return requested_probes, None
+    return (
+        requested_probes - frozenset({"walkthrough_e2e"}),
+        {
+            "probe": "walkthrough_e2e",
+            "canonical_keys": sorted(walkthrough_keys),
+            "active_keys": sorted(active_keys),
+        },
+    )
+
+
 def _qualification_probe_contract_is_reusable(
     prior_qual: dict[str, Any], current_probes: frozenset[str]
 ) -> bool:
@@ -1564,8 +1621,6 @@ async def _qualification_in_flight(
         required_keys.append("challenge_task_id")
     if qual.get("merge_grade_task_id"):
         required_keys.append("merge_grade_task_id")
-    if "walkthrough_e2e" in set(qual.get("requested_probes") or []):
-        required_keys.append("walkthrough_e2e_task_id")
     child_ids: list[uuid.UUID] = []
     parse_failed = False
     for key in required_keys:
@@ -1577,14 +1632,34 @@ async def _qualification_in_flight(
             child_ids.append(uuid.UUID(str(raw)))
         except (ValueError, AttributeError):
             parse_failed = True
+    # The walkthrough_e2e probe is optional and decision-bearing: a MISSING,
+    # unparseable, or deleted child is NOT in-flight work — the finalize path
+    # resolves an absent requested probe as a hard walkthrough_e2e_failed
+    # blocker, so there is nothing live left to wait for.  Only a present,
+    # parseable child id joins the required set (a live running probe still
+    # blocks re-entry); a deleted walkthrough row is skipped in the missing-row
+    # check below for the same reason.
+    walkthrough_child_id: uuid.UUID | None = None
+    if "walkthrough_e2e" in set(qual.get("requested_probes") or []):
+        _wt_raw = qual.get("walkthrough_e2e_task_id")
+        if _wt_raw:
+            try:
+                walkthrough_child_id = uuid.UUID(str(_wt_raw))
+                child_ids.append(walkthrough_child_id)
+            except (ValueError, AttributeError):
+                pass
     if parse_failed:
         return True
     rows = (
         await session.execute(select(Task.id, Task.status).where(Task.id.in_(child_ids)))
     ).all()
     found_ids = {row.id for row in rows}
-    if any(task_id not in found_ids for task_id in child_ids):
-        return True
+    for task_id in child_ids:
+        if task_id == walkthrough_child_id:
+            # A deleted walkthrough row cannot be in-flight work.
+            continue
+        if task_id not in found_ids:
+            return True
     return any(row.status not in _TERMINAL_STATUSES for row in rows)
 
 def _promotion_pending_result(
@@ -2436,6 +2511,45 @@ async def run_qualification(
         )
         return {"status": "explicit_request_required"}
 
+    # Drop a product probe the open version's ACTIVE rubric cannot satisfy
+    # BEFORE any qualification work (credential resolution, candidate SHA
+    # resolution, locking, or child spawn) is spent.  The walkthrough_e2e
+    # probe's canonical evidence keys are pinned to criteria the open rubric
+    # must actually carry; when none of them is active the probe is structurally
+    # impossible and would only fail (contained, but expensive) after a full
+    # qualification.  Dropping it and continuing with the remainder — probe-free
+    # when it was the only probe — replaces both the old silent late blackout
+    # AND the request-time refusal that blocked the whole qualification.  The
+    # drop is recorded durably on the spawned record under the existing
+    # ``qualify_request_blocked`` / ``qualify_request_blocked_at`` keys so the
+    # strategist can see why the requested probe never ran.
+    effective_requested_probes, _probe_drop = (
+        await _drop_incompatible_product_probes(
+            session, version, effective_requested_probes
+        )
+    )
+    _probe_drop_record: dict[str, Any] | None = None
+    _probe_drop_blocked_at: str | None = None
+    if _probe_drop is not None:
+        _probe_drop_record = {
+            "blocker": "incompatible_probe",
+            "probe": _probe_drop["probe"],
+            "canonical_evidence_keys": _probe_drop["canonical_keys"],
+            "active_rubric_keys": _probe_drop["active_keys"],
+        }
+        _probe_drop_blocked_at = _utcnow().isoformat()
+        logger.info(
+            "[RELEASE_QUALIFIER] v%d dropped incompatible product probe '%s' "
+            "before spawning: canonical evidence keys %s share no ACTIVE "
+            "criterion in the open rubric (active keys %s) — continuing "
+            "probe-free with %s",
+            version.version_number,
+            _probe_drop["probe"],
+            _probe_drop["canonical_keys"],
+            _probe_drop["active_keys"],
+            sorted(effective_requested_probes),
+        )
+
     # Promotion policy is a cheap capability fact.  A disabled project must not
     # burn a release audit merely to rediscover that delivery is unavailable.
     # Lock the version before recording that blocker: an already-running
@@ -2934,6 +3048,15 @@ async def run_qualification(
                 "status": "invalid_requested_probes",
                 "detail": str(exc)[:200],
             }
+    if _probe_drop is not None:
+        # The under-lock re-normalization above re-derives a continued attempt's
+        # frozen probe selection from prior_qual, which would resurrect the
+        # probe this gate dropped at request time.  Re-apply the same drop — the
+        # incompatibility is a property of the open version's rubric, which
+        # cannot change mid-run.
+        effective_requested_probes = effective_requested_probes - frozenset(
+            {_probe_drop["probe"]}
+        )
     if continued_attempt_id is not None:
         projected_attempt_id = _coerce_qualification_attempt_id(
             prior_qual.get("qualification_attempt_id")
@@ -3465,7 +3588,26 @@ async def run_qualification(
     # the first child-spawn await so a mid-flight operator/config change cannot
     # compose children spawned under one contract with a verdict computed under
     # another.  Legacy records that predate the freeze fall back to live values.
+    # The spawn block is ATOMIC: if a later spawn fails, every child row already
+    # created in this block is cancelled so a partial spawn cannot orphan a
+    # QUEUED/PROVISIONING child of an attempt that is going terminal.
+    walkthrough_e2e_task: Task | None = None
+    audit_task: Task | None = None
     try:
+        # Spawn the walkthrough_e2e child FIRST: its execution-site check fails
+        # closed (QualifierWalkthroughSiteUnavailableError) before any child row
+        # is created, so a site failure cannot orphan the QUEUED release_audit
+        # child that follows. The walkthrough spawn does not depend on the audit
+        # child's existence, so fail-before-allocating is safe here.
+        if _walkthrough_e2e_needed:
+            walkthrough_e2e_task = await _spawn_qualifier_walkthrough_task(
+                session,
+                project_id,
+                version_id=version.id,
+                candidate_sha=candidate_sha,
+                qualification_attempt_id=attempt_id,
+            )
+            walkthrough_e2e_task_id = str(walkthrough_e2e_task.id)
         if _audit_needed:
             audit_task = await _spawn_release_audit_task(
                 session,
@@ -3485,16 +3627,22 @@ async def run_qualification(
                 rubric_fingerprint=rubric_fingerprint,
             )
             audit_task_id = str(audit_task.id)
-        if _walkthrough_e2e_needed:
-            walkthrough_e2e_task = await _spawn_qualifier_walkthrough_task(
-                session,
-                project_id,
-                version_id=version.id,
-                candidate_sha=candidate_sha,
-                qualification_attempt_id=attempt_id,
-            )
-            walkthrough_e2e_task_id = str(walkthrough_e2e_task.id)
     except Exception as exc:  # noqa: BLE001 — spawn failure must not raise out
+        # Make the spawn block atomic: cancel any child row created before the
+        # failure so a partial spawn cannot leave a phantom QUEUED/PROVISIONING
+        # child of an attempt that is going terminal as spawn_failed.
+        _spawn_cleanup_at = _utcnow()
+        for _spawned_child in (walkthrough_e2e_task, audit_task):
+            if _spawned_child is None or _spawned_child.status in (
+                TaskStatus.COMPLETED,
+                TaskStatus.FAILED,
+                TaskStatus.CANCELLED,
+                TaskStatus.BLOCKED,
+            ):
+                continue
+            _spawned_child.status = TaskStatus.CANCELLED
+            _spawned_child.vm_stopped_at = _spawn_cleanup_at
+            session.add(_spawned_child)
         logger.warning(
             "[RELEASE_QUALIFIER] failed to spawn qualification children for "
             "version v%d: %s",
@@ -3502,9 +3650,19 @@ async def run_qualification(
             exc,
             exc_info=True,
         )
+        # Stamp the serving engine sha on the spawn_failed record so the
+        # error-redrive sweep can detect a later execution-site capability
+        # change: release_qualifier_redrive._walkthrough_execution_site_changed
+        # compares this against the current serving sha to re-arm a capped
+        # walkthrough spawn_failed exactly once after a deploy.  Lazy import
+        # mirrors the redrive module's idiom (app.deployed_sha is a lightweight
+        # env-reader; no load-order coupling here).
+        from app.deployed_sha import get_serving_sha  # noqa: PLC0415
+
         version.last_qualification = {
             "status": "error",
             "error": "spawn_failed",
+            "engine_sha": get_serving_sha(),
             "detail": str(exc)[:300],
             "candidate_sha": candidate_sha,
             "ci_green": ci_green,
@@ -3590,6 +3748,13 @@ async def run_qualification(
         # Explicitly requested decision-bearing product probe. It is a required
         # child for this attempt and finalization consumes its same-SHA result.
         "requested_probes": sorted(effective_requested_probes),
+        # Durable record of a product probe dropped at request time because the
+        # open version's ACTIVE rubric shares no canonical evidence key with it
+        # (blocker="incompatible_probe").  None when no probe was dropped.  The
+        # strategist reads this alongside requested_probes to see why the
+        # requested probe never ran.
+        "qualify_request_blocked": _probe_drop_record,
+        "qualify_request_blocked_at": _probe_drop_blocked_at,
         "walkthrough_e2e_task_id": walkthrough_e2e_task_id,
         "merge_grade_task_id": merge_grade_task_id,
         "rubric_snapshot": rubric_snapshot,
@@ -5584,6 +5749,10 @@ async def _record_rubric_provenance_outcome(
         "smoketest_task_id": qual.get("smoketest_task_id"),
         "merge_grade_task_id": qual.get("merge_grade_task_id"),
         "requested_probes": qual.get("requested_probes") or [],
+        # Durable record of a product probe dropped at request time
+        # (blocker="incompatible_probe"), carried forward from the pending record.
+        "qualify_request_blocked": qual.get("qualify_request_blocked"),
+        "qualify_request_blocked_at": qual.get("qualify_request_blocked_at"),
         "walkthrough_e2e_task_id": qual.get("walkthrough_e2e_task_id"),
         "walkthrough_e2e_result": qual.get("walkthrough_e2e_result"),
         "rubric_snapshot": (
@@ -5742,6 +5911,11 @@ async def _finalize_qualification(
             session, version, qual, "qualification_probe_contract_invalid"
         )
     walkthrough_e2e_task_id = qual.get("walkthrough_e2e_task_id")
+    # Computed by the requested-probe leg (which runs AFTER dimension
+    # composition, see below) and folded into the promotion decision by
+    # _apply_walkthrough_decision.  None when no probe was requested or the
+    # probe evaluation has not run yet.
+    walkthrough_e2e_result: dict[str, Any] | None = None
     smoketest_enabled = bool(qual.get("smoketest_enabled", False))
     # Dimensions already resolved (passed/failed/blocked) for this candidate_sha
     # from a prior finalize, carried forward by run_qualification from the
@@ -6287,125 +6461,6 @@ async def _finalize_qualification(
                 merge_grade_task_id,
                 version.version_number,
             )
-
-    # --- Explicit product probe: decision-bearing walkthrough --------------
-    walkthrough_e2e_result: dict[str, Any] | None = None
-    if "walkthrough_e2e" in requested_probes:
-        if not walkthrough_e2e_task_id:
-            return await _handle_infra_failure(
-                session, version, qual, "walkthrough_e2e_task_missing"
-            )
-        try:
-            _walkthrough_task_obj = await session.get(
-                Task, uuid.UUID(str(walkthrough_e2e_task_id))
-            )
-        except (ValueError, TypeError):
-            return await _handle_infra_failure(
-                session, version, qual, "walkthrough_e2e_task_id_invalid"
-            )
-        if _walkthrough_task_obj is None:
-            return await _handle_infra_failure(
-                session, version, qual, "walkthrough_e2e_task_missing"
-            )
-        if _walkthrough_task_obj.status in _INFRA_FAILURE_TERMINAL_STATUSES:
-            return await _handle_infra_failure(
-                session,
-                version,
-                qual,
-                _enrich_infra_error(
-                    f"walkthrough_e2e_task_{_walkthrough_task_obj.status.lower()}",
-                    _walkthrough_task_obj,
-                ),
-            )
-        if _walkthrough_task_obj.status != TaskStatus.COMPLETED:
-            return await _handle_infra_failure(
-                session, version, qual, "walkthrough_e2e_task_not_terminal"
-            )
-
-        walkthrough_report = await _latest_artifact_logs(
-            session,
-            uuid.UUID(str(walkthrough_e2e_task_id)),
-            ArtifactType.WALKTHROUGH_E2E_REPORT,
-        )
-        walkthrough_e2e_result = _evaluate_walkthrough_e2e_report(
-            walkthrough_report, candidate_sha
-        )
-        if walkthrough_e2e_result.get("status") == "invalid":
-            return await _handle_infra_failure(
-                session,
-                version,
-                qual,
-                "walkthrough_e2e_report_"
-                + str(walkthrough_e2e_result.get("reason") or "invalid")[:80],
-            )
-
-        # The report may use supported legacy aliases, but every reported key
-        # must resolve to an ACTIVE criterion in the frozen version contract.
-        # Unknown keys are malformed evidence, not a quality failure.
-        from app.acceptance_criteria import WALKTHROUGH_E2E_EVIDENCE_KIND
-
-        active_criterion_keys = {
-            str(row.criterion_key)
-            for row in live_criterion_rows
-            if row.status == "active" and row.criterion_key
-        }
-        normalized_results = walkthrough_e2e_result.get("results") or []
-        try:
-            resolved_report_keys = _walkthrough_e2e_canonical_evidence_keys(
-                normalized_results
-            )
-        except ValueError:
-            return await _handle_infra_failure(
-                session, version, qual, "walkthrough_e2e_report_duplicate_criteria"
-            )
-        if resolved_report_keys - active_criterion_keys:
-            return await _handle_infra_failure(
-                session, version, qual, "walkthrough_e2e_report_unknown_criteria"
-            )
-
-        # A passing probe may promote only after its covered-tier evidence was
-        # durably ingested. The agent posts it before terminal status and the
-        # backend completion handler is an idempotent backstop; this read proves
-        # that seam instead of trusting a best-effort HTTP call.
-        if walkthrough_e2e_result.get("status") == "passed":
-            active_criteria_by_key = {
-                str(row.criterion_key): row
-                for row in live_criterion_rows
-                if row.status == "active" and row.criterion_key
-            }
-            expected_evidence = {
-                f"walkthrough_e2e:{attempt_id}:{key}": active_criteria_by_key[
-                    key
-                ].id
-                for key in resolved_report_keys
-            }
-            observed_evidence = (
-                await session.execute(
-                    select(CriterionEvidence).where(
-                        CriterionEvidence.project_id == version.project_id,
-                        CriterionEvidence.source_kind
-                        == WALKTHROUGH_E2E_EVIDENCE_KIND,
-                        CriterionEvidence.source_id.in_(set(expected_evidence)),
-                    )
-                )
-            ).scalars().all()
-            observed_by_source: dict[str, list[CriterionEvidence]] = {}
-            for evidence in observed_evidence:
-                if evidence.source_id:
-                    observed_by_source.setdefault(evidence.source_id, []).append(
-                        evidence
-                    )
-            if any(
-                len(observed_by_source.get(source_id, [])) != 1
-                or observed_by_source[source_id][0].criterion_id != criterion_id
-                for source_id, criterion_id in expected_evidence.items()
-            ):
-                return await _handle_infra_failure(
-                    session,
-                    version,
-                    qual,
-                    "walkthrough_e2e_evidence_missing",
-                )
 
     # --- Read the release_audit report -------------------------------------
     # When both audit and test_erosion dimensions are already resolved from a
@@ -8083,6 +8138,143 @@ async def _finalize_qualification(
         env_preflight_ack_override=env_preflight_ack_override,
     )
 
+    # --- Explicit product probe: decision-bearing walkthrough --------------
+    # Runs AFTER the release_audit report was read and AFTER the composite was
+    # composed, so a probe that was requested but did not pass fails ONLY its
+    # own dimension (walkthrough_e2e → promote=False /
+    # blocker=walkthrough_e2e_failed via _apply_walkthrough_decision below)
+    # instead of discarding the already-computed audit / challenge /
+    # merge-grade verdicts.  Every requested-but-not-passed outcome — a missing
+    # task, an invalid or unknown-criteria report, missing ingested evidence,
+    # or a genuine criterion failure — is folded into the walkthrough_e2e
+    # dimension as a hard blocker; none becomes a pass, warning, or skip.
+    # SAFETY UNCHANGED: a requested probe that did not pass still blocks
+    # promotion, only where the failure lands is different.
+    if "walkthrough_e2e" in requested_probes:
+        _walkthrough_reason: str | None = None
+        if not walkthrough_e2e_task_id:
+            _walkthrough_reason = "walkthrough_e2e_task_missing"
+        else:
+            try:
+                _walkthrough_task_obj = await session.get(
+                    Task, uuid.UUID(str(walkthrough_e2e_task_id))
+                )
+            except (ValueError, TypeError):
+                _walkthrough_reason = "walkthrough_e2e_task_id_invalid"
+                _walkthrough_task_obj = None
+            if _walkthrough_reason is None:
+                if _walkthrough_task_obj is None:
+                    _walkthrough_reason = "walkthrough_e2e_task_missing"
+                elif (
+                    _walkthrough_task_obj.status
+                    in _INFRA_FAILURE_TERMINAL_STATUSES
+                ):
+                    _walkthrough_reason = _enrich_infra_error(
+                        f"walkthrough_e2e_task_{_walkthrough_task_obj.status.lower()}",
+                        _walkthrough_task_obj,
+                    )
+                elif _walkthrough_task_obj.status != TaskStatus.COMPLETED:
+                    _walkthrough_reason = "walkthrough_e2e_task_not_terminal"
+
+        if _walkthrough_reason is None:
+            walkthrough_report = await _latest_artifact_logs(
+                session,
+                uuid.UUID(str(walkthrough_e2e_task_id)),
+                ArtifactType.WALKTHROUGH_E2E_REPORT,
+            )
+            walkthrough_e2e_result = _evaluate_walkthrough_e2e_report(
+                walkthrough_report, candidate_sha
+            )
+            if walkthrough_e2e_result.get("status") == "invalid":
+                _walkthrough_reason = (
+                    "walkthrough_e2e_report_"
+                    + str(walkthrough_e2e_result.get("reason") or "invalid")[:80]
+                )
+            else:
+                # The report may use supported legacy aliases, but every
+                # reported key must resolve to an ACTIVE criterion in the frozen
+                # version contract.  Unknown keys are malformed evidence, not a
+                # pass.
+                from app.acceptance_criteria import WALKTHROUGH_E2E_EVIDENCE_KIND
+
+                active_criterion_keys = _resolve_active_criterion_keys(
+                    live_criterion_rows
+                )
+                normalized_results = walkthrough_e2e_result.get("results") or []
+                try:
+                    resolved_report_keys = _walkthrough_e2e_canonical_evidence_keys(
+                        normalized_results
+                    )
+                except ValueError:
+                    _walkthrough_reason = (
+                        "walkthrough_e2e_report_duplicate_criteria"
+                    )
+                else:
+                    if resolved_report_keys - active_criterion_keys:
+                        _walkthrough_reason = (
+                            "walkthrough_e2e_report_unknown_criteria"
+                        )
+                    elif walkthrough_e2e_result.get("status") == "passed":
+                        # A passing probe may promote only after its
+                        # covered-tier evidence was durably ingested.  The agent
+                        # posts it before terminal status and the backend
+                        # completion handler is an idempotent backstop; this
+                        # read proves that seam instead of trusting a
+                        # best-effort HTTP call.
+                        active_criteria_by_key = {
+                            str(row.criterion_key): row
+                            for row in live_criterion_rows
+                            if row.status == "active" and row.criterion_key
+                        }
+                        expected_evidence = {
+                            f"walkthrough_e2e:{attempt_id}:{key}": active_criteria_by_key[
+                                key
+                            ].id
+                            for key in resolved_report_keys
+                        }
+                        observed_evidence = (
+                            await session.execute(
+                                select(CriterionEvidence).where(
+                                    CriterionEvidence.project_id
+                                    == version.project_id,
+                                    CriterionEvidence.source_kind
+                                    == WALKTHROUGH_E2E_EVIDENCE_KIND,
+                                    CriterionEvidence.source_id.in_(
+                                        set(expected_evidence)
+                                    ),
+                                )
+                            )
+                        ).scalars().all()
+                        observed_by_source: dict[
+                            str, list[CriterionEvidence]
+                        ] = {}
+                        for evidence in observed_evidence:
+                            if evidence.source_id:
+                                observed_by_source.setdefault(
+                                    evidence.source_id, []
+                                ).append(evidence)
+                        if any(
+                            len(observed_by_source.get(source_id, [])) != 1
+                            or observed_by_source[source_id][0].criterion_id
+                            != criterion_id
+                            for source_id, criterion_id
+                            in expected_evidence.items()
+                        ):
+                            _walkthrough_reason = (
+                                "walkthrough_e2e_evidence_missing"
+                            )
+
+        if _walkthrough_reason is not None:
+            # A requested probe that did not pass is a FAILED walkthrough_e2e
+            # dimension (sub_score 0.0, promote=False, blocker
+            # walkthrough_e2e_failed) — not an infra blackout of the whole
+            # verdict.  The precise reason is preserved on the result for the
+            # operator; the dimension failure still hard-blocks promotion.
+            walkthrough_e2e_result = {
+                "status": "failed",
+                "reason": _walkthrough_reason,
+            }
+
     # --- Acceptance-window counts (additive evidence, no score impact) -----
     # Reuses the same verified-prs-merged predicate from direction_outcomes so
     # the release qualification surfaces the same proven-vs-delivered signal as
@@ -8143,6 +8335,11 @@ async def _finalize_qualification(
         "audit_challenge_spawn_error": qual.get("audit_challenge_spawn_error"),
         "smoketest_task_id": smoketest_task_id,
         "requested_probes": sorted(requested_probes),
+        # Durable record of a product probe dropped at request time
+        # (blocker="incompatible_probe"), carried forward from the pending record
+        # so the verdict keeps the drop trace.
+        "qualify_request_blocked": qual.get("qualify_request_blocked"),
+        "qualify_request_blocked_at": qual.get("qualify_request_blocked_at"),
         "walkthrough_e2e_task_id": walkthrough_e2e_task_id,
         "walkthrough_e2e_result": walkthrough_e2e_result,
         "audit_findings": audit_findings,

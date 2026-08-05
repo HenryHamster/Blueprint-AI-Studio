@@ -1223,12 +1223,19 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 #   shared resource that cannot be used concurrently — NOT "both are big" or "both touch
 #   the backend." When in doubt, omit: extra conflicts serialize work unnecessarily.
 # recommended_mode: audit|fundamentals|ship|pause — your judgment for this direction's system health.
-./strategic create-direction '{"text": "outcome statement", "priority": "high|medium|low", "category": "product|structural", "gap_id": "g-xxx", "rationale": "...", "conflicts_with": ["d-xxx"], "recommended_mode": "ship", "success_evidence": "observable outcome that proves this direction is done (required)", "retirement_condition": "measurable condition that triggers retirement (required)", "implementation_constraints": "optional constraints for implementors", "dedup_reasoning": {"closest_directions": ["d-xxx"], "distinction": "one-line justification why this is distinct in scope or mechanism"}}'
+# criterion_keys: accept the acceptance-criterion keys from the OPEN version's
+#   set-acceptance-criteria response (e.g. "c-xxx") that this direction's tasks produce
+#   evidence for. Tasks spawned under the direction inherit them, so a proven acceptance
+#   verdict writes a CriterionEvidence row. Use ONLY real keys the analysis references
+#   — never invent keys. A direction without criterion_keys produces no CriterionEvidence
+#   rows even when its tasks pass acceptance, so set them on create AND keep them in sync
+#   on update when the direction's acceptance scope changes.
+./strategic create-direction '{"text": "outcome statement", "priority": "high|medium|low", "category": "product|structural", "gap_id": "g-xxx", "rationale": "...", "criterion_keys": ["c-xxx"], "conflicts_with": ["d-xxx"], "recommended_mode": "ship", "success_evidence": "observable outcome that proves this direction is done (required)", "retirement_condition": "measurable condition that triggers retirement (required)", "implementation_constraints": "optional constraints for implementors", "dedup_reasoning": {"closest_directions": ["d-xxx"], "distinction": "one-line justification why this is distinct in scope or mechanism"}}'
 # To create a NEW idea that belongs to the NEXT version, pass "staged": true on
 # the SAME create-direction call — it is born staged (inert, gated to the open
 # version) in one atomic op, so it never passes through a research-eligible
 # active state. Requires an open version (skips 409 if none). Do NOT create-then-stage.
-./strategic update-direction '{"direction_id": "d-xxx", "changes": {"priority": "...", "text": "...", "conflicts_with": [...], "recommended_mode": "audit", "success_evidence": "updated observable outcome (optional)", "retirement_condition": "updated measurable retirement condition (optional)"}, "rationale": "..."}'
+./strategic update-direction '{"direction_id": "d-xxx", "changes": {"priority": "...", "text": "...", "conflicts_with": [...], "recommended_mode": "audit", "success_evidence": "updated observable outcome (optional)", "retirement_condition": "updated measurable retirement condition (optional)", "criterion_keys": ["c-xxx"]}, "rationale": "..."}'
 ./strategic retire-direction '{"direction_id": "d-xxx", "rationale": "..."}'
 # Stage a direction for the NEXT version: it goes inert (no work spawned) and
 # auto-activates when the current version promotes and the next one opens. Use

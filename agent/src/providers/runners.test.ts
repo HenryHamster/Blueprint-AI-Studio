@@ -101,7 +101,7 @@ import {
   syncAgentHelpersToPath,
 } from './runners.js';
 import { recordLlmTokens, recordToolResultBytes } from '../index.js';
-import { CLAUDE_RESULT_GRACE_MS } from '../constants.js';
+import { CLAUDE_RESULT_GRACE_MS, MAX_OUTPUT_BYTES } from '../constants.js';
 import { registerChildPid, unregisterChildPid } from '../processTracking.js';
 import { expectCalledWith } from '../utils/typed-mock-call.js';
 
@@ -271,6 +271,50 @@ describe('drainJsonChunks — assistant event dispatch', () => {
     ]);
     await runProviderAgent('prompt', null, statusRef);
     expect(statusRef.value).toBe('Using tool: Read');
+  });
+});
+
+describe('output byte cap — structured modes survive envelope amplification', () => {
+  beforeEach(() => {
+    mockSendLog.mockClear();
+    vi.mocked(spawn).mockReset();
+  });
+
+  it('a stream-json run passing MAX_OUTPUT_BYTES keeps running and still yields its result', async () => {
+    // ~12MB of envelope noise (deepseek-flash-style amplification), then the
+    // real result. Before the fix this killed the run with ClaudeTimeoutError
+    // ("exceeded the 10000000-byte output limit") and lost the task.
+    const pad = 'x'.repeat(2_000_000);
+    const noise = Array.from({ length: 6 }, () =>
+      JSON.stringify({ type: 'system', subtype: 'envelope-noise', pad }));
+    emitStream([
+      ...noise,
+      JSON.stringify({ type: 'result', result: 'survived past cap' }),
+    ]);
+    const { lastResultText, allOutput } = await runProviderAgent('prompt', null, { value: '' });
+    expect(lastResultText).toBe('survived past cap');
+    // The re-joined buffer marks the omission and carries the true stream
+    // tail, so post-exit marker/rate-limit regex scans see the end of the run.
+    expect(allOutput).toContain('[OUTPUT_LIMIT] middle of raw stream omitted');
+    expect(allOutput).toContain('survived past cap');
+    expect(Buffer.byteLength(allOutput, 'utf8')).toBeLessThan(MAX_OUTPUT_BYTES + 3_000_000);
+  });
+
+  it('a text-mode run still hard-terminates at the byte cap — output IS the deliverable there', async () => {
+    const savedProvider = process.env.PROVIDER;
+    process.env.PROVIDER = 'gemini';
+    process.env.GEMINI_API_KEY = 'test-key';
+    refreshRuntimeState();
+    try {
+      emitStream(Array.from({ length: 6 }, () => 'y'.repeat(2_000_000)));
+      await expect(
+        runProviderAgent('prompt', null, { value: '' }),
+      ).rejects.toThrow(/byte output limit/);
+    } finally {
+      process.env.PROVIDER = savedProvider;
+      delete process.env.GEMINI_API_KEY;
+      refreshRuntimeState();
+    }
   });
 });
 

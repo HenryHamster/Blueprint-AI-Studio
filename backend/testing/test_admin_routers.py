@@ -4981,6 +4981,57 @@ class TestTriggerQualify:
         resp = await client.post(f"/api/admin/projects/{project.id}/qualify")
         assert resp.status_code == 404
 
+    @pytest.mark.asyncio
+    async def test_qualify_forwards_requested_probes(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """The operator endpoint forwards ``probes`` to run_qualification —
+        the only lever besides Strategic's qualify_request that can select the
+        walkthrough_e2e live-evidence lane."""
+        from app import release_qualifier
+
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id, phase="stabilize")
+
+        seen: dict = {}
+
+        async def fake_run_qualification(session, project_id, version, **kwargs):
+            seen.update(kwargs)
+            return {"status": "spawned"}
+
+        monkeypatch.setattr(
+            release_qualifier, "run_qualification", fake_run_qualification
+        )
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/qualify",
+            json={"probes": ["walkthrough_e2e"]},
+        )
+        assert resp.status_code == 200
+        assert seen["requested_probes"] == ["walkthrough_e2e"]
+        assert seen["explicit_request"] is True
+
+        # Omitting the body keeps the legacy probe-less contract.
+        seen.clear()
+        resp = await client.post(f"/api/admin/projects/{project.id}/qualify")
+        assert resp.status_code == 200
+        assert seen["requested_probes"] is None
+
+    @pytest.mark.asyncio
+    async def test_qualify_invalid_probe_returns_422(
+        self, client: AsyncClient, db_session
+    ):
+        """An unsupported probe name surfaces as a 422 (from the qualifier's
+        own validation), never a silent probe-less qualification."""
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id, phase="stabilize")
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/qualify",
+            json={"probes": ["not_a_probe"]},
+        )
+        assert resp.status_code == 422
+        assert "unsupported qualification probe" in resp.text
+
 
 class TestClearWaveDeps:
     @pytest.mark.asyncio
@@ -5536,6 +5587,88 @@ class TestBulkApprove:
         # A QUEUED hold is not a PR merge — status is unchanged, no GitHub calls.
         assert task.status == TaskStatus.QUEUED
         merge_pr.assert_not_awaited()
+
+
+class TestBulkCancel:
+    """Bulk cancel must mirror the single-task cancel path: ADMIN_CANCEL
+    provenance on the target and its cascaded child/dependent tasks, stranding
+    no waiting dependent in BLOCKED/PARKED."""
+
+    async def _make_task(self, session, project_id, status=TaskStatus.QUEUED):
+        task = Task(
+            project_id=project_id,
+            title="Bulk cancel task",
+            status=status,
+            created_by="ORCHESTRATOR",
+        )
+        session.add(task)
+        await session.commit()
+        await session.refresh(task)
+        return task
+
+    @pytest.mark.asyncio
+    async def test_bulk_cancel_persists_provenance_and_cascades_dependents(
+        self, client: AsyncClient, db_session
+    ):
+        """Bulk cancellation writes ADMIN_CANCEL provenance on the target and
+        cascades to both active children and waiting dependents."""
+        from app.failure_classification import (
+            ADMIN_CANCEL,
+            classify_failure,
+            is_non_death_cancellation,
+        )
+
+        project = await _make_project(db_session)
+        task = await self._make_task(db_session, project.id, TaskStatus.IN_PROGRESS)
+        child = Task(
+            project_id=project.id,
+            parent_task_id=task.id,
+            title="Active child",
+            status=TaskStatus.IN_PROGRESS,
+            created_by="ORCHESTRATOR",
+        )
+        dependent = Task(
+            project_id=project.id,
+            title="Waiting dependent",
+            status=TaskStatus.QUEUED,
+            depends_on=[str(task.id)],
+            created_by="ORCHESTRATOR",
+        )
+        unrelated = Task(
+            project_id=project.id,
+            title="Unrelated queued task",
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+        )
+        db_session.add_all([child, dependent, unrelated])
+        await db_session.commit()
+
+        resp = await client.post(
+            "/api/admin/tasks/bulk-action",
+            json={"action": "cancel", "task_ids": [str(task.id)]},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["results"] == [{"task_id": str(task.id), "status": "ok"}]
+
+        for row in (task, child, dependent, unrelated):
+            await db_session.refresh(row)
+
+        assert task.status == TaskStatus.CANCELLED
+        assert task.context["failure_category"] == ADMIN_CANCEL
+        assert task.context["failure_class"] == ADMIN_CANCEL
+        assert task.context["cancelled_by"] == "USER"
+        assert classify_failure(task) == ADMIN_CANCEL
+        assert is_non_death_cancellation(task)
+
+        for cascaded in (child, dependent):
+            assert cascaded.status == TaskStatus.CANCELLED
+            assert cascaded.context["failure_category"] == ADMIN_CANCEL
+            assert cascaded.context["failure_class"] == ADMIN_CANCEL
+            assert cascaded.context["cancelled_by"] == "USER"
+            assert cascaded.context["cancelled_by_task_id"] == str(task.id)
+            assert is_non_death_cancellation(cascaded)
+        assert dependent.latest_status_message.startswith("Cancelled: dependency task")
+        assert unrelated.status == TaskStatus.QUEUED
 
 
 class TestBulkRetrySessionFactory:

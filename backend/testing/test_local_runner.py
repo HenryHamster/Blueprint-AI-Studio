@@ -4768,6 +4768,37 @@ class TestRunnerEndpoints:
         assert runner.capabilities["compute_backend"] == "bwrap"
 
     @pytest.mark.asyncio
+    async def test_heartbeat_keeps_nested_chromium_only(
+        self, client: AsyncClient, db_session
+    ):
+        # The walkthrough_e2e browser gate reads ONLY the NESTED
+        # isolation_backends.playwright_chromium_usable key. The vestigial
+        # top-level duplicate was removed: a heartbeat must never store it —
+        # even if an old runner still sends the field — while the nested key the
+        # runner's capabilities_inventory emits keeps persisting.
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={
+                "isolation_backends": {
+                    "docker_usable": True,
+                    "playwright_chromium_usable": True,
+                },
+                # Old-runner leftover: the removed top-level field must be
+                # ignored by the heartbeat, not stored into capabilities.
+                "playwright_chromium_usable": True,
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(runner)
+        backends = runner.capabilities.get("isolation_backends")
+        assert backends is not None
+        assert backends.get("playwright_chromium_usable") is True
+        assert "playwright_chromium_usable" not in runner.capabilities
+
+    @pytest.mark.asyncio
     async def test_heartbeat_tolerates_missing_isolation_backends(
         self, client: AsyncClient, db_session
     ):

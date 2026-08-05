@@ -70,7 +70,10 @@ from app.stall_alert_diagnostics import (
     _STALL_TITLE_PREFIX,
     _format_stall_alert,
 )
-from app.task_capabilities import STRATEGIC_TASK_TYPES
+from app.task_capabilities import (
+    STRATEGIC_TASK_TYPES,
+    execution_site_is_generic_dispatchable,
+)
 from app.time_utils import _utcnow
 from app.workbench_events import (
     SURFACE_RUNTIME,
@@ -384,6 +387,7 @@ from app.runner_eligibility import (  # noqa: F401
     _runner_agent_available,
     _runner_at_capacity,
     _runner_at_compute_capacity,
+    _runner_chromium_usable,
     _runner_container_image_storage,
     _runner_effective_workspace_disk_floor,
     _runner_gpu_capable,
@@ -767,6 +771,16 @@ async def _try_runner_dispatch(
         return False
     payload = task.first_payload or {}
     task_type = payload.get("type", "")
+    # A task whose registry execution site is not the generic default is a hard
+    # routing contract generic dispatch cannot satisfy: the qualifier's
+    # ``walkthrough_e2e`` runs only on a live runner proven for the candidate-stack
+    # site (docker info + Compose + Chromium) and is placed at birth by the
+    # qualifier, while the direct-GCE site is provisioned cold.  Do not let a live
+    # runner claim such a task merely because it advertises a generic
+    # agent/browser capability; the registry site contract is the dispatch
+    # authority and must not fall back to the default matrix.
+    if not execution_site_is_generic_dispatchable(task_type):
+        return False
     project = (
         await session.get(Project, task.project_id)
         if _task_is_authoring(task_type)
@@ -1392,12 +1406,10 @@ def _select_eligible_runner(
             # Browser-required work is fail-safe: only a current, explicit runner
             # proof is accepted. Older runners omit this capability and therefore
             # fall through to the Packer-proven cloud image instead of claiming a
-            # task that will fail after Chromium bootstrap.
-            out = [
-                r
-                for r in out
-                if (r.capabilities or {}).get("playwright_chromium_usable") is True
-            ]
+            # task that will fail after Chromium bootstrap. Reads the NESTED
+            # isolation_backends.playwright_chromium_usable flag the heartbeat
+            # writes (always a plain bool).
+            out = [r for r in out if _runner_chromium_usable(r)]
         if accelerator:
             # Trust VERIFIED GPU capability, not the bare self-reported has_gpu bool:
             # a mis-set flag would silently defeat this gate and win GPU jobs the
