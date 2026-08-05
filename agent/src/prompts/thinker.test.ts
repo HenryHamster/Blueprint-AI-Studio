@@ -38,6 +38,7 @@ import fs from 'fs';
 import { runClaudeCode, persistAndPostStatus } from '../index.js';
 import {
   buildThinkerPrompt,
+  buildThinkerPromptParts,
   computeResearchPlanPromptFingerprint,
   computeStrategicPromptFingerprint,
   runThinkerWithGate,
@@ -226,15 +227,17 @@ describe('buildThinkerPrompt', () => {
     expect(prompt).toContain('gap_id');
   });
 
-  it('section ordering is stable: key sections appear in expected sequence', () => {
+  it('stable guidance leads, volatile payload follows the cache boundary', () => {
     const prompt = buildThinkerPrompt(base);
     const idx = (s: string) => prompt.indexOf(s);
-    // Context sections appear before instructions
+    // Cache boundary: the stable instruction text (# Your job through the
+    // output contract) leads; per-cycle payload sections follow it.
+    expect(idx('# Your job')).toBeLessThan(idx('## Architecture'));
     expect(idx('## Architecture')).toBeLessThan(idx('## Direction Portfolio'));
-    expect(idx('## Direction Portfolio')).toBeLessThan(idx('# Your job'));
-    // Output sections appear at the end
+    // Output sections are part of the stable block, before the volatile payload.
     expect(idx('# Your job')).toBeLessThan(idx('## 1. State assessment'));
     expect(idx('## 1. State assessment')).toBeLessThan(idx('## 6. Problem model'));
+    expect(idx('## 6. Problem model')).toBeLessThan(idx('## Direction Portfolio'));
   });
 
   // Prompt-cache prefix stability: the wall-clock-derived userStateLine
@@ -280,7 +283,91 @@ describe('buildThinkerPrompt', () => {
     expect(prefixA).toBe(prefixB);
   });
 
-  it('renders cycleStartReconciliationSection after the problem_model and before # Your job', () => {
+  // ── Cache-boundary invariant (machine-enforced) ─────────────────────────────
+  // The strategic thinker prompt must lead with a byte-identical stable
+  // instruction block (the cacheable prefix) and put every per-cycle volatile
+  // section in the trailing suffix. A later edit that moves a mutable section
+  // into the prefix silently destroys the cache benefit; these tests make the
+  // boundary part of the build contract.
+
+  it('buildThinkerPromptParts splits at a stable-prefix / volatile-suffix boundary', () => {
+    const common = {
+      ...base,
+      questionSection: '## Operator Questions\nWhen can we ship?',
+      feedbackSection: '## User Feature Requests\nF-MARKER',
+      threadSection: '## Conversation History\nT-MARKER',
+    };
+    const turnA = buildThinkerPromptParts({
+      ...common,
+      userStateLine: 'User last active: today',
+      problemModelSection: '## Your current understanding (problem_model)\nMODEL-A',
+      directionPortfolioSection: '## Direction Portfolio\nPORTFOLIO-A',
+    });
+    const turnB = buildThinkerPromptParts({
+      ...common,
+      userStateLine: 'User last active: 5 days ago',
+      problemModelSection: '## Your current understanding (problem_model)\nMODEL-B',
+      directionPortfolioSection: '## Direction Portfolio\nPORTFOLIO-B',
+    });
+    // The stable prefix is byte-identical across builds with different
+    // per-cycle payloads — the entire cacheable region.
+    expect(turnA.stablePrefix).toBe(turnB.stablePrefix);
+    // The volatile suffix carries the per-cycle differences.
+    expect(turnA.variableBody).not.toBe(turnB.variableBody);
+    // The final prompt is exactly prefix + suffix.
+    expect(turnA.finalPrompt).toBe(turnA.stablePrefix + turnA.variableBody);
+  });
+
+  it('stable prefix precedes every volatile per-cycle section', () => {
+    const params = {
+      ...base,
+      contextPrefix: '## Strategic Context\nctx data',
+      userStateLine: 'User last active: 3 days ago',
+      questionSection: '## Operator Questions\nQ-MARKER',
+      feedbackSection: '## User Feature Requests\nF-MARKER',
+      threadSection: '## Conversation History\nT-MARKER',
+      problemModelSection: '## Your current understanding (problem_model)\nMODEL',
+      directionPortfolioSection: '## Direction Portfolio\nPORTFOLIO',
+      cycleStartReconciliationSection: '## Cycle-start reconciliation\nrecon',
+    };
+    const prompt = buildThinkerPrompt(params);
+    const stableEnd = buildThinkerPromptParts(params).stablePrefix.length;
+    for (const marker of [
+      'Clock:',
+      '## Strategic Context',
+      '## Your current understanding (problem_model)',
+      '## Direction Portfolio',
+      '## Cycle-start reconciliation',
+      'User last active: 3 days ago',
+      'Q-MARKER',
+      'F-MARKER',
+      'T-MARKER',
+    ]) {
+      const i = prompt.indexOf(marker);
+      expect(i).toBeGreaterThan(-1);
+      expect(i).toBeGreaterThanOrEqual(stableEnd);
+    }
+  });
+
+  it('stable prefix contains the full stable instruction contract and no volatile markers', () => {
+    const parts = buildThinkerPromptParts(base);
+    expect(parts.stablePrefix).toContain('# Your job');
+    expect(parts.stablePrefix).toContain('# How to think');
+    expect(parts.stablePrefix).toContain('# Running update: what the user reads');
+    expect(parts.stablePrefix).toContain('# What to write');
+    expect(parts.stablePrefix).toContain('## 8. Acceptance criteria');
+    expect(parts.stablePrefix).toContain('./playbook set');
+    expect(parts.stablePrefix).toContain('Use Grep/Glob for code search');
+    // None of the per-cycle payload section headers may leak into the prefix —
+    // a single volatile byte there busts the cache for the whole block.
+    expect(parts.stablePrefix).not.toContain('## Your current understanding (problem_model)');
+    expect(parts.stablePrefix).not.toContain('## Direction Portfolio');
+    expect(parts.stablePrefix).not.toContain('## Running Context (from prior cycles)');
+    expect(parts.stablePrefix).not.toContain('User last active:');
+    expect(parts.stablePrefix).not.toContain('Clock:');
+  });
+
+  it('renders cycleStartReconciliationSection after the problem_model, in the volatile suffix', () => {
     const prompt = buildThinkerPrompt({
       ...base,
       cycleStartReconciliationSection: '\n## Cycle-start reconciliation (your starting state)\nflagged conflict\n',
@@ -289,8 +376,10 @@ describe('buildThinkerPrompt', () => {
     const modelIdx = prompt.indexOf('## Your current understanding (problem_model)');
     const jobIdx = prompt.indexOf('# Your job');
     expect(reconIdx).toBeGreaterThan(-1);
+    // Both are per-cycle payload sections in the volatile suffix; they keep
+    // their relative order and both follow the stable guidance block.
     expect(reconIdx).toBeGreaterThan(modelIdx);
-    expect(reconIdx).toBeLessThan(jobIdx);
+    expect(reconIdx).toBeGreaterThan(jobIdx);
   });
 
   it('omits cycleStartReconciliationSection when empty', () => {
@@ -352,9 +441,14 @@ describe('buildThinkerPrompt', () => {
     expect(prompt).toContain('./fetch gap <gap_id>');
     // It must reference the backend marker the agent inspects
     expect(prompt).toContain('_gap_memory_trimmed');
-    // Steering lands before the output instructions so the thinker sees it
-    expect(prompt.indexOf('# Some gap memory was shortened')).toBeLessThan(
-      prompt.indexOf('## 1. State assessment'),
+    // The steering block is per-cycle data (depends on which gaps were trimmed
+    // this cycle), so it lives in the volatile suffix, after the stable output
+    // instructions — never in the cacheable prefix.
+    expect(prompt.indexOf('# Some gap memory was shortened')).toBeGreaterThan(
+      prompt.indexOf('# Your job'),
+    );
+    expect(prompt.indexOf('# Some gap memory was shortened')).toBeGreaterThan(
+      prompt.indexOf('## 8. Acceptance criteria'),
     );
   });
 
@@ -497,13 +591,15 @@ describe('buildThinkerPrompt', () => {
     expect(withEmpty).not.toContain('## Completed experiment sweeps');
   });
 
-  it('sweepComparisonSection appears after efficiencySnapshotSection and before # Your job', () => {
+  it('sweepComparisonSection appears after efficiencySnapshotSection, in the volatile suffix', () => {
     const efficiency = '\n## Pipeline Efficiency Axes\ndata\n';
     const sweep = '## Completed experiment sweeps\nArm A: MET\n';
     const prompt = buildThinkerPrompt({ ...base, efficiencySnapshotSection: efficiency, sweepComparisonSection: sweep });
     const idx = (s: string) => prompt.indexOf(s);
+    // Both are per-cycle payload sections in the volatile suffix; their
+    // relative order is preserved and both follow the stable guidance.
     expect(idx('## Pipeline Efficiency Axes')).toBeLessThan(idx('## Completed experiment sweeps'));
-    expect(idx('## Completed experiment sweeps')).toBeLessThan(idx('# Your job'));
+    expect(idx('## Completed experiment sweeps')).toBeGreaterThan(idx('# Your job'));
   });
 
   it('self-improvement block rendered when selfImprovementBlock is non-empty', () => {
@@ -563,7 +659,7 @@ describe('buildThinkerPrompt', () => {
     expect(withoutPhase).not.toContain('## Version Phase');
   });
 
-  it('version phase section appears before # Your job', () => {
+  it('version phase section appears in the volatile suffix, after # Your job', () => {
     const prompt = buildThinkerPrompt({
       ...base,
       versionPhaseSection: '\n## Version Phase\nv2 — STABILIZE\n',
@@ -572,7 +668,7 @@ describe('buildThinkerPrompt', () => {
     const jobIdx = prompt.indexOf('# Your job');
     expect(phaseIdx).toBeGreaterThan(-1);
     expect(jobIdx).toBeGreaterThan(-1);
-    expect(phaseIdx).toBeLessThan(jobIdx);
+    expect(phaseIdx).toBeGreaterThan(jobIdx);
   });
 
   it('memoCitationsSection rendered only when non-empty', () => {
@@ -595,8 +691,9 @@ describe('buildThinkerPrompt', () => {
     expect(prompt).toContain('## Memo Citations');
     // Memos are now rendered with handles and task_ids
     expect(prompt).toContain('M0 (task_id: memo-digest-1): The provisioning path leaks VMs.');
-    // Digest must land before the output instructions so the reviewer sees it.
-    expect(prompt.indexOf('## Memo Citations')).toBeLessThan(prompt.indexOf('# Your job'));
+    // Digest is per-cycle payload in the volatile suffix, after the stable
+    // output-instruction block.
+    expect(prompt.indexOf('## Memo Citations')).toBeGreaterThan(prompt.indexOf('# Your job'));
   });
 
   it('does not contain banned legacy directive phrases', () => {

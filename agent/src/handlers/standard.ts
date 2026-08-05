@@ -65,6 +65,7 @@ import { runCodeChangeTask } from './code-change.js';
 import { consumeAndCommitArtifacts, hydrateComputeResultArtifacts } from './artifact-consume.js';
 import { writeArtifactsHelper, COMPUTE_ARTIFACT_GUIDANCE } from './artifacts-helper.js';
 import { isBlueprintSelfRepo } from '../prompts/code-change-helpers.js';
+import { assembleStableVariablePrompt } from '../prompts/assemble.js';
 import { writeDiagnosticsAfterEditHook } from '../prompts/diagnostics-after-edit-hook.js';
 import { formatExecutionEvidenceForSrPrompt, formatHighFpRateLoosenHintForSrPrompt, formatSrCoFailurePairsForSrPrompt, formatSeverityCalibrationHintForSrPrompt, formatPrecisionRecallQuadrantHintForSrPrompt } from '../prompts/self-review.js';
 import {
@@ -388,7 +389,7 @@ export function assembleStandardPrompt(s: StandardPromptSections): {
     + s.srFeedbackBlock
     + s.promptSuffix
     + s.prTitlePrefixNote;
-  return { stablePrefix, variableBody, finalPrompt: stablePrefix + variableBody };
+  return assembleStableVariablePrompt(stablePrefix, variableBody);
 }
 
 async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
