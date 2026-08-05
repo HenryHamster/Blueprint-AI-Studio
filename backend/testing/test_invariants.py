@@ -12719,7 +12719,7 @@ class TestProblemModelWritePathInvariants:
         # strategic_completion.py: apply_agent_update (re-normalized)
         ("strategic_completion.py", 4895): "apply_agent_update result, then _normalize_active_moves_writeback",
         # strategic_completion.py: parse_problem_model -> model_dump (fallback gap reconciliation)
-        ("strategic_completion.py", 6490): "parse_problem_model(…) validated pydantic model_dump",
+        ("strategic_completion.py", 6562): "parse_problem_model(…) validated pydantic model_dump",
         # reaper_sweeps.py: parse_problem_model -> model_dump (moot-confirmation sweep)
         ("reaper_sweeps.py", 1253): "parse_problem_model(…) validated pydantic model_dump",
         # reaper_sweeps.py: parse_problem_model -> model_dump (stale-decay sweep)
