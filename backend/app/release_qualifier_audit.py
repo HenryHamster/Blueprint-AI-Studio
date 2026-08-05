@@ -44,6 +44,7 @@ from app.runner_eligibility import (
 )
 from app.runtime_config_state import resolve_project_promotion_enabled
 from app.shared_state import runtime_config as _runtime_config
+from app.task_capabilities import ExecutionSite, LOCAL_RUNNER_EXECUTION_SITE
 from app.time_utils import _utcnow
 from app.json_extract import async_json_loads
 from app.deployed_sha import get_serving_sha
@@ -513,11 +514,12 @@ _WALKTHROUGH_E2E_TASK_TYPE = "walkthrough_e2e"
 
 # The supported walkthrough_e2e execution site: a LIVE LOCAL RUNNER proven for
 # the candidate-stack site (docker info + Compose + Chromium), pinned at birth.
-# The registry still declares walkthrough_e2e as DIRECT_PACKER_GCE so generic
-# dispatch keeps refusing live-runner claims (fail-closed); this qualifier path
-# is the only permitted placement, so the task's execution_site label records the
-# ACTUAL dispatch target rather than the registry's fail-closed sentinel.
-_WALKTHROUGH_E2E_EXECUTION_SITE = "local_runner"
+# The registry declares the SAME site (LOCAL_RUNNER_EXECUTION_SITE), so
+# declaration, enforcement, and this consumption path share one typed vocabulary;
+# generic dispatch treats the site as non-default and fails closed rather than
+# claiming the type.  The annotation against ExecutionSite means a future untyped
+# value fails static checking instead of silently diverging.
+_WALKTHROUGH_E2E_EXECUTION_SITE: ExecutionSite = LOCAL_RUNNER_EXECUTION_SITE
 
 
 class QualifierWalkthroughSiteUnavailableError(RuntimeError):
@@ -646,7 +648,8 @@ async def _spawn_qualifier_walkthrough_task(
     stamps it on pull) — mirroring the orchestrator's own pin contract
     (``_try_runner_dispatch``) and the strategic-spawn pin-at-birth path. The
     task's ``execution_site`` context label records the actual dispatch target
-    (:data:`_WALKTHROUGH_E2E_EXECUTION_SITE`), NOT the registry declaration.
+    (:data:`_WALKTHROUGH_E2E_EXECUTION_SITE`), which the registry declares for the
+    task type, so declaration, enforcement, and consumption share one vocabulary.
     When no eligible site exists the spawn FAILS CLOSED (raises
     :class:`QualifierWalkthroughSiteUnavailableError`) before any task row is
     created, so the caller records a ``spawn_failed`` qualification with the

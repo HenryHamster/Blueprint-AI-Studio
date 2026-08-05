@@ -20,16 +20,51 @@ from app.time_utils import _utcnow
 
 
 def test_walkthrough_execution_site_is_registry_declared():
+    """The qualifier's walkthrough_e2e site is a legal ExecutionSite value AND
+    matches the registry declaration for the task type.
+
+    Declaration (task_capabilities registry), enforcement (dispatch), and
+    consumption (release_qualifier_audit) must share ONE typed ExecutionSite;
+    this is the assertion that prevents the registry/qualifier split from
+    recurring.
+    """
+    from typing import get_args
+
+    from app.release_qualifier_audit import _WALKTHROUGH_E2E_EXECUTION_SITE
     from app.task_capabilities import (
-        DIRECT_PACKER_GCE_EXECUTION_SITE,
+        ExecutionSite,
+        LOCAL_RUNNER_EXECUTION_SITE,
         TaskType,
         execution_site_for_task_type,
     )
 
+    # The qualifier-pinned site is a legal value of the type that governs it.
+    assert _WALKTHROUGH_E2E_EXECUTION_SITE in get_args(ExecutionSite)
+    assert LOCAL_RUNNER_EXECUTION_SITE in get_args(ExecutionSite)
+    # The qualifier pins the same site the registry declares for the task type.
     assert (
         execution_site_for_task_type(TaskType.walkthrough_e2e)
-        == DIRECT_PACKER_GCE_EXECUTION_SITE
+        == _WALKTHROUGH_E2E_EXECUTION_SITE
+        == LOCAL_RUNNER_EXECUTION_SITE
     )
+
+
+def test_walkthrough_execution_site_is_not_generically_dispatchable():
+    """Generic dispatch fails closed for the walkthrough site.
+
+    A non-default execution site is a hard routing contract: generic dispatch
+    (runner pin / warm pool / Cloud Run / GCE) must refuse to route the task
+    rather than silently treating the site as ``default``.  Unknown task types
+    and default-site types stay on the default matrix.
+    """
+    from app.task_capabilities import (
+        TaskType,
+        execution_site_is_generic_dispatchable,
+    )
+
+    assert execution_site_is_generic_dispatchable(TaskType.walkthrough_e2e) is False
+    assert execution_site_is_generic_dispatchable(TaskType.create) is True
+    assert execution_site_is_generic_dispatchable("totally_unknown_type") is True
 
 
 def test_qualification_contract_fingerprint_tracks_goal_and_categories():
@@ -900,33 +935,32 @@ def test_walkthrough_site_gate_reads_runner_emitted_chromium_only():
 
 
 @pytest.mark.asyncio
-async def test_walkthrough_spawn_records_live_runner_site_not_registry_declaration(
+async def test_walkthrough_spawn_records_live_runner_site_matching_registry(
     db_session,
 ):
-    """The walkthrough spawn's supported execution site is the LIVE LOCAL RUNNER.
+    """The walkthrough spawn's execution site is the LIVE LOCAL RUNNER, recorded
+    with the SAME typed site the registry declares.
 
-    The registry still declares walkthrough_e2e as DIRECT_PACKER_GCE (the
-    fail-closed sentinel that keeps generic dispatch from claiming the type), but
-    the qualifier path dispatches to a proven local runner and records the ACTUAL
-    site label. This is the DEFECT-A regression: assert (registry site) and
-    dispatch (live runner) can never disagree again — the function never requires
-    the registry site to equal the dispatch site, and the context never echoes the
-    registry declaration.
+    The registry and the qualifier's pin share one ExecutionSite value
+    (LOCAL_RUNNER_EXECUTION_SITE); the spawn records that exact site label on the
+    context. This regression keeps declaration, enforcement, and consumption from
+    diverging into a registry/qualifier vocabulary split again.
     """
     from app.release_qualifier_audit import (
         _WALKTHROUGH_E2E_EXECUTION_SITE,
         _spawn_qualifier_walkthrough_task,
     )
     from app.task_capabilities import (
-        DIRECT_PACKER_GCE_EXECUTION_SITE,
+        LOCAL_RUNNER_EXECUTION_SITE,
         TaskType,
         execution_site_for_task_type,
     )
 
-    # The fail-closed registry sentinel is unchanged.
+    # The registry declares the same typed site the qualifier pins.
     assert (
         execution_site_for_task_type(TaskType.walkthrough_e2e)
-        == DIRECT_PACKER_GCE_EXECUTION_SITE
+        == _WALKTHROUGH_E2E_EXECUTION_SITE
+        == LOCAL_RUNNER_EXECUTION_SITE
     )
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
@@ -948,10 +982,9 @@ async def test_walkthrough_spawn_records_live_runner_site_not_registry_declarati
     assert pinned.status == TaskStatus.PROVISIONING
     assert pinned.vm_instance_id == f"runner:{capable_runner.id}"
     assert pinned.context["runner_target_id"] == str(capable_runner.id)
-    # The recorded site is the ACTUAL dispatch target (live local runner), never
-    # the registry's DIRECT_PACKER_GCE sentinel.
+    # The recorded site is the typed live-local-runner site the registry declares.
     assert pinned.context["execution_site"] == _WALKTHROUGH_E2E_EXECUTION_SITE
-    assert _WALKTHROUGH_E2E_EXECUTION_SITE == "local_runner"
+    assert _WALKTHROUGH_E2E_EXECUTION_SITE == LOCAL_RUNNER_EXECUTION_SITE
 
 
 @pytest.mark.asyncio

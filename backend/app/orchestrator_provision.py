@@ -62,8 +62,7 @@ from app.models import (
 from app.shared_state import runtime_config as _runtime_config
 from app.task_capabilities import (
     CLOUD_RUN_CANDIDATE_TASK_TYPES,
-    DIRECT_PACKER_GCE_EXECUTION_SITE,
-    execution_site_for_task_type,
+    execution_site_is_generic_dispatchable,
 )
 from app.time_utils import _utcnow, set_retry_after
 from app.resource_envelope import resolve_project_execution_placement_policy
@@ -324,12 +323,15 @@ async def provision_and_handle(
         _effective_cr_types = (
             CLOUD_RUN_CANDIDATE_TASK_TYPES & _cr_allowlist
         )
-        _direct_packer_gce_dispatch = (
-            execution_site_for_task_type(t_type)
-            == DIRECT_PACKER_GCE_EXECUTION_SITE
+        # Cloud Run is part of the generic default dispatch matrix.  A task whose
+        # registry execution site is non-default (direct GCE, or the qualifier's
+        # live-local-runner walkthrough site) must never be handed to a Cloud Run
+        # job; fail closed by skipping Cloud Run for every non-default site.
+        _non_generic_site_dispatch = not execution_site_is_generic_dispatchable(
+            t_type
         )
         success = False
-        if t_type in _effective_cr_types and not _direct_packer_gce_dispatch:
+        if t_type in _effective_cr_types and not _non_generic_site_dispatch:
             # Stamp the Cloud Run sentinel machine type
             # so cost attribution and teardown skips work.
             async with _orch.AsyncSessionLocal() as _cr_stamp_session:

@@ -71,9 +71,8 @@ from app.stall_alert_diagnostics import (
     _format_stall_alert,
 )
 from app.task_capabilities import (
-    DIRECT_PACKER_GCE_EXECUTION_SITE,
     STRATEGIC_TASK_TYPES,
-    execution_site_for_task_type,
+    execution_site_is_generic_dispatchable,
 )
 from app.time_utils import _utcnow
 from app.workbench_events import (
@@ -772,12 +771,15 @@ async def _try_runner_dispatch(
         return False
     payload = task.first_payload or {}
     task_type = payload.get("type", "")
-    # ``walkthrough_e2e`` is qualified only on the single-tenant Packer GCE
-    # image, whose host Docker daemon is required before the candidate stack
-    # can boot.  Do not let a live runner claim it merely because it advertises
-    # a generic agent/browser capability; the registry site contract is the
-    # dispatch authority.
-    if execution_site_for_task_type(task_type) == DIRECT_PACKER_GCE_EXECUTION_SITE:
+    # A task whose registry execution site is not the generic default is a hard
+    # routing contract generic dispatch cannot satisfy: the qualifier's
+    # ``walkthrough_e2e`` runs only on a live runner proven for the candidate-stack
+    # site (docker info + Compose + Chromium) and is placed at birth by the
+    # qualifier, while the direct-GCE site is provisioned cold.  Do not let a live
+    # runner claim such a task merely because it advertises a generic
+    # agent/browser capability; the registry site contract is the dispatch
+    # authority and must not fall back to the default matrix.
+    if not execution_site_is_generic_dispatchable(task_type):
         return False
     project = (
         await session.get(Project, task.project_id)

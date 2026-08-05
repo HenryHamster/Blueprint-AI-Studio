@@ -3354,8 +3354,21 @@ async def orchestrator_worker():
                         _task_type_for_dispatch = str(
                             (task.first_payload or {}).get("type") or ""
                         )
+                        _execution_site_for_dispatch = execution_site_for_task_type(
+                            _task_type_for_dispatch
+                        )
+                        # A non-default execution site is a hard routing contract:
+                        # the task skips the generic runner/warm-pool/Cloud-Run
+                        # matrix and is placed only by its declared site path.  The
+                        # direct-GCE site is provisioned cold; any OTHER non-default
+                        # site (e.g. the qualifier's live-local-runner walkthrough
+                        # site) is not generically routable and fails closed below.
+                        _non_generic_site_dispatch = (
+                            _execution_site_for_dispatch is not None
+                            and _execution_site_for_dispatch != "default"
+                        )
                         _direct_packer_gce_dispatch = (
-                            execution_site_for_task_type(_task_type_for_dispatch)
+                            _execution_site_for_dispatch
                             == DIRECT_PACKER_GCE_EXECUTION_SITE
                         )
                         if task.requires_approval:
@@ -3494,7 +3507,7 @@ async def orchestrator_worker():
                         # existing dispatch path runs exactly as before. No
                         # LOCAL_MODE flag is involved.
                         if (
-                            not _direct_packer_gce_dispatch
+                            not _non_generic_site_dispatch
                             and await _try_runner_dispatch(
                                 session,
                                 task,
@@ -3545,9 +3558,9 @@ async def orchestrator_worker():
                         # fall-through mints a FRESH id instead of re-creating a GCP
                         # instance with a stale parked-VM name (name-collision hazard).
                         _is_parked_retarget = bool(_warm_ctx.get("parked_for_retarget"))
-                        if _direct_packer_gce_dispatch and _warm_target_vm_id:
-                            # A stale warm/pool pin must not survive onto the
-                            # direct site.  Clear it before the cold provision
+                        if _non_generic_site_dispatch and _warm_target_vm_id:
+                            # A stale warm/pool pin must not survive onto a locked
+                            # site.  Clear it before the site's cold provision
                             # mints the dedicated VM name, otherwise a prior
                             # pooled VM id could be reused accidentally.
                             _warm_ctx = {
@@ -3579,7 +3592,7 @@ async def orchestrator_worker():
                                     owning_task_id=task.id,
                                 )
                             _warm_target_vm_id = None
-                        if _warm_target_vm_id and not _direct_packer_gce_dispatch:
+                        if _warm_target_vm_id and not _non_generic_site_dispatch:
                             _warm_deadline_iso = _warm_ctx.get("warm_handoff_deadline")
                             _warm_expired = False
                             if _warm_deadline_iso:
@@ -3845,7 +3858,7 @@ async def orchestrator_worker():
                         )
                         _is_cloud_run_dispatch = (
                             _task_type_dispatch in _effective_cr_types_dispatch
-                            and not _direct_packer_gce_dispatch
+                            and not _non_generic_site_dispatch
                         )
                         if (
                             not _warm_target_vm_id
@@ -3853,7 +3866,7 @@ async def orchestrator_worker():
                             and is_warm_pool_enabled()
                             and runtime_selection is not None
                             and not _is_cloud_run_dispatch
-                            and not _direct_packer_gce_dispatch
+                            and not _non_generic_site_dispatch
                         ):
                             _leased_member = await try_pool_dispatch(
                                 session,
@@ -4010,6 +4023,56 @@ async def orchestrator_worker():
                             _iter_preclaimed_account_id = None
                             _iter_preclaimed_project_id = None
                             await session.rollback()
+                            continue
+
+                        # Fail-closed guard for a non-default execution site generic
+                        # dispatch cannot route.  Every generic path (fleet runner
+                        # pin, strategic/local-runner hold, warm continuity, warm
+                        # pool, Cloud Run) has already been skipped above for a
+                        # non-default site; the only thing left here is a COLD GCE
+                        # provision, which is the direct-Packer-GCE site's path.
+                        # Any OTHER non-default site (e.g. the qualifier's
+                        # live-local-runner walkthrough site) cannot boot the
+                        # candidate stack on a GCE VM, so cold-provisioning it would
+                        # strand the task on a site it was never qualified for.
+                        # Hold it QUEUED instead — the qualifier's own site-proven
+                        # spawn / redrive places it — rather than silently falling
+                        # back to the default matrix.
+                        if (
+                            _non_generic_site_dispatch
+                            and not _direct_packer_gce_dispatch
+                        ):
+                            logger.warning(
+                                "[ORCHESTRATOR] Task %s has non-generic execution "
+                                "site %r that generic dispatch cannot route — "
+                                "holding QUEUED (fail-closed)",
+                                task.id,
+                                _execution_site_for_dispatch,
+                            )
+                            # Release the slot pre-reserved during runtime selection
+                            # (select_max_plan_account pre-increments active_tasks),
+                            # exactly as the zone-exhaustion hold below does.
+                            if runtime_selection and runtime_selection.account:
+                                await release_max_plan_account(
+                                    runtime_selection.account["id"],
+                                    revert_daily_task_count=True,
+                                    project_id=str(task.project_id) if task.project_id else None,
+                                )
+                            _iter_preclaimed_account_id = None
+                            _iter_preclaimed_project_id = None
+                            try:
+                                await session.commit()
+                                if _pending_warm_pin_clear is not None:
+                                    _shared_state.record_warm_pin_clear(
+                                        *_pending_warm_pin_clear
+                                    )
+                                    _pending_warm_pin_clear = None
+                            except Exception:
+                                logger.exception(
+                                    "[ORCHESTRATOR] Failed to commit warm-pin clear "
+                                    f"while holding task {task.id} for non-generic site"
+                                )
+                                await session.rollback()
                             continue
 
                         # Zone-exhaustion hold — the ONLY thing left below this
