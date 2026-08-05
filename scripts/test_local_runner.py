@@ -2124,6 +2124,60 @@ class TestStaleWorkspaceCleanup(unittest.TestCase):
                 self.assertFalse(os.path.isdir(stale_b))
                 self.assertTrue(os.path.isdir(active_dir))
 
+    def test_atexit_cleanup_removes_workspaces(self):
+        """atexit teardown wipes EVERY workspace dir — no active-set/age filter.
+
+        A crashed runner leaks all its workspaces because neither the per-task
+        cleanup (agent exit) nor the stale sweep (the reap loop died) runs. The
+        registered atexit handler must remove workspaces unconditionally,
+        including ones that were still "active" at the moment of the crash.
+        """
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(os.environ, {"BLUEPRINT_RUNNER_WORKSPACE_ROOT": tmpdir},
+                            clear=False):
+                os.environ.pop("BLUEPRINT_RUNNER_KEEP_WORKSPACES", None)
+                # Workspaces a crashed runner left behind — including one that
+                # was "active" when the process died, so no active-set check
+                # would ever have flagged it.
+                for name in ("task_a", "task_b", "task_active"):
+                    os.makedirs(os.path.join(tmpdir, name))
+                with open(os.path.join(tmpdir, "task_active", "scratch.log"), "w") as fh:
+                    fh.write("x" * 1024)
+
+                removed = local_runner._cleanup_all_workspaces()
+
+                self.assertEqual(removed, 3)
+                self.assertFalse(os.path.isdir(os.path.join(tmpdir, "task_a")))
+                self.assertFalse(os.path.isdir(os.path.join(tmpdir, "task_b")))
+                self.assertFalse(os.path.isdir(os.path.join(tmpdir, "task_active")))
+
+    def test_atexit_cleanup_respects_keep_workspaces_opt_out(self):
+        """BLUEPRINT_RUNNER_KEEP_WORKSPACES=1 retains dirs even at shutdown."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(os.environ, {
+                "BLUEPRINT_RUNNER_WORKSPACE_ROOT": tmpdir,
+                "BLUEPRINT_RUNNER_KEEP_WORKSPACES": "1",
+            }):
+                os.makedirs(os.path.join(tmpdir, "task-keep"))
+                removed = local_runner._cleanup_all_workspaces()
+            self.assertEqual(removed, 0)
+            self.assertTrue(os.path.isdir(os.path.join(tmpdir, "task-keep")))
+
+    def test_atexit_cleanup_missing_root_is_noop(self):
+        """A workspace root that never existed must not raise."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            empty = os.path.join(tmpdir, "does-not-exist")
+            with patch.dict(os.environ, {"BLUEPRINT_RUNNER_WORKSPACE_ROOT": empty},
+                            clear=False):
+                os.environ.pop("BLUEPRINT_RUNNER_KEEP_WORKSPACES", None)
+                self.assertEqual(local_runner._cleanup_all_workspaces(), 0)
+
 
 # ── Startup summary ───────────────────────────────────────────────────────────
 
