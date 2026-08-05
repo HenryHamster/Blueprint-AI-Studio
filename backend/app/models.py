@@ -7818,9 +7818,7 @@ class ServiceCredential(SQLModel, table=True):
     """
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
-    # unique=True already backs lookups with a unique index (uq_servicecredential_name
-    # in migration 0723); index=True would demand a second, redundant ix_ index.
-    name: str = Field(sa_column=Column(String(64), nullable=False, unique=True))
+    name: str = Field(sa_column=Column(String(64), nullable=False))
     description: str | None = Field(
         default=None, sa_column=Column(String(255), nullable=True)
     )
@@ -7851,6 +7849,21 @@ class ServiceCredential(SQLModel, table=True):
     )
     last_used_path: str | None = Field(
         default=None, sa_column=Column(String(255), nullable=True)
+    )
+
+    __table_args__ = (
+        # Name uniqueness is PARTIAL on revoked_at: at most one ACTIVE (non-
+        # revoked) credential may hold a given name, but a revoked name may be
+        # re-minted. Migration 0723's full UNIQUE on name blocked that reuse —
+        # the app-level mint pre-check always allowed it — so 0724 narrows it
+        # to this partial unique index.
+        Index(
+            "uq_servicecredential_name_unrevoked",
+            "name",
+            unique=True,
+            postgresql_where=text("revoked_at IS NULL"),
+            sqlite_where=text("revoked_at IS NULL"),
+        ),
     )
 
 

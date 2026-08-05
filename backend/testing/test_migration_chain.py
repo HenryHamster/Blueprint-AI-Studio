@@ -1335,12 +1335,13 @@ def test_backfill_0707_chains_from_0702_and_declares_kv_keys():
         )
 
 
-def test_service_credential_0723_is_the_expected_schema_head():
-    """Service-credential migration follows admission removal as one linear chain.
+def test_service_credential_0724_is_the_expected_schema_head():
+    """Service-credential migrations follow admission removal as one linear chain.
 
     Historical contracts preserved:
     - 0722 (admission removal) revises 0721 (invited role)
     - 0723 (service credential) revises 0722
+    - 0724 (name reuse after revocation) revises 0723
     """
     versions_dir = Path(__file__).resolve().parents[1] / "alembic" / "versions"
     operability = (
@@ -1389,6 +1390,9 @@ def test_service_credential_0723_is_the_expected_schema_head():
     service_credential = (
         versions_dir / "0723_service_credential.py"
     ).read_text()
+    name_reuse = (
+        versions_dir / "0724_service_credential_name_reuse_after_revocation.py"
+    ).read_text()
     assert parse_revision_identifiers(operability) == ("0708", "0707")
     assert parse_revision_identifiers(claims) == ("0709", "0708")
     assert parse_revision_identifiers(incarnation) == ("0710", "0709")
@@ -1412,10 +1416,12 @@ def test_service_credential_0723_is_the_expected_schema_head():
     assert "WHERE verdict = 'advance'" in admission_removal
     # 0723 chains from 0722: service-credential migration revises admission removal.
     assert parse_revision_identifiers(service_credential) == ("0723", "0722")
+    # 0724 chains from 0723: name-reuse-after-revocation narrows the full UNIQUE.
+    assert parse_revision_identifiers(name_reuse) == ("0724", "0723")
 
     from app.main import EXPECTED_SCHEMA_REVISION
 
-    assert EXPECTED_SCHEMA_REVISION == "0723", (
-        f"Expected EXPECTED_SCHEMA_REVISION == '0723', got {EXPECTED_SCHEMA_REVISION!r}. "
+    assert EXPECTED_SCHEMA_REVISION == "0724", (
+        f"Expected EXPECTED_SCHEMA_REVISION == '0724', got {EXPECTED_SCHEMA_REVISION!r}. "
         "Bump EXPECTED_SCHEMA_REVISION in backend/app/main.py."
     )

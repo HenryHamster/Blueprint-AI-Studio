@@ -6563,6 +6563,14 @@ async def _handle_strategic_completion(
     # Update cycle history with final outcome
     # Audit W2: cycle outcome lives on the StrategicCycle row.
     cycle_id = task.strategic_cycle_id or (task.context or {}).get("strategic_cycle_id")
+    if not cycle_id:
+        # Legacy fallback task that never carried the cycle linkage (spawned
+        # before the strategic_cycle_id column/context, or a context-stripped
+        # replay): resolve the owning cycle from the task linkage so this
+        # completion still finalizes the row and broadcasts the real cycle id.
+        _linked_cycle = await strategic_cycle.get_by_task(session, task.id)
+        if _linked_cycle is not None:
+            cycle_id = _linked_cycle.id
     dirs_created = (
         creates_count if direction_ops and isinstance(direction_ops, list) else 0
     )

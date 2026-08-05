@@ -661,6 +661,31 @@ async def test_mint_rejects_duplicate_unrevoked_name(client: AsyncClient, db_ses
     assert second.status_code == 409, second.text
 
 
+@pytest.mark.asyncio
+async def test_mint_allows_name_reuse_after_revocation(
+    client: AsyncClient, db_session
+):
+    """A revoked name may be re-minted: the uniqueness rule only guards ACTIVE
+    (non-revoked) credentials, so reusing a revoked name must succeed instead
+    of tripping the DB-level unique constraint (regression for migration 0723's
+    full uq_servicecredential_name, which turned the intended reuse into a
+    409 IntegrityError)."""
+    first = await client.post(
+        MGMT_URL, json={"name": "reusable-bot", "scopes": ["observer:read"]}
+    )
+    assert first.status_code == 201, first.text
+    first_token = first.json()["token"]
+
+    revoke = await client.post(f"{MGMT_URL}/{first.json()['id']}/revoke")
+    assert revoke.status_code == 200, revoke.text
+
+    second = await client.post(
+        MGMT_URL, json={"name": "reusable-bot", "scopes": ["observer:read"]}
+    )
+    assert second.status_code == 201, second.text
+    assert second.json()["token"] != first_token
+
+
 # ---------------------------------------------------------------------------
 # 12. List endpoint never returns token/hash fields
 # ---------------------------------------------------------------------------

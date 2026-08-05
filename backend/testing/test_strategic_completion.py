@@ -4626,6 +4626,80 @@ async def test_retirement_critiques_persisted_via_fallback_path(db_session, mock
 
 
 @pytest.mark.asyncio
+async def test_fallback_completion_finalizes_cycle_linked_only_by_task(
+    db_session, mocker
+):
+    """Legacy log-parse completion finalizes the owning cycle even when the
+    task never carried a strategic_cycle_id (neither column nor context).
+
+    Regression: a strategic_review task completed via the fallback log-parse
+    path (parseable JSON output, no strategic API markers) applied all project
+    mutations but left the owning StrategicCycle in phase2_running. cycle_id
+    resolution only checked task.strategic_cycle_id / context, so a legacy
+    task whose only linkage was the cycle row's phase2_task_id stayed
+    unfinalized for 3+ hours until the stalled-cycle reaper marked it stalled.
+    """
+    import json
+    from unittest.mock import AsyncMock
+
+    from app import strategic_cycle
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.strategic_completion._check_direction_starvation", new_callable=AsyncMock
+    )
+    emit = AsyncMock()
+    mocker.patch("app.strategic_events.emit_strategic_cycle_completed", new=emit)
+
+    project = Project(
+        name="P-LEGACY-FB",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Legacy task: no strategic_cycle_id column, no context linkage.
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # The owning cycle is linked ONLY through the cycle row's phase2_task_id.
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await strategic_cycle.mark_phase1_completed(
+        db_session, cycle.id, phase2_task_id=task.id
+    )
+    await db_session.commit()
+
+    logs = json.dumps({"vision": {"purpose": "test", "revision": 2}})
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    assert (project.vision or {}).get("revision") == 2, (
+        "fallback path must still apply the vision mutation"
+    )
+    await db_session.refresh(cycle)
+    assert cycle.outcome == strategic_cycle.OUTCOME_COMPLETED, (
+        f"fallback completion left the owning cycle {cycle.outcome}; expected completed"
+    )
+    assert cycle.phase2_completed_at is not None
+    emit.assert_awaited_once()
+    assert emit.await_args.kwargs["cycle_id"] == cycle.id, (
+        "strategic_cycle_completed must carry the resolved owning cycle id"
+    )
+
+
+@pytest.mark.asyncio
 async def test_no_eligible_sentinel_stored_without_error(db_session, mocker):
     """no_eligible_retirements sentinel is persisted cleanly."""
     import json
