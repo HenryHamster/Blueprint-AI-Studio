@@ -1020,3 +1020,98 @@ async def test_walkthrough_site_failure_leaves_no_queued_release_audit_child(
         for task in project_tasks
         if (task.first_payload or {}).get("type") == "release_audit"
     ] == []
+
+
+@pytest.mark.asyncio
+async def test_audit_child_not_orphaned_when_probe_spawn_fails(db_session, mocker):
+    """A spawn failure after the walkthrough (probe) child is created must not
+    orphan a qualifier child.
+
+    run_qualification spawns the walkthrough_e2e (probe) child FIRST, then the
+    release_audit child.  When a later spawn fails, the already-created probe
+    child row must be cancelled with the attempt — the qualification is going
+    terminal as spawn_failed, so no child may linger in a non-terminal state
+    (QUEUED release_audit or PROVISIONING walkthrough_e2e).
+    """
+    from app import shared_state
+    from sqlmodel import select as _sqlmodel_select
+
+    shared_state.runtime_config["smoketest_enabled"] = False
+    shared_state.runtime_config["env_preflight_enabled"] = False
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    # A live runner proving the candidate-stack site so the walkthrough (probe)
+    # child spawn SUCCEEDS and its row is allocated before the audit spawn fails.
+    capable_runner = LocalRunner(
+        project_id=project.id, token_hash="x" * 64, status="active",
+        last_seen_at=_utcnow(),
+        capabilities={"task_types": "all", "max_concurrent": 2,
+                      "isolation_backends": {"docker_usable": True,
+                                             "playwright_chromium_usable": True}},
+    )
+    db_session.add(capable_runner)
+    await db_session.commit()
+
+    candidate = "c0ffee01" * 5  # 40-char placeholder SHA
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch("app.github.get_branch_sha", new=AsyncMock(return_value=candidate))
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"conclusion": "success"}),
+    )
+    # The probe child spawns first and succeeds; force the FOLLOWING audit spawn
+    # to fail so the already-allocated probe child would otherwise be orphaned.
+    mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(side_effect=RuntimeError("audit spawn boom")),
+    )
+
+    result = await rq.run_qualification(
+        db_session,
+        project.id,
+        version,
+        requested_probes=["walkthrough_e2e"],
+        explicit_request=True,
+    )
+    await db_session.commit()
+
+    # The spawn failure still blocks the qualification.
+    assert result["status"] == "spawn_failed"
+    await db_session.refresh(version)
+    assert version.last_qualification["error"] == "spawn_failed"
+    assert version.last_qualification.get("audit_task_id") is None
+    assert version.last_qualification.get("walkthrough_e2e_task_id") is None
+
+    project_tasks = (
+        (
+            await db_session.execute(
+                _sqlmodel_select(Task).where(Task.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    # No release_audit child may survive in QUEUED after the failed spawn.
+    assert [
+        task
+        for task in project_tasks
+        if (task.first_payload or {}).get("type") == "release_audit"
+        and task.status == TaskStatus.QUEUED
+    ] == []
+
+    # The walkthrough (probe) child was created before the audit spawn failed
+    # and must not be left orphaned in PROVISIONING — it is cancelled with the
+    # failing attempt.
+    walk_children = [
+        task
+        for task in project_tasks
+        if (task.context or {}).get("qualifier_walkthrough_e2e") is True
+    ]
+    assert len(walk_children) == 1
+    assert walk_children[0].status == TaskStatus.CANCELLED

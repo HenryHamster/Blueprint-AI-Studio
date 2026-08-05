@@ -3465,6 +3465,11 @@ async def run_qualification(
     # the first child-spawn await so a mid-flight operator/config change cannot
     # compose children spawned under one contract with a verdict computed under
     # another.  Legacy records that predate the freeze fall back to live values.
+    # The spawn block is ATOMIC: if a later spawn fails, every child row already
+    # created in this block is cancelled so a partial spawn cannot orphan a
+    # QUEUED/PROVISIONING child of an attempt that is going terminal.
+    walkthrough_e2e_task: Task | None = None
+    audit_task: Task | None = None
     try:
         # Spawn the walkthrough_e2e child FIRST: its execution-site check fails
         # closed (QualifierWalkthroughSiteUnavailableError) before any child row
@@ -3500,6 +3505,21 @@ async def run_qualification(
             )
             audit_task_id = str(audit_task.id)
     except Exception as exc:  # noqa: BLE001 — spawn failure must not raise out
+        # Make the spawn block atomic: cancel any child row created before the
+        # failure so a partial spawn cannot leave a phantom QUEUED/PROVISIONING
+        # child of an attempt that is going terminal as spawn_failed.
+        _spawn_cleanup_at = _utcnow()
+        for _spawned_child in (walkthrough_e2e_task, audit_task):
+            if _spawned_child is None or _spawned_child.status in (
+                TaskStatus.COMPLETED,
+                TaskStatus.FAILED,
+                TaskStatus.CANCELLED,
+                TaskStatus.BLOCKED,
+            ):
+                continue
+            _spawned_child.status = TaskStatus.CANCELLED
+            _spawned_child.vm_stopped_at = _spawn_cleanup_at
+            session.add(_spawned_child)
         logger.warning(
             "[RELEASE_QUALIFIER] failed to spawn qualification children for "
             "version v%d: %s",
