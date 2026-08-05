@@ -19,6 +19,20 @@ from app.models import LocalRunner
 from app.time_utils import _utcnow
 
 
+async def _seed_walkthrough_compatible_rubric(db_session, project, version):
+    """Seed the retired-v26 canonical keys so the walkthrough_e2e probe's
+    evidence contract intersects the open version's ACTIVE rubric (the
+    request-time compatibility gate in run_qualification)."""
+    for _wt_key in ("c-dfdc9d82", "c-f52fd975", "c-5214996f"):
+        await _add_version_criterion(
+            db_session,
+            project,
+            version,
+            key=_wt_key,
+            text=f"walkthrough {_wt_key}",
+        )
+
+
 def test_walkthrough_execution_site_is_registry_declared():
     """The qualifier's walkthrough_e2e site is a legal ExecutionSite value AND
     matches the registry declaration for the task type.
@@ -290,6 +304,11 @@ async def test_run_qualification_spawns_walkthrough_e2e_when_enabled(
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
 
+    # The walkthrough_e2e probe's canonical evidence keys must intersect the
+    # open version's ACTIVE rubric (request-time compatibility gate) or the
+    # probe is refused before any child spawn.
+    await _seed_walkthrough_compatible_rubric(db_session, project, version)
+
     # A live runner proving the candidate-stack site (docker info + Compose +
     # Chromium) so run_qualification pins the walkthrough child to it.
     capable_runner = LocalRunner(
@@ -412,6 +431,297 @@ async def test_run_qualification_skips_walkthrough_e2e_when_disabled(
         if (task.context or {}).get("qualifier_walkthrough_e2e") is True
     ]
     assert walk_tasks == []
+
+
+async def test_run_qualification_refuses_walkthrough_probe_without_rubric_overlap(
+    db_session, mocker
+):
+    """A walkthrough_e2e probe request is refused AT REQUEST TIME when the open
+    version's ACTIVE rubric shares no canonical evidence key with the probe.
+
+    The walkthrough evidence contract is pinned to the retired v26 criteria; a
+    rubric with zero overlap would only fail (contained, but expensive) after a
+    full qualification was spent.  The refusal names BOTH key sets so the
+    strategist/operator sees exactly why without burning a qualification."""
+    from app import shared_state
+
+    shared_state.runtime_config["smoketest_enabled"] = False
+    shared_state.runtime_config["env_preflight_enabled"] = False
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    # A v27-style rubric with NO overlap with the walkthrough canonical keys.
+    for _rubric_key in (
+        "c-28e29fc5",
+        "c-09e29209",
+        "c-13867029",
+        "c-635ee093",
+        "c-280480cf",
+    ):
+        await _add_version_criterion(
+            db_session,
+            project,
+            version,
+            key=_rubric_key,
+            text=f"criterion {_rubric_key}",
+        )
+
+    candidate = "de1e7ed0" * 5  # 40-char placeholder SHA
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch("app.github.get_branch_sha", new=AsyncMock(return_value=candidate))
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"conclusion": "success"}),
+    )
+
+    result = await rq.run_qualification(
+        db_session,
+        project.id,
+        version,
+        requested_probes=["walkthrough_e2e"],
+        explicit_request=True,
+    )
+    await db_session.commit()
+
+    assert result["status"] == "invalid_requested_probes"
+    # Both key sets are named in the readable refusal.
+    assert "c-dfdc9d82" in result["detail"]  # walkthrough canonical evidence key
+    assert "c-28e29fc5" in result["detail"]  # open version's active rubric key
+    # No qualification was started for the refused probe: the refusal happens
+    # before any child spawn or pending-record write.
+    await db_session.refresh(version)
+    assert (version.last_qualification or {}).get("status") is None
+
+
+async def test_finalize_failed_walkthrough_probe_blocks_promotion_and_preserves_verdict(
+    db_session, mocker
+):
+    """A requested walkthrough_e2e probe that FAILED blocks promotion while
+    preserving the already-computed audit verdict.
+
+    Regression for the probe-leg blast radius: the probe evaluation used to run
+    BEFORE the release_audit report was read, so any probe exit discarded the
+    whole verdict (three consecutive attempts reported audit='unavailable').  The
+    probe leg now runs AFTER dimension composition and a probe that did not pass
+    fails ONLY its own dimension — the audit sub-score survives alongside the
+    walkthrough_e2e=0.0 blocker."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    # Compatible rubric so the report keys resolve to ACTIVE criteria (the probe
+    # evaluation then reaches the genuine criterion-failure path).
+    await _seed_walkthrough_compatible_rubric(db_session, project, version)
+
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    candidate_sha = version.last_qualification["candidate_sha"]
+    walk_task = Task(
+        project_id=project.id,
+        title="walkthrough",
+        payloads=[{"type": "walkthrough_e2e", "base_branch": "automain"}],
+        vm_instance_id="vm-walkthrough",
+        status=TaskStatus.COMPLETED,
+        context={"candidate_sha": candidate_sha},
+    )
+    db_session.add(walk_task)
+    await db_session.flush()
+    db_session.add(
+        Artifact(
+            task_id=walk_task.id,
+            artifact_type=ArtifactType.WALKTHROUGH_E2E_REPORT,
+            logs=json.dumps(
+                {
+                    "git_sha": candidate_sha,
+                    "exercised_engine_sha": candidate_sha,
+                    "results": [
+                        {"criterion_key": "c-dfdc9d82", "passed": True},
+                        {"criterion_key": "c-f52fd975", "passed": False},
+                        {
+                            "criterion_key": "c-workday-session-lifecycle",
+                            "passed": True,
+                        },
+                        {"criterion_key": "c-5214996f", "passed": False},
+                    ],
+                }
+            ),
+        )
+    )
+    await db_session.commit()
+    await db_session.refresh(walk_task)
+
+    # Stamp the probe request + task id and re-compute the frozen contract so
+    # finalize does not treat the mutation as mid-flight rubric drift.
+    qual = {
+        **(version.last_qualification or {}),
+        "requested_probes": ["walkthrough_e2e"],
+        "walkthrough_e2e_task_id": str(walk_task.id),
+    }
+    version.last_qualification = _with_current_qualification_contract(
+        project, version, qual
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] == "not_promoted"
+    assert result["blocker"] == "walkthrough_e2e_failed"
+
+    await db_session.refresh(version)
+    lq = version.last_qualification
+    # The audit verdict is preserved alongside the walkthrough failure — the
+    # core regression: a probe failure no longer discards the computed audit.
+    assert lq["sub_scores"]["audit"] == pytest.approx(1.0)
+    assert lq["sub_scores"]["walkthrough_e2e"] == 0.0
+    assert lq["walkthrough_e2e_result"]["status"] == "failed"
+    assert lq["walkthrough_e2e_result"]["failed_criterion_keys"] == [
+        "c-f52fd975",
+        "c-5214996f",
+    ]
+
+
+async def test_finalize_unknown_criteria_probe_contained_and_preserves_verdict(
+    db_session, mocker
+):
+    """An infra-type probe failure (report keys not active in the version rubric)
+    is CONTAINED to the walkthrough_e2e dimension: it blocks promotion AND the
+    audit verdict survives.
+
+    This is the blast-radius regression: the probe evaluation used to run BEFORE
+    the release_audit report was read, and every probe exit routed to
+    _handle_infra_failure — discarding the already-computed audit/challenge/
+    merge-grade verdicts (three consecutive attempts reported audit='unavailable').
+    The probe leg now runs after dimension composition; even the unknown-criteria
+    case fails only its own dimension instead of blacking out the whole verdict."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    # A v27-style rubric — the walkthrough report's retired-v26 keys resolve to
+    # NO active criterion (unknown_criteria at finalize; refused at request time
+    # by the Change-B gate, but a legacy/redriven qual still reaches finalize).
+    for _rubric_key in (
+        "c-28e29fc5",
+        "c-09e29209",
+        "c-13867029",
+        "c-635ee093",
+        "c-280480cf",
+    ):
+        await _add_version_criterion(
+            db_session,
+            project,
+            version,
+            key=_rubric_key,
+            text=f"criterion {_rubric_key}",
+        )
+
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    candidate_sha = version.last_qualification["candidate_sha"]
+    walk_task = Task(
+        project_id=project.id,
+        title="walkthrough",
+        payloads=[{"type": "walkthrough_e2e", "base_branch": "automain"}],
+        vm_instance_id="vm-walkthrough",
+        status=TaskStatus.COMPLETED,
+        context={"candidate_sha": candidate_sha},
+    )
+    db_session.add(walk_task)
+    await db_session.flush()
+    db_session.add(
+        Artifact(
+            task_id=walk_task.id,
+            artifact_type=ArtifactType.WALKTHROUGH_E2E_REPORT,
+            logs=json.dumps(
+                {
+                    "git_sha": candidate_sha,
+                    "exercised_engine_sha": candidate_sha,
+                    "results": [
+                        {"criterion_key": "c-dfdc9d82", "passed": True},
+                        {"criterion_key": "c-f52fd975", "passed": True},
+                        {
+                            "criterion_key": "c-workday-session-lifecycle",
+                            "passed": True,
+                        },
+                        {"criterion_key": "c-5214996f", "passed": True},
+                    ],
+                }
+            ),
+        )
+    )
+    await db_session.commit()
+    await db_session.refresh(walk_task)
+
+    qual = {
+        **(version.last_qualification or {}),
+        "requested_probes": ["walkthrough_e2e"],
+        "walkthrough_e2e_task_id": str(walk_task.id),
+    }
+    version.last_qualification = _with_current_qualification_contract(
+        project, version, qual
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] == "not_promoted"
+    assert result["blocker"] == "walkthrough_e2e_failed"
+
+    await db_session.refresh(version)
+    lq = version.last_qualification
+    # The audit verdict survives the probe-leg containment — the core regression.
+    assert lq["sub_scores"]["audit"] == pytest.approx(1.0)
+    assert lq["sub_scores"]["walkthrough_e2e"] == 0.0
+    assert lq["walkthrough_e2e_result"]["status"] == "failed"
+    assert (
+        lq["walkthrough_e2e_result"]["reason"]
+        == "walkthrough_e2e_report_unknown_criteria"
+    )
 
 
 def test_walkthrough_probe_contract_is_strict_and_cache_safe():
@@ -1008,6 +1318,10 @@ async def test_walkthrough_site_failure_leaves_no_queued_release_audit_child(
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
 
+    # Compatible rubric so the probe request passes the request-time gate and
+    # reaches the spawn (which then fails closed on the missing runner site).
+    await _seed_walkthrough_compatible_rubric(db_session, project, version)
+
     # No live runner proves the candidate-stack site (docker info + Compose +
     # Chromium), so the walkthrough spawn fails closed before the release_audit
     # child is allocated.
@@ -1074,6 +1388,11 @@ async def test_audit_child_not_orphaned_when_probe_spawn_fails(db_session, mocke
     shared_state.runtime_config["promotion_enabled"] = True
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    # Compatible rubric so the probe request passes the request-time gate and
+    # reaches the spawn (the audit spawn below then fails and must not orphan
+    # the already-allocated walkthrough child).
+    await _seed_walkthrough_compatible_rubric(db_session, project, version)
 
     # A live runner proving the candidate-stack site so the walkthrough (probe)
     # child spawn SUCCEEDS and its row is allocated before the audit spawn fails.
