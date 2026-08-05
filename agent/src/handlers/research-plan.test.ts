@@ -1727,6 +1727,18 @@ describe('buildVersionPhaseSection', () => {
     expect(out).toContain('A real outcome.');
   });
 
+  it('ties coverage-blocked verdicts to the walkthrough_e2e probe exception', () => {
+    // Three identical criterion_coverage_incomplete verdicts on v27 showed the
+    // Thinker re-qualifying probe-less forever: nothing connected the blocker
+    // to the only live evidence lane that can clear it.
+    const out = buildVersionPhaseSection({
+      version_number: 27,
+      phase: 'stabilize',
+    });
+    expect(out).toContain('criterion_coverage_incomplete');
+    expect(out).toContain('"probes": ["walkthrough_e2e"]');
+  });
+
   it('returns empty string when versionPhase is undefined', () => {
     expect(buildVersionPhaseSection(undefined)).toBe('');
   });
