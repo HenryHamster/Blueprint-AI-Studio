@@ -3466,6 +3466,20 @@ async def run_qualification(
     # compose children spawned under one contract with a verdict computed under
     # another.  Legacy records that predate the freeze fall back to live values.
     try:
+        # Spawn the walkthrough_e2e child FIRST: its execution-site check fails
+        # closed (QualifierWalkthroughSiteUnavailableError) before any child row
+        # is created, so a site failure cannot orphan the QUEUED release_audit
+        # child that follows. The walkthrough spawn does not depend on the audit
+        # child's existence, so fail-before-allocating is safe here.
+        if _walkthrough_e2e_needed:
+            walkthrough_e2e_task = await _spawn_qualifier_walkthrough_task(
+                session,
+                project_id,
+                version_id=version.id,
+                candidate_sha=candidate_sha,
+                qualification_attempt_id=attempt_id,
+            )
+            walkthrough_e2e_task_id = str(walkthrough_e2e_task.id)
         if _audit_needed:
             audit_task = await _spawn_release_audit_task(
                 session,
@@ -3485,15 +3499,6 @@ async def run_qualification(
                 rubric_fingerprint=rubric_fingerprint,
             )
             audit_task_id = str(audit_task.id)
-        if _walkthrough_e2e_needed:
-            walkthrough_e2e_task = await _spawn_qualifier_walkthrough_task(
-                session,
-                project_id,
-                version_id=version.id,
-                candidate_sha=candidate_sha,
-                qualification_attempt_id=attempt_id,
-            )
-            walkthrough_e2e_task_id = str(walkthrough_e2e_task.id)
     except Exception as exc:  # noqa: BLE001 — spawn failure must not raise out
         logger.warning(
             "[RELEASE_QUALIFIER] failed to spawn qualification children for "

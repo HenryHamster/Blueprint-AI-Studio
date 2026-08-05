@@ -952,3 +952,71 @@ async def test_walkthrough_spawn_records_live_runner_site_not_registry_declarati
     # the registry's DIRECT_PACKER_GCE sentinel.
     assert pinned.context["execution_site"] == _WALKTHROUGH_E2E_EXECUTION_SITE
     assert _WALKTHROUGH_E2E_EXECUTION_SITE == "local_runner"
+
+
+@pytest.mark.asyncio
+async def test_walkthrough_site_failure_leaves_no_queued_release_audit_child(
+    db_session, mocker
+):
+    """A fail-closed walkthrough execution-site check must not orphan a QUEUED
+    release_audit child.
+
+    run_qualification spawns the walkthrough_e2e child BEFORE the release_audit
+    child. When no live runner proves the candidate-stack site, the walkthrough
+    spawn raises QualifierWalkthroughSiteUnavailableError before any child row
+    is allocated, so the spawn_failed record is written with zero surviving
+    release_audit children."""
+    from app import shared_state
+    from sqlmodel import select as _sqlmodel_select
+
+    shared_state.runtime_config["smoketest_enabled"] = False
+    shared_state.runtime_config["env_preflight_enabled"] = False
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    # No live runner proves the candidate-stack site (docker info + Compose +
+    # Chromium), so the walkthrough spawn fails closed before the release_audit
+    # child is allocated.
+    candidate = "deadbeef" * 5  # 40-char placeholder SHA
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch("app.github.get_branch_sha", new=AsyncMock(return_value=candidate))
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"conclusion": "success"}),
+    )
+
+    result = await rq.run_qualification(
+        db_session,
+        project.id,
+        version,
+        requested_probes=["walkthrough_e2e"],
+        explicit_request=True,
+    )
+    await db_session.commit()
+
+    # Fail-closed: the site failure still blocks the qualification.
+    assert result["status"] == "spawn_failed"
+    await db_session.refresh(version)
+    assert version.last_qualification["error"] == "spawn_failed"
+    assert version.last_qualification.get("audit_task_id") is None
+    assert version.last_qualification.get("walkthrough_e2e_task_id") is None
+
+    # No QUEUED release_audit child may survive the failed dispatch.
+    project_tasks = (
+        (
+            await db_session.execute(
+                _sqlmodel_select(Task).where(Task.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [
+        task
+        for task in project_tasks
+        if (task.first_payload or {}).get("type") == "release_audit"
+    ] == []
