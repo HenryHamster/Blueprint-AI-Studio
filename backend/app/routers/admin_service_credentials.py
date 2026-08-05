@@ -183,6 +183,36 @@ async def mint_service_credential(
             )
 
     principal_user_id = payload.principal_user_id or f"service:{payload.name}"
+
+    # A caller-supplied principal_user_id must never reference an existing
+    # project owner: the credential authenticates AS that principal, so it
+    # would inherit the owner's ProjectMember rows (owner role) and bypass the
+    # no-owner membership rule enforced above. The default service:{name}
+    # principal is a fresh non-human identity that cannot collide with an owner.
+    if payload.principal_user_id is not None:
+        owner_membership = (
+            await session.execute(
+                select(ProjectMember.id)
+                .where(
+                    ProjectMember.user_id == principal_user_id,
+                    ProjectMember.role == "owner",
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        owner_project = (
+            await session.execute(
+                select(Project.id)
+                .where(Project.user_id == principal_user_id)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if owner_membership is not None or owner_project is not None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="principal_user_id must not reference an existing project owner",
+            )
+
     token = mint_service_token()
     cred = ServiceCredential(
         name=payload.name,

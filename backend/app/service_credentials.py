@@ -57,24 +57,30 @@ def hash_service_token(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
+# A UUID-shaped path segment shared by the project-scoped allowlist regexes.
+_UUID_PATH_SEGMENT = r"[0-9a-fA-F-]{36}"
+
 # Scope registry: each scope name maps to a list of (HTTP method, compiled
 # path-regex) pairs allowlisting exactly which endpoints a credential holding
-# that scope may call. Only membership-scoped endpoints (those that resolve
-# access via ``_get_user_project``/``_get_user_project_with_role``, i.e. scope
-# to the caller's ProjectMember rows) belong here — a service credential's
-# reach is bounded by the ProjectMember rows minted for its principal, so the
-# endpoint itself must also honor that boundary. Admin-only/global endpoints
-# must never appear in a scope.
+# that scope may call. Only membership-scoped endpoints belong here — a service
+# credential's reach is bounded by the ProjectMember rows minted for its
+# principal, so the endpoint itself must also honor that boundary. Membership
+# scoping takes two forms: the per-project endpoints resolve access via
+# ``_get_user_project``/``_get_user_project_with_role`` (404 for projects the
+# caller holds no membership on), while GET /api/admin/projects lists the
+# caller's own projects via a ProjectMember join filtered on
+# current_user["user_id"]. Admin-only/global endpoints must never appear in a
+# scope.
 SCOPE_DEFINITIONS: dict[str, list[tuple[str, re.Pattern]]] = {
     # Read-only observation of authorized projects (Hermes observer).
     "observer:read": [
         # GET /api/admin/projects (admin_projects.py) — lists the CALLER's own
         # projects via a ProjectMember join filtered on current_user["user_id"];
         # membership-scoped, not admin-only. Verified against the live route.
-        ("GET", re.compile(r"^/api/admin/projects/?$")),
-        ("GET", re.compile(r"^/api/admin/operator-attention/?$")),
-        ("GET", re.compile(r"^/api/admin/projects/[0-9a-fA-F-]{36}/diagnostics/?$")),
-        ("GET", re.compile(r"^/api/admin/projects/[0-9a-fA-F-]{36}/resource-summary/?$")),
+        ("GET", re.compile(r"^/api/admin/projects$")),
+        ("GET", re.compile(r"^/api/admin/operator-attention$")),
+        ("GET", re.compile(rf"^/api/admin/projects/{_UUID_PATH_SEGMENT}/diagnostics$")),
+        ("GET", re.compile(rf"^/api/admin/projects/{_UUID_PATH_SEGMENT}/resource-summary$")),
     ],
 }
 
@@ -82,17 +88,22 @@ SCOPE_DEFINITIONS: dict[str, list[tuple[str, re.Pattern]]] = {
 def request_allowed(scopes: list[str], method: str, path: str) -> bool:
     """Return whether *method*/*path* is permitted by the union of *scopes*.
 
-    Unknown scope names (e.g. a credential minted under a scope later retired
-    from the registry) are ignored rather than treated as an error — they
-    simply grant nothing, so the credential fails closed instead of 500ing.
+    A single trailing slash is normalized away before matching so that
+    ``/api/admin/projects`` and ``/api/admin/projects/`` are treated as the
+    same endpoint — the allowlist is deliberately slash-insensitive regardless
+    of whether the router redirect-serves the trailing-slash form. Unknown
+    scope names (e.g. a credential minted under a scope later retired from the
+    registry) are ignored rather than treated as an error — they simply grant
+    nothing, so the credential fails closed instead of 500ing.
     """
+    normalized = path[:-1] if path.endswith("/") else path
     for scope in scopes:
         rules = SCOPE_DEFINITIONS.get(scope)
         if rules is None:
             logger.warning("Unknown service-credential scope %r ignored", scope)
             continue
         for allowed_method, pattern in rules:
-            if method == allowed_method and pattern.match(path):
+            if method == allowed_method and pattern.match(normalized):
                 return True
     return False
 

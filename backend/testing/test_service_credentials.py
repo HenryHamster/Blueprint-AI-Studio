@@ -35,6 +35,7 @@ from app.service_credentials import (
     authenticate_service_token,
     hash_service_token,
     mint_service_token,
+    request_allowed,
 )
 from testing.factories import make_membership
 
@@ -195,6 +196,55 @@ async def test_authorized_scoped_endpoints_return_200_for_real_token(
     assert attention.status_code == 200, attention.text
     assert resource_summary.status_code == 200, resource_summary.text
     assert diagnostics.status_code == 200, diagnostics.text
+
+
+@pytest.mark.asyncio
+async def test_service_credential_observer_read_authorized_endpoints(
+    override_get_session, db_session, monkeypatch
+):
+    """GET /api/admin/projects — the fourth observer:read allowlisted path — is
+    exercised with a real service token. Unlike the three per-project endpoints
+    (which 404 via _get_user_project), the list endpoint scopes via a
+    ProjectMember join: the credential's own project appears, a foreign project
+    it holds no membership on is silently excluded, and a viewer-role
+    credential gets build_config env_vars redacted. The trailing-slash form of
+    the list path is asserted at the allowlist seam (request_allowed) so the
+    slash normalization in request_allowed is exercised here too."""
+    monkeypatch.delenv("ADMIN_API_KEY", raising=False)
+    from sqlalchemy.orm.attributes import flag_modified
+
+    authorized = await _make_project(db_session, "Observer list authorized project")
+    authorized.build_config = {
+        "env_vars": {"PRIVATE_TOKEN": "s3cr3t"},
+        "node_version": "20",
+    }
+    flag_modified(authorized, "build_config")
+    db_session.add(authorized)
+    foreign = await _make_project(db_session, "Observer list foreign project")
+    cred, token = await _seed_credential(db_session, name="observer-list-read")
+    db_session.add(
+        make_membership(authorized.id, user_id=cred.principal_user_id, role="viewer")
+    )
+    await db_session.commit()
+
+    # Slash-insensitive allowlist: the bare and trailing-slash list paths are
+    # both authorized once request_allowed strips the single trailing slash.
+    assert request_allowed(["observer:read"], "GET", "/api/admin/projects")
+    assert request_allowed(["observer:read"], "GET", "/api/admin/projects/")
+
+    async with _real_auth_client() as rc:
+        resp = await rc.get("/api/admin/projects", headers=_auth_header(token))
+
+    assert resp.status_code == 200, resp.text
+    items = resp.json()["items"]
+    item_ids = {item["id"] for item in items}
+    assert str(authorized.id) in item_ids
+    assert str(foreign.id) not in item_ids
+
+    authorized_item = next(item for item in items if item["id"] == str(authorized.id))
+    assert authorized_item["my_role"] == "viewer"
+    assert "env_vars" not in authorized_item["build_config"]
+    assert authorized_item["build_config"].get("node_version") == "20"
 
 
 # ---------------------------------------------------------------------------
@@ -521,6 +571,81 @@ async def test_mint_rejects_owner_role_in_project_memberships(
         },
     )
     assert resp.status_code == 422, resp.text
+
+
+@pytest.mark.asyncio
+async def test_mint_rejects_principal_user_id_matching_project_owner(
+    client: AsyncClient, db_session
+):
+    """A caller-supplied principal_user_id that IS an existing project owner
+    (Project.user_id) is rejected: the credential would authenticate as that
+    owner and inherit owner-level membership, bypassing the no-owner rule."""
+    owner_uid = "firebase-uid-project-owner"
+    await _make_project(db_session, "Owner-principal project", owner=owner_uid)
+
+    resp = await client.post(
+        MGMT_URL,
+        json={
+            "name": "owner-principal-bot",
+            "scopes": ["observer:read"],
+            "principal_user_id": owner_uid,
+        },
+    )
+
+    assert resp.status_code == 422, resp.text
+    remaining = (
+        await db_session.execute(
+            select(ServiceCredential).where(
+                ServiceCredential.name == "owner-principal-bot"
+            )
+        )
+    ).scalar_one_or_none()
+    assert remaining is None
+
+
+@pytest.mark.asyncio
+async def test_mint_rejects_principal_user_id_with_owner_membership(
+    client: AsyncClient, db_session
+):
+    """A caller-supplied principal_user_id already holding an owner-role
+    ProjectMember row is rejected for the same impersonation reason."""
+    owner_uid = "firebase-uid-owner-member"
+    project = await _make_project(db_session, "Owner-member project")
+    db_session.add(make_membership(project.id, user_id=owner_uid, role="owner"))
+    await db_session.commit()
+
+    resp = await client.post(
+        MGMT_URL,
+        json={
+            "name": "owner-member-bot",
+            "scopes": ["observer:read"],
+            "principal_user_id": owner_uid,
+        },
+    )
+
+    assert resp.status_code == 422, resp.text
+
+
+@pytest.mark.asyncio
+async def test_mint_accepts_custom_non_owner_principal_user_id(
+    client: AsyncClient, db_session
+):
+    """A custom non-owner principal_user_id is honored and minted normally."""
+    project = await _make_project(db_session, "Custom-principal project")
+    resp = await client.post(
+        MGMT_URL,
+        json={
+            "name": "custom-principal-bot",
+            "scopes": ["observer:read"],
+            "principal_user_id": "custom-machine-principal-1",
+            "project_memberships": [
+                {"project_id": str(project.id), "role": "viewer"}
+            ],
+        },
+    )
+
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["principal_user_id"] == "custom-machine-principal-1"
 
 
 @pytest.mark.asyncio

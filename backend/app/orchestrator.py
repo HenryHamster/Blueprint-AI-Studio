@@ -1231,6 +1231,7 @@ async def orchestrator_worker():
     from app.warm_pool import (
         abandon_pool_dispatch,
         is_warm_pool_enabled,
+        release_pool_vm,
         try_pool_dispatch,
     )
 
@@ -3565,6 +3566,18 @@ async def orchestrator_worker():
                             task.context = _warm_ctx
                             task.vm_instance_id = None
                             flag_modified(task, "context")
+                            if _is_pool_pin:
+                                # The pinned member did not fail — this task type
+                                # simply cannot run on a pool VM (it needs a direct
+                                # Packer site). Return the healthy LEASED member to
+                                # IDLE so another task can re-lease it, instead of
+                                # leaving it LEASED until the orphan-lease sweep
+                                # retires it (warm-cost billing + lost pool capacity).
+                                await release_pool_vm(
+                                    session,
+                                    _warm_target_vm_id,
+                                    owning_task_id=task.id,
+                                )
                             _warm_target_vm_id = None
                         if _warm_target_vm_id and not _direct_packer_gce_dispatch:
                             _warm_deadline_iso = _warm_ctx.get("warm_handoff_deadline")
@@ -3646,8 +3659,6 @@ async def orchestrator_worker():
                                 )
                             }
                             task.context = _new_ctx
-                            from sqlalchemy.orm.attributes import flag_modified
-
                             flag_modified(task, "context")
                             if _cb_suppressed:
                                 _clear_reason = "circuit_breaker"
@@ -4381,8 +4392,6 @@ async def orchestrator_worker():
                             model=runtime_model,
                             execution_mode=runtime_execution_mode,
                         ):
-                            from sqlalchemy.orm.attributes import flag_modified
-
                             flag_modified(task, "payloads")
                             session.add(task)
 
@@ -4445,8 +4454,6 @@ async def orchestrator_worker():
                         from app.research_completion import recompute_launch_staleness
 
                         if await recompute_launch_staleness(session, task):
-                            from sqlalchemy.orm.attributes import flag_modified
-
                             flag_modified(task, "context")
                         # A dispatch that reaches the PROVISIONING commit resets
                         # the contained-crash counter (persisted by that commit;
