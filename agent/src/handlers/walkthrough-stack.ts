@@ -148,12 +148,21 @@ export class CandidateStackController {
     // handles real GitHub/webhook traffic. `${VAR?}` in docker-compose.yml
     // errors only when a var is UNSET (empty is accepted), but we pass real
     // placeholder values so any at-import parsing in the app does not choke.
+    //
+    // GITHUB_PAT_ENCRYPTION_KEY is the one exception to "placeholder": migration
+    // 0609's _load_fernet() raises RuntimeError on an absent OR invalid key
+    // (unlike the `${VAR?}`-tolerant placeholders), and the app itself fails
+    // closed without one. So this is a genuine per-boot Fernet key — 32 random
+    // bytes, urlsafe-base64 with the `=` pad (43 chars + '=' = 44) — minted
+    // fresh so a stack re-boot never reuses a prior stack's key. This mirrors
+    // the runner-side supervisor's per-boot key exactly.
     this.childEnv = {
       ...process.env,
       COMPOSE_PROJECT_NAME: this.composeProject,
       POSTGRES_PASSWORD: `wt-pg-${randomBytes(8).toString('hex')}`,
       AGENT_JWT_SECRET: randomBytes(24).toString('hex'),
       WS_TICKET_SECRET: randomBytes(24).toString('hex'),
+      GITHUB_PAT_ENCRYPTION_KEY: randomBytes(32).toString('base64url') + '=',
       GITHUB_APP_ID: '0',
       GITHUB_PRIVATE_KEY: '',
       GITHUB_WEBHOOK_SECRET: 'walkthrough-local',
@@ -167,6 +176,15 @@ export class CandidateStackController {
       DEPLOY_SHA: this.opts.candidateSha,
       WALKTHROUGH_APP_PORT: String(this.opts.backendPort),
       WALKTHROUGH_DB_PORT: String(this.opts.dbPort),
+      // Playwright's browser download must never run during the boot's `npm ci`.
+      // Inside the bwrap sandbox ~/.cache/ms-playwright is a READ-ONLY bind of
+      // the runner's browser cache (runner_isolation.build_bwrap_argv), so any
+      // version drift between the candidate's playwright and the cached chromium
+      // would make the postinstall try to WRITE the read-only bind, failing npm
+      // ci and the whole stack boot. Skip the download; the harness still
+      // launches the bound cache's chromium at runtime (reading the cache is
+      // fine — that is exactly what the read-only mount is for).
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1',
     };
   }
 
@@ -229,13 +247,9 @@ export class CandidateStackController {
     const deadline = Date.now() + this.opts.bootTimeoutMs;
     const log = this.opts.log;
 
-    if (this.opts.bootFrontend) {
-      // The candidate is a depth-1 clone with no node_modules; the frontend
-      // dev server cannot start without the root + admin-ui workspace deps
-      // installed, so install them up front as part of stack boot.
-      this.installDependencies(deadline);
-    }
-
+    // The boot PATH is decided first; workspace-level npm ci is deferred to the
+    // optional frontend leg below (the runner-supervisor path carries the
+    // backend in containers and treats the frontend as optional).
     if (this.runnerSupervisorAvailable()) {
       // Local runner: the sandbox has no docker socket; the runner-side
       // supervisor boots the fixed-shape stack and hands back loopback ports.
@@ -293,6 +307,9 @@ export class CandidateStackController {
 
     // 7. Serve the candidate frontend (vite dev server proxied at the local backend).
     if (this.opts.bootFrontend) {
+      // npm ci deferred to this leg (backend already up); the runner-supervisor
+      // path never pays workspace-level npm ci unless a frontend is requested.
+      this.installDependencies(deadline);
       await this.bootFrontend(deadline);
     }
 

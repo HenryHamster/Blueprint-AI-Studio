@@ -62,17 +62,63 @@ describe('CandidateStackController', () => {
     await expect(c.boot()).rejects.toThrow(/postgres did not become ready/);
   });
 
-  it('boot() installs clone dependencies (npm ci) at the workspace root', async () => {
-    const ws = mkdtempSync(path.join(os.tmpdir(), 'wt-stack-npmci-'));
-    const logs: string[] = [];
+  it('legacy compose path passes a valid per-boot Fernet key as GITHUB_PAT_ENCRYPTION_KEY', async () => {
+    // Boot through the legacy in-sandbox path and capture the env the docker
+    // compose invocation received (compose interpolates ${VAR} from this env).
+    // `start` scopes the search to calls made after a boot boundary, because
+    // mock calls accumulate across boots within a single test.
+    const composeEnvForKey = (start: number): string => {
+      const dockerCall = vi.mocked(execFileSync).mock.calls.slice(start).find((call) => call[0] === 'docker');
+      if (!dockerCall) throw new Error('expected a docker compose call on the legacy path');
+      const key = (dockerCall[2] as { env: NodeJS.ProcessEnv }).env.GITHUB_PAT_ENCRYPTION_KEY;
+      if (!key) throw new Error('legacy compose env must include GITHUB_PAT_ENCRYPTION_KEY');
+      return key;
+    };
+
     const c = new CandidateStackController({
-      workspace: ws,
+      workspace: '/tmp/workspace',
       candidateSha: SHA,
       adminToken: 'tok',
-      bootTimeoutMs: 0, // deadline already passed → the DB-readiness loop cannot succeed
-      log: (m) => logs.push(m),
+      bootTimeoutMs: 0, // deadline already passed → DB readiness loop cannot succeed
     });
-    await expect(c.boot()).rejects.toThrow();
+    await expect(c.boot()).rejects.toThrow(/postgres did not become ready/);
+    // Migration 0609's _load_fernet() rejects an absent OR invalid key, so the
+    // legacy path must pass a Fernet-valid key: 43 unpadded urlsafe base64
+    // chars + one '=' pad, decoding to 32 bytes.
+    const key1 = composeEnvForKey(0);
+    expect(key1).toMatch(/^[A-Za-z0-9_-]{43}=$/);
+    expect(Buffer.from(key1, 'base64url')).toHaveLength(32);
+
+    // Per-boot randomness: a second controller mints a different key so a stack
+    // re-boot never reuses the previous stack's encryption key.
+    const before = vi.mocked(execFileSync).mock.calls.length;
+    const c2 = new CandidateStackController({
+      workspace: '/tmp/workspace',
+      candidateSha: SHA,
+      adminToken: 'tok',
+      bootTimeoutMs: 0,
+    });
+    await expect(c2.boot()).rejects.toThrow(/postgres did not become ready/);
+    expect(composeEnvForKey(before)).not.toBe(key1);
+  });
+
+  it('boot() runs npm ci at the workspace root, deferred to the frontend leg (after the backend is up)', async () => {
+    const ws = mkdtempSync(path.join(os.tmpdir(), 'wt-stack-npmci-'));
+    const logs: string[] = [];
+    // Mock the probes so the legacy boot reaches the step-7 frontend leg.
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ status: 200, json: () => ({ sha: SHA }) }));
+    try {
+      const c = new CandidateStackController({
+        workspace: ws,
+        candidateSha: SHA,
+        adminToken: 'tok',
+        bootTimeoutMs: 20_000,
+        log: (m) => logs.push(m),
+      });
+      await expect(c.boot()).resolves.toMatchObject({ exercisedEngineSha: SHA });
+    } finally {
+      vi.unstubAllGlobals();
+    }
     // The depth-1 clone ships no node_modules; boot must run npm ci at the
     // workspace ROOT (both the root playwright dep and admin-ui workspace deps).
     const npmCiCalls = vi
@@ -80,7 +126,17 @@ describe('CandidateStackController', () => {
       .mock.calls.filter((call) => call[0] === 'npm' && call[1]?.[0] === 'ci');
     expect(npmCiCalls.length).toBeGreaterThan(0);
     expect(npmCiCalls[0][2]).toMatchObject({ cwd: ws });
+    // Playwright's postinstall must not attempt a browser download into the
+    // read-only bind-mounted cache: npm ci only works when the env carries the
+    // skip flag, regardless of which chromium build the runner's cache holds.
+    expect(npmCiCalls[0][2]?.env).toMatchObject({ PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1' });
     expect(logs.some((m) => m.includes('npm ci'))).toBe(true);
+    // npm ci is DEFERRED past the boot-path decision + backend boot.
+    const calls = vi.mocked(execFileSync).mock.calls;
+    const upIdx = calls.findIndex((call) => call[0] === 'docker' && JSON.stringify(call[1] ?? []).includes('up'));
+    const ciIdx = calls.findIndex((call) => call[0] === 'npm' && call[1]?.[0] === 'ci');
+    expect(upIdx).toBeGreaterThanOrEqual(0);
+    expect(ciIdx).toBeGreaterThan(upIdx);
   });
 
   it('teardown() is idempotent and never throws even when compose down errors', async () => {
@@ -184,6 +240,13 @@ describe('runner-side supervisor protocol', () => {
     });
     await expect(c.boot()).rejects.toThrow(/docker daemon unreachable/);
     expect(vi.mocked(execFileSync).mock.calls.filter((call) => call[0] === 'docker')).toHaveLength(0);
+    // npm ci is deferred past the boot-path decision — the supervisor-leg
+    // failure surfaces without paying workspace-level npm ci (npm/node,
+    // network, playwright postinstall). bootFrontend defaults true here.
+    const npmCiCalls = vi
+      .mocked(execFileSync)
+      .mock.calls.filter((call) => call[0] === 'npm' && call[1]?.[0] === 'ci');
+    expect(npmCiCalls).toHaveLength(0);
   });
 
   it('teardown in runner mode signals teardown.json instead of compose down', async () => {

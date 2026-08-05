@@ -42,16 +42,23 @@ agent fails closed, as it does today) and never takes the runner down.
 
 from __future__ import annotations
 
+import argparse
+import atexit
 import base64
 import json
 import os
 import re
 import secrets
+import signal
 import socket
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 import typing
+import urllib.error
+import urllib.request
 
 PROTOCOL_DIR = ".walkthrough-stack"
 PROTOCOL_VERSION = 1
@@ -241,11 +248,19 @@ class WalkthroughStackSupervisor:
         task_id: str,
         run: typing.Callable[..., "subprocess.CompletedProcess[str]"] | None = None,
         log: typing.Callable[[str], None] = print,
+        build_context: str | None = None,
     ) -> None:
         self.workspace = workspace
         self.task_id = task_id
         self._run = run or _run_docker
         self._log = log
+        # The runner bind layout nests the candidate checkout at
+        # <workspace>/agent (see _boot); a standalone CLI may point at a bare
+        # checkout where backend/ sits at the root — that caller passes an
+        # explicit build_context.
+        self.build_context = build_context or os.path.join(
+            self.workspace, "agent", "backend"
+        )
         unique = f"{_sanitize_task_fragment(task_id)}-{secrets.token_hex(3)}"
         self.network = f"{_NAME_PREFIX}-{unique}-net"
         self.db_name = f"{_NAME_PREFIX}-{unique}-db"
@@ -334,10 +349,26 @@ class WalkthroughStackSupervisor:
             f"backend=127.0.0.1:{backend_port} db=127.0.0.1:{db_port}"
         )
 
-    def _boot(self, req: dict[str, str]) -> tuple[int, int]:
-        """Fixed-shape stack boot. Raises on any failure (agent fails closed)."""
+    def _boot(
+        self,
+        req: dict[str, str],
+        *,
+        backend_port: int | None = None,
+        db_port: int | None = None,
+    ) -> tuple[int, int]:
+        """Fixed-shape stack boot. Raises on any failure (agent fails closed).
+
+        ``backend_port``/``db_port`` let a caller pin the published loopback
+        ports (the standalone CLI's ``--backend-port``/``--db-port``); when
+        either is None the port is auto-assigned.
+        """
         self._booted = True  # set BEFORE the first docker call so teardown covers partial boots
-        backend_port, db_port = pick_free_ports(2)
+        if backend_port is None or db_port is None:
+            picked = pick_free_ports(2)
+            if backend_port is None:
+                backend_port = picked[0]
+            if db_port is None:
+                db_port = picked[1]
         database_url = (
             f"postgresql+asyncpg://postgres:{req['pg_password']}@db:5432/postgres"
         )
@@ -372,12 +403,10 @@ class WalkthroughStackSupervisor:
         # The workspace passed by the runner is the per-task bind ROOT (the
         # marker lives there); the candidate checkout lives at
         # <workspace>/agent, so the backend build context is the agent
-        # subdirectory — never the bind root itself.
+        # subdirectory — never the bind root itself. A standalone CLI may
+        # pass an explicit build_context (bare-checkout layout).
         self._run(
-            [
-                "docker", "build", "-t", self.image,
-                os.path.join(self.workspace, "agent", "backend"),
-            ],
+            ["docker", "build", "-t", self.image, self.build_context],
             timeout=_BUILD_TIMEOUT_S,
         )
         self._wait_for_db()
@@ -452,3 +481,346 @@ class WalkthroughStackSupervisor:
                 self._run(argv, timeout=timeout, check=False)
             except Exception as exc:  # noqa: BLE001 — best-effort
                 self._log(f"[walkthrough-stack] teardown step {argv[:3]} failed: {exc}")
+
+
+# ── standalone CLI (pre-flight / debug outside the qualifier) ─────────────────
+#
+# The qualifier path boots a candidate stack only through the full
+# runner+orchestrator pipeline (scripts/local_runner.py). This CLI reuses the
+# SAME fixed-shape boot (`WalkthroughStackSupervisor._boot`) so a candidate SHA
+# can be proven bootable before it gates a promotion — the candidate's own
+# docker-compose.yml is never executed.
+
+_CLI_DEFAULT_TIMEOUT_S = 600
+_WALKTHROUGH_PROJECT_ID = "00000000-0000-4000-8000-000000000001"
+_HARNESS_SCRIPT = "scripts/walkthrough/v26-live-walkthrough.cjs"
+_HARNESS_BIN = "node"
+_SEED_SCRIPT = "scripts/walkthrough/seed_test_data.py"
+_ADMIN_UI_DIR = "admin-ui"
+_FRONTEND_DEFAULT_PORT = 3001
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _detect_build_context(workspace: str) -> str:
+    """Locate the backend docker build context for a given workspace.
+
+    The runner bind layout nests the candidate checkout at ``<workspace>/agent``
+    (backend at ``<workspace>/agent/backend``); a bare checkout puts ``backend/``
+    at the root. ``--build-context`` overrides this entirely. When neither shape
+    exists the nested candidate is returned so the caller reports a clear error.
+    """
+    nested = os.path.join(workspace, "agent", "backend")
+    if os.path.isdir(nested):
+        return nested
+    bare = os.path.join(workspace, "backend")
+    if os.path.isdir(bare):
+        return bare
+    return nested
+
+
+def _cli_build_request(args: argparse.Namespace) -> dict[str, str]:
+    """Assemble a validated stack request from CLI flags, minting secrets."""
+    def _secret(prefix: str) -> str:
+        return f"{prefix}{secrets.token_hex(16)}"
+
+    raw: dict[str, str] = {
+        "candidate_sha": args.candidate_sha,
+        "pg_password": args.pg_password or _secret("wt-pg-"),
+        "agent_jwt_secret": args.agent_jwt_secret or _secret("wt-jwt-"),
+        "ws_ticket_secret": args.ws_ticket_secret or _secret("wt-ws-"),
+        "admin_token": args.admin_token or _secret("wt-admin-"),
+    }
+    if args.anthropic_api_key:
+        raw["anthropic_api_key"] = args.anthropic_api_key
+    clean, err = validate_request(raw)
+    if clean is None:
+        raise ValueError(err)
+    return clean
+
+
+def _http_get_json(
+    url: str, *, timeout: float, headers: dict[str, str] | None = None
+) -> tuple[int, dict]:
+    request = urllib.request.Request(url, headers=headers or {})
+    with urllib.request.urlopen(request, timeout=timeout) as resp:
+        return resp.status, json.loads(resp.read().decode("utf-8"))
+
+
+def _wait_until_healthy(backend_port: int, admin_token: str, *, deadline: float) -> None:
+    """HTTP-poll ``/health`` until 200 or the boot deadline elapses."""
+    last = "no attempt"
+    while time.monotonic() < deadline:
+        try:
+            status, _ = _http_get_json(
+                f"http://127.0.0.1:{backend_port}/health",
+                timeout=5,
+                headers={"Authorization": f"Bearer {admin_token}"},
+            )
+            if status == 200:
+                return
+        except (OSError, ValueError, urllib.error.HTTPError) as exc:
+            last = str(exc)[:200]
+        time.sleep(_POLL_INTERVAL_S)
+    raise RuntimeError(f"candidate backend never became healthy (last: {last})")
+
+
+def _fetch_engine_sha(backend_port: int, *, timeout: float) -> str:
+    """Read the engine SHA from ``/api/version`` (the evidence-integrity seam)."""
+    _, body = _http_get_json(
+        f"http://127.0.0.1:{backend_port}/api/version", timeout=timeout
+    )
+    return str(body.get("sha") or body.get("revision") or "unknown")
+
+
+def _cli_check(args: argparse.Namespace) -> int:
+    """Pre-flight: docker reachable + a candidate checkout with a backend."""
+    workspace = args.workspace or os.getcwd()
+    build_context = args.build_context or _detect_build_context(workspace)
+    problems: list[str] = []
+    try:
+        result = subprocess.run(
+            ["docker", "info"],
+            capture_output=True,
+            encoding="utf-8",
+            timeout=_DOCKER_SMALL_TIMEOUT_S,
+        )
+        if result.returncode != 0:
+            problems.append(f"docker daemon unreachable (exit {result.returncode})")
+    except Exception as exc:  # noqa: BLE001 — pre-flight surface, never raises
+        problems.append(f"docker daemon unreachable: {exc}")
+    if not os.path.isdir(build_context):
+        problems.append(f"no backend/ build context at {build_context}")
+    try:
+        result = subprocess.run(
+            ["git", "-C", workspace, "rev-parse", "--is-inside-work-tree"],
+            capture_output=True,
+            encoding="utf-8",
+            timeout=_DOCKER_SMALL_TIMEOUT_S,
+        )
+        if result.returncode != 0 or result.stdout.strip() != "true":
+            problems.append(f"{workspace} is not a git checkout")
+    except Exception as exc:  # noqa: BLE001
+        problems.append(f"git checkout check failed: {exc}")
+    for problem in problems:
+        print(f"[walkthrough-stack-cli] prerequisite check failed: {problem}")
+    return 0 if not problems else 1
+
+
+def _serve_frontend(frontend_port: int) -> subprocess.Popen:
+    """Spawn the admin-ui dev server; vite is pinned via --strictPort so the
+    harness URL can never silently point at a different port."""
+    return subprocess.Popen(
+        ["npm", "run", "dev", "--", "--port", str(frontend_port), "--strictPort"],
+        cwd=os.path.join(_REPO_ROOT, _ADMIN_UI_DIR),
+        env=dict(os.environ),
+    )
+
+
+def _run_harness(
+    req: dict[str, str],
+    *,
+    backend_port: int,
+    db_port: int,
+    frontend_port: int,
+    workspace: str,
+    frontend_holder: list,
+) -> None:
+    """Seed fixture data, serve the admin-ui, run the node walkthrough harness.
+
+    The seed and harness scripts ship in this repo and run against the stack's
+    published loopback ports. ``frontend_holder`` receives the dev-server Popen
+    so teardown can kill it on any exit path. Prints the harness result JSON.
+    """
+    seed_env = dict(os.environ)
+    seed_env["DATABASE_URL"] = (
+        f"postgresql+asyncpg://postgres:{req['pg_password']}"
+        f"@127.0.0.1:{db_port}/postgres"
+    )
+    subprocess.run(
+        [sys.executable, os.path.join(_REPO_ROOT, _SEED_SCRIPT)],
+        env=seed_env,
+        timeout=_MIGRATE_TIMEOUT_S,
+        check=True,
+    )
+    frontend = _serve_frontend(frontend_port)
+    frontend_holder.append(frontend)
+    result_file = os.path.join(workspace, "walkthrough-result.json")
+    harness_env = dict(os.environ)
+    harness_env.update(
+        {
+            "WALKTHROUGH_BACKEND_URL": f"http://127.0.0.1:{backend_port}",
+            # vite runs with --host=localhost (admin-ui package.json), so the
+            # harness must hit the frontend via localhost, not 127.0.0.1.
+            "WALKTHROUGH_FRONTEND_URL": f"http://localhost:{frontend_port}",
+            "WALKTHROUGH_ADMIN_TOKEN": req["admin_token"],
+            "WALKTHROUGH_PROJECT_ID": _WALKTHROUGH_PROJECT_ID,
+            "GIT_SHA": req["candidate_sha"],
+            "WALKTHROUGH_RESULT_FILE": result_file,
+        }
+    )
+    subprocess.run(
+        [_HARNESS_BIN, os.path.join(_REPO_ROOT, _HARNESS_SCRIPT)],
+        env=harness_env,
+        timeout=_MIGRATE_TIMEOUT_S,
+        check=True,
+    )
+    with open(result_file, encoding="utf-8") as fh:
+        result = json.load(fh)
+    print(json.dumps(result, sort_keys=True))
+
+
+def _handle_signal(signum, frame):  # noqa: ARG001 — frame required by signal API
+    """Signal handler: SystemExit lets the registered atexit cleanup run."""
+    sys.exit(128 + signum)
+
+
+def _setup_teardown(
+    sup: "WalkthroughStackSupervisor", frontend_holder: list, *, keep: bool
+) -> typing.Callable[[], None]:
+    """Register atexit + SIGINT/SIGTERM teardown; return the cleanup callable.
+
+    ``keep`` skips every registration so an operator can inspect a live stack.
+    The returned cleanup is idempotent (``teardown`` and frontend kill both are).
+    """
+    def cleanup() -> None:
+        if frontend_holder:
+            frontend = frontend_holder[0]
+            frontend.terminate()
+            try:
+                frontend.wait(timeout=10)
+            except Exception:  # noqa: BLE001 — kill as a last resort
+                try:
+                    frontend.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+        sup.teardown()
+
+    if not keep:
+        atexit.register(cleanup)
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            try:
+                signal.signal(signum, _handle_signal)
+            except ValueError:
+                pass  # only the main thread can install handlers
+    return cleanup
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="walkthrough_stack",
+        description=(
+            "Boot the fixed-shape walkthrough_e2e candidate stack standalone, "
+            "decoupled from the qualifier pipeline. The candidate's own "
+            "docker-compose.yml is NEVER executed."
+        ),
+    )
+    parser.add_argument("--candidate-sha", metavar="SHA", help="candidate engine SHA to boot")
+    parser.add_argument(
+        "--workspace",
+        metavar="DIR",
+        help="candidate checkout (default: a temp dir for boot, cwd for --check)",
+    )
+    parser.add_argument(
+        "--build-context", metavar="DIR", help="override the backend docker build context"
+    )
+    parser.add_argument("--backend-port", type=int, default=0)
+    parser.add_argument("--db-port", type=int, default=0)
+    parser.add_argument("--frontend-port", type=int, default=_FRONTEND_DEFAULT_PORT)
+    parser.add_argument(
+        "--timeout", type=float, default=_CLI_DEFAULT_TIMEOUT_S, help="boot deadline in seconds"
+    )
+    parser.add_argument("--admin-token")
+    parser.add_argument("--anthropic-api-key")
+    parser.add_argument("--pg-password")
+    parser.add_argument("--agent-jwt-secret")
+    parser.add_argument("--ws-ticket-secret")
+    parser.add_argument(
+        "--run-harness",
+        action="store_true",
+        help="seed fixture data, serve admin-ui, run the node walkthrough harness",
+    )
+    parser.add_argument(
+        "--check", action="store_true", help="validate prerequisites only (no containers)"
+    )
+    parser.add_argument(
+        "--keep", action="store_true", help="skip teardown (debugging a live stack)"
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None, *, run=None) -> int:
+    """Standalone entry point; returns a process exit code."""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.check:
+        return _cli_check(args)
+    if not args.candidate_sha:
+        parser.error("--candidate-sha is required (unless --check)")
+    try:
+        req = _cli_build_request(args)
+    except ValueError as exc:
+        print(f"[walkthrough-stack-cli] invalid request: {exc}", file=sys.stderr)
+        return 2
+    workspace = args.workspace or tempfile.mkdtemp(prefix="bp-wt-cli-")
+    build_context = args.build_context or _detect_build_context(workspace)
+    if not os.path.isdir(build_context):
+        print(
+            f"[walkthrough-stack-cli] no backend/ build context at {build_context}; "
+            "pass --workspace pointing at a candidate checkout or --build-context",
+            file=sys.stderr,
+        )
+        return 2
+    sup = WalkthroughStackSupervisor(
+        workspace=workspace,
+        task_id="standalone-cli",
+        run=run,
+        build_context=build_context,
+        log=lambda message: print(f"[walkthrough-stack-cli] {message}", flush=True),
+    )
+    frontend_holder: list = []
+    cleanup = None
+    if not args.keep:
+        cleanup = _setup_teardown(sup, frontend_holder, keep=False)
+    exit_code = 1
+    try:
+        backend_port, db_port = sup._boot(
+            req,
+            backend_port=args.backend_port or None,
+            db_port=args.db_port or None,
+        )
+        print(
+            f"[walkthrough-stack-cli] stack booted: backend=127.0.0.1:{backend_port} "
+            f"db=127.0.0.1:{db_port}",
+            flush=True,
+        )
+        deadline = time.monotonic() + args.timeout
+        _wait_until_healthy(backend_port, req["admin_token"], deadline=deadline)
+        sha = _fetch_engine_sha(backend_port, timeout=min(15.0, args.timeout))
+        print(f"[walkthrough-stack-cli] candidate engine SHA: {sha}", flush=True)
+        if args.run_harness:
+            _run_harness(
+                req,
+                backend_port=backend_port,
+                db_port=db_port,
+                frontend_port=args.frontend_port,
+                workspace=workspace,
+                frontend_holder=frontend_holder,
+            )
+        print(
+            json.dumps(
+                {"status": "ok", "backend_port": backend_port, "db_port": db_port, "sha": sha}
+            ),
+            flush=True,
+        )
+        exit_code = 0
+    except Exception as exc:  # noqa: BLE001 — CLI surfaces the failure and exits non-zero
+        print(f"[walkthrough-stack-cli] {exc}", file=sys.stderr)
+        exit_code = 1
+    finally:
+        if cleanup is not None:
+            cleanup()
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

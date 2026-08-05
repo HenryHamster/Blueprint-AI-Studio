@@ -8,8 +8,11 @@ guarantees.
 """
 
 import base64
+import contextlib
+import io
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -345,6 +348,259 @@ class TestGcStaleStacks(unittest.TestCase):
         before = len(calls)
         wts.gc_stale_stacks(run=fake_run, log=lambda m: None)  # once per process
         self.assertEqual(len(calls), before)
+
+
+class TestCli(unittest.TestCase):
+    """Standalone CLI (``python3 scripts/walkthrough_stack.py --candidate-sha …``)."""
+
+    def _tmp_checkout(self):
+        ws = tempfile.mkdtemp()
+        os.makedirs(os.path.join(ws, "backend"))
+        return ws
+
+    # ── argument parsing ──
+    def test_parse_args_defaults(self):
+        args = wts.build_parser().parse_args(["--candidate-sha", "a" * 40])
+        self.assertEqual(args.candidate_sha, "a" * 40)
+        self.assertIsNone(args.workspace)
+        self.assertIsNone(args.build_context)
+        self.assertEqual(args.timeout, wts._CLI_DEFAULT_TIMEOUT_S)
+        self.assertEqual(args.frontend_port, 3001)
+        self.assertFalse(args.run_harness)
+        self.assertFalse(args.check)
+        self.assertFalse(args.keep)
+
+    def test_main_requires_candidate_sha_unless_check(self):
+        with self.assertRaises(SystemExit):
+            wts.main([])
+        args = wts.build_parser().parse_args(["--check"])
+        self.assertTrue(args.check)
+
+    def test_cli_build_request_mints_valid_secrets(self):
+        req = wts._cli_build_request(
+            wts.build_parser().parse_args(["--candidate-sha", "b" * 40])
+        )
+        clean, err = wts.validate_request(req)
+        self.assertEqual(err, "")
+        self.assertEqual(clean["candidate_sha"], "b" * 40)
+        self.assertTrue(req["pg_password"].startswith("wt-pg-"))
+        self.assertTrue(req["admin_token"].startswith("wt-admin-"))
+        self.assertNotIn("anthropic_api_key", clean)
+
+    # ── --check pre-flight ──
+    def test_check_passes_with_docker_and_checkout(self):
+        ws = self._tmp_checkout()
+        args = wts.build_parser().parse_args(["--check", "--workspace", ws])
+        with mock.patch.object(wts.subprocess, "run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(
+                [], 0, stdout="true", stderr=""
+            )
+            self.assertEqual(wts._cli_check(args), 0)
+        # docker info + git rev-parse both exercised; no containers created.
+        self.assertEqual(mock_run.call_count, 2)
+
+    def test_check_fails_when_backend_context_missing(self):
+        ws = tempfile.mkdtemp()
+        args = wts.build_parser().parse_args(["--check", "--workspace", ws])
+        with mock.patch.object(wts.subprocess, "run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(
+                [], 0, stdout="true", stderr=""
+            )
+            self.assertEqual(wts._cli_check(args), 1)
+
+    def test_check_fails_when_docker_unreachable(self):
+        ws = self._tmp_checkout()
+        args = wts.build_parser().parse_args(["--check", "--workspace", ws])
+
+        def fake_run(argv, **kwargs):
+            if argv[:2] == ["docker", "info"]:
+                return subprocess.CompletedProcess(
+                    argv, 1, stdout="", stderr="unreachable"
+                )
+            return subprocess.CompletedProcess(argv, 0, stdout="true", stderr="")
+
+        with mock.patch.object(wts.subprocess, "run", side_effect=fake_run):
+            self.assertEqual(wts._cli_check(args), 1)
+
+    # ── boot → health → SHA → teardown ──
+    def test_main_boots_healths_reads_sha_and_tears_down(self):
+        runner = RecordingRunner()
+        ws = self._tmp_checkout()
+        calls = []
+
+        def fake_http(url, *, timeout, headers=None):
+            calls.append(url)
+            if url.endswith("/health"):
+                return (200, {"status": "healthy"})
+            return (200, {"sha": "a" * 40, "revision": "rev-1"})
+
+        def fake_setup(sup, holder, *, keep):
+            return lambda: sup.teardown()
+
+        with mock.patch.object(wts, "_setup_teardown", fake_setup), mock.patch.object(
+            wts, "_http_get_json", side_effect=fake_http
+        ):
+            exit_code = wts.main(
+                ["--candidate-sha", "a" * 40, "--workspace", ws, "--timeout", "30"],
+                run=runner,
+            )
+        self.assertEqual(exit_code, 0)
+        joined = [" ".join(c) for c in runner.calls]
+        # Fixed-shape boot: network → db → build → migrate → app.
+        self.assertIn("docker network create", joined[0])
+        self.assertIn("docker build -t", joined[2])
+        # Bare-checkout layout detection: backend/ at the workspace root.
+        self.assertTrue(joined[2].endswith(os.path.join(ws, "backend")))
+        self.assertFalse(joined[2].endswith(os.path.join(ws, "agent", "backend")))
+        self.assertTrue(any("/health" in u for u in calls))
+        self.assertTrue(any("/api/version" in u for u in calls))
+        # Teardown ran on the normal exit path (idempotent with atexit).
+        self.assertTrue(any("docker rm -f" in j for j in joined))
+
+    def test_main_invalid_sha_exits_2_before_docker(self):
+        runner = RecordingRunner()
+        ws = self._tmp_checkout()
+        exit_code = wts.main(
+            ["--candidate-sha", "not-a-sha!", "--workspace", ws], run=runner
+        )
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(runner.calls, [])
+
+    def test_main_run_harness_invokes_harness(self):
+        runner = RecordingRunner()
+        ws = self._tmp_checkout()
+
+        def fake_http(url, *, timeout, headers=None):
+            if url.endswith("/health"):
+                return (200, {"status": "healthy"})
+            return (200, {"sha": "a" * 40, "revision": "rev-1"})
+
+        def fake_setup(sup, holder, *, keep):
+            return lambda: sup.teardown()
+
+        with mock.patch.object(wts, "_setup_teardown", fake_setup), mock.patch.object(
+            wts, "_http_get_json", side_effect=fake_http
+        ), mock.patch.object(wts, "_run_harness") as mock_harness:
+            exit_code = wts.main(
+                [
+                    "--candidate-sha", "a" * 40, "--workspace", ws,
+                    "--timeout", "30", "--run-harness",
+                ],
+                run=runner,
+            )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(mock_harness.call_count, 1)
+        self.assertEqual(mock_harness.call_args.kwargs["frontend_port"], 3001)
+        self.assertIn("backend_port", mock_harness.call_args.kwargs)
+
+    # ── teardown guarantees ──
+    def test_handle_signal_exits(self):
+        with mock.patch.object(wts.sys, "exit") as mock_exit:
+            wts._handle_signal(signal.SIGTERM, None)
+        mock_exit.assert_called_once_with(128 + signal.SIGTERM)
+
+    def test_setup_teardown_registers_handlers_and_cleans_up(self):
+        runner = RecordingRunner()
+        sup = wts.WalkthroughStackSupervisor(
+            workspace=self._tmp_checkout(), task_id="t1", run=runner, log=lambda m: None
+        )
+        clean, _ = wts.validate_request(_request())
+        sup._boot(clean)
+
+        class FakeFrontend:
+            def __init__(self):
+                self.terminated = False
+
+            def terminate(self):
+                self.terminated = True
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        frontend = FakeFrontend()
+        holder = [frontend]
+        with mock.patch.object(wts.atexit, "register") as mock_atexit, mock.patch.object(
+            wts.signal, "signal"
+        ) as mock_signal:
+            cleanup = wts._setup_teardown(sup, holder, keep=False)
+        mock_atexit.assert_called_once()
+        self.assertEqual(mock_signal.call_count, 2)
+        runner.calls.clear()
+        cleanup()
+        self.assertTrue(frontend.terminated)
+        self.assertTrue(any("docker rm -f" in " ".join(c) for c in runner.calls))
+        # Idempotent — a second cleanup (atexit + finally both fire) is a no-op.
+        runner.calls.clear()
+        cleanup()
+        self.assertEqual(runner.calls, [])
+
+    def test_setup_teardown_keep_skips_registration(self):
+        runner = RecordingRunner()
+        sup = wts.WalkthroughStackSupervisor(
+            workspace=self._tmp_checkout(), task_id="t1", run=runner, log=lambda m: None
+        )
+        with mock.patch.object(wts.atexit, "register") as mock_atexit, mock.patch.object(
+            wts.signal, "signal"
+        ) as mock_signal:
+            wts._setup_teardown(sup, [], keep=True)
+        mock_atexit.assert_not_called()
+        mock_signal.assert_not_called()
+
+    # ── --run-harness with a fake harness script ──
+    def test_run_harness_seeds_serves_and_runs_fake_harness(self):
+        req = wts.validate_request(_request())[0]
+        fake_root = tempfile.mkdtemp()
+        seed_dir = os.path.join(fake_root, "scripts", "walkthrough")
+        os.makedirs(seed_dir)
+        with open(os.path.join(seed_dir, "seed_test_data.py"), "w") as fh:
+            fh.write("print('seeded')\n")
+        # The fake harness is interpreted by _HARNESS_BIN, which the test points
+        # at the real python interpreter (node is not installed on task VMs).
+        with open(os.path.join(seed_dir, "v26-live-walkthrough.cjs"), "w") as fh:
+            fh.write(
+                "import json, os\n"
+                "with open(os.environ['WALKTHROUGH_RESULT_FILE'], 'w') as fh:\n"
+                "    json.dump({'passed': True, 'sha': os.environ['GIT_SHA'], 'backend': os.environ['WALKTHROUGH_BACKEND_URL']}, fh)\n"
+            )
+        os.makedirs(os.path.join(fake_root, "admin-ui"))
+
+        class FakeFrontend:
+            def __init__(self):
+                self.terminated = False
+
+            def terminate(self):
+                self.terminated = True
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        fake_frontend = FakeFrontend()
+        holder = []
+        out = io.StringIO()
+        with mock.patch.object(wts, "_REPO_ROOT", fake_root), mock.patch.object(
+            wts, "_HARNESS_BIN", sys.executable
+        ), mock.patch.object(wts, "_serve_frontend", return_value=fake_frontend):
+
+            with contextlib.redirect_stdout(out):
+                wts._run_harness(
+                    req,
+                    backend_port=18080,
+                    db_port=15432,
+                    frontend_port=13001,
+                    workspace=tempfile.mkdtemp(),
+                    frontend_holder=holder,
+                )
+        self.assertIs(holder[0], fake_frontend)
+        result = json.loads(out.getvalue())
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["sha"], "a" * 40)
+        self.assertEqual(result["backend"], "http://127.0.0.1:18080")
 
 
 if __name__ == "__main__":
