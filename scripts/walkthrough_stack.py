@@ -42,6 +42,7 @@ agent fails closed, as it does today) and never takes the runner down.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -340,6 +341,15 @@ class WalkthroughStackSupervisor:
         database_url = (
             f"postgresql+asyncpg://postgres:{req['pg_password']}@db:5432/postgres"
         )
+        # Ephemeral Fernet key for the throwaway stack. Migration 0609 refuses
+        # to stamp without GITHUB_PAT_ENCRYPTION_KEY, and the app would run
+        # keyless (plaintext-credential class) without one. The stack's DB is
+        # fresh and destroyed at teardown, so a per-boot random key is the
+        # correct scope: nothing encrypted here ever needs decrypting by
+        # anything outside this stack, and the key never leaves this process.
+        stack_encryption_key = base64.urlsafe_b64encode(
+            secrets.token_bytes(32)
+        ).decode("ascii")
 
         self._run(
             ["docker", "network", "create", self.network],
@@ -376,6 +386,7 @@ class WalkthroughStackSupervisor:
                 "docker", "run", "--rm",
                 "--network", self.network,
                 "-e", f"DATABASE_URL={database_url}",
+                "-e", f"GITHUB_PAT_ENCRYPTION_KEY={stack_encryption_key}",
                 self.image,
                 "alembic", "upgrade", "head",
             ],
@@ -383,6 +394,7 @@ class WalkthroughStackSupervisor:
         )
         app_env = {
             "DATABASE_URL": database_url,
+            "GITHUB_PAT_ENCRYPTION_KEY": stack_encryption_key,
             "AGENT_JWT_SECRET": req["agent_jwt_secret"],
             "WS_TICKET_SECRET": req["ws_ticket_secret"],
             "GITHUB_APP_ID": "0",

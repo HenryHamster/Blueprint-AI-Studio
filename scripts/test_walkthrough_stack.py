@@ -7,6 +7,7 @@ in the request can steer WHAT runs), the file protocol, and teardown
 guarantees.
 """
 
+import base64
 import json
 import os
 import subprocess
@@ -135,6 +136,37 @@ class TestBootArgvShape(unittest.TestCase):
         # No shell is involved anywhere: every element is a plain token.
         for call in self.runner.calls:
             self.assertNotIn(";", " ".join(call[:2]))
+
+    def test_boot_provisions_ephemeral_encryption_key(self):
+        """Migration 0609 refuses to stamp without GITHUB_PAT_ENCRYPTION_KEY,
+        and a keyless app runs in the plaintext-credential failure class. The
+        supervisor must mint a per-boot Fernet key and hand the SAME key to
+        both the migration run and the app container."""
+        clean, _ = wts.validate_request(_request())
+        self.sup._boot(clean)
+        joined = [" ".join(c) for c in self.runner.calls]
+
+        def _key_from(call: str) -> str:
+            for token in call.split():
+                if token.startswith("GITHUB_PAT_ENCRYPTION_KEY="):
+                    return token.split("=", 1)[1]
+            return ""
+
+        migrate_key = _key_from(joined[4])
+        app_key = _key_from(joined[5])
+        self.assertTrue(migrate_key, "migration run missing GITHUB_PAT_ENCRYPTION_KEY")
+        self.assertTrue(app_key, "app container missing GITHUB_PAT_ENCRYPTION_KEY")
+        self.assertEqual(migrate_key, app_key)
+        # Fernet shape: 32 url-safe-base64 bytes (44 chars with padding).
+        self.assertEqual(len(base64.urlsafe_b64decode(migrate_key)), 32)
+        # Ephemeral: a second supervisor boot mints a DIFFERENT key.
+        other_runner = RecordingRunner()
+        other = wts.WalkthroughStackSupervisor(
+            workspace=self.tmp, task_id="Task-456DEF", run=other_runner, log=lambda m: None
+        )
+        other._boot(clean)
+        other_key = _key_from(" ".join(other_runner.calls[4]))
+        self.assertNotEqual(migrate_key, other_key)
 
     def test_pick_free_ports_returns_distinct_ports(self):
         # Regression: backend and db must never share a port. The helper holds
