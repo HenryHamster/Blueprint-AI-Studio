@@ -1406,9 +1406,7 @@ def _select_eligible_runner(
             # fall through to the Packer-proven cloud image instead of claiming a
             # task that will fail after Chromium bootstrap. Reads the NESTED
             # isolation_backends.playwright_chromium_usable flag the heartbeat
-            # writes (always a plain bool) — the top-level key is the live
-            # chromium.launch() probe, None until it completes, so it can never
-            # satisfy a `is True` dispatch gate.
+            # writes (always a plain bool).
             out = [r for r in out if _runner_chromium_usable(r)]
         if accelerator:
             # Trust VERIFIED GPU capability, not the bare self-reported has_gpu bool:

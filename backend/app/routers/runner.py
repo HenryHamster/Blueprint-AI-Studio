@@ -716,13 +716,6 @@ class HeartbeatRequest(BaseModel):
     # systemd_run_ok); agent_backend/compute_backend name the backend the runner
     # would use for each class. All ride in capabilities JSONB for the fleet panel.
     isolation_backends: dict | None = None
-    # Runner-probed Playwright/Chromium launchability (optional; old runners
-    # omit it). This is the browser gate read by walkthrough_e2e site selection
-    # (release_qualifier_audit._walkthrough_e2e_site_eligible) and
-    # requires_browser dispatch. The runner proves a real headless launch in a
-    # background thread and reports True/False once known; None/omitted leaves
-    # the stored (possibly operator-set) value untouched.
-    playwright_chromium_usable: StrictBool | None = None
     # Additive functional evidence keyed by the runtime jobs will execute, e.g.
     # {"docker": {"verified": true, "mode": "cdi", "reason": "verified"}}.
     # Old runners omit it and remain heartbeat-compatible.
@@ -1760,8 +1753,6 @@ async def heartbeat(
     # All optional and tolerated as missing so older runners keep heartbeating.
     if payload.isolation_backends is not None:
         caps["isolation_backends"] = payload.isolation_backends
-    if payload.playwright_chromium_usable is not None:
-        caps["playwright_chromium_usable"] = payload.playwright_chromium_usable
     if payload.container_gpu_passthrough is not None:
         caps["container_gpu_passthrough"] = payload.container_gpu_passthrough
     elif payload.active_work_report:

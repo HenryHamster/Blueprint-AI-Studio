@@ -4768,43 +4768,35 @@ class TestRunnerEndpoints:
         assert runner.capabilities["compute_backend"] == "bwrap"
 
     @pytest.mark.asyncio
-    async def test_heartbeat_persists_playwright_chromium_usable(
+    async def test_heartbeat_keeps_nested_chromium_only(
         self, client: AsyncClient, db_session
     ):
-        # The runner-probed browser gate rides on capabilities; walkthrough_e2e
-        # site selection and requires_browser dispatch read it. A heartbeat
-        # OMITTING the field (probe not yet completed, or old runner) must leave
-        # the stored — possibly operator-set — value untouched.
+        # The walkthrough_e2e browser gate reads ONLY the NESTED
+        # isolation_backends.playwright_chromium_usable key. The vestigial
+        # top-level duplicate was removed: a heartbeat must never store it —
+        # even if an old runner still sends the field — while the nested key the
+        # runner's capabilities_inventory emits keeps persisting.
         project = await _make_project(db_session)
         runner, token = await _make_runner(db_session, project.id)
         resp = await client.post(
             "/api/runner/heartbeat",
-            json={"playwright_chromium_usable": True},
+            json={
+                "isolation_backends": {
+                    "docker_usable": True,
+                    "playwright_chromium_usable": True,
+                },
+                # Old-runner leftover: the removed top-level field must be
+                # ignored by the heartbeat, not stored into capabilities.
+                "playwright_chromium_usable": True,
+            },
             headers={"Authorization": f"Bearer {token}"},
         )
         assert resp.status_code == 200
         await db_session.refresh(runner)
-        assert runner.capabilities["playwright_chromium_usable"] is True
-
-        # Omission preserves the stored value (None-probe / legacy runner).
-        resp = await client.post(
-            "/api/runner/heartbeat",
-            json={"active_task_ids": []},
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        assert resp.status_code == 200
-        await db_session.refresh(runner)
-        assert runner.capabilities["playwright_chromium_usable"] is True
-
-        # A completed False probe reports honestly and downgrades the gate.
-        resp = await client.post(
-            "/api/runner/heartbeat",
-            json={"playwright_chromium_usable": False},
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        assert resp.status_code == 200
-        await db_session.refresh(runner)
-        assert runner.capabilities["playwright_chromium_usable"] is False
+        backends = runner.capabilities.get("isolation_backends")
+        assert backends is not None
+        assert backends.get("playwright_chromium_usable") is True
+        assert "playwright_chromium_usable" not in runner.capabilities
 
     @pytest.mark.asyncio
     async def test_heartbeat_tolerates_missing_isolation_backends(

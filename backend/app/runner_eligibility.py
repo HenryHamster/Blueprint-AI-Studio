@@ -317,13 +317,9 @@ def _runner_chromium_usable(runner: LocalRunner | RunnerDispatchSnapshot) -> boo
 
     Reads the NESTED ``isolation_backends.playwright_chromium_usable`` flag the
     runner heartbeat writes (``capabilities_inventory`` in
-    ``scripts/runner_isolation.py``). The TOP-LEVEL ``playwright_chromium_usable``
-    key carries a DIFFERENT contract: the runner's live ``chromium.launch()``
-    probe result, which is ``None`` until the first background probe completes —
-    and ``None is not True``, so reading that key made the browser gate
-    unsatisfiable. This predicate reads the nested map where the heartbeat always
-    writes a plain bool, so the capability the dispatcher reads is the same one
-    the heartbeat emits.
+    ``scripts/runner_isolation.py``), where the heartbeat always writes a plain
+    bool, so the capability the dispatcher reads is the same one the heartbeat
+    emits.
     """
     caps = runner.capabilities or {}
     backends = caps.get("isolation_backends")

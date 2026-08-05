@@ -1538,102 +1538,6 @@ def _gpu_memory_mib() -> tuple[list[int], list[int]] | None:
     return totals, frees
 
 
-_playwright_chromium_probe_lock = threading.Lock()
-_playwright_chromium_probe_state: dict = {
-    "value": None,  # None = never probed; True/False = last completed probe
-    "checked_at": 0.0,  # time.monotonic() of the last completed probe
-    "running": False,
-}
-# A False result is retried on this cadence so installing a browser on a live
-# host is picked up without a daemon restart; a True result sticks for the
-# daemon lifetime (browsers do not uninstall themselves mid-run).
-_PLAYWRIGHT_CHROMIUM_REPROBE_SECONDS = 30 * 60
-
-
-def _playwright_chromium_binaries() -> list[str]:
-    """Executable Playwright-managed Chromium binaries on this host, newest last."""
-    root = os.path.join(os.path.expanduser("~"), ".cache", "ms-playwright")
-    found: list[str] = []
-    try:
-        entries = sorted(os.listdir(root))
-    except OSError:
-        return found
-    for entry in entries:
-        if not entry.startswith("chromium-"):
-            continue
-        chrome = os.path.join(root, entry, "chrome-linux", "chrome")
-        if os.access(chrome, os.X_OK):
-            found.append(chrome)
-    return found
-
-
-def _probe_playwright_chromium_launch() -> bool:
-    """One uncached probe: prove a Playwright-managed Chromium LAUNCHES headless.
-
-    Binary presence alone is not enough — the historical failure mode is a
-    cached browser whose host shared libraries (libasound.so.2, libnss3) are
-    missing, which only a real launch exposes. Renders ``about:blank`` with the
-    newest cached browser first.
-    """
-    for chrome in reversed(_playwright_chromium_binaries()):
-        try:
-            result = subprocess.run(
-                [
-                    chrome,
-                    "--headless=new",
-                    "--no-sandbox",
-                    "--disable-gpu",
-                    "--dump-dom",
-                    "about:blank",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=60,
-            )
-        except (OSError, subprocess.SubprocessError):
-            continue
-        if result.returncode == 0 and "<html" in (result.stdout or ""):
-            return True
-    return False
-
-
-def _playwright_chromium_usable() -> bool | None:
-    """Latest chromium-launch probe result WITHOUT ever blocking the caller.
-
-    Returns the cached value (None until the first probe completes — the
-    heartbeat omits the field then, leaving any operator-set capability
-    untouched). When the cache is empty or a False result is older than
-    ``_PLAYWRIGHT_CHROMIUM_REPROBE_SECONDS``, kicks a single background probe
-    thread; the launch itself (seconds, up to a 60s timeout) never runs on the
-    heartbeat thread.
-    """
-    with _playwright_chromium_probe_lock:
-        state = _playwright_chromium_probe_state
-        value = state["value"]
-        needs_probe = value is None or (
-            value is False
-            and time.monotonic() - state["checked_at"]
-            >= _PLAYWRIGHT_CHROMIUM_REPROBE_SECONDS
-        )
-        if needs_probe and not state["running"]:
-            state["running"] = True
-
-            def _run() -> None:
-                try:
-                    result = _probe_playwright_chromium_launch()
-                except Exception:
-                    result = False
-                with _playwright_chromium_probe_lock:
-                    state["value"] = result
-                    state["checked_at"] = time.monotonic()
-                    state["running"] = False
-
-            threading.Thread(
-                target=_run, name="playwright-chromium-probe", daemon=True
-            ).start()
-        return value
-
-
 def _cpu_load_avg() -> float | None:
     """One-minute CPU load average, or None on any error."""
     try:
@@ -4118,10 +4022,6 @@ def _heartbeat_loop(
                 "hostname": hostname,
                 "version": version,
                 "isolation_backends": isolation_backends,
-                # Probed browser gate for walkthrough_e2e site selection. None
-                # until the first background probe completes (the server then
-                # leaves any existing/operator-set value untouched).
-                "playwright_chromium_usable": _playwright_chromium_usable(),
                 "container_gpu_passthrough": (
                     caps.container_gpu_passthrough if caps is not None else None
                 ),
