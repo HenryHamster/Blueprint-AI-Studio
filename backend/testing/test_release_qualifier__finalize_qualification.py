@@ -5529,7 +5529,7 @@ async def test_promote_proceeds_when_no_migrations_touched(db_session, mocker):
         new=AsyncMock(return_value={"merged": True, "message": "Merged"}),
     )
 
-    result = await rq.promote(
+    await rq.promote(
         db_session,
         version,
         "1234" * 10,
@@ -6313,3 +6313,349 @@ async def test_finalize_project_not_found_breaks_pending_loop(db_session, mocker
     # The pending loop is broken — status is terminal.
     assert version.last_qualification["status"] == "not_promoted"
     assert version.last_qualification["status"] != "pending"
+
+
+# ---------------------------------------------------------------------------
+# Walkthrough finalize gate: OPEN-rubric report keys (not the retired v26 trio)
+# ---------------------------------------------------------------------------
+# Regression for the finalize mirror-image of PR #16719.  The request-time gate
+# was re-pointed to resolve the walkthrough_e2e evidence contract semantically
+# from the OPEN version's ACTIVE criteria; the finalize-time gate still pinned
+# the report to the retired v26 key set (frozen raw-set equality in
+# _evaluate_walkthrough_e2e_report and frozen canonical-trio equality in
+# _walkthrough_e2e_canonical_evidence_keys), so a report authored against the
+# OPEN rubric was refused as malformed infra BEFORE the active-rubric check ran.
+# These tests pin the re-pointed finalize contract: a report whose keys resolve
+# to the open version's ACTIVE criteria passes the gate and is classified as a
+# QUALITY verdict, while a genuine canonical-collision report still infra-fails
+# with the accurate duplicate_criteria reason.
+
+
+@pytest.mark.asyncio
+async def test_finalize_walkthrough_report_against_open_rubric_is_quality_not_infra(
+    db_session, mocker
+):
+    """A walkthrough report authored against the OPEN version's rubric — fresh
+    criterion keys, none of the retired v26 trio — passes the finalize gate and
+    is classified as a QUALITY verdict (walkthrough_e2e_failed) rather than an
+    infra_failure preempted by the retired frozen-trio schema check."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    # Open-version rubric: FRESH walkthrough-provable criteria — none of the
+    # retired v26 trio.  The texts name the flows the live harness drives so the
+    # request-time contract also resolves (finalize only needs the active keys).
+    live_walkthrough_keys = []
+    for _text in (
+        "Prove runner enrollment on a live local runner",
+        "Project tools iframe subresource token flow works",
+        "Conversational Workday session lifecycle end to end",
+    ):
+        key = f"c-{uuid.uuid4().hex[:8]}"
+        live_walkthrough_keys.append(key)
+        await _add_version_criterion(
+            db_session, project, version, key=key, text=_text
+        )
+
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    candidate_sha = version.last_qualification["candidate_sha"]
+    walk_task = Task(
+        project_id=project.id,
+        title="walkthrough",
+        payloads=[{"type": "walkthrough_e2e", "base_branch": "automain"}],
+        vm_instance_id="vm-walkthrough",
+        status=TaskStatus.COMPLETED,
+        context={"candidate_sha": candidate_sha},
+    )
+    db_session.add(walk_task)
+    await db_session.flush()
+    db_session.add(
+        Artifact(
+            task_id=walk_task.id,
+            artifact_type=ArtifactType.WALKTHROUGH_E2E_REPORT,
+            logs=json.dumps(
+                {
+                    "git_sha": candidate_sha,
+                    "exercised_engine_sha": candidate_sha,
+                    "results": [
+                        {
+                            "criterion_key": live_walkthrough_keys[0],
+                            "passed": True,
+                        },
+                        {
+                            "criterion_key": live_walkthrough_keys[1],
+                            "passed": False,
+                        },
+                        {
+                            "criterion_key": live_walkthrough_keys[2],
+                            "passed": True,
+                        },
+                    ],
+                }
+            ),
+        )
+    )
+    await db_session.commit()
+    await db_session.refresh(walk_task)
+
+    qual = {
+        **(version.last_qualification or {}),
+        "requested_probes": ["walkthrough_e2e"],
+        "walkthrough_e2e_task_id": str(walk_task.id),
+    }
+    version.last_qualification = _with_current_qualification_contract(
+        project, version, qual
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    # The report reached the QUALITY classification — the live-rubric check ran
+    # and found a genuine criterion failure.  NOT an infra_failure that the
+    # retired frozen-trio schema assertion used to preempt.
+    assert result["status"] == "not_promoted"
+    assert result["blocker"] == "walkthrough_e2e_failed"
+
+    await db_session.refresh(version)
+    lq = version.last_qualification
+    assert lq["status"] == "not_promoted"
+    assert lq["walkthrough_e2e_result"]["status"] == "failed"
+    assert lq["walkthrough_e2e_result"]["failed_criterion_keys"] == [
+        live_walkthrough_keys[1]
+    ]
+    assert lq["sub_scores"]["walkthrough_e2e"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_finalize_walkthrough_report_open_rubric_all_passed_records_passed_dimension(
+    db_session, mocker
+):
+    """A fully-passing walkthrough report against the OPEN version's rubric —
+    with covered-tier evidence ingested for every resolved key — records the
+    walkthrough_e2e dimension as passed (sub_score 1.0) instead of infra-failing
+    on the retired frozen-trio schema check.  The overall verdict stays
+    not_promoted only because the fresh criteria have no merge-grade verdict (an
+    unrelated, pre-existing coverage gate); the point is that the walkthrough
+    probe itself is no longer refused as malformed."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    live_criteria = []
+    for _text in (
+        "Prove runner enrollment on a live local runner",
+        "Project tools iframe subresource token flow works",
+        "Conversational Workday session lifecycle end to end",
+    ):
+        key = f"c-{uuid.uuid4().hex[:8]}"
+        live_criteria.append(
+            await _add_version_criterion(
+                db_session, project, version, key=key, text=_text
+            )
+        )
+    live_walkthrough_keys = [c.criterion_key for c in live_criteria]
+
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    candidate_sha = version.last_qualification["candidate_sha"]
+    walk_task = Task(
+        project_id=project.id,
+        title="walkthrough",
+        payloads=[{"type": "walkthrough_e2e", "base_branch": "automain"}],
+        vm_instance_id="vm-walkthrough",
+        status=TaskStatus.COMPLETED,
+        context={"candidate_sha": candidate_sha},
+    )
+    db_session.add(walk_task)
+    await db_session.flush()
+
+    # The probe passed every criterion; the finalize gate's passed-probe path
+    # verifies covered-tier evidence was ingested for each resolved key.
+    attempt_id = uuid.uuid4()
+    for _crit in live_criteria:
+        db_session.add(
+            CriterionEvidence(
+                project_id=project.id,
+                criterion_id=_crit.id,
+                source_kind="walkthrough_e2e",
+                source_id=f"walkthrough_e2e:{attempt_id}:{_crit.criterion_key}",
+                detail={"candidate_sha": candidate_sha},
+            )
+        )
+    db_session.add(
+        Artifact(
+            task_id=walk_task.id,
+            artifact_type=ArtifactType.WALKTHROUGH_E2E_REPORT,
+            logs=json.dumps(
+                {
+                    "git_sha": candidate_sha,
+                    "exercised_engine_sha": candidate_sha,
+                    "results": [
+                        {"criterion_key": k, "passed": True}
+                        for k in live_walkthrough_keys
+                    ],
+                }
+            ),
+        )
+    )
+    await db_session.commit()
+    await db_session.refresh(walk_task)
+
+    qual = {
+        **(version.last_qualification or {}),
+        "qualification_attempt_id": str(attempt_id),
+        "requested_probes": ["walkthrough_e2e"],
+        "walkthrough_e2e_task_id": str(walk_task.id),
+    }
+    version.last_qualification = _with_current_qualification_contract(
+        project, version, qual
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] != "infra_failure"
+    await db_session.refresh(version)
+    lq = version.last_qualification
+    assert lq["walkthrough_e2e_result"]["status"] == "passed"
+    assert lq["sub_scores"]["walkthrough_e2e"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_finalize_walkthrough_report_unexpected_canonical_collision_still_infra_fails(
+    db_session, mocker, monkeypatch
+):
+    """A report that maps two DISTINCT raw keys onto one canonical evidence key
+    (beyond the sole allowed workday-slug/meta pair) is still real malformed
+    evidence: the finalize gate keeps the structural collision check and
+    infra-fails with the accurate 'duplicate_criteria' reason."""
+    from app import shared_state
+    from app import acceptance_criteria
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    candidate_sha = version.last_qualification["candidate_sha"]
+    # A second alias onto an existing canonical key makes two distinct FRESH
+    # raw keys collide — the malformed shape the structural check must reject.
+    # The patched alias is test-only; it proves the collision gate still fires
+    # now that the frozen-trio equality check is gone.  The keys are fresh (not
+    # the retired v26 set) so the report passes the report validator's legacy
+    # subset check and reaches the canonical-collision check.
+    monkeypatch.setitem(
+        acceptance_criteria.WALKTHROUGH_LEGACY_CRITERION_ALIASES,
+        "c-open-slug-b",
+        "c-open-slug-a",
+    )
+
+    walk_task = Task(
+        project_id=project.id,
+        title="walkthrough",
+        payloads=[{"type": "walkthrough_e2e", "base_branch": "automain"}],
+        vm_instance_id="vm-walkthrough",
+        status=TaskStatus.COMPLETED,
+        context={"candidate_sha": candidate_sha},
+    )
+    db_session.add(walk_task)
+    await db_session.flush()
+    db_session.add(
+        Artifact(
+            task_id=walk_task.id,
+            artifact_type=ArtifactType.WALKTHROUGH_E2E_REPORT,
+            logs=json.dumps(
+                {
+                    "git_sha": candidate_sha,
+                    "exercised_engine_sha": candidate_sha,
+                    "results": [
+                        {"criterion_key": "c-open-slug-a", "passed": True},
+                        {"criterion_key": "c-open-slug-b", "passed": True},
+                    ],
+                }
+            ),
+        )
+    )
+    await db_session.commit()
+    await db_session.refresh(walk_task)
+
+    qual = {
+        **(version.last_qualification or {}),
+        "requested_probes": ["walkthrough_e2e"],
+        "walkthrough_e2e_task_id": str(walk_task.id),
+    }
+    version.last_qualification = _with_current_qualification_contract(
+        project, version, qual
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    # Structural malformed evidence → non-conclusive infra failure with the
+    # accurate reason (NOT the misleading active-rubric classification).
+    assert result["status"] == "infra_failure"
+    assert result["error"] == "walkthrough_e2e_report_duplicate_criteria"

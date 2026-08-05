@@ -275,15 +275,21 @@ _SUPPORTED_QUALIFICATION_PROBES: frozenset[str] = frozenset({"walkthrough_e2e"})
 # collapse to one canonical evidence key.  No other raw or canonical duplicate
 # is part of the contract.
 #
-# THIS IS THE HARNESS OUTPUT CONTRACT, not the request-time evidence contract.
-# It pins exactly what the current v26-output harness writes, so the report
-# validator (_evaluate_walkthrough_e2e_report) and the canonical-key resolver
-# (_walkthrough_e2e_canonical_evidence_keys) can fail a malformed or truncated
-# report.  Which of these criteria a rubric can satisfy is resolved at request
-# time against the OPEN version's ACTIVE criteria — see
-# _resolve_walkthrough_e2e_evidence_contract — so a rubric that re-mints its
-# criteria under fresh keys is not silently refused just because the harness
-# still emits the legacy keys.
+# THESE CONSTANTS ARE OBSERVATIONAL — they describe what the current
+# v26-output harness writes.  They are NOT a blanket key contract on a
+# decision-bearing report: a report that emits NONE of the legacy keys (a
+# harness re-pointed to the OPEN version's rubric) is accepted and its keys are
+# validated against the ACTIVE rubric downstream, while a report that DOES emit
+# legacy keys must still carry the complete v26 set (a partial legacy report is
+# truncated).  The report validator (_evaluate_walkthrough_e2e_report) and the
+# canonical-key resolver (_walkthrough_e2e_canonical_evidence_keys) fail a
+# genuinely malformed report (empty results, invalid entries, duplicate raw
+# keys, an incomplete legacy set, or an unexpected canonical collision).  Which
+# criteria a report may name is resolved at request time
+# (see _resolve_walkthrough_e2e_evidence_contract) and re-validated at
+# finalize time against the OPEN version's ACTIVE criteria, so a rubric that
+# re-mints its criteria under fresh keys is not silently refused just because
+# the harness no longer emits the legacy keys.
 _WALKTHROUGH_E2E_EXPECTED_RAW_RESULT_KEYS: frozenset[str] = frozenset(
     {
         "c-dfdc9d82",
@@ -309,7 +315,8 @@ _WALKTHROUGH_E2E_ALLOWED_CANONICAL_COLLISION: frozenset[str] = frozenset(
 # flow is walkthrough-provable for that flow.  This is deliberately coarse: the
 # request-time gate's only job is to refuse when the open rubric genuinely has
 # no criterion the probe could produce evidence for; the finalize-time report
-# gate re-validates the exact keys against the ACTIVE rubric.
+# gate resolves the report's raw keys through the legacy alias map and
+# re-validates the exact resolved keys against the ACTIVE rubric.
 _WALKTHROUGH_E2E_FLOW_MARKERS: tuple[tuple[str, ...], ...] = (
     ("runner enroll", "runner enrollment"),
     ("iframe", "subresource token", "project tool"),
@@ -4006,7 +4013,26 @@ def _evaluate_walkthrough_e2e_report(
             }
         )
 
-    if seen_keys != _WALKTHROUGH_E2E_EXPECTED_RAW_RESULT_KEYS:
+    if not seen_keys:
+        # An empty results list is a truncated report — the harness must emit at
+        # least one flow outcome.
+        return {
+            "status": "invalid",
+            "reason": "result_schema_mismatch",
+            "candidate_sha": report_sha,
+            "exercised_engine_sha": exercised_sha,
+        }
+    if (
+        seen_keys & _WALKTHROUGH_E2E_EXPECTED_RAW_RESULT_KEYS
+        and seen_keys != _WALKTHROUGH_E2E_EXPECTED_RAW_RESULT_KEYS
+    ):
+        # A report that uses ANY of the legacy harness keys must carry the
+        # COMPLETE v26 output contract (a partial legacy report is truncated).
+        # A report that uses NONE of the legacy keys is authored against the
+        # OPEN version's rubric — the harness was re-pointed to emit that
+        # rubric's fresh criterion keys — so its keys are validated downstream
+        # by the finalize-time gate against the ACTIVE rubric, not against the
+        # retired v26 set here.
         return {
             "status": "invalid",
             "reason": "result_schema_mismatch",
@@ -4036,11 +4062,19 @@ def _evaluate_walkthrough_e2e_report(
 def _walkthrough_e2e_canonical_evidence_keys(
     normalized_results: list[dict[str, Any]],
 ) -> frozenset[str]:
-    """Resolve the frozen raw v26 schema to its unique evidence keys.
+    """Resolve a report's raw criterion keys to its unique evidence keys.
 
-    The legacy workday slug and the explicit meta row are the only intentional
-    many-to-one pair.  Keeping that exception exact prevents a later alias-table
-    edit from silently merging two otherwise independent probe outcomes.
+    Each raw key is resolved through the legacy alias map
+    (:func:`app.acceptance_criteria._resolve_walkthrough_criterion_key`) — e.g.
+    ``c-workday-session-lifecycle`` → ``c-5214996f`` — so a report that still
+    emits a legacy slug maps onto the same canonical evidence key as the
+    explicit meta row.  That workday slug / meta row is the only intentional
+    many-to-one pair; keeping the exception exact prevents a later alias-table
+    edit from silently merging two otherwise independent probe outcomes.  Any
+    OTHER pair of raw keys collapsing onto one canonical key is real malformed
+    evidence and raises.  WHICH canonical keys a report may name is NOT
+    validated here — the caller checks the resolved keys against the open
+    version's ACTIVE rubric rather than a frozen constant.
     """
     from app.acceptance_criteria import _resolve_walkthrough_criterion_key
 
@@ -4055,12 +4089,14 @@ def _walkthrough_e2e_canonical_evidence_keys(
         for raw_keys in canonical_groups.values()
         if len(raw_keys) > 1
     }
-    if duplicate_groups != {_WALKTHROUGH_E2E_ALLOWED_CANONICAL_COLLISION}:
+    # Raise only on a collision that is NOT the sole allowed workday/meta pair.
+    # A report with no collisions at all (e.g. fresh open-rubric keys, or a
+    # legacy report that omitted the meta row) must NOT raise — the previous
+    # ``!= {allowed}`` test treated the empty set as unexpected and refused any
+    # report that did not carry the v26 workday slug + meta row.
+    if duplicate_groups - {_WALKTHROUGH_E2E_ALLOWED_CANONICAL_COLLISION}:
         raise ValueError("unexpected canonical criterion collision")
-    resolved_keys = frozenset(canonical_groups)
-    if resolved_keys != _WALKTHROUGH_E2E_EXPECTED_CANONICAL_EVIDENCE_KEYS:
-        raise ValueError("canonical evidence schema mismatch")
-    return resolved_keys
+    return frozenset(canonical_groups)
 
 
 def _apply_walkthrough_decision(
@@ -8289,7 +8325,7 @@ async def _finalize_qualification(
                 + str(walkthrough_e2e_result.get("reason") or "invalid")[:80],
             )
         # The report may use supported legacy aliases, but every reported key
-        # must resolve to an ACTIVE criterion in the frozen version contract.
+        # must resolve to an ACTIVE criterion in the open version's rubric.
         # Unknown keys are malformed evidence, not a pass.
         from app.acceptance_criteria import WALKTHROUGH_E2E_EVIDENCE_KIND
 
