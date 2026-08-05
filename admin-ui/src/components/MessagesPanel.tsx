@@ -3002,10 +3002,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
             <span className="font-medium">
               {completionReceiptTone?.label ?? 'Cycle complete'}
             </span>
-            {conversationMode && lastCycleCompletion.failure_reason && (
-              <span className={`ml-1.5 ${completionReceiptTone?.message ?? 'text-emerald-400/80'}`}>{lastCycleCompletion.failure_reason.slice(0, 80)}</span>
-            )}
-            {!conversationMode && lastCycleCompletion.failure_reason && (
+            {lastCycleCompletion.failure_reason && (
               <span className={`ml-1.5 ${completionReceiptTone?.message ?? 'text-emerald-400/80'}`}>{lastCycleCompletion.failure_reason.slice(0, 80)}</span>
             )}
             {!conversationMode && (lastCycleCompletion.created_count ?? 0) > 0 && (

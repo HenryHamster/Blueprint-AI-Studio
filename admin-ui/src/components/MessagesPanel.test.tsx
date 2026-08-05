@@ -1345,6 +1345,31 @@ describe('MessagesPanel chrome modes', () => {
     expect(failed.textContent).toContain('Execution site unavailable');
   });
 
+  test('terminal failure reason renders in both minimal chat and full message chrome', async () => {
+    // The failure-reason span is mode-independent — the completion receipt keeps
+    // it visible in conversation (minimal) and non-conversation chrome alike. The
+    // minimal variant is covered above; this proves the non-conversation render
+    // stays byte-equivalent after the collapsed single branch.
+    const conversation = await renderPanel({
+      filterChrome: 'minimal',
+      lastCycleCompletion: { status: 'failed', failure_reason: 'Execution site unavailable' },
+    });
+    expect(conversation.textContent).toContain('Cycle failed');
+    expect(conversation.textContent).toContain('Execution site unavailable');
+
+    await act(async () => { root?.unmount(); });
+    root = null;
+    host?.remove();
+    host = null;
+
+    const full = await renderPanel({
+      filterChrome: 'compact',
+      lastCycleCompletion: { status: 'failed', failure_reason: 'Execution site unavailable' },
+    });
+    expect(full.textContent).toContain('Cycle failed');
+    expect(full.textContent).toContain('Execution site unavailable');
+  });
+
   test('minimal chat hides leaked batch action state after switching from full chrome', async () => {
     const first = makeMsg({
       id: 'feedback-a',

@@ -601,6 +601,10 @@ class TestCli(unittest.TestCase):
         self.assertTrue(result["passed"])
         self.assertEqual(result["sha"], "a" * 40)
         self.assertEqual(result["backend"], "http://127.0.0.1:18080")
+        # The emitted result must carry the frontend-source caveat so a green
+        # harness run is never misread as proof the candidate frontend works.
+        self.assertEqual(result["frontend_source"], "local_repo_checkout")
+        self.assertIn("frontend_caveat", result)
 
 
 if __name__ == "__main__":

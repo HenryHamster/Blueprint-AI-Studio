@@ -38,6 +38,18 @@ steer WHAT runs, only parameterize the fixed stack shape:
 
 Every failure degrades: a supervisor error writes an error response (the
 agent fails closed, as it does today) and never takes the runner down.
+
+Standalone ``--run-harness`` frontend-source caveat
+---------------------------------------------------
+The standalone ``--run-harness`` CLI (a debug/pre-flight tool, not the
+qualifier path) serves the LOCAL repo checkout's admin-ui via ``npm run dev``
+and runs THIS repo's seed/harness scripts against the CANDIDATE backend image.
+A green run proves the candidate backend interoperates with the serving
+engine's frontend; it does NOT exercise the candidate's own frontend build.
+The qualifier's agent-side boot path (``agent/src/handlers/walkthrough-stack.ts``)
+serves the candidate admin-ui from the candidate checkout instead. The emitted
+result carries a ``frontend_source`` marker so a green harness run is never
+misread as proof the candidate frontend works.
 """
 
 from __future__ import annotations
@@ -630,6 +642,14 @@ def _run_harness(
     The seed and harness scripts ship in this repo and run against the stack's
     published loopback ports. ``frontend_holder`` receives the dev-server Popen
     so teardown can kill it on any exit path. Prints the harness result JSON.
+
+    CAVEAT (frontend source): the served admin-ui is THIS local repo checkout's
+    vite dev server and the seed/harness scripts come from this checkout too —
+    only the backend is the candidate image. A green result therefore proves
+    the candidate backend against the serving engine's frontend, NOT the
+    candidate's own frontend build (the qualifier's agent-side boot path
+    exercises that). The printed result is annotated with a ``frontend_source``
+    marker so a green run is never misread as candidate-frontend proof.
     """
     seed_env = dict(os.environ)
     seed_env["DATABASE_URL"] = (
@@ -666,6 +686,17 @@ def _run_harness(
     )
     with open(result_file, encoding="utf-8") as fh:
         result = json.load(fh)
+    if isinstance(result, dict):
+        # Annotate the machine-readable result with the frontend source so a
+        # green run is never misread as proof the candidate's own frontend
+        # works (the admin-ui and seed/harness scripts come from the local
+        # checkout).
+        result["frontend_source"] = "local_repo_checkout"
+        result["frontend_caveat"] = (
+            "UI steps served the LOCAL repo checkout admin-ui (vite dev server) plus "
+            "this repo's seed/harness scripts against the CANDIDATE backend; the "
+            "candidate's own frontend build was NOT exercised by this run."
+        )
     print(json.dumps(result, sort_keys=True))
 
 
@@ -806,12 +837,18 @@ def main(argv: list[str] | None = None, *, run=None) -> int:
                 workspace=workspace,
                 frontend_holder=frontend_holder,
             )
-        print(
-            json.dumps(
-                {"status": "ok", "backend_port": backend_port, "db_port": db_port, "sha": sha}
-            ),
-            flush=True,
-        )
+        status = {
+            "status": "ok",
+            "backend_port": backend_port,
+            "db_port": db_port,
+            "sha": sha,
+        }
+        if args.run_harness:
+            # The harness served the LOCAL admin-ui against the CANDIDATE backend;
+            # label the status so a green run is never misread as proof the
+            # candidate's own frontend works (see _run_harness docstring).
+            status["frontend_source"] = "local_repo_checkout"
+        print(json.dumps(status), flush=True)
         exit_code = 0
     except Exception as exc:  # noqa: BLE001 — CLI surfaces the failure and exits non-zero
         print(f"[walkthrough-stack-cli] {exc}", file=sys.stderr)
