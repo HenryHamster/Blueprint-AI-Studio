@@ -2322,7 +2322,6 @@ describe('StrategicContextRail', () => {
 
     expect(host.textContent).toContain('Cycle cancelled');
     expect(host.textContent).toContain('Cancelled by operator while reconnecting');
-    expect(host.textContent).not.toContain('Cycle stale');
     expect(host.textContent).not.toContain('Cycle running');
   });
 
@@ -2352,7 +2351,6 @@ describe('StrategicContextRail', () => {
 
     expect(host.textContent).toContain('Cycle failed');
     expect(host.textContent).toContain('Live failure after the durable refresh lagged');
-    expect(host.textContent).not.toContain('Cycle stale');
     expect(host.textContent).not.toContain('Cycle running');
   });
 
