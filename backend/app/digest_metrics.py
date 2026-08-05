@@ -140,6 +140,7 @@ from app.failure_classification import (
     TIMEOUT_OOM,
     TIMEOUT_PROCESS_CRASH,
     TIMEOUT_UNKNOWN,
+    UNPLACEABLE_EXECUTION_SITE,
     VIEWPORT_REGRESSION,
 )
 
@@ -175,6 +176,7 @@ _FAILURE_CLASS_LABELS = {
     PARK_WAKE_STRANDED: "Park/Wake — stranded (no live wake registration)",
     APPROVED_CAP_PR_CLOSED: "Approved Cap PR Closed — fix-loop cap hit post-approval",
     ADMIN_CANCEL: "Admin Cancel",
+    UNPLACEABLE_EXECUTION_SITE: "Unplaceable — declared execution site has no dispatch path",
 }
 
 _FINDING_STRUCTURAL_GIVE_UP_LIST_LIMIT = 5
