@@ -15,9 +15,10 @@
 //
 // The reservation size is operator-tunable via BLUEPRINT_RUNNER_AGENT_DISK_
 // RESERVATION_BYTES — the same knob the fleet runner's resource ledger
-// consumes, forwarded to the agent through the isolation env allowlist. 0
-// (the default) disables per-workspace reservation; a separate measurement
-// task decides the value. The low-disk floor uses BLUEPRINT_RUNNER_MIN_DISK_BYTES.
+// consumes, forwarded to the agent through the isolation env allowlist.
+// Unset → DEFAULT_AGENT_DISK_RESERVATION_BYTES (a measured default, see the
+// constant below); an explicit 0 disables per-workspace reservation. The
+// low-disk floor uses BLUEPRINT_RUNNER_MIN_DISK_BYTES.
 //
 // Reservations are held in-process keyed by workspace path. The runner daemon
 // reaps the workspace directory when the agent exits, so in-process state is
@@ -33,6 +34,34 @@ import { sanitize } from './utils/sanitize.js';
 export const AGENT_DISK_RESERVATION_ENV = 'BLUEPRINT_RUNNER_AGENT_DISK_RESERVATION_BYTES';
 /** Env knob: low-disk floor a reservation must fit above. */
 export const MIN_FREE_DISK_ENV = 'BLUEPRINT_RUNNER_MIN_DISK_BYTES';
+
+/**
+ * Default per-workspace disk reservation, in bytes.
+ *
+ * Measured 2026-08-06 by building a real workspace for this repo through the
+ * same setup path the fleet uses — `git clone --depth 100` (as setupWorkspace
+ * and prepareWorkspaceForRole do) plus `npm ci` at the repo root, `agent/`,
+ * and `admin-ui/` (the exact `./check` install commands) plus a Python venv
+ * installing `backend/requirements.txt` — and du-measuring each component:
+ *
+ *   source tree (no .git / node_modules)    85 MiB
+ *   .git (depth-100 clone)                  21 MiB
+ *   root node_modules (npm ci)             509 MiB
+ *   agent node_modules (npm ci)            120 MiB
+ *   admin-ui node_modules (npm ci)          76 MiB
+ *   backend .venv (pip install)            404 MiB
+ *   ─────────────────────────────────────────────
+ *   measured high-water total             1215 MiB (1.19 GiB)
+ *
+ * The default is sized for that high-water — all dep trees present in one
+ * workspace, which a warm VM accumulates across roles — with headroom for
+ * growth, rounded up to 2 GiB. 2 GiB is also the figure the backend already
+ * uses as its workspace reserve floor for container-image jobs
+ * (`_CONTAINER_WORKSPACE_MIN_FREE_DISK_BYTES_DEFAULT` in
+ * orchestrator_runner_dispatch.py), so the agent and dispatch layers agree.
+ * Set BLUEPRINT_RUNNER_AGENT_DISK_RESERVATION_BYTES=0 to disable.
+ */
+export const DEFAULT_AGENT_DISK_RESERVATION_BYTES = 2 * 1024 * 1024 * 1024; // 2 GiB
 
 const _workspaceDiskReservations = new Map<string, number>();
 
@@ -64,7 +93,11 @@ function envBytes(name: string): number {
 
 /** Reserved bytes each workspace declares for itself (0 = reservation disabled). */
 export function workspaceDiskReservationBytes(): number {
-  return envBytes(AGENT_DISK_RESERVATION_ENV);
+  const raw = process.env[AGENT_DISK_RESERVATION_ENV];
+  // Unset or blank → the measured default. An explicit 0 still disables.
+  if (raw === undefined || !raw.trim()) return DEFAULT_AGENT_DISK_RESERVATION_BYTES;
+  const value = Number.parseInt(raw.trim(), 10);
+  return Number.isFinite(value) && value > 0 ? value : 0;
 }
 
 /** Low-disk floor on the workspace filesystem; a reservation must fit above it. */

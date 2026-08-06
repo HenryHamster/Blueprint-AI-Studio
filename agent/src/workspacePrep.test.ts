@@ -73,6 +73,7 @@ import {
   getLastWorkspacePrepOutcome, resetWorkspacePrepOutcome,
 } from './workspacePrep.js';
 import {
+  DEFAULT_AGENT_DISK_RESERVATION_BYTES,
   reserveWorkspaceDisk, releaseWorkspaceDiskReservation,
   getWorkspaceDiskReservation, getWorkspaceDiskAccounting,
   resetWorkspaceDiskReservations, DiskReservationError,
@@ -1464,8 +1465,9 @@ describe('prepareWorkspaceForRole', () => {
         checkpoint_reset_applied: true,
         cold_fallback_reason: null,
         lane_phase: true,
-        // Reservation env unset in this test → 0, still carried in the outcome.
-        disk_reserved_bytes: 0,
+        // Reservation env unset in this test → the measured default, still
+        // carried in the outcome.
+        disk_reserved_bytes: DEFAULT_AGENT_DISK_RESERVATION_BYTES,
       });
     });
   });
@@ -1514,7 +1516,14 @@ describe('workspaceDisk reservation ledger', () => {
         : '');
   }
 
-  it('reservation disabled (env unset) → no-op, nothing held', () => {
+  it('reservation uses the measured default when the env is unset', () => {
+    mockDfFreeKb(4 * 1024 * 1024); // 4 GiB free ≥ 2 GiB default reservation.
+    expect(reserveWorkspaceDisk('/ws')).toBe(DEFAULT_AGENT_DISK_RESERVATION_BYTES);
+    expect(getWorkspaceDiskReservation('/ws')).toBe(DEFAULT_AGENT_DISK_RESERVATION_BYTES);
+  });
+
+  it('reservation disabled (env explicitly 0) → no-op, nothing held', () => {
+    process.env.BLUEPRINT_RUNNER_AGENT_DISK_RESERVATION_BYTES = '0';
     expect(reserveWorkspaceDisk('/ws')).toBe(0);
     expect(getWorkspaceDiskReservation('/ws')).toBeNull();
   });
