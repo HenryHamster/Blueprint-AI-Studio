@@ -2074,3 +2074,74 @@ async def test_spawn_failed_redriven_on_site_change(db_session, mocker):
         "the record's engine matches the current serving engine"
     )
     assert mock_run_qual.call_count == 1
+
+
+def test_audited_surface_seam_is_reachable_via_rq_and_reuses_verdicts():
+    """The audited-surface cluster extracted into release_qualifier_audit_surface
+    stays reachable through the canonical ``rq.*`` surface (re-export seam), and
+    its verdict-reuse gating behaves correctly.
+
+    Regression direction (the orchestrator_ci_monitor trap): a behaviour-preserving
+    extraction that moves code out but does not keep the moved module reachable by
+    the tests that cover it silently orphans that coverage by blast radius. This
+    test anchors ``app.release_qualifier_audit_surface`` DIRECTLY (so the
+    impacted-tests resolver selects it at hop 0) AND asserts the re-export
+    identity, so the existing ``rq.*`` / mock-patch callers keep covering the
+    moved implementations.
+    """
+    from app import release_qualifier_audit_surface as rqas
+
+    # Re-export seam: the canonical rq.* surface must resolve to the moved
+    # implementation — existing rq.* callers and
+    # ``mocker.patch("app.release_qualifier.compute_audited_surface_hash", ...)``
+    # keep covering this code after the extraction.
+    assert rq.compute_audited_surface_hash is rqas.compute_audited_surface_hash
+    assert rq._incremental_audit_base_sha is rqas._incremental_audit_base_sha
+    assert rq._promotion_failed_reuse_eligible is rqas._promotion_failed_reuse_eligible
+    assert rq._merge_scoped_test_erosion_with_prior_fact is (
+        rqas._merge_scoped_test_erosion_with_prior_fact
+    )
+
+    # Deterministic content hash over the audited surface, excluding the
+    # mechanically-regenerated artifacts an audit does not judge.
+    tree = [
+        {"path": "app/foo.py", "sha": "a" * 40},
+        {"path": ".github/workflows/ci.yml", "sha": "b" * 40},
+        {"path": "backend/testing/module_size_limits.json", "sha": "c" * 40},
+        {"path": "docs/README.md", "sha": "d" * 40},
+    ]
+    h1 = rq.compute_audited_surface_hash(tree)
+    assert h1 is not None
+    # Re-ordering the tree entries must not change the hash (normalized map).
+    assert rq.compute_audited_surface_hash(list(reversed(tree))) == h1
+    # A real app-code change must change the surface hash.
+    changed = [
+        {"path": "app/foo.py", "sha": "a" * 40},
+        {"path": "app/bar.py", "sha": "e" * 40},
+    ]
+    assert rq.compute_audited_surface_hash(changed) != h1
+    # An unavailable tree fails open to None (no reuse signal).
+    assert rq.compute_audited_surface_hash(None) is None
+
+    # promotion_failed verdicts are reusable only when the live candidate diff
+    # hash matches the prior verdict's (a fix landing entirely in an
+    # audit-excluded path) — anything else must fall through to a re-audit.
+    assert (
+        rq._promotion_failed_reuse_eligible(
+            {"status": "promotion_failed", "candidate_diff_hash": "x"}, "x"
+        )
+        is True
+    )
+    assert (
+        rq._promotion_failed_reuse_eligible(
+            {"status": "not_promoted", "candidate_diff_hash": "x"}, "x"
+        )
+        is False
+    )
+    assert (
+        rq._promotion_failed_reuse_eligible(
+            {"status": "promotion_failed", "candidate_diff_hash": "x"}, "y"
+        )
+        is False
+    )
+    assert rq._promotion_failed_reuse_eligible(None, "x") is False
