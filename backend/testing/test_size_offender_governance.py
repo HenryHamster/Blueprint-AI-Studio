@@ -10,6 +10,9 @@ Covers:
 
 from __future__ import annotations
 
+import json
+import os
+import subprocess
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
@@ -17,6 +20,7 @@ import pytest
 from sqlmodel import select
 
 from app import hotfix_backmerge as hb
+from app import size_limit_policy as slp
 from app.models import Alert, Project
 from app.size_limit_policy import (
     CHRONIC_WINDOW_DAYS,
@@ -42,6 +46,39 @@ def _record(old_cap: int, new_cap: int, days_ago: int) -> BumpRecord:
         old_cap=old_cap,
         new_cap=new_cap,
     )
+
+
+@pytest.fixture
+def real_git_checkout(tmp_path):
+    """Pin the real-checkout precondition for the git-history failure tests.
+
+    Under the deployed-layout fallback, :func:`parse_bump_history` only takes the
+    git subprocess path when ``_REPO_ROOT`` is a git checkout. In the CI harness
+    ``_REPO_ROOT`` resolves to ``/`` (a non-checkout mount), so a test that must
+    exercise the git-failure path would silently become the ledger fallback
+    there. Patching ``_REPO_ROOT`` to a temp dir with a ``.git`` directory makes
+    the git path deterministic everywhere.
+    """
+    checkout = tmp_path / "checkout"
+    (checkout / ".git").mkdir(parents=True)
+    with patch("app.size_limit_policy._REPO_ROOT", str(checkout)):
+        yield
+
+
+def _deployed_layout(tmp_path, mocker, ledger_path: str | None = None):
+    """Pin the deployed backend layout: no git binary, ``_REPO_ROOT`` not a checkout.
+
+    Optionally repoints the committed ledger mirror to a hermetic fixture file.
+    Returns the ledger path in effect.
+    """
+    mocker.patch("app.size_limit_policy.shutil.which", return_value=None)
+    mocker.patch("app.size_limit_policy._REPO_ROOT", str(tmp_path / "deployed"))
+    if ledger_path is not None:
+        mocker.patch(
+            "app.size_limit_policy._CAP_BUMP_HISTORY_LEDGER_PATH", str(ledger_path)
+        )
+        return str(ledger_path)
+    return slp._CAP_BUMP_HISTORY_LEDGER_PATH
 
 
 async def _make_project(db_session) -> Project:
@@ -360,10 +397,13 @@ def test_classify_breach_chronic_override_grants_new_limit(mocker):
     assert verdict["suggested_new_limit"] > 1720
 
 
-def test_parse_bump_history_raises_on_git_failure():
-    """When git history cannot be read, parse_bump_history must raise
-    BumpHistoryUnavailableError rather than returning an empty list — so callers
-    can distinguish "no bumps on record" from "history could not be read"."""
+def test_parse_bump_history_raises_on_git_failure(real_git_checkout):
+    """When git history cannot be read in a real checkout, parse_bump_history
+    must raise BumpHistoryUnavailableError rather than returning an empty list —
+    so callers can distinguish "no bumps on record" from "history could not be
+    read". (The deployed-layout case is covered by the ledger-fallback tests:
+    there the same unreadable-git condition is what makes the ledger mirror the
+    history source instead.)"""
     with patch(
         "app.size_limit_policy.subprocess.run",
         side_effect=FileNotFoundError("git not found"),
@@ -372,10 +412,10 @@ def test_parse_bump_history_raises_on_git_failure():
             parse_bump_history("raises_git.py", "backend")
 
 
-def test_parse_bump_history_raises_on_nonzero_git_exit():
-    """A non-zero git log exit (e.g. a truncated/shallow task-VM clone) is also
-    unreadable history and must raise, not degrade to an empty list."""
-    import subprocess
+def test_parse_bump_history_raises_on_nonzero_git_exit(real_git_checkout):
+    """A non-zero git log exit in a real checkout (e.g. a truncated/shallow
+    task-VM clone) is also unreadable history and must raise, not degrade to an
+    empty list."""
 
     result = subprocess.CompletedProcess(
         args=[], returncode=128, stdout="", stderr="fatal: bad revision"
@@ -385,10 +425,11 @@ def test_parse_bump_history_raises_on_nonzero_git_exit():
             parse_bump_history("raises_rc.py", "backend")
 
 
-def test_classify_breach_git_unavailable_refuses_bump():
-    """When bump history is unreadable, classify_breach must FAIL CLOSED —
-    refuse the bump (no suggested_new_limit) and route to decomposition rather
-    than emitting a routine suggested_new_limit for a possibly chronic file."""
+def test_classify_breach_git_read_failure_refuses_bump(real_git_checkout):
+    """When bump history is unreadable in a real checkout, classify_breach must
+    FAIL CLOSED — refuse the bump (no suggested_new_limit) and route to
+    decomposition rather than emitting a routine suggested_new_limit for a
+    possibly chronic file."""
     with patch(
         "app.size_limit_policy.subprocess.run",
         side_effect=FileNotFoundError("git not found"),
@@ -433,3 +474,196 @@ def test_classify_breach_unreadable_history_override_still_grants_bump():
     assert verdict["suggested_new_limit"] is not None
     assert verdict["suggested_new_limit"] > 1720
     assert verdict["history_unavailable"] is True
+
+
+# ---------------------------------------------------------------------------
+# Deployed-layout ledger fallback — the production ``app`` stage ships no git
+# binary and ``_REPO_ROOT`` resolves to ``/`` (a non-checkout), so the history-
+# readable branch is only reachable through the committed cap-bump-history
+# ledger. These pin that branch reachable and the guard not weakened.
+# ---------------------------------------------------------------------------
+
+
+def test_classify_breach_reaches_history_readable_branch_in_deployed_layout(
+    tmp_path, mocker
+):
+    """Acceptance criterion: in the deployed backend layout — no git binary and
+    ``_REPO_ROOT`` is not a checkout — the chronic-offender guard must REACH its
+    history-readable branch by reading the committed cap-bump-history ledger,
+    instead of failing closed on history it can never obtain.
+
+    Regression direction: if the ledger fallback is removed or the shipped
+    ledger stops being readable, ``classify_breach`` returns
+    ``history_unavailable=True`` under this exact layout and the test fails —
+    the deployed layout is precisely where the guard previously could only ever
+    reach its fail-closed branch.
+    """
+    slp._bump_history_cache.clear()
+    ledger_path = _deployed_layout(tmp_path, mocker)
+
+    # The ledger mirror ships in the image; the real committed ledger must be
+    # readable at its shipped path under the deployed layout.
+    assert os.path.isfile(ledger_path)
+
+    # A real chronic offender recorded in the ledger (4 bumps — fires the growth
+    # trigger regardless of the 180-day window aging).
+    history = parse_bump_history("test_release_qualifier.py", "testing")
+    assert len(history) >= 3
+
+    verdict = classify_breach("test_release_qualifier.py", 2400, section="testing")
+
+    assert verdict["history_unavailable"] is False  # readable branch REACHED
+    assert verdict["is_chronic"] is True
+    assert verdict["suggested_new_limit"] is None
+    assert verdict["bump_count"] == len(history)
+
+
+def test_deployed_layout_routine_breach_still_classified(tmp_path, mocker):
+    """A genuine first-time breach in the deployed layout (no history on record)
+    must still classify as routine and receive a suggested new limit — the
+    ledger fallback does not turn every breach into a chronic refusal."""
+    slp._bump_history_cache.clear()
+    ledger_path = tmp_path / "cap_bump_history.json"
+    ledger_path.write_text(
+        json.dumps({"schema_version": 1, "history": {}}), encoding="utf-8"
+    )
+    _deployed_layout(tmp_path, mocker, ledger_path=ledger_path)
+
+    verdict = classify_breach("brand_new_module.py", 1720)
+
+    assert verdict["history_unavailable"] is False
+    assert verdict["is_chronic"] is False
+    assert verdict["suggested_new_limit"] is not None
+    assert verdict["suggested_new_limit"] > 1720
+    assert verdict["bump_count"] == 0
+
+
+def test_deployed_layout_missing_ledger_fails_closed(tmp_path, mocker):
+    """A deployed layout whose ledger mirror is missing/corrupt must STILL fail
+    closed — an unreadable mirror can never silently degrade to 'no bump
+    history' and grant a routine bump to a possibly chronic offender."""
+    slp._bump_history_cache.clear()
+    _deployed_layout(tmp_path, mocker, ledger_path=str(tmp_path / "missing.json"))
+
+    verdict = classify_breach("ghost_module.py", 1720)
+
+    assert verdict["history_unavailable"] is True
+    assert verdict["is_chronic"] is True
+    assert verdict["suggested_new_limit"] is None
+
+
+def test_ledger_with_pending_bumps_appends_and_dedups():
+    """ledger_with_pending_bumps appends a new bump and does not duplicate one
+    already recorded — a retried rollup cycle (or a regenerated --fix) is
+    idempotent."""
+    ledger = {
+        "schema_version": 1,
+        "history": {
+            "backend": {
+                "m.py": [
+                    {
+                        "commit_sha": "s1",
+                        "commit_date": "2026-01-01T00:00:00+00:00",
+                        "old_cap": 100,
+                        "new_cap": 200,
+                    }
+                ]
+            }
+        },
+    }
+    updated = slp.ledger_with_pending_bumps(ledger, [("backend", "m.py", 100, 200)])
+    assert len(updated["history"]["backend"]["m.py"]) == 1  # dedup, no duplicate
+
+    updated = slp.ledger_with_pending_bumps(ledger, [("backend", "m.py", 200, 300)])
+    assert len(updated["history"]["backend"]["m.py"]) == 2
+    assert updated["history"]["backend"]["m.py"][-1]["old_cap"] == 200
+    assert updated["history"]["backend"]["m.py"][-1]["new_cap"] == 300
+
+
+def _real_repo_checkout() -> str | None:
+    """Return a path to a real git checkout of this repo, or None."""
+    candidates = [slp._REPO_ROOT]
+    if os.path.isdir("/repo/.git"):
+        candidates.append("/repo")
+    for root in candidates:
+        if os.path.isdir(os.path.join(root, ".git")):
+            return root
+    return None
+
+
+def test_cap_bump_history_ledger_matches_git():
+    """The committed cap-bump-history ledger must mirror the git-recorded bumps.
+
+    The deployed backend reads the ledger (not git), so a ledger that drifts
+    from git history would change chronic-offender classification between dev
+    and production. Every bump the readable git history shows must be present in
+    the ledger (git ⊆ ledger). In a full (non-shallow) checkout the reverse is
+    checked too — the two must agree exactly. This is the guard that keeps
+    ``check_size_limits.py --fix`` and the rollup preflight honest about
+    updating the mirror.
+    """
+    repo_root = _real_repo_checkout()
+    if repo_root is None:
+        pytest.skip("no git checkout of this repo available for the ledger guard")
+    git_out = subprocess.run(
+        [
+            "git",
+            "log",
+            "--all",
+            "--format=COMMIT %H %aI",
+            "-p",
+            "--",
+            slp._MODULE_SIZE_LIMITS_RELPATH,
+        ],
+        capture_output=True,
+        text=True,
+        cwd=repo_root,
+        timeout=30,
+        check=True,
+    ).stdout
+
+    with open(slp._CAP_BUMP_HISTORY_LEDGER_PATH, encoding="utf-8") as f:
+        ledger = json.load(f)
+    ledger_history = ledger.get("history", {})
+    with open(slp._MODULE_SIZE_LIMITS_PATH, encoding="utf-8") as f:
+        caps = json.load(f)
+
+    mismatches = []
+    for section, keys in caps.items():
+        if not isinstance(keys, dict):
+            continue
+        for key in keys:
+            git_pairs = sorted(
+                (r["old_cap"], r["new_cap"])
+                for r in _parse_git_diff_output(git_out, key)
+            )
+            ledger_pairs = sorted(
+                (r["old_cap"], r["new_cap"])
+                for r in ledger_history.get(section, {}).get(key, [])
+            )
+            if not all(p in ledger_pairs for p in git_pairs):
+                mismatches.append((section, key, git_pairs, ledger_pairs))
+
+    assert not mismatches, (
+        "cap-bump-history ledger is missing git-recorded bumps "
+        "(regenerate with check_size_limits.py --fix): " + repr(mismatches)
+    )
+
+    # In a full-history checkout the mirror must also not contain phantom
+    # records — the ledger and git must agree exactly.
+    if not os.path.exists(os.path.join(repo_root, ".git", "shallow")):
+        for section, keys in caps.items():
+            if not isinstance(keys, dict):
+                continue
+            for key in keys:
+                git_pairs = sorted(
+                    (r["old_cap"], r["new_cap"])
+                    for r in _parse_git_diff_output(git_out, key)
+                )
+                ledger_pairs = sorted(
+                    (r["old_cap"], r["new_cap"])
+                    for r in ledger_history.get(section, {}).get(key, [])
+                )
+                assert git_pairs == ledger_pairs, (
+                    f"ledger drifted from git for {section}/{key}"
+                )

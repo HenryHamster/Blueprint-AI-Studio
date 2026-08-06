@@ -1,0 +1,300 @@
+{
+  "_doc": "Mirror of the cap-bump history recorded in backend/testing/module_size_limits.json's git log. The deployed backend has no git checkout, so classify_breach reads this file. Regenerate with check_size_limits.py --fix (or the rollup size preflight appends auto-bumps); a guard test keeps it in sync.",
+  "schema_version": 1,
+  "history": {
+    "backend": {
+      "task_lifecycle.py": [
+        {
+          "commit_sha": "1f87ef21fa6f4c003d0a6c3d91be87fb4d1262ff",
+          "commit_date": "2026-08-06T07:22:45+00:00",
+          "old_cap": 7750,
+          "new_cap": 8950
+        }
+      ],
+      "discovery_review.py": [
+        {
+          "commit_sha": "56155adb01fed84f8fe19a0e6fcbe267ed20dcff",
+          "commit_date": "2026-08-06T01:59:39+00:00",
+          "old_cap": 1700,
+          "new_cap": 2050
+        }
+      ],
+      "routers/agent_strategic_messages.py": [
+        {
+          "commit_sha": "824eb034c1e233e33eaf7898160317683ec37b61",
+          "commit_date": "2026-07-30T18:49:32-07:00",
+          "old_cap": 1950,
+          "new_cap": 3450
+        }
+      ],
+      "max_plan_pool.py": [
+        {
+          "commit_sha": "824eb034c1e233e33eaf7898160317683ec37b61",
+          "commit_date": "2026-07-30T18:49:32-07:00",
+          "old_cap": 6250,
+          "new_cap": 7200
+        }
+      ],
+      "strategic_completion.py": [
+        {
+          "commit_sha": "52d9f90d5719b12583f5da6753a9f9bb7efd319f",
+          "commit_date": "2026-08-06T07:47:06+00:00",
+          "old_cap": 7200,
+          "new_cap": 8350
+        }
+      ],
+      "admin_task_mutations.py": [
+        {
+          "commit_sha": "451e824e34db2acf91af1f7591f3234de2b3b1a7",
+          "commit_date": "2026-08-03T01:59:23+00:00",
+          "old_cap": 1650,
+          "new_cap": 1950
+        }
+      ],
+      "release_qualifier.py": [
+        {
+          "commit_sha": "2a103561935ae5a86f2083baaab128c008d4b83c",
+          "commit_date": "2026-08-05T12:25:20+00:00",
+          "old_cap": 9800,
+          "new_cap": 11350
+        }
+      ],
+      "models.py": [
+        {
+          "commit_sha": "824eb034c1e233e33eaf7898160317683ec37b61",
+          "commit_date": "2026-07-30T18:49:32-07:00",
+          "old_cap": 6450,
+          "new_cap": 9400
+        }
+      ],
+      "ci_completion.py": [
+        {
+          "commit_sha": "c5200163c144b6f3a516b4ca7543556c9ea4030c",
+          "commit_date": "2026-08-01T20:08:12-07:00",
+          "old_cap": 2660,
+          "new_cap": 3100
+        }
+      ],
+      "orchestrator_filters.py": [
+        {
+          "commit_sha": "88c5145b3acbb6a4c6e78ab6a02f9a5f41ffe765",
+          "commit_date": "2026-08-05T12:27:58+00:00",
+          "old_cap": 1850,
+          "new_cap": 2200
+        }
+      ],
+      "routers/directions.py": [
+        {
+          "commit_sha": "13627451b5399fc4eb1e7ebe2c5d4f1ca6c4bede",
+          "commit_date": "2026-08-03T06:05:11+00:00",
+          "old_cap": 2100,
+          "new_cap": 2450
+        }
+      ],
+      "routers/admin_project_config.py": [
+        {
+          "commit_sha": "8d806e7557fa1989e88b8d298940a97cfa64dd44",
+          "commit_date": "2026-08-03T02:38:00-07:00",
+          "old_cap": 1800,
+          "new_cap": 2000
+        }
+      ],
+      "release_qualifier_sweep.py": [
+        {
+          "commit_sha": "359419cef40f8ec7784bcc549629a6ddd723ee3e",
+          "commit_date": "2026-08-06T11:08:45+00:00",
+          "old_cap": 1500,
+          "new_cap": 2150
+        }
+      ],
+      "lifecycle.py": [
+        {
+          "commit_sha": "824eb034c1e233e33eaf7898160317683ec37b61",
+          "commit_date": "2026-07-30T18:49:32-07:00",
+          "old_cap": 2150,
+          "new_cap": 2500
+        }
+      ],
+      "routers/agent_strategic_fetch.py": [
+        {
+          "commit_sha": "824eb034c1e233e33eaf7898160317683ec37b61",
+          "commit_date": "2026-07-30T18:49:32-07:00",
+          "old_cap": 2550,
+          "new_cap": 3150
+        }
+      ],
+      "routers/runner.py": [
+        {
+          "commit_sha": "359419cef40f8ec7784bcc549629a6ddd723ee3e",
+          "commit_date": "2026-08-06T11:08:45+00:00",
+          "old_cap": 3800,
+          "new_cap": 4400
+        }
+      ],
+      "acceptance_gate.py": [
+        {
+          "commit_sha": "ead6f003650d60151a08b8c009617a6e55dccd06",
+          "commit_date": "2026-08-06T18:45:31+00:00",
+          "old_cap": 1800,
+          "new_cap": 2250
+        }
+      ],
+      "strategic_resident_session.py": [
+        {
+          "commit_sha": "c5200163c144b6f3a516b4ca7543556c9ea4030c",
+          "commit_date": "2026-08-01T20:08:12-07:00",
+          "old_cap": 5850,
+          "new_cap": 6850
+        }
+      ]
+    },
+    "agent": {
+      "prompts/check-helper.test.ts": [
+        {
+          "commit_sha": "456b0694e2c2bc2ef9b86d93d09121894c2428c9",
+          "commit_date": "2026-08-06T08:25:45+00:00",
+          "old_cap": 1950,
+          "new_cap": 2300
+        },
+        {
+          "commit_sha": "4ea383ac487f442b74aed4c0062da00a19acebf7",
+          "commit_date": "2026-08-06T08:55:39+00:00",
+          "old_cap": 2300,
+          "new_cap": 2350
+        }
+      ],
+      "handlers/strategic-resident-lib.ts": [
+        {
+          "commit_sha": "8843403eac58c3b50b36a2c7a0c9cd45281cc2cd",
+          "commit_date": "2026-08-02T03:12:40-07:00",
+          "old_cap": 3050,
+          "new_cap": 3550
+        }
+      ],
+      "handlers/strategic-resident.ts": [
+        {
+          "commit_sha": "824eb034c1e233e33eaf7898160317683ec37b61",
+          "commit_date": "2026-07-30T18:49:32-07:00",
+          "old_cap": 3700,
+          "new_cap": 5350
+        }
+      ],
+      "prompts/thinker.ts": [
+        {
+          "commit_sha": "95b4165cf7c1186ad2c11be95ac75717966dddd4",
+          "commit_date": "2026-08-06T04:24:11+00:00",
+          "old_cap": 1150,
+          "new_cap": 1400
+        }
+      ],
+      "utils/test-runners.ts": [
+        {
+          "commit_sha": "565960102b997febde95401edfe51618e7debe34",
+          "commit_date": "2026-08-06T08:11:23+00:00",
+          "old_cap": 2850,
+          "new_cap": 3350
+        }
+      ],
+      "providers/runners.ts": [
+        {
+          "commit_sha": "824eb034c1e233e33eaf7898160317683ec37b61",
+          "commit_date": "2026-07-30T18:49:32-07:00",
+          "old_cap": 2250,
+          "new_cap": 2700
+        }
+      ]
+    },
+    "testing": {
+      "test_agent.py": [
+        {
+          "commit_sha": "824eb034c1e233e33eaf7898160317683ec37b61",
+          "commit_date": "2026-07-30T18:49:32-07:00",
+          "old_cap": 27390,
+          "new_cap": 31550
+        }
+      ],
+      "test_compute.py": [
+        {
+          "commit_sha": "359419cef40f8ec7784bcc549629a6ddd723ee3e",
+          "commit_date": "2026-08-06T11:08:45+00:00",
+          "old_cap": 7976,
+          "new_cap": 9400
+        }
+      ],
+      "test_pack_under_budget.py": [
+        {
+          "commit_sha": "ead6f003650d60151a08b8c009617a6e55dccd06",
+          "commit_date": "2026-08-06T18:45:31+00:00",
+          "old_cap": 3100,
+          "new_cap": 3600
+        }
+      ],
+      "test_payload_schemas.py": [
+        {
+          "commit_sha": "c783ca41983438eb8e0ca43987529efa3ea3eea0",
+          "commit_date": "2026-08-06T14:03:08+00:00",
+          "old_cap": 2100,
+          "new_cap": 2500
+        }
+      ],
+      "test_release_qualifier.py": [
+        {
+          "commit_sha": "1932872da487ff054f0d763550bc2709154d95c9",
+          "commit_date": "2026-08-04T20:22:27-07:00",
+          "old_cap": 879,
+          "new_cap": 1100
+        },
+        {
+          "commit_sha": "56d870a7f2ccf7ff8b1287d9bbc1c4c911f0ad9e",
+          "commit_date": "2026-08-04T20:45:25-07:00",
+          "old_cap": 1100,
+          "new_cap": 1500
+        },
+        {
+          "commit_sha": "fb71fe7bf89e8b1751eab293da04d376d6f92865",
+          "commit_date": "2026-08-05T14:14:50+00:00",
+          "old_cap": 1500,
+          "new_cap": 1900
+        },
+        {
+          "commit_sha": "56155adb01fed84f8fe19a0e6fcbe267ed20dcff",
+          "commit_date": "2026-08-06T01:59:39+00:00",
+          "old_cap": 1900,
+          "new_cap": 2350
+        }
+      ],
+      "test_admin_routers__users.py": [
+        {
+          "commit_sha": "8d806e7557fa1989e88b8d298940a97cfa64dd44",
+          "commit_date": "2026-08-03T02:38:00-07:00",
+          "old_cap": 750,
+          "new_cap": 1000
+        }
+      ],
+      "test_strategic_resident_session.py": [
+        {
+          "commit_sha": "824eb034c1e233e33eaf7898160317683ec37b61",
+          "commit_date": "2026-07-30T18:49:32-07:00",
+          "old_cap": 3000,
+          "new_cap": 3550
+        }
+      ],
+      "test_admin_routers__strategic_directions.py": [
+        {
+          "commit_sha": "824eb034c1e233e33eaf7898160317683ec37b61",
+          "commit_date": "2026-07-30T18:49:32-07:00",
+          "old_cap": 1800,
+          "new_cap": 2200
+        }
+      ],
+      "test_ci_compliance_gate.py": [
+        {
+          "commit_sha": "7c341887830b45e8bb5548944007f1e4de72632d",
+          "commit_date": "2026-08-06T13:03:00+00:00",
+          "old_cap": 1950,
+          "new_cap": 2350
+        }
+      ]
+    }
+  }
+}

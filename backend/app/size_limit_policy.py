@@ -16,8 +16,10 @@ so the checker can import it without any install step or runtime context.
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import shutil
 import subprocess
 import time
 from datetime import datetime, timedelta, timezone
@@ -80,24 +82,60 @@ _CACHE_TTL_SECONDS: float = 60.0
 
 # Repo root: backend/app/ -> ../../
 _REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_TESTING_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "testing"))
 _MODULE_SIZE_LIMITS_RELPATH = "backend/testing/module_size_limits.json"
+_MODULE_SIZE_LIMITS_PATH = os.path.join(_TESTING_DIR, "module_size_limits.json")
+
+# Committed cap-bump-history ledger. In the deployed backend layout the git
+# evidence source is structurally unreachable (the production ``app`` stage
+# ships no git binary, and under WORKDIR /app ``_REPO_ROOT`` resolves to ``/``
+# which is not a checkout — ``.dockerignore`` also excludes ``.git``), so
+# :func:`parse_bump_history` reads this mirror of ``git log -p``'s bump records
+# instead of failing closed on history it can never obtain. Resolved relative to
+# this file so it works identically in a dev checkout (``backend/testing/``) and
+# in the image (``/app/testing/``). Maintained by ``check_size_limits.py --fix``
+# and the rollup size preflight; a guard test keeps it in sync with git.
+_CAP_BUMP_HISTORY_LEDGER_PATH = os.path.join(_TESTING_DIR, "cap_bump_history.json")
+_CAP_BUMP_HISTORY_LEDGER_SCHEMA = 1
+
+
+def _git_reads_history_here() -> bool:
+    """True only when git is on PATH AND ``_REPO_ROOT`` is a git checkout.
+
+    These are the two structural preconditions the deployed backend layout
+    fails: the production ``app`` stage has no git binary, and under WORKDIR
+    /app ``_REPO_ROOT`` resolves to ``/`` (no ``.git``; the image also excludes
+    it). When either is false the git evidence source is unreachable and
+    :func:`parse_bump_history` reads the committed ledger mirror instead.
+    """
+    return shutil.which("git") is not None and os.path.isdir(
+        os.path.join(_REPO_ROOT, ".git")
+    )
 
 
 def parse_bump_history(module_key: str, section: str = "backend") -> list[BumpRecord]:
-    """Return the cap-bump history for ``module_key`` from git log.
+    """Return the cap-bump history for ``module_key``.
 
     Reads ``backend/testing/module_size_limits.json``'s git history, extracts
     diff hunks commit-by-commit, and returns records where the given key's
     cap value increased (old_cap -> new_cap).  Results are sorted oldest-first.
 
+    In the deployed backend layout — where git is structurally unavailable (no
+    git binary and/or no git checkout under ``_REPO_ROOT``) — the history comes
+    from the committed cap-bump-history ledger
+    (``backend/testing/cap_bump_history.json``), which mirrors exactly what the
+    git read would produce. This is what makes the chronic-offender guard's
+    history-readable branch reachable in production.
+
     Cached for ``_CACHE_TTL_SECONDS`` so repeated calls in a single reconcile
-    cycle do not re-shell.  Returns ``[]`` ONLY when the git read succeeded and
-    contains no cap bumps for the key — a genuinely empty history.  Raises
+    cycle do not re-shell.  Returns ``[]`` ONLY when the history read succeeded
+    and contains no cap bumps for the key — a genuinely empty history.  Raises
     :class:`BumpHistoryUnavailableError` when the history could not be read at
-    all (subprocess timeout, git not available, non-repo environment, or a
-    non-zero ``git log`` exit).  Callers that gate the chronic-offender verdict
-    on this history must distinguish "no bumps on record" from "history could
-    not be read" instead of treating both as empty.
+    all (subprocess timeout, a non-zero ``git log`` exit in a real checkout —
+    e.g. a truncated/shallow task-VM clone — or an unreadable/malformed ledger
+    in the deployed layout).  Callers that gate the chronic-offender verdict on
+    this history must distinguish "no bumps on record" from "history could not
+    be read" instead of treating both as empty.
     """
     cache_key = (module_key, section)
     now = time.monotonic()
@@ -108,6 +146,40 @@ def parse_bump_history(module_key: str, section: str = "backend") -> list[BumpRe
             raise outcome
         return outcome
 
+    try:
+        records = _read_git_bump_history(module_key)
+    except BumpHistoryUnavailableError as err:
+        # Cache the failure too: a broken history read stays broken within the
+        # TTL, so a reconcile cycle does not re-shell git per capped file.
+        _bump_history_cache[cache_key] = (err, now)
+        raise err
+    if records is None:
+        # git structurally unreachable (deployed layout) — read the committed
+        # ledger mirror of the same history.
+        try:
+            records = _read_cap_bump_history_ledger(section, module_key)
+        except BumpHistoryUnavailableError as err:
+            _bump_history_cache[cache_key] = (err, now)
+            raise err
+    _bump_history_cache[cache_key] = (records, now)
+    return records
+
+
+def _read_git_bump_history(module_key: str) -> list[BumpRecord] | None:
+    """Read bump history from git, or ``None`` when git is structurally absent.
+
+    ``None`` (NOT an error) signals the deployed layout: no git binary on PATH
+    or ``_REPO_ROOT`` is not a git checkout.  The caller then falls back to the
+    committed ledger mirror.
+
+    Any other failure to read git history — a subprocess error, or a non-zero
+    ``git log`` exit (a truncated/shallow task-VM clone, a corrupt repo) —
+    raises :class:`BumpHistoryUnavailableError`.  In a real checkout that is
+    genuine evidence loss and must stay fail-closed rather than silently degrade
+    to "no bump history".
+    """
+    if not _git_reads_history_here():
+        return None
     try:
         result = subprocess.run(
             [
@@ -129,19 +201,273 @@ def parse_bump_history(module_key: str, section: str = "backend") -> list[BumpRe
             f"git log failed while reading bump history for {module_key!r}"
         )
         err.__cause__ = exc
-        _bump_history_cache[cache_key] = (err, now)
         raise err
     if result.returncode != 0:
-        err = BumpHistoryUnavailableError(
+        raise BumpHistoryUnavailableError(
             f"git log exited {result.returncode} while reading bump history "
             f"for {module_key!r}"
         )
-        _bump_history_cache[cache_key] = (err, now)
+    return _parse_git_diff_output(result.stdout, module_key)
+
+
+def _read_cap_bump_history_ledger(section: str, module_key: str) -> list[BumpRecord]:
+    """Read cap-bump history for ``module_key`` from the committed ledger mirror.
+
+    The ledger is the history source in the deployed backend layout, where git
+    is structurally unreachable.  An unreadable or malformed ledger raises
+    :class:`BumpHistoryUnavailableError` — the same fail-closed contract as an
+    unreadable git read, so a missing/corrupt mirror can never silently degrade
+    to "no bump history".  A valid ledger with no records for the key returns
+    ``[]`` (genuinely no bumps on record).
+    """
+    try:
+        with open(_CAP_BUMP_HISTORY_LEDGER_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as exc:
+        err = BumpHistoryUnavailableError(
+            f"cap-bump-history ledger unreadable at "
+            f"{_CAP_BUMP_HISTORY_LEDGER_PATH} while reading bump history for "
+            f"{module_key!r}"
+        )
+        err.__cause__ = exc
         raise err
 
-    records = _parse_git_diff_output(result.stdout, module_key)
-    _bump_history_cache[cache_key] = (records, now)
+    history = data.get("history") if isinstance(data, dict) else None
+    section_history = history.get(section) if isinstance(history, dict) else None
+    raw_records = (
+        section_history.get(module_key) if isinstance(section_history, dict) else None
+    )
+    if not raw_records:
+        return []
+
+    records: list[BumpRecord] = []
+    for raw in raw_records:
+        try:
+            records.append(
+                BumpRecord(
+                    commit_sha=str(raw["commit_sha"]),
+                    commit_date=str(raw["commit_date"]),
+                    old_cap=int(raw["old_cap"]),
+                    new_cap=int(raw["new_cap"]),
+                )
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            err = BumpHistoryUnavailableError(
+                f"malformed ledger record for {module_key!r} in "
+                f"{_CAP_BUMP_HISTORY_LEDGER_PATH}: {raw!r}"
+            )
+            err.__cause__ = exc
+            raise err
+    records.sort(key=lambda r: r["commit_date"])
     return records
+
+
+def ledger_with_pending_bumps(
+    ledger_data: dict, pending: list[tuple[str, str, int, int]]
+) -> dict:
+    """Return a copy of ``ledger_data`` with ``pending`` bumps appended.
+
+    ``pending`` entries are ``(section, key, old_cap, new_cap)`` — cap bumps
+    not yet in the committed history (an uncommitted ``--fix`` bump, or a rollup
+    auto-bump about to be committed).  Records already present for the same
+    (key, old_cap, new_cap) are not duplicated, so a retried rollup cycle (or a
+    regenerated ``--fix``) is idempotent.
+    """
+    result = dict(ledger_data) if isinstance(ledger_data, dict) else {}
+    history: dict = {}
+    for section, section_data in (result.get("history") or {}).items():
+        history[section] = dict(section_data) if isinstance(section_data, dict) else {}
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for section, key, old_cap, new_cap in pending:
+        section_records = history.setdefault(section, {})
+        records = list(section_records.get(key) or [])
+        known = {(r.get("old_cap"), r.get("new_cap")) for r in records}
+        if (old_cap, new_cap) not in known:
+            records.append(
+                {
+                    "commit_sha": "",
+                    "commit_date": now_iso,
+                    "old_cap": old_cap,
+                    "new_cap": new_cap,
+                }
+            )
+        section_records[key] = records
+    result["schema_version"] = _CAP_BUMP_HISTORY_LEDGER_SCHEMA
+    result["history"] = history
+    return result
+
+
+def rebuild_cap_bump_history_ledger(
+    *,
+    caps_json_path: str | None = None,
+    ledger_path: str | None = None,
+    pending: list[tuple[str, str, int, int]] | None = None,
+) -> dict:
+    """Regenerate the cap-bump-history ledger and write it; return the dict.
+
+    The ledger mirrors the bump records ``git log -p -- module_size_limits.json``
+    would produce, so the deployed backend (no git) classifies from the same
+    history it would read in a checkout.  Every cap-bump path must keep it in
+    sync: ``check_size_limits.py --fix`` passes the bumps it applies as
+    ``pending``, and the rollup size preflight appends its auto-bumps via
+    :func:`ledger_with_pending_bumps` before committing both files together.
+
+    The git-derived base is rebuilt only when the readable git history is not
+    missing any record the existing ledger already holds.  When git is absent
+    or truncated (a shallow task-VM clone), the existing ledger is preserved and
+    only git-visible records not already present are merged in — a truncated
+    ``git log`` must never truncate the mirror.  ``caps_json_path`` /
+    ``ledger_path`` default to the shipped files (under ``backend/testing/``);
+    callers with a hermetic fixture repo pass the fixture paths.
+    """
+    caps_path = caps_json_path or _MODULE_SIZE_LIMITS_PATH
+    out_path = ledger_path or _CAP_BUMP_HISTORY_LEDGER_PATH
+
+    try:
+        with open(out_path, encoding="utf-8") as f:
+            existing = json.load(f)
+    except (OSError, ValueError):
+        existing = {}
+    existing_history = (
+        existing.get("history") if isinstance(existing, dict) and existing.get("history") else {}
+    )
+
+    git_output = None
+    if _git_reads_history_here():
+        try:
+            result = subprocess.run(
+                [
+                    "git",
+                    "log",
+                    "--all",
+                    "--format=COMMIT %H %aI",
+                    "-p",
+                    "--",
+                    _MODULE_SIZE_LIMITS_RELPATH,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                cwd=_REPO_ROOT,
+            )
+        except Exception as exc:  # noqa: BLE001 — fall back to append-only below
+            result = None
+            _ = exc
+        if result is not None and result.returncode == 0:
+            git_output = result.stdout
+
+    if git_output is not None:
+        try:
+            with open(caps_path, encoding="utf-8") as f:
+                caps_data = json.load(f)
+        except (OSError, ValueError):
+            caps_data = {}
+        caps_keys: dict[str, set[str]] = {}
+        git_histories: dict[str, dict[str, list[BumpRecord]]] = {}
+        for section, keys in caps_data.items():
+            if not isinstance(keys, dict):
+                continue
+            caps_keys[section] = set(keys)
+            section_records: dict[str, list[BumpRecord]] = {}
+            for key in keys:
+                recs = _parse_git_diff_output(git_output, key)
+                if recs:
+                    section_records[key] = recs
+            if section_records:
+                git_histories[section] = section_records
+
+        if _git_would_drop_ledger_records(existing_history, git_histories, caps_keys):
+            # git is truncated — merge rather than regenerate, so records already
+            # in the mirror are never lost to a shallow ``git log``.
+            base_history = _merge_bump_histories(existing_history, git_histories)
+        else:
+            base_history = git_histories
+    else:
+        # git entirely unavailable — preserve the existing mirror.
+        base_history = existing_history
+
+    ledger = {
+        "_doc": (
+            "Mirror of the cap-bump history recorded in "
+            "backend/testing/module_size_limits.json's git log. The deployed "
+            "backend has no git checkout, so classify_breach reads this file. "
+            "Regenerate with check_size_limits.py --fix (or the rollup size "
+            "preflight appends auto-bumps); a guard test keeps it in sync."
+        ),
+        "schema_version": _CAP_BUMP_HISTORY_LEDGER_SCHEMA,
+        "history": base_history,
+    }
+    ledger = ledger_with_pending_bumps(ledger, pending or [])
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(ledger, f, indent=2, ensure_ascii=True)
+        f.write("\n")
+    return ledger
+
+
+def _git_would_drop_ledger_records(
+    existing_history: dict,
+    git_histories: dict[str, dict[str, list[BumpRecord]]],
+    caps_keys: dict[str, set[str]],
+) -> bool:
+    """True when regenerating from ``git_histories`` would drop a ledger record.
+
+    Only current-caps keys are consulted (removed keys can no longer breach, so
+    their records may be dropped safely).  If the existing ledger holds a record
+    for a current key that the readable git history does not show, git is
+    truncated (e.g. a shallow task-VM clone) and the mirror must be merged, not
+    regenerated, or history would be silently lost.
+    """
+    for section, section_records in existing_history.items():
+        if not isinstance(section_records, dict):
+            continue
+        current_keys = caps_keys.get(section, set())
+        git_section = git_histories.get(section, {})
+        for key, records in section_records.items():
+            if key not in current_keys or not isinstance(records, list):
+                continue
+            git_pairs = {
+                (r["old_cap"], r["new_cap"]) for r in git_section.get(key, [])
+            }
+            for record in records:
+                try:
+                    pair = (record["old_cap"], record["new_cap"])
+                except (KeyError, TypeError):
+                    return True
+                if pair not in git_pairs:
+                    return True
+    return False
+
+
+def _merge_bump_histories(
+    existing_history: dict, git_histories: dict[str, dict[str, list[BumpRecord]]]
+) -> dict[str, dict[str, list[BumpRecord]]]:
+    """Union two section->key->records maps, deduped by (key, old_cap, new_cap).
+
+    Existing records win on ties so the mirror's metadata is preserved; any
+    git-visible record the mirror lacks is added.
+    """
+    merged: dict[str, dict[str, list[BumpRecord]]] = {}
+    for section, section_records in existing_history.items():
+        if not isinstance(section_records, dict):
+            continue
+        by_key: dict[str, dict] = {}
+        for key, records in section_records.items():
+            if not isinstance(records, list):
+                continue
+            by_key[key] = {
+                (r.get("old_cap"), r.get("new_cap")): r for r in records
+            }
+        git_section = git_histories.get(section, {})
+        for key, records in git_section.items():
+            existing = by_key.setdefault(key, {})
+            for r in records:
+                existing.setdefault((r["old_cap"], r["new_cap"]), r)
+        merged[section] = {
+            key: sorted(records.values(), key=lambda r: r["commit_date"])
+            for key, records in by_key.items()
+            if records
+        }
+    return {s: sec for s, sec in merged.items() if sec}
 
 
 def _parse_git_diff_output(output: str, module_key: str) -> list[BumpRecord]:

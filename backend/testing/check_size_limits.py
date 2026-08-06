@@ -542,6 +542,34 @@ def main(argv: list[str] | None = None) -> int:
             added.append((section, rec, new_cap))
         if bumped or added:
             write_limits(args.json_path, data)
+            if bumped:
+                # Keep the committed cap-bump-history ledger (the deployed
+                # backend's history source) in sync with the bumps just applied.
+                # Rebuilding from git + the pending bumps is idempotent and
+                # self-heals any drift (including manual cap edits already in
+                # git). A ledger-maintenance failure must not roll back the cap
+                # bumps, but it must be loud — a stale ledger would change
+                # chronic-offender classification in production; the CI guard
+                # test would also catch it.
+                try:
+                    from app.size_limit_policy import rebuild_cap_bump_history_ledger
+
+                    ledger_path = os.path.join(
+                        os.path.dirname(args.json_path), "cap_bump_history.json"
+                    )
+                    rebuild_cap_bump_history_ledger(
+                        caps_json_path=args.json_path,
+                        ledger_path=ledger_path,
+                        pending=[
+                            (section, rec["rel"], rec["cap"], new_cap)
+                            for section, rec, new_cap in bumped
+                        ],
+                    )
+                    print(f"Updated {os.path.basename(ledger_path)}.")
+                except Exception as exc:  # noqa: BLE001 — cap bumps already written
+                    print(
+                        f"[warn] could not update cap-bump-history ledger: {exc}"
+                    )
             actions = []
             if bumped:
                 actions.append(f"Bumped {len(bumped)} cap(s)")

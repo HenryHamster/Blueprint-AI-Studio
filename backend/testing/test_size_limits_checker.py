@@ -385,20 +385,28 @@ def test_first_time_breach_still_bumped_normally(tmp_path, mocker):
     assert data["backend"]["new.py"] == bump_size_limit(1720)
 
 
-def test_fix_chronic_git_unavailable_refuses_bump(tmp_path, capsys, mocker):
-    """If git is unavailable (subprocess error), --fix must FAIL CLOSED — skip
-    the cap bump and route to decomposition, not degrade to a routine bump.
+def test_fix_chronic_git_read_failure_refuses_bump(tmp_path, capsys, mocker):
+    """If the git history read fails in a real checkout, --fix must FAIL CLOSED —
+    skip the cap bump and route to decomposition, not degrade to a routine bump.
 
     Unreadable bump history is NOT the same as "no bumps on record"; a possibly
     chronic offender must not receive a silent routine bump when its history
-    cannot be read (e.g. a truncated task-VM clone).
+    cannot be read (e.g. a truncated task-VM clone). The git-failure path is
+    only taken when ``_REPO_ROOT`` is a git checkout, so this pins that
+    precondition deterministically (in the CI harness ``_REPO_ROOT`` is a
+    non-checkout and would otherwise use the ledger fallback).
     """
     # Distinct key from the other real-subprocess tests so the module TTL cache
     # cannot leak a genuinely-empty history into this unreadable-history case.
     slp._bump_history_cache.clear()
     repo, jp = _build_repo(tmp_path, backend={"big_unreadable.py": (1720, 1600)})
 
-    # Simulate git subprocess failing entirely (e.g., non-repo CI shard).
+    # Pin the real-checkout precondition: git on PATH + _REPO_ROOT is a checkout.
+    checkout = tmp_path / "checkout"
+    (checkout / ".git").mkdir(parents=True)
+    mocker.patch("app.size_limit_policy._REPO_ROOT", str(checkout))
+
+    # Simulate git subprocess failing entirely.
     with mocker.patch(
         "app.size_limit_policy.subprocess.run",
         side_effect=FileNotFoundError("git not found"),

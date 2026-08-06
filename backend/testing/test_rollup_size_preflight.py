@@ -28,6 +28,13 @@ _SAMPLE_CAPS = {
 _CAPS_JSON = json.dumps(_SAMPLE_CAPS, indent=2) + "\n"
 _PINNED_HEAD = "a" * 40
 
+# The cap-bump-history ledger shipped alongside the caps file. The preflight
+# fetches it at the pinned head before an auto-bump commit so the deployed
+# backend's history mirror stays in sync; commit-path tests supply it as the
+# third get_file_text_at_ref result.
+_LEDGER = {"schema_version": 1, "history": {}}
+_LEDGER_JSON = json.dumps(_LEDGER, indent=2) + "\n"
+
 
 @pytest.fixture(autouse=True)
 def _stable_live_branch_head():
@@ -84,6 +91,7 @@ async def test_preflight_breach_auto_bumps_and_returns_bumped():
         mock_fetch.side_effect = [
             _CAPS_JSON,
             file_content,
+            _LEDGER_JSON,
         ]
 
         verdict, reason = await preflight_rollup_size_caps(
@@ -119,7 +127,7 @@ async def test_preflight_genuine_commit_failure_returns_hold():
         patch("app.size_limit_policy.parse_bump_history", return_value=[]),
     ):
         mock_pr_files.return_value = _pr_files("backend/app/models.py")
-        mock_fetch.side_effect = [_CAPS_JSON, file_content]
+        mock_fetch.side_effect = [_CAPS_JSON, file_content, _LEDGER_JSON]
         mock_commit.side_effect = RuntimeError(
             "GitHub Git Data API create-blob on owner/repo@staging "
             "returned HTTP 400 (expected 201)"
@@ -173,7 +181,7 @@ async def test_preflight_transient_commit_failure_returns_defer(commit_error):
         patch("app.size_limit_policy.parse_bump_history", return_value=[]),
     ):
         mock_pr_files.return_value = _pr_files("backend/app/models.py")
-        mock_fetch.side_effect = [_CAPS_JSON, file_content]
+        mock_fetch.side_effect = [_CAPS_JSON, file_content, _LEDGER_JSON]
         mock_commit.side_effect = commit_error
 
         verdict, reason = await preflight_rollup_size_caps(
@@ -306,7 +314,7 @@ async def test_preflight_agent_section_file_checked():
         patch("app.size_limit_policy.parse_bump_history", return_value=[]),
     ):
         mock_pr_files.return_value = _pr_files("agent/src/handlers/strategic.ts")
-        mock_fetch.side_effect = [_CAPS_JSON, file_content]
+        mock_fetch.side_effect = [_CAPS_JSON, file_content, _LEDGER_JSON]
 
         verdict, reason = await preflight_rollup_size_caps(
             "tok", "owner", "repo", 99, "staging/branch-2"
@@ -331,7 +339,7 @@ async def test_preflight_commit_bump_false_returns_hold_budget_exhausted():
         patch("app.size_limit_policy.parse_bump_history", return_value=[]),
     ):
         mock_pr_files.return_value = _pr_files("backend/app/models.py")
-        mock_fetch.side_effect = [_CAPS_JSON, file_content]
+        mock_fetch.side_effect = [_CAPS_JSON, file_content, _LEDGER_JSON]
 
         verdict, reason = await preflight_rollup_size_caps(
             "tok", "owner", "repo", 42, "staging/branch-1", commit_bump=False
@@ -442,7 +450,7 @@ async def test_chronic_offender_holds_not_bumped():
         patch("app.size_limit_policy.parse_bump_history", return_value=_chronic_history()),
     ):
         mock_pr_files.return_value = _pr_files("backend/app/models.py")
-        mock_fetch.side_effect = [_CAPS_JSON, file_content]
+        mock_fetch.side_effect = [_CAPS_JSON, file_content, _LEDGER_JSON]
 
         verdict, reason = await preflight_rollup_size_caps(
             "tok", "owner", "repo", 42, "staging/branch-1"
@@ -467,7 +475,7 @@ async def test_preflight_routine_breach_uses_classify_breach_new_limit():
         patch("app.size_limit_policy.parse_bump_history", return_value=[]),
     ):
         mock_pr_files.return_value = _pr_files("backend/app/models.py")
-        mock_fetch.side_effect = [_CAPS_JSON, file_content]
+        mock_fetch.side_effect = [_CAPS_JSON, file_content, _LEDGER_JSON]
 
         verdict, _reason = await preflight_rollup_size_caps(
             "tok", "owner", "repo", 42, "staging/branch-1"
@@ -479,6 +487,41 @@ async def test_preflight_routine_breach_uses_classify_breach_new_limit():
     # The committed cap must be the classify_breach suggested_new_limit for 600 lines:
     # bump_size_limit(600) = max(600+200, int(600*1.15)) rounded up to 50 = max(800, 690) -> 800
     assert updated["backend"]["models.py"] == 800
+
+
+@pytest.mark.asyncio
+async def test_preflight_auto_bump_records_ledger_bump():
+    """An auto-bump commit must also record the bump in the cap-bump-history ledger.
+
+    The deployed backend reads the ledger (not git), so a caps bump that is not
+    mirrored into the ledger would leave production classifying from a stale
+    history. The ledger must be fetched at the same pinned head and committed in
+    the same commit as the caps change.
+    """
+    file_content = "line\n" * 600  # 600 lines, cap 500
+
+    with (
+        patch("app.rollup_size_preflight.get_file_text_at_ref", new_callable=AsyncMock) as mock_fetch,
+        patch("app.rollup_size_preflight.get_pr_files", new_callable=AsyncMock) as mock_pr_files,
+        patch("app.rollup_size_preflight.commit_file_changes", new_callable=AsyncMock) as mock_commit,
+        patch("app.size_limit_policy.parse_bump_history", return_value=[]),
+    ):
+        mock_pr_files.return_value = _pr_files("backend/app/models.py")
+        mock_fetch.side_effect = [_CAPS_JSON, file_content, _LEDGER_JSON]
+
+        verdict, _reason = await preflight_rollup_size_caps(
+            "tok", "owner", "repo", 42, "staging/branch-1"
+        )
+
+    assert verdict == "bumped"
+    mock_commit.assert_awaited_once()
+    upserts = mock_commit.call_args.kwargs["upserts"]
+    from app.rollup_size_preflight import _CAP_BUMP_HISTORY_LEDGER_RELPATH
+
+    assert _CAP_BUMP_HISTORY_LEDGER_RELPATH in upserts
+    ledger = json.loads(upserts[_CAP_BUMP_HISTORY_LEDGER_RELPATH])
+    assert ledger["history"]["backend"]["models.py"][-1]["old_cap"] == 500
+    assert ledger["history"]["backend"]["models.py"][-1]["new_cap"] == 800
 
 
 @pytest.mark.asyncio
@@ -526,7 +569,7 @@ async def test_preflight_pins_reads_and_commit_to_same_head(_stable_live_branch_
         patch("app.size_limit_policy.parse_bump_history", return_value=[]),
     ):
         mock_pr_files.return_value = _pr_files("backend/app/models.py")
-        mock_fetch.side_effect = [_CAPS_JSON, file_content]
+        mock_fetch.side_effect = [_CAPS_JSON, file_content, _LEDGER_JSON]
         mock_commit.return_value = "b" * 40
 
         verdict, _ = await preflight_rollup_size_caps(
@@ -553,7 +596,7 @@ async def test_preflight_concurrent_branch_advance_defers_without_commit(
         patch("app.size_limit_policy.parse_bump_history", return_value=[]),
     ):
         mock_pr_files.return_value = _pr_files("backend/app/models.py")
-        mock_fetch.side_effect = [_CAPS_JSON, file_content]
+        mock_fetch.side_effect = [_CAPS_JSON, file_content, _LEDGER_JSON]
 
         verdict, reason = await preflight_rollup_size_caps(
             "tok", "owner", "repo", 42, "staging/branch-1"
@@ -577,7 +620,7 @@ async def test_preflight_idempotent_commit_result_does_not_rearm_bump(
         patch("app.size_limit_policy.parse_bump_history", return_value=[]),
     ):
         mock_pr_files.return_value = _pr_files("backend/app/models.py")
-        mock_fetch.side_effect = [_CAPS_JSON, file_content]
+        mock_fetch.side_effect = [_CAPS_JSON, file_content, _LEDGER_JSON]
         mock_commit.return_value = _PINNED_HEAD
 
         verdict, reason = await preflight_rollup_size_caps(
