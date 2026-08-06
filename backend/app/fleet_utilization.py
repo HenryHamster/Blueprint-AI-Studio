@@ -281,6 +281,18 @@ async def get_fleet_utilization_snapshot(
     excludes accounts currently in cooldown so a low utilization caused by
     rate-limits (not idle headroom) is distinguishable.
 
+    ``concurrent_peak`` / ``concurrent_p50`` / ``concurrent_p90`` /
+    ``concurrent_p95`` / ``concurrent_p99`` (populated only when ``session`` is
+    given) add the measured task-slot concurrency distribution, computed from
+    the same bounded task rows by ``_overlap_stats_from_task_rows`` — the one
+    sweep shared with ``get_task_concurrency_snapshot``, so the two surfaces can
+    never disagree. ``concurrent_peak`` is the maximum number of simultaneously
+    occupied slots observed in the window. The percentiles use that sweep's
+    denominator: seconds are weighted over the **active window** (first slot
+    start .. last slot end, interior idle gaps counted at level 0), *not* over
+    the full ``window_hours`` — leading/trailing idle does not drag the
+    distribution toward 0. They are integer concurrency levels.
+
     ``session`` is optional: with ``None`` the DB-derived fields are 0/None and
     only the in-memory capacity aggregation is returned (used by unit tests).
     """
@@ -308,6 +320,11 @@ async def get_fleet_utilization_snapshot(
     active_now = 0
     util_now: float | None = None
     util_avg: float | None = None
+    concurrent_peak: int | None = None
+    concurrent_p50: int | None = None
+    concurrent_p90: int | None = None
+    concurrent_p95: int | None = None
+    concurrent_p99: int | None = None
     active_task_vms: int | None = None
     managed_vm_count: int | None = None
     idle_pool_vms: int | None = None
@@ -357,6 +374,16 @@ async def get_fleet_utilization_snapshot(
         if nominal_capacity:
             util_now = active_now / nominal_capacity
             util_avg = occupancy_seconds / window_seconds / nominal_capacity
+
+        # Same rows, same slot definition, same sweep as
+        # get_task_concurrency_snapshot — measured overlap, not a simulation.
+        overlap = _overlap_stats_from_task_rows(rows, now, window_start)
+        percentiles = overlap["percentiles"]
+        concurrent_peak = overlap["peak"]
+        concurrent_p50 = percentiles.get("p50")
+        concurrent_p90 = percentiles.get("p90")
+        concurrent_p95 = percentiles.get("p95")
+        concurrent_p99 = percentiles.get("p99")
 
         active_task_vms = active_now
 
@@ -416,6 +443,11 @@ async def get_fleet_utilization_snapshot(
         "util_now": round(util_now, 4) if util_now is not None else None,
         "util_avg": round(util_avg, 4) if util_avg is not None else None,
         "window_hours": window_hours,
+        "concurrent_peak": concurrent_peak,
+        "concurrent_p50": concurrent_p50,
+        "concurrent_p90": concurrent_p90,
+        "concurrent_p95": concurrent_p95,
+        "concurrent_p99": concurrent_p99,
         "vm_cap": vm_cap or None,
         "active_task_vms": active_task_vms,
         "managed_vm_count": managed_vm_count,

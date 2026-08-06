@@ -203,6 +203,28 @@ The inputs are read from existing configuration / measured data, each cited:
 no-active-strategic (`autonomous_research.py:1732-1733`), so at most 1 concurrent
 strategic cycle per project at a time.
 
+**Task-slot concurrency is measured, not simulated (fleet sizing).** The 50-slot
+fleet-sizing claim no longer rests on the mocked vitest FIFO simulation
+(`agent/src/index.pool-mode.test.ts`, retained only as a scheduler-starvation
+regression). Peak and time-weighted percentile concurrent task-slot occupancy
+(p50 / p90 / p99, plus p95) are computed directly from the task table's
+slot-occupancy intervals via `get_fleet_utilization_snapshot`
+(`backend/app/fleet_utilization.py`) and surfaced on `/api/admin/fleet-utilization`
+as `concurrent_peak` / `concurrent_p50` / `concurrent_p90` / `concurrent_p95` /
+`concurrent_p99`. Both that endpoint and `get_task_concurrency_snapshot` read
+the single `_overlap_stats_from_task_rows` sweep, so they cannot disagree.
+**Denominator:** `concurrent_peak` is the maximum simultaneous slot occupancy
+in the window; the percentiles are seconds-weighted over the **active window**
+(first slot start to last slot end, with interior idle gaps counted at level 0)
+— *not* over the full `window_hours`, so leading/trailing idle does not drag the
+distribution toward 0. The slot itself is
+`vm_dispatched_at`/`vm_provisioned_at` → `vm_stopped_at` (still-active tasks
+extend to now); terminal tasks that never recorded a VM stamp hold no slot.
+This is *task-slot* concurrency — the number of fleet slots
+busy at once — and is distinct from the *strategic decision-loop* cadence in the
+'Target concurrency' row above (which remains unavailable and is not replaced by
+this measurement).
+
 ```
 Honest base (R=0.70, share 0.55):
   decision loop : $2.87/cycle × 256.6 (measured) = $  735.45/month

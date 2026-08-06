@@ -531,7 +531,13 @@ const BASELINE = loadBaseline();
 // Tests
 // ---------------------------------------------------------------------------
 
-describe('mock-factory-export-coverage (agent)', () => {
+// This scan walks every agent test file and dynamically imports each mocked
+// runtime module, so its wall-clock is dominated by Vite transform cost, not by
+// the assertions. On a constrained VM with a cold cache (./check runs `npm ci`
+// first, which wipes node_modules/.vite) that routinely exceeds Vitest's 5s
+// default and the test is killed mid-scan — a false red on a correct test.
+// Same convention as handlers/bake-smoke-run.test.ts:63.
+describe('mock-factory-export-coverage (agent)', { timeout: 120_000 }, () => {
   it('all_full_replacement_mock_factories_cover_runtime_exports', async () => {
     const testFiles = walkTestFiles(SRC_DIR);
 

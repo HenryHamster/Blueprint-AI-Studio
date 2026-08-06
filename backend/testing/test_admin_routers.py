@@ -10155,6 +10155,11 @@ class TestFleetUtilizationEndpoint:
             "util_now",
             "util_avg",
             "window_hours",
+            "concurrent_peak",
+            "concurrent_p50",
+            "concurrent_p90",
+            "concurrent_p95",
+            "concurrent_p99",
         ):
             assert field in data, f"missing field: {field}"
         # Derived saturation field must be present (may be None when no accounts)

@@ -873,7 +873,11 @@ def _format_fleet_utilization_axis(fleet: dict | None) -> str | None:
     breakdown is appended only when accounts are actually cooled, keeping the
     common (healthy) case terse — the cause of low utilization (idle headroom
     vs rate-limit cooldown) is what would otherwise mislead the strategist into
-    manufacturing work.
+    manufacturing work. When present, the measured task-slot concurrency
+    (``concurrent_peak`` / ``concurrent_p90`` from the fleet snapshot — peak
+    simultaneous slot occupancy, and the p90 of the concurrency distribution
+    weighted over the active window) is appended as ``peak N, p90 M``; it is
+    omitted entirely when absent.
     """
     if not fleet:
         return None
@@ -888,6 +892,12 @@ def _format_fleet_utilization_axis(fleet: dict | None) -> str | None:
     line = f"now {active}/{cap} ({now_pct})"
     if util_avg is not None:
         line += f", {window}h-avg {round(util_avg * 100)}%"
+    peak = fleet.get("concurrent_peak")
+    p90 = fleet.get("concurrent_p90")
+    if peak:
+        line += f", peak {peak}"
+        if p90 is not None:
+            line += f", p90 {round(p90)}"
     cooled = fleet.get("cooled_accounts") or 0
     usable = fleet.get("usable_capacity")
     if cooled and usable is not None and usable != cap:

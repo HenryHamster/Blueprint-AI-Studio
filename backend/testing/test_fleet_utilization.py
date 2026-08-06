@@ -19,6 +19,7 @@ import uuid
 
 from app import max_plan_pool
 from app.fleet_utilization import (
+    _overlap_stats_from_task_rows,
     _sum_slot_occupancy_seconds,
     get_fleet_utilization_snapshot,
 )
@@ -121,6 +122,39 @@ def test_format_respects_window_hours():
     assert "12h-avg 25%" in line
 
 
+def test_format_appends_concurrency_segment_when_present():
+    line = _format_fleet_utilization_axis(
+        {
+            "active_now": 6,
+            "nominal_capacity": 15,
+            "util_now": 0.4,
+            "util_avg": 0.38,
+            "window_hours": 24,
+            "cooled_accounts": 0,
+            "usable_capacity": 15,
+            "concurrent_peak": 9,
+            "concurrent_p90": 7,
+        }
+    )
+    assert line == "now 6/15 (40%), 24h-avg 38%, peak 9, p90 7"
+
+
+def test_format_omits_concurrency_segment_when_absent():
+    line = _format_fleet_utilization_axis(
+        {
+            "active_now": 6,
+            "nominal_capacity": 15,
+            "util_now": 0.4,
+            "util_avg": 0.38,
+            "window_hours": 24,
+            "cooled_accounts": 0,
+            "usable_capacity": 15,
+        }
+    )
+    assert line == "now 6/15 (40%), 24h-avg 38%"
+    assert "peak" not in line
+
+
 # ── _sum_slot_occupancy_seconds ─────────────────────────────────────────────
 
 
@@ -186,6 +220,160 @@ def test_occupancy_falls_back_to_provisioned_then_created_for_active():
     assert _sum_slot_occupancy_seconds(rows, now, window_start) == pytest.approx(3600)
 
 
+# ── measured slot concurrency (shared _overlap_stats_from_task_rows sweep) ───
+#
+# The fleet snapshot's concurrent_* fields are derived from the SAME sweep
+# get_task_concurrency_snapshot uses, so its denominator applies here: seconds
+# are weighted over the ACTIVE window (first slot start .. last slot end,
+# interior idle gaps at level 0), not over the full window_hours.
+
+
+def _completed_row(now, dispatched_h, stopped_h):
+    """Build a terminal COMPLETED row that held a slot ``[dispatched, stopped)``.
+
+    ``dispatched_h`` / ``stopped_h`` are offsets in hours BEFORE ``now``.
+    """
+
+    def _at(h):
+        return now - timedelta(hours=h)
+
+    return (
+        TaskStatus.COMPLETED,
+        _at(dispatched_h),
+        _at(stopped_h),
+        _at(dispatched_h),
+        None,
+        _at(stopped_h),
+    )
+
+
+def test_peak_concurrency_from_overlapping_intervals():
+    """Peak concurrent slot overlap is recovered from synthetic interval rows.
+
+    Builds a KNOWN overlap structure: an overlapping cluster peaking at 3, a
+    staggered tail with a brief overlap at 2, a task ending exactly when
+    another starts (half-open intervals -> the shared instant must NOT count
+    as overlap), and an empty input (peak 0 / empty percentiles).
+    """
+    now = datetime(2026, 6, 2, 12, 0, 0)
+    window_start = now - timedelta(hours=24)
+
+    # Overlapping cluster -> peak 3 at [3.5h, 3h) ago.
+    cluster = [
+        _completed_row(now, 5, 3),
+        _completed_row(now, 4, 2),
+        _completed_row(now, 3.5, 1.5),
+    ]
+
+    # Staggered tail -> brief overlap at 2, then a lone task.
+    tail = [
+        _completed_row(now, 8, 7),
+        _completed_row(now, 7.5, 6.5),
+        _completed_row(now, 6, 5.5),
+    ]
+
+    # A task ending exactly when another starts: the shared instant must NOT
+    # count as overlap (ends sort before starts at equal timestamps).
+    abutting = [
+        _completed_row(now, 10, 9),
+        _completed_row(now, 9, 8.5),
+    ]
+
+    stats = _overlap_stats_from_task_rows(cluster + tail + abutting, now, window_start)
+    assert stats["peak"] == 3
+
+    # The abutting pair alone must yield peak 1, not 2.
+    abutting_stats = _overlap_stats_from_task_rows(abutting, now, window_start)
+    assert abutting_stats["peak"] == 1
+
+    # Empty input -> sane defaults (peak 0, no percentiles to report).
+    empty = _overlap_stats_from_task_rows([], now, window_start)
+    assert empty["peak"] == 0
+    assert empty["percentiles"] == {}
+
+
+def test_sweep_time_weighted_percentiles():
+    """Percentiles are time-weighted over the ACTIVE window, not count-weighted.
+
+    1 slot occupied for 3h, then a 1h idle gap, then 2 slots for 1h. The active
+    window is first-start..last-end = 5h, so leading/trailing idle in the 24h
+    query window is NOT counted: level 0 holds 1h (20%), level 1 holds 3h
+    (cum 80%), level 2 holds 1h (cum 100%). p50 -> 1, p90/p95/p99 -> 2.
+    """
+    now = datetime(2026, 6, 2, 12, 0, 0)
+    window_start = now - timedelta(hours=24)
+    rows = [
+        _completed_row(now, 20, 17),  # 1 slot for 3h
+        _completed_row(now, 16, 15),  # 2 slots for 1h
+        _completed_row(now, 16, 15),
+    ]
+    stats = _overlap_stats_from_task_rows(rows, now, window_start)
+    assert stats["peak"] == 2
+    assert stats["window_seconds"] == pytest.approx(5 * 3600)
+    pcts = stats["percentiles"]
+    assert pcts["p50"] == 1
+    assert pcts["p90"] == 2
+    assert pcts["p95"] == 2
+    assert pcts["p99"] == 2
+    assert pcts["p100"] == 2
+
+
+def test_sweep_active_task_counts_to_now():
+    """A still-active task's interval extends to now (no stop stamp)."""
+    now = datetime(2026, 6, 2, 12, 0, 0)
+    window_start = now - timedelta(hours=24)
+    rows = [
+        (
+            TaskStatus.IN_PROGRESS,
+            now - timedelta(hours=2),
+            now - timedelta(hours=2),
+            now - timedelta(hours=2),
+            None,
+            None,
+        ),
+    ]
+    stats = _overlap_stats_from_task_rows(rows, now, window_start)
+    assert stats["peak"] == 1
+    # The active window is exactly the task's 2h, all at level 1 — trailing
+    # idle in the 24h query window is outside the denominator.
+    assert stats["window_seconds"] == pytest.approx(2 * 3600)
+    assert stats["percentiles"]["p50"] == 1
+    assert stats["percentiles"]["p90"] == 1
+    assert stats["percentiles"]["p95"] == 1
+    assert stats["percentiles"]["p99"] == 1
+
+
+def test_sweep_clips_to_window_and_skips_no_slot():
+    """Intervals are clipped to the window; terminal no-slot tasks are skipped."""
+    now = datetime(2026, 6, 2, 12, 0, 0)
+    window_start = now - timedelta(hours=24)
+    rows = [
+        # Started before the window, stopped inside -> clipped to window_start.
+        (
+            TaskStatus.COMPLETED,
+            now - timedelta(hours=30),
+            now - timedelta(hours=20),
+            now - timedelta(hours=30),
+            None,
+            now - timedelta(hours=20),
+        ),
+        # Terminal task that never recorded a VM stamp -> never held a slot.
+        (
+            TaskStatus.FAILED,
+            now - timedelta(hours=3),
+            now - timedelta(hours=3),
+            None,
+            None,
+            None,
+        ),
+    ]
+    stats = _overlap_stats_from_task_rows(rows, now, window_start)
+    assert stats["peak"] == 1
+    assert stats["task_count"] == 1
+    # Clipped at window_start: 20h of the 30h-old task, not 30h.
+    assert stats["window_seconds"] == pytest.approx(4 * 3600)
+
+
 # ── get_fleet_utilization_snapshot capacity aggregation (no DB) ──────────────
 
 
@@ -221,6 +409,80 @@ async def test_zero_capacity_yields_none(monkeypatch):
     assert snap["util_now"] is None
     assert snap["util_avg"] is None
     assert snap["cooled_accounts"] == 0
+
+
+async def test_snapshot_concurrency_fields_none_without_session(monkeypatch):
+    """session=None leaves the measured concurrency fields None."""
+    monkeypatch.setattr(max_plan_pool, "_all_accounts", lambda: [])
+    snap = await get_fleet_utilization_snapshot(session=None)
+    assert snap["concurrent_peak"] is None
+    assert snap["concurrent_p50"] is None
+    assert snap["concurrent_p90"] is None
+    assert snap["concurrent_p95"] is None
+    assert snap["concurrent_p99"] is None
+
+
+async def test_snapshot_surfaces_concurrency_fields_with_session(monkeypatch):
+    """With a mock session the concurrency sweep is surfaced in the snapshot."""
+    import app.runtime_config_state as rcs
+    import app.vm_lifecycle as vm_lifecycle
+    import app.warm_pool as warm_pool
+
+    monkeypatch.setitem(rcs.runtime_config, "max_concurrent_vms", 10)
+    monkeypatch.setattr(max_plan_pool, "_all_accounts", lambda: [])
+    monkeypatch.setattr(
+        max_plan_pool, "_account_available_for_model", lambda acct, model: True
+    )
+    monkeypatch.setattr(vm_lifecycle, "_last_gcp_vm_count", 6)
+    monkeypatch.setattr(vm_lifecycle, "_last_gcp_vm_check", float("inf"))
+    monkeypatch.setattr(warm_pool, "is_warm_pool_enabled", lambda: False)
+
+    now = _utcnow()
+    rows = [
+        # Overlapping cluster -> peak 3.
+        (
+            TaskStatus.COMPLETED,
+            now - timedelta(hours=5),
+            now - timedelta(hours=3),
+            now - timedelta(hours=5),
+            None,
+            now - timedelta(hours=3),
+        ),
+        (
+            TaskStatus.COMPLETED,
+            now - timedelta(hours=4),
+            now - timedelta(hours=2),
+            now - timedelta(hours=4),
+            None,
+            now - timedelta(hours=2),
+        ),
+        (
+            TaskStatus.COMPLETED,
+            now - timedelta(hours=3.5),
+            now - timedelta(hours=1.5),
+            now - timedelta(hours=3.5),
+            None,
+            now - timedelta(hours=1.5),
+        ),
+    ]
+
+    class _FakeResult:
+        def scalar(self):
+            return 3
+
+        def all(self):
+            return rows
+
+    class _FakeSession:
+        async def execute(self, stmt):
+            return _FakeResult()
+
+    snap = await get_fleet_utilization_snapshot(session=_FakeSession())
+    assert snap["concurrent_peak"] == 3
+    assert snap["concurrent_p50"] is not None
+    assert snap["concurrent_p90"] is not None
+    assert snap["concurrent_p95"] is not None
+    assert snap["concurrent_p99"] is not None
 
 
 # ── VM-slot fields ───────────────────────────────────────────────────────────
