@@ -429,7 +429,9 @@ describe('useTaskModal', () => {
       result.current.setAcceptanceEvidence(validNamedTestEvidence());
     });
     await act(async () => {
-      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+      await expect(
+        result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent),
+      ).rejects.toThrow('Invalid payload');
     });
     expect(addToast).toHaveBeenCalledWith(
       expect.stringContaining('Failed to create task'),
@@ -531,7 +533,9 @@ describe('useTaskModal', () => {
       result.current.setAcceptanceEvidence(validNamedTestEvidence());
     });
     await act(async () => {
-      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+      await expect(
+        result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent),
+      ).rejects.toThrow('not operator-launchable');
     });
     expect(addToast).toHaveBeenCalledWith(
       expect.stringContaining('not operator-launchable'),

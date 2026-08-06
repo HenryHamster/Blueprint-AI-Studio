@@ -841,8 +841,9 @@ export function useTaskModal(
       });
       if (!res.ok) {
         const errData = await res.json();
-        addToast(`Failed to create task: ${errData?.detail || errData?.error?.message || res.statusText}`, 'error');
-        return;
+        // Propagate the server's actual reason so the NewTaskModal can render it
+        // inline (a blanket 'Invalid request' hides the diagnosis).
+        throw new Error(errData?.detail || errData?.error?.message || res.statusText);
       }
       setShowNewTaskModal(false);
       setNewTaskTitle('');
@@ -853,8 +854,10 @@ export function useTaskModal(
       addToast('Task created successfully', 'success');
       fetchTasksRef.current();
     } catch (error) {
+      const message = error instanceof Error ? error.message : 'unknown error';
       console.error('Failed to create task:', error);
-      addToast('Failed to create task', 'error');
+      addToast(`Failed to create task: ${message}`, 'error');
+      throw error;
     }
   };
 

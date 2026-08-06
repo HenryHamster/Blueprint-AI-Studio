@@ -204,7 +204,7 @@ SURFACE_CONFIGS: dict[Surface, BranchLiteralSurfaceConfig] = {
         allowlist=(
             BranchLiteralAllowEntry(
                 path="components/NewTaskModal.tsx",
-                line=429,
+                line=434,
                 pattern="fallback-main",
                 rationale=(
                     "The resolved per-project integrationBranch is preferred; main is "

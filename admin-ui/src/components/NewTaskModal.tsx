@@ -136,6 +136,7 @@ export function NewTaskModal({
 }: NewTaskModalProps) {
   const [submitting, setSubmitting] = useState(false);
   const [submitAttempted, setSubmitAttempted] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
   const [prNumberError, setPrNumberError] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [registryAuthOpen, setRegistryAuthOpen] = useState(false);
@@ -338,8 +339,12 @@ export function NewTaskModal({
       return;
     }
     setSubmitting(true);
+    setSubmitError(null);
     try {
       await onSubmit(e);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      setSubmitError(message);
     } finally {
       setSubmitting(false);
     }
@@ -1170,6 +1175,9 @@ export function NewTaskModal({
             )}
           </div>
           <div className="flex justify-end gap-2 items-center">
+            {submitError && (
+              <span className="text-ui-md text-red-400 mr-auto">{submitError}</span>
+            )}
             {submitAttempted && (repoError || branchError || taskBranchDefaultsError) && (
               <span className="text-ui-md text-red-400 mr-auto">Fix errors above before launching.</span>
             )}

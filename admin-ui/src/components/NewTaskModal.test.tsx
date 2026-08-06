@@ -625,3 +625,56 @@ describe('NewTaskModal — Acceptance Evidence', () => {
     expect(onSubmit).toHaveBeenCalled();
   });
 });
+
+describe('NewTaskModal — submit surface', () => {
+  it('submits successfully without acceptance_evidence and surfaces the reason on 422', async () => {
+    const user = userEvent.setup();
+    const options = [
+      { value: 'plan', label: 'Plan', description: '' },
+      { value: 'create', label: 'Create', description: '' },
+    ];
+    const validEvidence = { ...defaultAcceptanceEvidenceForm(), testPath: 'tests/test_feature.py' };
+
+    // Success path: a non-code-producing task type submits with no
+    // acceptance_evidence declaration (no evidence section renders).
+    const successOnSubmit = vi.fn().mockResolvedValue(undefined);
+    const { unmount } = render(
+      <NewTaskModal
+        {...baseProps}
+        newTaskType="plan"
+        newTaskTitle="Build the roadmap"
+        newTaskPrompt="Decompose the work into a plan."
+        launchableTaskTypeOptions={options}
+        computeExperiment={makeComputeExperiment()}
+        setComputeExperiment={vi.fn()}
+        onSubmit={successOnSubmit}
+      />,
+    );
+    expect(screen.queryByText('Acceptance Evidence')).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Launch' }));
+    expect(successOnSubmit).toHaveBeenCalledTimes(1);
+    unmount();
+
+    // 422 path: the server's actual validation reason renders inline in the
+    // modal instead of a blanket 'Invalid request'.
+    const reason =
+      "Payload of code-producing task type 'create' requires an 'acceptance_evidence' declaration";
+    const failingOnSubmit = vi.fn().mockRejectedValue(new Error(reason));
+    render(
+      <NewTaskModal
+        {...baseProps}
+        newTaskType="create"
+        newTaskTitle="Build the feature"
+        newTaskPrompt="Implement the change."
+        launchableTaskTypeOptions={options}
+        computeExperiment={makeComputeExperiment()}
+        setComputeExperiment={vi.fn()}
+        acceptanceEvidence={validEvidence}
+        onSubmit={failingOnSubmit}
+      />,
+    );
+    await user.click(screen.getByRole('button', { name: 'Launch' }));
+    expect(failingOnSubmit).toHaveBeenCalledTimes(1);
+    expect(screen.getByText(reason)).toBeInTheDocument();
+  });
+});
