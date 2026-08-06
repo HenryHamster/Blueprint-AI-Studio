@@ -130,6 +130,13 @@ AGENT_ENV_ALLOWLIST: tuple[str, ...] = (
     "TERM",
     # Agent knobs
     "GIT_REFERENCE_CACHE_ROOT",
+    # Shared pip/uv package store (agent/src/packageStore.ts). PIP_CACHE_DIR /
+    # UV_CACHE_DIR let a workspace's pip/uv point at the RW-bound shared store;
+    # the BLUEPRINT_* knobs tune its location and eviction ceiling.
+    "PIP_CACHE_DIR",
+    "UV_CACHE_DIR",
+    "BLUEPRINT_PACKAGE_STORE_ROOT",
+    "BLUEPRINT_PACKAGE_STORE_MAX_BYTES",
     # Per-workspace disk reservation knobs (same names the runner's resource
     # ledger consumes): the agent re-checks its workspace's reservation at
     # creation time and fails fast when the filesystem cannot satisfy it.
@@ -1344,6 +1351,22 @@ def _covered_by(path: str, roots: tuple[str, ...]) -> bool:
 
 # ── bwrap argv builder ───────────────────────────────────────────────────────
 
+# Default host root for the shared pip/uv package store. Mirrors the agent-side
+# default in agent/src/packageStore.ts (DEFAULT_PACKAGE_STORE_ROOT).
+PACKAGE_STORE_DEFAULT_ROOT = "/opt/agent-cache"
+
+
+def package_store_dirs(source_env: dict[str, str]) -> list[str]:
+    """Host dirs backing the shared pip/uv package store.
+
+    The store is content-addressed: pip/uv stage downloads into a temp file then
+    atomically rename into place, so concurrent workspaces sharing the same dirs
+    is safe. Returns the ``pip``/``uv`` subdirs under the configured root (or the
+    baked ``/opt/agent-cache`` default) for RW-binding into a bwrap sandbox.
+    """
+    root = source_env.get("BLUEPRINT_PACKAGE_STORE_ROOT") or PACKAGE_STORE_DEFAULT_ROOT
+    return [os.path.join(root, "pip"), os.path.join(root, "uv")]
+
 
 def build_bwrap_argv(
     *,
@@ -1356,6 +1379,7 @@ def build_bwrap_argv(
     gpu_device_nodes_list: list[str] | None = None,
     extra_ro_libs: list[str] | None = None,
     playwright_cache: str | None = None,
+    rw_binds: list[str] | None = None,
 ) -> list[str]:
     """Assemble a rootless bwrap invocation.
 
@@ -1369,6 +1393,10 @@ def build_bwrap_argv(
         ``playwright_chromium_usable`` capability is true WHERE it is consumed.
       * Read-only minimal toolchain (/usr,/bin,/lib,... via --ro-bind-try) + the
         resolved tool paths; the per-task workspace bound RW at /workspace.
+      * ``rw_binds`` are bound READ-WRITE at the same path (--bind-try, skipped
+        when the host dir is absent). The shared pip/uv package store relies on
+        this so a workspace's pip/uv can populate a cache the host image baked
+        (content-addressed, safe for concurrent workspaces).
       * Network is NOT unshared (agent needs LLM + GitHub egress).
       * NO docker socket, NO host home. GPU nodes added only when provided.
     """
@@ -1421,6 +1449,15 @@ def build_bwrap_argv(
         if src and src not in seen_src:
             seen_src.add(src)
             argv += ["--ro-bind-try", src, src]
+
+    # Shared caches RW (pip/uv package store). --bind-try skips a host dir that
+    # does not exist (e.g. a local runner without the baked image dirs), leaving
+    # the sandbox with no shared store — the agent degrades to per-workspace
+    # caches. Dedup against RO binds so a path is never mounted twice.
+    for src in (rw_binds or []):
+        if src and src not in seen_src:
+            seen_src.add(src)
+            argv += ["--bind-try", src, src]
 
     # GPU device nodes AFTER --dev so they layer into the new /dev.
     for node in gpu_nodes:
@@ -2011,6 +2048,11 @@ def plan_agent_execution(
         # path the walkthrough harness reads (skipped when absent) so the
         # chromium capability the gate admits is true where it is consumed.
         playwright_cache=playwright_cache_dir(),
+        # Shared pip/uv package store, RW: workspace pip/uv writes into the
+        # content-addressed host cache (atomic rename → safe for concurrent
+        # workspaces) instead of re-downloading per workspace. Skipped when the
+        # host dirs are absent; the agent then falls back to per-workspace caches.
+        rw_binds=package_store_dirs(source_env),
     )
     return ExecutionPlan(backend=backend, argv=argv, env=env)
 

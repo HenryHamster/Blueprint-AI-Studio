@@ -36,6 +36,10 @@ import {
   releaseWorkspaceDiskReservation,
   getWorkspaceDiskReservation,
 } from './workspaceDisk.js';
+import {
+  configurePackageStoreEnv,
+  enforcePackageStoreBounds,
+} from './packageStore.js';
 
 /**
  * Resolve the pre-baked git object mirror path for an authenticated clone URL,
@@ -198,6 +202,19 @@ async function _prepareWorkspaceForRoleImpl(opts: PrepareWorkspaceOptions): Prom
   // git network operation so the helper always finds a valid token.
   if (opts.githubToken) {
     writeGitTokenFile(opts.githubToken);
+  }
+
+  // Point pip/uv at the shared content-addressed package store so per-workspace
+  // dependency installs read through the baked cache instead of re-downloading
+  // on every VM, then keep the store bounded on a long-lived runner host.
+  // Best-effort: a store that cannot be set up (e.g. a read-only /opt on a dev
+  // box) must not block workspace preparation — pip/uv fall back to their own
+  // per-workspace caching, which is the pre-existing behavior.
+  try {
+    configurePackageStoreEnv();
+    enforcePackageStoreBounds();
+  } catch (e) {
+    log(`prepareWorkspaceForRole: shared package store setup failed (${sanitize(String(e)).slice(0, 200)}); continuing with per-workspace pip/uv caches`);
   }
 
   // lane_phase is meaningful for both warm and cold paths — computed upfront.

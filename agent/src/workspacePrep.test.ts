@@ -9,6 +9,8 @@ const fsMocks = vi.hoisted(() => ({
   existsSync: vi.fn().mockReturnValue(false),
   readdirSync: vi.fn().mockReturnValue([]),
   rmSync: vi.fn(),
+  mkdirSync: vi.fn(),
+  statSync: vi.fn(),
 }));
 
 vi.mock('fs', () => ({
@@ -16,6 +18,8 @@ vi.mock('fs', () => ({
     existsSync: fsMocks.existsSync,
     readdirSync: fsMocks.readdirSync,
     rmSync: fsMocks.rmSync,
+    mkdirSync: fsMocks.mkdirSync,
+    statSync: fsMocks.statSync,
   },
 }));
 
@@ -73,6 +77,14 @@ import {
   getWorkspaceDiskReservation, getWorkspaceDiskAccounting,
   resetWorkspaceDiskReservations, DiskReservationError,
 } from './workspaceDisk.js';
+import {
+  configurePackageStoreEnv,
+  enforcePackageStoreBounds,
+  packageStoreDirs,
+  resolvedEnvPath,
+  DEFAULT_PACKAGE_STORE_ROOT,
+  DEFAULT_EVICTION_GRACE_MS,
+} from './packageStore.js';
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 describe('prepareWorkspaceForRole', () => {
@@ -86,6 +98,9 @@ describe('prepareWorkspaceForRole', () => {
     fsMocks.readdirSync.mockReset();
     fsMocks.readdirSync.mockReturnValue([]);
     fsMocks.rmSync.mockReset();
+    fsMocks.mkdirSync.mockReset();
+    fsMocks.statSync.mockReset();
+    fsMocks.statSync.mockReturnValue(undefined);
     logMock.mockReset();
     registerSizeCapMergeDriverMock.mockReset();
     writeGitTokenFileMock.mockReset();
@@ -98,6 +113,10 @@ describe('prepareWorkspaceForRole', () => {
     delete process.env.BLUEPRINT_WARM_HANDOFF;
     delete process.env.BLUEPRINT_RUNNER_AGENT_DISK_RESERVATION_BYTES;
     delete process.env.BLUEPRINT_RUNNER_MIN_DISK_BYTES;
+    delete process.env.PIP_CACHE_DIR;
+    delete process.env.UV_CACHE_DIR;
+    delete process.env.BLUEPRINT_PACKAGE_STORE_ROOT;
+    delete process.env.BLUEPRINT_PACKAGE_STORE_MAX_BYTES;
     resetWorkspacePrepOutcome();
     resetWorkspaceDiskReservations();
   });
@@ -107,7 +126,12 @@ describe('prepareWorkspaceForRole', () => {
     delete process.env.BLUEPRINT_RUNNER_AGENT_DISK_RESERVATION_BYTES;
     delete process.env.BLUEPRINT_RUNNER_MIN_DISK_BYTES;
     resetWorkspaceDiskReservations();
+    delete process.env.PIP_CACHE_DIR;
+    delete process.env.UV_CACHE_DIR;
+    delete process.env.BLUEPRINT_PACKAGE_STORE_ROOT;
+    delete process.env.BLUEPRINT_PACKAGE_STORE_MAX_BYTES;
   });
+
 
   // ── Disk reservation & accounting ──────────────────────────────────────────
   // df/du probe helper: only `df` and `du` receive real output; everything else
@@ -348,8 +372,10 @@ describe('prepareWorkspaceForRole', () => {
       baseBranch: 'main',
     });
 
-    // No workspace cleaning on the warm path (no readdirSync/rmSync, no rm -rf).
-    expect(fsMocks.readdirSync).not.toHaveBeenCalled();
+    // No workspace cleaning on the warm path: the workspace dir is never
+    // readdirSync'd or rmSync'd (the shared-store eviction may readdirSync the
+    // store dirs, but never the workspace itself).
+    expect(fsMocks.readdirSync).not.toHaveBeenCalledWith('/ws');
     expect(fsMocks.rmSync).not.toHaveBeenCalled();
     // No cloneWithRetry call.
     expect(cloneWithRetryMock).not.toHaveBeenCalled();
@@ -1341,5 +1367,178 @@ describe('workspaceDisk reservation ledger', () => {
     releaseWorkspaceDiskReservation('/ws');
     expect(getWorkspaceDiskReservation('/ws')).toBeNull();
     releaseWorkspaceDiskReservation('/ws'); // no-op, must not throw
+  });
+});
+
+// ── Shared pip/uv package store ─────────────────────────────────────────────
+//
+// The regression surface for the shared store is exactly the pair of
+// properties that break silently under concurrency: isolation between
+// workspaces (shared immutable artifacts, per-workspace resolved envs) and a
+// bounded store on a long-lived host (eviction of the oldest files past the
+// cap). These tests exercise the store module the workspace-prep path calls
+// (packageStore.ts) directly so the failing property is the store's own
+// contract, not an artifact of the fs mocks.
+describe('shared pip/uv package store', () => {
+  beforeEach(() => {
+    delete process.env.BLUEPRINT_PACKAGE_STORE_ROOT;
+    delete process.env.BLUEPRINT_PACKAGE_STORE_MAX_BYTES;
+    delete process.env.PIP_CACHE_DIR;
+    delete process.env.UV_CACHE_DIR;
+    fsMocks.existsSync.mockReset();
+    fsMocks.existsSync.mockReturnValue(false);
+    fsMocks.readdirSync.mockReset();
+    fsMocks.readdirSync.mockReturnValue([]);
+    fsMocks.rmSync.mockReset();
+    fsMocks.mkdirSync.mockReset();
+    fsMocks.statSync.mockReset();
+    fsMocks.statSync.mockReturnValue(undefined);
+  });
+
+  it('isolation: concurrent workspaces share the immutable store but keep distinct resolved envs', () => {
+    const dirs = configurePackageStoreEnv();
+    expect(dirs.pip).toBe(path.join(DEFAULT_PACKAGE_STORE_ROOT, 'pip'));
+    expect(dirs.uv).toBe(path.join(DEFAULT_PACKAGE_STORE_ROOT, 'uv'));
+
+    // Two workspaces being prepared concurrently must point at the SAME
+    // content-addressed store — that is the sharing that avoids re-downloading.
+    const wsA = '/workspaces/a';
+    const wsB = '/workspaces/b';
+    expect(process.env.PIP_CACHE_DIR).toBe(dirs.pip);
+    expect(process.env.UV_CACHE_DIR).toBe(dirs.uv);
+    expect(configurePackageStoreEnv().pip).toBe(dirs.pip);
+
+    // ...but each workspace's RESOLVED environment is its own, inside its own
+    // workspace, so neither workspace can see or mutate the other's.
+    const envA = resolvedEnvPath(wsA);
+    const envB = resolvedEnvPath(wsB);
+    expect(envA).toBe(path.join(wsA, '.venv'));
+    expect(envB).toBe(path.join(wsB, '.venv'));
+    expect(envA).not.toBe(envB);
+    expect(envA.startsWith(wsA + path.sep)).toBe(true);
+    expect(envB.startsWith(wsB + path.sep)).toBe(true);
+    expect(envA.startsWith(wsB + path.sep)).toBe(false);
+    // The shared store never holds a resolved environment — only cache dirs.
+    expect(dirs.pip.startsWith(wsA + path.sep)).toBe(false);
+    expect(dirs.pip.startsWith(wsB + path.sep)).toBe(false);
+  });
+
+  it('bounded eviction: removes the oldest files until the store is under the cap', () => {
+    const P = path.join(DEFAULT_PACKAGE_STORE_ROOT);
+    const dirent = (name: string, isDir: boolean) => ({
+      name,
+      isFile: () => !isDir,
+      isDirectory: () => isDir,
+    });
+    fsMocks.existsSync.mockImplementation((p: unknown) =>
+      [path.join(P, 'pip'), path.join(P, 'uv')].includes(String(p)));
+    fsMocks.readdirSync.mockImplementation((dir: unknown) => {
+      const d = String(dir);
+      if (d === path.join(P, 'pip')) return [dirent('a.whl', false), dirent('b.whl', false)];
+      if (d === path.join(P, 'uv')) return [dirent('c.whl', false)];
+      return [];
+    });
+    const statByPath: Record<string, { size: number; mtimeMs: number }> = {
+      [path.join(P, 'pip', 'a.whl')]: { size: 1000, mtimeMs: 1_000 },
+      [path.join(P, 'pip', 'b.whl')]: { size: 1000, mtimeMs: 2_000 },
+      [path.join(P, 'uv', 'c.whl')]: { size: 1000, mtimeMs: 3_000 },
+    };
+    fsMocks.statSync.mockImplementation((p: unknown) => statByPath[String(p)]);
+
+    // 3000 bytes total, cap 2500 → exactly the single oldest file must go.
+    const result = enforcePackageStoreBounds({ maxBytes: 2500 });
+
+    expect(result.removedFiles).toBe(1);
+    expect(result.reclaimedBytes).toBe(1000);
+    expect(result.totalBytesAfter).toBe(2000);
+    expect(fsMocks.rmSync).toHaveBeenCalledWith(path.join(P, 'pip', 'a.whl'), { force: true });
+    // Newer files are untouched.
+    expect(fsMocks.rmSync).not.toHaveBeenCalledWith(path.join(P, 'pip', 'b.whl'));
+    expect(fsMocks.rmSync).not.toHaveBeenCalledWith(path.join(P, 'uv', 'c.whl'));
+  });
+
+  it('bounded eviction: a store already under the cap is left untouched', () => {
+    const P = path.join(DEFAULT_PACKAGE_STORE_ROOT);
+    const dirent = (name: string) => ({ name, isFile: () => true, isDirectory: () => false });
+    fsMocks.existsSync.mockImplementation((p: unknown) =>
+      [path.join(P, 'pip'), path.join(P, 'uv')].includes(String(p)));
+    fsMocks.readdirSync.mockImplementation((dir: unknown) =>
+      String(dir) === path.join(P, 'pip') ? [dirent('a.whl')] : []);
+    fsMocks.statSync.mockReturnValue({ size: 500, mtimeMs: 1_000 });
+
+    const result = enforcePackageStoreBounds({ maxBytes: 2500 });
+
+    expect(result.removedFiles).toBe(0);
+    expect(result.reclaimedBytes).toBe(0);
+    expect(result.totalBytesAfter).toBe(500);
+    expect(fsMocks.rmSync).not.toHaveBeenCalled();
+  });
+
+  it('bounded eviction: files touched within the grace window are not evicted', () => {
+    const P = path.join(DEFAULT_PACKAGE_STORE_ROOT);
+    const dirent = (name: string) => ({ name, isFile: () => true, isDirectory: () => false });
+    fsMocks.existsSync.mockImplementation((p: unknown) =>
+      [path.join(P, 'pip'), path.join(P, 'uv')].includes(String(p)));
+    fsMocks.readdirSync.mockImplementation((dir: unknown) =>
+      String(dir) === path.join(P, 'pip') ? [dirent('old.whl'), dirent('fresh.whl')] : []);
+    const now = Date.now();
+    const oldPath = path.join(P, 'pip', 'old.whl');
+    const freshPath = path.join(P, 'pip', 'fresh.whl');
+    fsMocks.statSync.mockImplementation((p: unknown) => {
+      if (String(p) === oldPath) return { size: 1000, mtimeMs: now - 2 * 60 * 60 * 1000 };
+      return { size: 1000, mtimeMs: now - 60 * 1000 }; // 1 min old < 30 min grace
+    });
+
+    // Cap 1500 forces at least one eviction, but the fresh file is protected.
+    const result = enforcePackageStoreBounds({ maxBytes: 1500, graceMs: DEFAULT_EVICTION_GRACE_MS });
+
+    expect(result.removedFiles).toBe(1);
+    expect(fsMocks.rmSync).toHaveBeenCalledWith(oldPath, { force: true });
+    expect(fsMocks.rmSync).not.toHaveBeenCalledWith(freshPath, { force: true });
+  });
+
+  it('configurePackageStoreEnv creates both store dirs and honors a custom root', () => {
+    process.env.BLUEPRINT_PACKAGE_STORE_ROOT = '/mnt/package-cache';
+    const dirs = configurePackageStoreEnv();
+    expect(dirs.pip).toBe('/mnt/package-cache/pip');
+    expect(dirs.uv).toBe('/mnt/package-cache/uv');
+    expect(process.env.PIP_CACHE_DIR).toBe('/mnt/package-cache/pip');
+    expect(process.env.UV_CACHE_DIR).toBe('/mnt/package-cache/uv');
+    expect(fsMocks.mkdirSync).toHaveBeenCalledWith('/mnt/package-cache/pip', { recursive: true });
+    expect(fsMocks.mkdirSync).toHaveBeenCalledWith('/mnt/package-cache/uv', { recursive: true });
+  });
+
+  it('prepareWorkspaceForRole configures the shared store env and attempts store setup', async () => {
+    await prepareWorkspaceForRole({
+      workspace: '/ws',
+      repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+      githubToken: 'tok',
+      branch: 'feature/x',
+      depth: 50,
+    });
+
+    // The workspace-prep path points pip/uv at the shared store so the task's
+    // dependency installs read through it.
+    expect(process.env.PIP_CACHE_DIR).toBe(path.join(DEFAULT_PACKAGE_STORE_ROOT, 'pip'));
+    expect(process.env.UV_CACHE_DIR).toBe(path.join(DEFAULT_PACKAGE_STORE_ROOT, 'uv'));
+    expect(fsMocks.mkdirSync).toHaveBeenCalledWith(
+      path.join(DEFAULT_PACKAGE_STORE_ROOT, 'pip'),
+      { recursive: true },
+    );
+    expect(fsMocks.mkdirSync).toHaveBeenCalledWith(
+      path.join(DEFAULT_PACKAGE_STORE_ROOT, 'uv'),
+      { recursive: true },
+    );
+    // Eviction ran (store dirs absent → no-op) without disturbing the clone.
+    expect(cloneWithRetryMock).toHaveBeenCalledTimes(1);
+    expect(fsMocks.rmSync).not.toHaveBeenCalled();
+  });
+
+  it('packageStoreDirs falls back to the default root when no override is set', () => {
+    expect(packageStoreDirs()).toEqual({
+      root: DEFAULT_PACKAGE_STORE_ROOT,
+      pip: path.join(DEFAULT_PACKAGE_STORE_ROOT, 'pip'),
+      uv: path.join(DEFAULT_PACKAGE_STORE_ROOT, 'uv'),
+    });
   });
 });
