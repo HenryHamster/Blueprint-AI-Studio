@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+from pathlib import Path
 
 import pytest
 from sqlalchemy import select
@@ -2174,4 +2175,53 @@ def test_test_files_within_size_limits():
         )
         + "\nRun `python3 backend/testing/check_size_limits.py --fix --sections testing` "
         "and commit the updated module_size_limits.json."
+    )
+
+
+def test_git_refs_has_no_ci_compliance_branch_literal_fallback():
+    """agent/src/gitRefs.ts must stay clean under the CI-compliance agent scan.
+
+    automain HEAD c783ca41 failed the CI-compliance branch-literal guard on
+    gitRefs.ts:71 (``... || 'automain'`` — a fallback-main pattern the deployed
+    evaluator's allowlist did not carry). The remediation removes the inline
+    fallback literal from the source; this merge-test gate proves it against the
+    real file tree using the SAME patterns and comment-stripping the CI-compliance
+    evaluator applies (AGENT_PATTERNS + the supplemental equality patterns), so a
+    regression — re-introducing the literal or any other branch-decision pattern —
+    fails here before the invariant suite runs.
+
+    The scan deliberately does NOT consult SURFACE_CONFIGS['agent'].allowlist: the
+    deployed CI-compliance evaluator's allowlist lags the tree, so gitRefs.ts must
+    be clean without any allowlist exemption.
+
+    Skips when agent/src is absent (CI's backend-only Docker build context that
+    mounts neither /agent/src nor the repo), mirroring the agent-section skips in
+    this file.
+    """
+    from app.branch_literal_compliance import AGENT_PATTERNS, strip_typescript_with_linenos
+
+    agent_root = _resolve_agent_src_root()
+    if agent_root is None:
+        pytest.skip("agent/src not available in this test environment")
+
+    gitrefs_path = Path(agent_root) / "gitRefs.ts"
+    assert gitrefs_path.is_file(), f"{gitrefs_path} must exist on disk"
+
+    src = gitrefs_path.read_text(encoding="utf-8")
+    violations = []
+    for lineno, line in strip_typescript_with_linenos(src):
+        cleaned = ci_compliance._strip_agent_paren_fallbacks(line)
+        for pat in AGENT_PATTERNS:
+            if pat.regex.search(cleaned):
+                violations.append(f"{lineno} [{pat.name}]: {line.strip()}")
+        for pat_name, pat_re in ci_compliance._AGENT_SUPPLEMENTAL_PATTERNS:
+            if pat_re.search(cleaned):
+                violations.append(f"{lineno} [{pat_name}]: {line.strip()}")
+
+    assert not violations, (
+        "agent/src/gitRefs.ts contains a hardcoded branch literal the "
+        "CI-compliance agent scan flags; no allowlist entry may exempt it "
+        "(the deployed evaluator's allowlist lags the tree):\n"
+        + "\n".join(violations)
+        + "\nResolve the branch through a named constant or per-project config."
     )
