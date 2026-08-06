@@ -6566,13 +6566,16 @@ async def test_finalize_walkthrough_report_open_rubric_all_passed_records_passed
 
 
 @pytest.mark.asyncio
-async def test_finalize_walkthrough_report_unexpected_canonical_collision_still_infra_fails(
+async def test_finalize_walkthrough_report_unexpected_canonical_collision_is_contract_blocker(
     db_session, mocker, monkeypatch
 ):
     """A report that maps two DISTINCT raw keys onto one canonical evidence key
     (beyond the sole allowed workday-slug/meta pair) is still real malformed
-    evidence: the finalize gate keeps the structural collision check and
-    infra-fails with the accurate 'duplicate_criteria' reason."""
+    evidence — but it is a REPORT-CONTRACT defect resolved by the DEPLOYED
+    qualifier, so it now books a durable not_promoted verdict with
+    blocker=walkthrough_e2e_contract_failed / execution_site=deployed instead
+    of a transient infra hold.  No fix on automain changes how the serving
+    validator parses the report until this version itself promotes."""
     from app import shared_state
     from app import acceptance_criteria
 
@@ -6655,7 +6658,262 @@ async def test_finalize_walkthrough_report_unexpected_canonical_collision_still_
     result = await rq._finalize_qualification(db_session, version)
     await db_session.commit()
 
-    # Structural malformed evidence → non-conclusive infra failure with the
-    # accurate reason (NOT the misleading active-rubric classification).
-    assert result["status"] == "infra_failure"
+    # Structural malformed evidence → DEPLOYED-side hard blocker with the
+    # accurate reason (NOT a transient infra hold and NOT the misleading
+    # active-rubric classification).
+    assert result["status"] == "not_promoted"
+    assert result["blocker"] == "walkthrough_e2e_contract_failed"
+    assert result["execution_site"] == rs.EXECUTION_SITE_DEPLOYED
     assert result["error"] == "walkthrough_e2e_report_duplicate_criteria"
+
+    await db_session.refresh(version)
+    lq = version.last_qualification
+    assert lq["status"] == "not_promoted"
+    assert lq["blocker"] == "walkthrough_e2e_contract_failed"
+    assert lq["execution_site"] == rs.EXECUTION_SITE_DEPLOYED
+    assert lq["error"] == "walkthrough_e2e_report_duplicate_criteria"
+    assert lq["sub_scores"]["walkthrough_e2e"] == 0.0
+    assert version.phase == "stabilize"
+
+
+@pytest.mark.asyncio
+async def test_finalize_walkthrough_report_unknown_criteria_is_contract_blocker(
+    db_session, mocker
+):
+    """A report whose keys do not resolve to the open version's ACTIVE rubric
+    (the harness posted against criteria this version does not carry) is a
+    REPORT-CONTRACT defect resolved by the DEPLOYED qualifier: it books a
+    not_promoted verdict with blocker=walkthrough_e2e_contract_failed /
+    execution_site=deployed rather than a transient infra hold."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    candidate_sha = version.last_qualification["candidate_sha"]
+    walk_task = Task(
+        project_id=project.id,
+        title="walkthrough",
+        payloads=[{"type": "walkthrough_e2e", "base_branch": "automain"}],
+        vm_instance_id="vm-walkthrough",
+        status=TaskStatus.COMPLETED,
+        context={"candidate_sha": candidate_sha},
+    )
+    db_session.add(walk_task)
+    await db_session.flush()
+    # Fresh keys the open rubric does NOT carry — the validator accepts them
+    # (no legacy keys used), then the active-rubric gate rejects them as
+    # unknown criteria.
+    db_session.add(
+        Artifact(
+            task_id=walk_task.id,
+            artifact_type=ArtifactType.WALKTHROUGH_E2E_REPORT,
+            logs=json.dumps(
+                {
+                    "git_sha": candidate_sha,
+                    "exercised_engine_sha": candidate_sha,
+                    "results": [
+                        {"criterion_key": "c-unknown-aaa", "passed": True},
+                        {"criterion_key": "c-unknown-bbb", "passed": False},
+                        {"criterion_key": "c-unknown-ccc", "passed": True},
+                    ],
+                }
+            ),
+        )
+    )
+    await db_session.commit()
+    await db_session.refresh(walk_task)
+
+    qual = {
+        **(version.last_qualification or {}),
+        "requested_probes": ["walkthrough_e2e"],
+        "walkthrough_e2e_task_id": str(walk_task.id),
+    }
+    version.last_qualification = _with_current_qualification_contract(
+        project, version, qual
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] == "not_promoted"
+    assert result["blocker"] == "walkthrough_e2e_contract_failed"
+    assert result["execution_site"] == rs.EXECUTION_SITE_DEPLOYED
+    assert result["error"] == "walkthrough_e2e_report_unknown_criteria"
+
+    await db_session.refresh(version)
+    lq = version.last_qualification
+    assert lq["status"] == "not_promoted"
+    assert lq["blocker"] == "walkthrough_e2e_contract_failed"
+    assert lq["execution_site"] == rs.EXECUTION_SITE_DEPLOYED
+    assert lq["error"] == "walkthrough_e2e_report_unknown_criteria"
+    assert lq["sub_scores"]["walkthrough_e2e"] == 0.0
+    assert version.phase == "stabilize"
+
+
+@pytest.mark.asyncio
+async def test_finalize_walkthrough_report_partial_legacy_schema_is_contract_blocker(
+    db_session, mocker
+):
+    """A report that carries SOME but not ALL of the legacy harness keys is a
+    truncated report — the report validator classifies it invalid with reason
+    result_schema_mismatch.  That is a REPORT-CONTRACT defect resolved by the
+    DEPLOYED qualifier, so it books a not_promoted verdict with
+    blocker=walkthrough_e2e_contract_failed / execution_site=deployed."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    candidate_sha = version.last_qualification["candidate_sha"]
+    walk_task = Task(
+        project_id=project.id,
+        title="walkthrough",
+        payloads=[{"type": "walkthrough_e2e", "base_branch": "automain"}],
+        vm_instance_id="vm-walkthrough",
+        status=TaskStatus.COMPLETED,
+        context={"candidate_sha": candidate_sha},
+    )
+    db_session.add(walk_task)
+    await db_session.flush()
+    # Partial legacy set: only two of the four v26 raw keys → the report
+    # validator's legacy-subset check refuses it as result_schema_mismatch.
+    db_session.add(
+        Artifact(
+            task_id=walk_task.id,
+            artifact_type=ArtifactType.WALKTHROUGH_E2E_REPORT,
+            logs=json.dumps(
+                {
+                    "git_sha": candidate_sha,
+                    "exercised_engine_sha": candidate_sha,
+                    "results": [
+                        {"criterion_key": "c-dfdc9d82", "passed": True},
+                        {"criterion_key": "c-f52fd975", "passed": True},
+                    ],
+                }
+            ),
+        )
+    )
+    await db_session.commit()
+    await db_session.refresh(walk_task)
+
+    qual = {
+        **(version.last_qualification or {}),
+        "requested_probes": ["walkthrough_e2e"],
+        "walkthrough_e2e_task_id": str(walk_task.id),
+    }
+    version.last_qualification = _with_current_qualification_contract(
+        project, version, qual
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] == "not_promoted"
+    assert result["blocker"] == "walkthrough_e2e_contract_failed"
+    assert result["execution_site"] == rs.EXECUTION_SITE_DEPLOYED
+    assert result["error"] == "walkthrough_e2e_report_result_schema_mismatch"
+
+    await db_session.refresh(version)
+    lq = version.last_qualification
+    assert lq["status"] == "not_promoted"
+    assert lq["blocker"] == "walkthrough_e2e_contract_failed"
+    assert lq["execution_site"] == rs.EXECUTION_SITE_DEPLOYED
+    assert lq["error"] == "walkthrough_e2e_report_result_schema_mismatch"
+    assert lq["sub_scores"]["walkthrough_e2e"] == 0.0
+    assert version.phase == "stabilize"
+
+
+@pytest.mark.asyncio
+async def test_release_notification_idempotency(db_session):
+    """Retried release notifications for the same (version, event_type) are
+    deduplicated via the idempotency key; distinct event types for the same
+    version still produce distinct messages."""
+    from app.models import ProjectMessage
+
+    project, version = await _make_project_and_version(db_session)
+
+    await rq._notify_operator(db_session, version, "release_promoted", "v1 promoted")
+    await db_session.commit()
+    # A retried qualification / promotion re-posts the same outcome — the prior
+    # committed row must be found via the idempotency key and nothing new
+    # inserted.
+    await rq._notify_operator(db_session, version, "release_promoted", "v1 promoted")
+    await db_session.commit()
+
+    promoted_rows = (
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.idempotency_key
+                    == f"release:{version.id}:release_promoted",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(promoted_rows) == 1
+    assert promoted_rows[0].idempotency_key == f"release:{version.id}:release_promoted"
+    assert promoted_rows[0].context["event_type"] == "release_promoted"
+
+    # A different event type for the same version is a distinct notification
+    # (keys are scoped per event_type, so one outcome never masks another).
+    await rq._notify_operator(db_session, version, "release_blocked", "v1 blocked")
+    await db_session.commit()
+
+    all_rows = (
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(all_rows) == 2

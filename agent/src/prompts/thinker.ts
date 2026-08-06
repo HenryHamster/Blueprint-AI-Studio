@@ -281,6 +281,19 @@ export interface ThinkerPromptParams {
 }
 
 /**
+ * Placeholder tokens for the per-task /tmp handoff file paths used in the
+ * stable prefix. The stable prefix must be byte-identical across tasks with
+ * different taskIds (Anthropic's prefix cache matches from byte 0, so a
+ * taskId leaked into a file path would bust the cache for the whole block).
+ * Each token is mapped to this task's concrete path in
+ * buildStrategicHandoffPathsSection (volatile suffix).
+ */
+const RUNNING_UPDATE_PATH_TOKEN = '$RUNNING_UPDATE_PATH';
+const PROBLEM_MODEL_PATH_TOKEN = '$PROBLEM_MODEL_PATH';
+const RESEARCH_PROGRESS_PATH_TOKEN = '$RESEARCH_PROGRESS_PATH';
+const PROPOSED_CRITERIA_PATH_TOKEN = '$PROPOSED_CRITERIA_PATH';
+
+/**
  * Stable leading prefix of the strategic thinker prompt — the instruction text
  * that is byte-identical across cycles for a given project, so Anthropic's
  * automatic prefix cache can match the whole block. Contains ONLY
@@ -288,6 +301,10 @@ export interface ThinkerPromptParams {
  * the `# Your job` / `# How to think` guidance, the `# Running update` guidance,
  * the `# What to write` output contract, and the playbook + tool guidance.
  * Per-cycle payload data lives in buildStrategicVolatileSuffix.
+ *
+ * Task-specific handoff file paths are referenced by the placeholder tokens
+ * above (never by their concrete taskId-derived paths) and resolved to the
+ * actual `/tmp/...` paths in the volatile suffix.
  *
  * This is a byte-ORDER refactor of the previous inline assembly: every section
  * that was emitted before is still emitted — the volatile per-cycle payload is
@@ -352,7 +369,6 @@ without either a move or an explicit no-change judgment is drift.
 
 **Model-size hygiene (soft).** The "Problem-model size" section above reports weight. Healthy: **<=12 active gaps / <=20 capabilities / <=8 active friction** — dimension >=1.5x = \`growing\`, >=2x = \`large\`, >=3x = \`oversized\`. When \`large\`/\`oversized\`, close resolved entries before opening new ones (**never a hard cap**). A model you can't read in one pass is one you can't defend.
 
-${p.selfImprovementBlock}
 # Running update: what the user reads
 
 The running_update is a **single living markdown document** the user sees as "the project's current state." It is NOT a log of per-cycle entries — you rewrite it each cycle as a clean snapshot, not by appending. The prior version is shown above; refine it. Remove what's now stale, integrate what's now true, keep it short and coherent.
@@ -475,13 +491,13 @@ Each direction in the "Direction outcomes" section above lists its cumulative co
 **Weight evidence by verification basis.** A direction may carry a \`recent_findings_verification_basis\` distribution (counts of \`code_verified\` / \`path_verified\` / \`pattern_inferred\` / \`deduced\` findings). This records HOW each finding's claim was established, not whether it is implementable. Weight your \`evidence_progress\` read accordingly: a direction whose recent findings are predominantly \`code_verified\`/\`path_verified\` warrants higher confidence that its claimed progress is real than one whose findings are predominantly \`pattern_inferred\`/\`deduced\`. This is purely a WEIGHTING signal, NOT a gate — inferred findings remain valid and are often correct; a heavily-inferred direction is not stalled merely for being inferred.
 
 ## 4. Running update document (for the user)
-Write the full refined running_update as markdown to \`/tmp/running_update_${p.taskId}.md\` ${READ_ONLY_BASH_WRITE_NOTE} (also show it as a code block in your analysis for auditability — the file is the authoritative handoff to the Executor). This is the document the user sees as "project current state" — rewrite, don't append. Under 400 words. Follow the section guidance above.
+Write the full refined running_update as markdown to \`${RUNNING_UPDATE_PATH_TOKEN}\` ${READ_ONLY_BASH_WRITE_NOTE} (also show it as a code block in your analysis for auditability — the file is the authoritative handoff to the Executor). This is the document the user sees as "project current state" — rewrite, don't append. Under 400 words. Follow the section guidance above.
 
 ## 5. Self-reflection (optional)
 Only if something this cycle was hard in a way worth remembering. Fields: what_was_hard, missing_context, proposed_self_improvement. Empty is fine. Don't fill with platitudes.
 
 ## 6. Problem model (update — non-destructive merge)
-Write your problem_model update as JSON to \`/tmp/problem_model_${p.taskId}.json\` ${READ_ONLY_BASH_WRITE_NOTE} (use a code block in your analysis for auditability AND write the file — the file is the authoritative handoff to the Executor). The backend MERGES the agent-owned collections (\`capabilities\`, \`gaps\`, \`friction\`, \`pending_user_confirmation\`) rather than replacing them: entries upsert by stable key (\`capabilities\` by name; the rest by id), **entries you omit are preserved**, and per-gap \`history\`/\`past_moves\` union. So you do NOT need to reconstruct every gap/capability from memory — emit the ones you're changing plus enough to stay coherent. If a section was trimmed or dropped from your payload (see "Context not shipped" above), write just the parts you're changing and trust the rest is retained, or \`./fetch problem-model\` first to read the full current state.
+Write your problem_model update as JSON to \`${PROBLEM_MODEL_PATH_TOKEN}\` ${READ_ONLY_BASH_WRITE_NOTE} (use a code block in your analysis for auditability AND write the file — the file is the authoritative handoff to the Executor). The backend MERGES the agent-owned collections (\`capabilities\`, \`gaps\`, \`friction\`, \`pending_user_confirmation\`) rather than replacing them: entries upsert by stable key (\`capabilities\` by name; the rest by id), **entries you omit are preserved**, and per-gap \`history\`/\`past_moves\` union. So you do NOT need to reconstruct every gap/capability from memory — emit the ones you're changing plus enough to stay coherent. If a section was trimmed or dropped from your payload (see "Context not shipped" above), write just the parts you're changing and trust the rest is retained, or \`./fetch problem-model\` first to read the full current state.
 
 Normally your **whole** problem_model is shipped inline this cycle — full gaps, capabilities, and friction — so you edit it directly. Only in the exceptional case where the full model cannot fit the byte budget does it arrive floored/skeletonized (recoverable siblings yield first, so this is rare). **If** that happened — look for the \`_agent_view_floor_applied\` marker, which means gap \`description\`/\`evidence\` were stripped and capabilities/friction were reduced to \`name\`+\`status\` — **echo that marker back verbatim** in your update file. The backend uses it to know which fields you never actually saw, so editing and resubmitting a skeleton entry (e.g. bumping a gap's \`priority\` or a capability's \`status\`) won't blank the durable \`description\`, \`notes\`, \`source\`, etc. you couldn't see. Without the marker echoed, a blank field is treated as a deliberate clear. When the marker is absent (the normal case), the model you see is complete — edit freely.
 
@@ -510,7 +526,7 @@ Source = {type (user_message|friction_promotion|agent_observation|self_reflectio
 
 When describing changes in prose, be precise: "opening gap g-xxx (from user_message msg-N)", "retiring direction d-xxx (gap g-yyy closed by merged PR #N)".
 
-Before finishing, write /tmp/research_progress_${p.taskId}.md ${READ_ONLY_BASH_WRITE_NOTE} — a concise markdown summary (≤3000 chars) capturing the model changes proposed, gaps opening/closing, and moves. This is a breadcrumb for retry agents if this task fails — lets a retry pick up from your analysis rather than redoing it from scratch.
+Before finishing, write ${RESEARCH_PROGRESS_PATH_TOKEN} ${READ_ONLY_BASH_WRITE_NOTE} — a concise markdown summary (≤3000 chars) capturing the model changes proposed, gaps opening/closing, and moves. This is a breadcrumb for retry agents if this task fails — lets a retry pick up from your analysis rather than redoing it from scratch.
 
 ## 7. Version goal (author or revise when warranted)
 
@@ -538,7 +554,7 @@ Author criteria only when the version needs a root acceptance contract:
 
 Skip entirely if criteria already exist and are reasonably mapped. Do NOT fabricate criteria when the version goal is unset — Section 7 handles that case first.
 
-When criteria are warranted, write \`/tmp/proposed_criteria_${p.taskId}.json\` ${READ_ONLY_BASH_WRITE_NOTE} as the backend payload shape:
+When criteria are warranted, write \`${PROPOSED_CRITERIA_PATH_TOKEN}\` ${READ_ONLY_BASH_WRITE_NOTE} as the backend payload shape:
 
 \`\`\`json
 {"criteria":[{"text":"Users can complete the key workflow without manual operator intervention.","direction_keys":["d-xxx"]}],"retract":[{"criterion_key":"c-old-key","reason":"All directions that could produce covering evidence have been retired; this criterion is permanently uncoverable.","superseded_by_key":"c-new-key"}]}
@@ -561,6 +577,27 @@ ${PLAYBOOK_GUIDANCE}
 
 ${DEFAULT_TOOL_GUIDANCE}
 `;
+}
+
+/**
+ * Resolve the stable-prefix path tokens to this task's concrete /tmp handoff
+ * paths. This is the ONLY place the taskId-derived paths appear; because the
+ * block lives in the volatile suffix, the cacheable prefix above stays
+ * byte-identical across tasks with different taskIds.
+ */
+function buildStrategicHandoffPathsSection(p: ThinkerPromptParams): string {
+  return [
+    '# Handoff file paths (this task)',
+    '',
+    'The output sections above reference task-specific handoff files by the',
+    'placeholder tokens below. Write each file to its concrete path — the',
+    'Executor reads these exact files verbatim:',
+    `- \`${RUNNING_UPDATE_PATH_TOKEN}\` → \`/tmp/running_update_${p.taskId}.md\``,
+    `- \`${PROBLEM_MODEL_PATH_TOKEN}\` → \`/tmp/problem_model_${p.taskId}.json\``,
+    `- \`${RESEARCH_PROGRESS_PATH_TOKEN}\` → \`/tmp/research_progress_${p.taskId}.md\``,
+    `- \`${PROPOSED_CRITERIA_PATH_TOKEN}\` → \`/tmp/proposed_criteria_${p.taskId}.json\``,
+    '',
+  ].join('\n');
 }
 
 /**
@@ -604,7 +641,9 @@ The append-only \`history\` / \`past_moves\` of these gaps were trimmed to only 
 When you reason about whether to keep pushing, refine, or retire any of these gaps, first run \`./fetch problem-model\` (or \`./fetch gap <gap_id>\`) to read its complete history and past_moves. Do not treat the shortened view as the gap's entire lifetime — a long-lived gap may have a much longer arc than the few events shown here.`
       : '';
 
-  return `${p.clockHeader}
+  return `${buildStrategicHandoffPathsSection(p)}
+${p.selfImprovementBlock}
+${p.clockHeader}
 ${p.contextPrefix}
 ${p.packerMetaSection ? `\n${p.packerMetaSection}\n` : ''}
 ${p.payloadStalenessSection ? `\n${p.payloadStalenessSection}\n` : ''}

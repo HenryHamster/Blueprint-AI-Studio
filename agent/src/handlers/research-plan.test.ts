@@ -2718,6 +2718,28 @@ describe('handlePlan / handleResearch task-specific prompt fingerprints', () => 
     expectCalledWith(writeDesignDocHelper, FP_TASK_ID, expect.anything(), { readOnly: true });
   });
 
+  // ── handleResearch git history probes are timeout-bounded ───────────────────
+  // The research context mines git history (log/shortlog/diff/hotspots); each
+  // probe must carry a bounded execFileSync timeout so a slow or hung repo state
+  // fails fast instead of blocking the research task indefinitely (standard.ts
+  // already bounds its git subprocess calls the same way).
+  it('passes a numeric timeout to every git log/shortlog/diff execFileSync call', async () => {
+    await handleResearch(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+
+    const gitHistoryCalls = vi.mocked(execFileSync).mock.calls.filter(([file, args]) => {
+      const a = Array.isArray(args) ? (args as string[]) : [];
+      return file === 'git' && (a.includes('log') || a.includes('shortlog') || a.includes('diff'));
+    });
+
+    // The four research-context probes — recent log, contributor shortlog,
+    // diff stat, and hotspot file list — must each be timeout-bounded.
+    expect(gitHistoryCalls.length).toBeGreaterThanOrEqual(4);
+    for (const call of gitHistoryCalls) {
+      const options = call[2];
+      expect(options?.timeout, `git history probe ${JSON.stringify(call[1])} must carry a timeout`).toBeGreaterThan(0);
+    }
+  });
+
   // ── handlePlan fingerprints ──────────────────────────────────────────────────
 
   it('handlePlan prompt contains depends_on_indices (plan output schema cue)', async () => {

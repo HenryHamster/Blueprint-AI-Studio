@@ -3072,7 +3072,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
                     await acceptPendingConfirmation(projectId, pendingId);
                     setResolvedConfirmationIds(prev => new Set(prev).add(item.id));
                     setExpandedConfirmationItemId(null);
-                    refreshStrategicState?.();
+                    void refreshStrategicState?.();
                   } catch {
                     addToast?.('Failed to accept — try again', 'error');
                   }
@@ -3086,7 +3086,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, ca
                     await dismissPendingConfirmation(projectId, pendingId);
                     setResolvedConfirmationIds(prev => new Set(prev).add(item.id));
                     setExpandedConfirmationItemId(null);
-                    refreshStrategicState?.();
+                    void refreshStrategicState?.();
                   } catch {
                     addToast?.('Failed to dismiss — try again', 'error');
                   }

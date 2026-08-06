@@ -11400,6 +11400,99 @@ async def test_walkthrough_merge_evidence_flips_criterion_coverage(db_session):
         assert "evaluated_at" in row.detail, f"{key}: detail missing evaluated_at"
 
 
+@pytest.mark.asyncio
+async def test_meta_criterion_gate_resolves_active_rubric(db_session):
+    """The walkthrough meta-criterion gate resolves its sub-criteria from the OPEN rubric.
+
+    A rubric that re-mints its walkthrough criteria under fresh (non-v26) keys
+    must still gate c-5214996f on those fresh keys: the meta criterion earns
+    covered-tier evidence only when every rubric-resolved walkthrough
+    sub-criterion passes in the same batch, and a partial batch blocks it.  This
+    is the named acceptance-evidence test for the meta-gate generalization — the
+    production code change (rubric-derived required sub-criteria in
+    acceptance_criteria) is exercised by the assertions below; a test-only diff
+    would fail the gate.
+    """
+    project = await _make_project_with_member(db_session, name="Walk-Meta-Resolves-Rubric")
+    sha = "d" * 40
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"status": "scoring", "candidate_sha": sha},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Fresh keys whose texts name the walkthrough flows the live harness drives
+    # — none of the legacy v26 keys appears in the rubric or the batch.
+    fresh_runner = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-fresh-runner-enroll",
+        text="Runner enrollment validates credentials against the fleet",
+        status="active",
+    )
+    fresh_iframe = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-fresh-iframe-token",
+        text="Project Tools iframe subresource token is minted and served",
+        status="active",
+    )
+    meta = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-5214996f",
+        text="Workday click-to-talk session lifecycle (re-walk)",
+        status="active",
+    )
+    db_session.add_all([fresh_runner, fresh_iframe, meta])
+    await db_session.commit()
+    for crit in (fresh_runner, fresh_iframe, meta):
+        await db_session.refresh(crit)
+
+    # Full pass: both fresh sub-criteria + meta → meta earns covered evidence.
+    summary = await ac.record_walkthrough_e2e_evidence(
+        db_session,
+        version,
+        candidate_sha=sha,
+        results=[
+            {"criterion_key": "c-fresh-runner-enroll", "passed": True, "notes": "ok"},
+            {"criterion_key": "c-fresh-iframe-token", "passed": True, "notes": "ok"},
+            {"criterion_key": "c-5214996f", "passed": True, "notes": "meta"},
+        ],
+        qualification_attempt_id="attempt-resolves-rubric-full",
+    )
+    assert summary["status"] == "recorded"
+    assert summary["recorded"] == 3, f"Expected 3 recorded; got {summary}"
+    assert summary["unmatched_keys"] == []
+    meta_evidence = await ac.get_evidence_for_criterion(db_session, meta.id)
+    assert len(meta_evidence) == 1, "meta must earn covered evidence on a full fresh-key pass"
+    assert ac.compute_criterion_coverage(meta_evidence) == "covered"
+
+    # Partial pass: one fresh sub-criterion fails → meta blocked. The passed
+    # fresh sub-criterion still records under its own new attempt source_id.
+    summary2 = await ac.record_walkthrough_e2e_evidence(
+        db_session,
+        version,
+        candidate_sha=sha,
+        results=[
+            {"criterion_key": "c-fresh-runner-enroll", "passed": True, "notes": "ok"},
+            {"criterion_key": "c-fresh-iframe-token", "passed": False, "notes": "broken"},
+            {"criterion_key": "c-5214996f", "passed": True, "notes": "meta"},
+        ],
+        qualification_attempt_id="attempt-resolves-rubric-partial",
+    )
+    assert summary2["recorded"] == 1, f"Only the passed fresh sub-criterion may record; got {summary2}"
+    assert summary2["skipped_not_passed"] == 2, (
+        f"Failed iframe + gated meta must be skipped; got {summary2}"
+    )
+    meta_evidence = await ac.get_evidence_for_criterion(db_session, meta.id)
+    assert len(meta_evidence) == 1, "meta must NOT gain a second covered row from a partial batch"
+
+
 # ---------------------------------------------------------------------------
 # Alert on unmatched walkthrough criterion keys
 # ---------------------------------------------------------------------------

@@ -971,20 +971,17 @@ async def test_finalize_failed_walkthrough_probe_blocks_promotion_and_preserves_
     ]
 
 
-async def test_finalize_unknown_criteria_probe_is_infra_failure_preserves_verdict(
+async def test_finalize_unknown_criteria_probe_is_contract_blocker_preserves_verdict(
     db_session, mocker
 ):
-    """An infra-shaped probe failure (report keys not active in the version rubric)
-    is classified as a non-conclusive infra_failure — NOT booked as a quality
-    not_promoted verdict — while the eager-written audit fact survives.
-
-    This is the restored infra-failure recovery contract: the probe lane itself
-    broke (the harness posted against criteria this version does not carry), so
-    it must be re-driven rather than recorded as a conclusive quality judgment
-    against the candidate.  The audit/challenge/merge-grade verdicts survive via
-    the per-dimension ledger (the probe leg runs AFTER dimension composition and
-    the eager writes), so the re-drive does not discard the already-computed
-    facts."""
+    """A report whose keys are not active in the version rubric (unknown criteria)
+    is a REPORT-CONTRACT defect resolved by the DEPLOYED qualifier — booked as a
+    durable not_promoted verdict with blocker=walkthrough_e2e_contract_failed /
+    execution_site=deployed — NOT a transient infra hold.  The eager-written
+    audit fact still survives via the per-dimension ledger: the probe leg runs
+    AFTER dimension composition and the eager writes, and the contract-blocker
+    record composes the resolved facts back in, so the already-computed audit
+    verdict stays visible."""
     from app import shared_state
 
     shared_state.runtime_config["promotion_enabled"] = True
@@ -1077,20 +1074,25 @@ async def test_finalize_unknown_criteria_probe_is_infra_failure_preserves_verdic
     result = await rq._finalize_qualification(db_session, version)
     await db_session.commit()
 
-    # Infra-shaped probe failure → non-conclusive infra_failure, NOT a quality
-    # verdict against the candidate.
-    assert result["status"] == "infra_failure"
+    # Report-contract defect → DEPLOYED-side hard blocker, NOT a transient
+    # infra hold and NOT a candidate-side quality verdict.
+    assert result["status"] == "not_promoted"
+    assert result["blocker"] == "walkthrough_e2e_contract_failed"
+    assert result["execution_site"] == rs.EXECUTION_SITE_DEPLOYED
     assert result["error"] == "walkthrough_e2e_report_unknown_criteria"
 
     await db_session.refresh(version)
     lq = version.last_qualification
-    assert lq["status"] == "infra_failure"
+    assert lq["status"] == "not_promoted"
+    assert lq["blocker"] == "walkthrough_e2e_contract_failed"
+    assert lq["execution_site"] == rs.EXECUTION_SITE_DEPLOYED
     assert lq["error"] == "walkthrough_e2e_report_unknown_criteria"
     # The audit verdict survives via the eager-written per-dimension ledger —
-    # the core regression.  The infra record composes the resolved facts back in.
+    # the core regression.  The contract-blocker record composes the resolved
+    # facts back in, exactly like the infra record did.
     assert lq["resolved_dimensions"]["audit"]["status"] == "passed"
     assert lq["resolved_dimensions"]["audit"]["sub_score"] == pytest.approx(1.0)
-    # The failing probe's child is carried on the infra record for re-drive.
+    # The failing probe's child is carried on the verdict for traceability.
     assert lq["walkthrough_e2e_task_id"] == str(walk_task.id)
 
 

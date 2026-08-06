@@ -1198,7 +1198,17 @@ BLOCKER_EXECUTION_SITE: dict[str, str] = {
     "ci_unresolved": EXECUTION_SITE_CANDIDATE,
     "audit_missing": EXECUTION_SITE_CANDIDATE,
     "test_file_deleted": EXECUTION_SITE_CANDIDATE,
+    # Candidate-side: a genuine criterion failure (the report is valid and
+    # every key resolves to an ACTIVE criterion in the open rubric, but one or
+    # more criteria failed) — an automain fix to the candidate tree clears it
+    # on the next qualification.
     "walkthrough_e2e_failed": EXECUTION_SITE_CANDIDATE,
+    # Deployed-side: report-key validation (schema mismatch, duplicate/invalid
+    # entries, canonical collisions, unknown criteria) is performed by the
+    # DEPLOYED qualifier against the DEPLOYED rubric.  No fix on automain can
+    # change how the currently-serving validator parses the report, so the
+    # block is inert until this version itself promotes.
+    "walkthrough_e2e_contract_failed": EXECUTION_SITE_DEPLOYED,
     # Deployed-side: the category verdict ledger is composed and rendered by
     # the deployed qualifier.  Its recovery/minting path (acceptance-window,
     # unverified-merge, and metrics-integrity evidence) also imports and runs

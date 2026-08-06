@@ -187,6 +187,14 @@ async def _notify_operator(
     outcome without polling.  Does not commit — the message rides the caller's
     commit, the same one that persists ``last_qualification``.
 
+    The message is idempotent per ``(version, event_type)``: a retried
+    qualification / promotion that re-posts the same outcome for the same
+    version finds the prior row via ``post_event_message``'s
+    ``idempotency_key`` lookup and posts nothing, so crash-retry loops cannot
+    flood the operator with duplicate notifications.  Distinct event types for
+    the same version (e.g. ``release_blocked`` then ``release_promoted``)
+    produce distinct messages.
+
     A messaging failure must NEVER abort or fail qualification/promotion: the
     verdict is already decided and recorded by the time this runs.  Mirrors the
     best-effort ``create_tag`` pattern — wrapped in try/except, logs a warning
@@ -205,6 +213,7 @@ async def _notify_operator(
             event_type,
             summary,
             context=context,
+            idempotency_key=f"release:{version.id}:{event_type}",
         )
     except Exception as exc:  # noqa: BLE001 — notifications must never break a release
         logger.warning(

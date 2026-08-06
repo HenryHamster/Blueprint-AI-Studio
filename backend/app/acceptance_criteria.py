@@ -2510,28 +2510,103 @@ def _version_qualifying_candidate_sha(version: Any) -> str:
     return str(last_qualification.get("candidate_sha") or "").strip()
 
 
-#: Sub-criteria that must ALL appear as passed=True in a walkthrough results batch
-#: before the meta criterion (c-5214996f) may earn covered-tier evidence.
-_WALKTHROUGH_META_REQUIRED_SUBCRITERIA = frozenset({"c-dfdc9d82", "c-f52fd975", "c-workday-session-lifecycle"})
+#: Canonical key of the walkthrough meta criterion: a full re-walk summary that
+#: MUST NOT be minted from a partial run where one or more of its
+#: rubric-resolved substantive sub-criteria failed or were absent.
+_WALKTHROUGH_META_CRITERION_KEY = "c-5214996f"
+
+#: Flows the live walkthrough harness can exercise against the candidate stack
+#: (Runner Enrollment, Project Tools iframe subresource token, Conversational
+#: Workday session lifecycle).  Each flow is matched against the OPEN version's
+#: ACTIVE criterion texts so the evidence contract stays version-agnostic: a
+#: rubric that re-mints its criteria under fresh keys still resolves when a
+#: criterion's text names the flow the harness drives.  Matching is a
+#: case-insensitive substring.  Housed here (rather than release_qualifier) so
+#: the meta-criterion gate and the evidence-contract resolver share one source
+#: of truth.
+WALKTHROUGH_E2E_FLOW_MARKERS: tuple[tuple[str, ...], ...] = (
+    ("runner enroll", "runner enrollment"),
+    ("iframe", "subresource token", "project tool"),
+    ("workday",),
+)
+
+#: Legacy harness canonical keys — a rubric that carries these criteria verbatim
+#: is still satisfiable by the current v26-output harness, so walkthrough
+#: resolution treats them as walkthrough-provable for backward compatibility.
+#: Kept separate from the flow markers so the version-agnostic contract stays
+#: the primary path.
+WALKTHROUGH_E2E_LEGACY_HARNESS_KEYS: frozenset[str] = frozenset(
+    {"c-dfdc9d82", "c-f52fd975", "c-5214996f"}
+)
 
 
-def _walkthrough_meta_criterion_gate(results: list[dict]) -> bool:
-    """Return True only when all required sub-criteria are passed in ``results``.
+async def _walkthrough_meta_required_subcriteria(
+    session: AsyncSession,
+    version: Any,
+) -> frozenset[str]:
+    """Resolve the walkthrough sub-criteria the meta gate requires for ``version``.
 
-    Pure function (no I/O). The meta criterion c-5214996f summarises a full
-    re-walk; it MUST NOT be minted from a partial run where one or more of its
-    substantive sub-criteria failed or were absent.
+    Loads the version's ACTIVE criteria and keeps exactly those the live
+    walkthrough harness can produce evidence for (criterion text names a flow
+    marker OR the criterion carries a legacy harness key), alias-resolving each
+    key to its canonical form and excluding the meta criterion itself.  The
+    result feeds :func:`_walkthrough_meta_criterion_gate`, so a rubric that
+    re-mints its walkthrough criteria under fresh keys gates c-5214996f on
+    those fresh keys instead of a hardcoded v26 key set.
+    """
+    rows = await get_criteria_for_version(session, version.id)
+    required: set[str] = set()
+    for row in rows:
+        if row.status != "active" or not row.criterion_key:
+            continue
+        raw_key = str(row.criterion_key)
+        key = _resolve_walkthrough_criterion_key(raw_key)
+        if key == _WALKTHROUGH_META_CRITERION_KEY:
+            continue
+        text = str(row.text or "").lower()
+        if any(
+            marker in text
+            for flow_markers in WALKTHROUGH_E2E_FLOW_MARKERS
+            for marker in flow_markers
+        ) or raw_key in WALKTHROUGH_E2E_LEGACY_HARNESS_KEYS:
+            required.add(key)
+    return frozenset(required)
+
+
+def _walkthrough_meta_criterion_gate(
+    results: list[dict],
+    required_subcriteria: frozenset[str],
+) -> bool:
+    """Return True only when all rubric-resolved sub-criteria are passed in ``results``.
+
+    Pure function (no I/O).  ``required_subcriteria`` comes from
+    :func:`_walkthrough_meta_required_subcriteria` — the ACTIVE walkthrough
+    sub-criteria on the open version's rubric, so a rubric that re-mints its
+    walkthrough criteria under fresh keys gates the meta on those fresh keys
+    rather than a hardcoded v26 set.
+
+    Fail-closed: an empty required set (a rubric whose only walkthrough
+    criterion is the meta itself) returns False — c-5214996f must never be
+    minted from a lone row with no registered substantive sub-flows.
+
+    The batch is compared in canonical (alias-resolved) form so the legacy
+    'c-workday-session-lifecycle' slug and its canonical target both count
+    against the same canonical required key.
 
     Called by :func:`record_walkthrough_e2e_evidence` and
     :func:`record_operator_walkthrough_evidence` before c-5214996f is allowed
     into ``passed_keys``.
     """
+    if not required_subcriteria:
+        return False
     passed_in_batch = {
-        str(entry.get("criterion_key") or "").strip()
+        _resolve_walkthrough_criterion_key(
+            str(entry.get("criterion_key") or "").strip()
+        )
         for entry in results
         if isinstance(entry, dict) and entry.get("passed") is True
     }
-    return _WALKTHROUGH_META_REQUIRED_SUBCRITERIA.issubset(passed_in_batch)
+    return required_subcriteria.issubset(passed_in_batch)
 
 
 async def record_walkthrough_e2e_evidence(
@@ -2640,7 +2715,8 @@ async def record_walkthrough_e2e_evidence(
     # a silent drop. The meta gate is instead applied at the evidence-writing
     # loop below, where the key has already resolved to an ACTIVE criterion — so
     # the gate only ever suppresses covered meta evidence, never observability.
-    meta_gate_passes = _walkthrough_meta_criterion_gate(results)
+    meta_required = await _walkthrough_meta_required_subcriteria(session, version)
+    meta_gate_passes = _walkthrough_meta_criterion_gate(results, meta_required)
     passed_keys: list[str] = []
     skipped_not_passed = 0
     for entry in results:
@@ -2705,7 +2781,7 @@ async def record_walkthrough_e2e_evidence(
                 "record_walkthrough_e2e_evidence: skipping c-5214996f — "
                 "required sub-criteria %s not all passed in this batch "
                 "(version %s); no covered meta evidence written",
-                sorted(_WALKTHROUGH_META_REQUIRED_SUBCRITERIA),
+                sorted(meta_required),
                 getattr(version, "id", None),
             )
             skipped_not_passed += 1
@@ -2870,7 +2946,8 @@ async def record_operator_walkthrough_evidence(
     # a silent drop. The meta gate is instead applied at the evidence-writing
     # loop below, where the key has already resolved to an ACTIVE criterion — so
     # the gate only ever suppresses covered meta evidence, never observability.
-    meta_gate_passes = _walkthrough_meta_criterion_gate(results)
+    meta_required = await _walkthrough_meta_required_subcriteria(session, version)
+    meta_gate_passes = _walkthrough_meta_criterion_gate(results, meta_required)
     passed_keys: list[str] = []
     skipped_not_passed = 0
     for entry in results:
@@ -2932,7 +3009,7 @@ async def record_operator_walkthrough_evidence(
                 "record_operator_walkthrough_evidence: skipping c-5214996f — "
                 "required sub-criteria %s not all passed in this batch "
                 "(version %s); no covered meta evidence written",
-                sorted(_WALKTHROUGH_META_REQUIRED_SUBCRITERIA),
+                sorted(meta_required),
                 getattr(version, "id", None),
             )
             skipped_not_passed += 1

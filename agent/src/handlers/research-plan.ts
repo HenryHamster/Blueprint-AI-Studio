@@ -595,6 +595,21 @@ ${planFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
   }
 }
 
+// Read-only git history probes used to build the research context. All run
+// through execFileSync with a bounded timeout so a slow, shallow, or hung repo
+// state fails fast into the caller's try/catch instead of blocking the research
+// task indefinitely — standard.ts already bounds its git subprocess calls the
+// same way.
+const GIT_HISTORY_TIMEOUT_MS = 30_000;
+
+function gitHistoryProbe(args: string[], opts: { cwd?: string } = {}): string {
+  return execFileSync(
+    'git',
+    args,
+    { encoding: 'utf-8', timeout: GIT_HISTORY_TIMEOUT_MS, ...(opts.cwd ? { cwd: opts.cwd } : {}) },
+  ).trim();
+}
+
 // ── Handler: Research (analyze codebase, output improvement findings) ──────
 export async function handleResearch(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
@@ -644,24 +659,24 @@ export async function handleResearch(
   let gitLogOutput = '';
   let gitDiffStatOutput = '';
   try {
-    gitLogOutput = execFileSync('git', ['-C', WORKSPACE, 'log', '--oneline', '-30'], { encoding: 'utf-8' }).trim();
+    gitLogOutput = gitHistoryProbe(['-C', WORKSPACE, 'log', '--oneline', '-30']);
   } catch (e) {
     sendLog(ws, `Warning: git log failed: ${String(e)}\n`);
   }
   let gitShortlogOutput = '';
   try {
-    gitShortlogOutput = execFileSync('git', ['-C', WORKSPACE, 'shortlog', '-sn', '--no-merges', '-20'], { encoding: 'utf-8' }).trim();
+    gitShortlogOutput = gitHistoryProbe(['-C', WORKSPACE, 'shortlog', '-sn', '--no-merges', '-20']);
   } catch (e) {
     sendLog(ws, `Warning: git shortlog failed: ${String(e)}\n`);
   }
   try {
-    gitDiffStatOutput = execFileSync('git', ['-C', WORKSPACE, 'diff', '--stat', 'HEAD~5..HEAD'], { encoding: 'utf-8' }).trim();
+    gitDiffStatOutput = gitHistoryProbe(['-C', WORKSPACE, 'diff', '--stat', 'HEAD~5..HEAD']);
   } catch (e) {
     sendLog(ws, `Warning: git diff --stat failed: ${String(e)}\n`);
   }
   let hotspotsSection = '';
   try {
-    const hotspots = execFileSync('git', ['log', '--pretty=format:', '--name-only', '-50'], {cwd: WORKSPACE, encoding: 'utf-8'})
+    const hotspots = gitHistoryProbe(['log', '--pretty=format:', '--name-only', '-50'], { cwd: WORKSPACE })
       .split('\n').filter(Boolean);
     const fileCounts = hotspots.reduce<Record<string, number>>((acc, f) => ({...acc, [f]: (acc[f] ?? 0)+1}), {});
     const topFiles = Object.entries(fileCounts).sort((a,b) => b[1]-a[1]).slice(0, 10);

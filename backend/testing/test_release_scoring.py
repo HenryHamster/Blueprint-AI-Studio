@@ -1074,6 +1074,23 @@ class TestBlockerExecutionSite:
                 rs.blocker_execution_site(code) == rs.EXECUTION_SITE_CANDIDATE
             ), code
 
+    def test_walkthrough_e2e_blockers_split_by_execution_site(self):
+        # A GENUINE walkthrough criterion failure (report valid, every key
+        # resolves to an ACTIVE criterion) fires on candidate content — an
+        # automain fix to the candidate tree clears it next qualification.
+        assert (
+            rs.blocker_execution_site("walkthrough_e2e_failed")
+            == rs.EXECUTION_SITE_CANDIDATE
+        )
+        # A REPORT-CONTRACT failure (schema mismatch, duplicate/invalid entries,
+        # canonical collisions, unknown criteria) is validated by the DEPLOYED
+        # qualifier against the DEPLOYED rubric — a fix on automain is inert
+        # until this version itself promotes.
+        assert (
+            rs.blocker_execution_site("walkthrough_e2e_contract_failed")
+            == rs.EXECUTION_SITE_DEPLOYED
+        )
+
     def test_none_and_unknown_return_none(self):
         assert rs.blocker_execution_site(None) is None
         assert rs.blocker_execution_site("") is None

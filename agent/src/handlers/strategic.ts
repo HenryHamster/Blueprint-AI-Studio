@@ -416,6 +416,35 @@ export function renderDesignDocIndexOverview(index: Record<string, unknown> | un
   return blocks.join('\n\n');
 }
 
+/**
+ * Detect whether the thinker's analysis recommended direction operations.
+ *
+ * The executor-completed-but-no-direction-ops retry below fires when the
+ * thinker recommended create/retire/update/stage/approve/reject moves but the
+ * executor finished without executing any. The thinker prompt's "What to write"
+ * contract (Section 3 "Moves") has the thinker produce PROSE recommendations,
+ * not a `## Structured Output` block — so this scans the whole analysis instead
+ * of gating on a header the prompt no longer emits. Command names and JSON op
+ * keys are the strongest signal; natural-language verbs naming a direction or
+ * a d-id extend detection to the prose form. A bare verb without a direction
+ * target is deliberately NOT matched — an over-eager retry could nudge the
+ * executor into fabricating durable direction state.
+ */
+export function detectThinkerDirectionRecommendations(analysisText: string): {
+  recommendsCreates: boolean;
+  recommendsOtherOps: boolean;
+} {
+  const recommendsCreates =
+    /\bcreate[_-]direction\b/i.test(analysisText) ||
+    /"op"\s*:\s*"create"/i.test(analysisText) ||
+    /\b(?:create|open)\b[^\n]{0,80}\bdirection\b/i.test(analysisText) ||
+    /\bcreate\b[^\n]{0,40}\bd[_-][a-z0-9]+\b/i.test(analysisText);
+  const recommendsOtherOps =
+    /\b(?:retire|update|stage|approve|reject)[_-]direction\b/i.test(analysisText) ||
+    /\b(?:retire|update|stage|approve|reject)\b[^\n]{0,60}\bd[_-][a-z0-9]+\b/i.test(analysisText);
+  return { recommendsCreates, recommendsOtherOps };
+}
+
 export async function handleStrategic(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
@@ -1599,10 +1628,14 @@ ${proposedCriteriaBlock}
       // Detect constraint rejections (cap/dedup) so we don't retry wastefully
       const directionRejectedInOutput = /\[CONSTRAINT\].*(create_direction|approve_direction|reject_direction)/.test(allOutput) || /"status"\s*:\s*"skipped"/.test(allOutput);
 
-      // Check if thinker's structured output contained direction recommendations
-      const structuredSection = analysisText.match(/## Structured Output[\s\S]*$/i)?.[0] ?? '';
-      const thinkerRecommendedCreates = /create[_-]direction|"op"\s*:\s*"create"/i.test(structuredSection);
-      const thinkerRecommendedOtherOps = /retire[_-]direction|update[_-]direction|stage[_-]direction|approve[_-]direction|reject[_-]direction/i.test(structuredSection);
+      // Check whether the thinker's analysis recommended direction operations.
+      // Detection scans the analysis PROSE (the thinker prompt's Section 3
+      // "Moves"), not a `## Structured Output` block — the prompt no longer
+      // emits that header, so a header-gated match would be dead code.
+      const {
+        recommendsCreates: thinkerRecommendedCreates,
+        recommendsOtherOps: thinkerRecommendedOtherOps,
+      } = detectThinkerDirectionRecommendations(analysisText);
 
       if (directionRejectedInOutput && !anyDirectionOp) {
         sendLog(ws, '\n[INFO] Direction creation was attempted but rejected by constraints (cap/duplicate). Not retrying.\n');

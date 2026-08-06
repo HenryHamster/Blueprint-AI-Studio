@@ -318,6 +318,43 @@ describe('buildThinkerPrompt', () => {
     expect(turnA.finalPrompt).toBe(turnA.stablePrefix + turnA.variableBody);
   });
 
+  it('stable prefix is byte-identical across tasks with different taskIds', () => {
+    // The stable prefix must not interpolate taskId (it is baked into the /tmp
+    // handoff file paths) — taskId differs per strategic task, so a leaked byte
+    // would bust Anthropic's prefix cache for the whole block. The concrete
+    // per-task paths must be resolved in the volatile suffix instead.
+    const partsA = buildThinkerPromptParts({ ...base, taskId: 'task-aaa' });
+    const partsB = buildThinkerPromptParts({ ...base, taskId: 'task-bbb' });
+    expect(partsA.stablePrefix).toBe(partsB.stablePrefix);
+    // The per-task /tmp paths are rendered only in the volatile suffix.
+    expect(partsA.variableBody).toContain('/tmp/problem_model_task-aaa.json');
+    expect(partsA.variableBody).toContain('/tmp/running_update_task-aaa.md');
+    expect(partsA.variableBody).toContain('/tmp/research_progress_task-aaa.md');
+    expect(partsA.variableBody).toContain('/tmp/proposed_criteria_task-aaa.json');
+    expect(partsB.variableBody).toContain('/tmp/problem_model_task-bbb.json');
+    expect(partsB.variableBody).toContain('/tmp/running_update_task-bbb.md');
+    // No task-specific byte may leak into the cacheable prefix.
+    expect(partsA.stablePrefix).not.toContain('task-aaa');
+    expect(partsB.stablePrefix).not.toContain('task-bbb');
+    expect(partsA.stablePrefix).not.toContain('/tmp/problem_model_');
+    expect(partsA.stablePrefix).not.toContain('/tmp/running_update_');
+    expect(partsA.stablePrefix).not.toContain('/tmp/research_progress_');
+    expect(partsA.stablePrefix).not.toContain('/tmp/proposed_criteria_');
+  });
+
+  it('self-improvement block lives in the volatile suffix, not the cacheable prefix', () => {
+    // selfImprovementBlock is per-cycle payload content (enable_self_improvement
+    // framing), so it must render after the stable guidance — never in the
+    // byte-identical cacheable region.
+    const parts = buildThinkerPromptParts({
+      ...base,
+      selfImprovementBlock: '\n\n# Self-improvement\n\nThis project\'s codebase includes your own prompts.',
+    });
+    expect(parts.variableBody).toContain('# Self-improvement');
+    expect(parts.stablePrefix).not.toContain('# Self-improvement');
+    expect(parts.stablePrefix).not.toContain('# Project improvement');
+  });
+
   it('stable prefix precedes every volatile per-cycle section', () => {
     const params = {
       ...base,

@@ -20,6 +20,7 @@ from sqlmodel import select
 
 from app import strategic_cycle
 from app.strategic_review_effort import (
+    CONSEQUENTIAL_EFFORT,
     CONSEQUENTIAL_TIER,
     ROUTINE_EFFORT,
     ROUTINE_TIER,
@@ -5710,6 +5711,56 @@ async def _spawn_strategic_review(
         _res_recent_handled = await _fetch_recent_handled_conversation(
             session, project.id
         )
+        # Pre-spawn effort classification for the resident fast path: classify
+        # from DB-only signals; the LTS version-phase is unexamined (its build
+        # can hit GitHub), so an LTS split forces CONSEQUENTIAL.
+        _res_recent_cycle_failures = any(
+            (h or {}).get("outcome") in _FAILED_CYCLE_OUTCOMES
+            for h in (cycle_history or [])[:3]
+        )
+        _res_prior_cycle_dirty = False
+        try:
+            _res_trend = await strategic_cycle.recent_integrity_conflict_trend(
+                session, project.id, limit=10
+            )
+            _res_last_counts = (_res_trend or {}).get("last_counts") or {}
+            _res_prior_cycle_dirty = any(
+                int(_res_last_counts.get(k) or 0) > 0
+                for k in (
+                    "orphaned_gaps",
+                    "ungrounded_directions",
+                    "stale_active_moves",
+                    "staffed_but_deferred",
+                )
+            )
+        except Exception:
+            logger.exception("[STRATEGIC] integrity_conflict_trend fetch failed; continuing")
+        _res_effort_pin = _runtime_config.get("task_type_efforts", {}).get("strategic_review")
+        if _res_effort_pin is not None:
+            _res_effort_tier = "pinned"
+            _res_effort_reason = f"task_type_efforts['strategic_review']={_res_effort_pin} pinned"
+        elif get_project_integration_branch(project) != get_project_promotion_target(project):
+            _res_effort_tier = CONSEQUENTIAL_TIER
+            _res_effort_reason = "resident LTS split: version-phase state unexamined"
+            review_effort = CONSEQUENTIAL_EFFORT
+        else:
+            _res_reconciliation = _build_cycle_start_reconciliation(
+                _res_direction_stats, project.problem_model, None
+            )
+            _res_conflict_counts = (_res_reconciliation or {}).get("counts") or {}
+            _effort_level, _res_effort_tier, _res_effort_reason = classify_strategic_review_effort(
+                {
+                    "open_message_count": len(_res_open_messages),
+                    "operator_steered": bool(operator_steered),
+                    "integrity_conflict_counts": _res_conflict_counts,
+                    "prior_cycle_dirty": _res_prior_cycle_dirty,
+                    "recent_cycle_failures": _res_recent_cycle_failures,
+                }
+            )
+            if _res_effort_tier == ROUTINE_TIER:
+                review_effort = _effort_level
+            else:
+                review_effort = CONSEQUENTIAL_EFFORT
         # Ship the resident-session pacing knobs from _runtime_config onto the
         # payload so the agent's residentConfig() reads LIVE, operator-tunable
         # values instead of falling back to hardcoded defaults. The exploration
@@ -5818,6 +5869,8 @@ async def _spawn_strategic_review(
             # spawn path passes this; cadence spawns leave it None → QUEUED as before)
             # so POST /api/runner/next-task claims it directly.
             runner_pin_id=runner_pin_id,
+            effort_tier=_res_effort_tier,
+            effort_reason=_res_effort_reason,
             expected_legacy_generation=expected_legacy_generation,
         )
 
@@ -7672,12 +7725,14 @@ async def _spawn_strategic_review(
     # Pre-spawn effort classification: decide ROUTINE vs CONSEQUENTIAL from
     # signals computed ABOVE (all available before the LLM call) and pin the
     # effort on the payload so routing resolution picks a cheaper tier for
-    # routine cycles. Fail-closed: any high-stakes or unknown signal stays at
-    # the category default ('max'). An explicit ``task_type_efforts`` pin for
-    # ``strategic_review`` wins over the classifier.
+    # routine cycles. Fail-closed: a consequential verdict — or classifier
+    # error — forces CONSEQUENTIAL_EFFORT ('max') on the payload so a
+    # high-stakes cycle can never inherit a cheaper research fallback. An
+    # explicit ``task_type_efforts`` pin for ``strategic_review`` wins over
+    # the classifier.
     if _review_effort_pin is None:
         try:
-            _effort_tier, _effort_reason = classify_strategic_review_effort(
+            _effort_level, _effort_tier, _effort_reason = classify_strategic_review_effort(
                 {
                     "open_message_count": len(open_msgs),
                     "operator_steered": bool(operator_steered),
@@ -7688,15 +7743,25 @@ async def _spawn_strategic_review(
                     "prior_cycle_dirty": _prior_cycle_dirty,
                     "recent_cycle_failures": _recent_cycle_failures,
                 }
-            )[1:]
+            )
         except Exception:  # noqa: BLE001 — a classifier bug must never block a cycle
             logger.exception(
                 "[STRATEGIC] effort classifier failed; keeping consequential"
             )
+            _effort_level = CONSEQUENTIAL_EFFORT
             _effort_tier = CONSEQUENTIAL_TIER
             _effort_reason = "classifier error"
+        # The classifier's effort level is authoritative — the previous code
+        # discarded it (``[1:]``) and only cheapened routine cycles, so a
+        # CONSEQUENTIAL verdict silently inherited the generic research
+        # fallback instead of 'max'. Fail-closed: a routine verdict cheapens
+        # the cycle; a consequential verdict — or classifier error — forces
+        # CONSEQUENTIAL_EFFORT so a high-stakes cycle can never be cheapened
+        # by ``task_type_efforts['research']``.
         if _effort_tier == ROUTINE_TIER:
-            review_effort = ROUTINE_EFFORT
+            review_effort = _effort_level
+        else:
+            review_effort = CONSEQUENTIAL_EFFORT
     else:
         _effort_tier = "pinned"
         _effort_reason = (

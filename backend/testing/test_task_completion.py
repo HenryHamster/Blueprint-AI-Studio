@@ -4461,12 +4461,14 @@ class TestHandleWalkthroughE2eCompletionStandalone:
 def test_meta_criterion_requires_substantive_subcriteria():
     """c-5214996f is blocked when a required sub-criterion is failed or absent.
 
-    Exercises _walkthrough_meta_criterion_gate directly (pure, no DB).
-    Also verifies the gate is wired into record_walkthrough_e2e_evidence by
-    checking that c-5214996f is excluded from passed_keys when the gate fails,
-    while a fully-passing batch admits it.
+    Exercises _walkthrough_meta_criterion_gate directly (pure, no DB). The
+    required set is supplied by the caller (resolved from the open version's
+    ACTIVE rubric by _walkthrough_meta_required_subcriteria) — the gate is the
+    subset check on that resolved set, not a hardcoded v26 key list.
     """
     from app.acceptance_criteria import _walkthrough_meta_criterion_gate
+
+    v26_required = frozenset({"c-dfdc9d82", "c-f52fd975"})
 
     # Gate should pass only when ALL required sub-criteria are passed.
     full_pass = [
@@ -4475,15 +4477,15 @@ def test_meta_criterion_requires_substantive_subcriteria():
         {"criterion_key": "c-workday-session-lifecycle", "passed": True, "notes": "ok"},
         {"criterion_key": "c-5214996f", "passed": True, "notes": "ok"},
     ]
-    assert _walkthrough_meta_criterion_gate(full_pass) is True, \
-        "gate must pass when c-dfdc9d82, c-f52fd975, AND c-workday-session-lifecycle are all passed"
+    assert _walkthrough_meta_criterion_gate(full_pass, v26_required) is True, \
+        "gate must pass when c-dfdc9d82 and c-f52fd975 are both passed"
 
     # Missing c-f52fd975 entirely → gate fails.
     missing_iframe = [
         {"criterion_key": "c-dfdc9d82", "passed": True, "notes": "ok"},
         {"criterion_key": "c-5214996f", "passed": True, "notes": "ok"},
     ]
-    assert _walkthrough_meta_criterion_gate(missing_iframe) is False, \
+    assert _walkthrough_meta_criterion_gate(missing_iframe, v26_required) is False, \
         "gate must fail when c-f52fd975 is absent"
 
     # c-f52fd975 present but passed=False → gate fails.
@@ -4492,7 +4494,7 @@ def test_meta_criterion_requires_substantive_subcriteria():
         {"criterion_key": "c-f52fd975", "passed": False, "notes": "failed"},
         {"criterion_key": "c-5214996f", "passed": True, "notes": "ok"},
     ]
-    assert _walkthrough_meta_criterion_gate(iframe_failed) is False, \
+    assert _walkthrough_meta_criterion_gate(iframe_failed, v26_required) is False, \
         "gate must fail when c-f52fd975 has passed=False"
 
     # c-dfdc9d82 absent → gate fails.
@@ -4500,9 +4502,33 @@ def test_meta_criterion_requires_substantive_subcriteria():
         {"criterion_key": "c-f52fd975", "passed": True, "notes": "ok"},
         {"criterion_key": "c-5214996f", "passed": True, "notes": "ok"},
     ]
-    assert _walkthrough_meta_criterion_gate(missing_runner) is False, \
+    assert _walkthrough_meta_criterion_gate(missing_runner, v26_required) is False, \
         "gate must fail when c-dfdc9d82 is absent"
 
+    # Fresh (non-v26) rubric keys resolve the same way: the meta is gated on
+    # whatever walkthrough sub-criteria the OPEN rubric registers.
+    fresh_required = frozenset({"c-fresh-runner", "c-fresh-iframe"})
+    fresh_full_pass = [
+        {"criterion_key": "c-fresh-runner", "passed": True, "notes": "ok"},
+        {"criterion_key": "c-fresh-iframe", "passed": True, "notes": "ok"},
+        {"criterion_key": "c-5214996f", "passed": True, "notes": "ok"},
+    ]
+    assert _walkthrough_meta_criterion_gate(fresh_full_pass, fresh_required) is True, \
+        "gate must recognize fresh walkthrough-provable sub-criterion keys"
+
+    # A legacy workday alias in the batch resolves to the meta itself and must
+    # NOT satisfy a fresh substantive sub-criterion that was not exercised.
+    assert _walkthrough_meta_criterion_gate(
+        [{"criterion_key": "c-workday-session-lifecycle", "passed": True, "notes": "ok"}],
+        fresh_required,
+    ) is False, \
+        "a batch that does not exercise a fresh required sub-criterion must fail the gate"
+
     # Empty batch → gate fails.
-    assert _walkthrough_meta_criterion_gate([]) is False, \
+    assert _walkthrough_meta_criterion_gate([], v26_required) is False, \
         "gate must fail on empty results"
+
+    # Fail-closed: an empty required set (a rubric whose only walkthrough
+    # criterion is the meta itself) must never mint meta evidence.
+    assert _walkthrough_meta_criterion_gate(full_pass, frozenset()) is False, \
+        "gate must fail closed when the rubric resolves no substantive sub-criteria"
