@@ -110,11 +110,14 @@
         FAILED+=("$_VERIFICATION_DIR verification: harness missing")
       else
         _verification_postgres_flag=""
-        if PG_BIN="$(resolve_pg_bindir)" && [ -x /opt/blueprint-backend-venv/bin/python ]; then
+        if PG_BIN="$(resolve_pg_bindir)" && [ -x "${BLUEPRINT_SANDBOX_PYTHON:-/opt/blueprint-backend-venv/bin/python}" ]; then
           # --sandbox-postgres runs the harness against the Packer-baked venv
           # (scripts/test-backend.sh hard-exits without it). A host with the
           # bindir but no baked venv must fall through to the Docker branch
-          # below, not hard-exit.
+          # below, not hard-exit. The interpreter path is the same
+          # BLUEPRINT_SANDBOX_PYTHON-overridable default the harness
+          # (scripts/test-backend.sh) and the capability probe use, so the
+          # gate, the harness and the proof cannot drift apart.
           _verification_postgres_flag=--sandbox-postgres
         elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
           # Developer/bootstrap compatibility. A runner can only advertise this

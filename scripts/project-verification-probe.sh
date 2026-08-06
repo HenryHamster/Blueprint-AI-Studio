@@ -76,11 +76,28 @@ resolve_pg_bindir() {
 # isolation namespace. This is the same socketless boundary used by generated
 # authoring checks: no host Docker socket or host data directory is exposed.
 if [ "$PROBE_MODE" = "all" ] || [ "$PROBE_MODE" = "docker-postgres" ]; then
+  # Resolution is the SHARED helper above, byte-identical to the mirrored
+  # resolve_pg_bindir in check, scripts/test-backend.sh and
+  # check_backend_verification.sh: this probe's result IS the input to the
+  # dispatch gate (runner_eligibility.py keys authoring dispatch off the
+  # docker_postgres probe), so proof and gate admit exactly the same hosts.
   POSTGRES_BIN="$(resolve_pg_bindir)" || {
     echo "Sandbox PostgreSQL verification failed: no usable PostgreSQL server bindir" >&2
     exit 1
   }
   test -x "$POSTGRES_BIN/pg_ctl"
+  # The `check` gate selects --sandbox-postgres only when the baked backend
+  # interpreter is present AND usable, so the capability we advertise here must
+  # include it: a host with PostgreSQL but no baked venv would otherwise be
+  # dispatched a backend authoring task that fails closed at the gate. Prove it
+  # functionally (imports pytest), not by testing for a file.
+  SANDBOX_PYTHON="${BLUEPRINT_SANDBOX_PYTHON:-/opt/blueprint-backend-venv/bin/python}"
+  if ! timeout "$COMMAND_TIMEOUT_SECONDS" "$SANDBOX_PYTHON" -c 'import pytest' \
+    >/dev/null 2>&1; then
+    echo "Sandbox PostgreSQL verification failed: baked sandbox interpreter $SANDBOX_PYTHON cannot import pytest" >&2
+    exit 1
+  fi
+
   mkdir -p "$POSTGRES_SOCKET"
   timeout "$COMMAND_TIMEOUT_SECONDS" "$POSTGRES_BIN/initdb" \
     -D "$POSTGRES_DATA" -A trust --no-locale -U postgres >/dev/null

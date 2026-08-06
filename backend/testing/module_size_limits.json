@@ -169,7 +169,7 @@
     "prompts/code-change-helpers.ts": 1250,
     "prompts/code-change-helpers.test.ts": 1900,
     "prompts/check-helper.ts": 1200,
-    "prompts/check-helper.test.ts": 2300,
+    "prompts/check-helper.test.ts": 2350,
     "prompts/done-helper.ts": 650,
     "prompts/done-helper.test.ts": 900,
     "handlers/research-plan.ts": 3000,

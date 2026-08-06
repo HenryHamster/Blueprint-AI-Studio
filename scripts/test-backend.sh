@@ -142,7 +142,7 @@ fi
 # host Docker socket. Ordinary developer/CI calls retain the Docker path. ---
 if [ "$SANDBOX_POSTGRES" = "1" ]; then
   USE_DOCKER=0
-  PYTHON=/opt/blueprint-backend-venv/bin/python
+  PYTHON="${BLUEPRINT_SANDBOX_PYTHON:-/opt/blueprint-backend-venv/bin/python}"
   [ -x "$PYTHON" ] || {
     echo "ERROR: --sandbox-postgres requires $PYTHON" >&2
     exit 2

@@ -923,9 +923,6 @@ describe('writeCheckHelper — required backend-authoring verification', () => {
     expect(script).toContain('python3 -m ruff check --select E,F,W --ignore E501');
     expect(script).toContain('USE_TEST_POSTGRES=true bash "$_VERIFICATION_HARNESS" "$_verification_postgres_flag"');
     expect(script).toContain('pg_config --bindir');
-    // --sandbox-postgres is gated on the Packer-baked venv the harness
-    // hard-exits without; a host missing it falls through to Docker --postgres.
-    expect(script).toContain('/opt/blueprint-backend-venv/bin/python');
     expect(script).toContain('/tmp/project_verification_receipt_verify-authoring-1.json');
     expect(script).toContain('"skipped":runtime["skipped"],"exit_code":0');
     expect(script).toContain('no impacted pytest file/node was resolved');
@@ -1084,11 +1081,10 @@ describe('writeCheckHelper — required backend-authoring verification', () => {
       ruffExit: number; docker: boolean; harnessExit: number; skipped?: number;
       changedPath?: string; changedPaths?: string[]; missingPaths?: string[];
       harnessPath?: string;
-      // Whether the Packer-baked /opt/blueprint-backend-venv interpreter the
-      // --sandbox-postgres branch requires is present (defaults to true, as on
-      // baked task VMs). When false, the gate must fall through to Docker
-      // --postgres instead of hard-exiting.
-      venvPresent?: boolean;
+      /** Whether the baked sandbox interpreter exists (defaults to `docker`). */
+      sandboxPython?: boolean;
+      /** Whether a usable PostgreSQL server bindir exists (defaults to `docker`). */
+      pgBindir?: 'present' | 'missing';
     },
   ): Promise<{
     status: number;
@@ -1119,16 +1115,9 @@ describe('writeCheckHelper — required backend-authoring verification', () => {
     // Vitest workers and persistent runner users must never contend for the
     // helper's fixed lint lists, logs, worktrees, or receipts. Static render
     // assertions continue to verify the real /tmp paths above.
-    // The gate requires the Packer-baked sandbox venv before it selects
-    // --sandbox-postgres (gap-2 reachability fix). Redirect that hardcoded path
-    // to a fixture-owned copy so tests can drive both branches: venv present ->
-    // --sandbox-postgres; venv absent -> falls through to Docker --postgres.
-    const venvPresent = scenario.venvPresent ?? true;
-    const venvPython = realPath.join(dir, 'venv', 'bin', 'python');
     const script = renderedScript
       .replaceAll('verify-authoring-1', runtimeTaskId)
-      .replaceAll('/tmp/', `${posix(runtimeTmp)}/`)
-      .replaceAll('/opt/blueprint-backend-venv/bin/python', posix(venvPython));
+      .replaceAll('/tmp/', `${posix(runtimeTmp)}/`);
     const receiptPath = realPath.join(
       runtimeTmp,
       `project_verification_receipt_${runtimeTaskId}.json`,
@@ -1139,11 +1128,19 @@ describe('writeCheckHelper — required backend-authoring verification', () => {
       const changedPaths = scenario.changedPaths ?? [scenario.changedPath ?? 'backend/x.py'];
       const missingPaths = new Set(scenario.missingPaths ?? []);
       const harnessPath = scenario.harnessPath ?? 'scripts/test-backend.sh';
-      realFs.mkdirSync(bin, { recursive: true });
-      if (venvPresent) {
-        realFs.mkdirSync(realPath.dirname(venvPython), { recursive: true });
-        realFs.writeFileSync(venvPython, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      // The gate now requires BOTH a usable PostgreSQL server bindir AND the
+      // baked sandbox interpreter before selecting --sandbox-postgres. The
+      // runtime mock cannot write /opt, so model the baked venv inside the
+      // sandbox dir and pin BLUEPRINT_SANDBOX_PYTHON to it in the exec env.
+      const pgBindirPresent = scenario.pgBindir ?? scenario.docker;
+      const sandboxPythonPresent = scenario.sandboxPython ?? scenario.docker;
+      const sandboxPythonDir = realPath.join(dir, 'sandbox-venv', 'bin');
+      const sandboxPythonPath = realPath.join(sandboxPythonDir, 'python');
+      if (sandboxPythonPresent) {
+        realFs.mkdirSync(sandboxPythonDir, { recursive: true });
+        realFs.writeFileSync(sandboxPythonPath, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
       }
+      realFs.mkdirSync(bin, { recursive: true });
       realFs.mkdirSync(realPath.join(dir, 'backend', 'testing'), { recursive: true });
       realFs.mkdirSync(realPath.join(dir, 'scripts'), { recursive: true });
       realFs.writeFileSync(realPath.join(dir, 'backend', 'x.py'), 'value = 1\n');
@@ -1183,7 +1180,7 @@ exec "${realPython}" "$@"
       realFs.writeFileSync(realPath.join(bin, 'npm'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
       realFs.writeFileSync(
         realPath.join(bin, 'pg_config'),
-        `#!/bin/sh\n[ "$1" = "--bindir" ] && echo "${scenario.docker ? posix(bin) : '/missing/postgres/bin'}"\n`,
+        `#!/bin/sh\n[ "$1" = "--bindir" ] && echo "${pgBindirPresent ? posix(bin) : '/missing/postgres/bin'}"\n`,
         { mode: 0o755 },
       );
       realFs.writeFileSync(realPath.join(bin, 'initdb'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
@@ -1216,6 +1213,14 @@ exit ${scenario.harnessExit}
             WORKSPACE: posix(dir),
             LOGFILE: posix(logPath),
             HOME: process.env.HOME ?? '',
+            // Pin the baked-sandbox-interpreter path to a deterministic
+            // location inside this sandbox (the runtime mock cannot write /opt):
+            // when sandboxPython is present the shim exists so the
+            // --sandbox-postgres branch is reachable; when absent the env var
+            // points at a missing file so the gate deterministically falls
+            // through to --postgres / fail-closed regardless of whether this
+            // host happens to have /opt/blueprint-backend-venv installed.
+            BLUEPRINT_SANDBOX_PYTHON: posix(sandboxPythonPath),
           },
           encoding: 'utf8',
           stdio: ['ignore', 'pipe', 'pipe'],
@@ -1280,23 +1285,6 @@ exit ${scenario.harnessExit}
     expect(result.log).not.toContain('test_deleted.py');
     expect(result.receipt).toMatchObject({
       pytest: { selectors: ['testing/test_bar.py', 'testing/test_x.py'] },
-    });
-  });
-  it('runtime: a usable bindir without the baked venv falls through to Docker --postgres, not a hard exit', async () => {
-    const result = await runRequiredCheck(await render(), {
-      ruffExit: 0,
-      docker: true,
-      harnessExit: 0,
-      venvPresent: false,
-    });
-    expect(result.status, result.stdout).toBe(0);
-    // Gap 2: --sandbox-postgres must NOT be selected on bindir presence alone
-    // — its harness hard-exits without the baked venv. A Docker-capable host
-    // takes the --postgres branch on the very next line instead.
-    expect(result.log).toContain('harness USE_TEST_POSTGRES=true --postgres testing/test_x.py');
-    expect(result.log).not.toContain('--sandbox-postgres');
-    expect(result.receipt).toMatchObject({
-      pytest: { postgres_sidecar: true },
     });
   });
   it('runtime: a nested opted-in project ignores non-Python-only changes', async () => {
@@ -1377,6 +1365,65 @@ exit ${scenario.harnessExit}
     expect(result.status, result.stdout).not.toBe(0);
     expect(result.receipt).toBeUndefined();
     expect(result.stdout).toContain('FAIL');
+  });
+  it('runtime: baked sandbox venv + PG bindir select --sandbox-postgres without Docker', async () => {
+    const result = await runRequiredCheck(await render(), {
+      ruffExit: 0,
+      docker: false,
+      harnessExit: 0,
+      pgBindir: 'present',
+      sandboxPython: true,
+    });
+    expect(result.status, result.stdout).toBe(0);
+    expect(result.log).toContain(
+      'harness USE_TEST_POSTGRES=true --sandbox-postgres testing/test_x.py',
+    );
+    expect(result.receipt).toMatchObject({
+      pytest: {
+        selectors: ['testing/test_x.py'],
+        targeted: true,
+        use_test_postgres: true,
+        postgres_sidecar: true,
+        skipped: 0,
+        exit_code: 0,
+      },
+    });
+  });
+  it('runtime: PG bindir present but baked venv missing falls back to the Docker --postgres sidecar', async () => {
+    const result = await runRequiredCheck(await render(), {
+      ruffExit: 0,
+      docker: true,
+      harnessExit: 0,
+      pgBindir: 'present',
+      sandboxPython: false,
+    });
+    expect(result.status, result.stdout).toBe(0);
+    expect(result.log).toContain(
+      'harness USE_TEST_POSTGRES=true --postgres testing/test_x.py',
+    );
+    expect(result.log).not.toContain('--sandbox-postgres');
+    expect(result.receipt).toMatchObject({
+      pytest: {
+        selectors: ['testing/test_x.py'],
+        targeted: true,
+        use_test_postgres: true,
+        postgres_sidecar: true,
+        skipped: 0,
+        exit_code: 0,
+      },
+    });
+  });
+  it('runtime: PG bindir present but baked venv missing and no Docker fails closed', async () => {
+    const result = await runRequiredCheck(await render(), {
+      ruffExit: 0,
+      docker: false,
+      harnessExit: 0,
+      pgBindir: 'present',
+      sandboxPython: false,
+    });
+    expect(result.status, result.stdout).not.toBe(0);
+    expect(result.stdout).toContain('PostgreSQL runtime unavailable');
+    expect(result.receipt).toBeUndefined();
   });
 });
 

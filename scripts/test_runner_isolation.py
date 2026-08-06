@@ -1612,11 +1612,18 @@ class TestProjectVerificationProbe(unittest.TestCase):
         if not os.path.isfile(os.path.join(bindir, "initdb")):
             self.skipTest("functional probe requires the PostgreSQL server tools")
 
+        # The probe also proves the baked sandbox interpreter the check gate
+        # requires before selecting --sandbox-postgres. Hosts running this test
+        # need not carry /opt/blueprint-backend-venv, so designate the running
+        # interpreter (it imports pytest by construction) as the sandbox one.
+        probe_env = os.environ.copy()
+        probe_env["BLUEPRINT_SANDBOX_PYTHON"] = sys.executable
         completed = subprocess.run(
             [iso.PROJECT_VERIFICATION_PROBE_PATH, "all"],
             capture_output=True,
             text=True,
             timeout=90,
+            env=probe_env,
         )
         self.assertEqual(
             completed.returncode,
