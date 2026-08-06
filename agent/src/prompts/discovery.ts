@@ -250,6 +250,27 @@ The files this design describes do NOT exist in the repository yet, so you CANNO
  * ref or an unreadable `git ls-files` (countSourceFiles → null) is NOT treated as
  * a clone failure on its own — only an explicit durable/live disagreement is.
  */
+/**
+ * Probe the configured origin for zero head refs — i.e. the remote has no
+ * commits. Runs `git ls-remote --heads origin` against the clean origin URL the
+ * credential helper was configured for (no token appears on the command line),
+ * and treats an unanswerable probe as "has commits" so a transient network
+ * failure can never flip a real repo into a false repo-uninitialized diagnosis.
+ * Mirrors the semantics of `remoteHasNoCommits` in index.ts (the clone-fails
+ * branch-missing probe), with `origin` instead of a raw URL since this runs
+ * after the clone has configured the remote.
+ */
+function probeRemoteHasNoCommits(): boolean {
+  try {
+    const refs = execFileSync('git', ['ls-remote', '--heads', 'origin'], {
+      cwd: WORKSPACE, encoding: 'utf-8', timeout: 30_000,
+    });
+    return refs.trim() === '';
+  } catch {
+    return false;
+  }
+}
+
 export async function verifyCloneDelivered(task: Record<string, unknown>, branch?: string): Promise<void> {
   const cloneFailure = (message: string): Error & { failureCategory: FailureCategory } => {
     const err = new Error(message) as Error & { failureCategory: FailureCategory };
@@ -265,6 +286,28 @@ export async function verifyCloneDelivered(task: Record<string, unknown>, branch
     head = null;
   }
   if (!head) {
+    // A successful clone of a commitless remote (git warns "you appear to have
+    // cloned an empty repository" and exits 0) leaves an empty working tree with
+    // no resolvable HEAD. Distinguish that from a partial/wrong checkout by
+    // probing the remote: when the remote advertises zero refs this is the SAME
+    // REPO_UNINITIALIZED condition the clone-fails branch-missing path reports,
+    // so self-report the observed emptiness and throw the canonical
+    // "repository has no commits" signature the backend keys on — instead of the
+    // generic no-HEAD message, which the backend routes nowhere and would loop
+    // clone_failed forever on a stale repo_is_empty=False.
+    if (probeRemoteHasNoCommits()) {
+      // Best-effort self-report: the backend re-runs authoritative detection and
+      // flips a stale repo_is_empty=False so the NEXT task proceeds greenfield.
+      // Never let a reporting failure suppress the real clone_failed below.
+      try {
+        await apiPost('/api/agent/build-config-discovery', { observed_repo_is_empty: true });
+      } catch { /* best-effort; do not mask the real clone_failed below */ }
+      throw cloneFailure(
+        'clone_failed: the repository has no commits, so the clone produced an empty working tree with no HEAD. '
+        + 'Blueprint seeds an initial commit when a project is onboarded — this repo was never seeded. '
+        + 'Push any commit to the default branch (or re-onboard the project) to fix.'
+      );
+    }
     throw cloneFailure('clone_failed: working tree has no resolvable HEAD after clone — the clone did not deliver a checkout');
   }
 

@@ -688,8 +688,22 @@ _BRANCH_GONE_PATTERNS: tuple[str, ...] = (
 # probes the remote (`git ls-remote`) on a missing-branch clone failure and says
 # so explicitly, because git's own error text cannot tell an empty repo apart
 # from a deleted branch; the GitHub API phrasings are matched too.
+#
+# Two agent shapes produce these:
+#   1. clone-FAILS path: `git clone --branch <trunk>` of a commitless repo dies
+#      with the branch-missing text; `cloneWithRetry` (index.ts) probes the
+#      remote, finds zero refs, and throws "the repository has no commits…".
+#   2. clone-SUCCEEDS path: a commitless repo clones with exit 0 (git only warns
+#      "you appear to have cloned an empty repository"), leaving no HEAD;
+#      `verifyCloneDelivered` (discovery.ts) probes the remote, finds zero refs,
+#      self-reports the emptiness, and throws the same canonical phrase.
+# ``"clone produced an empty working tree"`` is the narrow no-HEAD fallback from
+# shape 2 — it only appears when the agent has explicitly confirmed the remote is
+# commitless, so an unrelated clone failure (partial/wrong checkout) cannot match
+# it. The GitHub API phrasings are matched too.
 _REPO_UNINITIALIZED_PATTERNS: tuple[str, ...] = (
     "repository has no commits",
+    "clone produced an empty working tree",
     "this repository is empty",
     "git repository is empty",
 )

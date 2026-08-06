@@ -1708,10 +1708,14 @@ async def update_agent_status(
         #      cloned tree is empty/near-empty (verifyCloneDelivered caught it);
         #      re-detect authoritatively and flip only on a confirmed-empty
         #      verdict.
-        #   2. REPO_UNINITIALIZED — the repo has NO branches at all, so
-        #      ``git clone --branch <trunk>`` dies before verifyCloneDelivered
-        #      runs; the failure text matches the repo-uninitialized patterns.
-        #      Confirm with repo_has_commits() and flip only when commitless.
+        #   2. REPO_UNINITIALIZED — the repo has NO branches at all. This
+        #      surfaces two ways: (a) ``git clone --branch <trunk>`` dies before
+        #      verifyCloneDelivered runs (the branch-missing probe in
+        #      cloneWithRetry throws "the repository has no commits…"), or
+        #      (b) the clone SUCCEEDS with exit 0 and verifyCloneDelivered finds
+        #      no HEAD, probes the remote, and throws the same canonical phrase.
+        #      Both match the repo-uninitialized patterns. Confirm with
+        #      repo_has_commits() and flip only when commitless.
         # Best-effort: never raises, and preserves fail-loud for a real clone
         # shortfall (a repo with content leaves the stored signal untouched, so
         # the next task still fails loud).

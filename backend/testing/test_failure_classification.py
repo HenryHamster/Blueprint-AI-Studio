@@ -3100,6 +3100,82 @@ class TestRepoUninitializedClassification:
         t = _task(self._AGENT_MSG, ctx={"failure_category": "CODE_ERROR"})
         assert should_trigger_code_defect_investigation(t) is False
 
+    # The clone-SUCCEEDS commitless path: `git clone` of a repo with zero commits
+    # exits 0 (git only warns "you appear to have cloned an empty repository"),
+    # so the branch-missing probe in cloneWithRetry never runs. The empty tree
+    # surfaces downstream in verifyCloneDelivered as an unresolvable HEAD; the
+    # agent probes the remote, finds zero refs, self-reports the emptiness, and
+    # throws this exact message (must stay in sync with discovery.ts).
+    _CLONE_SUCCEEDS_MSG = (
+        "clone_failed: the repository has no commits, so the clone produced an "
+        "empty working tree with no HEAD. Blueprint seeds an initial commit when "
+        "a project is onboarded — this repo was never seeded. Push any commit to "
+        "the default branch (or re-onboard the project) to fix."
+    )
+
+    def test_clone_succeeds_commitless_no_head_classifies(self):
+        """The message the clone-SUCCEEDS commitless path emits must classify as
+        REPO_UNINITIALIZED (not a generic clone_failed / CODE_ERROR), so the
+        failure reads as an unseeded repo instead of a transient clone problem."""
+        assert classify_failure(_task(self._CLONE_SUCCEEDS_MSG)) == REPO_UNINITIALIZED
+        # Also with an agent-posted clone_failed category, the text check wins.
+        assert (
+            classify_failure(
+                _task(self._CLONE_SUCCEEDS_MSG, ctx={"failure_category": "clone_failed"})
+            )
+            == REPO_UNINITIALIZED
+        )
+
+    def test_clone_succeeds_commitless_no_head_routes_to_repo_is_empty_self_heal(self):
+        """The clone-succeeds signature must satisfy ``is_repo_uninitialized`` —
+        the exact predicate agent_status.py uses to route a ``clone_failed``
+        report to ``maybe_correct_stale_commitless_repo_signal``, which is what
+        re-verifies against GitHub and clears a stale ``repo_is_empty=False``."""
+        from app.failure_classification import is_repo_uninitialized
+
+        assert is_repo_uninitialized(self._CLONE_SUCCEEDS_MSG) is True
+
+    def test_generic_no_head_clone_failure_not_swept_into_repo_uninitialized(self):
+        """NEGATIVE case: a HEAD-missing clone failure with no commitless evidence
+        (remote probe unanswerable, or the message predates the probe) must NOT be
+        swept into REPO_UNINITIALIZED — it stays a generic clone_failed so an
+        unrelated partial/wrong checkout is not misreported as an empty repo."""
+        from app.failure_classification import is_repo_uninitialized
+
+        generic = (
+            "clone_failed: working tree has no resolvable HEAD after clone — "
+            "the clone did not deliver a checkout"
+        )
+        assert is_repo_uninitialized(generic) is False
+        assert classify_failure(_task(generic)) != REPO_UNINITIALIZED
+
+    def test_clone_succeeds_pattern_matches_agent_source_of_truth(self):
+        """Cross-language contract: the clone-succeeds canonical phrase and its
+        narrow no-HEAD fallback pattern must appear verbatim in the agent's
+        discovery.ts so the two ends cannot silently drift apart (the defect
+        class that produced the original wedge: the agent emitted one phrase
+        while the backend matched another)."""
+        from app.failure_classification import _REPO_UNINITIALIZED_PATTERNS
+
+        agent_file = _REPO_ROOT / "agent" / "src" / "prompts" / "discovery.ts"
+        if not agent_file.exists():
+            pytest.skip(
+                f"{agent_file} not available in this environment — the backend "
+                "test image ships no agent/ tree (build context is ./backend). "
+                "This cross-language drift guard runs wherever the full repo "
+                "tree is checked out (local dev, agent VM workspace)."
+            )
+        src = agent_file.read_text(encoding="utf-8").lower()
+        for pat in _REPO_UNINITIALIZED_PATTERNS:
+            if pat in ("this repository is empty", "git repository is empty"):
+                # GitHub API phrasings, not agent-emitted — only the agent's own
+                # phrases must appear in discovery.ts.
+                continue
+            assert pat in src, (
+                f"repo-uninitialized pattern {pat!r} not found in discovery.ts — "
+                "the cross-language contract has drifted"
+            )
+
 
 class TestParkWakeFailureClassRegistration:
     """park_wake_timeout / park_wake_stranded are canonical recognized classes.

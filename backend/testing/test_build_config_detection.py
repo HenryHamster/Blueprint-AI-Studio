@@ -578,3 +578,31 @@ class TestAgentStatusRepoUninitializedSelfHeal:
             "The clone-delivery-disagreement trigger must still self-heal; got "
             f"build_config={project.build_config!r}"
         )
+
+    @pytest.mark.asyncio
+    async def test_clone_succeeds_no_head_commitless_signature_corrects_stale_flag(
+        self,
+    ):
+        """The clone-SUCCEEDS commitless path (git clone exits 0, verifyCloneDelivered
+        finds no HEAD, probes the remote, and throws the canonical
+        repository-has-no-commits signature) must ALSO route to the commitless
+        self-heal and flip the stale repo_is_empty=False once GitHub confirms the
+        repo has no commits — otherwise this shape loops clone_failed forever the
+        same way the clone-fails branch-missing shape did before PR #16725."""
+        project = _heal_project(name="clone-succeeds-empty", repo="clone-succeeds-empty")
+
+        await _run_heal_report(
+            project,
+            logs=(
+                "clone_failed: the repository has no commits, so the clone produced "
+                "an empty working tree with no HEAD. Blueprint seeds an initial "
+                "commit when a project is onboarded — this repo was never seeded."
+            ),
+            repo_has_commits_value=False,
+        )
+
+        assert project.build_config["repo_is_empty"] is True, (
+            "The clone-succeeds commitless signature must self-heal the stale "
+            f"repo_is_empty=False; got build_config={project.build_config!r}"
+        )
+        assert project.build_config.get("source_file_count") == 0
