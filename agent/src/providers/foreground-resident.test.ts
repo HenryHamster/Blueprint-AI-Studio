@@ -56,14 +56,24 @@ describe('Fast Resident foreground profile', () => {
   });
 
   it('routes effort through the compatible provider environment instead of a CLI flag', () => {
-    const profile = createForegroundResidentProfile({ PATH: process.env.PATH });
+    // Hermetic: an ambient CLAUDE_CODE_EFFORT_LEVEL (e.g. a dev shell export)
+    // would leak into buildBaseCliEnv and mask the explicit low effort this
+    // test asserts is routed through the provider environment.
+    const priorEffort = process.env.CLAUDE_CODE_EFFORT_LEVEL;
+    delete process.env.CLAUDE_CODE_EFFORT_LEVEL;
+    let profile: ReturnType<typeof createForegroundResidentProfile> | undefined;
     try {
+      profile = createForegroundResidentProfile({ PATH: process.env.PATH });
       const launch = buildClaudeForegroundLaunch(profile, '/tmp/strict-mcp.json', 'haiku', 'low');
       expect(launch.args).not.toContain('--effort');
       expect(launch.env.CLAUDE_CODE_EFFORT_LEVEL).toBe('low');
     } finally {
-      fs.rmSync(profile.cwd, { recursive: true, force: true });
-      if (profile.env.HOME) fs.rmSync(profile.env.HOME, { recursive: true, force: true });
+      if (priorEffort !== undefined) process.env.CLAUDE_CODE_EFFORT_LEVEL = priorEffort;
+      else delete process.env.CLAUDE_CODE_EFFORT_LEVEL;
+      if (profile) {
+        fs.rmSync(profile.cwd, { recursive: true, force: true });
+        if (profile.env.HOME) fs.rmSync(profile.env.HOME, { recursive: true, force: true });
+      }
     }
   });
 

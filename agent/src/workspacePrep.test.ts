@@ -291,8 +291,16 @@ describe('prepareWorkspaceForRole', () => {
   });
 
   it('cold path: base-branch fetch failure is non-fatal (gate will surface the missing base)', async () => {
-    execFileSyncMock.mockImplementationOnce((cmd: string) => {
-      if (cmd === 'git') throw new Error('fatal: couldn\'t find remote ref main');
+    // Scope the failure to the git fetch. reserveWorkspaceDisk probes the
+    // filesystem via execFileSync('df', ...) before any clone work, so a
+    // one-shot mockImplementationOnce would be consumed by the df probe and
+    // the base fetch would silently succeed. Throwing on every git fetch is
+    // still precise here: the only fetch on this non-self-repo cold path is
+    // the base-branch fetch this test targets.
+    execFileSyncMock.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === 'git' && Array.isArray(args) && args.includes('fetch')) {
+        throw new Error('fatal: couldn\'t find remote ref main');
+      }
       return '';
     });
 
