@@ -52,7 +52,7 @@ def test_strategist_dispatch_policy_uses_one_spawn_task_contract():
         "refactor",
         "qa",
     }.issubset(STRATEGIST_SPAWNABLE_TASK_TYPES)
-    assert STRATEGIST_CONTEXTUAL_TASK_TYPES == {"fix"}
+    assert STRATEGIST_CONTEXTUAL_TASK_TYPES == frozenset()
 
 
 def test_task_capability_registry_covers_task_type_enum():

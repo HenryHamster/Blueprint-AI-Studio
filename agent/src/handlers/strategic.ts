@@ -1378,10 +1378,13 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 #     should be settled by a design doc instead of re-derived per task)
 #   - the "Existing knowledge documents" index is empty or thin for a direction
 #     you are actively advancing
-# (Implementation/PR types — create/fix/refactor/migrate/qa — are intentionally
-# NOT spawnable here; they flow through the normal direction → research → plan →
-# create path. compute_experiment is the exception: it is empirical measurement,
-# not implementation, so it IS spawnable directly from the strategist.)
+# (Implementation types that start from a fresh branch — create/refactor/qa — ARE
+# spawnable directly below. fix/migrate are NOT: fix needs a live-PR target
+# (pr_number + branch) bound by the normal review pipeline, which the strategist
+# cannot resolve at spawn — existing-PR work flows through the normal
+# direction → research → plan → create path. compute_experiment is the exception
+# among measurement work: it is empirical measurement, not implementation, so it
+# IS spawnable directly from the strategist.)
 ./strategic spawn-task '{"type": "research", "title": "...", "prompt": "Full investigation prompt...", "direction_id": "d-xxx"}'
 ./strategic spawn-task '{"type": "web_research", "title": "...", "prompt": "What external knowledge to gather...", "direction_id": "d-xxx"}'
 ./strategic spawn-task '{"type": "design", "title": "...", "prompt": "Design question grounded in the codebase...", "direction_id": "d-xxx"}'
@@ -1422,8 +1425,6 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 
 # Implementation-ready bounded work uses the same command and needs no direction.
 ./strategic spawn-task '{"type": "create|refactor|qa", "title": "...", "prompt": "Full implementation prompt...", "idempotency_key": "stable-logical-request"}'
-# Fixing an existing PR additionally requires its normal launch context.
-./strategic spawn-task '{"type": "fix", "title": "...", "prompt": "...", "pr_number": 123, "branch": "task/existing-pr"}'
 
 # Dispose an open completion-debt ledger entry.
 # disposition: "resolved" (requires evidence) or "dismissed" (requires reason).

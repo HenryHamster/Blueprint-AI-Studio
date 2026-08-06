@@ -298,7 +298,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         default_category="review",
         user_launchable=True,
         delivers_product=True,
-        strategist_dispatch="requires_context",
+        strategist_dispatch="disabled",
         description="Fix a PR from review feedback or CI failures.",
         run_shape="workflow",
         output_kind="pr",
@@ -988,7 +988,11 @@ STRATEGIST_SPAWNABLE_TASK_TYPES: frozenset[str] = frozenset(
 )
 # Task types accepted by spawn_task only when their normal launch context is
 # present. Kept separate from the direct set so the router can emit a precise
-# validation error rather than silently constructing an unusable task.
+# validation error rather than silently constructing an unusable task. This is
+# currently EMPTY: ``fix`` — the sole former member — needs a live-PR target
+# (pr_number + branch) bound by the normal review pipeline, which the strategist
+# cannot resolve at spawn, so it is ``disabled`` and flows through the normal
+# direction → research → plan → create path instead.
 STRATEGIST_CONTEXTUAL_TASK_TYPES: frozenset[str] = frozenset(
     capability.id.value
     for capability in TASK_CAPABILITIES

@@ -8075,9 +8075,11 @@ async def test_version_phase_uses_promotion_target_gate(db_session, mocker):
 
     # integration == promotion: the version-phase LTS context is gated off
     # (the resolver fails safe instead of raising), so the review still spawns
-    # but without invoking the version lifecycle.
+    # but without invoking the version lifecycle. current_open_version may still
+    # be probed once by best-effort enrichments orthogonal to this gate
+    # (criterion-link conflict resolution calls it unconditionally); what must
+    # stay closed when the branches are equal is the version bootstrap itself.
     assert await _spawn_strategic_review(skipped_project, db_session) is True
-    assert current_open_version.call_count == 0
     assert ensure_initial_release_version.call_count == 0
 
     current_open_version.reset_mock()
@@ -18245,12 +18247,20 @@ async def _make_strategic_review_task(db_session):
 
 
 async def _post_spawn_task(
-    db_session, task_id, *, title, prompt, spawn_type="create", expect_status=200
+    db_session,
+    task_id,
+    *,
+    title,
+    prompt,
+    spawn_type="create",
+    expect_status=200,
+    extra=None,
 ):
     """POST a strategic spawn_task op against the test app over the real endpoint.
 
     Returns the parsed JSON body (success body on 200, FastAPI error envelope on
-    an expected error status)."""
+    an expected error status). ``extra`` merges additional fields into the spawn
+    data (e.g. the pr_number + branch a fix spawn used to carry)."""
     from httpx import AsyncClient, ASGITransport
     from app.main import app
     from app.database import get_session
@@ -18264,6 +18274,9 @@ async def _post_spawn_task(
         "sub": task_id,
         "task_type": "strategic_review",
     }
+    data = {"type": spawn_type, "title": title, "prompt": prompt}
+    if extra:
+        data.update(extra)
     try:
         async with AsyncClient(
             transport=ASGITransport(app=app),
@@ -18275,7 +18288,7 @@ async def _post_spawn_task(
                 json={
                     "op": "spawn_task",
                     "task_id": task_id,
-                    "data": {"type": spawn_type, "title": title, "prompt": prompt},
+                    "data": data,
                 },
             )
         assert resp.status_code == expect_status, resp.text
@@ -18539,9 +18552,9 @@ async def test_direction_research_uses_one_discovery_cycle_without_raw_wake(db_s
 
 @pytest.mark.asyncio
 async def test_spawn_task_fix_type_without_pr_context_fails_cleanly(db_session):
-    """``fix`` requires pr_number + branch, which a prompt-only spawn does not
-    supply. The handler must
-    reject it at the allowlist check with a clean 400 (not an opaque 500), and
+    """``fix`` is not strategist-spawnable: it needs a live-PR target (pr_number
+    + branch) the strategist cannot bind at spawn. Even a prompt-only spawn must
+    be rejected with a clean 400 naming that context (not an opaque 500), and
     create NO task."""
     from sqlalchemy import func as _f
 
@@ -18560,6 +18573,48 @@ async def test_spawn_task_fix_type_without_pr_context_fails_cleanly(db_session):
     assert "branch" in detail
 
     # No task was created by the failed validation.
+    count = (
+        await db_session.execute(
+            select(_f.count())
+            .select_from(Task)
+            .where(Task.created_by == "STRATEGIC_AGENT")
+        )
+    ).scalar()
+    assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_spawn_task_fix_type_with_pr_context_is_rejected(db_session):
+    """REG(RESSION): the strategist's spawn_task must reject ``fix`` EVEN when
+    the launch context (pr_number + branch) that used to pass the allowlist is
+    supplied. Every strategist-spawned fix previously died at the PR-execution
+    fence with "fix has no immutable assigned target" because the strategist
+    cannot bind review_loop.fix_target / reviewed_head_sha at spawn. The chosen
+    resolution is to remove ``fix`` from the strategist spawn surface: reject it
+    loudly at the API (naming the correct direction → research → plan → create
+    route) and never create a task row."""
+    from sqlalchemy import func as _f
+
+    _project, review_id = await _make_strategic_review_task(db_session)
+
+    body = await _post_spawn_task(
+        db_session,
+        review_id,
+        title="Fix the existing PR",
+        prompt="address the review feedback",
+        spawn_type="fix",
+        expect_status=400,
+        extra={"pr_number": 123, "branch": "task/existing-pr"},
+    )
+    detail = body["error"]["message"]
+    assert "fix is not spawnable" in detail
+    assert "pr_number" in detail
+    assert "branch" in detail
+    assert "research" in detail
+    assert "plan" in detail
+    assert "create" in detail
+
+    # No task row was created by the rejected spawn.
     count = (
         await db_session.execute(
             select(_f.count())

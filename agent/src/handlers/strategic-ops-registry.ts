@@ -153,8 +153,7 @@ const INPUTS = {
     fields: [
       'type', 'title', 'prompt', 'direction_id', 'criterion_ids',
       'acceptance_evidence', 'debt_id', 'idempotency_key', 'watch',
-      'watch_purpose', 'preview_only', 'pr_number', 'branch', 'original_task_id',
-      'original_prompt', 'command', 'hypothesis', 'spend_cap_usd',
+      'watch_purpose', 'preview_only', 'command', 'hypothesis', 'spend_cap_usd',
       'deadline_seconds', 'success_criterion', 'success_criteria', 'machine_type',
       'runner_target', 'accelerator', 'vram_gb', 'min_compute_capability',
       'cwd', 'env', 'container_image', 'allow_host_fallback',
@@ -169,7 +168,7 @@ const INPUTS = {
     notes: [
       'Use this operation for bounded implementation, research, plan, design, and compute work under an existing strategic outcome.',
       'Parallelize independent implementation with multiple tasks under one direction; do not create file-, PR-, or phase-sharded directions.',
-      'type=fix additionally requires pr_number and branch.',
+      'fix is not spawnable: it needs a live-PR target (pr_number + branch) bound by the normal review pipeline, which the strategist cannot resolve at spawn — route existing-PR work through direction → research → plan → create.',
       'Write/plan/design tasks and standalone research are watched by default. Direction-linked research is filtered through discovery review; set watch=true only when its raw completion itself needs Resident attention.',
       'Exceptional project bursts return a durable deferred request instead of HTTP 429.',
       'For compute_experiment, set preview_only=true to validate and inspect the normalized launch without dispatching.',

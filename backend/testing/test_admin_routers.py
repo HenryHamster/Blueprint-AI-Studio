@@ -9322,7 +9322,7 @@ class TestStrategistSpawnableRegistry:
         )
         assert direct == STRATEGIST_SPAWNABLE_TASK_TYPES
         assert contextual == STRATEGIST_CONTEXTUAL_TASK_TYPES
-        assert STRATEGIST_CONTEXTUAL_TASK_TYPES == frozenset({"fix"})
+        assert STRATEGIST_CONTEXTUAL_TASK_TYPES == frozenset()
 
     @pytest.mark.asyncio
     async def test_strategist_spawn_compute_experiment_persists_launch_contract(
