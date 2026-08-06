@@ -249,6 +249,18 @@ export interface BlindMergeGrade {
   biggest_gap?: string | null;
 }
 
+/** One category's grade from the goal-verification gate that refused promotion.
+ *  Persisted per-attempt on the qualification record/verdict; surfaced so the
+ *  operator/agent sees WHY the category is unmet (status + tier + written gap)
+ *  instead of only the opaque criterion key. */
+export interface QualificationCategoryVerdict {
+  category_key: string;
+  status: string;            // 'met' | 'partial' | 'not_met' | 'unverified'
+  tier: string | null;       // 'judged' | 'machine' | 'unverified'
+  gap?: string | null;
+  citations?: unknown[] | null;
+}
+
 export interface AuditFinding {
   severity: string;
   summary: string;
@@ -330,6 +342,11 @@ export interface VersionQualification {
   completion_debt?: CompletionDebtQualSnapshot | null;
   debt_enforce_confidence_preview?: number | null;
   debt_enforce_weight_preview?: number | null;
+  // Per-category goal-verification verdicts + residual gap that drove the
+  // criterion_coverage gate at finalize time (additive; null when no rubric or
+  // grade was issued). Names WHY each category is unmet.
+  category_verdicts?: QualificationCategoryVerdict[] | null;
+  residual_uncaptured_gap?: string | null;
 }
 
 /** Single resolved serving block — the canonical answer to "is this version live?"
@@ -1188,6 +1205,9 @@ export interface QualificationVerdictRecord {
   completion_debt?: CompletionDebtQualSnapshot | null;
   debt_enforce_confidence_preview?: number | null;
   debt_enforce_weight_preview?: number | null;
+  // Per-attempt category verdicts + residual gap (mirrors VersionQualification).
+  category_verdicts?: QualificationCategoryVerdict[] | null;
+  residual_uncaptured_gap?: string | null;
 }
 
 export interface QualificationVerdictsInfraContext {

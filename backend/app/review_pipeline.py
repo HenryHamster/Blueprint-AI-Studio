@@ -3230,6 +3230,24 @@ async def _spawn_pipeline_task(
         # Prior review feedback is carried via review_loop.review_history in the
         # task context, which the fix agent formats with severity tags and file/line
         # locations. Avoid duplicating it here as unstructured text.
+        # Surface a pre-merge acceptance finding (a structural defect in the
+        # declared acceptance evidence, e.g. the named test was never added to
+        # the diff) AHEAD of the review feedback so the fix agent corrects the
+        # code or the declaration in the same pass — otherwise the defect is
+        # only discovered at merge-landing, when nothing can be done about it.
+        from app.acceptance_gate import (
+            format_premerge_acceptance_finding,
+            premerge_acceptance_finding,
+        )
+
+        _premerge_finding = None
+        if orig is not None:
+            _premerge_finding = premerge_acceptance_finding(orig)
+        if _premerge_finding is None:
+            _premerge_finding = premerge_acceptance_finding(source_task)
+        _premerge_block = format_premerge_acceptance_finding(_premerge_finding)
+        if _premerge_block:
+            fix_prompt = f"{_premerge_block}{fix_prompt}"
         payload_data = {
             "type": "fix",
             "pr_number": pr_number,

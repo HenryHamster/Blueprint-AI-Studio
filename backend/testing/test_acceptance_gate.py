@@ -21,6 +21,7 @@ from sqlmodel import select
 from app.acceptance_gate import (
     CODE_ACCEPTANCE_VERDICT_KEY,
     CRITERION_OPS,
+    PREMERGE_ACCEPTANCE_FINDING_KEY,
     TEST_COVERAGE_RESULT_KEY,
     acceptance_blocks_success,
     acceptance_is_proven,
@@ -34,8 +35,12 @@ from app.acceptance_gate import (
     coerce_number,
     criterion_met,
     evaluate_code_acceptance,
+    evaluate_premerge_acceptance,
+    format_premerge_acceptance_finding,
+    premerge_acceptance_finding,
     record_artifact_consumptions_for_task,
     record_code_acceptance_verdict,
+    stamp_premerge_acceptance_finding,
     summarize_version_acceptance_aggregate,
     _evaluate_coverage_delta,
 )
@@ -317,6 +322,174 @@ def test_targeted_green_test_only_diff_still_fails_closed():
     assert verdict.satisfied is False
     assert verdict.proven is False
     assert "test-only" in verdict.reason
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pre-merge acceptance: judge the structurally-checkable half while PR is open
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_premerge_acceptance_failure_reaches_review_loop():
+    # A PR whose declared named_test is NOT among its changed files is
+    # structurally unsatisfiable BEFORE the merge: the test was never added to
+    # the diff, so no merge-time green run can ever satisfy the declaration.
+    # The pre-merge gate must route that failure into the review/fix loop (a
+    # durable, readable finding) so the task can correct the code or the
+    # declaration while the PR is still open — instead of discovering it only
+    # at merge-landing, when nothing can be done.
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+            "test_id": "test_widget_handles_empty",
+        },
+        changed_files=["backend/app/widget.py"],  # declared test absent
+        unverified_reason=None,
+    )
+    verdict = evaluate_premerge_acceptance(task)
+    assert verdict is not None
+    assert verdict.declared is True
+    assert verdict.satisfied is False
+    assert "not among" in verdict.reason
+    assert verdict.proven is False
+
+    # The structural failure is stamped as a durable finding and read back by
+    # the review/fix pipeline's reader.
+    finding = stamp_premerge_acceptance_finding(task)
+    assert finding is not None
+    assert finding["satisfied"] is False
+    assert finding["kind"] == "named_test"
+    assert finding["cause"] == "named_test_missing_from_diff"
+    assert finding["reason"] == verdict.reason
+    assert premerge_acceptance_finding(task) == finding
+    assert (task.context or {}).get(PREMERGE_ACCEPTANCE_FINDING_KEY) == finding
+
+    # The finding renders as a fix-prompt block naming the defect and cause, so
+    # a fix agent corrects it in the same pass as the review feedback.
+    block = format_premerge_acceptance_finding(finding)
+    assert "PRE-MERGE ACCEPTANCE FAILURE" in block
+    assert "not among" in block
+    assert "named_test_missing_from_diff" in block
+    assert format_premerge_acceptance_finding(None) == ""
+    assert format_premerge_acceptance_finding({"satisfied": True}) == ""
+
+    # Self-healing: once the agent adds the declared test to the diff (a new
+    # status POST with corrected changed files), re-stamping clears the finding.
+    task.context = {
+        **(task.context or {}),
+        "_pr_changed_files": [
+            "backend/app/widget.py",
+            "backend/testing/test_widget.py",
+        ],
+    }
+    assert stamp_premerge_acceptance_finding(task) is None
+    assert premerge_acceptance_finding(task) is None
+    assert PREMERGE_ACCEPTANCE_FINDING_KEY not in (task.context or {})
+
+    # The green-run half is NOT pre-merge checkable: a structurally sound
+    # named_test (test present + non-test seam + semantically grounded) is
+    # satisfied/unproven pre-merge and produces no finding.
+    sound = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+        },
+        changed_files=["backend/app/widget.py", "backend/testing/test_widget.py"],
+        unverified_reason=None,
+    )
+    sound_verdict = evaluate_premerge_acceptance(sound)
+    assert sound_verdict is not None
+    assert sound_verdict.satisfied is True
+    assert sound_verdict.proven is False
+    assert stamp_premerge_acceptance_finding(sound) is None
+    assert premerge_acceptance_finding(sound) is None
+
+    # A task that declared NO acceptance evidence is never judged pre-merge and
+    # never produces a finding.
+    undeclared = _make_code_task(
+        acceptance_evidence=None,
+        changed_files=["backend/app/widget.py"],
+    )
+    assert evaluate_premerge_acceptance(undeclared) is None
+    assert stamp_premerge_acceptance_finding(undeclared) is None
+    assert premerge_acceptance_finding(undeclared) is None
+
+
+def test_premerge_acceptance_other_kinds_structural_only():
+    # downstream_artifact: grounded delivery is structural; an artifact id with
+    # no grounded changed path fails closed pre-merge with the same actionable
+    # cause as the merge-time gate.
+    artifact_task = _make_code_task(
+        acceptance_evidence={
+            "kind": "downstream_artifact",
+            "artifact_id": "deploy-pipeline-registry",
+        },
+        changed_files=["backend/app/other_module.py"],  # unrelated diff
+        unverified_reason=None,
+    )
+    assert evaluate_premerge_acceptance(artifact_task) is not None
+    finding = stamp_premerge_acceptance_finding(artifact_task)
+    assert finding is not None
+    assert finding["cause"] == "artifact_not_in_diff"
+
+    # visual: a well-formed declaration (component + viewport_width) is
+    # satisfied/unproven pre-merge — the uploaded screenshot is a merge-time
+    # artifact, so no finding is stamped. A malformed declaration reads as
+    # undeclared at the fail-soft read layer (indistinguishable from no
+    # declaration), so it produces no finding either.
+    sound_visual = _make_code_task(
+        acceptance_evidence={
+            "kind": "visual",
+            "component": "ComputeJobsPanel",
+            "viewport_width": 1280,
+        },
+        changed_files=["admin-ui/src/ComputeJobsPanel.tsx"],
+        unverified_reason=None,
+    )
+    visual_verdict = evaluate_premerge_acceptance(sound_visual)
+    assert visual_verdict is not None and visual_verdict.satisfied is True
+    assert visual_verdict.proven is False
+    assert stamp_premerge_acceptance_finding(sound_visual) is None
+
+    malformed_visual = _make_code_task(
+        acceptance_evidence={
+            "kind": "visual",
+            "component": "ComputeJobsPanel",
+            # viewport_width omitted → malformed declaration
+        },
+        changed_files=["admin-ui/src/ComputeJobsPanel.tsx"],
+        unverified_reason=None,
+    )
+    assert evaluate_premerge_acceptance(malformed_visual) is None
+    assert stamp_premerge_acceptance_finding(malformed_visual) is None
+
+    # coverage_delta: a well-formed declaration (numeric threshold) is
+    # satisfied/unproven pre-merge — the measurement is produced only by a real
+    # test run, so it is verified at merge. A missing threshold reads as
+    # undeclared (fail-soft), so it produces no finding.
+    sound_coverage = _make_code_task(
+        acceptance_evidence={
+            "kind": "coverage_delta",
+            "threshold": 80.0,
+        },
+        changed_files=["backend/app/widget.py"],
+        unverified_reason=None,
+    )
+    coverage_verdict = evaluate_premerge_acceptance(sound_coverage)
+    assert coverage_verdict is not None and coverage_verdict.satisfied is True
+    assert coverage_verdict.proven is False
+    assert stamp_premerge_acceptance_finding(sound_coverage) is None
+
+    missing_threshold = _make_code_task(
+        acceptance_evidence={
+            "kind": "coverage_delta",
+            # threshold omitted → malformed declaration
+        },
+        changed_files=["backend/app/widget.py"],
+        unverified_reason=None,
+    )
+    assert evaluate_premerge_acceptance(missing_threshold) is None
+    assert stamp_premerge_acceptance_finding(missing_threshold) is None
 
 
 def test_targeted_green_parent_derived_capped_at_soft():

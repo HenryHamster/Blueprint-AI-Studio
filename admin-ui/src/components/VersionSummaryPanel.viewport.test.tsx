@@ -970,4 +970,80 @@ describe('VersionSummaryPanel — viewport regression', () => {
     const badge = host.querySelector('[data-testid="phantom-drift-badge"]');
     if (badge !== null) throw new Error('Expected no phantom-drift-badge when has_drift is false');
   });
+
+  // ── qualification category verdicts (why promotion is blocked) ─────────────
+
+  test('renders unmet category verdicts with key, status, tier, and gap', async () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <VersionSummaryPanel
+          tasksMerged={SAMPLE_TASKS}
+          categoryVerdicts={[
+            {
+              category_key: 'c-1',
+              status: 'not_met',
+              tier: 'judged',
+              gap: 'No end-to-end test proves the promote path.',
+              citations: ['backend/app/release_promotion.py'],
+            },
+            {
+              category_key: 'c-2',
+              status: 'met',
+              tier: 'machine',
+              gap: null,
+            },
+          ]}
+          residualUncapturedGap="Nothing covers the rollback path."
+        />,
+      );
+    });
+    const block = host.querySelector('[data-testid="qualification-category-verdicts"]');
+    if (block === null) throw new Error('Expected qualification-category-verdicts block when unmet verdicts present');
+    const text = block.textContent ?? '';
+    if (!text.includes('c-1')) throw new Error('Expected unmet category key c-1');
+    if (!text.includes('not met')) throw new Error('Expected not met status label');
+    if (!text.includes('No end-to-end test proves the promote path.')) throw new Error('Expected grader gap text');
+    if (text.includes('c-2')) throw new Error('Met category must not render in the unmet block');
+    const residual = host.querySelector('[data-testid="residual-uncaptured-gap"]');
+    if (residual === null) throw new Error('Expected residual-uncaptured-gap element');
+    if (!residual.textContent?.includes('Nothing covers the rollback path.')) {
+      throw new Error('Expected residual gap text');
+    }
+  });
+
+  test('renders no category-verdicts block when props are absent', async () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<VersionSummaryPanel tasksMerged={SAMPLE_TASKS} />);
+    });
+    const block = host.querySelector('[data-testid="qualification-category-verdicts"]');
+    if (block !== null) throw new Error('Expected no qualification-category-verdicts block when props absent');
+  });
+
+  test('renders no category-verdicts block when every category is met and no residual', async () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <VersionSummaryPanel
+          tasksMerged={SAMPLE_TASKS}
+          categoryVerdicts={[
+            { category_key: 'c-1', status: 'met', tier: 'machine', gap: null },
+          ]}
+          residualUncapturedGap={null}
+        />,
+      );
+    });
+    const block = host.querySelector('[data-testid="qualification-category-verdicts"]');
+    if (block !== null) throw new Error('Expected no block when all categories are met');
+  });
 });

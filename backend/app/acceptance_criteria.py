@@ -2981,6 +2981,7 @@ async def record_named_test_execution_evidence(
     executed_sha: str,
     test_refs: list[str],
     trial_task_id: str,
+    enrolled_sha: str | None = None,
 ) -> dict[str, Any]:
     """Mint ``covered``-tier evidence from a GREEN executed named-test trial.
 
@@ -2995,10 +2996,16 @@ async def record_named_test_execution_evidence(
     no-op via the dedup unique index).
 
     **CRITICAL SAFETY** — covered-tier evidence is written ONLY when the posted
-    ``executed_sha`` is non-empty AND matches the version's qualifying candidate
-    SHA (:func:`_version_qualifying_candidate_sha`). A missing or mismatched SHA
-    writes NOTHING and is reported as ``rejected`` — a trial run against the
-    wrong commit (or with no pinned SHA) can never forge coverage.
+    ``executed_sha`` is non-empty AND matches the SHA the trial was pinned to.
+    When ``enrolled_sha`` is provided (the orchestrator-authored enrollment
+    pin), it is the authoritative anchor: the version may have re-pinned its
+    qualifying candidate SHA between enrollment and ingestion, so comparing
+    against the *current* scratch value would reject legitimate green runs.
+    Callers that bypass enrollment (no ``enrolled_sha``) fall back to the
+    version's qualifying candidate SHA (:func:`_version_qualifying_candidate_sha`)
+    exactly as before. A missing or mismatched SHA writes NOTHING and is
+    reported as ``rejected`` — a trial run against the wrong commit (or with no
+    pinned SHA) can never forge coverage.
 
     Returns a summary dict::
 
@@ -3014,6 +3021,11 @@ async def record_named_test_execution_evidence(
     """
     posted_sha = str(executed_sha or "").strip()
     qualifying_sha = _version_qualifying_candidate_sha(version)
+    # The enrollment pin (when present) is the durable anchor.  Falling back to
+    # the *current* qualifying SHA for un-pinned callers preserves the legacy
+    # contract, but the completion handler always passes the pinned value so
+    # ingestion stops depending on the volatile scratch field.
+    anchor_sha = str(enrolled_sha or "").strip() or qualifying_sha
     if not posted_sha:
         logger.warning(
             "record_named_test_execution_evidence: missing executed_sha for "
@@ -3028,12 +3040,14 @@ async def record_named_test_execution_evidence(
             "unmatched_keys": [],
             "executed_sha": posted_sha,
         }
-    if not qualifying_sha or posted_sha != qualifying_sha:
+    if not anchor_sha or posted_sha != anchor_sha:
         logger.warning(
             "record_named_test_execution_evidence: executed_sha %s does not "
-            "match version %s qualifying SHA %r — rejecting (no coverage written)",
+            "match version %s pinned SHA %r (qualifying=%r) — rejecting "
+            "(no coverage written)",
             posted_sha[:12],
             getattr(version, "id", None),
+            anchor_sha[:12] if anchor_sha else anchor_sha,
             qualifying_sha[:12] if qualifying_sha else qualifying_sha,
         )
         return {

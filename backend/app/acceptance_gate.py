@@ -49,6 +49,8 @@ from sqlalchemy import String, cast, exists, not_
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
+from app.time_utils import _utcnow
+
 from app.artifact_prerequisites import ARTIFACT_PREREQUISITES_KEY
 from app.artifact_prerequisites import downstream_artifact_logical_key
 from app.models import Artifact
@@ -122,6 +124,12 @@ def criterion_met(value: Any, op: str, threshold: Any) -> bool:
 # means "no acceptance verdict was recorded" and preserves prior bare-merge
 # scoring exactly.
 CODE_ACCEPTANCE_VERDICT_KEY = "code_acceptance_verdict"
+
+# Durable top-level context key where a PRE-MERGE structural acceptance finding
+# is stamped while a PR is still open. Lives at the TOP level (not inside
+# ``review_loop``) so it can never flip the merge-verification semantics that an
+# empty ``review_loop`` dict signals. Absence means no structural defect recorded.
+PREMERGE_ACCEPTANCE_FINDING_KEY = "premerge_acceptance_finding"
 
 # Context key where the verify-tests handler stores the coverage measurement
 # result for the coverage_delta acceptance gate to consume. The value is a dict
@@ -578,6 +586,78 @@ def _evaluate_named_test(
     )
 
 
+def _evaluate_named_test_premerge(
+    evidence: AcceptanceEvidence,
+    changed: list[str],
+    truncated: bool = False,
+    parent_derived: bool = False,
+) -> AcceptanceGateVerdict:
+    """Pre-merge structural gate for a ``named_test`` acceptance declaration.
+
+    Mirrors :func:`_evaluate_named_test`'s structurally-checkable requirements
+    (test present, non-test seam, semantic grounding) while skipping the
+    merge-time green-run requirement. Same fail-closed reason strings, so
+    :func:`classify_unsatisfied_reason` maps them identically. Truncated /
+    parent-derived input stays inconclusive (satisfied/unproven), as at merge.
+    """
+    declared_path = (evidence.test_path or "").partition("::")[0].strip()
+    test_present = any(_paths_match(cf, declared_path) for cf in changed)
+    if not test_present:
+        if truncated:
+            return AcceptanceGateVerdict(
+                True,
+                True,
+                evidence.kind,
+                f"declared named_test {declared_path!r} could not be confirmed "
+                "among the PR's changed files because the changed-file list was "
+                "truncated (>50 files, only the first 50 paths are stored) — the "
+                "test may ship beyond the stored prefix, so absence is "
+                "inconclusive before merge",
+            )
+        return AcceptanceGateVerdict(
+            True,
+            False,
+            evidence.kind,
+            f"declared named_test {declared_path!r} is not among the PR's "
+            "changed files — the claimed test was not added or modified here",
+        )
+    seam_files = [cf for cf in changed if not _is_test_path(cf)]
+    if not seam_files:
+        return AcceptanceGateVerdict(
+            True,
+            False,
+            evidence.kind,
+            f"declared named_test {declared_path!r} ships no production code "
+            "change it could exercise (the diff is test-only)",
+        )
+    if not _test_semantically_grounded(declared_path, seam_files):
+        return AcceptanceGateVerdict(
+            True,
+            False,
+            evidence.kind,
+            f"declared named_test {declared_path!r} exercises a production seam "
+            "that does not semantically correspond to the declared test module — "
+            "none of the changed production files match the test file's module name",
+        )
+    if parent_derived:
+        return AcceptanceGateVerdict(
+            True,
+            True,
+            evidence.kind,
+            f"declared named_test {declared_path!r} matches the rollup parent's "
+            "combined changed-file diff (inherited, not the child's own PR) — "
+            "credited soft without machine proof before merge",
+        )
+    return AcceptanceGateVerdict(
+        True,
+        True,
+        evidence.kind,
+        f"declared named_test {declared_path!r} is present among the PR's changed "
+        f"files and exercises a semantically grounded production seam "
+        f"({len(seam_files)} non-test file(s)); the green run is verified at merge",
+    )
+
+
 def _artifact_tokens(artifact_id: str) -> list[str]:
     """Substantive lowercase tokens of an ``artifact_id``, split on non-alphanums.
 
@@ -853,6 +933,83 @@ def evaluate_code_acceptance(task: Task) -> AcceptanceGateVerdict:
     )
 
 
+def evaluate_premerge_acceptance(task: Task) -> AcceptanceGateVerdict | None:
+    """Evaluate the structurally-checkable half of ``task``'s declared acceptance
+    evidence while the PR is still open.
+
+    Mirrors :func:`evaluate_code_acceptance` but only judges what is decidable
+    from the declaration + the PR's changed files before merge: named_test is
+    present with a non-test, semantically-grounded seam (the green run is
+    verified at merge); downstream_artifact is delivered by the diff; visual /
+    coverage_delta declarations are guaranteed well-formed by the schema (the
+    screenshot / measurement is verified at merge); observable_behavior ships a
+    real diff. A structural defect returns ``satisfied=False`` with the same
+    actionable reason string the merge-time gate uses
+    (:func:`classify_unsatisfied_reason` maps it identically); a task with no
+    declaration returns ``None``.
+    """
+    evidence = read_acceptance_evidence(task.first_payload)
+    if evidence is None:
+        return None
+
+    changed = _changed_files(task)
+    truncated = bool((task.context or {}).get("_pr_changed_files_truncated"))
+    parent_derived_files = bool(
+        (task.context or {}).get(PARENT_DERIVED_CHANGED_FILES_KEY)
+    )
+
+    if evidence.kind == "named_test":
+        return _evaluate_named_test_premerge(
+            evidence,
+            changed,
+            truncated,
+            parent_derived=parent_derived_files,
+        )
+
+    if evidence.kind == "downstream_artifact":
+        # Purely structural: grounded against the changed files. Reused as-is.
+        return _evaluate_downstream_artifact(evidence, changed)
+
+    if evidence.kind == "visual":
+        # Schema guarantees component + viewport_width; the screenshot match is
+        # a merge-time check (see _evaluate_visual).
+        return AcceptanceGateVerdict(
+            True, True, evidence.kind,
+            "declared visual acceptance evidence is well-formed (component + "
+            "viewport width); the uploaded screenshot is verified at merge",
+        )
+    if evidence.kind == "coverage_delta":
+        # Schema guarantees a numeric threshold; the measurement is a merge-time
+        # check (see _evaluate_coverage_delta).
+        return AcceptanceGateVerdict(
+            True, True, evidence.kind,
+            "coverage_delta acceptance evidence declares a numeric threshold; the "
+            "coverage measurement is verified at merge",
+        )
+
+    if evidence.kind == "observable_behavior":
+        if not changed:
+            return AcceptanceGateVerdict(
+                True,
+                False,
+                evidence.kind,
+                f"declared {evidence.kind} acceptance evidence but the task "
+                "shipped no changed files to exercise it",
+            )
+        return AcceptanceGateVerdict(
+            True,
+            True,
+            evidence.kind,
+            f"declared {evidence.kind} acceptance evidence shipped with a real "
+            f"diff ({len(changed)} changed file(s))",
+        )
+
+    # Unknown/future kind — fail closed rather than silently pass.
+    return AcceptanceGateVerdict(
+        True, False, evidence.kind, f"unrecognized acceptance kind {evidence.kind!r}"
+    )
+
+
 def record_code_acceptance_verdict(task: Task) -> AcceptanceGateVerdict | None:
     """Evaluate and durably stamp ``task``'s acceptance verdict on its context.
 
@@ -876,6 +1033,72 @@ def record_code_acceptance_verdict(task: Task) -> AcceptanceGateVerdict | None:
     }
     task.context = ctx
     return verdict
+
+
+def premerge_acceptance_finding(task: Task) -> dict | None:
+    """Read the durable pre-merge acceptance finding stamped on ``task`` (``None``
+    when absent / malformed). Pure and side-effect-free — the channel the
+    review/fix pipeline reads to surface a structural defect to the fix agent.
+    """
+    finding = (task.context or {}).get(PREMERGE_ACCEPTANCE_FINDING_KEY)
+    return finding if isinstance(finding, dict) else None
+
+
+def stamp_premerge_acceptance_finding(task: Task) -> dict | None:
+    """Judge the structurally-checkable half of the declared acceptance evidence
+    while the PR is open and route a failure into the review/fix loop.
+
+    Stamps a durable finding under :data:`PREMERGE_ACCEPTANCE_FINDING_KEY` (a
+    top-level key — never inside ``review_loop``, so merge-verification
+    semantics are untouched) when a structural defect exists; else clears any
+    stale finding and returns ``None``, so a task that corrected its code or
+    declaration self-heals on the next status POST. Mutates ``task.context``
+    (the caller commits). Fail-safe: never raises.
+    """
+    verdict = evaluate_premerge_acceptance(task)
+    ctx = dict(task.context or {})
+    if verdict is None or verdict.satisfied:
+        if PREMERGE_ACCEPTANCE_FINDING_KEY in ctx:
+            ctx.pop(PREMERGE_ACCEPTANCE_FINDING_KEY)
+            task.context = ctx
+        return None
+    finding = {
+        "satisfied": False,
+        "kind": verdict.kind,
+        "cause": classify_unsatisfied_reason(
+            {"kind": verdict.kind, "reason": verdict.reason, "satisfied": False}
+        ),
+        "reason": verdict.reason,
+        "evaluated_at": _utcnow().isoformat(),
+    }
+    ctx[PREMERGE_ACCEPTANCE_FINDING_KEY] = finding
+    task.context = ctx
+    return finding
+
+
+def format_premerge_acceptance_finding(finding: Any) -> str:
+    """Render a pre-merge acceptance finding as a fix-prompt block, ``""`` for a
+    missing / malformed / non-blocking finding so callers prepend the result
+    unconditionally. Naming the structural defect up front lets the fix agent
+    correct code or declaration in the same pass as the review feedback.
+    """
+    if not isinstance(finding, dict) or finding.get("satisfied") is not False:
+        return ""
+    reason = str(finding.get("reason") or "").strip()
+    if not reason:
+        return ""
+    cause = str(finding.get("cause") or "").strip()
+    block = [
+        "PRE-MERGE ACCEPTANCE FAILURE — this PR's declared acceptance evidence "
+        "is structurally unsatisfiable. Fix the CODE or the DECLARATION so the "
+        "declared evidence is genuinely delivered by this PR before it merges:",
+        "",
+        f"- {reason}",
+    ]
+    if cause:
+        block.append(f"  (cause: {cause})")
+    block.append("")
+    return "\n".join(block)
 
 
 def acceptance_blocks_success(recorded: Any) -> bool:

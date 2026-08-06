@@ -639,6 +639,124 @@ class TestChallengeRefutedRate:
 
 
 # ---------------------------------------------------------------------------
+# Qualification payload names WHY each category is unmet
+# ---------------------------------------------------------------------------
+
+
+class TestFormatQualificationApiCategoryVerdicts:
+    """format_qualification_for_api / format_verdict_for_api surface the
+    per-category verdicts + residual gap that drove the criterion_coverage gate
+    instead of dropping them at the API boundary."""
+
+    def test_format_qualification_for_api_includes_unmet_category_gaps(self):
+        """A refused promotion carries the grader's per-category status/tier/gap
+        and the residual gap so operators/agents don't need to dig into the
+        database to learn what is actually missing."""
+        from app.release_readiness import format_qualification_for_api
+
+        qual = {
+            "status": "not_promoted",
+            "confidence": 0.62,
+            "threshold": 0.90,
+            "category_verdicts": [
+                {
+                    "category_key": "c-1",
+                    "status": "not_met",
+                    "tier": "judged",
+                    "gap": "No end-to-end test proves the promote path.",
+                    "citations": ["backend/app/release_promotion.py"],
+                },
+                {
+                    "category_key": "c-2",
+                    "status": "met",
+                    "tier": "machine",
+                    "gap": None,
+                    "citations": ["backend/testing/test_release_promotion.py"],
+                },
+            ],
+            "residual_uncaptured_gap": "Nothing covers the rollback path.",
+        }
+        out = format_qualification_for_api(qual)
+
+        assert out["category_verdicts"] == qual["category_verdicts"]
+        assert out["category_verdicts"][0]["category_key"] == "c-1"
+        assert out["category_verdicts"][0]["status"] == "not_met"
+        assert out["category_verdicts"][0]["tier"] == "judged"
+        assert "end-to-end test" in out["category_verdicts"][0]["gap"]
+        assert out["category_verdicts"][1]["status"] == "met"
+        assert out["residual_uncaptured_gap"] == "Nothing covers the rollback path."
+
+    def test_missing_category_verdicts_return_none(self):
+        """Legacy / rubric-less qualification records return None for both keys,
+        so callers can distinguish 'no data' from an unmet category."""
+        from app.release_readiness import format_qualification_for_api
+
+        out = format_qualification_for_api({"status": "pending"})
+        assert out["category_verdicts"] is None
+        assert out["residual_uncaptured_gap"] is None
+        out_empty = format_qualification_for_api({})
+        assert out_empty["category_verdicts"] is None
+        assert out_empty["residual_uncaptured_gap"] is None
+
+    def test_format_verdict_for_api_surfaces_category_verdicts(self):
+        """The immutable QualificationVerdict row carries the same per-attempt
+        category_verdicts / residual snapshot so the verdict-history boundary
+        also names WHY each category is unmet."""
+        import uuid
+
+        from app.release_models import QualificationVerdict
+        from app.release_readiness import format_verdict_for_api
+
+        verdict = QualificationVerdict(
+            project_id=uuid.uuid4(),
+            release_version_id=uuid.uuid4(),
+            candidate_sha="abc123",
+            confidence=0.7,
+            blocker=None,
+            would_promote=False,
+            promotion_enabled=False,
+            terminal_status="not_promoted",
+            threshold=0.9,
+            category_verdicts=[
+                {
+                    "category_key": "c-7",
+                    "status": "partial",
+                    "tier": "judged",
+                    "gap": "Only the happy path is covered.",
+                    "citations": [],
+                }
+            ],
+            residual_uncaptured_gap="Rollback is unproven.",
+        )
+        out = format_verdict_for_api(verdict)
+        assert out["category_verdicts"] == [
+            {
+                "category_key": "c-7",
+                "status": "partial",
+                "tier": "judged",
+                "gap": "Only the happy path is covered.",
+                "citations": [],
+            }
+        ]
+        assert out["residual_uncaptured_gap"] == "Rollback is unproven."
+
+        legacy = QualificationVerdict(
+            project_id=uuid.uuid4(),
+            release_version_id=uuid.uuid4(),
+            candidate_sha="legacy",
+            confidence=0.9,
+            blocker=None,
+            would_promote=True,
+            promotion_enabled=True,
+            terminal_status="promoted",
+            threshold=0.8,
+        )
+        out_legacy = format_verdict_for_api(legacy)
+        assert out_legacy["category_verdicts"] is None
+        assert out_legacy["residual_uncaptured_gap"] is None
+
+
+# ---------------------------------------------------------------------------
 # v22 backfill count-divergence → evergreen enrollment (DB-backed)
 # ---------------------------------------------------------------------------
 

@@ -2782,6 +2782,66 @@ def test_compact_last_qualification_includes_qualify_request_blocked():
     assert out_floor["qualify_request_blocked"]["blocker"] == "ci_compliance"
 
 
+def test_compact_last_qualification_preserves_category_verdicts():
+    """_compact_last_qualification keeps the per-category grader verdicts and
+    residual gap — the WHY each category is unmet — on both the normal and
+    floor paths, while dropping bulky citations."""
+    from app.strategic_payload_compaction import _compact_last_qualification
+
+    value = {
+        "status": "not_promoted",
+        "blocker": "ci_compliance",
+        "category_verdicts": [
+            {
+                "category_key": "merge_grade",
+                "status": "not_met",
+                "tier": "judged",
+                "gap": "Merge grade below threshold: " + "x" * 600,
+                "citations": [{"id": "cite-1", "body": "big citation " * 50}],
+            },
+            {"category_key": "ci", "status": "met", "tier": "machine", "gap": None},
+        ],
+        "residual_uncaptured_gap": (
+            "No criterion captures token-budget erosion: " + "y" * 600
+        ),
+    }
+
+    out = _compact_last_qualification(value)
+    assert out is not None
+
+    verdicts = out["category_verdicts"]
+    assert verdicts[0]["category_key"] == "merge_grade"
+    assert verdicts[0]["status"] == "not_met"
+    assert verdicts[0]["tier"] == "judged"
+    assert verdicts[0]["gap"] == "Merge grade below threshold: " + "x" * 468 + "..."
+    assert verdicts[1] == {"category_key": "ci", "status": "met", "tier": "machine"}
+    # Bulky citations never survive compaction.
+    assert "citations" not in verdicts[0]
+    assert "gap" not in verdicts[1], "None gap should be dropped, not kept"
+    assert out["residual_uncaptured_gap"].startswith("No criterion captures")
+
+    # floor=True caps the text tighter but keeps the same shape.
+    out_floor = _compact_last_qualification(value, floor=True)
+    assert out_floor is not None
+    floor_verdicts = out_floor["category_verdicts"]
+    assert floor_verdicts[0]["category_key"] == "merge_grade"
+    assert floor_verdicts[0]["status"] == "not_met"
+    assert floor_verdicts[0]["tier"] == "judged"
+    assert len(floor_verdicts[0]["gap"]) <= 240
+    assert out_floor["residual_uncaptured_gap"] != out["residual_uncaptured_gap"]
+
+
+def test_compact_last_qualification_missing_category_verdicts_is_none():
+    """Absent category verdicts stay absent — legacy rows without the field
+    must not fabricate an empty list in the compacted output."""
+    from app.strategic_payload_compaction import _compact_last_qualification
+
+    out = _compact_last_qualification({"status": "promoted"})
+    assert out is not None
+    assert "category_verdicts" not in out
+    assert "residual_uncaptured_gap" not in out
+
+
 def test_compact_version_phase_passes_failure_marker_through():
     """_compact_version_phase must preserve the failure-marker keys
     (lifecycle_signal, signal_status, error, integration_branch, promotion_target)

@@ -461,6 +461,12 @@ def format_qualification_for_api(qual: dict[str, Any]) -> dict[str, Any]:
         # is already enforce, a hard blocker fired, or debt pressure was unavailable).
         "debt_enforce_confidence_preview": qual.get("debt_enforce_confidence_preview"),
         "debt_enforce_weight_preview": qual.get("debt_enforce_weight_preview"),
+        # Per-category goal-verification verdicts + residual gap that drove the
+        # criterion_coverage gate at finalize time (additive; None when no rubric
+        # or grade was issued). Names WHY each category is unmet so operators and
+        # agents don't have to dig into the ledger/database.
+        "category_verdicts": qual.get("category_verdicts"),
+        "residual_uncaptured_gap": qual.get("residual_uncaptured_gap"),
     }
 
 
@@ -600,6 +606,12 @@ def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
         # Observe-mode preview of the enforce-path confidence / weight.
         "debt_enforce_confidence_preview": debt_enforce_confidence_preview,
         "debt_enforce_weight_preview": debt_enforce_weight_preview,
+        # Per-category goal-verification verdicts + residual gap persisted on the
+        # immutable verdict row (additive; None on legacy rows that predate the
+        # columns). Mirrors format_qualification_for_api so the verdict history
+        # boundary also names WHY each category is unmet.
+        "category_verdicts": verdict.category_verdicts,
+        "residual_uncaptured_gap": verdict.residual_uncaptured_gap,
     }
 
 

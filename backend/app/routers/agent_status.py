@@ -96,6 +96,7 @@ from app.landed_signal import merge_verification_status as _merge_verification_s
 from app.acceptance_gate import check_required_diff_paths
 from app.acceptance_gate import record_artifact_consumptions_for_task
 from app.acceptance_gate import stamp_changed_files_signal
+from app.acceptance_gate import stamp_premerge_acceptance_finding
 from app.time_utils import _utcnow, exponential_backoff, set_retry_after
 from app.agent_status_spawn import (
     _recover_poisoned_session,
@@ -2009,6 +2010,15 @@ async def update_agent_status(
                         ctx["_fix_agent_responses"] = payload.fix_agent_responses
                     task.context = ctx
                     flag_modified(task, "context")
+                    if payload.changed_files:
+                        # Judge the structurally-checkable half of the declared
+                        # acceptance evidence now that the PR's changed files are
+                        # known, and route a structural failure into the
+                        # review/fix loop so the task can correct the code or the
+                        # declaration before the merge (see
+                        # acceptance_gate.stamp_premerge_acceptance_finding).
+                        stamp_premerge_acceptance_finding(task)
+                        flag_modified(task, "context")
         else:
             artifact = Artifact(
                 task_id=task.id,

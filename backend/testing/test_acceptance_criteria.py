@@ -10747,6 +10747,87 @@ async def test_record_named_test_execution_evidence_rejects_missing_sha(db_sessi
 
 
 @pytest.mark.asyncio
+async def test_record_named_test_execution_evidence_accepts_enrolled_sha_after_candidate_moves(db_session):
+    """An enrollment-pinned SHA stays authoritative after the version re-pins.
+
+    Regression for the volatile-SHA-anchor bug: the version's qualifying
+    candidate SHA is a mutable scratch field rewritten by many call sites. When
+    the recorder is given the orchestrator-enrolled ``enrolled_sha``, a green
+    run of that exact commit must still mint covered evidence even though the
+    version's ``last_qualification["candidate_sha"]`` has since advanced.
+    """
+    project = await _make_project_with_member(db_session, name="NamedTest-PinnedMove")
+    enrolled_sha = "a" * 40
+    advanced_sha = "b" * 40
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"status": "scoring", "candidate_sha": advanced_sha},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = await ac.create_criterion(db_session, project.id, version.id, "Trial covered")
+
+    summary = await ac.record_named_test_execution_evidence(
+        db_session,
+        version,
+        criterion_keys=[crit.criterion_key],
+        executed_sha=enrolled_sha,
+        test_refs=["testing/test_foo.py"],
+        trial_task_id="trial-pinned-move",
+        enrolled_sha=enrolled_sha,
+    )
+    assert summary["status"] == "recorded"
+    assert summary["recorded"] == 1
+    ev = await ac.get_evidence_for_criterion(db_session, crit.id)
+    assert len(ev) == 1
+    assert ev[0].detail["executed_sha"] == enrolled_sha
+    assert ev[0].detail["passed"] is True
+    assert ac.compute_criterion_coverage(ev) == "covered"
+
+
+@pytest.mark.asyncio
+async def test_record_named_test_execution_evidence_rejects_executed_sha_not_matching_enrolled(db_session):
+    """executed_sha must match the enrollment pin even when it is the current SHA.
+
+    Anti-forgery stays intact: a runner that reports a different commit than the
+    one the orchestrator enrolled cannot mint evidence by coincidentally naming
+    the version's *current* qualifying candidate SHA.
+    """
+    project = await _make_project_with_member(db_session, name="NamedTest-PinnedReject")
+    enrolled_sha = "a" * 40
+    current_sha = "c" * 40  # current qualifying SHA — NOT the enrolled pin
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"status": "scoring", "candidate_sha": current_sha},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = await ac.create_criterion(db_session, project.id, version.id, "Meta")
+
+    summary = await ac.record_named_test_execution_evidence(
+        db_session,
+        version,
+        criterion_keys=[crit.criterion_key],
+        executed_sha=current_sha,  # matches current qualifying SHA...
+        test_refs=["testing/test_foo.py"],
+        trial_task_id="trial-pinned-reject",
+        enrolled_sha=enrolled_sha,  # ...but NOT the enrolled pin
+    )
+    assert summary["status"] == "rejected"
+    assert summary["rejected_reason"] == "executed_sha_mismatch"
+    assert summary["recorded"] == 0
+    assert await ac.get_evidence_for_criterion(db_session, crit.id) == []
+
+
+@pytest.mark.asyncio
 async def test_walkthrough_e2e_endpoint_happy_path(client: AsyncClient, db_session):
     """POST .../walkthrough-e2e-evidence writes covered evidence and coverage flips."""
     project = await _make_project_with_member(db_session, name="Walk-Endpoint")
@@ -11905,6 +11986,79 @@ async def test_named_test_execution_completion_mints_covered_evidence(db_session
     assert ev[0].source_kind == ac.NAMED_TEST_EXECUTION_EVIDENCE_KIND
     assert ev[0].source_id == f"named_test_exec:{task.id}:{crit.criterion_key}"
     assert ev[0].detail["executed_sha"] == sha
+    assert ev[0].detail["passed"] is True
+    assert ev[0].detail["test_refs"] == refs
+    assert ac.compute_criterion_coverage(ev) == "covered"
+
+
+@pytest.mark.asyncio
+async def test_named_test_execution_evidence_accepted_when_candidate_advanced_to_descendant(db_session):
+    """A GREEN trial at the enrolled SHA mints evidence after a descendant re-pin.
+
+    End-to-end regression for the volatile-SHA-anchor bug: the trial is enrolled
+    pinned to SHA X, the version's qualifying candidate SHA advances to a
+    descendant SHA Y before the runner's green receipt is ingested, and the
+    receipt reporting X must still mint ``covered`` evidence — the work is not
+    silently thrown away because a scratch field was re-pinned mid-flight.
+    """
+    import json as _json
+    from app.task_completion import _handle_criterion_named_test_trial_completion
+
+    project = await _make_project(db_session, name="CriterionTrial-AdvancedCandidate")
+    version = await _make_version(db_session, project)
+    enrolled_sha = "a" * 40
+    advanced_sha = "b" * 40
+    version.last_qualification = {"status": "scoring", "candidate_sha": enrolled_sha}
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = await ac.create_criterion(db_session, project.id, version.id, "Trial covered")
+    refs = ["testing/test_foo.py"]
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "criterion_named_test_trial",
+                "criterion_key": crit.criterion_key,
+                "test_refs": refs,
+                "head_sha": enrolled_sha,
+            }
+        ],
+        criterion_ids=[crit.criterion_key],
+        status=TaskStatus.COMPLETED,
+        context={"criterion_release_version_id": str(version.id)},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # The qualifying candidate advances to a descendant commit between
+    # enrollment and ingestion — the volatile scratch field moves under the
+    # trial, which must not invalidate the enrolled run.
+    version.last_qualification = {"status": "scoring", "candidate_sha": advanced_sha}
+    await db_session.commit()
+
+    logs = _json.dumps({
+        "criterion_named_test_trial_result": {
+            "type": "criterion_named_test_trial",
+            "criterion_key": crit.criterion_key,
+            "head_sha": enrolled_sha,
+            "queued_head_sha": enrolled_sha,
+            "test_refs": refs,
+            "ran": True,
+            "passed": True,
+            "skipped_summary": {"total": 1, "skipped": 0},
+        }
+    })
+
+    await _handle_criterion_named_test_trial_completion(task, logs, db_session)
+
+    ev = await ac.get_evidence_for_criterion(db_session, crit.id)
+    assert len(ev) == 1, "a GREEN run of the enrolled SHA must mint evidence after a re-pin"
+    assert ev[0].source_kind == ac.NAMED_TEST_EXECUTION_EVIDENCE_KIND
+    assert ev[0].source_id == f"named_test_exec:{task.id}:{crit.criterion_key}"
+    assert ev[0].detail["executed_sha"] == enrolled_sha
     assert ev[0].detail["passed"] is True
     assert ev[0].detail["test_refs"] == refs
     assert ac.compute_criterion_coverage(ev) == "covered"

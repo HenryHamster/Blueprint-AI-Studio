@@ -1055,7 +1055,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
                   </span>
                 </button>
                 {changelogExpanded && (
-                  <VersionSummaryPanel tasksMerged={cv.tasks_merged} acceptanceAggregate={cv.acceptance_aggregate} criterionCoverage={cv.criterion_coverage} onReinstate={handleReinstate} onAttest={handleAttest} onLinkDirection={handleLinkDirection} />
+                  <VersionSummaryPanel tasksMerged={cv.tasks_merged} acceptanceAggregate={cv.acceptance_aggregate} criterionCoverage={cv.criterion_coverage} categoryVerdicts={cv.last_qualification?.category_verdicts} residualUncapturedGap={cv.last_qualification?.residual_uncaptured_gap} onReinstate={handleReinstate} onAttest={handleAttest} onLinkDirection={handleLinkDirection} />
                 )}
               </div>
             )}

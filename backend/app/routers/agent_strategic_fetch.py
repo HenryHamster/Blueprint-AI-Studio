@@ -599,6 +599,10 @@ def _compact_last_qualification(qual: dict[str, Any] | None) -> dict[str, Any] |
         "merge_grade_biggest_gap",
         "debt_enforce_confidence_preview",
         "debt_enforce_weight_preview",
+        # Per-category goal-verification verdicts + residual gap so the compact
+        # lifecycle view also names WHY each category is unmet (additive).
+        "category_verdicts",
+        "residual_uncaptured_gap",
     )
     out = {key: qual.get(key) for key in keys if qual.get(key) is not None}
 
@@ -1909,6 +1913,20 @@ async def agent_fetch_qualification(
                 if evidence_verdict is not None
                 else verdict.goal_alignment
             ),
+            # Per-category goal-verification verdicts + residual gap that drove
+            # the criterion_coverage gate. Prefer the immutable verdict row's
+            # snapshot; fall back to the mutable last_qualification blob for
+            # legacy rows that predate the verdict columns.
+            "category_verdicts": (
+                verdict.category_verdicts
+                if verdict is not None and verdict.category_verdicts is not None
+                else lq.get("category_verdicts")
+            ),
+            "residual_uncaptured_gap": (
+                verdict.residual_uncaptured_gap
+                if verdict is not None and verdict.residual_uncaptured_gap is not None
+                else lq.get("residual_uncaptured_gap")
+            ),
             "error": lq.get("error") or None,
             "detail": lq.get("detail") or None,
             "blocker": lq.get("blocker") or None,
@@ -1971,6 +1989,8 @@ async def agent_fetch_qualification(
         "challenger_refuted_findings": qual.get("challenger_refuted_audit_findings")
         or [],
         "goal_alignment": qual.get("goal_alignment"),
+        "category_verdicts": qual.get("category_verdicts"),
+        "residual_uncaptured_gap": qual.get("residual_uncaptured_gap"),
         "error": qual.get("error") or None,
         "detail": qual.get("detail") or None,
         "blocker": qual.get("blocker") or None,
@@ -2409,6 +2429,9 @@ SECTION_FETCH_INVENTORY: dict[str, str | None] = {
     "operator_context_refs": None, "cycle_start_reconciliation": None,
     "model_health": None, "prune_candidates": None, "playbook_keys_index": None,
     "staged_directions": None, "retirement_deferrals": None,
+    # Direction/criterion-rejection tails — bounded at build time to ≤20/≤5
+    # records and carried verbatim in the strategic payload; no recovery path.
+    "criterion_link_conflicts": None, "rejected_direction_ops": None,
     "payload_staleness": None, "deployment_state": None,
     "operator_overrides": None, "missing_capability_demand": None,
     "available_capabilities": None, "local_runner_status": None,

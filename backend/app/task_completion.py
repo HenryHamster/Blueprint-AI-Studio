@@ -4085,6 +4085,12 @@ async def _handle_criterion_named_test_trial_completion(
             executed_sha=executed_sha,
             test_refs=refs_enrolled,
             trial_task_id=str(task.id),
+            # Anchor the evidence on the orchestrator-enrolled revision, not the
+            # version's *current* qualifying candidate SHA: that scratch field is
+            # re-pinned by many call sites, so a trial that finishes after any
+            # re-pin would otherwise mint zero evidence even though it ran the
+            # exact enrolled commit.
+            enrolled_sha=head_sha_enrolled,
         )
         if summary.get("recorded", 0) > 0:
             await session.commit()
