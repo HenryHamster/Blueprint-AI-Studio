@@ -1712,6 +1712,44 @@ async def lifespan(app):
 
     branch_reconciliation_task = asyncio.create_task(_branch_reconciliation_service())
 
+    # ── Deploy-state health tick ──
+    # DeploymentState.current_sha is written only at boot and that write is
+    # best-effort; a contended boot commit leaves the singleton stale for the
+    # whole revision's lifetime, and every post-promotion serving provider
+    # (backend_revision / agent_image) reads the same stale row — a promotion
+    # whose SHA IS live can sit at confirmation_timed_out/no_new_revision
+    # forever. This leader-only tick re-detects the deployed SHA and reconciles
+    # the singleton when current_sha has drifted. Bounded per tick so a hung
+    # Cloud Run lookup cannot pin the task.
+    async def _deploy_state_health_tick_service():
+        """Leader-only periodic re-detection of the serving SHA."""
+        from app.main import _reconcile_deploy_state_health_tick
+
+        _INTERVAL = 60
+        _TICK_BUDGET = 30  # < interval, so ticks never overlap-stack
+        while True:
+            await asyncio.sleep(_INTERVAL)
+            try:
+                async with asyncio.timeout(_TICK_BUDGET):
+                    reconciled = await _reconcile_deploy_state_health_tick()
+                    if reconciled:
+                        logger.info(
+                            "[DEPLOY] Health tick reconciled DeploymentState "
+                            "to the observed serving SHA"
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception as tick_exc:
+                logger.warning(
+                    "[DEPLOY] Health-tick reconciliation error: %s",
+                    tick_exc,
+                    exc_info=True,
+                )
+
+    deploy_state_health_tick_task = asyncio.create_task(
+        _deploy_state_health_tick_service()
+    )
+
     # ── Cluster C3: EVALUATING-timeout recovery as a dedicated background task ──
     # Previously _check_evaluating_timeouts ran INLINE on the orchestrator's
     # monitoring tail every 300s. That coupled the leader's dispatch-cycle
@@ -1862,6 +1900,7 @@ async def lifespan(app):
     _bg_tasks["compute_job_monitor"] = compute_job_monitor_task
     _bg_tasks["efficiency_snapshot"] = efficiency_snapshot_task
     _bg_tasks["branch_reconciliation"] = branch_reconciliation_task
+    _bg_tasks["deploy_state_health_tick"] = deploy_state_health_tick_task
     _bg_tasks["evaluating_timeout"] = evaluating_timeout_task
     _bg_tasks["config_sync"] = config_sync_task
     _bg_tasks["jwt_revocation"] = jwt_revocation_task
@@ -1898,6 +1937,7 @@ async def lifespan(app):
             "compute_job_monitor": compute_job_monitor_service,
             "efficiency_snapshot": _efficiency_snapshot_service,
             "branch_reconciliation": _branch_reconciliation_service,
+            "deploy_state_health_tick": _deploy_state_health_tick_service,
             "evaluating_timeout": _evaluating_timeout_service,
             "config_sync": runtime_config_sync_service,
             "jwt_revocation": jwt_revocation_service,

@@ -1468,3 +1468,83 @@ class TestNotificationConfigStartupRestore:
             async with _engine.begin() as conn:
                 await conn.run_sync(SQLModel.metadata.drop_all)
             await _engine.dispose()
+
+    @pytest.mark.asyncio
+    async def test_periodic_deploy_state_reconciles_stale_current_sha(self, mocker):
+        """A degraded boot write leaves DeploymentState.current_sha stale; the
+        periodic health-tick reconciliation must re-detect the deployed SHA and
+        reconcile the singleton so the serving-confirmation providers
+        (backend_revision / agent_image) read the truth instead of a stale row."""
+        from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+        from sqlalchemy.orm import sessionmaker
+        from sqlalchemy.pool import StaticPool
+        from sqlmodel import SQLModel
+        from unittest.mock import AsyncMock
+        from app.models import DeploymentState, DeploymentStatus
+        from app.main import _reconcile_deploy_state_health_tick
+        import app.main as _main
+
+        _engine = create_async_engine(
+            "sqlite+aiosqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        async with _engine.begin() as conn:
+            await conn.run_sync(SQLModel.metadata.create_all)
+        _Session = sessionmaker(
+            bind=_engine,
+            class_=AsyncSession,
+            autocommit=False,
+            autoflush=False,
+            expire_on_commit=False,
+        )
+        mocker.patch("app.main.AsyncSessionLocal", _Session)
+
+        # Seed a stale singleton: a previous boot's best-effort write failed, so
+        # the row still records the OLD revision/sha while this process is
+        # actually serving a NEW revision/sha.
+        async with _Session() as session:
+            session.add(
+                DeploymentState(
+                    id=1,
+                    current_revision="old-rev",
+                    current_sha="old-sha",
+                    last_known_good_revision="old-rev",
+                    last_known_good_sha="old-sha",
+                    status=DeploymentStatus.STABLE,
+                )
+            )
+            await session.commit()
+
+        mocker.patch.object(_main, "_current_revision", "new-rev")
+        mocker.patch.object(_main, "_current_sha", "unknown")
+        mocker.patch.object(
+            _main,
+            "resolve_deployed_sha",
+            new=AsyncMock(return_value="cafebabe123"),
+        )
+
+        try:
+            # The health tick re-detects the deployed SHA and reconciles the
+            # drifted singleton row (and the in-process _current_sha global).
+            reconciled = await _reconcile_deploy_state_health_tick()
+            assert reconciled is True
+            assert _main._current_sha == "cafebabe123"
+            async with _Session() as session:
+                row = await session.get(DeploymentState, 1)
+                assert row is not None
+                assert row.current_sha == "cafebabe123"
+                assert row.current_revision == "new-rev"
+
+            # No drift — the row already matches the observed serving state, so
+            # the tick must be a no-op (conservative: never churn an up-to-date row).
+            async with _Session() as session:
+                row = await session.get(DeploymentState, 1)
+                row.current_sha = "cafebabe123"
+                row.current_revision = "new-rev"
+                await session.commit()
+            assert await _reconcile_deploy_state_health_tick() is False
+        finally:
+            async with _engine.begin() as conn:
+                await conn.run_sync(SQLModel.metadata.drop_all)
+            await _engine.dispose()

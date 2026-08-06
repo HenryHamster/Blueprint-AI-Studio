@@ -891,6 +891,46 @@ async def _init_deployment_state():
         )
 
 
+async def _reconcile_deploy_state_health_tick() -> bool:
+    """Periodic leader-only re-detection of the deployed SHA.
+
+    ``DeploymentState.current_sha`` is written only at boot
+    (``_init_deployment_state``), and that write is best-effort — a contended
+    commit degrades and logs "deploy state reconciles on the next boot / health
+    tick", but no such tick existed. A degraded boot write leaves the singleton
+    stale for the whole revision's lifetime, and every post-promotion serving
+    provider (``backend_revision`` / ``agent_image`` in release_artifacts.py)
+    reads the same stale row — a promotion whose SHA IS live can sit at
+    ``confirmation_timed_out``/``no_new_revision`` forever.
+
+    This bounded re-detection re-resolves the deployed SHA (same source as boot:
+    DEPLOY_SHA env, then Cloud Run image lookups) and reconciles the singleton
+    when ``current_sha`` has drifted from what the running revision actually
+    serves. Conservative: an unresolved SHA, a missing row, or an unchanged row
+    are all no-ops. Returns True when the row was reconciled.
+    """
+    global _current_sha
+    resolved = await resolve_deployed_sha()
+    if not resolved:
+        return False
+
+    async with AsyncSessionLocal() as session:
+        state = await session.get(DeploymentState, 1)
+        if state is None:
+            return False
+        if (
+            state.current_sha == resolved
+            and state.current_revision == _current_revision
+        ):
+            return False
+        _current_sha = resolved
+        state.current_sha = resolved
+        state.current_revision = _current_revision
+        state.deployed_at = _utcnow()
+        session.add(state)
+        return await _best_effort_deploy_state_commit(session)
+
+
 # --- Webhook notification + alert dispatch (extracted) ---
 # _send_webhook_notification moved to app.notification; the alert-creation
 # helpers (_get_broadcast_limit, the _create_*_alert family, the
