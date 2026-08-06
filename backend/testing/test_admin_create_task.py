@@ -649,3 +649,38 @@ async def test_ambiguous_repo_prefers_writable_project_over_viewer_one(
     assert await _count_tasks(db_session, viewer_project.id) == 0
     # ...and no shadow project was minted.
     assert await _count_projects_for_repo(db_session, "acme", "widget") == 2
+
+
+@pytest.mark.asyncio
+async def test_create_validation_reason_surfaces_in_422(
+    client: AsyncClient, db_session
+):
+    """A schema-validation failure on the operator create surface returns the
+    authored reason instead of the opaque 'Invalid request'.
+
+    Regression for the payload-validation 422 opacity fix: submitting a
+    code-producing task without an acceptance_evidence declaration must surface
+    WHY it was rejected (the field/validator message), so the operator UI toast
+    and an autonomously spawning agent can see the reason and self-correct.
+    """
+    await _make_project_with_member(db_session, "acme/widget")
+
+    resp = await client.post(
+        "/api/admin/tasks",
+        json={
+            "github_repo": "acme/widget",
+            "title": "Missing evidence",
+            "prompt": "patch the bug",
+            "base_branch": "main",
+            "task_type": "create",
+        },
+    )
+
+    assert resp.status_code == 422, resp.text
+    # The app wraps HTTPException as {"error": {"code", "message"}} (main.py
+    # http_exception_handler) — there is no top-level "detail" key.
+    message = resp.json()["error"]["message"]
+    assert "acceptance_evidence" in message
+    assert "Invalid request" not in message
+    # The reason must survive end-to-end (no multi-line pydantic block).
+    assert "\n" not in message

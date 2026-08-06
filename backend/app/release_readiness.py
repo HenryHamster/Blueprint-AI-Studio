@@ -585,9 +585,11 @@ def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
         "acceptance_window_total_all_merges": _sub(verdict, "acceptance_window_total_all_merges"),
         # Additive per-bucket / per-reason breakdown of the write-task window (None on
         # legacy rows without the aggregate). Makes the fraction auditable: operators see
-        # which buckets contribute to `verified` and why undeclared merges stayed undeclared.
+        # which buckets contribute to `verified`, why undeclared merges stayed undeclared,
+        # and why each declared-but-unsatisfied verdict failed.
         "acceptance_window_buckets": _sub(verdict, "acceptance_window_buckets"),
         "acceptance_window_undeclared_reasons": _sub(verdict, "acceptance_window_undeclared_reasons"),
+        "acceptance_window_declared_unsatisfied_reasons": _sub(verdict, "acceptance_window_declared_unsatisfied_reasons"),
         # Goal-alignment cert (additive; None on legacy rows predating migration 0328).
         "goal_alignment": verdict.goal_alignment,
         # Blind merge-grade cert (additive; None on legacy rows predating migration 0327).

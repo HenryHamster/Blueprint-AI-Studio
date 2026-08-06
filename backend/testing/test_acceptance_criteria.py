@@ -11383,6 +11383,67 @@ async def test_backfill_merged_named_test_no_qualifying_sha_enrolls_nothing(db_s
 
 
 @pytest.mark.asyncio
+async def test_enroll_criterion_named_test_trial_defaults_on_when_flag_key_absent(db_session):
+    """Enrollment stays live when the runtime-config dict omits the flag key.
+
+    ``enroll_criterion_named_test_trial`` must default the
+    ``criterion_named_test_trials_enabled`` gate to True (matching the ingester
+    and the runtime-config default). A config dict that simply lacks the key
+    must not silently darken the enroll half while ingestion stays live.
+    """
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    project = await _make_project(db_session, "MergedNamedTestFlagAbsent")
+    version = await _make_version(db_session, project)
+    sha = "e" * 40
+    version.last_qualification = {"status": "scoring", "candidate_sha": sha}
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id,
+        "Merged named-test flag-absent criterion",
+        created_by="strategist",
+    )
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "create",
+            "prompt": "add the test",
+            "acceptance_evidence": {
+                "kind": "named_test",
+                "test_path": "testing/test_flag_absent.py",
+            },
+        }],
+        context={
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            "_pr_changed_files": [
+                "testing/test_flag_absent.py",
+                "backend/app/target_module.py",
+            ],
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    # No flag key at all — the enroller must still enroll (default ON).
+    with patch("app.shared_state.runtime_config", new={}):
+        recorded = await ac.backfill_merged_named_test_coverage(db_session, project.id)
+    assert recorded == 1, "backfill evidence must still record"
+
+    trials = await _select_criterion_trials(db_session, project.id)
+    assert len(trials) == 1, (
+        "enrollment must NOT darken when the flag key is absent from the config dict"
+    )
+    assert trials[0].first_payload["criterion_key"] == criterion.criterion_key
+    assert trials[0].status == TaskStatus.QUEUED
+
+
+@pytest.mark.asyncio
 async def test_post_merge_earn_loop_executes_covering_test_and_mints_covered(db_session):
     """ACCEPTANCE: the post-merge earn loop executes the covering test to reach covered.
 
@@ -11694,6 +11755,80 @@ async def test_named_test_execution_completion_mints_covered_evidence(db_session
     assert ev[0].detail["passed"] is True
     assert ev[0].detail["test_refs"] == refs
     assert ac.compute_criterion_coverage(ev) == "covered"
+
+
+@pytest.mark.asyncio
+async def test_named_test_execution_completion_mints_evidence_only_for_reported_criterion(db_session):
+    """A GREEN receipt mints covered evidence ONLY for the criterion that ran.
+
+    The trial task may be bound to several criteria (``criterion_ids``), but an
+    executed-named-test trial proves exactly one: the ``criterion_key`` named in
+    the enrollment and validated against the receipt. Covered evidence must not
+    be minted for sibling bound criteria that never ran.
+    """
+    import json as _json
+    from app.task_completion import _handle_criterion_named_test_trial_completion
+
+    project = await _make_project(db_session, name="CriterionTrial-NoOverCredit")
+    version = await _make_version(db_session, project)
+    sha = "f" * 40
+    version.last_qualification = {"status": "scoring", "candidate_sha": sha}
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit_ran = await ac.create_criterion(db_session, project.id, version.id, "Ran crit")
+    crit_sibling = await ac.create_criterion(
+        db_session, project.id, version.id, "Sibling crit"
+    )
+    refs = ["testing/test_foo.py"]
+
+    # The trial is bound to TWO criteria but enrolled to prove only crit_ran.
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "criterion_named_test_trial",
+                "criterion_key": crit_ran.criterion_key,
+                "test_refs": refs,
+                "head_sha": sha,
+            }
+        ],
+        criterion_ids=[crit_ran.criterion_key, crit_sibling.criterion_key],
+        status=TaskStatus.COMPLETED,
+        context={"criterion_release_version_id": str(version.id)},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # GREEN receipt naming the enrolled criterion.
+    logs = _json.dumps({
+        "criterion_named_test_trial_result": {
+            "type": "criterion_named_test_trial",
+            "criterion_key": crit_ran.criterion_key,
+            "head_sha": sha,
+            "queued_head_sha": sha,
+            "test_refs": refs,
+            "ran": True,
+            "passed": True,
+            "skipped_summary": {"total": 1, "skipped": 0},
+        }
+    })
+
+    await _handle_criterion_named_test_trial_completion(task, logs, db_session)
+
+    ev_ran = await ac.get_evidence_for_criterion(db_session, crit_ran.id)
+    assert len(ev_ran) == 1, (
+        "the reported criterion must get exactly one named_test_execution row"
+    )
+    assert ev_ran[0].source_kind == ac.NAMED_TEST_EXECUTION_EVIDENCE_KIND
+    assert ev_ran[0].detail["criterion_key"] == crit_ran.criterion_key
+    assert ac.compute_criterion_coverage(ev_ran) == "covered"
+
+    ev_sibling = await ac.get_evidence_for_criterion(db_session, crit_sibling.id)
+    assert ev_sibling == [], (
+        "a sibling bound criterion that never ran must NOT receive covered evidence"
+    )
 
 
 @pytest.mark.asyncio

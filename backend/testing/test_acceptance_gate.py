@@ -30,6 +30,7 @@ from app.acceptance_gate import (
     classify_merged_acceptance,
     classify_merged_acceptance_context,
     classify_undeclared_reason,
+    classify_unsatisfied_reason,
     coerce_number,
     criterion_met,
     evaluate_code_acceptance,
@@ -1403,6 +1404,215 @@ def test_classify_undeclared_reason_partitions_undeclared_bucket():
         classify_undeclared_reason(_inferred_ctx(["backend/app/x.py"])),
     }
     assert reasons == set(_UNDECLARED_REASON_KEYS)
+
+
+# The persisted per-verdict ``reason`` strings the fail-closed gate emits, one
+# per canonical cause. Kept as real strings (with the same repr-quoted paths the
+# gate formats) so the classifier is tested against what actually lands in
+# task.context[CODE_ACCEPTANCE_VERDICT_KEY], not a hand-rolled reimplementation.
+_REASONED_UNSATISFIED_SAMPLES = {
+    "named_test_missing_from_diff": (
+        "named_test",
+        "declared named_test 'backend/testing/test_widget.py' is not among the "
+        "PR's changed files — the claimed test was not added or modified here",
+    ),
+    "named_test_not_run_green": (
+        "named_test",
+        "declared named_test 'backend/testing/test_widget.py' did not run green "
+        "under a real merge-test verdict (the merge fell open without verification)",
+    ),
+    "named_test_test_only_diff": (
+        "named_test",
+        "declared named_test 'backend/testing/test_widget.py' ships no production "
+        "code change it could exercise (the diff is test-only)",
+    ),
+    "named_test_ungrounded_seam": (
+        "named_test",
+        "declared named_test 'backend/testing/test_widget.py' exercises a "
+        "production seam that does not semantically correspond to the declared "
+        "test module — none of the changed production files match the test file's "
+        "module name",
+    ),
+    "artifact_empty_diff": (
+        "downstream_artifact",
+        "declared downstream_artifact acceptance evidence but the task shipped "
+        "no changed files to deliver it",
+    ),
+    "artifact_not_in_diff": (
+        "downstream_artifact",
+        "declared downstream_artifact 'release-deploy-artifact-registry' is not "
+        "reflected in any of the 3 shipped changed file(s) — the diff does not "
+        "deliver the named artifact",
+    ),
+    "visual_malformed": (
+        "visual",
+        "declared visual acceptance evidence is malformed or incomplete",
+    ),
+    "visual_no_screenshot": (
+        "visual",
+        "declared visual acceptance evidence but no matching viewport screenshot "
+        "was uploaded for component 'MetricsDashboard' at 375px",
+    ),
+    "coverage_missing_threshold": (
+        "coverage_delta",
+        "coverage_delta acceptance evidence requires a numeric threshold "
+        "(coverage percentage 0–100)",
+    ),
+    "coverage_missing_result_no_result": (
+        "coverage_delta",
+        "coverage_delta acceptance evidence requires a test coverage result in "
+        "task context (test_coverage_result) — no result found",
+    ),
+    "coverage_missing_result_no_pct": (
+        "coverage_delta",
+        "coverage_delta acceptance evidence: coverage result is missing numeric "
+        "coverage_pct",
+    ),
+    "coverage_below_threshold": (
+        "coverage_delta",
+        "coverage_delta acceptance evidence: achieved 55.0% coverage < 80% "
+        "threshold",
+    ),
+    "observable_empty_diff": (
+        "observable_behavior",
+        "declared observable_behavior acceptance evidence but the task shipped "
+        "no changed files to exercise it",
+    ),
+    "unrecognized_kind": (
+        "future_kind",
+        "unrecognized acceptance kind 'future_kind'",
+    ),
+}
+
+# The two coverage_missing_result variants collapse to one canonical cause.
+_COVERAGE_MISSING_RESULT_SAMPLES = {
+    "coverage_missing_result_no_result",
+    "coverage_missing_result_no_pct",
+}
+
+
+@pytest.mark.parametrize(
+    "expected,kind,reason",
+    [
+        (key, kind, reason)
+        for key, (kind, reason) in _REASONED_UNSATISFIED_SAMPLES.items()
+    ],
+)
+def test_classify_unsatisfied_reason_maps_recorded_reason(expected, kind, reason):
+    """Every fail-closed verdict reason maps to exactly one canonical cause."""
+    recorded = {"satisfied": False, "proven": False, "kind": kind, "reason": reason}
+    if expected in _COVERAGE_MISSING_RESULT_SAMPLES:
+        expected = "coverage_missing_result"
+    assert classify_unsatisfied_reason(recorded) == expected
+
+
+def test_classify_unsatisfied_reason_partitions_known_causes():
+    """The canonical causes partition the declared_unsatisfied bucket.
+
+    Each ``_UNSATISFIED_REASON_KEYS`` key is reachable from a verdict the gate
+    can actually emit (plus the ``unknown`` catch-all for unreasoned rows), and
+    the two coverage_missing_result variants collapse onto the single canonical
+    key, so tallies always partition.
+    """
+    from app.acceptance_gate import _UNSATISFIED_REASON_KEYS
+
+    outputs = set()
+    for key, (kind, reason) in _REASONED_UNSATISFIED_SAMPLES.items():
+        canonical = (
+            "coverage_missing_result"
+            if key in _COVERAGE_MISSING_RESULT_SAMPLES
+            else key
+        )
+        recorded = {"satisfied": False, "proven": False, "kind": kind, "reason": reason}
+        assert classify_unsatisfied_reason(recorded) == canonical
+        outputs.add(canonical)
+    outputs.add(classify_unsatisfied_reason({"satisfied": False, "kind": "named_test"}))
+    assert outputs == set(_UNSATISFIED_REASON_KEYS)
+
+
+def test_classify_unsatisfied_reason_missing_reason_falls_back_unknown():
+    """Verdicts stamped without a reason (legacy / manually-written rows) are
+    classified ``unknown`` deterministically rather than raising or inventing a
+    cause — the split still sums to the declared_unsatisfied bucket."""
+    assert (
+        classify_unsatisfied_reason(
+            {"satisfied": False, "proven": False, "kind": "named_test"}
+        )
+        == "unknown"
+    )
+    assert classify_unsatisfied_reason({"satisfied": False, "kind": "visual"}) == "unknown"
+    assert classify_unsatisfied_reason({"satisfied": False}) == "unknown"
+    assert classify_unsatisfied_reason(None) == "unknown"
+    assert classify_unsatisfied_reason("not-a-dict") == "unknown"
+
+
+def test_classify_unsatisfied_reason_matches_gate_recorded_verdicts():
+    """Drive the REAL gate: a declared-but-unsatisfied task's recorded verdict
+    reason classifies to the same cause the reason text describes.
+
+    Connects the classifier to what :func:`record_code_acceptance_verdict`
+    actually stamps, for each distinct fail-closed branch of the gate."""
+    unsatisfied_cases = [
+        (  # named_test absent from the diff
+            {
+                "acceptance_evidence": {
+                    "kind": "named_test",
+                    "test_path": "backend/testing/test_widget.py",
+                },
+                "changed_files": ["backend/app/widget.py"],
+                "unverified_reason": None,
+            },
+            "named_test_missing_from_diff",
+        ),
+        (  # named_test that never ran green
+            {
+                "acceptance_evidence": {
+                    "kind": "named_test",
+                    "test_path": "backend/testing/test_widget.py",
+                },
+                "changed_files": [
+                    "backend/app/widget.py",
+                    "backend/testing/test_widget.py",
+                ],
+                "unverified_reason": "no_detectable_test_command",
+            },
+            "named_test_not_run_green",
+        ),
+        (  # named_test with a test-only diff (no production seam)
+            {
+                "acceptance_evidence": {
+                    "kind": "named_test",
+                    "test_path": "backend/testing/test_widget.py",
+                },
+                "changed_files": ["backend/testing/test_widget.py"],
+                "unverified_reason": None,
+            },
+            "named_test_test_only_diff",
+        ),
+        (  # observable_behavior with an empty diff
+            {
+                "acceptance_evidence": {
+                    "kind": "observable_behavior",
+                    "description": "the dashboard shows the live serving SHA banner",
+                },
+                "changed_files": [],
+                "unverified_reason": None,
+            },
+            "observable_empty_diff",
+        ),
+    ]
+    for kwargs, expected in unsatisfied_cases:
+        task = _make_code_task(**kwargs)
+        verdict = evaluate_code_acceptance(task)
+        assert verdict.satisfied is False, expected
+        assert classify_unsatisfied_reason(
+            {
+                "satisfied": verdict.satisfied,
+                "proven": verdict.proven,
+                "kind": verdict.kind,
+                "reason": verdict.reason,
+            }
+        ) == expected
 
 
 def test_degraded_unverified_test_cochange_stays_degraded():

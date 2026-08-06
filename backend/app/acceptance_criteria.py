@@ -4418,7 +4418,7 @@ async def enroll_criterion_named_test_trial(
     try:
         from app.shared_state import runtime_config as _rc
 
-        if not (_rc or {}).get("criterion_named_test_trials_enabled", False):
+        if not (_rc or {}).get("criterion_named_test_trials_enabled", True):
             return None
 
         refs = [r for r in (test_refs or []) if isinstance(r, str) and r.strip()]

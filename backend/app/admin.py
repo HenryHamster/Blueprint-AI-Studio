@@ -62,6 +62,7 @@ from app.task_locking import task_lock
 from app.payload_schemas import (
     ComputeSuccessCriterion,
     TaskType,
+    format_payload_validation_error,
     validate_task_payload,
 )
 from app.task_capabilities import (
@@ -2930,7 +2931,9 @@ async def create_task_manually(
         logger.warning(
             "Validation error in task payload: %s: %s", type(exc).__name__, exc
         )
-        raise HTTPException(status_code=422, detail="Invalid request")
+        raise HTTPException(
+            status_code=422, detail=format_payload_validation_error(exc)
+        )
 
     # Guard: cap active tasks per project to prevent queue explosion
     active_count = (
@@ -3855,7 +3858,9 @@ async def create_compute_experiment_task(
         logger.warning(
             "Validation error in task payload: %s: %s", type(exc).__name__, exc
         )
-        raise HTTPException(status_code=422, detail="Invalid request")
+        raise HTTPException(
+            status_code=422, detail=format_payload_validation_error(exc)
+        )
 
     active_count = (
         await session.execute(
@@ -4085,7 +4090,10 @@ async def rerun_compute_experiment(
         task_payload = validate_task_payload(new_payload_raw)
     except ValueError as exc:
         logger.warning("Rerun payload validation error: %s: %s", type(exc).__name__, exc)
-        raise HTTPException(status_code=422, detail="Invalid re-run payload")
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid re-run payload: {format_payload_validation_error(exc)}",
+        )
 
     # Load the project to check spend-approval threshold.
     project = await session.get(Project, source.project_id)

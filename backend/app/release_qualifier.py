@@ -45,10 +45,13 @@ from app.failure_classification import (
 )
 from app.acceptance_gate import (
     ACCEPTANCE_AGGREGATE_BUCKETS,
+    CODE_ACCEPTANCE_VERDICT_KEY,
     _UNDECLARED_REASON_KEYS,
+    _UNSATISFIED_REASON_KEYS,
     _is_test_path,
     classify_merged_acceptance_context,
     classify_undeclared_reason,
+    classify_unsatisfied_reason,
 )
 from app.acceptance_criteria import (
     WALKTHROUGH_E2E_FLOW_MARKERS,
@@ -4773,14 +4776,19 @@ async def _compute_acceptance_window_aggregate(
         "acceptance_window_total_all_merges": int, # all landed merges regardless of type (observability)
         "acceptance_window_buckets": dict,         # per-bucket counts over the write-task window (sums to write_total)
         "acceptance_window_undeclared_reasons": dict, # split of the undeclared bucket by reason (sums to buckets["undeclared"])
+        "acceptance_window_declared_unsatisfied_reasons": dict, # split of the declared_unsatisfied bucket by reason (sums to buckets["declared_unsatisfied"])
         "acceptance_window_inferred_test_cochange": int,  # verified merges credited via inferred_test_cochange
       }
 
-    The two nested breakdowns are purely additive: ``acceptance_window_buckets``
+    The nested breakdowns are purely additive: ``acceptance_window_buckets``
     keys the 7 canonical ``ACCEPTANCE_AGGREGATE_BUCKETS`` and makes the fraction
     auditable (verified == proven + satisfied_unproven + inferred_test_cochange),
     while ``acceptance_window_undeclared_reasons`` explains why the remaining
-    undeclared merges did not infer coverage. No existing key changes type or value.
+    undeclared merges did not infer coverage and
+    ``acceptance_window_declared_unsatisfied_reasons`` explains WHY each
+    explicitly declared-but-unsatisfied verdict failed (its persisted per-verdict
+    reason, previously discarded at aggregation). No existing key changes type or
+    value.
     """
 
     since = version.opened_at
@@ -4805,17 +4813,23 @@ async def _compute_acceptance_window_aggregate(
     total = len(rows_write)
     # Single classification pass: tally every write-task merge into its acceptance
     # bucket, and for each undeclared merge additionally record WHY it stayed
-    # undeclared. Both breakdowns are additive observability — the scalar
-    # ``verified`` is derived from the three verified buckets so its value and the
-    # invariant contract are byte-for-byte unchanged from the prior ``sum(...)``.
+    # undeclared, and for each declared-but-unsatisfied verdict WHY it failed.
+    # All breakdowns are additive observability — the scalar ``verified`` is
+    # derived from the three verified buckets so its value and the invariant
+    # contract are byte-for-byte unchanged from the prior ``sum(...)``.
     buckets: dict[str, int] = dict.fromkeys(ACCEPTANCE_AGGREGATE_BUCKETS, 0)
     undeclared_reasons: dict[str, int] = dict.fromkeys(_UNDECLARED_REASON_KEYS, 0)
+    unsatisfied_reasons: dict[str, int] = dict.fromkeys(_UNSATISFIED_REASON_KEYS, 0)
     for task in rows_write:
         ctx = task.context or {}
         bucket = classify_merged_acceptance_context(ctx)
         buckets[bucket] += 1
         if bucket == "undeclared":
             undeclared_reasons[classify_undeclared_reason(ctx)] += 1
+        elif bucket == "declared_unsatisfied":
+            unsatisfied_reasons[
+                classify_unsatisfied_reason(ctx.get(CODE_ACCEPTANCE_VERDICT_KEY))
+            ] += 1
     verified = (
         buckets["proven"]
         + buckets["satisfied_unproven"]
@@ -4838,10 +4852,13 @@ async def _compute_acceptance_window_aggregate(
         "acceptance_window_write_total": total,
         "acceptance_window_total_all_merges": total_all_merges,
         # Additive nested breakdowns (None-safe on legacy rows that lack them):
-        # per-bucket counts over the write-task window, and the undeclared reason
-        # split. Sum(buckets) == total; sum(undeclared_reasons) == buckets["undeclared"].
+        # per-bucket counts over the write-task window, and the undeclared /
+        # declared-unsatisfied reason splits.
+        # Sum(buckets) == total; sum(undeclared_reasons) == buckets["undeclared"];
+        # sum(unsatisfied_reasons) == buckets["declared_unsatisfied"].
         "acceptance_window_buckets": buckets,
         "acceptance_window_undeclared_reasons": undeclared_reasons,
+        "acceptance_window_declared_unsatisfied_reasons": unsatisfied_reasons,
         # Additive audit breakdown: how many verified merges were credited via the
         # inferred test-cochange path (undeclared merge, CI-verified, test+prod
         # co-change) rather than an explicit proven/satisfied declaration. Consumed

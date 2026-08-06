@@ -18,7 +18,14 @@ import re
 import uuid
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from app.task_capabilities import ALL_TASK_TYPES, TaskType
 from app.viewport_evidence import VIEWPORT_WIDTH_MAX, VIEWPORT_WIDTH_MIN
@@ -1976,3 +1983,41 @@ def validate_internal_payload(payload: dict, context: str) -> dict:
             exc,
         )
         return payload
+
+
+def format_payload_validation_error(exc: Exception) -> str:
+    """One-line, actionable reason for a :func:`validate_task_payload` failure.
+
+    The external authoring surfaces (operator create-task / agent spawn / project
+    deploy) used to collapse every schema failure into an opaque ``"Invalid
+    request"`` 422 detail, hiding the authored validator message from the
+    operator UI toast and from an autonomously spawning agent. This helper
+    recovers that message for the HTTP ``detail``.
+
+    ``validate_task_payload`` raises either a plain ``ValueError`` (missing /
+    unknown ``type``, undeclared ``acceptance_evidence`` on a code task) or a
+    ``PayloadTooLargeError``; when the failure is a pydantic schema violation
+    the ``ValueError``'s ``__cause__`` is the pydantic ``ValidationError``.
+    That cause's ``str()`` is a verbose multi-line block (``1 validation error
+    for CreatePayload`` / field / indented message) whose message pydantic v2
+    prefixes with ``Value error, `` for validator-authored errors. Collapse the
+    first error to ``loc: message`` so the surfaced detail is one line. Plain
+    ``ValueError`` and ``PayloadTooLargeError`` messages pass through unchanged
+    — they are already single-line and actionable.
+    """
+    cause = getattr(exc, "__cause__", None)
+    if isinstance(cause, ValidationError):
+        try:
+            errors = cause.errors()
+        except Exception:  # noqa: BLE001 — formatting must never fail the HTTP path
+            errors = None
+        if errors:
+            first = errors[0]
+            loc = ".".join(str(part) for part in first.get("loc", ()))
+            msg = first.get("msg", str(exc))
+            if isinstance(msg, str) and msg.startswith("Value error, "):
+                msg = msg[len("Value error, ") :]
+            if loc:
+                return f"{loc}: {msg}"
+            return msg
+    return str(exc)

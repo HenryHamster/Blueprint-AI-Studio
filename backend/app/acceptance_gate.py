@@ -1025,6 +1025,102 @@ def classify_undeclared_reason(context: Mapping[str, Any] | None) -> str:
     return "no_test_prod_cochange"
 
 
+# The mutually-exclusive reasons an already-``declared_unsatisfied`` verdict
+# failed, partitioning the ``declared_unsatisfied`` bucket for operator-visible
+# audit. ``unknown`` is the fail-safe catch-all: it keeps tallies partitioning
+# even on verdicts stamped without a ``reason`` (legacy / manually-written rows)
+# or carrying a future reason string this module has not seen yet.
+_UNSATISFIED_REASON_KEYS: tuple[str, ...] = (
+    "named_test_missing_from_diff",
+    "named_test_not_run_green",
+    "named_test_test_only_diff",
+    "named_test_ungrounded_seam",
+    "artifact_empty_diff",
+    "artifact_not_in_diff",
+    "visual_malformed",
+    "visual_no_screenshot",
+    "coverage_missing_threshold",
+    "coverage_missing_result",
+    "coverage_below_threshold",
+    "observable_empty_diff",
+    "unrecognized_kind",
+    "unknown",
+)
+
+
+def classify_unsatisfied_reason(recorded: Any) -> str:
+    """Sub-classify a ``declared_unsatisfied`` verdict into WHY it failed.
+
+    Precondition: ``acceptance_blocks_success(recorded) is True`` (a recorded
+    verdict with ``satisfied is False``). Reads the persisted verdict dict —
+    exactly what :func:`record_code_acceptance_verdict` stamps under
+    :data:`CODE_ACCEPTANCE_VERDICT_KEY` — and returns one canonical cause keyed
+    first on the verdict ``kind`` and disambiguated within the kind by a
+    distinctive ``reason`` substring (every fail-closed reason string originates
+    in this module). The returned keys are the causes an operator can act on:
+    a named test that was never added to the diff, that fell open without a real
+    green run, that shipped no production seam, or that is not semantically
+    grounded; an artifact the diff never delivered; a malformed or missing
+    visual screenshot; a coverage declaration with a missing threshold, a
+    missing/invalid measurement, or a genuine below-threshold measurement; an
+    observable-behavior declaration with an empty diff; an unrecognized
+    declaration kind; and the ``unknown`` catch-all for verdicts whose reason
+    was not recorded (legacy / manually-stamped rows).
+
+    Pure and read-only; never raises. On a verdict that is NOT actually declared
+    unsatisfied the return value is meaningless (callers must gate on the bucket
+    first), but the function still returns one of the keys deterministically.
+    """
+    if not isinstance(recorded, dict):
+        return "unknown"
+    kind = recorded.get("kind")
+    reason = recorded.get("reason")
+    reason_str = reason if isinstance(reason, str) else ""
+
+    # The unrecognized-kind reason is emitted regardless of the offending kind,
+    # so it wins before the kind dispatch below.
+    if "unrecognized acceptance kind" in reason_str:
+        return "unrecognized_kind"
+
+    if kind == "named_test":
+        if "is not among the PR's changed files" in reason_str:
+            return "named_test_missing_from_diff"
+        if "did not run green under a real merge-test verdict" in reason_str:
+            return "named_test_not_run_green"
+        if "ships no production code change it could exercise" in reason_str:
+            return "named_test_test_only_diff"
+        if "does not semantically correspond to the declared test module" in reason_str:
+            return "named_test_ungrounded_seam"
+        return "unknown"
+    if kind == "downstream_artifact":
+        if "shipped no changed files to deliver it" in reason_str:
+            return "artifact_empty_diff"
+        if "is not reflected in" in reason_str:
+            return "artifact_not_in_diff"
+        return "unknown"
+    if kind == "visual":
+        if "malformed or incomplete" in reason_str:
+            return "visual_malformed"
+        if "no matching viewport screenshot was uploaded" in reason_str:
+            return "visual_no_screenshot"
+        return "unknown"
+    if kind == "coverage_delta":
+        if "requires a numeric threshold" in reason_str:
+            return "coverage_missing_threshold"
+        if "requires a test coverage result" in reason_str:
+            return "coverage_missing_result"
+        if "missing numeric coverage_pct" in reason_str:
+            return "coverage_missing_result"
+        if "coverage <" in reason_str:
+            return "coverage_below_threshold"
+        return "unknown"
+    if kind == "observable_behavior":
+        if "shipped no changed files to exercise it" in reason_str:
+            return "observable_empty_diff"
+        return "unknown"
+    return "unknown"
+
+
 def acceptance_counts_as_verified_context(
     context: Mapping[str, Any] | None,
 ) -> bool:

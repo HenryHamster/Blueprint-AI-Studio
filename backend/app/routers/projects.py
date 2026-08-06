@@ -30,7 +30,6 @@ from app.auth import (
 from app.database import get_session, AsyncSessionLocal
 from app.models import (
     Artifact,
-    ArtifactType,
     Project,
     ProjectMember,
     ProjectMessage,
@@ -40,7 +39,7 @@ from app.models import (
     get_task_total_vm_cost_usd_or_none,
 )
 from app.max_plan_pool import filter_user_task_context
-from app.payload_schemas import validate_task_payload
+from app.payload_schemas import format_payload_validation_error, validate_task_payload
 from app.task_capabilities import BACKEND_MANAGED_TASK_TYPES
 from app.findings_index import resolve_research_findings_for_surface
 from app.schemas import DeployPayload
@@ -190,7 +189,9 @@ async def deploy_blueprint(
             logger.warning(
                 "Validation error in task payload: %s: %s", type(exc).__name__, exc
             )
-            raise HTTPException(status_code=422, detail="Invalid request")  # noqa: B904
+            raise HTTPException(  # noqa: B904
+                status_code=422, detail=format_payload_validation_error(exc)
+            )
         # GCP instance names must match a specific regex (lowercase, hyphens, numbers)
         vm_name = f"agent-vm-{uuid.uuid4().hex}"
 

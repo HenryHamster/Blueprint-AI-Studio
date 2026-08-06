@@ -3,8 +3,8 @@ import { render, screen, waitFor } from '@testing-library/react';
 import React from 'react';
 import userEvent from '@testing-library/user-event';
 import { NewTaskModal } from './NewTaskModal';
-import type { ComputeExperimentForm } from '../hooks/useTaskModal';
-import { defaultComputeExperimentForm } from '../hooks/useTaskModal';
+import type { AcceptanceEvidenceForm, ComputeExperimentForm } from '../hooks/useTaskModal';
+import { defaultAcceptanceEvidenceForm, defaultComputeExperimentForm } from '../hooks/useTaskModal';
 import { usePersistedState } from '../hooks/usePersistedState';
 
 const mockDraftComputeExperiment = vi.fn();
@@ -70,6 +70,8 @@ const baseProps = {
   onRepoChange: vi.fn(),
   onSubmit: vi.fn(),
   onClose: vi.fn(),
+  acceptanceEvidence: defaultAcceptanceEvidenceForm(),
+  setAcceptanceEvidence: vi.fn(),
 };
 
 function makeComputeExperiment(overrides?: Partial<ComputeExperimentForm>): ComputeExperimentForm {
@@ -523,5 +525,103 @@ describe('NewTaskModal — Draft contract', () => {
 
     await waitFor(() => expect(screen.getByText(/draft not available/i)).toBeInTheDocument());
     expect(onDraftApplied).not.toHaveBeenCalled();
+  });
+});
+
+describe('NewTaskModal — Acceptance Evidence', () => {
+  function makeValidEvidence(): AcceptanceEvidenceForm {
+    const form = defaultAcceptanceEvidenceForm();
+    form.testPath = 'tests/test_feature.py';
+    return form;
+  }
+
+  it('hides the Acceptance Evidence section for non-code-producing task types', () => {
+    render(
+      <NewTaskModal
+        {...baseProps}
+        newTaskType="plan"
+        computeExperiment={makeComputeExperiment()}
+        setComputeExperiment={vi.fn()}
+      />,
+    );
+    expect(screen.queryByText('Acceptance Evidence')).not.toBeInTheDocument();
+    expect(screen.queryByPlaceholderText('e.g., tests/test_foo.py')).not.toBeInTheDocument();
+  });
+
+  it('shows the Acceptance Evidence section for code-producing task types', () => {
+    render(
+      <NewTaskModal
+        {...baseProps}
+        newTaskType="create"
+        computeExperiment={makeComputeExperiment()}
+        setComputeExperiment={vi.fn()}
+      />,
+    );
+    expect(screen.getByText('Acceptance Evidence')).toBeInTheDocument();
+    // named_test is the default kind, so the Test Path field renders.
+    expect(screen.getByPlaceholderText('e.g., tests/test_foo.py')).toBeInTheDocument();
+  });
+
+  it('switching the evidence kind renders the corresponding fields', async () => {
+    const user = userEvent.setup();
+    function EvidenceStateWrapper(props: Omit<React.ComponentProps<typeof NewTaskModal>, 'acceptanceEvidence' | 'setAcceptanceEvidence'>) {
+      const [evidence, setEvidence] = React.useState<AcceptanceEvidenceForm>(defaultAcceptanceEvidenceForm());
+      return (
+        <NewTaskModal
+          {...props}
+          acceptanceEvidence={evidence}
+          setAcceptanceEvidence={setEvidence}
+        />
+      );
+    }
+    render(
+      <EvidenceStateWrapper
+        {...baseProps}
+        newTaskType="create"
+        computeExperiment={makeComputeExperiment()}
+        setComputeExperiment={vi.fn()}
+      />,
+    );
+    await user.selectOptions(screen.getByDisplayValue(/Named test/), 'observable_behavior');
+    expect(screen.getByPlaceholderText(/describe a concrete behavior/i)).toBeInTheDocument();
+  });
+
+  it('blocks submit with an inline error when acceptance evidence is invalid', async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn();
+    render(
+      <NewTaskModal
+        {...baseProps}
+        newTaskType="create"
+        newTaskTitle="Build feature"
+        newTaskPrompt="Make it work"
+        computeExperiment={makeComputeExperiment()}
+        setComputeExperiment={vi.fn()}
+        onSubmit={onSubmit}
+      />,
+    );
+    // Default evidence has an empty test path — invalid for named_test.
+    await user.click(screen.getByRole('button', { name: 'Launch' }));
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(screen.getByText(/name a real test file/i)).toBeInTheDocument();
+  });
+
+  it('calls onSubmit when acceptance evidence is valid', async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn();
+    render(
+      <NewTaskModal
+        {...baseProps}
+        newTaskType="create"
+        newTaskTitle="Build feature"
+        newTaskPrompt="Make it work"
+        computeExperiment={makeComputeExperiment()}
+        setComputeExperiment={vi.fn()}
+        acceptanceEvidence={makeValidEvidence()}
+        onSubmit={onSubmit}
+      />,
+    );
+    await user.click(screen.getByRole('button', { name: 'Launch' }));
+    expect(onSubmit).toHaveBeenCalled();
   });
 });

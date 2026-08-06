@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { renderHook, act, waitFor } from '@testing-library/react';
-import { useTaskModal } from './useTaskModal';
+import { defaultAcceptanceEvidenceForm, useTaskModal, type AcceptanceEvidenceForm } from './useTaskModal';
 import { authGet, fetchTaskTypeCatalog, createComputeExperiment, listFleetRunners, type TaskTypeCatalogEntry } from '../api';
 
 vi.mock('../api', () => ({
@@ -41,6 +41,20 @@ function catalogEntry(overrides: Partial<TaskTypeCatalogEntry> & { id: string })
 
 function okGet(data: unknown) {
   return Promise.resolve({ ok: true, json: () => Promise.resolve(data) } as Response);
+}
+
+// A minimal valid named_test declaration. Code-producing task types (the hook's
+// default 'create') hard-require acceptance_evidence at authoring time, so
+// submission tests must set one before calling handleCreateTask.
+function validNamedTestEvidence(): AcceptanceEvidenceForm {
+  const form = defaultAcceptanceEvidenceForm();
+  form.testPath = 'tests/test_feature.py';
+  return form;
+}
+
+function parsePostedBody() {
+  const init = fetchSpy.mock.calls[0][1] as RequestInit;
+  return JSON.parse(init.body as string) as Record<string, unknown>;
 }
 
 let fetchSpy: ReturnType<typeof vi.fn>;
@@ -362,6 +376,7 @@ describe('useTaskModal', () => {
       result.current.setNewTaskRepo('owner/repo');
       result.current.setNewTaskTitle('Build feature');
       result.current.setNewTaskPrompt('Make it work');
+      result.current.setAcceptanceEvidence(validNamedTestEvidence());
     });
     await act(async () => {
       await result.current.handleCreateTask({
@@ -372,6 +387,9 @@ describe('useTaskModal', () => {
       expect.stringContaining('/api/admin/tasks'),
       expect.objectContaining({ method: 'POST' }),
     );
+    const body = parsePostedBody();
+    expect(body.task_type).toBe('create');
+    expect(body.acceptance_evidence).toEqual({ kind: 'named_test', test_path: 'tests/test_feature.py' });
     expect(addToast).toHaveBeenCalledWith('Task created successfully', 'success');
     expect(fetchTasksRef.current).toHaveBeenCalled();
   });
@@ -385,6 +403,7 @@ describe('useTaskModal', () => {
       result.current.setShowNewTaskModal(true);
       result.current.setNewTaskTitle('Some title');
       result.current.setNewTaskPrompt('Some prompt');
+      result.current.setAcceptanceEvidence(validNamedTestEvidence());
     });
     await act(async () => {
       await result.current.handleCreateTask({
@@ -406,6 +425,9 @@ describe('useTaskModal', () => {
     const { result } = renderHook(() =>
       useTaskModal('create', addToast, { current: vi.fn() }),
     );
+    act(() => {
+      result.current.setAcceptanceEvidence(validNamedTestEvidence());
+    });
     await act(async () => {
       await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
     });
@@ -506,6 +528,7 @@ describe('useTaskModal', () => {
       result.current.setNewTaskRepo('owner/repo');
       result.current.setNewTaskTitle('t');
       result.current.setNewTaskPrompt('p');
+      result.current.setAcceptanceEvidence(validNamedTestEvidence());
     });
     await act(async () => {
       await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
@@ -514,6 +537,117 @@ describe('useTaskModal', () => {
       expect.stringContaining('not operator-launchable'),
       'error',
     );
+  });
+
+  it('handleCreateTask blocks code-producing submission without acceptance evidence', async () => {
+    const addToast = vi.fn();
+    const { result } = renderHook(() =>
+      useTaskModal('create', addToast, { current: vi.fn() }),
+    );
+    act(() => {
+      result.current.setNewTaskRepo('owner/repo');
+      result.current.setNewTaskTitle('Build feature');
+      result.current.setNewTaskPrompt('Make it work');
+      // acceptanceEvidence left at the default (empty named_test) declaration.
+    });
+    await act(async () => {
+      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+    });
+    expect(addToast).toHaveBeenCalledWith(
+      expect.stringContaining('Acceptance evidence is required'),
+      'error',
+    );
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('handleCreateTask blocks code-producing submission with invalid acceptance evidence', async () => {
+    const addToast = vi.fn();
+    const { result } = renderHook(() =>
+      useTaskModal('create', addToast, { current: vi.fn() }),
+    );
+    act(() => {
+      result.current.setNewTaskRepo('owner/repo');
+      result.current.setNewTaskTitle('Build feature');
+      result.current.setNewTaskPrompt('Make it work');
+      const form = defaultAcceptanceEvidenceForm();
+      form.testPath = 'not-a-test.txt';
+      result.current.setAcceptanceEvidence(form);
+    });
+    await act(async () => {
+      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+    });
+    expect(addToast).toHaveBeenCalledWith(
+      expect.stringContaining('Acceptance evidence is required'),
+      'error',
+    );
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('handleCreateTask omits acceptance_evidence for non-code-producing task types', async () => {
+    fetchSpy.mockResolvedValue({ ok: true, json: vi.fn().mockResolvedValue({ id: 'task-plan' }) });
+    const addToast = vi.fn();
+    const { result } = renderHook(() =>
+      useTaskModal('create', addToast, { current: vi.fn() }),
+    );
+    act(() => {
+      result.current.setNewTaskType('plan');
+      result.current.setNewTaskRepo('owner/repo');
+      result.current.setNewTaskTitle('Plan the work');
+      result.current.setNewTaskPrompt('Write a plan');
+    });
+    await act(async () => {
+      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+    });
+    expect(fetchSpy).toHaveBeenCalled();
+    const body = parsePostedBody();
+    expect(body.task_type).toBe('plan');
+    expect(body.acceptance_evidence).toBeUndefined();
+  });
+
+  it('handleCreateTask sends acceptance_evidence for refactor task', async () => {
+    fetchSpy.mockResolvedValue({ ok: true, json: vi.fn().mockResolvedValue({ id: 'task-refactor' }) });
+    const addToast = vi.fn();
+    const { result } = renderHook(() =>
+      useTaskModal('create', addToast, { current: vi.fn() }),
+    );
+    act(() => {
+      result.current.setNewTaskType('refactor');
+      result.current.setNewTaskRepo('owner/repo');
+      result.current.setNewTaskTitle('Refactor the module');
+      result.current.setNewTaskPrompt('Clean up the code');
+      result.current.setAcceptanceEvidence(validNamedTestEvidence());
+    });
+    await act(async () => {
+      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+    });
+    const body = parsePostedBody();
+    expect(body.task_type).toBe('refactor');
+    expect(body.acceptance_evidence).toEqual({ kind: 'named_test', test_path: 'tests/test_feature.py' });
+  });
+
+  it('handleCreateTask sends acceptance_evidence for fix task with PR details', async () => {
+    fetchSpy.mockResolvedValue({ ok: true, json: vi.fn().mockResolvedValue({ id: 'task-fix' }) });
+    const addToast = vi.fn();
+    const { result } = renderHook(() =>
+      useTaskModal('create', addToast, { current: vi.fn() }),
+    );
+    act(() => {
+      result.current.setNewTaskType('fix');
+      result.current.setNewTaskPrNumber('42');
+      result.current.setNewTaskPrBranch('fix/thing');
+      result.current.setNewTaskRepo('owner/repo');
+      result.current.setNewTaskTitle('Fix the bug');
+      result.current.setNewTaskPrompt('Repair the flow');
+      result.current.setAcceptanceEvidence(validNamedTestEvidence());
+    });
+    await act(async () => {
+      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+    });
+    const body = parsePostedBody();
+    expect(body.task_type).toBe('fix');
+    expect(body.pr_number).toBe(42);
+    expect(body.branch).toBe('fix/thing');
+    expect(body.acceptance_evidence).toEqual({ kind: 'named_test', test_path: 'tests/test_feature.py' });
   });
 
   // --- Duplicate-task flow: non-launchable types must not be re-emitted ---
@@ -550,6 +684,26 @@ describe('useTaskModal', () => {
       } as unknown as Parameters<typeof result.current.openDuplicateTaskModal>[0]);
     });
     expect(result.current.newTaskType).toBe('research');
+  });
+
+  it('openDuplicateTaskModal prefills acceptance evidence from the source payload', () => {
+    const { result } = renderHook(() =>
+      useTaskModal('create', vi.fn(), { current: vi.fn() }),
+    );
+    act(() => {
+      result.current.openDuplicateTaskModal({
+        id: 'task-101',
+        title: 'Old create task',
+        description: 'rerun it',
+        task_type: 'create',
+        payloads: [{
+          base_branch: 'main',
+          acceptance_evidence: { kind: 'observable_behavior', description: 'the feature is reachable from the UI' },
+        }],
+      } as unknown as Parameters<typeof result.current.openDuplicateTaskModal>[0]);
+    });
+    expect(result.current.acceptanceEvidence.kind).toBe('observable_behavior');
+    expect(result.current.acceptanceEvidence.description).toBe('the feature is reachable from the UI');
   });
 
   // --- localStorage integration ---

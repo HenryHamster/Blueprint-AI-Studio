@@ -4081,7 +4081,7 @@ async def _handle_criterion_named_test_trial_completion(
         summary = await record_named_test_execution_evidence(
             session,
             version,
-            criterion_keys=criterion_ids,
+            criterion_keys=[criterion_key],
             executed_sha=executed_sha,
             test_refs=refs_enrolled,
             trial_task_id=str(task.id),

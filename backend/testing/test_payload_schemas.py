@@ -8,6 +8,7 @@ from app.payload_schemas import (
     TaskType,
     _CODE_PRODUCING_TASK_TYPES,
     _MAX_PAYLOAD_BYTES,
+    format_payload_validation_error,
     normalize_acceptance_evidence,
     parse_acceptance_evidence,
     read_acceptance_evidence,
@@ -2060,3 +2061,80 @@ def test_salvage_bundle_surfaces_browser_routing_requirement(candidate, expected
     payload = _build_salvage_payload([candidate], "source-task")
 
     assert payload["requires_browser"] is expected
+
+
+# ---------------------------------------------------------------------------
+# format_payload_validation_error — one-line, actionable 422 detail
+# ---------------------------------------------------------------------------
+
+
+def test_format_payload_validation_error_wrapped_pydantic_is_one_line():
+    """A pydantic schema violation is collapsed to one 'loc: message' line.
+
+    The authored validator message must survive (minus pydantic v2's
+    'Value error, ' prefix and the multi-line ValidationError block) so the
+    operator toast / agent CLI shows the real reason instead of 'Invalid
+    request'.
+    """
+    with pytest.raises(ValueError) as exc_info:
+        validate_task_payload(
+            {
+                "type": "create",
+                "prompt": "x",
+                "title": "t",
+                "acceptance_evidence": {
+                    "kind": "named_test",
+                    "test_path": "test_true",  # not a real test file
+                },
+            }
+        )
+    formatted = format_payload_validation_error(exc_info.value)
+    assert "\n" not in formatted
+    assert formatted.startswith("acceptance_evidence: ")
+    assert "test file" in formatted
+    assert "Value error, " not in formatted
+    assert "Invalid request" not in formatted
+
+
+def test_format_payload_validation_error_field_constraint_loc_surfaces():
+    """A plain field-constraint failure (no validator prefix) keeps its loc."""
+    with pytest.raises(ValueError) as exc_info:
+        validate_task_payload(
+            {
+                "type": "create",
+                "prompt": "",  # min_length=1 on the model
+                "title": "t",
+                "acceptance_evidence": _CODE_EVIDENCE,
+            }
+        )
+    formatted = format_payload_validation_error(exc_info.value)
+    assert "\n" not in formatted
+    assert formatted.startswith("prompt: ")
+
+
+def test_format_payload_validation_error_plain_value_error_passthrough():
+    """A non-pydantic ValueError (undeclared acceptance_evidence) passes through
+    unchanged — its message is already single-line and actionable."""
+    with pytest.raises(ValueError) as exc_info:
+        validate_task_payload({"type": "create", "prompt": "x", "title": "t"})
+    formatted = format_payload_validation_error(exc_info.value)
+    assert formatted == str(exc_info.value)
+    assert "acceptance_evidence" in formatted
+    assert "Invalid request" not in formatted
+
+
+def test_format_payload_validation_error_payload_too_large_passthrough():
+    """PayloadTooLargeError (a ValueError subclass) passes through unchanged."""
+    err = PayloadTooLargeError(1000, 500, [("prompt", 800)])
+    formatted = format_payload_validation_error(err)
+    assert formatted == str(err)
+    assert "exceeds limit" in formatted
+
+
+def test_format_payload_validation_error_non_pydantic_cause_passthrough():
+    """A ValueError chained to a non-pydantic cause still passes through — the
+    helper only rewrites pydantic ValidationError causes."""
+    cause = RuntimeError("boom")
+    err = ValueError("plain reason")
+    err.__cause__ = cause
+    assert format_payload_validation_error(err) == "plain reason"

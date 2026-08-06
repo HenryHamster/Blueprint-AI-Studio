@@ -1,8 +1,8 @@
 import { useState, useRef } from 'react';
 import { GitBranch, X, Plus, GitFork, Microscope, CheckCircle, AlertCircle, Loader2, ChevronDown, ArrowUpDown, Wrench, Boxes, Cpu } from 'lucide-react';
 import type { LaunchableTaskTypeOption } from '../taskCapabilities';
-import type { ComputeExperimentForm } from '../hooks/useTaskModal';
-import { COMPUTE_ACCELERATOR_OPTIONS, COMPUTE_EXPERIMENT_TASK_TYPE, canonicalMachineTypeForAccelerator } from '../hooks/useTaskModal';
+import type { AcceptanceEvidenceForm, ComputeExperimentForm } from '../hooks/useTaskModal';
+import { ACCEPTANCE_EVIDENCE_KINDS, COMPUTE_ACCELERATOR_OPTIONS, COMPUTE_EXPERIMENT_TASK_TYPE, canonicalMachineTypeForAccelerator, defaultAcceptanceEvidenceForm, isCodeProducingTaskType, validateAcceptanceEvidenceForm } from '../hooks/useTaskModal';
 import type { ComputeSuccessOperator, ComputeExperimentPreflightResponse, ComputeExperimentDraftResponse, FleetRunner } from '../api';
 import { draftComputeExperiment } from '../api';
 
@@ -44,6 +44,8 @@ interface NewTaskModalProps {
   setNewTaskEffort: (value: string) => void;
   computeExperiment: ComputeExperimentForm;
   setComputeExperiment: React.Dispatch<React.SetStateAction<ComputeExperimentForm>>;
+  acceptanceEvidence?: AcceptanceEvidenceForm;
+  setAcceptanceEvidence?: React.Dispatch<React.SetStateAction<AcceptanceEvidenceForm>>;
   getDefaultModelForType: (taskType: string) => string;
   getDefaultEffortForType: (taskType: string) => string;
   repoOptions: Array<{ full_name: string; default_branch: string }>;
@@ -98,6 +100,8 @@ export function NewTaskModal({
   setNewTaskEffort,
   computeExperiment,
   setComputeExperiment,
+  acceptanceEvidence,
+  setAcceptanceEvidence = () => {},
   getDefaultModelForType,
   getDefaultEffortForType,
   repoOptions,
@@ -257,6 +261,16 @@ export function NewTaskModal({
   const isPrNumberValid = (value: string) => /^[1-9]\d*$/.test(value);
 
   const isComputeExperiment = newTaskType === COMPUTE_EXPERIMENT_TASK_TYPE;
+  // Code-producing types (create / fix / refactor / migrate / ...) require an
+  // acceptance_evidence declaration at authoring time; render the declaration
+  // section and block submit until it is valid.
+  const isCodeProducing = isCodeProducingTaskType(newTaskType);
+  const evidence = acceptanceEvidence ?? defaultAcceptanceEvidenceForm();
+  const evidenceError = validateAcceptanceEvidenceForm(evidence);
+  const updateEvidence = (field: keyof AcceptanceEvidenceForm, value: string) =>
+    // The cast mirrors updateCompute: every field holds a string, and `kind` is
+    // only ever set from the closed ACCEPTANCE_EVIDENCE_KINDS option set.
+    setAcceptanceEvidence(f => ({ ...f, [field]: value }) as AcceptanceEvidenceForm);
   const updateCompute = (field: keyof ComputeExperimentForm, value: string) =>
     // The cast is safe: every text field holds a string, and `successOperator`
     // is only ever set from the operator <select> whose options are the closed
@@ -317,6 +331,10 @@ export function NewTaskModal({
     }
     if (isComputeExperiment && isPreflightBlocking) {
       // Policy panel shows the reason inline; just prevent the submit.
+      return;
+    }
+    if (isCodeProducing && evidenceError !== null) {
+      // Inline error renders via submitAttempted; don't round-trip a doomed launch.
       return;
     }
     setSubmitting(true);
@@ -479,6 +497,121 @@ export function NewTaskModal({
               </div>
             </div>
           </div>
+          {isCodeProducing && (
+            <div className="mb-4 rounded-lg border border-neutral-800 bg-neutral-950/50 p-3">
+              <div className="flex items-center justify-between mb-3">
+                <div className="text-ui-md font-semibold text-neutral-400 uppercase tracking-wider">
+                  Acceptance Evidence
+                </div>
+                <span className="text-ui-sm text-neutral-600 normal-case font-normal tracking-normal">What would prove this change worked?</span>
+              </div>
+              <div className="mb-3">
+                <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Kind</label>
+                <select
+                  value={evidence.kind}
+                  onChange={e => updateEvidence('kind', e.target.value)}
+                  className="w-full truncate bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all appearance-none cursor-pointer"
+                >
+                  {ACCEPTANCE_EVIDENCE_KINDS.map(option => (
+                    <option key={option.value} value={option.value}>
+                      {option.label} — {option.description}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              {evidence.kind === 'named_test' && (
+                <div className="grid grid-cols-2 gap-3 mb-3">
+                  <div>
+                    <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Test Path</label>
+                    <input
+                      type="text"
+                      value={evidence.testPath}
+                      onChange={e => updateEvidence('testPath', e.target.value)}
+                      className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 ${submitAttempted && evidenceError ? 'border-red-500' : 'border-neutral-800'}`}
+                      placeholder="e.g., tests/test_foo.py"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Test ID <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional)</span></label>
+                    <input
+                      type="text"
+                      value={evidence.testId}
+                      onChange={e => updateEvidence('testId', e.target.value)}
+                      className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                      placeholder="e.g., test_handle_create"
+                    />
+                  </div>
+                </div>
+              )}
+              {evidence.kind === 'observable_behavior' && (
+                <div className="mb-3">
+                  <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Behavior to Verify</label>
+                  <textarea
+                    value={evidence.description}
+                    onChange={e => updateEvidence('description', e.target.value)}
+                    className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 resize-y min-h-[64px] transition-all placeholder:text-neutral-600 ${submitAttempted && evidenceError ? 'border-red-500' : 'border-neutral-800'}`}
+                    placeholder="Describe a concrete behavior an operator or reviewer can verify…"
+                  />
+                </div>
+              )}
+              {evidence.kind === 'downstream_artifact' && (
+                <div className="mb-3">
+                  <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Artifact ID</label>
+                  <input
+                    type="text"
+                    value={evidence.artifactId}
+                    onChange={e => updateEvidence('artifactId', e.target.value)}
+                    className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 ${submitAttempted && evidenceError ? 'border-red-500' : 'border-neutral-800'}`}
+                    placeholder="e.g., gs://bucket/path or a job id"
+                  />
+                </div>
+              )}
+              {evidence.kind === 'visual' && (
+                <div className="grid grid-cols-2 gap-3 mb-3">
+                  <div>
+                    <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Component</label>
+                    <input
+                      type="text"
+                      value={evidence.component}
+                      onChange={e => updateEvidence('component', e.target.value)}
+                      className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 ${submitAttempted && evidenceError ? 'border-red-500' : 'border-neutral-800'}`}
+                      placeholder="e.g., NewTaskModal"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Viewport Width</label>
+                    <input
+                      type="number"
+                      min="1"
+                      max="4096"
+                      value={evidence.viewportWidth}
+                      onChange={e => updateEvidence('viewportWidth', e.target.value)}
+                      className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                      placeholder="375"
+                    />
+                  </div>
+                </div>
+              )}
+              {evidence.kind === 'coverage_delta' && (
+                <div className="mb-3">
+                  <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Coverage Threshold <span className="text-neutral-600 normal-case font-normal tracking-normal">(0–100)</span></label>
+                  <input
+                    type="number"
+                    min="0"
+                    max="100"
+                    step="0.1"
+                    value={evidence.threshold}
+                    onChange={e => updateEvidence('threshold', e.target.value)}
+                    className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 ${submitAttempted && evidenceError ? 'border-red-500' : 'border-neutral-800'}`}
+                    placeholder="e.g., 80"
+                  />
+                </div>
+              )}
+              {submitAttempted && evidenceError && (
+                <p className="text-ui-sm text-red-500 mt-1">{evidenceError}</p>
+              )}
+            </div>
+          )}
           {isComputeExperiment && (
             <div className="mb-4 rounded-lg border border-neutral-800 bg-neutral-950/50 p-3">
               <div className="flex items-center justify-between mb-3">

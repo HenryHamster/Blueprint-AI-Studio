@@ -4598,6 +4598,122 @@ async def test_acceptance_window_fraction_nonzero_with_inferred_cochange(db_sess
 
 
 @pytest.mark.asyncio
+async def test_acceptance_window_aggregate_declared_unsatisfied_reasons(db_session):
+    """The declared_unsatisfied bucket is sub-classified by the PERSISTED verdict
+    reason (previously discarded at aggregation), partitioning it exactly:
+    sum(unsatisfied_reasons) == buckets["declared_unsatisfied"], every canonical
+    cause is reachable, and verdicts stamped without a reason land in ``unknown``
+    so the split still sums (fail-safe on legacy/manual rows)."""
+    from app.acceptance_gate import (
+        CODE_ACCEPTANCE_VERDICT_KEY,
+        _UNSATISFIED_REASON_KEYS,
+        acceptance_window_sub_scores_violations,
+        classify_merged_acceptance_context,
+    )
+
+    project, version = await _make_project_and_version(db_session)
+
+    reasoned = [
+        (
+            "named_test",
+            "declared named_test 'backend/testing/test_widget.py' is not among "
+            "the PR's changed files — the claimed test was not added or modified here",
+        ),
+        (
+            "named_test",
+            "declared named_test 'backend/testing/test_widget.py' did not run "
+            "green under a real merge-test verdict (the merge fell open without "
+            "verification)",
+        ),
+        (
+            "downstream_artifact",
+            "declared downstream_artifact acceptance evidence but the task "
+            "shipped no changed files to deliver it",
+        ),
+        (
+            "visual",
+            "declared visual acceptance evidence but no matching viewport "
+            "screenshot was uploaded for component 'X' at 375px",
+        ),
+        (
+            "coverage_delta",
+            "coverage_delta acceptance evidence: achieved 55.0% coverage < 80% "
+            "threshold",
+        ),
+        (
+            "observable_behavior",
+            "declared observable_behavior acceptance evidence but the task "
+            "shipped no changed files to exercise it",
+        ),
+        ("future_kind", "unrecognized acceptance kind 'future_kind'"),
+    ]
+    for i, (kind, reason) in enumerate(reasoned):
+        ctx = {
+            "pr_merged": True,
+            "landed_on_integration": True,
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": False,
+                "proven": False,
+                "kind": kind,
+                "reason": reason,
+            },
+        }
+        assert classify_merged_acceptance_context(ctx) == "declared_unsatisfied"
+        db_session.add(
+            Task(
+                project_id=project.id,
+                title=f"unsat-{i}",
+                payloads=[{"type": "create"}],
+                status=TaskStatus.COMPLETED,
+                context=ctx,
+            )
+        )
+    # One legacy declared-unsatisfied verdict stamped without a reason.
+    db_session.add(
+        Task(
+            project_id=project.id,
+            title="unsat-no-reason",
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+            context={
+                "pr_merged": True,
+                "landed_on_integration": True,
+                CODE_ACCEPTANCE_VERDICT_KEY: {
+                    "satisfied": False,
+                    "proven": False,
+                    "kind": "named_test",
+                },
+            },
+        )
+    )
+    await db_session.commit()
+
+    agg = await rq._compute_acceptance_window_aggregate(db_session, version)
+
+    buckets = agg["acceptance_window_buckets"]
+    assert buckets["declared_unsatisfied"] == len(reasoned) + 1  # 7 reasoned + 1 unknown
+    reasons = agg["acceptance_window_declared_unsatisfied_reasons"]
+    assert set(reasons.keys()) == set(_UNSATISFIED_REASON_KEYS)
+    assert sum(reasons.values()) == buckets["declared_unsatisfied"]
+
+    expected_counts = {
+        "named_test_missing_from_diff": 1,
+        "named_test_not_run_green": 1,
+        "artifact_empty_diff": 1,
+        "visual_no_screenshot": 1,
+        "coverage_below_threshold": 1,
+        "observable_empty_diff": 1,
+        "unrecognized_kind": 1,
+        "unknown": 1,
+    }
+    for key, count in reasons.items():
+        assert count == expected_counts.get(key, 0), key
+
+    # The additive breakdown does not break the sub-scores invariant guard.
+    assert acceptance_window_sub_scores_violations(agg) == []
+
+
+@pytest.mark.asyncio
 async def test_acceptance_window_aggregate_fraction_none_when_empty(db_session):
     """When no tasks land in the version window, fraction is None (not 0 or NaN)."""
     _project, version = await _make_project_and_version(db_session)

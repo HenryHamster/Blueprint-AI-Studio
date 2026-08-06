@@ -357,6 +357,29 @@ def reset_anomaly_adjustments():
 
 
 @pytest.fixture(autouse=True)
+def reset_deploy_monitoring_rings():
+    """Clear deploy_monitoring's bounded result/event rings around every test.
+
+    ``record_task_result`` (agent_status) and the reaper append to these
+    module-global deques that outlive a single test. A test file that
+    exercises failure paths (e.g. test_agent.py's agent-status tests) can
+    therefore poison the 60-minute rolling failure-rate gate
+    (``_assess_spawn_health``) for a LATER test file in the same pytest
+    process — research-completion tests saw ``47/91 recent tasks failed`` and
+    had findings deferred by the degradation gate that the test asserted must
+    spawn. Clearing at setup makes every test hermetic regardless of what ran
+    before it in the process.
+    """
+    from app import shared_state
+
+    shared_state.deploy_monitoring["task_results"].clear()
+    shared_state.deploy_monitoring["pipeline_events"].clear()
+    yield
+    shared_state.deploy_monitoring["task_results"].clear()
+    shared_state.deploy_monitoring["pipeline_events"].clear()
+
+
+@pytest.fixture(autouse=True)
 def reset_github_module_caches():
     """Clear module-level GitHub API caches between tests.
 

@@ -73,9 +73,37 @@ Launch a new task on a repository.
 ```json
 {
   "name": "string",                    // Project name
-  "payloads": [{"key": "value"}],      // Task-specific parameters
+  "payloads": [{"key": "value"}],      // Task-specific parameters (see below)
   "github_owner": "string | null",     // GitHub repo owner (optional)
   "github_repo": "string | null"       // GitHub repo name (optional)
+}
+```
+
+Each entry in `payloads` must include a `type` field (e.g. `"create"`, `"fix"`, `"refactor"`, `"qa"`, `"migrate"`, `"deps"`, `"docs"`) and type-specific fields such as `prompt`.
+
+**`acceptance_evidence` (required for code-producing task types)**
+
+For `type` values `create`, `fix`, `refactor`, `qa`, `migrate`, `deps`, and `docs`, each payload entry **must** include an `acceptance_evidence` object. Payloads that omit it are rejected with `422`. The object has a `kind` discriminator and kind-specific fields:
+
+| `kind` | Required additional fields | Description |
+|--------|---------------------------|-------------|
+| `named_test` | `test_path` (path to a real test file) | A test that exercises the changed seam end-to-end. `test_id` optionally pins a specific node. |
+| `observable_behavior` | `description` (≥10 non-trivial characters) | A concise human-readable description of a behavior that should be exercised. |
+| `downstream_artifact` | `artifact_id` (non-trivial string) | An artifact ID a later task consumes. |
+| `visual` | `component` (non-trivial string), `viewport_width` (int 1–4096) | Before/after viewport screenshot pair proving a frontend change. `assertion_type` is optional. |
+| `coverage_delta` | `threshold` (float 0–100) | Minimum coverage percentage the merged PR must achieve. |
+
+Trivial placeholders (`"test"`, `"pass"`, `"n/a"`, `"assert True"`, etc.) are rejected at validation time.
+
+**Example payload entry with `acceptance_evidence`:**
+```json
+{
+  "type": "create",
+  "prompt": "Add a login rate-limiter that locks an account after 5 failed attempts.",
+  "acceptance_evidence": {
+    "kind": "named_test",
+    "test_path": "backend/testing/test_auth.py::test_rate_limiter_locks_account"
+  }
 }
 ```
 
@@ -96,7 +124,7 @@ fetch them via `GET /api/projects/{project_id}/tasks`.
 **Status codes:**
 - `200` — Project created and tasks queued
 - `429` — Rate limited (5 per minute)
-- `422` — Invalid task payload (failed `validate_task_payload`)
+- `422` — Invalid task payload (failed `validate_task_payload`), including missing or malformed `acceptance_evidence` on code-producing task types
 - `401` — Unauthorized
 
 ---
@@ -336,6 +364,8 @@ Create a subtask (child task spawned by the agent during its work).
   "payload": {...}
 }
 ```
+
+The `payload` object is validated by `validate_task_payload`. For code-producing `child_task_type` values (`create`, `fix`, `refactor`, `qa`, `migrate`, `deps`, `docs`), the payload **must** include an `acceptance_evidence` object. See the [acceptance_evidence reference](#acceptance_evidence-required-for-code-producing-task-types) under `POST /api/deploy` for the full `kind` vocabulary and field requirements. Omitting `acceptance_evidence` on a code-producing spawn returns `422`.
 
 **Response:** `{ "child_task_id": "uuid" }`
 
@@ -1182,6 +1212,7 @@ Manual operator escape hatches for the autonomous pipeline.
 | POST | `/api/admin/projects/{project_id}/self-audit` | Enqueue a `self_audit` task for the project. |
 | POST | `/api/admin/projects/{project_id}/qualify` | Manually trigger the release qualifier for the open version. |
 | POST | `/api/admin/projects/{project_id}/clear-wave-deps` | Clear only stale/legacy wave serialization edges on QUEUED tasks; structural prerequisites are preserved. |
+| POST | `/api/admin/tasks` | Create a task manually. Auto-creates a project for the repo if one does not exist. Requires `acceptance_evidence` for code-producing task types. |
 | PATCH | `/api/admin/tasks/{task_id}` | Mutate an existing task in place — drives single-task Retry (`status → QUEUED`), Cancel/Dismiss/Reject/card cancel (`status → CANCELLED`), and Edit (`payloads[0].prompt`) actions. Does not create a new task. |
 | GET | `/api/admin/tasks/{task_id}/cancel-impact` | Preview cancellation impact for confirmations: active child cascade count, waiting dependent count, VM cleanup signals, and PR cleanup hints. |
 | POST | `/api/admin/tasks/bulk-action` | Bulk approve, retry, or cancel selected tasks. |
@@ -1200,6 +1231,28 @@ router). The full paths below already include that prefix.
 
 Manual operator actions that kick off pipeline work
 (`backend/app/routers/admin_operator_triggers.py`). All require admin access.
+
+- **`POST /api/admin/tasks`** — create a task manually (rate-limited 60/min). The request body is the `CreateTaskPayload` model. Key fields:
+
+  | Field | Type | Required | Notes |
+  |-------|------|----------|-------|
+  | `task_type` | string | ✅ | Any valid task type (e.g. `create`, `fix`, `refactor`, `qa`, `migrate`, `deps`, `docs`, `research`, `plan`, …). |
+  | `github_owner` | string | ✅ | GitHub org/user. |
+  | `github_repo` | string | ✅ | Repository name. |
+  | `prompt` | string | ✅ for most types | Human-readable task description. |
+  | `acceptance_evidence` | object | **Required for code-producing types** | Proof-of-completion declaration. Required when `task_type` is `create`, `fix`, `refactor`, `qa`, `migrate`, `deps`, or `docs`. See the [acceptance_evidence reference](#acceptance_evidence-required-for-code-producing-task-types) under `POST /api/deploy` for the full shape. |
+  | `base_branch` | string | — | Branch to base the task off (defaults to integration branch). |
+  | `branch` | string | — | Pre-existing branch to use instead of creating a new one. |
+  | `model` | string | — | LLM model override. |
+  | `effort` | string | — | `low` / `medium` / `high` / `max`. |
+  | `idempotency_key` | string | — | Alphanumeric key (max 255 chars) to dedupe retried requests — returns the existing task if one with the same key is already active. |
+  | `hotfix` | bool | — | `true` + `base_branch="main"` routes a plan task through the expedited hotfix path. |
+  | `work_class` | string | — | `exploratory` / `confirmatory` / `productization` — research task planning envelope. |
+  | `stop_or_pivot_condition` | string | — | Research stop/pivot criterion (max 4000 chars). |
+
+  The payload is validated by `validate_task_payload` with `require_acceptance_evidence=True`. Omitting `acceptance_evidence` on a code-producing task type returns `422` with a message naming the accepted `kind` values.
+
+  **Response:** `{ "task_id": "uuid", "project_id": "uuid", "status": "QUEUED" }`
 
 - **`POST /api/admin/projects/{project_id}/self-audit`** — spawn a self-audit task.
 - **`POST /api/admin/projects/{project_id}/qualify`** — trigger a release-qualification run.

@@ -197,7 +197,7 @@ async def launch_compute_job(
         logger.warning(
             "Validation error launching compute job: %s: %s", type(exc).__name__, exc
         )
-        raise HTTPException(status_code=422, detail="Invalid request") from exc
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     return {"status": "success", "data": serialize_compute_job_response(job)}
 
