@@ -231,6 +231,68 @@ async def test_ci_compliance_fetch_gate_and_cap_bump_spawn(
 
 
 @pytest.mark.asyncio
+async def test_branch_literal_only_violation_spawns_literal_remediation(
+    db_session, mocker
+):
+    """A HEAD blocked purely on branch-literal violations spawns a branch-name
+    remediation task — not a mislabeled size-cap-bump task.
+
+    Regression for the title/description that told the agent to run
+    ``check_size_limits.py --fix`` on a violation that has nothing to do with
+    size caps (observed on a real spawn for gitRefs.ts:71, which surfaced as
+    "Fix CI-compliance cap bump for <sha>" despite containing only a branch
+    literal, not a size breach).
+    """
+    project, _agent_task = await _make_project_with_agent_task(
+        db_session, module_line_count=_CAP - 1, mocker=mocker
+    )
+    ci_compliance.record_ci_compliance(
+        project,
+        {
+            "ref": _HEAD_SHA,
+            "compliant": False,
+            "violations": [],
+            "branch_literal_violations": [
+                {
+                    "section": "agent",
+                    "rel": "gitRefs.ts",
+                    "line": 71,
+                    "text": (
+                        "return process.env.BLUEPRINT_SELF_REPO_INTEGRATION_BRANCH"
+                        " || 'automain';"
+                    ),
+                }
+            ],
+            "checked": 1,
+            "limits_available": True,
+            "tree_available": True,
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    gate = ci_compliance_qualify_gate(project, _HEAD_SHA)
+    assert gate["blocked"] is True
+    assert gate["violation_count"] == 0
+    assert gate["branch_literal_violation_count"] == 1
+
+    spawned = await _maybe_spawn_ci_compliance_cap_bump_fix(db_session, project, gate)
+    await db_session.commit()
+    assert spawned is not None
+
+    repair_task = (
+        await db_session.execute(select(Task).where(Task.id == spawned.id))
+    ).scalar_one()
+    assert repair_task.status == TaskStatus.QUEUED
+    assert repair_task.title.startswith("Fix CI-compliance branch literals")
+    # The branch-literal remediation must NOT instruct a size-cap bump.
+    assert "check_size_limits.py --fix" not in repair_task.first_payload["prompt"]
+    assert "gitRefs.ts:71" in repair_task.first_payload["prompt"]
+    assert "Remove hardcoded branch names" in repair_task.description
+
+
+@pytest.mark.asyncio
 async def test_ci_compliance_fetch_and_gate_surface_testing_section_breach(
     client, db_session, mocker
 ):

@@ -4911,12 +4911,25 @@ async def _maybe_spawn_ci_compliance_cap_bump_fix(
             "Extract cohesive clusters into sibling modules to bring them under "
             "the existing caps — do NOT bump the caps."
         )
-    else:
+    elif violations:
         task_title_payload = "Bump CI-compliance size caps"
         task_title = f"Fix CI-compliance cap bump for {head_sha[:8]}"
         task_description = (
             "Run backend/testing/check_size_limits.py --fix and commit the "
             "resulting size-cap update."
+        )
+    else:
+        # No size violations — the gate is blocked purely on hardcoded branch
+        # literals, so the remediation is a branch-name removal, NOT a cap bump.
+        # The old single else-branch titled/described this as a size-cap bump and
+        # told the agent to run check_size_limits.py --fix, which cannot fix a
+        # branch-literal violation and mislabels the task (observed 2026-08-06:
+        # a branch-literal-only spawn surfaced as "Fix CI-compliance cap bump").
+        task_title_payload = "Remove hardcoded branch literals"
+        task_title = f"Fix CI-compliance branch literals for {head_sha[:8]}"
+        task_description = (
+            "Remove hardcoded branch names from the listed source files. "
+            "No size-cap bump is involved."
         )
 
     payload = validate_internal_payload(
