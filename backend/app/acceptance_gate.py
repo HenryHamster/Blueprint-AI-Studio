@@ -394,18 +394,20 @@ def _test_semantically_grounded(
 
 
 def _merge_was_test_verified(task: Task) -> bool:
-    """Whether the merge was gated by a REAL test verdict (fail-closed).
+    """Whether the merge was gated by a REAL test verdict.
 
-    The no-CI merge gate stamps ``review_loop["unverified_merge_reason"]`` when
-    it legitimately "falls open" and merges WITHOUT running real tests. Presence
-    of that reason (or an absent/malformed review_loop) means the merge was NOT
-    test-verified — returns False. Only returns True when review_loop is a dict
-    AND ``unverified_merge_reason`` is absent or empty, meaning a real CI / test
-    verdict gated the merge.
+    Mirrors the canonical ``landed_signal.is_verified_merge`` predicate (and
+    this module's own ``_context_merge_verification_status``): the no-CI merge
+    gate stamps ``review_loop["unverified_merge_reason"]`` when it legitimately
+    "falls open" and merges WITHOUT running real tests. Presence of that reason
+    means the merge was NOT test-verified — returns False. An ABSENT or
+    malformed review_loop carries no fall-open reason, so the merge is treated
+    as VERIFIED — exactly the fail-safe default every other consumer uses. Only
+    an explicit, non-empty ``unverified_merge_reason`` returns False.
     """
     review_loop = (task.context or {}).get(REVIEW_LOOP_KEY)
     if not isinstance(review_loop, dict):
-        return False
+        return True
     reason = review_loop.get(UNVERIFIED_MERGE_REASON_KEY)
     return not (isinstance(reason, str) and reason)
 
@@ -1632,12 +1634,19 @@ def summarize_version_acceptance_aggregate(
 
 async def backfill_acceptance_verdicts(session) -> int:
     """Re-evaluate pre-fix named_test acceptance verdicts that may have been
-    false-negatives before the ``_CROSS_CUTTING_TEST_FILES`` semantic-grounding
-    fix (8acdd3780, 2026-07-09T09:23 UTC).
+    false-negatives. Two historical failure classes are healed:
 
-    Finds merged tasks whose recorded verdict is ``named_test`` with
-    ``satisfied=True`` but ``proven=False``, re-evaluates with the current
-    (fixed) logic, and records :class:`~app.models.CriterionEvidence` via
+    1. ``satisfied=True, proven=False`` — recorded before the
+       ``_CROSS_CUTTING_TEST_FILES`` semantic-grounding fix (8acdd3780,
+       2026-07-09T09:23 UTC);
+    2. ``satisfied=False`` with the "did not run green under a real
+       merge-test verdict" reason — recorded while ``_merge_was_test_verified``
+       treated an ABSENT/malformed ``review_loop`` as unverified, so a landed
+       task whose context simply lacked a ``review_loop`` dict was scored
+       unsatisfied even though the merge was genuinely verified.
+
+    Both classes are re-evaluated with the current (fixed) logic, and
+    :class:`~app.models.CriterionEvidence` is recorded via
     :func:`~app.acceptance_criteria.record_task_merge_evidence` when the new
     verdict is ``proven=True``.
 
@@ -1655,7 +1664,13 @@ async def backfill_acceptance_verdicts(session) -> int:
     """
     from datetime import datetime, timezone
 
-    FIX_TIMESTAMP = datetime(2026, 7, 9, 9, 23, 0, tzinfo=timezone.utc)
+    # Upper bound on completion time for re-evaluation candidates. The bound
+    # tracks the current time so EVERY pre-fix verdict is eventually examined
+    # exactly once — covering both failure classes above. Tasks completed after
+    # the corrected predicates ship record correct verdicts at landing; the
+    # ``_proven_exists`` and ``_backfill_checked`` filters keep the sweep
+    # idempotent, so the window always advances.
+    FIX_TIMESTAMP = datetime.now(timezone.utc)
 
     # Exclude tasks that already have a proven CriterionEvidence row from a
     # prior backfill run so the LIMIT window advances to unprocessed tasks.
@@ -1742,10 +1757,30 @@ async def backfill_acceptance_verdicts(session) -> int:
             if verdict_data.get("kind") != "named_test":
                 marked_ids.append(task_id)
                 continue
-            if verdict_data.get("satisfied") is not True:
+            if verdict_data.get("proven") is True:
                 marked_ids.append(task_id)
                 continue
-            if verdict_data.get("proven") is True:
+            satisfied = verdict_data.get("satisfied")
+            if satisfied is True:
+                pass
+            elif satisfied is False:
+                # Pre-fix verified-merge mis-scoring: the old
+                # _merge_was_test_verified treated an absent/malformed
+                # review_loop as UNVERIFIED, so a landed task whose context
+                # simply lacked a review_loop dict was recorded unsatisfied
+                # with the "did not run green" reason even though the merge was
+                # genuinely verified. Only re-evaluate verdicts whose persisted
+                # reason matches that exact mis-scoring; a genuinely-unverified
+                # or otherwise-unsatisfied verdict re-evaluates to not-proven
+                # and stays untouched.
+                reason = verdict_data.get("reason")
+                if not isinstance(reason, str) or (
+                    "did not run green under a real merge-test verdict"
+                    not in reason
+                ):
+                    marked_ids.append(task_id)
+                    continue
+            else:
                 marked_ids.append(task_id)
                 continue
 

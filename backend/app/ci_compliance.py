@@ -51,6 +51,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from app import github
@@ -64,6 +65,7 @@ from app.branch_literal_compliance import (
     strip_typescript_with_linenos,
 )
 from app.json_extract import async_json_loads
+from app.time_utils import _coerce_naive_utc, _is_cadence_due, _utcnow
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -101,6 +103,36 @@ _MAX_RECORDED_SHAS = 50
 # full-evaluation round-trips to GitHub (which are expensive: 200+ file reads).
 # Entries are removed once the task completes (success or exception).
 _in_flight_evals: dict[str, asyncio.Task[dict[str, Any]]] = {}
+
+# Minimum wall-clock spacing between re-evaluations of the SAME SHA whose stored
+# verdict is DEGRADED (see _verdict_is_authoritative / _degraded_recheck_is_due).
+#
+# Re-evaluating a degraded verdict is what lets a TRANSIENT GitHub read failure
+# self-heal — but not every degraded status is transient. The evaluator's own
+# taxonomy distinguishes them: ``malformed`` means the file WAS read and its
+# bytes are not a JSON object, and ``unreadable`` on the hardcoded
+# _MODULE_SIZE_LIMITS_PATH / BRANCH_LITERAL_ALLOWLIST_PATH usually means a 404
+# — both are DETERMINISTIC at a fixed ref and can never heal without a new
+# commit. Re-evaluating unconditionally would make such a SHA a permanent cache
+# miss that re-runs the FULL evaluation (limits read + rules read + tree listing
+# + a 200-file branch-literal scan) on EVERY call, spending the project owner's
+# GitHub token against the 60/minute agent endpoint until the branch tip moves.
+# _in_flight_evals coalesces only CONCURRENT calls, never sequential ones.
+#
+# So the re-check is rate-limited per SHA rather than disabled: the first call
+# after a degraded verdict lands still re-evaluates immediately (fast self-heal
+# for the transient case), and subsequent re-evaluations happen at most once per
+# this interval. A deterministically-degraded ref therefore keeps producing a
+# fresh diagnostic, just boundedly.
+_DEGRADED_RECHECK_INTERVAL_SECONDS = 300.0
+
+# Key stamped onto a stored DEGRADED result recording when its evaluation ran,
+# so the rate limit above survives a backend restart (the per-SHA map lives in
+# the Project.ci_compliance JSONB column, not in process memory). AUTHORITATIVE
+# results are never stamped — they are cache hits and never re-evaluated. A
+# degraded record without the key (written before this field existed, or seeded
+# by another writer) is always due, preserving self-heal-on-next-call.
+_DEGRADED_EVALUATED_AT_KEY = "degraded_evaluated_at"
 
 # Maximum concurrent GitHub API requests for file reads. The three scan helpers
 # (_scan_capped_files, _scan_uncapped_files, _scan_branch_literals) parallelize
@@ -844,6 +876,55 @@ def _verdict_is_authoritative(stored: Any) -> bool:
     )
 
 
+def _degraded_recheck_is_due(stored: Any, now: datetime | None = None) -> bool:
+    """Whether a non-authoritative stored verdict may be re-evaluated NOW.
+
+    Only consulted for verdicts :func:`_verdict_is_authoritative` rejects, so a
+    ``True`` here never causes an authoritative verdict to be re-scanned.
+
+    Returns True (re-evaluate) when there is no usable prior-attempt stamp — no
+    record at all, a non-dict record, a record predating
+    :data:`_DEGRADED_EVALUATED_AT_KEY`, or an unparseable stamp. That keeps the
+    self-heal fast: the FIRST call after a degraded verdict lands always
+    re-evaluates. Thereafter the stamp rate-limits re-evaluation to once per
+    :data:`_DEGRADED_RECHECK_INTERVAL_SECONDS`, so a DETERMINISTICALLY degraded
+    ref (a malformed limits/rules blob, or a 404 on their hardcoded paths — both
+    of which cannot heal without a new commit) can no longer turn every call
+    into a full GitHub re-scan.
+
+    A stamp in the FUTURE (clock skew between writers, or a backward clock
+    step) is not due: ``_is_cadence_due`` computes a negative elapsed time,
+    which is below the interval. It expires naturally once wall clock passes
+    it, so a skewed stamp delays the next re-check by at most the skew rather
+    than wedging the SHA.
+    """
+    if not isinstance(stored, dict):
+        return True
+    raw = stored.get(_DEGRADED_EVALUATED_AT_KEY)
+    if not isinstance(raw, str):
+        return True
+    try:
+        last = _coerce_naive_utc(datetime.fromisoformat(raw))
+    except (ValueError, TypeError):
+        return True
+    return _is_cadence_due(last, _DEGRADED_RECHECK_INTERVAL_SECONDS, now)
+
+
+def _stamp_degraded_evaluation(result: Any) -> Any:
+    """Return ``result`` with the degraded re-check stamp applied when needed.
+
+    A DEGRADED result gets a copy carrying :data:`_DEGRADED_EVALUATED_AT_KEY`
+    set to now, so :func:`_degraded_recheck_is_due` can rate-limit the next
+    re-evaluation of the same SHA. An AUTHORITATIVE result is returned
+    unchanged (never stamped — it is a cache hit and is never re-evaluated), as
+    is a non-dict. A copy is made rather than a mutation because the input may
+    be the shared object returned by a coalesced ``_in_flight_evals`` task.
+    """
+    if not isinstance(result, dict) or _verdict_is_authoritative(result):
+        return result
+    return {**result, _DEGRADED_EVALUATED_AT_KEY: _utcnow().isoformat()}
+
+
 def compact_ci_compliance(result: dict[str, Any] | None) -> dict[str, Any] | None:
     """Return the small strategist/fetch shape for one compliance result."""
     if not isinstance(result, dict):
@@ -893,6 +974,15 @@ async def ensure_current_ci_compliance(
     cache. An authoritative verdict that found a REAL violation is reused and
     keeps refusing.
 
+    That degraded re-evaluation is RATE-LIMITED per SHA (see
+    :func:`_degraded_recheck_is_due`): the first call after a degraded verdict
+    lands re-evaluates immediately, then at most once per
+    :data:`_DEGRADED_RECHECK_INTERVAL_SECONDS`. Without the bound a
+    deterministically degraded ref — a malformed limits/rules blob, or a 404 on
+    their hardcoded paths, neither of which can heal without a new commit —
+    would be a permanent cache miss re-running the full ~200-file GitHub scan on
+    every call.
+
     Returns ``{"status": "success", "head_sha": ..., "data": result, ...}`` on
     success. When GitHub credentials or the branch SHA cannot be resolved it
     returns ``status="unavailable"`` instead of raising, so strategic spawning
@@ -940,7 +1030,7 @@ async def ensure_current_ci_compliance(
 
     stored = get_ci_compliance(project, head_sha)
     computed = False
-    if not _verdict_is_authoritative(stored):
+    if not _verdict_is_authoritative(stored) and _degraded_recheck_is_due(stored):
         # Re-evaluate on a cache miss AND on a DEGRADED stored verdict. A
         # verdict persisted from evidence the system could not read (unreadable
         # size-limits file, unreadable branch-literal rules, or unavailable repo
@@ -950,6 +1040,18 @@ async def ensure_current_ci_compliance(
         # verdict that READ the evidence and found a real violation is
         # authoritative (``_verdict_is_authoritative`` True) and is reused to
         # keep refusing.
+        #
+        # ``_degraded_recheck_is_due`` BOUNDS that re-evaluation. A degraded
+        # status is not necessarily transient: a malformed limits/rules blob, or
+        # a 404 on their hardcoded repo paths, is deterministic at a fixed ref
+        # and cannot heal without a new commit. Without the bound such a SHA is
+        # a permanent cache miss that re-runs the full ~200-file scan on EVERY
+        # call (``_in_flight_evals`` coalesces concurrent calls only, not
+        # sequential ones), burning the owner's GitHub token behind the
+        # 60/minute agent endpoint until the branch tip moves. The first call
+        # after a degraded verdict lands is always due, so a genuinely transient
+        # failure still self-heals immediately; further re-checks are spaced by
+        # _DEGRADED_RECHECK_INTERVAL_SECONDS and still emit a fresh diagnostic.
         flight_key = f"{project.id}:{head_sha}"
         if flight_key in _in_flight_evals:
             # Another coroutine is already computing this SHA — await its result
@@ -973,6 +1075,11 @@ async def ensure_current_ci_compliance(
                 stored = await task
             finally:
                 _in_flight_evals.pop(flight_key, None)
+        # Stamp a still-degraded verdict with this attempt's timestamp so the
+        # next re-check is spaced by _DEGRADED_RECHECK_INTERVAL_SECONDS. A
+        # healed (authoritative) verdict is returned unstamped — it is a cache
+        # hit from here on and is never re-evaluated for this SHA.
+        stored = _stamp_degraded_evaluation(stored)
         record_ci_compliance(project, stored)
         session.add(project)
         await session.flush()

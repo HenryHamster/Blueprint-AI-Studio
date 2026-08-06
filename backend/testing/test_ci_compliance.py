@@ -17,12 +17,14 @@ Exercises :mod:`app.ci_compliance`:
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 
 import pytest
 from sqlmodel import select
 
 from app import ci_compliance
 from app.models import Project
+from app.time_utils import _utcnow
 
 # A capped backend module guaranteed to exist in module_size_limits.json with a
 # small cap, so an over-cap body is easy to synthesise.
@@ -1392,3 +1394,221 @@ def test_in_flight_evals_dict_exists_and_is_mutable():
     assert "_test_key" in d
     del d["_test_key"]
     assert len(d) == original_len
+
+
+# ---------------------------------------------------------------------------
+# Bounded re-check of DEGRADED verdicts
+# ---------------------------------------------------------------------------
+
+
+def _degraded_verdict(**overrides) -> dict:
+    """A verdict that FAILED CLOSED because the limits file was unreadable."""
+    verdict = {
+        "ref": _HEAD_SHA,
+        "compliant": False,
+        "violations": [],
+        "branch_literal_violations": [],
+        "checked": 0,
+        "limits_available": False,
+        "limits_status": ci_compliance._LIMITS_STATUS_MALFORMED,
+        "limits_error": "backend/testing/module_size_limits.json is not valid JSON",
+        "rules_available": True,
+        "rules_status": ci_compliance._RULES_STATUS_OK,
+        "rules_error": None,
+        "tree_available": True,
+    }
+    verdict.update(overrides)
+    return verdict
+
+
+def test_degraded_recheck_is_due_only_when_interval_elapsed():
+    """The per-SHA re-check bound: due with no usable stamp, else once per interval.
+
+    A degraded status is not necessarily transient — ``malformed`` (the config
+    WAS read and is not a JSON object) and ``unreadable`` (a 404 on a hardcoded
+    repo path) are deterministic at a fixed ref and cannot heal without a new
+    commit. Re-evaluating them on every call makes the SHA a permanent cache
+    miss that re-runs the full GitHub scan forever. The bound must still let
+    the FIRST call after a degraded verdict lands re-evaluate (fast self-heal
+    for the genuinely transient case).
+    """
+    interval = ci_compliance._DEGRADED_RECHECK_INTERVAL_SECONDS
+    key = ci_compliance._DEGRADED_EVALUATED_AT_KEY
+
+    # No usable prior-attempt stamp => due (self-heal on the very next call).
+    assert ci_compliance._degraded_recheck_is_due(None) is True
+    assert ci_compliance._degraded_recheck_is_due("not-a-dict") is True
+    assert ci_compliance._degraded_recheck_is_due(_degraded_verdict()) is True
+    assert (
+        ci_compliance._degraded_recheck_is_due(_degraded_verdict(**{key: 12345}))
+        is True
+    )
+    assert (
+        ci_compliance._degraded_recheck_is_due(
+            _degraded_verdict(**{key: "not-a-timestamp"})
+        )
+        is True
+    )
+
+    now = _utcnow()
+    # Stamped just now => NOT due; the SHA is not re-scanned on every call.
+    fresh_stamp = _degraded_verdict(**{key: now.isoformat()})
+    assert ci_compliance._degraded_recheck_is_due(fresh_stamp, now=now) is False
+    # Still inside the interval => NOT due.
+    inside = _degraded_verdict(
+        **{key: (now - timedelta(seconds=interval - 1)).isoformat()}
+    )
+    assert ci_compliance._degraded_recheck_is_due(inside, now=now) is False
+    # Interval elapsed => due again, so a fresh diagnostic is still produced.
+    elapsed = _degraded_verdict(
+        **{key: (now - timedelta(seconds=interval + 1)).isoformat()}
+    )
+    assert ci_compliance._degraded_recheck_is_due(elapsed, now=now) is True
+    # A future stamp (clock skew) is not due, and expires on its own rather
+    # than wedging the SHA.
+    skewed = _degraded_verdict(**{key: (now + timedelta(seconds=30)).isoformat()})
+    assert ci_compliance._degraded_recheck_is_due(skewed, now=now) is False
+
+
+def test_stamp_degraded_evaluation_never_stamps_an_authoritative_verdict():
+    """Only DEGRADED results carry the attempt stamp; authoritative ones are untouched.
+
+    An authoritative verdict is a permanent cache hit for its SHA and is never
+    re-evaluated, so it needs no stamp — and stamping it would pollute the
+    operator-visible record and the strategist payload with cache bookkeeping.
+    """
+    key = ci_compliance._DEGRADED_EVALUATED_AT_KEY
+
+    authoritative = {
+        "ref": _HEAD_SHA,
+        "compliant": False,
+        "violations": [{"section": "backend", "rel": _CAPPED_REL, "count": 1, "cap": 0}],
+        "branch_literal_violations": [],
+        "checked": 1,
+        "limits_available": True,
+        "limits_status": ci_compliance._LIMITS_STATUS_OK,
+        "limits_error": None,
+        "rules_available": True,
+        "rules_status": ci_compliance._RULES_STATUS_OK,
+        "rules_error": None,
+        "tree_available": True,
+    }
+    assert ci_compliance._verdict_is_authoritative(authoritative) is True
+    assert ci_compliance._stamp_degraded_evaluation(authoritative) == authoritative
+    assert key not in ci_compliance._stamp_degraded_evaluation(authoritative)
+
+    degraded = _degraded_verdict()
+    stamped = ci_compliance._stamp_degraded_evaluation(degraded)
+    assert isinstance(stamped[key], str)
+    # The input is not mutated — it may be the shared object handed to every
+    # coalesced _in_flight_evals awaiter.
+    assert key not in degraded
+    # Every non-bookkeeping field survives the stamp.
+    assert {k: v for k, v in stamped.items() if k != key} == degraded
+
+    assert ci_compliance._stamp_degraded_evaluation(None) is None
+
+
+@pytest.mark.asyncio
+async def test_deterministically_degraded_sha_is_not_rescanned_every_call(
+    db_session, mocker
+):
+    """A degraded SHA re-evaluates once, then at most once per interval.
+
+    Regression for the unbounded-rescan defect: treating EVERY non-authoritative
+    stored verdict as a cache miss made a deterministically degraded ref (a
+    malformed config blob, or a 404 on the hardcoded config path — neither of
+    which can heal without a new commit) re-run the full evaluation on every
+    single call, with no possibility of healing until the branch tip moved.
+    ``_in_flight_evals`` coalesces only CONCURRENT calls, so sequential polls of
+    the 60/minute agent endpoint each paid a full GitHub scan.
+
+    (a) First call re-evaluates (self-heal stays fast for transient failures).
+    (b) The immediately-following call does NOT re-evaluate; the stored degraded
+        verdict is served and keeps failing closed.
+    (c) Once the interval has elapsed, re-evaluation resumes, so the ref still
+        gets a fresh diagnostic and a healed read still re-opens the gate.
+    """
+    project = Project(
+        name="CI-Compliance Recheck Bound",
+        user_id="test-user-123",
+        github_owner="owner",
+        github_repo="repo",
+        integration_branch="automain",
+    )
+    db_session.add(project)
+    await db_session.flush()
+
+    async def _resolve(_session, _project):
+        return ("token", "owner", "repo")
+
+    mocker.patch("app.release_promotion._resolve_github_with_session", new=_resolve)
+    mocker.patch.object(
+        ci_compliance.github,
+        "get_branch_sha",
+        new=mocker.AsyncMock(return_value=_HEAD_SHA),
+    )
+    eval_mock = mocker.patch.object(
+        ci_compliance,
+        "evaluate_ci_compliance_at_ref",
+        new=mocker.AsyncMock(return_value=_degraded_verdict()),
+    )
+
+    key = ci_compliance._DEGRADED_EVALUATED_AT_KEY
+
+    # (a) Cache miss -> evaluate. The still-degraded verdict is stamped so the
+    # next re-check is bounded.
+    first = await ci_compliance.ensure_current_ci_compliance(db_session, project)
+    assert first["computed"] is True
+    assert eval_mock.await_count == 1
+    assert first["data"]["compliant"] is False
+    assert first["data"]["limits_available"] is False
+    stored = ci_compliance.get_ci_compliance(project, sha=_HEAD_SHA)
+    assert isinstance(stored[key], str)
+
+    # (b) Immediately again: NOT re-evaluated. The degraded verdict is served
+    # from cache and still fails closed.
+    second = await ci_compliance.ensure_current_ci_compliance(db_session, project)
+    assert second["computed"] is False
+    assert eval_mock.await_count == 1, "degraded SHA was re-scanned within the interval"
+    assert second["data"]["compliant"] is False
+    assert second["data"]["limits_available"] is False
+    assert second["data"][key] == stored[key]
+
+    # (c) Interval elapsed: due again. A healed read re-opens the gate, proving
+    # the bound delays re-evaluation rather than disabling it.
+    aged = dict(stored)
+    aged[key] = (
+        _utcnow()
+        - timedelta(seconds=ci_compliance._DEGRADED_RECHECK_INTERVAL_SECONDS + 1)
+    ).isoformat()
+    ci_compliance.record_ci_compliance(project, aged)
+    await db_session.flush()
+
+    healed = {
+        "ref": _HEAD_SHA,
+        "compliant": True,
+        "violations": [],
+        "branch_literal_violations": [],
+        "checked": 1,
+        "limits_available": True,
+        "limits_status": ci_compliance._LIMITS_STATUS_OK,
+        "limits_error": None,
+        "rules_available": True,
+        "rules_status": ci_compliance._RULES_STATUS_OK,
+        "rules_error": None,
+        "tree_available": True,
+    }
+    eval_mock.return_value = healed
+
+    third = await ci_compliance.ensure_current_ci_compliance(db_session, project)
+    assert third["computed"] is True
+    assert eval_mock.await_count == 2
+    # The healed verdict is authoritative, so it is stored unstamped and every
+    # later call is a plain cache hit.
+    assert third["data"] == healed
+    assert ci_compliance.get_ci_compliance(project, sha=_HEAD_SHA) == healed
+
+    fourth = await ci_compliance.ensure_current_ci_compliance(db_session, project)
+    assert fourth["computed"] is False
+    assert eval_mock.await_count == 2

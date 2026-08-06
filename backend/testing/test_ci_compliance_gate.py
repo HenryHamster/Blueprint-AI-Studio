@@ -708,6 +708,67 @@ async def test_qualify_gate_blocks_when_limits_unreadable(client, db_session, mo
 
 
 @pytest.mark.asyncio
+async def test_healed_degraded_record_unblocks_gate(db_session, mocker):
+    """A healed degraded record re-opens the qualify gate.
+
+    A degraded per-SHA record (limits file unreadable at the ref — a transient
+    GitHub read failure) blocks the gate fail-closed. Once
+    ``ensure_current_ci_compliance`` re-evaluates with healthy reads, the
+    degraded record is a cache miss, is replaced by a fully-available clean
+    one, and the gate no longer blocks — previously the degraded record was
+    served from cache forever and every entry path for the SHA stayed refused.
+
+    The seeded record carries no ``degraded_evaluated_at`` stamp, so the
+    per-SHA re-check bound (``_degraded_recheck_is_due``) reports it due: the
+    bound rate-limits REPEATED re-evaluation of a degraded ref, it never delays
+    the first self-heal.
+    """
+    project, _agent_task = await _make_project_with_agent_task(
+        db_session, module_line_count=_CAP - 1, mocker=mocker
+    )
+
+    # Seed a degraded record: non-compliant ONLY because the limits file was
+    # unreadable at the ref.
+    ci_compliance.record_ci_compliance(
+        project,
+        {
+            "ref": _HEAD_SHA,
+            "compliant": False,
+            "violations": [],
+            "branch_literal_violations": [],
+            "checked": 0,
+            "limits_available": False,
+            "limits_status": "unreadable",
+            "limits_error": "could not read backend/testing/module_size_limits.json",
+            "rules_available": True,
+            "rules_status": "ok",
+            "rules_error": None,
+            "tree_available": True,
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # The degraded record blocks the gate fail-closed.
+    gate = ci_compliance_qualify_gate(project, _HEAD_SHA)
+    assert gate["blocked"] is True
+    assert gate["reason"] == "ci_compliance_evidence_unavailable"
+
+    # Re-evaluate with healthy reads (module within cap): the degraded record
+    # is a cache miss and is replaced by the healed record.
+    healed = await ci_compliance.ensure_current_ci_compliance(db_session, project)
+    assert healed["status"] == "success"
+    assert healed["computed"] is True
+    assert healed["head_sha"] == _HEAD_SHA
+    assert healed["data"]["compliant"] is True
+
+    # The gate now passes.
+    gate = ci_compliance_qualify_gate(project, _HEAD_SHA)
+    assert gate["blocked"] is False
+
+
+@pytest.mark.asyncio
 async def test_noncompliant_qualify_request_is_blocked_and_spawns_cap_bump(
     db_session, mocker
 ):

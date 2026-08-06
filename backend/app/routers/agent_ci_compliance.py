@@ -26,8 +26,18 @@ async def agent_fetch_ci_compliance(
 
     Checks module-size guardrails (capped files in module_size_limits.json)
     and branch-literal guardrails (agent handler TS files) via GitHub snapshot
-    reads.  Results are SHA-keyed and cached in-memory so a stable HEAD costs
-    only one snapshot round-trip per backend restart.
+    reads.  Results are SHA-keyed and persisted on the project, so a stable
+    HEAD whose verdict is AUTHORITATIVE (every evidence channel was read)
+    costs one snapshot round-trip and is served from that cache thereafter.
+
+    A DEGRADED verdict (an evidence channel was unreadable at the ref) is
+    re-evaluated rather than replayed, so a transient GitHub read failure
+    self-heals — but that re-evaluation is rate-limited per SHA to at most once
+    per ``ci_compliance._DEGRADED_RECHECK_INTERVAL_SECONDS``.  A ref that is
+    deterministically degraded (a malformed config, or a 404 on a hardcoded
+    config path — neither heals without a new commit) therefore cannot turn
+    this 60/minute endpoint into an unbounded full-repo re-scan billed to the
+    project owner's GitHub token.
 
     Returns ``{"status": "success", "data": {"source": "unavailable"}}`` when
     GitHub credentials are unavailable (e.g. project has no GitHub repo

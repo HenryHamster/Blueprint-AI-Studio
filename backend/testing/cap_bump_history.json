@@ -57,6 +57,12 @@
           "commit_date": "2026-08-05T12:25:20+00:00",
           "old_cap": 9800,
           "new_cap": 11350
+        },
+        {
+          "commit_sha": "",
+          "commit_date": "2026-08-06T20:00:09.116390+00:00",
+          "old_cap": 10300,
+          "new_cap": 11900
         }
       ],
       "models.py": [
@@ -293,6 +299,20 @@
           "commit_date": "2026-08-06T13:03:00+00:00",
           "old_cap": 1950,
           "new_cap": 2350
+        },
+        {
+          "commit_sha": "",
+          "commit_date": "2026-08-06T20:32:35.793864+00:00",
+          "old_cap": 2350,
+          "new_cap": 2750
+        }
+      ],
+      "test_acceptance_gate.py": [
+        {
+          "commit_sha": "",
+          "commit_date": "2026-08-06T20:00:09.116390+00:00",
+          "old_cap": 3400,
+          "new_cap": 4000
         }
       ]
     }

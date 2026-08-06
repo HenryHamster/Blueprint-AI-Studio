@@ -70,7 +70,7 @@
     "digest_direction_progress.py": 1600,
     "failure_layer_classifier.py": 400,
     "pipeline_alert_scan.py": 600,
-    "release_qualifier.py": 10300,
+    "release_qualifier.py": 11900,
     "release_reconciliation.py": 3700,
     "release_stall_alerts.py": 1050,
     "release_promotion.py": 2350,
@@ -327,7 +327,7 @@
     "test_admin_compute_jobs.py": 3700,
     "test_digest_direction_progress.py": 3600,
     "test_reaper_sweeps_compute_image.py": 3500,
-    "test_acceptance_gate.py": 3400,
+    "test_acceptance_gate.py": 4000,
     "test_migration_apply_gate.py": 3350,
     "test_warm_vm_integration.py": 3350,
     "test_auto_remediation.py": 3300,
@@ -396,6 +396,7 @@
     "test_strategic_session_messages.py": 1950,
     "test_warm_pool_dispatch.py": 2100,
     "test_admin_routers__notifications.py": 1800,
-    "test_ci_compliance_gate.py": 2350
+    "test_ci_compliance_gate.py": 2750,
+    "test_ci_compliance.py": 1900
   }
 }

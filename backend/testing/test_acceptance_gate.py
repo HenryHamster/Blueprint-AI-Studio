@@ -2827,75 +2827,93 @@ def test_aggregate_invariant_coverage_never_exceeds_bounds():
             assert coverage <= 1.0
 
 
-def test_missing_review_loop_not_scored_as_proven():
-    """Missing/malformed review_loop fails closed: unverified merge not scored as proven.
+def test_missing_review_loop_matches_canonical_verified_merge_predicate():
+    """Missing/malformed review_loop defaults to VERIFIED, matching is_verified_merge.
 
-    The _merge_was_test_verified helper must fail closed when review_loop context
-    is absent or malformed (like all other evidence checks in the module), NOT
-    return True and give an unverified merge a free pass to proven scoring.
-    An absent review_loop means we cannot attest the merge was verified —
-    the safe default is unverified.
+    The acceptance gate's _merge_was_test_verified helper must use the SAME
+    fail-safe default as the canonical landed_signal.is_verified_merge predicate
+    (and this module's own _context_merge_verification_status): an ABSENT or
+    malformed review_loop carries no unverified_merge_reason, so the merge was
+    genuinely verified. A landed task whose context simply lacks a review_loop
+    dict must NOT be scored declared_unsatisfied — it must earn machine proof.
+    Only an explicit unverified_merge_reason makes the merge unverified.
     """
-    # Case 1: completely missing review_loop context
-    task_no_context = _make_code_task(
-        acceptance_evidence={
-            "kind": "named_test",
-            "test_path": "backend/testing/test_widget.py",
-        },
-        changed_files=["backend/app/widget.py", "backend/testing/test_widget.py"],
-        unverified_reason=None,  # Context dict has no review_loop at all
-    )
-    # Explicitly clear the context to simulate no review_loop key
-    task_no_context.context = {"_pr_changed_files": task_no_context.context["_pr_changed_files"]}
+    from app.landed_signal import is_verified_merge
 
-    verdict_no_context = evaluate_code_acceptance(task_no_context)
-    # Missing review_loop should fail closed: NOT proven, not satisfied for named_test
-    assert verdict_no_context.declared is True
-    assert verdict_no_context.satisfied is False
-    assert verdict_no_context.proven is False
-    assert "did not run green" in verdict_no_context.reason
+    def _landed(task: Task) -> Task:
+        # Stamp the integration-landing signal so the canonical
+        # is_merged_completion gate (status COMPLETED + landed signal) is met,
+        # exactly as a real landed task would carry it.
+        task.context = {
+            **(task.context or {}),
+            "pr_merged": True,
+            "landed_on_integration": True,
+        }
+        return task
 
-    # Case 2: malformed review_loop (not a dict)
-    task_malformed = _make_code_task(
+    # Case 1: completely missing review_loop context. The canonical predicate
+    # treats this as a VERIFIED merge, so the acceptance gate must agree and
+    # mint machine proof instead of scoring declared_unsatisfied.
+    task_no_context = _landed(_make_code_task(
         acceptance_evidence={
             "kind": "named_test",
             "test_path": "backend/testing/test_widget.py",
         },
         changed_files=["backend/app/widget.py", "backend/testing/test_widget.py"],
         unverified_reason=None,
-    )
+    ))
+    # Explicitly drop review_loop to simulate a context that simply lacks it.
+    task_no_context.context.pop(REVIEW_LOOP_KEY, None)
+
+    assert is_verified_merge(task_no_context) is True
+    verdict_no_context = evaluate_code_acceptance(task_no_context)
+    assert verdict_no_context.declared is True
+    assert verdict_no_context.satisfied is True
+    assert verdict_no_context.proven is True
+
+    record_code_acceptance_verdict(task_no_context)
+    stamped = task_no_context.context[CODE_ACCEPTANCE_VERDICT_KEY]
+    assert acceptance_blocks_success(stamped) is False
+    assert acceptance_is_proven(stamped) is True
+    assert classify_merged_acceptance(task_no_context) == "proven"
+
+    # Case 2: malformed review_loop (not a dict) — same verified default.
+    task_malformed = _landed(_make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+        },
+        changed_files=["backend/app/widget.py", "backend/testing/test_widget.py"],
+        unverified_reason=None,
+    ))
     task_malformed.context[REVIEW_LOOP_KEY] = "not a dict"  # Malformed
 
+    assert is_verified_merge(task_malformed) is True
     verdict_malformed = evaluate_code_acceptance(task_malformed)
-    assert verdict_malformed.declared is True
-    assert verdict_malformed.satisfied is False
-    assert verdict_malformed.proven is False
-    assert "did not run green" in verdict_malformed.reason
+    assert verdict_malformed.satisfied is True
+    assert verdict_malformed.proven is True
 
-    # Case 3: with explicit unverified_reason (control — should already fail)
-    task_explicit_unverified = _make_code_task(
+    # Case 3: explicit unverified_merge_reason — the ONLY fail-closed case; both
+    # predicates agree the merge was NOT verified.
+    task_explicit_unverified = _landed(_make_code_task(
         acceptance_evidence={
             "kind": "named_test",
             "test_path": "backend/testing/test_widget.py",
         },
         changed_files=["backend/app/widget.py", "backend/testing/test_widget.py"],
         unverified_reason="no_runnable_suite",  # Explicit fall-open
-    )
-
+    ))
+    assert is_verified_merge(task_explicit_unverified) is False
     verdict_explicit = evaluate_code_acceptance(task_explicit_unverified)
     assert verdict_explicit.declared is True
     assert verdict_explicit.satisfied is False
     assert verdict_explicit.proven is False
+    assert "did not run green" in verdict_explicit.reason
 
-    # All three (missing, malformed, explicit unverified) fail closed identically
-    # when a named_test is declared with a real changed seam.
-    record_code_acceptance_verdict(task_no_context)
-    record_code_acceptance_verdict(task_malformed)
     record_code_acceptance_verdict(task_explicit_unverified)
-
-    assert acceptance_blocks_success(task_no_context.context[CODE_ACCEPTANCE_VERDICT_KEY]) is True
-    assert acceptance_blocks_success(task_malformed.context[CODE_ACCEPTANCE_VERDICT_KEY]) is True
-    assert acceptance_blocks_success(task_explicit_unverified.context[CODE_ACCEPTANCE_VERDICT_KEY]) is True
+    assert acceptance_blocks_success(
+        task_explicit_unverified.context[CODE_ACCEPTANCE_VERDICT_KEY]
+    ) is True
 
 
 @pytest.mark.asyncio
@@ -3011,6 +3029,99 @@ async def test_backfill_acceptance_verdicts_upgrades_frontend_named_test(db_sess
     assert updated is not None
     assert updated.get("proven") is True, "frontend verdict should upgrade to proven"
     assert updated.get("backfilled") is True
+
+
+@pytest.mark.asyncio
+async def test_backfill_acceptance_verdicts_heals_missing_review_loop_misscoring(
+    db_session,
+):
+    """A pre-fix named_test verdict recorded unsatisfied with the 'did not run
+    green' reason — because _merge_was_test_verified treated an ABSENT
+    review_loop as unverified — is upgraded to proven=True by the backfill once
+    the verified-merge default matches is_verified_merge. A genuinely-unverified
+    verdict carrying the same reason stays unsatisfied.
+    """
+    from datetime import datetime, timezone
+
+    from testing.factories import make_project
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.flush()
+
+    # Mis-scored task: the named_test shipped with a real production seam, but
+    # the recorded verdict is unsatisfied because the merge context simply
+    # lacked a review_loop dict (the pre-fix fail-closed default).
+    mis_scored = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+        },
+        changed_files=["backend/app/widget.py", "backend/testing/test_widget.py"],
+        unverified_reason=None,
+    )
+    mis_scored.project_id = project.id
+    mis_scored.completed_at = datetime(2026, 8, 5, 0, 0, 0, tzinfo=timezone.utc)
+    ctx = dict(mis_scored.context or {})
+    # Simulate the pre-fix shape: NO review_loop key + recorded "did not run green".
+    ctx.pop(REVIEW_LOOP_KEY, None)
+    ctx[CODE_ACCEPTANCE_VERDICT_KEY] = {
+        "satisfied": False,
+        "proven": False,
+        "kind": "named_test",
+        "reason": (
+            "declared named_test 'backend/testing/test_widget.py' did not run green "
+            "under a real merge-test verdict (the merge fell open without verification)"
+        ),
+    }
+    mis_scored.context = ctx
+    db_session.add(mis_scored)
+
+    # Genuinely-unverified task: the same verdict shape but an explicit
+    # unverified_merge_reason remains — must NOT be upgraded.
+    genuinely_unverified = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+        },
+        changed_files=["backend/app/widget.py", "backend/testing/test_widget.py"],
+        unverified_reason="no_runnable_suite",
+    )
+    genuinely_unverified.project_id = project.id
+    genuinely_unverified.completed_at = datetime(
+        2026, 8, 5, 1, 0, 0, tzinfo=timezone.utc
+    )
+    gctx = dict(genuinely_unverified.context or {})
+    gctx[CODE_ACCEPTANCE_VERDICT_KEY] = {
+        "satisfied": False,
+        "proven": False,
+        "kind": "named_test",
+        "reason": (
+            "declared named_test 'backend/testing/test_widget.py' did not run green "
+            "under a real merge-test verdict (the merge fell open without verification)"
+        ),
+    }
+    genuinely_unverified.context = gctx
+    db_session.add(genuinely_unverified)
+    await db_session.flush()
+
+    result = await backfill_acceptance_verdicts(db_session)
+    assert result >= 1, "backfill should heal the missing-review_loop mis-scored verdict"
+
+    await db_session.refresh(mis_scored)
+    updated = (mis_scored.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+    assert updated is not None
+    assert updated.get("satisfied") is True
+    assert updated.get("proven") is True, "mis-scored verdict should upgrade to proven"
+    assert updated.get("backfilled") is True
+
+    await db_session.refresh(genuinely_unverified)
+    kept = (genuinely_unverified.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+    assert kept is not None
+    assert kept.get("satisfied") is False
+    assert kept.get("proven") is False, (
+        "a genuinely-unverified merge must stay unsatisfied, not be upgraded"
+    )
 
 
 @pytest.mark.asyncio
