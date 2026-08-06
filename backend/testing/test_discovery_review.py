@@ -1165,11 +1165,82 @@ async def test_invalid_or_failed_decision_blocks_visibly(db_session):
         db_session, second_cycle.id
     )
     second_review = await db_session.get(Task, second_spawn.task_id)
+    second_review.status = TaskStatus.FAILED
+    db_session.add(second_review)
+    await db_session.flush()
     assert await block_failed_discovery_review(
         db_session, task=second_review, reason="provider retries exhausted"
     )
-    assert second_cycle.state == "review_blocked"
+    # A transient decision-task death retries before failing the cycle closed.
+    assert second_cycle.state == "review_pending"
+    assert second_cycle.review_result["status"] == "DECISION_RETRY"
     assert second_cycle.review_result["error"] == "provider retries exhausted"
+
+
+@pytest.mark.asyncio
+async def test_transient_decision_death_retries_then_blocks(db_session):
+    """A decision task that dies without deciding respawns (bounded), then blocks."""
+    _, cycle, _ = await _cycle_with_source(db_session)
+    first = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    assert first.spawned is True
+    seen_review_ids = {first.task_id}
+
+    for _attempt in (1, 2):
+        review = await db_session.get(Task, cycle.review_task_id)
+        review.status = TaskStatus.CANCELLED
+        db_session.add(review)
+        await db_session.flush()
+        result = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+        assert result.spawned is True
+        assert cycle.state == "reviewing"
+        assert cycle.review_task_id not in seen_review_ids
+        seen_review_ids.add(cycle.review_task_id)
+
+    review = await db_session.get(Task, cycle.review_task_id)
+    review.status = TaskStatus.CANCELLED
+    db_session.add(review)
+    await db_session.flush()
+    final = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    assert final.spawned is False
+    assert final.reason == "review_blocked"
+    assert cycle.state == "review_blocked"
+    assert cycle.review_result["status"] == "DECISION_FAILED"
+
+
+@pytest.mark.asyncio
+async def test_failed_parent_stranded_delivery_reviews_instead_of_pending(db_session):
+    """A FAILED research parent's unlanded child PR is settled evidence, not a hold.
+
+    The parent's staging branch dies with it, so the child PR can never gain a
+    landed receipt — the review must spawn and judge the stranded delivery
+    rather than the cycle waiting in EVIDENCE_PENDING forever.
+    """
+    _, cycle, source = await _cycle_with_source(
+        db_session, source_status=TaskStatus.FAILED
+    )
+    db_session.add(
+        Task(
+            project_id=source.project_id,
+            discovery_cycle_id=cycle.id,
+            parent_task_id=source.id,
+            title="Stranded write",
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            context={"pr_number": 123},
+        )
+    )
+    await db_session.flush()
+
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    assert spawned.spawned is True
+    review = await db_session.get(Task, spawned.task_id)
+    manifest = review.first_payload["evidence_packet_manifest"]
+    assert manifest["stranded_delivery_count"] == 1
+    assert not any(
+        "without landed receipt" in item
+        for item in manifest["missing_required_evidence"]
+    )
 
 
 @pytest.mark.asyncio
@@ -1637,11 +1708,14 @@ async def test_sweep_requeues_terminal_legacy_review_and_blocks_cancelled_curren
     db_session.add(current_task)
     await db_session.flush()
 
-    blocked = await maybe_close_and_spawn_discovery_review(
+    # A cancelled current-format decision task retries (bounded) rather than
+    # failing the cycle closed on the first transient death.
+    retried = await maybe_close_and_spawn_discovery_review(
         db_session, current_cycle.id
     )
-    assert blocked.reason == "review_blocked"
-    assert current_cycle.state == "review_blocked"
+    assert retried.spawned is True
+    assert retried.task_id != current_task.id
+    assert current_cycle.state == "reviewing"
 
 
 @pytest.mark.asyncio

@@ -71,7 +71,7 @@ from app.failure_classification import (
     GRADER_CAUSE_REFUSAL,
     GRADER_TIMEOUT_CAUSES,
     GRADER_TRANSIENT_INFRA_CAUSES,
-    INFRA_CLASSES,
+    INFRA_ANALYTICS_CLASSES,
     classify_external_api_subtype,
     classify_failure,
 )
@@ -4825,13 +4825,15 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         _retry_prompt_suffix = ""
         _prior = prior_failure_by_hash.get(fhash)
         if _prior is not None:
-            # Infra failures (SCOPE_EMPTY, PROVISION_FAILURE, RATE_LIMIT, …) are
-            # pre-emptions or infra events — the task never produced useful output.
-            # Treat re-spawns as fresh attempts; injecting "_attempt_number: 2"
-            # for an infra failure would mislead the agent into conservative retry
-            # behaviour that is only appropriate after a real code failure.
+            # Infra failures (SCOPE_EMPTY, PROVISION_FAILURE, RATE_LIMIT, …, and
+            # the terminal routing-contract class UNPLACEABLE_EXECUTION_SITE via
+            # the INFRA analytics superset) are pre-emptions or infra events — the
+            # task never produced useful output. Treat re-spawns as fresh attempts;
+            # injecting "_attempt_number: 2" for an infra failure would mislead the
+            # agent into conservative retry behaviour that is only appropriate after
+            # a real code failure.
             try:
-                if classify_failure(_prior) in INFRA_CLASSES:
+                if classify_failure(_prior) in INFRA_ANALYTICS_CLASSES:
                     _prior = None
             except Exception:
                 pass
@@ -6932,7 +6934,11 @@ async def _record_research_task_failure(task: Task, session: AsyncSession) -> No
     Appends a minimal history entry tagged research_task_failed=True to the direction
     referenced in task.context.direction_id (falling back to the payload field).
     """
-    from app.failure_classification import INFRA_CLASSES, classify_failure
+    from app.failure_classification import (
+        INFRA_ANALYTICS_CLASSES,
+        INFRA_CLASSES,
+        classify_failure,
+    )
 
     # Evergreen-fill requeue adapter: an environmental (infra-class) failure of
     # an evergreen probe requeues the backlog item (attempts+=1, bounded), rather
@@ -6982,8 +6988,11 @@ async def _record_research_task_failure(task: Task, session: AsyncSession) -> No
         "failure_category": failure_category,
     }
     # Infra failures are transient — use the shorter productive cooldown so the
-    # direction is retried promptly instead of waiting out the full unproductive window.
-    productive = failure_category in INFRA_CLASSES
+    # direction is retried promptly instead of waiting out the full unproductive
+    # window.  The INFRA analytics superset also admits UNPLACEABLE_EXECUTION_SITE:
+    # a never-placed research task is a routing/platform condition, not a
+    # direction defect, so it must not mark the direction unproductive either.
+    productive = failure_category in INFRA_ANALYTICS_CLASSES
     _found = False
 
     def _record_failure(dirs: list) -> None:

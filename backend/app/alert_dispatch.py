@@ -206,7 +206,13 @@ async def _create_rollback_alerts(
 
 
 async def _create_halted_recovery_alerts(session: AsyncSession) -> None:
-    """Create INFO alerts and dismiss existing HALTED ERROR alerts when deployment auto-recovers."""
+    """Dismiss HALTED ERROR alerts and raise the recovery INFO alert only when the alert policy permits it.
+
+    The recovery event is routed to the timeline (not a durable alert row) by
+    ``ALERT_EVENT_POLICIES`` and INFO severity is suppressed by the default
+    ``allow_info=False``, so under the default policy this only dismisses the
+    prior HALTED ERROR alerts and does not create a new INFO row.
+    """
     recovery_title = "Deployment auto-recovered from HALTED state after 1h cooldown"
     now = _utcnow()
     global_limit = _runtime_config.get("project_broadcast_limit", 1000)
@@ -244,15 +250,22 @@ async def _create_halted_recovery_alerts(session: AsyncSession) -> None:
         for h in halted_by_project.get(pid, []):
             h.dismissed_at = now
             session.add(h)
-        # Create INFO recovery alert
-        alert = Alert(
+        # Create the INFO recovery alert only when the alert policy permits it.
+        # The default policy routes ``deployment.halted_recovered`` to the
+        # timeline (not a durable alert row) and suppresses INFO severity, so
+        # this is normally a no-op that leaves only the dismissal above.
+        alert, _created, _decision = await create_project_alert_if_allowed(
+            session,
             project_id=pid,
+            event_type="deployment.halted_recovered",
             severity=AlertSeverity.INFO,
             title=recovery_title,
             message=recovery_title,
-            event_type="deployment.halted_recovered",
+            source="alert_dispatch",
+            dedupe_key=f"deployment.halted_recovered:{pid}",
         )
-        session.add(alert)
+        if alert is None:
+            continue
         await broadcast_to_project(
             str(pid),
             "alert_created",
@@ -2030,23 +2043,16 @@ async def _maybe_create_compute_image_drift_alert(
     Deduplicated on a STABLE title so a project that rebuilds on consecutive
     sweep ticks raises exactly ONE open alert per project; the dep_hash and
     pinned_ref live in the message so a moving metric never defeats dedup.
+    The durable row is created only when the alert policy permits it — the
+    default policy has ``allow_info=False``, so the INFO-severity drift event
+    is suppressed unless a project opts into INFO for this event type.
     Commits its own ``Alert`` row and broadcasts ``alert_created``; caller
     wraps best-effort so an alert failure can never abort the sweep.
 
     Returns ``True`` when a NEW alert was created, ``False`` when dedup
-    short-circuited.
+    short-circuited or the policy suppressed the alert.
     """
     title = _COMPUTE_IMAGE_DRIFT_ALERT_TITLE
-    existing = await session.execute(
-        select(Alert).where(
-            Alert.project_id == project_id,
-            Alert.task_id.is_(None),
-            Alert.dismissed_at.is_(None),
-            Alert.title == title,
-        )
-    )
-    if existing.scalars().first() is not None:
-        return False
     ref_label = pinned_ref or "(unknown)"
     if len(ref_label) > 120:
         ref_label = ref_label[:117] + "…"
@@ -2057,14 +2063,21 @@ async def _maybe_create_compute_image_drift_alert(
         f"New pinned ref: {ref_label}. "
         f"Authoring agents and new compute jobs will use the updated image."
     )[:1000]
-    alert = Alert(
+    alert, created, _decision = await create_project_alert_if_allowed(
+        session,
         project_id=project_id,
+        event_type="compute.image_drift",
         severity=AlertSeverity.INFO,
         title=title,
         message=message,
-        event_type="compute.image_drift",
+        source="alert_dispatch",
+        dedupe_key=f"compute.image_drift:{project_id}",
     )
-    session.add(alert)
+    if alert is None:
+        return False
+    if not created:
+        await session.commit()
+        return False
     await session.commit()
     await broadcast_to_project(
         str(project_id),
@@ -2105,37 +2118,37 @@ async def _maybe_create_compute_image_drift_deferred_alert(
     Deduplicated on a STABLE title so a project deferred across consecutive
     sweep ticks raises exactly ONE open alert per project; the dep_hash and
     reason live in the message so a moving metric never defeats dedup.
+    The durable row is created only when the alert policy permits it — the
+    default policy has ``allow_info=False``, so the INFO-severity drift event
+    is suppressed unless a project opts into INFO for this event type.
     Commits its own ``Alert`` row and broadcasts ``alert_created``; the caller
     wraps best-effort so an alert failure can never abort the sweep.
 
     Returns ``True`` when a NEW alert was created, ``False`` when dedup
-    short-circuited.
+    short-circuited or the policy suppressed the alert.
     """
     title = _COMPUTE_IMAGE_DRIFT_DEFERRED_ALERT_TITLE
-    existing = await session.execute(
-        select(Alert).where(
-            Alert.project_id == project_id,
-            Alert.task_id.is_(None),
-            Alert.dismissed_at.is_(None),
-            Alert.title == title,
-        )
-    )
-    if existing.scalars().first() is not None:
-        return False
     hash_label = (dep_hash or "(unknown)")[:32]
     message = (
         f"The project's baked compute image dependency manifest changed "
         f"(dep_hash={hash_label}), but the rebuild was deferred: {reason}. "
         f"The hourly refresh sweep will retry on the next pass."
     )[:1000]
-    alert = Alert(
+    alert, created, _decision = await create_project_alert_if_allowed(
+        session,
         project_id=project_id,
+        event_type="compute.image_drift_deferred",
         severity=AlertSeverity.INFO,
         title=title,
         message=message,
-        event_type="compute.image_drift_deferred",
+        source="alert_dispatch",
+        dedupe_key=f"compute.image_drift_deferred:{project_id}",
     )
-    session.add(alert)
+    if alert is None:
+        return False
+    if not created:
+        await session.commit()
+        return False
     await session.commit()
     await broadcast_to_project(
         str(project_id),

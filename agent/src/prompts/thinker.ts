@@ -5,6 +5,7 @@ import { sendLog, runClaudeCode, persistAndPostStatus } from '../index.js';
 import { PLAYBOOK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, READ_ONLY_BASH_WRITE_NOTE } from '../prompt.js';
 import { extractJsonObjectDetailed } from '../json-extract.js';
 import { repairStructuredOutput } from '../handlers/structured-output-repair.js';
+import { assembleStableVariablePrompt, type AssembledStableVariablePrompt } from './assemble.js';
 import type { RepairStructuredOutputResult } from '../handlers/structured-output-repair.js';
 
 export function computeResearchPlanPromptFingerprint(mode: 'plan' | 'research'): string {
@@ -279,67 +280,44 @@ export interface ThinkerPromptParams {
   compactionHintsSection?: string;
 }
 
-export function buildThinkerPrompt(p: ThinkerPromptParams): string {
-  // Bootstrap-vs-recover branch. A genuinely empty model gets the cold-start
-  // bootstrap path. A model that EXISTS but was dropped/summarized by the
-  // packer (recovery === 'fetch') must NOT be bootstrapped from scratch — that
-  // would wipe real durable state when the Executor submits the full
-  // replacement. Steer it to fetch-then-edit instead. A present model needs
-  // neither block.
-  const bootstrapOrRecoverSection =
-    p.problemModelRecovery === 'empty'
-      ? `# Bootstrap (when the problem_model is empty)
+/**
+ * Placeholder tokens for the per-task /tmp handoff file paths used in the
+ * stable prefix. The stable prefix must be byte-identical across tasks with
+ * different taskIds (Anthropic's prefix cache matches from byte 0, so a
+ * taskId leaked into a file path would bust the cache for the whole block).
+ * Each token is mapped to this task's concrete path in
+ * buildStrategicHandoffPathsSection (volatile suffix).
+ */
+const RUNNING_UPDATE_PATH_TOKEN = '$RUNNING_UPDATE_PATH';
+const PROBLEM_MODEL_PATH_TOKEN = '$PROBLEM_MODEL_PATH';
+const RESEARCH_PROGRESS_PATH_TOKEN = '$RESEARCH_PROGRESS_PATH';
+const PROPOSED_CRITERIA_PATH_TOKEN = '$PROPOSED_CRITERIA_PATH';
 
-Populate intent from: the existing vision field (if any), the conversation_thread (the user's own words), and rejected_proposals (they tell you what the user does NOT want). Populate capabilities from: what shipped work and active directions observably demonstrate the project does. Open initial gaps for: anything in conversation_thread the user explicitly asked for that isn't yet a capability; anything in the vision's stated direction not reflected in shipped work. Bootstrapped models are imperfect by design — subsequent cycles refine. Don't fail to populate because you're uncertain.`
-      : p.problemModelRecovery === 'fetch'
-      ? `# Recover your durable model (fetch-then-edit)
-
-Your problem_model was NOT shipped in full this cycle — the packer dropped or summarized it under the byte budget (see "Context not shipped this cycle" above). It EXISTS; **this is not the first cycle.** Do NOT bootstrap a cold-start model from the sections above: the backend merges your output into the durable model (upsert by key, omitted entries preserved), so a cold-start model would upsert guessed placeholder entries over the real capabilities, gaps, and friction — and the per-gap history you never saw can't be reconstructed from scratch.
-
-Instead: run \`./fetch problem-model\` to retrieve the full current model, then EDIT it in place — refine intent, open/close gaps, upgrade capabilities, record friction — and submit the edited whole.`
-      : '';
-  // Pre-trim steering. Independent of bootstrap/recover: the model IS present,
-  // but specific gaps' append-only memory was shortened to a recent window for
-  // payload size. The shortened view is NOT the gap's complete arc, so steer
-  // the agent to pull full history before deciding whether to push, refine, or
-  // retire those gaps — otherwise it reasons over a partial lifetime it has no
-  // reason to suspect is partial.
-  const gapMemoryTrimmedSection =
-    p.gapMemoryTrimmedGapIds && p.gapMemoryTrimmedGapIds.length > 0
-      ? `# Some gap memory was shortened for payload size
-
-The append-only \`history\` / \`past_moves\` of these gaps were trimmed to only their most recent entries when this payload was assembled (look for the \`_gap_memory_trimmed\` marker in your problem_model above): ${p.gapMemoryTrimmedGapIds.join(', ')}. What you see is the tail, NOT the gap's full arc.
-
-When you reason about whether to keep pushing, refine, or retire any of these gaps, first run \`./fetch problem-model\` (or \`./fetch gap <gap_id>\`) to read its complete history and past_moves. Do not treat the shortened view as the gap's entire lifetime — a long-lived gap may have a much longer arc than the few events shown here.`
-      : '';
+/**
+ * Stable leading prefix of the strategic thinker prompt — the instruction text
+ * that is byte-identical across cycles for a given project, so Anthropic's
+ * automatic prefix cache can match the whole block. Contains ONLY
+ * project-invariant content: the intro, `# Project: <name>`, `Self-repo`,
+ * the `# Your job` / `# How to think` guidance, the `# Running update` guidance,
+ * the `# What to write` output contract, and the playbook + tool guidance.
+ * Per-cycle payload data lives in buildStrategicVolatileSuffix.
+ *
+ * Task-specific handoff file paths are referenced by the placeholder tokens
+ * above (never by their concrete taskId-derived paths) and resolved to the
+ * actual `/tmp/...` paths in the volatile suffix.
+ *
+ * This is a byte-ORDER refactor of the previous inline assembly: every section
+ * that was emitted before is still emitted — the volatile per-cycle payload is
+ * just relocated to the suffix so it no longer busts the cache prefix early.
+ */
+function buildStrategicStablePrefix(p: ThinkerPromptParams): string {
   return `You own this project's direction. Not as a task runner, not as a scheduler — as the mind responsible for where it goes.
 
 Each cycle you look at what's happening and decide whether it's still on the right track. If it is, keep going. If it isn't, change course. You're allowed to be wrong; you're not allowed to defer. The problem_model below is your working understanding of the project — nothing else has more authority. Update it, defend it, rewrite it when you see a better shape. The user hired you for judgment, not for audit trails or incremental polish.
 
 # Project: ${p.projectName}
-${p.clockHeader}
 Self-repo: ${p.isSelfRepo ? 'true' : 'false'}
-${p.contextPrefix}
-${p.packerMetaSection ? `\n${p.packerMetaSection}\n` : ''}
-${p.payloadStalenessSection ? `\n${p.payloadStalenessSection}\n` : ''}
-${p.strategicContext ? `\n## Running Context (from prior cycles)\n${p.strategicContext}\n` : ''}
-${p.problemModelSection}
-${p.cycleStartReconciliationSection ? `\n${p.cycleStartReconciliationSection}\n` : ''}
 
-${p.reflectionSection}
-
-${p.runningUpdateSection}
-${p.runningUpdateSupersededSection || ''}
-## Architecture (design document — overview index)
-${p.designDocJson || 'No design document yet.'}
-${p.designDocJson ? '_The above is an OVERVIEW INDEX of the design document — which systems and capabilities exist, their reconciled presence status, and declared backing module paths. `repo_overview` additionally carries inline bootstrap context (tech_stack, directory_layout, first_steps) for immediate orientation; the full section remains fetchable. It is NOT the full design doc. To read any section\'s FULL prose/specs, run `./design-doc get <key>` (e.g. `./design-doc get systems/auth`); run `./design-doc list` to enumerate every section key. Fetch the full text whenever you need a section\'s detailed prose or specs to reason or decide._' : ''}
-
-${p.visionJson ? `## Vision (legacy artifact — use problem_model instead; retained for bootstrap reference only)\n${p.visionJson}\n` : ''}
-${p.outcomeSection}${p.previousDecisionOutcomes}${p.pastRetirementCritiquesSection}${p.retiredDirectionsSummarySection}
-${p.directionPortfolioSection}
-${p.stagedDirectionsSection ? `\n${p.stagedDirectionsSection}\n` : ''}${p.userPausedSection}${p.rejectedProposalsSection}${p.operatorOverridesSection}
-${p.availableCapabilitiesSection ? `\n${p.availableCapabilitiesSection}` : ''}${p.modelHealthSection}${p.pruneCandidatesSection ? `\n${p.pruneCandidatesSection}\n` : ''}${p.systemMaturitySection}${p.driftSection}${p.heldDirectionsSection ? `\n${p.heldDirectionsSection}` : ''}${p.efficiencySnapshotSection}${p.ciComplianceSection ? `\n${p.ciComplianceSection}` : ''}${p.completionDebtSection ? `\n${p.completionDebtSection}` : ''}${p.pendingFollowupsSection ? `\n${p.pendingFollowupsSection}` : ''}${p.sweepComparisonSection ? `\n${p.sweepComparisonSection}` : ''}${p.localRunnerSection ? `\n${p.localRunnerSection}\n` : ''}${p.compactionHintsSection ? `\n${p.compactionHintsSection}\n` : ''}
-${p.recentWorkSection}${p.versionPhaseSection}${p.memoCitationsSection}
 # Your job
 
 You operate on a **problem model** — a structured representation of what the user wants (intent), what the project can do (capabilities), and what's between those (gaps). Friction is *obstacles* in the way.
@@ -391,10 +369,6 @@ without either a move or an explicit no-change judgment is drift.
 
 **Model-size hygiene (soft).** The "Problem-model size" section above reports weight. Healthy: **<=12 active gaps / <=20 capabilities / <=8 active friction** — dimension >=1.5x = \`growing\`, >=2x = \`large\`, >=3x = \`oversized\`. When \`large\`/\`oversized\`, close resolved entries before opening new ones (**never a hard cap**). A model you can't read in one pass is one you can't defend.
 
-${p.selfImprovementBlock}
-
-${bootstrapOrRecoverSection}
-${gapMemoryTrimmedSection ? `\n${gapMemoryTrimmedSection}\n` : ''}
 # Running update: what the user reads
 
 The running_update is a **single living markdown document** the user sees as "the project's current state." It is NOT a log of per-cycle entries — you rewrite it each cycle as a clean snapshot, not by appending. The prior version is shown above; refine it. Remove what's now stale, integrate what's now true, keep it short and coherent.
@@ -517,13 +491,13 @@ Each direction in the "Direction outcomes" section above lists its cumulative co
 **Weight evidence by verification basis.** A direction may carry a \`recent_findings_verification_basis\` distribution (counts of \`code_verified\` / \`path_verified\` / \`pattern_inferred\` / \`deduced\` findings). This records HOW each finding's claim was established, not whether it is implementable. Weight your \`evidence_progress\` read accordingly: a direction whose recent findings are predominantly \`code_verified\`/\`path_verified\` warrants higher confidence that its claimed progress is real than one whose findings are predominantly \`pattern_inferred\`/\`deduced\`. This is purely a WEIGHTING signal, NOT a gate — inferred findings remain valid and are often correct; a heavily-inferred direction is not stalled merely for being inferred.
 
 ## 4. Running update document (for the user)
-Write the full refined running_update as markdown to \`/tmp/running_update_${p.taskId}.md\` ${READ_ONLY_BASH_WRITE_NOTE} (also show it as a code block in your analysis for auditability — the file is the authoritative handoff to the Executor). This is the document the user sees as "project current state" — rewrite, don't append. Under 400 words. Follow the section guidance above.
+Write the full refined running_update as markdown to \`${RUNNING_UPDATE_PATH_TOKEN}\` ${READ_ONLY_BASH_WRITE_NOTE} (also show it as a code block in your analysis for auditability — the file is the authoritative handoff to the Executor). This is the document the user sees as "project current state" — rewrite, don't append. Under 400 words. Follow the section guidance above.
 
 ## 5. Self-reflection (optional)
 Only if something this cycle was hard in a way worth remembering. Fields: what_was_hard, missing_context, proposed_self_improvement. Empty is fine. Don't fill with platitudes.
 
 ## 6. Problem model (update — non-destructive merge)
-Write your problem_model update as JSON to \`/tmp/problem_model_${p.taskId}.json\` ${READ_ONLY_BASH_WRITE_NOTE} (use a code block in your analysis for auditability AND write the file — the file is the authoritative handoff to the Executor). The backend MERGES the agent-owned collections (\`capabilities\`, \`gaps\`, \`friction\`, \`pending_user_confirmation\`) rather than replacing them: entries upsert by stable key (\`capabilities\` by name; the rest by id), **entries you omit are preserved**, and per-gap \`history\`/\`past_moves\` union. So you do NOT need to reconstruct every gap/capability from memory — emit the ones you're changing plus enough to stay coherent. If a section was trimmed or dropped from your payload (see "Context not shipped" above), write just the parts you're changing and trust the rest is retained, or \`./fetch problem-model\` first to read the full current state.
+Write your problem_model update as JSON to \`${PROBLEM_MODEL_PATH_TOKEN}\` ${READ_ONLY_BASH_WRITE_NOTE} (use a code block in your analysis for auditability AND write the file — the file is the authoritative handoff to the Executor). The backend MERGES the agent-owned collections (\`capabilities\`, \`gaps\`, \`friction\`, \`pending_user_confirmation\`) rather than replacing them: entries upsert by stable key (\`capabilities\` by name; the rest by id), **entries you omit are preserved**, and per-gap \`history\`/\`past_moves\` union. So you do NOT need to reconstruct every gap/capability from memory — emit the ones you're changing plus enough to stay coherent. If a section was trimmed or dropped from your payload (see "Context not shipped" above), write just the parts you're changing and trust the rest is retained, or \`./fetch problem-model\` first to read the full current state.
 
 Normally your **whole** problem_model is shipped inline this cycle — full gaps, capabilities, and friction — so you edit it directly. Only in the exceptional case where the full model cannot fit the byte budget does it arrive floored/skeletonized (recoverable siblings yield first, so this is rare). **If** that happened — look for the \`_agent_view_floor_applied\` marker, which means gap \`description\`/\`evidence\` were stripped and capabilities/friction were reduced to \`name\`+\`status\` — **echo that marker back verbatim** in your update file. The backend uses it to know which fields you never actually saw, so editing and resubmitting a skeleton entry (e.g. bumping a gap's \`priority\` or a capability's \`status\`) won't blank the durable \`description\`, \`notes\`, \`source\`, etc. you couldn't see. Without the marker echoed, a blank field is treated as a deliberate clear. When the marker is absent (the normal case), the model you see is complete — edit freely.
 
@@ -552,7 +526,7 @@ Source = {type (user_message|friction_promotion|agent_observation|self_reflectio
 
 When describing changes in prose, be precise: "opening gap g-xxx (from user_message msg-N)", "retiring direction d-xxx (gap g-yyy closed by merged PR #N)".
 
-Before finishing, write /tmp/research_progress_${p.taskId}.md ${READ_ONLY_BASH_WRITE_NOTE} — a concise markdown summary (≤3000 chars) capturing the model changes proposed, gaps opening/closing, and moves. This is a breadcrumb for retry agents if this task fails — lets a retry pick up from your analysis rather than redoing it from scratch.
+Before finishing, write ${RESEARCH_PROGRESS_PATH_TOKEN} ${READ_ONLY_BASH_WRITE_NOTE} — a concise markdown summary (≤3000 chars) capturing the model changes proposed, gaps opening/closing, and moves. This is a breadcrumb for retry agents if this task fails — lets a retry pick up from your analysis rather than redoing it from scratch.
 
 ## 7. Version goal (author or revise when warranted)
 
@@ -580,7 +554,7 @@ Author criteria only when the version needs a root acceptance contract:
 
 Skip entirely if criteria already exist and are reasonably mapped. Do NOT fabricate criteria when the version goal is unset — Section 7 handles that case first.
 
-When criteria are warranted, write \`/tmp/proposed_criteria_${p.taskId}.json\` ${READ_ONLY_BASH_WRITE_NOTE} as the backend payload shape:
+When criteria are warranted, write \`${PROPOSED_CRITERIA_PATH_TOKEN}\` ${READ_ONLY_BASH_WRITE_NOTE} as the backend payload shape:
 
 \`\`\`json
 {"criteria":[{"text":"Users can complete the key workflow without manual operator intervention.","direction_keys":["d-xxx"]}],"retract":[{"criterion_key":"c-old-key","reason":"All directions that could produce covering evidence have been retired; this criterion is permanently uncoverable.","superseded_by_key":"c-new-key"}]}
@@ -599,15 +573,145 @@ Retractions are processed before additions this cycle. Omit the \`retract\` key 
 
 Keep the total to 5-7 criteria maximum. Frame text as outcomes ("Users can X", "System handles Y"), not implementation steps ("Implement Z"). Ground every criterion in the version goal and active gap descriptions. If no criteria are needed this cycle, do not write the file at all.
 
+${PLAYBOOK_GUIDANCE}
+
+${DEFAULT_TOOL_GUIDANCE}
+`;
+}
+
+/**
+ * Resolve the stable-prefix path tokens to this task's concrete /tmp handoff
+ * paths. This is the ONLY place the taskId-derived paths appear; because the
+ * block lives in the volatile suffix, the cacheable prefix above stays
+ * byte-identical across tasks with different taskIds.
+ */
+function buildStrategicHandoffPathsSection(p: ThinkerPromptParams): string {
+  return [
+    '# Handoff file paths (this task)',
+    '',
+    'The output sections above reference task-specific handoff files by the',
+    'placeholder tokens below. Write each file to its concrete path — the',
+    'Executor reads these exact files verbatim:',
+    `- \`${RUNNING_UPDATE_PATH_TOKEN}\` → \`/tmp/running_update_${p.taskId}.md\``,
+    `- \`${PROBLEM_MODEL_PATH_TOKEN}\` → \`/tmp/problem_model_${p.taskId}.json\``,
+    `- \`${RESEARCH_PROGRESS_PATH_TOKEN}\` → \`/tmp/research_progress_${p.taskId}.md\``,
+    `- \`${PROPOSED_CRITERIA_PATH_TOKEN}\` → \`/tmp/proposed_criteria_${p.taskId}.json\``,
+    '',
+  ].join('\n');
+}
+
+/**
+ * Volatile suffix of the strategic thinker prompt — every per-cycle payload
+ * section, emitted after the stable prefix so it cannot invalidate the
+ * cacheable region. Everything that varies per call (clock, context prefix,
+ * problem model, portfolio, messages) lives here; nothing stable may appear in
+ * this function, and nothing volatile may be added to buildStrategicStablePrefix.
+ */
+function buildStrategicVolatileSuffix(p: ThinkerPromptParams): string {
+  // Bootstrap-vs-recover branch. A genuinely empty model gets the cold-start
+  // bootstrap path. A model that EXISTS but was dropped/summarized by the
+  // packer (recovery === 'fetch') must NOT be bootstrapped from scratch — that
+  // would wipe real durable state when the Executor submits the full
+  // replacement. Steer it to fetch-then-edit instead. A present model needs
+  // neither block.
+  const bootstrapOrRecoverSection =
+    p.problemModelRecovery === 'empty'
+      ? `# Bootstrap (when the problem_model is empty)
+
+Populate intent from: the existing vision field (if any), the conversation_thread (the user's own words), and rejected_proposals (they tell you what the user does NOT want). Populate capabilities from: what shipped work and active directions observably demonstrate the project does. Open initial gaps for: anything in conversation_thread the user explicitly asked for that isn't yet a capability; anything in the vision's stated direction not reflected in shipped work. Bootstrapped models are imperfect by design — subsequent cycles refine. Don't fail to populate because you're uncertain.`
+      : p.problemModelRecovery === 'fetch'
+      ? `# Recover your durable model (fetch-then-edit)
+
+Your problem_model was NOT shipped in full this cycle — the packer dropped or summarized it under the byte budget (see "Context not shipped this cycle" above). It EXISTS; **this is not the first cycle.** Do NOT bootstrap a cold-start model from the sections above: the backend merges your output into the durable model (upsert by key, omitted entries preserved), so a cold-start model would upsert guessed placeholder entries over the real capabilities, gaps, and friction — and the per-gap history you never saw can't be reconstructed from scratch.
+
+Instead: run \`./fetch problem-model\` to retrieve the full current model, then EDIT it in place — refine intent, open/close gaps, upgrade capabilities, record friction — and submit the edited whole.`
+      : '';
+  // Pre-trim steering. Independent of bootstrap/recover: the model IS present,
+  // but specific gaps' append-only memory was shortened to a recent window for
+  // payload size. The shortened view is NOT the gap's complete arc, so steer
+  // the agent to pull full history before deciding whether to push, refine, or
+  // retire those gaps — otherwise it reasons over a partial lifetime it has no
+  // reason to suspect is partial.
+  const gapMemoryTrimmedSection =
+    p.gapMemoryTrimmedGapIds && p.gapMemoryTrimmedGapIds.length > 0
+      ? `# Some gap memory was shortened for payload size
+
+The append-only \`history\` / \`past_moves\` of these gaps were trimmed to only their most recent entries when this payload was assembled (look for the \`_gap_memory_trimmed\` marker in your problem_model above): ${p.gapMemoryTrimmedGapIds.join(', ')}. What you see is the tail, NOT the gap's full arc.
+
+When you reason about whether to keep pushing, refine, or retire any of these gaps, first run \`./fetch problem-model\` (or \`./fetch gap <gap_id>\`) to read its complete history and past_moves. Do not treat the shortened view as the gap's entire lifetime — a long-lived gap may have a much longer arc than the few events shown here.`
+      : '';
+
+  return `${buildStrategicHandoffPathsSection(p)}
+${p.selfImprovementBlock}
+${p.clockHeader}
+${p.contextPrefix}
+${p.packerMetaSection ? `\n${p.packerMetaSection}\n` : ''}
+${p.payloadStalenessSection ? `\n${p.payloadStalenessSection}\n` : ''}
+${p.strategicContext ? `\n## Running Context (from prior cycles)\n${p.strategicContext}\n` : ''}
+${p.problemModelSection}
+${p.cycleStartReconciliationSection ? `\n${p.cycleStartReconciliationSection}\n` : ''}
+
+${p.reflectionSection}
+
+${p.runningUpdateSection}
+${p.runningUpdateSupersededSection || ''}
+## Architecture (design document — overview index)
+${p.designDocJson || 'No design document yet.'}
+${p.designDocJson ? '_The above is an OVERVIEW INDEX of the design document — which systems and capabilities exist, their reconciled presence status, and declared backing module paths. `repo_overview` additionally carries inline bootstrap context (tech_stack, directory_layout, first_steps) for immediate orientation; the full section remains fetchable. It is NOT the full design doc. To read any section\'s FULL prose/specs, run `./design-doc get <key>` (e.g. `./design-doc get systems/auth`); run `./design-doc list` to enumerate every section key. Fetch the full text whenever you need a section\'s detailed prose or specs to reason or decide._' : ''}
+
+${p.visionJson ? `## Vision (legacy artifact — use problem_model instead; retained for bootstrap reference only)\n${p.visionJson}\n` : ''}
+${p.outcomeSection}${p.previousDecisionOutcomes}${p.pastRetirementCritiquesSection}${p.retiredDirectionsSummarySection}
+${p.directionPortfolioSection}
+${p.stagedDirectionsSection ? `\n${p.stagedDirectionsSection}\n` : ''}${p.userPausedSection}${p.rejectedProposalsSection}${p.operatorOverridesSection}
+${p.availableCapabilitiesSection ? `\n${p.availableCapabilitiesSection}` : ''}${p.modelHealthSection}${p.pruneCandidatesSection ? `\n${p.pruneCandidatesSection}\n` : ''}${p.systemMaturitySection}${p.driftSection}${p.heldDirectionsSection ? `\n${p.heldDirectionsSection}` : ''}${p.efficiencySnapshotSection}${p.ciComplianceSection ? `\n${p.ciComplianceSection}` : ''}${p.completionDebtSection ? `\n${p.completionDebtSection}` : ''}${p.pendingFollowupsSection ? `\n${p.pendingFollowupsSection}` : ''}${p.sweepComparisonSection ? `\n${p.sweepComparisonSection}` : ''}${p.localRunnerSection ? `\n${p.localRunnerSection}\n` : ''}${p.compactionHintsSection ? `\n${p.compactionHintsSection}\n` : ''}
+${p.recentWorkSection}${p.versionPhaseSection}${p.memoCitationsSection}
+
+${bootstrapOrRecoverSection}
+${gapMemoryTrimmedSection ? `\n${gapMemoryTrimmedSection}\n` : ''}
 # Current user activity & open messages
 
 The following reflects the live wall clock (relative-time strings such as "N days ago" / message ages). It is deliberately placed AFTER the stable guidance above so those clock-derived strings do not change the cacheable prompt prefix each turn — identical underlying payloads then render an identical prefix regardless of the current time.
 
 ${p.userStateLine}
 ${p.questionSection}${p.feedbackSection}${p.threadSection}
-${PLAYBOOK_GUIDANCE}
+`;
+}
 
-${DEFAULT_TOOL_GUIDANCE}`;
+/**
+ * Assemble the strategic thinker prompt split at the cache boundary. The
+ * byte-identical stable prefix leads; the volatile per-cycle payload follows.
+ * buildThinkerPrompt returns only the final prompt for callers that do not
+ * need the split.
+ */
+export function buildThinkerPromptParts(p: ThinkerPromptParams): {
+  stablePrefix: string;
+  variableBody: string;
+  finalPrompt: string;
+} {
+  const stablePrefix = buildStrategicStablePrefix(p);
+  const variableBody = buildStrategicVolatileSuffix(p);
+  return assembleStableVariablePrompt(stablePrefix, variableBody);
+}
+
+export function buildThinkerPrompt(p: ThinkerPromptParams): string {
+  return buildThinkerPromptParts(p).finalPrompt;
+}
+
+/**
+ * Byte share of the stable cacheable prefix within the assembled prompt.
+ *
+ * c-24f843a8 clause (2) requires the stable prefix to carry the MAJORITY
+ * (>50%) of the prompt's instruction bytes — a cache boundary whose stable
+ * region is only a small fraction of the prompt would pass byte-identity
+ * checks while delivering almost no cache benefit. "Instruction bytes" = the
+ * full rendered prompt the model actually receives (stablePrefix +
+ * variableBody), counted as UTF-8 bytes. Nothing is excluded from the
+ * denominator, so the ratio cannot be flattered by dropping volatile bytes.
+ */
+export function computeStablePrefixByteShare(parts: AssembledStableVariablePrompt): number {
+  const totalBytes = Buffer.byteLength(parts.finalPrompt, 'utf8');
+  if (totalBytes === 0) return 0;
+  return Buffer.byteLength(parts.stablePrefix, 'utf8') / totalBytes;
 }
 
 // ── Pass-1 gate: run thinker, verify artifacts, retry once if missing ────────

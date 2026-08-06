@@ -19,6 +19,13 @@ from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 from app import strategic_cycle
+from app.strategic_review_effort import (
+    CONSEQUENTIAL_EFFORT,
+    CONSEQUENTIAL_TIER,
+    ROUTINE_EFFORT,
+    ROUTINE_TIER,
+    classify_strategic_review_effort,
+)
 from app.direction_metrics import (
     _compute_direction_quality_score,
     canonical_cost_per_merged_pr,
@@ -228,6 +235,9 @@ from app.strategic_payload_summaries import (  # noqa: F401 — re-exported for 
     _KNOWLEDGE_INDEX_HEAVY_FIELDS,
     _KNOWLEDGE_INDEX_KEEP_KEYS,
     _summarize_knowledge_index,
+    _floor_knowledge_index,
+    _floor_design_doc_index,
+    _floor_outcome_evaluation,
     _PREV_OUTCOMES_ROLE_KEEP,
     _PREV_OUTCOMES_TEXT_CAP,
     _PREV_OUTCOMES_SUMMARY_TEXT_CAP,
@@ -968,22 +978,19 @@ def _build_staged_directions_summary(project: Project) -> list[dict]:
 def _summarize_outcome_evaluation(oe: dict) -> dict:
     """Trim an outcome_evaluation payload to the strategic agent's working set.
 
-    The biggest growth driver is ``direction_outcomes`` (one entry per active
-    direction, each carrying scope_performance, type_distribution, lifetime
-    aggregates, etc). Cap to top-N by activity. Top-level summaries
-    (``overall_summary``, ``systems``, trend) are kept in full — they're
-    aggregates that don't grow with project size.
+    The biggest growth driver is ``directions`` (one entry per active direction,
+    each carrying scope_performance, type_distribution, lifetime aggregates,
+    etc). Cap to top-N by activity. Top-level summaries (``overall``, ``systems``,
+    trend) are kept in full — they're aggregates that don't grow with project
+    size.
     """
     if not isinstance(oe, dict):
         return oe
     trimmed = dict(oe)
-    direction_outcomes = trimmed.get("direction_outcomes")
-    if (
-        isinstance(direction_outcomes, list)
-        and len(direction_outcomes) > _OUTCOME_DIRECTION_OUTCOMES_KEEP
-    ):
+    directions = trimmed.get("directions")
+    if isinstance(directions, list) and len(directions) > _OUTCOME_DIRECTION_OUTCOMES_KEEP:
         sorted_outcomes = sorted(
-            direction_outcomes,
+            directions,
             key=lambda d: (
                 int((d or {}).get("merged") or 0) * 3
                 + int((d or {}).get("failed") or 0)
@@ -991,9 +998,7 @@ def _summarize_outcome_evaluation(oe: dict) -> dict:
             ),
             reverse=True,
         )
-        trimmed["direction_outcomes"] = sorted_outcomes[
-            :_OUTCOME_DIRECTION_OUTCOMES_KEEP
-        ]
+        trimmed["directions"] = sorted_outcomes[:_OUTCOME_DIRECTION_OUTCOMES_KEEP]
     return trimmed
 
 
@@ -2140,6 +2145,19 @@ def _build_operator_steering_directive(
 
 
 
+# StrategicCycle outcomes that mean the cycle itself failed or stalled. A cycle
+# spawned right after one of these is a recovery decision, never routine.
+_FAILED_CYCLE_OUTCOMES = frozenset(
+    {
+        strategic_cycle.OUTCOME_FAILED_PHASE1,
+        strategic_cycle.OUTCOME_FAILED_PHASE2,
+        strategic_cycle.OUTCOME_STALLED_PHASE1,
+        strategic_cycle.OUTCOME_STALLED_PHASE2,
+        strategic_cycle.OUTCOME_FAILED_PHASE2_SPAWN,
+        strategic_cycle.OUTCOME_THINKER_ARTIFACTS_MISSING,
+    }
+)
+
 # Schemas for pack_under_budget. Each key declares its priority tier and an
 # optional summarize_fn. Critical = always shipped (raises if can't fit).
 # High = shipped unless budget exhausted by summarized criticals + earlier
@@ -2277,16 +2295,27 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # presence status/modules/warning for systems/capabilities). The full
     # per-section content is fetched on demand via POST /api/agent/design-doc
     # (op:get) — see _design_doc_index. The summarize fallback drops per-entry
-    # summaries to a navigation skeleton under genuine budget exhaustion.
-    "design_doc": {"priority": "medium", "summarize": _summarize_design_doc_index, "fetch_verb": "section"},
+    # summaries to a navigation skeleton under genuine budget exhaustion. Core
+    # section: the floor callback guarantees a compact architecture-relevant
+    # skeleton (systems/capabilities first) ALWAYS ships, so design context
+    # degrades before it disappears entirely — never dropped wholesale.
+    "design_doc": {
+        "priority": "medium",
+        "summarize": _summarize_design_doc_index,
+        "floor": _floor_design_doc_index,
+        "fetch_verb": "section",
+    },
     # Compact, body-omitted index of existing knowledge documents (web_research /
     # design output). Medium priority. Summarize fallback keeps the newest few
     # entries with their navigation pointers (id/title/topic/direction) and drops
     # the heavy per-arm-verdict / provenance sub-fields; full bodies remain
-    # fetchable on demand via ``./fetch knowledge <id>``.
+    # fetchable on demand via ``./fetch knowledge <id>``. Core section: the floor
+    # callback guarantees a pointer-only digest of the top decision-relevant
+    # entries ALWAYS ships, so knowledge context degrades before disappearing.
     "knowledge_index": {
         "priority": "medium",
         "summarize": _summarize_knowledge_index,
+        "floor": _floor_knowledge_index,
         "fetch_verb": "knowledge",
     },
     # Pending knowledge follow-ups: design/web_research docs the strategist
@@ -2305,9 +2334,16 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
         "priority": "medium",
         "summarize": _summarize_capability_trial_verdicts,
     },
+    # Planned-vs-actual portfolio assessment. Medium priority; the summarize
+    # fallback caps ``directions`` to the top-N by activity. Core section: the
+    # floor callback guarantees the headline aggregates plus the top few
+    # direction outcomes ALWAYS ship (with a ``_outcome_floor`` marker + the
+    # "sections" fetch verb), so outcome-evaluation context never drops whole.
     "outcome_evaluation": {
         "priority": "medium",
         "summarize": _summarize_outcome_evaluation,
+        "floor": _floor_outcome_evaluation,
+        "fetch_verb": "sections",
     },
     "recent_interventions": {
         "priority": "medium",
@@ -5250,6 +5286,8 @@ async def _finalize_strategic_review_spawn(
     launched_by_user_id: str | None = None,
     runner_pin_id: str | None = None,
     integrity_conflict_counts: dict[str, int] | None = None,
+    effort_tier: str | None = None,
+    effort_reason: str | None = None,
     expected_legacy_generation: int | None = None,
 ) -> bool:
     """Guarded INSERT/commit tail for the cadence spawn path.
@@ -5428,6 +5466,9 @@ async def _finalize_strategic_review_spawn(
     )
     if _cycle_row is not None and integrity_conflict_counts is not None:
         strategic_cycle.record_integrity_conflict_counts(_cycle_row, integrity_conflict_counts)
+        session.add(_cycle_row)
+    if _cycle_row is not None and effort_tier is not None:
+        strategic_cycle.record_effort_tier(_cycle_row, effort_tier, effort_reason)
         session.add(_cycle_row)
     await commit_legacy_authorized(
         session, project_id, expected_legacy_generation
@@ -5670,6 +5711,56 @@ async def _spawn_strategic_review(
         _res_recent_handled = await _fetch_recent_handled_conversation(
             session, project.id
         )
+        # Pre-spawn effort classification for the resident fast path: classify
+        # from DB-only signals; the LTS version-phase is unexamined (its build
+        # can hit GitHub), so an LTS split forces CONSEQUENTIAL.
+        _res_recent_cycle_failures = any(
+            (h or {}).get("outcome") in _FAILED_CYCLE_OUTCOMES
+            for h in (cycle_history or [])[:3]
+        )
+        _res_prior_cycle_dirty = False
+        try:
+            _res_trend = await strategic_cycle.recent_integrity_conflict_trend(
+                session, project.id, limit=10
+            )
+            _res_last_counts = (_res_trend or {}).get("last_counts") or {}
+            _res_prior_cycle_dirty = any(
+                int(_res_last_counts.get(k) or 0) > 0
+                for k in (
+                    "orphaned_gaps",
+                    "ungrounded_directions",
+                    "stale_active_moves",
+                    "staffed_but_deferred",
+                )
+            )
+        except Exception:
+            logger.exception("[STRATEGIC] integrity_conflict_trend fetch failed; continuing")
+        _res_effort_pin = _runtime_config.get("task_type_efforts", {}).get("strategic_review")
+        if _res_effort_pin is not None:
+            _res_effort_tier = "pinned"
+            _res_effort_reason = f"task_type_efforts['strategic_review']={_res_effort_pin} pinned"
+        elif get_project_integration_branch(project) != get_project_promotion_target(project):
+            _res_effort_tier = CONSEQUENTIAL_TIER
+            _res_effort_reason = "resident LTS split: version-phase state unexamined"
+            review_effort = CONSEQUENTIAL_EFFORT
+        else:
+            _res_reconciliation = _build_cycle_start_reconciliation(
+                _res_direction_stats, project.problem_model, None
+            )
+            _res_conflict_counts = (_res_reconciliation or {}).get("counts") or {}
+            _effort_level, _res_effort_tier, _res_effort_reason = classify_strategic_review_effort(
+                {
+                    "open_message_count": len(_res_open_messages),
+                    "operator_steered": bool(operator_steered),
+                    "integrity_conflict_counts": _res_conflict_counts,
+                    "prior_cycle_dirty": _res_prior_cycle_dirty,
+                    "recent_cycle_failures": _res_recent_cycle_failures,
+                }
+            )
+            if _res_effort_tier == ROUTINE_TIER:
+                review_effort = _effort_level
+            else:
+                review_effort = CONSEQUENTIAL_EFFORT
         # Ship the resident-session pacing knobs from _runtime_config onto the
         # payload so the agent's residentConfig() reads LIVE, operator-tunable
         # values instead of falling back to hardcoded defaults. The exploration
@@ -5778,6 +5869,8 @@ async def _spawn_strategic_review(
             # spawn path passes this; cadence spawns leave it None → QUEUED as before)
             # so POST /api/runner/next-task claims it directly.
             runner_pin_id=runner_pin_id,
+            effort_tier=_res_effort_tier,
+            effort_reason=_res_effort_reason,
             expected_legacy_generation=expected_legacy_generation,
         )
 
@@ -5915,8 +6008,15 @@ async def _spawn_strategic_review(
         or _runtime_config.get("task_type_models", {}).get("research")
         or None
     )
+    # ``_review_effort_pin`` distinguishes an EXPLICIT strategic_review effort
+    # pin (operator-set — wins over the pre-spawn classifier) from the generic
+    # research fallback (a default the classifier is allowed to override for
+    # routine cycles).
+    _review_effort_pin = _runtime_config.get("task_type_efforts", {}).get(
+        "strategic_review"
+    )
     review_effort = (
-        _runtime_config.get("task_type_efforts", {}).get("strategic_review")
+        _review_effort_pin
         or _runtime_config.get("task_type_efforts", {}).get("research")
         or None
     )
@@ -6656,6 +6756,26 @@ async def _spawn_strategic_review(
             _integrity_trend = _trend_result
     except Exception:
         logger.exception("[STRATEGIC] integrity_conflict_trend fetch failed; continuing")
+    # Pre-spawn effort-classifier inputs: was the prior COMPLETED cycle dirty,
+    # and did any of the last 3 cycles fail/stall? Both flag this cycle as a
+    # recovery decision rather than a routine heartbeat.
+    _prior_cycle_dirty = bool(
+        _integrity_trend
+        and isinstance(_integrity_trend.get("last_counts"), dict)
+        and any(
+            int(_integrity_trend["last_counts"].get(k) or 0) > 0
+            for k in (
+                "orphaned_gaps",
+                "ungrounded_directions",
+                "stale_active_moves",
+                "staffed_but_deferred",
+            )
+        )
+    )
+    _recent_cycle_failures = any(
+        (h or {}).get("outcome") in _FAILED_CYCLE_OUTCOMES
+        for h in (cycle_history or [])[:3]
+    )
     # Post-promotion handoff — when a fresh version has just opened, it was
     # opened by the PROMOTION of the prior version: open_version() is only ever
     # called from _record_promotion_success and the v1 bootstrap, so a version
@@ -7602,6 +7722,52 @@ async def _spawn_strategic_review(
         session, project.id, _active_direction_ids
     )
 
+    # Pre-spawn effort classification: decide ROUTINE vs CONSEQUENTIAL from
+    # signals computed ABOVE (all available before the LLM call) and pin the
+    # effort on the payload so routing resolution picks a cheaper tier for
+    # routine cycles. Fail-closed: a consequential verdict — or classifier
+    # error — forces CONSEQUENTIAL_EFFORT ('max') on the payload so a
+    # high-stakes cycle can never inherit a cheaper research fallback. An
+    # explicit ``task_type_efforts`` pin for ``strategic_review`` wins over
+    # the classifier.
+    if _review_effort_pin is None:
+        try:
+            _effort_level, _effort_tier, _effort_reason = classify_strategic_review_effort(
+                {
+                    "open_message_count": len(open_msgs),
+                    "operator_steered": bool(operator_steered),
+                    "version_phase_block": _version_phase_block,
+                    "integrity_conflict_counts": (
+                        (_cycle_start_reconciliation or {}).get("counts") or {}
+                    ),
+                    "prior_cycle_dirty": _prior_cycle_dirty,
+                    "recent_cycle_failures": _recent_cycle_failures,
+                }
+            )
+        except Exception:  # noqa: BLE001 — a classifier bug must never block a cycle
+            logger.exception(
+                "[STRATEGIC] effort classifier failed; keeping consequential"
+            )
+            _effort_level = CONSEQUENTIAL_EFFORT
+            _effort_tier = CONSEQUENTIAL_TIER
+            _effort_reason = "classifier error"
+        # The classifier's effort level is authoritative — the previous code
+        # discarded it (``[1:]``) and only cheapened routine cycles, so a
+        # CONSEQUENTIAL verdict silently inherited the generic research
+        # fallback instead of 'max'. Fail-closed: a routine verdict cheapens
+        # the cycle; a consequential verdict — or classifier error — forces
+        # CONSEQUENTIAL_EFFORT so a high-stakes cycle can never be cheapened
+        # by ``task_type_efforts['research']``.
+        if _effort_tier == ROUTINE_TIER:
+            review_effort = _effort_level
+        else:
+            review_effort = CONSEQUENTIAL_EFFORT
+    else:
+        _effort_tier = "pinned"
+        _effort_reason = (
+            f"task_type_efforts['strategic_review']={_review_effort_pin} pinned"
+        )
+
     payload: dict = pack_under_budget(
         {
             "type": "strategic_review",
@@ -7873,6 +8039,8 @@ async def _spawn_strategic_review(
         steering_excerpt=steering_excerpt,
         launched_by_user_id=launched_by_user_id,
         integrity_conflict_counts=_integrity_counts,
+        effort_tier=_effort_tier,
+        effort_reason=_effort_reason,
         expected_legacy_generation=expected_legacy_generation,
     )
 

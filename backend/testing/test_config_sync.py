@@ -171,6 +171,8 @@ async def test_sync_applies_runtime_config_json():
             "warm_backlog_scan_limit": 18,
             "warm_backlog_teardown_defer_secs": 25,
             "productive_direction_cooldown_minutes": 15,
+            "directed_research_cooldown_minutes": 45,
+            "undirected_research_cooldown_minutes": 30,
             "improvement_lanes_enabled": True,
             "review_fix_lane_pilot_enabled": True,
         },
@@ -189,6 +191,8 @@ async def test_sync_applies_runtime_config_json():
     _shared_state.runtime_config["warm_backlog_scan_limit"] = 10
     _shared_state.runtime_config["warm_backlog_teardown_defer_secs"] = 20
     _shared_state.runtime_config["productive_direction_cooldown_minutes"] = 45
+    _shared_state.runtime_config["directed_research_cooldown_minutes"] = 120
+    _shared_state.runtime_config["undirected_research_cooldown_minutes"] = 60
     _shared_state.runtime_config["improvement_lanes_enabled"] = False
     _shared_state.runtime_config["review_fix_lane_pilot_enabled"] = False
 
@@ -214,6 +218,8 @@ async def test_sync_applies_runtime_config_json():
     assert _shared_state.runtime_config["warm_backlog_scan_limit"] == 18
     assert _shared_state.runtime_config["warm_backlog_teardown_defer_secs"] == 25
     assert _shared_state.runtime_config["productive_direction_cooldown_minutes"] == 15
+    assert _shared_state.runtime_config["directed_research_cooldown_minutes"] == 45
+    assert _shared_state.runtime_config["undirected_research_cooldown_minutes"] == 30
     assert _shared_state.runtime_config["improvement_lanes_enabled"] is True
     assert _shared_state.runtime_config["review_fix_lane_pilot_enabled"] is True
     for key in (
@@ -229,6 +235,8 @@ async def test_sync_applies_runtime_config_json():
         "warm_backlog_scan_limit",
         "warm_backlog_teardown_defer_secs",
         "productive_direction_cooldown_minutes",
+        "directed_research_cooldown_minutes",
+        "undirected_research_cooldown_minutes",
         "improvement_lanes_enabled",
         "review_fix_lane_pilot_enabled",
     ):

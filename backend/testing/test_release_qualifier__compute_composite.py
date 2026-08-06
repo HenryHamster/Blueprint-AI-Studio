@@ -459,6 +459,30 @@ def test_boot_prereq_missing_has_operator_label():
     assert "bind" in label.lower()
 
 
+def test_walkthrough_contract_failed_label_is_deployed_side():
+    """The walkthrough report-contract blocker labels the fix as DEPLOYED-side.
+
+    The strategist agent is handed these labels: a report-key validation failure
+    is resolved by the DEPLOYED qualifier, so the label must direct the operator
+    to a deploy rather than suggesting an automain fix clears it.
+    """
+    label = rq._BLOCKER_LABELS.get("walkthrough_e2e_contract_failed")
+    assert label is not None
+    assert "DEPLOYED" in label
+    assert "inert until this version itself promotes" in label
+    # Must NOT suggest the candidate-side "a fix on automain clears it" story.
+    assert "clears it on the next" not in label
+    assert "a fix on automain is inert" in label
+    # The classification agrees with the label.
+    assert (
+        rq.blocker_execution_site("walkthrough_e2e_contract_failed")
+        == rs.EXECUTION_SITE_DEPLOYED
+    )
+    assert rq.blocker_execution_site_label(
+        "walkthrough_e2e_contract_failed"
+    ) == rs.EXECUTION_SITE_LABELS[rs.EXECUTION_SITE_DEPLOYED]
+
+
 def test_deployed_env_presence_snapshot_is_presence_only(monkeypatch):
     """The deploy-target snapshot reads ONLY bool(os.getenv) — never a value.
 

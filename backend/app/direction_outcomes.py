@@ -17,7 +17,7 @@ from app.failure_classification import (
     ADMIN_CANCEL,
     CODE_ERROR,
     CO_DEFERRED_SHELVED,
-    INFRA_CLASSES,
+    INFRA_ANALYTICS_CLASSES,
     REASSIGNED,
     SCOPE_EMPTY,
     SCOPE_OVERFLOW,
@@ -1986,7 +1986,12 @@ async def _update_direction_research_outcomes(
                 }
             )
             effective_cat = category or _classify_failure(ct)
-            if effective_cat in INFRA_CLASSES and not _is_review_cap_exhausted(ct):
+            # The INFRA analytics superset admits UNPLACEABLE_EXECUTION_SITE: an
+            # unplaceable task is a routing/platform condition, not a code defect.
+            if (
+                effective_cat in INFRA_ANALYTICS_CLASSES
+                and not _is_review_cap_exhausted(ct)
+            ):
                 infra_failures += 1
     entry["failed_task_details"] = failed_details[:5]  # cap at 5 to avoid bloat
     entry["tasks_failed_infra"] = infra_failures
@@ -2055,7 +2060,10 @@ async def _update_direction_research_outcomes(
             elif fc == "CODE_ERROR":
                 sd_code_error += 1
                 sd_code_error_ids.add(ct.id)
-            elif fc in INFRA_CLASSES:
+            # INFRA analytics superset: UNPLACEABLE_EXECUTION_SITE is a
+            # routing/platform dropout, not a code dropout — it must land in the
+            # infra bucket rather than falling out of both buckets entirely.
+            elif fc in INFRA_ANALYTICS_CLASSES:
                 sd_infra += 1
     # tasks_required_approval: non-completed tasks that required manual approval
     # Exclude tasks already counted as CODE_ERROR to avoid double-counting
@@ -2192,7 +2200,7 @@ async def _update_direction_research_outcomes(
         if _counts_as_failure(ct):
             scope_breakdown[scope]["failed"] += 1
             fcat = ctx_.get("failure_category") or _classify_failure(ct)
-            if fcat in INFRA_CLASSES and not _is_review_cap_exhausted(ct):
+            if fcat in INFRA_ANALYTICS_CLASSES and not _is_review_cap_exhausted(ct):
                 scope_breakdown[scope]["failed_infra"] += 1
             if fcat == CODE_ERROR:
                 scope_breakdown[scope]["failed_code_error"] += 1
@@ -2408,16 +2416,18 @@ async def _update_direction_research_outcomes(
         for plan_id, sts in by_parent.items():
             merged_ct = sum(1 for st in sts if is_merged_completion(st))
             # SCOPE_OVERFLOW stays in the denominator even though it lives in
-            # INFRA_CLASSES: it is a scope-quality signal (subtasks cut too
+            # the infra sets: it is a scope-quality signal (subtasks cut too
             # large), which is exactly what subtask_merge_rate exists to detect.
             # Mirrors spawn_calibration._effective_scope_denominator, which keeps
-            # SCOPE_OVERFLOW and excludes only non-overflow infra fails.
+            # SCOPE_OVERFLOW and excludes only non-overflow infra fails. The
+            # INFRA analytics superset excludes UNPLACEABLE_EXECUTION_SITE too —
+            # a never-placed subtask reveals nothing about decomposition quality.
             failed_nc = sum(
                 1
                 for st in sts
                 if _counts_as_failure(st)
                 and (
-                    (fc := _classify_failure(st)) not in INFRA_CLASSES
+                    (fc := _classify_failure(st)) not in INFRA_ANALYTICS_CLASSES
                     or fc == SCOPE_OVERFLOW
                     or _is_review_cap_exhausted(st)
                 )

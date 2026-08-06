@@ -433,6 +433,54 @@ class TestEnvAllowlist(unittest.TestCase):
         self.assertNotIn("MY_CUSTOM_TOKEN", env)
         self.assertEqual(env["PROVIDER"], "anthropic")
 
+    def test_agent_env_passes_disk_reservation_knobs(self):
+        # The per-workspace disk reservation knobs are allowlisted so the agent's
+        # workspacePrep admission check sees the same numbers as the runner ledger.
+        source = {
+            "BLUEPRINT_RUNNER_AGENT_DISK_RESERVATION_BYTES": str(10 * 1024 * 1024),
+            "BLUEPRINT_RUNNER_MIN_DISK_BYTES": str(2 * 1024 * 1024),
+            "BLUEPRINT_RUNNER_TOKEN": "SECRET",
+        }
+        env = iso.build_agent_env(source, {}, [])
+        self.assertEqual(
+            env["BLUEPRINT_RUNNER_AGENT_DISK_RESERVATION_BYTES"],
+            str(10 * 1024 * 1024),
+        )
+        self.assertEqual(
+            env["BLUEPRINT_RUNNER_MIN_DISK_BYTES"],
+            str(2 * 1024 * 1024),
+        )
+        # Runner secrets still never pass through alongside the knobs.
+        self.assertNotIn("BLUEPRINT_RUNNER_TOKEN", env)
+
+    def test_agent_env_passes_shared_package_store_keys(self):
+        # PIP/UV_CACHE_DIR + BLUEPRINT_PACKAGE_STORE_* are allowlisted so a host
+        # that pre-sets them (systemd unit, shell env) forwards them into the
+        # sandboxed agent, which then points pip/uv at the RW-bound store.
+        source = {
+            "PIP_CACHE_DIR": "/opt/agent-cache/pip",
+            "UV_CACHE_DIR": "/opt/agent-cache/uv",
+            "BLUEPRINT_PACKAGE_STORE_ROOT": "/srv/pkgstore",
+            "BLUEPRINT_PACKAGE_STORE_MAX_BYTES": "8589934592",
+        }
+        env = iso.build_agent_env(source, {}, [])
+        self.assertEqual(env["PIP_CACHE_DIR"], "/opt/agent-cache/pip")
+        self.assertEqual(env["UV_CACHE_DIR"], "/opt/agent-cache/uv")
+        self.assertEqual(env["BLUEPRINT_PACKAGE_STORE_ROOT"], "/srv/pkgstore")
+        self.assertEqual(env["BLUEPRINT_PACKAGE_STORE_MAX_BYTES"], "8589934592")
+
+    def test_package_store_dirs_default_and_custom_root(self):
+        # Mirrors the agent-side default (agent/src/packageStore.ts): the baked
+        # /opt/agent-cache root unless BLUEPRINT_PACKAGE_STORE_ROOT overrides it.
+        self.assertEqual(
+            iso.package_store_dirs({}),
+            ["/opt/agent-cache/pip", "/opt/agent-cache/uv"],
+        )
+        self.assertEqual(
+            iso.package_store_dirs({"BLUEPRINT_PACKAGE_STORE_ROOT": "/srv/pkgstore"}),
+            ["/srv/pkgstore/pip", "/srv/pkgstore/uv"],
+        )
+
     def test_compute_env_excludes_provider_creds(self):
         source = {
             "ANTHROPIC_API_KEY": "sk-ant",
@@ -667,6 +715,37 @@ class TestBwrapArgv(unittest.TestCase):
         idx = argv.index("--bind")
         self.assertEqual(argv[idx + 1], "/tmp/ws/task1")
         self.assertEqual(argv[idx + 2], "/workspace")
+
+    def test_rw_binds_emitted_as_bind_try(self):
+        # Shared pip/uv package store dirs mount RW (--bind-try) at the SAME
+        # sandbox path so pip/uv can populate the host cache from inside bwrap.
+        argv = self._argv(
+            rw_binds=["/opt/agent-cache/pip", "/opt/agent-cache/uv"]
+        )
+        joined = " ".join(argv)
+        self.assertIn("--bind-try /opt/agent-cache/pip /opt/agent-cache/pip", joined)
+        self.assertIn("--bind-try /opt/agent-cache/uv /opt/agent-cache/uv", joined)
+        # Store dirs are RW, never RO toolchain binds.
+        self.assertNotIn("--ro-bind-try /opt/agent-cache/pip", joined)
+        # Appear before the terminal -- command separator.
+        self.assertLess(argv.index("--bind-try"), argv.index("--"))
+
+    def test_rw_binds_skipped_when_not_supplied(self):
+        # A caller that did not opt into the store (e.g. compute sandboxes) must
+        # not get the package-store mount at all.
+        argv = self._argv()
+        self.assertNotIn("agent-cache/pip", " ".join(argv))
+        self.assertNotIn("--bind-try", " ".join(argv))
+
+    def test_rw_bind_deduped_against_ro_bind(self):
+        # A path already RO-bound must not be mounted a second time RW.
+        argv = self._argv(
+            ro_binds=["/opt/agent-cache/pip"],
+            rw_binds=["/opt/agent-cache/pip"],
+        )
+        joined = " ".join(argv)
+        self.assertEqual(joined.count("--ro-bind-try /opt/agent-cache/pip"), 1)
+        self.assertNotIn("--bind-try /opt/agent-cache/pip", joined)
 
     def test_playwright_cache_bound_readonly_into_sandbox_home(self):
         with tempfile.TemporaryDirectory() as cache:
@@ -958,6 +1037,42 @@ class TestAgentPlan(unittest.TestCase):
         )
         self.assertFalse(plan.declined)
         self.assertEqual(plan.env["WALKTHROUGH_STACK_DIR"], "/workspace/.walkthrough-stack")
+
+    def test_agent_bwrap_plan_binds_shared_package_store(self):
+        plan = iso.plan_agent_execution(
+            caps=_caps(bwrap_path="/usr/bin/bwrap", userns_ok=True),
+            agent_binary=["node", "/opt/agent/dist/index.js"],
+            workspace_host="/tmp/ws/t1",
+            injected_env={"AGENT_SECRET_TOKEN": "jwt", "TASK_ID": "t1"},
+            source_env={"PATH": "/usr/bin"},
+        )
+        self.assertFalse(plan.declined)
+        self.assertEqual(plan.backend, iso.BACKEND_BWRAP)
+        joined = " ".join(plan.argv)
+        # The baked default store dirs are RW-bound into the sandbox so a
+        # workspace's pip/uv writes into the shared content-addressed cache
+        # instead of re-downloading into a per-workspace copy.
+        self.assertIn(
+            "--bind-try /opt/agent-cache/pip /opt/agent-cache/pip", joined
+        )
+        self.assertIn(
+            "--bind-try /opt/agent-cache/uv /opt/agent-cache/uv", joined
+        )
+
+    def test_agent_bwrap_plan_store_respects_custom_root(self):
+        plan = iso.plan_agent_execution(
+            caps=_caps(bwrap_path="/usr/bin/bwrap", userns_ok=True),
+            agent_binary=["node", "/opt/agent/dist/index.js"],
+            workspace_host="/tmp/ws/t1",
+            injected_env={"AGENT_SECRET_TOKEN": "jwt", "TASK_ID": "t1"},
+            source_env={
+                "PATH": "/usr/bin",
+                "BLUEPRINT_PACKAGE_STORE_ROOT": "/srv/pkgstore",
+            },
+        )
+        joined = " ".join(plan.argv)
+        self.assertIn("--bind-try /srv/pkgstore/pip /srv/pkgstore/pip", joined)
+        self.assertNotIn("/opt/agent-cache/pip", joined)
 
     def test_agent_plan_docker_backend(self):
         plan = iso.plan_agent_execution(

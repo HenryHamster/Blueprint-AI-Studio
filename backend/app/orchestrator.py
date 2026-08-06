@@ -61,7 +61,6 @@ from app.compute_cloud_run import (
 from app.task_capabilities import (
     AGENT_EXECUTED_TASK_TYPES,
     CLOUD_RUN_CANDIDATE_TASK_TYPES,
-    DIRECT_PACKER_GCE_EXECUTION_SITE,
     execution_site_for_task_type,
 )
 from app.database import AsyncSessionLocal
@@ -3361,17 +3360,13 @@ async def orchestrator_worker():
                         )
                         # A non-default execution site is a hard routing contract:
                         # the task skips the generic runner/warm-pool/Cloud-Run
-                        # matrix and is placed only by its declared site path.  The
-                        # direct-GCE site is provisioned cold; any OTHER non-default
-                        # site (e.g. the qualifier's live-local-runner walkthrough
-                        # site) is not generically routable and fails closed below.
+                        # matrix and is placed only by its declared site path.  Only
+                        # the ``default`` site is generically routable; any other
+                        # non-default site (e.g. the qualifier's live-local-runner
+                        # walkthrough site) is not and fails closed below.
                         _non_generic_site_dispatch = (
                             _execution_site_for_dispatch is not None
                             and _execution_site_for_dispatch != "default"
-                        )
-                        _direct_packer_gce_dispatch = (
-                            _execution_site_for_dispatch
-                            == DIRECT_PACKER_GCE_EXECUTION_SITE
                         )
                         if task.requires_approval:
                             await session.rollback()
@@ -4032,11 +4027,11 @@ async def orchestrator_worker():
                         # pin, strategic/local-runner hold, warm continuity, warm
                         # pool, Cloud Run) has already been skipped above for a
                         # non-default site; the only thing left here is a COLD GCE
-                        # provision, which is the direct-Packer-GCE site's path.
-                        # Any OTHER non-default site (e.g. the qualifier's
-                        # live-local-runner walkthrough site) cannot boot the
-                        # candidate stack on a GCE VM, so cold-provisioning it would
-                        # strand the task on a site it was never qualified for.
+                        # provision, which serves only the generic ``default`` site.
+                        # A non-default site (e.g. the qualifier's live-local-runner
+                        # walkthrough site) cannot boot the candidate stack on a GCE
+                        # VM, so cold-provisioning it would strand the task on a
+                        # site it was never qualified for.
                         #
                         # A QUEUED task here is a stranded requeue, not a fresh
                         # placement: the site owner pins such tasks AT BIRTH
@@ -4044,17 +4039,16 @@ async def orchestrator_worker():
                         # creating a walkthrough_e2e child), so no path will ever
                         # re-place a QUEUED instance of it.  The old behaviour
                         # held it QUEUED with a warning on EVERY dispatch cycle
-                        # forever — and the qualifier's finalize treats a
-                        # non-terminal walkthrough child as
-                        # walkthrough_e2e_task_not_terminal, so the qualification
-                        # deadlocks with it.  Fail closed to a terminal state with
-                        # a readable reason naming the execution site instead;
-                        # the qualifier then treats the FAILED child as an
-                        # infra_failure and redrives a FRESH site-pinned child.
-                        if (
-                            _non_generic_site_dispatch
-                            and not _direct_packer_gce_dispatch
-                        ):
+                        # forever.  Fail closed to a terminal state with a
+                        # readable reason naming the execution site instead; the
+                        # qualifier's finalize then treats the FAILED (or
+                        # non-terminal) walkthrough child as an INFRA-SHAPED
+                        # probe failure — it holds the release as a non-conclusive
+                        # infra_failure via _handle_infra_failure rather than a
+                        # quality verdict, and the release-qualifier infra
+                        # re-driver re-runs the qualification and spawns a FRESH
+                        # site-pinned child.
+                        if _non_generic_site_dispatch:
                             logger.warning(
                                 "[ORCHESTRATOR] Task %s has non-generic execution "
                                 "site %r that generic dispatch cannot route — "
@@ -4427,18 +4421,18 @@ async def orchestrator_worker():
                         # (and, in a rollup, review-fix iterations wasted). Re-derive a
                         # model valid for the resolved provider; no-op when already
                         # consistent or the model is operator-custom (infers to None).
+                        _runtime_quality_tier = (
+                            runtime_selection.quality_tier
+                            if runtime_selection
+                            else None
+                        ) or resolve_task_quality_tier(task, _runtime_config)
                         _runtime_identity = reconcile_llm_runtime_identity(
                             account=account,
                             account_id=account_id,
                             provider=runtime_provider,
                             auth_mode=runtime_auth_mode,
                             model=runtime_model,
-                            quality_tier=(
-                                runtime_selection.quality_tier
-                                if runtime_selection
-                                else None
-                            )
-                            or resolve_task_quality_tier(task, _runtime_config),
+                            quality_tier=_runtime_quality_tier,
                             runtime_config=_runtime_config,
                         )
                         if (
@@ -4489,6 +4483,7 @@ async def orchestrator_worker():
                             auth_mode=runtime_auth_mode,
                             model=runtime_model,
                             execution_mode=runtime_execution_mode,
+                            quality_tier=_runtime_quality_tier,
                         )
                         # Keep the promoted column in sync with context
                         # (D2 over-fetch fix) — context keys are still written

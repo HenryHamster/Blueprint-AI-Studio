@@ -50,6 +50,11 @@ DISCOVERY_REVIEW_TASK_TYPE = "discovery_review"
 DISCOVERY_REVIEW_SWEEP_LIMIT = 40
 DISCOVERY_REVIEW_ROUTINE_EFFORT = "medium"
 DISCOVERY_EVIDENCE_ESCALATION_GRACE = timedelta(hours=2)
+# Total decision-task attempts (original + respawns) before a cycle fails
+# closed into review_blocked. Attempts are counted from the task ledger
+# (terminal discovery_review tasks on the cycle), not from mutable cycle
+# state, so a respawn wiping review_result cannot reset the budget.
+DISCOVERY_REVIEW_MAX_DECISION_ATTEMPTS = 3
 
 _ACTIVE_COHORT_STATUSES = frozenset(
     {
@@ -614,6 +619,10 @@ async def _reconcile_review_reference(
             task=review_task,
             reason=f"decision task ended {str(_enum_value(review_task.status))}",
         )
+        if cycle.state == "review_pending":
+            # Bounded retry accepted: fall through so this same sweep spawns
+            # the replacement decision task instead of waiting a full interval.
+            return None
         return DiscoveryReviewSpawnResult(
             cycle.id, review_task.id, False, False, "review_blocked"
         )
@@ -1601,6 +1610,53 @@ async def block_failed_discovery_review(
     ).scalar_one_or_none()
     if cycle is None or cycle.review_task_id != task.id or cycle.state != "reviewing":
         return False
+    # A decision task that died without producing a decision (VM loss, runner
+    # outage, provision failure) says nothing about the cycle's evidence — so
+    # respawn a fresh decision task, bounded by the ledger-derived attempt
+    # count, instead of failing the cycle closed on the first transient death.
+    # Semantic failures (a completed task whose output cannot transition the
+    # cycle) still fail closed via complete_discovery_review.
+    from sqlalchemy import func as _sql_func
+
+    prior_attempts = (
+        await session.execute(
+            select(_sql_func.count())
+            .select_from(Task)
+            .where(
+                Task.discovery_cycle_id == cycle.id,
+                Task.payloads[0]["type"].as_string() == DISCOVERY_REVIEW_TASK_TYPE,
+                Task.status.in_([TaskStatus.FAILED, TaskStatus.CANCELLED]),
+            )
+        )
+    ).scalar() or 0
+    attempts = max(int(prior_attempts), 1)
+    if attempts < DISCOVERY_REVIEW_MAX_DECISION_ATTEMPTS:
+        cycle.state = "review_pending"
+        cycle.review_task_id = None
+        cycle.review_result = {
+            "status": "DECISION_RETRY",
+            "error": reason[:2_000],
+            "failed_review_task_id": str(task.id),
+            "task_status": str(_enum_value(task.status)),
+            "attempt": attempts,
+            "max_attempts": DISCOVERY_REVIEW_MAX_DECISION_ATTEMPTS,
+        }
+        cycle.revision = int(cycle.revision or 0) + 1
+        cycle.updated_at = _utcnow()
+        session.add(cycle)
+        await _emit_review_event(
+            session,
+            cycle=cycle,
+            task_id=task.id,
+            event_type="discovery.review_retry",
+            summary=(
+                f"Discovery decision task for {cycle.direction_key} ended "
+                f"{_enum_value(task.status)!s} without a decision; respawning "
+                f"(attempt {attempts}/{DISCOVERY_REVIEW_MAX_DECISION_ATTEMPTS})"
+            ),
+            extra={"reason": reason[:500], "policy_status": "DECISION_RETRY"},
+        )
+        return True
     cycle.state = "review_blocked"
     cycle.review_result = {
         "status": "DECISION_FAILED",

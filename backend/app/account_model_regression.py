@@ -22,7 +22,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from app.failure_classification import INFRA_CLASSES
+from app.failure_classification import INFRA_ANALYTICS_CLASSES
 from app.models import MaxPlanAccount, Task, TaskStatus, _utcnow
 
 # Minimum total tasks for a (provider, model) group to appear in the breakdown.
@@ -120,12 +120,15 @@ async def compute_provider_model_breakdown(
     task_rows = (await session.execute(stmt)).all()
 
     # Aggregate per (provider, model, account_id), skipping infra failures.
+    # UNPLACEABLE_EXECUTION_SITE is included in the skip set via
+    # INFRA_ANALYTICS_CLASSES: the task never ran, so it must not depress a
+    # provider/model/account's success rate.
     raw: dict[tuple[str, str], dict[str, dict[str, int]]] = defaultdict(
         lambda: defaultdict(lambda: {"total": 0, "successes": 0})
     )
     for provider, model, account_id, status, ctx in task_rows:
         fc = (ctx if isinstance(ctx, dict) else {}).get("failure_category", "")
-        if fc in INFRA_CLASSES:
+        if fc in INFRA_ANALYTICS_CLASSES:
             continue
         raw[(provider, model)][account_id or ""]["total"] += 1
         if status == TaskStatus.COMPLETED:

@@ -47,11 +47,20 @@ vi.mock('../uiLoadTiming', () => ({
 // (and any future export) silently `undefined`; preserving the real module via
 // importOriginal keeps every transitively-needed name resolving while we still
 // stub the network call. Override only `apiFetch`.
+//
+// `acceptPendingConfirmation`/`dismissPendingConfirmation` are ALSO stubbed:
+// their implementations live in `../api/projects`, which imports `apiFetch` from
+// `./core` — NOT the `../api` re-export this mock replaces. Without the stub the
+// needs-action accept/dismiss handlers would fire a real request (ECONNREFUSED
+// in the test environment); mocking the module-level export keeps the handlers
+// exercising their real code paths (state updates + refresh) without a network.
 vi.mock('../api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../api')>();
   return {
     ...actual,
     apiFetch: vi.fn(async () => new Response(JSON.stringify({ messages: [] }), { status: 200 })),
+    acceptPendingConfirmation: vi.fn(async () => ({ status: 'accepted', type: 'plan' })),
+    dismissPendingConfirmation: vi.fn(async () => {}),
   };
 });
 
@@ -1345,6 +1354,31 @@ describe('MessagesPanel chrome modes', () => {
     expect(failed.textContent).toContain('Execution site unavailable');
   });
 
+  test('terminal failure reason renders in both minimal chat and full message chrome', async () => {
+    // The failure-reason span is mode-independent — the completion receipt keeps
+    // it visible in conversation (minimal) and non-conversation chrome alike. The
+    // minimal variant is covered above; this proves the non-conversation render
+    // stays byte-equivalent after the collapsed single branch.
+    const conversation = await renderPanel({
+      filterChrome: 'minimal',
+      lastCycleCompletion: { status: 'failed', failure_reason: 'Execution site unavailable' },
+    });
+    expect(conversation.textContent).toContain('Cycle failed');
+    expect(conversation.textContent).toContain('Execution site unavailable');
+
+    await act(async () => { root?.unmount(); });
+    root = null;
+    host?.remove();
+    host = null;
+
+    const full = await renderPanel({
+      filterChrome: 'compact',
+      lastCycleCompletion: { status: 'failed', failure_reason: 'Execution site unavailable' },
+    });
+    expect(full.textContent).toContain('Cycle failed');
+    expect(full.textContent).toContain('Execution site unavailable');
+  });
+
   test('minimal chat hides leaked batch action state after switching from full chrome', async () => {
     const first = makeMsg({
       id: 'feedback-a',
@@ -1922,6 +1956,71 @@ describe('MessagesPanel chrome modes', () => {
     const showAllBtnAfter = el.querySelector<HTMLButtonElement>('[data-testid="needs-action-filter-show-all"]');
     expect(needsActionBtnAfter!.getAttribute('aria-pressed')).toBe('true');
     expect(showAllBtnAfter!.getAttribute('aria-pressed')).toBe('false');
+  });
+
+  test('needs-action accept/dismiss uses void on refreshStrategicState', async () => {
+    // The accept/dismiss handlers fire refreshStrategicState fire-and-forget
+    // (void'd) after the pending-confirmation API resolves. Exercise both paths
+    // through the real handlers so the void'd call sites stay covered.
+    const confirmationState = (pendingId: string): StrategicStateResponse => makeStrategicState({
+      attention: {
+        level: 'needs_operator',
+        summary: '1 confirmation needs action',
+        last_seen_at: null,
+        counts: {
+          needs_operator: 1, watch: 0, unread: 0, questions: 0, blockers: 0,
+          approvals: 1, manual_directions: 0, failed_tasks: 0, blocked_tasks: 0, parked_tasks: 0,
+        },
+        items: [
+          {
+            id: `confirmation:${pendingId}`,
+            kind: 'confirmation',
+            severity: 'needs_operator',
+            reason: 'approval_needed',
+            label: 'Confirm deployment plan',
+            ref: { kind: 'pending_confirmation', id: pendingId, project_id: 'proj-1' },
+          },
+        ],
+      },
+    });
+
+    const findChip = (el: HTMLElement): HTMLButtonElement | undefined =>
+      [...(el.querySelector('[data-testid="needs-action-strip"]')?.querySelectorAll('button') ?? [])]
+        .find(b => b.textContent?.includes('Confirm deployment plan'));
+
+    // Accept path: the void'd refresh fires after acceptPendingConfirmation resolves.
+    const acceptRefresh = vi.fn(async () => {});
+    const acceptEl = await renderPanel({
+      strategicState: confirmationState('confirm-accept'),
+      onStrategicStateRefresh: acceptRefresh,
+    });
+    const acceptChip = findChip(acceptEl);
+    expect(acceptChip).toBeTruthy();
+    await act(async () => { acceptChip!.click(); });
+    const acceptBtn = acceptEl.querySelector('[data-testid="confirmation-accept-btn"]');
+    expect(acceptBtn).toBeTruthy();
+    await act(async () => { (acceptBtn as HTMLButtonElement).click(); });
+    await waitFor(() => expect(acceptRefresh).toHaveBeenCalledTimes(1));
+
+    // Unmount before the dismiss render so each path gets a fresh panel.
+    await act(async () => { root?.unmount(); });
+    root = null;
+    host?.remove();
+    host = null;
+
+    // Dismiss path: same handler shape, the void'd refresh fires after dismiss resolves.
+    const dismissRefresh = vi.fn(async () => {});
+    const dismissEl = await renderPanel({
+      strategicState: confirmationState('confirm-dismiss'),
+      onStrategicStateRefresh: dismissRefresh,
+    });
+    const dismissChip = findChip(dismissEl);
+    expect(dismissChip).toBeTruthy();
+    await act(async () => { dismissChip!.click(); });
+    const dismissBtn = dismissEl.querySelector('[data-testid="confirmation-dismiss-btn"]');
+    expect(dismissBtn).toBeTruthy();
+    await act(async () => { (dismissBtn as HTMLButtonElement).click(); });
+    await waitFor(() => expect(dismissRefresh).toHaveBeenCalledTimes(1));
   });
 
   test('test_triage_poll_request_window_is_constant_after_load_older', async () => {

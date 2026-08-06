@@ -1743,8 +1743,9 @@ async def required_children_terminal(
         return False
     # A MISSING walkthrough_e2e child (absent task id, or the row was deleted)
     # is deliberately NOT a non-terminal condition: there is no live child to
-    # wait for, and _finalize_qualification resolves an absent requested probe
-    # as a hard walkthrough_e2e_failed blocker (reason walkthrough_e2e_task_missing).
+    # wait for, and _finalize_qualification holds an absent requested probe as
+    # an infra failure (reason walkthrough_e2e_task_missing — a non-conclusive
+    # hold that the sweep's finalize path re-drives, never a quality verdict).
     # Treating it as missing-and-terminal lets the sweep's finalize path process
     # the qualification instead of stranding it in pending until the 6h timeout.
     # A PRESENT, non-terminal walkthrough child still blocks below.

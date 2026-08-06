@@ -24,7 +24,7 @@ from sqlmodel import select
 from app.failure_classification import (
     AGENT_TIMEOUT,
     CODE_ERROR,
-    INFRA_CLASSES,
+    INFRA_ANALYTICS_CLASSES,
     SCOPE_OVERFLOW,
     classify_failure,
 )
@@ -153,7 +153,10 @@ async def compute_effective_max_requeues(
     """Return the max requeue count, reduced when failed children show recurring
     failure patterns:
 
-    - Same non-infra class repeats (current == previous): reduce by 1.
+    - Same non-infra class repeats (current == previous): reduce by 1.  "Infra"
+      uses the analytics superset INFRA_ANALYTICS_CLASSES, so a repeated
+      UNPLACEABLE_EXECUTION_SITE (a platform routing contract, not a code issue)
+      never reduces the parent's budget.
     - A non-infra class appears 2+ times in ``_failure_class_history``: reduce
       by 1; 3+ times: reduce by 2 (root cause clearly not being addressed).
     - SCOPE_OVERFLOW appears 2+ times in history: reduce by 1, despite being
@@ -195,7 +198,7 @@ async def compute_effective_max_requeues(
         if (
             prev_class
             and current_class == prev_class
-            and current_class not in INFRA_CLASSES
+            and current_class not in INFRA_ANALYTICS_CLASSES
         ):
             reduction = max(reduction, 1)
         history = failure_class_history_classes(
@@ -210,9 +213,9 @@ async def compute_effective_max_requeues(
                     reduction = max(reduction, 1)
                 elif cls == AGENT_TIMEOUT and count >= 2:
                     reduction = max(reduction, 1)
-                elif cls not in INFRA_CLASSES and count >= 3:
+                elif cls not in INFRA_ANALYTICS_CLASSES and count >= 3:
                     reduction = max(reduction, 2)
-                elif cls not in INFRA_CLASSES and count >= 2:
+                elif cls not in INFRA_ANALYTICS_CLASSES and count >= 2:
                     reduction = max(reduction, 1)
         prev_failing = ctx.get("_previous_failing_tests") or []
         if isinstance(prev_failing, list) and prev_failing:

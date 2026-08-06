@@ -784,6 +784,7 @@ runtime_config: Dict = {
     "autonomous_direction_cooldown_minutes": 240,
     "productive_direction_cooldown_minutes": 45,
     "directed_research_cooldown_minutes": 120,
+    "undirected_research_cooldown_minutes": 60,
     "direction_auto_recovery_hours": 48,
     # Non-merge churn guardrail (Rule 5 in _check_direction_health).
     # window_cycles: how many recent research cycles to evaluate (rolling window).
@@ -2575,6 +2576,8 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "spend_approval_timeout_hours",
                     "max_total_research_per_project",
                     "productive_direction_cooldown_minutes",
+                    "directed_research_cooldown_minutes",
+                    "undirected_research_cooldown_minutes",
                     "next_role_poll_timeout_secs",
                     "direction_churn_window_cycles",
                     "direction_churn_non_merge_threshold",

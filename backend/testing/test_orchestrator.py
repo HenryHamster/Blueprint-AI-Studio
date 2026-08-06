@@ -6375,6 +6375,125 @@ class TestDispatchWindowPreservesRank(_OrchDispatchCycleHarness):
         )
 
 
+class TestRuntimeContextRecordsEffortTier(_OrchDispatchCycleHarness):
+    """Cost auditability: the resolved effort/quality tier is recorded on the task.
+
+    ``apply_task_llm_runtime_context`` records llm_account_id / llm_provider /
+    llm_auth_mode / llm_model / llm_execution_mode but historically NOT the effort
+    tier that drove model selection, so an auditor could not tell from a task row
+    whether a strategic_review cycle ran at the expensive ``max``/opus tier or a
+    cheaper one. These tests pin the new ``llm_quality_tier`` context key both at
+    the recorder seam and through a real orchestrator dispatch cycle.
+    """
+
+    @pytest.mark.asyncio
+    async def test_llm_runtime_context_includes_effort(self, orch_cap_db, mocker):
+        from sqlmodel import select as _select
+
+        import app.orchestrator as _orch_module
+        from app.max_plan_pool import (
+            TASK_RUNTIME_CONTEXT_KEYS,
+            LLMSelectionResult,
+            apply_task_llm_runtime_context,
+            get_task_llm_quality_tier,
+        )
+
+        # Recorder seam: the tier survives apply + read-back, and the key is part
+        # of the cleared runtime-context set so a requeue cannot pin a stale tier.
+        ctx = apply_task_llm_runtime_context(
+            {},
+            account_id="acct-effort",
+            provider="anthropic",
+            auth_mode="oauth",
+            model="claude-opus-5",
+            quality_tier="opus",
+        )
+        assert ctx["llm_quality_tier"] == "opus"
+        assert get_task_llm_quality_tier(ctx) == "opus"
+        assert "llm_quality_tier" in TASK_RUNTIME_CONTEXT_KEYS
+        assert get_task_llm_quality_tier({"llm_quality_tier": "  sonnet  "}) == "sonnet"
+        assert get_task_llm_quality_tier({}) is None
+
+        # Dispatch seam: the orchestrator passes the selection's quality_tier into
+        # the task context, so a dispatched task's row alone reveals its cost tier.
+        mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new_callable=AsyncMock,
+            return_value=LLMSelectionResult(
+                provider="anthropic",
+                auth_mode="oauth",
+                model="claude-opus-5",
+                quality_tier="opus",
+                account={
+                    "id": "acct-effort",
+                    "name": "Effort Acct",
+                    "runtime_secret": "tok",
+                    "claude_config_json": None,
+                    "provider_metadata": {},
+                },
+            ),
+        )
+        mocker.patch(
+            "app.warm_pool.try_pool_dispatch",
+            new_callable=AsyncMock,
+            return_value=None,
+        )
+        mocker.patch(
+            "app.orchestrator._sync_runtime_config_from_state",
+            new_callable=AsyncMock,
+            return_value=[],
+        )
+
+        _orch_module._runtime_config["max_concurrent_vms"] = 1
+        _orch_module._runtime_config["warm_pool_enabled"] = False
+
+        task_id = None
+        async with orch_cap_db() as session:
+            project = make_project(name="EffortProject", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+            task = make_task(
+                project_id=project.id,
+                status=TaskStatus.QUEUED,
+                vm_instance_id=None,
+                payloads=[{"type": "create", "prompt": "effort-tier task"}],
+            )
+            session.add(task)
+            await session.commit()
+            await session.refresh(task)
+            task_id = task.id
+
+        try:
+            await self._run_one_cycle(mocker)
+        finally:
+            _orch_module._runtime_config.pop("max_concurrent_vms", None)
+            _orch_module._runtime_config.pop("warm_pool_enabled", None)
+
+        async with orch_cap_db() as verify:
+            row = (
+                (await verify.execute(_select(Task).where(Task.id == task_id)))
+                .scalars()
+                .first()
+            )
+
+        assert row is not None
+        assert row.status == TaskStatus.PROVISIONING, (
+            f"task must dispatch to PROVISIONING so the context is stamped; got "
+            f"{row.status}"
+        )
+        assert row.context.get("llm_quality_tier") == "opus", (
+            "the orchestrator must record the resolved effort/quality tier on the "
+            "task row for cost auditability; got "
+            f"{row.context.get('llm_quality_tier')!r}"
+        )
+
+
 class TestComputeJobVMDispatchHeadroom:
     """Compute-job VMs must not consume agent dispatch slots (direction d-9d6c2c94).
 

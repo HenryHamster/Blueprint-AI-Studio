@@ -18138,3 +18138,81 @@ async def test_lifecycle_vision_lock_timeout_logs_error_and_reraises(db_session,
     assert any("d-lock-timeout-01" in c for c in error_calls), (
         f"Expected error mentioning dropped direction ID; got: {error_calls}"
     )
+
+
+@pytest.mark.asyncio
+async def test_cycle_blocked_direction_keys_excludes_unadmittable_directions(
+    db_session,
+):
+    """Selection must skip directions whose live cycle cannot admit a new root.
+
+    Incident 2026-08-06: with max_parallel_research=1 the chooser picked the
+    same direction (live cycle wedged in review_pending) every sweep, spawning
+    nothing while three healthy directions starved behind it.
+    """
+    from app.autonomous_research import _cycle_blocked_direction_keys
+    from app.models import DiscoveryCycle
+
+    project = Project(name=f"cycle-hol-{uuid.uuid4().hex[:8]}", user_id="test")
+    db_session.add(project)
+    await db_session.flush()
+
+    source = Task(
+        project_id=project.id,
+        title="research root",
+        payloads=[{"type": "research"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(source)
+    await db_session.flush()
+
+    cycles = {
+        "d-open-fresh": DiscoveryCycle(
+            project_id=project.id,
+            direction_key="d-open-fresh",
+            generation=1,
+            outcome_kind="mixed",
+            state="open",
+        ),
+        "d-open-bound": DiscoveryCycle(
+            project_id=project.id,
+            direction_key="d-open-bound",
+            generation=1,
+            outcome_kind="mixed",
+            state="open",
+            source_research_task_id=source.id,
+        ),
+        "d-review-pending": DiscoveryCycle(
+            project_id=project.id,
+            direction_key="d-review-pending",
+            generation=1,
+            outcome_kind="mixed",
+            state="review_pending",
+        ),
+        "d-review-blocked": DiscoveryCycle(
+            project_id=project.id,
+            direction_key="d-review-blocked",
+            generation=1,
+            outcome_kind="mixed",
+            state="review_blocked",
+        ),
+        "d-reviewed": DiscoveryCycle(
+            project_id=project.id,
+            direction_key="d-reviewed",
+            generation=1,
+            outcome_kind="mixed",
+            state="reviewed",
+            verdict="advance",
+        ),
+    }
+    db_session.add_all(cycles.values())
+    await db_session.flush()
+
+    blocked = await _cycle_blocked_direction_keys(db_session, project.id)
+
+    # A fresh open cycle joins; a settled (reviewed) cycle admits a successor.
+    assert "d-open-fresh" not in blocked
+    assert "d-reviewed" not in blocked
+    # Everything a spawn-time admission check would reject is excluded upfront.
+    assert {"d-open-bound", "d-review-pending", "d-review-blocked"} <= blocked

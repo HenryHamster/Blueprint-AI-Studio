@@ -605,6 +605,7 @@ import {
   buildLocalRunnerSection,
   handleStrategic,
   formatRelativeDays,
+  detectThinkerDirectionRecommendations,
 } from './strategic.js';
 import * as mockedIndexModule from '../index.js';
 import { runClaudeCode, apiPost, setCurrentPromptFingerprint, sendHeartbeatSync } from '../index.js';
@@ -2254,11 +2255,12 @@ describe('handleStrategic executor prompt: arms-based compute_experiment commiss
 describe('handleStrategic create-direction recovery prompt', () => {
   it('recovery prompt includes gap_id, success_evidence, retirement_condition and omits system_id', async () => {
     vi.mocked(runClaudeCode).mockReset();
-    // Thinker returns analysisText with a ## Structured Output section referencing create-direction
+    // Thinker returns analysisText with prose Section 3 "Moves" (the prompt no
+    // longer emits a ## Structured Output block) referencing a create.
     vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
       ok: true,
       analysisText:
-        'Some analysis text.\n\n## Structured Output\n\ncreate-direction: build new feature\n',
+        'Some analysis text.\n\n## 3. Moves\n\nCreate a direction to build new feature\n',
     });
     // Executor (call 0): exits 0 with no direction ops in output → triggers recovery
     // Executor output must include the required calls (set-problem-model, set-running-update,
@@ -2311,7 +2313,7 @@ describe('handleStrategic direction-op post-check: all portfolio verbs', () => {
     vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
       ok: true,
       analysisText:
-        'Some analysis text.\n\n## Structured Output\n\nretire-direction: d-abc123 — stale direction\n',
+        'Some analysis text.\n\n## 3. Moves\n\nRetire d-abc123 — stale direction\n',
     });
     vi.mocked(runClaudeCode)
       .mockResolvedValueOnce({ exitCode: 0, allOutput: requiredCallsOutput, lastResultText: '' })
@@ -2342,7 +2344,7 @@ describe('handleStrategic direction-op post-check: all portfolio verbs', () => {
     vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
       ok: true,
       analysisText:
-        'Analysis.\n\n## Structured Output\n\nupdate-direction: d-xyz — priority bump\n',
+        'Analysis.\n\n## 3. Moves\n\nUpdate d-xyz — priority bump\n',
     });
     vi.mocked(runClaudeCode)
       .mockResolvedValueOnce({ exitCode: 0, allOutput: requiredCallsOutput, lastResultText: '' })
@@ -2374,7 +2376,7 @@ describe('handleStrategic direction-op post-check: all portfolio verbs', () => {
     vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
       ok: true,
       analysisText:
-        'Analysis.\n\n## Structured Output\n\nstage-direction: d-staged — next version\n',
+        'Analysis.\n\n## 3. Moves\n\nStage d-staged — next version\n',
     });
     vi.mocked(runClaudeCode)
       .mockResolvedValueOnce({ exitCode: 0, allOutput: requiredCallsOutput, lastResultText: '' })
@@ -2401,7 +2403,7 @@ describe('handleStrategic direction-op post-check: all portfolio verbs', () => {
     vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
       ok: true,
       analysisText:
-        'Analysis.\n\n## Structured Output\n\nstage-direction: d-staged — next version\n',
+        'Analysis.\n\n## 3. Moves\n\nStage d-staged — next version\n',
     });
     const outputWithStageOp =
       requiredCallsOutput +
@@ -2431,7 +2433,7 @@ describe('handleStrategic direction-op post-check: all portfolio verbs', () => {
     vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
       ok: true,
       analysisText:
-        'Analysis.\n\n## Structured Output\n\napprove-direction: d-qa1\nreject-direction: d-qa2\n',
+        'Analysis.\n\n## 3. Moves\n\nApprove d-qa1\nReject d-qa2\n',
     });
     vi.mocked(runClaudeCode)
       .mockResolvedValueOnce({ exitCode: 0, allOutput: requiredCallsOutput, lastResultText: '' })
@@ -2455,6 +2457,147 @@ describe('handleStrategic direction-op post-check: all portfolio verbs', () => {
     expect(recoveryPrompt).toContain('reject-direction');
 
     vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+  });
+
+  it('detects thinker-recommended creates from prose Section 3 Moves (no Structured Output header)', async () => {
+    // The thinker prompt produces PROSE moves (create/retire/...), not a
+    // `## Structured Output` block — the retry gate must detect a create
+    // recommendation from that prose and re-run the executor when it
+    // completed without executing any direction op.
+    vi.mocked(runClaudeCode).mockReset();
+    vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
+      ok: true,
+      analysisText: [
+        '## 1. State assessment',
+        'The project is healthy; corpus production is still unowned.',
+        '',
+        '## 3. Moves',
+        '',
+        'Create a direction to own corpus production, closing gap g-123.',
+        'No retirements this cycle.',
+        '',
+        '## 4. Running update',
+        'Rewrite /tmp/running_update_task-create-prose.md.',
+      ].join('\n'),
+    });
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: requiredCallsOutput, lastResultText: '' })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' });
+
+    const statusRef = { value: '' };
+    await handleStrategic(
+      'task-create-prose',
+      { project_name: 'Blueprint' },
+      {},
+      'tok',
+      'owner',
+      'repo',
+      null,
+      statusRef,
+    );
+
+    // Executor (call 0) satisfied the required calls but executed no direction
+    // op; the prose create recommendation must trigger the create retry (call 1).
+    expect(vi.mocked(runClaudeCode).mock.calls).toHaveLength(2);
+    const recoveryPrompt = vi.mocked(runClaudeCode).mock.calls[1]?.[0];
+    expect(recoveryPrompt).toBeDefined();
+    expect(recoveryPrompt).toContain('create-direction');
+
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+  });
+
+  it('does not retry when the analysis recommends no direction moves', async () => {
+    vi.mocked(runClaudeCode).mockReset();
+    vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
+      ok: true,
+      analysisText: [
+        '## 1. State assessment',
+        'Portfolio is healthy.',
+        '',
+        '## 3. Moves',
+        'No direction moves this cycle — existing directions already cover the work.',
+        '',
+        '## 4. Running update',
+        'Nothing shifted.',
+      ].join('\n'),
+    });
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0,
+      allOutput: requiredCallsOutput,
+      lastResultText: '',
+    });
+
+    const statusRef = { value: '' };
+    await handleStrategic(
+      'task-no-moves',
+      { project_name: 'Blueprint' },
+      {},
+      'tok',
+      'owner',
+      'repo',
+      null,
+      statusRef,
+    );
+
+    // Only the executor call — no direction-op retry fired.
+    expect(vi.mocked(runClaudeCode).mock.calls).toHaveLength(1);
+
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+  });
+});
+
+describe('detectThinkerDirectionRecommendations', () => {
+  it('detects creates from command names, JSON op keys, and prose', () => {
+    expect(detectThinkerDirectionRecommendations('Run create-direction for gap g-123')).toEqual({
+      recommendsCreates: true,
+      recommendsOtherOps: false,
+    });
+    expect(detectThinkerDirectionRecommendations('{"op":"create","gap_id":"g-1"}')).toEqual({
+      recommendsCreates: true,
+      recommendsOtherOps: false,
+    });
+    expect(detectThinkerDirectionRecommendations('Create a direction for corpus production')).toEqual({
+      recommendsCreates: true,
+      recommendsOtherOps: false,
+    });
+    expect(detectThinkerDirectionRecommendations('**Create** d-abc — own corpus production')).toEqual({
+      recommendsCreates: true,
+      recommendsOtherOps: false,
+    });
+  });
+
+  it('detects retire/update/stage/approve/reject from command names and prose', () => {
+    expect(detectThinkerDirectionRecommendations('Retire d-abc123 — stale')).toEqual({
+      recommendsCreates: false,
+      recommendsOtherOps: true,
+    });
+    expect(detectThinkerDirectionRecommendations('stage-direction d-staged')).toEqual({
+      recommendsCreates: false,
+      recommendsOtherOps: true,
+    });
+    expect(detectThinkerDirectionRecommendations('Approve d-qa1 and Reject d-qa2')).toEqual({
+      recommendsCreates: false,
+      recommendsOtherOps: true,
+    });
+    expect(detectThinkerDirectionRecommendations('update-direction d-xyz')).toEqual({
+      recommendsCreates: false,
+      recommendsOtherOps: true,
+    });
+  });
+
+  it('does not flag a bare verb, a decided-against move, or empty text', () => {
+    expect(detectThinkerDirectionRecommendations('')).toEqual({
+      recommendsCreates: false,
+      recommendsOtherOps: false,
+    });
+    expect(detectThinkerDirectionRecommendations('No moves this cycle.')).toEqual({
+      recommendsCreates: false,
+      recommendsOtherOps: false,
+    });
+    expect(detectThinkerDirectionRecommendations('We considered retiring d-abc but kept it active.')).toEqual({
+      recommendsCreates: false,
+      recommendsOtherOps: false,
+    });
   });
 });
 

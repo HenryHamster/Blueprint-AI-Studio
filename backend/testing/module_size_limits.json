@@ -24,7 +24,7 @@
     "github_pulls.py": 1500,
     "github_http.py": 250,
     "github_merge_summary.py": 350,
-    "discovery_review.py": 1700,
+    "discovery_review.py": 2050,
     "routers/admin_settings.py": 4750,
     "routers/admin_analytics.py": 2750,
     "routers/admin_operator_triggers.py": 1450,
@@ -70,7 +70,7 @@
     "digest_direction_progress.py": 1600,
     "failure_layer_classifier.py": 400,
     "pipeline_alert_scan.py": 600,
-    "release_qualifier.py": 11350,
+    "release_qualifier.py": 10300,
     "release_reconciliation.py": 3700,
     "release_stall_alerts.py": 1050,
     "release_promotion.py": 2350,
@@ -177,7 +177,7 @@
     "handlers/strategic-resident-lib.ts": 3550,
     "handlers/strategic-resident.ts": 5350,
     "handlers/research-direction-context.ts": 250,
-    "prompts/thinker.ts": 1150,
+    "prompts/thinker.ts": 1400,
     "handlers/standard.ts": 1900,
     "handlers/review-fix.ts": 2050,
     "handlers/review-fix-history.ts": 200,
@@ -194,6 +194,7 @@
     "fix-loop-events.ts": 320,
     "constants.ts": 420,
     "json-extract.ts": 330,
+    "workspaceDisk.ts": 400,
     "workspacePrep.ts": 500,
     "reset.ts": 550,
     "utils/test-runners.ts": 2850,
@@ -374,7 +375,7 @@
     "test_release_qualifier__sweep_stuck_qualifications.py": 6100,
     "test_release_qualifier__site_b_lock_window_fix.py": 4950,
     "_release_qualifier_testhelpers.py": 2350,
-    "test_release_qualifier.py": 1900,
+    "test_release_qualifier.py": 2350,
     "test_operator_inbox_liveness.py": 2800,
     "test_compute_image_build_local.py": 9400,
     "test_compute_runner_dispatch.py": 3350,
@@ -393,6 +394,7 @@
     "test_admin_routers__projects.py": 4100,
     "test_admin_routers__strategic_directions.py": 2200,
     "test_strategic_session_messages.py": 1950,
-    "test_warm_pool_dispatch.py": 2100
+    "test_warm_pool_dispatch.py": 2100,
+    "test_admin_routers__notifications.py": 1800
   }
 }

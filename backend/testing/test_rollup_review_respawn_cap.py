@@ -474,3 +474,113 @@ async def test_dedup_hit_does_not_increment_counter(rollup_db, mocker):
     assert (child.context or {}).get("_review_respawn_count") == start
     await rollup_db.refresh(parent)
     assert parent.requires_approval is False
+
+
+@pytest.mark.asyncio
+async def test_dirty_pr_respawns_conflict_fix_not_review(rollup_db, mocker):
+    """Regression — 2026-08-06 incident (PR #16741): sibling child PRs merged
+    serially into the research base, leaving the last child CONFLICTING. The
+    recovery loop respawned approved review after approved review — a review
+    can never land a dirty PR — until the respawn cap escalated the parent.
+    A child PR whose live mergeable_state is 'dirty' must respawn a conflict
+    FIX task (rebase prompt), not another review."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.rollup_management._verify_pr_merged",
+        new=AsyncMock(return_value=False),
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={"mergeable_state": "dirty", "state": "open"}
+        ),
+    )
+    spawned_fix = Task(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        payloads=[{"type": "fix", "prompt": "fix"}],
+        status=TaskStatus.QUEUED,
+    )
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(spawned_fix, True),
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    parent, child = await _make_respawn_scenario(rollup_db, child_respawn_count=0)
+
+    await _check_and_trigger_rollup(child, rollup_db)
+
+    mock_spawn.assert_awaited_once()
+    spawn_args = mock_spawn.call_args.args
+    spawn_kwargs = mock_spawn.call_args.kwargs
+    task_type = spawn_kwargs.get("task_type") or spawn_args[1]
+    assert task_type == "fix", (
+        f"dirty PR must respawn a conflict fix, got {task_type!r}"
+    )
+    fix_prompt = spawn_kwargs.get("fix_prompt", "")
+    assert "merge conflicts" in fix_prompt
+    assert "git rebase" in fix_prompt
+    # The shared respawn counter still advances — the cap bounds conflict-fix
+    # respawns exactly like review respawns.
+    await rollup_db.refresh(child)
+    assert (child.context or {}).get("_review_respawn_count") == 1
+    await rollup_db.refresh(parent)
+    assert parent.requires_approval is False
+
+
+@pytest.mark.asyncio
+async def test_clean_pr_still_respawns_review(rollup_db, mocker):
+    """When classification succeeds and the PR is NOT dirty, the recovery loop
+    keeps today's behavior: respawn a review with no fix prompt."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.rollup_management._verify_pr_merged",
+        new=AsyncMock(return_value=False),
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={"mergeable_state": "clean", "state": "open"}
+        ),
+    )
+    spawned_review = Task(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        payloads=[{"type": "review", "prompt": "review"}],
+        status=TaskStatus.QUEUED,
+    )
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(spawned_review, True),
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    _parent, child = await _make_respawn_scenario(rollup_db, child_respawn_count=0)
+
+    await _check_and_trigger_rollup(child, rollup_db)
+
+    mock_spawn.assert_awaited_once()
+    spawn_args = mock_spawn.call_args.args
+    spawn_kwargs = mock_spawn.call_args.kwargs
+    task_type = spawn_kwargs.get("task_type") or spawn_args[1]
+    assert task_type == "review"
+    assert spawn_kwargs.get("fix_prompt", "") == ""

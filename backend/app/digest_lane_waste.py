@@ -57,12 +57,14 @@ def classify_lane_waste_category(t: "Task") -> str:
     """Classify one review-loop iteration-task into a pilot waste category.
 
     Pure function reusing the canonical helpers so the diagnostic matches
-    operator logic: ``failure_classification.INFRA_CLASSES`` for infra-class
-    terminal failures, ``review_loop.drift_signal`` for lost repo state,
+    operator logic: ``failure_classification.INFRA_ANALYTICS_CLASSES`` for the
+    infra-class terminal failures (the analytics superset — it also admits
+    UNPLACEABLE_EXECUTION_SITE, a terminal routing-contract failure whose work
+    never ran), ``review_loop.drift_signal`` for lost repo state,
     ``fix_loop_telemetry`` divergence reasons for lost reasoning, and
     ``classify_iteration_lane`` for the mechanical review-fix lanes.
     """
-    from app.failure_classification import INFRA_CLASSES
+    from app.failure_classification import INFRA_ANALYTICS_CLASSES
     from app.fix_loop_telemetry import has_terminal_divergence
     from app.review_heuristics import (
         LANE_CI,
@@ -73,7 +75,7 @@ def classify_lane_waste_category(t: "Task") -> str:
 
     ctx = t.context or {}
     if t.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
-        if ctx.get("failure_category") in INFRA_CLASSES:
+        if ctx.get("failure_category") in INFRA_ANALYTICS_CLASSES:
             return "infra"
     rl = ctx.get("review_loop") or {}
     drift = rl.get("drift_signal")

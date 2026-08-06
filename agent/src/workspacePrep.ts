@@ -31,6 +31,15 @@ import {
   ensureGitCredentialHelperScript,
   gitCredentialHelperPath,
 } from './git-credential.js';
+import {
+  reserveWorkspaceDisk,
+  releaseWorkspaceDiskReservation,
+  getWorkspaceDiskReservation,
+} from './workspaceDisk.js';
+import {
+  configurePackageStoreEnv,
+  enforcePackageStoreBounds,
+} from './packageStore.js';
 
 /**
  * Resolve the pre-baked git object mirror path for an authenticated clone URL,
@@ -127,6 +136,8 @@ export interface WorkspacePrepOutcome {
   cold_fallback_reason: string | null;
   /** Whether lane mode was requested (BLUEPRINT_LANE_MODE=1 with allowLaneResume). */
   lane_phase: boolean;
+  /** Disk reservation held for this workspace (0 when reservation is disabled). */
+  disk_reserved_bytes: number;
 }
 
 // Module-level recorder: written by prepareWorkspaceForRole, read by
@@ -149,6 +160,25 @@ export function resetWorkspacePrepOutcome(): void {
  * (warm path) or wipes + re-clones (cold path).
  */
 export async function prepareWorkspaceForRole(opts: PrepareWorkspaceOptions): Promise<void> {
+  // Fail-fast admission: this workspace must be able to hold its disk
+  // reservation BEFORE any clone work. If the workspace filesystem cannot
+  // satisfy the reservation (plus the configured low-disk floor and any other
+  // reservations this process still holds), we abort with a clear reason
+  // instead of starting a task that would die mid-run on ENOSPC.
+  reserveWorkspaceDisk(opts.workspace);
+
+  try {
+    await _prepareWorkspaceForRoleImpl(opts);
+  } catch (e) {
+    // Abnormal exit: the workspace was not successfully prepared, so its
+    // reservation must not be left held — a leaked reservation would silently
+    // starve later admission. Release before propagating.
+    releaseWorkspaceDiskReservation(opts.workspace);
+    throw e;
+  }
+}
+
+async function _prepareWorkspaceForRoleImpl(opts: PrepareWorkspaceOptions): Promise<void> {
   const { workspace, repoUrl, branch, baseBranch } = opts;
   // depth: undefined → DEFAULT_CLONE_DEPTH; <=0 → full clone (omit --depth).
   const depthOpt = typeof opts.depth === 'number' && Number.isFinite(opts.depth)
@@ -172,6 +202,19 @@ export async function prepareWorkspaceForRole(opts: PrepareWorkspaceOptions): Pr
   // git network operation so the helper always finds a valid token.
   if (opts.githubToken) {
     writeGitTokenFile(opts.githubToken);
+  }
+
+  // Point pip/uv at the shared content-addressed package store so per-workspace
+  // dependency installs read through the baked cache instead of re-downloading
+  // on every VM, then keep the store bounded on a long-lived runner host.
+  // Best-effort: a store that cannot be set up (e.g. a read-only /opt on a dev
+  // box) must not block workspace preparation — pip/uv fall back to their own
+  // per-workspace caching, which is the pre-existing behavior.
+  try {
+    configurePackageStoreEnv();
+    enforcePackageStoreBounds();
+  } catch (e) {
+    log(`prepareWorkspaceForRole: shared package store setup failed (${sanitize(String(e)).slice(0, 200)}); continuing with per-workspace pip/uv caches`);
   }
 
   // lane_phase is meaningful for both warm and cold paths — computed upfront.
@@ -328,6 +371,7 @@ export async function prepareWorkspaceForRole(opts: PrepareWorkspaceOptions): Pr
         checkpoint_reset_applied: checkpointResetApplied,
         cold_fallback_reason: null,
         lane_phase: lanePhase,
+        disk_reserved_bytes: getWorkspaceDiskReservation(workspace) ?? 0,
       };
       return;
     } catch (e) {
@@ -398,5 +442,6 @@ export async function prepareWorkspaceForRole(opts: PrepareWorkspaceOptions): Pr
     checkpoint_reset_applied: false,
     cold_fallback_reason: coldFallbackReason,
     lane_phase: lanePhase,
+    disk_reserved_bytes: getWorkspaceDiskReservation(workspace) ?? 0,
   };
 }

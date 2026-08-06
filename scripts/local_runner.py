@@ -121,6 +121,7 @@ it MUST be under a process supervisor, or wrapped so it comes back:
 ``--check`` reports whether a supervisor was detected and warns if not.
 """
 
+import atexit
 import base64
 import hashlib
 import http.client
@@ -7159,7 +7160,11 @@ def _workspace_writable(root: str) -> bool:
         return False
 
 
-def _cleanup_stale_workspaces(active_task_ids: set, max_age_seconds: float = 300) -> int:
+# Stale-workspace sweep grace: a clean agent exit already reaps its workspace
+# via _cleanup_agent_workspace, so the periodic sweep only catches workspaces
+# stranded by a crashed agent subprocess. 60 s (down from 300 s) never races a
+# freshly-created workspace but keeps a stranded dir from lingering.
+def _cleanup_stale_workspaces(active_task_ids: set, max_age_seconds: float = 60.0) -> int:
     """Remove per-task workspace dirs that are not in *active_task_ids* and older than *max_age_seconds*."""
     root = _workspace_root()
     if not os.path.isdir(root):
@@ -7186,6 +7191,43 @@ def _cleanup_stale_workspaces(active_task_ids: set, max_age_seconds: float = 300
                 continue
     except OSError:
         pass
+    return removed
+
+
+def _cleanup_all_workspaces() -> int:
+    """Remove every per-task workspace dir under the workspace root.
+
+    Last-resort teardown registered with ``atexit`` in ``main()``. A crashed
+    runner never runs the per-task cleanup (agent exit) nor the stale sweep
+    (the reap loop died), so every workspace it held would otherwise leak until
+    a future runner's sweep — and this process is gone, so no active-set check
+    can know those dirs are orphaned. Removing everything at shutdown closes
+    that gap. Safe because each runner owns its workspace root (the runbook's
+    multi-runner setup requires non-overlapping BLUEPRINT_RUNNER_WORKSPACE_ROOT
+    dirs). Honors BLUEPRINT_RUNNER_KEEP_WORKSPACES=1 like the per-task cleanup.
+    """
+    if os.environ.get("BLUEPRINT_RUNNER_KEEP_WORKSPACES", "").strip().lower() in (
+        "1", "true", "yes",
+    ):
+        return 0
+    root = _workspace_root()
+    if not os.path.isdir(root):
+        return 0
+    removed = 0
+    try:
+        for name in os.listdir(root):
+            dirpath = os.path.join(root, name)
+            if not os.path.isdir(dirpath):
+                continue
+            try:
+                shutil.rmtree(dirpath, ignore_errors=True)
+                removed += 1
+            except OSError:
+                continue
+    except OSError:
+        pass
+    if removed:
+        print(f"[runner] atexit cleanup removed {removed} workspace(s)", flush=True)
     return removed
 
 
@@ -8572,6 +8614,12 @@ def main() -> None:
     # An agent sandbox exists iff bwrap can be built OR a docker+image backend is
     # available. When agent_image is None this is exactly caps.bwrap_ok (unchanged).
     agent_sandbox_ok = caps.bwrap_ok or _docker_agent_possible(caps, agent_image)
+
+    # Last-resort teardown: a crashed runner never runs the per-task cleanup
+    # (agent exit) nor the stale sweep (the reap loop died), so every workspace
+    # it held would leak. Registered only once the runner is operating (workspaces
+    # are created below), so --check and setup failures never touch the root.
+    atexit.register(_cleanup_all_workspaces)
 
     # Agent poll loop — only runs when an agent sandbox can be built (fail-closed).
     # Otherwise we idle on the shutdown event while compute/heartbeat continue.

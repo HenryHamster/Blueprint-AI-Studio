@@ -355,3 +355,68 @@ async def test_infra_failure_dim_streak_carries_across_sha_advance(db_session):
     assert new_row.detail["consecutive_infra_errors"] == 3, (
         "persisted streak must be 3 (carry-forward from sha_a), not 99 from ci"
     )
+
+
+@pytest.mark.asyncio
+async def test_infra_failure_redrive_skips_when_qualifier_audit_already_live(
+    db_session, mocker
+):
+    """A live qualifier audit means a qualification is already in flight.
+
+    Incident 2026-08-05: an explicit qualification and the sweep's
+    infra_failure re-driver double-spawned duplicate release_audit tasks two
+    minutes apart — the explicit path only rewrites ``last_qualification``
+    when its spawn transaction commits, so the sweep read a stale
+    ``infra_failure`` marker. The re-driver must defer to the running attempt.
+    """
+    from app import release_qualifier
+    from app.models import Task, TaskStatus
+    from app.release_qualifier_redrive import _redrive_infra_failure_qualification
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "infra_failure",
+        "candidate_sha": "ca11face" * 5,
+        "error": "qualifier child timeout",
+        "consecutive_infra_errors": 0,
+    }
+    db_session.add(version)
+    audit = Task(
+        project_id=project.id,
+        title="Release review audit",
+        payloads=[{"type": "release_audit"}],
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(audit)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    run_qualification = mocker.patch.object(
+        release_qualifier,
+        "run_qualification",
+        side_effect=AssertionError("must not re-drive while an audit is live"),
+    )
+
+    assert (
+        await _redrive_infra_failure_qualification(
+            version.id, session_factory=_shared_session_factory(db_session)
+        )
+        is False
+    )
+    run_qualification.assert_not_called()
+
+    # Once the audit settles, the same marker re-drives normally.
+    audit.status = TaskStatus.COMPLETED
+    db_session.add(audit)
+    await db_session.commit()
+    run_qualification.side_effect = None
+    run_qualification.return_value = {"status": "spawned"}
+
+    assert (
+        await _redrive_infra_failure_qualification(
+            version.id, session_factory=_shared_session_factory(db_session)
+        )
+        is True
+    )
+    run_qualification.assert_called_once()

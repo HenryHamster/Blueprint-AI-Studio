@@ -510,6 +510,7 @@ async def build_discovery_review_packet(
     )
 
     landed: list[dict[str, Any]] = []
+    stranded_deliveries: list[dict[str, Any]] = []
     missing: list[str] = []
     if intent_truncated:
         missing.append("intent authority exceeds the bounded decision contract")
@@ -517,6 +518,15 @@ async def build_discovery_review_packet(
         missing.append("bet authority exceeds the bounded decision contract")
     if source is None:
         missing.append("source research parent is missing from the discovery cohort")
+    # A research parent that settled FAILED/CANCELLED never rolls its staging
+    # branch up, so a child PR merged into that branch can never gain a landed
+    # receipt. That absence is a settled fact for the review to judge (salvage,
+    # re-bet, or stop) — not evidence still in flight — so holding the cycle in
+    # EVIDENCE_PENDING on it would starve the direction forever.
+    source_settled_unlanded = source is not None and source.status in {
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+    }
     for task in tasks:
         task_type = _task_type(task)
         is_source_parent = task.id == cycle.source_research_task_id
@@ -530,9 +540,22 @@ async def build_discovery_review_packet(
         pr_number = _pr_number(task)
         landed_signal = has_landed_signal(task)
         if pr_number is not None and not landed_signal:
-            missing.append(
-                f"delivery task {task.id} has PR {pr_number} without landed receipt"
-            )
+            if source_settled_unlanded:
+                stranded_deliveries.append(
+                    {
+                        "task_id": str(task.id),
+                        "task_type": task_type,
+                        "pr_number": pr_number,
+                        "reason": (
+                            "research parent settled "
+                            f"{_enum_value(source.status)} before rollup"
+                        ),
+                    }
+                )
+            else:
+                missing.append(
+                    f"delivery task {task.id} has PR {pr_number} without landed receipt"
+                )
         if landed_signal and not commit_hash:
             missing.append(f"landed write task {task.id} lacks exact commit identity")
         if landed_signal:
@@ -705,6 +728,7 @@ async def build_discovery_review_packet(
         "research_findings": included_research_findings,
         "knowledge_outcomes": included_knowledge_outcomes,
         "landed_outcomes": included_landed,
+        "stranded_deliveries": stranded_deliveries[:DISCOVERY_REVIEW_LANDED_OUTCOMES],
         "experiment_outcomes": included_experiments,
         "verification_summaries": included_verification_summaries,
         "evidence_coverage": evidence_coverage,
@@ -752,6 +776,9 @@ async def build_discovery_review_packet(
             "research_findings": [],
             "knowledge_outcomes": [],
             "landed_outcomes": [],
+            "stranded_deliveries": stranded_deliveries[
+                :DISCOVERY_REVIEW_LANDED_OUTCOMES
+            ],
             "experiment_outcomes": [],
             "verification_summaries": [],
             "evidence_coverage": evidence_coverage,
@@ -808,6 +835,7 @@ async def build_discovery_review_packet(
         "artifact_count": len(artifacts),
         "semantic_receipt_checksum": outcome_item.checksum,
         "exact_landed_sha": landed_sha,
+        "stranded_delivery_count": len(stranded_deliveries),
         "missing_required_evidence": missing_reasons,
         "binding_action_blockers": binding_action_blockers,
         "binding_decision_allowed": not binding_action_blockers,

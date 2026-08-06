@@ -255,7 +255,7 @@ async def test_unplaceable_non_generic_site_task_is_terminal_not_provision_failu
 
     A walkthrough_e2e task that is QUEUED can never be re-placed (its execution
     site is a live local runner pinned at birth; generic dispatch serves only
-    'default'/'direct_packer_gce'). Failing it closed with PROVISION_FAILURE
+    'default'). Failing it closed with PROVISION_FAILURE
     would mark a never-provisioned task as a transient provisioning blip and
     hand it to the resurrection sweep, which re-queues it into the same dead
     end every cycle. The category must instead be terminal and outside
@@ -307,6 +307,79 @@ async def test_unplaceable_non_generic_site_task_is_terminal_not_provision_failu
     message = task.latest_status_message or ""
     assert "local_runner" in message, f"must name the declared site: {message!r}"
     assert "no eligible runner" in message, f"must state the contradiction: {message!r}"
+
+
+class TestUnplaceableExecutionSiteAnalyticsBucket:
+    """UNPLACEABLE_EXECUTION_SITE is a TERMINAL, non-resurrectable routing
+    failure.  The analytics consumers that bucket failures into infra vs
+    code-defect gate on a membership set; because the class deliberately lives
+    OUTSIDE INFRA_CLASSES (so the resurrection sweep never re-queues it), those
+    consumers must route it via the explicit INFRA_ANALYTICS_CLASSES superset —
+    landing in exactly ONE analytics bucket (infra), never the code-defect
+    bucket, and never falling out of both (the pre-fix behavior)."""
+
+    def test_infra_analytics_superset_admits_it_but_resurrection_set_does_not(self):
+        from app.failure_classification import (
+            INFRA_ANALYTICS_CLASSES,
+            INFRA_CLASSES,
+        )
+
+        # Non-resurrectable: the resurrection sweep flips only INFRA_CLASSES
+        # members back to QUEUED.
+        assert UNPLACEABLE_EXECUTION_SITE not in INFRA_CLASSES
+        # Analytics infra bucket membership is explicit, not incidental.
+        assert UNPLACEABLE_EXECUTION_SITE in INFRA_ANALYTICS_CLASSES
+        # Taxonomy agrees on exactly one bucket: infra_related.
+        assert (
+            classify_failure_taxonomy(
+                _task(ctx={"failure_category": UNPLACEABLE_EXECUTION_SITE})
+            )
+            == TAXONOMY_INFRA_RELATED
+        )
+
+    def test_direction_streak_does_not_count_unplaceable_as_code_failure(self):
+        from app.direction_streaks import (
+            direction_failure_streaks,
+            record_direction_result,
+        )
+
+        direction_id = "d-analytics-unplaceable-streak"
+        record_direction_result(
+            direction_id,
+            success=False,
+            failure_class=UNPLACEABLE_EXECUTION_SITE,
+            project_id="p-1",
+        )
+        streak = direction_failure_streaks[direction_id]
+        assert streak["consecutive_failures"] == 0, (
+            "an unplaceable task never ran — it must not count toward the "
+            "direction's code-failure streak or hold an innocent direction"
+        )
+        assert streak["held"] is False
+        direction_failure_streaks.pop(direction_id, None)
+
+    def test_lane_waste_classifies_unplaceable_as_infra(self):
+        from app.digest_lane_waste import classify_lane_waste_category
+        from app.models import TaskStatus
+
+        task = _task(ctx={"failure_category": UNPLACEABLE_EXECUTION_SITE})
+        task.status = TaskStatus.FAILED
+        assert classify_lane_waste_category(task) == "infra", (
+            "an unplaceable review-loop task is an infra-class waste category, "
+            "not 'unknown'"
+        )
+
+    def test_review_cap_excludes_unplaceable_task(self):
+        from app.models import TaskStatus
+        from app.review_pipeline import task_counts_toward_review_cap
+
+        task = _task(ctx={"failure_category": UNPLACEABLE_EXECUTION_SITE})
+        task.archived = False
+        task.status = TaskStatus.FAILED
+        assert task_counts_toward_review_cap(task) is False, (
+            "an unplaceable task never ran a review — it must not consume the "
+            "per-PR review-fix iteration cap"
+        )
 
 
 def _effort_timeout_task(subtype: str, *, effort: str = "medium") -> Task:
@@ -3026,6 +3099,82 @@ class TestRepoUninitializedClassification:
         # An unseeded repo is an operator fix, not a code defect to debug.
         t = _task(self._AGENT_MSG, ctx={"failure_category": "CODE_ERROR"})
         assert should_trigger_code_defect_investigation(t) is False
+
+    # The clone-SUCCEEDS commitless path: `git clone` of a repo with zero commits
+    # exits 0 (git only warns "you appear to have cloned an empty repository"),
+    # so the branch-missing probe in cloneWithRetry never runs. The empty tree
+    # surfaces downstream in verifyCloneDelivered as an unresolvable HEAD; the
+    # agent probes the remote, finds zero refs, self-reports the emptiness, and
+    # throws this exact message (must stay in sync with discovery.ts).
+    _CLONE_SUCCEEDS_MSG = (
+        "clone_failed: the repository has no commits, so the clone produced an "
+        "empty working tree with no HEAD. Blueprint seeds an initial commit when "
+        "a project is onboarded — this repo was never seeded. Push any commit to "
+        "the default branch (or re-onboard the project) to fix."
+    )
+
+    def test_clone_succeeds_commitless_no_head_classifies(self):
+        """The message the clone-SUCCEEDS commitless path emits must classify as
+        REPO_UNINITIALIZED (not a generic clone_failed / CODE_ERROR), so the
+        failure reads as an unseeded repo instead of a transient clone problem."""
+        assert classify_failure(_task(self._CLONE_SUCCEEDS_MSG)) == REPO_UNINITIALIZED
+        # Also with an agent-posted clone_failed category, the text check wins.
+        assert (
+            classify_failure(
+                _task(self._CLONE_SUCCEEDS_MSG, ctx={"failure_category": "clone_failed"})
+            )
+            == REPO_UNINITIALIZED
+        )
+
+    def test_clone_succeeds_commitless_no_head_routes_to_repo_is_empty_self_heal(self):
+        """The clone-succeeds signature must satisfy ``is_repo_uninitialized`` —
+        the exact predicate agent_status.py uses to route a ``clone_failed``
+        report to ``maybe_correct_stale_commitless_repo_signal``, which is what
+        re-verifies against GitHub and clears a stale ``repo_is_empty=False``."""
+        from app.failure_classification import is_repo_uninitialized
+
+        assert is_repo_uninitialized(self._CLONE_SUCCEEDS_MSG) is True
+
+    def test_generic_no_head_clone_failure_not_swept_into_repo_uninitialized(self):
+        """NEGATIVE case: a HEAD-missing clone failure with no commitless evidence
+        (remote probe unanswerable, or the message predates the probe) must NOT be
+        swept into REPO_UNINITIALIZED — it stays a generic clone_failed so an
+        unrelated partial/wrong checkout is not misreported as an empty repo."""
+        from app.failure_classification import is_repo_uninitialized
+
+        generic = (
+            "clone_failed: working tree has no resolvable HEAD after clone — "
+            "the clone did not deliver a checkout"
+        )
+        assert is_repo_uninitialized(generic) is False
+        assert classify_failure(_task(generic)) != REPO_UNINITIALIZED
+
+    def test_clone_succeeds_pattern_matches_agent_source_of_truth(self):
+        """Cross-language contract: the clone-succeeds canonical phrase and its
+        narrow no-HEAD fallback pattern must appear verbatim in the agent's
+        discovery.ts so the two ends cannot silently drift apart (the defect
+        class that produced the original wedge: the agent emitted one phrase
+        while the backend matched another)."""
+        from app.failure_classification import _REPO_UNINITIALIZED_PATTERNS
+
+        agent_file = _REPO_ROOT / "agent" / "src" / "prompts" / "discovery.ts"
+        if not agent_file.exists():
+            pytest.skip(
+                f"{agent_file} not available in this environment — the backend "
+                "test image ships no agent/ tree (build context is ./backend). "
+                "This cross-language drift guard runs wherever the full repo "
+                "tree is checked out (local dev, agent VM workspace)."
+            )
+        src = agent_file.read_text(encoding="utf-8").lower()
+        for pat in _REPO_UNINITIALIZED_PATTERNS:
+            if pat in ("this repository is empty", "git repository is empty"):
+                # GitHub API phrasings, not agent-emitted — only the agent's own
+                # phrases must appear in discovery.ts.
+                continue
+            assert pat in src, (
+                f"repo-uninitialized pattern {pat!r} not found in discovery.ts — "
+                "the cross-language contract has drifted"
+            )
 
 
 class TestParkWakeFailureClassRegistration:

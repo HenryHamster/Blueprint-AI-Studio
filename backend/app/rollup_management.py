@@ -1787,6 +1787,7 @@ async def _check_and_trigger_rollup(
             now = _utcnow()
             stale_threshold = timedelta(minutes=10)
             respawned = 0
+            respawned_fixes = 0
             # Phase A: decide under lock; collect respawn candidates.
             respawn_candidates: list[dict] = []
             # Batch-fetch PR artifacts for all unmerged children in one query.
@@ -2010,18 +2011,66 @@ async def _check_and_trigger_rollup(
                 child = children_by_id.get(cand["child_id"])
                 if child is None:
                     continue
+                # A review can never land a PR whose merge blocker is a genuine
+                # conflict with its base: the exact-target merge authority holds
+                # every approval, and this loop would re-review until the respawn
+                # cap escalates (incident 2026-08-06, PR #16741 — sibling child
+                # PRs merged serially into the research base, leaving the last
+                # one CONFLICTING; repeated approved reviews, zero fix tasks).
+                # Classify the live mergeable state first and route dirty PRs to
+                # a conflict-fix spawn. Any classification failure falls back to
+                # the review respawn, so this path never blocks recovery.
+                spawn_type = "review"
+                fix_prompt = ""
+                _live_pr: dict = {}
+                try:
+                    _cls_token, _cls_owner, _cls_repo = (
+                        await get_github_token_for_task(child.id, session)
+                    )
+                    _live_pr = await get_pull_request(
+                        _cls_token,
+                        _cls_owner,
+                        _cls_repo,
+                        cand["pr_number"],
+                        project_id=str(child.project_id),
+                    )
+                except Exception as _classify_exc:
+                    logger.warning(
+                        f"[ROLLUP] Could not classify PR #{cand['pr_number']} "
+                        f"mergeable state before respawn ({_classify_exc}) — "
+                        f"falling back to review respawn"
+                    )
+                if (_live_pr.get("mergeable_state") or "").lower() == "dirty":
+                    spawn_type = "fix"
+                    fix_prompt = (
+                        f"PR #{cand['pr_number']} merging {cand['branch']} into "
+                        f"{cand['base_branch']} has merge conflicts (GitHub "
+                        f"mergeable_state=dirty), so review approvals cannot land it.\n\n"
+                        f"Original task goal: {cand['original_prompt'][:500]}\n\n"
+                        f"Steps to resolve:\n"
+                        f"1. Run: git fetch origin {cand['base_branch']}\n"
+                        f"2. Run: git rebase origin/{cand['base_branch']}\n"
+                        f"3. Resolve conflicts — {cand['base_branch']} is the source of "
+                        f"truth. Keep its current state and re-apply only the changes "
+                        f"that serve the original task goal on top of it.\n"
+                        f"4. Run: git rebase --continue after resolving each file, "
+                        f"then git push --force-with-lease"
+                    )
                 review_task, was_spawned = await _spawn_pipeline_task(
                     child,
-                    "review",
+                    spawn_type,
                     session,
                     cand["pr_number"],
                     cand["branch"],
                     cand["base_branch"],
                     original_prompt=cand["original_prompt"],
+                    fix_prompt=fix_prompt,
                     original_task_id=str(child.id),
                 )
                 if review_task and review_task.id != child.id:
                     respawned += 1
+                    if spawn_type == "fix":
+                        respawned_fixes += 1
                     if was_spawned:
                         child.context = {
                             **(child.context or {}),
@@ -2029,8 +2078,8 @@ async def _check_and_trigger_rollup(
                         }
                         session.add(child)
                     logger.warning(
-                        f"[ROLLUP] Respawned review for stale child {str(child.id)[:8]} "
-                        f"PR #{cand['pr_number']} → review {str(review_task.id)[:8]} "
+                        f"[ROLLUP] Respawned {spawn_type} for stale child {str(child.id)[:8]} "
+                        f"PR #{cand['pr_number']} → {spawn_type} {str(review_task.id)[:8]} "
                         f"(respawn {_review_respawn_count(child)}/{MAX_REVIEW_RESPAWNS})"
                     )
                 elif review_task is None and child.requires_approval:
@@ -2079,7 +2128,10 @@ async def _check_and_trigger_rollup(
                         )
 
             if respawned:
-                parent.latest_status_message = f"Recovering: respawned {respawned} review(s) for unmerged PR(s) — {', '.join(unmerged_titles)}"
+                _fix_note = (
+                    f" ({respawned_fixes} conflict-fix)" if respawned_fixes else ""
+                )
+                parent.latest_status_message = f"Recovering: respawned {respawned} review(s){_fix_note} for unmerged PR(s) — {', '.join(unmerged_titles)}"
             else:
                 parent.latest_status_message = f"Blocked: {len(unmerged)} subtask(s) completed but PR not merged — {', '.join(unmerged_titles)}"
             logger.info(

@@ -217,10 +217,12 @@ describe('verifyCloneDelivered', () => {
   // Route the execFileSync mock by the git subcommand verifyCloneDelivered runs:
   //   git rev-parse HEAD            → head
   //   git rev-parse --verify origin/<branch> → originHead (or throw if undefined)
+  //   git ls-remote --heads origin  → lsRemote (raw ls-remote stdout; '' = no refs)
   //   git ls-files                  → lsFiles joined (via countSourceFiles)
   const routeGit = (opts: {
     head?: string | (() => never);
     originHead?: string | (() => never);
+    lsRemote?: string | (() => never);
     lsFiles?: string[] | (() => never);
   }) => {
     vi.mocked(execFileSync).mockImplementation((_cmd, args) => {
@@ -233,6 +235,10 @@ describe('verifyCloneDelivered', () => {
         if (typeof opts.originHead === 'function') return opts.originHead();
         if (opts.originHead === undefined) throw new Error('unknown revision');
         return opts.originHead;
+      }
+      if (a[0] === 'ls-remote') {
+        if (typeof opts.lsRemote === 'function') return opts.lsRemote();
+        return (opts.lsRemote ?? '');
       }
       if (a[0] === 'ls-files') {
         if (typeof opts.lsFiles === 'function') return opts.lsFiles();
@@ -299,12 +305,68 @@ describe('verifyCloneDelivered', () => {
     expect(caught?.message).toContain('does not match');
   });
 
-  it('throws clone_failed when HEAD cannot be resolved at all', async () => {
-    routeGit({ head: () => { throw new Error('fatal: not a git repository'); } });
+  it('throws clone_failed when HEAD cannot be resolved at all (remote has commits)', async () => {
+    // The generic no-HEAD clone_failed: HEAD is unresolvable but the remote is
+    // NOT commitless (probe sees refs), so this is a partial/wrong checkout, not
+    // a repo-uninitialized condition — the generic message must be preserved.
+    routeGit({
+      head: () => { throw new Error('fatal: not a git repository'); },
+      lsRemote: 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4\trefs/heads/main\n',
+    });
     let caught: (Error & { failureCategory?: string }) | null = null;
     try { await verifyCloneDelivered({ repo_is_empty: false }, 'main'); } catch (e) { caught = e as Error & { failureCategory?: string }; }
     expect(caught?.failureCategory).toBe('clone_failed');
     expect(caught?.message).toContain('no resolvable HEAD');
+    expect(apiPost).not.toHaveBeenCalled();
+  });
+
+  it('detects a commitless remote on the clone-succeeds no-HEAD path and self-reports', async () => {
+    // The clone command exited 0 (empty-repo clone succeeds with a warning) but
+    // the working tree has no HEAD, and the remote advertises zero refs → this
+    // is REPO_UNINITIALIZED, not a generic clone failure. The recovery path must
+    // (a) reach the best-effort self-report and (b) throw the canonical
+    // "repository has no commits" signature the backend classifier keys on.
+    routeGit({
+      head: () => { throw new Error('fatal: ambiguous argument HEAD'); },
+      lsRemote: '', // `git ls-remote --heads origin` of a commitless remote is empty
+    });
+    let caught: (Error & { failureCategory?: string }) | null = null;
+    try { await verifyCloneDelivered({ repo_is_empty: false }, 'main'); } catch (e) { caught = e as Error & { failureCategory?: string }; }
+    expect(caught?.failureCategory).toBe('clone_failed');
+    expect(caught?.message).toContain('the repository has no commits');
+    expect(caught?.message).toContain('empty working tree with no HEAD');
+    expectCalledWith(apiPost,
+      '/api/agent/build-config-discovery',
+      { observed_repo_is_empty: true },
+    );
+  });
+
+  it('still reports observed_repo_is_empty=true even when the backend report fails', async () => {
+    // The self-report is best-effort — a reporting failure must not suppress the
+    // real clone_failed, and must not change the emitted canonical signature.
+    routeGit({
+      head: () => { throw new Error('fatal: ambiguous argument HEAD'); },
+      lsRemote: '',
+    });
+    vi.mocked(apiPost).mockRejectedValue(new Error('network error'));
+    let caught: (Error & { failureCategory?: string }) | null = null;
+    try { await verifyCloneDelivered({ repo_is_empty: false }, 'main'); } catch (e) { caught = e as Error & { failureCategory?: string }; }
+    expect(caught?.failureCategory).toBe('clone_failed');
+    expect(caught?.message).toContain('the repository has no commits');
+  });
+
+  it('falls back to the generic no-HEAD message when the remote probe is unanswerable', async () => {
+    // An unanswerable probe must NOT flip a real repo into a false
+    // repo-uninitialized diagnosis — conservative "not empty" → generic error.
+    routeGit({
+      head: () => { throw new Error('fatal: ambiguous argument HEAD'); },
+      lsRemote: () => { throw new Error('fatal: unable to access origin'); },
+    });
+    let caught: (Error & { failureCategory?: string }) | null = null;
+    try { await verifyCloneDelivered({ repo_is_empty: false }, 'main'); } catch (e) { caught = e as Error & { failureCategory?: string }; }
+    expect(caught?.failureCategory).toBe('clone_failed');
+    expect(caught?.message).toContain('no resolvable HEAD');
+    expect(apiPost).not.toHaveBeenCalled();
   });
 
   it('does not fail on a missing origin/<branch> ref alone (durable check is the net)', async () => {

@@ -2022,7 +2022,32 @@ async def test_sweep_passes_progress_cb_to_driver(db):
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Operator-visible drift alert: sweep surfaces a rebuilt image via Alert
+#
+# The DEFAULT alert policy suppresses INFO severity for these event types
+# (allow_info=False — the suppression contract is asserted in
+# test_alert_policy.py).  The tests below opt the two compute drift events
+# into durable INFO alerts so the still-live creation/dedupe/content
+# mechanics of the drift-alert helpers stay covered.
 # ══════════════════════════════════════════════════════════════════════════════
+
+
+def _drift_info_allowed():
+    """patch.dict context: allow durable INFO alerts for the drift events."""
+    from app.alert_policy import ALERT_EVENT_POLICIES, AlertEventPolicy
+
+    return patch.dict(
+        ALERT_EVENT_POLICIES,
+        {
+            "compute.image_drift": AlertEventPolicy(
+                "compute.image_drift", allow_info=True, action_required=False
+            ),
+            "compute.image_drift_deferred": AlertEventPolicy(
+                "compute.image_drift_deferred",
+                allow_info=True,
+                action_required=False,
+            ),
+        },
+    )
 
 
 @pytest.mark.asyncio
@@ -2037,7 +2062,7 @@ async def test_rebuilt_creates_info_alert(db):
     async def _refresh(session, project, **kwargs):
         return {"status": "rebuilt", "dep_hash": "deadbeef01234567", "pinned_ref": pinned}
 
-    with patch("app.reaper_sweeps._last_compute_image_refresh_sweep", None):
+    with patch("app.reaper_sweeps._last_compute_image_refresh_sweep", None), _drift_info_allowed():
         result = await sweep_refresh_project_compute_images(
             db,
             now=datetime(2026, 6, 1, 12, 0, 0),
@@ -2076,7 +2101,7 @@ async def test_rebuilt_alert_deduped_on_second_sweep(db):
         return {"status": "rebuilt", "dep_hash": "aabbccdd", "pinned_ref": f"{_FULL_REPO}@{_DIGEST_A}"}
 
     async def _run():
-        with patch("app.reaper_sweeps._last_compute_image_refresh_sweep", None):
+        with patch("app.reaper_sweeps._last_compute_image_refresh_sweep", None), _drift_info_allowed():
             return await sweep_refresh_project_compute_images(
                 db,
                 now=datetime(2026, 6, 1, 12, 0, 0),
@@ -2151,7 +2176,7 @@ async def test_deferred_creates_drift_alert(db):
     async def _refresh(session, p, **kwargs):
         return {"status": "deferred", "reason": "build_budget_exhausted", "dep_hash": dep_hash}
 
-    with patch("app.reaper_sweeps._last_compute_image_refresh_sweep", None):
+    with patch("app.reaper_sweeps._last_compute_image_refresh_sweep", None), _drift_info_allowed():
         result = await sweep_refresh_project_compute_images(
             db,
             now=datetime(2026, 6, 1, 12, 0, 0),
@@ -2187,7 +2212,7 @@ async def test_deferred_builder_busy_creates_alert(db):
     async def _refresh(session, p, **kwargs):
         return {"status": "deferred", "reason": "builder_busy", "dep_hash": "aabbccdd"}
 
-    with patch("app.reaper_sweeps._last_compute_image_refresh_sweep", None):
+    with patch("app.reaper_sweeps._last_compute_image_refresh_sweep", None), _drift_info_allowed():
         result = await sweep_refresh_project_compute_images(
             db,
             now=datetime(2026, 6, 1, 12, 0, 0),
@@ -2223,7 +2248,7 @@ async def test_deferred_alert_deduped_on_second_sweep(db):
         return {"status": "deferred", "reason": "build_budget_exhausted", "dep_hash": "aabbccdd"}
 
     async def _run():
-        with patch("app.reaper_sweeps._last_compute_image_refresh_sweep", None):
+        with patch("app.reaper_sweeps._last_compute_image_refresh_sweep", None), _drift_info_allowed():
             return await sweep_refresh_project_compute_images(
                 db,
                 now=datetime(2026, 6, 1, 12, 0, 0),
@@ -2337,7 +2362,7 @@ async def test_deferred_no_alert_when_dep_hash_missing(db):
     async def _refresh(session, p, **kwargs):
         return {"status": "deferred", "reason": "builder_busy"}
 
-    with patch("app.reaper_sweeps._last_compute_image_refresh_sweep", None):
+    with patch("app.reaper_sweeps._last_compute_image_refresh_sweep", None), _drift_info_allowed():
         result = await sweep_refresh_project_compute_images(
             db,
             now=datetime(2026, 6, 1, 12, 0, 0),
@@ -2373,7 +2398,7 @@ async def test_deferred_alert_type_not_confused_with_rebuilt_alert(db):
     async def _deferred_refresh(session, p, **kwargs):
         return {"status": "deferred", "reason": "build_budget_exhausted", "dep_hash": "a"}
 
-    with patch("app.reaper_sweeps._last_compute_image_refresh_sweep", None):
+    with patch("app.reaper_sweeps._last_compute_image_refresh_sweep", None), _drift_info_allowed():
         result = await sweep_refresh_project_compute_images(
             db,
             now=datetime(2026, 6, 1, 12, 0, 0),

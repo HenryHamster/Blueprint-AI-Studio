@@ -9,7 +9,7 @@ import logging
 from datetime import timedelta
 from typing import Any, Dict
 
-from app.failure_classification import INFRA_CLASSES as _DIRECTION_INFRA_CLASSES
+from app.failure_classification import INFRA_ANALYTICS_CLASSES as _DIRECTION_INFRA_CLASSES
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -30,11 +30,13 @@ DIRECTION_HOLD_THRESHOLD = 3
 # Automatic hold expiry (safety valve so a direction doesn't stay blocked forever)
 DIRECTION_HOLD_TIMEOUT_HOURS = 2
 
-# _DIRECTION_INFRA_CLASSES: imported from failure_classification at module top-level.
-# Infrastructure failures (RATE_LIMIT, PROVISION_FAILURE, AGENT_TIMEOUT,
-# EXTERNAL_API, SCOPE_OVERFLOW) do NOT count toward the direction streak —
-# they're platform noise, not the direction's fault. Account health +
-# provisioning tracking handle them upstream.
+# _DIRECTION_INFRA_CLASSES: the INFRA analytics superset, imported from
+# failure_classification at module top-level. Infrastructure failures
+# (RATE_LIMIT, PROVISION_FAILURE, AGENT_TIMEOUT, EXTERNAL_API, SCOPE_OVERFLOW,
+# and the terminal routing-contract class UNPLACEABLE_EXECUTION_SITE — the task
+# never ran) do NOT count toward the direction streak — they're platform noise,
+# not the direction's fault. Account health + provisioning tracking handle them
+# upstream.
 
 
 def record_direction_result(

@@ -141,6 +141,110 @@ def test_info_severity_is_suppressed_for_durable_alerts():
     assert decision.domain == DOMAIN_RELEASE_LIFECYCLE
 
 
+@pytest.mark.asyncio
+async def test_info_alerts_blocked_by_default_policy(db_session, mocker):
+    """INFO-severity alerts created through the direct-creation helpers in
+    alert_dispatch (e.g. compute.image_drift) must NOT create durable Alert
+    rows under the default policy, whose ``allow_info`` defaults to False.
+
+    Before routing these paths through ``create_project_alert_if_allowed`` the
+    helper bypassed the policy and leaked an undismissed INFO row into the
+    operator inbox (counted as ``info_alert_noise`` by operator_inbox_liveness).
+    """
+    from app.alert_dispatch import _maybe_create_compute_image_drift_alert
+
+    broadcast = mocker.patch(
+        "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+    )
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    created = await _maybe_create_compute_image_drift_alert(
+        db_session,
+        project.id,
+        dep_hash="abc123",
+        pinned_ref="refs/tags/v1.0.0",
+    )
+
+    assert created is False
+    rows = (await db_session.execute(select(Alert))).scalars().all()
+    assert rows == []
+    broadcast.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_info_alerts_blocked_by_default_policy_deferred(db_session, mocker):
+    """The compute.image_drift_deferred INFO path is suppressed the same way as
+    the drift alert under the default policy."""
+    from app.alert_dispatch import _maybe_create_compute_image_drift_deferred_alert
+
+    broadcast = mocker.patch(
+        "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+    )
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    created = await _maybe_create_compute_image_drift_deferred_alert(
+        db_session,
+        project.id,
+        dep_hash="abc123",
+        reason="builder busy",
+    )
+
+    assert created is False
+    rows = (await db_session.execute(select(Alert))).scalars().all()
+    assert rows == []
+    broadcast.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_halted_recovery_dismisses_errors_without_info_alert(
+    db_session, mocker
+):
+    """Auto-recovery dismisses the HALTED ERROR alert but does not create an
+    INFO recovery alert: deployment.halted_recovered is routed to the timeline
+    (not a durable alert row) and INFO is suppressed by the default
+    allow_info=False policy."""
+    from app.alert_dispatch import _create_halted_recovery_alerts
+
+    broadcast = mocker.patch(
+        "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+    )
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    halted = Alert(
+        project_id=project.id,
+        severity=AlertSeverity.ERROR,
+        title=(
+            "Deployment HALTED — 1 consecutive rollbacks, "
+            "manual intervention required"
+        ),
+        message="halted",
+        event_type="deployment.halted",
+    )
+    db_session.add(halted)
+    await db_session.commit()
+
+    await _create_halted_recovery_alerts(db_session)
+    await db_session.commit()
+    await db_session.refresh(halted)
+
+    assert halted.dismissed_at is not None
+    info_rows = [
+        a
+        for a in (await db_session.execute(select(Alert))).scalars().all()
+        if a.severity == AlertSeverity.INFO
+    ]
+    assert info_rows == []
+    broadcast.assert_not_called()
+
+
 def test_audience_gate_suppresses_strategist_internal_events():
     """Strategist-internal events are suppressed regardless of domain enablement."""
     project = make_project(is_self_repo=True)

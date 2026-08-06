@@ -1697,16 +1697,28 @@ async def update_agent_status(
         ctx["failure_class"] = normalized_failure_category
         task.context = ctx
 
-        # Self-heal the stale-``repo_is_empty=False`` wedge. When the agent's
-        # clone-delivery guard reports ``clone_failed`` because the DURABLE
-        # signal says the repo is NOT empty but the cloned tree is empty, a
-        # genuinely empty/near-empty repo can never self-correct — every task
-        # dies clone_failed forever. On that specific disagreement signature
-        # (NOT ordinary transient clone failures), re-verify the durable signal
-        # against GitHub and flip it only when fresh detection authoritatively
-        # confirms the repo is empty. Best-effort: never raises, and preserves
-        # fail-loud for a real clone shortfall (a repo with content leaves the
-        # stored signal untouched, so the next task still fails loud).
+        # Self-heal the stale-``repo_is_empty=False`` wedge. When the agent
+        # reports ``clone_failed`` because the DURABLE signal says the repo is
+        # NOT empty but the live repo disagrees, a genuinely empty repo can
+        # never self-correct — every task dies clone_failed forever. Two
+        # failure shapes reach this block, and BOTH are re-verified against
+        # GitHub before any durable mutation (never flip on the failure
+        # signature alone):
+        #   1. clone-delivery disagreement — durable says non-empty but the
+        #      cloned tree is empty/near-empty (verifyCloneDelivered caught it);
+        #      re-detect authoritatively and flip only on a confirmed-empty
+        #      verdict.
+        #   2. REPO_UNINITIALIZED — the repo has NO branches at all. This
+        #      surfaces two ways: (a) ``git clone --branch <trunk>`` dies before
+        #      verifyCloneDelivered runs (the branch-missing probe in
+        #      cloneWithRetry throws "the repository has no commits…"), or
+        #      (b) the clone SUCCEEDS with exit 0 and verifyCloneDelivered finds
+        #      no HEAD, probes the remote, and throws the same canonical phrase.
+        #      Both match the repo-uninitialized patterns. Confirm with
+        #      repo_has_commits() and flip only when commitless.
+        # Best-effort: never raises, and preserves fail-loud for a real clone
+        # shortfall (a repo with content leaves the stored signal untouched, so
+        # the next task still fails loud).
         from app.failure_classification import (
             is_clone_delivery_disagreement,
             is_repo_uninitialized,
@@ -1716,32 +1728,25 @@ async def update_agent_status(
         _disagreement_text = "\n".join(
             t for t in (payload.logs, task.latest_status_message) if t
         )
-        if _raw_fc == "clone_failed" and is_clone_delivery_disagreement(
-            _disagreement_text
-        ):
+        if _raw_fc == "clone_failed":
             from app.build_config_detection import (
+                maybe_correct_stale_commitless_repo_signal,
                 maybe_correct_stale_repo_empty_signal,
             )
 
-            _heal_project = await session.get(Project, task.project_id)
-            if _heal_project is not None:
-                await maybe_correct_stale_repo_empty_signal(_heal_project, session)
-        elif _raw_fc == "clone_failed" and is_repo_uninitialized(_disagreement_text):
-            # Second self-heal shape: a genuinely commitless repo whose stored
-            # repo_is_empty=False is stale.  git clone --branch <trunk> dies
-            # before verifyCloneDelivered runs, so the failure text matches the
-            # REPO_UNINITIALIZED patterns (not the clone-delivery-disagreement
-            # string).  Re-verify against GitHub and flip the durable signal when
-            # repo_has_commits() confirms the repo is truly commitless.
-            from app.build_config_detection import (
-                maybe_correct_stale_commitless_repo_signal,
-            )
-
-            _heal_project = await session.get(Project, task.project_id)
-            if _heal_project is not None:
-                await maybe_correct_stale_commitless_repo_signal(
-                    _heal_project, session
-                )
+            # Resolve which stale-signal self-heal this clone_failed shape maps
+            # to. A transient clone failure matching neither signature is left
+            # untouched so it keeps failing loud.
+            if is_clone_delivery_disagreement(_disagreement_text):
+                _heal_fn = maybe_correct_stale_repo_empty_signal
+            elif is_repo_uninitialized(_disagreement_text):
+                _heal_fn = maybe_correct_stale_commitless_repo_signal
+            else:
+                _heal_fn = None
+            if _heal_fn is not None:
+                _heal_project = await session.get(Project, task.project_id)
+                if _heal_project is not None:
+                    await _heal_fn(_heal_project, session)
     if payload.scope_gate_triggered:
         ctx = dict(task.context or {})
         ctx["scope_gate_triggered"] = payload.scope_gate_triggered

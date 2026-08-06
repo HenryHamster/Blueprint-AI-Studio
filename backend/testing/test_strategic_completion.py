@@ -20500,3 +20500,184 @@ def test_rejected_proposals_dedup_preserves_cap():
     # Replay: the new entry is already present — list must stay at 30
     _merge_rejected_proposals(vision, batch)
     assert len(vision["rejected_proposals"]) == 30
+
+
+@pytest.mark.asyncio
+async def test_strategic_review_effort_classifier(db_session):
+    """Pre-spawn effort classifier for strategic_review cycles.
+
+    A strategic_review cycle with no high-stakes signals (no open messages, no
+    operator steering, no version decision pending, clean integrity
+    reconciliation, no prior-cycle dirt, no recent cycle failures) must spawn at
+    ROUTINE effort ('medium') — which routing resolution resolves to a cheaper
+    provider cell than the 'strategic' category default 'max' — and stamp the
+    tier + reason on the StrategicCycle row for cost auditability. Any
+    high-stakes or unknown signal resolves CONSEQUENTIAL ('max'), fail-closed.
+    """
+    from app.strategic_review_effort import (
+        classify_strategic_review_effort,
+        CONSEQUENTIAL_EFFORT,
+        CONSEQUENTIAL_TIER,
+        ROUTINE_EFFORT,
+        ROUTINE_TIER,
+    )
+    from app.strategic_spawning import _spawn_strategic_review
+    from app.models import CYCLE_META_EFFORT_REASON, CYCLE_META_EFFORT_TIER
+
+    # ── Pure classifier behavior ────────────────────────────────────────────
+    # Routine: every low-stakes condition holds.
+    routine = classify_strategic_review_effort(
+        {
+            "open_message_count": 0,
+            "operator_steered": False,
+            "version_phase_block": None,
+            "integrity_conflict_counts": None,
+            "prior_cycle_dirty": False,
+            "recent_cycle_failures": False,
+        }
+    )
+    assert routine == (ROUTINE_EFFORT, ROUTINE_TIER, "all routine signals clean")
+
+    # Consequential: each high-stakes signal alone forces the max tier.
+    assert classify_strategic_review_effort(
+        {"open_message_count": 1, "operator_steered": False}
+    )[1] == CONSEQUENTIAL_TIER
+    assert classify_strategic_review_effort(
+        {"open_message_count": 0, "operator_steered": True}
+    )[1] == CONSEQUENTIAL_TIER
+    assert classify_strategic_review_effort(
+        {"open_message_count": 0, "version_phase_block": {"goal_needed": True}}
+    )[1] == CONSEQUENTIAL_TIER
+    assert classify_strategic_review_effort(
+        {
+            "open_message_count": 0,
+            "version_phase_block": {"qualification_state": "required_check_failed"},
+        }
+    )[1] == CONSEQUENTIAL_TIER
+    # The spawn path carries the full summarize_qualification_state DICT form
+    # ({"state", "summary", ...}) — both shapes must classify identically.
+    assert classify_strategic_review_effort(
+        {
+            "open_message_count": 0,
+            "version_phase_block": {
+                "qualification_state": {"state": "required_check_failed"}
+            },
+        }
+    )[1] == CONSEQUENTIAL_TIER
+    assert classify_strategic_review_effort(
+        {
+            "open_message_count": 0,
+            "version_phase_block": {"qualification_state": {"state": "promoted"}},
+        }
+    )[1] == ROUTINE_TIER  # settled version does not force consequential
+    assert classify_strategic_review_effort(
+        {
+            "open_message_count": 0,
+            "integrity_conflict_counts": {
+                "orphaned_gaps": 2,
+                "ungrounded_directions": 0,
+                "stale_active_moves": 0,
+                "staffed_but_deferred": 0,
+            },
+        }
+    )[1] == CONSEQUENTIAL_TIER
+    assert classify_strategic_review_effort(
+        {"open_message_count": 0, "prior_cycle_dirty": True}
+    )[1] == CONSEQUENTIAL_TIER
+    assert classify_strategic_review_effort(
+        {"open_message_count": 0, "recent_cycle_failures": True}
+    )[1] == CONSEQUENTIAL_TIER
+
+    # Fail-closed: missing/unknown signals never cheapen a cycle.
+    assert classify_strategic_review_effort(
+        {"operator_steered": False}
+    )[1] == CONSEQUENTIAL_TIER  # open_message_count unknown
+    assert classify_strategic_review_effort(
+        {"open_message_count": 0, "version_phase_block": "garbage"}
+    )[1] == CONSEQUENTIAL_TIER  # malformed version phase
+    assert classify_strategic_review_effort(
+        {
+            "open_message_count": 0,
+            "version_phase_block": {"qualification_state": "brand_new_state"},
+        }
+    )[1] == CONSEQUENTIAL_TIER  # novel qual state fails closed
+    assert classify_strategic_review_effort("not-a-mapping")[1] == CONSEQUENTIAL_TIER
+
+    # ── Wiring: a routine cadence spawn carries effort 'medium' and stamps the
+    # cycle row. Equal integration/promotion branches → no version decision
+    # surfaced; a fresh project has no messages / conflicts / failed cycles.
+    project = Project(
+        name="Effort-Routine",
+        user_id="test-user-123",
+        integration_branch="main",
+        promotion_target="main",
+        vision={"purpose": "test purpose", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    task = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()[0]
+    )
+    assert task.payloads[0]["type"] == "strategic_review"
+    assert task.payloads[0].get("effort") == ROUTINE_EFFORT, (
+        "A routine strategic_review cycle must pin the cheaper effort tier on "
+        "the payload so routing resolution does not fall through to the "
+        "'strategic' category default 'max'."
+    )
+
+    cycle = (
+        (
+            await db_session.execute(
+                select(StrategicCycle).where(StrategicCycle.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()[0]
+    )
+    meta = cycle.cycle_metadata or {}
+    assert meta.get(CYCLE_META_EFFORT_TIER) == ROUTINE_TIER
+    assert meta.get(CYCLE_META_EFFORT_REASON) == "all routine signals clean"
+    # The resolved effort for the payload is 'medium' — distinct from the
+    # consequential tier — so the two cannot be confused in cost attribution.
+    assert ROUTINE_EFFORT != CONSEQUENTIAL_EFFORT
+
+
+def test_record_effort_tier_stamps_cycle_metadata():
+    """``record_effort_tier`` writes ``effort_tier`` + ``effort_tier_reason``
+    into cycle_metadata without disturbing existing keys, and the legacy dict
+    renderer (agent cycle-history context) surfaces both so cost analysis can
+    read the tier without re-deriving the classifier."""
+    from app.models import CYCLE_META_EFFORT_REASON, CYCLE_META_EFFORT_TIER
+    from app.strategic_cycle import _to_legacy_dict, record_effort_tier
+
+    cycle = StrategicCycle(
+        id="sc-effort-unit",
+        project_id=uuid.uuid4(),
+        outcome="phase2_running",
+        phase1_started_at=datetime.now(timezone.utc),
+        cycle_metadata={"existing_key": "value"},
+    )
+    record_effort_tier(cycle, "routine", "all routine signals clean")
+
+    meta = cycle.cycle_metadata or {}
+    assert meta.get(CYCLE_META_EFFORT_TIER) == "routine"
+    assert meta.get(CYCLE_META_EFFORT_REASON) == "all routine signals clean"
+    assert meta.get("existing_key") == "value", (
+        "record_effort_tier must merge, never replace, existing cycle metadata."
+    )
+
+    legacy = _to_legacy_dict(cycle)
+    assert legacy.get(CYCLE_META_EFFORT_TIER) == "routine"
+    assert legacy.get(CYCLE_META_EFFORT_REASON) == "all routine signals clean"
