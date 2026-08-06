@@ -76,6 +76,7 @@ from app.compute_experiment_contract import (
 from app.compute_jobs import clamp_spend_cap_usd, clamp_deadline_seconds
 from app.vm_cost_rates import (
     get_compute_rate_per_second,
+    resolve_accelerator_spec,
     resolve_compute_machine_type,
     validate_compute_request,
 )
@@ -3732,13 +3733,34 @@ async def create_compute_experiment_task(
         launch_contract.get("machine_type"),
     )
     if gpu_reason is not None:
-        raise HTTPException(status_code=422, detail=gpu_reason)
+        # Runner-pinned contracts execute on operator hardware whose GPUs are
+        # not in the GCP-shaped catalog (e.g. RTX 5080); create_compute_job
+        # accepts any non-empty accelerator name for the runner-subprocess
+        # backend, so don't pre-reject those here. Everything else (unpinned
+        # contracts, catalog names with shape mismatches) stays strict.
+        _raw_accel = str(launch_contract.get("accelerator") or "").strip()
+        _pinned_noncatalog_accel = (
+            payload.runner_target is not None
+            and bool(_raw_accel)
+            and resolve_accelerator_spec(_raw_accel) is None
+        )
+        if not _pinned_noncatalog_accel:
+            raise HTTPException(status_code=422, detail=gpu_reason)
 
     # Enforce the project's hardware policy before persisting the Task so a
     # project-disallowed accelerator or machine type fails at dispatch time
     # rather than silently passing the form and dying later in create_compute_job.
     _lc_accelerator = launch_contract.get("accelerator")
-    _canonical_accelerator = accel_spec.name if accel_spec is not None else None
+    # Non-catalog names (runner-pinned only — anything else raised above) keep
+    # the raw trimmed name so GPU contracts are checked against
+    # allowed_accelerator_types, mirroring _check_project_hardware_policy.
+    _canonical_accelerator = (
+        accel_spec.name
+        if accel_spec is not None
+        else (str(_lc_accelerator).strip() or None)
+        if _lc_accelerator
+        else None
+    )
     _resolved_mt = resolve_compute_machine_type(
         accelerator=_lc_accelerator,
         machine_type=launch_contract.get("machine_type"),

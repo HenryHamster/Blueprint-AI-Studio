@@ -98,6 +98,7 @@ from app import storage
 from app.time_utils import _utcnow, exponential_backoff
 from app.vm_cost_rates import (
     get_compute_rate_per_second,
+    resolve_accelerator_spec,
     resolve_compute_machine_type,
     validate_compute_request,
 )
@@ -599,19 +600,20 @@ async def create_compute_job(
         accelerator=accelerator,
         machine_type=machine_type,
     )
-    # Single gate for CPU and GPU shapes: a GPU machine type is accepted ONLY when
-    # paired with a supported single-GPU accelerator (rejects A100/over-quota,
-    # count != 1, unknown accelerators, and GPU/machine-family mismatch); a CPU
-    # request still requires an explicitly priced e2 machine type, unchanged.
-    accel_spec, reject_reason = validate_compute_request(
-        accelerator, resolved_machine_type, accelerator_count
-    )
-    if reject_reason is not None:
-        raise ValueError(reject_reason)
-
-    if backend_name is not None:
+    requested_accelerator = accelerator.strip() if accelerator is not None else None
+    # Resolve the effective backend BEFORE accelerator validation: operator-hardware
+    # backends (runner-subprocess, local-gpu) run GPUs the GCP-shaped catalog does
+    # not know about (e.g. an RTX 5080 on a pinned runner), and the runner dispatch
+    # gate checks verified capability (has_gpu / VRAM / compute-capability floors),
+    # never the name — so only GCP-bound jobs go through the strict catalog gate.
+    # A runner pin read here from the caller's (unlocked) task predicts the
+    # unconditional post-lock override further down; the override itself is kept
+    # (idempotent) so the locked-row semantics are unchanged.
+    if ((task.context or {}).get("runner_target_id") or None) is not None:
+        normalized_backend = RUNNER_SUBPROCESS_BACKEND_NAME
+    elif backend_name is not None:
         normalized_backend = backend_name
-    elif accel_spec is not None:
+    elif requested_accelerator:
         # GPU job: route to local GPU when present, fall back to cloud.
         normalized_backend = (
             LOCAL_GPU_BACKEND_NAME
@@ -623,10 +625,40 @@ async def create_compute_job(
     # Validate BEFORE persisting: an unknown / mode-incompatible backend would
     # otherwise wedge the row in QUEUED forever (monitor raises every pass).
     validate_backend_name(normalized_backend)
+
+    accel_spec = resolve_accelerator_spec(requested_accelerator)
+    if (
+        accelerator is not None
+        and accel_spec is None
+        and normalized_backend
+        in (RUNNER_SUBPROCESS_BACKEND_NAME, LOCAL_GPU_BACKEND_NAME)
+    ):
+        # Operator-hardware backend with a non-catalog GPU name: accept the raw
+        # name (the single-GPU count=1 contract is unchanged). Actual GPU
+        # capability is enforced by the runner dispatch gate; GCP can never
+        # receive this name (_provision_gcp keeps its own strict catalog guard).
+        if not requested_accelerator:
+            raise ValueError("accelerator must be a non-empty string")
+        if accelerator_count != 1:
+            raise ValueError(
+                f"unsupported accelerator count {accelerator_count!r} for "
+                f"{requested_accelerator!r}: only single-GPU (count=1) requests "
+                "are supported"
+            )
+    else:
+        # Single gate for CPU and GPU shapes: a GPU machine type is accepted ONLY when
+        # paired with a supported single-GPU accelerator (rejects A100/over-quota,
+        # count != 1, unknown accelerators, and GPU/machine-family mismatch); a CPU
+        # request still requires an explicitly priced e2 machine type, unchanged.
+        accel_spec, reject_reason = validate_compute_request(
+            requested_accelerator, resolved_machine_type, accelerator_count
+        )
+        if reject_reason is not None:
+            raise ValueError(reject_reason)
     # A GPU can never be provisioned by the CPU-only local-subprocess backend —
     # reject loudly at create time rather than silently running the command CPU-only.
     # runner-subprocess is allowed: GPU is on the operator's own hardware.
-    if accel_spec is not None and normalized_backend not in (
+    if accelerator is not None and normalized_backend not in (
         LOCAL_GPU_BACKEND_NAME,
         GCP_BACKEND_NAME,
         RUNNER_SUBPROCESS_BACKEND_NAME,
@@ -666,10 +698,16 @@ async def create_compute_job(
                 "input_artifact_job_id": str(input_artifact_job_id),
             }
         )
-    # Persist the canonical accelerator short name (e.g. "T4") so the launch spec,
-    # cost rate, and provisioning path all resolve the same supported shape.
-    persisted_accelerator = accel_spec.name if accel_spec is not None else None
-    persisted_accelerator_count = accelerator_count if accel_spec is not None else None
+    # Persist the canonical accelerator short name (e.g. "T4") when the catalog
+    # resolves it, so the launch spec, cost rate, and provisioning path all
+    # resolve the same supported shape; operator-hardware backends persist the
+    # raw trimmed name (only reachable for local backends — GCP raised above).
+    persisted_accelerator = (
+        accel_spec.name if accel_spec is not None else requested_accelerator
+    )
+    persisted_accelerator_count = (
+        accelerator_count if persisted_accelerator is not None else None
+    )
     locked_task = await _lock_task_for_compute_job(session, task.id)
     if locked_task is None:
         raise ValueError("task not found")
