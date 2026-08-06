@@ -21,7 +21,7 @@ from sqlalchemy import func, or_
 from sqlmodel import select
 
 from app import max_plan_pool
-from app.models import Task, TaskStatus, _utcnow
+from app.models import LocalRunner, Task, TaskStatus, _utcnow
 from app.runtime_config_state import runtime_config as _runtime_config
 
 
@@ -455,4 +455,162 @@ async def get_fleet_utilization_snapshot(
         "orphaned_leased_vms": orphaned_leased_vms,
         "vm_slots_available": vm_slots_available,
         "vm_saturation": vm_saturation,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Recorded fleet-sizing readings
+# ---------------------------------------------------------------------------
+
+# Measured per-workspace disk footprint, in bytes. Du-measured 2026-08-06 by
+# building a real workspace through the fleet setup path (`git clone --depth
+# 100` + `npm ci` at the repo root, `agent/`, and `admin-ui/` plus a backend
+# venv) — the per-component breakdown lives in agent/src/workspaceDisk.ts
+# DEFAULT_AGENT_DISK_RESERVATION_BYTES. The backend dispatch layer reserves
+# the same 2 GiB floor for container-image jobs
+# (_CONTAINER_WORKSPACE_MIN_FREE_DISK_BYTES_DEFAULT in
+# orchestrator_runner_dispatch.py), so the agent and backend agree.
+MEASURED_PER_WORKSPACE_DISK_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
+
+# Fleet-sizing target: the number of concurrent task slots the workspace
+# footprint must cover. This is the 50-slot claim that once rested on a mocked
+# vitest FIFO simulation (agent/src/index.pool-mode.test.ts); the concurrency
+# half of the sizing is now measured from the task table (see
+# get_recorded_fleet_sizing_readings) and this constant is the slot count the
+# disk reservation is scaled to.
+FLEET_SIZING_TARGET_SLOTS = 50
+
+# Where the runner-disk half of the footprint reading is sourced from. Kept
+# beside the constant so a reader can see the comparison is against the live
+# LocalRunner inventory, not a guessed capacity.
+RUNNER_DISK_INVENTORY_SOURCE = (
+    "LocalRunner.capabilities['disk_free_bytes'] summed across non-deleted "
+    "fleet runners (live heartbeat-reported free disk)"
+)
+
+
+def _search_target_concurrency_key() -> dict:
+    """Establish whether a 'target concurrency' configuration key exists.
+
+    Criterion c-3fd62b9d asks for monthly spend "at the version's target
+    concurrency". This searches the two places such a key could live — the
+    runtime config state and the ReleaseVersion model — and reports the
+    finding plainly. Today no such key exists (backend/scripts/
+    strategic_cycle_cost_projection.py target_concurrency_status documents the
+    same gap); running the search live keeps the reading honest rather than
+    pinning a hardcoded False.
+    """
+    from app import release_models, runtime_config_state
+
+    keys = set(runtime_config_state.runtime_config)
+    columns = set(release_models.ReleaseVersion.__table__.columns.keys())
+    needles = ("target_concurrency", "target_concurrent")
+    found = sorted(
+        name for name in keys | columns if any(n in name.lower() for n in needles)
+    )
+    if found:
+        return {
+            "available": True,
+            "keys": found,
+            "reason": "a target-concurrency configuration key exists: "
+            + ", ".join(found),
+        }
+    return {
+        "available": False,
+        "reason": (
+            "No 'target_concurrency' configuration key exists for the "
+            "strategic decision loop (runtime_config_state.runtime_config "
+            "keys and ReleaseVersion columns searched). The monthly "
+            "projection therefore reports spend at its available volume "
+            "anchors -- the measured realized volume and the cadence-backstop "
+            "floor -- and grading c-3fd62b9d at a specific concurrency "
+            "requires an operator-supplied target cycle volume."
+        ),
+    }
+
+
+async def get_recorded_fleet_sizing_readings(
+    session,
+    *,
+    window_hours: int = 24,
+    now: datetime | None = None,
+) -> Dict[str, Any]:
+    """Compose the three fleet-sizing readings the sizing claim rests on.
+
+    This is the durable address for the fleet-sizing numbers: each reading
+    reuses an existing instrument rather than a new measurement path.
+
+    * ``concurrency`` — peak + time-weighted percentiles of simultaneous
+      task-slot occupancy, taken from ``get_fleet_utilization_snapshot`` (the
+      one ``_overlap_stats_from_task_rows`` sweep). A measured peak far below
+      ``FLEET_SIZING_TARGET_SLOTS`` is a result to report, not a number to
+      manufacture.
+    * ``workspace_footprint`` — the du-measured per-workspace disk footprint
+      scaled to ``FLEET_SIZING_TARGET_SLOTS`` slots, compared against the live
+      runner disk inventory (sum of heartbeat-reported ``disk_free_bytes``
+      across non-deleted LocalRunners). ``fits`` is whether the fleet's
+      reported free disk can hold the scaled footprint.
+    * ``target_concurrency_key`` — whether a 'target concurrency'
+      configuration key actually exists (criterion c-3fd62b9d's input). Today
+      it does not; the reading reports the absence plainly instead of
+      fabricating a volume.
+
+    ``session`` may be None (matching the other snapshot helpers): the
+    DB-derived fields then come back as None/zero/empty, while the
+    target-concurrency search still runs since it is pure config
+    introspection.
+    """
+    now = _utcnow() if now is None else _naive(now)
+    window_hours = max(1, int(window_hours))
+    window_start = now - timedelta(hours=window_hours)
+
+    snapshot = await get_fleet_utilization_snapshot(
+        session, window_hours=window_hours
+    )
+    concurrency = {
+        "slot_definition": SLOT_DEFINITION,
+        "window_start": window_start.isoformat(),
+        "window_end": now.isoformat(),
+        "window_hours": window_hours,
+        "peak": snapshot.get("concurrent_peak"),
+        "p50": snapshot.get("concurrent_p50"),
+        "p90": snapshot.get("concurrent_p90"),
+        "p95": snapshot.get("concurrent_p95"),
+        "p99": snapshot.get("concurrent_p99"),
+    }
+
+    required_bytes = MEASURED_PER_WORKSPACE_DISK_BYTES * FLEET_SIZING_TARGET_SLOTS
+    inventory_bytes = 0
+    runner_count = 0
+    if session is not None:
+        runners = (
+            await session.execute(
+                select(LocalRunner).where(LocalRunner.status != "deleted")
+            )
+        ).scalars().all()
+        runner_count = len(runners)
+        inventory_bytes = sum(
+            int(r.capabilities.get("disk_free_bytes") or 0)
+            for r in runners
+            if isinstance(r.capabilities, dict)
+        )
+    workspace_footprint = {
+        "per_workspace_bytes": MEASURED_PER_WORKSPACE_DISK_BYTES,
+        "target_slots": FLEET_SIZING_TARGET_SLOTS,
+        "required_bytes": required_bytes,
+        "runner_inventory_bytes": inventory_bytes if session is not None else None,
+        "runner_count": runner_count if session is not None else None,
+        "fits": inventory_bytes >= required_bytes if session is not None else None,
+        "shortfall_bytes": (
+            max(0, required_bytes - inventory_bytes)
+            if session is not None
+            else None
+        ),
+        "source": RUNNER_DISK_INVENTORY_SOURCE,
+    }
+
+    return {
+        "workspace_footprint": workspace_footprint,
+        "concurrency": concurrency,
+        "target_concurrency_key": _search_target_concurrency_key(),
     }

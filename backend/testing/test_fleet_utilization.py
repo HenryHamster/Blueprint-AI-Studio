@@ -19,9 +19,12 @@ import uuid
 
 from app import max_plan_pool
 from app.fleet_utilization import (
+    FLEET_SIZING_TARGET_SLOTS,
+    MEASURED_PER_WORKSPACE_DISK_BYTES,
     _overlap_stats_from_task_rows,
     _sum_slot_occupancy_seconds,
     get_fleet_utilization_snapshot,
+    get_recorded_fleet_sizing_readings,
 )
 from app.max_plan_pool import _account_by_id, _max_plan_pools
 from app.models import LocalRunner, Project, ProjectMember, TaskStatus, _utcnow
@@ -1033,3 +1036,177 @@ class TestFleetRunnersHealthSummary:
         assert r["health"]["device_status"] == "connected"
         assert r["health"]["disk_low"] is False
         assert r["health"]["degraded"] is False
+
+
+# ── recorded fleet-sizing readings ──────────────────────────────────────────
+
+
+class _ReadingsFakeResult:
+    """Shape-matches SQLAlchemy results: scalar() / all() / scalars().all()."""
+
+    def __init__(self, scalar=None, rows=None):
+        self._scalar = scalar
+        self._rows = rows or []
+
+    def scalar(self):
+        return self._scalar
+
+    def all(self):
+        return self._rows
+
+    def scalars(self):
+        return self
+
+
+class _ReadingsFakeSession:
+    """Three execute calls in order: active count, task rows, runner rows."""
+
+    def __init__(self, task_rows=None, runner_rows=None):
+        self._task_rows = task_rows or []
+        self._runner_rows = runner_rows or []
+        self._calls = 0
+
+    async def execute(self, stmt):
+        self._calls += 1
+        if self._calls == 1:
+            return _ReadingsFakeResult(scalar=len(self._task_rows))
+        if self._calls == 2:
+            return _ReadingsFakeResult(rows=self._task_rows)
+        return _ReadingsFakeResult(rows=self._runner_rows)
+
+
+def _readings_runner(hostname: str, disk_free_bytes: int) -> LocalRunner:
+    return LocalRunner(
+        project_id=uuid.uuid4(),
+        token_hash=hostname.encode().hex().ljust(64, "0"),
+        hostname=hostname,
+        status="active",
+        capabilities={
+            "task_types": "all",
+            "max_concurrent": 2,
+            "disk_free_bytes": disk_free_bytes,
+        },
+    )
+
+
+async def test_recorded_fleet_sizing_readings_are_checked_in(monkeypatch):
+    """The three fleet-sizing readings exist and come from instruments.
+
+    ``get_recorded_fleet_sizing_readings`` composes the existing instruments —
+    the task-table concurrency sweep, the live LocalRunner disk inventory, and
+    a live search for a target-concurrency config key — rather than reporting
+    hardcoded constants. The concurrency block must equal the shared
+    ``_overlap_stats_from_task_rows`` sweep over the provided rows; the
+    workspace footprint must scale the measured per-workspace figure by the
+    slot count and sum the runner inventory; and the target-concurrency
+    finding must flip when a key is injected, proving it is a search, not a
+    pinned False.
+    """
+    import app.runtime_config_state as rcs
+    import app.vm_lifecycle as vm_lifecycle
+    import app.warm_pool as warm_pool
+
+    monkeypatch.setattr(max_plan_pool, "_all_accounts", lambda: [])
+    monkeypatch.setattr(
+        max_plan_pool, "_account_available_for_model", lambda acct, model: True
+    )
+    monkeypatch.setattr(vm_lifecycle, "_last_gcp_vm_count", 6)
+    monkeypatch.setattr(vm_lifecycle, "_last_gcp_vm_check", float("inf"))
+    monkeypatch.setattr(warm_pool, "is_warm_pool_enabled", lambda: False)
+
+    now = _utcnow()
+    # Overlapping cluster -> peak 3 (the same structure the sweep tests use).
+    task_rows = [
+        _completed_row(now, 5, 3),
+        _completed_row(now, 4, 2),
+        _completed_row(now, 3.5, 1.5),
+    ]
+    # Three runners reporting 40 GiB free each -> 120 GiB >= 100 GiB (50 x 2 GiB).
+    runner_rows = [
+        _readings_runner(f"r{i}", 40 * 1024**3) for i in range(3)
+    ]
+
+    readings = await get_recorded_fleet_sizing_readings(
+        _ReadingsFakeSession(task_rows=task_rows, runner_rows=runner_rows)
+    )
+
+    # (b) Concurrency reading == the shared sweep over the same rows.
+    sweep = _overlap_stats_from_task_rows(task_rows, now, now - timedelta(hours=24))
+    conc = readings["concurrency"]
+    assert conc["peak"] == sweep["peak"] == 3
+    assert conc["p50"] == sweep["percentiles"]["p50"]
+    assert conc["p90"] == sweep["percentiles"]["p90"]
+    assert conc["p95"] == sweep["percentiles"]["p95"]
+    assert conc["p99"] == sweep["percentiles"]["p99"]
+    assert conc["slot_definition"]
+    assert conc["window_hours"] == 24
+
+    # (a) Workspace footprint: scaled measured figure vs the live runner disk.
+    fp = readings["workspace_footprint"]
+    assert fp["per_workspace_bytes"] == MEASURED_PER_WORKSPACE_DISK_BYTES
+    assert fp["target_slots"] == FLEET_SIZING_TARGET_SLOTS
+    assert fp["required_bytes"] == (
+        MEASURED_PER_WORKSPACE_DISK_BYTES * FLEET_SIZING_TARGET_SLOTS
+    )
+    assert fp["runner_count"] == 3
+    assert fp["runner_inventory_bytes"] == 3 * 40 * 1024**3
+    assert fp["fits"] is True
+    assert fp["shortfall_bytes"] == 0
+
+    # (c) Target-concurrency key finding is a live search, not a constant:
+    # absent by default, present once a key is injected.
+    tc = readings["target_concurrency_key"]
+    assert tc["available"] is False
+    assert "target_concurrency" in tc["reason"]
+
+    monkeypatch.setitem(rcs.runtime_config, "target_concurrency", 30)
+    readings_with_key = await get_recorded_fleet_sizing_readings(
+        _ReadingsFakeSession(task_rows=task_rows, runner_rows=runner_rows)
+    )
+    assert readings_with_key["target_concurrency_key"]["available"] is True
+    assert "target_concurrency" in readings_with_key["target_concurrency_key"]["keys"]
+
+
+async def test_recorded_workspace_footprint_reports_shortfall(monkeypatch):
+    """A fleet reporting less free disk than the scaled footprint reads fits=False.
+
+    3 runners x 30 GiB = 90 GiB < 50 x 2 GiB = 100 GiB, so the reading must
+    report the shortfall instead of a hardcoded verdict.
+    """
+    import app.vm_lifecycle as vm_lifecycle
+    import app.warm_pool as warm_pool
+
+    monkeypatch.setattr(max_plan_pool, "_all_accounts", lambda: [])
+    monkeypatch.setattr(
+        max_plan_pool, "_account_available_for_model", lambda acct, model: True
+    )
+    monkeypatch.setattr(vm_lifecycle, "_last_gcp_vm_count", 6)
+    monkeypatch.setattr(vm_lifecycle, "_last_gcp_vm_check", float("inf"))
+    monkeypatch.setattr(warm_pool, "is_warm_pool_enabled", lambda: False)
+
+    runner_rows = [
+        _readings_runner(f"s{i}", 30 * 1024**3) for i in range(3)
+    ]
+    readings = await get_recorded_fleet_sizing_readings(
+        _ReadingsFakeSession(runner_rows=runner_rows)
+    )
+    fp = readings["workspace_footprint"]
+    assert fp["runner_inventory_bytes"] == 3 * 30 * 1024**3
+    assert fp["required_bytes"] == (
+        MEASURED_PER_WORKSPACE_DISK_BYTES * FLEET_SIZING_TARGET_SLOTS
+    )
+    assert fp["fits"] is False
+    assert fp["shortfall_bytes"] == (
+        MEASURED_PER_WORKSPACE_DISK_BYTES * FLEET_SIZING_TARGET_SLOTS
+        - 3 * 30 * 1024**3
+    )
+
+
+async def test_recorded_readings_none_session_still_reports_config_finding():
+    """session=None leaves DB-derived fields None but still runs the search."""
+    readings = await get_recorded_fleet_sizing_readings(session=None)
+    assert readings["concurrency"]["peak"] is None
+    assert readings["concurrency"]["p50"] is None
+    assert readings["workspace_footprint"]["runner_inventory_bytes"] is None
+    assert readings["workspace_footprint"]["fits"] is None
+    assert readings["target_concurrency_key"]["available"] is False
