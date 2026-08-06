@@ -5202,6 +5202,180 @@ async def test_redrive_infra_failure_noop_when_not_stabilize_phase(db_session, m
 
 
 @pytest.mark.asyncio
+async def test_redrive_infra_failure_defers_when_live_audit_exists(db_session, mocker):
+    """The double-spawn guard defers the re-drive when a QUEUED release_audit
+    task already exists for the same project.
+
+    Regression proof for the bug that broke CI run 31072175565: the original
+    test pre-created a QUEUED release_audit row before the spawn mock was
+    registered, which tripped this exact guard and caused the re-drive to
+    return False before ever calling the spawn mock.  The guard is now
+    explicitly tested: a pre-existing live audit task must defer the re-drive,
+    leaving last_qualification unchanged.
+    """
+    from app.release_qualifier_sweep import _redrive_infra_failure_qualification
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "infra_failure",
+        "blocker": "qualification_timeout",
+        "detail": "qualification pending 361 min (> 360 min limit)",
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    # Pre-create a QUEUED release_audit task (same project) — this is the
+    # exact pre-condition that trips the live-audit double-spawn guard.
+    live_audit = Task(
+        project_id=project.id,
+        title="release-audit-already-running",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        vm_instance_id="vm-already-running",
+        status=TaskStatus.QUEUED,
+        context={"release_version_id": str(version.id)},
+    )
+    db_session.add(live_audit)
+    await db_session.commit()
+
+    spawn_mock = mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(),
+    )
+
+    result = await _redrive_infra_failure_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    # Guard must have fired: re-drive deferred, spawn not called.
+    assert result is False
+    spawn_mock.assert_not_called()
+    # Version state must be unchanged.
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "infra_failure"
+
+
+@pytest.mark.asyncio
+async def test_redrive_infra_failure_defers_when_live_audit_challenge_exists(
+    db_session, mocker
+):
+    """The double-spawn guard also defers when a release_audit_challenge task is
+    live — both task types share the audit lane and re-driving either risks
+    double-spawning.
+    """
+    from app.release_qualifier_sweep import _redrive_infra_failure_qualification
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "infra_failure",
+        "blocker": "qualification_timeout",
+        "detail": "qualification pending 361 min (> 360 min limit)",
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    # A live release_audit_challenge task (not release_audit) should also
+    # trigger the guard.
+    live_challenge = Task(
+        project_id=project.id,
+        title="release-audit-challenge-running",
+        payloads=[{"type": "release_audit_challenge", "base_branch": "main"}],
+        vm_instance_id="vm-challenge-running",
+        status=TaskStatus.IN_PROGRESS,
+        context={"release_version_id": str(version.id)},
+    )
+    db_session.add(live_challenge)
+    await db_session.commit()
+
+    spawn_mock = mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(),
+    )
+
+    result = await _redrive_infra_failure_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert result is False
+    spawn_mock.assert_not_called()
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "infra_failure"
+
+
+@pytest.mark.asyncio
+async def test_redrive_infra_failure_proceeds_when_only_completed_audit_exists(
+    db_session, mocker
+):
+    """A COMPLETED release_audit task for the same project does NOT block the
+    re-drive — the guard targets only live (non-terminal) statuses so that
+    a previous successful run does not permanently block recovery.
+    """
+    from app.release_qualifier_sweep import _redrive_infra_failure_qualification
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    sha = "c0ffee12" * 5
+    attempt_id = uuid.uuid4()
+    version.last_qualification = {
+        "status": "infra_failure",
+        "qualification_attempt_id": str(attempt_id),
+        "blocker": "qualification_timeout",
+        "detail": "qualification pending 361 min (> 360 min limit)",
+        "started_at": "2026-07-06T00:00:00",
+        "finalized_at": "2026-07-06T06:01:00",
+    }
+    version.active_qualification_attempt_id = attempt_id
+    version.qualification_attempts = 1
+    db_session.add(version)
+    await db_session.commit()
+
+    # A COMPLETED release_audit task must not trip the live-audit guard.
+    completed_audit = Task(
+        project_id=project.id,
+        title="release-audit-completed",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        vm_instance_id="vm-completed",
+        status=TaskStatus.COMPLETED,
+        context={"release_version_id": str(version.id)},
+    )
+    db_session.add(completed_audit)
+    await db_session.commit()
+
+    # Spawn mock persists the audit row inside the call, mirroring the real
+    # spawner so the re-drive transaction is coherent.
+    fresh_audit = Task(
+        project_id=project.id,
+        title="release-audit-fresh",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        vm_instance_id="vm-fresh",
+        status=TaskStatus.QUEUED,
+        context={"release_version_id": str(version.id)},
+    )
+
+    async def _spawn_and_persist(*_args, **_kwargs):
+        db_session.add(fresh_audit)
+        await db_session.flush()
+        return fresh_audit
+
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock(automain=sha))
+    mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(side_effect=_spawn_and_persist),
+    )
+    mocker.patch("app.release_qualifier.compute_audited_surface_hash", return_value="h")
+    mocker.patch(
+        "app.release_qualifier.resolve_project_promotion_enabled", return_value=True
+    )
+
+    result = await _redrive_infra_failure_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    # A terminal completed audit does not block; the re-drive must have fired.
+    assert result is True
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+
+
+@pytest.mark.asyncio
 async def test_redrive_infra_failure_cap_keyed_on_persisted_streak(
     db_session, mocker
 ):
