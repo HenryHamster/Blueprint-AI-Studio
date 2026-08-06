@@ -344,9 +344,42 @@ resolve_deps_image() {
   return 1
 }
 
+# --- PostgreSQL bindir resolution for --sandbox-postgres ---
+# Resolve a usable PostgreSQL server bindir. Prefers `pg_config --bindir` when
+# it is on PATH and points at a real server (images with libpq-dev /
+# postgresql-client install pg_config on PATH). When pg_config is absent from
+# PATH, falls back to the highest-versioned /usr/lib/postgresql/*/bin that
+# actually holds initdb (an image with only the server packages still has the
+# server binaries there). Prints the bindir and returns 0; returns 1 when
+# neither exists — a pg_config that exists but points at a non-server dir stays
+# fail-closed rather than scanning. Keep this helper byte-identical across
+# check, scripts/test-backend.sh and the generated check_backend_verification.sh
+# fragment — mirrored paths must not diverge again.
+resolve_pg_bindir() {
+  local bindir cand
+  if command -v pg_config >/dev/null 2>&1; then
+    bindir="$(pg_config --bindir 2>/dev/null || true)"
+    if [ -n "$bindir" ] && [ -x "$bindir/initdb" ]; then
+      printf '%s\n' "$bindir"
+      return 0
+    fi
+    return 1
+  fi
+  for cand in $(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -V | tail -n 1); do
+    if [ -x "$cand/initdb" ]; then
+      printf '%s\n' "$cand"
+      return 0
+    fi
+  done
+  return 1
+}
+
 # --- Configure DATABASE_URL / ENV_ARGS based on --postgres ---
 if [ "$USE_POSTGRES" = "1" ] && [ "$SANDBOX_POSTGRES" = "1" ]; then
-  PG_BIN="$(pg_config --bindir)"
+  PG_BIN="$(resolve_pg_bindir)" || {
+    echo "ERROR: --sandbox-postgres requires a PostgreSQL server bindir (pg_config on PATH, or /usr/lib/postgresql/*/bin with initdb)" >&2
+    exit 2
+  }
   PG_DATA=$(mktemp -d /tmp/blueprint-test-pg.XXXXXX)
   PG_SOCKET=$(mktemp -d /tmp/blueprint-test-pg-sock.XXXXXX)
   "$PG_BIN/initdb" -D "$PG_DATA" -A trust --no-locale --encoding=UTF-8 -U test >/dev/null
