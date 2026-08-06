@@ -1989,8 +1989,21 @@ async def test_compute_qualification_trigger_state_armed_despite_incomplete_crit
 
 
 @pytest.mark.asyncio
-async def test_sweep_does_not_start_initial_qualification(db_session, mocker):
-    """Strategic, not a scheduler sweep, starts an initial qualification."""
+async def test_sweep_starts_initial_qualification_when_auto_trigger_fires(
+    db_session, mocker
+):
+    """The sweep executes the trigger resolver's fire decision.
+
+    The ``auto_qualification_triggers`` resolver armed a stabilize-phase
+    never-attempted version but nothing executed that decision — the agent-emitted
+    qualify_request path was the only starter, so the trigger engine "decided but
+    never fired".  With the knob defaulting to "on", the sweep's auto-trigger leg
+    now starts the initial qualification with ``explicit_request=True``.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["auto_qualification_triggers"] = "on"
+
     project, version = await _make_project_and_version(db_session, phase="stabilize")
     await _add_version_criterion(
         db_session, project, version,
@@ -2012,8 +2025,13 @@ async def test_sweep_does_not_start_initial_qualification(db_session, mocker):
         session_factory=_shared_session_factory(db_session),
     )
 
+    # Auto-fires are not counted as finalized; the assertion that matters is that
+    # the armed never-attempted version's decision was executed explicitly.
     assert count == 0
-    run_qual_mock.assert_not_called()
+    run_qual_mock.assert_awaited_once()
+    call = run_qual_mock.await_args
+    assert call.args[1] == project.id
+    assert call.kwargs.get("explicit_request") is True
 
 
 # Named acceptance test: test_drift_sentinel_runs_by_default_without_build_config_flag

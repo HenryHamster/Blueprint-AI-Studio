@@ -24,7 +24,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app import release_version
 from app.database import AsyncSessionLocal
-from app.models import Alert, AlertSeverity
+from app.models import Alert, AlertSeverity, Project
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -318,6 +318,22 @@ async def _redrive_error_qualification(
                 error_redrive_count = 0
             else:
                 return False
+        # The CI-compliance qualify gate must not be bypassed by a re-drive.  If
+        # the integration HEAD currently breaches the guardrails (per the latest
+        # stored evaluation), defer until a repair lands — the sweep's
+        # ``_recheck_ci_compliance_blocked_version`` keeps re-evaluating.  Uses
+        # the stored record (no fresh GitHub scan under the sweep session); an
+        # empty/stale store fails open to the existing re-drive behavior.
+        from app.strategic_spawning import ci_compliance_qualify_gate
+
+        project = await redrive_session.get(Project, version.project_id)
+        if project is not None and ci_compliance_qualify_gate(project).get("blocked"):
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep: deferring error re-drive for v%d — "
+                "integration HEAD breaches CI-compliance guardrails",
+                version.version_number,
+            )
+            return False
         result = await release_qualifier.run_qualification(
             redrive_session,
             version.project_id,
@@ -637,6 +653,20 @@ async def _redrive_infra_failure_qualification(
                         return False
                 except (ValueError, TypeError):
                     pass  # malformed timestamp → do not gate, allow redrive
+        # Same CI-compliance gate as the error re-driver: never spawn a fresh
+        # qualification while the integration HEAD breaches the guardrails (per
+        # the latest stored evaluation).  The sweep's block re-check re-evaluates
+        # until the guardrail is clean, then this re-drive resumes normally.
+        from app.strategic_spawning import ci_compliance_qualify_gate
+
+        project = await redrive_session.get(Project, version.project_id)
+        if project is not None and ci_compliance_qualify_gate(project).get("blocked"):
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep: deferring infra_failure re-drive for "
+                "v%d — integration HEAD breaches CI-compliance guardrails",
+                version.version_number,
+            )
+            return False
         result = await release_qualifier.run_qualification(
             redrive_session,
             version.project_id,

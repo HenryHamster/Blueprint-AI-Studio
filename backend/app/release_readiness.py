@@ -1211,7 +1211,7 @@ async def compute_requalification_readiness(
 # Gate-state vocabulary emitted by ``compute_promotion_ci_green_gate``.  Only
 # ``green`` clears the promotion_failed re-driver; every other state defers.
 _PROMOTION_CI_GATE_STATES = frozenset(
-    {"green", "pending", "red", "dispatched", "no_signal", "unavailable"}
+    {"green", "pending", "red", "cancelled", "dispatched", "no_signal", "unavailable"}
 )
 
 
@@ -1238,6 +1238,7 @@ async def compute_promotion_ci_green_gate(
     project_id: uuid.UUID,
     *,
     dispatch: bool = True,
+    dispatch_on_cancelled: bool = True,
 ) -> dict[str, Any]:
     """Resolve whether the integration-branch HEAD has a green full-suite CI run.
 
@@ -1253,6 +1254,10 @@ async def compute_promotion_ci_green_gate(
       * ``green``      — a COMPLETED ``ci.yml`` run for the current HEAD concluded success
       * ``pending``    — a run for HEAD is queued / in_progress (not yet concluded)
       * ``red``        — a run for HEAD concluded non-success
+      * ``cancelled``  — a run for HEAD concluded cancelled and
+                         ``dispatch_on_cancelled=False`` (surfaced as a distinct
+                         signal; the caller decides whether a fresh dispatch is
+                         warranted — used by the drift sentinel to stop churn)
       * ``dispatched`` — no run existed for HEAD, so one was just dispatched
       * ``no_signal``  — ``dispatch=False`` and no run exists for HEAD, or a
                          cancelled run exists with ``dispatch=False``
@@ -1261,7 +1266,12 @@ async def compute_promotion_ci_green_gate(
     When ``dispatch=True`` and there is no run for the current HEAD, dispatches a
     fresh ``ci.yml`` run on the integration branch (the full 8-shard backend +
     frontend + agent matrix, since ci.yml's ``detect`` job forces all-true on a
-    ``workflow_dispatch``) and returns ``dispatched``.
+    ``workflow_dispatch``) and returns ``dispatched``.  A completed run whose
+    conclusion is ``cancelled`` is treated as absent when ``dispatch=True`` (the
+    concurrency policy routinely cancels superseded integration-branch runs), UNLESS
+    ``dispatch_on_cancelled=False``, in which case it surfaces as ``cancelled``
+    without dispatching so a caller that wants to avoid dispatch churn can react
+    instead of re-dispatching the full matrix on every sweep.
 
     IMPORTANT: this performs a GitHub round-trip and is DELIBERATELY separate from
     :func:`compute_requalification_readiness`, which stays DB-only and
@@ -1318,6 +1328,18 @@ async def compute_promotion_ci_green_gate(
                         reason="ci.yml run for integration HEAD concluded success",
                     )
                 if conclusion == "cancelled":
+                    if not dispatch_on_cancelled:
+                        return _promotion_ci_gate_verdict(
+                            "cancelled",
+                            head_sha=head_sha,
+                            run_id=run_id,
+                            html_url=html_url,
+                            reason=(
+                                "ci.yml run for integration HEAD was cancelled — "
+                                "surfaced as a distinct signal; caller decides "
+                                "whether a fresh dispatch is warranted"
+                            ),
+                        )
                     if not dispatch:
                         return _promotion_ci_gate_verdict(
                             "no_signal",

@@ -595,7 +595,14 @@ async def _check_full_suite_drift_sentinel(
                 return False
 
             gate = await compute_promotion_ci_green_gate(
-                session, version.project_id, dispatch=True
+                session,
+                version.project_id,
+                dispatch=True,
+                # A cancelled run must surface as its own state, not collapse into
+                # an immediate re-dispatch — otherwise the ci.yml concurrency
+                # policy's cancel-in-progress on the integration branch drives a
+                # fresh full 8-shard dispatch on every sweep with no signal.
+                dispatch_on_cancelled=False,
             )
             gate_state = gate.get("gate_state")
             head_sha = gate.get("head_sha") or ""
@@ -608,6 +615,78 @@ async def _check_full_suite_drift_sentinel(
                     head_sha[:8] if head_sha else "?",
                 )
                 return True
+
+            if gate_state == "cancelled":
+                # ci.yml's concurrency policy cancels in-flight integration-branch
+                # runs, so a dispatched full-suite run legitimately reads back as
+                # cancelled.  Treating that as "absent" (the old behaviour) re-ran
+                # the full 8-shard matrix once per sweep forever — churn with no
+                # alert and no resolution.  Instead raise a deduplicated operator
+                # Alert and do NOT re-dispatch for this HEAD; the next integration
+                # commit (a new HEAD with no run yet) dispatches afresh through the
+                # normal no-run path.
+                _dedupe_key = (
+                    f"drift_sentinel:cancelled:{version.project_id}:{head_sha}"
+                )
+                existing = (
+                    (
+                        await session.execute(
+                            select(Alert).where(
+                                Alert.project_id == version.project_id,
+                                Alert.dedupe_key == _dedupe_key,
+                                Alert.dismissed_at.is_(None),
+                            )
+                        )
+                    )
+                    .scalars()
+                    .first()
+                )
+                if existing is None:
+                    run_url = gate.get("html_url") or str(gate.get("run_id") or "")
+                    session.add(
+                        Alert(
+                            project_id=version.project_id,
+                            severity=AlertSeverity.WARNING,
+                            title=(
+                                f"Full-suite CI run cancelled on integration branch "
+                                f"({head_sha[:8] if head_sha else '?'})"
+                            ),
+                            message=(
+                                f"Standing drift sentinel: the ci.yml run for "
+                                f"integration HEAD "
+                                f"{head_sha[:12] if head_sha else '?'} was cancelled "
+                                "(the ci.yml concurrency policy cancels in-flight "
+                                "integration-branch runs). No fresh run was "
+                                "re-dispatched for this HEAD, so the sentinel "
+                                "cannot churn 8-shard dispatches; the next "
+                                "integration commit dispatches afresh."
+                                + (f" Run: {run_url}." if run_url else "")
+                            ),
+                            dedupe_key=_dedupe_key,
+                            event_type="release.ci_unresolved",
+                        )
+                    )
+                    await session.commit()
+                    logger.warning(
+                        "[DRIFT_SENTINEL] full-suite CI run cancelled for project %s "
+                        "HEAD %s — alert raised, no re-dispatch for this HEAD",
+                        version.project_id,
+                        head_sha[:8] if head_sha else "?",
+                    )
+                return True
+
+            if gate_state == "unavailable":
+                # The gate could not resolve creds / HEAD / API.  A transient
+                # failure is self-healing on the next sweep; surface it in logs
+                # rather than staying fully silent (the pre-fix behaviour).
+                logger.warning(
+                    "[DRIFT_SENTINEL] full-suite CI gate unavailable for project %s "
+                    "HEAD %s — %s",
+                    version.project_id,
+                    head_sha[:8] if head_sha else "?",
+                    gate.get("reason") or "unknown reason",
+                )
+                return False
 
             if gate_state != "red":
                 return False
@@ -809,6 +888,348 @@ async def _run_lifecycle_stall_alerts(
             )
 
 
+async def _recheck_ci_compliance_blocked_version(
+    version_id: Any, *, session_factory=None
+) -> bool:
+    """Re-evaluate an open version whose qualify_request was CI-compliance-blocked.
+
+    Closes the block→repair→requalify loop on the sweep cadence — the piece that
+    no sweep previously owned.  The qualify_request block site spawns the
+    cap-bump repair and records ``repair_task``; this sweep step is the backstop
+    that keeps re-evaluating the version until the guardrail is clean:
+
+      * STILL BLOCKED — ensure a cap-bump repair task is queued (deduped per
+        project + HEAD) and keep the durable block marker.  Covers versions
+        blocked before the block site gained its own spawn and repairs that were
+        cancelled or failed.
+      * BLOCK CLEARED — the integration HEAD no longer breaches the guardrails:
+        drop the stale ``qualify_request_blocked`` / ``qualify_request_blocked_at``
+        keys so the version row is truthful again, then arm a Strategic refresh
+        so the strategist re-issues its deferred qualify_request.
+
+    Returns True only when the block was cleared (the version row changed).  A
+    still-blocked / no-op / deferral outcome returns False.  Runs in its own
+    dedicated session (the sweep's per-version isolation): the version is locked
+    so a concurrent explicit qualification serializes against the marker clear.
+    """
+    from app import ci_compliance as _ci_compliance
+    from app.strategic_spawning import (
+        _maybe_spawn_ci_compliance_cap_bump_fix,
+        ci_compliance_qualify_gate,
+    )
+
+    factory = session_factory or AsyncSessionLocal
+    async with factory() as recheck_session:
+        version = (
+            (
+                await recheck_session.execute(
+                    select(release_version.ReleaseVersion)
+                    .where(release_version.ReleaseVersion.id == version_id)
+                    .with_for_update()
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if version is None:
+            return False
+        qual = (
+            version.last_qualification
+            if isinstance(version.last_qualification, dict)
+            else {}
+        )
+        blocked = qual.get("qualify_request_blocked")
+        if not isinstance(blocked, dict) or blocked.get("blocker") != "ci_compliance":
+            return False
+        project = await recheck_session.get(Project, version.project_id)
+        if project is None:
+            return False
+        try:
+            status = await _ci_compliance.ensure_current_ci_compliance(
+                recheck_session, project
+            )
+        except Exception:  # noqa: BLE001 — best-effort sweep; defer to next cycle
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: ci_compliance re-check raised for "
+                "version %s; deferring",
+                version_id,
+            )
+            await recheck_session.rollback()
+            return False
+        if status.get("status") != "success":
+            # Compliance cannot be resolved this cycle (GitHub outage / missing
+            # credentials) — leave the marker and retry on the next sweep.
+            await recheck_session.rollback()
+            return False
+        gate = ci_compliance_qualify_gate(project, status.get("head_sha"))
+        if gate.get("blocked"):
+            # Still violating — backstop the repair spawn (deduped).  The block
+            # marker already points at a repair_task when the block site ran; a
+            # cancelled repair is re-queued here.
+            await _maybe_spawn_ci_compliance_cap_bump_fix(
+                recheck_session, project, gate
+            )
+            await recheck_session.commit()
+            return False
+        # Block cleared — drop the stale marker and re-arm Strategic so the
+        # deferred qualify_request is re-issued on the next cycle.
+        version.last_qualification = {
+            k: v
+            for k, v in qual.items()
+            if k not in ("qualify_request_blocked", "qualify_request_blocked_at")
+        }
+        flag_modified(version, "last_qualification")
+        recheck_session.add(version)
+        await recheck_session.commit()
+        try:
+            from app.strategic_trigger import request_strategic_refresh
+
+            async with factory() as refresh_session:
+                armed = await request_strategic_refresh(
+                    refresh_session,
+                    version.project_id,
+                    "CI-compliance block cleared; qualification may proceed",
+                    skip_locked=False,
+                )
+                if armed:
+                    await refresh_session.commit()
+                else:
+                    await refresh_session.rollback()
+        except Exception:  # noqa: BLE001 — the marker is already cleared
+            logger.warning(
+                "[RELEASE_QUALIFIER] sweep: ci_compliance block cleared for "
+                "version %s but Strategic refresh could not be armed",
+                version_id,
+                exc_info=True,
+            )
+        return True
+
+
+async def _fire_auto_triggered_qualification(
+    version_id: Any,
+    *,
+    session_factory=None,
+    pre_sweep_status: str | None = None,
+) -> bool:
+    """Execute the qualification-trigger resolver's fire decision for one version.
+
+    ``qualification_triggers.resolve_qualification_trigger`` is the pure decision
+    module that maps an open version's state to fire/hold, but until now nothing
+    EXECUTED it: the only production consumers were read surfaces (strategic fetch,
+    admin lifecycle), the ``auto_qualification_triggers`` knob defaulted to
+    ``observe``, and ``run_qualification`` refused any non-explicit fresh
+    qualification (``explicit_request=False`` ⇒ ``{"status":
+    "explicit_request_required"}``).  The result was a trigger engine that decided
+    "armed" forever without ever spawning a qualification.  This helper is the
+    sweep's executor for that decision.
+
+    For each open, stabilize-phase version it mirrors the read surface's resolver
+    inputs (candidate-fully-met from the ledger, requalification readiness, and a
+    best-effort automain HEAD/CI state for the advanced-candidate legs), then:
+
+      * knob == "off"       — no-op (never even resolves).
+      * knob == "observe"   — resolve and LOG a would-fire decision, but do not run.
+      * knob == "on" + fire — call ``run_qualification(..., explicit_request=True)``.
+      * fire == False       — hold; nothing to do this cycle.
+
+    Guardrails (mirroring the qualify_request path so the auto-trigger can never
+    bypass the CI-compliance guardrail or race a bespoke re-driver):
+
+      * A durable ``qualify_request_blocked`` marker with blocker ``ci_compliance``
+        is skipped — ``_recheck_ci_compliance_blocked_version`` owns that loop and
+        must be the one to clear it.
+      * The STORED ci-compliance gate record is checked (fail-open: no record ⇒ not
+        blocked) using the same cheap, no-GitHub-scan read the error/infra re-drivers
+        use — a fresh ``ensure_current_ci_compliance`` scan stays the strategic
+        qualify_request path's job.
+      * Verdict re-drives are NOT auto-trigger work: ``error`` / ``infra_failure``
+        are owned by the dedicated re-drivers above (which re-enter
+        ``run_qualification`` with a bounded attempt cap), and
+        ``deferred_unsynced`` / ``promotion_failed`` / ``not_promoted`` with any
+        blocker other than the acceptance grade are Strategic qualify_request
+        decisions — the existing contract forbids the scheduler from starting a
+        new review on those.  The resolver surfaces them to Strategic; the sweep
+        only fires the initial start and attempt-scoped recovery.
+      * ``pre_sweep_status`` — when provided, a version whose qualification
+        status differs from that snapshot is deferred.  An earlier sweep leg
+        (finalize, promotion_pending_timeout / managed-check-wait reconcile)
+        just wrote this cycle's outcome; those transitions re-arm the trigger
+        on the NEXT cycle, and firing now would race the fresh state.
+
+    Best-effort like every other sweep leg: any exception is swallowed and logged so
+    one version can never wedge the sweep.  Returns True only when a qualification
+    was actually started (``run_qualification`` returned ``{"status": "spawned"}``).
+    """
+    from app import release_qualifier
+    from app.qualification_triggers import resolve_qualification_trigger
+    from app.runtime_config_state import get_auto_qualification_triggers_mode
+
+    knob = get_auto_qualification_triggers_mode()
+    if knob == "off":
+        return False
+
+    factory = session_factory or AsyncSessionLocal
+    async with factory() as fire_session:
+        version = await fire_session.get(release_version.ReleaseVersion, version_id)
+        if version is None:
+            return False
+        if version.status != "open" or version.phase != "stabilize":
+            return False
+        qual = (
+            version.last_qualification
+            if isinstance(version.last_qualification, dict)
+            else {}
+        )
+        status = qual.get("status")
+        # Defer when an earlier sweep leg transitioned this version THIS cycle
+        # (finalize, the promotion_pending_timeout / managed-check-wait
+        # reconciles).  Those transitions settle to a fire-eligible state but
+        # document a deliberate "re-arm next cycle" — firing now would race the
+        # just-written outcome (and, on the error path, overwrite its error
+        # detail).  A version whose status is unchanged since the sweep started
+        # is a settled state the resolver may fire on.
+        if pre_sweep_status is not None and status != pre_sweep_status:
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep: auto-trigger deferring version %s — "
+                "qualification status moved %r -> %r during this sweep cycle",
+                version_id,
+                pre_sweep_status,
+                status,
+            )
+            return False
+        # Verdict re-drives the scheduler must NOT execute.  ``error`` /
+        # ``infra_failure`` are owned by the dedicated re-drivers above (which
+        # re-enter ``run_qualification`` with a bounded attempt cap); the rest are
+        # Strategic delivery decisions — the existing contract is explicit that the
+        # sweep must leave them for Strategic to re-issue ("Resolved findings do
+        # not authorize the scheduler to start a new review", "A cleared deferral
+        # remains a Strategic delivery decision, not sweep work", "Green CI is
+        # evidence for Strategic, not scheduler qualification authority").  The
+        # resolver surfaces these to Strategic via the read surfaces; the sweep's
+        # auto-trigger authority is the INITIAL start (status None) plus
+        # attempt-scoped recovery (rubric changes, dry-run advance, and the
+        # acceptance-grade ``criterion_coverage_incomplete`` re-grade).
+        if status in (
+            "error",
+            "infra_failure",
+            "deferred_unsynced",
+            "promotion_failed",
+        ):
+            return False
+        if status == "not_promoted" and qual.get("blocker") != "criterion_coverage_incomplete":
+            return False
+        # A CI-compliance deferral is durable and owned by the recheck loop above.
+        blocked = qual.get("qualify_request_blocked")
+        if isinstance(blocked, dict) and blocked.get("blocker") == "ci_compliance":
+            return False
+        project = await fire_session.get(Project, version.project_id)
+        if project is None:
+            return False
+        from app.strategic_spawning import ci_compliance_qualify_gate
+
+        if ci_compliance_qualify_gate(project).get("blocked"):
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep: deferring auto-trigger for v%d — "
+                "stored CI-compliance record shows the integration HEAD breaches "
+                "the guardrails",
+                version.version_number,
+            )
+            return False
+        try:
+            from app import category_verdict_ledger as _cvl
+            from app.release_readiness import compute_requalification_readiness
+
+            _is_candidate_fully_met = await _cvl.is_candidate_fully_met(
+                fire_session, version.id, qual.get("candidate_sha")
+            )
+            _readiness = await compute_requalification_readiness(
+                fire_session, version.project_id
+            )
+        except Exception:  # noqa: BLE001 — best-effort sweep; defer to next cycle
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: auto-trigger readiness resolution "
+                "failed for version %s; deferring",
+                version_id,
+            )
+            await fire_session.rollback()
+            return False
+        # Best-effort automain HEAD / CI state for the advanced-candidate legs
+        # (T1 candidate-advanced, T4 post_dry_run_advance).  The gate never raises
+        # and degrades to ``unavailable`` (automain_sha=None) without credentials,
+        # which simply disables those legs — the same conservative behaviour as the
+        # read surface, which passes None to avoid any GitHub I/O.
+        automain_sha = None
+        automain_ci_state = None
+        try:
+            from app.release_readiness import compute_promotion_ci_green_gate
+
+            _gate = await compute_promotion_ci_green_gate(
+                fire_session, version.project_id, dispatch=False
+            )
+            automain_sha = _gate.get("head_sha")
+            _gstate = _gate.get("gate_state")
+            if _gstate in ("red", "green", "pending", "no_checks"):
+                automain_ci_state = _gstate
+        except Exception:  # noqa: BLE001 — best-effort; degrade to None
+            logger.warning(
+                "[RELEASE_QUALIFIER] sweep: automain HEAD resolution failed for "
+                "version %s; auto-trigger running without the advanced-candidate "
+                "legs",
+                version_id,
+                exc_info=True,
+            )
+        decision = resolve_qualification_trigger(
+            phase=version.phase or "",
+            status=status,
+            error_code=qual.get("error") if status == "error" else None,
+            qualification_attempts=version.qualification_attempts or 0,
+            error_redrive_count=int(qual.get("error_redrive_count") or 0),
+            is_candidate_fully_met=_is_candidate_fully_met,
+            requalification_ready=_readiness.get("requalification_ready"),
+            candidate_sha=qual.get("candidate_sha"),
+            automain_sha=automain_sha,
+            automain_ci_state=automain_ci_state,
+            blocker=qual.get("blocker"),
+            in_flight=status == "pending",
+            promotion_check_wait=bool(qual.get("promotion_pending")),
+            consecutive_infra_errors=int(qual.get("consecutive_infra_errors") or 0),
+        )
+        if not decision.fire:
+            return False
+        if knob == "observe":
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep: auto-trigger OBSERVE would fire "
+                "qualification for version %s (trigger=%s reason=%s)",
+                version_id,
+                decision.trigger,
+                decision.reason,
+            )
+            return False
+        result = await release_qualifier.run_qualification(
+            fire_session,
+            version.project_id,
+            version,
+            explicit_request=True,
+        )
+        await fire_session.commit()
+        if result and result.get("status") == "spawned":
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep auto-fired qualification for version "
+                "%s (trigger=%s reason=%s)",
+                version_id,
+                decision.trigger,
+                decision.reason,
+            )
+            return True
+        logger.info(
+            "[RELEASE_QUALIFIER] sweep auto-trigger fired run_qualification for "
+            "version %s but it did not spawn (status=%s)",
+            version_id,
+            (result or {}).get("status"),
+        )
+        return False
+
+
 async def sweep_stuck_qualifications(
     session: AsyncSession,
     *,
@@ -877,6 +1298,16 @@ async def sweep_stuck_qualifications(
     # FOR UPDATE lock in its own dedicated session, so the id is all that is
     # carried out of the scan.
     version_ids = [v.id for v in open_versions]
+    # Snapshot each version's pre-sweep qualification status.  Several sweep
+    # legs below (finalize, the timeout/check-wait reconciles) transition a
+    # version INTO a state the trigger resolver considers fire-eligible in the
+    # SAME cycle (e.g. promotion_pending_timeout -> promotion_failed).  The
+    # auto-trigger must not fire on a transition this cycle just made — those
+    # transitions document an explicit "re-arm next cycle" intent — so the
+    # executor defers any version whose status changed since this snapshot.
+    pre_sweep_statuses: dict = {
+        v.id: (v.last_qualification or {}).get("status") for v in open_versions
+    }
 
     # Evidence upkeep is deployed-side bookkeeping, not a release decision.
     # Keep it on the sweep after removing scheduler-owned qualification starts:
@@ -1052,6 +1483,33 @@ async def sweep_stuck_qualifications(
             logger.info(
                 "[RELEASE_QUALIFIER] sweep re-drove infra_failure version %s "
                 "(transient infra cleared — qualification spawned)",
+                version_id,
+            )
+
+    # Re-evaluate open versions whose qualify_request was deferred by a
+    # CI-compliance block.  The block site spawns a cap-bump repair; this loop
+    # is the sweep's re-evaluation leg: while the guardrail is still red it
+    # backstops the repair spawn (deduped); once the HEAD is clean it drops the
+    # stale block marker and arms a Strategic refresh so the deferred
+    # qualify_request is re-issued.  Runs after the transient-outcome re-drivers
+    # so a version that is BOTH infra/error and block-marked is re-driven first.
+    for version_id in version_ids:
+        try:
+            unblocked = await _recheck_ci_compliance_blocked_version(
+                version_id,
+                session_factory=session_factory,
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: ci_compliance re-check failed for "
+                "version %s",
+                version_id,
+            )
+            continue
+        if unblocked:
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep: version %s CI-compliance block "
+                "cleared — stale marker dropped, Strategic refresh armed",
                 version_id,
             )
 
@@ -1345,5 +1803,36 @@ async def sweep_stuck_qualifications(
     # another.  Extracted to a helper so the fresh-per-version re-read is
     # independently testable.
     await _run_lifecycle_stall_alerts(open_versions, session_factory=session_factory)
+
+    # Qualification trigger auto-fire.  The resolver
+    # (``qualification_triggers.resolve_qualification_trigger``) decides fire/hold
+    # for open versions but nothing executed that decision — this loop is the
+    # executor.  It runs AFTER every other sweep leg (finalize, transient-outcome
+    # re-drivers, ci_compliance recheck, reconciles, drift sentinel, lifecycle
+    # alerts) so a version is auto-fired only when no other leg owns it first: a
+    # just-spawned qualification reads back as in-flight and is held by the
+    # resolver, and the bespoke error/infra re-drivers have already re-entered
+    # ``run_qualification`` for those statuses.  Gated on the
+    # ``auto_qualification_triggers`` knob ("on" fires, "observe" logs would-fire,
+    # "off" no-ops).
+    for version_id in version_ids:
+        try:
+            fired = await _fire_auto_triggered_qualification(
+                version_id,
+                session_factory=session_factory,
+                pre_sweep_status=pre_sweep_statuses.get(version_id),
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: qualification auto-trigger failed "
+                "for version %s",
+                version_id,
+            )
+            continue
+        if fired:
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep auto-fired qualification for version %s",
+                version_id,
+            )
 
     return finalized

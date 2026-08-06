@@ -1054,12 +1054,14 @@ runtime_config: Dict = {
     # Event-driven qualification trigger mode.  Controls whether the sweep-based
     # qualification trigger resolver (qualification_triggers.py) actually fires
     # run_qualification for matched versions:
-    #   "observe" (default) — resolver runs and logs would-fire decisions without
-    #                          spawning any qualification.  Compare against actual
-    #                          strategist/sweep activity before flipping to "on".
-    #   "on"                — resolver fires run_qualification for matched versions.
+    #   "on" (default)      — resolver fires run_qualification for matched versions
+    #                          (the sweep's auto-trigger leg executes the
+    #                          resolver's fire decision with explicit_request=True).
+    #   "observe"           — resolver runs and logs would-fire decisions without
+    #                          spawning any qualification.  Diagnostic rollback
+    #                          path only.
     #   "off"               — resolver does not run at all (legacy behavior).
-    "auto_qualification_triggers": "observe",
+    "auto_qualification_triggers": "on",
     # Account-agnostic lease: when True, a same-tenant IDLE pool member may be
     # leased for a task whose resolved account (and model) differ from the
     # member's frozen boot account, and the warm-claim path re-materializes the
@@ -2902,10 +2904,13 @@ def is_review_fix_lane_pilot_shadow_mode_enabled() -> bool:
 def get_auto_qualification_triggers_mode() -> str:
     """Return the event-driven qualification trigger mode.
 
-    Values: "observe" (default, logs decisions without spawning),
-    "on" (actively fires run_qualification), "off" (resolver does not run).
+    Values: "on" (default, actively fires run_qualification),
+    "observe" (logs decisions without spawning), "off" (resolver does not run).
     """
     raw = config_get("auto_qualification_triggers")
     if raw in ("on", "observe", "off"):
         return raw
-    return "observe"
+    # Fall back to the shipped default ("on").  The default flipped from
+    # "observe" when the sweep's auto-trigger leg became the executor, so a
+    # stale/unset persisted value must not silently re-disable the fix.
+    return "on"

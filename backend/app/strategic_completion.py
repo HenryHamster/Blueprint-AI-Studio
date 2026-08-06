@@ -1514,6 +1514,7 @@ async def _apply_qualify_request(
         try:
             from app import ci_compliance as _ci_compliance
             from app.strategic_spawning import (
+                _maybe_spawn_ci_compliance_cap_bump_fix,
                 ci_compliance_qualify_gate,
             )
 
@@ -1527,7 +1528,7 @@ async def _apply_qualify_request(
                         "[STRATEGIC] Task %s (%s path): qualify_request for "
                         "project %s version v%d blocked by CI-compliance "
                         "violations=%s head=%s; returning evidence to Strategic "
-                        "without spawning a release-specific repair (reason=%r)",
+                        "(reason=%r)",
                         task.id,
                         path,
                         project.id,
@@ -1536,18 +1537,36 @@ async def _apply_qualify_request(
                         gate.get("head_sha"),
                         reason,
                     )
+                    # Spawn the cap-bump repair HERE so the block path is
+                    # self-sufficient. The strategic-review payload build is the
+                    # only other spawner; if it never runs (no strategic cycle)
+                    # the repair would otherwise never be queued. The spawn is
+                    # deduped per project+HEAD, so an already-queued repair is
+                    # returned rather than duplicated.
+                    try:
+                        repair_task = await _maybe_spawn_ci_compliance_cap_bump_fix(
+                            session, project, gate
+                        )
+                    except Exception:
+                        logger.exception(
+                            "[STRATEGIC] Task %s (%s path): failed to spawn "
+                            "CI-compliance cap-bump repair for project %s",
+                            task.id,
+                            path,
+                            project.id,
+                        )
+                        repair_task = None
                     # Record the CI-compliance block durably on the version row
                     # so the resident strategist can see WHY a requested
-                    # qualification never started. The previous path only
-                    # spawned a cap-bump task and logged, leaving
+                    # qualification never started (and which repair task is
+                    # addressing it). The previous path only spawned a cap-bump
+                    # task from the payload build and logged, leaving
                     # last_qualification null and therefore indistinguishable
                     # from "never requested" without log access.
                     # Merged under a dedicated key (like the qualify_request_error
                     # trace on the failure path below) so it never overwrites a
                     # prior verdict's "status" and cannot perturb
-                    # run_qualification's cached-verdict guard. Strategic sees
-                    # the actionable evidence on its next state-change wake and
-                    # may use its ordinary task authority to choose a repair.
+                    # run_qualification's cached-verdict guard.
                     try:
                         open_ver.last_qualification = {
                             **(open_ver.last_qualification or {}),
@@ -1556,7 +1575,11 @@ async def _apply_qualify_request(
                                 "blocker_class": "actionable",
                                 "violation_count": gate.get("violation_count", 0),
                                 "head_sha": gate.get("head_sha"),
-                                "repair_task": None,
+                                "repair_task": (
+                                    str(repair_task.id)
+                                    if repair_task is not None
+                                    else None
+                                ),
                             },
                             "qualify_request_blocked_at": _utcnow().isoformat(),
                         }
@@ -1570,6 +1593,55 @@ async def _apply_qualify_request(
                             path,
                         )
                         return False
+                    # Notify the operator (deduped per project + HEAD) so the
+                    # block is not silent. The strategist payload also surfaces
+                    # the evidence, but a durable Alert is the operator-facing
+                    # signal. Policy fail-closed is fine: if the event type is
+                    # not operator-visible the alert is a no-op, never a crash.
+                    try:
+                        from app.alert_policy import (
+                            create_project_alert_if_allowed,
+                        )
+                        from app.models import AlertSeverity
+
+                        await create_project_alert_if_allowed(
+                            session,
+                            project_id=project.id,
+                            event_type="release.qualification_ci_compliance_block",
+                            severity=AlertSeverity.WARNING,
+                            task_id=(
+                                repair_task.id
+                                if repair_task is not None
+                                else None
+                            ),
+                            title=(
+                                f"Release v{open_ver.version_number} blocked by "
+                                "CI-compliance violations"
+                            ),
+                            message=(
+                                f"qualify_request for release "
+                                f"v{open_ver.version_number} was blocked by "
+                                f"{gate.get('violation_count', 0)} CI-compliance "
+                                f"violation(s) at HEAD "
+                                f"{str(gate.get('head_sha') or '')[:12]}. "
+                                f"Repair task "
+                                f"{repair_task.id if repair_task is not None else 'spawn failed'} "
+                                "queued; qualification resumes once the guardrail "
+                                "is clean."
+                            ),
+                            dedupe_key=(
+                                f"ci_compliance_block:{project.id}:"
+                                f"{str(gate.get('head_sha') or 'unknown')[:12]}"
+                            ),
+                        )
+                    except Exception:
+                        logger.exception(
+                            "[STRATEGIC] Task %s (%s path): failed to raise "
+                            "CI-compliance block alert for project %s",
+                            task.id,
+                            path,
+                            project.id,
+                        )
                     return True
             else:
                 logger.info(

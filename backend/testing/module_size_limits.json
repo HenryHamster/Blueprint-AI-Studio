@@ -131,7 +131,7 @@
     "project_message_sequence_fence.py": 100,
     "max_plan_slot_accounting.py": 50,
     "work_session_check_in.py": 400,
-    "release_qualifier_sweep.py": 1500,
+    "release_qualifier_sweep.py": 2150,
     "operator_attention.py": 3150,
     "payload_schemas.py": 2050,
     "lifecycle.py": 2500,
@@ -145,7 +145,7 @@
     "routers/agent_strategic_fetch.py": 3150,
     "runner_health_monitors.py": 1450,
     "strategic_context_package.py": 2500,
-    "routers/runner.py": 3800,
+    "routers/runner.py": 4400,
     "capability_trial_verdict.py": 1750,
     "acceptance_gate.py": 1800,
     "review_loop_convergence.py": 1950,
@@ -265,7 +265,7 @@
   "testing": {
     "test_admin_routers.py": 22725,
     "test_agent.py": 31550,
-    "test_compute.py": 7976,
+    "test_compute.py": 9400,
     "test_research_completion.py": 23850,
     "test_strategic_completion.py": 22750,
     "test_strategic_spawning.py": 22650,
@@ -395,6 +395,7 @@
     "test_admin_routers__strategic_directions.py": 2200,
     "test_strategic_session_messages.py": 1950,
     "test_warm_pool_dispatch.py": 2100,
-    "test_admin_routers__notifications.py": 1800
+    "test_admin_routers__notifications.py": 1800,
+    "test_ci_compliance_gate.py": 1950
   }
 }

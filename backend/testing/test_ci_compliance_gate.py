@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 
@@ -10,7 +11,7 @@ from sqlalchemy import select
 
 from app import ci_compliance
 from app.auth import create_agent_token
-from app.models import Project, Task, TaskStatus
+from app.models import Alert, Project, Task, TaskStatus
 from app.strategic_spawning import (
     _maybe_spawn_ci_compliance_cap_bump_fix,
     _spawn_strategic_review,
@@ -18,13 +19,34 @@ from app.strategic_spawning import (
 )
 from testing import check_size_limits as csl
 
+
+def _shared_session_factory(db_session):
+    @contextlib.asynccontextmanager
+    async def _factory():
+        yield db_session
+
+    return _factory
+
 _HEAD_SHA = "a" * 40
 _CAPPED_REL = "main.py"
 _CAP = 10
+_TESTING_REL = "test_fake_module.py"
+_TESTING_CAP = 50
 
 
 def _limits_json(cap: int = _CAP) -> str:
     return json.dumps({"backend": {_CAPPED_REL: cap}})
+
+
+def _limits_json_with_testing() -> str:
+    """A limits JSON that also caps a backend/testing/ file, mirroring CI's
+    TestTestFileSizeGuardrails over the enforced ``testing`` section."""
+    return json.dumps(
+        {
+            "backend": {_CAPPED_REL: _CAP},
+            "testing": {_TESTING_REL: _TESTING_CAP},
+        }
+    )
 
 
 def _fake_reader(module_line_count: int):
@@ -33,6 +55,19 @@ def _fake_reader(module_line_count: int):
             return _limits_json()
         if path == f"backend/app/{_CAPPED_REL}":
             return "\n".join("x" for _ in range(module_line_count))
+        return None
+
+    return _reader
+
+
+def _fake_reader_with_testing(module_line_count: int, testing_line_count: int):
+    async def _reader(path, *, token, owner, repo, ref, project_id=None):
+        if path == ci_compliance._MODULE_SIZE_LIMITS_PATH:
+            return _limits_json_with_testing()
+        if path == f"backend/app/{_CAPPED_REL}":
+            return "\n".join("x" for _ in range(module_line_count))
+        if path == f"backend/testing/{_TESTING_REL}":
+            return "\n".join("x" for _ in range(testing_line_count))
         return None
 
     return _reader
@@ -161,6 +196,62 @@ async def test_ci_compliance_fetch_gate_and_cap_bump_spawn(
     assert cap_bump_task.first_payload["type"] == "create"
     assert "python3 backend/testing/check_size_limits.py --fix" in cap_bump_task.first_payload[
         "prompt"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_ci_compliance_fetch_and_gate_surface_testing_section_breach(
+    client, db_session, mocker
+):
+    """A testing-section breach at automain HEAD surfaces and blocks the gate.
+
+    The evaluator scans the enforced ``testing`` section of
+    module_size_limits.json (mirroring CI's TestTestFileSizeGuardrails), so a
+    backend/testing/*.py file over its cap must appear in the fetch response as
+    a section-``testing`` violation and block ``ci_compliance_qualify_gate``.
+    """
+    project, agent_task = await _make_project_with_agent_task(
+        db_session, module_line_count=_CAP - 1, mocker=mocker
+    )
+    # Re-point the reader at a limits file that also caps a testing file, which
+    # is over its cap (backend file stays within cap to isolate the testing breach).
+    mocker.patch.object(
+        ci_compliance.github,
+        "get_file_text_at_ref",
+        new=_fake_reader_with_testing(_CAP - 1, _TESTING_CAP + 3),
+    )
+
+    token = create_agent_token(str(agent_task.id), "agent-vm-ci-compliance")
+    response = await client.get(
+        f"/api/agent/projects/{project.id}/ci-compliance",
+        headers={"x-agent-token": token},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()["data"]
+    assert body["head_sha"] == _HEAD_SHA
+    assert body["compliant"] is False
+    assert body["violation_count"] == 1
+    assert body["violations"] == [
+        {
+            "section": "testing",
+            "rel": _TESTING_REL,
+            "count": _TESTING_CAP + 3,
+            "cap": _TESTING_CAP,
+        }
+    ]
+
+    await db_session.refresh(project)
+    gate = ci_compliance_qualify_gate(project, _HEAD_SHA)
+    assert gate["blocked"] is True
+    assert gate["violation_count"] == 1
+    assert gate["violations"] == [
+        {
+            "section": "testing",
+            "rel": _TESTING_REL,
+            "count": _TESTING_CAP + 3,
+            "cap": _TESTING_CAP,
+        }
     ]
 
 
@@ -300,10 +391,13 @@ async def test_noncompliant_qualify_request_is_blocked_and_spawns_cap_bump(
         for task in tasks
         if (task.context or {}).get("spawned_by") == "ci_compliance_cap_bump_gate"
     ]
-    # Qualification reports the blocker to Strategic; it does not hard-code a
-    # release-specific repair task. Strategic retains normal task-spawning
-    # authority and can choose the appropriate repair from this evidence.
-    assert cap_bump_tasks == []
+    # The block site spawns the cap-bump repair directly so the blocked
+    # qualification always leaves a queued repair behind — Strategic never has
+    # to discover the breach on its own for the loop to close.
+    assert len(cap_bump_tasks) == 1
+    repair_task = cap_bump_tasks[0]
+    assert repair_task.status == TaskStatus.QUEUED
+    assert repair_task.context["head_sha"] == _HEAD_SHA
 
     # Observability: the CI-compliance block is recorded durably on the version
     # row (queryable via the strategic payload / version fetch), not just logged.
@@ -312,9 +406,236 @@ async def test_noncompliant_qualify_request_is_blocked_and_spawns_cap_bump(
     blocked_trace = version.last_qualification["qualify_request_blocked"]
     assert blocked_trace["blocker"] == "ci_compliance"
     assert blocked_trace["head_sha"] == _HEAD_SHA
-    assert blocked_trace["repair_task"] is None
+    assert blocked_trace["repair_task"] == str(repair_task.id)
     assert "qualify_request_blocked_at" in version.last_qualification
     assert refresh_required is True
+
+    # The operator is notified through the alert policy (FAIL-CLOSED route_event
+    # is overridden by the explicit registration in message_audience).
+    alerts = (
+        await db_session.execute(select(Alert).where(Alert.project_id == project.id))
+    ).scalars().all()
+    assert len(alerts) == 1
+    assert alerts[0].event_type == "release.qualification_ci_compliance_block"
+    assert alerts[0].task_id == repair_task.id
+
+
+@pytest.mark.asyncio
+async def test_sweep_rechecks_still_blocked_and_backstops_repair(db_session, mocker):
+    """A still-violating HEAD keeps its block marker and gets a repair task.
+
+    Covers the pre-fix gap directly: a version blocked when the block site had
+    no spawn (repair_task=None, nothing queued) is re-evaluated by the sweep,
+    which backstops a cap-bump repair so the loop is not dead.
+    """
+    from app import release_version as rv
+    from app.release_qualifier_sweep import _recheck_ci_compliance_blocked_version
+
+    project, agent_task = await _make_project_with_agent_task(
+        db_session, module_line_count=_CAP + 4, mocker=mocker
+    )
+    stored_result = _violation_result(_CAP + 4)
+    ci_compliance.record_ci_compliance(project, stored_result)
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    rv.set_version_phase(version, "stabilize", reasoning="ready to qualify")
+    version.last_qualification = {
+        "qualify_request_blocked": {
+            "blocker": "ci_compliance",
+            "blocker_class": "actionable",
+            "violation_count": 1,
+            "head_sha": _HEAD_SHA,
+            "repair_task": None,
+        },
+        "qualify_request_blocked_at": "2026-08-06T00:00:00+00:00",
+    }
+    db_session.add(version)
+    db_session.add(project)
+    await db_session.commit()
+
+    async def _stored_current(_session, _project):
+        return {
+            "status": "success",
+            "integration_branch": "automain",
+            "head_sha": _HEAD_SHA,
+            "data": stored_result,
+            "computed": False,
+        }
+
+    mocker.patch(
+        "app.ci_compliance.ensure_current_ci_compliance",
+        new=_stored_current,
+    )
+
+    cleared = await _recheck_ci_compliance_blocked_version(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert cleared is False
+
+    # The durable block marker survives the re-check.
+    await db_session.refresh(version)
+    assert (
+        version.last_qualification["qualify_request_blocked"]["blocker"]
+        == "ci_compliance"
+    )
+
+    # The backstop queued exactly one cap-bump repair task.
+    tasks = (
+        await db_session.execute(select(Task).where(Task.project_id == project.id))
+    ).scalars().all()
+    cap_bump_tasks = [
+        task
+        for task in tasks
+        if (task.context or {}).get("spawned_by") == "ci_compliance_cap_bump_gate"
+    ]
+    assert len(cap_bump_tasks) == 1
+    assert cap_bump_tasks[0].context["head_sha"] == _HEAD_SHA
+
+
+@pytest.mark.asyncio
+async def test_sweep_rechecks_cleared_block_drops_marker_and_rearms_strategic(
+    db_session, mocker
+):
+    """Once HEAD is compliant the sweep drops the stale block and re-arms Strategic.
+
+    The requalify half of the loop: the sweep re-evaluates the blocked version,
+    sees the guardrail is clean, clears the durable marker, and asks the
+    strategist to re-issue its deferred qualify_request.
+    """
+    from app import release_version as rv
+    from app.release_qualifier_sweep import _recheck_ci_compliance_blocked_version
+
+    project, agent_task = await _make_project_with_agent_task(
+        db_session, module_line_count=_CAP - 1, mocker=mocker
+    )
+    compliant_result = {
+        "ref": _HEAD_SHA,
+        "compliant": True,
+        "violations": [],
+        "checked": 1,
+        "limits_available": True,
+    }
+    ci_compliance.record_ci_compliance(project, compliant_result)
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    rv.set_version_phase(version, "stabilize", reasoning="ready to qualify")
+    version.last_qualification = {
+        "qualify_request_blocked": {
+            "blocker": "ci_compliance",
+            "blocker_class": "actionable",
+            "violation_count": 1,
+            "head_sha": _HEAD_SHA,
+            "repair_task": str(agent_task.id),
+        },
+        "qualify_request_blocked_at": "2026-08-06T00:00:00+00:00",
+    }
+    db_session.add(version)
+    db_session.add(project)
+    await db_session.commit()
+
+    async def _stored_current(_session, _project):
+        return {
+            "status": "success",
+            "integration_branch": "automain",
+            "head_sha": _HEAD_SHA,
+            "data": compliant_result,
+            "computed": False,
+        }
+
+    mocker.patch(
+        "app.ci_compliance.ensure_current_ci_compliance",
+        new=_stored_current,
+    )
+    refreshed = []
+
+    async def _fake_refresh(session, project_id, reason, *, skip_locked=True):
+        refreshed.append((project_id, reason))
+        return True
+
+    mocker.patch(
+        "app.strategic_trigger.request_strategic_refresh",
+        new=_fake_refresh,
+    )
+
+    cleared = await _recheck_ci_compliance_blocked_version(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert cleared is True
+
+    await db_session.refresh(version)
+    assert "qualify_request_blocked" not in version.last_qualification
+    assert "qualify_request_blocked_at" not in version.last_qualification
+    assert refreshed and refreshed[0][0] == project.id
+    assert "CI-compliance" in refreshed[0][1]
+
+
+@pytest.mark.asyncio
+async def test_redrive_defers_error_qualification_while_gate_blocked(
+    db_session, mocker
+):
+    """The sweep error re-driver does not spawn a fresh qualification while the
+    stored CI-compliance gate is red — the block→repair→requalify loop owns the
+    version until the guardrail is clean."""
+    from app import release_version as rv
+    from app.release_qualifier_redrive import _redrive_error_qualification
+
+    project, agent_task = await _make_project_with_agent_task(
+        db_session, module_line_count=_CAP + 4, mocker=mocker
+    )
+    stored_result = _violation_result(_CAP + 4)
+    ci_compliance.record_ci_compliance(project, stored_result)
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    rv.set_version_phase(version, "stabilize", reasoning="ready to qualify")
+    version.last_qualification = {
+        "status": "error",
+        "error": "sha_error",
+        "error_redrive_count": 0,
+        "qualification_attempt_id": "attempt-1",
+    }
+    db_session.add(version)
+    db_session.add(project)
+    await db_session.commit()
+
+    run_qualification = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=mocker.AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    redriven = await _redrive_error_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert redriven is False
+    run_qualification.assert_not_awaited()
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_operator_qualify_respects_ci_compliance_gate(db_session, client, mocker):
+    """The operator /qualify lever returns 409 while the stored gate is red.
+
+    Previously the operator lever called run_qualification directly and bypassed
+    the CI-compliance gate entirely; a 409 keeps the gate invariant consistent
+    across the strategic, sweep, and operator paths.
+    """
+    from app import release_version as rv
+    from app.models import ProjectMember
+
+    project, agent_task = await _make_project_with_agent_task(
+        db_session, module_line_count=_CAP + 4, mocker=mocker
+    )
+    stored_result = _violation_result(_CAP + 4)
+    ci_compliance.record_ci_compliance(project, stored_result)
+    db_session.add(
+        ProjectMember(project_id=project.id, user_id="test-user-123", role="owner")
+    )
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    rv.set_version_phase(version, "stabilize", reasoning="ready to qualify")
+    db_session.add(version)
+    db_session.add(project)
+    await db_session.commit()
+
+    resp = await client.post(f"/api/admin/projects/{project.id}/qualify")
+    assert resp.status_code == 409
+    assert "CI-compliance" in resp.text
 
 
 def test_cap_bump_resolves_orchestrator_runner_dispatch_breach():

@@ -36,6 +36,26 @@ def _limits_json(cap: int = _CAP) -> str:
     return json.dumps({"backend": {_CAPPED_REL: cap}})
 
 
+# A capped backend/testing/ file guaranteed to be exercised once the evaluator
+# scans the enforced ``testing`` section (mirroring CI's TestTestFileSizeGuardrails).
+_TESTING_REL = "test_fake_module.py"
+_TESTING_CAP = 100
+
+
+def _limits_json_with_testing(
+    cap: int = _CAP,
+    testing_cap: int = _TESTING_CAP,
+    testing_rel: str = _TESTING_REL,
+) -> str:
+    """A limits JSON with capped backend + testing sections."""
+    return json.dumps(
+        {
+            "backend": {_CAPPED_REL: cap},
+            "testing": {testing_rel: testing_cap},
+        }
+    )
+
+
 def _fake_reader(file_bodies: dict[str, str | None]):
     """Build an async stand-in for ``github.get_file_text_at_ref``.
 
@@ -181,6 +201,121 @@ async def test_evaluator_compliant_when_limits_unreadable(mocker):
     assert result["compliant"] is True
     assert result["violations"] == []
     assert result["limits_available"] is False
+    assert result["tree_available"] is True
+    assert result["checked"] == 0
+    # An empty tree makes the branch-literal scan a no-op, so unreadable limits
+    # on a clean tree still yield a compliant verdict.
+    assert result["branch_literal_violations"] == []
+
+
+@pytest.mark.asyncio
+async def test_evaluator_flags_testing_section_breach(mocker):
+    """A capped backend/testing/ file over its cap is a section-'testing' violation."""
+    testing_body = "\n".join("x" for _ in range(_TESTING_CAP + 5))
+    bodies = {
+        ci_compliance._MODULE_SIZE_LIMITS_PATH: _limits_json_with_testing(),
+        f"backend/app/{_CAPPED_REL}": "\n".join("x" for _ in range(_CAP - 100)),
+        f"backend/testing/{_TESTING_REL}": testing_body,
+    }
+    mocker.patch.object(
+        ci_compliance.github, "get_file_text_at_ref", new=_fake_reader(bodies)
+    )
+    mocker.patch.object(
+        ci_compliance.github, "list_repo_tree_paths_at_ref", new=_fake_tree(_EMPTY_TREE)
+    )
+
+    result = await ci_compliance.evaluate_ci_compliance_at_ref(
+        token="t", owner="o", repo="r", ref=_HEAD_SHA, project_id="p"
+    )
+
+    assert result["compliant"] is False
+    assert result["limits_available"] is True
+    testing_violations = [
+        v for v in result["violations"] if v.get("section") == "testing"
+    ]
+    assert len(testing_violations) == 1
+    assert testing_violations[0] == {
+        "section": "testing",
+        "rel": _TESTING_REL,
+        "count": _TESTING_CAP + 5,
+        "cap": _TESTING_CAP,
+    }
+
+
+@pytest.mark.asyncio
+async def test_evaluator_flags_testing_uncapped_large_file(mocker):
+    """An uncapped backend/testing/*.py over the threshold is an uncapped violation."""
+    big_body = "\n".join("x" for _ in range(ci_compliance._UNCAPPED_THRESHOLD + 10))
+    big_body_bytes = len(big_body.encode())
+    testing_rel = "test_large_module.py"
+    testing_path = f"backend/testing/{testing_rel}"
+
+    bodies = {
+        ci_compliance._MODULE_SIZE_LIMITS_PATH: _limits_json_with_testing(),
+        f"backend/app/{_CAPPED_REL}": "\n".join("x" for _ in range(_CAP - 100)),
+        testing_path: big_body,
+    }
+    tree = [
+        {"path": testing_path, "size": big_body_bytes},
+        {"path": f"backend/app/{_CAPPED_REL}", "size": 10000},
+    ]
+    mocker.patch.object(
+        ci_compliance.github, "get_file_text_at_ref", new=_fake_reader(bodies)
+    )
+    mocker.patch.object(
+        ci_compliance.github, "list_repo_tree_paths_at_ref", new=_fake_tree(tree)
+    )
+
+    result = await ci_compliance.evaluate_ci_compliance_at_ref(
+        token="t", owner="o", repo="r", ref=_HEAD_SHA, project_id="p"
+    )
+
+    assert result["compliant"] is False
+    uncapped_violations = [v for v in result["violations"] if v.get("cap") is None]
+    assert len(uncapped_violations) == 1
+    assert uncapped_violations[0]["section"] == "testing"
+    assert uncapped_violations[0]["rel"] == testing_rel
+    assert uncapped_violations[0]["count"] == ci_compliance._UNCAPPED_THRESHOLD + 10
+
+
+@pytest.mark.asyncio
+async def test_evaluator_runs_branch_literal_scan_when_limits_unreadable(mocker):
+    """Unreadable limits still surface branch-literal violations from the tree.
+
+    The limits file 404s (not in ``bodies``), so the size scans are skipped and
+    ``limits_available`` is False — but the branch-literal scan depends only on
+    the repo tree (as CI's branch-literal invariants do), so an offending
+    backend/app/ file must still be reported and flip ``compliant`` to False.
+    """
+    offending_body = (
+        "def get_branch(config):\n"
+        "    return config.get('integration_branch') else 'main'\n"
+    )
+    tree = [{"path": "backend/app/some_module.py", "size": 100}]
+    bodies = {
+        # limits file intentionally ABSENT -> unreadable
+        "backend/app/some_module.py": offending_body,
+    }
+    mocker.patch.object(
+        ci_compliance.github, "get_file_text_at_ref", new=_fake_reader(bodies)
+    )
+    mocker.patch.object(
+        ci_compliance.github, "list_repo_tree_paths_at_ref", new=_fake_tree(tree)
+    )
+
+    result = await ci_compliance.evaluate_ci_compliance_at_ref(
+        token="t", owner="o", repo="r", ref=_HEAD_SHA, project_id="p"
+    )
+
+    assert result["compliant"] is False
+    assert result["violations"] == []
+    assert result["checked"] == 0
+    assert result["limits_available"] is False
+    assert result["tree_available"] is True
+    assert len(result["branch_literal_violations"]) >= 1
+    offender = result["branch_literal_violations"][0]
+    assert offender["section"] == "backend"
+    assert offender["rel"] == "some_module.py"
 
 
 @pytest.mark.asyncio

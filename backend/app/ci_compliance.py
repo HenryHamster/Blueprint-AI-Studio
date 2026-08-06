@@ -24,6 +24,11 @@ Three public entry points:
     limits file and repo tree at the ref, then checks (a) capped modules for
     line-count breaches, (b) uncapped source files over the coverage threshold,
     and (c) backend/agent source files for hardcoded branch-literal patterns.
+    Sections mirror CI: ``backend``, ``agent``, ``frontend``, and ``testing``
+    (``backend/testing/*.py`` per-file caps and the 1500-line uncapped
+    coverage guardrail). The branch-literal scan runs whenever the repo tree is
+    available — even when the limits file is unreadable — because CI's
+    branch-literal invariants run regardless of the limits file's readability.
     Returns a JSON-serializable result. Fail-safe: a file that 404s / cannot be
     read at the ref is SKIPPED (treated as not-a-violation), never crashing the
     evaluation.
@@ -65,11 +70,14 @@ _MODULE_SIZE_LIMITS_PATH = "backend/testing/module_size_limits.json"
 
 # Maps a module_size_limits.json section to the repo-relative path prefix its
 # ``rel`` keys are rooted at. Mirrors hotfix_backmerge._FILE_PREFIX_MAP (inverted
-# direction) and check_size_limits.resolve_section_root's section roots.
+# direction) and check_size_limits.resolve_section_root's section roots. The
+# ``testing`` section is enforced by CI's TestTestFileSizeGuardrails /
+# test_testing_no_uncapped_large_file and must be scanned exactly like CI does.
 _SECTION_PREFIXES: dict[str, str] = {
     "backend": "backend/app/",
     "agent": "agent/src/",
     "frontend": "admin-ui/src/",
+    "testing": "backend/testing/",
 }
 
 # Bound the per-SHA history so the JSONB column cannot grow without limit across
@@ -102,15 +110,18 @@ _semaphore = asyncio.Semaphore(_DEFAULT_CONCURRENCY)
 _UNCAPPED_THRESHOLD = 1500
 
 # Per-section source file extensions for the uncapped-coverage guardrail.
-# Mirrors check_size_limits._SECTION_SCAN.
+# Mirrors check_size_limits._SECTION_SCAN (backend/app .py, agent .ts,
+# frontend .ts/.tsx, testing .py).
 _SECTION_EXTENSIONS: dict[str, tuple[str, ...]] = {
     "backend": (".py",),
     "agent": (".ts",),
     "frontend": (".ts", ".tsx"),
+    "testing": (".py",),
 }
 
 # Files excluded from the uncapped-coverage guardrail per section.
-# Mirrors check_size_limits._is_frontend_excluded / _is_agent_excluded.
+# Mirrors check_size_limits._is_frontend_excluded / _is_agent_excluded /
+# _no_exclusion (testing scans every .py like the backend section).
 def _is_frontend_excluded(rel: str) -> bool:
     return rel.endswith((".test.ts", ".test.tsx", ".d.ts")) or rel.startswith("test/")
 
@@ -123,6 +134,7 @@ _SECTION_EXCLUDED: dict[str, Any] = {
     "backend": lambda rel: False,
     "agent": _is_agent_excluded,
     "frontend": _is_frontend_excluded,
+    "testing": lambda rel: False,
 }
 
 # Supplemental agent patterns: extend canonical AGENT_PATTERNS with loose
@@ -472,13 +484,15 @@ async def evaluate_ci_compliance_at_ref(
     1. **Capped-file size breach** — for every capped key in
        ``module_size_limits.json``, reads that file at the ref, line-counts it,
        and classifies the breach via
-       :func:`testing.check_size_limits.classify_size_record`.
+       :func:`testing.check_size_limits.classify_size_record`. Covers the
+       ``backend``, ``agent``, ``frontend``, and ``testing`` sections exactly as
+       CI's per-file size guardrails do.
 
     2. **Uncapped large file** — uses the GitHub recursive tree API to enumerate
-       ALL source files in backend/app/, agent/src/, and admin-ui/src/. Any file
-       over ``_UNCAPPED_THRESHOLD`` lines that has NO cap entry in the limits JSON
-       is reported as a violation (it would fail the ``test_*_no_uncapped_large_file``
-       coverage meta-tests in CI).
+       ALL source files in backend/app/, agent/src/, admin-ui/src/, and
+       backend/testing/. Any file over ``_UNCAPPED_THRESHOLD`` lines that has NO
+       cap entry in the limits JSON is reported as a violation (it would fail
+       the ``test_*_no_uncapped_large_file`` coverage meta-tests in CI).
 
     3. **Branch-literal regression** — scans backend/app/*.py for the hardcoded
        branch-fallback patterns from
@@ -500,9 +514,12 @@ async def evaluate_ci_compliance_at_ref(
 
     Fail-safe throughout: a file that 404s / cannot be read at the ref is
     SKIPPED (counted as compliant), never raising. An unreadable limits file
-    yields ``compliant=True`` with ``limits_available=False`` (nothing to
-    evaluate, never a crash). An unavailable repo tree yields ``tree_available=False``
-    and skips guardrails 2 and 3 (branch-literal, uncapped).
+    yields ``limits_available=False`` and skips the size guardrails (they need
+    the caps dict), but the branch-literal scan STILL runs when the repo tree is
+    available and ``compliant`` reflects its findings — CI's branch-literal
+    invariants do not depend on the limits file. An unavailable repo tree yields
+    ``tree_available=False`` and skips guardrails 2 and 3 (branch-literal,
+    uncapped).
     """
     # Fetch limits and repo tree in parallel — they are independent.
     limits, tree_paths_raw = await asyncio.gather(
@@ -514,19 +531,35 @@ async def evaluate_ci_compliance_at_ref(
         ),
     )
 
-    if not limits:
-        return {
-            "ref": ref,
-            "compliant": True,
-            "violations": [],
-            "branch_literal_violations": [],
-            "checked": 0,
-            "limits_available": False,
-            "tree_available": tree_paths_raw is not None,
-        }
-
     tree_available = tree_paths_raw is not None
     tree_paths: list[dict] = tree_paths_raw if tree_paths_raw is not None else []
+
+    # An unreadable limits file means the size guardrails (capped + uncapped)
+    # cannot run — they need the caps dict. But the branch-literal scan only
+    # needs the repo tree, and CI's branch-literal invariants run regardless of
+    # the limits file's readability, so keep scanning whenever the tree exists.
+    if not limits:
+        branch_literal_violations = (
+            await _scan_branch_literals(
+                tree_paths=tree_paths,
+                token=token,
+                owner=owner,
+                repo=repo,
+                ref=ref,
+                project_id=project_id,
+            )
+            if tree_available
+            else []
+        )
+        return {
+            "ref": ref,
+            "compliant": not branch_literal_violations,
+            "violations": [],
+            "branch_literal_violations": branch_literal_violations,
+            "checked": 0,
+            "limits_available": False,
+            "tree_available": tree_available,
+        }
 
     # Run all three guardrails in parallel: capped-file reads (guardrail 1),
     # uncapped large-file reads (guardrail 2), and branch-literal scans
