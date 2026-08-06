@@ -1134,7 +1134,9 @@ async def _fire_auto_triggered_qualification(
     qualification (``explicit_request=False`` ⇒ ``{"status":
     "explicit_request_required"}``).  The result was a trigger engine that decided
     "armed" forever without ever spawning a qualification.  This helper is the
-    sweep's executor for that decision.
+    sweep's executor for that decision: it fires ``run_qualification`` through the
+    sweep's OWN sanctioned path (``auto_trigger=True``), which the ownership guard
+    admits as a distinct source — never by claiming ``explicit_request``.
 
     For each open, stabilize-phase version it mirrors the read surface's resolver
     inputs (candidate-fully-met from the ledger, requalification readiness, and a
@@ -1142,7 +1144,7 @@ async def _fire_auto_triggered_qualification(
 
       * knob == "off"       — no-op (never even resolves).
       * knob == "observe"   — resolve and LOG a would-fire decision, but do not run.
-      * knob == "on" + fire — call ``run_qualification(..., explicit_request=True)``.
+      * knob == "on" + fire — call ``run_qualification(..., auto_trigger=True)``.
       * fire == False       — hold; nothing to do this cycle.
 
     Guardrails (mirroring the qualify_request path so the auto-trigger can never
@@ -1322,7 +1324,7 @@ async def _fire_auto_triggered_qualification(
             fire_session,
             version.project_id,
             version,
-            explicit_request=True,
+            auto_trigger=True,
         )
         await fire_session.commit()
         if result and result.get("status") == "spawned":

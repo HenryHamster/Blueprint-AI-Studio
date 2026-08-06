@@ -2492,6 +2492,7 @@ async def run_qualification(
     retry_episode_cap: int | None = None,
     requested_probes: list[str] | tuple[str, ...] | set[str] | None = None,
     explicit_request: bool = False,
+    auto_trigger: bool = False,
 ) -> dict[str, Any]:
     """Kick off qualification for the open release ``version``.
 
@@ -2596,10 +2597,28 @@ async def run_qualification(
         return {"status": "wrong_phase"}
 
     # Fresh qualification is an ownership decision, not a branch-head side
-    # effect.  Strategic's qualify_request and the operator endpoint pass this
-    # explicitly; sweeps/reconcilers pass False and may only continue an
-    # already-requested attempt by carrying its immutable attempt id.
-    if not explicit_request and continued_attempt_id is None:
+    # effect.  Exactly two sanctioned sources may START a fresh review, and each
+    # is distinct so the guard keeps meaning:
+    #
+    #   * ``explicit_request=True`` — Strategic's qualify_request and the
+    #     operator endpoint: a human (or a caller acting for one) decided this
+    #     candidate deserves a review right now.
+    #   * ``auto_trigger=True`` — the sweep's sanctioned auto-trigger: the
+    #     trigger resolver (``qualification_triggers.resolve_qualification_trigger``)
+    #     fired a bounded rule (initial fire, rubric redrive, candidate/dry-run
+    #     advance, acceptance-grade re-grade) gated behind the
+    #     ``auto_qualification_triggers`` knob.  The sweep must NOT masquerade
+    #     as an explicit caller — it is automatic machinery with its own,
+    #     narrower authority.
+    #
+    # Any other automatic caller — the bespoke error/infra re-drivers, stale
+    # reconcilers — may only CONTINUE an already-requested attempt by carrying
+    # its immutable attempt id; they never start a fresh review.
+    if (
+        not explicit_request
+        and not auto_trigger
+        and continued_attempt_id is None
+    ):
         logger.info(
             "[RELEASE_QUALIFIER] v%d ignored automatic fresh qualification; "
             "Strategic or an operator must request a candidate review",

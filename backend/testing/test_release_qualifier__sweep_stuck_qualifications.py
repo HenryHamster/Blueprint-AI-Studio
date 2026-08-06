@@ -5352,10 +5352,11 @@ async def test_sweep_auto_trigger_fires_never_attempted_qualification(
 
     A never-attempted (status=None) stabilize version is armed by T1
     (coverage_complete) and — with the ``auto_qualification_triggers`` knob "on"
-    — the sweep's auto-trigger leg fires ``run_qualification`` with
-    ``explicit_request=True``.  This is the fix for "decides but never fires":
-    before the auto-trigger leg, the resolver returned armed forever and no sweep
-    step ever called run_qualification (and a non-explicit call would have been
+    — the sweep's auto-trigger leg fires ``run_qualification`` through the sweep's
+    OWN sanctioned path (``auto_trigger=True``), NOT by claiming
+    ``explicit_request``.  This is the fix for "decides but never fires": before
+    the auto-trigger leg, the resolver returned armed forever and no sweep step
+    ever called run_qualification (and a plain non-explicit call would have been
     refused as ``explicit_request_required`` anyway).
     """
     from app import shared_state
@@ -5390,7 +5391,10 @@ async def test_sweep_auto_trigger_fires_never_attempted_qualification(
     assert run_mock.await_count == 1
     call = run_mock.await_args
     assert call.args[1] == project.id
-    assert call.kwargs.get("explicit_request") is True
+    # The sweep auto-trigger is automatic machinery: it must use the distinct
+    # sanctioned auto_trigger path, not claim explicit-request status.
+    assert call.kwargs.get("explicit_request") is not True
+    assert call.kwargs.get("auto_trigger") is True
 
 
 @pytest.mark.asyncio
@@ -5557,7 +5561,7 @@ async def test_auto_trigger_fires_post_dry_run_advance(db_session, mocker):
     This exercises the advanced-candidate leg, which requires the sweep to resolve
     the automain HEAD/CI state (unlike the read surfaces, which pass None).  The
     candidate advanced (new_sha != candidate_sha) and CI is green, so the resolver
-    returns armed and run_qualification fires with explicit_request=True.
+    returns armed and run_qualification fires with auto_trigger=True.
     """
     from app import shared_state
 
@@ -5598,4 +5602,5 @@ async def test_auto_trigger_fires_post_dry_run_advance(db_session, mocker):
 
     assert fired is True
     assert run_mock.await_count == 1
-    assert run_mock.await_args.kwargs.get("explicit_request") is True
+    assert run_mock.await_args.kwargs.get("explicit_request") is not True
+    assert run_mock.await_args.kwargs.get("auto_trigger") is True
