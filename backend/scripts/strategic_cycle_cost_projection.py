@@ -67,19 +67,33 @@ approximation; the byte counts themselves are exact, and the cost model is
 anchored on the measured $4.41, so the token estimate only affects the tiny
 cross-cycle term).
 
-The module also projects MONTHLY spend (criterion c-3fd62b9d): per-cycle cost
-x a cycle-volume anchor. The volume anchors are cited — the measured realized
-volume (59 cycles / 7-day measurement window, direction d-e860fe17 measured
-basis) and the cadence-backstop floor from the ``strategic_max_interval_minutes``
-config default (runtime_config_state.py:830). No ``target_concurrency``
-configuration key exists for the strategic decision loop; when no volume input
-is available the projection refuses to guess and says so explicitly.
+The module also projects MONTHLY spend (criterion c-3fd62b9d). The criterion's
+envelope covers BOTH halves of the cost envelope, so the monthly figure is two
+terms:
+
+  * DECISION LOOP — per-cycle cost x a cycle-volume anchor. The anchors are
+    cited — the measured realized volume (59 cycles / 7-day measurement
+    window, direction d-e860fe17 measured basis) and the cadence-backstop
+    floor from the ``strategic_max_interval_minutes`` config default
+    (runtime_config_state.py:830).
+  * TASK EXECUTION — per-task cost x a task-volume anchor, sourced from the
+    same VM/LLM cost accounting that backs the existing per-task cost
+    reporting (efficiency_snapshot cost_per_verified_task /
+    total_cost_per_verified_task, built from get_task_total_vm_cost_usd +
+    _task_llm_cost). The measured basis: the non-strategic fleet that merged
+    75 PRs over the 7-day window cost $15.46 LLM + $8.00 VM.
+
+No ``target_concurrency`` configuration key exists for the strategic decision
+loop, and no per-task cost/volume is fabricated either: when any input is
+unavailable the projection refuses to guess and says so explicitly rather than
+silently dropping a term to zero.
 """
 
 from __future__ import annotations
 
 import math
 import textwrap
+from typing import cast
 
 # ---------------------------------------------------------------------------
 # Measured / stated inputs
@@ -136,8 +150,24 @@ MINUTES_PER_MONTH = DAYS_PER_MONTH * 24 * 60
 MEASURED_CYCLES_PER_7_DAYS = 59
 
 # The cost envelope the monthly projection is judged against (direction
-# d-e860fe17 success evidence: "within $3,000").
+# d-e860fe17 success evidence: "within $3,000"). The envelope covers decision
+# loop AND task execution — one budget question, not two.
 MONTHLY_ENVELOPE_USD = 3_000.0
+
+# ---------------------------------------------------------------------------
+# Task-execution inputs (criterion c-3fd62b9d's second half)
+# ---------------------------------------------------------------------------
+
+# Measured per-task execution cost, sourced from the project's VM/LLM cost
+# accounting — the same figures that back the existing per-task cost reporting
+# (efficiency_snapshot cost_per_verified_task / total_cost_per_verified_task,
+# built from get_task_total_vm_cost_usd + _task_llm_cost). Direction
+# d-e860fe17 measured basis: over the 7-day window the non-strategic fleet
+# that merged 75 PRs cost $15.46 LLM and $8.00 VM. Per-task execution cost is
+# therefore (LLM + VM) / tasks.
+MEASURED_FLEET_LLM_USD_PER_7_DAYS = 15.46
+MEASURED_FLEET_VM_USD_PER_7_DAYS = 8.00
+MEASURED_TASKS_PER_7_DAYS = 75
 
 
 def effective_input_price_multiplier(read_share: float) -> float:
@@ -238,6 +268,30 @@ def measured_cycles_per_month() -> float:
     return MEASURED_CYCLES_PER_7_DAYS * DAYS_PER_MONTH / 7.0
 
 
+def mean_task_execution_cost_usd() -> float:
+    """Mean per-task execution cost (LLM + VM), USD — measured fleet basis.
+
+    The non-strategic fleet that merged MEASURED_TASKS_PER_7_DAYS (75) PRs over
+    the 7-day window cost MEASURED_FLEET_LLM_USD_PER_7_DAYS ($15.46) LLM plus
+    MEASURED_FLEET_VM_USD_PER_7_DAYS ($8.00) VM (direction d-e860fe17 measured
+    basis). This is the same VM/LLM accounting that backs the existing per-task
+    cost reporting, so the term is a measured input, not an estimate.
+    """
+    return (
+        MEASURED_FLEET_LLM_USD_PER_7_DAYS + MEASURED_FLEET_VM_USD_PER_7_DAYS
+    ) / MEASURED_TASKS_PER_7_DAYS
+
+
+def measured_tasks_per_month() -> float:
+    """Realized task-execution volume scaled to a month, tasks/month.
+
+    MEASURED_TASKS_PER_7_DAYS (75 merged PRs over the 7-day measurement window)
+    scaled by DAYS_PER_MONTH / 7 — the same 30.44-day month convention used for
+    the cycle volume.
+    """
+    return MEASURED_TASKS_PER_7_DAYS * DAYS_PER_MONTH / 7.0
+
+
 def target_concurrency_status() -> dict:
     """Report whether a stored 'target concurrency' input exists.
 
@@ -293,6 +347,81 @@ def project_monthly_spend(
         "per_cycle_cost_usd": round(per_cycle_cost_usd, 4),
         "cycles_per_month": round(cycles_per_month, 2),
         "monthly_spend_usd": round(monthly, 2),
+    }
+
+
+def project_monthly_spend_with_tasks(
+    per_cycle_cost_usd: float,
+    cycles_per_month: float | None,
+    per_task_cost_usd: float | None,
+    tasks_per_month: float | None,
+) -> dict[str, object]:
+    """Projected monthly TOTAL spend, USD: decision loop + task execution.
+
+    The $3,000/month envelope (criterion c-3fd62b9d) is one budget question
+    covering BOTH the strategist decision loop and per-task execution, so the
+    monthly figure is the sum of two terms:
+
+      * decision-loop:  per_cycle_cost_usd x cycles_per_month
+      * task-execution: per_task_cost_usd x tasks_per_month
+
+    Returns a dict so the arithmetic is explicit and the split is auditable —
+    the reader can sum ``decision_loop_monthly_usd`` + ``task_execution_monthly_usd``
+    and get ``total_monthly_spend_usd`` exactly.
+
+    The same refusal-to-fabricate discipline as :func:`project_monthly_spend`
+    extends to EVERY input: when any of the volume/cost inputs is unavailable
+    (None), negative, or non-finite, the projection returns ``available=False``
+    with a reason naming the missing input — it never substitutes a placeholder
+    and never silently drops the task term to a zero to make the total look
+    complete.
+    """
+    if (
+        cycles_per_month is None
+        or cycles_per_month < 0
+        or not math.isfinite(cycles_per_month)
+        or per_task_cost_usd is None
+        or per_task_cost_usd < 0
+        or not math.isfinite(per_task_cost_usd)
+        or tasks_per_month is None
+        or tasks_per_month < 0
+        or not math.isfinite(tasks_per_month)
+    ):
+        missing = [
+            label
+            for label, value in (
+                ("cycle volume", cycles_per_month),
+                ("per-task cost", per_task_cost_usd),
+                ("task volume", tasks_per_month),
+            )
+            if value is None or value < 0 or not math.isfinite(value)
+        ]
+        return {
+            "available": False,
+            "reason": (
+                "monthly total unavailable: "
+                + ", ".join(missing)
+                + " missing or invalid — refusing to fabricate a term"
+            ),
+            "decision_loop_monthly_usd": None,
+            "task_execution_monthly_usd": None,
+            "total_monthly_spend_usd": None,
+            "within_envelope": None,
+        }
+    decision = round(per_cycle_cost_usd * cycles_per_month, 2)
+    task_exec = round(per_task_cost_usd * tasks_per_month, 2)
+    total = round(decision + task_exec, 2)
+    return {
+        "available": True,
+        "per_cycle_cost_usd": round(per_cycle_cost_usd, 4),
+        "cycles_per_month": round(cycles_per_month, 2),
+        "per_task_cost_usd": round(per_task_cost_usd, 4),
+        "tasks_per_month": round(tasks_per_month, 2),
+        "decision_loop_monthly_usd": decision,
+        "task_execution_monthly_usd": task_exec,
+        "total_monthly_spend_usd": total,
+        "monthly_envelope_usd": MONTHLY_ENVELOPE_USD,
+        "within_envelope": total <= MONTHLY_ENVELOPE_USD,
     }
 
 
@@ -361,8 +490,8 @@ def main() -> None:
         print(f"  {r:>14.2f} {('$' + f'{tier_only:.2f}'):>16} {('$' + f'{with_target:.2f}'):>14}")
     print("  (input-cost share fixed at 0.90; cross-cycle survival 0)")
     print("\n  Cache-share sensitivity at R=0.70 (the reorder's plausible range):")
-    for share in (0.55, 0.60, 0.70, 0.80):
-        print(f"    share {share:.2f} -> ${project_cycle_cost(0.70, share, 0.0):.2f}/cycle")
+    for cache_share in (0.55, 0.60, 0.70, 0.80):
+        print(f"    share {cache_share:.2f} -> ${project_cycle_cost(0.70, cache_share, 0.0):.2f}/cycle")
     print("\n  Cross-cycle survival sensitivity at R=0.70, share 0.55:")
     for surv in (0.0, 0.10, 1.0):
         print(f"    survival {surv:.2f} -> ${project_cycle_cost(0.70, 0.55, surv):.2f}/cycle")
@@ -392,7 +521,16 @@ def main() -> None:
           f"({MEASURED_CYCLES_PER_7_DAYS} cycles / 7-day window, d-e860fe17 measured basis)")
     print(f"    Cadence-backstop floor   : {cadence_cycles_per_month():>8.1f}  "
           f"(strategic_max_interval_minutes={STRATEGIC_MAX_INTERVAL_MINUTES} default)")
-    print("\n  Monthly spend = per-cycle cost x cycles/month")
+    print("\n  Task-volume anchor (tasks/month):")
+    print(f"    Measured task volume    : {measured_tasks_per_month():>8.1f}  "
+          f"({MEASURED_TASKS_PER_7_DAYS} tasks / 7-day window, d-e860fe17 measured basis)")
+    print(f"  Per-task execution cost   : ${mean_task_execution_cost_usd():.4f}/task "
+          f"(fleet ${MEASURED_FLEET_LLM_USD_PER_7_DAYS:.2f} LLM + "
+          f"${MEASURED_FLEET_VM_USD_PER_7_DAYS:.2f} VM over "
+          f"{MEASURED_TASKS_PER_7_DAYS} tasks — the VM/LLM accounting behind "
+          f"cost_per_verified_task / total_cost_per_verified_task)")
+
+    print("\n  Monthly spend = decision-loop term + task-execution term")
     base_cost = project_cycle_cost(0.70, BASELINE_CACHE_READ_SHARE, 0.0)
     target_cost = project_cycle_cost(0.85, 0.80, 0.0)
     for label, cost in (
@@ -405,18 +543,43 @@ def main() -> None:
         ):
             m = project_monthly_spend(cost, volume)
             print(f"    {label}: ${cost:.2f}/cycle x {volume:>7.1f} ({vol_label}) "
-                  f"= ${m['monthly_spend_usd']:>8,.2f}/month")
-    print(f"\n  $3,000/month envelope vs honest base case (${base_cost:.2f}/cycle):")
-    print(f"    binds at {MONTHLY_ENVELOPE_USD / base_cost:,.0f} cycles/month "
-          f"= ~{MONTHLY_ENVELOPE_USD / base_cost / measured_cycles_per_month():.1f}x "
-          f"the measured volume. At today's cadence the decision loop is "
-          f"${project_monthly_spend(base_cost, measured_cycles_per_month())['monthly_spend_usd']:,.0f}/month "
-          f"-- the envelope is not the binding constraint; the loop could run "
-          f"~{(MONTHLY_ENVELOPE_USD / base_cost) / measured_cycles_per_month():.1f}x "
-          f"its current volume before it binds.")
-    print("\n  If no cycle volume were available at all (no measured data and no cadence")
-    print("  config), the projection would refuse to guess rather than fabricate a number:")
-    print(f"    {project_monthly_spend(base_cost, None)}")
+                  f"= ${m['monthly_spend_usd']:>8,.2f}/month (decision loop)")
+        # Task-execution term + total at the measured volume (the auditable split).
+        mt = project_monthly_spend_with_tasks(
+            cost, measured_cycles_per_month(),
+            mean_task_execution_cost_usd(), measured_tasks_per_month(),
+        )
+        print(f"      + task execution at measured volume: "
+              f"${mt['task_execution_monthly_usd']:>8,.2f}/month "
+              f"(${mt['per_task_cost_usd']:.4f}/task x {mt['tasks_per_month']:.1f} tasks)")
+        print(f"      TOTAL = ${mt['total_monthly_spend_usd']:>8,.2f}/month "
+              f"({'within' if mt['within_envelope'] else 'OVER'} the "
+              f"${mt['monthly_envelope_usd']:,.0f} envelope)")
+    print("\n  $3,000/month envelope vs the honest base case TOTAL at the measured volume:")
+    base_total = project_monthly_spend_with_tasks(
+        base_cost, measured_cycles_per_month(),
+        mean_task_execution_cost_usd(), measured_tasks_per_month(),
+    )
+    print(f"    decision loop : ${base_total['decision_loop_monthly_usd']:>8,.2f}/month "
+          f"(${base_cost:.2f}/cycle x {base_total['cycles_per_month']:.1f} cycles)")
+    print(f"    task execution: ${base_total['task_execution_monthly_usd']:>8,.2f}/month "
+          f"(${base_total['per_task_cost_usd']:.4f}/task x "
+          f"{base_total['tasks_per_month']:.1f} tasks)")
+    base_total_usd = cast(float, base_total["total_monthly_spend_usd"])
+    print(f"    TOTAL         : ${base_total_usd:>8,.2f}/month "
+          f"= {base_total_usd / MONTHLY_ENVELOPE_USD:.1%} of the "
+          f"${MONTHLY_ENVELOPE_USD:,.0f} envelope "
+          f"({'within' if base_total['within_envelope'] else 'OVER'})")
+    print("    The decision-loop-only half binds at "
+          f"{MONTHLY_ENVELOPE_USD / base_cost:,.0f} cycles/month "
+          f"(~{MONTHLY_ENVELOPE_USD / base_cost / measured_cycles_per_month():.1f}x "
+          f"the measured volume); the combined envelope binds at a lower volume, "
+          f"but task volume does not scale with cycle volume at the measured basis, "
+          f"so no combined binds-at figure is fabricated.")
+    print("\n  If a projection input were unavailable, the projection would refuse to")
+    print("  guess rather than fabricate a number:")
+    print(f"    no cycle volume : {project_monthly_spend(base_cost, None)}")
+    print(f"    no per-task data: {project_monthly_spend_with_tasks(base_cost, measured_cycles_per_month(), None, None)}")
 
 
 if __name__ == "__main__":

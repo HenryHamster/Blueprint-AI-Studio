@@ -10,11 +10,13 @@ It derives the projected median from stated inputs, cites each input to its sour
 prices the two caching regimes separately, states every assumption, shows sensitivity,
 and reports the number honestly: **the projected median is above $1.50.**
 
-The same script also projects **monthly spend at a cycle volume** (§7, criterion
-c-3fd62b9d): per-cycle cost × a cited cycle-volume anchor, showing the arithmetic so a
-reader can check it by hand. The honest base case at the measured realized volume lands
-at **~$735/month** — comfortably within the $3,000/month envelope, so the envelope is not
-the binding constraint at today's cadence.
+The same script also projects **monthly spend** (§7, criterion c-3fd62b9d): the
+monthly TOTAL is the decision-loop term (per-cycle cost × a cited cycle-volume anchor)
+plus the task-execution term (per-task cost × a cited task-volume anchor), both sourced
+from measured data and shown separately so the split is auditable. The honest base case
+at the measured realized volume lands at **~$837/month** ($735 decision loop + $102 task
+execution) — comfortably within the $3,000/month envelope, so the envelope is not the
+binding constraint at today's cadence.
 
 ---
 
@@ -179,15 +181,22 @@ tier-mix lever (PR #16730) is the one reliable cost reduction, and its ceiling a
 
 ---
 
-## 7. Projected monthly spend at a cycle volume (criterion c-3fd62b9d)
+## 7. Projected monthly spend (criterion c-3fd62b9d)
 
-`monthly spend = per-cycle cost × cycles/month`. The cycle-volume anchors are read
-from existing configuration / measured data, each cited:
+The monthly TOTAL is **decision-loop term + task-execution term**:
+
+```
+monthly total = (per-cycle cost × cycles/month) + (per-task cost × tasks/month)
+```
+
+The inputs are read from existing configuration / measured data, each cited:
 
 | Anchor | Value | Source |
 |---|---|---|
-| Measured realized volume | **59 cycles / 7 days → ~256.6/month** | Direction d-e860fe17 measured basis ($276.87 total / $261.33 strategic across 59 cycles). Scaled by `DAYS_PER_MONTH / 7` with `DAYS_PER_MONTH = 30.44`. |
-| Cadence-backstop floor | **~30.4/month** | `strategic_max_interval_minutes = 1,440` default (`runtime_config_state.py:830`) — the wall-clock floor that forces a strategic spawn. A floor, not the realized volume. |
+| Measured cycle volume | **59 cycles / 7 days → ~256.6/month** | Direction d-e860fe17 measured basis ($276.87 total / $261.33 strategic across 59 cycles). Scaled by `DAYS_PER_MONTH / 7` with `DAYS_PER_MONTH = 30.44`. |
+| Cadence-backstop floor | **~30.4 cycles/month** | `strategic_max_interval_minutes = 1,440` default (`runtime_config_state.py:830`) — the wall-clock floor that forces a strategic spawn. A floor, not the realized volume. |
+| Measured task volume | **75 tasks / 7 days → ~326.1 tasks/month** | Direction d-e860fe17 measured basis (75 merged PRs over the window). Same 30.44-day month convention. |
+| Per-task execution cost | **~$0.3128/task** | Direction d-e860fe17 measured basis: non-strategic fleet cost **$15.46 LLM + $8.00 VM** over 75 tasks. This is the same VM/LLM cost accounting that backs the existing per-task cost reporting (`cost_per_verified_task` / `total_cost_per_verified_task`, built from `get_task_total_vm_cost_usd` + `_task_llm_cost`). |
 | Target concurrency | **NOT AVAILABLE** | No `target_concurrency` configuration key exists for the strategic decision loop (searched `runtime_config_state.py` defaults and the `ReleaseVersion` model). The projection surfaces this rather than guessing a volume. |
 
 **Concurrency assumption:** cycles run serially — the cadence spawner gates on
@@ -195,21 +204,28 @@ no-active-strategic (`autonomous_research.py:1732-1733`), so at most 1 concurren
 strategic cycle per project at a time.
 
 ```
-Honest base (R=0.70, share 0.55):  $2.87/cycle × 256.6 (measured) = $  735.45/month
-                                   $2.87/cycle ×  30.4 (floor)    = $   87.26/month
-Direction-target (R=0.85, share 0.80): $1.52/cycle × 256.6 = $389.71/month
+Honest base (R=0.70, share 0.55):
+  decision loop : $2.87/cycle × 256.6 (measured) = $  735.45/month
+  task execution: $0.3128/task × 326.1 tasks     = $  102.02/month
+  TOTAL                                        = $  837.47/month
+Direction-target (R=0.85, share 0.80):
+  decision loop : $1.52/cycle × 256.6 (measured) = $  389.71/month
+  task execution: $0.3128/task × 326.1 tasks     = $  102.02/month
+  TOTAL                                        = $  491.73/month
 ```
 
-**Envelope verdict:** the honest base case at the measured volume is **~$735/month** —
-comfortably within the $3,000/month envelope. The envelope binds at **~1,047
-cycles/month** at the honest base case, i.e. ~4.1× the measured volume. The envelope
-is therefore *not* the binding constraint on the decision loop at today's cadence; the
-loop could run ~4× its current volume before the $3,000 budget is reached. (This is
-honest measurement, not target-tuning — the per-cycle number that feeds it is still
-above the $1.50 headline.)
+**Envelope verdict:** the honest base case TOTAL at the measured volume is
+**~$837/month** — **27.9%** of the $3,000/month envelope, comfortably within it. The
+decision-loop-only half binds at **~1,047 cycles/month** (~4.1× the measured volume);
+the combined envelope binds at a lower volume, but task volume does not scale with
+cycle volume at the measured basis, so the script asserts no combined binds-at figure
+(rather than fabricating a scaling assumption). The envelope is therefore *not* the
+binding constraint at today's cadence. (This is honest measurement, not target-tuning —
+the per-cycle number that feeds it is still above the $1.50 headline.)
 
-If no cycle volume were available at all (no measured data and no cadence config), the
-script returns `available: False` and a reason instead of fabricating a number.
+If any input were unavailable (no cycle volume, or no per-task cost/volume), the script
+returns `available: False` with a reason naming the missing input instead of
+fabricating a number — it never silently drops the task term to a zero.
 
 A falsified target is a real, useful result; a number tuned backwards from $1.50 is
 not. The actionable levers that could actually reach $1.50: fewer/smaller turns

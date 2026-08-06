@@ -24,6 +24,10 @@ the per-cycle projection:
     strategic_max_interval_minutes cadence default — not a magic number;
   * no stored ``target_concurrency`` config exists, and when a volume input is
     unavailable the projection refuses to guess (available=False);
+  * the monthly TOTAL is decision-loop cost + task-execution cost — the
+    per-task term sourced from the measured fleet basis (75 tasks, $15.46 LLM
+    + $8.00 VM over the 7-day window), and when per-task inputs are missing
+    the total surfaces an explicit gap rather than silently dropping to zero;
   * the honest base case at the measured volume is comfortably within the
     $3,000/month envelope — an honest result, not a tuned one.
 
@@ -57,8 +61,11 @@ def test_script_is_importable_and_exposes_the_model_functions():
         "cross_cycle_saving_per_cycle",
         "cadence_cycles_per_month",
         "measured_cycles_per_month",
+        "mean_task_execution_cost_usd",
+        "measured_tasks_per_month",
         "target_concurrency_status",
         "project_monthly_spend",
+        "project_monthly_spend_with_tasks",
         "main",
     ):
         assert callable(getattr(mod, name, None)), f"missing {name}"
@@ -205,3 +212,68 @@ def test_main_output_includes_the_monthly_arithmetic():
     assert "[7] Projected monthly spend" in out
     assert "Target-concurrency input: NOT AVAILABLE" in out
     assert str(monthly["monthly_spend_usd"]) in out
+
+
+def test_mean_task_execution_cost_matches_documented_basis():
+    """Per-task execution cost = (fleet LLM + VM) / tasks = $0.3128/task.
+
+    The direction's measured basis (d-e860fe17): the non-strategic fleet that
+    merged 75 PRs over the 7-day window cost $15.46 LLM + $8.00 VM — the same
+    VM/LLM accounting that backs the existing per-task cost reporting.
+    """
+    mod = _load_module()
+    expected = (mod.MEASURED_FLEET_LLM_USD_PER_7_DAYS + mod.MEASURED_FLEET_VM_USD_PER_7_DAYS) / mod.MEASURED_TASKS_PER_7_DAYS
+    assert mod.mean_task_execution_cost_usd() == expected
+    assert 0.25 < expected < 0.40
+
+
+def test_measured_task_volume_matches_documented_basis():
+    """75 tasks / 7-day window scaled to a month ~ 326.1 tasks/month."""
+    mod = _load_module()
+    expected = mod.MEASURED_TASKS_PER_7_DAYS * mod.DAYS_PER_MONTH / 7.0
+    assert mod.measured_tasks_per_month() == expected
+    assert 320 < expected < 335
+
+
+def test_monthly_spend_includes_per_task_term():
+    """The monthly TOTAL is decision-loop cost + task-execution cost.
+
+    (a) For non-zero task volume the total strictly exceeds the decision-loop-
+    only figure; (b) missing per-task inputs surface as an explicit gap, never
+    a silent zero that understates the monthly bill.
+    """
+    mod = _load_module()
+    decision_only = mod.project_monthly_spend(2.8665, 256.57)
+    assert decision_only["available"] is True
+
+    total = mod.project_monthly_spend_with_tasks(2.8665, 256.57, 0.31, 100.0)
+    assert total["available"] is True
+    # (a) the total strictly exceeds the decision-loop-only figure.
+    assert total["total_monthly_spend_usd"] > decision_only["monthly_spend_usd"]
+    # Both terms reported separately so the split is auditable.
+    assert total["decision_loop_monthly_usd"] == decision_only["monthly_spend_usd"]
+    assert total["task_execution_monthly_usd"] == round(0.31 * 100.0, 2)
+    assert total["total_monthly_spend_usd"] == round(
+        total["decision_loop_monthly_usd"] + total["task_execution_monthly_usd"], 2
+    )
+    # (b) missing per-task inputs surface as an explicit gap, not a silent zero.
+    for kwargs in (
+        {"per_task_cost_usd": None, "tasks_per_month": 100.0},
+        {"per_task_cost_usd": 0.31, "tasks_per_month": None},
+        {"per_task_cost_usd": 0.31, "tasks_per_month": -1.0},
+        {"per_task_cost_usd": float("nan"), "tasks_per_month": 100.0},
+    ):
+        gap = mod.project_monthly_spend_with_tasks(2.8665, 256.57, **kwargs)
+        assert gap["available"] is False, kwargs
+        assert gap["total_monthly_spend_usd"] is None, kwargs
+        assert "task" in gap["reason"].lower(), kwargs
+
+
+def test_monthly_spend_with_tasks_preserves_cycle_volume_refusal():
+    """The total projection keeps the decision-loop no-fabrication discipline:
+    an unavailable cycle volume is the same unavailable-input gap."""
+    mod = _load_module()
+    gap = mod.project_monthly_spend_with_tasks(2.8665, None, 0.31, 100.0)
+    assert gap["available"] is False
+    assert "cycle volume" in gap["reason"]
+    assert gap["total_monthly_spend_usd"] is None
