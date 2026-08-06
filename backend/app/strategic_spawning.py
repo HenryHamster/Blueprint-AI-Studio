@@ -4729,6 +4729,8 @@ def ci_compliance_qualify_gate(
             "compliant": record.get("compliant"),
             "limits_available": limits_available,
             "tree_available": tree_available,
+            "limits_status": record.get("limits_status"),
+            "limits_error": record.get("limits_error"),
         }
     blocked = record.get("compliant") is False and (
         bool(violations) or bool(branch_literal_violations)
@@ -4741,6 +4743,9 @@ def ci_compliance_qualify_gate(
         "branch_literal_violations": branch_literal_violations,
         "branch_literal_violation_count": len(branch_literal_violations),
         "compliant": record.get("compliant"),
+        "limits_available": limits_available,
+        "limits_status": record.get("limits_status"),
+        "limits_error": record.get("limits_error"),
     }
 
 

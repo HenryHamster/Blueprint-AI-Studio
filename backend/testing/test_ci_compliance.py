@@ -181,8 +181,15 @@ async def test_evaluator_skips_unreadable_file(mocker):
 
 
 @pytest.mark.asyncio
-async def test_evaluator_compliant_when_limits_unreadable(mocker):
-    """An unreadable limits file is fail-safe: compliant, limits_available=False."""
+async def test_unreadable_limits_fails_closed(mocker):
+    """An unreadable limits config fails closed: compliant=False + diagnostic.
+
+    The fail-open behavior this replaces reported compliant=True when the
+    size-limits file could not be read — the guard silently stopped guarding
+    and reported success. Fail-closed discipline: when the limits source is
+    unreadable, the gate must refuse with a diagnostic naming the path it tried
+    to read.
+    """
     mocker.patch.object(
         ci_compliance.github,
         "get_file_text_at_ref",
@@ -198,13 +205,74 @@ async def test_evaluator_compliant_when_limits_unreadable(mocker):
         token="t", owner="o", repo="r", ref=_HEAD_SHA, project_id="p"
     )
 
-    assert result["compliant"] is True
+    assert result["compliant"] is False
     assert result["violations"] == []
     assert result["limits_available"] is False
+    assert result["limits_status"] == "unreadable"
+    assert ci_compliance._MODULE_SIZE_LIMITS_PATH in result["limits_error"]
     assert result["tree_available"] is True
     assert result["checked"] == 0
-    # An empty tree makes the branch-literal scan a no-op, so unreadable limits
-    # on a clean tree still yield a compliant verdict.
+    assert result["branch_literal_violations"] == []
+
+
+@pytest.mark.asyncio
+async def test_evaluator_fails_closed_when_limits_malformed(mocker):
+    """A malformed limits config (bad JSON / non-object) fails closed too."""
+    for bad_body in ("not json", "[1, 2, 3]"):
+        bodies = {ci_compliance._MODULE_SIZE_LIMITS_PATH: bad_body}
+        mocker.patch.object(
+            ci_compliance.github,
+            "get_file_text_at_ref",
+            new=_fake_reader(bodies),
+        )
+        mocker.patch.object(
+            ci_compliance.github,
+            "list_repo_tree_paths_at_ref",
+            new=_fake_tree(_EMPTY_TREE),
+        )
+
+        result = await ci_compliance.evaluate_ci_compliance_at_ref(
+            token="t", owner="o", repo="r", ref=_HEAD_SHA, project_id="p"
+        )
+
+        assert result["compliant"] is False, f"body {bad_body!r} must fail closed"
+        assert result["violations"] == []
+        assert result["limits_available"] is False
+        assert result["limits_status"] == "malformed"
+        assert ci_compliance._MODULE_SIZE_LIMITS_PATH in result["limits_error"]
+        assert result["branch_literal_violations"] == []
+
+
+@pytest.mark.asyncio
+async def test_evaluator_compliant_when_limits_legitimately_empty(mocker):
+    """A valid config declaring no limits ({}) still passes.
+
+    Distinguishes 'unreadable' from 'legitimately empty': an empty-but-valid
+    caps object means the size guardrails have nothing to enforce, and the
+    branch-literal scan (independent of the limits file) still runs.
+    """
+    bodies = {ci_compliance._MODULE_SIZE_LIMITS_PATH: "{}"}
+    mocker.patch.object(
+        ci_compliance.github,
+        "get_file_text_at_ref",
+        new=_fake_reader(bodies),
+    )
+    mocker.patch.object(
+        ci_compliance.github,
+        "list_repo_tree_paths_at_ref",
+        new=_fake_tree(_EMPTY_TREE),
+    )
+
+    result = await ci_compliance.evaluate_ci_compliance_at_ref(
+        token="t", owner="o", repo="r", ref=_HEAD_SHA, project_id="p"
+    )
+
+    assert result["compliant"] is True
+    assert result["violations"] == []
+    assert result["limits_available"] is True
+    assert result["limits_status"] == "ok"
+    assert result["limits_error"] is None
+    assert result["checked"] == 0
     assert result["branch_literal_violations"] == []
 
 
@@ -285,7 +353,8 @@ async def test_evaluator_runs_branch_literal_scan_when_limits_unreadable(mocker)
     The limits file 404s (not in ``bodies``), so the size scans are skipped and
     ``limits_available`` is False — but the branch-literal scan depends only on
     the repo tree (as CI's branch-literal invariants do), so an offending
-    backend/app/ file must still be reported and flip ``compliant`` to False.
+    backend/app/ file must still be reported even while the verdict fails
+    closed on the unreadable limits.
     """
     offending_body = (
         "def get_branch(config):\n"

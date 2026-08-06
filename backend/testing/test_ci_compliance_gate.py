@@ -548,6 +548,48 @@ async def test_qualify_request_blocked_when_compliance_gate_raises(
 
 
 @pytest.mark.asyncio
+async def test_qualify_gate_blocks_when_limits_unreadable(client, db_session, mocker):
+    """A HEAD whose size-limits config is unreadable blocks the qualify gate.
+
+    The evaluator fails closed (compliant=False, limits_available=False, no
+    violations), and the qualify gate must refuse — an unreadable config is
+    exactly when the gate is least entitled to pass. No cap-bump repair is
+    spawned because there is no cap to bump.
+    """
+    project, agent_task = await _make_project_with_agent_task(
+        db_session, module_line_count=_CAP - 1, mocker=mocker
+    )
+    # Everything 404s, including the limits file.
+    mocker.patch.object(
+        ci_compliance.github,
+        "get_file_text_at_ref",
+        new=mocker.AsyncMock(return_value=None),
+    )
+
+    token = create_agent_token(str(agent_task.id), "agent-vm-ci-compliance")
+    response = await client.get(
+        f"/api/agent/projects/{project.id}/ci-compliance",
+        headers={"x-agent-token": token},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()["data"]
+    assert body["compliant"] is False
+    assert body["limits_available"] is False
+    assert body["violation_count"] == 0
+
+    await db_session.refresh(project)
+    gate = ci_compliance_qualify_gate(project, _HEAD_SHA)
+    assert gate["blocked"] is True
+    assert gate["violation_count"] == 0
+    assert gate["limits_available"] is False
+
+    spawned = await _maybe_spawn_ci_compliance_cap_bump_fix(db_session, project, gate)
+    await db_session.commit()
+    assert spawned is None
+
+
+@pytest.mark.asyncio
 async def test_noncompliant_qualify_request_is_blocked_and_spawns_cap_bump(
     db_session, mocker
 ):

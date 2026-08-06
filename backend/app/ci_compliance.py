@@ -29,9 +29,14 @@ Three public entry points:
     coverage guardrail). The branch-literal scan runs whenever the repo tree is
     available — even when the limits file is unreadable — because CI's
     branch-literal invariants run regardless of the limits file's readability.
-    Returns a JSON-serializable result. Fail-safe: a file that 404s / cannot be
-    read at the ref is SKIPPED (treated as not-a-violation), never crashing the
-    evaluation.
+    Returns a JSON-serializable result. Fail-safe: a source file that 404s /
+    cannot be read at the ref is SKIPPED (treated as not-a-violation), never
+    crashing the evaluation. The size-limits FILE itself is the deliberate
+    exception: when it cannot be read or parsed, the verdict FAILS CLOSED
+    (``compliant=False`` with a diagnostic) — an unreadable limits config is
+    exactly the circumstance in which the gate is least entitled to pass, so the
+    evaluator refuses instead of skipping the size guardrails and reporting
+    success.
   * :func:`record_ci_compliance` — persist a result onto ``Project.ci_compliance``
     keyed by its commit SHA.
   * :func:`get_ci_compliance` — read the per-SHA status back.
@@ -147,14 +152,37 @@ _AGENT_SUPPLEMENTAL_PATTERNS: list[tuple[str, re.Pattern]] = [
 ]
 
 
+# Status values returned by _load_size_limits_at_ref. ``ok`` means the limits
+# file was read and parsed as a JSON object — possibly ``{}``, a legitimate
+# empty config that simply declares no caps. The other two are genuine
+# read/parse failures and FAIL CLOSED: an unreadable size-limits config is
+# exactly the circumstance in which the compliance gate is least entitled to
+# pass, because the size guardrails cannot be verified at all.
+_LIMITS_STATUS_OK = "ok"
+_LIMITS_STATUS_UNREADABLE = "unreadable"
+_LIMITS_STATUS_MALFORMED = "malformed"
+
+
 async def _load_size_limits_at_ref(
     *, token: str, owner: str, repo: str, ref: str, project_id: str | None
-) -> dict:
-    """Read ``module_size_limits.json`` AT ``ref`` and parse it; ``{}`` on failure.
+) -> tuple[dict, str, str | None]:
+    """Read ``module_size_limits.json`` AT ``ref`` and parse it.
 
-    Fail-safe: a 404 / non-file / undecodable / unparseable limits file yields
-    an empty dict so the evaluator reports no discoverable violations rather
-    than crashing the per-merge producer.
+    Returns ``(limits, status, error)``:
+
+      * ``status == "ok"`` — the file was read and parsed as a JSON object.
+        ``limits`` is that object (``{}`` when the config legitimately declares
+        no caps); ``error`` is None.
+      * ``status == "unreadable"`` — the file could not be read at the ref
+        (404 / non-file / undecodable transport outcome). ``limits`` is ``{}``
+        and ``error`` names the path and the failure.
+      * ``status == "malformed"`` — the file was read but its body is not a
+        JSON object (unparseable JSON or a non-dict top-level value).
+        ``limits`` is ``{}`` and ``error`` names the path and the failure.
+
+    The distinction between a legitimate empty config and a genuine failure is
+    deliberate: only the former may pass, so the caller can fail closed on the
+    latter instead of silently skipping the size guardrails.
     """
     text = await github.get_file_text_at_ref(
         _MODULE_SIZE_LIMITS_PATH,
@@ -164,20 +192,27 @@ async def _load_size_limits_at_ref(
         ref=ref,
         project_id=project_id,
     )
+    _where = f"{_MODULE_SIZE_LIMITS_PATH} at {owner}/{repo}@{ref[:12]}"
+    if text is None:
+        return {}, _LIMITS_STATUS_UNREADABLE, (
+            f"could not read {_where} (404 / non-file / undecodable)"
+        )
     if not text:
-        return {}
+        return {}, _LIMITS_STATUS_MALFORMED, (
+            f"{_where} is empty; expected a JSON object of size caps"
+        )
     try:
         data = await async_json_loads(text)
-    except (ValueError, TypeError):
-        logger.warning(
-            "[CI-COMPLIANCE] could not parse %s at %s/%s@%s — treating as empty",
-            _MODULE_SIZE_LIMITS_PATH,
-            owner,
-            repo,
-            ref,
+    except (ValueError, TypeError) as exc:
+        logger.warning("[CI-COMPLIANCE] could not parse %s: %s", _where, exc)
+        return {}, _LIMITS_STATUS_MALFORMED, (
+            f"{_where} is not valid JSON: {exc}"
         )
-        return {}
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        return {}, _LIMITS_STATUS_MALFORMED, (
+            f"{_where} is a JSON {type(data).__name__}, not an object"
+        )
+    return data, _LIMITS_STATUS_OK, None
 
 
 def _strip_agent_paren_fallbacks(line: str) -> str:
@@ -509,20 +544,25 @@ async def evaluate_ci_compliance_at_ref(
             "branch_literal_violations": [{section, rel, line, text}],
             "checked": <int>,                           # capped files actually read
             "limits_available": <bool>,                 # limits file readable?
+            "limits_status": <"ok"|"unreadable"|"malformed">,
+            "limits_error": <str|None>,                 # diagnostic when status != ok
             "tree_available": <bool>,                   # repo tree listing available?
         }
 
-    Fail-safe throughout: a file that 404s / cannot be read at the ref is
-    SKIPPED (counted as compliant), never raising. An unreadable limits file
-    yields ``limits_available=False`` and skips the size guardrails (they need
-    the caps dict), but the branch-literal scan STILL runs when the repo tree is
-    available and ``compliant`` reflects its findings — CI's branch-literal
-    invariants do not depend on the limits file. An unavailable repo tree yields
-    ``tree_available=False`` and skips guardrails 2 and 3 (branch-literal,
-    uncapped).
+    Fail-safe throughout: a source file that 404s / cannot be read at the ref is
+    SKIPPED (counted as compliant), never raising. The size-limits FILE itself
+    is the deliberate exception — it FAILS CLOSED: when the limits config
+    cannot be read or parsed, ``compliant`` is False with a diagnostic
+    (``limits_status`` / ``limits_error``), because an unreadable config is
+    exactly when the gate is least entitled to pass. A legitimately-empty
+    config (a valid ``{}`` that declares no caps) still passes. The
+    branch-literal scan runs whenever the repo tree is available, even when the
+    limits file is unreadable — CI's branch-literal invariants do not depend on
+    it. An unavailable repo tree yields ``tree_available=False`` and skips
+    guardrails 2 and 3 (branch-literal, uncapped).
     """
     # Fetch limits and repo tree in parallel — they are independent.
-    limits, tree_paths_raw = await asyncio.gather(
+    (limits, limits_status, limits_error), tree_paths_raw = await asyncio.gather(
         _load_size_limits_at_ref(
             token=token, owner=owner, repo=repo, ref=ref, project_id=project_id
         ),
@@ -534,11 +574,16 @@ async def evaluate_ci_compliance_at_ref(
     tree_available = tree_paths_raw is not None
     tree_paths: list[dict] = tree_paths_raw if tree_paths_raw is not None else []
 
-    # An unreadable limits file means the size guardrails (capped + uncapped)
-    # cannot run — they need the caps dict. But the branch-literal scan only
-    # needs the repo tree, and CI's branch-literal invariants run regardless of
-    # the limits file's readability, so keep scanning whenever the tree exists.
-    if not limits:
+    # FAIL CLOSED on an unreadable/malformed limits config. The fail-open
+    # predecessor returned compliant=True here — the size guardrails silently
+    # skipped and the gate reported success, exactly the circumstance in which
+    # it is least entitled to pass. When the limits source cannot be read, the
+    # size guardrails cannot be verified, so the verdict refuses. The
+    # branch-literal scan is independent of the limits file (CI's branch-literal
+    # invariants run regardless of its readability), so its findings are
+    # surfaced too when the tree is available; the verdict stays non-compliant
+    # either way.
+    if limits_status != _LIMITS_STATUS_OK:
         branch_literal_violations = (
             await _scan_branch_literals(
                 tree_paths=tree_paths,
@@ -553,11 +598,13 @@ async def evaluate_ci_compliance_at_ref(
         )
         return {
             "ref": ref,
-            "compliant": not branch_literal_violations,
+            "compliant": False,
             "violations": [],
             "branch_literal_violations": branch_literal_violations,
             "checked": 0,
             "limits_available": False,
+            "limits_status": limits_status,
+            "limits_error": limits_error,
             "tree_available": tree_available,
         }
 
@@ -612,6 +659,8 @@ async def evaluate_ci_compliance_at_ref(
         "branch_literal_violations": branch_literal_violations,
         "checked": checked,
         "limits_available": True,
+        "limits_status": _LIMITS_STATUS_OK,
+        "limits_error": None,
         "tree_available": tree_available,
     }
 
@@ -670,6 +719,8 @@ def compact_ci_compliance(result: dict[str, Any] | None) -> dict[str, Any] | Non
         "branch_literal_violations": branch_literal_violations,
         "checked": result.get("checked"),
         "limits_available": result.get("limits_available"),
+        "limits_status": result.get("limits_status"),
+        "limits_error": result.get("limits_error"),
         "tree_available": result.get("tree_available"),
     }
 
