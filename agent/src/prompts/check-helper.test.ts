@@ -1636,7 +1636,7 @@ esac
 // blocks ./pr open instead of leaking to the promotion-PR full matrix. The set
 // is derived from $CHANGED via the committed reverse-dep resolver
 // (backend/testing/impacted_tests.py), invoked BY REFERENCE (no embedded Python
-// heredoc, per CLAUDE.md), capped, with overflow deferred-to-CI, and degrading
+// heredoc, per CLAUDE.md), capped, with overflow deferred-unverified, and degrading
 // gracefully (GATE-ENVIRONMENT marker, non-blocking) when Docker is absent.
 describe('writeCheckHelper — impacted-test merge-time gate', () => {
   let capturedScripts: Record<string, string> = {};
@@ -1665,11 +1665,13 @@ describe('writeCheckHelper — impacted-test merge-time gate', () => {
     // committed resolver, invoked BY REFERENCE (no embedded Python heredoc).
     expect(script).toContain('impacted-test merge-time gate');
     expect(script).toContain('python3 backend/testing/impacted_tests.py');
-    // Capped run, overflow deferred to CI (never silently dropped).
+    // Capped run, overflow logged as unverified (never silently dropped).
     expect(script).toContain('IMPACTED_TEST_CAP=8');
     expect(script).toContain('IMPACTED_RESOLVER_TIMEOUT_SECS=30');
     expect(script).toContain('IMPACTED_GATE_TIMEOUT_SECS=120');
-    expect(script).toContain('deferred-to-CI:');
+    expect(script).toContain('deferred-unverified:');
+    // Overflow is NOT covered by this gate or automain PR CI — the old "CI verifies the rest" claim must not return.
+    expect(script).not.toContain('CI verifies the rest');
     // Both resolver and sanctioned Postgres harness are bounded; the harness
     // emits progress while it runs so an operator can distinguish work from a wedge.
     expect(script).toContain('timeout --foreground --signal=TERM');

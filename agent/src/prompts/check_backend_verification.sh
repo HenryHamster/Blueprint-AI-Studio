@@ -102,7 +102,7 @@
     elif [ "$_VERIFICATION_RUFF_OK" = "1" ]; then
       _verification_count=$(printf '%s\n' "$_VERIFICATION_SELECTORS" | grep -c '^' || true)
       if [ "$_verification_count" -gt 8 ]; then
-        echo "[check] required backend verification: $_verification_count impacted files; running bounded first 8"
+        echo "[check] required backend verification: $_verification_count impacted files; running the 8 most diff-relevant (the remainder are not run here)"
       fi
       mapfile -t _verification_selector_args < <(printf '%s\n' "$_VERIFICATION_SELECTORS" | head -n 8)
       if [ -z "$_VERIFICATION_HARNESS" ] || [ ! -f "$_VERIFICATION_HARNESS" ]; then
