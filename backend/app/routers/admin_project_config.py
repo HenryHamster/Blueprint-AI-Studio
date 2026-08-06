@@ -1720,9 +1720,10 @@ async def update_broadcast_limit_config(
 
 
 def _full_suite_drift_sentinel_value(project) -> bool:
-    return bool(
-        (project.build_config or {}).get("full_suite_drift_sentinel_enabled", False)
-    )
+    value = (project.build_config or {}).get("full_suite_drift_sentinel_enabled")
+    if value is None:
+        return True  # canonical default: the sentinel runs.
+    return bool(value)
 
 
 @router.get("/projects/{project_id}/full-suite-drift-sentinel")
@@ -1731,7 +1732,7 @@ async def get_full_suite_drift_sentinel_config(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    """Return whether the standing full-suite CI drift sentinel is enabled (default OFF)."""
+    """Return whether the standing full-suite CI drift sentinel is enabled (default ON)."""
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
@@ -1751,9 +1752,10 @@ async def update_full_suite_drift_sentinel_config(
 ):
     """Enable or disable the standing full-suite CI drift sentinel (owner-only).
 
-    When enabled, each reaper sweep dispatches ci.yml on the integration branch
-    for every open stabilize-phase version and alerts + spawns harvest remediation
-    when a concluded run is red.  Pass ``false`` to revert to the default (OFF).
+    The sentinel is canonical and ON by default: each reaper sweep dispatches
+    ci.yml on the integration branch for every open version and alerts + spawns
+    harvest remediation when a concluded run is red.  Pass ``false`` to
+    explicitly disable it (temporary rollback path); pass ``true`` to re-enable.
     """
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "owner"
@@ -1774,10 +1776,9 @@ async def update_full_suite_drift_sentinel_config(
 
     project = await lock_project_or_429(session, project_id)
     build_config = dict(project.build_config or {})
-    if enabled:
-        build_config["full_suite_drift_sentinel_enabled"] = True
-    else:
-        build_config.pop("full_suite_drift_sentinel_enabled", None)
+    # Store the boolean explicitly — an explicit ``False`` is the rollback
+    # opt-out; the key's absence is the canonical default (enabled).
+    build_config["full_suite_drift_sentinel_enabled"] = enabled
     project.build_config = build_config
     flag_modified(project, "build_config")
     session.add(project)

@@ -7346,6 +7346,81 @@ async def test_harvest_real_failure_spawns_fix(db_session, mocker):
     handle_mock.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_harvest_flake_budget_tristate(db_session, mocker):
+    """``flake_rerun_budget`` is the bound on the live-branch rerun loop.
+
+    ``>0`` re-runs and reports ``flake_rerun`` so the caller can consume budget;
+    ``0`` (budget spent, gate still red) stops re-running and escalates the
+    flake to a fix spawn instead of looping the full matrix forever.
+    """
+    from app.release_reconciliation import _harvest_promotion_ci_failures
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="main"
+    )
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={
+                "status": "completed",
+                "conclusion": "failure",
+                "details": [{"name": "build", "conclusion": "failure"}],
+                "failed_logs": "npm error code ECONNREFUSED registry.npmjs.org",
+                "setup_phase_failure": False,
+                "failed_run_ids": [777],
+            }
+        ),
+    )
+    rerun_mock = mocker.patch(
+        "app.github_checks.rerun_failed_jobs", new=AsyncMock(return_value=True)
+    )
+    mocker.patch(
+        "app.strategic_trigger.request_strategic_refresh",
+        new=AsyncMock(return_value=True),
+    )
+    handle_mock = mocker.patch(
+        "app.auto_remediation._handle_main_branch_ci_failure", new=AsyncMock()
+    )
+
+    kwargs = dict(
+        project_id=_project.id,
+        version_id=version.id,
+        version_number=version.version_number,
+        owner="acme",
+        repo="widget",
+        ci_source_sha="dead" * 10,
+        integration_branch="automain",
+        auto_remediation_config={"enabled": True},
+        selfheal_enabled=True,
+    )
+
+    assert (
+        await _harvest_promotion_ci_failures(**kwargs, flake_rerun_budget=1)
+        == "flake_rerun"
+    )
+    rerun_mock.assert_awaited_once_with("tok", "acme", "widget", 777)
+    handle_mock.assert_not_awaited()
+
+    # Budget exhausted: no further rerun, escalate to the fix path.
+    assert (
+        await _harvest_promotion_ci_failures(**kwargs, flake_rerun_budget=0)
+        == "fix_spawned"
+    )
+    assert rerun_mock.await_count == 1
+    handle_mock.assert_awaited_once()
+
+    # The promotion re-driver entry point (None) is unchanged: hand off, never
+    # rerun the dead release branch's workflow, never spawn a fix.
+    assert await _harvest_promotion_ci_failures(**kwargs) == "flake_handoff"
+    assert rerun_mock.await_count == 1
+    assert handle_mock.await_count == 1
+
+
 # ===========================================================================
 # Promotion-CI self-heal gate: decoupled from design_doc._auto_remediation,
 # governed by durable operator-owned build_config (default ON, project-agnostic)

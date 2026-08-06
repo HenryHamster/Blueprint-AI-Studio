@@ -739,7 +739,8 @@ async def _harvest_promotion_ci_failures(
     integration_branch: str,
     auto_remediation_config: dict[str, Any],
     selfheal_enabled: bool,
-) -> None:
+    flake_rerun_budget: int | None = None,
+) -> str:
     """Spawn a CI auto-remediation fix task — on the integration branch — for a
     just-failed promotion PR's CI failures.
 
@@ -763,6 +764,33 @@ async def _harvest_promotion_ci_failures(
     MECHANICS only (per-hour / concurrent caps, branch suspension), and it safely
     falls back to built-in defaults when the project never customized it.
 
+    ``flake_rerun_budget`` distinguishes the two harvest entry points AND bounds
+    the rerun loop.  It is tri-state:
+
+    * ``None`` — the promotion-failure re-driver.  By the time it harvests, the
+      release branch has been deleted and re-running the dead workflow is
+      useless, so an infra flake is handed to Strategic without any rerun.
+    * ``> 0`` — the standing drift sentinel
+      (``release_qualifier_sweep._check_full_suite_drift_sentinel``) with rerun
+      budget remaining.  The CI run it harvests lives on the LIVE integration
+      branch, so re-running a flake's failed jobs can clear the same HEAD's red
+      gate without waiting for a new commit.
+    * ``0`` — the drift sentinel with its per-HEAD rerun budget EXHAUSTED.  The
+      sentinel re-runs this harvest on every sweep while the gate is red, and
+      ``_CI_INFRA_LOG_PATTERNS`` matches broad substrings against the whole
+      aggregated log, so a genuine regression can be misclassified as a flake.
+      Without a budget that would rerun the full matrix forever and never
+      escalate.  At zero budget the flake verdict is treated as un-actionable
+      and we FALL THROUGH to the fix spawn, exactly as
+      ``ci_completion``'s ``ci_infra_rerun_done`` / ``_CI_RERUN_BUDGET`` gates
+      do when their one rerun fails to clear the red.
+
+    The caller owns budget accounting (keyed on HEAD sha so a new commit gets a
+    fresh budget); the return value tells it what happened.  Returns one of:
+    ``"selfheal_disabled"``, ``"flake_rerun"`` (a rerun was actually issued —
+    consume budget), ``"flake_handoff"`` (flake, no rerun issued),
+    ``"fix_spawned"``, or ``"error"``.
+
     Best-effort: the promotion failure is already recorded and committed by the
     caller, so any error here is logged and swallowed — a harvest failure must
     never turn a recorded promotion failure into an unhandled exception.  The
@@ -778,7 +806,7 @@ async def _harvest_promotion_ci_failures(
                 project_id,
                 version_number,
             )
-            return
+            return "selfheal_disabled"
 
         # ── Infra-flake guard (Fix X) ──────────────────────────────────────────
         # Before spawning a code-fix task, check whether the promotion CI failure
@@ -795,6 +823,15 @@ async def _harvest_promotion_ci_failures(
         # promotion-failure edge. The harvest is invoked for the failure event,
         # not from a standing-state sweep, and the marker is single-slot, so this
         # cannot accumulate repeated wakes for persistent state.
+        #
+        # ``flake_rerun_budget`` bounds the live-branch rerun (see the docstring):
+        # None = re-driver (never rerun, always hand off), >0 = sentinel with
+        # budget, 0 = sentinel out of budget -> escalate the flake to a fix.
+        _flake_budget_remaining = max(0, flake_rerun_budget or 0)
+        _flake_budget_exhausted = (
+            flake_rerun_budget is not None and _flake_budget_remaining == 0
+        )
+        _flake_outcome = "flake_handoff"
         try:
             from app.github import get_repo_installation_token, get_check_runs_cached
             from app.failure_classification import _is_ci_infra_flake_log
@@ -811,7 +848,25 @@ async def _harvest_promotion_ci_failures(
                 _setup_flake = _ci_result.get("setup_phase_failure", False)
                 _failed_logs = _ci_result.get("failed_logs", "")
                 _content_flake = _is_ci_infra_flake_log(_failed_logs)
-                if _setup_flake or _content_flake:
+                if (_setup_flake or _content_flake) and _flake_budget_exhausted:
+                    # Rerun budget for THIS head_sha is spent and the gate is
+                    # still red, so the flake verdict is not actionable — either
+                    # the infra problem is persistent or (more likely, given the
+                    # broad substring patterns) a genuine regression was
+                    # misclassified.  Escalate to the fix path rather than
+                    # re-running the full matrix on every sweep forever.  Same
+                    # fall-through the ci_completion rerun gates take when their
+                    # one rerun fails to clear the red.
+                    logger.warning(
+                        "[RELEASE_QUALIFIER] promotion-CI harvest: v%d CI failure "
+                        "still looks like an infrastructure flake (%s) but the "
+                        "per-HEAD rerun budget is exhausted for %s — escalating "
+                        "to a fix spawn instead of re-running again",
+                        version_number,
+                        "setup_phase_failure" if _setup_flake else "infra_log_patterns",
+                        ci_source_sha[:8],
+                    )
+                elif _setup_flake or _content_flake:
                     _flake_reason = (
                         "setup_phase_failure" if _setup_flake else "infra_log_patterns"
                     )
@@ -824,6 +879,33 @@ async def _harvest_promotion_ci_failures(
                         _flake_reason,
                         ci_source_sha[:8],
                     )
+                    # Drift-sentinel path only: the CI run being harvested lives
+                    # on the LIVE integration branch (not a torn-down release
+                    # branch), so re-running the failed jobs can clear a
+                    # transient infra flake for the SAME HEAD.  Without this,
+                    # compute_promotion_ci_green_gate stays red for the commit —
+                    # it only dispatches a fresh run when NO run exists for the
+                    # SHA — and the qualification latch cannot clear until a new
+                    # commit lands.  Best-effort: GitHub rejects the rerun on a
+                    # run that is still completing or already re-running, and a
+                    # rerun that concludes red again still falls through to the
+                    # Strategic handoff below.
+                    if _flake_budget_remaining > 0:
+                        from app.github_checks import rerun_failed_jobs
+
+                        _reran_any = False
+                        for _run_id in _ci_result.get("failed_run_ids") or []:
+                            if await rerun_failed_jobs(_token, owner, repo, _run_id):
+                                _reran_any = True
+                        if _reran_any:
+                            _flake_outcome = "flake_rerun"
+                            logger.info(
+                                "[RELEASE_QUALIFIER] promotion-CI harvest: v%d "
+                                "infra flake on live integration branch — re-ran "
+                                "failed jobs; the green gate can clear for HEAD "
+                                "without a new commit",
+                                version_number,
+                            )
                     # This is an edge-triggered semantic wake, not another
                     # scheduler-owned qualification decision. The marker
                     # coalesces with any already-pending Strategic refresh.
@@ -852,7 +934,7 @@ async def _harvest_promotion_ci_failures(
                             version_number,
                             exc_info=True,
                         )
-                    return
+                    return _flake_outcome
         except Exception:
             logger.warning(
                 "[RELEASE_QUALIFIER] promotion-CI harvest: infra-flake check "
@@ -880,12 +962,14 @@ async def _harvest_promotion_ci_failures(
             ci_source_sha=ci_source_sha,
             release_version_id=version_id,
         )
+        return "fix_spawned"
     except Exception:
         logger.exception(
             "[RELEASE_QUALIFIER] promotion-CI harvest failed for v%d — the "
             "promotion failure is already recorded; continuing",
             version_number,
         )
+        return "error"
 
 
 async def _finish_managed_check_wait_landing(

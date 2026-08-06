@@ -141,11 +141,11 @@ Read or update the branch prefixes that route into staging/rollup flows.
 
 ### `GET|PATCH /api/admin/projects/{project_id}/full-suite-drift-sentinel`
 
-Enable or disable the standing full-suite CI drift sentinel (default OFF, stored in `build_config`).
-When enabled, each reaper sweep dispatches ci.yml on the integration branch for every open
-stabilize-phase version and alerts + spawns harvest remediation when a concluded run is red.
-PATCH body: `{ "full_suite_drift_sentinel_enabled": true|false }`. Response includes
-`full_suite_drift_sentinel_enabled` and `is_default`.
+Read or update the standing full-suite CI drift sentinel (canonical and ON by default, stored in `build_config`).
+Each reaper sweep dispatches ci.yml on the integration branch for every open version and alerts + spawns
+harvest remediation when a concluded run is red. PATCH body: `{ "full_suite_drift_sentinel_enabled": true|false }`.
+Pass `false` to explicitly disable the sentinel (temporary rollback path); the key's absence is the canonical
+default (enabled). Response includes `full_suite_drift_sentinel_enabled` and `is_default`.
 
 ### `GET|PATCH /api/admin/projects/{project_id}/approval-gate-config`
 

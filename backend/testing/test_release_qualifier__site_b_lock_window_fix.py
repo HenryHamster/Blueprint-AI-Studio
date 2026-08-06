@@ -2016,34 +2016,98 @@ async def test_sweep_does_not_start_initial_qualification(db_session, mocker):
     run_qual_mock.assert_not_called()
 
 
-# Named acceptance test: test_sweep_finalized_count_excludes_redrives
+# Named acceptance test: test_drift_sentinel_runs_by_default_without_build_config_flag
 @pytest.mark.asyncio
-async def test_drift_sentinel_skips_when_flag_disabled(db_session):
-    """Sentinel returns False immediately when build_config flag is absent."""
-    from app.release_qualifier_sweep import _check_full_suite_drift_sentinel
+async def test_drift_sentinel_runs_by_default_without_build_config_flag(
+    db_session, mocker
+):
+    """The sentinel runs by default with no build_config flag (canonical, not opt-in).
+
+    Without any ``full_suite_drift_sentinel_enabled`` key the sweep must reach
+    compute_promotion_ci_green_gate (the dispatch entrypoint) — proving the
+    default-OFF build_config opt-in was removed.
+    """
+    from unittest.mock import AsyncMock  # noqa: PLC0415
+    from app.release_qualifier_sweep import _check_full_suite_drift_sentinel  # noqa: PLC0415
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
-    # No build_config flag set — sentinel must no-op.
+    # No build_config flag set — the sentinel must still run (default ON).
+
+    gate_mock = mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(
+            return_value={
+                "gate_state": "dispatched",
+                "head_sha": "abc12345" * 5,
+                "run_id": 999,
+                "html_url": "https://github.com/runs/999",
+                "reason": "no run for HEAD — dispatched",
+            }
+        ),
+    )
+
     result = await _check_full_suite_drift_sentinel(
         version.id, session_factory=_shared_session_factory(db_session)
     )
-    assert result is False
+    assert result is True
+    gate_mock.assert_called_once()
 
 
 @pytest.mark.asyncio
-async def test_drift_sentinel_skips_non_stabilize_version(db_session, mocker):
-    """Sentinel returns False for a build-phase version even when flag is set."""
-    from app.release_qualifier_sweep import _check_full_suite_drift_sentinel
+async def test_drift_sentinel_skips_when_explicitly_disabled(db_session, mocker):
+    """Sentinel returns False only when build_config explicitly disables it."""
+    from unittest.mock import AsyncMock  # noqa: PLC0415
+    from app.release_qualifier_sweep import _check_full_suite_drift_sentinel  # noqa: PLC0415
 
-    project, version = await _make_project_and_version(db_session, phase="build")
-    project.build_config = {"full_suite_drift_sentinel_enabled": True}
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    project.build_config = {"full_suite_drift_sentinel_enabled": False}
     db_session.add(project)
     await db_session.commit()
 
+    gate_mock = mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(
+            return_value={
+                "gate_state": "dispatched",
+                "head_sha": "abc12345" * 5,
+                "run_id": 999,
+            }
+        ),
+    )
     result = await _check_full_suite_drift_sentinel(
         version.id, session_factory=_shared_session_factory(db_session)
     )
     assert result is False
+    gate_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_drift_sentinel_runs_for_non_stabilize_version(db_session, mocker):
+    """Sentinel dispatches for a build-phase open version too (no phase hedge)."""
+    from unittest.mock import AsyncMock  # noqa: PLC0415
+    from app.release_qualifier_sweep import _check_full_suite_drift_sentinel  # noqa: PLC0415
+
+    project, version = await _make_project_and_version(db_session, phase="build")
+    # No flag needed — the sentinel is canonical and phase-agnostic.
+
+    gate_mock = mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(
+            return_value={
+                "gate_state": "dispatched",
+                "head_sha": "abc12345" * 5,
+                "run_id": 999,
+                "html_url": "https://github.com/runs/999",
+                "reason": "no run for HEAD — dispatched",
+            }
+        ),
+    )
+
+    result = await _check_full_suite_drift_sentinel(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert result is True
+    gate_mock.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -2052,9 +2116,7 @@ async def test_drift_sentinel_dispatches_when_no_ci_run(db_session, mocker):
     from app.release_qualifier_sweep import _check_full_suite_drift_sentinel
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
-    project.build_config = {"full_suite_drift_sentinel_enabled": True}
-    db_session.add(project)
-    await db_session.commit()
+    # No build_config flag — the sentinel is canonical and ON by default.
 
     mocker.patch(
         "app.release_readiness.compute_promotion_ci_green_gate",
@@ -2084,9 +2146,7 @@ async def test_drift_sentinel_alerts_and_harvests_on_red(db_session, mocker):
     HEAD_SHA = "deadbeef" * 5
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
-    project.build_config = {"full_suite_drift_sentinel_enabled": True}
-    db_session.add(project)
-    await db_session.commit()
+    # No build_config flag — the sentinel is canonical and ON by default.
 
     mocker.patch(
         "app.release_readiness.compute_promotion_ci_green_gate",
@@ -2136,9 +2196,7 @@ async def test_drift_sentinel_deduplicates_alert_on_same_sha(db_session, mocker)
     HEAD_SHA = "cafebabe" * 5
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
-    project.build_config = {"full_suite_drift_sentinel_enabled": True}
-    db_session.add(project)
-    await db_session.commit()
+    # No build_config flag — the sentinel is canonical and ON by default.
 
     mocker.patch(
         "app.release_readiness.compute_promotion_ci_green_gate",
@@ -2174,6 +2232,212 @@ async def test_drift_sentinel_deduplicates_alert_on_same_sha(db_session, mocker)
         )
     ).scalars().all()
     assert len(alerts) == 1
+
+
+@pytest.mark.asyncio
+async def test_drift_sentinel_reruns_failed_jobs_on_infra_flake_red(db_session, mocker):
+    """On an infra-flake red, the drift sentinel harvest re-runs the failed jobs
+    so the promotion-CI green gate can clear for the SAME HEAD, while still
+    handing the delivery decision to Strategic and spawning no code-fix task."""
+    from app.release_qualifier_sweep import _check_full_suite_drift_sentinel
+    from sqlalchemy import select
+
+    HEAD_SHA = "feedface" * 5
+    RUN_ID = 4242
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    # No build_config flag — the sentinel is canonical and ON by default.
+
+    mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(
+            return_value={
+                "gate_state": "red",
+                "head_sha": HEAD_SHA,
+                "run_id": RUN_ID,
+                "html_url": "https://github.com/runs/4242",
+                "reason": "ci.yml concluded failure",
+            }
+        ),
+    )
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={
+                "status": "completed",
+                "conclusion": "failure",
+                "details": [{"name": "build", "conclusion": "failure"}],
+                "failed_logs": "npm error code ECONNREFUSED connecting to registry.npmjs.org",
+                "setup_phase_failure": False,
+                "failed_run_ids": [RUN_ID],
+            }
+        ),
+    )
+    rerun_mock = mocker.patch(
+        "app.github_checks.rerun_failed_jobs",
+        new=AsyncMock(return_value=True),
+    )
+    refresh_mock = mocker.patch(
+        "app.strategic_trigger.request_strategic_refresh",
+        new=AsyncMock(return_value=True),
+    )
+    handle_mock = mocker.patch(
+        "app.auto_remediation._handle_main_branch_ci_failure",
+        new=AsyncMock(),
+    )
+
+    result = await _check_full_suite_drift_sentinel(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert result is True
+
+    # The flake's failed jobs were re-run so the green gate can clear for the
+    # same HEAD — the behavior that unlatches ci_not_green without a new commit.
+    rerun_mock.assert_awaited_once_with("tok", "acme", "widget", RUN_ID)
+
+    # Strategic is still handed the delivery decision...
+    refresh_mock.assert_awaited_once()
+    assert refresh_mock.await_args.args[1] == project.id
+    assert refresh_mock.await_args.args[2].startswith(
+        f"promotion_ci_infra_flake:v{version.version_number}:"
+    )
+
+    # ...and no code-fix task is spawned for an infra flake.
+    handle_mock.assert_not_awaited()
+
+    # The red SHA still raises the deduplicated Alert.
+    alert = (
+        await db_session.execute(
+            select(Alert).where(Alert.project_id == project.id)
+        )
+    ).scalars().first()
+    assert alert is not None
+    assert HEAD_SHA[:8] in alert.title
+
+
+def _flake_sentinel_mocks(mocker, head_sha, run_id):
+    """Patch the sentinel's collaborators for a persistent infra-flake red.
+
+    Returns ``(rerun_mock, refresh_mock, handle_mock)``.
+    """
+    mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(
+            return_value={
+                "gate_state": "red",
+                "head_sha": head_sha,
+                "run_id": run_id,
+                "html_url": "",
+                "reason": "ci.yml concluded failure",
+            }
+        ),
+    )
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={
+                "status": "completed",
+                "conclusion": "failure",
+                "details": [{"name": "build", "conclusion": "failure"}],
+                # Deliberately a log that TRIPS the broad infra substrings while
+                # actually carrying a genuine test regression — the
+                # misclassification the rerun budget has to bound.
+                "failed_logs": (
+                    "FAILED testing/test_foo.py::test_bar\n"
+                    "AssertionError: docker pull cache warning"
+                ),
+                "setup_phase_failure": False,
+                "failed_run_ids": [run_id],
+            }
+        ),
+    )
+    return (
+        mocker.patch(
+            "app.github_checks.rerun_failed_jobs",
+            new=AsyncMock(return_value=True),
+        ),
+        mocker.patch(
+            "app.strategic_trigger.request_strategic_refresh",
+            new=AsyncMock(return_value=True),
+        ),
+        mocker.patch(
+            "app.auto_remediation._handle_main_branch_ci_failure",
+            new=AsyncMock(),
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_drift_sentinel_rerun_budget_stops_second_pass_on_same_head(
+    db_session, mocker
+):
+    """The per-HEAD rerun budget bounds the sentinel's infra-flake rerun.
+
+    The sentinel runs on EVERY sweep while the gate is red and the Alert
+    dedupe_key does not gate the harvest, so without a budget a misclassified
+    genuine regression would re-run the full 8-shard matrix once per CI cycle
+    forever and never escalate.  The second red pass on the SAME head_sha must
+    issue no rerun and instead fall through to the fix spawn.
+    """
+    from app.release_qualifier_sweep import _check_full_suite_drift_sentinel
+
+    HEAD_SHA = "abadcafe" * 5
+    RUN_ID = 5150
+
+    _project, version = await _make_project_and_version(db_session, phase="stabilize")
+    rerun_mock, _refresh_mock, handle_mock = _flake_sentinel_mocks(
+        mocker, HEAD_SHA, RUN_ID
+    )
+    factory = _shared_session_factory(db_session)
+
+    # First red pass: budget available -> one rerun, no fix spawn.
+    assert await _check_full_suite_drift_sentinel(version.id, session_factory=factory)
+    rerun_mock.assert_awaited_once_with("tok", "acme", "widget", RUN_ID)
+    handle_mock.assert_not_awaited()
+
+    # Second red pass on the SAME head: budget exhausted.
+    assert await _check_full_suite_drift_sentinel(version.id, session_factory=factory)
+    assert rerun_mock.await_count == 1, (
+        "rerun budget is per-HEAD: a second red pass on the same head_sha must "
+        "not re-run the matrix again"
+    )
+    # ...and the flake escalates to the fix path instead of latching forever.
+    handle_mock.assert_awaited_once()
+    assert handle_mock.await_args.kwargs["head_sha"] == HEAD_SHA
+
+    # A third pass keeps escalating, never re-running.
+    assert await _check_full_suite_drift_sentinel(version.id, session_factory=factory)
+    assert rerun_mock.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_drift_sentinel_rerun_budget_resets_on_new_head(db_session, mocker):
+    """A new integration HEAD legitimately earns a fresh rerun attempt."""
+    from app.release_qualifier_sweep import _check_full_suite_drift_sentinel
+
+    OLD_SHA = "0ldc0ffe" * 5
+    NEW_SHA = "beefbeef" * 5
+
+    _project, version = await _make_project_and_version(db_session, phase="stabilize")
+    rerun_mock, _refresh_mock, _handle_mock = _flake_sentinel_mocks(mocker, OLD_SHA, 111)
+    factory = _shared_session_factory(db_session)
+
+    await _check_full_suite_drift_sentinel(version.id, session_factory=factory)
+    await _check_full_suite_drift_sentinel(version.id, session_factory=factory)
+    assert rerun_mock.await_count == 1
+
+    # New commit lands: budget resets, so the flake gets one more attempt.
+    rerun_mock, _refresh_mock, _handle_mock = _flake_sentinel_mocks(mocker, NEW_SHA, 222)
+    await _check_full_suite_drift_sentinel(version.id, session_factory=factory)
+    rerun_mock.assert_awaited_once_with("tok", "acme", "widget", 222)
 
 
 @pytest.mark.asyncio
@@ -2419,8 +2683,8 @@ async def test_finalize_logs_actionable_open_count_failure(db_session, mocker, c
 
 
 @pytest.mark.asyncio
-async def test_full_suite_drift_sentinel_get_default_off(db_session, client):
-    """GET returns enabled=False and is_default=True when flag is absent."""
+async def test_full_suite_drift_sentinel_get_default_on(db_session, client):
+    """GET returns enabled=True and is_default=True when flag is absent."""
     project = await _make_project_with_owner(db_session)
 
     resp = await client.get(
@@ -2428,7 +2692,7 @@ async def test_full_suite_drift_sentinel_get_default_off(db_session, client):
     )
     assert resp.status_code == 200
     body = resp.json()
-    assert body["full_suite_drift_sentinel_enabled"] is False
+    assert body["full_suite_drift_sentinel_enabled"] is True
     assert body["is_default"] is True
 
 
@@ -2437,7 +2701,7 @@ async def test_full_suite_drift_sentinel_patch_enable_disable(db_session, client
     """PATCH toggles full_suite_drift_sentinel_enabled and GET reflects the change."""
     project = await _make_project_with_owner(db_session)
 
-    # Enable the sentinel.
+    # Explicitly enable the sentinel.
     resp = await client.patch(
         f"/api/admin/projects/{project.id}/full-suite-drift-sentinel",
         json={"full_suite_drift_sentinel_enabled": True},
@@ -2454,7 +2718,8 @@ async def test_full_suite_drift_sentinel_patch_enable_disable(db_session, client
     assert resp.status_code == 200
     assert resp.json()["full_suite_drift_sentinel_enabled"] is True
 
-    # Disable the sentinel — is_default returns to True (key removed).
+    # Disable the sentinel — stored explicitly (rollback path); is_default is
+    # False because the build_config now carries an explicit override.
     resp = await client.patch(
         f"/api/admin/projects/{project.id}/full-suite-drift-sentinel",
         json={"full_suite_drift_sentinel_enabled": False},
@@ -2462,7 +2727,7 @@ async def test_full_suite_drift_sentinel_patch_enable_disable(db_session, client
     assert resp.status_code == 200
     body = resp.json()
     assert body["full_suite_drift_sentinel_enabled"] is False
-    assert body["is_default"] is True
+    assert body["is_default"] is False
 
 
 @pytest.mark.asyncio
@@ -2487,11 +2752,11 @@ async def test_full_suite_drift_sentinel_patch_validation(db_session, client):
 
 @pytest.mark.asyncio
 async def test_full_suite_drift_sentinel_sweep_uses_build_config(db_session, mocker):
-    """Sweep evaluates sentinel only when build_config flag is True.
+    """Sweep runs the sentinel by default; explicit build_config False disables.
 
-    Verifies that enabling via build_config causes _check_full_suite_drift_sentinel
-    to call compute_promotion_ci_green_gate (the dispatch entrypoint), while
-    a disabled flag is a no-op.
+    Verifies that WITHOUT any build_config flag the sentinel calls
+    compute_promotion_ci_green_gate (the dispatch entrypoint), while an
+    explicit ``full_suite_drift_sentinel_enabled: False`` is a no-op rollback.
     """
     from unittest.mock import AsyncMock  # noqa: PLC0415
     from app.release_qualifier_sweep import _check_full_suite_drift_sentinel  # noqa: PLC0415
@@ -2509,23 +2774,24 @@ async def test_full_suite_drift_sentinel_sweep_uses_build_config(db_session, moc
         ),
     )
 
-    # Flag OFF — gate must NOT be called.
+    # No flag — canonical default ON: gate must be called.
     result = await _check_full_suite_drift_sentinel(
         version.id, session_factory=_shared_session_factory(db_session)
     )
-    assert result is False
-    gate_mock.assert_not_called()
+    assert result is True
+    gate_mock.assert_called_once()
 
-    # Enable via build_config (as the new endpoint would do).
-    project.build_config = {"full_suite_drift_sentinel_enabled": True}
+    # Explicitly disable via build_config (the rollback path) — no-op.
+    gate_mock.reset_mock()
+    project.build_config = {"full_suite_drift_sentinel_enabled": False}
     db_session.add(project)
     await db_session.commit()
 
     result = await _check_full_suite_drift_sentinel(
         version.id, session_factory=_shared_session_factory(db_session)
     )
-    assert result is True
-    gate_mock.assert_called_once()
+    assert result is False
+    gate_mock.assert_not_called()
 
 
 @pytest.mark.asyncio

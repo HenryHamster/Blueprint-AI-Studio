@@ -546,6 +546,13 @@ async def _force_finalize_sweep_crash_loop(
     )
 
 
+# Durable per-HEAD rerun accounting for the drift sentinel's infra-flake path.
+# Stored as ``{"head_sha": str, "reruns": int}`` in project_telemetry: a new
+# integration HEAD resets the budget, the same HEAD does not.
+_DRIFT_SENTINEL_RERUN_KEY = "_drift_sentinel_rerun"
+_DRIFT_SENTINEL_RERUN_BUDGET = 1
+
+
 async def _check_full_suite_drift_sentinel(
     version_id,
     *,
@@ -553,13 +560,17 @@ async def _check_full_suite_drift_sentinel(
 ) -> bool:
     """Dispatch and evaluate the standing full-suite CI sentinel on automain.
 
-    When ``build_config.full_suite_drift_sentinel_enabled`` is True, resolves
-    the integration-branch HEAD and dispatches a ci.yml full-matrix run if none
-    exists for that SHA.  A concluded-red run raises a deduplicated Alert
-    (keyed on project+SHA so repeated sweeps do not double-alert) and spawns
-    harvest remediation via the same path used by the promotion-failed re-driver.
+    Resolves the integration-branch HEAD and dispatches a ci.yml full-matrix
+    run if none exists for that SHA.  A concluded-red run raises a deduplicated
+    Alert (keyed on project+SHA so repeated sweeps do not double-alert) and
+    spawns harvest remediation via the same path used by the promotion-failed
+    re-driver.
 
-    Only fires for open, stabilize-phase versions; ignores all others.
+    Canonical and ON by default: every open version fires the sentinel
+    regardless of phase, so full-suite CI drift is caught before it accumulates
+    across targeted-CI merges.  The only opt-out is an explicit
+    ``build_config.full_suite_drift_sentinel_enabled: False`` (temporary
+    rollback path).
     Best-effort: any exception is swallowed and logged.  Returns True when a
     dispatch or alert/harvest occurred.
     """
@@ -571,12 +582,16 @@ async def _check_full_suite_drift_sentinel(
     async with factory() as session:
         try:
             version = await session.get(release_version.ReleaseVersion, version_id)
-            if version is None or version.phase != "stabilize" or version.status != "open":
+            if version is None or version.status != "open":
                 return False
             project = await session.get(Project, version.project_id)
             if project is None:
                 return False
-            if not (project.build_config or {}).get("full_suite_drift_sentinel_enabled"):
+            # Only an explicit ``False`` disables the sentinel; the key's
+            # absence (the canonical default) and ``True`` both keep it armed.
+            if not (project.build_config or {}).get(
+                "full_suite_drift_sentinel_enabled", True
+            ):
                 return False
 
             gate = await compute_promotion_ci_green_gate(
@@ -642,7 +657,11 @@ async def _check_full_suite_drift_sentinel(
 
             # Harvest is best-effort and self-gating (per-hour/concurrent caps).
             integration_branch, _ = release_qualifier._lts_branch_names(project)
-            from app.project_telemetry import read_telemetry_or_doc
+            from app.project_telemetry import (
+                read_telemetry,
+                read_telemetry_or_doc,
+                upsert_telemetry,
+            )
 
             auto_rem = (
                 await read_telemetry_or_doc(
@@ -654,7 +673,33 @@ async def _check_full_suite_drift_sentinel(
                 )
                 or {}
             )
-            await _harvest_promotion_ci_failures(
+
+            # ── Per-HEAD rerun budget ──────────────────────────────────────────
+            # This sentinel runs on EVERY sweep while the gate is red, and the
+            # Alert dedupe_key only suppresses duplicate alerts — it does not
+            # gate the harvest.  Without a budget, an infra-flake verdict (whose
+            # log patterns are broad substrings matched against the whole
+            # aggregated failure log) would re-run the full 8-shard matrix once
+            # per CI cycle forever and never escalate a misclassified genuine
+            # regression to a fix task — the very ci_not_green latch the sentinel
+            # exists to clear.  Budget is keyed on head_sha, so a new commit
+            # legitimately gets a fresh attempt; exhausting it makes the harvest
+            # fall through to the fix spawn (same shape as ci_completion's
+            # ci_infra_rerun_done / _CI_RERUN_BUDGET gates).
+            _rerun_state = (
+                await read_telemetry(
+                    session, version.project_id, _DRIFT_SENTINEL_RERUN_KEY
+                )
+                or {}
+            )
+            _consumed = (
+                int(_rerun_state.get("reruns") or 0)
+                if _rerun_state.get("head_sha") == head_sha
+                else 0
+            )
+            _budget = max(0, _DRIFT_SENTINEL_RERUN_BUDGET - _consumed)
+
+            outcome = await _harvest_promotion_ci_failures(
                 project_id=version.project_id,
                 version_id=version.id,
                 version_number=version.version_number,
@@ -664,7 +709,28 @@ async def _check_full_suite_drift_sentinel(
                 integration_branch=integration_branch,
                 auto_remediation_config=auto_rem,
                 selfheal_enabled=True,
+                # The sentinel harvests a run on the LIVE integration branch, so
+                # an infra flake should re-run its failed jobs to clear the red
+                # gate for the same HEAD — but only while budget remains.  A 0
+                # here tells the harvest to escalate the flake to a fix spawn.
+                flake_rerun_budget=_budget,
             )
+            if outcome == "flake_rerun":
+                await upsert_telemetry(
+                    session,
+                    version.project_id,
+                    _DRIFT_SENTINEL_RERUN_KEY,
+                    {"head_sha": head_sha, "reruns": _consumed + 1},
+                )
+                await session.commit()
+                logger.info(
+                    "[DRIFT_SENTINEL] consumed rerun budget %d/%d for project %s "
+                    "HEAD %s",
+                    _consumed + 1,
+                    _DRIFT_SENTINEL_RERUN_BUDGET,
+                    version.project_id,
+                    head_sha[:8] if head_sha else "?",
+                )
             return True
         except Exception:
             logger.exception(
@@ -1251,12 +1317,13 @@ async def sweep_stuck_qualifications(
                 version_id,
             )
 
-    # Standing full-suite drift sentinel: on a build_config opt-in, dispatch
-    # ci.yml on the integration branch for each stabilize-phase open version,
-    # alert+harvest when a run concludes red.  This catches full-suite CI drift
-    # before it accumulates invisibly across hundreds of targeted-CI merges and
-    # surfaces at a promotion-gate failure.  Each version runs in its own
-    # dedicated session via the function itself.
+    # Standing full-suite drift sentinel: canonical and ON by default, dispatch
+    # ci.yml on the integration branch for each open version (the only opt-out
+    # is an explicit build_config False), alert+harvest when a run concludes
+    # red.  This catches full-suite CI drift before it accumulates invisibly
+    # across hundreds of targeted-CI merges and surfaces at a promotion-gate
+    # failure.  Each version runs in its own dedicated session via the function
+    # itself.
     for version_id in version_ids:
         try:
             await _check_full_suite_drift_sentinel(
