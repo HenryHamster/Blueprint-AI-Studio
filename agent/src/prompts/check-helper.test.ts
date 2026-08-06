@@ -923,6 +923,9 @@ describe('writeCheckHelper — required backend-authoring verification', () => {
     expect(script).toContain('python3 -m ruff check --select E,F,W --ignore E501');
     expect(script).toContain('USE_TEST_POSTGRES=true bash "$_VERIFICATION_HARNESS" "$_verification_postgres_flag"');
     expect(script).toContain('pg_config --bindir');
+    // --sandbox-postgres is gated on the Packer-baked venv the harness
+    // hard-exits without; a host missing it falls through to Docker --postgres.
+    expect(script).toContain('/opt/blueprint-backend-venv/bin/python');
     expect(script).toContain('/tmp/project_verification_receipt_verify-authoring-1.json');
     expect(script).toContain('"skipped":runtime["skipped"],"exit_code":0');
     expect(script).toContain('no impacted pytest file/node was resolved');
@@ -1081,6 +1084,11 @@ describe('writeCheckHelper — required backend-authoring verification', () => {
       ruffExit: number; docker: boolean; harnessExit: number; skipped?: number;
       changedPath?: string; changedPaths?: string[]; missingPaths?: string[];
       harnessPath?: string;
+      // Whether the Packer-baked /opt/blueprint-backend-venv interpreter the
+      // --sandbox-postgres branch requires is present (defaults to true, as on
+      // baked task VMs). When false, the gate must fall through to Docker
+      // --postgres instead of hard-exiting.
+      venvPresent?: boolean;
     },
   ): Promise<{
     status: number;
@@ -1111,9 +1119,16 @@ describe('writeCheckHelper — required backend-authoring verification', () => {
     // Vitest workers and persistent runner users must never contend for the
     // helper's fixed lint lists, logs, worktrees, or receipts. Static render
     // assertions continue to verify the real /tmp paths above.
+    // The gate requires the Packer-baked sandbox venv before it selects
+    // --sandbox-postgres (gap-2 reachability fix). Redirect that hardcoded path
+    // to a fixture-owned copy so tests can drive both branches: venv present ->
+    // --sandbox-postgres; venv absent -> falls through to Docker --postgres.
+    const venvPresent = scenario.venvPresent ?? true;
+    const venvPython = realPath.join(dir, 'venv', 'bin', 'python');
     const script = renderedScript
       .replaceAll('verify-authoring-1', runtimeTaskId)
-      .replaceAll('/tmp/', `${posix(runtimeTmp)}/`);
+      .replaceAll('/tmp/', `${posix(runtimeTmp)}/`)
+      .replaceAll('/opt/blueprint-backend-venv/bin/python', posix(venvPython));
     const receiptPath = realPath.join(
       runtimeTmp,
       `project_verification_receipt_${runtimeTaskId}.json`,
@@ -1125,6 +1140,10 @@ describe('writeCheckHelper — required backend-authoring verification', () => {
       const missingPaths = new Set(scenario.missingPaths ?? []);
       const harnessPath = scenario.harnessPath ?? 'scripts/test-backend.sh';
       realFs.mkdirSync(bin, { recursive: true });
+      if (venvPresent) {
+        realFs.mkdirSync(realPath.dirname(venvPython), { recursive: true });
+        realFs.writeFileSync(venvPython, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      }
       realFs.mkdirSync(realPath.join(dir, 'backend', 'testing'), { recursive: true });
       realFs.mkdirSync(realPath.join(dir, 'scripts'), { recursive: true });
       realFs.writeFileSync(realPath.join(dir, 'backend', 'x.py'), 'value = 1\n');
@@ -1261,6 +1280,23 @@ exit ${scenario.harnessExit}
     expect(result.log).not.toContain('test_deleted.py');
     expect(result.receipt).toMatchObject({
       pytest: { selectors: ['testing/test_bar.py', 'testing/test_x.py'] },
+    });
+  });
+  it('runtime: a usable bindir without the baked venv falls through to Docker --postgres, not a hard exit', async () => {
+    const result = await runRequiredCheck(await render(), {
+      ruffExit: 0,
+      docker: true,
+      harnessExit: 0,
+      venvPresent: false,
+    });
+    expect(result.status, result.stdout).toBe(0);
+    // Gap 2: --sandbox-postgres must NOT be selected on bindir presence alone
+    // — its harness hard-exits without the baked venv. A Docker-capable host
+    // takes the --postgres branch on the very next line instead.
+    expect(result.log).toContain('harness USE_TEST_POSTGRES=true --postgres testing/test_x.py');
+    expect(result.log).not.toContain('--sandbox-postgres');
+    expect(result.receipt).toMatchObject({
+      pytest: { postgres_sidecar: true },
     });
   });
   it('runtime: a nested opted-in project ignores non-Python-only changes', async () => {

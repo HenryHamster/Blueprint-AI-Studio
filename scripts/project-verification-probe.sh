@@ -40,12 +40,46 @@ if [ "$PROBE_MODE" = "all" ] || [ "$PROBE_MODE" = "ruff" ]; then
   timeout "$COMMAND_TIMEOUT_SECONDS" python3 -m ruff check --isolated --no-cache "$RUFF_INPUT"
 fi
 
+# Resolve a usable PostgreSQL server bindir. Prefers `pg_config --bindir` when
+# it is on PATH and points at a real server (images with libpq-dev /
+# postgresql-client install pg_config on PATH). When pg_config is absent from
+# PATH, falls back to the highest-versioned /usr/lib/postgresql/*/bin that
+# actually holds initdb (an image with only the server packages still has the
+# server binaries there). Prints the bindir and returns 0; returns 1 when
+# neither exists — a pg_config that exists but points at a non-server dir stays
+# fail-closed rather than scanning. A pg_config that EXISTS but exits non-zero
+# (a broken wrapper) must not falsely deny the capability: the guarded
+# substitution above captures whatever it prints and the bindir check keeps the
+# decision fail-closed. Keep this helper byte-identical across check,
+# scripts/test-backend.sh, the generated check_backend_verification.sh fragment
+# and this probe — mirrored paths must not diverge again.
+resolve_pg_bindir() {
+  local bindir cand
+  if command -v pg_config >/dev/null 2>&1; then
+    bindir="$(pg_config --bindir 2>/dev/null || true)"
+    if [ -n "$bindir" ] && [ -x "$bindir/initdb" ]; then
+      printf '%s\n' "$bindir"
+      return 0
+    fi
+    return 1
+  fi
+  for cand in $(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -V | tail -n 1); do
+    if [ -x "$cand/initdb" ]; then
+      printf '%s\n' "$cand"
+      return 0
+    fi
+  done
+  return 1
+}
+
 # Start a private, Unix-socket-only PostgreSQL sidecar inside the caller's
 # isolation namespace. This is the same socketless boundary used by generated
 # authoring checks: no host Docker socket or host data directory is exposed.
 if [ "$PROBE_MODE" = "all" ] || [ "$PROBE_MODE" = "docker-postgres" ]; then
-  POSTGRES_BIN="$(pg_config --bindir)"
-  test -x "$POSTGRES_BIN/initdb"
+  POSTGRES_BIN="$(resolve_pg_bindir)" || {
+    echo "Sandbox PostgreSQL verification failed: no usable PostgreSQL server bindir" >&2
+    exit 1
+  }
   test -x "$POSTGRES_BIN/pg_ctl"
   mkdir -p "$POSTGRES_SOCKET"
   timeout "$COMMAND_TIMEOUT_SECONDS" "$POSTGRES_BIN/initdb" \

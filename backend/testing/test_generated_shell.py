@@ -26,6 +26,7 @@ Related bug history (see comments on each check for details):
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -1878,7 +1879,16 @@ class TestProjectVerificationRuntimeContract:
     def test_probe_runs_ruff_and_live_postgres_query(self):
         probe = _PROJECT_VERIFICATION_PROBE.read_text(encoding="utf-8")
         assert "python3 -m ruff check" in probe
-        assert 'POSTGRES_BIN="$(pg_config --bindir)"' in probe
+        # The probe must resolve the bindir through the guarded resolver
+        # (#16778's pattern), NOT the bare `POSTGRES_BIN="$(pg_config --bindir)"`
+        # that dies under `set -euo pipefail` when pg_config exits non-zero. A
+        # broken pg_config wrapper must not falsely deny the capability when a
+        # usable bindir exists — see
+        # test_probe_survives_nonzero_pg_config_when_bindir_usable.
+        assert "resolve_pg_bindir" in probe
+        assert 'bindir="$(pg_config --bindir 2>/dev/null || true)"' in probe
+        assert '[ -x "$bindir/initdb" ]' in probe
+        assert 'POSTGRES_BIN="$(resolve_pg_bindir)"' in probe
         assert '"$POSTGRES_BIN/initdb"' in probe
         assert "-c listen_addresses=''" in probe
         assert '"$POSTGRES_BIN/pg_isready"' in probe
@@ -1886,6 +1896,65 @@ class TestProjectVerificationRuntimeContract:
         assert "docker image inspect" not in probe
         assert "command -v docker" not in probe
         assert "/var/run/docker.sock" not in probe
+
+    def test_probe_survives_nonzero_pg_config_when_bindir_usable(
+        self, bash_executable: str | None, tmp_path: Path
+    ):
+        """A pg_config that exits non-zero must not falsely deny the v1
+        capability when a usable server bindir exists.
+
+        Regression: the probe assigned ``POSTGRES_BIN="$(pg_config --bindir)"``
+        unguarded under ``set -euo pipefail``, so a pg_config wrapper that exits
+        non-zero killed the probe before it could use a perfectly usable server
+        bindir. The guarded resolver captures whatever pg_config prints (even on
+        a non-zero exit), validates ``initdb``, and only fails closed when no
+        usable bindir exists at all.
+        """
+        if not bash_executable:
+            pytest.skip("bash not available on this host")
+        fake_bin = tmp_path / "bin"
+        fake_pgbindir = tmp_path / "pgbin"
+        fake_bin.mkdir()
+        fake_pgbindir.mkdir()
+        # A broken pg_config: present on PATH, prints the (usable) bindir, but
+        # exits non-zero. Before #16778's guarded resolution this killed the
+        # probe via `set -e` on the assignment.
+        (fake_bin / "pg_config").write_text(
+            f"#!/bin/sh\nprintf '%s\\n' '{fake_pgbindir.as_posix()}'\nexit 1\n",
+            encoding="utf-8",
+        )
+        (fake_bin / "pg_config").chmod(0o755)
+        # A "genuinely usable" server bindir: stub binaries that drive the
+        # probe's initdb -> pg_ctl -> pg_isready -> psql flow to success.
+        (fake_pgbindir / "initdb").write_text(
+            "#!/bin/sh\n"
+            "while [ $# -gt 0 ]; do case \"$1\" in -D) mkdir -p \"$2\" ;; esac; shift; done\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        (fake_pgbindir / "pg_ctl").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        (fake_pgbindir / "pg_isready").write_text(
+            "#!/bin/sh\nexit 0\n", encoding="utf-8"
+        )
+        (fake_pgbindir / "psql").write_text(
+            "#!/bin/sh\nprintf '1\\n'\nexit 0\n", encoding="utf-8"
+        )
+        for stub in ("initdb", "pg_ctl", "pg_isready", "psql"):
+            (fake_pgbindir / stub).chmod(0o755)
+        env = os.environ.copy()
+        env["PATH"] = f"{fake_bin}{os.pathsep}{env.get('PATH', '')}"
+        result = subprocess.run(
+            [bash_executable, str(_PROJECT_VERIFICATION_PROBE), "docker-postgres"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
+        )
+        assert result.returncode == 0, (
+            f"probe denied the capability despite a usable bindir:\n"
+            f"stdout={result.stdout}\nstderr={result.stderr}"
+        )
+        assert "PROJECT_VERIFICATION_V1_OK" in result.stdout
 
     def test_packer_runs_probe_as_agent_before_success_sentinel(self):
         hcl = _read_packer_hcl()
@@ -1953,6 +2022,10 @@ class TestProjectVerificationRuntimeContract:
             "USE_TEST_POSTGRES=true bash",
             "--sandbox-postgres",
             "pg_config --bindir",
+            # The sandbox branch additionally requires the Packer-baked venv the
+            # harness hard-exits without; a host missing it must take the Docker
+            # branch rather than hard-exit (gap-2 reachability fix).
+            "/opt/blueprint-backend-venv/bin/python",
             "no impacted pytest file/node",
             "project_verification_receipt_",
             "postgres_sidecar",
