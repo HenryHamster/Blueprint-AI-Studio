@@ -196,9 +196,54 @@ def test_script_exposes_the_aggregation_surface():
         "aggregate_effort_tier_evidence",
         "row_to_dict",
         "filter_rows_by_window",
+        "split_to_json_payload",
         "main",
     ):
         assert callable(getattr(mod, name, None)), f"missing {name}"
+
+
+def test_split_to_json_payload_records_measured_routine_share():
+    """--write-json payload: measured status, routine share, honest counts."""
+    mod = _load_module()
+    rows = [
+        _row(id="c1", cycle_metadata={"effort_tier": "routine"}, directions_created=1),
+        _row(id="c2", cycle_metadata={"effort_tier": "routine"}),
+        _row(id="c3", cycle_metadata={"effort_tier": "consequential"}),
+    ]
+    agg = mod.aggregate_effort_tier_evidence(rows)
+    as_of = datetime(2026, 8, 6, tzinfo=timezone.utc)
+    payload = mod.split_to_json_payload(agg, None, None, None, as_of, "test provenance")
+
+    assert payload["schema_version"] == 1
+    assert payload["measurement_status"] == "measured"
+    assert payload["routine_share"] == pytest.approx(2 / 3)
+    assert payload["split"] == {
+        "routine": pytest.approx(2 / 3),
+        "consequential": pytest.approx(1 / 3),
+        "pinned": 0.0,
+        "other": 0.0,
+    }
+    assert payload["denominator_cycles"] == 3
+    assert payload["counts"] == {"routine": 2, "consequential": 1}
+    assert payload["completed_missing_tier_count"] == 0
+    assert payload["non_completed_with_tier_count"] == 0
+    assert payload["rows_considered"] == 3
+    assert payload["measured_at"] == as_of.isoformat()
+    assert payload["provenance"] == "test provenance"
+
+
+def test_split_to_json_payload_reports_unmeasured_when_no_stamps():
+    """No completed stamped cycles -> honest unmeasured payload (R = null)."""
+    mod = _load_module()
+    agg = mod.aggregate_effort_tier_evidence([])
+    as_of = datetime(2026, 8, 6, tzinfo=timezone.utc)
+    payload = mod.split_to_json_payload(agg, None, None, None, as_of, "test provenance")
+
+    assert payload["measurement_status"] == "unmeasured"
+    assert payload["routine_share"] is None
+    assert payload["denominator_cycles"] == 0
+    assert all(v is None for v in payload["split"].values())
+    assert payload["counts"] == {}
 
 
 @pytest.mark.asyncio

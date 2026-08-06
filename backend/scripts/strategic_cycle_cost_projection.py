@@ -51,8 +51,11 @@ Inputs and sources (each cited):
     strategic_spawning.py).
   * Tier mix                       PR #16730: ROUTINE cycles classify to
     effort 'medium' (openai gpt-5.6-terra), CONSEQUENTIAL stay 'max'
-    (gpt-5.6-sol). Routine share R is UNOBSERVED (the classifier is inert until
-    v28 promotes); assumed base 0.70, sensitivity 0.3-0.9. Fail-closed
+    (gpt-5.6-sol). Routine share R is read from the MEASURED effort-tier split
+    checked in alongside this script (measured_effort_tier_split.json, written
+    by strategic_effort_tier_evidence.py --write-json). R is currently
+    UNMEASURED, so the headline is reported UNVERIFIED rather than at an
+    assumed 0.70 (the previous constant was the defect). Fail-closed
     classifier (backend/app/strategic_review_effort.py) means dirty/recovering
     periods push R down.
   * Pricing (per 1M tokens)       backend/app/llm_cost_attribution.py:
@@ -91,9 +94,11 @@ silently dropping a term to zero.
 
 from __future__ import annotations
 
+import json
 import math
 import textwrap
-from typing import cast
+from pathlib import Path
+from typing import Any, Mapping, cast
 
 # ---------------------------------------------------------------------------
 # Measured / stated inputs
@@ -122,9 +127,20 @@ CACHE_CREATE_MULTIPLIER = 1.25        # cache create = 1.25 x input rate
 BASELINE_CACHE_READ_SHARE = 0.55
 
 # Assumptions (stated explicitly).
-ROUTINE_SHARE_BASE = 0.70             # share of cycles classified 'routine'
 INPUT_COST_SHARE_BASE = 0.90          # input(+create+read) share of the $4.41
 CROSS_CYCLE_SURVIVAL_BASE = 0.0       # P(cache survives the inter-cycle gap)
+
+# Sensitivity points for the routine share -- scenario inputs, NOT the headline.
+# The headline routine share is read from the measured effort-tier split
+# (measured_effort_tier_split.json), never assumed: the original defect was a
+# hardcoded 0.70 constant driving the '34.9% below baseline' headline on an
+# UNOBSERVED value. Keeping the table makes the next defect visible the same way.
+SENSITIVITY_ROUTINE_SHARES = (0.30, 0.50, 0.70, 0.85, 0.90, 1.00)
+
+# Durable address of the measured routine share R: the checked-in split written
+# by strategic_effort_tier_evidence.py --write-json. The headline derives from
+# this file and fails closed when R is unmeasured.
+MEASURED_SPLIT_PATH = Path(__file__).resolve().parent / "measured_effort_tier_split.json"
 
 # ---------------------------------------------------------------------------
 # Cycle-volume inputs (each cited)
@@ -226,6 +242,82 @@ def project_cycle_cost(
         * (input_cost_share * after / before + (1.0 - input_cost_share))
     )
     return cost - cross_cycle_saving_per_cycle(routine_share, survival)
+
+
+def load_measured_split() -> dict[str, Any]:
+    """Load the checked-in measured effort-tier split (the durable address of R).
+
+    Returns {} when the file is absent or unreadable — the fail-closed path
+    treats that exactly like an unmeasured split.
+    """
+    try:
+        with open(MEASURED_SPLIT_PATH, encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def routine_share_from_split(split: Mapping[str, Any]) -> float | None:
+    """The measured routine share R, or None when R is unmeasured (fail-closed).
+
+    A split is measured only when ``measurement_status == 'measured'`` AND its
+    ``routine_share`` is a finite, non-negative number. Anything else — an
+    unmeasured status, a missing/malformed file, a null or non-finite share —
+    returns None, so the headline never falls back to an assumed value.
+    """
+    if split.get("measurement_status") != "measured":
+        return None
+    value = split.get("routine_share")
+    if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0.0:
+        return None
+    return float(value)
+
+
+def headline_routine_share() -> float | None:
+    """R used for the headline claim: the measured split's routine share, or
+    None when R is unmeasured (the fail-closed case)."""
+    return routine_share_from_split(load_measured_split())
+
+
+def headline_claim() -> dict[str, object]:
+    """The >=30%-below-baseline headline, derived from the measured split.
+
+    ``available=False`` (claim UNVERIFIED) when R is unmeasured: the projection
+    substitutes no assumed share — the original defect. When measured, the
+    claim is computed at the measured R with the honest-case cache settings
+    (baseline cache-read share, zero cross-cycle survival) — the same base the
+    claim has always used, so the restatement is apples-to-apples.
+    """
+    r = headline_routine_share()
+    if r is None:
+        return {
+            "available": False,
+            "claim_verified": False,
+            "routine_share": None,
+            "below_baseline_pct": None,
+            "cost_per_cycle_usd": None,
+            "threshold_pct": 0.30,
+            "reason": (
+                "routine share R is unmeasured: no completed strategic cycle "
+                "with a stamped effort_tier is recorded in the measured split "
+                f"({MEASURED_SPLIT_PATH.name}). The >=30%-below-baseline "
+                "headline is UNVERIFIED — no assumed routine share is "
+                "substituted. Regenerate the split with "
+                "backend/scripts/strategic_effort_tier_evidence.py --write-json."
+            ),
+        }
+    cost = project_cycle_cost(r, BASELINE_CACHE_READ_SHARE, CROSS_CYCLE_SURVIVAL_BASE)
+    below = (BASELINE_COST_PER_CYCLE_USD - cost) / BASELINE_COST_PER_CYCLE_USD
+    return {
+        "available": True,
+        "claim_verified": below >= 0.30,
+        "routine_share": r,
+        "below_baseline_pct": below,
+        "cost_per_cycle_usd": cost,
+        "threshold_pct": 0.30,
+        "reason": None,
+    }
 
 
 def rendered_instruction_share() -> dict[str, float]:
@@ -430,6 +522,29 @@ def main() -> None:
     print("v28 projected median per-cycle strategist LLM cost")
     print("=" * 78)
 
+    split = load_measured_split()
+    r = routine_share_from_split(split)
+
+    print("\n[0] HEADLINE claim (>=30% below the $4.41 baseline)\n")
+    claim = headline_claim()
+    if claim["available"]:
+        print(f"  Measured routine share R = {claim['routine_share']:.4f} "
+              f"({split.get('denominator_cycles', 0)} completed tiered cycles)")
+        print(f"  Projected cost at measured R : ${claim['cost_per_cycle_usd']:.2f}/cycle")
+        print(f"  Below $4.41 baseline         : {claim['below_baseline_pct']:.1%} "
+              f"(threshold {claim['threshold_pct']:.0%})")
+        if claim["claim_verified"]:
+            print("  HEADLINE CLAIM HOLDS at the measured R.")
+        else:
+            print("  HEADLINE CLAIM FALSIFIED at the measured R — reported honestly.")
+    else:
+        print(f"  Routine share R is UNMEASURED (measured split: "
+              f"{MEASURED_SPLIT_PATH.name}).")
+        print("  The >=30%-below-baseline headline is UNVERIFIED — no assumed")
+        print("  routine share is substituted. Regenerate the measured split with:")
+        print("    python3 backend/scripts/strategic_effort_tier_evidence.py \\")
+        print("      --days 7 --write-json backend/scripts/measured_effort_tier_split.json")
+
     print("\n[1] Measured / stated inputs (each cited to its source)\n")
     rows = [
         ("Baseline cost/cycle", f"${BASELINE_COST_PER_CYCLE_USD} (task measurement; design doc $4.43)"),
@@ -440,6 +555,9 @@ def main() -> None:
         ("Volatile total (rep. payload)", f"{VOLATILE_PAYLOAD_BYTES_REP:,} B ~ {VOLATILE_PAYLOAD_BYTES_REP/4:,.0f} tokens"),
         ("Routine tier / price ratio", "gpt-5.6-terra (medium) vs gpt-5.6-sol (max) = 0.5x every rate (PR #16730, llm_cost_attribution.py)"),
         ("Cache read rate", "0.1 x input rate; cache create 1.25 x input rate (llm_cost_attribution.py)"),
+        ("Routine share R (measured split)",
+         "UNMEASURED — no completed stamped cycles; headline UNVERIFIED" if r is None
+         else f"{r:.4f} (realised split, {split.get('denominator_cycles', 0)} completed tiered cycles)"),
     ]
     for k, v in rows:
         print(f"  {k:<42} {v}")
@@ -465,31 +583,39 @@ def main() -> None:
     print("    Turn 1 of a cycle can cache the ~10.5K-token stable prefix instead of")
     print("    the few hundred bytes the old order allowed. But cycle cadence is")
     print("    hours/days > 1h cache TTL, so survival ~ 0 in steady state.")
-    print(f"    Bound at full survival: ${cross_cycle_saving_per_cycle(0.7, 1.0):.3f}/cycle (R=0.7).")
+    print(f"    Bound at full survival: ${cross_cycle_saving_per_cycle(0.70, 1.0):.3f}/cycle "
+          "(R=0.70 sensitivity point).")
 
     print("\n[4] Projected median (base assumptions)\n")
-    print(f"  Assumptions: routine share R={ROUTINE_SHARE_BASE:.2f}, "
-          f"input-cost share={INPUT_COST_SHARE_BASE:.2f}, "
+    print(f"  Inputs: input-cost share={INPUT_COST_SHARE_BASE:.2f}, "
           f"cross-cycle survival={CROSS_CYCLE_SURVIVAL_BASE:.0f}")
-    # Honest case: the reorder does not move the intra-cycle share, and cross-
-    # cycle survival is 0, so cache read share stays at the baseline 0.55.
-    honest = project_cycle_cost(ROUTINE_SHARE_BASE, BASELINE_CACHE_READ_SHARE,
-                                CROSS_CYCLE_SURVIVAL_BASE)
-    print(f"  Honest case (reorder alone, share stays {BASELINE_CACHE_READ_SHARE:.2f}): "
-          f"${honest:.2f}/cycle")
+    if r is None:
+        print("  Routine share R: UNMEASURED — no honest base case exists.")
+        print("  The headline is reported UNVERIFIED (see [0]); the sensitivity")
+        print("  table below shows the tier-only range across scenario inputs.")
+    else:
+        print(f"  Routine share R (measured): {r:.4f}")
+        # Honest case: the reorder does not move the intra-cycle share, and
+        # cross-cycle survival is 0, so cache read share stays at baseline 0.55.
+        honest = project_cycle_cost(r, BASELINE_CACHE_READ_SHARE,
+                                    CROSS_CYCLE_SURVIVAL_BASE)
+        print(f"  Honest case at measured R (share stays {BASELINE_CACHE_READ_SHARE:.2f}): "
+              f"${honest:.2f}/cycle")
     # Direction-target case: cache read share genuinely rises to 0.80.
-    for r in (0.70, 0.85, 0.90):
-        c = project_cycle_cost(r, 0.80, CROSS_CYCLE_SURVIVAL_BASE)
-        print(f"  Direction-target (share=0.80, R={r:.2f}): ${c:.2f}/cycle")
+    for sr in (0.70, 0.85, 0.90):
+        c = project_cycle_cost(sr, 0.80, CROSS_CYCLE_SURVIVAL_BASE)
+        print(f"  Direction-target (share=0.80, R={sr:.2f}): ${c:.2f}/cycle")
 
-    print("\n[5] Sensitivity\n")
+    print("\n[5] Sensitivity (scenario inputs — NOT the headline)\n")
+    print("  The headline derives from the MEASURED split ([0]); this table is")
+    print("  the range the claim must survive, kept so the next defect stays visible.")
     print(f"  {'routine share':>14} {'tier-only cost':>16} {'+ share 0.80':>14}")
-    for r in (0.30, 0.50, 0.70, 0.85, 0.90, 1.00):
-        tier_only = project_cycle_cost(r, BASELINE_CACHE_READ_SHARE, 0.0)
-        with_target = project_cycle_cost(r, 0.80, 0.0)
-        print(f"  {r:>14.2f} {('$' + f'{tier_only:.2f}'):>16} {('$' + f'{with_target:.2f}'):>14}")
+    for sr in SENSITIVITY_ROUTINE_SHARES:
+        tier_only = project_cycle_cost(sr, BASELINE_CACHE_READ_SHARE, 0.0)
+        with_target = project_cycle_cost(sr, 0.80, 0.0)
+        print(f"  {sr:>14.2f} {('$' + f'{tier_only:.2f}'):>16} {('$' + f'{with_target:.2f}'):>14}")
     print("  (input-cost share fixed at 0.90; cross-cycle survival 0)")
-    print("\n  Cache-share sensitivity at R=0.70 (the reorder's plausible range):")
+    print("\n  Cache-share sensitivity at R=0.70 (a sensitivity point):")
     for cache_share in (0.55, 0.60, 0.70, 0.80):
         print(f"    share {cache_share:.2f} -> ${project_cycle_cost(0.70, cache_share, 0.0):.2f}/cycle")
     print("\n  Cross-cycle survival sensitivity at R=0.70, share 0.55:")
@@ -497,10 +623,21 @@ def main() -> None:
         print(f"    survival {surv:.2f} -> ${project_cycle_cost(0.70, 0.55, surv):.2f}/cycle")
 
     print("\n[6] Verdict\n")
-    print("  The projected median is well ABOVE the $1.50 headline target.")
-    print(f"  Base case (tier mix R=0.7 alone): ${project_cycle_cost(0.70, 0.55, 0.0):.2f}/cycle.")
-    print(f"  Full range (R=0.3-0.9, tier only): $"
-          f"{project_cycle_cost(0.90, 0.55, 0.0):.2f} - ${project_cycle_cost(0.30, 0.55, 0.0):.2f}/cycle.")
+    claim = headline_claim()
+    if claim["available"]:
+        print(f"  Measured R = {claim['routine_share']:.4f}: "
+              f"${claim['cost_per_cycle_usd']:.2f}/cycle = "
+              f"{claim['below_baseline_pct']:.1%} below the $4.41 baseline.")
+        if claim["claim_verified"]:
+            print("  The >=30%-below-baseline headline HOLDS at the measured R.")
+        else:
+            print("  The >=30%-below-baseline headline is FALSIFIED at the measured R.")
+            print("  Reporting that falsification is the honest result, not a failure.")
+    else:
+        print("  Routine share R is UNMEASURED, so the >=30%-below-baseline headline")
+        print("  is UNVERIFIED. The claim needs R >= ~0.60 (tier-only); the sensitivity")
+        print("  table shows the full range. A measured R below ~0.60 FALSIFIES the")
+        print("  claim — reporting that is the honest result, not a failure.")
     print("  Reaching $1.50 needs BOTH the direction's cache-read-share target (0.80)")
     print("  AND a routine share of ~85%+. The prefix reorder alone cannot deliver")
     print("  the share: the only cross-cycle-cacheable content is the ~10.5K-token")
@@ -531,10 +668,12 @@ def main() -> None:
           f"cost_per_verified_task / total_cost_per_verified_task)")
 
     print("\n  Monthly spend = decision-loop term + task-execution term")
+    print("  R is unmeasured, so the per-cycle costs below are SCENARIO labels")
+    print("  (sensitivity points), not a verified base.")
     base_cost = project_cycle_cost(0.70, BASELINE_CACHE_READ_SHARE, 0.0)
     target_cost = project_cycle_cost(0.85, 0.80, 0.0)
     for label, cost in (
-        ("Honest base (R=0.70, share 0.55)", base_cost),
+        ("Scenario R=0.70 (sensitivity point), share 0.55", base_cost),
         ("Direction-target (R=0.85, share 0.80)", target_cost),
     ):
         for vol_label, volume in (
@@ -555,7 +694,7 @@ def main() -> None:
         print(f"      TOTAL = ${mt['total_monthly_spend_usd']:>8,.2f}/month "
               f"({'within' if mt['within_envelope'] else 'OVER'} the "
               f"${mt['monthly_envelope_usd']:,.0f} envelope)")
-    print("\n  $3,000/month envelope vs the honest base case TOTAL at the measured volume:")
+    print("\n  $3,000/month envelope vs the scenario R=0.70 TOTAL at the measured volume:")
     base_total = project_monthly_spend_with_tasks(
         base_cost, measured_cycles_per_month(),
         mean_task_execution_cost_usd(), measured_tasks_per_month(),

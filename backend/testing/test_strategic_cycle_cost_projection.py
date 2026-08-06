@@ -36,8 +36,11 @@ A number tuned backwards from $1.50 would fail these tests.
 import contextlib
 import importlib.util
 import io
+import json
 from itertools import pairwise
 from pathlib import Path
+
+import pytest
 
 _SCRIPT_PATH = Path(__file__).parent.parent / "scripts" / "strategic_cycle_cost_projection.py"
 
@@ -66,6 +69,10 @@ def test_script_is_importable_and_exposes_the_model_functions():
         "target_concurrency_status",
         "project_monthly_spend",
         "project_monthly_spend_with_tasks",
+        "load_measured_split",
+        "routine_share_from_split",
+        "headline_routine_share",
+        "headline_claim",
         "main",
     ):
         assert callable(getattr(mod, name, None)), f"missing {name}"
@@ -132,6 +139,91 @@ def test_cross_cycle_term_is_bounded_small():
     mod = _load_module()
     saving = mod.cross_cycle_saving_per_cycle(0.70, 1.0)
     assert saving < 0.05
+
+
+def test_projection_headline_uses_measured_routine_share(tmp_path, monkeypatch):
+    """The >=30%-below-baseline headline derives from the MEASURED effort-tier
+    split, never an assumed routine share.
+
+    Proves the wiring three ways:
+      (a) a measured split's routine_share feeds the headline cost and the
+          below-baseline percentage;
+      (b) changing the measured value changes the headline (so it is wired to
+          the split, not a hardcoded constant);
+      (c) an unmeasured split FAILS CLOSED -- available=False, claim UNVERIFIED,
+          no cost -- so reintroducing an assumed share (the original defect)
+          cannot silently resurrect the claim.
+    """
+    mod = _load_module()
+    split_path = tmp_path / "measured_effort_tier_split.json"
+
+    def write_split(routine_share, status="measured", denominator=20):
+        split_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "measurement_status": status,
+                    "routine_share": routine_share,
+                    "split": {
+                        "routine": routine_share,
+                        "consequential": (
+                            None if routine_share is None else 1.0 - routine_share
+                        ),
+                        "pinned": 0.0,
+                        "other": 0.0,
+                    },
+                    "counts": (
+                        {"routine": round(denominator * routine_share)}
+                        if routine_share is not None
+                        else {}
+                    ),
+                    "denominator_cycles": denominator,
+                    "completed_missing_tier_count": 0,
+                    "non_completed_with_tier_count": 0,
+                    "rows_considered": denominator,
+                    "window_days": 7,
+                    "window_start": "2026-07-30T00:00:00+00:00",
+                    "window_end": "2026-08-06T00:00:00+00:00",
+                    "measured_at": "2026-08-06T00:00:00+00:00",
+                    "provenance": "test fixture",
+                }
+            )
+        )
+
+    monkeypatch.setattr(mod, "MEASURED_SPLIT_PATH", split_path)
+
+    # (a) measured R drives the headline.
+    write_split(0.85)
+    claim = mod.headline_claim()
+    assert claim["available"] is True
+    assert claim["routine_share"] == 0.85
+    expected_cost = mod.project_cycle_cost(0.85, mod.BASELINE_CACHE_READ_SHARE, 0.0)
+    assert claim["cost_per_cycle_usd"] == pytest.approx(expected_cost)
+    expected_below = (
+        mod.BASELINE_COST_PER_CYCLE_USD - expected_cost
+    ) / mod.BASELINE_COST_PER_CYCLE_USD
+    assert claim["below_baseline_pct"] == pytest.approx(expected_below)
+    assert claim["claim_verified"] is True
+
+    # (b) a different measured value moves the headline (wired to the split,
+    # not a constant).
+    write_split(0.30)
+    claim_low = mod.headline_claim()
+    assert claim_low["available"] is True
+    assert claim_low["routine_share"] == 0.30
+    assert claim_low["cost_per_cycle_usd"] > expected_cost
+    # The low measured R falsifies the >=30% claim.
+    assert claim_low["claim_verified"] is False
+
+    # (c) unmeasured split -> fail closed: UNVERIFIED, no assumed share.
+    write_split(None, status="unmeasured")
+    claim_unmeasured = mod.headline_claim()
+    assert claim_unmeasured["available"] is False
+    assert claim_unmeasured["routine_share"] is None
+    assert claim_unmeasured["cost_per_cycle_usd"] is None
+    assert claim_unmeasured["below_baseline_pct"] is None
+    assert claim_unmeasured["claim_verified"] is False
+    assert "unmeasured" in claim_unmeasured["reason"].lower()
 
 
 # --- Monthly spend (criterion c-3fd62b9d) --------------------------------
