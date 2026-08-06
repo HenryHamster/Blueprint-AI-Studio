@@ -19650,6 +19650,114 @@ async def test_cap_bump_task_decomposes_chronic_offender(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_cap_bump_task_unreadable_history_routes_to_decomposition(db_session, mocker):
+    """When bump history cannot be read, the ci-compliance cap-bump gate must
+    route to DECOMPOSITION with NO suggested cap bump — the guard distinguishes
+    "history shows no bumps" from "history could not be read" and refuses in the
+    second case.
+
+    This is the direction's success evidence: it must FAIL against the old
+    fail-open code (git error -> is_chronic=False -> routine --fix bump) and
+    PASS after the fail-closed fix (git error -> refuse -> decomposition).
+    """
+    from app.size_limit_policy import BumpHistoryUnavailableError
+
+    project = Project(
+        name="unreadable-test",
+        user_id="test-user",
+        github_owner="owner",
+        github_repo="repo",
+        integration_branch="automain",
+        promotion_target="main",
+        autonomous_enabled=True,
+        directions=[],
+        vision={"purpose": "test unreadable spawn"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    gate = _make_gate(
+        [{"section": "backend", "rel": "task_lifecycle.py", "count": 9200, "cap": 7750}]
+    )
+
+    with patch(
+        "app.size_limit_policy.parse_bump_history",
+        side_effect=BumpHistoryUnavailableError("truncated clone"),
+    ):
+        spawned = await _maybe_spawn_ci_compliance_cap_bump_fix(db_session, project, gate)
+    await db_session.commit()
+
+    assert spawned is not None
+    prompt = spawned.first_payload["prompt"]
+    title = spawned.first_payload["title"]
+
+    # Must route to decomposition, not a cap bump.
+    assert "decompos" in prompt.lower(), (
+        "Expected prompt to mention decomposition for unreadable bump history"
+    )
+    assert "task_lifecycle.py" in prompt, (
+        "Expected prompt to name the offender file"
+    )
+    # Must NOT tell the agent to run --fix (a blind cap bump) on the file.
+    assert "python3 backend/testing/check_size_limits.py --fix" not in prompt, (
+        "Prompt must not instruct --fix for an unreadable-history offender"
+    )
+    # Title should signal decomposition, not a cap bump.
+    assert "decompos" in title.lower() or "chronic" in title.lower(), (
+        f"Task title should indicate decomposition, got: {title!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cap_bump_task_classify_failure_fails_closed_to_decomposition(
+    db_session, mocker
+):
+    """If classify_breach itself raises (not just an unreadable history), the
+    gate must still refuse the bump and route to decomposition rather than
+    falling back to a false routine verdict.
+    """
+    project = Project(
+        name="classify-fail-test",
+        user_id="test-user",
+        github_owner="owner",
+        github_repo="repo",
+        integration_branch="automain",
+        promotion_target="main",
+        autonomous_enabled=True,
+        directions=[],
+        vision={"purpose": "test classify failure spawn"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    gate = _make_gate(
+        [{"section": "backend", "rel": "task_lifecycle.py", "count": 9200, "cap": 7750}]
+    )
+
+    mocker.patch(
+        "app.strategic_spawning.classify_breach",
+        side_effect=RuntimeError("unexpected classification failure"),
+    )
+    spawned = await _maybe_spawn_ci_compliance_cap_bump_fix(db_session, project, gate)
+    await db_session.commit()
+
+    assert spawned is not None
+    prompt = spawned.first_payload["prompt"]
+    title = spawned.first_payload["title"]
+    assert "decompos" in prompt.lower(), (
+        "Expected decomposition routing when classify_breach fails"
+    )
+    assert "python3 backend/testing/check_size_limits.py --fix" not in prompt, (
+        "Prompt must not instruct --fix when classification fails"
+    )
+    assert "decompos" in title.lower() or "chronic" in title.lower(), (
+        f"Task title should indicate decomposition, got: {title!r}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_cap_bump_task_routine_violation_keeps_fix_instruction(db_session, mocker):
     """When all violations are routine (no chronic history), the spawned task
     must still instruct `check_size_limits.py --fix` as before.

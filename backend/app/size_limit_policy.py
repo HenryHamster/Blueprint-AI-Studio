@@ -57,8 +57,25 @@ class BumpRecord(TypedDict):
     new_cap: int
 
 
-# Module-level TTL cache: (module_key, section) -> (records, monotonic_time)
-_bump_history_cache: dict[tuple[str, str], tuple[list[BumpRecord], float]] = {}
+class BumpHistoryUnavailableError(Exception):
+    """Raised when cap-bump history could not be read.
+
+    Distinct from an empty history: ``[]`` means the git read SUCCEEDED and
+    found no cap bumps for the key, while this exception means the read itself
+    failed (subprocess timeout, git not available, non-repo environment, or a
+    non-zero ``git log`` exit — e.g. a truncated/shallow task-VM clone). Callers
+    that gate a cap bump on the chronic-offender verdict must treat this state
+    as fail-closed (refuse the bump) rather than as "no bump history".
+    """
+
+
+# Module-level TTL cache: (module_key, section) -> (outcome, monotonic_time)
+# where ``outcome`` is either a ``list[BumpRecord]`` (read succeeded) or a
+# ``BumpHistoryUnavailableError`` (read failed). Failures are cached too so a
+# broken-git reconcile cycle does not re-shell (and re-timeout) per call.
+_bump_history_cache: dict[
+    tuple[str, str], tuple[list[BumpRecord] | BumpHistoryUnavailableError, float]
+] = {}
 _CACHE_TTL_SECONDS: float = 60.0
 
 # Repo root: backend/app/ -> ../../
@@ -74,15 +91,22 @@ def parse_bump_history(module_key: str, section: str = "backend") -> list[BumpRe
     cap value increased (old_cap -> new_cap).  Results are sorted oldest-first.
 
     Cached for ``_CACHE_TTL_SECONDS`` so repeated calls in a single reconcile
-    cycle do not re-shell.  Returns ``[]`` on any error (subprocess timeout,
-    git not available, non-repo environment) — all callers treat bump history
-    as advisory-only.
+    cycle do not re-shell.  Returns ``[]`` ONLY when the git read succeeded and
+    contains no cap bumps for the key — a genuinely empty history.  Raises
+    :class:`BumpHistoryUnavailableError` when the history could not be read at
+    all (subprocess timeout, git not available, non-repo environment, or a
+    non-zero ``git log`` exit).  Callers that gate the chronic-offender verdict
+    on this history must distinguish "no bumps on record" from "history could
+    not be read" instead of treating both as empty.
     """
     cache_key = (module_key, section)
     now = time.monotonic()
     cached = _bump_history_cache.get(cache_key)
     if cached is not None and now - cached[1] < _CACHE_TTL_SECONDS:
-        return cached[0]
+        outcome = cached[0]
+        if isinstance(outcome, BumpHistoryUnavailableError):
+            raise outcome
+        return outcome
 
     try:
         result = subprocess.run(
@@ -100,10 +124,22 @@ def parse_bump_history(module_key: str, section: str = "backend") -> list[BumpRe
             timeout=15,
             cwd=_REPO_ROOT,
         )
-        records = _parse_git_diff_output(result.stdout, module_key)
-    except Exception:  # noqa: BLE001 — advisory; never propagate
-        records = []
+    except Exception as exc:  # noqa: BLE001 — surfaced as BumpHistoryUnavailableError
+        err = BumpHistoryUnavailableError(
+            f"git log failed while reading bump history for {module_key!r}"
+        )
+        err.__cause__ = exc
+        _bump_history_cache[cache_key] = (err, now)
+        raise err
+    if result.returncode != 0:
+        err = BumpHistoryUnavailableError(
+            f"git log exited {result.returncode} while reading bump history "
+            f"for {module_key!r}"
+        )
+        _bump_history_cache[cache_key] = (err, now)
+        raise err
 
+    records = _parse_git_diff_output(result.stdout, module_key)
     _bump_history_cache[cache_key] = (records, now)
     return records
 
@@ -196,6 +232,7 @@ class BreachVerdict(TypedDict):
     suggested_new_limit: int | None  # None when chronic and no operator override
     bump_count: int
     reason: str
+    history_unavailable: bool  # True when bump history could not be read
 
 
 def classify_breach(
@@ -212,15 +249,42 @@ def classify_breach(
     ``override_chronic=True``, the explicit operator-approval path, which
     grants the bump but records attribution).
 
-    Degrades gracefully when git is unavailable — any error from
-    ``parse_bump_history`` is caught and treated as empty history, falling
-    back to a routine bump rather than hard-failing every agent's gate.
-    This matches the advisory-only contract ``parse_bump_history`` documents.
+    When bump history could not be read (truncated task-VM clone, git
+    unavailable), the verdict FAILS CLOSED: ``is_chronic=True`` with
+    ``suggested_new_limit=None`` and ``history_unavailable=True``, routing the
+    breach to decomposition rather than silently granting a routine cap bump.
+    A genuinely readable but empty history keeps the routine-bump behaviour —
+    the guard distinguishes "no bumps on record" from "history could not be
+    read" instead of treating both as empty.
     """
     try:
         history = parse_bump_history(module_key, section)
-    except Exception:  # noqa: BLE001 — advisory degradation, never propagate
-        history = []
+    except BumpHistoryUnavailableError as exc:
+        # Unreadable history is NOT "no bumps on record": refuse the automatic
+        # bump and route to decomposition. An explicit operator override
+        # (override_chronic=True) still grants the bump — it is the documented
+        # human-approval escape hatch, identical to a verified chronic offender.
+        if override_chronic:
+            return BreachVerdict(
+                is_chronic=True,
+                suggested_new_limit=bump_size_limit(current_size),
+                bump_count=0,
+                history_unavailable=True,
+                reason=(
+                    f"Bump history could not be read: {exc}. "
+                    "Operator-approved bump granted despite unreadable history."
+                ),
+            )
+        return BreachVerdict(
+            is_chronic=True,
+            suggested_new_limit=None,
+            bump_count=0,
+            history_unavailable=True,
+            reason=(
+                f"Bump history could not be read: {exc}. "
+                "Refusing cap bump — decomposition required until history is readable."
+            ),
+        )
 
     chronic = _is_chronic_offender(history)
     bump_count = len(history)
@@ -230,6 +294,7 @@ def classify_breach(
             is_chronic=True,
             suggested_new_limit=None,
             bump_count=bump_count,
+            history_unavailable=False,
             reason=(
                 f"Chronic offender: {bump_count} cap bumps on record. "
                 "Decomposition required — do not bump without operator approval."
@@ -240,6 +305,7 @@ def classify_breach(
         is_chronic=chronic,
         suggested_new_limit=bump_size_limit(current_size),
         bump_count=bump_count,
+        history_unavailable=False,
         reason=(
             "Chronic offender — operator-approved bump."
             if chronic

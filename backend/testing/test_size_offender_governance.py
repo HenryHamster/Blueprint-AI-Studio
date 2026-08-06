@@ -20,10 +20,12 @@ from app import hotfix_backmerge as hb
 from app.models import Alert, Project
 from app.size_limit_policy import (
     CHRONIC_WINDOW_DAYS,
+    BumpHistoryUnavailableError,
     BumpRecord,
     _is_chronic_offender,
     _parse_git_diff_output,
     classify_breach,
+    parse_bump_history,
 )
 
 
@@ -358,14 +360,76 @@ def test_classify_breach_chronic_override_grants_new_limit(mocker):
     assert verdict["suggested_new_limit"] > 1720
 
 
-def test_classify_breach_git_unavailable_degrades_to_routine():
-    """When git errors, classify_breach must degrade to routine (not raise)."""
+def test_parse_bump_history_raises_on_git_failure():
+    """When git history cannot be read, parse_bump_history must raise
+    BumpHistoryUnavailableError rather than returning an empty list — so callers
+    can distinguish "no bumps on record" from "history could not be read"."""
     with patch(
         "app.size_limit_policy.subprocess.run",
         side_effect=FileNotFoundError("git not found"),
     ):
-        verdict = classify_breach("any_module.py", 1720)
+        with pytest.raises(BumpHistoryUnavailableError):
+            parse_bump_history("raises_git.py", "backend")
 
-    assert verdict["is_chronic"] is False
+
+def test_parse_bump_history_raises_on_nonzero_git_exit():
+    """A non-zero git log exit (e.g. a truncated/shallow task-VM clone) is also
+    unreadable history and must raise, not degrade to an empty list."""
+    import subprocess
+
+    result = subprocess.CompletedProcess(
+        args=[], returncode=128, stdout="", stderr="fatal: bad revision"
+    )
+    with patch("app.size_limit_policy.subprocess.run", return_value=result):
+        with pytest.raises(BumpHistoryUnavailableError):
+            parse_bump_history("raises_rc.py", "backend")
+
+
+def test_classify_breach_git_unavailable_refuses_bump():
+    """When bump history is unreadable, classify_breach must FAIL CLOSED —
+    refuse the bump (no suggested_new_limit) and route to decomposition rather
+    than emitting a routine suggested_new_limit for a possibly chronic file."""
+    with patch(
+        "app.size_limit_policy.subprocess.run",
+        side_effect=FileNotFoundError("git not found"),
+    ):
+        verdict = classify_breach("classify_git.py", 1720)
+
+    assert verdict["is_chronic"] is True
+    assert verdict["suggested_new_limit"] is None
+    assert verdict["history_unavailable"] is True
+    assert "decomposition" in verdict["reason"].lower()
+
+
+def test_classify_breach_unreadable_history_refuses_bump():
+    """Regression (direction success evidence): an injected failure in the
+    history read must route the chronic-offender gate to decomposition with no
+    suggested_new_limit — the guard distinguishes "history shows no bumps" from
+    "history could not be read" and refuses in the second case."""
+    with patch(
+        "app.size_limit_policy.parse_bump_history",
+        side_effect=BumpHistoryUnavailableError("git log failed for x"),
+    ):
+        verdict = classify_breach("unreadable.py", 1720)
+
+    assert verdict["is_chronic"] is True
+    assert verdict["suggested_new_limit"] is None
+    assert verdict["history_unavailable"] is True
+    assert "decomposition" in verdict["reason"].lower()
+
+
+def test_classify_breach_unreadable_history_override_still_grants_bump():
+    """An explicit operator override (override_chronic=True) still grants a bump
+    even when history is unreadable — matching the documented override path for a
+    verified chronic offender and keeping consumers' ``assert new_cap is not None``
+    invariant intact."""
+    with patch(
+        "app.size_limit_policy.parse_bump_history",
+        side_effect=BumpHistoryUnavailableError("git log failed for x"),
+    ):
+        verdict = classify_breach("override_unreadable.py", 1720, override_chronic=True)
+
+    assert verdict["is_chronic"] is True
     assert verdict["suggested_new_limit"] is not None
     assert verdict["suggested_new_limit"] > 1720
+    assert verdict["history_unavailable"] is True

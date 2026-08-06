@@ -10,6 +10,7 @@ import json
 import os
 import sys
 
+import app.size_limit_policy as slp
 from app.size_limit_policy import bump_size_limit
 from testing import check_size_limits as csl
 
@@ -384,9 +385,18 @@ def test_first_time_breach_still_bumped_normally(tmp_path, mocker):
     assert data["backend"]["new.py"] == bump_size_limit(1720)
 
 
-def test_fix_chronic_git_unavailable_degrades_to_routine(tmp_path, mocker):
-    """If git is unavailable (subprocess error), --fix must degrade to routine bump."""
-    repo, jp = _build_repo(tmp_path, backend={"big.py": (1720, 1600)})
+def test_fix_chronic_git_unavailable_refuses_bump(tmp_path, capsys, mocker):
+    """If git is unavailable (subprocess error), --fix must FAIL CLOSED — skip
+    the cap bump and route to decomposition, not degrade to a routine bump.
+
+    Unreadable bump history is NOT the same as "no bumps on record"; a possibly
+    chronic offender must not receive a silent routine bump when its history
+    cannot be read (e.g. a truncated task-VM clone).
+    """
+    # Distinct key from the other real-subprocess tests so the module TTL cache
+    # cannot leak a genuinely-empty history into this unreadable-history case.
+    slp._bump_history_cache.clear()
+    repo, jp = _build_repo(tmp_path, backend={"big_unreadable.py": (1720, 1600)})
 
     # Simulate git subprocess failing entirely (e.g., non-repo CI shard).
     with mocker.patch(
@@ -395,13 +405,21 @@ def test_fix_chronic_git_unavailable_degrades_to_routine(tmp_path, mocker):
     ):
         rc = _run(jp, repo, "--fix", "--sections", "backend")
 
-    # Must succeed (degrade to routine bump, not hard-fail).
-    assert rc == 0
+    # Must refuse the bump (exit 1) and leave the cap untouched.
+    assert rc == 1
 
     import json
 
     data = json.loads(_read(jp))
-    assert data["backend"]["big.py"] == bump_size_limit(1720)
+    assert data["backend"]["big_unreadable.py"] == 1600, (
+        f"Unreadable history must not bump the cap; "
+        f"got {data['backend']['big_unreadable.py']}"
+    )
+    out = capsys.readouterr().out
+    assert "[chronic]" in out, (
+        f"Expected the unreadable-history breach to be classified as a "
+        f"chronic/decomposition refusal, got output:\n{out}"
+    )
 
 
 def test_force_chronic_flag_overrides_chronic_gate(tmp_path, capsys, mocker):

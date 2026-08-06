@@ -1404,16 +1404,17 @@ def test_cap_bump_resolves_discovery_review_breach():
 
 
 def test_cap_bump_resolves_task_lifecycle_breach():
-    """After bumping caps via check_size_limits --fix, task_lifecycle.py must be
-    within its new cap on the real file tree.
+    """task_lifecycle.py must be within its cap on the real file tree.
 
-    This is the breach the 2026-08-06 ci-compliance remediation (8199244e)
-    targets: automain HEAD 8199244e reported backend/task_lifecycle.py at 7776
-    lines over its old cap of 7750. The fix bumps that cap to 8950 in
-    module_size_limits.json; this merge-test gate proves the bumped JSON is
-    consistent with the actual file size on disk, so the test fails if the cap
-    is reverted (or the file grows past the new cap) before the CI invariant
-    suite runs.
+    This guards the cap that was raised 7750 -> 8950 WITHOUT operator approval
+    on Blueprint's worst chronic offender (PR #16787) — the failure mode the
+    chronic-offender governance guard exists to refuse. That bump is reversed
+    here: the approved cap is 7750. The old assertion of >= 8950 was written
+    alongside the unapproved bump, so it encoded the defect rather than the
+    intent. task_lifecycle.py is well under 7750 lines, so this merge-test gate
+    still proves the JSON is consistent with the actual file size on disk and
+    fails if the cap ever rises above the approved figure without an explicit
+    decision, or the file grows past it before the CI invariant suite runs.
     """
     json_path = os.path.join(os.path.dirname(__file__), "module_size_limits.json")
     data = csl.load_limits(json_path)
@@ -1423,9 +1424,9 @@ def test_cap_bump_resolves_task_lifecycle_breach():
     assert target_rel in backend_caps, (
         f"{target_rel} must have a cap entry in module_size_limits.json"
     )
-    assert backend_caps[target_rel] >= 8950, (
-        f"{target_rel} cap must be at least 8950 (bumped from old 7750 cap); "
-        f"got {backend_caps[target_rel]}"
+    assert backend_caps[target_rel] == 7750, (
+        f"{target_rel} cap must be the approved figure 7750 (unapproved bump to "
+        f"8950 reverted); got {backend_caps[target_rel]}"
     )
 
     # Resolve app/ as testing/'s sibling, matching the Docker harness layout

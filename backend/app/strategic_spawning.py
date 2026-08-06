@@ -4771,8 +4771,18 @@ async def _maybe_spawn_ci_compliance_cap_bump_fix(
                 current_size=v["count"],
                 section=v.get("section", "backend"),
             )
-        except Exception:  # noqa: BLE001 — advisory; fall back to routine
-            verdict = {"is_chronic": False}
+        except Exception:  # noqa: BLE001
+            # Never silently permit a bump when classification fails; route to
+            # decomposition (fail-closed) instead of a false routine verdict.
+            verdict = {
+                "is_chronic": True,
+                "suggested_new_limit": None,
+                "bump_count": 0,
+                "reason": (
+                    "Bump history unavailable — refusing cap bump; "
+                    "decomposition required."
+                ),
+            }
         if verdict.get("is_chronic"):
             chronic_violations.append(v)
         else:
@@ -5787,14 +5797,20 @@ async def _spawn_strategic_review(
         _res_retired_summary = _build_retired_directions_summary(project)
         _res_prev_outcomes = _build_previous_decision_outcomes(project, cycle_history)
         _res_criterion_conflicts: list[dict] | None = None
-        try:
-            _res_criterion_conflicts = await _build_criterion_link_conflicts(
-                session, project
-            )
-        except Exception:
-            logger.exception(
-                "[STRATEGIC] criterion_link_conflicts fetch failed; continuing"
-            )
+        if get_project_integration_branch(project) != get_project_promotion_target(project):
+            # Criterion-link conflicts are version-lifecycle context (they key off
+            # the open version's active criterion keys), so they are meaningful
+            # only under an LTS split — the same gate the version-phase block
+            # uses. When integration == promotion there is no open version, so
+            # skip the lookup instead of invoking the version lifecycle.
+            try:
+                _res_criterion_conflicts = await _build_criterion_link_conflicts(
+                    session, project
+                )
+            except Exception:
+                logger.exception(
+                    "[STRATEGIC] criterion_link_conflicts fetch failed; continuing"
+                )
         _res_rejected_ops = _build_rejected_direction_ops(cycle_history, n=5)
         _res_open_messages = await _fetch_open_messages(session, project.id)
         # Recently-answered operator conversation tail — DB-only, bounded, and
@@ -6865,12 +6881,20 @@ async def _spawn_strategic_review(
     # shows and can remap before the completion path drops a re-proposed key.
     # Best-effort: absent when clean, no open version, or the query fails.
     _criterion_link_conflicts: list[dict] | None = None
-    try:
-        _criterion_link_conflicts = await _build_criterion_link_conflicts(
-            session, project
-        )
-    except Exception:
-        logger.exception("[STRATEGIC] criterion_link_conflicts fetch failed; continuing")
+    if _integration_branch != _promotion_target:
+        # Criterion-link conflicts are version-lifecycle context (they key off
+        # the open version's active criterion keys), so they are meaningful only
+        # under an LTS split — the same gate the version-phase block uses. When
+        # integration == promotion there is no open version, so skip the lookup
+        # instead of invoking the version lifecycle.
+        try:
+            _criterion_link_conflicts = await _build_criterion_link_conflicts(
+                session, project
+            )
+        except Exception:
+            logger.exception(
+                "[STRATEGIC] criterion_link_conflicts fetch failed; continuing"
+            )
     # Direction ops dropped for invalid criterion_keys in recent completed
     # cycles (cycle_metadata.rejected_direction_ops) — surfaced so the
     # strategist sees the exact refusal instead of a silent skip.
