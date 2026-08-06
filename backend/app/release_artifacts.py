@@ -783,20 +783,46 @@ async def _check_agent_image_serving(
         version stays unconfirmed within the existing confirmation window.
       * Indeterminate (non-self-repo, no GitHub creds, the rebake lookup errored,
         the diff base is unobservable, or no fleet VM has reported a source SHA
-        yet) — treat as NOT-YET-CONFIRMED (return ``None``), never
-        ``deploy_failed``.  The version then resolves within the existing
-        confirmation/recovery windows exactly as the backend_revision artifact
-        does.
+        yet) — treat as NOT-YET-CONFIRMED (return ``None``) WITHIN the
+        confirmation window, never ``deploy_failed``.  Past the
+        ``confirmation_deadline`` the indeterminate paths time out to
+        ``confirmation_timed_out`` (exactly like the promotion_merge and
+        backend_revision providers) so a bake-path promotion whose fleet never
+        serves the promoted SHA resolves instead of pinning the aggregate
+        ``unconfirmed`` forever.  The version then resolves within the existing
+        confirmation/recovery windows, and the recovery sweep can re-check the
+        timed-out artifact when the fleet later catches up.
 
     Lazy imports avoid a load-time cycle (``release_promotion`` imports this
     module), mirroring ``_check_backend_revision_serving``.
     """
     from app import compute, github_refs
     from app.models import Project
-    from app.release_promotion import _resolve_github_with_session
+    from app.release_promotion import (
+        _DEPLOY_CONFIRM_WINDOW_SECONDS,
+        _resolve_github_with_session,
+    )
+    from app.release_reconciliation import _to_naive_utc
 
     promoted_sha = version.promoted_sha
     if not promoted_sha:
+        return None
+
+    # Effective confirmation deadline — mirrors the backstop in
+    # _classify_serving_outcome and _check_promotion_merge_serving so every
+    # indeterminate path is bounded, never waited on forever.
+    _raw_deadline = artifact.confirmation_deadline or version.deploy_confirm_deadline
+    if _raw_deadline is None and version.promoted_at is not None:
+        _raw_deadline = version.promoted_at + timedelta(
+            seconds=_DEPLOY_CONFIRM_WINDOW_SECONDS
+        )
+    _deadline = _to_naive_utc(_raw_deadline)
+    _now_naive = _to_naive_utc(now) or now
+
+    def _defer_or_timeout(reason: str) -> ServingDecision | None:
+        """Return confirmation_timed_out if the deadline elapsed, else None."""
+        if _deadline is not None and _now_naive >= _deadline:
+            return ("confirmation_timed_out", reason, None)
         return None
 
     project = await session.get(Project, version.project_id)
@@ -816,7 +842,9 @@ async def _check_agent_image_serving(
 
     resolved = await _resolve_github_with_session(session, project)
     if resolved is None:
-        return None
+        # No GitHub credentials → indeterminate — times out at the deadline
+        # rather than waiting forever (mirrors _check_promotion_merge_serving).
+        return _defer_or_timeout("agent_image_no_github_credentials")
     token, owner, repo = resolved
 
     ds = await session.get(DeploymentState, 1)
@@ -839,7 +867,7 @@ async def _check_agent_image_serving(
         except Exception:  # noqa: BLE001 - ancestry lookup is an indeterminate serving signal
             ancestry = None
         if ancestry is None:
-            return None
+            return _defer_or_timeout("agent_image_ancestry_indeterminate")
         current_contains_promoted = ancestry is True
 
     base_sha = _previously_deployed_sha(
@@ -848,14 +876,15 @@ async def _check_agent_image_serving(
         current_contains_promoted=current_contains_promoted,
     )
     if not base_sha:
-        # Diff base unobservable → indeterminate → not-yet-confirmed.
+        # Diff base unobservable → indeterminate → not-yet-confirmed within the
+        # window; times out past the deadline.
         logger.info(
             "agent_image_serving_indeterminate path=base_sha_unobservable"
             " version_id=%s promoted_sha=%s",
             version.id,
             promoted_sha,
         )
-        return None
+        return _defer_or_timeout("agent_image_base_sha_unobservable")
 
     rebake = await github_refs.agent_image_rebake_expected(
         token,
@@ -866,14 +895,15 @@ async def _check_agent_image_serving(
         project_id=str(version.project_id),
     )
     if rebake is None:
-        # API/ref error → indeterminate → not-yet-confirmed.
+        # API/ref error → indeterminate → not-yet-confirmed within the window;
+        # times out past the deadline.
         logger.info(
             "agent_image_serving_indeterminate path=rebake_lookup_indeterminate"
             " version_id=%s promoted_sha=%s",
             version.id,
             promoted_sha,
         )
-        return None
+        return _defer_or_timeout("agent_image_rebake_lookup_indeterminate")
     if rebake is False:
         # No bake-path change → no agent rebake required → confirm immediately so
         # the aggregate tracks the backend revision alone.
@@ -897,7 +927,7 @@ async def _check_agent_image_serving(
         version.id,
         promoted_sha,
     )
-    return None
+    return _defer_or_timeout("agent_image_fleet_not_yet_serving")
 
 
 # Self-repo agent VM image serving gate.  Registered REQUIRED so a bake-path
