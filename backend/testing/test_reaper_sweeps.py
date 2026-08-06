@@ -1,5 +1,7 @@
 """Tests for reaper bug-message sweep helpers (Step 18e: unlinked BLOCKER decay)."""
 
+from unittest.mock import AsyncMock
+
 import pytest
 import pytest_asyncio
 from datetime import timedelta
@@ -235,3 +237,76 @@ async def test_blocker_auto_decay_does_not_touch_bug_report(sweep_db):
     assert acted == 0
     await sweep_db.refresh(msg)
     assert msg.status == "open"
+
+
+# ---------------------------------------------------------------------------
+# Step 21b: acceptance-verdict healing backfill sweep
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_acceptance_healing_backfill_cadence_gated(sweep_db):
+    """Step 21b runs on its own cadence timer and is suppressed within the interval.
+
+    The timer is independent of every other sweep's stamp, so an earlier sweep in
+    the same reaper cycle cannot accidentally suppress the healing pass.
+    """
+    import app.reaper_sweeps as rsw
+
+    _prev = rsw._last_acceptance_healing_backfill_sweep
+    rsw._last_acceptance_healing_backfill_sweep = None
+    try:
+        now = _utcnow()
+        first = await rsw.sweep_acceptance_verdict_healing_backfills(sweep_db, now=now)
+        assert first == 0, "no projects -> nothing to heal, but the timer fires"
+        assert rsw._last_acceptance_healing_backfill_sweep == now
+
+        # Immediate second call within the interval is suppressed without
+        # re-stamping the timer.
+        second = await rsw.sweep_acceptance_verdict_healing_backfills(
+            sweep_db, now=now
+        )
+        assert second == 0
+        assert rsw._last_acceptance_healing_backfill_sweep == now
+    finally:
+        rsw._last_acceptance_healing_backfill_sweep = _prev
+
+
+@pytest.mark.asyncio
+async def test_acceptance_healing_backfill_skips_closed_projects(sweep_db, mocker):
+    """Step 21b invokes the healing passes only for projects with an open version.
+
+    A project with no open release version has no active acceptance criteria to
+    heal, so none of the reconcile passes (rollup stamping, unverified-merge
+    backfill, window minter) are invoked for it.
+    """
+    import app.reaper_sweeps as rsw
+
+    await _make_project(sweep_db)  # project with NO open version
+
+    rollup = mocker.patch(
+        "app.acceptance_criteria.backfill_rollup_child_changed_files",
+        new=AsyncMock(return_value=0),
+    )
+    unverified = mocker.patch(
+        "app.acceptance_criteria.backfill_unverified_merge_evidence",
+        new=AsyncMock(return_value=0),
+    )
+    window = mocker.patch(
+        "app.acceptance_criteria.record_acceptance_window_coverage_evidence",
+        new=AsyncMock(return_value=0),
+    )
+
+    _prev = rsw._last_acceptance_healing_backfill_sweep
+    rsw._last_acceptance_healing_backfill_sweep = None
+    try:
+        total = await rsw.sweep_acceptance_verdict_healing_backfills(
+            sweep_db, now=_utcnow()
+        )
+    finally:
+        rsw._last_acceptance_healing_backfill_sweep = _prev
+
+    assert total == 0
+    rollup.assert_not_called()
+    unverified.assert_not_called()
+    window.assert_not_called()

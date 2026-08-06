@@ -552,6 +552,48 @@ async def _force_finalize_sweep_crash_loop(
 _DRIFT_SENTINEL_RERUN_KEY = "_drift_sentinel_rerun"
 _DRIFT_SENTINEL_RERUN_BUDGET = 1
 
+# Durable per-HEAD re-dispatch accounting for the drift sentinel's cancelled-run
+# path.  Stored as ``{"head_sha": str, "redispatched_at": str}`` in
+# project_telemetry: ci.yml's branch-keyed cancel-in-progress concurrency policy
+# cancels in-flight integration-branch runs, so a dispatched sentinel run
+# routinely reads back as cancelled.  Without a bounded re-dispatch the sentinel
+# would give up on the HEAD permanently, which on an actively-merging branch can
+# starve the full-suite signal of a green conclusion forever (every fresh run is
+# cancelled by the next merge, and the sentinel never tries again for that SHA).
+# A cooldown-bounded re-dispatch lets a quiet window on the branch conclude a
+# green run; a new integration commit still dispatches afresh through the normal
+# no-run path.
+_DRIFT_SENTINEL_CANCELLED_REDISPATCH_KEY = "_drift_sentinel_cancelled_redispatch"
+_DRIFT_SENTINEL_CANCELLED_REDISPATCH_COOLDOWN_SECONDS = 30 * 60
+
+
+def _drift_sentinel_cancelled_redispatch_due(
+    marker: dict | None,
+    head_sha: str | None,
+    now: datetime,
+) -> bool:
+    """Decide whether a fresh full-suite dispatch is due for a cancelled HEAD.
+
+    Due when there is no prior marker, when the integration HEAD advanced past
+    the marker's recorded sha, or when the cooldown has elapsed since the last
+    re-dispatch.  An unparseable / missing timestamp errs toward re-dispatching
+    (the safe direction — a missing green signal must not starve forever).
+    """
+    if not isinstance(marker, dict):
+        return True
+    if marker.get("head_sha") != head_sha:
+        return True
+    redispatched_at = marker.get("redispatched_at")
+    if not redispatched_at:
+        return True
+    try:
+        prev = datetime.fromisoformat(redispatched_at)
+    except (ValueError, TypeError):
+        return True
+    return (
+        now - prev
+    ).total_seconds() >= _DRIFT_SENTINEL_CANCELLED_REDISPATCH_COOLDOWN_SECONDS
+
 
 async def _check_full_suite_drift_sentinel(
     version_id,
@@ -617,63 +659,134 @@ async def _check_full_suite_drift_sentinel(
                 return True
 
             if gate_state == "cancelled":
-                # ci.yml's concurrency policy cancels in-flight integration-branch
-                # runs, so a dispatched full-suite run legitimately reads back as
-                # cancelled.  Treating that as "absent" (the old behaviour) re-ran
-                # the full 8-shard matrix once per sweep forever — churn with no
-                # alert and no resolution.  Instead raise a deduplicated operator
-                # Alert and do NOT re-dispatch for this HEAD; the next integration
-                # commit (a new HEAD with no run yet) dispatches afresh through the
-                # normal no-run path.
-                _dedupe_key = (
-                    f"drift_sentinel:cancelled:{version.project_id}:{head_sha}"
+                # ci.yml's branch-keyed cancel-in-progress concurrency policy
+                # cancels in-flight integration-branch runs, so a dispatched
+                # full-suite run legitimately reads back as cancelled.  The old
+                # behaviour raised a deduplicated operator Alert and never
+                # re-dispatched for the HEAD; on an actively-merging branch that
+                # can starve the full-suite signal of a green conclusion forever
+                # (every fresh dispatch is promptly cancelled by the next merge,
+                # and the sentinel had already given up on that SHA).  Instead
+                # re-dispatch once per HEAD per cooldown window, so a quiet window
+                # on the branch lets the fresh run conclude and green becomes
+                # reachable for the same HEAD.  A new integration commit still
+                # dispatches afresh through the normal no-run path.
+                from app.project_telemetry import (
+                    read_telemetry,
+                    upsert_telemetry,
                 )
-                existing = (
-                    (
-                        await session.execute(
-                            select(Alert).where(
-                                Alert.project_id == version.project_id,
-                                Alert.dedupe_key == _dedupe_key,
-                                Alert.dismissed_at.is_(None),
+
+                _marker = (
+                    await read_telemetry(
+                        session,
+                        version.project_id,
+                        _DRIFT_SENTINEL_CANCELLED_REDISPATCH_KEY,
+                    )
+                    or {}
+                )
+                _now = _utcnow()
+                _cancelled_unresolved = False
+                if _drift_sentinel_cancelled_redispatch_due(_marker, head_sha, _now):
+                    # Treat the cancelled run as absent (dispatch_on_cancelled=True)
+                    # so the gate dispatches a fresh full-suite run for the SAME
+                    # HEAD — this is the seam that lets a quiet head reach green.
+                    gate = await compute_promotion_ci_green_gate(
+                        session,
+                        version.project_id,
+                        dispatch=True,
+                        dispatch_on_cancelled=True,
+                    )
+                    gate_state = gate.get("gate_state")
+                    head_sha = gate.get("head_sha") or ""
+                    if gate_state == "dispatched":
+                        await upsert_telemetry(
+                            session,
+                            version.project_id,
+                            _DRIFT_SENTINEL_CANCELLED_REDISPATCH_KEY,
+                            {
+                                "head_sha": head_sha,
+                                "redispatched_at": _now.isoformat(),
+                            },
+                        )
+                        await session.commit()
+                        logger.info(
+                            "[DRIFT_SENTINEL] re-dispatched full-suite CI run after "
+                            "cancellation for project %s HEAD %s",
+                            version.project_id,
+                            head_sha[:8] if head_sha else "?",
+                        )
+                        return True
+                    if gate_state in ("green", "pending"):
+                        # A run for the HEAD is green or in flight — nothing left
+                        # to do; the sentinel will read it on the next sweep.
+                        return False
+                    if gate_state != "red":
+                        # unavailable / no_signal: the re-dispatch could not be
+                        # attempted, so the cancellation is unresolved.  Raise the
+                        # operator alert (deduped on project+SHA) and let the next
+                        # sweep retry the re-dispatch once the cooldown allows.
+                        _cancelled_unresolved = True
+                    # gate_state == "red": the re-dispatched run concluded red —
+                    # fall through to the shared red handler (alert + harvest).
+                else:
+                    # Cooldown has not elapsed for this HEAD — do NOT re-dispatch
+                    # yet.  Surface the cancelled run as a deduplicated operator
+                    # alert; the sentinel re-arms once the cooldown elapses.
+                    _cancelled_unresolved = True
+
+                if _cancelled_unresolved:
+                    _dedupe_key = (
+                        f"drift_sentinel:cancelled:{version.project_id}:{head_sha}"
+                    )
+                    existing = (
+                        (
+                            await session.execute(
+                                select(Alert).where(
+                                    Alert.project_id == version.project_id,
+                                    Alert.dedupe_key == _dedupe_key,
+                                    Alert.dismissed_at.is_(None),
+                                )
                             )
                         )
+                        .scalars()
+                        .first()
                     )
-                    .scalars()
-                    .first()
-                )
-                if existing is None:
-                    run_url = gate.get("html_url") or str(gate.get("run_id") or "")
-                    session.add(
-                        Alert(
-                            project_id=version.project_id,
-                            severity=AlertSeverity.WARNING,
-                            title=(
-                                f"Full-suite CI run cancelled on integration branch "
-                                f"({head_sha[:8] if head_sha else '?'})"
-                            ),
-                            message=(
-                                f"Standing drift sentinel: the ci.yml run for "
-                                f"integration HEAD "
-                                f"{head_sha[:12] if head_sha else '?'} was cancelled "
-                                "(the ci.yml concurrency policy cancels in-flight "
-                                "integration-branch runs). No fresh run was "
-                                "re-dispatched for this HEAD, so the sentinel "
-                                "cannot churn 8-shard dispatches; the next "
-                                "integration commit dispatches afresh."
-                                + (f" Run: {run_url}." if run_url else "")
-                            ),
-                            dedupe_key=_dedupe_key,
-                            event_type="release.ci_unresolved",
+                    if existing is None:
+                        run_url = gate.get("html_url") or str(
+                            gate.get("run_id") or ""
                         )
-                    )
-                    await session.commit()
-                    logger.warning(
-                        "[DRIFT_SENTINEL] full-suite CI run cancelled for project %s "
-                        "HEAD %s — alert raised, no re-dispatch for this HEAD",
-                        version.project_id,
-                        head_sha[:8] if head_sha else "?",
-                    )
-                return True
+                        session.add(
+                            Alert(
+                                project_id=version.project_id,
+                                severity=AlertSeverity.WARNING,
+                                title=(
+                                    f"Full-suite CI run cancelled on integration "
+                                    f"branch ({head_sha[:8] if head_sha else '?'})"
+                                ),
+                                message=(
+                                    f"Standing drift sentinel: the ci.yml run for "
+                                    f"integration HEAD "
+                                    f"{head_sha[:12] if head_sha else '?'} was "
+                                    "cancelled (the ci.yml concurrency policy "
+                                    "cancels in-flight integration-branch runs). "
+                                    "A fresh run will be re-dispatched after the "
+                                    "cooldown window, so a quiet HEAD can still "
+                                    "reach green."
+                                    + (f" Run: {run_url}." if run_url else "")
+                                ),
+                                dedupe_key=_dedupe_key,
+                                event_type="release.ci_unresolved",
+                            )
+                        )
+                        await session.commit()
+                        logger.warning(
+                            "[DRIFT_SENTINEL] full-suite CI run cancelled for "
+                            "project %s HEAD %s — alert raised, re-dispatch "
+                            "cooldown in effect",
+                            version.project_id,
+                            head_sha[:8] if head_sha else "?",
+                        )
+                    return True
 
             if gate_state == "unavailable":
                 # The gate could not resolve creds / HEAD / API.  A transient

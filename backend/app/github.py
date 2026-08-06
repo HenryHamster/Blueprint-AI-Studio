@@ -1307,6 +1307,7 @@ from app.github_checks import (  # noqa: F401
     _unique,
     get_check_runs,
     get_workflow_run_for_sha,
+    get_latest_inflight_workflow_run_for_branch,
     AGENT_BAKE_WORKFLOW_FILE,
     CI_WORKFLOW_FILE,
     dispatch_workflow_run,

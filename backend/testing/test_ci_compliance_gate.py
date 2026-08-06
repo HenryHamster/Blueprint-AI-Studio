@@ -182,6 +182,21 @@ async def test_ci_compliance_fetch_gate_and_cap_bump_spawn(
     assert gate["blocked"] is True
     assert gate["violation_count"] == 1
 
+    # Pin a deterministic ROUTINE verdict: a fresh project on a task VM has no
+    # readable bump history, which classify_breach FAILS CLOSED as chronic
+    # (decomposition prompt, no --fix). The routine cap-bump prompt is what this
+    # test exercises, so classify the breach as routine up front.
+    mocker.patch(
+        "app.strategic_spawning.classify_breach",
+        return_value={
+            "is_chronic": False,
+            "suggested_new_limit": _CAP + 3,
+            "bump_count": 0,
+            "history_unavailable": False,
+            "reason": "Routine breach (0 prior bumps).",
+        },
+    )
+
     spawned = await _maybe_spawn_ci_compliance_cap_bump_fix(db_session, project, gate)
     await db_session.commit()
     assert spawned is not None

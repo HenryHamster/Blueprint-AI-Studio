@@ -4911,6 +4911,13 @@ async def test_sweep_error_redrive_accumulates_attempts_until_capped(
     from app.release_qualifier_sweep import _MAX_ERROR_REDRIVE_ATTEMPTS
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
+    # Disable the standing full-suite drift sentinel for this project: its
+    # per-sweep compute_promotion_ci_green_gate round-trip hits
+    # github.get_branch_sha too, and this test counts those calls to prove the
+    # error re-drive stops at the cap. The sentinel's documented opt-out keeps
+    # the count attributable to the re-drive path alone.
+    project.build_config = {"full_suite_drift_sentinel_enabled": False}
+    db_session.add(project)
     attempt_id = uuid.uuid4()
     version.last_qualification = {
         "status": "error",

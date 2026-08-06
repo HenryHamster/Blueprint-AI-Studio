@@ -5057,48 +5057,194 @@ async def test_sweep_triggers_calcification_check(db_session, mocker):
 
 
 # ===========================================================================
-# Drift sentinel — cancelled-run dispatch churn + red-only reaction
+# Drift sentinel — cancelled-run cooldown-bounded re-dispatch + red-only reaction
 # ===========================================================================
 
 
 @pytest.mark.asyncio
-async def test_drift_sentinel_cancelled_run_alerts_and_does_not_redispatch(
+async def test_drift_sentinel_rearms_quiet_head_after_cancellation(
     db_session, mocker
 ):
-    """A full-suite run cancelled by the ci.yml concurrency policy must NOT
-    re-dispatch the 8-shard matrix on every sweep.
+    """A cancelled full-suite run re-arms a fresh dispatch so a quiet HEAD can
+    reach green.
 
-    The old behaviour treated a cancelled run as "absent" (the gate's
-    dispatch=True collapse), so each sweep dispatched a fresh full-matrix run
-    that the concurrency policy promptly cancelled again — endless churn with no
-    alert and no resolution.  The sentinel now asks the gate to surface
-    ``cancelled`` as its own state (``dispatch_on_cancelled=False``), raises a
-    deduplicated operator Alert, and re-dispatches nothing for the same HEAD.
+    The old behaviour raised an operator Alert and never re-dispatched for the
+    HEAD, so on an actively-merging integration branch the sentinel could never
+    report green: every fresh dispatch was promptly cancelled by the next merge
+    and the sentinel had already given up on that SHA.  The sentinel now
+    re-dispatches (re-arms) once per HEAD per cooldown window; a quiet window
+    lets the fresh run conclude and the next sweep reads ``green``.
     """
-    from app.release_qualifier_sweep import _check_full_suite_drift_sentinel
+    from app.project_telemetry import read_telemetry
+    from app.release_qualifier_sweep import (
+        _DRIFT_SENTINEL_CANCELLED_REDISPATCH_KEY,
+        _check_full_suite_drift_sentinel,
+    )
 
     HEAD_SHA = "cance11ed" * 5
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
-    gate_mock = mocker.patch(
-        "app.release_readiness.compute_promotion_ci_green_gate",
-        new=AsyncMock(
-            return_value={
+
+    async def _gate(session, project_id, *, dispatch=True, dispatch_on_cancelled=True):
+        if not dispatch_on_cancelled:
+            # First gate call: surface the cancelled run as its own state.
+            return {
                 "gate_state": "cancelled",
                 "head_sha": HEAD_SHA,
                 "run_id": 777,
                 "html_url": "https://github.com/runs/777",
                 "reason": "ci.yml run was cancelled — surfaced as a distinct signal",
             }
-        ),
+        # Re-dispatch call: a fresh run is now in flight for the SAME HEAD.
+        return {
+            "gate_state": "dispatched",
+            "head_sha": HEAD_SHA,
+            "run_id": 778,
+            "html_url": "https://github.com/runs/778",
+            "reason": "cancelled run treated as absent — fresh run dispatched",
+        }
+
+    gate_mock = mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(side_effect=_gate),
     )
 
-    # First pass: the cancelled run raises a deduplicated Alert and no fresh
-    # dispatch is attempted for this HEAD.
+    # Sweep 1: the run for HEAD reads back cancelled.  The sentinel RE-ARMS —
+    # it asks the gate for a dispatch_on_cancelled re-dispatch instead of
+    # giving up on the SHA.
     assert await _check_full_suite_drift_sentinel(
         version.id, session_factory=_shared_session_factory(db_session)
     ) is True
 
+    assert gate_mock.call_count == 2
+    assert gate_mock.await_args.kwargs["dispatch_on_cancelled"] is True
+    assert gate_mock.await_args.kwargs["dispatch"] is True
+
+    # No operator alert while a fresh run is in flight, and the re-arm marker
+    # is persisted for the HEAD (the cooldown anchor).
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(Alert.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert alerts == []
+    marker = await read_telemetry(
+        db_session, project.id, _DRIFT_SENTINEL_CANCELLED_REDISPATCH_KEY
+    )
+    assert marker is not None
+    assert marker["head_sha"] == HEAD_SHA
+    assert marker["redispatched_at"]
+
+    # Quiet window: the re-dispatched run concludes green.  The next sweep
+    # reads green and the sentinel reports nothing outstanding — the HEAD
+    # reached the state the old give-up behaviour could never observe.
+    gate_mock.reset_mock()
+    gate_mock.side_effect = None
+    gate_mock.return_value = {
+        "gate_state": "green",
+        "head_sha": HEAD_SHA,
+        "run_id": 778,
+        "html_url": "https://github.com/runs/778",
+        "reason": "ci.yml run for integration HEAD concluded success",
+    }
+    assert await _check_full_suite_drift_sentinel(
+        version.id, session_factory=_shared_session_factory(db_session)
+    ) is False
+    gate_mock.assert_called_once()
+    assert gate_mock.await_args.kwargs["dispatch_on_cancelled"] is False
+
+
+@pytest.mark.asyncio
+async def test_drift_sentinel_cancelled_redispatch_is_cooldown_bounded(
+    db_session, mocker
+):
+    """A cancelled HEAD is re-dispatched at most once per cooldown window.
+
+    The first cancelled pass re-arms a fresh dispatch; a second pass for the
+    same HEAD within the cooldown does NOT re-dispatch and instead raises a
+    deduplicated operator Alert; once the cooldown elapses the sentinel
+    re-dispatches again.  This bounds dispatch churn to one full 8-shard run per
+    HEAD per 30 minutes while still letting a quiet HEAD reach green.
+    """
+    from datetime import datetime, timedelta
+
+    from app.project_telemetry import read_telemetry
+    from app.release_qualifier_sweep import (
+        _DRIFT_SENTINEL_CANCELLED_REDISPATCH_KEY,
+        _check_full_suite_drift_sentinel,
+    )
+
+    HEAD_SHA = "coo1down" * 5
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    fake_now = datetime(2026, 8, 6, 12, 0, 0)
+    utcnow_mock = mocker.patch(
+        "app.release_qualifier_sweep._utcnow", return_value=fake_now
+    )
+
+    async def _gate(session, project_id, *, dispatch=True, dispatch_on_cancelled=True):
+        if not dispatch_on_cancelled:
+            return {
+                "gate_state": "cancelled",
+                "head_sha": HEAD_SHA,
+                "run_id": 777,
+                "html_url": "https://github.com/runs/777",
+                "reason": "ci.yml run was cancelled — surfaced as a distinct signal",
+            }
+        return {
+            "gate_state": "dispatched",
+            "head_sha": HEAD_SHA,
+            "run_id": 778,
+            "html_url": "https://github.com/runs/778",
+            "reason": "cancelled run treated as absent — fresh run dispatched",
+        }
+
+    gate_mock = mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(side_effect=_gate),
+    )
+
+    # Pass 1: cancelled -> re-dispatch (2nd gate call) -> marker persisted, no
+    # alert (a fresh run is in flight).
+    assert await _check_full_suite_drift_sentinel(
+        version.id, session_factory=_shared_session_factory(db_session)
+    ) is True
+    assert gate_mock.call_count == 2
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(Alert.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert alerts == []
+    marker = await read_telemetry(
+        db_session, project.id, _DRIFT_SENTINEL_CANCELLED_REDISPATCH_KEY
+    )
+    assert marker is not None
+    assert marker["head_sha"] == HEAD_SHA
+
+    def _redispatch_calls():
+        return [
+            c
+            for c in gate_mock.call_args_list
+            if c.kwargs.get("dispatch_on_cancelled") is True
+        ]
+
+    # Pass 2 (same fake_now, same HEAD): cooldown NOT elapsed -> no re-dispatch
+    # (only the state-discovery gate call), deduplicated WARNING alert instead.
+    assert await _check_full_suite_drift_sentinel(
+        version.id, session_factory=_shared_session_factory(db_session)
+    ) is True
+    assert gate_mock.call_count == 3  # 2 (pass 1) + 1 discovery call
+    assert len(_redispatch_calls()) == 1  # no re-dispatch in pass 2
     alerts = (
         (
             await db_session.execute(
@@ -5112,10 +5258,18 @@ async def test_drift_sentinel_cancelled_run_alerts_and_does_not_redispatch(
     assert HEAD_SHA[:8] in alerts[0].title
     assert "cancelled" in alerts[0].title.lower()
 
-    # Second pass on the SAME SHA: the alert is deduplicated (still one row).
+    # Cooldown elapsed: the sentinel re-arms a fresh dispatch for the SAME HEAD
+    # (no new alert — the dedupe key is still the same HEAD).
+    utcnow_mock.return_value = fake_now + timedelta(minutes=31)
     assert await _check_full_suite_drift_sentinel(
         version.id, session_factory=_shared_session_factory(db_session)
     ) is True
+    assert gate_mock.call_count == 5  # 3 + discovery + re-dispatch
+    assert len(_redispatch_calls()) == 2
+    marker = await read_telemetry(
+        db_session, project.id, _DRIFT_SENTINEL_CANCELLED_REDISPATCH_KEY
+    )
+    assert marker["redispatched_at"] == (fake_now + timedelta(minutes=31)).isoformat()
     alerts = (
         (
             await db_session.execute(
@@ -5126,11 +5280,6 @@ async def test_drift_sentinel_cancelled_run_alerts_and_does_not_redispatch(
         .all()
     )
     assert len(alerts) == 1
-
-    # The sentinel asked the gate NOT to auto-dispatch on a cancelled run —
-    # this is the seam that breaks the per-sweep re-dispatch churn.
-    assert gate_mock.call_args.kwargs["dispatch_on_cancelled"] is False
-    assert gate_mock.call_args.kwargs["dispatch"] is True
 
 
 @pytest.mark.asyncio
@@ -5162,6 +5311,12 @@ async def test_promotion_ci_gate_cancelled_run_surfaces_without_dispatch(
                 "html_url": "https://gh/run/15",
             }
         ),
+    )
+    # No in-flight branch run, so the dispatch_on_cancelled=True path falls
+    # through to a real dispatch (the coalescing seam is exercised but idle).
+    mocker.patch(
+        "app.github.get_latest_inflight_workflow_run_for_branch",
+        new=AsyncMock(return_value=None),
     )
     dispatch_mock = mocker.patch(
         "app.github.dispatch_workflow_run", new=AsyncMock(return_value=True)

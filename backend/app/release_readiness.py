@@ -1216,6 +1216,16 @@ _PROMOTION_CI_GATE_STATES = frozenset(
     {"green", "pending", "red", "cancelled", "dispatched", "no_signal", "unavailable"}
 )
 
+# Branch-level dispatch coalescing window for the promotion CI gate.  ci.yml is
+# keyed to a branch-level ``cancel-in-progress`` concurrency group, so a fresh
+# dispatch for a NEW integration HEAD cancels whatever full-suite run is already
+# in flight on the branch.  On an actively-merging branch that churns full
+# 8-shard dispatches (each new HEAD's dispatch kills the prior run before it
+# concludes) and starves the branch of a green conclusion — the very signal the
+# standing drift sentinel needs.  When a ci.yml run is already queued/in_progress
+# on the branch within this window, the gate waits for it instead of dispatching.
+_PROMOTION_CI_BRANCH_COALESCE_WINDOW_SECONDS = 60 * 60
+
 
 def _promotion_ci_gate_verdict(
     gate_state: str,
@@ -1265,15 +1275,23 @@ async def compute_promotion_ci_green_gate(
                          cancelled run exists with ``dispatch=False``
       * ``unavailable``— GitHub creds / HEAD / API unavailable (or an error occurred)
 
-    When ``dispatch=True`` and there is no run for the current HEAD, dispatches a
-    fresh ``ci.yml`` run on the integration branch (the full 8-shard backend +
-    frontend + agent matrix, since ci.yml's ``detect`` job forces all-true on a
-    ``workflow_dispatch``) and returns ``dispatched``.  A completed run whose
-    conclusion is ``cancelled`` is treated as absent when ``dispatch=True`` (the
-    concurrency policy routinely cancels superseded integration-branch runs), UNLESS
-    ``dispatch_on_cancelled=False``, in which case it surfaces as ``cancelled``
-    without dispatching so a caller that wants to avoid dispatch churn can react
-    instead of re-dispatching the full matrix on every sweep.
+    When ``dispatch=True`` and there is no run for the current HEAD, first checks
+    whether a ci.yml run is already queued/in-progress ANYWHERE on the
+    integration branch within ``_PROMOTION_CI_BRANCH_COALESCE_WINDOW_SECONDS``.
+    Because ci.yml's concurrency policy is keyed on the branch ref
+    (``cancel-in-progress``), a fresh dispatch for a new HEAD would cancel the
+    in-flight run before it concludes — on an actively-merging branch that
+    churns full 8-shard dispatches and starves the branch of a green conclusion.
+    When such a run exists the gate returns ``pending`` (coalescing onto it)
+    instead of dispatching; otherwise it dispatches a fresh ``ci.yml`` run on the
+    integration branch (the full 8-shard backend + frontend + agent matrix, since
+    ci.yml's ``detect`` job forces all-true on a ``workflow_dispatch``) and
+    returns ``dispatched``.  A completed run whose conclusion is ``cancelled`` is
+    treated as absent when ``dispatch=True`` (the concurrency policy routinely
+    cancels superseded integration-branch runs), UNLESS ``dispatch_on_cancelled=False``,
+    in which case it surfaces as ``cancelled`` without dispatching so a caller
+    that wants to avoid dispatch churn can react instead of re-dispatching the
+    full matrix on every sweep.
 
     IMPORTANT: this performs a GitHub round-trip and is DELIBERATELY separate from
     :func:`compute_requalification_readiness`, which stays DB-only and
@@ -1386,6 +1404,38 @@ async def compute_promotion_ci_green_gate(
                     "(read-only gate, no run dispatched)"
                 ),
             )
+
+        # Branch-level dispatch coalescing.  ci.yml is keyed to a branch
+        # ``cancel-in-progress`` concurrency group, so dispatching a fresh run
+        # for this NEW HEAD would cancel whatever full-suite run is already in
+        # flight on the integration branch.  On an actively-merging branch that
+        # churns 8-shard dispatches (each new HEAD's dispatch kills the prior
+        # run before it concludes) and starves the branch of a green conclusion.
+        # If a run is already queued/in_progress within the coalesce window,
+        # wait for it to conclude instead of cancelling it — the sentinel reads
+        # ``pending`` and re-checks once the run resolves.
+        inflight = await github.get_latest_inflight_workflow_run_for_branch(
+            token,
+            owner,
+            repo,
+            integration_branch,
+            workflow_file=CI_WORKFLOW_FILE,
+            project_id=str(project_id),
+            max_age_seconds=_PROMOTION_CI_BRANCH_COALESCE_WINDOW_SECONDS,
+        )
+        if inflight is not None:
+            return _promotion_ci_gate_verdict(
+                "pending",
+                head_sha=head_sha,
+                run_id=inflight["run_id"],
+                html_url=inflight["html_url"],
+                reason=(
+                    "a ci.yml run is already in flight on the integration "
+                    "branch — coalescing onto it instead of cancelling it "
+                    "with a fresh dispatch"
+                ),
+            )
+
         dispatched = await github.dispatch_workflow_run(
             token,
             owner,

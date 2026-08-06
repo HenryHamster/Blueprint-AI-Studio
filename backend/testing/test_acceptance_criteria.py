@@ -10168,6 +10168,159 @@ async def test_reconcile_backfill_skips_child_without_github_verified_ancestor(
 
 
 # ---------------------------------------------------------------------------
+# Reaper Step 21b: acceptance-verdict healing backfill sweep
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sweep_heals_rollup_child_acceptance_verdict(db_session):
+    """The reaper's acceptance-verdict healing sweep (Step 21b) unblocks a
+    deadlocked acceptance window without an operator reconcile-backfill POST.
+
+    An open version whose only write-task merge is an already-landed rollup child
+    with no changed-file context is stuck: the child's declared ``named_test``
+    cannot be located in any diff (``declared_unsatisfied``), so the
+    acceptance-window aggregate scores ``verified=0`` and the evidence minter
+    refuses to record on its false-zero guard. The sweep runs the reconcile-only
+    backfills automatically — rollup-child changed-files stamping first, then the
+    unverified-merge backfill — and finally the window minter, flipping the child
+    to ``satisfied_unproven`` so the window re-scores non-zero and criterion
+    evidence is recorded. A second sweep pass (past the cadence window) records
+    nothing.
+    """
+    from datetime import timedelta
+
+    from app import release_version as rv
+    import app.reaper_sweeps as rsw
+    from app.acceptance_gate import (
+        CODE_ACCEPTANCE_VERDICT_KEY,
+        classify_merged_acceptance_context,
+        record_code_acceptance_verdict,
+        stamp_changed_files_signal,
+    )
+    from app.time_utils import _utcnow
+
+    prod_seam = "backend/app/widgetflow.py"
+    declared_test = "backend/testing/test_widgetflow.py"
+
+    project = await _make_project(db_session, name="SweepHealsRollupChild")
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+
+    criterion = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="The false acceptance-coverage 0/346 is fixed (acceptance_window_fraction non-zero)",
+        created_by="operator",
+    )
+
+    # Rollup parent landed on integration carrying the GitHub-verified combined
+    # diff (a production seam + the declared test).
+    parent_ctx = {"pr_merged": True, "landed_on_integration": True}
+    parent_ctx.update(
+        stamp_changed_files_signal([prod_seam, declared_test], github_verified=True)
+    )
+    parent = Task(
+        project_id=project.id,
+        title="rollup parent",
+        payloads=[{"type": "research", "prompt": "rollup"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context=parent_ctx,
+    )
+    db_session.add(parent)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    # Already-landed rollup child: completed in this version's window, declares the
+    # named_test, but carries NO changed-file context (merged via the parent's PR).
+    child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        title="rollup child",
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "child",
+                "acceptance_evidence": {
+                    "kind": "named_test",
+                    "test_path": declared_test,
+                },
+            }
+        ],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        criterion_ids=[criterion.criterion_key],
+        completed_at=version.opened_at + timedelta(seconds=1),
+        context={"pr_merged": True, "landed_on_integration": True, "review_loop": {}},
+    )
+    db_session.add(child)
+    await db_session.commit()
+    await db_session.refresh(child)
+
+    # BEFORE: with no changed-file context the child fails closed as
+    # declared_unsatisfied (the declared test cannot be located in any diff).
+    assert record_code_acceptance_verdict(child) is not None
+    assert classify_merged_acceptance_context(child.context) == "declared_unsatisfied"
+    await db_session.commit()
+
+    summary_before = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary_before["uncovered"] == 1
+    assert summary_before["probed"] == 0
+
+    # Run the sweep. Reset the cadence timer so the first call always executes
+    # regardless of prior tests' runs; restore afterward for process isolation.
+    _prev_cadence = rsw._last_acceptance_healing_backfill_sweep
+    rsw._last_acceptance_healing_backfill_sweep = None
+    try:
+        total = await rsw.sweep_acceptance_verdict_healing_backfills(
+            db_session, now=_utcnow()
+        )
+    finally:
+        rsw._last_acceptance_healing_backfill_sweep = _prev_cadence
+    assert total >= 1, (
+        "the sweep must record acceptance-window criterion evidence for the "
+        "healed window"
+    )
+
+    # The child healed: verdict flipped off declared_unsatisfied to
+    # satisfied_unproven, and the acceptance window now scores verified > 0.
+    await db_session.refresh(child)
+    healed_ctx = child.context or {}
+    assert healed_ctx.get("_pr_changed_files") == [prod_seam, declared_test]
+    assert classify_merged_acceptance_context(healed_ctx) == "satisfied_unproven"
+    verdict = healed_ctx.get(CODE_ACCEPTANCE_VERDICT_KEY) or {}
+    assert verdict.get("satisfied") is True
+    assert verdict.get("proven") is False, (
+        "parent-derived credit must cap at satisfied/unproven, never machine-proven"
+    )
+
+    evidence = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert any(
+        e.source_kind == "acceptance_window_recompute" for e in evidence
+    ), "window minter must record probe evidence for the healed window"
+    summary_after = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary_after["probed"] == 1
+    assert summary_after["uncovered"] == 0
+
+    # A second sweep pass (past the cadence window) is a no-op: rollup stamping is
+    # setdefault-idempotent, the unverified-merge backfill finds nothing new, and
+    # the minter's durable evidence row suppresses a duplicate mint.
+    second_now = _utcnow() + timedelta(
+        seconds=rsw._ACCEPTANCE_HEALING_BACKFILL_INTERVAL_SECONDS + 1
+    )
+    rsw._last_acceptance_healing_backfill_sweep = None
+    try:
+        total_second = await rsw.sweep_acceptance_verdict_healing_backfills(
+            db_session, now=second_now
+        )
+    finally:
+        rsw._last_acceptance_healing_backfill_sweep = _prev_cadence
+    assert total_second == 0
+
+
+# ---------------------------------------------------------------------------
 # Evidence summary tier + provenance fields
 # ---------------------------------------------------------------------------
 
