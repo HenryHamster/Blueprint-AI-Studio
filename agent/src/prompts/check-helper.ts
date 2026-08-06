@@ -333,20 +333,44 @@ ${projectVerificationDirectories(cfg).length > 0 ? `rm -f /tmp/project_verificat
 BASE="${cfg.baseBranch}"
 BASE_DIFF_OK=0
 COMMITTED=""
-if git rev-parse --verify "origin/$BASE" >/dev/null 2>&1; then
-  if COMMITTED=$(git diff --name-only "origin/$BASE...HEAD" 2>/dev/null); then
-    BASE_DIFF_OK=1
-  else
-    echo "[check] ERROR: git diff against origin/$BASE failed (no merge base in a shallow clone?)" >&2
+# Try the candidate base refs in order; COMMITTED is set by the first ref whose
+# diff computes (possibly to the empty string = genuine no-op). Returns 0 when
+# the committed diff is known, 1 when it cannot be computed from any ref.
+_try_base_diff() {
+  local ref committed
+  for ref in "origin/$BASE" "$BASE"; do
+    if ! git rev-parse --verify "$ref" >/dev/null 2>&1; then
+      continue
+    fi
+    if ! committed=$(git diff --name-only "$ref...HEAD" 2>/dev/null); then
+      continue
+    fi
+    COMMITTED="$committed"
+    return 0
+  done
+  return 1
+}
+
+if ! _try_base_diff; then
+  # Base diff uncomputable. A truncated shallow clone is the common cause, so
+  # try to repair it before failing closed — but never swallow the failure and
+  # report a green run. The final fetch uses the EXPLICIT refspec so
+  # refs/remotes/origin/$BASE actually exists in a single-branch shallow clone
+  # (a plain \`git fetch origin $BASE\` would only update FETCH_HEAD there).
+  _repaired=0
+  if git remote get-url origin >/dev/null 2>&1; then
+    GIT_TERMINAL_PROMPT=0 git fetch --deepen=200 origin "$BASE" >/dev/null 2>&1 || true
+    GIT_TERMINAL_PROMPT=0 git fetch --unshallow origin >/dev/null 2>&1 || true
+    GIT_TERMINAL_PROMPT=0 git fetch origin "$BASE":refs/remotes/origin/$BASE >/dev/null 2>&1 || true
+    if _try_base_diff; then
+      _repaired=1
+    fi
   fi
-elif git rev-parse --verify "$BASE" >/dev/null 2>&1; then
-  if COMMITTED=$(git diff --name-only "$BASE...HEAD" 2>/dev/null); then
+  if [ "$_repaired" -eq 1 ]; then
     BASE_DIFF_OK=1
-  else
-    echo "[check] ERROR: git diff against $BASE failed (no merge base in a shallow clone?)" >&2
   fi
 else
-  echo "[check] ERROR: neither origin/$BASE nor $BASE exists locally — cannot compute the base diff" >&2
+  BASE_DIFF_OK=1
 fi
 UNCOMMITTED=$(git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null)
 CHANGED=$(printf '%s\\n%s\\n' "$COMMITTED" "$UNCOMMITTED" | sort -u | grep -v '^$' || true)

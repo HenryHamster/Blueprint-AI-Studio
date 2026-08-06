@@ -19,6 +19,7 @@ import pytest
 from sqlmodel import select
 
 from app import max_plan_pool
+from app.auth import create_agent_token
 from app.fleet_utilization import (
     FLEET_SIZING_TARGET_SLOTS,
     MEASURED_PER_WORKSPACE_DISK_BYTES,
@@ -1350,3 +1351,95 @@ async def test_read_latest_fleet_sizing_reading_none_before_any_record(db_sessio
     """Before any reading is recorded, the read-back path returns None."""
     latest = await read_latest_fleet_sizing_reading(db_session)
     assert latest is None
+
+
+@pytest.mark.asyncio
+async def test_recorded_fleet_sizing_readings_are_reachable_over_the_agent_surface(
+    client, db_session, monkeypatch
+):
+    """The three fleet-sizing readings are reachable over the agent fetch surface.
+
+    The agent task that must commit a fleet-sizing evidence artifact runs on a
+    VM with no production database, so the recorded readings have to be
+    readable through the agent-token surface rather than the operator-only
+    admin endpoints. This drives the full HTTP path:
+    ``GET /api/agent/projects/{project_id}/fleet-sizing`` resolves the task's
+    project (cross-project → 404), then serves the same three readings that
+    ``get_recorded_fleet_sizing_readings`` composes — concurrency from the
+    task-table overlap sweep, the runner-disk workspace footprint scaled to the
+    50-slot target, and the target-concurrency key search.
+    """
+    import app.vm_lifecycle as vm_lifecycle
+    import app.warm_pool as warm_pool
+
+    monkeypatch.setattr(max_plan_pool, "_all_accounts", lambda: [])
+    monkeypatch.setattr(
+        max_plan_pool, "_account_available_for_model", lambda acct, model: True
+    )
+    # Deterministic GCP-vm / warm-pool path: cached count + pool disabled, so the
+    # endpoint's snapshot never touches a live cloud API.
+    monkeypatch.setattr(vm_lifecycle, "_last_gcp_vm_count", 6)
+    monkeypatch.setattr(vm_lifecycle, "_last_gcp_vm_check", float("inf"))
+    monkeypatch.setattr(warm_pool, "is_warm_pool_enabled", lambda: False)
+
+    project = Project(name="Fleet Sizing Reachable", user_id="test-user-fleet-reach")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{}],
+        vm_instance_id="agent-vm-fleet-reach",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-fleet-reach")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/fleet-sizing",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "success"
+    data = body["data"]
+    assert set(data.keys()) == {
+        "workspace_footprint",
+        "concurrency",
+        "target_concurrency_key",
+    }
+
+    # Concurrency reading: the task-table sweep served through the endpoint.
+    conc = data["concurrency"]
+    assert conc["window_hours"] == 24
+    assert conc["slot_definition"]
+    assert "peak" in conc
+    assert "p50" in conc and "p90" in conc and "p99" in conc
+
+    # Workspace footprint: measured per-workspace figure scaled to the slot target.
+    fp = data["workspace_footprint"]
+    assert fp["per_workspace_bytes"] == MEASURED_PER_WORKSPACE_DISK_BYTES
+    assert fp["target_slots"] == FLEET_SIZING_TARGET_SLOTS
+    assert fp["required_bytes"] == (
+        MEASURED_PER_WORKSPACE_DISK_BYTES * FLEET_SIZING_TARGET_SLOTS
+    )
+    assert fp["source"]
+    assert fp["runner_count"] >= 0
+    assert fp["fits"] in (True, False)
+
+    # Target-concurrency key finding: a live search (absent by default).
+    tc = data["target_concurrency_key"]
+    assert tc["available"] is False
+
+    # A token for another project cannot read this project's readings (404).
+    other = Project(name="Other Project", user_id="test-user-fleet-reach")
+    db_session.add(other)
+    await db_session.commit()
+    await db_session.refresh(other)
+    res = await client.get(
+        f"/api/agent/projects/{other.id}/fleet-sizing",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 404

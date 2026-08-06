@@ -8,8 +8,10 @@ v28's headline goal promises a **median strategist cycle under $1.50**, down fro
 measured **$4.41/cycle**. Nothing in the repo computed that number — this artifact does.
 It derives the projected median from stated inputs, cites each input to its source,
 prices the two caching regimes separately, states every assumption, shows sensitivity,
-and reports the number honestly: **the projected median is above $1.50, and routine
-share R is unmeasured so the >=30%-below-baseline headline is UNVERIFIED.**
+and reports the number honestly: **the projected median is above $1.50, and the
+>=30%-below-baseline headline is UNVERIFIED unless the effort-tier split carries a
+measured share or a replayed fail-closed lower bound that itself clears the
+threshold.**
 
 The same script also projects **monthly spend** (§7, criterion c-3fd62b9d): the
 monthly TOTAL is the decision-loop term (per-cycle cost × a cited cycle-volume anchor)
@@ -31,7 +33,7 @@ envelope, so the envelope is not the binding constraint at today's cadence.
 | Stable prefix rendered | **42,073 bytes ≈ 10,518 tokens** | Measured statically: `buildStrategicStablePrefix` in `agent/src/prompts/thinker.ts` with representative params (`projectName='Blueprint AI Studio'`, `isSelfRepo=true`, 355-byte `selfImprovementBlock` from `agent/src/handlers/strategic.ts`, `PLAYBOOK_GUIDANCE`/`DEFAULT_TOOL_GUIDANCE`/`READ_ONLY_BASH_WRITE_NOTE` from `agent/src/prompt.ts`). |
 | Volatile instruction text | **2,666 bytes ≈ 666 tokens** | Same static render, every per-cycle payload field set to `''`, with the largest conditional instruction blocks active (recover `798 B` + gap-memory trim `687 B` + design-doc overview `626 B` + current-activity intro `383 B` + 591 B direct literal + structural headers — the 2,666 B figure is the exact stripped render, not the author's byte estimate). |
 | Volatile total (representative cycle) | **≈ 104 KB ≈ 26,000 tokens** | 2,666 B instruction + ~100 KB per-cycle payload (large `problem_model` JSON, direction portfolio, context blocks — see the payload pack in `backend/app/strategic_spawning.py`). |
-| Tier mix | Routine → `gpt-5.6-terra` (medium), Consequential → `gpt-5.6-sol` (max) | PR #16730 (`backend/app/strategic_review_effort.py`). **Routine share R is read from the measured effort-tier split** checked in at `backend/scripts/measured_effort_tier_split.json` (written by `strategic_effort_tier_evidence.py --write-json`). R is currently **UNMEASURED** (classifier inert until v28 promotes; no stamps could be read), so the projection reports the headline UNVERIFIED rather than substituting an assumed 0.70 — the fail-closed wiring that replaces the old constant. |
+| Tier mix | Routine → `gpt-5.6-terra` (medium), Consequential → `gpt-5.6-sol` (max) | PR #16730 (`backend/app/strategic_review_effort.py`). **Routine share R is read from the effort-tier split** checked in at `backend/scripts/measured_effort_tier_split.json` (written by `strategic_effort_tier_evidence.py --write-json`). The split is accepted in **three states**: **`measured`** (a realised split over stamped cycles), **`replayed`** (the fail-closed replayed **LOWER BOUND**, produced with `--replay`, labelled `measurement_status 'replayed'` / `bound_kind 'fail_closed_lower_bound'` — a lower bound on the classifier's share, never a realised split), and **`unmeasured`** (neither available). The headline reports UNVERIFIED rather than substituting an assumed 0.70 — the fail-closed wiring that replaces the old constant; a measured share is preferred over a replayed lower bound **only when its stamped basis (`measured_denominator_cycles`) covers the whole replayed basis (`denominator_cycles`)** — a stamped SUBSET is strictly narrower evidence than the bound, which already folds those stamps in, so the bound wins there rather than letting one stamped cycle flip the headline. Whichever view drives it, the reported denominator is that share's own basis, never the other view's. A replayed lower bound is never presented as measured. |
 | Pricing (per 1M tokens) | sol: in `$5` / out `$30` / read `$0.50`; terra: in `$2.5` / out `$15` / read `$0.25`; cache create = 1.25× input, cache read = 0.1× input | `backend/app/llm_cost_attribution.py:50-51,89-96`. |
 
 **Tokens are estimated from measured bytes at 4 bytes/token** (standard English-text
@@ -107,10 +109,11 @@ projected cost = $4.41 · (1 − 0.5R) · [ φ_in · m(ρ_after)/m(ρ_before) + 
 ```
 
 Base assumptions: `φ_in = 0.90`, `survival = 0`. Routine share `R` is **not assumed** —
-it is read from the measured split (`backend/scripts/measured_effort_tier_split.json`).
-R is currently UNMEASURED, so the headline is reported **UNVERIFIED**; the R = 0.70
-figure that previously anchored the "honest base" is now a sensitivity scenario, not an
-input.
+it is read from the effort-tier split (`backend/scripts/measured_effort_tier_split.json`):
+a **measured** realised share, or the **replayed fail-closed LOWER BOUND** (`--replay`).
+When neither is available R is UNMEASURED and the headline is reported **UNVERIFIED**;
+the R = 0.70 figure that previously anchored the "honest base" is now a sensitivity
+scenario, not an input.
 
 ### Scenario — tier mix at R = 0.70 (the old assumed base, for reference)
 
@@ -171,15 +174,37 @@ below 0.7. The direction's own health depends on R being high.
 
 ## 6. Verdict
 
-**Routine share R is UNMEASURED as of 2026-08-06, so the >=30%-below-baseline headline
-is UNVERIFIED.** The projection fails closed: no assumed routine share is substituted
-(the old R = 0.70 constant was the defect). The checked-in address
-`backend/scripts/measured_effort_tier_split.json` records the honest unmeasured state
-and the regeneration command; once a real split is measured and checked in, the script
-derives the headline from it. At the measured-R boundary, the tier-only cost is
-$3.09/cycle at R = 0.60 (exactly 30% below baseline) — the claim needs R ≥ 0.60. The
-full tier-only range across R = 0.3-0.9 is $2.43-$3.75, and the projected median stays
-above the $1.50 headline across the entire range (even R = 1.0 is $2.21/cycle tier-only).
+**The >=30%-below-baseline headline is UNVERIFIED unless the effort-tier split carries a
+measured share or a replayed fail-closed LOWER BOUND that itself clears the threshold.**
+The projection fails closed: no assumed routine share is substituted (the old R = 0.70
+constant was the defect). The checked-in address
+`backend/scripts/measured_effort_tier_split.json` records the honest state and the
+regeneration command.
+
+The **replayed lower bound** is an available, explicitly-labelled input and is how the
+measurement deadlock is broken: `--replay` re-runs the checked-in classifier
+(`strategic_review_effort.py`) on signals reconstructed from historical
+`StrategicCycle` rows, so it needs **only the historical rows plus the checked-in
+classifier code — no serving stamps** (stamps cannot exist until promotion, which the
+criterion that needs the measurement itself blocks). An unavailable signal a ROUTINE
+verdict needs (most load-bearing: `open_message_count`) resolves to CONSEQUENTIAL, so
+the replayed share is a strict **LOWER BOUND** on the classifier's full-signals share,
+never the realized split. When it drives the headline, the headline is reported **AT
+that bound**, labelled "at the fail-closed replayed lower bound (replayed split, NOT a
+measured realized split)", and `claim_verified` is True ONLY when the bound itself
+clears the >=30% threshold (R ≥ 0.60 tier-only). A bound below it is reported
+UNVERIFIED with the lower-bound caveat — never an over-claim. Regenerate it with (run
+with DB access):
+
+```
+python3 backend/scripts/strategic_effort_tier_evidence.py --replay --days 7 \
+  --write-json backend/scripts/measured_effort_tier_split.json
+```
+
+At the measured-R boundary, the tier-only cost is $3.09/cycle at R = 0.60 (exactly 30%
+below baseline) — the claim needs R ≥ 0.60. The full tier-only range across
+R = 0.3-0.9 is $2.43-$3.75, and the projected median stays above the $1.50 headline
+across the entire range (even R = 1.0 is $2.21/cycle tier-only).
 
 Reaching $1.50 requires **both** of these to hold simultaneously:
 
@@ -261,7 +286,8 @@ cycle volume at the measured basis, so the script asserts no combined binds-at f
 (rather than fabricating a scaling assumption). The envelope is therefore *not* the
 binding constraint at today's cadence. (The per-cycle number that feeds it is still
 above the $1.50 headline, and the >=30%-below-baseline claim is UNVERIFIED until a
-measured routine share is checked in.)
+measured share — or a replayed fail-closed lower bound that itself clears the
+threshold — is checked in.)
 
 If any input were unavailable (no cycle volume, or no per-task cost/volume), the script
 returns `available: False` with a reason naming the missing input instead of

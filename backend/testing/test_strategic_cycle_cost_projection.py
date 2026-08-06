@@ -37,6 +37,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import math
 from itertools import pairwise
 from pathlib import Path
 
@@ -71,6 +72,7 @@ def test_script_is_importable_and_exposes_the_model_functions():
         "project_monthly_spend_with_tasks",
         "load_measured_split",
         "routine_share_from_split",
+        "routine_share_source",
         "headline_routine_share",
         "headline_claim",
         "main",
@@ -224,6 +226,282 @@ def test_projection_headline_uses_measured_routine_share(tmp_path, monkeypatch):
     assert claim_unmeasured["below_baseline_pct"] is None
     assert claim_unmeasured["claim_verified"] is False
     assert "unmeasured" in claim_unmeasured["reason"].lower()
+
+
+# --- Replayed fail-closed lower bound (strategic_effort_tier_evidence --replay)
+# --- The replayed payload schema is produced by split_to_json_payload:
+# --- measurement_status 'replayed', bound_kind 'fail_closed_lower_bound',
+# --- top-level routine_share = the replayed LOWER BOUND, and the ``split``
+# --- sub-object preserved as the (possibly empty) measured view.
+
+def _replayed_payload(
+    routine_share,
+    denominator=40,
+    measured_routine=None,
+    bound_kind="fail_closed_lower_bound",
+    measured_denominator=None,
+):
+    """A replayed payload in the exact schema split_to_json_payload emits."""
+    return {
+        "schema_version": 1,
+        "measurement_status": "replayed",
+        "bound_kind": bound_kind,
+        "routine_share": routine_share,
+        "split": {
+            "routine": measured_routine,
+            "consequential": (
+                None if measured_routine is None else 1.0 - measured_routine
+            ),
+            "pinned": 0.0,
+            "other": 0.0,
+        },
+        "counts": (
+            {"routine": round(denominator * routine_share)}
+            if routine_share is not None and isinstance(routine_share, (int, float))
+            and math.isfinite(routine_share) and routine_share >= 0.0
+            else {}
+        ),
+        "denominator_cycles": denominator,
+        "measured_denominator_cycles": (
+            denominator if measured_denominator is None else measured_denominator
+        ),
+        "completed_missing_tier_count": 0,
+        "non_completed_with_tier_count": 0,
+        "rows_considered": denominator,
+        "window_days": 7,
+        "window_start": "2026-07-30T00:00:00+00:00",
+        "window_end": "2026-08-06T00:00:00+00:00",
+        "measured_at": "2026-08-06T00:00:00+00:00",
+        "provenance": "test fixture",
+        "signal_resolution": {"open_message_count": {"defaulted-fail-closed": denominator}},
+        "replay_sources": {"stamp": 0, "replay": denominator, "unresolved": 0},
+    }
+
+
+def test_replayed_split_drives_headline_at_labelled_lower_bound(tmp_path, monkeypatch):
+    """The REQUIRED named test: a replayed split is recognised and drives the
+    headline cost/below-baseline at that share, labelled a lower bound.
+
+    (a) the replayed routine_share feeds the headline cost and the
+        below-baseline percentage (wired to the split, not a constant);
+    (b) the headline carries the lower-bound label and never claims 'measured'.
+    """
+    mod = _load_module()
+    split_path = tmp_path / "measured_effort_tier_split.json"
+    monkeypatch.setattr(mod, "MEASURED_SPLIT_PATH", split_path)
+    split_path.write_text(json.dumps(_replayed_payload(0.85, denominator=40)))
+
+    claim = mod.headline_claim()
+    assert claim["available"] is True
+    assert claim["routine_share_status"] == "replayed"
+    assert claim["bound_kind"] == "fail_closed_lower_bound"
+    assert claim["routine_share"] == 0.85
+    expected_cost = mod.project_cycle_cost(0.85, mod.BASELINE_CACHE_READ_SHARE, 0.0)
+    assert claim["cost_per_cycle_usd"] == pytest.approx(expected_cost)
+    expected_below = (
+        mod.BASELINE_COST_PER_CYCLE_USD - expected_cost
+    ) / mod.BASELINE_COST_PER_CYCLE_USD
+    assert claim["below_baseline_pct"] == pytest.approx(expected_below)
+    assert claim["claim_verified"] is True
+    # (b) labelled a lower bound; the status never claims 'measured'.
+    assert "fail-closed replayed lower bound" in claim["reason"]
+    assert "NOT a measured realized split" in claim["reason"]
+    assert claim["routine_share_status"] != "measured"
+
+
+def test_replayed_lower_bound_below_threshold_reports_unverified(tmp_path, monkeypatch):
+    """A replayed lower bound below ~0.60 does not clear the >=30% threshold:
+    claim_verified=False with the lower-bound caveat, never an over-claim."""
+    mod = _load_module()
+    split_path = tmp_path / "measured_effort_tier_split.json"
+    monkeypatch.setattr(mod, "MEASURED_SPLIT_PATH", split_path)
+    split_path.write_text(json.dumps(_replayed_payload(0.50, denominator=40)))
+
+    claim = mod.headline_claim()
+    assert claim["available"] is True
+    assert claim["routine_share"] == 0.50
+    assert claim["claim_verified"] is False
+    assert claim["routine_share_status"] == "replayed"
+    # lower-bound caveat, not a flat falsification of a measured share.
+    assert "NOT a measured realized split" in claim["reason"]
+    assert "does NOT clear" in claim["reason"]
+    assert "measured realized share could still clear it" in claim["reason"]
+
+
+def test_unmeasured_split_still_fails_closed_exactly_as_today(tmp_path, monkeypatch):
+    """No measured share and no replayed lower bound -> the original fail-closed
+    behavior is unchanged: UNVERIFIED, no assumed share, unmeasured reason."""
+    mod = _load_module()
+    split_path = tmp_path / "measured_effort_tier_split.json"
+    monkeypatch.setattr(mod, "MEASURED_SPLIT_PATH", split_path)
+    split_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "measurement_status": "unmeasured",
+                "routine_share": None,
+                "split": {
+                    "routine": None,
+                    "consequential": None,
+                    "pinned": None,
+                    "other": None,
+                },
+                "counts": {},
+                "denominator_cycles": 0,
+                "completed_missing_tier_count": 0,
+                "non_completed_with_tier_count": 0,
+                "rows_considered": 0,
+                "window_days": 7,
+                "window_start": None,
+                "window_end": None,
+                "measured_at": "2026-08-06T00:00:00+00:00",
+                "provenance": "test fixture",
+            }
+        )
+    )
+
+    claim = mod.headline_claim()
+    assert claim["available"] is False
+    assert claim["claim_verified"] is False
+    assert claim["routine_share"] is None
+    assert claim["cost_per_cycle_usd"] is None
+    assert claim["below_baseline_pct"] is None
+    assert claim["routine_share_status"] == "unmeasured"
+    assert "unmeasured" in claim["reason"].lower()
+    # The replayed lower bound is explicitly offered as the unmeasured escape.
+    assert "--replay" in claim["reason"]
+
+
+def test_measured_view_takes_precedence_over_replayed_lower_bound(tmp_path, monkeypatch):
+    """When a replayed payload preserves a realised measured view (split.routine)
+    over the WHOLE replayed basis, that measured share drives the headline —
+    never the lower bound — and the reported denominator is the measured one."""
+    mod = _load_module()
+    split_path = tmp_path / "measured_effort_tier_split.json"
+    monkeypatch.setattr(mod, "MEASURED_SPLIT_PATH", split_path)
+    # replayed lower bound 0.50, but the preserved measured view says 0.85 and
+    # it covers all 40 cycles the replay ran over (every cycle was stamped).
+    split_path.write_text(
+        json.dumps(
+            _replayed_payload(
+                0.50, denominator=40, measured_routine=0.85, measured_denominator=40
+            )
+        )
+    )
+
+    claim = mod.headline_claim()
+    assert claim["available"] is True
+    assert claim["routine_share"] == 0.85
+    assert claim["routine_share_status"] == "measured"
+    assert claim["bound_kind"] is None
+    assert claim["reason"] is None
+    assert claim["claim_verified"] is True
+    assert claim["denominator_cycles"] == 40
+
+
+def test_stamped_subset_never_preempts_the_wider_replayed_bound(tmp_path, monkeypatch):
+    """A stamped SUBSET of the replayed basis must not drive the headline.
+
+    The over-claim this guards: 3 completed cycles, 1 stamped routine. The
+    stamp-only view is routine=1.0 over 1 cycle; the fail-closed replayed bound
+    is 0.3333 over 3. Preferring the 1.0 flips the headline to VERIFIED on a
+    single cycle while printing a 3-cycle denominator. The replay already folds
+    that stamp in, so the wider bound must win — and whatever share is reported,
+    the denominator must be that share's own basis.
+    """
+    mod = _load_module()
+    split_path = tmp_path / "measured_effort_tier_split.json"
+    monkeypatch.setattr(mod, "MEASURED_SPLIT_PATH", split_path)
+    split_path.write_text(
+        json.dumps(
+            _replayed_payload(
+                0.333333,
+                denominator=3,
+                measured_routine=1.0,
+                measured_denominator=1,
+            )
+        )
+    )
+
+    claim = mod.headline_claim()
+    assert claim["routine_share"] == pytest.approx(0.333333)
+    assert claim["routine_share_status"] == "replayed"
+    assert claim["bound_kind"] == "fail_closed_lower_bound"
+    assert claim["denominator_cycles"] == 3
+    # The single-cycle 1.0 would have cleared the threshold; the honest 3-cycle
+    # lower bound does not, and is reported UNVERIFIED rather than over-claimed.
+    assert claim["claim_verified"] is False
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        mod.main()
+    out = buf.getvalue()
+    assert "Measured routine share R = 1.0000" not in out
+    assert "(3 completed cycles)" in out
+    # No line pairs the 1.0 numerator with the 3-cycle denominator.
+    assert "1.0000 (realised split, 3 completed tiered cycles)" not in out
+
+
+def test_measured_denominator_is_reported_for_a_stamp_only_split(tmp_path, monkeypatch):
+    """A plain measured split reports its own denominator on the claim."""
+    mod = _load_module()
+    split_path = tmp_path / "measured_effort_tier_split.json"
+    monkeypatch.setattr(mod, "MEASURED_SPLIT_PATH", split_path)
+    split_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "measurement_status": "measured",
+                "routine_share": 0.9,
+                "split": {"routine": 0.9, "consequential": 0.1},
+                "counts": {"routine": 18, "consequential": 2},
+                "denominator_cycles": 20,
+                "measured_denominator_cycles": 20,
+            }
+        )
+    )
+
+    claim = mod.headline_claim()
+    assert claim["routine_share_status"] == "measured"
+    assert claim["denominator_cycles"] == 20
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        mod.main()
+    assert "0.9000 (realised split, 20 completed tiered cycles)" in buf.getvalue()
+
+
+def test_cli_sections_name_the_replayed_lower_bound(tmp_path, monkeypatch):
+    """The [0] and [6] CLI sections print which status drove the headline and
+    the lower-bound caveat for a replayed split."""
+    mod = _load_module()
+    split_path = tmp_path / "measured_effort_tier_split.json"
+    monkeypatch.setattr(mod, "MEASURED_SPLIT_PATH", split_path)
+    split_path.write_text(json.dumps(_replayed_payload(0.50, denominator=40)))
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        mod.main()
+    out = buf.getvalue()
+    assert "fail-closed LOWER BOUND" in out
+    assert "NOT a measured realized split" in out
+    assert "Replayed R" in out
+    assert "does NOT clear the >=30%-below-baseline threshold" in out
+
+
+def test_routine_share_from_split_rejects_invalid_replayed_bounds():
+    """A replayed share that is NaN, negative, non-finite, over zero denominator,
+    or missing the fail-closed bound_kind is not a valid lower bound:
+    routine_share_from_split fails closed to None."""
+    mod = _load_module()
+    for share in (float("nan"), float("inf"), -0.5):
+        payload = _replayed_payload(share, denominator=40)
+        assert mod.routine_share_from_split(payload) is None, share
+    # zero denominator -> not a bound (no completed cycles).
+    payload = _replayed_payload(0.0, denominator=0)
+    assert mod.routine_share_from_split(payload) is None
+    # missing the fail-closed bound_kind contract.
+    payload = _replayed_payload(0.85, denominator=40, bound_kind="something_else")
+    assert mod.routine_share_from_split(payload) is None
 
 
 # --- Monthly spend (criterion c-3fd62b9d) --------------------------------

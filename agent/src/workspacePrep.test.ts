@@ -731,6 +731,64 @@ describe('prepareWorkspaceForRole', () => {
     expect(fetchCalls).toContain('-C /ws fetch origin automain:refs/remotes/origin/automain');
   });
 
+  it('warm path: self-repo baseBranch===branch===automain still fetches automain (presentRefs skip must verify the tracking ref resolves)', async () => {
+    process.env.BLUEPRINT_WARM_HANDOFF = '1';
+    fsMocks.existsSync.mockReturnValue(true);
+    // The wedge this regression covers: a warm workspace running ON the
+    // integration branch itself (branch === baseBranch === automain, e.g. the
+    // strategic handler). The base fetch is skipped (baseBranch === branch), the
+    // warm branch fetch (`git fetch origin automain`) only updates FETCH_HEAD in
+    // a single-branch shallow clone, and presentRefs=['automain','automain']
+    // would otherwise claim the ref present while refs/remotes/origin/automain
+    // is genuinely missing — wedging the fail-closed ./check that this very
+    // fetch could have repaired. So the presentRefs skip must verify the
+    // tracking ref actually resolves before honoring the claim.
+    execFileSyncMock.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === 'git' && args.includes('rev-parse')) {
+        // refs/remotes/origin/automain does NOT resolve on this warm workspace.
+        throw new Error('fatal: Needed a single revision');
+      }
+      return '';
+    });
+
+    await prepareWorkspaceForRole({
+      workspace: '/ws',
+      repoUrl: 'https://x-access-token:tok@github.com/HenryHamster/BlueprintAIStudio.git',
+      githubToken: 'tok',
+      branch: 'automain',
+      baseBranch: 'automain',
+    });
+
+    const fetchCalls = execFileSyncMock.mock.calls
+      .filter(c => c[0] === 'git' && (c[1] as string[]).includes('fetch'))
+      .map(c => (c[1] as string[]).join(' '));
+    // Base fetch is skipped here, so the self-repo integration fetch is the only
+    // way origin/automain can exist — and it must NOT be skipped by the
+    // presentRefs claim when the tracking ref is absent.
+    expect(fetchCalls).toContain('-C /ws fetch origin automain:refs/remotes/origin/automain');
+  });
+
+  it('warm path: self-repo presentRefs skip is honored when the tracking ref already resolves', async () => {
+    process.env.BLUEPRINT_WARM_HANDOFF = '1';
+    fsMocks.existsSync.mockReturnValue(true);
+
+    await prepareWorkspaceForRole({
+      workspace: '/ws',
+      repoUrl: 'https://x-access-token:tok@github.com/HenryHamster/BlueprintAIStudio.git',
+      githubToken: 'tok',
+      branch: 'automain',
+      baseBranch: 'automain',
+    });
+
+    const fetchCalls = execFileSyncMock.mock.calls
+      .filter(c => c[0] === 'git' && (c[1] as string[]).includes('fetch'))
+      .map(c => (c[1] as string[]).join(' '));
+    // The default mock makes `rev-parse --verify refs/remotes/origin/automain`
+    // succeed, so presentRefs=['automain','automain'] is a true claim — only the
+    // single branch fetch runs, no redundant automain refspec fetch.
+    expect(fetchCalls.some(a => a.includes('fetch origin automain:refs/remotes/origin/automain'))).toBe(false);
+  });
+
   it('warm path: checkout fallback via -B when direct checkout fails', async () => {
     process.env.BLUEPRINT_WARM_HANDOFF = '1';
     fsMocks.existsSync.mockReturnValue(true);

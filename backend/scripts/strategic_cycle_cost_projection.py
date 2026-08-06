@@ -51,13 +51,20 @@ Inputs and sources (each cited):
     strategic_spawning.py).
   * Tier mix                       PR #16730: ROUTINE cycles classify to
     effort 'medium' (openai gpt-5.6-terra), CONSEQUENTIAL stay 'max'
-    (gpt-5.6-sol). Routine share R is read from the MEASURED effort-tier split
-    checked in alongside this script (measured_effort_tier_split.json, written
-    by strategic_effort_tier_evidence.py --write-json). R is currently
-    UNMEASURED, so the headline is reported UNVERIFIED rather than at an
-    assumed 0.70 (the previous constant was the defect). Fail-closed
-    classifier (backend/app/strategic_review_effort.py) means dirty/recovering
-    periods push R down.
+    (gpt-5.6-sol). Routine share R is read from the effort-tier split checked
+    in alongside this script (measured_effort_tier_split.json, written by
+    strategic_effort_tier_evidence.py --write-json). The split is accepted in
+    THREE states: 'measured' (a realised split over stamped cycles), 'replayed'
+    (the fail-closed replayed LOWER BOUND, produced with --replay -- a lower
+    bound on the classifier's share, never a realised split; it needs only the
+    historical StrategicCycle rows plus the checked-in classifier code, so it
+    breaks the promotion deadlock that waiting for serving stamps could never
+    clear), and 'unmeasured' (neither available -- headline UNVERIFIED, no
+    assumed 0.70; the previous constant was the defect). A measured share is
+    always preferred over a replayed lower bound; a replayed lower bound is
+    explicitly labelled as a lower bound and never presented as measured.
+    Fail-closed classifier (backend/app/strategic_review_effort.py) means
+    dirty/recovering periods push R down.
   * Pricing (per 1M tokens)       backend/app/llm_cost_attribution.py:
       gpt-5.6-sol:   input $5,  output $30, cache read $0.50, cache create $6.25
       gpt-5.6-terra: input $2.5, output $15, cache read $0.25, cache create $3.125
@@ -131,15 +138,19 @@ INPUT_COST_SHARE_BASE = 0.90          # input(+create+read) share of the $4.41
 CROSS_CYCLE_SURVIVAL_BASE = 0.0       # P(cache survives the inter-cycle gap)
 
 # Sensitivity points for the routine share -- scenario inputs, NOT the headline.
-# The headline routine share is read from the measured effort-tier split
+# The headline routine share is read from the effort-tier split
 # (measured_effort_tier_split.json), never assumed: the original defect was a
 # hardcoded 0.70 constant driving the '34.9% below baseline' headline on an
-# UNOBSERVED value. Keeping the table makes the next defect visible the same way.
+# UNOBSERVED value. The split may carry a measured realised share OR a
+# fail-closed replayed LOWER BOUND (measurement_status 'replayed' /
+# bound_kind 'fail_closed_lower_bound'); both drive the headline at their own
+# labelled value, and neither is an assumed constant. Keeping the table makes
+# the next defect visible the same way.
 SENSITIVITY_ROUTINE_SHARES = (0.30, 0.50, 0.70, 0.85, 0.90, 1.00)
 
-# Durable address of the measured routine share R: the checked-in split written
-# by strategic_effort_tier_evidence.py --write-json. The headline derives from
-# this file and fails closed when R is unmeasured.
+# Durable address of the routine share R: the checked-in split written by
+# strategic_effort_tier_evidence.py --write-json. The headline derives from
+# this file and fails closed when R is neither measured nor replayed.
 MEASURED_SPLIT_PATH = Path(__file__).resolve().parent / "measured_effort_tier_split.json"
 
 # ---------------------------------------------------------------------------
@@ -245,7 +256,7 @@ def project_cycle_cost(
 
 
 def load_measured_split() -> dict[str, Any]:
-    """Load the checked-in measured effort-tier split (the durable address of R).
+    """Load the checked-in effort-tier split (the durable address of R).
 
     Returns {} when the file is absent or unreadable — the fail-closed path
     treats that exactly like an unmeasured split.
@@ -258,38 +269,164 @@ def load_measured_split() -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def routine_share_from_split(split: Mapping[str, Any]) -> float | None:
-    """The measured routine share R, or None when R is unmeasured (fail-closed).
-
-    A split is measured only when ``measurement_status == 'measured'`` AND its
-    ``routine_share`` is a finite, non-negative number. Anything else — an
-    unmeasured status, a missing/malformed file, a null or non-finite share —
-    returns None, so the headline never falls back to an assumed value.
-    """
-    if split.get("measurement_status") != "measured":
-        return None
-    value = split.get("routine_share")
+def _finite_share(value: Any) -> float | None:
+    """A finite, non-negative routine share, or None when the value is invalid."""
     if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0.0:
         return None
     return float(value)
 
 
+def routine_share_source(split: Mapping[str, Any]) -> dict[str, Any]:
+    """The routine share that drives the headline, plus how it was obtained.
+
+    Returns ``{"routine_share": float | None, "status": str, "bound_kind":
+    str | None, "denominator_cycles": int | None}`` where
+    ``denominator_cycles`` is ALWAYS the basis the returned share is a
+    proportion of (never the other view's denominator), and ``status`` is one
+    of:
+
+      * ``'measured'``  — a REALISED measured share: either a split with
+        ``measurement_status == 'measured'`` and a finite non-negative
+        ``routine_share``, or a REPLAYED payload that preserves a finite
+        realised share in its ``split['routine']`` view (the measured view the
+        replay payload keeps alongside the lower bound). The replayed payload's
+        measured view may preempt the lower bound ONLY when it covers the whole
+        replayed basis (``measured_denominator_cycles >= denominator_cycles``).
+        A stamped subset — e.g. 1 stamped cycle inside a 3-cycle replay — is a
+        strictly narrower basis than the fail-closed bound, which already folds
+        those stamps in, so preferring it would over-claim the headline on the
+        smaller sample; in that case the replayed bound drives instead.
+      * ``'replayed'``  — the fail-closed replayed LOWER BOUND: a replayed
+        split (``measurement_status == 'replayed'``,
+        ``bound_kind == 'fail_closed_lower_bound'``) whose top-level
+        ``routine_share`` is a finite, non-negative number over a positive
+        ``denominator_cycles``. This is a LOWER BOUND on the classifier's share,
+        never a realised split.
+      * ``'unmeasured'`` — everything else: no measured share and no valid
+        replayed bound. ``routine_share`` is None so the headline fails closed
+        (no assumed share).
+    """
+    measured_view = split.get("split")
+    measured_view = measured_view if isinstance(measured_view, Mapping) else {}
+
+    def _count(value: Any) -> int | None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        if not math.isfinite(float(value)) or value < 0:
+            return None
+        return int(value)
+
+    replay_denominator = _count(split.get("denominator_cycles"))
+
+    if split.get("measurement_status") == "measured":
+        value = _finite_share(split.get("routine_share"))
+        if value is not None:
+            return {
+                "routine_share": value,
+                "status": "measured",
+                "bound_kind": None,
+                "denominator_cycles": (
+                    _count(split.get("measured_denominator_cycles"))
+                    if split.get("measured_denominator_cycles") is not None
+                    else replay_denominator
+                ),
+            }
+
+    # A replayed payload keeps the realised measured view in ``split['routine']``
+    # over ``measured_denominator_cycles`` stamped cycles. It preempts the lower
+    # bound only when that stamped basis is not NARROWER than the replayed one:
+    # the replay already folds every stamp in, so a stamped subset is strictly
+    # less evidence, and quoting its share against the replay denominator is the
+    # over-claim this branch exists to prevent.
+    if split.get("measurement_status") == "replayed":
+        value = _finite_share(measured_view.get("routine"))
+        measured_denominator = _count(split.get("measured_denominator_cycles"))
+        covers_replay = (
+            measured_denominator is not None
+            and measured_denominator > 0
+            and (replay_denominator is None or measured_denominator >= replay_denominator)
+        )
+        if value is not None and covers_replay:
+            return {
+                "routine_share": value,
+                "status": "measured",
+                "bound_kind": None,
+                "denominator_cycles": measured_denominator,
+            }
+
+    # The fail-closed replayed LOWER BOUND (only when no measured view exists,
+    # or the measured view covers a strictly narrower basis than the replay).
+    if (
+        split.get("measurement_status") == "replayed"
+        and split.get("bound_kind") == "fail_closed_lower_bound"
+        and replay_denominator is not None
+        and replay_denominator > 0
+    ):
+        value = _finite_share(split.get("routine_share"))
+        if value is not None:
+            return {
+                "routine_share": value,
+                "status": "replayed",
+                "bound_kind": "fail_closed_lower_bound",
+                "denominator_cycles": replay_denominator,
+            }
+
+    return {
+        "routine_share": None,
+        "status": "unmeasured",
+        "bound_kind": None,
+        "denominator_cycles": None,
+    }
+
+
+def routine_share_from_split(split: Mapping[str, Any]) -> float | None:
+    """The routine share R that drives the headline, or None when unavailable.
+
+    Delegates to :func:`routine_share_source`: a measured share (realised split
+    or the measured view preserved inside a replayed payload), else the
+    fail-closed replayed lower bound. Returns None when neither exists, so the
+    headline never falls back to an assumed value.
+    """
+    return routine_share_source(split)["routine_share"]
+
+
 def headline_routine_share() -> float | None:
-    """R used for the headline claim: the measured split's routine share, or
-    None when R is unmeasured (the fail-closed case)."""
-    return routine_share_from_split(load_measured_split())
+    """R used for the headline claim: the measured or replayed split's routine
+    share, or None when neither is available (the fail-closed case)."""
+    return routine_share_source(load_measured_split())["routine_share"]
+
+
+# The exact label the headline must carry when the driving share is the
+# fail-closed replayed LOWER BOUND (a replayed split is never presented as
+# measured).
+REPLAYED_LOWER_BOUND_LABEL = (
+    "at the fail-closed replayed lower bound "
+    "(replayed split, NOT a measured realized split)"
+)
 
 
 def headline_claim() -> dict[str, object]:
-    """The >=30%-below-baseline headline, derived from the measured split.
+    """The >=30%-below-baseline headline, derived from the split on disk.
 
-    ``available=False`` (claim UNVERIFIED) when R is unmeasured: the projection
-    substitutes no assumed share — the original defect. When measured, the
-    claim is computed at the measured R with the honest-case cache settings
-    (baseline cache-read share, zero cross-cycle survival) — the same base the
-    claim has always used, so the restatement is apples-to-apples.
+    ``available=False`` (claim UNVERIFIED) when R is neither measured nor
+    replayed: the projection substitutes no assumed share — the original
+    defect. When the driving share is the fail-closed replayed LOWER BOUND, the
+    headline is reported AT that bound and explicitly labelled as a lower bound
+    — ``claim_verified`` is True ONLY when the lower bound itself clears the
+    >=30%-below-baseline threshold; a bound below it is reported UNVERIFIED,
+    never over-claimed. A measured share always takes precedence over a
+    replayed lower bound, but only when the measured basis is not narrower
+    than the replayed one (see :func:`routine_share_source`).
+    ``denominator_cycles`` is the basis the reported share is a proportion of,
+    so a caller never pairs one view's numerator with the other's denominator.
+    The claim is computed with the honest-case cache
+    settings (baseline cache-read share, zero cross-cycle survival) — the same
+    base the claim has always used, so the restatement is apples-to-apples.
     """
-    r = headline_routine_share()
+    source = routine_share_source(load_measured_split())
+    r = source["routine_share"]
+    status = source["status"]
+    bound_kind = source["bound_kind"]
     if r is None:
         return {
             "available": False,
@@ -298,17 +435,36 @@ def headline_claim() -> dict[str, object]:
             "below_baseline_pct": None,
             "cost_per_cycle_usd": None,
             "threshold_pct": 0.30,
+            "routine_share_status": "unmeasured",
+            "bound_kind": None,
+            "denominator_cycles": None,
             "reason": (
-                "routine share R is unmeasured: no completed strategic cycle "
-                "with a stamped effort_tier is recorded in the measured split "
+                "routine share R is unmeasured: no measured share and no valid "
+                "fail-closed replayed lower bound are recorded in the split "
                 f"({MEASURED_SPLIT_PATH.name}). The >=30%-below-baseline "
                 "headline is UNVERIFIED — no assumed routine share is "
                 "substituted. Regenerate the split with "
-                "backend/scripts/strategic_effort_tier_evidence.py --write-json."
+                "backend/scripts/strategic_effort_tier_evidence.py --write-json "
+                "(measured — needs serving stamps) or add --replay for the "
+                "fail-closed lower bound (needs only historical StrategicCycle "
+                "rows plus the checked-in classifier code)."
             ),
         }
     cost = project_cycle_cost(r, BASELINE_CACHE_READ_SHARE, CROSS_CYCLE_SURVIVAL_BASE)
     below = (BASELINE_COST_PER_CYCLE_USD - cost) / BASELINE_COST_PER_CYCLE_USD
+    if status == "replayed":
+        if below >= 0.30:
+            reason = REPLAYED_LOWER_BOUND_LABEL
+        else:
+            reason = (
+                REPLAYED_LOWER_BOUND_LABEL
+                + f": the replayed lower bound R={r:.4f} itself does NOT clear "
+                "the >=30%-below-baseline threshold, so the claim is UNVERIFIED "
+                "at the lower bound — a measured realized share could still "
+                "clear it, but the fail-closed lower bound cannot."
+            )
+    else:
+        reason = None
     return {
         "available": True,
         "claim_verified": below >= 0.30,
@@ -316,7 +472,10 @@ def headline_claim() -> dict[str, object]:
         "below_baseline_pct": below,
         "cost_per_cycle_usd": cost,
         "threshold_pct": 0.30,
-        "reason": None,
+        "routine_share_status": status,
+        "bound_kind": bound_kind,
+        "denominator_cycles": source["denominator_cycles"],
+        "reason": reason,
     }
 
 
@@ -523,27 +682,51 @@ def main() -> None:
     print("=" * 78)
 
     split = load_measured_split()
-    r = routine_share_from_split(split)
+    source = routine_share_source(split)
+    r = source["routine_share"]
+    # ALWAYS the basis of the share actually being printed — never the other
+    # view's denominator (a replayed payload's measured view is a stamped
+    # SUBSET of the replay denominator).
+    basis = source["denominator_cycles"] or 0
 
     print("\n[0] HEADLINE claim (>=30% below the $4.41 baseline)\n")
     claim = headline_claim()
     if claim["available"]:
-        print(f"  Measured routine share R = {claim['routine_share']:.4f} "
-              f"({split.get('denominator_cycles', 0)} completed tiered cycles)")
-        print(f"  Projected cost at measured R : ${claim['cost_per_cycle_usd']:.2f}/cycle")
+        if claim["routine_share_status"] == "replayed":
+            print(f"  Replayed routine share R (fail-closed LOWER BOUND) = "
+                  f"{claim['routine_share']:.4f} "
+                  f"({basis} completed cycles)")
+            print("  Headline is AT the fail-closed replayed lower bound (replayed")
+            print("  split, NOT a measured realized split).")
+        else:
+            print(f"  Measured routine share R = {claim['routine_share']:.4f} "
+                  f"({basis} completed tiered cycles)")
+        print(f"  Projected cost at the driving R : ${claim['cost_per_cycle_usd']:.2f}/cycle")
         print(f"  Below $4.41 baseline         : {claim['below_baseline_pct']:.1%} "
               f"(threshold {claim['threshold_pct']:.0%})")
         if claim["claim_verified"]:
-            print("  HEADLINE CLAIM HOLDS at the measured R.")
+            if claim["routine_share_status"] == "replayed":
+                print("  HEADLINE CLAIM HOLDS at the replayed lower bound.")
+            else:
+                print("  HEADLINE CLAIM HOLDS at the measured R.")
         else:
-            print("  HEADLINE CLAIM FALSIFIED at the measured R — reported honestly.")
+            if claim["routine_share_status"] == "replayed":
+                print("  HEADLINE CLAIM NOT VERIFIED at the replayed lower bound — "
+                      "reported honestly.")
+            else:
+                print("  HEADLINE CLAIM FALSIFIED at the measured R — reported honestly.")
+        if claim["reason"]:
+            for line in textwrap.wrap(str(claim["reason"]), width=96):
+                print(f"      {line}")
     else:
-        print(f"  Routine share R is UNMEASURED (measured split: "
+        print(f"  Routine share R is UNMEASURED (split: "
               f"{MEASURED_SPLIT_PATH.name}).")
         print("  The >=30%-below-baseline headline is UNVERIFIED — no assumed")
-        print("  routine share is substituted. Regenerate the measured split with:")
+        print("  routine share is substituted. Regenerate the split with:")
         print("    python3 backend/scripts/strategic_effort_tier_evidence.py \\")
         print("      --days 7 --write-json backend/scripts/measured_effort_tier_split.json")
+        print("    (measured — needs serving stamps) or add --replay for the")
+        print("    fail-closed lower bound (needs only historical rows)")
 
     print("\n[1] Measured / stated inputs (each cited to its source)\n")
     rows = [
@@ -555,9 +738,16 @@ def main() -> None:
         ("Volatile total (rep. payload)", f"{VOLATILE_PAYLOAD_BYTES_REP:,} B ~ {VOLATILE_PAYLOAD_BYTES_REP/4:,.0f} tokens"),
         ("Routine tier / price ratio", "gpt-5.6-terra (medium) vs gpt-5.6-sol (max) = 0.5x every rate (PR #16730, llm_cost_attribution.py)"),
         ("Cache read rate", "0.1 x input rate; cache create 1.25 x input rate (llm_cost_attribution.py)"),
-        ("Routine share R (measured split)",
-         "UNMEASURED — no completed stamped cycles; headline UNVERIFIED" if r is None
-         else f"{r:.4f} (realised split, {split.get('denominator_cycles', 0)} completed tiered cycles)"),
+        ("Routine share R (effort-tier split)",
+         "UNMEASURED — no measured share and no replayed lower bound; "
+         "headline UNVERIFIED" if r is None
+         else (
+             f"{r:.4f} (replayed fail-closed LOWER BOUND, "
+             f"{basis} completed cycles — NOT a "
+             "measured realized split)"
+             if source["status"] == "replayed"
+             else f"{r:.4f} (realised split, {basis} completed tiered cycles)"
+         )),
     ]
     for k, v in rows:
         print(f"  {k:<42} {v}")
@@ -594,12 +784,15 @@ def main() -> None:
         print("  The headline is reported UNVERIFIED (see [0]); the sensitivity")
         print("  table below shows the tier-only range across scenario inputs.")
     else:
-        print(f"  Routine share R (measured): {r:.4f}")
+        if source["status"] == "replayed":
+            print(f"  Routine share R (replayed fail-closed LOWER BOUND): {r:.4f}")
+        else:
+            print(f"  Routine share R (measured): {r:.4f}")
         # Honest case: the reorder does not move the intra-cycle share, and
         # cross-cycle survival is 0, so cache read share stays at baseline 0.55.
         honest = project_cycle_cost(r, BASELINE_CACHE_READ_SHARE,
                                     CROSS_CYCLE_SURVIVAL_BASE)
-        print(f"  Honest case at measured R (share stays {BASELINE_CACHE_READ_SHARE:.2f}): "
+        print(f"  Honest case at the driving R (share stays {BASELINE_CACHE_READ_SHARE:.2f}): "
               f"${honest:.2f}/cycle")
     # Direction-target case: cache read share genuinely rises to 0.80.
     for sr in (0.70, 0.85, 0.90):
@@ -607,8 +800,9 @@ def main() -> None:
         print(f"  Direction-target (share=0.80, R={sr:.2f}): ${c:.2f}/cycle")
 
     print("\n[5] Sensitivity (scenario inputs — NOT the headline)\n")
-    print("  The headline derives from the MEASURED split ([0]); this table is")
-    print("  the range the claim must survive, kept so the next defect stays visible.")
+    print("  The headline derives from the effort-tier split ([0]) — the measured")
+    print("  share or the replayed fail-closed lower bound; this table is the range")
+    print("  the claim must survive, kept so the next defect stays visible.")
     print(f"  {'routine share':>14} {'tier-only cost':>16} {'+ share 0.80':>14}")
     for sr in SENSITIVITY_ROUTINE_SHARES:
         tier_only = project_cycle_cost(sr, BASELINE_CACHE_READ_SHARE, 0.0)
@@ -625,14 +819,28 @@ def main() -> None:
     print("\n[6] Verdict\n")
     claim = headline_claim()
     if claim["available"]:
-        print(f"  Measured R = {claim['routine_share']:.4f}: "
-              f"${claim['cost_per_cycle_usd']:.2f}/cycle = "
-              f"{claim['below_baseline_pct']:.1%} below the $4.41 baseline.")
-        if claim["claim_verified"]:
-            print("  The >=30%-below-baseline headline HOLDS at the measured R.")
+        if claim["routine_share_status"] == "replayed":
+            print(f"  Replayed R (fail-closed LOWER BOUND) = {claim['routine_share']:.4f}: "
+                  f"${claim['cost_per_cycle_usd']:.2f}/cycle = "
+                  f"{claim['below_baseline_pct']:.1%} below the $4.41 baseline.")
+            print("  The headline is AT the fail-closed replayed lower bound (replayed")
+            print("  split, NOT a measured realized split).")
+            if claim["claim_verified"]:
+                print("  The >=30%-below-baseline headline HOLDS at the replayed lower bound.")
+            else:
+                print("  The >=30%-below-baseline headline is NOT verified at the replayed")
+                print("  lower bound: the lower bound itself does not clear the threshold.")
+                print("  A measured realized share could still clear it; the fail-closed")
+                print("  lower bound cannot. Reporting that is the honest result.")
         else:
-            print("  The >=30%-below-baseline headline is FALSIFIED at the measured R.")
-            print("  Reporting that falsification is the honest result, not a failure.")
+            print(f"  Measured R = {claim['routine_share']:.4f}: "
+                  f"${claim['cost_per_cycle_usd']:.2f}/cycle = "
+                  f"{claim['below_baseline_pct']:.1%} below the $4.41 baseline.")
+            if claim["claim_verified"]:
+                print("  The >=30%-below-baseline headline HOLDS at the measured R.")
+            else:
+                print("  The >=30%-below-baseline headline is FALSIFIED at the measured R.")
+                print("  Reporting that falsification is the honest result, not a failure.")
     else:
         print("  Routine share R is UNMEASURED, so the >=30%-below-baseline headline")
         print("  is UNVERIFIED. The claim needs R >= ~0.60 (tier-only); the sensitivity")
@@ -668,8 +876,13 @@ def main() -> None:
           f"cost_per_verified_task / total_cost_per_verified_task)")
 
     print("\n  Monthly spend = decision-loop term + task-execution term")
-    print("  R is unmeasured, so the per-cycle costs below are SCENARIO labels")
-    print("  (sensitivity points), not a verified base.")
+    if r is None:
+        print("  R is unmeasured, so the per-cycle costs below are SCENARIO labels")
+        print("  (sensitivity points), not a verified base.")
+    else:
+        print(f"  R = {r:.4f} ({source['status']} split) drives the headline ([0]/[6]);")
+        print("  the per-cycle costs below are still SCENARIO labels (sensitivity")
+        print("  points), because the monthly envelope is volume-driven, not R-driven.")
     base_cost = project_cycle_cost(0.70, BASELINE_CACHE_READ_SHARE, 0.0)
     target_cost = project_cycle_cost(0.85, 0.80, 0.0)
     for label, cost in (

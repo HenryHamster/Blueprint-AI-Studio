@@ -87,7 +87,7 @@ For `type` values `create`, `fix`, `refactor`, `qa`, `migrate`, `deps`, and `doc
 
 | `kind` | Required additional fields | Description |
 |--------|---------------------------|-------------|
-| `named_test` | `test_path` (path to a real test file) | A test that exercises the changed seam end-to-end. `test_id` optionally pins a specific node. |
+| `named_test` | `test_path` (path to a real test file, optionally with an inline node id as `path::test_fn`) | A test that exercises the changed seam end-to-end. The node id may be given inline in `test_path` (`backend/testing/test_auth.py::test_rate_limiter_locks_account`) or separately in `test_id`; only the path part is checked against the test-file naming rules. |
 | `observable_behavior` | `description` (≥10 non-trivial characters) | A concise human-readable description of a behavior that should be exercised. |
 | `downstream_artifact` | `artifact_id` (non-trivial string) | An artifact ID a later task consumes. |
 | `visual` | `component` (non-trivial string), `viewport_width` (int 1–4096) | Before/after viewport screenshot pair proving a frontend change. `assertion_type` is optional. |

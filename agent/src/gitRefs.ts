@@ -88,6 +88,29 @@ export function isSelfRepo(ownerRepo: { owner: string; repo: string } | null): b
 }
 
 /**
+ * True when the remote-tracking ref `refs/remotes/origin/<ref>` already exists
+ * in this workspace. Used to verify a `presentRefs` claim instead of trusting
+ * the branch name alone: on a warm reuse where baseBranch === branch === the
+ * integration ref, the base fetch is skipped (baseBranch === branch) AND the
+ * warm branch fetch (`git fetch origin <branch>`) only updates FETCH_HEAD in a
+ * single-branch shallow clone — so the tracking ref can be genuinely absent
+ * while the branch name sits in the caller's presentRefs list. Never throws: a
+ * failed probe just means "not present, fetch it".
+ */
+function remoteTrackingRefResolves(workspace: string, ref: string): boolean {
+  try {
+    execFileSync(
+      'git',
+      ['-C', workspace, 'rev-parse', '--verify', `refs/remotes/origin/${ref}`],
+      { encoding: 'utf-8', timeout: 30_000 },
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Fetch the self-repo integration branch into its remote-tracking ref when
  * (and only when) this workspace is the Blueprint self-repo and that ref is not
  * already among the branches the clone brought down.
@@ -96,6 +119,14 @@ export function isSelfRepo(ownerRepo: { owner: string; repo: string } | null): b
  * prepareWorkspaceForRole paths (warm/cold role reuse) and index.setupWorkspace
  * (the create/fix/refactor lane, which runs the TRACKED root `check` whose BASE
  * is the integration branch, NOT the task's base branch).
+ *
+ * A `presentRefs` entry is only honored when the tracking ref ACTUALLY
+ * resolves: workspacePrep's base fetch is conditional on `baseBranch !==
+ * branch`, so a warm role that runs on the integration branch itself (e.g.
+ * strategic passing branch === baseBranch === automain) skips the base fetch
+ * AND would otherwise claim the integration ref "present" while
+ * `refs/remotes/origin/automain` is missing — wedging the fail-closed gate that
+ * could have been self-repaired by this very fetch.
  *
  * Returns the ref that was fetched (for the caller to log), or null when the
  * fetch was correctly skipped. Never throws — a failed fetch reports itself
@@ -109,7 +140,9 @@ export function fetchSelfRepoIntegrationRef(
 ): string | null {
   if (!isSelfRepo(ownerRepo)) return null;
   const integrationRef = selfRepoIntegrationBranch();
-  if (presentRefs.includes(integrationRef)) return null;
+  if (presentRefs.includes(integrationRef) && remoteTrackingRefResolves(workspace, integrationRef)) {
+    return null;
+  }
   const result = fetchRemoteTrackingRef(workspace, integrationRef);
   if (!result.ok) onError(integrationRef, result.error);
   return integrationRef;

@@ -533,7 +533,7 @@ export function NewTaskModal({
                       value={evidence.testPath}
                       onChange={e => updateEvidence('testPath', e.target.value)}
                       className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 ${submitAttempted && evidenceError ? 'border-red-500' : 'border-neutral-800'}`}
-                      placeholder="e.g., tests/test_foo.py"
+                      placeholder="e.g., tests/test_foo.py::test_bar or src/foo.test.ts"
                     />
                   </div>
                   <div>

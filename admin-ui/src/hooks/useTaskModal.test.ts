@@ -1,6 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { renderHook, act, waitFor } from '@testing-library/react';
-import { defaultAcceptanceEvidenceForm, useTaskModal, type AcceptanceEvidenceForm } from './useTaskModal';
+import {
+  acceptanceEvidenceFormFromPayload,
+  buildAcceptanceEvidence,
+  defaultAcceptanceEvidenceForm,
+  useTaskModal,
+  validateAcceptanceEvidenceForm,
+  type AcceptanceEvidenceForm,
+} from './useTaskModal';
 import { authGet, fetchTaskTypeCatalog, createComputeExperiment, listFleetRunners, type TaskTypeCatalogEntry } from '../api';
 
 vi.mock('../api', () => ({
@@ -1615,5 +1622,77 @@ describe('useTaskModal', () => {
     // The forced runner target from the original task must never be carried over
     // to a clone — the operator must choose a target for each new launch.
     expect(result.current.computeExperiment.forcedRunnerId).toBe('');
+  });
+});
+
+// The named_test validator mirrors the backend AcceptanceEvidence rules
+// (payload_schemas.py _check_kind_shape / _split_test_reference): the operator
+// may embed the node id inline as `path::test_fn`, and only the path part is
+// checked against the test-file heuristic.
+describe('validateAcceptanceEvidenceForm — named_test', () => {
+  function namedTest(testPath: string, testId = ''): AcceptanceEvidenceForm {
+    return { ...defaultAcceptanceEvidenceForm(), testPath, testId };
+  }
+
+  it('accepts inline path::test_fn outside a tests directory', () => {
+    // The regression: `useTaskModal.test.ts` lives under src/hooks/, not a
+    // tests/ directory, so the whole raw string never matched the basename
+    // pattern and the declaration was rejected client-side despite the backend
+    // accepting it.
+    expect(validateAcceptanceEvidenceForm(
+      namedTest('admin-ui/src/hooks/useTaskModal.test.ts::validates inline node refs'),
+    )).toBeNull();
+    expect(validateAcceptanceEvidenceForm(
+      namedTest('agent/src/gitRefs.test.ts::prepares the base ref'),
+    )).toBeNull();
+  });
+
+  it('accepts inline path::test_fn inside a testing directory', () => {
+    expect(validateAcceptanceEvidenceForm(
+      namedTest('backend/testing/test_auth.py::test_rate_limiter_locks_account'),
+    )).toBeNull();
+  });
+
+  it('rejects a trivial inline node reference with an actionable message', () => {
+    expect(validateAcceptanceEvidenceForm(namedTest('tests/test_feature.py::test_true')))
+      .toBe('Test reference "test_true" is a placeholder — name a real test target (e.g. test_rate_limiter_locks_account).');
+    // Normalization mirrors _normalize_evidence_token: trim, lowercase, collapse whitespace.
+    expect(validateAcceptanceEvidenceForm(namedTest('tests/test_feature.py::  Assert   True  ')))
+      .toContain('is a placeholder');
+  });
+
+  it('rejects a trivial separate test_id', () => {
+    expect(validateAcceptanceEvidenceForm(namedTest('tests/test_feature.py', 'placeholder')))
+      .toBe('Test reference "placeholder" is a placeholder — name a real test target (e.g. test_rate_limiter_locks_account).');
+    expect(validateAcceptanceEvidenceForm(namedTest('tests/test_feature.py', 'test_handle_create')))
+      .toBeNull();
+  });
+
+  it('still rejects empty, bare-test and non-test paths, with or without ::', () => {
+    const expected = 'Name a real test file (e.g. tests/test_foo.py or src/foo.test.ts) that exercises the change.';
+    expect(validateAcceptanceEvidenceForm(namedTest(''))).toBe(expected);
+    expect(validateAcceptanceEvidenceForm(namedTest('test'))).toBe(expected);
+    expect(validateAcceptanceEvidenceForm(namedTest('test::test_thing'))).toBe(expected);
+    expect(validateAcceptanceEvidenceForm(namedTest('not-a-test.txt'))).toBe(expected);
+    expect(validateAcceptanceEvidenceForm(namedTest('not-a-test.txt::test_thing'))).toBe(expected);
+    expect(validateAcceptanceEvidenceForm(namedTest('src/hooks/useTaskModal.ts::test_thing'))).toBe(expected);
+  });
+
+  it('buildAcceptanceEvidence emits the inline path verbatim and round-trips', () => {
+    const inline = 'admin-ui/src/hooks/useTaskModal.test.ts::validates inline node refs';
+    expect(buildAcceptanceEvidence(namedTest(inline))).toEqual({
+      kind: 'named_test',
+      test_path: inline,
+    });
+    expect(buildAcceptanceEvidence(namedTest(inline, 'test_handle_create'))).toEqual({
+      kind: 'named_test',
+      test_path: inline,
+      test_id: 'test_handle_create',
+    });
+    // Rehydration must not rewrite the operator's inline path.
+    expect(acceptanceEvidenceFormFromPayload({ kind: 'named_test', test_path: inline }).testPath)
+      .toBe(inline);
+    // A declaration the backend would reject never reaches the wire.
+    expect(buildAcceptanceEvidence(namedTest('tests/test_feature.py::todo'))).toBeNull();
   });
 });

@@ -1734,6 +1734,44 @@ esac
     expect(r.stdout).toContain('FAIL');
     expect(r.stdout).not.toContain('PASS — all checks green');
   });
+
+  it('generated check repairs a shallow clone before failing the base-diff gate', async () => {
+    const script = await selfRepoCheck([], 'rt-repair');
+    // The generated script must carry the shallow-clone repair: deepen a
+    // truncated clone, unshallow, and — the decisive step — fetch the base ref
+    // with the EXPLICIT refspec so refs/remotes/origin/main actually exists in a
+    // single-branch shallow clone (a plain `git fetch origin main` there only
+    // updates FETCH_HEAD, leaving origin/main unresolvable and the gate wedged).
+    expect(script).toContain('git fetch --deepen=200 origin "$BASE"');
+    expect(script).toContain('git fetch --unshallow origin');
+    expect(script).toContain('git fetch origin "$BASE":refs/remotes/origin/$BASE');
+    // The base refs do NOT resolve on this (shallow) clone, and only the
+    // explicit-refspec fetch creates the tracking ref — so a regression back to
+    // the plain fetch form (which never touches .shim_refspec_fetched) fails the
+    // re-verify and re-wedges the gate. Every other git call is inert.
+    const repairShim = `#!/bin/sh
+case "$*" in
+  *"rev-parse --git-dir"*) echo .git; exit 0 ;;
+  *"rev-parse --verify origin/main"*|*"rev-parse --verify main"*)
+    [ -f "$WORKSPACE/.shim_refspec_fetched" ] && exit 0 || exit 1 ;;
+  *"diff --name-only origin/main...HEAD"*) printf '%s\\n' 'backend/x.py'; exit 0 ;;
+  *"fetch --deepen=200"*) exit 0 ;;
+  *"fetch --unshallow"*) exit 0 ;;
+  *"fetch origin main:refs/remotes/origin/main"*) touch "$WORKSPACE/.shim_refspec_fetched"; exit 0 ;;
+  *) exit 0 ;;
+esac
+`;
+    const r = await runCheck(script, { harnessExit: 0, docker: false }, repairShim);
+    // The repair turned a would-be fail-closed gate (base refs absent) into a
+    // genuine green run scoped to the repaired diff. The "skipping ruff" line
+    // only appears inside `if touches backend/` — so it proves CHANGED carried
+    // the repaired backend/x.py diff (a failed repair would leave CHANGED empty
+    // and the whole backend stack block skipped, then fail closed).
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('PASS — all checks green');
+    expect(r.stdout).not.toContain('base diff source unavailable');
+    expect(r.stdout).toContain('skipping ruff');
+  });
 });
 
 // ── impacted-test merge-time gate ────────────────────────────────────────────

@@ -91,16 +91,46 @@ export function looksLikeTestFile(path: string): boolean {
   return inTestDir || nameMatches;
 }
 
+// Mirror of the backend _TRIVIAL_EVIDENCE_TOKENS (payload_schemas.py): tokens
+// the backend rejects as always-true placeholders. Kept in sync so a doomed
+// declaration is caught inline instead of round-tripping a 422.
+const TRIVIAL_EVIDENCE_TOKENS = new Set([
+  'test', 'test_true', 'test_truth', 'test_always_true', 'always_true',
+  'assert true', 'assert_true', 'asserttrue', 'assert true == true',
+  'true', 'pass', 'test_pass', 'noop', 'test_noop', 'placeholder',
+  'test_placeholder', 'dummy', 'test_dummy', 'todo', 'tbd', 'n/a', 'na', 'none',
+]);
+
+// Mirrors _normalize_evidence_token: trim, lowercase, collapse whitespace.
+function isTrivialEvidence(value: string): boolean {
+  return TRIVIAL_EVIDENCE_TOKENS.has(value.trim().toLowerCase().replace(/\s+/g, ' '));
+}
+
+// Mirrors the backend _split_test_reference / _check_kind_shape partition: the
+// operator may embed the node id inline as `path::test_fn`, so the test-file
+// heuristic applies to the PATH part only.
+function splitTestReference(value: string): { path: string; nodeRef: string } {
+  const [path, ...rest] = value.split('::');
+  return { path: path.trim(), nodeRef: rest.join('::').trim() };
+}
+
 // Client-side mirror of the backend AcceptanceEvidence._check_kind_shape rules.
 // Returns null when the declaration is valid, else an actionable message shown
 // inline so a code-producing submission is never sent with a partial field.
 export function validateAcceptanceEvidenceForm(form: AcceptanceEvidenceForm): string | null {
   switch (form.kind) {
-    case 'named_test':
-      if (!looksLikeTestFile(form.testPath)) {
+    case 'named_test': {
+      const { path, nodeRef } = splitTestReference(form.testPath);
+      if (!looksLikeTestFile(path)) {
         return 'Name a real test file (e.g. tests/test_foo.py or src/foo.test.ts) that exercises the change.';
       }
+      for (const ref of [nodeRef, form.testId.trim()]) {
+        if (ref && isTrivialEvidence(ref)) {
+          return `Test reference "${ref}" is a placeholder — name a real test target (e.g. test_rate_limiter_locks_account).`;
+        }
+      }
       return null;
+    }
     case 'observable_behavior':
       if (form.description.trim().length < 10) {
         return 'Describe the observable behavior to verify (at least 10 characters).';

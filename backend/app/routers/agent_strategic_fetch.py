@@ -2307,6 +2307,43 @@ async def agent_fetch_efficiency_snapshot(
     }
 
 
+@router.get("/projects/{project_id}/fleet-sizing")
+@limiter.limit("60/minute")
+async def agent_fetch_fleet_sizing_readings(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+    window_hours: int = Query(24, ge=1, le=24 * 7),
+):
+    """Return the recorded fleet-sizing readings for the project.
+
+    This is the agent-reachable read path for the fleet-sizing numbers that
+    ``get_recorded_fleet_sizing_readings`` composes from existing instruments:
+
+    * ``concurrency`` — peak + time-weighted percentiles of simultaneous
+      task-slot occupancy from the one task-table sweep.
+    * ``workspace_footprint`` — the du-measured per-workspace disk footprint
+      scaled to the 50-slot target, compared against the live runner disk
+      inventory (``fits`` / ``shortfall_bytes``).
+    * ``target_concurrency_key`` — whether a 'target_concurrency' config key
+      exists (criterion c-3fd62b9d's input).
+
+    A task agent running on a VM with no production database still needs these
+    recorded readings when it must commit an evidence artifact; this endpoint
+    is that surface. Read-only; cross-project access returns 404.
+    """
+    await _resolve_agent_project(project_id, token, session)
+    from app.fleet_utilization import (  # noqa: PLC0415
+        get_recorded_fleet_sizing_readings,
+    )
+
+    readings = await get_recorded_fleet_sizing_readings(
+        session, window_hours=window_hours
+    )
+    return {"status": "success", "data": readings}
+
+
 @router.get("/projects/{project_id}/capability-trials")
 @limiter.limit("60/minute")
 async def agent_fetch_capability_trials(

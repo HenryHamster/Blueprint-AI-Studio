@@ -545,7 +545,7 @@ describe('NewTaskModal — Acceptance Evidence', () => {
       />,
     );
     expect(screen.queryByText('Acceptance Evidence')).not.toBeInTheDocument();
-    expect(screen.queryByPlaceholderText('e.g., tests/test_foo.py')).not.toBeInTheDocument();
+    expect(screen.queryByPlaceholderText('e.g., tests/test_foo.py::test_bar or src/foo.test.ts')).not.toBeInTheDocument();
   });
 
   it('shows the Acceptance Evidence section for code-producing task types', () => {
@@ -559,7 +559,7 @@ describe('NewTaskModal — Acceptance Evidence', () => {
     );
     expect(screen.getByText('Acceptance Evidence')).toBeInTheDocument();
     // named_test is the default kind, so the Test Path field renders.
-    expect(screen.getByPlaceholderText('e.g., tests/test_foo.py')).toBeInTheDocument();
+    expect(screen.getByPlaceholderText('e.g., tests/test_foo.py::test_bar or src/foo.test.ts')).toBeInTheDocument();
   });
 
   it('switching the evidence kind renders the corresponding fields', async () => {

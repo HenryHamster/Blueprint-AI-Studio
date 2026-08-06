@@ -3779,6 +3779,62 @@ async def test_fetch_efficiency_snapshot_rejects_cross_project(
 
 
 @pytest.mark.asyncio
+async def test_agent_fetch_fleet_sizing_readings(
+    client: AsyncClient, db_session, monkeypatch
+):
+    """GET /api/agent/projects/{id}/fleet-sizing serves the three readings.
+
+    The endpoint is the agent-reachable read path for the recorded fleet-sizing
+    numbers (workspace_footprint, concurrency, target_concurrency_key), so a
+    task agent on a VM with no production DB can pull them when committing an
+    evidence artifact. Cross-project access is fenced to 404 by
+    ``_resolve_agent_project``."""
+    import app.vm_lifecycle as vm_lifecycle
+    import app.warm_pool as warm_pool
+
+    from app import max_plan_pool
+
+    monkeypatch.setattr(max_plan_pool, "_all_accounts", lambda: [])
+    monkeypatch.setattr(
+        max_plan_pool, "_account_available_for_model", lambda acct, model: True
+    )
+    monkeypatch.setattr(vm_lifecycle, "_last_gcp_vm_count", 6)
+    monkeypatch.setattr(vm_lifecycle, "_last_gcp_vm_check", float("inf"))
+    monkeypatch.setattr(warm_pool, "is_warm_pool_enabled", lambda: False)
+
+    project, task = await _make_project_task(db_session, vm="agent-vm-fleetsz")
+    token = create_agent_token(str(task.id), "agent-vm-fleetsz")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/fleet-sizing",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "success"
+    data = body["data"]
+    assert set(data.keys()) == {
+        "workspace_footprint",
+        "concurrency",
+        "target_concurrency_key",
+    }
+    assert data["concurrency"]["window_hours"] == 24
+    assert data["concurrency"]["slot_definition"]
+    assert data["workspace_footprint"]["target_slots"] == 50
+    assert data["workspace_footprint"]["per_workspace_bytes"] == 2 * 1024**3
+
+    # A token for another project cannot read this project's readings (404).
+    other = Project(name="FS Other", user_id="test-user-fso")
+    db_session.add(other)
+    await db_session.commit()
+    await db_session.refresh(other)
+    res = await client.get(
+        f"/api/agent/projects/{other.id}/fleet-sizing",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_strategic_resolve_question_posts_answer_note(
     client: AsyncClient, db_session, mocker
 ):
