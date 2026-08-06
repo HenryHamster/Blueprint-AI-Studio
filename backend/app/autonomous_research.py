@@ -350,6 +350,43 @@ async def _undirected_research_recently_active(project_id, session) -> bool:
     return recent > 0
 
 
+async def _cycle_blocked_direction_keys(session, project_id) -> set[str]:
+    """Direction keys whose live discovery cycle cannot admit a new research root.
+
+    Mirrors the admission predicate in ``ensure_discovery_cycle_for_research``:
+    a live cycle blocks a new root unless it is ``open`` with no source research
+    task bound yet. Used by candidate selection so a blocked direction never
+    consumes a ``max_parallel`` slot (head-of-line blocking every other
+    eligible direction when the cap is low).
+    """
+    from app.models import DiscoveryCycle
+
+    return {
+        key
+        for key, state, source_id in (
+            await session.execute(
+                select(
+                    DiscoveryCycle.direction_key,
+                    DiscoveryCycle.state,
+                    DiscoveryCycle.source_research_task_id,
+                ).where(
+                    DiscoveryCycle.project_id == project_id,
+                    DiscoveryCycle.state.in_(
+                        [
+                            "open",
+                            "admission_closed",
+                            "review_pending",
+                            "reviewing",
+                            "review_blocked",
+                        ]
+                    ),
+                )
+            )
+        ).all()
+        if state != "open" or source_id is not None
+    }
+
+
 async def _spawn_research_task(
     project: Project,
     session: AsyncSession,
@@ -1401,8 +1438,22 @@ async def _spawn_research_task_inner(
         directed_cooldown_minutes = _runtime_config.get(
             "directed_research_cooldown_minutes", 120
         )
+        # Admission-aware selection: a direction whose live discovery cycle
+        # cannot admit a new research root (mirrors the predicate in
+        # ensure_discovery_cycle_for_research) would consume one of the
+        # max_parallel candidate slots only to be skipped at spawn admission.
+        # With a low cap the same blocked direction then head-of-line blocks
+        # every other eligible direction on every sweep, so exclude them here.
+        cycle_blocked_keys = await _cycle_blocked_direction_keys(session, project.id)
         for d in sorted_eligible:
             did = d.get("id")
+            if did in cycle_blocked_keys:
+                logger.info(
+                    "[AUTONOMOUS] skipped direction %s: live discovery cycle "
+                    "cannot admit a new research root",
+                    did,
+                )
+                continue
             if is_pause_mode(d):
                 logger.info(
                     "[AUTONOMOUS] skipped direction due to recommended_mode",

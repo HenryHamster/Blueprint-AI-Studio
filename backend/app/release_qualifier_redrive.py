@@ -411,7 +411,18 @@ async def _redrive_infra_failure_qualification(
 
     factory = session_factory or AsyncSessionLocal
     async with factory() as redrive_session:
-        version = await redrive_session.get(release_version.ReleaseVersion, version_id)
+        # Row-lock the version so this autonomous re-drive serializes against a
+        # concurrently-committing explicit qualification instead of reading a
+        # stale ``infra_failure`` marker mid-flight (2026-08-05: an explicit
+        # qualification and this re-driver double-spawned duplicate
+        # release_audit tasks two minutes apart).
+        version = (
+            await redrive_session.execute(
+                select(release_version.ReleaseVersion)
+                .where(release_version.ReleaseVersion.id == version_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
         if version is None:
             return False
         qual = version.last_qualification
@@ -420,6 +431,44 @@ async def _redrive_infra_failure_qualification(
             or qual.get("status") != "infra_failure"
             or version.phase != "stabilize"
         ):
+            return False
+        # A live qualifier audit means a qualification is ALREADY in flight —
+        # the ``infra_failure`` marker is just stale (the explicit path only
+        # rewrites ``last_qualification`` when its spawn transaction commits).
+        # Re-driving now would double-spawn the audit lane, so defer to the
+        # running attempt; if it dies, its own finalize/stall machinery updates
+        # the marker and a later sweep re-drives cleanly.
+        from app.models import Task, TaskStatus
+
+        _live_audit_id = (
+            await redrive_session.execute(
+                select(Task.id)
+                .where(
+                    Task.project_id == version.project_id,
+                    Task.status.in_(
+                        [
+                            TaskStatus.QUEUED,
+                            TaskStatus.PROVISIONING,
+                            TaskStatus.IN_PROGRESS,
+                            TaskStatus.EVALUATING,
+                            TaskStatus.BLOCKED,
+                            TaskStatus.PARKED,
+                        ]
+                    ),
+                    Task.payloads[0]["type"]
+                    .as_string()
+                    .in_(["release_audit", "release_audit_challenge"]),
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if _live_audit_id is not None:
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep: skipping infra_failure re-drive for "
+                "v%d — qualifier audit task %s is already live",
+                version.version_number,
+                _live_audit_id,
+            )
             return False
         # Bounded attempts: stop re-driving a persistently broken infra path.
         # Phase 1b (per-dimension failure isolation): when the failing dimension
