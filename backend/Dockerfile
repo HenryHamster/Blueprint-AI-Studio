@@ -23,6 +23,12 @@ RUN pip install --no-cache-dir -r requirements.txt uvicorn
 # migration check needs an explicit, non-production test key in this image.
 FROM base AS deps
 ENV GITHUB_PAT_ENCRYPTION_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+# git is required by testing/test_check_gate_fail_closed.py, which drives the
+# repo-root ./check gate against throwaway git repos (the base stage only
+# installs shellcheck). Kept in deps (test image) so the production app stage
+# stays free of the extra tooling.
+RUN apt-get update && apt-get install -y --no-install-recommends git && \
+    rm -rf /var/lib/apt/lists/*
 
 # ── Final image: base + application source ──────────────────────────────────
 FROM base AS app

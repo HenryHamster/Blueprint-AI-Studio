@@ -43,28 +43,61 @@ rm -f /tmp/check_gate_env_6867e9ef-f0d6-41cb-8b9d-1be50b02c806.txt
 _VERIFY_TASK_ID="${TASK_ID:-6867e9ef-f0d6-41cb-8b9d-1be50b02c806}"
 rm -f "/tmp/project_verification_receipt_${_VERIFY_TASK_ID}.json"
 
-# Determine changed paths: committed since base + uncommitted. Fail closed
-# when the base diff cannot be computed — a silently-empty CHANGED used to
-# fall through to "PASS — all checks green" without running anything, making
-# "could not compute the diff" indistinguishable from "nothing changed".
+# Determine changed paths: committed since base + uncommitted. The base diff
+# FAILS CLOSED when it cannot be computed — an empty CHANGED must only ever
+# mean "the diff was computed and genuinely no files changed", never "we
+# could not tell". A truncated/shallow clone is the NORMAL case in CI and on
+# task VMs, so the old `git diff ... 2>/dev/null || true` swallowed the exact
+# error that should have red-lit the gate: the empty changed-set made every
+# downstream stack block skip and the run printed PASS with zero checks.
 BASE="automain"
 BASE_DIFF_OK=0
 COMMITTED=""
-if git rev-parse --verify "origin/$BASE" >/dev/null 2>&1; then
-  if COMMITTED=$(git diff --name-only "origin/$BASE...HEAD" 2>/dev/null); then
-    BASE_DIFF_OK=1
-  else
-    echo "[check] ERROR: git diff against origin/$BASE failed (no merge base in a shallow clone?)" >&2
+_base_diff_error=""
+# Try the candidate base refs in order; COMMITTED is set by the first ref whose
+# diff computes (possibly to the empty string = genuine no-op). Returns 0 when
+# the committed diff is known, 1 when it cannot be computed from any ref.
+_try_base_diff() {
+  local ref
+  _base_diff_error=""
+  for ref in "origin/$BASE" "$BASE"; do
+    if ! git rev-parse --verify "$ref" >/dev/null 2>&1; then
+      continue
+    fi
+    if ! COMMITTED=$(git diff --name-only "$ref...HEAD" 2>&1); then
+      _base_diff_error="git diff --name-only $ref...HEAD failed"
+      continue
+    fi
+    return 0
+  done
+  return 1
+}
+
+if ! _try_base_diff; then
+  # Base diff uncomputable. A truncated clone is the common cause, so try to
+  # repair it (deepen a shallow repo, then fetch the base ref) before failing
+  # closed — but never swallow the failure and report a green run.
+  _repaired=0
+  if git remote get-url origin >/dev/null 2>&1; then
+    GIT_TERMINAL_PROMPT=0 git fetch --deepen=200 origin "$BASE" >/dev/null 2>&1 || true
+    GIT_TERMINAL_PROMPT=0 git fetch --unshallow origin >/dev/null 2>&1 || true
+    GIT_TERMINAL_PROMPT=0 git fetch origin "$BASE" >/dev/null 2>&1 || true
+    if _try_base_diff; then
+      _repaired=1
+    fi
   fi
-elif git rev-parse --verify "$BASE" >/dev/null 2>&1; then
-  if COMMITTED=$(git diff --name-only "$BASE...HEAD" 2>/dev/null); then
-    BASE_DIFF_OK=1
-  else
-    echo "[check] ERROR: git diff against $BASE failed (no merge base in a shallow clone?)" >&2
+  if [ "$_repaired" -ne 1 ]; then
+    echo "[check] ERROR: cannot compute the committed diff against base ref '$BASE'." >&2
+    echo "[check]   ${_base_diff_error:-neither origin/$BASE nor $BASE resolves in this clone}." >&2
+    echo "[check]   The changed-file set is the scope for every gate below; a green run with" >&2
+    echo "[check]   an uncomputable diff would report PASS without checking anything." >&2
+    echo "[check]   Repair the clone and re-run:" >&2
+    echo "[check]     git fetch origin $BASE" >&2
+    echo "[check]     git fetch --unshallow   # depth-limited clones: fetch full history" >&2
+    exit 2
   fi
-else
-  echo "[check] ERROR: neither origin/$BASE nor $BASE exists locally — cannot compute the base diff" >&2
 fi
+BASE_DIFF_OK=1
 UNCOMMITTED=$(git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null)
 CHANGED=$(printf '%s\n%s\n' "$COMMITTED" "$UNCOMMITTED" | sort -u | grep -v '^$' || true)
 
