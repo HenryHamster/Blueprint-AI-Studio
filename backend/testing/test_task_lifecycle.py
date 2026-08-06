@@ -10820,3 +10820,40 @@ async def test_requeue_llm_cost_zero_for_unpriced_provider_model(tl_db, mocker):
     assert clone_ctx.get("_prior_attempts_llm_cost", 0.0) == 0.0, (
         "Unpriced provider/model must contribute $0, not fail the requeue"
     )
+
+
+def test_wake_cluster_reexported_from_extracted_module():
+    """The park-and-wake cluster was extracted to ``app.task_lifecycle_wakes``;
+    ``app.task_lifecycle`` must re-export the SAME function objects so every
+    existing caller (``from app.task_lifecycle import park_task`` and the
+    ``app.task_lifecycle.park_task`` patch targets in tests) keeps working.
+
+    Guards the refactor contract: if a future edit drops a re-export, the
+    ``hasattr`` check fails; if it re-implements a function instead of
+    forwarding it, the identity check fails.
+    """
+    import app.task_lifecycle as tl
+    import app.task_lifecycle_wakes as tl_wakes
+
+    moved = [
+        "close_orphan_pr_if_any",
+        "park_task",
+        "fire_task_wakes",
+        "deliver_wake",
+        "expire_wake",
+        "_maybe_fire_terminal_compute_wake",
+    ]
+    for name in moved:
+        assert hasattr(tl, name), (
+            f"task_lifecycle no longer re-exports {name} from task_lifecycle_wakes"
+        )
+        assert getattr(tl, name) is getattr(tl_wakes, name), (
+            f"{name} must be the SAME function object in task_lifecycle and "
+            "task_lifecycle_wakes (re-export, not a re-implementation)"
+        )
+
+    # Constants moved with the cluster are re-exported too.
+    for const in ("_PARKABLE_STATUSES", "_PARK_STRAND_SECONDS"):
+        assert getattr(tl, const) is getattr(tl_wakes, const), (
+            f"{const} must be re-exported from task_lifecycle"
+        )
