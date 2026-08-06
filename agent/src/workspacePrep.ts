@@ -31,6 +31,11 @@ import {
   ensureGitCredentialHelperScript,
   gitCredentialHelperPath,
 } from './git-credential.js';
+import {
+  reserveWorkspaceDisk,
+  releaseWorkspaceDiskReservation,
+  getWorkspaceDiskReservation,
+} from './workspaceDisk.js';
 
 /**
  * Resolve the pre-baked git object mirror path for an authenticated clone URL,
@@ -127,6 +132,8 @@ export interface WorkspacePrepOutcome {
   cold_fallback_reason: string | null;
   /** Whether lane mode was requested (BLUEPRINT_LANE_MODE=1 with allowLaneResume). */
   lane_phase: boolean;
+  /** Disk reservation held for this workspace (0 when reservation is disabled). */
+  disk_reserved_bytes: number;
 }
 
 // Module-level recorder: written by prepareWorkspaceForRole, read by
@@ -149,6 +156,25 @@ export function resetWorkspacePrepOutcome(): void {
  * (warm path) or wipes + re-clones (cold path).
  */
 export async function prepareWorkspaceForRole(opts: PrepareWorkspaceOptions): Promise<void> {
+  // Fail-fast admission: this workspace must be able to hold its disk
+  // reservation BEFORE any clone work. If the workspace filesystem cannot
+  // satisfy the reservation (plus the configured low-disk floor and any other
+  // reservations this process still holds), we abort with a clear reason
+  // instead of starting a task that would die mid-run on ENOSPC.
+  reserveWorkspaceDisk(opts.workspace);
+
+  try {
+    await _prepareWorkspaceForRoleImpl(opts);
+  } catch (e) {
+    // Abnormal exit: the workspace was not successfully prepared, so its
+    // reservation must not be left held — a leaked reservation would silently
+    // starve later admission. Release before propagating.
+    releaseWorkspaceDiskReservation(opts.workspace);
+    throw e;
+  }
+}
+
+async function _prepareWorkspaceForRoleImpl(opts: PrepareWorkspaceOptions): Promise<void> {
   const { workspace, repoUrl, branch, baseBranch } = opts;
   // depth: undefined → DEFAULT_CLONE_DEPTH; <=0 → full clone (omit --depth).
   const depthOpt = typeof opts.depth === 'number' && Number.isFinite(opts.depth)
@@ -328,6 +354,7 @@ export async function prepareWorkspaceForRole(opts: PrepareWorkspaceOptions): Pr
         checkpoint_reset_applied: checkpointResetApplied,
         cold_fallback_reason: null,
         lane_phase: lanePhase,
+        disk_reserved_bytes: getWorkspaceDiskReservation(workspace) ?? 0,
       };
       return;
     } catch (e) {
@@ -398,5 +425,6 @@ export async function prepareWorkspaceForRole(opts: PrepareWorkspaceOptions): Pr
     checkpoint_reset_applied: false,
     cold_fallback_reason: coldFallbackReason,
     lane_phase: lanePhase,
+    disk_reserved_bytes: getWorkspaceDiskReservation(workspace) ?? 0,
   };
 }

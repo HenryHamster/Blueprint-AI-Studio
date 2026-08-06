@@ -68,6 +68,11 @@ import {
   prepareWorkspaceForRole, resolveReferenceRepo,
   getLastWorkspacePrepOutcome, resetWorkspacePrepOutcome,
 } from './workspacePrep.js';
+import {
+  reserveWorkspaceDisk, releaseWorkspaceDiskReservation,
+  getWorkspaceDiskReservation, getWorkspaceDiskAccounting,
+  resetWorkspaceDiskReservations, DiskReservationError,
+} from './workspaceDisk.js';
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 describe('prepareWorkspaceForRole', () => {
@@ -91,11 +96,101 @@ describe('prepareWorkspaceForRole', () => {
     gitCredentialHelperPathMock.mockReset();
     gitCredentialHelperPathMock.mockReturnValue(MOCK_HELPER_PATH);
     delete process.env.BLUEPRINT_WARM_HANDOFF;
+    delete process.env.BLUEPRINT_RUNNER_AGENT_DISK_RESERVATION_BYTES;
+    delete process.env.BLUEPRINT_RUNNER_MIN_DISK_BYTES;
     resetWorkspacePrepOutcome();
+    resetWorkspaceDiskReservations();
   });
 
   afterEach(() => {
     delete process.env.BLUEPRINT_WARM_HANDOFF;
+    delete process.env.BLUEPRINT_RUNNER_AGENT_DISK_RESERVATION_BYTES;
+    delete process.env.BLUEPRINT_RUNNER_MIN_DISK_BYTES;
+    resetWorkspaceDiskReservations();
+  });
+
+  // ── Disk reservation & accounting ──────────────────────────────────────────
+  // df/du probe helper: only `df` and `du` receive real output; everything else
+  // keeps the default '' so warm-path `git` invocations never succeed spuriously.
+  function mockDiskProbe(opts: { freeKb: number; usedKb?: number }): void {
+    execFileSyncMock.mockImplementation((cmd: string) => {
+      if (cmd === 'df') {
+        return `Filesystem 1K-blocks Used Available Use% Mounted on\n/dev/root ${opts.freeKb + (opts.usedKb ?? 0)} ${opts.usedKb ?? 0} ${opts.freeKb} 0% /\n`;
+      }
+      if (cmd === 'du') {
+        return `${opts.usedKb ?? 0}  /ws\n`;
+      }
+      return '';
+    });
+  }
+
+  describe('disk reservation and accounting', () => {
+    const WS = '/ws';
+    const opts = {
+      workspace: WS,
+      repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+      githubToken: 'tok',
+      branch: 'main',
+    };
+
+    it('admission: prepare fails fast with a clear reason when the disk reservation cannot be satisfied', async () => {
+      process.env.BLUEPRINT_RUNNER_AGENT_DISK_RESERVATION_BYTES = String(10 * 1024 * 1024);
+      process.env.BLUEPRINT_RUNNER_MIN_DISK_BYTES = String(2 * 1024 * 1024);
+      // 5 MiB free < 2 MiB floor + 10 MiB reservation → cannot admit.
+      mockDiskProbe({ freeKb: 5 * 1024 });
+
+      await expect(prepareWorkspaceForRole(opts)).rejects.toMatchObject({
+        name: 'DiskReservationError',
+        workspace: WS,
+        reservationBytes: 10 * 1024 * 1024,
+        freeBytes: 5 * 1024 * 1024,
+        minFreeBytes: 2 * 1024 * 1024,
+      });
+      // Admission failed BEFORE any workspace work — no clone, no directory scan.
+      expect(cloneWithRetryMock).not.toHaveBeenCalled();
+      expect(fsMocks.readdirSync).not.toHaveBeenCalled();
+      // Nothing was recorded — a rejected admission holds no reservation.
+      expect(getWorkspaceDiskReservation(WS)).toBeNull();
+    });
+
+    it('admission: holds the reservation for the workspace when disk suffices', async () => {
+      process.env.BLUEPRINT_RUNNER_AGENT_DISK_RESERVATION_BYTES = String(10 * 1024 * 1024);
+      process.env.BLUEPRINT_RUNNER_MIN_DISK_BYTES = String(2 * 1024 * 1024);
+      mockDiskProbe({ freeKb: 50 * 1024 }); // 50 MiB free ≥ 2 MiB floor + 10 MiB reservation.
+
+      await prepareWorkspaceForRole(opts);
+
+      expect(getWorkspaceDiskReservation(WS)).toBe(10 * 1024 * 1024);
+      // The workspace was admitted and prepared normally.
+      expect(cloneWithRetryMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('release: abnormal exit (clone failure) releases the reservation so later admission is not starved', async () => {
+      process.env.BLUEPRINT_RUNNER_AGENT_DISK_RESERVATION_BYTES = String(10 * 1024 * 1024);
+      mockDiskProbe({ freeKb: 50 * 1024 }); // Admission passes; preparation then fails.
+      cloneWithRetryMock.mockRejectedValueOnce(new Error('fatal: repository not found'));
+
+      await expect(prepareWorkspaceForRole(opts)).rejects.toMatchObject({
+        failureCategory: 'clone_failed',
+      });
+
+      // The abnormal-exit path must not leak the reservation it held.
+      expect(getWorkspaceDiskReservation(WS)).toBeNull();
+    });
+
+    it('accounting: reports actual per-workspace usage against the reservation', async () => {
+      process.env.BLUEPRINT_RUNNER_AGENT_DISK_RESERVATION_BYTES = String(10 * 1024 * 1024);
+      // du -sk /ws → 2048 KiB used; df -k /ws → 50 MiB free.
+      mockDiskProbe({ freeKb: 50 * 1024, usedKb: 2048 });
+
+      await prepareWorkspaceForRole(opts);
+
+      const accounting = getWorkspaceDiskAccounting(WS);
+      expect(accounting.reserved_bytes).toBe(10 * 1024 * 1024);
+      expect(accounting.actual_bytes).toBe(2048 * 1024);
+      expect(accounting.overcommit_bytes).toBe(2048 * 1024 - 10 * 1024 * 1024);
+      expect(accounting.free_bytes).toBe(50 * 1024 * 1024);
+    });
   });
 
   // ── Cold path ──────────────────────────────────────────────────────────────
@@ -1143,6 +1238,8 @@ describe('prepareWorkspaceForRole', () => {
         checkpoint_reset_applied: true,
         cold_fallback_reason: null,
         lane_phase: true,
+        // Reservation env unset in this test → 0, still carried in the outcome.
+        disk_reserved_bytes: 0,
       });
     });
   });
@@ -1171,5 +1268,78 @@ describe('prepareWorkspaceForRole', () => {
       // Nested path (owner/group/repo) — not the 2-segment owner/repo layout.
       expect(resolveReferenceRepo('https://github.com/o/g/r.git')).toBeNull();
     });
+  });
+});
+
+// ── workspaceDisk reservation ledger unit behavior ───────────────────────────
+describe('workspaceDisk reservation ledger', () => {
+  beforeEach(() => {
+    execFileSyncMock.mockReset();
+    execFileSyncMock.mockReturnValue('');
+    delete process.env.BLUEPRINT_RUNNER_AGENT_DISK_RESERVATION_BYTES;
+    delete process.env.BLUEPRINT_RUNNER_MIN_DISK_BYTES;
+    resetWorkspaceDiskReservations();
+  });
+
+  function mockDfFreeKb(freeKb: number): void {
+    execFileSyncMock.mockImplementation((cmd: string) =>
+      cmd === 'df'
+        ? `Filesystem 1K-blocks Used Available Use% Mounted on\n/dev/root 1000000 500000 ${freeKb} 50% /\n`
+        : '');
+  }
+
+  it('reservation disabled (env unset) → no-op, nothing held', () => {
+    expect(reserveWorkspaceDisk('/ws')).toBe(0);
+    expect(getWorkspaceDiskReservation('/ws')).toBeNull();
+  });
+
+  it('reserve holds the reservation and is idempotent (no re-probe on warm reuse)', () => {
+    process.env.BLUEPRINT_RUNNER_AGENT_DISK_RESERVATION_BYTES = String(10 * 1024 * 1024);
+    mockDfFreeKb(50 * 1024);
+
+    expect(reserveWorkspaceDisk('/ws')).toBe(10 * 1024 * 1024);
+    expect(reserveWorkspaceDisk('/ws')).toBe(10 * 1024 * 1024); // warm reuse
+    expect(execFileSyncMock).toHaveBeenCalledTimes(1); // one df probe, not two
+    expect(getWorkspaceDiskReservation('/ws')).toBe(10 * 1024 * 1024);
+  });
+
+  it('reserve throws DiskReservationError when free disk is below floor + reservation', () => {
+    process.env.BLUEPRINT_RUNNER_AGENT_DISK_RESERVATION_BYTES = String(10 * 1024 * 1024);
+    process.env.BLUEPRINT_RUNNER_MIN_DISK_BYTES = String(2 * 1024 * 1024);
+    mockDfFreeKb(5 * 1024);
+
+    expect(() => reserveWorkspaceDisk('/ws')).toThrowError(DiskReservationError);
+    expect(getWorkspaceDiskReservation('/ws')).toBeNull();
+  });
+
+  it('reserve counts other held reservations against free disk', () => {
+    process.env.BLUEPRINT_RUNNER_AGENT_DISK_RESERVATION_BYTES = String(10 * 1024 * 1024);
+    mockDfFreeKb(50 * 1024);
+    reserveWorkspaceDisk('/a'); // holds 10 MiB
+
+    // 50 MiB free is enough for /b: floor 0 + existing 10 MiB + new 10 MiB.
+    expect(reserveWorkspaceDisk('/b')).toBe(10 * 1024 * 1024);
+
+    // Free drops to 25 MiB: /c needs 0 floor + 10 (/a) + 10 (/b) + 10 (/c) = 30 MiB.
+    mockDfFreeKb(25 * 1024);
+    expect(() => reserveWorkspaceDisk('/c')).toThrowError(DiskReservationError);
+  });
+
+  it('reserve fails open on an unmeasurable filesystem but still records the reservation', () => {
+    process.env.BLUEPRINT_RUNNER_AGENT_DISK_RESERVATION_BYTES = String(10 * 1024 * 1024);
+    // execFileSync returns '' → df parse yields no usable line → freeBytes null.
+    expect(reserveWorkspaceDisk('/ws')).toBe(10 * 1024 * 1024);
+    expect(getWorkspaceDiskReservation('/ws')).toBe(10 * 1024 * 1024);
+  });
+
+  it('release clears the held reservation; releasing again is a no-op', () => {
+    process.env.BLUEPRINT_RUNNER_AGENT_DISK_RESERVATION_BYTES = String(10 * 1024 * 1024);
+    mockDfFreeKb(50 * 1024);
+    reserveWorkspaceDisk('/ws');
+    expect(getWorkspaceDiskReservation('/ws')).toBe(10 * 1024 * 1024);
+
+    releaseWorkspaceDiskReservation('/ws');
+    expect(getWorkspaceDiskReservation('/ws')).toBeNull();
+    releaseWorkspaceDiskReservation('/ws'); // no-op, must not throw
   });
 });

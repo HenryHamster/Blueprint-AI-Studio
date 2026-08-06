@@ -433,6 +433,26 @@ class TestEnvAllowlist(unittest.TestCase):
         self.assertNotIn("MY_CUSTOM_TOKEN", env)
         self.assertEqual(env["PROVIDER"], "anthropic")
 
+    def test_agent_env_passes_disk_reservation_knobs(self):
+        # The per-workspace disk reservation knobs are allowlisted so the agent's
+        # workspacePrep admission check sees the same numbers as the runner ledger.
+        source = {
+            "BLUEPRINT_RUNNER_AGENT_DISK_RESERVATION_BYTES": str(10 * 1024 * 1024),
+            "BLUEPRINT_RUNNER_MIN_DISK_BYTES": str(2 * 1024 * 1024),
+            "BLUEPRINT_RUNNER_TOKEN": "SECRET",
+        }
+        env = iso.build_agent_env(source, {}, [])
+        self.assertEqual(
+            env["BLUEPRINT_RUNNER_AGENT_DISK_RESERVATION_BYTES"],
+            str(10 * 1024 * 1024),
+        )
+        self.assertEqual(
+            env["BLUEPRINT_RUNNER_MIN_DISK_BYTES"],
+            str(2 * 1024 * 1024),
+        )
+        # Runner secrets still never pass through alongside the knobs.
+        self.assertNotIn("BLUEPRINT_RUNNER_TOKEN", env)
+
     def test_compute_env_excludes_provider_creds(self):
         source = {
             "ANTHROPIC_API_KEY": "sk-ant",

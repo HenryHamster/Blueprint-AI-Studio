@@ -130,6 +130,11 @@ AGENT_ENV_ALLOWLIST: tuple[str, ...] = (
     "TERM",
     # Agent knobs
     "GIT_REFERENCE_CACHE_ROOT",
+    # Per-workspace disk reservation knobs (same names the runner's resource
+    # ledger consumes): the agent re-checks its workspace's reservation at
+    # creation time and fails fast when the filesystem cannot satisfy it.
+    "BLUEPRINT_RUNNER_AGENT_DISK_RESERVATION_BYTES",
+    "BLUEPRINT_RUNNER_MIN_DISK_BYTES",
 )
 
 # Speech credentials are never process-environment inputs. The active Resident
