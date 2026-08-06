@@ -274,6 +274,45 @@ def clear_review_escalation_approval_gate(orig: Task, *, resolved_by: str) -> bo
     return True
 
 
+def review_loop_parked_for_operator(orig: Task | None) -> str | None:
+    """Return the operator-park reason for this chain root, or ``None``.
+
+    A chain root is "parked" when the stuck-cycle/standoff detector recorded a
+    review-loop terminal outcome of kind ``stuck``/``standoff`` via
+    :func:`_set_review_loop_terminal_outcome` and no later convergence released
+    the hold (:func:`clear_review_escalation_approval_gate` stamps
+    ``resolved=True`` when a later APPROVE or merge proves the loop healthy).
+    Parked means an operator owns the next move: sweeps must NOT respawn
+    reviews for the chain's PR, and cap exhaustion must NOT close the PR the
+    escalation deliberately preserved.
+
+    Incident this exists for (lineage d3c12745 / PR #16759, 2026-08-06): after
+    the stuck escalation parked the chain, every rollup sweep kept respawning a
+    review (the prior one had COMPLETED, freeing its idempotency key), each
+    respawn re-hit the stuck gate, the recount ratcheted pr_iterations to the
+    global cap, and the cap handler auto-closed the PR the park had deliberately
+    preserved — destroying a real landed fix across 19 burned review tasks.
+
+    Deliberately narrow: only ``stuck``/``standoff`` park. ``cap_exhausted``
+    terminalizes the chain through its own path, and the remaining resolvable
+    escalation kinds (repeat_fingerprint_halt / supersession_churn_halt) gate
+    their own respawn sites. The breadcrumb — not ``requires_approval`` — is
+    the signal: the flag is discretionary (require_approval_gates) and can
+    belong to unrelated holds (spend budget, branch safety), while the
+    breadcrumb is written on every stuck/standoff escalation regardless of
+    gate configuration.
+    """
+    if orig is None:
+        return None
+    outcome = (orig.context or {}).get(_REVIEW_LOOP_TERMINAL_OUTCOME_KEY)
+    if not isinstance(outcome, dict) or outcome.get("resolved"):
+        return None
+    kind = outcome.get("kind")
+    if kind in ("stuck", "standoff"):
+        return str(kind)
+    return None
+
+
 _CHURN_NARROW_FOCUS_PREFIX = (
     "⚠️ ISSUE CHURN DETECTED: the prior {window} fix iterations resolved some "
     "issues but introduced new ones (CRITICAL+MAJOR counts: {counts}). "
@@ -850,6 +889,26 @@ async def _handle_cap_exhaustion(
         await session.commit()
         return
 
+    # ── OPERATOR-PARK GUARD (lineage d3c12745 / PR #16759). ──
+    # ``_cap_already_handled`` cannot cover this: a parked orig is NOT terminal
+    # (the stuck/standoff escalation leaves it non-terminal on purpose so an
+    # operator can adjudicate), so a separate guard is needed. When the
+    # stuck-cycle/standoff detector already escalated this chain to the
+    # operator, cap exhaustion is a LATER, weaker terminal policy: it must not
+    # override the park by closing the PR the escalation deliberately preserved
+    # and FAILing the root out from under the operator. Idempotent — log and
+    # return, leaving the park (status, requires_approval, breadcrumb) exactly
+    # as the escalation recorded it.
+    _park_reason = review_loop_parked_for_operator(orig)
+    if _park_reason is not None:
+        logger.warning(
+            f"[PIPELINE] Cap exhaustion for PR #{pr_number} ({iterations} iterations, "
+            f"{cap_label}) suppressed — orig {resolved_original_id[:8]} is parked for "
+            f"operator ({_park_reason}); NOT closing the PR or overriding the park"
+        )
+        await session.commit()
+        return
+
     # ── Decide FIRST, mutate SECOND. ──
     # Both the after-approve classification (a pure durable-context read) and
     # the preservability check (a real GitHub GET) now run here, with NO
@@ -1056,6 +1115,18 @@ async def _handle_cap_exhaustion(
             f"[PIPELINE] Cap-exhaustion: orig {resolved_original_id[:8]} went terminal "
             f"({(orig.context or {}).get('failure_detail')}) during the preservability "
             f"lookup for PR #{pr_number} — skipping duplicate side effects"
+        )
+        await session.commit()
+        return
+    # Re-assert the operator-park guard on the FRESH row too: the stuck/standoff
+    # escalation may have parked this chain while we were on the network for the
+    # preservability GET. Same rule as the entry guard — the park wins.
+    _park_reason = review_loop_parked_for_operator(orig)
+    if _park_reason is not None:
+        logger.warning(
+            f"[PIPELINE] Cap exhaustion for PR #{pr_number} suppressed under lock — "
+            f"orig {resolved_original_id[:8]} was parked for operator ({_park_reason}) "
+            f"during the preservability lookup; NOT closing the PR or overriding the park"
         )
         await session.commit()
         return

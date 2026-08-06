@@ -1323,6 +1323,35 @@ async def _mark_scan_report_posted(
         await session.rollback()
 
 
+def _rollup_review_respawn_park_message(
+    parent: Task, rollup_pr_number: int
+) -> str | None:
+    """Park-honoring gate for the rollup-PR review (re)spawn.
+
+    Returns the truthful ``latest_status_message`` when the parent's review
+    loop was already escalated to the operator (stuck/standoff breadcrumb from
+    ``review_loop_parked_for_operator``), or ``None`` when the spawn should
+    proceed — including the FIRST spawn for a fresh rollup PR, which has no
+    terminal outcome recorded yet.
+
+    Incident (lineage d3c12745 / PR #16759, 2026-08-06): after the stuck
+    escalation parked the chain at 04:36, this sweep respawned 13 reviews —
+    each prior review had COMPLETED, freeing its active-idempotency key, and
+    nothing checked the park. Every respawn ran a model, re-hit the stuck gate
+    on its fix spawn, and COUNTED toward the global pr_iterations recount,
+    ratcheting the loop to the cap that then auto-closed the parked PR.
+    """
+    from app.review_loop_convergence import review_loop_parked_for_operator
+
+    reason = review_loop_parked_for_operator(parent)
+    if reason is None:
+        return None
+    return (
+        f"Review loop parked for operator ({reason}) — not respawning review "
+        f"for rollup PR #{rollup_pr_number}"
+    )
+
+
 async def _check_and_trigger_rollup(
     child_task: Task, session: AsyncSession, progress_cb=None
 ) -> bool:
@@ -5348,6 +5377,28 @@ async def _check_and_trigger_rollup(
                     # instead of overwriting it. (Changes A+B keep a BLOCKED fix
                     # visible so this resume path is rarely reached in the incident
                     # scenario; this is the direct backstop.)
+                    #
+                    # Park-honoring gate (lineage d3c12745 / PR #16759): when the
+                    # stuck/standoff escalation already parked this chain for the
+                    # operator, do NOT respawn a review — the previous review
+                    # COMPLETED (freeing its active-idempotency key), so without
+                    # this check every sweep spawns another review that re-hits
+                    # the stuck gate and ratchets pr_iterations toward the cap.
+                    # Leave the parent EVALUATING for operator action with a
+                    # truthful message; a fresh rollup PR (no breadcrumb yet)
+                    # falls through to the normal first spawn.
+                    _park_msg = _rollup_review_respawn_park_message(
+                        parent, rollup_pr_number
+                    )
+                    if _park_msg is not None:
+                        parent.latest_status_message = _park_msg
+                        session.add(parent)
+                        await session.commit()
+                        logger.warning(
+                            f"[ROLLUP] {_park_msg} (parent {str(parent.id)[:8]} left "
+                            f"for operator action)"
+                        )
+                        return
                     existing_loop = parent_ctx.get("review_loop") or {}
                     # Only trust prior loop state that belongs to THIS PR — a
                     # recreated rollup PR must not inherit a stale loop (and its

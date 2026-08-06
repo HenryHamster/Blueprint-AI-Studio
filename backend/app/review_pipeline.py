@@ -122,6 +122,7 @@ from app.review_loop_convergence import (
     _is_pipeline_task_stale,
     _task_is_actively_ci_waiting,
     _set_review_loop_terminal_outcome,
+    review_loop_parked_for_operator,  # noqa: F401 — re-exported for lifecycle/rollup callers
 )
 
 logger = logging.getLogger(__name__)

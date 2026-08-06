@@ -68,6 +68,7 @@ from app.review_pipeline import (
     evaluate_auto_approve_small_main,
     ensure_issue_ids,
     should_skip_initial_review,
+    review_loop_parked_for_operator,
 )
 from app.failure_classification import (
     classify_failure,
@@ -100,6 +101,24 @@ _PR_OPENING_COMPLETION_TYPES: frozenset[str] = (WRITE_TASK_TYPES - {"fix"}) | {"
 
 def _safe_exception_message(e: Exception, context: str) -> str:
     return _sanitize_log(f"{context}: {type(e).__name__}")[:500]
+
+
+def _pipeline_spawn_refusal_label(task: Task) -> str:
+    """Human-readable reason why ``_spawn_pipeline_task`` returned ``None``.
+
+    ``_spawn_pipeline_task`` records its refusal reason in
+    ``task.context[SPAWN_REASON_KEY]`` (stuck_cycle, cap_exhausted,
+    supersession_churn_halt, ...). Status messages must surface THAT reason —
+    not a blanket "iteration cap reached" (lineage d3c12745 / PR #16759: 13
+    tasks claimed the cap when the truth was stuck_cycle; Blueprint directive:
+    surface REASONS, not just states). Unmapped reason codes pass through
+    verbatim so a new refusal reason is never mislabeled.
+    """
+    reason = (task.context or {}).get(SPAWN_REASON_KEY) or "unknown"
+    return {
+        "stuck_cycle": "stuck_cycle (operator review required)",
+        "cap_exhausted": "cap_exhausted (iteration cap reached)",
+    }.get(reason, reason)
 
 
 def _sidecar_application_marker(
@@ -2792,12 +2811,20 @@ async def _process_post_commit(
                                 f"[REVIEW PIPELINE] Spawned review for PR #{pr_number} → task {review_task.id}"
                             )
                     else:
-                        task.latest_status_message = f"Review not spawned for PR #{pr_number} — iteration cap reached"
+                        # Truthful refusal: _spawn_pipeline_task records why it
+                        # returned None in SPAWN_REASON_KEY (stuck_cycle,
+                        # cap_exhausted, ...) — surface that instead of a
+                        # blanket "iteration cap reached".
+                        _review_refusal_label = _pipeline_spawn_refusal_label(task)
+                        task.latest_status_message = (
+                            f"Review not spawned for PR #{pr_number} — "
+                            f"{_review_refusal_label}"
+                        )
                         task.requires_approval = True
                         session.add(task)
                         await session.commit()
                         logger.warning(
-                            f"[REVIEW PIPELINE] WARNING: Review spawn returned None for PR #{pr_number}"
+                            f"[REVIEW PIPELINE] WARNING: Review spawn returned None for PR #{pr_number} ({_review_refusal_label})"
                         )
 
             # Review task completed → parse verdict
@@ -5556,7 +5583,49 @@ async def _process_post_commit(
                         # respawn against the immutable live target; idempotent
                         # spawn keys bound duplicate work without weakening the
                         # target invariant.
-                        if not (task.context or {}).get("_review_stale_head"):
+                        #
+                        # Park-honoring gate (lineage d3c12745 / PR #16759):
+                        # when the chain root was already escalated to the
+                        # operator (stuck/standoff), a respawned exact-target
+                        # review only burns another model run into the same
+                        # stuck gate — and counts toward the global
+                        # pr_iterations recount that eventually auto-closed the
+                        # parked PR. Discard the stale review WITHOUT
+                        # respawning and say so truthfully.
+                        _stale_park_reason = None
+                        if original_task_id:
+                            try:
+                                _stale_park_reason = review_loop_parked_for_operator(
+                                    await session.get(
+                                        Task, uuid.UUID(original_task_id)
+                                    )
+                                )
+                            except Exception as _park_err:
+                                logger.warning(
+                                    f"[REVIEW PIPELINE] Could not check operator-park "
+                                    f"state for chain root {original_task_id[:8]}: "
+                                    f"{_park_err}"
+                                )
+                        if _stale_park_reason is not None:
+                            task.status = TaskStatus.COMPLETED
+                            task.latest_status_message = (
+                                f"Stale-target review discarded for PR #{pr_number} — "
+                                f"review loop parked for operator "
+                                f"({_stale_park_reason}); not respawning review"
+                            )
+                            task.context = {
+                                **(task.context or {}),
+                                "_review_stale_head": True,
+                            }
+                            flag_modified(task, "context")
+                            session.add(task)
+                            logger.warning(
+                                f"[REVIEW PIPELINE] Stale-target review for PR "
+                                f"#{pr_number} discarded without respawn — chain root "
+                                f"{original_task_id[:8]} parked for operator "
+                                f"({_stale_park_reason})"
+                            )
+                        elif not (task.context or {}).get("_review_stale_head"):
                             task.status = TaskStatus.COMPLETED
                             task.latest_status_message = (
                                 f"Stale-target review discarded for PR #{pr_number} "
@@ -5881,11 +5950,20 @@ async def _process_post_commit(
                             f"[REVIEW PIPELINE] Spawned fix for PR #{pr_number} → task {fix_task.id}"
                         )
                     else:
-                        task.latest_status_message = f"Fix not spawned for PR #{pr_number} — iteration cap reached"
+                        # Surface the REAL refusal reason, not a blanket "cap
+                        # reached" (lineage d3c12745 / PR #16759: 13 tasks said
+                        # "iteration cap reached" when the truth was
+                        # stuck_cycle). _spawn_pipeline_task records why it
+                        # returned None in SPAWN_REASON_KEY on the source task.
+                        _fix_refusal_label = _pipeline_spawn_refusal_label(task)
+                        task.latest_status_message = (
+                            f"Fix not spawned for PR #{pr_number} — "
+                            f"{_fix_refusal_label}"
+                        )
                         task.requires_approval = True
                         session.add(task)
                         cap_alert_title = (
-                            f"PR #{pr_number} stalled — iteration cap reached"
+                            f"PR #{pr_number} stalled — {_fix_refusal_label}"
                         )
                         existing_cap_alert = (
                             (
@@ -5906,7 +5984,7 @@ async def _process_post_commit(
                                 project_id=task.project_id,
                                 severity=AlertSeverity.WARNING,
                                 title=cap_alert_title,
-                                message=f"Review requested changes on PR #{pr_number} but the fix iteration cap was reached. Manual intervention required.",
+                                message=f"Review requested changes on PR #{pr_number} but no fix was spawned ({_fix_refusal_label}). Manual intervention required.",
                                 task_id=task.id,
                                 event_type="review.escalated",
                             )
@@ -5924,7 +6002,7 @@ async def _process_post_commit(
                         else:
                             await session.commit()
                         logger.warning(
-                            f"[REVIEW PIPELINE] WARNING: Fix spawn returned None for PR #{pr_number}"
+                            f"[REVIEW PIPELINE] WARNING: Fix spawn returned None for PR #{pr_number} ({_fix_refusal_label})"
                         )
                     # On every review rejection, store which issue categories caused it
                     # on the original task.  Iteration 1 → _first_attempt_rejection_categories
