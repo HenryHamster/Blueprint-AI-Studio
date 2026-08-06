@@ -300,6 +300,56 @@ async def test_explicit_null_image_store_telemetry_clears_stale_capacity(db_sess
         "container_image_reclaim",
     ):
         assert key not in runner.capabilities
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_persists_bounded_container_images_present(db_session):
+    """The present-image inventory is stored sanitized and bounded, an omitted
+    field keeps the previous report, and an explicit null clears it (a stale
+    "image present" claim must never waive a real image-pull disk floor)."""
+    _project, runner = await _make_runner(db_session)
+
+    oversized = [f"repo/image:{i}" for i in range(150)]
+    await heartbeat(
+        payload=HeartbeatRequest(
+            container_images_present=[
+                "nvcr.io/nvidia/tensorflow:24.12-tf2-py3",
+                "  python:3.12-slim  ",
+                "",
+                "x" * 1000,
+                *oversized,
+            ]
+        ),
+        runner=runner,
+        session=db_session,
+    )
+    await db_session.refresh(runner)
+    stored = runner.capabilities["container_images_present"]
+    assert stored[0] == "nvcr.io/nvidia/tensorflow:24.12-tf2-py3"
+    assert stored[1] == "python:3.12-slim"  # whitespace stripped
+    assert "" not in stored  # blank entries dropped
+    assert len(stored[2]) == 256  # per-entry length bound
+    assert len(stored) == 100  # entry-count bound
+
+    # Omission (older daemon / probe not run this tick) keeps the last report.
+    await heartbeat(
+        payload=HeartbeatRequest(agent_available=True),
+        runner=runner,
+        session=db_session,
+    )
+    await db_session.refresh(runner)
+    assert "container_images_present" in runner.capabilities
+
+    # Explicit null clears it, same discipline as the image-store fields.
+    await heartbeat(
+        payload=HeartbeatRequest(container_images_present=None),
+        runner=runner,
+        session=db_session,
+    )
+    await db_session.refresh(runner)
+    assert "container_images_present" not in runner.capabilities
+
+
 @pytest.mark.asyncio
 async def test_heartbeat_persists_agent_unavailable_legs(db_session):
     """The per-leg breakdown map rides in capabilities JSONB alongside the

@@ -2118,6 +2118,50 @@ def _container_image_store(
     }
 
 
+# Bound the advertised present-image list so an image-hoarding runner cannot
+# bloat the heartbeat payload; dispatch only needs the requested ref findable.
+_CONTAINER_IMAGES_PRESENT_MAX_ENTRIES = 100
+
+
+def _container_images_present(
+    caps: "iso.Capabilities | None", *, _run=subprocess.run
+) -> list | None:
+    """Image references already present in the local container image store.
+
+    Dispatch uses this to waive the multi-GB image-pull disk floor when the
+    requested image needs no pull — a shared-lab runner can sit permanently
+    below the pull floor while the image its jobs use is already cached.
+    Strictly best-effort: ``None`` on any probe failure means UNKNOWN and the
+    server keeps the full floor; it must never be conflated with a genuinely
+    empty store (which reports ``[]``). Dangling ``<none>`` entries are
+    skipped and the list is bounded.
+    """
+    if caps is None:
+        return None
+    runtime = caps.preferred_container()
+    if runtime == iso.BACKEND_DOCKER:
+        argv = ["docker", "image", "ls", "--format", "{{.Repository}}:{{.Tag}}"]
+    elif runtime == iso.BACKEND_PODMAN:
+        argv = ["podman", "image", "ls", "--format", "{{.Repository}}:{{.Tag}}"]
+    else:
+        return None
+    try:
+        result = _run(argv, capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    images: list = []
+    for line in (result.stdout or "").splitlines():
+        ref = line.strip()
+        if not ref or "<none>" in ref:
+            continue
+        images.append(ref)
+        if len(images) >= _CONTAINER_IMAGES_PRESENT_MAX_ENTRIES:
+            break
+    return images
+
+
 def _compute_image_keep_days() -> int:
     """Days of LAST-USE recency that protect a Docker image from cache hygiene.
 
@@ -3996,6 +4040,11 @@ def _heartbeat_loop(
             # limiting capacity while bwrap work remains workspace-only.
             workspace_free_bytes = _disk_free_bytes(workspace_root)
             container_image_store = _container_image_store(caps)
+            # Present-image inventory rides the image-store probe's cadence
+            # (once per heartbeat, same runtime discovery). Best-effort: a
+            # failed probe yields None and the field is omitted entirely below
+            # — absence means unknown, so dispatch keeps the full pull floor.
+            container_images_present = _container_images_present(caps)
             # Per-project docker image-cache accounting. Only probed when docker
             # (or podman) is the selected compute backend — a bwrap-only / GCP
             # runner has no docker image cache to account, and we skip the two
@@ -4071,6 +4120,8 @@ def _heartbeat_loop(
                 "gpu_free_vram_mib": gpu_memory[1] if gpu_memory else None,
                 **gpu_capabilities,
             }
+            if container_images_present is not None:
+                body["container_images_present"] = container_images_present
             if project_verification is not None:
                 body["project_verification"] = project_verification
             # Per-GPU VRAM (probe failure ⇒ fields omitted entirely, matching

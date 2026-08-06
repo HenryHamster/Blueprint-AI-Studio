@@ -388,6 +388,7 @@ from app.runner_eligibility import (  # noqa: F401
     _runner_at_capacity,
     _runner_at_compute_capacity,
     _runner_chromium_usable,
+    _runner_container_image_present,
     _runner_container_image_storage,
     _runner_effective_workspace_disk_floor,
     _runner_gpu_capable,
@@ -1193,8 +1194,28 @@ async def _diagnose_strict_runner_pin_hold(
                 snapshot,
                 image_store_floor,
                 workspace_required_bytes=workspace_floor,
+                container_image=container_image,
             ):
                 storage = _runner_container_image_storage(snapshot)
+                # Mirror the selection gate: an image already in the runner's
+                # local store waives the pull floor, so the only floor that can
+                # still fail is workspace scratch — say that, not a bogus
+                # multi-GB-pull message about a pull that would never happen.
+                if _runner_container_image_present(snapshot, container_image):
+                    workspace_only_floor = _runner_effective_workspace_disk_floor(
+                        snapshot,
+                        0,
+                        workspace_required_bytes=workspace_floor,
+                    )
+                    return (
+                        "insufficient_disk",
+                        f"job declares container_image {container_image!r} "
+                        "which is already present in the runner's local image "
+                        "store (no pull needed), but the runner has "
+                        f"workspace_free_bytes={storage['workspace_free_bytes']}"
+                        " and checkout/artifact scratch requires the workspace "
+                        f"to clear {workspace_only_floor} bytes",
+                    )
                 effective_workspace_floor = _runner_effective_workspace_disk_floor(
                     snapshot,
                     image_store_floor,
@@ -1437,7 +1458,11 @@ def _select_eligible_runner(
             # disk is below the fit floor so a doomed pull is never claimed —
             # the job holds for a runner that can fit it (or the cloud backend)
             # instead of dying mid-pull. Runners that do not report
-            # disk_free_bytes are not gated (backward compatible).
+            # disk_free_bytes are not gated (backward compatible). When the
+            # runner reports the requested image ALREADY in its local store
+            # (container_images_present), the pull is a no-op and only the
+            # smaller workspace scratch floor applies — a dgx-class runner
+            # permanently below the pull floor can still run its cached image.
             image_store_floor = _container_image_min_free_disk_bytes()
             workspace_floor = _container_workspace_min_free_disk_bytes()
             out = [
@@ -1447,6 +1472,7 @@ def _select_eligible_runner(
                     r,
                     image_store_floor,
                     workspace_required_bytes=workspace_floor,
+                    container_image=container_image,
                 )
             ]
         if _job_requires_gpu_in_container(accelerator, container_image, vram_gb):
@@ -2293,6 +2319,7 @@ async def _dispatch_compute_experiment_directly(
                 r,
                 image_store_floor,
                 workspace_required_bytes=workspace_floor,
+                container_image=container_image,
             )
             for r in project_runners
         )
@@ -2370,6 +2397,7 @@ async def _dispatch_compute_experiment_directly(
                 r,
                 image_store_floor,
                 workspace_required_bytes=workspace_floor,
+                container_image=container_image,
             )
         ]
         # Capacity is deliberately excluded from this companion subset. A full
@@ -2388,6 +2416,7 @@ async def _dispatch_compute_experiment_directly(
                 r,
                 image_store_floor,
                 workspace_required_bytes=workspace_floor,
+                container_image=container_image,
             )
         ]
         gpu_in_container_blocked = any(

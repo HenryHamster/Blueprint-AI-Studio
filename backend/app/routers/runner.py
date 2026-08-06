@@ -166,6 +166,10 @@ def _observed_runner_hardware(runner: LocalRunner) -> dict[str, Any]:
 _MAX_CONTAINER_IMAGE_STORE_PATH_CHARS = 512
 _MAX_CONTAINER_IMAGE_RECLAIM_REASON_CHARS = 500
 _CONTAINER_IMAGE_STORE_RUNTIMES = frozenset({"docker", "podman"})
+# Present-image inventory bounds: entry count matches the runner-side cap, and
+# a container image reference comfortably fits 256 chars.
+_MAX_CONTAINER_IMAGES_PRESENT_ENTRIES = 100
+_MAX_CONTAINER_IMAGE_REF_CHARS = 256
 _PROJECT_VERIFICATION_VERSION = 1
 _MAX_PROJECT_VERIFICATION_REASON_CHARS = 500
 _PROJECT_VERIFICATION_BACKENDS = frozenset({"bwrap", "declined"})
@@ -760,6 +764,13 @@ class HeartbeatRequest(BaseModel):
     container_image_store_path: str | None = None
     container_image_store_free_bytes: int | None = None
     container_image_reclaim: dict | None = None
+    # Image references already present in the runner's local container image
+    # store (``docker image ls`` refs). Dispatch uses this to waive the
+    # multi-GB image-pull disk floor when the requested image needs no pull.
+    # Best-effort and optional: an older daemon or a failed probe OMITS the
+    # field entirely, which means UNKNOWN (the full floor applies) — never an
+    # empty store.
+    container_images_present: List[str] | None = None
     cpu_load_avg: float | None = None
     memory_free_bytes: int | None = None
     gpu_utilization_pct: int | None = None
@@ -1846,6 +1857,24 @@ async def heartbeat(
         if field_name in reported_fields and getattr(payload, field_name) is None:
             caps.pop(field_name, None)
 
+    # Present-image inventory follows the same explicit-null discipline as the
+    # image-store fields above: a reported null clears the stored list so a
+    # stale "image present" claim can never waive a real pull floor, while an
+    # omitted field (older daemon / probe not run) leaves capabilities alone.
+    if (
+        "container_images_present" in reported_fields
+        and payload.container_images_present is None
+    ):
+        caps.pop("container_images_present", None)
+    if payload.container_images_present is not None:
+        images_present: List[str] = []
+        for ref in payload.container_images_present:
+            if len(images_present) >= _MAX_CONTAINER_IMAGES_PRESENT_ENTRIES:
+                break
+            if not isinstance(ref, str) or not ref.strip():
+                continue
+            images_present.append(ref.strip()[:_MAX_CONTAINER_IMAGE_REF_CHARS])
+        caps["container_images_present"] = images_present
     if payload.container_image_store_free_bytes is not None:
         caps["container_image_store_free_bytes"] = max(
             0, int(payload.container_image_store_free_bytes)
