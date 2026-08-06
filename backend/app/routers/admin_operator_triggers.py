@@ -320,12 +320,20 @@ async def trigger_qualify(
     gate = ci_compliance_qualify_gate(project)
     if gate.get("blocked"):
         head_sha = str(gate.get("head_sha") or "")[:12] or "unknown"
-        detail = (
-            f"CI-compliance violations block qualification: "
-            f"{gate.get('violation_count', 0)} violation(s) at HEAD {head_sha}. "
-            f"Repair the guardrails (a cap-bump task is typically queued) and "
-            f"re-trigger once the integration HEAD is compliant."
-        )
+        if gate.get("reason") == "ci_compliance_evidence_unavailable":
+            detail = (
+                f"CI-compliance could not be evaluated at HEAD {head_sha}: the "
+                f"guardrail evidence is unavailable, so compliance is not "
+                f"verified. Qualification is blocked until compliance can be "
+                f"checked; re-trigger once the integration HEAD is evaluable."
+            )
+        else:
+            detail = (
+                f"CI-compliance violations block qualification: "
+                f"{gate.get('violation_count', 0)} violation(s) at HEAD {head_sha}. "
+                f"Repair the guardrails (a cap-bump task is typically queued) and "
+                f"re-trigger once the integration HEAD is compliant."
+            )
         raise HTTPException(status_code=409, detail=detail)
 
     result = await release_qualifier.run_qualification(

@@ -998,6 +998,80 @@ async def test_operator_qualify_respects_ci_compliance_gate(db_session, client, 
     assert "CI-compliance" in resp.text
 
 
+@pytest.mark.asyncio
+async def test_operator_409_distinguishes_unavailable_evidence_from_violations(
+    db_session, client, mocker
+):
+    """The operator /qualify 409 body reflects the blocker class the gate returned.
+
+    A block caused by UNAVAILABLE compliance evidence (limits file / branch-literal
+    rules / repo tree could not be read) fails closed with zero observed
+    violations: the operator must be told compliance could not be evaluated, not
+    that violations exist — no violation count, no cap-bump promise. A block
+    caused by REAL detected violations keeps today's message, including the count
+    and the remediation pointer. Both cases still return 409.
+    """
+    from app import release_version as rv
+    from app.models import ProjectMember
+
+    project, _agent_task = await _make_project_with_agent_task(
+        db_session, module_line_count=_CAP - 1, mocker=mocker
+    )
+    db_session.add(
+        ProjectMember(project_id=project.id, user_id="test-user-123", role="owner")
+    )
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    rv.set_version_phase(version, "stabilize", reasoning="ready to qualify")
+    db_session.add(version)
+    db_session.add(project)
+    await db_session.commit()
+
+    # (a) Unavailable evidence: the evaluator could not read its inputs, so the
+    # gate fails closed with no observed violations.
+    ci_compliance.record_ci_compliance(
+        project,
+        {
+            "ref": _HEAD_SHA,
+            "compliant": True,
+            "violations": [],
+            "branch_literal_violations": [],
+            "checked": 0,
+            "limits_available": False,
+            "tree_available": True,
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    gate = ci_compliance_qualify_gate(project, _HEAD_SHA)
+    assert gate["blocked"] is True
+    assert gate["reason"] == "ci_compliance_evidence_unavailable"
+    assert gate["violation_count"] == 0
+
+    resp = await client.post(f"/api/admin/projects/{project.id}/qualify")
+    assert resp.status_code == 409
+    assert "could not be evaluated" in resp.text
+    assert "violation" not in resp.text.lower()
+    assert "cap-bump" not in resp.text.lower()
+
+    # (b) Real violations: the stored record is non-compliant with an observed
+    # breach; the block keeps the count and the remediation pointer.
+    ci_compliance.record_ci_compliance(project, _violation_result(_CAP + 2))
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    gate = ci_compliance_qualify_gate(project, _HEAD_SHA)
+    assert gate["blocked"] is True
+    assert gate["violation_count"] == 1
+
+    resp = await client.post(f"/api/admin/projects/{project.id}/qualify")
+    assert resp.status_code == 409
+    assert "1 violation(s)" in resp.text
+    assert "cap-bump task is typically queued" in resp.text
+
+
 def test_cap_bump_resolves_orchestrator_runner_dispatch_breach():
     """After bumping caps via check_size_limits --fix, orchestrator_runner_dispatch
     must be within its new cap and the module_size_limits.json must be consistent
