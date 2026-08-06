@@ -13,9 +13,10 @@ correctly in the aggregate counts.
 """
 
 from datetime import datetime, timedelta
+import uuid
 
 import pytest
-import uuid
+from sqlmodel import select
 
 from app import max_plan_pool
 from app.fleet_utilization import (
@@ -25,9 +26,19 @@ from app.fleet_utilization import (
     _sum_slot_occupancy_seconds,
     get_fleet_utilization_snapshot,
     get_recorded_fleet_sizing_readings,
+    read_latest_fleet_sizing_reading,
+    record_fleet_sizing_reading,
 )
 from app.max_plan_pool import _account_by_id, _max_plan_pools
-from app.models import LocalRunner, Project, ProjectMember, TaskStatus, _utcnow
+from app.models import (
+    FleetSizingReading,
+    LocalRunner,
+    Project,
+    ProjectMember,
+    Task,
+    TaskStatus,
+    _utcnow,
+)
 from app.strategic_spawning import _format_fleet_utilization_axis
 
 TEST_USER_ID = "test-user-fleet-health"
@@ -1210,3 +1221,132 @@ async def test_recorded_readings_none_session_still_reports_config_finding():
     assert readings["workspace_footprint"]["runner_inventory_bytes"] is None
     assert readings["workspace_footprint"]["fits"] is None
     assert readings["target_concurrency_key"]["available"] is False
+
+
+# ── persisted fleet-sizing readings (production record path) ────────────────
+
+
+async def test_record_and_read_fleet_sizing_reading_persists_provenance(
+    db_session, monkeypatch
+):
+    """The production record path computes from live data and persists a reading.
+
+    ``record_fleet_sizing_reading`` must compute the three readings from the
+    live session (task-table concurrency overlap + LocalRunner disk inventory),
+    persist a ``FleetSizingReading`` row with provenance (captured_at,
+    serving_sha, derivation source), and be readable back unchanged by
+    ``read_latest_fleet_sizing_reading`` — so the recorded output is not
+    dropped on the floor.
+    """
+    import app.vm_lifecycle as vm_lifecycle
+    import app.warm_pool as warm_pool
+
+    monkeypatch.setattr(max_plan_pool, "_all_accounts", lambda: [])
+    monkeypatch.setattr(
+        max_plan_pool, "_account_available_for_model", lambda acct, model: True
+    )
+    monkeypatch.setattr(vm_lifecycle, "_last_gcp_vm_count", 6)
+    monkeypatch.setattr(vm_lifecycle, "_last_gcp_vm_check", float("inf"))
+    monkeypatch.setattr(warm_pool, "is_warm_pool_enabled", lambda: False)
+
+    project = Project(name="Fleet Sizing Reading Project", user_id=TEST_USER_ID)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    # Three overlapping IN_PROGRESS tasks -> concurrency peak 3 from the task
+    # table, not a simulation.
+    db_session.add_all(
+        [
+            Task(
+                project_id=project.id,
+                payloads=[{"type": "create", "prompt": "fleet reading t1"}],
+                status=TaskStatus.IN_PROGRESS,
+                created_by="ORCHESTRATOR",
+                vm_dispatched_at=now - timedelta(hours=3),
+            ),
+            Task(
+                project_id=project.id,
+                payloads=[{"type": "create", "prompt": "fleet reading t2"}],
+                status=TaskStatus.IN_PROGRESS,
+                created_by="ORCHESTRATOR",
+                vm_dispatched_at=now - timedelta(hours=2),
+            ),
+            Task(
+                project_id=project.id,
+                payloads=[{"type": "create", "prompt": "fleet reading t3"}],
+                status=TaskStatus.IN_PROGRESS,
+                created_by="ORCHESTRATOR",
+                vm_dispatched_at=now - timedelta(hours=1),
+            ),
+        ]
+    )
+    # Two runners reporting 40 GiB free each -> 80 GiB < 100 GiB (50 x 2 GiB).
+    db_session.add_all(
+        [
+            LocalRunner(
+                project_id=project.id,
+                token_hash=f"r{i:063x}",
+                hostname=f"r{i}",
+                status="active",
+                capabilities={
+                    "task_types": "all",
+                    "max_concurrent": 2,
+                    "disk_free_bytes": 40 * 1024**3,
+                },
+            )
+            for i in range(2)
+        ]
+    )
+    await db_session.commit()
+
+    recorded = await record_fleet_sizing_reading(db_session)
+    await db_session.commit()
+
+    # Provenance is present on the returned reading.
+    prov = recorded["provenance"]
+    assert prov["captured_at"]
+    assert prov["source"]
+    assert "task-table" in prov["source"]
+
+    # Concurrency was computed from the live task-table overlap.
+    assert recorded["concurrency"]["peak"] == 3
+    assert recorded["concurrency"]["slot_definition"]
+
+    # The disk footprint carries the MEASURED non-zero per-workspace value and
+    # the live LocalRunner inventory comparison.
+    fp = recorded["workspace_footprint"]
+    assert fp["per_workspace_bytes"] == MEASURED_PER_WORKSPACE_DISK_BYTES
+    assert fp["target_slots"] == FLEET_SIZING_TARGET_SLOTS
+    assert fp["required_bytes"] == (
+        MEASURED_PER_WORKSPACE_DISK_BYTES * FLEET_SIZING_TARGET_SLOTS
+    )
+    assert fp["runner_count"] == 2
+    assert fp["runner_inventory_bytes"] == 2 * 40 * 1024**3
+    assert fp["fits"] is False
+    assert fp["shortfall_bytes"] == (
+        MEASURED_PER_WORKSPACE_DISK_BYTES * FLEET_SIZING_TARGET_SLOTS
+        - 2 * 40 * 1024**3
+    )
+
+    # A FleetSizingReading row was actually persisted.
+    rows = (await db_session.execute(select(FleetSizingReading))).scalars().all()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.captured_at is not None
+    assert row.blob["concurrency"]["peak"] == 3
+    assert row.blob["workspace_footprint"]["fits"] is False
+
+    # The recorded output is readable back, unchanged.
+    latest = await read_latest_fleet_sizing_reading(db_session)
+    assert latest == recorded
+    assert latest["concurrency"]["peak"] == 3
+    assert latest["workspace_footprint"]["fits"] is False
+    assert latest["provenance"]["captured_at"] == prov["captured_at"]
+
+
+async def test_read_latest_fleet_sizing_reading_none_before_any_record(db_session):
+    """Before any reading is recorded, the read-back path returns None."""
+    latest = await read_latest_fleet_sizing_reading(db_session)
+    assert latest is None

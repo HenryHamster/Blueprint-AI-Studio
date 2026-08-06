@@ -14,6 +14,8 @@ surface.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from datetime import datetime, timedelta
 from typing import Any, Dict
 
@@ -21,8 +23,10 @@ from sqlalchemy import func, or_
 from sqlmodel import select
 
 from app import max_plan_pool
-from app.models import LocalRunner, Task, TaskStatus, _utcnow
+from app.models import FleetSizingReading, LocalRunner, Task, TaskStatus, _utcnow
 from app.runtime_config_state import runtime_config as _runtime_config
+
+logger = logging.getLogger(__name__)
 
 
 def _naive(dt: datetime | None) -> datetime | None:
@@ -614,3 +618,100 @@ async def get_recorded_fleet_sizing_readings(
         "concurrency": concurrency,
         "target_concurrency_key": _search_target_concurrency_key(),
     }
+
+
+async def record_fleet_sizing_reading(
+    session,
+    *,
+    window_hours: int = 24,
+    now: datetime | None = None,
+) -> Dict[str, Any]:
+    """Compute and persist one fleet-sizing reading with provenance.
+
+    This is the production trigger for ``get_recorded_fleet_sizing_readings``:
+    it computes the three readings from LIVE data (task-table concurrency
+    overlap + LocalRunner disk inventory) and appends a ``FleetSizingReading``
+    row annotated with *when* it was measured (``captured_at``) and *which*
+    deployed backend code computed it (``serving_sha``) — the provenance that
+    ties each persisted number to the data it was derived from.
+
+    The caller owns the session's commit. The returned dict is the persisted
+    blob (readings + provenance) so a caller can log/return it without an extra
+    read.
+    """
+    now = _utcnow() if now is None else _naive(now)
+    assert now is not None  # _utcnow() is a datetime; _naive() only strips tzinfo
+    readings = await get_recorded_fleet_sizing_readings(
+        session, window_hours=window_hours, now=now
+    )
+    from app.deployed_sha import get_serving_sha
+
+    serving_sha = get_serving_sha()
+    blob = {
+        **readings,
+        "provenance": {
+            "captured_at": now.isoformat(),
+            "serving_sha": serving_sha,
+            "source": (
+                "computed from live task-table slot overlap + LocalRunner "
+                "disk inventory via get_recorded_fleet_sizing_readings"
+            ),
+        },
+    }
+    row = FleetSizingReading(
+        captured_at=now,
+        serving_sha=serving_sha,
+        window_start=now - timedelta(hours=max(1, int(window_hours))),
+        window_end=now,
+        blob=blob,
+    )
+    session.add(row)
+    return blob
+
+
+async def read_latest_fleet_sizing_reading(session) -> Dict[str, Any] | None:
+    """Return the most recently persisted fleet-sizing reading, or None.
+
+    The returned dict is the same shape ``record_fleet_sizing_reading``
+    persisted (the three readings plus ``provenance``), so a caller can render
+    the measured values and their provenance together. ``None`` when no reading
+    has been recorded yet.
+    """
+    row = (
+        await session.execute(
+            select(FleetSizingReading)
+            .order_by(FleetSizingReading.captured_at.desc())
+            .limit(1)
+        )
+    ).scalars().first()
+    if row is None:
+        return None
+    return dict(row.blob or {})
+
+
+# Cadence for the leader-only fleet-sizing reading recorder. Kept beside the
+# record function so the measurement cadence and the record path stay together.
+FLEET_SIZING_READING_INTERVAL_SECONDS = 15 * 60  # 15 minutes
+
+
+async def fleet_sizing_reading_service() -> None:
+    """Leader-only periodic recorder of fleet-sizing readings.
+
+    Computes a fleet-sizing reading from live data every 15 minutes and
+    persists it with provenance, independent of when a strategic cycle happens
+    to run — so the fleet-sizing clause has a durable measured record as long
+    as the deployed backend is up. Failures are logged and skipped; the
+    measurement must never take down the background loop.
+    """
+    from app.database import AsyncSessionLocal
+
+    while True:
+        await asyncio.sleep(FLEET_SIZING_READING_INTERVAL_SECONDS)
+        try:
+            async with AsyncSessionLocal() as session:
+                await record_fleet_sizing_reading(session)
+                await session.commit()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("[FLEET_SIZING] reading record failed; skipping tick")

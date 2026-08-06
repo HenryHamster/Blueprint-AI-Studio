@@ -8186,6 +8186,46 @@ class ProjectEfficiencySnapshot(SQLModel, table=True):
     )
 
 
+class FleetSizingReading(SQLModel, table=True):
+    """Append-only global fleet-sizing reading (measured, with provenance).
+
+    One row per recorded reading: the workspace disk footprint scaled to the
+    fleet slot target, the task-table concurrency overlap peak/percentiles, and
+    the target-concurrency-key search — computed from live data by
+    ``fleet_utilization.get_recorded_fleet_sizing_readings`` and persisted by
+    ``record_fleet_sizing_reading``. ``captured_at`` (when measured) and
+    ``serving_sha`` (which deployed backend code computed it) are the
+    provenance that ties each reading to the data it was derived from; the full
+    reading dict lives in ``blob``.
+    """
+
+    __tablename__ = "fleet_sizing_reading"
+
+    id: uuid.UUID = Field(
+        default_factory=uuid.uuid4,
+        sa_column=Column(GUID(), primary_key=True, nullable=False),
+    )
+    captured_at: datetime = Field(
+        sa_column=Column(NaiveUTCDateTime, nullable=False),
+    )
+    serving_sha: str | None = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
+    window_start: datetime = Field(
+        sa_column=Column(NaiveUTCDateTime, nullable=False),
+    )
+    window_end: datetime = Field(
+        sa_column=Column(NaiveUTCDateTime, nullable=False),
+    )
+    blob: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+    __table_args__ = (
+        Index("ix_fleet_sizing_reading_captured_at", "captured_at"),
+    )
+
+
 class ProjectLaneBaseline(SQLModel, table=True):
     """Persisted lane-baseline telemetry for a project.
 

@@ -1661,6 +1661,14 @@ async def lifespan(app):
 
     efficiency_snapshot_task = asyncio.create_task(_efficiency_snapshot_service())
 
+    # Start the fleet-sizing reading recorder — leader-only periodic global
+    # measurement persistence. Independent of strategic-cycle scheduling so the
+    # v28 fleet-sizing clause gets a durable measured record whenever the
+    # deployed backend is up (15 min cadence inside the service).
+    from app.fleet_utilization import fleet_sizing_reading_service
+
+    fleet_sizing_reading_task = asyncio.create_task(fleet_sizing_reading_service())
+
     # Start the Branch Reconciliation service — keeps automain in sync with main.
     async def _branch_reconciliation_service():
         """Periodic leader-only scan: back-merge the LTS branch into the
@@ -1899,6 +1907,7 @@ async def lifespan(app):
     _bg_tasks["pool_maintainer"] = pool_maintainer_task
     _bg_tasks["compute_job_monitor"] = compute_job_monitor_task
     _bg_tasks["efficiency_snapshot"] = efficiency_snapshot_task
+    _bg_tasks["fleet_sizing_reading"] = fleet_sizing_reading_task
     _bg_tasks["branch_reconciliation"] = branch_reconciliation_task
     _bg_tasks["deploy_state_health_tick"] = deploy_state_health_tick_task
     _bg_tasks["evaluating_timeout"] = evaluating_timeout_task
@@ -1936,6 +1945,7 @@ async def lifespan(app):
             "pool_maintainer": pool_maintainer_service,
             "compute_job_monitor": compute_job_monitor_service,
             "efficiency_snapshot": _efficiency_snapshot_service,
+            "fleet_sizing_reading": fleet_sizing_reading_service,
             "branch_reconciliation": _branch_reconciliation_service,
             "deploy_state_health_tick": _deploy_state_health_tick_service,
             "evaluating_timeout": _evaluating_timeout_service,
