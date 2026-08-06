@@ -5,7 +5,7 @@ import { sendLog, runClaudeCode, persistAndPostStatus } from '../index.js';
 import { PLAYBOOK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, READ_ONLY_BASH_WRITE_NOTE } from '../prompt.js';
 import { extractJsonObjectDetailed } from '../json-extract.js';
 import { repairStructuredOutput } from '../handlers/structured-output-repair.js';
-import { assembleStableVariablePrompt } from './assemble.js';
+import { assembleStableVariablePrompt, type AssembledStableVariablePrompt } from './assemble.js';
 import type { RepairStructuredOutputResult } from '../handlers/structured-output-repair.js';
 
 export function computeResearchPlanPromptFingerprint(mode: 'plan' | 'research'): string {
@@ -695,6 +695,23 @@ export function buildThinkerPromptParts(p: ThinkerPromptParams): {
 
 export function buildThinkerPrompt(p: ThinkerPromptParams): string {
   return buildThinkerPromptParts(p).finalPrompt;
+}
+
+/**
+ * Byte share of the stable cacheable prefix within the assembled prompt.
+ *
+ * c-24f843a8 clause (2) requires the stable prefix to carry the MAJORITY
+ * (>50%) of the prompt's instruction bytes — a cache boundary whose stable
+ * region is only a small fraction of the prompt would pass byte-identity
+ * checks while delivering almost no cache benefit. "Instruction bytes" = the
+ * full rendered prompt the model actually receives (stablePrefix +
+ * variableBody), counted as UTF-8 bytes. Nothing is excluded from the
+ * denominator, so the ratio cannot be flattered by dropping volatile bytes.
+ */
+export function computeStablePrefixByteShare(parts: AssembledStableVariablePrompt): number {
+  const totalBytes = Buffer.byteLength(parts.finalPrompt, 'utf8');
+  if (totalBytes === 0) return 0;
+  return Buffer.byteLength(parts.stablePrefix, 'utf8') / totalBytes;
 }
 
 // ── Pass-1 gate: run thinker, verify artifacts, retry once if missing ────────

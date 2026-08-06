@@ -40,6 +40,7 @@ import {
   buildThinkerPrompt,
   buildThinkerPromptParts,
   computeResearchPlanPromptFingerprint,
+  computeStablePrefixByteShare,
   computeStrategicPromptFingerprint,
   runThinkerWithGate,
   type ThinkerPromptParams,
@@ -316,6 +317,26 @@ describe('buildThinkerPrompt', () => {
     expect(turnA.variableBody).not.toBe(turnB.variableBody);
     // The final prompt is exactly prefix + suffix.
     expect(turnA.finalPrompt).toBe(turnA.stablePrefix + turnA.variableBody);
+
+    // ── c-24f843a8 clause (2): the stable prefix carries the MAJORITY of the
+    // prompt's instruction bytes ──────────────────────────────────────────────
+    // 'instruction bytes' = the full rendered prompt the model actually
+    // receives (`stablePrefix` + `variableBody`), counted as UTF-8 bytes — no
+    // exclusions, so the denominator cannot flatter the ratio. A boundary whose
+    // stable region were only a small fraction of the prompt would pass every
+    // byte-identity check above while delivering almost no cache benefit; >50%
+    // per the criterion is the floor, and the failure message reports the
+    // measured share so a regression shows how far it slipped.
+    for (const turn of [turnA, turnB]) {
+      const share = computeStablePrefixByteShare(turn);
+      expect(
+        share,
+        `stable prefix byte share of the rendered prompt = ${(share * 100).toFixed(2)}% ` +
+          `(${Buffer.byteLength(turn.stablePrefix, 'utf8')} of ` +
+          `${Buffer.byteLength(turn.finalPrompt, 'utf8')} UTF-8 bytes) — ` +
+          'expected > 50% per c-24f843a8 clause (2)',
+      ).toBeGreaterThan(0.5);
+    }
   });
 
   it('stable prefix is byte-identical across tasks with different taskIds', () => {

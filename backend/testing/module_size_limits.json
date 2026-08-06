@@ -177,7 +177,7 @@
     "handlers/strategic-resident-lib.ts": 3550,
     "handlers/strategic-resident.ts": 5350,
     "handlers/research-direction-context.ts": 250,
-    "prompts/thinker.ts": 1150,
+    "prompts/thinker.ts": 1400,
     "handlers/standard.ts": 1900,
     "handlers/review-fix.ts": 2050,
     "handlers/review-fix-history.ts": 200,
