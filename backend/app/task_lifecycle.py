@@ -1177,6 +1177,80 @@ async def trigger_stranded_sidecar_resolution(
         )
 
 
+async def _resolve_ci_for_unpolled_rollup_parent(
+    session: AsyncSession,
+    orig_task: Task,
+    orig_loop: dict,
+    pr_number: int,
+    token: str,
+    owner: str,
+    repo: str,
+) -> tuple[bool, str]:
+    """Resolve CI inline for a rollup parent the CI monitor will never poll.
+
+    The orchestrator CI monitor restricts its poll set to EVALUATING rows
+    (``orchestrator_ci_monitor._ci_waiting_sql_filter``), so a rollup child
+    that is already COMPLETED parks its exact-target approvals at the CI gate
+    forever: ``ci_passed`` never flips, the rollup recovery respawns another
+    review, and the respawn cap eventually escalates the parent to manual
+    approval (PR #16735 treadmill, 2026-08-06). Mirror the monitor's
+    *definitive* rules here:
+
+      - a completed all-green build → pass;
+      - definitive ``no_checks`` on a base where checks will never appear
+        (``ci_resolution.proceed_on_no_checks`` — internal staging branch or
+        declared no-CI repo — minus the external verify_tests gate, which
+        needs the monitor's polling loop to await a verdict) → pass;
+      - pending / unresolved / red → keep parked; never merge on the absence
+        of a signal.
+
+    Returns ``(ci_ok, resolved_state)``. Never raises.
+    """
+    from app import ci_resolution
+    from app.shared_state import runtime_config
+
+    try:
+        resolved = await ci_resolution.resolve_pr_ci_status(
+            pr_number,
+            str(orig_loop.get("head_sha") or ""),
+            token=token,
+            owner=owner,
+            repo=repo,
+            project_id=str(orig_task.project_id)
+            if orig_task.project_id
+            else None,
+        )
+        state = str(resolved.get("state") or "")
+        if resolved.get("ci_passed"):
+            return True, state
+        if state == "no_checks":
+            project = (
+                await session.get(Project, orig_task.project_id)
+                if orig_task.project_id is not None
+                else None
+            )
+            base_ref = str(orig_loop.get("base_branch") or "")
+            if (
+                project is not None
+                and ci_resolution.proceed_on_no_checks(project, base_ref)
+                and not ci_resolution.should_run_no_ci_test_gate(
+                    project,
+                    base_ref,
+                    gate_enabled=runtime_config.get(
+                        "no_ci_test_gate_enabled", True
+                    ),
+                )
+            ):
+                return True, state
+        return False, state
+    except Exception as exc:
+        logger.warning(
+            f"[REVIEW PIPELINE] Inline CI resolution failed for rollup PR #{pr_number}: {exc}",
+            exc_info=True,
+        )
+        return False, "error"
+
+
 async def _process_post_commit(
     task_id: uuid.UUID,
     payload: AgentStatusPayload,
@@ -3714,7 +3788,100 @@ async def _process_post_commit(
                                     session.add(task)
                                     await session.commit()
 
-                                    if _orig_loop.get("ci_passed"):
+                                    _gate_ci_ok = bool(
+                                        _orig_loop.get("ci_passed")
+                                    )
+                                    if (
+                                        not _gate_ci_ok
+                                        and _orig_status_snap
+                                        != TaskStatus.EVALUATING
+                                    ):
+                                        # The CI monitor polls only EVALUATING
+                                        # rows — nothing else ever flips
+                                        # ci_passed for this parent, so the
+                                        # approval would park at this gate
+                                        # forever while the rollup recovery
+                                        # respawns reviews up to the cap.
+                                        # Resolve the definitive CI states
+                                        # inline; pending keeps parking.
+                                        _gate_ci_state = ""
+                                        try:
+                                            if (
+                                                _pre_rollup_gh
+                                                and _pre_rollup_own
+                                                and _pre_rollup_rep
+                                            ):
+                                                _cig = _pre_rollup_gh
+                                                _cio = _pre_rollup_own
+                                                _cir = _pre_rollup_rep
+                                            else:
+                                                (
+                                                    _cig,
+                                                    _cio,
+                                                    _cir,
+                                                ) = await get_github_token_for_task(
+                                                    _orig.id, session
+                                                )
+                                        except Exception:
+                                            _cig = _cio = _cir = ""
+                                        if _cig:
+                                            (
+                                                _gate_ci_ok,
+                                                _gate_ci_state,
+                                            ) = await _resolve_ci_for_unpolled_rollup_parent(
+                                                session,
+                                                _orig,
+                                                _orig_loop,
+                                                pr_number,
+                                                _cig,
+                                                _cio,
+                                                _cir,
+                                            )
+                                        if _gate_ci_ok:
+                                            _orig_loop["ci_passed"] = True
+                                            _orig_loop["ci_passed_source"] = (
+                                                f"rollup_handoff_inline:{_gate_ci_state}"
+                                            )
+                                            # The CI verdict was just resolved
+                                            # at the approval's exact target —
+                                            # stamp the checked pair from it,
+                                            # or the merge authority compares
+                                            # the live base against a
+                                            # ci_checked_base_sha stamped
+                                            # before a sibling merge moved the
+                                            # base and holds forever (PR
+                                            # #16735: checked 64a39c00 vs live
+                                            # a2ec7e09).
+                                            _orig_checked_head_sha = str(
+                                                _orig_loop.get("head_sha") or ""
+                                            )
+                                            _orig_checked_base_sha = str(
+                                                _orig_loop.get("base_sha") or ""
+                                            )
+                                            _orig_loop["ci_checked_head_sha"] = (
+                                                _orig_checked_head_sha
+                                            )
+                                            _orig_loop["ci_checked_base_sha"] = (
+                                                _orig_checked_base_sha
+                                            )
+                                            _orig.context = {
+                                                **(_orig.context or {}),
+                                                "review_loop": _orig_loop,
+                                            }
+                                            flag_modified(_orig, "context")
+                                            session.add(_orig)
+                                            logger.info(
+                                                f"[REVIEW PIPELINE] Rollup PR #{pr_number}: CI resolved inline "
+                                                f"({_gate_ci_state}) for non-EVALUATING parent {_orig_id_str[:8]} — proceeding to gate merge"
+                                            )
+                                        else:
+                                            logger.warning(
+                                                f"[REVIEW PIPELINE] Rollup PR #{pr_number}: approval parked on CI "
+                                                f"({_gate_ci_state or 'unresolved'}) for {_orig_status_snap} parent "
+                                                f"{_orig_id_str[:8]} — the CI monitor does not poll this row"
+                                            )
+
+                                    if _gate_ci_ok:
                                         try:
                                             # Use pre-lock token if resolved; fall
                                             # back to under-lock resolution when the
