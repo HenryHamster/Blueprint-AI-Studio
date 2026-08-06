@@ -2130,6 +2130,15 @@ def plan_compute_execution(
         if clone_dir_host:
             binds.append((clone_dir_host, "/workspace"))
             inner["PYTHONPATH"] = "/workspace"
+            # The clone is owned by the runner's host UID but the container
+            # user (root in NGC images) differs, so git inside the container
+            # refuses every command with "dubious ownership". Injected via env
+            # rather than writing /workspace/.gitconfig — a written file would
+            # show up as an untracked path and dirty the very checkout that
+            # strict-cleanliness experiment scripts are verifying.
+            inner["GIT_CONFIG_COUNT"] = "1"
+            inner["GIT_CONFIG_KEY_0"] = "safe.directory"
+            inner["GIT_CONFIG_VALUE_0"] = "/workspace"
         inner.update({k: str(v) for k, v in job_env.items()})
         for forbidden in FORBIDDEN_ENV_KEYS:
             inner.pop(forbidden, None)

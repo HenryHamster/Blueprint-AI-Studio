@@ -1307,6 +1307,32 @@ class TestComputePlan(unittest.TestCase):
 
         self.assertEqual(plan.argv[plan.argv.index("-w") + 1], "/workspace/DEN")
 
+    def test_docker_clone_marks_workspace_git_safe_directory(self):
+        # The clone is owned by the host UID while NGC containers run as root;
+        # without safe.directory every in-container git command dies with
+        # "dubious ownership" and strict-cleanliness experiment scripts refuse.
+        plan = self._common(
+            caps=_caps(docker_usable=True),
+            image="nvcr.io/nvidia/pytorch:24.01",
+            clone_dir_host="/tmp/bp_x/repo",
+        )
+        self.assertEqual(plan.env["GIT_CONFIG_COUNT"], "1")
+        self.assertEqual(plan.env["GIT_CONFIG_KEY_0"], "safe.directory")
+        self.assertEqual(plan.env["GIT_CONFIG_VALUE_0"], "/workspace")
+        joined = " ".join(plan.argv)
+        self.assertIn("-e GIT_CONFIG_COUNT", joined)
+        self.assertIn("-e GIT_CONFIG_KEY_0", joined)
+        self.assertIn("-e GIT_CONFIG_VALUE_0", joined)
+
+    def test_docker_cloneless_job_gets_no_git_safe_directory(self):
+        plan = self._common(
+            caps=_caps(docker_usable=True, gpu_indices=(0,)),
+            image="nvcr.io/nvidia/pytorch:24.01",
+            gpu_indices=[0],
+        )
+        self.assertNotIn("GIT_CONFIG_COUNT", plan.env)
+        self.assertNotIn("GIT_CONFIG_KEY_0", plan.env)
+
     def test_docker_clone_allows_directory_name_starting_with_dotdot(self):
         plan = self._common(
             caps=_caps(docker_usable=True),
