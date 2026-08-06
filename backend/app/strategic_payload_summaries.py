@@ -770,6 +770,185 @@ def _summarize_knowledge_index(v: Any) -> Any:
     return out
 
 
+# ── Producer-side core floors for the strategic context families ─────────────
+# design_doc, knowledge_index, and outcome_evaluation were previously medium-tier
+# keys with only a ``summarize`` fallback — under byte pressure their summarized
+# form still could not fit and they were DROPPED WHOLESALE every cycle. Each now
+# carries a ``floor`` callback producing a guaranteed-minimum, bounded, ranked,
+# truncated-with-a-marker form so the strategist ALWAYS receives something useful
+# from these context families alongside the full problem_model, with full detail
+# reachable on demand via the existing fetch verbs.
+
+_DESIGN_DOC_FLOOR_SECTIONS_KEEP = 6
+_DESIGN_DOC_FLOOR_SUMMARY_CHARS = 120
+
+
+def _design_doc_floor_rank(key: str) -> int:
+    """Rank a design-doc section key by relevance to currently active directions.
+
+    ``systems/*`` and ``capabilities/*`` are the architecture sections active
+    directions touch via ``system_id`` / gap links, so they lead; ``repo_overview``
+    orients a cold-start cycle and ranks next; generic prose sections (notes,
+    roadmap, …) trail. Higher rank = trimmed first under the floor bound.
+    """
+    if key.startswith("systems/") or key.startswith("capabilities/"):
+        return 0
+    if key == "repo_overview":
+        return 1
+    return 2
+
+
+def _floor_design_doc_index(index: Any) -> Any:
+    """Guaranteed-minimum core floor for the ``design_doc`` pack key.
+
+    Keeps the top :data:`_DESIGN_DOC_FLOOR_SECTIONS_KEEP` sections, ranked so the
+    architecture sections active directions reference lead, each reduced to
+    key + status + a shortened one-line summary (backing module lists and
+    presence warnings dropped). A ``_design_floor`` marker records how many
+    sections were omitted so the strategist knows detail exists beyond the
+    shipped skeleton and can pull it via the design-doc op:get endpoint
+    (``fetch_verb: "section"``).
+    """
+    if not isinstance(index, dict):
+        return index
+    sections = index.get("sections")
+    if not isinstance(sections, list):
+        return index
+    ranked = sorted(
+        (s for s in sections if isinstance(s, dict)),
+        key=lambda s: (_design_doc_floor_rank(s.get("key") or ""), s.get("key") or ""),
+    )
+    shipped = ranked[:_DESIGN_DOC_FLOOR_SECTIONS_KEEP]
+    out_sections: list[dict[str, Any]] = []
+    for entry in shipped:
+        item: dict[str, Any] = {"key": entry.get("key")}
+        status = entry.get("status")
+        if isinstance(status, str) and status.strip():
+            item["status"] = status
+        summary = _bounded_text(entry.get("summary"), _DESIGN_DOC_FLOOR_SUMMARY_CHARS)
+        if summary is not None:
+            item["summary"] = summary
+        out_sections.append(item)
+    result: dict[str, Any] = {"sections": out_sections}
+    total = len(sections)
+    if total > len(out_sections):
+        result["_design_floor"] = {
+            "total_sections": total,
+            "shipped_sections": len(out_sections),
+            "fetch_verb": "section",
+        }
+    return result
+
+
+_KNOWLEDGE_INDEX_FLOOR_KEEP = 4
+
+
+def _floor_knowledge_index(v: Any) -> Any:
+    """Guaranteed-minimum core floor for the ``knowledge_index`` pack key.
+
+    Keeps the top :data:`_KNOWLEDGE_INDEX_FLOOR_KEEP` entries in the value's
+    existing relevance order with their navigation pointers only — no summary
+    body. ``build_knowledge_index`` already ranks decision-relevant docs first
+    (durable kinds design/web_research/compute ahead of stubs, newest-first, and
+    direction-scoped callers list the target direction's docs first), so taking
+    the head of that order prefers what is relevant to the currently active
+    directions. Truncation is surfaced via the packer's ``list_trimmed`` record
+    (shown/total) plus the ``./fetch knowledge <id>`` verb.
+    """
+    if not isinstance(v, list):
+        return v
+    out: list = []
+    for e in v[:_KNOWLEDGE_INDEX_FLOOR_KEEP]:
+        if not isinstance(e, dict):
+            out.append(e)
+            continue
+        out.append({k: e[k] for k in _KNOWLEDGE_INDEX_KEEP_KEYS if k in e})
+    return out
+
+
+_OUTCOME_FLOOR_DIRECTIONS_KEEP = 3
+_OUTCOME_FLOOR_DIRECTION_TEXT_CAP = 120
+# Aggregate headline scalars retained from the ``overall`` block; the verbose
+# per-direction ``cost_efficiency_ranking`` list is dropped under the floor so
+# the reserved form stays small no matter how many directions a project has.
+_OUTCOME_FLOOR_OVERALL_KEYS = (
+    "cycles",
+    "merged",
+    "failed",
+    "success_rate",
+    "trend",
+    "generalized_successes",
+    "generalized_success_rate",
+)
+
+
+def _outcome_activity_score(outcome: dict) -> int:
+    """Sort key ranking an outcome direction's decision relevance HIGH→LOW.
+
+    Mirrors the summarize path's activity heuristic: work shipped (merged)
+    weighs most, then failures and cycle count. The head of the sorted list
+    survives the floor bound.
+    """
+    return (
+        int(outcome.get("merged") or 0) * 3
+        + int(outcome.get("failed") or 0)
+        + int(outcome.get("cycles") or 0)
+    )
+
+
+def _floor_outcome_evaluation(oe: Any) -> Any:
+    """Guaranteed-minimum core floor for the ``outcome_evaluation`` pack key.
+
+    Keeps the ``window`` + headline ``overall`` aggregates (bounded, they do not
+    grow with project size) and the top :data:`_OUTCOME_FLOOR_DIRECTIONS_KEEP`
+    direction outcomes by activity score, each compacted to headline metrics
+    (id, status, cycles, merged, failed, trend, acceptance_rate, velocity, a
+    short text headline). A ``_outcome_floor`` marker records how many directions
+    were omitted so the strategist knows the full evaluation exists and can pull
+    it via ``fetch_verb: "sections"``.
+    """
+    if not isinstance(oe, dict):
+        return oe
+    result: dict[str, Any] = {}
+    if isinstance(oe.get("window"), dict):
+        result["window"] = oe["window"]
+    overall = oe.get("overall")
+    if isinstance(overall, dict):
+        result["overall"] = {
+            k: overall[k] for k in _OUTCOME_FLOOR_OVERALL_KEYS if k in overall
+        }
+    directions = oe.get("directions")
+    if isinstance(directions, list):
+        ranked = sorted(
+            (d for d in directions if isinstance(d, dict)),
+            key=_outcome_activity_score,
+            reverse=True,
+        )
+        shipped: list[dict[str, Any]] = []
+        for d in ranked[:_OUTCOME_FLOOR_DIRECTIONS_KEEP]:
+            item: dict[str, Any] = {}
+            for key in ("id", "status", "cycles", "merged", "failed"):
+                if key in d:
+                    item[key] = d[key]
+            for key in ("trend", "acceptance_rate", "velocity", "difficulty_index"):
+                if d.get(key) is not None:
+                    item[key] = d[key]
+            text = _bounded_text(d.get("text"), _OUTCOME_FLOOR_DIRECTION_TEXT_CAP)
+            if text is not None:
+                item["text"] = text
+            shipped.append(item)
+        if shipped:
+            result["directions"] = shipped
+        total = len(directions)
+        if total > len(shipped):
+            result["_outcome_floor"] = {
+                "total_directions": total,
+                "shipped_directions": len(shipped),
+                "fetch_verb": "sections",
+            }
+    return result
+
+
 _PREV_OUTCOMES_ROLE_KEEP = 6
 _PREV_OUTCOMES_TEXT_CAP = 100
 _PREV_OUTCOMES_SUMMARY_TEXT_CAP = 300

@@ -234,6 +234,9 @@ from app.strategic_payload_summaries import (  # noqa: F401 — re-exported for 
     _KNOWLEDGE_INDEX_HEAVY_FIELDS,
     _KNOWLEDGE_INDEX_KEEP_KEYS,
     _summarize_knowledge_index,
+    _floor_knowledge_index,
+    _floor_design_doc_index,
+    _floor_outcome_evaluation,
     _PREV_OUTCOMES_ROLE_KEEP,
     _PREV_OUTCOMES_TEXT_CAP,
     _PREV_OUTCOMES_SUMMARY_TEXT_CAP,
@@ -974,22 +977,19 @@ def _build_staged_directions_summary(project: Project) -> list[dict]:
 def _summarize_outcome_evaluation(oe: dict) -> dict:
     """Trim an outcome_evaluation payload to the strategic agent's working set.
 
-    The biggest growth driver is ``direction_outcomes`` (one entry per active
-    direction, each carrying scope_performance, type_distribution, lifetime
-    aggregates, etc). Cap to top-N by activity. Top-level summaries
-    (``overall_summary``, ``systems``, trend) are kept in full — they're
-    aggregates that don't grow with project size.
+    The biggest growth driver is ``directions`` (one entry per active direction,
+    each carrying scope_performance, type_distribution, lifetime aggregates,
+    etc). Cap to top-N by activity. Top-level summaries (``overall``, ``systems``,
+    trend) are kept in full — they're aggregates that don't grow with project
+    size.
     """
     if not isinstance(oe, dict):
         return oe
     trimmed = dict(oe)
-    direction_outcomes = trimmed.get("direction_outcomes")
-    if (
-        isinstance(direction_outcomes, list)
-        and len(direction_outcomes) > _OUTCOME_DIRECTION_OUTCOMES_KEEP
-    ):
+    directions = trimmed.get("directions")
+    if isinstance(directions, list) and len(directions) > _OUTCOME_DIRECTION_OUTCOMES_KEEP:
         sorted_outcomes = sorted(
-            direction_outcomes,
+            directions,
             key=lambda d: (
                 int((d or {}).get("merged") or 0) * 3
                 + int((d or {}).get("failed") or 0)
@@ -997,9 +997,7 @@ def _summarize_outcome_evaluation(oe: dict) -> dict:
             ),
             reverse=True,
         )
-        trimmed["direction_outcomes"] = sorted_outcomes[
-            :_OUTCOME_DIRECTION_OUTCOMES_KEEP
-        ]
+        trimmed["directions"] = sorted_outcomes[:_OUTCOME_DIRECTION_OUTCOMES_KEEP]
     return trimmed
 
 
@@ -2296,16 +2294,27 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # presence status/modules/warning for systems/capabilities). The full
     # per-section content is fetched on demand via POST /api/agent/design-doc
     # (op:get) — see _design_doc_index. The summarize fallback drops per-entry
-    # summaries to a navigation skeleton under genuine budget exhaustion.
-    "design_doc": {"priority": "medium", "summarize": _summarize_design_doc_index, "fetch_verb": "section"},
+    # summaries to a navigation skeleton under genuine budget exhaustion. Core
+    # section: the floor callback guarantees a compact architecture-relevant
+    # skeleton (systems/capabilities first) ALWAYS ships, so design context
+    # degrades before it disappears entirely — never dropped wholesale.
+    "design_doc": {
+        "priority": "medium",
+        "summarize": _summarize_design_doc_index,
+        "floor": _floor_design_doc_index,
+        "fetch_verb": "section",
+    },
     # Compact, body-omitted index of existing knowledge documents (web_research /
     # design output). Medium priority. Summarize fallback keeps the newest few
     # entries with their navigation pointers (id/title/topic/direction) and drops
     # the heavy per-arm-verdict / provenance sub-fields; full bodies remain
-    # fetchable on demand via ``./fetch knowledge <id>``.
+    # fetchable on demand via ``./fetch knowledge <id>``. Core section: the floor
+    # callback guarantees a pointer-only digest of the top decision-relevant
+    # entries ALWAYS ships, so knowledge context degrades before disappearing.
     "knowledge_index": {
         "priority": "medium",
         "summarize": _summarize_knowledge_index,
+        "floor": _floor_knowledge_index,
         "fetch_verb": "knowledge",
     },
     # Pending knowledge follow-ups: design/web_research docs the strategist
@@ -2324,9 +2333,16 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
         "priority": "medium",
         "summarize": _summarize_capability_trial_verdicts,
     },
+    # Planned-vs-actual portfolio assessment. Medium priority; the summarize
+    # fallback caps ``directions`` to the top-N by activity. Core section: the
+    # floor callback guarantees the headline aggregates plus the top few
+    # direction outcomes ALWAYS ship (with a ``_outcome_floor`` marker + the
+    # "sections" fetch verb), so outcome-evaluation context never drops whole.
     "outcome_evaluation": {
         "priority": "medium",
         "summarize": _summarize_outcome_evaluation,
+        "floor": _floor_outcome_evaluation,
+        "fetch_verb": "sections",
     },
     "recent_interventions": {
         "priority": "medium",

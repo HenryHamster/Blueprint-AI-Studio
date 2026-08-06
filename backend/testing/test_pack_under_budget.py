@@ -1235,6 +1235,281 @@ def test_design_doc_index_and_whole_problem_model_coexist_in_realistic_payload()
     assert out["_packer_meta"]["budget_used"] <= 120 * 1024
 
 
+def test_over_budget_payload_ships_context_families_alongside_whole_problem_model():
+    """Acceptance (c-407fb5d3): a REPRESENTATIVE OVER-BUDGET strategic-review
+    payload still ships design, knowledge, and outcome-evaluation context
+    alongside the FULL problem model.
+
+    Producer-side packing: design_doc, knowledge_index, and outcome_evaluation
+    previously carried only a ``summarize`` fallback, so under byte pressure
+    their summarized form still could not fit and they were DROPPED WHOLESALE
+    every cycle. Each now also carries a ``floor`` callback producing a
+    guaranteed-minimum, bounded, ranked, truncated-with-a-marker form. This test
+    proves the end-to-end contract at the real default budget: every context
+    family ships something useful (never dropped whole) while the problem_model —
+    the strategic source of truth — ships complete and unfloored.
+
+    The payload is deliberately well over the 120KB budget (worst-case GC'd
+    agent-view problem_model + a 60-section design index + a 60-entry knowledge
+    index + a 40-direction outcome evaluation + inbox/directions/conversation
+    context = ~265KB), so all three families cannot fit by accident: stripping
+    the three floors from the schema makes this exact payload DROP design_doc and
+    outcome_evaluation (the packer has no bounded form left to ship), which is
+    what failed in production every cycle.
+    """
+    from app.problem_model import gc_problem_model
+    from app.strategic_spawning import (
+        _STRATEGIC_REVIEW_SCHEMA,
+        _agent_view_problem_model,
+    )
+
+    worst = _worst_case_floor_inputs()
+
+    model = _worst_case_durable_problem_model()
+    gc_problem_model(model)
+
+    payload = {
+        "type": "strategic_review",
+        "research_mode": False,
+        "project_name": "Blueprint",
+        "base_branch": "main",
+        "is_self_repo": True,
+        "enable_self_improvement": True,
+        "model": "opus",
+        "effort": "standard",
+        "direction_counts": {"active": 12, "paused": 2, "total": 14},
+        "max_active_directions": 6,
+        "open_message_count": 40,
+        "vision": {"purpose": "Stabilize platform and add observability hooks"},
+        "effective_purpose": "Stabilize platform and add observability hooks",
+        "model_health": {"gaps_count": 12, "capabilities_count": 20},
+        "playbook_keys_index": [
+            {"key": f"playbook-{i}", "title": f"Playbook {i}"} for i in range(10)
+        ],
+        # Large high-tier inbox/directions that ship full and consume most of
+        # the budget, forcing the medium context families below into their
+        # bounded floor/summarize forms.
+        "open_messages": [
+            {"id": f"m-{i}", "type": "BUG_REPORT", "title": f"Bug {i}", "content": "c" * 1000}
+            for i in range(40)
+        ],
+        "directions_summary": [
+            {
+                "id": f"d-{i:04d}",
+                "priority": "high",
+                "status": "active",
+                "text": "t" * 900,
+                "gap_id": f"g-{i}",
+                "system_id": f"s-{i}",
+            }
+            for i in range(25)
+        ],
+        "problem_model": _agent_view_problem_model(model.model_dump()),
+        # The three context families at their worst-case sizes.
+        "design_doc": worst["design_doc"],
+        "knowledge_index": worst["knowledge_index"],
+        "outcome_evaluation": worst["outcome_evaluation"],
+        "conversation_thread": [
+            {"id": f"c-{i}", "author": "operator", "excerpt": "e" * 400} for i in range(30)
+        ],
+        "self_reflection_log": [
+            {"ts": f"2026-05-{(i % 27) + 1:02d}T00:00:00Z", "reflection": "r" * 300}
+            for i in range(20)
+        ],
+        "playbook_summary": [
+            {"key": f"pb-{i}", "summary": "s" * 250} for i in range(20)
+        ],
+        "strategic_memory_notes": [
+            {"note": f"note {i}", "set_at": f"2026-05-{(i % 27) + 1:02d}T00:00:00Z"}
+            for i in range(15)
+        ],
+        "previous_decision_outcomes": [
+            {"direction_id": f"d-{i}", "outcome": "merged", "summary": "p" * 200}
+            for i in range(15)
+        ],
+    }
+
+    # Self-verifying: the payload is genuinely over budget before packing.
+    assert _size(payload) > 120 * 1024, "test payload must exceed the default budget"
+
+    out = pack_under_budget(payload, _STRATEGIC_REVIEW_SCHEMA)
+    meta = out["_packer_meta"]
+    dropped_keys = {d["key"] for d in meta["dropped"]}
+    trimmed_by_key = {t["key"]: t for t in meta["trimmed"]}
+
+    assert meta["budget_used"] <= 120 * 1024
+
+    # The FULL problem_model ships whole — never floored or dropped.
+    assert "problem_model" in out, "problem_model dropped under budget pressure"
+    assert "problem_model" not in dropped_keys
+    pm = out["problem_model"]
+    assert "_agent_view_floor_applied" not in pm, (
+        "problem_model must ship whole (not degraded) alongside the context families"
+    )
+    assert isinstance(pm.get("gaps"), list) and len(pm["gaps"]) > 0
+
+    # All three context families ship alongside it (never dropped wholesale).
+    for key in ("design_doc", "knowledge_index", "outcome_evaluation"):
+        assert key in out, f"{key} was dropped under budget pressure"
+        assert key not in dropped_keys, f"{key} was dropped: {meta['dropped']}"
+
+    # Each family is BOUNDED by the packer (not shipped full): the over-budget
+    # payload forces design/knowledge/outcome into their floor or summarize
+    # forms, proving "packed to fit" rather than silently-believed-full.
+    for key in ("design_doc", "knowledge_index", "outcome_evaluation"):
+        assert key in trimmed_by_key, (
+            f"{key} shipped full despite the over-budget payload — the budget "
+            f"math changed; {meta['trimmed']}"
+        )
+
+    # Truncation is VISIBLE to the strategist for every family: either an inline
+    # floor marker in the shipped value or a packer-meta trim record carrying the
+    # fetch verb, so the agent knows detail exists and can pull it on demand.
+    design_out = out["design_doc"]
+    assert isinstance(design_out, dict) and isinstance(design_out.get("sections"), list)
+    design_floor = design_out.get("_design_floor")
+    assert design_floor is not None, "design_doc truncation must be marked inline"
+    assert design_floor["total_sections"] == 60
+    assert design_floor["shipped_sections"] == len(design_out["sections"])
+    assert design_floor["fetch_verb"] == "section"
+    # Bounded + ranked: the shipped skeleton keeps the architecture sections
+    # (systems/capabilities) that active directions reference.
+    shipped_design_keys = [s.get("key") for s in design_out["sections"]]
+    assert len(shipped_design_keys) <= 6
+    assert all(
+        k.startswith(("systems/", "capabilities/")) for k in shipped_design_keys
+    )
+
+    k_out = out["knowledge_index"]
+    assert isinstance(k_out, list)
+    k_trim = trimmed_by_key.get("knowledge_index")
+    assert k_trim is not None and k_trim["kind"] == "list_trimmed"
+    assert k_trim["fetch_verb"] == "knowledge"
+    assert k_trim["shown"] < k_trim["total"]
+    assert len(k_out) == k_trim["shown"]
+
+    oe_out = out["outcome_evaluation"]
+    assert isinstance(oe_out, dict)
+    oe_floor = oe_out.get("_outcome_floor")
+    assert oe_floor is not None, "outcome_evaluation truncation must be marked inline"
+    assert oe_floor["total_directions"] == 40
+    assert oe_floor["shipped_directions"] == len(oe_out.get("directions") or [])
+    assert oe_floor["fetch_verb"] == "sections"
+    # Bounded + decision-relevant: only the top activity-ranked directions ship.
+    assert len(oe_out.get("directions") or []) <= 3
+
+
+def test_floor_design_doc_index_bounds_ranks_and_marks():
+    """The design_doc floor is bounded, architecture-ranked, and truncation-marked.
+
+    The floor is the guaranteed-minimum design context the strategist ALWAYS
+    receives under budget pressure: top-N sections ranked so the architecture
+    sections active directions reference lead, each reduced to key + status + a
+    short summary (backing module lists dropped), with a ``_design_floor`` marker
+    recording how many sections were omitted and the fetch verb for the rest.
+    """
+    from app.strategic_payload_summaries import _floor_design_doc_index
+
+    index = _worst_case_floor_inputs()["design_doc"]
+    floored = _floor_design_doc_index(index)
+
+    marker = floored["_design_floor"]
+    assert marker["total_sections"] == len(index["sections"]) == 60
+    assert marker["shipped_sections"] == len(floored["sections"])
+    assert marker["fetch_verb"] == "section"
+
+    sections = floored["sections"]
+    assert 0 < len(sections) <= 6, "floor must keep a bounded, non-empty section set"
+    keys = [s.get("key") for s in sections]
+    # Ranked: systems/capabilities (the sections active directions reference)
+    # lead; within rank the keys stay sorted.
+    assert all(k.startswith(("systems/", "capabilities/")) for k in keys), (
+        "architecture sections must lead the floored design index"
+    )
+    for entry in sections:
+        # Compact per-entry form: key + status + short bounded summary.
+        assert "key" in entry
+        assert "summary" in entry and len(entry["summary"]) <= 120 + 3
+        assert "modules" not in entry, "backing-module lists are heavy — dropped"
+
+    # The floor is a strict reduction (watermark monotonicity holds).
+    assert _size(floored) < _size(index)
+
+
+def test_floor_knowledge_index_bounds_to_relevance_head():
+    """The knowledge_index floor keeps a bounded pointer-only head.
+
+    ``build_knowledge_index`` already orders decision-relevant docs first, so the
+    floor keeps the top entries' navigation pointers (id/title/topic/direction_id)
+    with no summary body — the full document stays reachable via the fetch verb.
+    """
+    from app.strategic_payload_summaries import _floor_knowledge_index
+
+    entries = _worst_case_floor_inputs()["knowledge_index"]
+    floored = _floor_knowledge_index(entries)
+
+    assert 0 < len(floored) <= 4, "floor must keep a bounded, non-empty head"
+    for entry in floored:
+        assert isinstance(entry, dict)
+        # Pointer-only: navigation keys survive, body/provenance does not.
+        assert "id" in entry and "title" in entry and "direction_id" in entry
+        assert "summary" not in entry, "summary body must be dropped in the floor"
+        assert "content_path" not in entry
+
+    assert _size(floored) < _size(entries)
+
+
+def test_floor_outcome_evaluation_keeps_aggregates_and_top_directions():
+    """The outcome_evaluation floor keeps bounded aggregates + top directions.
+
+    The headline ``overall``/``window`` aggregates are bounded (they do not grow
+    with project size) and the per-direction list is capped to the top-N by
+    activity, each compacted to headline metrics. A ``_outcome_floor`` marker
+    records how many directions were omitted and the fetch verb for the full
+    evaluation.
+    """
+    from app.strategic_payload_summaries import _floor_outcome_evaluation
+
+    oe = _worst_case_floor_inputs()["outcome_evaluation"]
+    floored = _floor_outcome_evaluation(oe)
+
+    # Bounded headline aggregates survive.
+    assert "window" in floored and isinstance(floored["window"], dict)
+    assert "overall" in floored and isinstance(floored["overall"], dict)
+    # Aggregates are compact: only the declared headline keys.
+    for k in floored["overall"]:
+        assert k in (
+            "cycles",
+            "merged",
+            "failed",
+            "success_rate",
+            "trend",
+            "generalized_successes",
+            "generalized_success_rate",
+        )
+
+    marker = floored["_outcome_floor"]
+    assert marker["total_directions"] == len(oe["directions"]) == 40
+    assert marker["shipped_directions"] == len(floored["directions"])
+    assert marker["fetch_verb"] == "sections"
+
+    directions = floored["directions"]
+    assert 0 < len(directions) <= 3, "floor must keep a bounded direction set"
+    # Ranked by decision relevance (merged*3 + failed + cycles), desc.
+    scores = [
+        d["merged"] * 3 + d["failed"] + d["cycles"] for d in directions
+    ]
+    assert scores == sorted(scores, reverse=True), (
+        "floored directions must be the highest-activity subset"
+    )
+    for d in directions:
+        # Compacted per-direction form: headline metrics only.
+        assert "id" in d and "text" in d and "cycles" in d
+        assert "type_distribution" not in d, "heavy per-direction metrics dropped"
+
+    assert _size(floored) < _size(oe)
+
+
 def test_droppable_sections_declare_summarize_or_exemption():
     """Every non-critical schema entry must declare a summarize fallback OR an
     explicit ``exempt`` marker.  Without one, a section can silently vanish from
@@ -2188,6 +2463,96 @@ def _worst_case_floor_inputs() -> dict:
                 }
                 for i in range(30)
             ]
+        },
+        # design_doc: 60-section navigation index (systems/capabilities first) —
+        # worst case for the floor, which must keep the architecture-relevant head.
+        "design_doc": {
+            "sections": [
+                {
+                    "key": f"systems/sys-{i:03d}" if i % 2 else f"capabilities/cap-{i:03d}",
+                    "title": f"Section {i} title with enough prose to be realistic",
+                    "status": "working" if i % 3 else "draft",
+                    "summary": "s" * 200,
+                    "modules": [f"backend/app/mod{i}_a.py", f"backend/app/mod{i}_b.py"],
+                }
+                for i in range(60)
+            ]
+        },
+        # knowledge_index: 60 body-bearing entries (per-arm verdict / provenance
+        # sub-fields) — worst case for the floor, which keeps the relevance head.
+        "knowledge_index": [
+            {
+                "id": f"k-{i:04d}",
+                "title": f"Knowledge {i} title",
+                "topic": f"topic-{i % 7}",
+                "direction_id": f"d-{i % 5}",
+                "source_kind": "design",
+                "sweep_id": f"sweep-{i % 3}",
+                "arm_label": f"arm-{i % 2}",
+                "criterion_met": True,
+                "compute_acceptance_grade": "B",
+                "created_at": f"2026-05-{(i % 27) + 1:02d}T00:00:00Z",
+                "summary": "u" * 300,
+                "content_path": f"sweeps/{i}/notes.md",
+            }
+            for i in range(60)
+        ],
+        # outcome_evaluation: 40 direction outcomes with the full per-direction
+        # metric surface — worst case for the floor, which keeps the bounded
+        # headline aggregates plus the top few activity-ranked directions.
+        "outcome_evaluation": {
+            "window": {"from": "2026-04-01", "to": "2026-08-01", "vision_revision": 3},
+            "overall": {
+                "cycles": 200,
+                "merged": 120,
+                "failed": 30,
+                "success_rate": 0.8,
+                "trend": "improving",
+                "generalized_successes": 10,
+                "generalized_success_rate": 0.5,
+            },
+            "systems": [{"system_id": f"s{i}", "merged": i} for i in range(5)],
+            "directions": [
+                {
+                    "id": f"d-{i:04d}",
+                    "text": "t" * 220,
+                    "status": "active",
+                    "cycles": 5 + i,
+                    "merged": 1 + i % 4,
+                    "failed": i % 3,
+                    "prs_rejected": 2,
+                    "taxonomy_summary": {"primary": f"task-{i % 5}", "secondary": []},
+                    "acceptance_rate": 0.6,
+                    "avg_time_to_merge_hours": 12,
+                    "difficulty_index": 2,
+                    "generalized_successes": [f"g{i}"],
+                    "generalized_success_rate": 0.8,
+                    "estimated_cost_usd": 1000,
+                    "cost_per_merged_pr": 500,
+                    "cost_budget_usd": 2000,
+                    "budget_exceeded": False,
+                    "operator_rejection_rate": 0.1,
+                    "success_evidence": [f"ev{i}-1"],
+                    "retirement_condition": None,
+                    "confirmed": [f"cf{i}"],
+                    "proposed": [],
+                    "failed_approaches": [f"fa{i}"],
+                    "outcome_progress_summary_fields": {"summary": "p" * 100},
+                    "recent_diagnosis": {"diagnosis": "d" * 80},
+                    "evidence": [f"e{i}"],
+                    "recent_findings": ["f"],
+                    "direction_knowledge": [f"dk{i}"],
+                    "lifetime": {"cycles": 5, "merged": 2, "failed": 1, "status": "active"},
+                    "type_distribution": {"design": 3, "implementation": 2},
+                    "product_ratio": {"maintenance": 0.5, "feature": 0.5},
+                    "scope_performance": {"high_cost_per_merge": 1},
+                    "escalation_outcomes": [{"cycle": i, "outcome": "continued"}],
+                    "trend": "improving",
+                    "velocity": 3.1,
+                    "high_cost_per_merge": False,
+                }
+                for i in range(40)
+            ],
         },
         "version_phase": {
             "version_number": 22,
