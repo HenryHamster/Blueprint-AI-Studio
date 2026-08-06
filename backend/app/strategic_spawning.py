@@ -22,7 +22,6 @@ from app import strategic_cycle
 from app.strategic_review_effort import (
     CONSEQUENTIAL_EFFORT,
     CONSEQUENTIAL_TIER,
-    ROUTINE_EFFORT,
     ROUTINE_TIER,
     classify_strategic_review_effort,
 )
@@ -2480,6 +2479,15 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # condition for the direction-gap referential-integrity work. Fetchable on
     # demand via ./fetch integrity-conflict-trend.
     "integrity_conflict_trend": {"priority": "low", "exempt": True},
+    # Active-direction criterion_link_conflicts for the open version (dangling
+    # or inactive criterion_keys). Low priority, exempt: bounded at build time
+    # to 20 entries; absent when the model is clean. Lets the strategist remap
+    # before a create/update op gets dropped for an invalid key.
+    "criterion_link_conflicts": {"priority": "low", "exempt": True},
+    # create/update_direction ops dropped for invalid criterion_keys in recent
+    # completed cycles. Low priority, exempt: bounded at build time to 5
+    # records. Surfaces the rejection the fallback path used to log-only.
+    "rejected_direction_ops": {"priority": "low", "exempt": True},
 }
 
 
@@ -3740,6 +3748,81 @@ def _build_past_retirement_deferrals(
             if len(results) >= n:
                 return results[:n]
     return results[:n]
+
+
+def _build_rejected_direction_ops(
+    cycle_history: list, n: int = 5
+) -> list[dict[str, Any]]:
+    """Collect recent create/update_direction ops dropped for invalid criterion_keys.
+
+    Walks ``cycle_history`` newest-first for completed cycles whose
+    ``cycle_metadata`` carried a bounded ``rejected_direction_ops`` list (see
+    ``strategic_completion._record_rejected_direction_op`` — the records are
+    already normalized + capped at record time, so they pass through verbatim).
+    The strategist sees exactly which ops were refused and which criterion keys
+    are currently active, so it can remap instead of re-proposing a bad key.
+    """
+    results: list[dict[str, Any]] = []
+    for entry in cycle_history:
+        if entry.get("outcome") != "completed":
+            continue
+        rejected = entry.get("rejected_direction_ops")
+        if not isinstance(rejected, list):
+            continue
+        for record in rejected:
+            if isinstance(record, dict):
+                results.append(record)
+            if len(results) >= n:
+                return results[:n]
+    return results[:n]
+
+
+async def _build_criterion_link_conflicts(
+    session: AsyncSession,
+    project: Project,
+) -> list[dict[str, Any]] | None:
+    """Compute active-direction criterion_link_conflicts for the open version.
+
+    Reuses the read model's conflict classifier
+    (``strategic_state_read_model.compute_model_integrity_conflicts``) so the
+    strategist sees the SAME dangling/inactive criterion-key conflicts the admin
+    workspace panel shows — a chance to remap before the completion path drops a
+    later op that re-proposes the bad key. Returns None when the model is clean
+    or there is no open version, so the payload key is omitted entirely.
+    """
+    from app.release_version import current_open_version
+
+    open_version = await current_open_version(session, project.id)
+    if open_version is None:
+        return None
+
+    from app.direction_referential_guard import load_version_criterion_key_sets
+    from app.strategic_state_read_model import compute_model_integrity_conflicts
+
+    active_keys, inactive_keys = await load_version_criterion_key_sets(
+        session, project.id, open_version.id
+    )
+    criterion_links = [
+        {
+            "id": str(d.get("id") or ""),
+            "text": str(d.get("text") or ""),
+            "status": d.get("status") or "active",
+            "criterion_keys": list(d.get("criterion_keys") or []),
+        }
+        for d in (project.directions or [])
+        if d.get("criterion_keys")
+    ]
+    conflicts = compute_model_integrity_conflicts(
+        project.problem_model,
+        project.directions,
+        criterion_links=criterion_links,
+        active_criterion_keys=active_keys,
+        inactive_criterion_keys=inactive_keys,
+    )
+    if not conflicts:
+        return None
+    link_conflicts = conflicts.get("criterion_link_conflicts") or []
+    return link_conflicts[:20] or None
 
 
 def _build_anomaly_summary(project: Project) -> dict[str, Any] | None:
@@ -5703,6 +5786,16 @@ async def _spawn_strategic_review(
             session.add(project)
         _res_retired_summary = _build_retired_directions_summary(project)
         _res_prev_outcomes = _build_previous_decision_outcomes(project, cycle_history)
+        _res_criterion_conflicts: list[dict] | None = None
+        try:
+            _res_criterion_conflicts = await _build_criterion_link_conflicts(
+                session, project
+            )
+        except Exception:
+            logger.exception(
+                "[STRATEGIC] criterion_link_conflicts fetch failed; continuing"
+            )
+        _res_rejected_ops = _build_rejected_direction_ops(cycle_history, n=5)
         _res_open_messages = await _fetch_open_messages(session, project.id)
         # Recently-answered operator conversation tail — DB-only, bounded, and
         # explicitly non-actionable. Surfaces a correction the operator just made
@@ -5804,6 +5897,16 @@ async def _spawn_strategic_review(
                     "running_update": project.running_update or "",
                     # Pure-computation direction grounding (no I/O).
                     "directions_summary": _res_direction_stats,
+                    **(
+                        {"criterion_link_conflicts": _res_criterion_conflicts}
+                        if _res_criterion_conflicts
+                        else {}
+                    ),
+                    **(
+                        {"rejected_direction_ops": _res_rejected_ops}
+                        if _res_rejected_ops
+                        else {}
+                    ),
                     "direction_counts": _res_direction_counts,
                     "max_active_directions": _res_direction_counts["max_active"],
                     **(
@@ -6756,6 +6859,22 @@ async def _spawn_strategic_review(
             _integrity_trend = _trend_result
     except Exception:
         logger.exception("[STRATEGIC] integrity_conflict_trend fetch failed; continuing")
+    # Criterion-link integrity for the open version — active directions whose
+    # criterion_keys are dangling or inactive. Reuses the admin read model's
+    # classifier so the strategist sees the same conflicts the workspace panel
+    # shows and can remap before the completion path drops a re-proposed key.
+    # Best-effort: absent when clean, no open version, or the query fails.
+    _criterion_link_conflicts: list[dict] | None = None
+    try:
+        _criterion_link_conflicts = await _build_criterion_link_conflicts(
+            session, project
+        )
+    except Exception:
+        logger.exception("[STRATEGIC] criterion_link_conflicts fetch failed; continuing")
+    # Direction ops dropped for invalid criterion_keys in recent completed
+    # cycles (cycle_metadata.rejected_direction_ops) — surfaced so the
+    # strategist sees the exact refusal instead of a silent skip.
+    _rejected_ops_block = _build_rejected_direction_ops(cycle_history, n=5)
     # Pre-spawn effort-classifier inputs: was the prior COMPLETED cycle dirty,
     # and did any of the last 3 cycles fail/stall? Both flag this cycle as a
     # recovery decision rather than a routine heartbeat.
@@ -7866,6 +7985,16 @@ async def _spawn_strategic_review(
             "direction_counts": _direction_counts,
             "max_active_directions": _max_active_directions,
             "directions_summary": direction_stats,
+            **(
+                {"criterion_link_conflicts": _criterion_link_conflicts}
+                if _criterion_link_conflicts
+                else {}
+            ),
+            **(
+                {"rejected_direction_ops": _rejected_ops_block}
+                if _rejected_ops_block
+                else {}
+            ),
             **(
                 {"staged_directions": _staged_directions}
                 if (_staged_directions := _build_staged_directions_summary(project))

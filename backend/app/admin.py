@@ -2451,6 +2451,13 @@ class CreateTaskPayload(BaseModel):
     # The agent handler branches hotfix/* off main and the orchestrator
     # back-merges main → automain after the hotfix lands.
     hotfix: bool = False
+    # Plan-time acceptance_evidence declaration for code-producing task types
+    # (create / fix / refactor / qa / migrate / deps / docs). Required for those
+    # types: validate_task_payload rejects a code payload that omits it, so a
+    # merged task has a proof the acceptance gate can check and mint criterion
+    # credit from. The raw dict is validated strictly against
+    # payload_schemas.AcceptanceEvidence at validate_task_payload time.
+    acceptance_evidence: dict[str, Any] | None = None
     # Optional originating ProjectMessage (e.g. a BUG_REPORT) this task is being
     # spawned from. Additive and backward compatible — omitted by existing
     # callers. When provided for an ``investigate`` task, the message's citations
@@ -2782,6 +2789,8 @@ async def create_task_manually(
         "prompt": payload.prompt,
         "base_branch": resolved_base_branch,
     }
+    if payload.acceptance_evidence is not None:
+        task_payload["acceptance_evidence"] = payload.acceptance_evidence
     if payload.model is not None:
         task_payload["model"] = payload.model
     if payload.effort is not None:

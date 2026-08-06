@@ -295,25 +295,42 @@ _WALKTHROUGH_REPORT_CONTRACT_INVALID_REASONS: frozenset[str] = frozenset(
 #
 # THESE CONSTANTS ARE OBSERVATIONAL — they describe what the current
 # v26-output harness writes.  They are NOT a blanket key contract on a
-# decision-bearing report: a report that emits NONE of the legacy keys (a
-# harness re-pointed to the OPEN version's rubric) is accepted and its keys are
-# validated against the ACTIVE rubric downstream, while a report that DOES emit
-# legacy keys must still carry the complete v26 set (a partial legacy report is
-# truncated).  The report validator (_evaluate_walkthrough_e2e_report) and the
-# canonical-key resolver (_walkthrough_e2e_canonical_evidence_keys) fail a
-# genuinely malformed report (empty results, invalid entries, duplicate raw
-# keys, an incomplete legacy set, or an unexpected canonical collision).  Which
-# criteria a report may name is resolved at request time
-# (see _resolve_walkthrough_e2e_evidence_contract) and re-validated at
-# finalize time against the OPEN version's ACTIVE criteria, so a rubric that
-# re-mints its criteria under fresh keys is not silently refused just because
-# the harness no longer emits the legacy keys.
+# decision-bearing report: a report that emits NONE of the legacy SUBSTANTIVE
+# keys (a harness re-pointed to the OPEN version's rubric) is accepted and its
+# keys are validated against the ACTIVE rubric downstream, while a report that
+# DOES emit a legacy substantive key must still carry the complete v26 set (a
+# partial legacy report is truncated).  The canonical meta key c-5214996f is
+# NOT a legacy signal for this rule: it participates in both the retired v26
+# report and the open rubric, so a report carrying the meta row alongside fresh
+# substantive keys is an open-rubric report.  The report validator
+# (_evaluate_walkthrough_e2e_report) and the canonical-key resolver
+# (_walkthrough_e2e_canonical_evidence_keys) fail a genuinely malformed report
+# (empty results, invalid entries, duplicate raw keys, an incomplete legacy set,
+# or an unexpected canonical collision).  Which criteria a report may name is
+# resolved at request time (see _resolve_walkthrough_e2e_evidence_contract) and
+# re-validated at finalize time against the OPEN version's ACTIVE criteria, so a
+# rubric that re-mints its criteria under fresh keys is not silently refused just
+# because the harness no longer emits the legacy keys.
 _WALKTHROUGH_E2E_EXPECTED_RAW_RESULT_KEYS: frozenset[str] = frozenset(
     {
         "c-dfdc9d82",
         "c-f52fd975",
         "c-workday-session-lifecycle",
         "c-5214996f",
+    }
+)
+# The SUBSTANTIVE subset of the legacy report contract — the raw rows that carry
+# actual flow evidence.  The meta key c-5214996f is deliberately excluded: it is
+# the canonical meta criterion that participates in BOTH the retired v26 report
+# and the open rubric, so a report that carries the meta row alongside fresh
+# open-rubric keys is an OPEN-rubric report, not a partial legacy report.  The
+# partial-legacy rule below triggers on these keys only; the COMPLETE four-row
+# contract is still required once a report uses any of them.
+_WALKTHROUGH_E2E_SUBSTANTIVE_LEGACY_RAW_KEYS: frozenset[str] = frozenset(
+    {
+        "c-dfdc9d82",
+        "c-f52fd975",
+        "c-workday-session-lifecycle",
     }
 )
 _WALKTHROUGH_E2E_EXPECTED_CANONICAL_EVIDENCE_KEYS: frozenset[str] = frozenset(
@@ -4020,16 +4037,19 @@ def _evaluate_walkthrough_e2e_report(
             "exercised_engine_sha": exercised_sha,
         }
     if (
-        seen_keys & _WALKTHROUGH_E2E_EXPECTED_RAW_RESULT_KEYS
+        seen_keys & _WALKTHROUGH_E2E_SUBSTANTIVE_LEGACY_RAW_KEYS
         and seen_keys != _WALKTHROUGH_E2E_EXPECTED_RAW_RESULT_KEYS
     ):
-        # A report that uses ANY of the legacy harness keys must carry the
-        # COMPLETE v26 output contract (a partial legacy report is truncated).
-        # A report that uses NONE of the legacy keys is authored against the
-        # OPEN version's rubric — the harness was re-pointed to emit that
-        # rubric's fresh criterion keys — so its keys are validated downstream
-        # by the finalize-time gate against the ACTIVE rubric, not against the
-        # retired v26 set here.
+        # A report that uses ANY of the legacy SUBSTANTIVE harness keys must
+        # carry the COMPLETE v26 output contract (a partial legacy report is
+        # truncated).  A report that uses NONE of the substantive legacy keys is
+        # authored against the OPEN version's rubric — the harness was re-pointed
+        # to emit that rubric's fresh criterion keys — so its keys are validated
+        # downstream by the finalize-time gate against the ACTIVE rubric, not
+        # against the retired v26 set here.  The canonical meta key c-5214996f
+        # is deliberately NOT a legacy signal: it participates in both the
+        # retired report and the open rubric, so a report carrying the meta row
+        # alongside fresh substantive keys is an open-rubric report.
         return {
             "status": "invalid",
             "reason": "result_schema_mismatch",

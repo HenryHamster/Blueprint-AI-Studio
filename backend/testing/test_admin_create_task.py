@@ -17,6 +17,15 @@ from httpx import AsyncClient
 
 from app.models import Project, ProjectMember, ProjectStatus
 
+# Code-producing tasks now require an acceptance_evidence declaration at
+# validation (validate_task_payload). These tests exercise the operator
+# create-task surface, so every create/fix body that must reach a 200 carries a
+# minimal valid observable_behavior declaration.
+_CODE_EVIDENCE = {
+    "kind": "observable_behavior",
+    "description": "operator-spawned task ships a real, testable change",
+}
+
 
 async def _make_project_with_member(db_session, repo="acme/widget", role="owner"):
     """Project for the given owner/repo with test-user-123 as a member.
@@ -151,6 +160,7 @@ async def test_omitted_base_branch_uses_project_promotion_target(
             "title": "Task without base_branch",
             "prompt": "do something useful",
             "task_type": "create",
+            "acceptance_evidence": _CODE_EVIDENCE,
             # base_branch intentionally omitted
         },
     )
@@ -194,6 +204,7 @@ async def test_explicit_base_branch_preserved(client: AsyncClient, db_session):
             "prompt": "work on main",
             "task_type": "create",
             "base_branch": "main",
+            "acceptance_evidence": _CODE_EVIDENCE,
         },
     )
 
@@ -222,6 +233,7 @@ async def test_non_hotfix_create_task_still_works(client: AsyncClient, db_sessio
             "prompt": "build the feature",
             "base_branch": "main",
             "task_type": "create",
+            "acceptance_evidence": _CODE_EVIDENCE,
         },
     )
 
@@ -356,6 +368,7 @@ async def test_idempotency_key_dedupes_duplicate_submit(
             "title": "Idempotent task",
             "prompt": "do something",
             "task_type": "create",
+            "acceptance_evidence": _CODE_EVIDENCE,
             "idempotency_key": key,
         },
     )
@@ -373,6 +386,7 @@ async def test_idempotency_key_dedupes_duplicate_submit(
             "title": "Idempotent task",
             "prompt": "do something",
             "task_type": "create",
+            "acceptance_evidence": _CODE_EVIDENCE,
             "idempotency_key": key,
         },
     )
@@ -400,6 +414,7 @@ async def test_idempotency_key_no_second_task_created(
             "title": "First request",
             "prompt": "do work",
             "task_type": "create",
+            "acceptance_evidence": _CODE_EVIDENCE,
             "idempotency_key": key,
         },
     )
@@ -411,6 +426,7 @@ async def test_idempotency_key_no_second_task_created(
             "title": "First request",
             "prompt": "do work",
             "task_type": "create",
+            "acceptance_evidence": _CODE_EVIDENCE,
             "idempotency_key": key,
         },
     )
@@ -436,6 +452,7 @@ async def test_without_idempotency_key_creates_duplicates(
             "title": "Unprotected task",
             "prompt": "do something",
             "task_type": "create",
+            "acceptance_evidence": _CODE_EVIDENCE,
         },
     )
 
@@ -450,6 +467,7 @@ async def test_without_idempotency_key_creates_duplicates(
             "title": "Unprotected task",
             "prompt": "do something",
             "task_type": "create",
+            "acceptance_evidence": _CODE_EVIDENCE,
         },
     )
 
@@ -485,6 +503,7 @@ async def test_idempotency_key_scoped_per_project(client: AsyncClient, db_sessio
             "title": "Task in project A",
             "prompt": "do A",
             "task_type": "create",
+            "acceptance_evidence": _CODE_EVIDENCE,
             "idempotency_key": key,
         },
     )
@@ -498,6 +517,7 @@ async def test_idempotency_key_scoped_per_project(client: AsyncClient, db_sessio
             "title": "Task in project B",
             "prompt": "do B",
             "task_type": "create",
+            "acceptance_evidence": _CODE_EVIDENCE,
             "idempotency_key": key,
         },
     )
@@ -577,6 +597,7 @@ async def test_member_can_create_task_on_existing_project(
             "prompt": "do the work",
             "base_branch": "main",
             "task_type": "create",
+            "acceptance_evidence": _CODE_EVIDENCE,
         },
     )
 
@@ -617,6 +638,7 @@ async def test_ambiguous_repo_prefers_writable_project_over_viewer_one(
                 "prompt": "do the work",
                 "base_branch": "main",
                 "task_type": "create",
+                "acceptance_evidence": _CODE_EVIDENCE,
             },
         )
         assert resp.status_code == 200, resp.text

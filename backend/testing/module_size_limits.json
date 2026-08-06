@@ -48,7 +48,7 @@
     "research_provenance_validation.py": 400,
     "research_scope_calibration.py": 650,
     "findings_index.py": 350,
-    "strategic_completion.py": 7200,
+    "strategic_completion.py": 8350,
     "rollup_management.py": 6450,
     "rollup_migration_validation.py": 1350,
     "reaper.py": 4250,

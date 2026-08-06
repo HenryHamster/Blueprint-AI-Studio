@@ -1341,6 +1341,51 @@ def test_walkthrough_report_rejects_subset_duplicate_and_malformed_rows():
     assert malformed["reason"] == "result_entry_invalid"
 
 
+def test_walkthrough_report_accepts_fresh_substantive_keys_with_active_meta():
+    """A report carrying fresh open-rubric keys alongside the canonical meta row
+    is an open-rubric report, not a partial legacy report.
+
+    The canonical meta criterion c-5214996f participates in BOTH the retired v26
+    report and the open rubric, so it is deliberately NOT a legacy signal in the
+    partial-legacy rule (_WALKTHROUGH_E2E_SUBSTANTIVE_LEGACY_RAW_KEYS excludes
+    it).  A report that carries the meta row alongside re-minted fresh
+    substantive keys — the exact shape the harness now emits for a fresh+meta
+    rubric (see test_meta_criterion_gate_resolves_active_rubric) — must pass the
+    report validator; its keys are validated downstream against the ACTIVE
+    rubric, not against the retired v26 set.
+    """
+    candidate = "d" * 40
+    fresh_with_meta = {
+        "git_sha": candidate,
+        "exercised_engine_sha": candidate,
+        "results": [
+            {"criterion_key": "c-fresh-runner-enroll", "passed": True},
+            {"criterion_key": "c-fresh-iframe-token", "passed": True},
+            {"criterion_key": "c-5214996f", "passed": True},
+        ],
+    }
+    out = rq._evaluate_walkthrough_e2e_report(fresh_with_meta, candidate)
+    assert out["status"] == "passed", f"fresh+meta report must pass; got {out}"
+    # No canonical collision: the fresh keys and the meta key are distinct.
+    assert rq._walkthrough_e2e_canonical_evidence_keys(out["results"]) == {
+        "c-fresh-runner-enroll",
+        "c-fresh-iframe-token",
+        "c-5214996f",
+    }
+
+    # The meta row ALONE (no substantive rows) is also an open-rubric report —
+    # the meta gate downstream fails it closed, but the report is well-formed.
+    meta_only = {
+        "git_sha": candidate,
+        "exercised_engine_sha": candidate,
+        "results": [
+            {"criterion_key": "c-5214996f", "passed": True},
+        ],
+    }
+    meta_out = rq._evaluate_walkthrough_e2e_report(meta_only, candidate)
+    assert meta_out["status"] == "passed", f"meta-only report must pass; got {meta_out}"
+
+
 @pytest.mark.asyncio
 async def test_requested_walkthrough_is_a_required_terminal_child():
     import uuid

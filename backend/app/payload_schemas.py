@@ -47,6 +47,16 @@ _PYDANTIC_V2_ONLY = True
 # When raising this, raise the DB constraint in a new migration first.
 _MAX_PAYLOAD_BYTES = 190 * 1024
 
+# Task payload types that ship a code-producing PR, which the acceptance gate
+# scores (:mod:`app.acceptance_gate` documents the same set — create / fix /
+# refactor / qa / migrate / deps / docs). These must declare acceptance_evidence
+# at authoring time so a merged task has a proof the merge gate can check and
+# mint CriterionEvidence credit from; a code payload authored through the
+# strict validation surface without a declaration is rejected.
+_CODE_PRODUCING_TASK_TYPES: frozenset[str] = frozenset(
+    {"create", "fix", "refactor", "qa", "migrate", "deps", "docs"}
+)
+
 
 class PayloadTooLargeError(ValueError):
     """Raised when a payload exceeds _MAX_PAYLOAD_BYTES after serialization.
@@ -1862,7 +1872,9 @@ def pack_under_budget(
     return packed
 
 
-def validate_task_payload(raw: dict) -> dict:
+def validate_task_payload(
+    raw: dict, *, require_acceptance_evidence: bool = True
+) -> dict:
     """Validate *raw* against the per-type schema.
 
     Returns a plain dict (model_dump).  Raises ValueError on any violation
@@ -1873,6 +1885,15 @@ def validate_task_payload(raw: dict) -> dict:
     payload-model dispatch table, falls back to BasePayload (extra='allow' +
     shared constraints). This enables a new task type to be runnable by
     registration alone, without requiring a parallel edit to the dispatch dict.
+
+    ``require_acceptance_evidence`` — ``True`` for the strict external authoring
+    surface (operator / agent / project APIs): a code-producing payload type
+    (create / fix / refactor / qa / migrate / deps / docs) that omits the
+    ``acceptance_evidence`` declaration is rejected here, so a merged task always
+    has a plan-time proof for the acceptance gate to evaluate and mint criterion
+    credit from. Internal spawn sites (``validate_internal_payload``) pass
+    ``False`` because they are system-generated tasks with a known purpose, not
+    authoring-time declarations — the gate treats them exactly as today.
     """
     type_value = raw.get("type")
     if not type_value:
@@ -1897,7 +1918,20 @@ def validate_task_payload(raw: dict) -> dict:
     result: dict[str, Any] = instance.model_dump(exclude_none=True)
     # Re-inject 'type' — it lives on the raw dict but not on the Pydantic model
     result["type"] = type_value
+    # Size check first: an oversized payload is rejected as oversized, not as
+    # undeclared, so callers relying on PayloadTooLargeError keep their contract.
     _enforce_payload_size(result)
+    if (
+        require_acceptance_evidence
+        and type_value in _CODE_PRODUCING_TASK_TYPES
+        and result.get("acceptance_evidence") is None
+    ):
+        raise ValueError(
+            f"Payload of code-producing task type {type_value!r} requires an "
+            "'acceptance_evidence' declaration (kind: named_test, "
+            "observable_behavior, downstream_artifact, visual, or "
+            "coverage_delta)"
+        )
     return result
 
 
@@ -1915,9 +1949,16 @@ def validate_internal_payload(payload: dict, context: str) -> dict:
 
     Other exceptions still log a WARNING and return the original payload so a
     truly unexpected error can't take down all spawns at once.
+
+    The code-producing ``acceptance_evidence`` requirement is intentionally NOT
+    enforced here: internal spawns are system-generated tasks whose proof is
+    evaluated by the acceptance gate exactly as today (a system task that cannot
+    name a test at spawn time is not an authoring-time omission). The strict
+    requirement applies only to the external authoring surface
+    (``validate_task_payload`` with ``require_acceptance_evidence=True``).
     """
     try:
-        return validate_task_payload(payload)
+        return validate_task_payload(payload, require_acceptance_evidence=False)
     except (PayloadTooLargeError, ValueError):
         # Schema/size errors are caller bugs, not deployment skew.
         raise

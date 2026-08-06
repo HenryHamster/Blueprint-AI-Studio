@@ -291,6 +291,12 @@ def _strategic_event_completion_summary(
     _retirement_deferrals = meta.get("retirement_deferrals")
     if isinstance(_retirement_deferrals, list) and _retirement_deferrals:
         summary["retirement_deferrals"] = _retirement_deferrals
+    # Direction ops dropped for invalid criterion_keys — surfaced so the
+    # rejection reaches the operator (websocket payload + digest) instead of
+    # vanishing as a log line. Bounded at record time; capped again here.
+    _rejected_ops = ctx.get(REJECTED_DIRECTION_OPS_CONTEXT_KEY)
+    if isinstance(_rejected_ops, list) and _rejected_ops:
+        summary["rejected_direction_ops"] = _rejected_ops[-_REJECTED_DIRECTION_OPS_MAX:]
     return summary
 
 
@@ -515,6 +521,20 @@ _VALID_EVIDENCE_PROGRESS = frozenset({"advancing", "stalled", "met"})
 _EVIDENCE_PROGRESS_SUPPRESSING = frozenset({"advancing", "met"})
 _EVIDENCE_PROGRESS_RATIONALE_MAX = 300
 EVIDENCE_PROGRESS_CONTEXT_KEY = "_strategic_evidence_progress"
+
+# Transient task.context key carrying direction create/update ops that were
+# REJECTED because their criterion_keys reference unknown (dangling) or
+# retracted/superseded (inactive) acceptance criteria. The fallback parse path
+# used to drop these ops with only a log line, so the strategist never learned
+# the link was refused. The bounded list is recorded on task.context, surfaced
+# in the completion summary and cycle_metadata, and re-surfaced in the next
+# cycle's payload so the strategist can remap to an active criterion.
+REJECTED_DIRECTION_OPS_CONTEXT_KEY = "_strategic_rejected_direction_ops"
+_REJECTED_DIRECTION_OPS_MAX = 10
+# Per-entry field caps so the recorded list stays bounded regardless of the
+# agent's proposed text/keys (mirrors the API validation error surface).
+_REJECTED_OP_TEXT_MAX = 120
+_REJECTED_OP_KEYS_MAX = 20
 
 
 # ── Strategic judgment challenge record ──────────────────────────────────────
@@ -4105,6 +4125,50 @@ def _merge_rejected_proposals(vision: dict, batch: list) -> None:
     vision["rejected_proposals"] = _rp[-30:]
 
 
+def _record_rejected_direction_op(
+    task: Task,
+    *,
+    op: str,
+    direction_id: str | None,
+    text: str,
+    invalid_criterion_keys: list[str],
+    active_criterion_keys=None,
+) -> None:
+    """Record a create/update_direction op dropped for invalid criterion_keys.
+
+    The fallback parse path previously dropped these ops with only a log line,
+    so the strategist never saw the rejection and the proposed criterion link
+    was lost silently. This appends a bounded entry to
+    ``task.context[REJECTED_DIRECTION_OPS_CONTEXT_KEY]`` — newest last, capped
+    at ``_REJECTED_DIRECTION_OPS_MAX`` — which then flows into the completion
+    summary, the cycle's ``cycle_metadata``, and the next cycle's payload so the
+    strategist can remap to an active criterion.
+
+    ``active_criterion_keys`` carries the current valid keys for the open
+    version so the record is actionable, not just a refusal.
+    """
+    ctx = dict(task.context or {})
+    rejected = list(ctx.get(REJECTED_DIRECTION_OPS_CONTEXT_KEY) or [])
+    rejected.append(
+        {
+            "op": str(op)[:32],
+            "direction_id": str(direction_id)[:64] if direction_id else None,
+            "text": str(text or "")[: _REJECTED_OP_TEXT_MAX],
+            "reason": "invalid_criterion_keys",
+            "invalid_criterion_keys": [
+                str(k)[:80] for k in (invalid_criterion_keys or [])
+            ][:_REJECTED_OP_KEYS_MAX],
+            "active_criterion_keys": sorted(
+                str(k) for k in (active_criterion_keys or [])
+            )[:_REJECTED_OP_KEYS_MAX],
+            "rejected_at": _utcnow().isoformat(),
+        }
+    )
+    ctx[REJECTED_DIRECTION_OPS_CONTEXT_KEY] = rejected[-_REJECTED_DIRECTION_OPS_MAX:]
+    task.context = ctx
+    flag_modified(task, "context")
+
+
 def strategic_completion_message_count(logs: str) -> int:
     """Return a bounded reservation covering every fallback message emission."""
 
@@ -4242,6 +4306,16 @@ async def _handle_strategic_completion(
                 "created_predictions": created_predictions,
                 "retired_final_metrics": retired_final_metrics,
             }
+            # Direction ops dropped for invalid criterion_keys — copied into
+            # cycle_metadata so the next cycle's payload producer can re-surface
+            # them to the strategist (durable across the transaction boundary).
+            _api_rejected_ops = (task.context or {}).get(
+                REJECTED_DIRECTION_OPS_CONTEXT_KEY
+            )
+            if _api_rejected_ops:
+                _extra["rejected_direction_ops"] = _api_rejected_ops[
+                    -_REJECTED_DIRECTION_OPS_MAX:
+                ]
             try:
                 _extra["model_gc_telemetry"] = _compute_model_gc_telemetry(
                     project, task
@@ -5350,6 +5424,14 @@ async def _handle_strategic_completion(
                                 text[:60],
                                 invalid_criterion_keys,
                             )
+                            _record_rejected_direction_op(
+                                task,
+                                op=op,
+                                direction_id=None,
+                                text=text,
+                                invalid_criterion_keys=invalid_criterion_keys,
+                                active_criterion_keys=active_keys,
+                            )
                             continue
                         criterion_release_version_id = criterion_version.id
 
@@ -5671,6 +5753,14 @@ async def _handle_strategic_completion(
                                 task.id,
                                 dir_id,
                                 invalid_criterion_keys,
+                            )
+                            _record_rejected_direction_op(
+                                task,
+                                op=op,
+                                direction_id=str(dir_id),
+                                text=str(changes.get("text") or ""),
+                                invalid_criterion_keys=invalid_criterion_keys,
+                                active_criterion_keys=active_keys,
                             )
                             continue
                         update_criterion_release_version_id = criterion_version.id
@@ -6681,6 +6771,16 @@ async def _handle_strategic_completion(
             _fb_challenge = (task.context or {}).get(STRATEGIC_CHALLENGE_CONTEXT_KEY)
             if _fb_challenge is not None:
                 _fb_extra["strategic_judgment_challenge"] = _fb_challenge
+            # Direction ops dropped for invalid criterion_keys — copied into
+            # cycle_metadata so the next cycle's payload producer can re-surface
+            # them to the strategist (durable across the transaction boundary).
+            _fb_rejected_ops = (task.context or {}).get(
+                REJECTED_DIRECTION_OPS_CONTEXT_KEY
+            )
+            if _fb_rejected_ops:
+                _fb_extra["rejected_direction_ops"] = _fb_rejected_ops[
+                    -_REJECTED_DIRECTION_OPS_MAX:
+                ]
             fallback_cycle = await strategic_cycle.mark_phase2_completed(
                 session,
                 cycle_id,

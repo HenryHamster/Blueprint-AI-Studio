@@ -51,7 +51,15 @@ class TestDeployBranchColumnInit:
                     "github_owner": "acme",
                     "github_repo": "myrepo",
                     "payloads": [
-                        {"type": "create", "prompt": "hello", "title": "Init task"}
+                        {
+                            "type": "create",
+                            "prompt": "hello",
+                            "title": "Init task",
+                            "acceptance_evidence": {
+                                "kind": "observable_behavior",
+                                "description": "project bootstrap task ships a real change",
+                            },
+                        }
                     ],
                 },
             )

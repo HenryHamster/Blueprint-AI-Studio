@@ -982,6 +982,7 @@ from app.release_artifacts import (  # noqa: E402
     AGENT_IMAGE_ARTIFACT_KIND,
     BACKEND_REVISION_ARTIFACT_KIND,
     PROMOTION_MERGE_ARTIFACT_KIND,
+    ReleaseArtifactEvidence,
     ReleaseArtifactProvider,
     SUPERSEDED_BY_DESCENDANT_REASON,
     _previously_deployed_sha,
@@ -3565,6 +3566,71 @@ async def _aggregate_serving_status(db_session, version_id):
     ]
     status, _reason = aggregate_required_artifact_status(rows)
     return status
+
+
+def _timed_out_row(
+    artifact_kind: str, reason_code: str | None
+) -> tuple[ReleaseArtifactProvider, ReleaseArtifactEvidence]:
+    """Build a (provider, evidence) pair for a confirmation_timed_out artifact."""
+    provider = ReleaseArtifactProvider(
+        artifact_kind=artifact_kind, check=_async_noop
+    )
+    evidence = ReleaseArtifactEvidence(
+        artifact_kind=artifact_kind,
+        required=True,
+        serving_status="confirmation_timed_out",
+        served_identifier=None,
+        served_at=None,
+        reason_code=reason_code,
+    )
+    return provider, evidence
+
+
+async def _async_noop(*_args, **_kwargs):  # pragma: no cover - callable shape only
+    return None
+
+
+def test_aggregate_reason_reports_actual_blocking_gate():
+    """When several required artifacts time out together, the aggregate reason
+    must reflect the REAL unsatisfied gate, not registry-first ordering.  A
+    backend ``no_new_revision`` (the registry-first artifact) is a
+    low-information backstop that must not mask a concrete blocker like
+    ``agent_image_fleet_not_yet_serving`` — otherwise a live-serving backend
+    gets mislabeled ``no_new_revision`` and the operator cannot see the fleet
+    gate that is actually blocking confirmation."""
+    rows = [
+        _timed_out_row(BACKEND_REVISION_ARTIFACT_KIND, "no_new_revision"),
+        _timed_out_row(AGENT_IMAGE_ARTIFACT_KIND, "agent_image_fleet_not_yet_serving"),
+        (
+            ReleaseArtifactProvider(
+                artifact_kind=PROMOTION_MERGE_ARTIFACT_KIND, check=_async_noop
+            ),
+            ReleaseArtifactEvidence(
+                artifact_kind=PROMOTION_MERGE_ARTIFACT_KIND,
+                required=True,
+                serving_status="serving_confirmed",
+                served_identifier=None,
+                served_at=None,
+                reason_code=None,
+            ),
+        ),
+    ]
+    status, reason = aggregate_required_artifact_status(rows)
+    assert status == "confirmation_timed_out"
+    # The concrete fleet gate surfaces over the registry-first no_new_revision
+    # backstop — the actual blocker, not the first-timed-out artifact.
+    assert reason == "agent_image_fleet_not_yet_serving"
+
+
+def test_aggregate_reason_falls_back_to_backstop_when_all_no_new_revision():
+    """When every timed-out artifact is the low-information backstop (no more
+    specific signal exists), the aggregate falls back to the first reason
+    rather than inventing one — single-gate and all-backstop cases keep their
+    historical reason."""
+    rows = [_timed_out_row(BACKEND_REVISION_ARTIFACT_KIND, "no_new_revision")]
+    status, reason = aggregate_required_artifact_status(rows)
+    assert status == "confirmation_timed_out"
+    assert reason == "no_new_revision"
 
 
 def test_previously_deployed_sha_uses_prior_when_current_advanced():

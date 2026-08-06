@@ -538,6 +538,10 @@ def test_registry_does_not_constrain_payload_extension_fields():
             "type": "create",
             "prompt": "build it",
             "future_capability_field": {"nested": ["still", "allowed"]},
+            "acceptance_evidence": {
+                "kind": "observable_behavior",
+                "description": "ships a real, testable change",
+            },
         }
     )
 

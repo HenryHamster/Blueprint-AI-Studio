@@ -354,7 +354,18 @@ class TestPayloadSerializationSizeDeterminism:
         """
         from app.payload_schemas import validate_task_payload
 
-        result = validate_task_payload({"type": "create", "prompt": "do the thing"})
+        result = validate_task_payload(
+            {
+                "type": "create",
+                "prompt": "do the thing",
+                # A code-producing payload must declare acceptance_evidence on
+                # the strict validation surface.
+                "acceptance_evidence": {
+                    "kind": "observable_behavior",
+                    "description": "ships a real, testable change",
+                },
+            }
+        )
         assert result["type"] == "create"
         assert result["prompt"] == "do the thing"
         # Exactly one 'type' key

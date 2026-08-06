@@ -31,19 +31,37 @@ import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { resolveCandidateSha } from './specialized.js';
 import { CandidateStackController } from './walkthrough-stack.js';
 
-// Frozen output contract of scripts/walkthrough/v26-live-walkthrough.cjs.
+// Legacy frozen output contract of scripts/walkthrough/v26-live-walkthrough.cjs.
 // The first three raw rows are the substantive gates consumed by backend
 // _WALKTHROUGH_META_REQUIRED_SUBCRITERIA; c-5214996f is their conjunction.
 // The workday slug intentionally aliases that registered meta criterion in the
 // backend, but both raw rows must still be present exactly once so a truncated
 // harness result can never look like a complete probe.
+// These are now the LEGACY key set for the partial-legacy rule below: a report
+// that uses ANY of them must carry ALL of them, while a report using NONE is an
+// open-rubric report whose fresh keys are validated downstream by the backend
+// against the open version's ACTIVE criteria.
 export const WALKTHROUGH_V26_RESULT_KEYS = [
   'c-dfdc9d82',
   'c-f52fd975',
   'c-workday-session-lifecycle',
   'c-5214996f',
 ] as const;
-const WALKTHROUGH_V26_RESULT_KEY_SET = new Set<string>(WALKTHROUGH_V26_RESULT_KEYS);
+
+/**
+ * Substantive subset of the frozen legacy contract — the raw rows that carry
+ * actual flow evidence.  The meta key c-5214996f is deliberately excluded: it is
+ * the canonical meta criterion that participates in BOTH the retired v26 report
+ * and the open rubric, so a report carrying the meta row alongside fresh
+ * open-rubric keys is an open-rubric report, not a partial legacy report.  The
+ * partial-legacy rule below triggers on these keys only; a report that uses any
+ * of them must still carry the COMPLETE four-row legacy set.
+ */
+export const WALKTHROUGH_V26_SUBSTANTIVE_LEGACY_KEYS = [
+  'c-dfdc9d82',
+  'c-f52fd975',
+  'c-workday-session-lifecycle',
+] as const;
 
 /**
  * Map a per-criterion result entry to the shape expected by the
@@ -63,6 +81,21 @@ function normalizeResultEntry(r: Record<string, unknown>): {
 
 /**
  * Validate the walkthrough JSON result has the expected shape.
+ *
+ * Mirrors the backend report contract (`_evaluate_walkthrough_e2e_report`):
+ * the `git_sha` / `run_timestamp` provenance strings must be non-empty,
+ * `results` must be a NON-EMPTY array (an empty list is a truncated report),
+ * and each entry must carry a non-empty `criterion_key` (capped at 120 chars
+ * to match the backend validator), a boolean `passed`, and an optional
+ * `notes` that is a string or null. Duplicate criterion keys are rejected.
+ *
+ * PARTIAL-LEGACY RULE: a report that uses ANY of the frozen legacy V26
+ * SUBSTANTIVE keys (the meta c-5214996f is not a legacy signal — it is the
+ * canonical meta criterion in both the retired report and the open rubric)
+ * must carry ALL of them — a partial legacy report is truncated and invalid.
+ * A report that uses NONE of the substantive legacy keys is authored against
+ * the open version's rubric: its fresh keys are validated downstream by the
+ * backend against the ACTIVE criteria, so it is accepted here.
  */
 function isValidWalkthroughResult(value: unknown): value is {
   git_sha: string;
@@ -73,26 +106,44 @@ function isValidWalkthroughResult(value: unknown): value is {
   const v = value as Record<string, unknown>;
   if (
     typeof v.git_sha !== 'string'
+    || v.git_sha.trim() === ''
     || typeof v.run_timestamp !== 'string'
+    || v.run_timestamp.trim() === ''
     || !Array.isArray(v.results)
-    || v.results.length !== WALKTHROUGH_V26_RESULT_KEYS.length
+    || v.results.length === 0
   ) return false;
 
   const seen = new Set<string>();
   for (const rawEntry of v.results) {
     if (!rawEntry || typeof rawEntry !== 'object' || Array.isArray(rawEntry)) return false;
     const entry = rawEntry as Record<string, unknown>;
-    const key = entry.criterion_key;
+    const key = typeof entry.criterion_key === 'string' ? entry.criterion_key.trim() : '';
     if (
-      typeof key !== 'string'
-      || !WALKTHROUGH_V26_RESULT_KEY_SET.has(key)
-      || seen.has(key)
+      key === ''
+      || key.length > 120
       || typeof entry.passed !== 'boolean'
       || (entry.notes != null && typeof entry.notes !== 'string')
+      || seen.has(key)
     ) return false;
     seen.add(key);
   }
-  return seen.size === WALKTHROUGH_V26_RESULT_KEYS.length;
+
+  // PARTIAL-LEGACY RULE: if any frozen SUBSTANTIVE legacy key appears, the
+  // report must be EXACTLY the complete legacy set (mirrors
+  // `seen_keys & _SUBSTANTIVE_LEGACY and seen_keys != _LEGACY` — a partial set
+  // OR legacy keys mixed with fresh keys is truncated). The canonical meta key
+  // c-5214996f is NOT a legacy signal here: it participates in both the retired
+  // v26 report and the open rubric, so a report carrying the meta row alongside
+  // fresh keys is an open-rubric report and is accepted; the backend validates
+  // its keys at finalize time.
+  const usesAnyLegacyKey = WALKTHROUGH_V26_SUBSTANTIVE_LEGACY_KEYS.some((k) => seen.has(k));
+  if (usesAnyLegacyKey) {
+    const isExactLegacyReport =
+      seen.size === WALKTHROUGH_V26_RESULT_KEYS.length
+      && WALKTHROUGH_V26_RESULT_KEYS.every((k) => seen.has(k));
+    if (!isExactLegacyReport) return false;
+  }
+  return true;
 }
 
 /** True iff `bwrap --version` runs (the binary is present and executable). */

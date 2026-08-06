@@ -16,7 +16,11 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { execSync, spawn } = require('child_process');
-const { computeGates } = require('./criterion-gates.cjs');
+const {
+  computeGates,
+  resolveCriterionResults,
+  shouldEmitResolvedRows,
+} = require('./criterion-gates.cjs');
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -1571,20 +1575,16 @@ async function main() {
 // ── JSON result writer (machine-readable) ────────────────────────────────────
 
 /**
- * Write a machine-readable JSON result artifact so the walkthrough_e2e agent
- * handler can parse per-criterion results and POST SHA-pinned evidence.
+ * Build the frozen v26 four-row result contract (backward compat / fallback).
  *
- * Respects the WALKTHROUGH_RESULT_FILE env var; defaults to
- * /tmp/walkthrough_result.json.
- *
- * The SHA integrity gate (git cat-file) is enforced: if the SHA isn't
- * reachable, the JSON is written with passed=false for every criterion so a
- * fabricated SHA can never produce covered evidence.
+ * Rows are keyed by the legacy harness keys exactly as the pre-open-rubric
+ * harness emitted them. The c-workday-session-lifecycle slug is kept alongside
+ * the c-5214996f meta row on purpose: the backend alias-resolves the slug to
+ * the canonical meta key (WALKTHROUGH_LEGACY_CRITERION_ALIASES), and keeping
+ * the slug distinct from the meta entry avoids first-occurrence dedup silently
+ * dropping the meta entry (both would collapse to c-5214996f otherwise).
  */
-async function writeJsonResult(startTs, projectId) {
-  const resultFile = process.env.WALKTHROUGH_RESULT_FILE || '/tmp/walkthrough_result.json';
-  const shaValid = verifyShaExists(HEAD_SHA);
-
+function buildLegacyResultRows(startTs, shaValid) {
   // Compute per-criterion pass/fail using the centralized gate definitions from
   // criterion-gates.cjs. Each criterion requires ALL listed flow steps to pass;
   // see that module for the authoritative flow-to-criterion mapping.
@@ -1671,15 +1671,72 @@ async function writeJsonResult(startTs, projectId) {
         ].filter(Boolean).join('; ') || 'Walkthrough did not complete successfully'
       : 'SHA integrity check failed — walkthrough report not trustworthy';
 
+  return [
+    { criterion_key: 'c-dfdc9d82', passed: runnerEnrollmentPassed, notes: runnerNotes },
+    { criterion_key: 'c-f52fd975', passed: iframeTokenPassed, notes: iframeNotes },
+    { criterion_key: 'c-workday-session-lifecycle', passed: workdaySessionPassed, notes: workdayNotes },
+    { criterion_key: 'c-5214996f', passed: walkthroughMetaPassed, notes: walkthroughNotes },
+  ];
+}
+
+/**
+ * Write a machine-readable JSON result artifact so the walkthrough_e2e agent
+ * handler can parse per-criterion results and POST SHA-pinned evidence.
+ *
+ * Respects the WALKTHROUGH_RESULT_FILE env var; defaults to
+ * /tmp/walkthrough_result.json.
+ *
+ * The report rows are resolved against the OPEN version's ACTIVE
+ * walkthrough-provable criteria (fetched from the backend) so a rubric that
+ * re-mints its walkthrough criteria under fresh keys earns valid evidence
+ * end-to-end; the frozen v26 four-row contract is used as the backward-compat
+ * and fetch-failure fallback.
+ *
+ * The SHA integrity gate (git cat-file) is enforced: if the SHA isn't
+ * reachable, the JSON is written with passed=false for every criterion so a
+ * fabricated SHA can never produce covered evidence.
+ */
+async function writeJsonResult(startTs, projectId) {
+  const resultFile = process.env.WALKTHROUGH_RESULT_FILE || '/tmp/walkthrough_result.json';
+  const shaValid = verifyShaExists(HEAD_SHA);
+
+  // Resolve the report rows against the OPEN rubric's ACTIVE walkthrough-provable
+  // criteria. A rubric that re-mints those criteria under fresh keys yields one
+  // row per fresh key; a rubric that still carries ANY of the SUBSTANTIVE legacy
+  // harness keys must emit the COMPLETE four-row legacy contract — the backend
+  // rejects a report that uses SOME legacy keys without ALL four
+  // (_evaluate_walkthrough_e2e_report partial-legacy rule). The canonical meta
+  // key c-5214996f is NOT a legacy signal: it participates in both the retired
+  // v26 report and the open rubric, so a fresh-substantive + active-meta rubric
+  // emits its fresh rows (meta included) instead of collapsing to the legacy
+  // four-row report whose keys are not active in the re-minted rubric. When the
+  // criteria fetch fails or resolves no walkthrough-provable criteria, fall back
+  // to the legacy four-row report so the operator lane is never broken by a
+  // transient API failure.
+  let rows = null;
+  try {
+    const criteriaResp = await apiGet(`/api/admin/projects/${projectId}/acceptance-criteria`);
+    const criteria = Array.isArray(criteriaResp.body?.criteria) ? criteriaResp.body.criteria : [];
+    const activeCriteria = criteria
+      .filter(c => c && typeof c.criterion_key === 'string' && c.criterion_key && c.status === 'active')
+      .map(c => ({ criterion_key: c.criterion_key, text: String(c.text || '') }));
+    if (activeCriteria.length > 0) {
+      const resolved = resolveCriterionResults(activeCriteria, results, shaValid);
+      if (shouldEmitResolvedRows(resolved)) {
+        rows = resolved;
+      }
+    }
+  } catch (critErr) {
+    console.warn(`\n[WARN] Acceptance-criteria fetch failed — falling back to v26 four-row report: ${critErr.message}`);
+  }
+  if (!rows) {
+    rows = buildLegacyResultRows(startTs, shaValid);
+  }
+
   const jsonResult = {
     git_sha: HEAD_SHA,
     run_timestamp: startTs,
-    results: [
-      { criterion_key: 'c-dfdc9d82', passed: runnerEnrollmentPassed, notes: runnerNotes },
-      { criterion_key: 'c-f52fd975', passed: iframeTokenPassed, notes: iframeNotes },
-      { criterion_key: 'c-workday-session-lifecycle', passed: workdaySessionPassed, notes: workdayNotes },
-      { criterion_key: 'c-5214996f', passed: walkthroughMetaPassed, notes: walkthroughNotes },
-    ],
+    results: rows,
   };
 
   try {

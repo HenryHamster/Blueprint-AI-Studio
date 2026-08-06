@@ -205,6 +205,17 @@ def artifact_is_unconfirmed(artifact: ReleaseDeployArtifact | None) -> bool:
     return (artifact.serving_status or "unconfirmed") == "unconfirmed"
 
 
+# ``confirmation_timed_out`` reason codes that name no specific unsatisfied
+# gate.  ``no_new_revision`` is the backend's low-information backstop ("the
+# serving SHA just couldn't be confirmed in time") — not evidence of the actual
+# blocker.  When several required artifacts time out together, the reported
+# reason must reflect the real gate, not registry-first ordering
+# (backend_revision -> agent_image -> promotion_merge), so a stale backend
+# ``no_new_revision`` cannot mask a concrete gate like a fleet that never
+# served the promoted SHA.
+_TIMED_OUT_BACKSTOP_REASONS = frozenset({"no_new_revision"})
+
+
 def aggregate_required_artifact_status(
     artifacts: list[
         tuple[ReleaseArtifactProvider, ReleaseDeployArtifact | ReleaseArtifactEvidence]
@@ -226,9 +237,25 @@ def aggregate_required_artifact_status(
     for _provider, artifact in required:
         if (artifact.serving_status or "unconfirmed") == "unconfirmed":
             return ("unconfirmed", None)
-    for _provider, artifact in required:
-        if artifact.serving_status == "confirmation_timed_out":
-            return ("confirmation_timed_out", artifact.reason_code)
+    timed_out = [
+        artifact
+        for _provider, artifact in required
+        if artifact.serving_status == "confirmation_timed_out"
+    ]
+    if timed_out:
+        # Report the real gate: prefer a timed-out artifact whose reason is not
+        # the no_new_revision backstop, so a registry-first backend "no new
+        # revision" reading cannot mask a concrete blocker.  Fall back to the
+        # first when every timed-out reason is a backstop (no signal to prefer).
+        primary = next(
+            (
+                artifact.reason_code
+                for artifact in timed_out
+                if artifact.reason_code not in _TIMED_OUT_BACKSTOP_REASONS
+            ),
+            timed_out[0].reason_code,
+        )
+        return ("confirmation_timed_out", primary)
     if all(
         artifact.serving_status == "serving_confirmed"
         for _provider, artifact in required

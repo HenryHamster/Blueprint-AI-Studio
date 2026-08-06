@@ -6,6 +6,7 @@ from app.payload_schemas import (
     ALL_TASK_TYPES,
     PayloadTooLargeError,
     TaskType,
+    _CODE_PRODUCING_TASK_TYPES,
     _MAX_PAYLOAD_BYTES,
     normalize_acceptance_evidence,
     parse_acceptance_evidence,
@@ -13,6 +14,16 @@ from app.payload_schemas import (
     validate_internal_payload,
     validate_task_payload,
 )
+
+
+# A minimal, schema-valid observable_behavior declaration for code-producing
+# payloads. ``validate_task_payload`` now rejects a code payload that omits the
+# declaration entirely, so every test fixture that validates a create / fix /
+# refactor / qa / migrate / deps / docs payload must carry one.
+_CODE_EVIDENCE = {
+    "kind": "observable_behavior",
+    "description": "ships a real, testable change",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -423,7 +434,10 @@ def test_model_for_type_count_matches_enum():
     ],
 )
 def test_prompt_required_types_pass(task_type):
-    result = _valid({"type": task_type, "prompt": "Do the thing"})
+    payload: dict = {"type": task_type, "prompt": "Do the thing"}
+    if task_type in _CODE_PRODUCING_TASK_TYPES:
+        payload["acceptance_evidence"] = dict(_CODE_EVIDENCE)
+    result = _valid(payload)
     assert result["type"] == task_type
     assert result["prompt"] == "Do the thing"
 
@@ -436,7 +450,13 @@ def test_review_passes():
 
 def test_fix_passes():
     result = _valid(
-        {"type": "fix", "prompt": "Fix it", "pr_number": 7, "branch": "main"}
+        {
+            "type": "fix",
+            "prompt": "Fix it",
+            "pr_number": 7,
+            "branch": "main",
+            "acceptance_evidence": dict(_CODE_EVIDENCE),
+        }
     )
     assert result["prompt"] == "Fix it"
     assert result["pr_number"] == 7
@@ -562,7 +582,10 @@ def test_discovery_review_payload_rejects_removed_confirmation_fields(legacy_fie
     ],
 )
 def test_system_populated_types_pass_with_no_extra_fields(task_type):
-    result = _valid({"type": task_type})
+    payload: dict = {"type": task_type}
+    if task_type in _CODE_PRODUCING_TASK_TYPES:
+        payload["acceptance_evidence"] = dict(_CODE_EVIDENCE)
+    result = _valid(payload)
     assert result["type"] == task_type
 
 
@@ -805,6 +828,51 @@ def test_missing_type_field_raises():
 
 
 # ---------------------------------------------------------------------------
+# Code-producing payloads require an acceptance_evidence declaration
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "task_type", ["create", "fix", "refactor", "qa", "migrate", "deps", "docs"]
+)
+def test_code_payload_without_acceptance_evidence_rejected(task_type):
+    """A code-producing payload authored through the strict surface without an
+    acceptance_evidence declaration is rejected at validation, so a merged task
+    always has a plan-time proof for the acceptance gate to evaluate."""
+    # Build a schema-valid payload for the type (satisfying its own required
+    # fields) so the ONLY missing thing is the acceptance_evidence declaration.
+    raw = {"type": task_type, **_ACCEPTANCE_TYPES[task_type]}
+    msg = _invalid(raw)
+    assert task_type in msg
+    assert "acceptance_evidence" in msg
+
+
+@pytest.mark.parametrize(
+    "task_type", ["create", "fix", "refactor", "qa", "migrate", "deps", "docs"]
+)
+def test_code_payload_with_acceptance_evidence_passes(task_type):
+    payload: dict = {"type": task_type, "prompt": "Do the thing"}
+    if task_type in ("fix", "review"):
+        payload.update(pr_number=7, branch="main")
+    payload["acceptance_evidence"] = dict(_CODE_EVIDENCE)
+    result = _valid(payload)
+    assert result["type"] == task_type
+    assert result["acceptance_evidence"]["kind"] == "observable_behavior"
+
+
+def test_internal_spawn_payload_does_not_require_acceptance_evidence():
+    """System-internal spawn sites (validate_internal_payload) are exempt: a
+    system-generated code task with a known purpose is not an authoring-time
+    omission, and the acceptance gate evaluates it exactly as before."""
+    result = validate_internal_payload(
+        {"type": "create", "prompt": "Debug auto-fix the failing test"},
+        "test:internal_spawn_exempt",
+    )
+    assert result["type"] == "create"
+    assert "acceptance_evidence" not in result
+
+
+# ---------------------------------------------------------------------------
 # Extra fields are preserved (not stripped)
 # ---------------------------------------------------------------------------
 
@@ -816,6 +884,7 @@ def test_extra_fields_preserved_create():
         "directions": ["some direction"],
         "vision": "Our grand vision",
         "custom_key": "custom_value",
+        "acceptance_evidence": dict(_CODE_EVIDENCE),
     }
     result = _valid(raw)
     assert result["directions"] == ["some direction"]
@@ -851,7 +920,12 @@ def test_branch_leading_dash_rejected():
 
 def test_branch_feature_slash_passes():
     result = _valid(
-        {"type": "create", "prompt": "x", "base_branch": "feature/my-branch"}
+        {
+            "type": "create",
+            "prompt": "x",
+            "base_branch": "feature/my-branch",
+            "acceptance_evidence": dict(_CODE_EVIDENCE),
+        }
     )
     assert result["base_branch"] == "feature/my-branch"
 
@@ -897,13 +971,17 @@ def test_effort_ultra_rejected():
 
 
 def test_effort_max_accepted():
-    result = _valid({"type": "create", "prompt": "x", "effort": "max"})
+    result = _valid(
+        {"type": "create", "prompt": "x", "effort": "max", "acceptance_evidence": dict(_CODE_EVIDENCE)}
+    )
     assert result["effort"] == "max"
 
 
 @pytest.mark.parametrize("effort", ["low", "medium", "high"])
 def test_standard_effort_values_accepted(effort):
-    result = _valid({"type": "create", "prompt": "x", "effort": effort})
+    result = _valid(
+        {"type": "create", "prompt": "x", "effort": effort, "acceptance_evidence": dict(_CODE_EVIDENCE)}
+    )
     assert result["effort"] == effort
 
 
@@ -931,6 +1009,7 @@ def test_research_completion_pattern():
         "model": "claude-opus-4-6",
         "effort": "high",
         "prompt_suffix": "Be concise.",
+        "acceptance_evidence": dict(_CODE_EVIDENCE),
     }
     result = _valid(raw)
     assert result["prompt"] == "Add feature X"
@@ -962,6 +1041,7 @@ def test_fix_pipeline_pattern():
         "prompt": "Address review comments",
         "pr_number": 55,
         "branch": "fix/issue-55",
+        "acceptance_evidence": dict(_CODE_EVIDENCE),
     }
     result = _valid(raw)
     assert result["prompt"] == "Address review comments"
@@ -1196,6 +1276,7 @@ def test_fix_optional_fields_accepted():
         "branch": "main",
         "original_task_id": "task-456",
         "original_prompt": "Original request",
+        "acceptance_evidence": dict(_CODE_EVIDENCE),
     }
     result = _valid(raw)
     assert result["original_task_id"] == "task-456"
@@ -1204,7 +1285,13 @@ def test_fix_optional_fields_accepted():
 
 def test_fix_omit_optional_fields_passes():
     result = _valid(
-        {"type": "fix", "prompt": "Fix it", "pr_number": 1, "branch": "main"}
+        {
+            "type": "fix",
+            "prompt": "Fix it",
+            "pr_number": 1,
+            "branch": "main",
+            "acceptance_evidence": dict(_CODE_EVIDENCE),
+        }
     )
     assert "original_task_id" not in result
     assert "original_prompt" not in result
@@ -1265,10 +1352,13 @@ def test_type_preserved_in_output():
         raw: dict = {"type": t}
         if t in ("create",):
             raw["prompt"] = "x"
+            raw["acceptance_evidence"] = dict(_CODE_EVIDENCE)
         if t == "review":
             raw.update({"pr_number": 1, "branch": "main"})
         if t == "fix":
-            raw.update({"prompt": "x", "pr_number": 1, "branch": "main"})
+            raw.update(
+                {"prompt": "x", "pr_number": 1, "branch": "main", "acceptance_evidence": dict(_CODE_EVIDENCE)}
+            )
         result = validate_task_payload(raw)
         assert result["type"] == t, f"'type' missing from result for {t!r}"
 
@@ -1413,13 +1503,17 @@ def test_base_branch_absent_not_defaulted_to_main():
 
 def test_base_branch_none_excluded_from_dump():
     """A payload validated without base_branch must not emit base_branch=None."""
-    result = _valid({"type": "create", "prompt": "Do the thing"})
+    result = _valid(
+        {"type": "create", "prompt": "Do the thing", "acceptance_evidence": dict(_CODE_EVIDENCE)}
+    )
     assert "base_branch" not in result
 
 
 def test_base_branch_explicit_value_preserved():
     """Explicitly supplied base_branch values are still accepted and returned."""
-    result = _valid({"type": "create", "prompt": "x", "base_branch": "trunk"})
+    result = _valid(
+        {"type": "create", "prompt": "x", "base_branch": "trunk", "acceptance_evidence": dict(_CODE_EVIDENCE)}
+    )
     assert result["base_branch"] == "trunk"
 
 
@@ -1580,9 +1674,18 @@ def test_acceptance_evidence_valid_kinds_round_trip(task_type, evidence_key):
         assert result["acceptance_evidence"][k] == v
 
 
-@pytest.mark.parametrize("task_type", sorted(_ACCEPTANCE_TYPES))
+@pytest.mark.parametrize(
+    "task_type",
+    [t for t in sorted(_ACCEPTANCE_TYPES) if t not in _CODE_PRODUCING_TASK_TYPES],
+)
 def test_acceptance_evidence_absent_is_legacy_compatible(task_type):
-    """A payload with no acceptance_evidence validates and omits the field entirely (legacy)."""
+    """A non-code payload with no acceptance_evidence still validates and omits the field (legacy).
+
+    Code-producing types now REQUIRE an acceptance_evidence declaration on the
+    strict authoring surface (see
+    test_code_payload_without_acceptance_evidence_rejected); this legacy
+    round-trip contract remains for non-code types such as plan.
+    """
     raw = {"type": task_type, **_ACCEPTANCE_TYPES[task_type]}
     result = _valid(raw)
     assert "acceptance_evidence" not in result, (
