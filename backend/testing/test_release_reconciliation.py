@@ -1067,13 +1067,17 @@ def test_classify_unobservable_serving_sha_times_out_after_deadline():
 
 
 def test_classify_no_new_revision_times_out_after_deadline():
+    """A STABLE revision whose serving SHA is UNOBSERVABLE and predates the
+    promotion never yields a decision; past the deadline the classifier lands
+    confirmation_timed_out/no_new_revision (no active failure observed).  A
+    STABLE revision serving an OBSERVABLE mismatched SHA now emits sha_mismatch
+    (delegated to the consumer-layer descendant check), so this no-new-revision
+    timeout path is exercised through the unobservable pre-promotion case."""
     promoted_at = datetime(2026, 6, 5, 12, 0, 0)
     deadline = datetime(2026, 6, 5, 13, 0, 0)
-    # Old revision that predates the promotion never advanced; STABLE but stale.
-    # It runs _SHA_B (the pre-promotion sha) — NOT the promoted sha (_SHA_A),
-    # which is the post-merge commit that did not exist before the promotion.
+    # Pre-promotion STABLE revision whose serving SHA could not be read.
     ds = _ds(
-        DeploymentStatus.STABLE, datetime(2026, 6, 5, 11, 50, 0), current_sha=_SHA_B
+        DeploymentStatus.STABLE, datetime(2026, 6, 5, 11, 50, 0), current_sha=""
     )
     # Within the window → no decision yet.
     assert (
@@ -1096,11 +1100,11 @@ def test_classify_missing_deadline_backstops_from_promoted_at():
     from app.release_promotion import _DEPLOY_CONFIRM_WINDOW_SECONDS
 
     promoted_at = datetime(2026, 6, 5, 12, 0, 0)
-    # Stale revision that predates the promotion never advanced; deadline=None.
-    # It runs _SHA_B (the pre-promotion sha) — a pre-promotion revision cannot
-    # serve the promoted sha (_SHA_A) which did not exist before the promotion.
+    # Pre-promotion STABLE revision whose serving SHA is unobservable and which
+    # never advances; deadline=None.  (An observable mismatched SHA now routes
+    # to sha_mismatch, so the deadline backstop is exercised via this path.)
     ds = _ds(
-        DeploymentStatus.STABLE, datetime(2026, 6, 5, 11, 50, 0), current_sha=_SHA_B
+        DeploymentStatus.STABLE, datetime(2026, 6, 5, 11, 50, 0), current_sha=""
     )
     # Just before the derived deadline → still waiting (no premature decision).
     within = promoted_at + timedelta(seconds=_DEPLOY_CONFIRM_WINDOW_SECONDS - 60)
@@ -1161,17 +1165,23 @@ def test_classify_serving_confirmed_deploy_finished_before_promotion_recorded():
     assert out[2] == deployed_at  # served_at is the boot time
 
 
-def test_classify_stable_pre_promotion_sha_mismatch_waits_not_fails():
+def test_classify_stable_pre_promotion_sha_mismatch_routes_to_descendant_check():
     """A pre-promotion revision (deployed_at < promoted_at) serving a different
-    SHA must NOT be reported as sha_mismatch — it predates the promotion, so
-    the mismatch is expected while waiting for the new revision to boot."""
+    SHA is AMBIGUOUS: it may be the OLD revision still serving (deploy in
+    flight) OR the deploy landing as the promotion MERGE COMMIT — a descendant
+    of promoted_sha that was observed booting before the orchestrator stamped
+    promoted_at (the v25/v27 merge-commit promotion pattern).  The classifier
+    therefore emits sha_mismatch REGARDLESS of ordering so the consumer-layer
+    descendant check (_reclassify_sha_mismatch_if_superseded) can resolve the
+    ambiguity: it confirms a descendant and keeps a diverged/behind/unrelated
+    pre-promotion revision waiting (then timing out honestly)."""
     promoted_at = datetime(2026, 6, 5, 12, 0, 0)
     deployed_at = datetime(2026, 6, 5, 11, 50, 0)  # predates promotion
     deadline = promoted_at + timedelta(hours=1)
     now = promoted_at + timedelta(minutes=15)
     ds = _ds(DeploymentStatus.STABLE, deployed_at, current_sha=_SHA_B)
     out = _classify_serving_outcome(ds, promoted_at, _SHA_A, deadline, now)
-    assert out is None  # still waiting, not sha_mismatch
+    assert out == ("deploy_failed", "sha_mismatch", None)
 
 
 async def _make_promoted_unconfirmed_version(
@@ -1983,18 +1993,25 @@ async def test_confirm_unobservable_sha_after_deadline_times_out(db_session):
 
 
 @pytest.mark.asyncio
-async def test_confirm_no_new_revision_times_out_scenario(db_session):
+async def test_confirm_no_new_revision_times_out_scenario(db_session, mocker):
     """(b) The live revision never advances within the window → CONFIRMATION
     TIMED OUT, distinct from deploy_failed: nothing was observed going bad, so NO
     loud ERROR alert fires and the verdict outcome is confirmation_timed_out. The
     never-confirmed promotion is reported as a distinct state, not cleanly
-    shipped and not a crisis."""
+    shipped and not a crisis.
+
+    The stale pre-promotion revision now emits sha_mismatch (the descendant
+    check runs for every STABLE mismatch); because it PREDATES the promotion and
+    is determinately NOT a descendant, the supersession check keeps the
+    conservative wait → honest-timeout path instead of hard-failing."""
     promoted_at = _utcnow() - timedelta(hours=2)
     deadline = promoted_at + timedelta(hours=1)  # already elapsed
     _project, version = await _make_promoted_unconfirmed_version(
         db_session, promoted_at=promoted_at, deadline=deadline
     )
-    # Stale revision predating the promotion; STABLE but never advanced.
+    # Stale revision predating the promotion; STABLE but never advanced, and
+    # determinately NOT a descendant of the promoted commit.
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
     await _set_deploy_state(
         db_session,
         status=DeploymentStatus.STABLE,
@@ -2152,7 +2169,7 @@ async def test_confirm_deploy_failed_arms_strategic_refresh(db_session):
 
 
 @pytest.mark.asyncio
-async def test_confirm_timed_out_arms_strategic_refresh_distinctly(db_session):
+async def test_confirm_timed_out_arms_strategic_refresh_distinctly(db_session, mocker):
     """A confirmation TIMEOUT also wakes the strategist, but with a DISTINCT
     reason (promotion_confirmation_timed_out:...) — never the deploy_failed crisis
     reason — so the handoff reads as 'verify serving', not 'recover a failed
@@ -2162,7 +2179,9 @@ async def test_confirm_timed_out_arms_strategic_refresh_distinctly(db_session):
     project, version = await _make_promoted_unconfirmed_version(
         db_session, promoted_at=promoted_at, deadline=deadline
     )
-    # Stale revision that never advanced → no active failure → timeout.
+    # Stale revision that never advanced → no active failure → timeout.  The
+    # pre-promotion divergent ancestry keeps the wait → honest-timeout path.
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
     await _set_deploy_state(
         db_session,
         status=DeploymentStatus.STABLE,
@@ -2593,7 +2612,7 @@ async def test_recover_confirmation_timed_out_when_sha_serves_within_window(db_s
 
 
 @pytest.mark.asyncio
-async def test_recover_skips_when_sha_never_serves(db_session):
+async def test_recover_skips_when_sha_never_serves(db_session, mocker):
     """(b) A genuinely failed deploy (promoted SHA never serves — the live revision
     predates the promotion and never advanced) stays deploy_failed and keeps its
     alert and verdict outcome; no recovery, no refresh."""
@@ -2607,7 +2626,9 @@ async def test_recover_skips_when_sha_never_serves(db_session):
         deadline=deadline,
         alerted_at=alerted_at,
     )
-    # Stale revision predating the promotion; STABLE but never advanced.
+    # Stale revision predating the promotion; STABLE but never advanced, and
+    # determinately NOT a descendant → the re-check keeps it non-recovered.
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
     await _set_deploy_state(
         db_session,
         status=DeploymentStatus.STABLE,
@@ -3109,6 +3130,267 @@ async def test_confirm_github_failure_falls_back_to_sha_mismatch(
     assert version.serving_status == expected_status
     assert version.deploy_failure_reason == expected_reason
     assert version.served_sha is None
+
+
+@pytest.mark.asyncio
+async def test_confirm_merge_commit_descendant_deployed_before_promoted_at_confirms(
+    db_session, mocker
+):
+    """The v25/v27 merge-commit promotion: deploy.yml deploys github.sha (the
+    MERGE COMMIT) while version.promoted_sha records the automain tip, so the
+    exact-match path can never fire.  When the observed STABLE revision is a
+    DESCENDANT of promoted_sha and the deploy was observed BEFORE the
+    orchestrator stamped promoted_at (deployed_at <= promoted_at), the version
+    must CONFIRM serving with the OBSERVED SHA — this is the case the ordering
+    gate used to skip straight into confirmation_timed_out."""
+    promoted_at = _utcnow()
+    deadline = promoted_at + timedelta(hours=1)
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    # The merge commit (a descendant of promoted_sha) booted BEFORE the
+    # orchestrator recorded promoted_at — the v27 structural pattern.
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_B,
+        deployed_at=promoted_at - timedelta(hours=2),
+    )
+    is_ancestor = mocker.patch(
+        "app.github.is_ancestor_of", new=AsyncMock(return_value=True)
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(minutes=40),
+    )
+    assert resolved is True
+    await db_session.refresh(version)
+    assert version.serving_status == "serving_confirmed"
+    # The served SHA is the OBSERVED live SHA (the merge commit), never the
+    # promoted automain-tip SHA echoed as a stand-in.
+    assert version.served_sha == _SHA_B
+    assert version.deploy_failure_reason is None
+
+    # Ancestry was asked exactly once with base = promoted SHA, head = observed.
+    is_ancestor.assert_awaited_once_with(
+        "tok",
+        "acme",
+        "widget",
+        _SHA_A,
+        _SHA_B,
+        project_id=str(version.project_id),
+    )
+
+    artifact = await _backend_artifact_for(db_session, version)
+    assert artifact.serving_status == "serving_confirmed"
+    assert artifact.served_identifier == _SHA_B
+    assert artifact.reason_code == SUPERSEDED_BY_DESCENDANT_REASON
+
+
+@pytest.mark.asyncio
+async def test_confirm_pre_promotion_diverged_sha_waits_then_times_out(
+    db_session, mocker
+):
+    """A pre-promotion revision that is determinately NOT a descendant
+    (diverged / behind / unrelated) must NEVER silently confirm.  Within the
+    window the version stays unconfirmed (defer — the deploy may still land);
+    past the deadline it times out honestly as confirmation_timed_out — the
+    "genuinely absent revision still times out honestly" guarantee now that the
+    classifier routes every STABLE mismatch through the descendant check."""
+    promoted_at = _utcnow()
+    deadline = promoted_at + timedelta(hours=1)
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_C,
+        deployed_at=promoted_at - timedelta(hours=2),  # predates promotion
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+
+    # Within the confirmation window: no decision, version stays unconfirmed.
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(minutes=30),
+    )
+    assert resolved is False
+    await db_session.refresh(version)
+    assert version.serving_status == "unconfirmed"
+    assert version.served_sha is None
+
+    # Past the deadline: honest confirmation_timed_out, never deploy_failed and
+    # never serving_confirmed.
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(hours=2),
+    )
+    assert resolved is True
+    await db_session.refresh(version)
+    assert version.serving_status == "confirmation_timed_out"
+    assert version.deploy_failure_reason == "no_new_revision"
+    assert version.served_sha is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["raises", "no_credentials", "indeterminate"])
+async def test_confirm_pre_promotion_github_failure_never_confirms(
+    db_session, mocker, failure
+):
+    """A GitHub API / credential failure on the descendant check for a
+    PRE-promotion STABLE mismatch must never silently confirm.  ``raises`` and
+    ``no_credentials`` fall back to deploy_failed/sha_mismatch; an
+    ``indeterminate`` answer defers within the window and times out past the
+    deadline — all non-confirmations."""
+    promoted_at = _utcnow() - timedelta(hours=2)
+    deadline = promoted_at + timedelta(hours=1)  # already elapsed
+    if failure == "raises":
+        mocker.patch(
+            "app.github.is_ancestor_of",
+            new=AsyncMock(side_effect=RuntimeError("github exploded")),
+        )
+        expected_status = "deploy_failed"
+        expected_reason = "sha_mismatch"
+    elif failure == "indeterminate":
+        mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=None))
+        expected_status = "confirmation_timed_out"
+        expected_reason = "backend_revision_ancestry_indeterminate"
+    else:  # no_credentials — the compare API must never even be attempted.
+        mocker.patch(
+            "app.release_promotion._resolve_github_with_session",
+            new=AsyncMock(return_value=None),
+        )
+        mocker.patch(
+            "app.github.is_ancestor_of",
+            new=AsyncMock(side_effect=AssertionError("must not be called")),
+        )
+        expected_status = "deploy_failed"
+        expected_reason = "sha_mismatch"
+
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_B,
+        deployed_at=promoted_at - timedelta(minutes=30),  # predates promotion
+    )
+
+    resolved = await _confirm_serving_or_fail(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=promoted_at + timedelta(hours=2),  # well past deadline
+    )
+    assert resolved is True
+    await db_session.refresh(version)
+    assert version.serving_status == expected_status
+    assert version.deploy_failure_reason == expected_reason
+    assert version.served_sha is None
+
+
+@pytest.mark.asyncio
+async def test_recover_confirmation_timed_out_when_descendant_deployed_before_promoted_at(
+    db_session, mocker
+):
+    """A version LATCHED confirmation_timed_out becomes re-checkable and
+    recoverable: once the live revision is observed to be a DESCENDANT of
+    promoted_sha — even though it booted before promoted_at was stamped (the
+    v27 merge-commit ordering that the old gate sent to an unrecoverable
+    timeout) — the recovery sweep re-confirms it serving_confirmed with the
+    observed SHA, clearing the timeout latch and the verdict outcome."""
+    now = _utcnow()
+    promoted_at = now - timedelta(hours=5)
+    project = Project(
+        name="Recover-Timeout-Desc",
+        user_id="recover-user",
+        github_owner="acme",
+        github_repo="widget",
+        integration_branch="automain",
+        promotion_target="main",
+        is_self_repo=True,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    version.status = "promoted"
+    version.promoted_at = promoted_at
+    version.promoted_sha = _SHA_A
+    version.serving_status = "confirmation_timed_out"
+    version.deploy_failure_reason = "no_new_revision"
+    version.deploy_confirm_deadline = promoted_at + timedelta(hours=1)
+    version.last_qualification = {"status": "promoted", "promoted_sha": _SHA_A}
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    db_session.add(
+        QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha=_SHA_A,
+            terminal_status="promoted",
+            would_promote=True,
+            promotion_enabled=True,
+            post_promotion_outcome="confirmation_timed_out",
+            post_promotion_outcome_at=promoted_at + timedelta(hours=1),
+        )
+    )
+    db_session.add(
+        ReleaseDeployArtifact(
+            version_id=version.id,
+            artifact_kind=BACKEND_REVISION_ARTIFACT_KIND,
+            serving_status="confirmation_timed_out",
+            reason_code="no_new_revision",
+            confirmation_deadline=promoted_at + timedelta(hours=1),
+        )
+    )
+    await db_session.commit()
+
+    # The merge commit (a descendant of promoted_sha) is serving, booted BEFORE
+    # the orchestrator stamped promoted_at.
+    await _set_deploy_state(
+        db_session,
+        status=DeploymentStatus.STABLE,
+        current_sha=_SHA_B,
+        deployed_at=promoted_at - timedelta(hours=2),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=True))
+
+    recovered = await _reconcile_if_deploy_failed_recovered(
+        version.id,
+        session_factory=_shared_session_factory(db_session),
+        now=now,
+    )
+    assert recovered is True
+    await db_session.refresh(version)
+    assert version.serving_status == "serving_confirmed"
+    assert version.served_sha == _SHA_B
+    assert version.deploy_failure_reason is None
+
+    artifact = await _backend_artifact_for(db_session, version)
+    assert artifact.serving_status == "serving_confirmed"
+    assert artifact.served_identifier == _SHA_B
+    assert artifact.reason_code == SUPERSEDED_BY_DESCENDANT_REASON
+
+    verdict = (
+        (
+            await db_session.execute(
+                _select(QualificationVerdict).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert verdict.post_promotion_outcome == "serving_confirmed"
 
 
 @pytest.mark.asyncio

@@ -2831,8 +2831,16 @@ def _classify_serving_outcome(
       * ``("deploy_failed", reason)`` (third element ``None``) — the deploy
         ACTIVELY went bad: a ROLLED_BACK/HALTED state arose after the promotion
         (``reason`` ``rolled_back``/``halted``), or the observed serving SHA does
-        not match the promoted SHA (``sha_mismatch``).  This is a real failure
-        the operator/strategist must treat as a crisis (roll forward / recover).
+        not match the promoted SHA (``sha_mismatch``).  A STABLE ``sha_mismatch``
+        is AMBIGUOUS rather than an outright failure: the consumer layer
+        (``_reclassify_sha_mismatch_if_superseded``) re-checks it against GitHub
+        ancestry and resolves a descendant serving revision to
+        ``serving_confirmed`` (supersession) while keeping non-descendant /
+        indeterminate outcomes conservative.  Emitting it here for ANY STABLE
+        mismatch — regardless of the deployed_at/promoted_at ordering — is what
+        lets the merge-commit promotion (deploy.yml deploys the merge commit;
+        ``promoted_sha`` records the automain tip) confirm even when the deploy
+        was observed before the orchestrator stamped ``promoted_at``.
       * ``("confirmation_timed_out", reason)`` (third element ``None``) — the
         bounded confirmation window elapsed WITHOUT a positive confirmation but
         also WITHOUT any active failure signal: no new healthy revision appeared
@@ -2897,21 +2905,26 @@ def _classify_serving_outcome(
         # the Cloud Run revision booted before the orchestrator finished
         # recording promoted_at (deployed_at <= promoted_at) is safe to
         # confirm: the matched SHA proves this is the right revision.
-        #
-        # SHA-mismatch and serving_sha_unobservable still require
-        # revision_after_promotion to guard against a stale pre-promotion
-        # revision that happens to be running a different SHA — in that case
-        # we just wait, we do not fail the deploy.
         if status == DeploymentStatus.STABLE:
             current_sha = ds.current_sha or None
             if current_sha and promoted_sha:
                 if current_sha == promoted_sha:
                     return ("serving_confirmed", current_sha, deployed_at)
-                # SHA mismatch is a hard failure only for a revision that
-                # booted AFTER the promotion was stamped — a pre-promotion
-                # revision still running a different SHA is just "waiting".
-                if revision_after_promotion:
-                    return ("deploy_failed", "sha_mismatch", None)
+                # A STABLE revision serving a DIFFERENT SHA is AMBIGUOUS: it may
+                # be the deploy landing as the promotion MERGE COMMIT (a
+                # descendant of promoted_sha — the v25/v27 pattern where
+                # deploy.yml deploys github.sha = merge commit while promoted_sha
+                # records the automain tip), a wrong/rolled-back revision, or the
+                # OLD revision still serving while the deploy is in flight.  The
+                # consumer-layer descendant check
+                # (_reclassify_sha_mismatch_if_superseded) resolves the ambiguity
+                # via GitHub ancestry.  Do NOT gate it on revision_after_promotion:
+                # a merge commit's deploy can be observed before the orchestrator
+                # records promoted_at (deployed_at <= promoted_at), and that
+                # descendant MUST confirm.  Emitting sha_mismatch here routes every
+                # STABLE mismatch through that check; non-descendant outcomes keep
+                # their conservative wait / honest-fail semantics there.
+                return ("deploy_failed", "sha_mismatch", None)
             elif revision_after_promotion:
                 # New revision booted after promotion but serving SHA is
                 # unobservable (Cloud Run lookup degraded) — not confirmable.

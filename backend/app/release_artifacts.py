@@ -557,8 +557,19 @@ async def _reclassify_sha_mismatch_if_superseded(
         SUCCEEDED and was superseded: resolve ``serving_confirmed`` with the
         OBSERVED live SHA as the served identifier (never the promoted SHA) and
         the distinct ``superseded_by_descendant`` reason code;
-      * diverged / behind / unrelated → keep ``deploy_failed``/``sha_mismatch``
-        exactly as today;
+      * diverged / behind / unrelated that booted AFTER the promotion was
+        stamped (``deployed_at > promoted_at``) → keep
+        ``deploy_failed``/``sha_mismatch`` exactly as today — a revision that
+        arrived after the promotion but does NOT contain the promoted commit is
+        a genuinely wrong deploy;
+      * diverged / behind / unrelated that PREDATES the promotion
+        (``deployed_at <= promoted_at``) → the OLD revision is still serving
+        while the deploy is in flight (or never arrived).  That is not an
+        active failure: keep the conservative pre-fix semantics — wait within
+        the confirmation window and time out honestly past the deadline, so a
+        genuinely absent revision never hard-fails and never silently confirms.
+        The classifier now routes every STABLE mismatch through this check, so
+        this branch is what preserves the timeout path for absent revisions;
       * any credential/API failure → fall back to the current behavior
         (``deploy_failed``/``sha_mismatch``) with a warning — fail toward
         existing semantics, never silently confirm.
@@ -636,6 +647,38 @@ async def _reclassify_sha_mismatch_if_superseded(
                 "backend_revision_ancestry_indeterminate",
                 None,
             )
+        # ancestry is determinately False — the observed revision does NOT
+        # contain the promoted commit.  Whether that is a hard failure or
+        # "still waiting" depends on the deploy/promote ordering (see the
+        # docstring): a revision that PREDATES the promotion is the old one
+        # still serving while the deploy is in flight (or never arrived) —
+        # keep waiting within the window and time out honestly past the
+        # deadline, never hard-failing and never silently confirming.  A
+        # revision that booted AFTER the promotion yet lacks the promoted
+        # commit is a genuinely wrong deploy — keep deploy_failed/sha_mismatch.
+        _deployed_at = (
+            _to_naive_utc(getattr(ds, "deployed_at", None))
+            if ds is not None
+            else None
+        )
+        _promoted_at_naive = _to_naive_utc(version.promoted_at)
+        if not (
+            _deployed_at is not None
+            and _promoted_at_naive is not None
+            and _deployed_at > _promoted_at_naive
+        ):
+            _deadline = _to_naive_utc(version.deploy_confirm_deadline)
+            _now_naive = _to_naive_utc(now) or now
+            if _deadline is None or _now_naive < _deadline:
+                return None  # within window — defer, retry on next sweep
+            logger.warning(
+                "[RELEASE_ARTIFACTS] sha_mismatch supersession check for v%s: "
+                "observed revision predates the promotion and is not a "
+                "descendant — no descendant revision observed by the deadline; "
+                "resolving confirmation_timed_out",
+                getattr(version, "version_number", "?"),
+            )
+            return ("confirmation_timed_out", "no_new_revision", None)
         return decision
 
     served_at = _to_naive_utc(ds.deployed_at) if ds is not None else None
