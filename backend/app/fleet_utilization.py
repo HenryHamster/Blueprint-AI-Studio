@@ -25,6 +25,45 @@ from app.models import Task, TaskStatus, _utcnow
 from app.runtime_config_state import runtime_config as _runtime_config
 
 
+def _naive(dt: datetime | None) -> datetime | None:
+    """Strip tzinfo when present (all app columns are naive-UTC)."""
+    return (
+        dt.replace(tzinfo=None) if dt is not None and dt.tzinfo is not None else dt
+    )
+
+
+def _task_occupancy_interval(
+    status,
+    created_at,
+    updated_at,
+    dispatched,
+    provisioned,
+    stopped,
+    now: datetime,
+) -> tuple[datetime, datetime] | None:
+    """Half-open slot-occupancy interval ``[start, end)`` for one task row.
+
+    A task occupies an account slot from when it was dispatched/provisioned
+    (or, for a still-active task with neither stamp yet, its ``created_at``)
+    until it stopped (or, for a still-active task, ``now``). Terminal tasks
+    that never recorded a VM stamp never held a slot and return None. This is
+    the single source of truth for the start/end pair shared by the
+    time-weighted occupancy average and the concurrency-overlap measurement,
+    so the two signals cannot disagree about what counts as occupying a slot.
+    """
+    active_states = (TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS)
+    is_active = status in active_states
+    start = dispatched or provisioned or (created_at if is_active else None)
+    if start is None:
+        return None
+    end = stopped or (now if is_active else updated_at) or now
+    start = _naive(start)
+    end = _naive(end)
+    if start is None or end is None:
+        return None
+    return start, end
+
+
 def _sum_slot_occupancy_seconds(
     rows: list, now: datetime, window_start: datetime
 ) -> float:
@@ -32,35 +71,199 @@ def _sum_slot_occupancy_seconds(
 
     Pure helper (no DB) so the time-weighted utilization average is unit-
     testable. ``rows`` are ``(status, created_at, updated_at, vm_dispatched_at,
-    vm_provisioned_at, vm_stopped_at)`` tuples. A task occupies an account slot
-    from when it was dispatched/provisioned (or, for a still-active task with
-    neither stamp yet, its ``created_at``) until it stopped (or, for a still-
-    active task, ``now``). Terminal tasks that never recorded a VM stamp never
-    held a slot and contribute zero.
+    vm_provisioned_at, vm_stopped_at)`` tuples. Occupancy intervals are derived
+    by ``_task_occupancy_interval`` (see its docstring for the slot
+    definition); each interval is clipped to ``[window_start, now]``.
     """
-    active_states = (TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS)
-
-    def _naive(dt: datetime | None) -> datetime | None:
-        return (
-            dt.replace(tzinfo=None) if dt is not None and dt.tzinfo is not None else dt
-        )
-
     total = 0.0
-    for status, created_at, updated_at, dispatched, provisioned, stopped in rows:
-        is_active = status in active_states
-        start = dispatched or provisioned or (created_at if is_active else None)
-        if start is None:
+    for row in rows:
+        interval = _task_occupancy_interval(*row, now)
+        if interval is None:
             continue
-        end = stopped or (now if is_active else updated_at) or now
-        start = _naive(start)
-        end = _naive(end)
-        if start is None or end is None:
-            continue
+        start, end = interval
         lo = max(start, window_start)
         hi = min(end, now)
         if hi > lo:
             total += (hi - lo).total_seconds()
     return total
+
+
+# The slot definition used by every concurrency-overlap measurement. Kept in
+# one place so the reported number always names the timestamp pair it is
+# derived from.
+SLOT_DEFINITION = (
+    "vm_dispatched_at/vm_provisioned_at -> vm_stopped_at (still-active tasks "
+    "extend to now); terminal tasks that never recorded a VM stamp hold no slot"
+)
+
+
+def _percentiles_from_histogram(
+    hist: Dict[int, float], total_seconds: float, peak: int
+) -> Dict[str, int]:
+    """Time-weighted concurrency percentiles from a ``{level: seconds}`` histogram.
+
+    ``pN`` is the concurrency level at or below which the fleet spent at least
+    N% of the measured window, so ``p50`` is the median instantaneous
+    concurrency and ``p100`` is the peak. The histogram spans from the first
+    task's start to the last task's end, so interior idle gaps count as level 0.
+    """
+    if total_seconds <= 0:
+        return {}
+    labels = [("p50", 50), ("p90", 90), ("p95", 95), ("p99", 99), ("p100", 100)]
+    cum = 0.0
+    result: Dict[str, int] = {}
+    idx = 0
+    for level in sorted(hist):
+        cum += hist[level]
+        while idx < len(labels) and cum >= total_seconds * labels[idx][1] / 100.0:
+            result[labels[idx][0]] = level
+            idx += 1
+    result.setdefault("p100", peak)
+    return result
+
+
+def compute_concurrency_overlap(intervals) -> Dict[str, Any]:
+    """Peak + time-weighted distribution of concurrent half-open intervals.
+
+    Standard interval-overlap sweep: ``+1`` at each start, ``-1`` at each end,
+    running maximum — a measurement, not a sampling or estimate. Intervals are
+    half-open ``[start, end)``, so exactly-abutting intervals (``end == start``)
+    do NOT overlap. Events sharing a timestamp are applied ends-first so a task
+    ending at ``t`` and one starting at ``t`` are never counted together. The
+    returned histogram counts seconds at each concurrency level over the active
+    window (first start .. last end), including interior idle (level 0) gaps.
+    """
+    clean = [
+        (s, e)
+        for s, e in intervals
+        if s is not None and e is not None and s < e
+    ]
+    if not clean:
+        return {
+            "peak": 0,
+            "task_count": 0,
+            "window_seconds": 0.0,
+            "concurrency_histogram": {},
+            "percentiles": {},
+        }
+
+    events = []
+    for start, end in clean:
+        events.append((start, 1))
+        events.append((end, -1))
+    # Sort by (timestamp, delta): an end (-1) sorts before a start (+1) at the
+    # same timestamp, which is what makes the sweep half-open.
+    events.sort(key=lambda e: (e[0], e[1]))
+
+    active = 0
+    peak = 0
+    prev_ts = events[0][0]
+    histogram: Dict[int, float] = {}
+    total_seconds = 0.0
+    for ts, delta in events:
+        if ts > prev_ts:
+            secs = (ts - prev_ts).total_seconds()
+            if secs > 0:
+                histogram[active] = histogram.get(active, 0.0) + secs
+                total_seconds += secs
+                if active > peak:
+                    peak = active
+        active += delta
+        prev_ts = ts
+
+    return {
+        "peak": peak,
+        "task_count": len(clean),
+        "window_seconds": round(total_seconds, 3),
+        "concurrency_histogram": {str(k): round(v, 3) for k, v in histogram.items()},
+        "percentiles": _percentiles_from_histogram(histogram, total_seconds, peak),
+    }
+
+
+def _overlap_stats_from_task_rows(rows, now: datetime, window_start: datetime) -> Dict[str, Any]:
+    """Compute concurrency-overlap stats from raw task rows.
+
+    ``rows`` is an iterable of ``(status, created_at, updated_at,
+    vm_dispatched_at, vm_provisioned_at, vm_stopped_at)`` tuples — the same
+    shape ``_sum_slot_occupancy_seconds`` consumes. Each task's occupancy
+    interval is derived by ``_task_occupancy_interval`` and clipped to
+    ``[window_start, now]`` before the overlap sweep.
+    """
+    intervals = []
+    for row in rows:
+        interval = _task_occupancy_interval(*row, now)
+        if interval is None:
+            continue
+        start, end = interval
+        lo = max(start, window_start)
+        hi = min(end, now)
+        if hi > lo:
+            intervals.append((lo, hi))
+    return compute_concurrency_overlap(intervals)
+
+
+async def get_task_concurrency_snapshot(
+    session,
+    *,
+    window_hours: int = 24,
+    now: datetime | None = None,
+) -> Dict[str, Any]:
+    """Measure peak/percentile concurrent slot-occupancy from the task table.
+
+    Unlike ``get_fleet_utilization_snapshot`` (which reports instantaneous
+    ``util_now`` and the time-weighted ``util_avg``), this derives the actual
+    *distribution* of simultaneous slot-occupying tasks by sweeping each task's
+    lifecycle interval across the window — the fleet-sizing evidence the mocked
+    scheduler simulation previously stood in for.
+
+    ``now`` defaults to ``_utcnow()``; pass an explicit value for deterministic
+    tests. With ``session=None`` all measured fields are zero/empty.
+    """
+    now = _utcnow() if now is None else _naive(now)
+    window_hours = max(1, int(window_hours))
+    window_start = now - timedelta(hours=window_hours)
+
+    if session is None:
+        return {
+            "slot_definition": SLOT_DEFINITION,
+            "window_start": window_start.isoformat(),
+            "window_end": now.isoformat(),
+            "window_hours": window_hours,
+            "peak": 0,
+            "task_count": 0,
+            "window_seconds": 0.0,
+            "concurrency_histogram": {},
+            "percentiles": {},
+        }
+
+    rows = (
+        await session.execute(
+            select(
+                Task.status,
+                Task.created_at,
+                Task.updated_at,
+                Task.vm_dispatched_at,
+                Task.vm_provisioned_at,
+                Task.vm_stopped_at,
+            ).where(
+                or_(
+                    Task.status.in_(
+                        [TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]
+                    ),
+                    Task.updated_at >= window_start,
+                )
+            )
+        )
+    ).all()
+
+    stats = _overlap_stats_from_task_rows(rows, now, window_start)
+    return {
+        "slot_definition": SLOT_DEFINITION,
+        "window_start": window_start.isoformat(),
+        "window_end": now.isoformat(),
+        "window_hours": window_hours,
+        **stats,
+    }
 
 
 async def get_fleet_utilization_snapshot(
