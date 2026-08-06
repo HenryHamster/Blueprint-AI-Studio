@@ -773,6 +773,139 @@ def test_record_ci_compliance_bounds_history():
 
 
 @pytest.mark.asyncio
+async def test_degraded_ci_compliance_verdict_is_reevaluated_not_replayed(
+    db_session, mocker
+):
+    """A stored DEGRADED verdict is re-evaluated; an authoritative one is reused.
+
+    Regression for the permanent-block defect: ``ensure_current_ci_compliance``
+    reused ANY stored per-SHA dict, including a DEGRADED verdict persisted when
+    the size-limits or branch-literal rules file could not be read at the ref
+    (or the repo tree was unavailable). One transient GitHub read failure
+    therefore replayed that verdict for the SHA forever, wedging every
+    qualification entry path with no self-heal. The reuse decision must consider
+    whether the evaluation READ its evidence, not just the stored value's type:
+    a verdict produced from evidence the system could not read must be
+    re-evaluated on a subsequent call; a verdict produced from evidence that
+    WAS read and found a REAL violation must be reused and keep refusing.
+
+    (a) A verdict persisted from unreadable evidence IS re-evaluated on the
+        next call for the same SHA (``computed=True``; the fresh verdict is
+        returned and stored).
+    (b) A verdict persisted from successfully-read evidence that found a REAL
+        violation is NOT re-evaluated (``computed=False``; the refusing verdict
+        is returned unchanged).
+    """
+    project = Project(
+        name="CI-Compliance Reuse",
+        user_id="test-user-123",
+        github_owner="owner",
+        github_repo="repo",
+        integration_branch="automain",
+    )
+    db_session.add(project)
+    await db_session.flush()
+    project_id = project.id
+
+    async def _resolve(_session, _project):
+        return ("token", "owner", "repo")
+
+    mocker.patch(
+        "app.release_promotion._resolve_github_with_session", new=_resolve
+    )
+    mocker.patch.object(
+        ci_compliance.github,
+        "get_branch_sha",
+        new=mocker.AsyncMock(return_value=_HEAD_SHA),
+    )
+
+    # (a) DEGRADED verdict: the size-limits file could not be read at the ref,
+    # so the evaluator FAILED CLOSED rather than verifying compliance. Such a
+    # verdict must not be replayed forever — the next call re-evaluates.
+    degraded = {
+        "ref": _HEAD_SHA,
+        "compliant": False,
+        "violations": [],
+        "branch_literal_violations": [],
+        "checked": 0,
+        "limits_available": False,
+        "limits_status": ci_compliance._LIMITS_STATUS_UNREADABLE,
+        "limits_error": "could not read backend/testing/module_size_limits.json",
+        "rules_available": True,
+        "rules_status": ci_compliance._RULES_STATUS_OK,
+        "rules_error": None,
+        "tree_available": True,
+    }
+    fresh = {
+        "ref": _HEAD_SHA,
+        "compliant": True,
+        "violations": [],
+        "branch_literal_violations": [],
+        "checked": 1,
+        "limits_available": True,
+        "limits_status": ci_compliance._LIMITS_STATUS_OK,
+        "limits_error": None,
+        "rules_available": True,
+        "rules_status": ci_compliance._RULES_STATUS_OK,
+        "rules_error": None,
+        "tree_available": True,
+    }
+    ci_compliance.record_ci_compliance(project, degraded)
+    await db_session.flush()
+    eval_mock = mocker.patch.object(
+        ci_compliance,
+        "evaluate_ci_compliance_at_ref",
+        new=mocker.AsyncMock(return_value=fresh),
+    )
+
+    result = await ci_compliance.ensure_current_ci_compliance(db_session, project)
+    assert result["computed"] is True
+    assert result["data"] == fresh
+    eval_mock.assert_awaited_once_with(
+        token="token",
+        owner="owner",
+        repo="repo",
+        ref=_HEAD_SHA,
+        project_id=str(project_id),
+    )
+    assert ci_compliance.get_ci_compliance(project, sha=_HEAD_SHA) == fresh
+
+    # (b) AUTHORITATIVE verdict: the evaluation READ the evidence and found a
+    # real violation. It must be reused (no re-evaluation) and keep refusing.
+    violating = {
+        "ref": _HEAD_SHA,
+        "compliant": False,
+        "violations": [
+            {
+                "section": "backend",
+                "rel": _CAPPED_REL,
+                "count": _CAP + 5,
+                "cap": _CAP,
+            }
+        ],
+        "branch_literal_violations": [],
+        "checked": 1,
+        "limits_available": True,
+        "limits_status": ci_compliance._LIMITS_STATUS_OK,
+        "limits_error": None,
+        "rules_available": True,
+        "rules_status": ci_compliance._RULES_STATUS_OK,
+        "rules_error": None,
+        "tree_available": True,
+    }
+    ci_compliance.record_ci_compliance(project, violating)
+    await db_session.flush()
+    eval_mock.reset_mock()
+
+    result = await ci_compliance.ensure_current_ci_compliance(db_session, project)
+    assert result["computed"] is False
+    assert result["data"] == violating
+    eval_mock.assert_not_awaited()
+    # The refusing verdict is still the stored one — the gate keeps blocking.
+    assert ci_compliance.get_ci_compliance(project, sha=_HEAD_SHA) == violating
+
+
+@pytest.mark.asyncio
 async def test_evaluator_flags_backend_display_string_branch_literal(mocker):
     """display-main-range pattern in backend/app/ triggers a branch-literal violation."""
     offending_body = (

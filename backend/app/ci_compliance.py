@@ -818,6 +818,32 @@ def get_ci_compliance(project: "Project", sha: str | None = None) -> Any:
     return data.get(sha)
 
 
+def _verdict_is_authoritative(stored: Any) -> bool:
+    """Whether a stored per-SHA result reflects evidence that was actually READ.
+
+    The per-SHA cache is safe to reuse only for verdicts whose evaluation READ
+    the guardrails' evidence: the size-limits file, the branch-literal rules
+    file, and the repo tree. A stored result missing any of those channels is
+    DEGRADED — it failed closed (or skipped guardrails) because the system could
+    not verify compliance, not because it observed a violation. A degraded
+    verdict must be re-evaluated on a subsequent call rather than replayed for
+    that SHA forever: one transient GitHub read failure must not wedge every
+    qualification entry path (the qualify_request / re-driver / sweep /
+    force-qualify surfaces all read this cache). A verdict that read the
+    evidence and found a REAL violation (``compliant=False`` with all channels
+    ``ok``) IS authoritative: it is reused and keeps refusing, exactly as
+    today. A non-dict stored value (no record / a legacy non-JSON shape) is
+    never authoritative.
+    """
+    if not isinstance(stored, dict):
+        return False
+    return (
+        stored.get("limits_status") == _LIMITS_STATUS_OK
+        and stored.get("rules_status") == _RULES_STATUS_OK
+        and stored.get("tree_available") is True
+    )
+
+
 def compact_ci_compliance(result: dict[str, Any] | None) -> dict[str, Any] | None:
     """Return the small strategist/fetch shape for one compliance result."""
     if not isinstance(result, dict):
@@ -855,6 +881,17 @@ async def ensure_current_ci_compliance(
     The evaluator still reads all repo contents through GitHub at the resolved
     SHA; this helper only coordinates credential resolution, branch-tip lookup,
     per-SHA cache reuse, and JSONB persistence.
+
+    A stored per-SHA result is reused only when it is AUTHORITATIVE — computed
+    from evidence the evaluator actually read (size-limits file, branch-literal
+    rules file, and repo tree all available; see
+    :func:`_verdict_is_authoritative`). A DEGRADED stored verdict (one of those
+    evidence channels was unreadable/unavailable, so the evaluator failed
+    closed rather than verifying) is re-evaluated on this call instead of being
+    replayed for the SHA forever, so a transient GitHub read failure self-heals
+    and never permanently wedges the qualification entry paths that read this
+    cache. An authoritative verdict that found a REAL violation is reused and
+    keeps refusing.
 
     Returns ``{"status": "success", "head_sha": ..., "data": result, ...}`` on
     success. When GitHub credentials or the branch SHA cannot be resolved it
@@ -903,7 +940,16 @@ async def ensure_current_ci_compliance(
 
     stored = get_ci_compliance(project, head_sha)
     computed = False
-    if not isinstance(stored, dict):
+    if not _verdict_is_authoritative(stored):
+        # Re-evaluate on a cache miss AND on a DEGRADED stored verdict. A
+        # verdict persisted from evidence the system could not read (unreadable
+        # size-limits file, unreadable branch-literal rules, or unavailable repo
+        # tree) must not be replayed for this SHA forever — the next call
+        # re-runs the evaluator so a transient GitHub read failure self-heals
+        # instead of permanently refusing every qualification entry path. A
+        # verdict that READ the evidence and found a real violation is
+        # authoritative (``_verdict_is_authoritative`` True) and is reused to
+        # keep refusing.
         flight_key = f"{project.id}:{head_sha}"
         if flight_key in _in_flight_evals:
             # Another coroutine is already computing this SHA — await its result
