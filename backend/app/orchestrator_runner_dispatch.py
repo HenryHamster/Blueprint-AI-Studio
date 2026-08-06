@@ -1114,7 +1114,7 @@ async def _diagnose_strict_runner_pin_hold(
     Returns ``(reason_code, detail)``. The reason must be truthful and specific
     (runner id + why), never a generic no-runner message: reason codes are
     ``declined_recently`` / ``at_capacity`` / ``task_type_not_allowed`` /
-    ``missing_project_verification`` / ``missing_gpu`` / ``missing_container_runtime`` / ``not_eligible`` (live but
+    ``missing_project_verification`` / ``missing_gpu`` / ``missing_container_runtime`` / ``insufficient_vram`` / ``not_eligible`` (live but
     failed another gate) for runners in the live cache, and ``not_found`` /
     ``not_enrolled`` / ``offline`` for runners that are not live. The pair is
     stamped into ``task.context['runner_pin_hold']`` and the hold status message
@@ -1242,6 +1242,17 @@ async def _diagnose_strict_runner_pin_hold(
                 f"job declares both container_image {container_image!r} and "
                 f"{gpu_req} but GPU passthrough is not verified: "
                 f"{_runner_gpu_passthrough_blocker(snapshot)}",
+            )
+        if (
+            vram_gb is not None
+            and vram_gb > 0
+            and not _runner_has_free_vram(snapshot, int(vram_gb * 1024))
+        ):
+            reported = (snapshot.capabilities or {}).get("gpu_free_vram_mib")
+            return (
+                "insufficient_vram",
+                f"job requires {vram_gb} GB free VRAM but the runner's GPUs "
+                f"report gpu_free_vram_mib={reported}",
             )
         return ("not_eligible", "runner failed dispatch eligibility this cycle")
 

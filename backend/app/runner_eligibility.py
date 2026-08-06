@@ -328,6 +328,15 @@ def _runner_chromium_usable(runner: LocalRunner | RunnerDispatchSnapshot) -> boo
     return backends.get("playwright_chromium_usable") is True
 
 
+# A card's marketing size overstates what nvidia-smi reports: driver/ECC
+# reserves shave 1–2% off the visible total (a "16 GB" V100-SXM2 reports
+# 16145 MiB, not 16384). vram_gb requirements are authored in marketing GB,
+# so without slack a job naming exactly the card it needs (vram_gb=16 on a
+# 16 GB card) is PERMANENTLY undispatchable. 3% covers observed reserve
+# overhead without admitting a meaningfully busy GPU.
+_VRAM_REQUIREMENT_TOLERANCE = 0.97
+
+
 def _runner_has_free_vram(
     runner: LocalRunner | RunnerDispatchSnapshot,
     required_mib: int,
@@ -339,12 +348,17 @@ def _runner_has_free_vram(
     this field (older runners, or a runner that does not expose nvidia-smi)
     the check is skipped and the runner is treated as eligible — we only
     gate dispatch when we have real data, not on absence of telemetry.
+
+    The comparison allows ``_VRAM_REQUIREMENT_TOLERANCE`` slack so a
+    marketing-GB requirement matches the card class it names despite the
+    driver/ECC reserve gap.
     """
     caps = runner.capabilities or {}
     free_mib_list = caps.get("gpu_free_vram_mib")
     if not isinstance(free_mib_list, list) or not free_mib_list:
         return True
-    return any(mib >= required_mib for mib in free_mib_list)
+    effective_floor = required_mib * _VRAM_REQUIREMENT_TOLERANCE
+    return any(mib >= effective_floor for mib in free_mib_list)
 
 
 def _known_free_bytes(value: object) -> int | None:

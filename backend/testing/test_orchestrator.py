@@ -2322,6 +2322,74 @@ def test_runner_has_free_vram_any_gpu_sufficient():
     )
 
 
+def test_runner_has_free_vram_tolerates_marketing_size_gap():
+    """A vram_gb requirement equal to the card's marketing size must accept
+    that card despite the driver/ECC reserve gap (a "16 GB" V100-SXM2 reports
+    16145 MiB, not 16384), while a meaningfully busy GPU is still excluded."""
+    from app.orchestrator_runner_dispatch import (
+        _runner_has_free_vram,
+        RunnerDispatchSnapshot,
+    )
+
+    v100_16gb = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        capabilities={"task_types": "all", "gpu_free_vram_mib": [16145] * 8},
+    )
+    assert _runner_has_free_vram(v100_16gb, required_mib=16 * 1024) is True, (
+        "an idle 16 GB card must satisfy a 16 GB requirement — the reserve "
+        "gap is not real occupancy"
+    )
+    busy = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        capabilities={"task_types": "all", "gpu_free_vram_mib": [15200] * 8},
+    )
+    assert _runner_has_free_vram(busy, required_mib=16 * 1024) is False, (
+        "a GPU missing more than the tolerance is genuinely busy and must "
+        "not be admitted"
+    )
+
+
+async def test_strict_pin_hold_diagnosis_reports_insufficient_vram():
+    """The strict-pin hold diagnostician must surface the VRAM gate rather
+    than the generic not_eligible: a permanently unsatisfiable requirement
+    was invisible to operators (observed live: dgx-1 held for days with
+    'runner failed dispatch eligibility this cycle')."""
+    from app.orchestrator_runner_dispatch import (
+        _diagnose_strict_runner_pin_hold,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "has_gpu": True,
+            "gpu_count": 8,
+            "gpu_names": ["Tesla V100-SXM2-16GB"] * 8,
+            "gpu_free_vram_mib": [8000] * 8,
+        },
+    )
+    # session is only consulted on the not-in-cache path; the runner is in the
+    # live cache here, so the diagnosis must not touch the DB at all.
+    code, detail = await _diagnose_strict_runner_pin_hold(
+        None,
+        active_runners_cache={project_id: [runner]},
+        project_id=project_id,
+        pinned_runner_id=str(runner.id),
+        task_type="compute_experiment",
+        accelerator=None,
+        container_image=None,
+        runner_pins_this_cycle={},
+        vram_gb=16.0,
+    )
+    assert code == "insufficient_vram", detail
+    assert "16.0 GB" in detail and "8000" in detail
+
+
 # ── Forced (hard) runner pin: _select_eligible_runner ──────────────────────────
 
 
