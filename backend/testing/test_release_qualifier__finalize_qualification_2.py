@@ -5091,6 +5091,10 @@ async def test_sweep_redrives_infra_failure_version(db_session, mocker):
     db_session.add(version)
     await db_session.commit()
 
+    # The audit row is persisted INSIDE the spawn mock, mirroring the real
+    # spawner: pre-creating a QUEUED release_audit row would trip the
+    # live-audit double-spawn guard in _redrive_infra_failure_qualification
+    # and defer the very re-drive under test.
     audit_task = Task(
         project_id=project.id,
         title="release-audit",
@@ -5099,10 +5103,11 @@ async def test_sweep_redrives_infra_failure_version(db_session, mocker):
         status=TaskStatus.QUEUED,
         context={"release_version_id": str(version.id)},
     )
-    db_session.add(audit_task)
-    await db_session.commit()
-    await db_session.refresh(audit_task)
-    spawned_audit = mocker.Mock(id=audit_task.id)
+
+    async def _spawn_and_persist(*_args, **_kwargs):
+        db_session.add(audit_task)
+        await db_session.flush()
+        return audit_task
 
     mocker.patch(
         "app.github.get_branch_sha",
@@ -5110,7 +5115,7 @@ async def test_sweep_redrives_infra_failure_version(db_session, mocker):
     )
     mocker.patch(
         "app.release_qualifier._spawn_release_audit_task",
-        new=AsyncMock(return_value=spawned_audit),
+        new=AsyncMock(side_effect=_spawn_and_persist),
     )
     mocker.patch(
         "app.release_qualifier.compute_audited_surface_hash",

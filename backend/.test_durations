@@ -14872,7 +14872,6 @@
   "testing/test_release_reconciliation.py::test_classify_serving_confirmed_deploy_finished_before_promotion_recorded": 10.55,
   "testing/test_release_reconciliation.py::test_classify_serving_confirmed_new_stable_revision": 0.144,
   "testing/test_release_reconciliation.py::test_classify_sha_mismatch_is_deploy_failed": 0.65,
-  "testing/test_release_reconciliation.py::test_classify_stable_pre_promotion_sha_mismatch_waits_not_fails": 1.5,
   "testing/test_release_reconciliation.py::test_classify_unobservable_serving_sha_does_not_confirm_within_window": 3.85,
   "testing/test_release_reconciliation.py::test_classify_unobservable_serving_sha_times_out_after_deadline": 2.85,
   "testing/test_release_reconciliation.py::test_is_ci_infra_flake_log_detects_npm_error": 16.4,
