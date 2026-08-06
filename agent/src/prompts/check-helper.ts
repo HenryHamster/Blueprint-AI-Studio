@@ -326,17 +326,27 @@ done
 rm -f /tmp/check_gate_env_${cfg.taskId}.txt
 ${projectVerificationDirectories(cfg).length > 0 ? `rm -f /tmp/project_verification_receipt_${cfg.taskId}.json` : ''}
 
-# Determine changed paths: committed since base + uncommitted. Verify at
-# least one diff source actually worked — silently-empty CHANGED used to
-# fall through to "PASS — all checks green" without running anything.
+# Determine changed paths: committed since base + uncommitted. Fail closed
+# when the base diff cannot be computed — a silently-empty CHANGED used to
+# fall through to "PASS — all checks green" without running anything, making
+# "could not compute the diff" indistinguishable from "nothing changed".
 BASE="${cfg.baseBranch}"
+BASE_DIFF_OK=0
 COMMITTED=""
 if git rev-parse --verify "origin/$BASE" >/dev/null 2>&1; then
-  COMMITTED=$(git diff --name-only "origin/$BASE...HEAD" 2>/dev/null || true)
+  if COMMITTED=$(git diff --name-only "origin/$BASE...HEAD" 2>/dev/null); then
+    BASE_DIFF_OK=1
+  else
+    echo "[check] ERROR: git diff against origin/$BASE failed (no merge base in a shallow clone?)" >&2
+  fi
 elif git rev-parse --verify "$BASE" >/dev/null 2>&1; then
-  COMMITTED=$(git diff --name-only "$BASE...HEAD" 2>/dev/null || true)
+  if COMMITTED=$(git diff --name-only "$BASE...HEAD" 2>/dev/null); then
+    BASE_DIFF_OK=1
+  else
+    echo "[check] ERROR: git diff against $BASE failed (no merge base in a shallow clone?)" >&2
+  fi
 else
-  echo "[check] WARNING: neither origin/$BASE nor $BASE exists locally — falling back to working-tree diff only" >&2
+  echo "[check] ERROR: neither origin/$BASE nor $BASE exists locally — cannot compute the base diff" >&2
 fi
 UNCOMMITTED=$(git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null)
 CHANGED=$(printf '%s\\n%s\\n' "$COMMITTED" "$UNCOMMITTED" | sort -u | grep -v '^$' || true)
@@ -348,6 +358,11 @@ admin_ui_runtime_touched() {
 }
 
 FAILED=()
+
+if [ "$BASE_DIFF_OK" -ne 1 ]; then
+  echo "[check] ERROR: base diff source unavailable — cannot scope checks. Refusing to report PASS with nothing run; fetch the base branch and re-run (e.g. 'git fetch origin $BASE')." >&2
+  FAILED+=("base diff unavailable")
+fi
 
 run() {
   local label="$1"; shift

@@ -1455,11 +1455,17 @@ async def _apply_qualify_request(
     by CI-compliance violations, and calls ``release_qualifier.run_qualification``
     (which snapshots the candidate SHA + spawns the active qualifier children;
     the caller's surrounding commit persists its version-row writes). When
-    CI-compliance blocks qualification, durable blocker evidence is recorded and
-    the durable blocker is staged and ``True`` is returned. The post-commit
-    wrapper then arms a coalesced Strategic refresh in a separate transaction,
-    after blocker durability is established. Strategic uses its ordinary task
-    authority to choose any repair; this path never hard-codes one.
+    CI-compliance blocks qualification — either an observed violation or
+    evidence that is unavailable/degraded (GitHub credentials, HEAD, limits
+    file, or repo tree) — durable blocker evidence is recorded and ``True`` is
+    returned. The gate is fail-CLOSED: a qualify_request never proceeds on the
+    assumption that compliance is clean when it could not be verified — an
+    exception raised BY the gate itself (network error, unexpected shape) is
+    the same evidence-unavailable class and is recorded and blocked too. The
+    post-commit wrapper then arms a coalesced Strategic refresh in a separate
+    transaction, after blocker durability is established. Strategic uses its
+    ordinary task authority to choose any repair; this path never hard-codes
+    one.
 
     Silently no-ops when ``request`` is None/not a dict, there is no open
     ``ReleaseVersion``, or that version is not in ``stabilize``. All errors are
@@ -1644,23 +1650,81 @@ async def _apply_qualify_request(
                         )
                     return True
             else:
+                # CI-compliance evidence is UNAVAILABLE (GitHub credentials or
+                # HEAD unresolvable). Fail CLOSED: a qualify_request must not
+                # proceed on the assumption that compliance is clean when it
+                # could not be checked. Record the block durably so Strategic
+                # can act on the root cause (e.g. re-authorize GitHub) instead
+                # of silently qualifying on unverified evidence.
                 logger.info(
                     "[STRATEGIC] Task %s (%s path): CI-compliance status "
                     "unavailable for project %s before qualify_request "
-                    "(reason=%s); failing open",
+                    "(reason=%s); blocking qualification",
                     task.id,
                     path,
                     project.id,
                     status.get("reason"),
                 )
+                try:
+                    open_ver.last_qualification = {
+                        **(open_ver.last_qualification or {}),
+                        "qualify_request_blocked": {
+                            "blocker": "ci_compliance",
+                            "blocker_class": "unavailable_evidence",
+                            "violation_count": 0,
+                            "head_sha": None,
+                            "repair_task": None,
+                        },
+                        "qualify_request_blocked_at": _utcnow().isoformat(),
+                    }
+                    flag_modified(open_ver, "last_qualification")
+                    session.add(open_ver)
+                except Exception:
+                    logger.exception(
+                        "[STRATEGIC] Task %s (%s path): failed to record "
+                        "qualify_request CI-compliance unavailability block",
+                        task.id,
+                        path,
+                    )
+                    return False
+                return True
         except Exception:
+            # The gate itself raised (network error from the compliance fetch,
+            # unexpected payload shape, import failure). That is the SAME
+            # evidence-unavailable class as the `status != success` branch
+            # above: we do not know whether compliance is clean. Fail CLOSED —
+            # record the blocker durably and return without qualifying, rather
+            # than proceeding on unverified evidence.
             logger.exception(
                 "[STRATEGIC] Task %s (%s path): CI-compliance qualify gate "
-                "failed for project %s; failing open",
+                "raised for project %s; blocking qualification (fail-closed)",
                 task.id,
                 path,
                 project.id,
             )
+            try:
+                open_ver.last_qualification = {
+                    **(open_ver.last_qualification or {}),
+                    "qualify_request_blocked": {
+                        "blocker": "ci_compliance",
+                        "blocker_class": "unavailable_evidence",
+                        "violation_count": 0,
+                        "head_sha": None,
+                        "repair_task": None,
+                    },
+                    "qualify_request_blocked_at": _utcnow().isoformat(),
+                }
+                flag_modified(open_ver, "last_qualification")
+                session.add(open_ver)
+            except Exception:
+                logger.exception(
+                    "[STRATEGIC] Task %s (%s path): failed to record "
+                    "qualify_request CI-compliance gate-error block",
+                    task.id,
+                    path,
+                )
+                return False
+            return True
         result = await _rq.run_qualification(
             session,
             project.id,

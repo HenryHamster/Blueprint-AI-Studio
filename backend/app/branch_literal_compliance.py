@@ -170,6 +170,21 @@ SURFACE_CONFIGS: dict[Surface, BranchLiteralSurfaceConfig] = {
                 ),
             ),
             BranchLiteralAllowEntry(
+                path="gitRefs.ts",
+                line=71,
+                pattern="fallback-main",
+                rationale=(
+                    "selfRepoIntegrationBranch() names the branch the Blueprint "
+                    "self-repo's own committed ./check diffs against (BASE=automain "
+                    "in the tracked check). It is read ONLY behind isSelfRepo(), so "
+                    "it never decides a branch for an onboarded project; those paths "
+                    "still resolve via resolveBaseBranch. Env-overridable for forks. "
+                    "Lives in gitRefs.ts (moved from workspacePrep.ts) so both "
+                    "prepareWorkspaceForRole and index.setupWorkspace share one "
+                    "definition."
+                ),
+            ),
+            BranchLiteralAllowEntry(
                 path="prompts/review-prompt.ts",
                 line=121,
                 pattern="fallback-main",

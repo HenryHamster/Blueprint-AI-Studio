@@ -24,6 +24,7 @@ import { execFileSync } from 'child_process';
 import { cloneWithRetry, log, GIT_REFERENCE_CACHE_ROOT, registerSizeCapMergeDriver } from './index.js';
 import type { FailureCategory } from './index.js';
 import { DEFAULT_CLONE_DEPTH } from './constants.js';
+import { fetchRemoteTrackingRef, fetchSelfRepoIntegrationRef } from './gitRefs.js';
 import { sanitize } from './utils/sanitize.js';
 import {
   writeGitTokenFile,
@@ -155,6 +156,25 @@ export function resetWorkspacePrepOutcome(): void {
   _lastWorkspacePrepOutcome = null;
 }
 
+// Best-effort fetch of a branch into its remote-tracking ref so the ./check
+// gate's `origin/<base>...HEAD` diff has a ref to compute against. The explicit
+// refspec form guarantees the remote-tracking ref exists even in a single-branch
+// shallow clone, where `git fetch origin <branch>` only updates FETCH_HEAD.
+// Non-fatal: the gate fails closed and surfaces the missing base loudly if this
+// fetch fails, so a failed fetch here degrades to a loud error, not a silent pass.
+function fetchBaseRef(workspace: string, ref: string, label: string): void {
+  const result = fetchRemoteTrackingRef(workspace, ref);
+  if (!result.ok) {
+    log(`prepareWorkspaceForRole: fetch ${label} failed: ${result.error}`);
+  }
+}
+
+// selfRepoIntegrationBranch() / isSelfRepo() / fetchSelfRepoIntegrationRef()
+// live in gitRefs.ts so index.setupWorkspace shares ONE definition with the
+// two paths below — see that module's docstring for why they are not
+// exported from here (full-replacement vi.mock factories would all have to
+// mirror a new export; mock-factory-export-coverage.test.ts enforces that).
+
 /**
  * Prepare the workspace for the next role. Either reuses the existing clone
  * (warm path) or wipes + re-clones (cold path).
@@ -278,15 +298,23 @@ async function _prepareWorkspaceForRoleImpl(opts: PrepareWorkspaceOptions): Prom
           }
         }
       }
+      // A warm workspace was cloned for whatever branch the PRIOR role used, so
+      // refs/remotes/origin/<baseBranch> may not exist at all. Use the explicit
+      // refspec form for the same reason the cold path does: in a single-branch
+      // shallow clone `git fetch origin <branch>` only updates FETCH_HEAD and
+      // never creates the remote-tracking ref the fail-closed ./check needs.
       if (baseBranch && baseBranch !== branch) {
-        try {
-          execFileSync('git', ['-C', workspace, 'fetch', 'origin', baseBranch], {
-            encoding: 'utf-8', timeout: 120_000,
-          });
-        } catch (e) {
-          log(`prepareWorkspaceForRole: fetch base-branch ${baseBranch} failed: ${String(e)}`);
-        }
+        fetchBaseRef(workspace, baseBranch, `base-branch ${baseBranch}`);
       }
+      // Blueprint self-repo: the committed `./check` diffs against the integration
+      // branch, which a warm-handoff workspace may not carry either
+      // (the cold clone only ever fetched the PR branch + base). Non-fatal.
+      fetchSelfRepoIntegrationRef(
+        workspace, ownerRepo, [baseBranch, branch],
+        (_ref, error) => {
+          log(`prepareWorkspaceForRole: fetch self-repo integration branch failed: ${error}`);
+        },
+      );
       // Try to checkout the branch directly; create from origin if it doesn't
       // exist locally yet (warm VM may have only seen baseBranch so far).
       try {
@@ -436,6 +464,23 @@ async function _prepareWorkspaceForRoleImpl(opts: PrepareWorkspaceOptions): Prom
   // A fresh clone does NOT carry .git/config, so the .gitattributes sizecap
   // mapping is inert until the driver command is registered here.
   registerSizeCapMergeDriver(workspace);
+  // A cold clone only carries the branch it was cloned with. The ./check gate
+  // derives its scope from a git diff against the base branch and FAILS CLOSED
+  // when that ref is absent — fetch it here so a cold-started role can compute
+  // its base diff instead of tripping the gate.
+  if (baseBranch && baseBranch !== branch) {
+    fetchBaseRef(workspace, baseBranch, `base-branch ${baseBranch}`);
+  }
+  // Blueprint self-repo: the committed `./check` diffs against the integration
+  // branch, which a cold PR-branch clone does not carry either.
+  // Fetch it too (unless the base fetch above already did) or the fail-closed
+  // gate has no ref to compute a diff from.
+  fetchSelfRepoIntegrationRef(
+    workspace, ownerRepo, [baseBranch, branch],
+    (_ref, error) => {
+      log(`prepareWorkspaceForRole: fetch self-repo integration branch failed: ${error}`);
+    },
+  );
   _lastWorkspacePrepOutcome = {
     path: 'cold',
     warm_reuse_succeeded: false,

@@ -348,6 +348,206 @@ async def test_compliant_head_fetch_gate_and_spawn_are_noops(client, db_session,
 
 
 @pytest.mark.asyncio
+async def test_gate_does_not_pass_on_unavailable_compliance_evidence(
+    db_session, mocker
+):
+    """The qualify gate fails CLOSED when compliance evidence is DEGRADED.
+
+    'Compliance verified clean' and 'compliance could not be checked' must not
+    reach the qualification decision as the same verdict: a record computed
+    with an unreadable limits file or an unavailable repo tree
+    (``limits_available`` / ``tree_available`` False) blocks qualification. A
+    fully-available clean record is the only pass.
+
+    An EMPTY store is deliberately NOT in that class. This assertion previously
+    demanded ``blocked is True`` for a missing per-SHA record, which conflated
+    'unreadable evidence' with 'no evaluation stored yet' and refused every
+    first-ever qualification — it broke the operator force-qualify lever
+    (``admin_operator_triggers.trigger_qualify`` returned 409 for any project
+    with no record) and the sweep's initial auto-trigger. The
+    unverifiable-evidence refusal lives at the caller that can tell the
+    difference: see
+    ``test_qualify_request_blocked_when_compliance_evidence_unavailable`` and
+    ``test_qualify_request_blocked_when_compliance_gate_raises``, which still
+    prove the qualifier never runs when the evaluation could not be performed.
+    """
+    project, agent_task = await _make_project_with_agent_task(
+        db_session, module_line_count=_CAP - 1, mocker=mocker
+    )
+
+    # 1. No record for the SHA → NOT blocked here (empty store ≠ unreadable
+    #    evidence); the unavailable-evidence refusal is asserted by the
+    #    _apply_qualify_request tests named in the docstring.
+    gate = ci_compliance_qualify_gate(project, _HEAD_SHA)
+    assert gate["blocked"] is False
+    assert gate["reason"] == "ci_compliance_record_missing"
+
+    # 2. Record computed with an unreadable limits file → blocked.
+    ci_compliance.record_ci_compliance(
+        project,
+        {
+            "ref": _HEAD_SHA,
+            "compliant": True,
+            "violations": [],
+            "branch_literal_violations": [],
+            "checked": 0,
+            "limits_available": False,
+            "tree_available": True,
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    gate = ci_compliance_qualify_gate(project, _HEAD_SHA)
+    assert gate["blocked"] is True
+    assert gate["reason"] == "ci_compliance_evidence_unavailable"
+
+    # 3. Record computed without a repo tree → blocked.
+    ci_compliance.record_ci_compliance(
+        project,
+        {
+            "ref": _HEAD_SHA,
+            "compliant": True,
+            "violations": [],
+            "branch_literal_violations": [],
+            "checked": 1,
+            "limits_available": True,
+            "tree_available": False,
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    gate = ci_compliance_qualify_gate(project, _HEAD_SHA)
+    assert gate["blocked"] is True
+    assert gate["reason"] == "ci_compliance_evidence_unavailable"
+
+    # 4. Control: a fully-available clean record passes the gate.
+    ci_compliance.record_ci_compliance(
+        project,
+        {
+            "ref": _HEAD_SHA,
+            "compliant": True,
+            "violations": [],
+            "branch_literal_violations": [],
+            "checked": 1,
+            "limits_available": True,
+            "tree_available": True,
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    gate = ci_compliance_qualify_gate(project, _HEAD_SHA)
+    assert gate["blocked"] is False
+
+
+@pytest.mark.asyncio
+async def test_qualify_request_blocked_when_compliance_evidence_unavailable(
+    db_session, mocker
+):
+    """A qualify_request is blocked (qualifier not run) when CI-compliance
+    evidence is unavailable — GitHub credentials or HEAD unresolvable."""
+    from app import release_version as rv
+    from app.strategic_completion import _apply_qualify_request
+
+    project, agent_task = await _make_project_with_agent_task(
+        db_session, module_line_count=_CAP - 1, mocker=mocker
+    )
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    rv.set_version_phase(version, "stabilize", reasoning="ready to qualify")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    run_qualification = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=mocker.AsyncMock(return_value={"status": "spawned"}),
+    )
+    mocker.patch(
+        "app.ci_compliance.ensure_current_ci_compliance",
+        new=mocker.AsyncMock(
+            return_value={
+                "status": "unavailable",
+                "reason": "github_credentials_unavailable",
+                "integration_branch": "automain",
+                "head_sha": None,
+                "data": None,
+            }
+        ),
+    )
+
+    refresh_required = await _apply_qualify_request(
+        {"reason": "ready"},
+        agent_task,
+        project,
+        db_session,
+        path="test",
+    )
+    await db_session.commit()
+
+    # The qualifier was never reached — fail-closed on unverifiable evidence.
+    run_qualification.assert_not_awaited()
+    assert refresh_required is True
+    await db_session.refresh(version)
+    blocked = version.last_qualification["qualify_request_blocked"]
+    assert blocked["blocker"] == "ci_compliance"
+    assert blocked["blocker_class"] == "unavailable_evidence"
+    assert blocked["head_sha"] is None
+    assert "qualify_request_blocked_at" in version.last_qualification
+
+
+@pytest.mark.asyncio
+async def test_qualify_request_blocked_when_compliance_gate_raises(
+    db_session, mocker
+):
+    """An exception OUT of the CI-compliance gate is the same
+    evidence-unavailable class as an ``unavailable`` status: the qualifier must
+    not run on unverified evidence, and the blocker must be recorded durably.
+
+    Regression guard for the fail-OPEN ``except Exception`` that used to log
+    "failing open" and fall straight through to ``run_qualification``.
+    """
+    from app import release_version as rv
+    from app.strategic_completion import _apply_qualify_request
+
+    project, agent_task = await _make_project_with_agent_task(
+        db_session, module_line_count=_CAP - 1, mocker=mocker
+    )
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    rv.set_version_phase(version, "stabilize", reasoning="ready to qualify")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    run_qualification = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=mocker.AsyncMock(return_value={"status": "spawned"}),
+    )
+    mocker.patch(
+        "app.ci_compliance.ensure_current_ci_compliance",
+        new=mocker.AsyncMock(side_effect=RuntimeError("github unreachable")),
+    )
+
+    refresh_required = await _apply_qualify_request(
+        {"reason": "ready"},
+        agent_task,
+        project,
+        db_session,
+        path="test",
+    )
+    await db_session.commit()
+
+    run_qualification.assert_not_awaited()
+    assert refresh_required is True
+    await db_session.refresh(version)
+    blocked = version.last_qualification["qualify_request_blocked"]
+    assert blocked["blocker"] == "ci_compliance"
+    assert blocked["blocker_class"] == "unavailable_evidence"
+    assert "qualify_request_blocked_at" in version.last_qualification
+
+
+@pytest.mark.asyncio
 async def test_noncompliant_qualify_request_is_blocked_and_spawns_cap_bump(
     db_session, mocker
 ):

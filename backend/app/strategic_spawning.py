@@ -4667,7 +4667,27 @@ def ci_compliance_qualify_gate(
     project: Project,
     head_sha: str | None = None,
 ) -> dict[str, Any]:
-    """Return whether current CI-compliance violations block qualification."""
+    """Return whether current CI-compliance violations block qualification.
+
+    Fail-closed on DEGRADED evidence: a record whose evaluation ran with an
+    unreadable limits file or an unavailable repo tree
+    (``limits_available`` / ``tree_available`` False) reports 'no violations
+    OBSERVED', not 'compliance verified', so it blocks. That keeps 'verified
+    clean' and 'could not be checked' from reaching the qualification decision
+    as the same verdict.
+
+    Fail-OPEN on an EMPTY store: no record for the SHA means no evaluation has
+    been stored yet, which is distinct from an evaluation that could not read
+    its inputs. Blocking here would refuse every first-ever qualification and
+    strand the operator lever (``admin_operator_triggers.trigger_qualify``
+    documents the empty store as fail-open precisely so a force-qualify stays
+    possible). The callers that KNOW an evaluation was attempted and failed —
+    ``strategic_completion._apply_qualify_request`` on
+    ``ensure_current_ci_compliance`` returning ``status != "success"`` or
+    raising — already fail closed with ``blocker_class="unavailable_evidence"``,
+    so unverifiable evidence is refused at the site that can tell the
+    difference.
+    """
     records = project.ci_compliance or {}
     selected_sha = head_sha
     if selected_sha is None and isinstance(records, dict) and records:
@@ -4682,6 +4702,7 @@ def ci_compliance_qualify_gate(
             "branch_literal_violations": [],
             "branch_literal_violation_count": 0,
             "reason": "ci_compliance_record_missing",
+            "compliant": None,
         }
     violations = record.get("violations") if isinstance(record.get("violations"), list) else []
     branch_literal_violations = (
@@ -4689,6 +4710,26 @@ def ci_compliance_qualify_gate(
         if isinstance(record.get("branch_literal_violations"), list)
         else []
     )
+    limits_available = record.get("limits_available")
+    tree_available = record.get("tree_available")
+    if limits_available is False or tree_available is False:
+        # The evaluator could not fully verify compliance (limits file or repo
+        # tree unavailable), so a ``compliant: True`` here only means 'no
+        # violations OBSERVED', not 'compliance verified'. Block rather than
+        # passing on incomplete evidence. Any violations that WERE observed are
+        # still surfaced for the strategist.
+        return {
+            "blocked": True,
+            "head_sha": selected_sha,
+            "violations": violations,
+            "violation_count": len(violations),
+            "branch_literal_violations": branch_literal_violations,
+            "branch_literal_violation_count": len(branch_literal_violations),
+            "reason": "ci_compliance_evidence_unavailable",
+            "compliant": record.get("compliant"),
+            "limits_available": limits_available,
+            "tree_available": tree_available,
+        }
     blocked = record.get("compliant") is False and (
         bool(violations) or bool(branch_literal_violations)
     )
@@ -4710,6 +4751,11 @@ async def _maybe_spawn_ci_compliance_cap_bump_fix(
 ) -> Task | None:
     """Spawn one cap-bump remediation task for a non-compliant HEAD."""
     if not gate.get("blocked"):
+        return None
+    if not gate.get("violations") and not gate.get("branch_literal_violations"):
+        # Blocked because compliance evidence is missing/degraded, not because an
+        # actual violation was observed — there is nothing to fix yet. Let the
+        # strategist react to the root cause instead of spawning a no-op task.
         return None
     head_sha = gate.get("head_sha")
     if not isinstance(head_sha, str) or not head_sha:

@@ -1586,6 +1586,7 @@ describe('writeCheckHelper — ci_failure selector verify gate (runtime)', () =>
   const runCheck = async (
     script: string,
     scenario: { harnessExit: number; docker: boolean },
+    gitShim?: string,
   ): Promise<{ status: number; stdout: string; log: string }> => {
     const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
     const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
@@ -1600,7 +1601,9 @@ describe('writeCheckHelper — ci_failure selector verify gate (runtime)', () =>
       realFs.mkdirSync(realPath.join(dir, 'scripts'), { recursive: true });
       realFs.mkdirSync(realPath.join(dir, 'backend', 'testing'), { recursive: true });
       // git shim: valid repo whose diff vs origin/main touched backend/x.py.
-      realFs.writeFileSync(realPath.join(bin, 'git'), `#!/bin/sh
+      // A caller-supplied shim replaces it (e.g. to simulate the base diff
+      // source being UNAVAILABLE so the gate must fail closed).
+      realFs.writeFileSync(realPath.join(bin, 'git'), gitShim ?? `#!/bin/sh
 case "$*" in
   *"rev-parse --git-dir"*) echo .git; exit 0 ;;
   *"rev-parse --verify origin/main"*) exit 0 ;;
@@ -1707,6 +1710,29 @@ esac
     expect(r.status).toBe(0);
     expect(r.stdout).toContain('Docker unavailable');
     expect(r.stdout).toContain('PASS — all checks green');
+  });
+
+  it('check gate fails closed when the base diff source is unavailable', async () => {
+    const script = await selfRepoCheck(['testing/test_x.py::test_y'], 'rt-nobase');
+    // The generated script must carry the fail-closed guard.
+    expect(script).toContain('BASE_DIFF_OK');
+    expect(script).toContain('base diff unavailable');
+    // A valid repo whose base ref (origin/main AND main) does NOT exist — the
+    // cold-clone scenario where the diff source is unavailable. Every git
+    // invocation except the repo sanity check fails, so CHANGED can never be
+    // computed. This used to swallow the error and exit PASS having run nothing.
+    const noBaseShim = `#!/bin/sh
+case "$*" in
+  *"rev-parse --git-dir"*) echo .git; exit 0 ;;
+  *) exit 1 ;;
+esac
+`;
+    const r = await runCheck(script, { harnessExit: 1, docker: false }, noBaseShim);
+    // Fail closed, loudly: a silently-empty CHANGED must not read as "PASS".
+    expect(r.status).not.toBe(0);
+    expect(r.stdout).toContain('base diff source unavailable');
+    expect(r.stdout).toContain('FAIL');
+    expect(r.stdout).not.toContain('PASS — all checks green');
   });
 });
 

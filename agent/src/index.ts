@@ -6,6 +6,7 @@ import os from 'os';
 import WebSocket from 'ws';
 import { enforceNodeVersion } from './node-preflight.js';
 import { getLastWorkspacePrepOutcome, resetWorkspacePrepOutcome } from './workspacePrep.js';
+import { fetchRemoteTrackingRef, fetchSelfRepoIntegrationRef } from './gitRefs.js';
 import { handlers, resolveHandler } from './handlers/index.js';
 import {
   loadTaskCapabilityContract,
@@ -3164,6 +3165,39 @@ export async function setupWorkspace(
   // Configure the credential helper and clean remote URL in the workspace git
   // config so all subsequent operations authenticate via the helper.
   setupGitCredentialHelper(owner, repo, WORKSPACE);
+  // The generated ./check for this lane scopes its work with a diff against
+  // `origin/<baseBranch>` and now FAILS CLOSED when that ref is missing. The
+  // clone above was `--branch baseBranch`, so git already created the
+  // remote-tracking ref — assert that rather than assume it, and repair with
+  // the explicit refspec form if a future clone shape ever stops creating it
+  // (a plain `git fetch origin <branch>` would only update FETCH_HEAD).
+  // Non-fatal: a failure degrades to the gate's loud fail-closed error.
+  try {
+    execFileSync('git', ['-C', WORKSPACE, 'rev-parse', '--verify', `refs/remotes/origin/${baseBranch}`], {
+      encoding: 'utf-8', timeout: 30_000, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch {
+    sendLog(ws, `origin/${baseBranch} missing after clone — fetching it so ./check can compute its base diff\n`);
+    const fetched = fetchRemoteTrackingRef(WORKSPACE, baseBranch);
+    if (!fetched.ok) {
+      sendLog(ws, `WARNING: could not fetch origin/${baseBranch}: ${sanitizeError(fetched.error)}\n`);
+    }
+  }
+  // Blueprint self-repo: this lane runs the TRACKED `check` at the repo root,
+  // whose BASE is the integration branch — NOT this task's baseBranch. A
+  // subtask based on a direction branch (`research/<id>`) clones with
+  // `--branch research/<id>`, so the clone creates only that remote-tracking
+  // ref and the fail-closed gate has nothing to diff against. Fetch the
+  // integration ref explicitly (skipped when it IS the base). Non-fatal.
+  const integrationRef = fetchSelfRepoIntegrationRef(
+    WORKSPACE, { owner, repo }, [baseBranch],
+    (ref, error) => {
+      sendLog(ws, `WARNING: could not fetch self-repo integration branch origin/${ref}: ${sanitizeError(error)}\n`);
+    },
+  );
+  if (integrationRef) {
+    sendLog(ws, `Fetched self-repo integration branch origin/${integrationRef} for ./check base diff\n`);
+  }
   sendHeartbeatSync(taskId, `Clone complete, configuring workspace...`);
   git(['config', 'user.email', buildConfig?.git_user_email || 'blueprint-agent@automated.dev']);
   git(['config', 'user.name', buildConfig?.git_user_name || 'Blueprint Agent']);

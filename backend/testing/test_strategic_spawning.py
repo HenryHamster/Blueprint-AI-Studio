@@ -8080,6 +8080,13 @@ async def test_version_phase_uses_promotion_target_gate(db_session, mocker):
     # (criterion-link conflict resolution calls it unconditionally); what must
     # stay closed when the branches are equal is the version bootstrap itself.
     assert await _spawn_strategic_review(skipped_project, db_session) is True
+    # Every LTS-gated call site passes ``include_artifacts=True`` (all of them
+    # sit under ``_integration_branch != _promotion_target`` in
+    # strategic_spawning.py), so gate on that marker rather than a zero total —
+    # the unconditional enrichment probe uses the default ``include_artifacts``.
+    assert not any(
+        c.kwargs.get("include_artifacts") for c in current_open_version.call_args_list
+    )
     assert ensure_initial_release_version.call_count == 0
 
     current_open_version.reset_mock()

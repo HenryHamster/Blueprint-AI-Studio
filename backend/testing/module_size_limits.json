@@ -396,6 +396,6 @@
     "test_strategic_session_messages.py": 1950,
     "test_warm_pool_dispatch.py": 2100,
     "test_admin_routers__notifications.py": 1800,
-    "test_ci_compliance_gate.py": 1950
+    "test_ci_compliance_gate.py": 2350
   }
 }

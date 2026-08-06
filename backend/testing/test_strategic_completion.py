@@ -9781,6 +9781,40 @@ async def test_qualify_request_flows_end_to_end(client, db_session, mocker):
     await db_session.commit()
     await db_session.refresh(task)
 
+    # The qualify gate is fail-CLOSED on unavailable compliance evidence, so the
+    # flow under test (qualify_request → run_qualification) needs a fully-available
+    # clean compliance record. Stub the GitHub-backed evaluation as success and
+    # persist the result exactly as production ensure_current_ci_compliance does
+    # (the gate reads project.ci_compliance for the envelope's head_sha).
+    from app import ci_compliance as _ci_mod
+
+    _head_sha = "c" * 40
+    _compliant_data = {
+        "ref": _head_sha,
+        "compliant": True,
+        "violations": [],
+        "branch_literal_violations": [],
+        "checked": 0,
+        "limits_available": True,
+        "tree_available": True,
+    }
+    mocker.patch(
+        "app.ci_compliance.ensure_current_ci_compliance",
+        new=AsyncMock(
+            return_value={
+                "status": "success",
+                "integration_branch": "automain",
+                "head_sha": _head_sha,
+                "data": _compliant_data,
+                "computed": False,
+            }
+        ),
+    )
+    _ci_mod.record_ci_compliance(project, _compliant_data)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
     token = create_agent_token(str(task.id), "vm-qr-e2e", task_type="strategic_review")
 
     # The agent embeds qualify_request as a TOP-LEVEL SIBLING of the
@@ -10121,6 +10155,40 @@ async def test_qualify_request_failure_recorded_on_release_version(
     db_session.add(task)
     await db_session.commit()
     await db_session.refresh(task)
+
+    # The qualify gate is fail-CLOSED on unavailable compliance evidence, so this
+    # test needs a fully-available clean record to reach run_qualification (the
+    # seam under test is the durable error write, not the gate). Stub the
+    # GitHub-backed evaluation as success and persist the result exactly as
+    # production ensure_current_ci_compliance does.
+    from app import ci_compliance as _ci_mod
+
+    _head_sha = "d" * 40
+    _compliant_data = {
+        "ref": _head_sha,
+        "compliant": True,
+        "violations": [],
+        "branch_literal_violations": [],
+        "checked": 0,
+        "limits_available": True,
+        "tree_available": True,
+    }
+    mocker.patch(
+        "app.ci_compliance.ensure_current_ci_compliance",
+        new=AsyncMock(
+            return_value={
+                "status": "success",
+                "integration_branch": "automain",
+                "head_sha": _head_sha,
+                "data": _compliant_data,
+                "computed": False,
+            }
+        ),
+    )
+    _ci_mod.record_ci_compliance(project, _compliant_data)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
 
     # Force run_qualification to raise — simulates any unexpected failure
     # (DB error, network blip, unhandled edge case inside the qualifier).
