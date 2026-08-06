@@ -40,6 +40,7 @@ TASK_RUNTIME_CONTEXT_KEYS = (
     "llm_auth_mode",
     "llm_model",
     "llm_execution_mode",
+    "llm_quality_tier",
     "max_plan_account_id",
     # Runner pin — cleared on requeue so a dead runner is not re-pinned forever
     # and the next dispatch cycle can fall over to GCP cloud fallback.
@@ -126,6 +127,14 @@ def get_task_llm_model(task_or_ctx: Any) -> str | None:
     return None
 
 
+def get_task_llm_quality_tier(task_or_ctx: Any) -> str | None:
+    ctx = _task_context(task_or_ctx)
+    raw = ctx.get("llm_quality_tier")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return None
+
+
 def get_task_rate_limit_scope(task_or_ctx: Any) -> dict[str, Any]:
     """Return the candidate-pool scope for rate-limit correlation."""
     providers: list[str] | None = None
@@ -172,6 +181,7 @@ def apply_task_llm_runtime_context(
     auth_mode: str | None,
     model: str | None,
     execution_mode: str | None = None,
+    quality_tier: str | None = None,
 ) -> dict[str, Any]:
     new_ctx = clear_task_llm_runtime_context(context)
     if account_id:
@@ -186,6 +196,8 @@ def apply_task_llm_runtime_context(
         new_ctx["llm_model"] = model
     if execution_mode:
         new_ctx["llm_execution_mode"] = execution_mode
+    if quality_tier:
+        new_ctx["llm_quality_tier"] = quality_tier
     return new_ctx
 
 

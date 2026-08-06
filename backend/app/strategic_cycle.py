@@ -27,6 +27,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.models import (
+    CYCLE_META_EFFORT_REASON,
+    CYCLE_META_EFFORT_TIER,
     CYCLE_META_INTEGRITY_CONFLICT_COUNTS,
     DeploymentState,
     StrategicCycle,
@@ -855,6 +857,29 @@ def record_integrity_conflict_counts(
         "stale_active_moves": int(counts.get("stale_active_moves") or 0),
         "staffed_but_deferred": int(counts.get("staffed_but_deferred") or 0),
     }
+    cycle.cycle_metadata = new_meta
+    flag_modified(cycle, "cycle_metadata")
+
+
+def record_effort_tier(
+    cycle: StrategicCycle,
+    tier: str,
+    reason: str | None = None,
+) -> None:
+    """Stamp the pre-spawn effort tier a strategic_review cycle was spawned at.
+
+    Written at spawn time (before the LLM call) into
+    ``cycle_metadata['effort_tier']`` (plus an optional
+    ``cycle_metadata['effort_tier_reason']``) so cost analysis can distinguish
+    ROUTINE (cheapened) cycles from CONSEQUENTIAL / pinned ones without
+    re-deriving the classifier. ``tier`` is one of
+    'routine' | 'consequential' | 'pinned'. Callers are responsible for
+    ``session.add(cycle)`` / commit.
+    """
+    new_meta = dict(cycle.cycle_metadata or {})
+    new_meta[CYCLE_META_EFFORT_TIER] = tier
+    if reason:
+        new_meta[CYCLE_META_EFFORT_REASON] = reason
     cycle.cycle_metadata = new_meta
     flag_modified(cycle, "cycle_metadata")
 

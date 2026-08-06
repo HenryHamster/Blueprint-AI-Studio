@@ -19885,3 +19885,104 @@ async def test_resident_minimal_spawn_payload_ships_knowledge_index(db_session):
     # Raw JSONB note shape ({note, set_at}) must NOT appear.
     for n in notes:
         assert "note" not in n, f"Raw JSONB note shape leaked into spawn payload: {n}"
+
+
+@pytest.mark.asyncio
+async def test_spawn_review_consequential_keeps_max_effort(db_session):
+    """A strategic_review spawned while a version decision is pending stays
+    CONSEQUENTIAL: the payload gets NO effort downgrade (routing falls through
+    to the 'strategic' category default 'max') and the cycle row is stamped
+    effort_tier='consequential' with the classifier reason.
+
+    The LTS project (automain/main) bootstraps an open v1 with goal=None, so
+    ``version_phase_block.goal_needed`` fires — the canonical consequential
+    signal that must never be cheapened.
+    """
+    from app.models import CYCLE_META_EFFORT_REASON, CYCLE_META_EFFORT_TIER, StrategicCycle
+
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    task = (
+        (await db_session.execute(_select_agent_tasks(project.id)))
+        .scalars()
+        .all()[0]
+    )
+    payload = task.payloads[0]
+    assert payload["type"] == "strategic_review"
+    assert payload.get("effort") is None, (
+        "A consequential cycle must not carry a payload effort override — "
+        "routing must fall through to the 'strategic' category default 'max'."
+    )
+
+    cycle = (
+        (
+            await db_session.execute(
+                select(StrategicCycle).where(StrategicCycle.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()[0]
+    )
+    meta = cycle.cycle_metadata or {}
+    assert meta.get(CYCLE_META_EFFORT_TIER) == "consequential"
+    assert "version goal needed" in meta.get(CYCLE_META_EFFORT_REASON, "")
+
+
+@pytest.mark.asyncio
+async def test_spawn_review_explicit_effort_pin_wins(db_session):
+    """An explicit ``task_type_efforts['strategic_review']`` pin wins over the
+    pre-spawn classifier: the pinned effort rides the payload (not the routine
+    downgrade) and the cycle row is stamped effort_tier='pinned' so the operator
+    override is attributable in cost analysis."""
+    from app.models import CYCLE_META_EFFORT_TIER, StrategicCycle
+
+    # Equal branches → routine-eligible signals; the pin must still win.
+    project = _make_project(
+        vision={"purpose": "test purpose"},
+        integration_branch="main",
+        promotion_target="main",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    old_efforts = dict(_shared_state.runtime_config.get("task_type_efforts") or {})
+    _shared_state.runtime_config["task_type_efforts"] = {
+        **old_efforts,
+        "strategic_review": "high",
+    }
+    try:
+        spawned = await _spawn_strategic_review(project, db_session)
+    finally:
+        _shared_state.runtime_config["task_type_efforts"] = old_efforts
+    assert spawned is True
+
+    task = (
+        (await db_session.execute(_select_agent_tasks(project.id)))
+        .scalars()
+        .all()[0]
+    )
+    assert task.payloads[0]["type"] == "strategic_review"
+    assert task.payloads[0].get("effort") == "high", (
+        "An explicit strategic_review effort pin must be carried on the payload "
+        "instead of the classifier's routine downgrade."
+    )
+
+    cycle = (
+        (
+            await db_session.execute(
+                select(StrategicCycle).where(StrategicCycle.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()[0]
+    )
+    meta = cycle.cycle_metadata or {}
+    assert meta.get(CYCLE_META_EFFORT_TIER) == "pinned"

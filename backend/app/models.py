@@ -3246,6 +3246,12 @@ CYCLE_META_MEMOS_CITED = "memos_cited"
 CYCLE_META_KNOWLEDGE_AVAILABLE = "knowledge_available"
 CYCLE_META_KNOWLEDGE_CITED = "knowledge_cited"
 CYCLE_META_INTEGRITY_CONFLICT_COUNTS = "integrity_conflict_counts"
+# Pre-spawn effort tier a strategic_review cycle was spawned at (routine /
+# consequential / pinned), plus the classifier reason. Written at spawn time so
+# cost analysis can distinguish cheapened routine cycles without re-deriving
+# the classifier.
+CYCLE_META_EFFORT_TIER = "effort_tier"
+CYCLE_META_EFFORT_REASON = "effort_tier_reason"
 
 
 class StrategicCycle(SQLModel, table=True):

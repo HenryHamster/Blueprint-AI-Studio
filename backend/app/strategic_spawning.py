@@ -19,6 +19,12 @@ from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 from app import strategic_cycle
+from app.strategic_review_effort import (
+    CONSEQUENTIAL_TIER,
+    ROUTINE_EFFORT,
+    ROUTINE_TIER,
+    classify_strategic_review_effort,
+)
 from app.direction_metrics import (
     _compute_direction_quality_score,
     canonical_cost_per_merged_pr,
@@ -2139,6 +2145,19 @@ def _build_operator_steering_directive(
 
 
 
+
+# StrategicCycle outcomes that mean the cycle itself failed or stalled. A cycle
+# spawned right after one of these is a recovery decision, never routine.
+_FAILED_CYCLE_OUTCOMES = frozenset(
+    {
+        strategic_cycle.OUTCOME_FAILED_PHASE1,
+        strategic_cycle.OUTCOME_FAILED_PHASE2,
+        strategic_cycle.OUTCOME_STALLED_PHASE1,
+        strategic_cycle.OUTCOME_STALLED_PHASE2,
+        strategic_cycle.OUTCOME_FAILED_PHASE2_SPAWN,
+        strategic_cycle.OUTCOME_THINKER_ARTIFACTS_MISSING,
+    }
+)
 
 # Schemas for pack_under_budget. Each key declares its priority tier and an
 # optional summarize_fn. Critical = always shipped (raises if can't fit).
@@ -5250,6 +5269,8 @@ async def _finalize_strategic_review_spawn(
     launched_by_user_id: str | None = None,
     runner_pin_id: str | None = None,
     integrity_conflict_counts: dict[str, int] | None = None,
+    effort_tier: str | None = None,
+    effort_reason: str | None = None,
     expected_legacy_generation: int | None = None,
 ) -> bool:
     """Guarded INSERT/commit tail for the cadence spawn path.
@@ -5428,6 +5449,9 @@ async def _finalize_strategic_review_spawn(
     )
     if _cycle_row is not None and integrity_conflict_counts is not None:
         strategic_cycle.record_integrity_conflict_counts(_cycle_row, integrity_conflict_counts)
+        session.add(_cycle_row)
+    if _cycle_row is not None and effort_tier is not None:
+        strategic_cycle.record_effort_tier(_cycle_row, effort_tier, effort_reason)
         session.add(_cycle_row)
     await commit_legacy_authorized(
         session, project_id, expected_legacy_generation
@@ -5915,8 +5939,15 @@ async def _spawn_strategic_review(
         or _runtime_config.get("task_type_models", {}).get("research")
         or None
     )
+    # ``_review_effort_pin`` distinguishes an EXPLICIT strategic_review effort
+    # pin (operator-set — wins over the pre-spawn classifier) from the generic
+    # research fallback (a default the classifier is allowed to override for
+    # routine cycles).
+    _review_effort_pin = _runtime_config.get("task_type_efforts", {}).get(
+        "strategic_review"
+    )
     review_effort = (
-        _runtime_config.get("task_type_efforts", {}).get("strategic_review")
+        _review_effort_pin
         or _runtime_config.get("task_type_efforts", {}).get("research")
         or None
     )
@@ -6656,6 +6687,26 @@ async def _spawn_strategic_review(
             _integrity_trend = _trend_result
     except Exception:
         logger.exception("[STRATEGIC] integrity_conflict_trend fetch failed; continuing")
+    # Pre-spawn effort-classifier inputs: was the prior COMPLETED cycle dirty,
+    # and did any of the last 3 cycles fail/stall? Both flag this cycle as a
+    # recovery decision rather than a routine heartbeat.
+    _prior_cycle_dirty = bool(
+        _integrity_trend
+        and isinstance(_integrity_trend.get("last_counts"), dict)
+        and any(
+            int(_integrity_trend["last_counts"].get(k) or 0) > 0
+            for k in (
+                "orphaned_gaps",
+                "ungrounded_directions",
+                "stale_active_moves",
+                "staffed_but_deferred",
+            )
+        )
+    )
+    _recent_cycle_failures = any(
+        (h or {}).get("outcome") in _FAILED_CYCLE_OUTCOMES
+        for h in (cycle_history or [])[:3]
+    )
     # Post-promotion handoff — when a fresh version has just opened, it was
     # opened by the PROMOTION of the prior version: open_version() is only ever
     # called from _record_promotion_success and the v1 bootstrap, so a version
@@ -7602,6 +7653,40 @@ async def _spawn_strategic_review(
         session, project.id, _active_direction_ids
     )
 
+    # Pre-spawn effort classification: decide ROUTINE vs CONSEQUENTIAL from
+    # signals computed ABOVE (all available before the LLM call) and pin the
+    # effort on the payload so routing resolution picks a cheaper tier for
+    # routine cycles. Fail-closed: any high-stakes or unknown signal stays at
+    # the category default ('max'). An explicit ``task_type_efforts`` pin for
+    # ``strategic_review`` wins over the classifier.
+    if _review_effort_pin is None:
+        try:
+            _effort_tier, _effort_reason = classify_strategic_review_effort(
+                {
+                    "open_message_count": len(open_msgs),
+                    "operator_steered": bool(operator_steered),
+                    "version_phase_block": _version_phase_block,
+                    "integrity_conflict_counts": (
+                        (_cycle_start_reconciliation or {}).get("counts") or {}
+                    ),
+                    "prior_cycle_dirty": _prior_cycle_dirty,
+                    "recent_cycle_failures": _recent_cycle_failures,
+                }
+            )[1:]
+        except Exception:  # noqa: BLE001 — a classifier bug must never block a cycle
+            logger.exception(
+                "[STRATEGIC] effort classifier failed; keeping consequential"
+            )
+            _effort_tier = CONSEQUENTIAL_TIER
+            _effort_reason = "classifier error"
+        if _effort_tier == ROUTINE_TIER:
+            review_effort = ROUTINE_EFFORT
+    else:
+        _effort_tier = "pinned"
+        _effort_reason = (
+            f"task_type_efforts['strategic_review']={_review_effort_pin} pinned"
+        )
+
     payload: dict = pack_under_budget(
         {
             "type": "strategic_review",
@@ -7873,6 +7958,8 @@ async def _spawn_strategic_review(
         steering_excerpt=steering_excerpt,
         launched_by_user_id=launched_by_user_id,
         integrity_conflict_counts=_integrity_counts,
+        effort_tier=_effort_tier,
+        effort_reason=_effort_reason,
         expected_legacy_generation=expected_legacy_generation,
     )
 

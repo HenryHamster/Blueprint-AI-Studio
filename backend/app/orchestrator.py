@@ -4421,18 +4421,18 @@ async def orchestrator_worker():
                         # (and, in a rollup, review-fix iterations wasted). Re-derive a
                         # model valid for the resolved provider; no-op when already
                         # consistent or the model is operator-custom (infers to None).
+                        _runtime_quality_tier = (
+                            runtime_selection.quality_tier
+                            if runtime_selection
+                            else None
+                        ) or resolve_task_quality_tier(task, _runtime_config)
                         _runtime_identity = reconcile_llm_runtime_identity(
                             account=account,
                             account_id=account_id,
                             provider=runtime_provider,
                             auth_mode=runtime_auth_mode,
                             model=runtime_model,
-                            quality_tier=(
-                                runtime_selection.quality_tier
-                                if runtime_selection
-                                else None
-                            )
-                            or resolve_task_quality_tier(task, _runtime_config),
+                            quality_tier=_runtime_quality_tier,
                             runtime_config=_runtime_config,
                         )
                         if (
@@ -4483,6 +4483,7 @@ async def orchestrator_worker():
                             auth_mode=runtime_auth_mode,
                             model=runtime_model,
                             execution_mode=runtime_execution_mode,
+                            quality_tier=_runtime_quality_tier,
                         )
                         # Keep the promoted column in sync with context
                         # (D2 over-fetch fix) — context keys are still written
