@@ -197,7 +197,7 @@
     "workspaceDisk.ts": 400,
     "workspacePrep.ts": 500,
     "reset.ts": 550,
-    "utils/test-runners.ts": 2850,
+    "utils/test-runners.ts": 3350,
     "utils/diff-detection.ts": 150,
     "utils/stale-result.ts": 150,
     "handlers/strategic-sections.ts": 1800,

@@ -35,6 +35,7 @@ import { handleComputeExperiment } from './compute-experiment.js';
 import { handleWebResearch } from './web-research.js';
 import { handleDesign } from './design.js';
 import { handleCapabilityProofTrial } from './capability-proof-trial.js';
+import { handleCriterionNamedTestTrial } from './criterion-named-test-trial.js';
 import { handleMemoryConsolidation } from './memory-consolidation.js';
 import {
   resolveTaskCapabilityContract,
@@ -119,6 +120,7 @@ export const handlers: Record<AgentTaskType, Handler> = {
   repo_bootstrap: handleRepoBootstrap,
   salvage_bundle: handleSalvageBundle,
   capability_proof_trial: handleCapabilityProofTrial,
+  criterion_named_test_trial: handleCriterionNamedTestTrial,
   memory_consolidation: handleMemoryConsolidation,
   walkthrough_e2e: handleWalkthroughE2e,
 };

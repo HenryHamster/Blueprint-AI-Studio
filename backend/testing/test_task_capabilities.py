@@ -147,6 +147,7 @@ def test_completion_handler_declarations_match_legacy_dispatch():
         "design": "design",
         "repo_bootstrap": "repo_bootstrap",
         "capability_proof_trial": "capability_proof_trial",
+        "criterion_named_test_trial": "criterion_named_test_trial",
         "walkthrough_e2e": "walkthrough_e2e",
     }
     # Only the two strategic completion handlers consume the pre-locked Project.

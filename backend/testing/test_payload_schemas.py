@@ -391,6 +391,7 @@ EXPECTED_TYPES = {
     "repo_bootstrap",
     "salvage_bundle",
     "capability_proof_trial",
+    "criterion_named_test_trial",
     "memory_consolidation",
     "walkthrough_e2e",
 }

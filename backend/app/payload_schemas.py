@@ -1405,6 +1405,13 @@ _MODEL_FOR_TYPE: dict[TaskType, type[BasePayload]] = {
     # salvage_bundle). The bounded caps are enforced at enrollment + in the agent
     # handler, not by the schema.
     TaskType.capability_proof_trial: BasePayload,
+    # criterion_named_test_trial carries a small free-form payload
+    # ({criterion_key, criterion_text, test_refs, head_sha, max_test_files,
+    # wall_clock_seconds}); the extra-field-tolerant BasePayload validates it
+    # without constraining the shape (mirrors capability_proof_trial). The
+    # bounded caps are enforced at enrollment + in the agent handler, not by the
+    # schema.
+    TaskType.criterion_named_test_trial: BasePayload,
     TaskType.memory_consolidation: MemoryConsolidationPayload,
 }
 

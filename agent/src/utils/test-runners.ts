@@ -2131,6 +2131,81 @@ export function buildTargetedPytestRunners(runners: TestRunner[], selectors: str
     .filter((runner): runner is TestRunner => runner !== null);
 }
 
+// ── JS/TS (vitest/jest) selector targeting ───────────────────────────────────
+// A vitest/jest named_test declaration (``Foo.test.ts``, ``Foo.spec.tsx``, …) is
+// a FILE-PATH selector, not a pytest node id. Target it against a detected
+// JS/TS-capable runner by appending the (cwd-rebased) path. CONSERVATIVE: a
+// runner that cannot take a file-path target returns null and the caller falls
+// open (could_not_run) rather than fabricating an arbitrary command — exactly
+// like the pytest branch.
+
+const JS_TEST_SELECTOR_RE = /\.(test|spec)\.(?:[cm]?[jt]sx?)(?:::|$)/;
+
+function looksLikeJsTestSelector(selector: string): boolean {
+  return JS_TEST_SELECTOR_RE.test(selector.trim());
+}
+
+function acceptsJsTestSelectors(runner: TestRunner): boolean {
+  // A `bash -c '<cmd>'` wrapper runs its command string as a single argv
+  // element; appending selectors as further argv would land them in $0/$1…
+  // (positional params of the shell), NOT as arguments to the wrapped test
+  // command. So never target-append to a wrapped runner.
+  if (runner.cmd === 'bash' && runner.args[0] === '-c') return false;
+  const cmdAndArgs = [runner.cmd, ...runner.args].join(' ');
+  // An npm/yarn/pnpm `test` script receives a trailing file path as a
+  // positional filter (vitest/jest/mocha/CRA all accept one); a runner that
+  // literally invokes vitest/jest takes the path directly.
+  return (
+    (runner.cmd === 'npm' || runner.cmd === 'yarn' || runner.cmd === 'pnpm') &&
+    runner.args[0] === 'test'
+  ) || cmdAndArgs.includes('vitest') || cmdAndArgs.includes('jest');
+}
+
+// Rebase a repo-root-relative selector (``agent/src/x.test.ts``) onto the
+// runner's own working directory (a runner rooted at ``<ws>/agent`` receives
+// ``src/x.test.ts``). A selector that lives OUTSIDE the runner's package (e.g.
+// an admin-ui test while only the agent/ runner is active) is not targetable
+// from here and yields '' so the caller declines.
+function normalizeJsSelectorForRunner(selector: string, runner: TestRunner): string {
+  const normalized = selector.trim().replace(/\\/g, '/');
+  if (!normalized) return '';
+  const cwd = runner.cwd.replace(/\\/g, '/');
+  const ws = WORKSPACE.replace(/\\/g, '/');
+  if (cwd === ws) return normalized;
+  if (cwd.startsWith(ws + '/')) {
+    const prefix = cwd.slice(ws.length + 1);
+    if (normalized.startsWith(prefix + '/')) return normalized.slice(prefix.length + 1);
+    return '';
+  }
+  return normalized;
+}
+
+function withJsTestSelectors(runner: TestRunner, selectors: string[]): TestRunner | null {
+  if (!acceptsJsTestSelectors(runner)) return null;
+  const normalized = Array.from(new Set(
+    selectors
+      .map(selector => normalizeJsSelectorForRunner(selector, runner))
+      .filter(Boolean)
+  ));
+  if (normalized.length === 0) return null;
+  // npm/yarn/pnpm: `--` separates the script name from the file-path filter so
+  // the underlying test command (vitest/jest/…) receives the path verbatim.
+  const args = (runner.cmd === 'npm' || runner.cmd === 'yarn' || runner.cmd === 'pnpm')
+    ? [...runner.args, '--', ...normalized]
+    : [...runner.args, ...normalized];
+  return {
+    ...runner,
+    args,
+    label: `${runner.label} (targeted acceptance test)`,
+  };
+}
+
+export function buildTargetedJsTestRunners(runners: TestRunner[], selectors: string[]): TestRunner[] {
+  return runners
+    .map(runner => withJsTestSelectors(runner, selectors))
+    .filter((runner): runner is TestRunner => runner !== null);
+}
+
 // ── Declared acceptance-test probe ───────────────────────────────────────────
 // When an implementation task declared, at plan time, a named acceptance test
 // (``acceptance_evidence`` with ``kind="test"``), the no-CI merge gate must
@@ -2148,12 +2223,15 @@ export interface DeclaredAcceptanceTest {
 /** Build a TARGETED runner that runs ONLY the declared acceptance test, reusing
  *  the same pytest-selector targeting the gate uses for CI-failure replay.
  *
- *  Conservative: it only knows how to target a pytest-style selector (a
+ *  Conservative: it knows how to target a pytest-style selector (a
  *  ``…test_x.py::test_y`` node id, or a ``testing/…`` path) against an
- *  already-detected pytest runner. When the declaration carries no usable
- *  selector, or no detected runner accepts pytest selectors, it returns ``null``
- *  — the caller then degrades to a "could not run the check" fall-open rather
- *  than fabricating an arbitrary command. ``runners`` is passed in (not detected
+ *  already-detected pytest runner, OR a vitest/jest file-path selector
+ *  (``Foo.test.ts``, ``Foo.spec.tsx``, …) against an already-detected
+ *  JS/TS-capable runner (npm/yarn/pnpm test, or a runner invoking
+ *  vitest/jest). When the declaration carries no usable selector, or no
+ *  detected runner accepts the selector's family, it returns ``null`` — the
+ *  caller then degrades to a "could not run the check" fall-open rather than
+ *  fabricating an arbitrary command. ``runners`` is passed in (not detected
  *  here) so the function stays pure and the caller controls detection. */
 export function buildAcceptanceTestRunner(
   declared: DeclaredAcceptanceTest,
@@ -2161,13 +2239,22 @@ export function buildAcceptanceTestRunner(
 ): TestRunner | null {
   const selector = (declared.selector || declared.descriptor || '').trim();
   if (!selector) return null;
-  // Only a pytest-shaped selector can be targeted today. A bare prose
-  // descriptor (no ``.py`` node id / ``testing/`` path) is not runnable as a
-  // selector, so we decline rather than guess.
+  // pytest-shaped selector → target the detected pytest runner(s).
   const looksPytest = /\.py(::|$)/.test(selector) || /(^|\/)testing\//.test(selector);
-  if (!looksPytest) return null;
-  const targeted = buildTargetedPytestRunners(runners, [selector]);
-  return targeted.length > 0 ? targeted[0] : null;
+  if (looksPytest) {
+    const targeted = buildTargetedPytestRunners(runners, [selector]);
+    return targeted.length > 0 ? targeted[0] : null;
+  }
+  // vitest/jest file-path selector → target the detected JS/TS runner(s) so a
+  // JS/TS named_test declaration can earn targeted-green instead of
+  // could_not_run.
+  if (looksLikeJsTestSelector(selector)) {
+    const targeted = buildTargetedJsTestRunners(runners, [selector]);
+    return targeted.length > 0 ? targeted[0] : null;
+  }
+  // A bare prose descriptor (no pytest or JS test-file shape) is not runnable
+  // as a selector, so we decline rather than guess.
+  return null;
 }
 
 /** Classify whether the declared acceptance test's targeted run actually

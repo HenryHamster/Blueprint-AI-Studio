@@ -351,6 +351,41 @@ MACHINE_PROBE_WINDOW_DAYS = 14
 #: trust and returns ``False`` in :func:`_evidence_is_walkthrough_e2e`.
 WALKTHROUGH_E2E_WINDOW_DAYS = 14
 
+#: ``source_kind`` for executed-named-test trial evidence written by
+#: :func:`record_named_test_execution_evidence` when the earn loop's targeted
+#: trial of a task's declared covering tests runs GREEN against the version's
+#: qualifying candidate SHA.  A ``named_test_execution`` row earns genuine
+#: machine-verified ``covered`` coverage — but ONLY when it is BOTH SHA-pinned
+#: (``detail["executed_sha"]`` is non-empty) AND fresh (recorded within
+#: :data:`NAMED_TEST_EXECUTION_WINDOW_DAYS`), exactly mirroring the
+#: walkthrough_e2e lane: a stale or unpinned trial row must not keep counting
+#: as coverage.  Recognised as covering by :func:`_evidence_proves_covered` via
+#: :func:`_evidence_is_named_test_execution_covered`.
+NAMED_TEST_EXECUTION_EVIDENCE_KIND = "named_test_execution"
+
+#: Coverage-tier constant: how long a ``named_test_execution`` evidence row (a
+#: GREEN targeted run of a merged task's declared covering tests against the
+#: candidate SHA) counts as full ``'covered'`` tier before it expires and the
+#: criterion falls back to its underlying evidence state.  Mirrors
+#: :data:`WALKTHROUGH_E2E_WINDOW_DAYS`: executed-test evidence is
+#: machine-verifiable on re-run, so a stale row decays quickly and the next
+#: qualification attempt re-verifies.  Measured from ``recorded_at``; a row
+#: with no ``recorded_at`` cannot grant perpetual trust and returns ``False``
+#: in :func:`_evidence_is_named_test_execution_covered`.
+NAMED_TEST_EXECUTION_WINDOW_DAYS = 14
+
+#: Hard cap on how many covering test files one ``criterion_named_test_trial`` may
+#: execute. Bounds the runner job so a merged task that (mis)declares a huge test
+#: surface cannot fan out into an unbounded targeted test run.  Mirrors
+#: :data:`app.capability_proof.MAX_CAPABILITY_PROOF_TRIAL_TEST_FILES`.
+MAX_CRITERION_NAMED_TEST_TRIAL_TEST_FILES = 10
+#: Wall-clock timeout (seconds) carried in the ``criterion_named_test_trial``
+#: launch contract. The agent handler runs ONLY the targeted covering tests under
+#: this bound; a trial that exceeds it is a no-op (records nothing), never a
+#: demotion.  Mirrors
+#: :data:`app.capability_proof.CAPABILITY_PROOF_TRIAL_WALL_CLOCK_SECONDS`.
+CRITERION_NAMED_TEST_TRIAL_WALL_CLOCK_SECONDS = 900
+
 # Legacy criterion-key aliases.  A walkthrough script may post a semantic slug
 # (e.g. 'c-workday-session-lifecycle') before the script is updated to emit the
 # canonical registered criterion key.  Both evidence-recording lanes apply this
@@ -416,6 +451,48 @@ def _evidence_is_walkthrough_e2e_covered(e: CriterionEvidence) -> bool:
     )
 
 
+def _evidence_is_named_test_execution_covered(e: CriterionEvidence) -> bool:
+    """Whether a single ``named_test_execution`` row is fresh AND SHA-pinned covering.
+
+    Returns ``True`` only for ``source_kind == NAMED_TEST_EXECUTION_EVIDENCE_KIND``
+    whose evidence is ALL of:
+
+      * **SHA-pinned** — ``detail`` is a dict carrying a non-empty
+        ``executed_sha`` (the exact commit the targeted test run executed
+        against). A row with no ``detail``, a non-dict ``detail``, or a
+        missing/blank ``executed_sha`` is NOT covering — it cannot prove which
+        commit it exercised, so it must not forge coverage.
+      * **passed** — ``detail["passed"] is True``; the trial reported a GREEN
+        run (a RED/could-not-run receipt mints nothing, so a row written by
+        :func:`record_named_test_execution_evidence` always carries ``True``,
+        but a legacy or malformed row must not cover).
+      * **fresh** — ``recorded_at`` is within
+        :data:`NAMED_TEST_EXECUTION_WINDOW_DAYS` of now (mirroring the
+        walkthrough_e2e time-bounding). A stale row, or one with no
+        ``recorded_at`` at all, is NOT covering — a missing timestamp cannot
+        grant perpetual trust.
+
+    Either failure drops the row out of the ``covered`` tier; because no other
+    predicate recognises this ``source_kind`` it then classifies as ``partial``
+    (evidence exists but none is covering). This is the whole point of the
+    executed-named-test lane: stale or unpinned trial evidence must stop
+    counting as machine-verified coverage.
+    """
+    if e.source_kind != NAMED_TEST_EXECUTION_EVIDENCE_KIND:
+        return False
+    detail = e.detail if isinstance(e.detail, dict) else {}
+    executed_sha = detail.get("executed_sha")
+    if not isinstance(executed_sha, str) or not executed_sha.strip():
+        return False
+    if detail.get("passed") is not True:
+        return False
+    if e.recorded_at is None:
+        return False
+    return (_utcnow() - _coerce_naive_utc(e.recorded_at)) <= timedelta(
+        days=NAMED_TEST_EXECUTION_WINDOW_DAYS
+    )
+
+
 def _evidence_proves_covered(e: CriterionEvidence) -> bool:
     """Whether a single evidence record satisfies the machine-verified 'covered' condition.
 
@@ -429,6 +506,14 @@ def _evidence_proves_covered(e: CriterionEvidence) -> bool:
     fresh (recorded within :data:`WALKTHROUGH_E2E_WINDOW_DAYS`) — see
     :func:`_evidence_is_walkthrough_e2e_covered`. A stale or unpinned row is not
     covering and falls back to ``partial``.
+
+    ``named_test_execution`` (a GREEN targeted run of a merged task's declared
+    covering tests against the candidate SHA) is covering ONLY when it is BOTH
+    SHA-pinned (``detail["executed_sha"]`` non-empty), passed (``detail["passed"]
+    is True``) AND fresh (recorded within
+    :data:`NAMED_TEST_EXECUTION_WINDOW_DAYS`) — see
+    :func:`_evidence_is_named_test_execution_covered`. A stale, unpinned, or
+    non-passed row is not covering and falls back to ``partial``.
 
     ``acceptance_window_recompute`` and ``metrics_integrity_sweep`` are
     deliberately NOT covering here.  Both prove only that a standing MECHANISM
@@ -469,6 +554,14 @@ def _evidence_proves_covered(e: CriterionEvidence) -> bool:
         if "verdict" in detail and detail.get("verdict") != "PASS":
             return False
         return _evidence_is_walkthrough_e2e_covered(e)
+    if e.source_kind == NAMED_TEST_EXECUTION_EVIDENCE_KIND:
+        # A GREEN targeted run of a task's declared covering tests against the
+        # candidate SHA. Covering iff the row is SHA-pinned
+        # (``detail["executed_sha"]`` non-empty), reports ``passed is True``, AND
+        # is fresh within NAMED_TEST_EXECUTION_WINDOW_DAYS — see
+        # :func:`_evidence_is_named_test_execution_covered`. A stale, unpinned,
+        # or non-passed row must not cover.
+        return _evidence_is_named_test_execution_covered(e)
     # Unverified-merge backfill evidence is deliberately NOT covering here.  The
     # evidence only proves that the declared named_test was in the PR's changed
     # files — i.e. the test shipped — not that the merge was CI-verified or that
@@ -2880,6 +2973,186 @@ async def record_walkthrough_e2e_evidence(
     }
 
 
+async def record_named_test_execution_evidence(
+    session: AsyncSession,
+    version: Any,
+    *,
+    criterion_keys: list[str],
+    executed_sha: str,
+    test_refs: list[str],
+    trial_task_id: str,
+) -> dict[str, Any]:
+    """Mint ``covered``-tier evidence from a GREEN executed named-test trial.
+
+    Called by the ``criterion_named_test_trial`` completion handler when a
+    targeted run of a merged task's declared covering tests has been validated
+    as GREEN. For each criterion key in ``criterion_keys`` that resolves to an
+    ACTIVE criterion on ``version``, writes one
+    :data:`NAMED_TEST_EXECUTION_EVIDENCE_KIND` :class:`CriterionEvidence` row
+    with ``detail = {executed_sha, evaluated_at, criterion_key, passed: True,
+    test_refs}`` and a ``source_id`` keyed on ``named_test_exec:{trial_task_id}:
+    {criterion_key}`` (so a re-ingestion of the same trial task is an idempotent
+    no-op via the dedup unique index).
+
+    **CRITICAL SAFETY** — covered-tier evidence is written ONLY when the posted
+    ``executed_sha`` is non-empty AND matches the version's qualifying candidate
+    SHA (:func:`_version_qualifying_candidate_sha`). A missing or mismatched SHA
+    writes NOTHING and is reported as ``rejected`` — a trial run against the
+    wrong commit (or with no pinned SHA) can never forge coverage.
+
+    Returns a summary dict::
+
+        {"status": "recorded" | "rejected",
+         "rejected_reason": str | None,  # only when status == "rejected"
+         "recorded": int,                # rows newly written
+         "skipped_not_passed": int,      # always 0 (only GREEN trials reach here)
+         "unmatched_keys": list[str],    # keys not resolving to an active criterion
+         "executed_sha": str}
+
+    Best-effort per-row: a failure recording one criterion's evidence is logged
+    and does not abort the others. Never raises.
+    """
+    posted_sha = str(executed_sha or "").strip()
+    qualifying_sha = _version_qualifying_candidate_sha(version)
+    if not posted_sha:
+        logger.warning(
+            "record_named_test_execution_evidence: missing executed_sha for "
+            "version %s — rejecting (no coverage written)",
+            getattr(version, "id", None),
+        )
+        return {
+            "status": "rejected",
+            "rejected_reason": "missing_executed_sha",
+            "recorded": 0,
+            "skipped_not_passed": 0,
+            "unmatched_keys": [],
+            "executed_sha": posted_sha,
+        }
+    if not qualifying_sha or posted_sha != qualifying_sha:
+        logger.warning(
+            "record_named_test_execution_evidence: executed_sha %s does not "
+            "match version %s qualifying SHA %r — rejecting (no coverage written)",
+            posted_sha[:12],
+            getattr(version, "id", None),
+            qualifying_sha[:12] if qualifying_sha else qualifying_sha,
+        )
+        return {
+            "status": "rejected",
+            "rejected_reason": "executed_sha_mismatch",
+            "recorded": 0,
+            "skipped_not_passed": 0,
+            "unmatched_keys": [],
+            "executed_sha": posted_sha,
+        }
+
+    project_id = version.project_id
+    release_version_id = version.id
+
+    keys = [
+        str(k).strip()
+        for k in (criterion_keys or [])
+        if isinstance(k, str) and k.strip()
+    ]
+    if not keys:
+        return {
+            "status": "recorded",
+            "rejected_reason": None,
+            "recorded": 0,
+            "skipped_not_passed": 0,
+            "unmatched_keys": [],
+            "executed_sha": posted_sha,
+        }
+
+    criteria = await get_criteria_by_keys(
+        session, project_id, keys, release_version_id=release_version_id
+    )
+    active_by_key = {c.criterion_key: c for c in criteria if c.status == "active"}
+    unmatched_keys = [k for k in keys if k not in active_by_key]
+
+    evaluated_at = _utcnow().isoformat()
+    trial_token = str(trial_task_id or "na").strip() or "na"
+    # Pre-compute the deterministic source_ids so re-ingestion of the same trial
+    # is idempotent: the DB unique index (uq_criterionevidence_dedup) guards the
+    # Postgres path, and this explicit existence check keeps it idempotent on
+    # every dialect (e.g. the SQLite test backend, which does not render the
+    # postgresql_where partial index).
+    source_ids_by_key = {
+        key: f"named_test_exec:{trial_token}:{key}" for key in active_by_key
+    }
+    existing_result = await session.execute(
+        select(CriterionEvidence.criterion_id).where(
+            CriterionEvidence.source_kind == NAMED_TEST_EXECUTION_EVIDENCE_KIND,
+            CriterionEvidence.source_id.in_(list(source_ids_by_key.values())),
+        )
+    )
+    existing_criterion_ids = set(existing_result.scalars().all())
+
+    recorded = 0
+    for key, criterion in active_by_key.items():
+        if criterion.id in existing_criterion_ids:
+            logger.debug(
+                "record_named_test_execution_evidence: duplicate evidence skipped "
+                "for criterion %s (source_id %s)",
+                key,
+                source_ids_by_key[key],
+            )
+            continue
+        detail: dict[str, Any] = {
+            "executed_sha": posted_sha,
+            "evaluated_at": evaluated_at,
+            "criterion_key": key,
+            "passed": True,
+            "test_refs": [
+                str(r) for r in (test_refs or []) if isinstance(r, str) and r.strip()
+            ],
+        }
+        source_id = source_ids_by_key[key]
+        try:
+            await record_evidence(
+                session,
+                criterion_id=criterion.id,
+                project_id=project_id,
+                source_kind=NAMED_TEST_EXECUTION_EVIDENCE_KIND,
+                source_id=source_id,
+                detail=detail,
+            )
+            recorded += 1
+        except Exception:  # noqa: BLE001 — best-effort per-row
+            logger.exception(
+                "record_named_test_execution_evidence: failed to record evidence "
+                "for criterion %s (version %s)",
+                key,
+                getattr(version, "id", None),
+            )
+
+    if unmatched_keys:
+        logger.warning(
+            "record_named_test_execution_evidence: version=%s executed_sha=%s "
+            "recorded=%d unmatched=%s — keys dropped, no evidence written",
+            getattr(version, "id", None),
+            posted_sha[:12],
+            recorded,
+            unmatched_keys,
+        )
+    else:
+        logger.info(
+            "record_named_test_execution_evidence: version=%s executed_sha=%s "
+            "recorded=%d unmatched=%s",
+            getattr(version, "id", None),
+            posted_sha[:12],
+            recorded,
+            unmatched_keys,
+        )
+    return {
+        "status": "recorded",
+        "rejected_reason": None,
+        "recorded": recorded,
+        "skipped_not_passed": 0,
+        "unmatched_keys": unmatched_keys,
+        "executed_sha": posted_sha,
+    }
+
+
 async def record_operator_walkthrough_evidence(
     session: AsyncSession,
     version: Any,
@@ -4103,6 +4376,199 @@ async def spawn_corroboration_task(
         )
 
 
+async def enroll_criterion_named_test_trial(
+    session: AsyncSession,
+    project: Any,
+    *,
+    version: Any,
+    criterion_key: str,
+    criterion_text: str,
+    test_refs: list[str],
+) -> Any:
+    """Create + persist a QUEUED ``criterion_named_test_trial`` Task for one criterion.
+
+    Slice 2 of the machine-verified executed-named-test earn path: the earn loop's
+    backfill discovers a merged task whose declared ``named_test`` test shipped in
+    the PR's changed files, records lower-confidence ``backfilled`` evidence, and
+    then enrolls this targeted runner job in its place. The agent handler runs ONLY
+    the passed ``test_refs`` (the covering test the backfill discovered) at the
+    version's qualifying candidate SHA; on a green run the ingestion handler
+    (:func:`app.task_completion._handle_criterion_named_test_trial_completion`)
+    mints genuine ``covered`` evidence via :func:`record_named_test_execution_evidence`.
+
+    This is the ENROLL half, called by :func:`backfill_merged_named_test_coverage`
+    in place of the research corroboration spawn. It is gated on the
+    ``criterion_named_test_trials_enabled`` runtime flag (default True); with the
+    operator kill switch off it is a no-op returning ``None``. It is also gated on
+    the version having a qualifying candidate SHA — without a pinned revision the
+    trial could not be verified against anything, so nothing is enrolled.
+
+    Bounded launch contract (mirrors ``enroll_capability_proof_trial``):
+    ``test_refs`` is normalized and capped to
+    :data:`MAX_CRITERION_NAMED_TEST_TRIAL_TEST_FILES`, and a wall-clock timeout
+    (:data:`CRITERION_NAMED_TEST_TRIAL_WALL_CLOCK_SECONDS`) is stamped into the
+    payload. A trial that cannot be built cleanly (flag off, no usable test refs,
+    no qualifying SHA) is a no-op returning ``None`` — never a raise, never a
+    fabricated proof.
+
+    Returns the persisted Task on success, or ``None`` on any no-op/degraded path.
+    Non-raising: any error is logged at WARNING level and yields ``None`` so the
+    backfill sweep can never be crashed by enrollment.
+    """
+    try:
+        from app.shared_state import runtime_config as _rc
+
+        if not (_rc or {}).get("criterion_named_test_trials_enabled", False):
+            return None
+
+        refs = [r for r in (test_refs or []) if isinstance(r, str) and r.strip()]
+        if not refs:
+            logger.warning(
+                "[CRITERION_TRIAL] cannot enroll trial for criterion %s — "
+                "no usable test refs",
+                criterion_key,
+            )
+            return None
+        refs = refs[:MAX_CRITERION_NAMED_TEST_TRIAL_TEST_FILES]
+        # Belt-and-suspenders: MAX_CRITERION_NAMED_TEST_TRIAL_TEST_FILES must never
+        # be 0, but guard defensively so a misconfigured constant can't produce a
+        # fabricated empty proof.
+        if not refs:
+            logger.warning(
+                "[CRITERION_TRIAL] cannot enroll trial for criterion %s — refs empty "
+                "after cap (MAX_CRITERION_NAMED_TEST_TRIAL_TEST_FILES=%d)",
+                criterion_key,
+                MAX_CRITERION_NAMED_TEST_TRIAL_TEST_FILES,
+            )
+            return None
+
+        head_sha = _version_qualifying_candidate_sha(version)
+        if not head_sha:
+            logger.info(
+                "[CRITERION_TRIAL] cannot enroll trial for criterion %s — version %s "
+                "has no qualifying candidate SHA",
+                criterion_key,
+                getattr(version, "id", None),
+            )
+            return None
+
+        project_id = getattr(project, "id", None)
+        version_id = getattr(version, "id", None)
+
+        # Dedup guard: only block re-enrollment when an in-flight (non-terminal)
+        # trial already exists for the same criterion_key + release version.
+        # Terminal states (COMPLETED, FAILED) deliberately do NOT block a fresh
+        # enrollment so a completed trial can be re-run after a new commit lands.
+        # Note: a narrow TOCTOU window exists — two concurrent sweeps that both
+        # miss the in-flight check can both enroll; this is tolerated (idempotent
+        # evidence recording handles the duplicate) and only risks one extra
+        # runner job per criterion per sweep cycle.
+        in_flight_statuses = [
+            TaskStatus.QUEUED,
+            TaskStatus.PROVISIONING,
+            TaskStatus.IN_PROGRESS,
+            TaskStatus.EVALUATING,
+        ]
+        try:
+            from app.database import resolve_dialect_name
+            from sqlalchemy import func as _func
+
+            # ``Task.payloads.contains`` renders ``@>`` which PostgreSQL supports
+            # but SQLite does not — branch on dialect like
+            # ``backfill_direction_merge_evidence`` does.
+            dialect = resolve_dialect_name(session)
+            existing_q = (
+                select(Task.id)
+                .where(
+                    Task.project_id == project_id,
+                    Task.status.in_(in_flight_statuses),
+                    Task.context[CRITERION_RELEASE_VERSION_CONTEXT_KEY].as_string()
+                    == str(version_id),
+                )
+                .limit(1)
+            )
+            if dialect == "sqlite":
+                existing_q = existing_q.where(
+                    _func.json_extract(Task.payloads, "$[0].type")
+                    == "criterion_named_test_trial",
+                    _func.json_extract(Task.payloads, "$[0].criterion_key")
+                    == criterion_key,
+                )
+            else:
+                existing_q = existing_q.where(
+                    Task.payloads.contains(
+                        [
+                            {
+                                "type": "criterion_named_test_trial",
+                                "criterion_key": criterion_key,
+                            }
+                        ]
+                    )
+                )
+            if (await session.execute(existing_q)).scalar_one_or_none() is not None:
+                logger.info(
+                    "[CRITERION_TRIAL] skipping duplicate enrollment for criterion %s — "
+                    "a trial is already in-flight",
+                    criterion_key,
+                )
+                return None
+        except Exception:  # noqa: BLE001 — dedup failure is non-fatal; enroll anyway
+            logger.warning(
+                "[CRITERION_TRIAL] dedup check failed for criterion %s — "
+                "proceeding with enroll",
+                criterion_key,
+                exc_info=True,
+            )
+
+        payload: dict[str, Any] = {
+            "type": "criterion_named_test_trial",
+            "criterion_key": criterion_key,
+            "criterion_text": criterion_text,
+            "test_refs": refs,
+            "head_sha": head_sha,
+            "max_test_files": MAX_CRITERION_NAMED_TEST_TRIAL_TEST_FILES,
+            "wall_clock_seconds": CRITERION_NAMED_TEST_TRIAL_WALL_CLOCK_SECONDS,
+        }
+        task = Task(
+            project_id=project_id,
+            title=f"Criterion named-test trial: {criterion_key}",
+            criterion_ids=[criterion_key],
+            context={
+                "corroboration_of": criterion_key,
+                "spawned_by": NAMED_TEST_EXECUTION_EVIDENCE_KIND,
+                CRITERION_RELEASE_VERSION_CONTEXT_KEY: str(version_id),
+            },
+            payloads=[payload],
+            status=TaskStatus.QUEUED,
+            created_by="SYSTEM_AUTO_REVIEW",
+        )
+        session.add(task)
+        await session.commit()
+        await session.refresh(task)
+        logger.info(
+            "[CRITERION_TRIAL] enrolled trial task %s for criterion=%s refs=%s sha=%s",
+            task.id,
+            criterion_key,
+            refs,
+            head_sha,
+        )
+        return task
+    except Exception:  # noqa: BLE001 — enrollment must degrade, never raise
+        logger.warning(
+            "[CRITERION_TRIAL] failed to enroll criterion_named_test_trial for criterion=%r",
+            criterion_key,
+            exc_info=True,
+        )
+        try:
+            await session.rollback()
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[CRITERION_TRIAL] rollback after enroll failure also failed",
+                exc_info=True,
+            )
+        return None
+
+
 async def backfill_merged_named_test_coverage(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -4125,6 +4591,15 @@ async def backfill_merged_named_test_coverage(
     whose criteria were added AFTER the merge (so ``record_task_merge_evidence``
     never fired) also qualifies.
 
+    For every active criterion that received (or already had) merged-named-test
+    backfill evidence, this ALSO enrolls a targeted
+    :func:`enroll_criterion_named_test_trial` — a bounded runner job that executes
+    the covering test against the version's qualifying candidate SHA.  A green
+    run upgrades the criterion from the lower-confidence 'backfilled' tier to
+    genuine machine-verified 'covered'; this replaces the research corroboration
+    spawn for this lane.  ``backfilled`` stays the floor until such a trial
+    upgrades the criterion.
+
     Best-effort: errors are logged and swallowed so a backfill failure never blocks
     the caller (the reaper sweep).
 
@@ -4143,10 +4618,11 @@ async def backfill_merged_named_test_coverage(
         total = 0
         offset = 0
         open_version: Any = None
-        # Criteria (key -> text) covered by backfill this run — each gets a
-        # corroboration task so the 'backfilled' tier has an earn-up-or-downgrade
-        # path, mirroring operator attestation and unverified-merge backfill.
-        corroboration_targets: dict[str, str] = {}
+        # Criteria (key -> (text, declared_test)) covered by backfill this run —
+        # each gets a criterion_named_test_trial so the 'backfilled' tier has an
+        # execute-the-covering-test earn-up path toward machine-verified
+        # 'covered', replacing the research corroboration spawn for this lane.
+        trial_targets: dict[str, tuple[str, str]] = {}
         while True:
             query = (
                 select(Task)
@@ -4279,10 +4755,14 @@ async def backfill_merged_named_test_coverage(
                     or declared_test
                 )
                 for criterion in active:
-                    # Queue a corroboration task for every active backfilled
-                    # criterion, whether or not its evidence row is new — this
-                    # earns-up or downgrades pre-existing backfill too.
-                    corroboration_targets[criterion.criterion_key] = criterion.text
+                    # Enroll a targeted named-test trial for every active
+                    # backfilled criterion, whether or not its evidence row is
+                    # new — this earns-up or re-verifies pre-existing backfill
+                    # too (in-flight dedup in the enroller guards duplicates).
+                    trial_targets[criterion.criterion_key] = (
+                        criterion.text,
+                        declared_test,
+                    )
                     if criterion.id in already_present:
                         continue
 
@@ -4311,21 +4791,27 @@ async def backfill_merged_named_test_coverage(
                 batch_recorded = await _record_evidence_batch(session, evidence_batch)
                 total += batch_recorded
 
-        # Give each backfilled criterion an earn-up path: spawn a corroboration
-        # task (deduped by the existing ``Verify: {key}`` title guard) so the
-        # lower-confidence backfill tier is re-verified toward machine-verified
-        # coverage — and downgraded to 'partial' if that verification fails.
-        for _ck, _ctext in corroboration_targets.items():
-            await spawn_corroboration_task(
-                session,
-                project_id,
-                _ck,
-                _ctext,
-                "merged named_test backfill: the declared test shipped in the PR's "
-                "changed files but may not exercise the criterion's specific condition",
-                spawned_by=UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND,
-                release_version_id=open_version.id,
-            )
+        # Give each backfilled criterion an earn-up path: enroll a targeted
+        # criterion_named_test_trial (deduped on in-flight trials for the same
+        # criterion + release version) that executes the declared covering test
+        # against the version's qualifying candidate SHA — a green run upgrades
+        # the criterion from the lower-confidence backfill tier to real
+        # machine-verified 'covered'.  This replaces the research corroboration
+        # spawn for the merged-named-test lane.
+        if trial_targets:
+            from app.models import Project
+
+            project_row = await session.get(Project, project_id)
+            if project_row is not None:
+                for _ck, (_ctext, _declared_test) in trial_targets.items():
+                    await enroll_criterion_named_test_trial(
+                        session,
+                        project_row,
+                        version=open_version,
+                        criterion_key=_ck,
+                        criterion_text=_ctext,
+                        test_refs=[_declared_test],
+                    )
 
         if total:
             logger.info(

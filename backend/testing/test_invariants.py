@@ -10504,6 +10504,7 @@ def test_task_type_evaluation_registry_is_consistent():
         "repo_bootstrap": "none",
         "salvage_bundle": "code-ci-review",
         "capability_proof_trial": "none",
+        "criterion_named_test_trial": "none",
         "walkthrough_e2e": "none",
         "memory_consolidation": "none",
     }

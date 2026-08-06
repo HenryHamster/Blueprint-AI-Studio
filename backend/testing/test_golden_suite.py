@@ -57,6 +57,7 @@ VALID_TASK_TYPES: set[str] = {
     "repo_bootstrap",
     "salvage_bundle",
     "capability_proof_trial",
+    "criterion_named_test_trial",
     "walkthrough_e2e",
     "memory_consolidation",
 }

@@ -431,6 +431,15 @@ runtime_config: Dict = {
         "CAPABILITY_PROOF_EXECUTION_TRIALS_ENABLED", "true"
     ).lower()
     in ("1", "true", "yes"),
+    # Executed-named-test acceptance evidence lane: gates the completion-side
+    # ingestion of ``criterion_named_test_trial`` receipts into machine-verified
+    # ``covered`` criterion evidence (record_named_test_execution_evidence).
+    # Default ON now that the ingestion half is wired; operators retain the
+    # PATCH/env kill switch for a fleet that needs to pause trial ingestion.
+    "criterion_named_test_trials_enabled": os.getenv(
+        "CRITERION_NAMED_TEST_TRIALS_ENABLED", "true"
+    ).lower()
+    in ("1", "true", "yes"),
     # Co-change auto-decomposition: split a medium research finding's files into
     # independent co-change/dir clusters and spawn one small sub-finding per
     # cluster (research_completion -> cochange_decomposition.py). Default OFF:
@@ -2266,6 +2275,11 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     _set(
                         "capability_proof_execution_trials_enabled",
                         bool(config_json["capability_proof_execution_trials_enabled"]),
+                    )
+                if "criterion_named_test_trials_enabled" in config_json:
+                    _set(
+                        "criterion_named_test_trials_enabled",
+                        bool(config_json["criterion_named_test_trials_enabled"]),
                     )
                 for _cap_grad_float_key in (
                     "capability_proof_gate_auto_graduation_observe_threshold",

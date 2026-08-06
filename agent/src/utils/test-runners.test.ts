@@ -3730,6 +3730,54 @@ describe('buildAcceptanceTestRunner — targeted declared acceptance test', () =
   it('returns null for an empty selector/descriptor', () => {
     expect(buildAcceptanceTestRunner({ descriptor: '   ' }, [PYTEST_RUNNER])).toBeNull();
   });
+
+  it('test_build_acceptance_test_runner_targets_vitest_selector', () => {
+    // A vitest/jest file-path selector (``agent/src/x.test.ts``) must produce a
+    // TARGETED runner against a detected npm test runner — the missing half of
+    // the acceptance probe that left JS/TS named_test declarations at
+    // could_not_run instead of earning targeted-green.
+    const NPM_RUNNER: TestRunner = {
+      cmd: 'npm', args: ['test'], cwd: `${WORKSPACE}/agent`, label: 'npm test (agent)',
+    };
+    const runner = buildAcceptanceTestRunner(
+      { descriptor: 'the seam test', selector: 'agent/src/utils/test-runners.test.ts' },
+      [NPM_RUNNER],
+    );
+    expect(runner).not.toBeNull();
+    // The file path is appended after `--` so the package's OWN test command
+    // receives it as a positional filter, rebased onto the runner's cwd.
+    expect(runner?.cmd).toBe('npm');
+    expect(runner?.args).toEqual(['test', '--', 'src/utils/test-runners.test.ts']);
+    expect(runner?.cwd).toBe(`${WORKSPACE}/agent`);
+  });
+
+  it('targets a .spec.tsx selector against a direct vitest runner (no npm wrapper)', () => {
+    const VITEST_RUNNER: TestRunner = {
+      cmd: 'npx', args: ['vitest', 'run'], cwd: `${WORKSPACE}/admin-ui`, label: 'vitest run (admin-ui)',
+    };
+    const runner = buildAcceptanceTestRunner(
+      { descriptor: 'x', selector: 'admin-ui/src/components/Widget.spec.tsx' },
+      [VITEST_RUNNER],
+    );
+    expect(runner).not.toBeNull();
+    // A direct vitest/jest invocation takes the path as a positional arg.
+    expect(runner?.cmd).toBe('npx');
+    expect(runner?.args).toEqual(['vitest', 'run', 'src/components/Widget.spec.tsx']);
+  });
+
+  it('declines a vitest selector that lives OUTSIDE the runner package (cross-package)', () => {
+    // The agent/ runner cannot target an admin-ui test; decline → caller falls
+    // open (could_not_run) rather than running the wrong package's suite.
+    const NPM_RUNNER: TestRunner = {
+      cmd: 'npm', args: ['test'], cwd: `${WORKSPACE}/agent`, label: 'npm test (agent)',
+    };
+    expect(
+      buildAcceptanceTestRunner(
+        { descriptor: 'x', selector: 'admin-ui/src/components/Widget.test.tsx' },
+        [NPM_RUNNER],
+      ),
+    ).toBeNull();
+  });
 });
 
 describe('classifyAcceptanceTestRun — ran / skipped / absent', () => {

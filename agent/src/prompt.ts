@@ -277,6 +277,7 @@ export const TASK_TYPES_WITHOUT_HINT: ReadonlySet<string> = new Set([
   'repo_bootstrap',          // Uses specialized.ts bespoke prompt assembly (external-repo first-cycle bootstrap)
   'salvage_bundle',          // Uses standard.ts handleSalvageBundle bespoke prompt assembly (consolidated fix batch)
   'capability_proof_trial',  // Uses capability-proof-trial.ts; runs the targeted covering tests directly, no Claude prompt
+  'criterion_named_test_trial', // Uses criterion-named-test-trial.ts; runs covering tests at pinned head, no Claude prompt
   'memory_consolidation',     // Uses memory-consolidation.ts bespoke receipt-only prompt
   'walkthrough_e2e',        // Uses specialized.ts bespoke prompt assembly (live-stack walkthrough harness)
 ]);
