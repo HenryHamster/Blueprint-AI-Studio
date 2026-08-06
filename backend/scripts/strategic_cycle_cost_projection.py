@@ -66,9 +66,20 @@ Tokens are estimated from measured bytes at 4 bytes/token (standard English-text
 approximation; the byte counts themselves are exact, and the cost model is
 anchored on the measured $4.41, so the token estimate only affects the tiny
 cross-cycle term).
+
+The module also projects MONTHLY spend (criterion c-3fd62b9d): per-cycle cost
+x a cycle-volume anchor. The volume anchors are cited — the measured realized
+volume (59 cycles / 7-day measurement window, direction d-e860fe17 measured
+basis) and the cadence-backstop floor from the ``strategic_max_interval_minutes``
+config default (runtime_config_state.py:830). No ``target_concurrency``
+configuration key exists for the strategic decision loop; when no volume input
+is available the projection refuses to guess and says so explicitly.
 """
 
 from __future__ import annotations
+
+import math
+import textwrap
 
 # ---------------------------------------------------------------------------
 # Measured / stated inputs
@@ -100,6 +111,33 @@ BASELINE_CACHE_READ_SHARE = 0.55
 ROUTINE_SHARE_BASE = 0.70             # share of cycles classified 'routine'
 INPUT_COST_SHARE_BASE = 0.90          # input(+create+read) share of the $4.41
 CROSS_CYCLE_SURVIVAL_BASE = 0.0       # P(cache survives the inter-cycle gap)
+
+# ---------------------------------------------------------------------------
+# Cycle-volume inputs (each cited)
+# ---------------------------------------------------------------------------
+
+# Strategic-cadence backstop (existing configuration). runtime_config_state.py
+# defaults ``strategic_max_interval_minutes`` to 1,440: the wall-clock floor
+# that forces a strategic spawn when this long passes without one. 1,440 min is
+# a daily backstop -> ~30.4 cycles/month. This is a FLOOR, not the realized
+# volume — the cadence spawner also fires on research frequency, operator
+# refresh, and state-change wakes (autonomous_research.py:1275-1304).
+STRATEGIC_MAX_INTERVAL_MINUTES = 1_440
+
+# Calendar-month length used to scale the 7-day measurement window (the same
+# 30.44-day convention the direction's monthly-envelope framing uses).
+DAYS_PER_MONTH = 30.44
+MINUTES_PER_MONTH = DAYS_PER_MONTH * 24 * 60
+
+# Realized cycle volume over the measurement window. The direction's measured
+# basis (d-e860fe17) records 59 strategic cycles over the 7-day window
+# ($276.87 total LLM spend / $261.33 strategic across 59 cycles at $4.43 each).
+# Scaled to a month this is ~256.6 cycles/month.
+MEASURED_CYCLES_PER_7_DAYS = 59
+
+# The cost envelope the monthly projection is judged against (direction
+# d-e860fe17 success evidence: "within $3,000").
+MONTHLY_ENVELOPE_USD = 3_000.0
 
 
 def effective_input_price_multiplier(read_share: float) -> float:
@@ -176,6 +214,85 @@ def rendered_instruction_share() -> dict[str, float]:
         "total_prompt_bytes": TOTAL_PROMPT_BYTES_REP,
         "stable_share_of_instruction": STABLE_PREFIX_BYTES / instruction_bytes,
         "stable_share_of_total": STABLE_PREFIX_BYTES / TOTAL_PROMPT_BYTES_REP,
+    }
+
+
+def cadence_cycles_per_month() -> float:
+    """Cycle-volume floor from the strategic cadence backstop, cycles/month.
+
+    The wall-clock backstop forces a strategic spawn at least every
+    ``strategic_max_interval_minutes`` (default 1,440 = daily). The monthly
+    floor is therefore MINUTES_PER_MONTH / STRATEGIC_MAX_INTERVAL_MINUTES
+    (~30.4). This is a floor, not the realized volume — the cadence spawner
+    also fires on research frequency, operator refresh, and state wakes.
+    """
+    return MINUTES_PER_MONTH / STRATEGIC_MAX_INTERVAL_MINUTES
+
+
+def measured_cycles_per_month() -> float:
+    """Realized strategic-cycle volume scaled to a month, cycles/month.
+
+    MEASURED_CYCLES_PER_7_DAYS (59 cycles over the 7-day measurement window,
+    direction d-e860fe17 measured basis) scaled by DAYS_PER_MONTH / 7.
+    """
+    return MEASURED_CYCLES_PER_7_DAYS * DAYS_PER_MONTH / 7.0
+
+
+def target_concurrency_status() -> dict:
+    """Report whether a stored 'target concurrency' input exists.
+
+    The success criterion (c-3fd62b9d) asks for monthly spend "at the version's
+    target concurrency", but no configuration key stores a target concurrency
+    for the strategic decision loop (searched runtime_config_state.py defaults
+    and the ReleaseVersion model). This surfaces that gap explicitly instead of
+    guessing a volume — per the task's instruction to report an unavailable
+    input rather than invent one.
+    """
+    return {
+        "available": False,
+        "reason": (
+            "No 'target_concurrency' configuration exists for the strategic "
+            "decision loop (runtime_config_state.py defaults and the "
+            "ReleaseVersion model have no such key). The projection therefore "
+            "shows monthly spend at the two available volume anchors -- the "
+            "measured realized volume and the cadence-backstop floor -- and "
+            "reports the volume at which the $3,000 envelope binds. Grading "
+            "c-3fd62b9d at a specific concurrency requires an "
+            "operator-supplied target cycle volume."
+        ),
+    }
+
+
+def project_monthly_spend(
+    per_cycle_cost_usd: float,
+    cycles_per_month: float | None,
+) -> dict[str, object]:
+    """Projected monthly spend, USD: per-cycle cost x cycle volume.
+
+    Returns a dict so the arithmetic is explicit and a reader can check it by
+    hand (monthly = per_cycle_cost x cycles_per_month). When
+    ``cycles_per_month`` is None (no measured volume and no configured cadence
+    available) or non-finite/negative, returns ``available=False`` with a
+    reason instead of guessing a volume.
+    """
+    if (
+        cycles_per_month is None
+        or cycles_per_month < 0
+        or not math.isfinite(cycles_per_month)
+    ):
+        return {
+            "available": False,
+            "reason": "cycle volume unavailable (no measured volume and no configured cadence)",
+            "per_cycle_cost_usd": round(per_cycle_cost_usd, 4),
+            "cycles_per_month": None,
+            "monthly_spend_usd": None,
+        }
+    monthly = per_cycle_cost_usd * cycles_per_month
+    return {
+        "available": True,
+        "per_cycle_cost_usd": round(per_cycle_cost_usd, 4),
+        "cycles_per_month": round(cycles_per_month, 2),
+        "monthly_spend_usd": round(monthly, 2),
     }
 
 
@@ -261,6 +378,45 @@ def main() -> None:
     print("  stable block (vs ~1.5M input tokens/cycle), and the volatile payload")
     print("  changes every cycle. A falsified target is a useful result; a number")
     print("  tuned backwards from $1.50 is not.")
+
+    print("\n[7] Projected monthly spend at a cycle volume (criterion c-3fd62b9d)\n")
+    tc = target_concurrency_status()
+    print(f"  Target-concurrency input: {'AVAILABLE' if tc['available'] else 'NOT AVAILABLE'}")
+    for line in textwrap.wrap(tc["reason"], width=96):
+        print(f"      {line}")
+    print("\n  Concurrency assumption: cycles run serially — the cadence spawner gates")
+    print("    on no-active-strategic (autonomous_research.py:1732-1733), so at most 1")
+    print("    concurrent strategic cycle per project at a time.")
+    print("\n  Cycle-volume anchors (cycles/month):")
+    print(f"    Measured realized volume : {measured_cycles_per_month():>8.1f}  "
+          f"({MEASURED_CYCLES_PER_7_DAYS} cycles / 7-day window, d-e860fe17 measured basis)")
+    print(f"    Cadence-backstop floor   : {cadence_cycles_per_month():>8.1f}  "
+          f"(strategic_max_interval_minutes={STRATEGIC_MAX_INTERVAL_MINUTES} default)")
+    print("\n  Monthly spend = per-cycle cost x cycles/month")
+    base_cost = project_cycle_cost(0.70, BASELINE_CACHE_READ_SHARE, 0.0)
+    target_cost = project_cycle_cost(0.85, 0.80, 0.0)
+    for label, cost in (
+        ("Honest base (R=0.70, share 0.55)", base_cost),
+        ("Direction-target (R=0.85, share 0.80)", target_cost),
+    ):
+        for vol_label, volume in (
+            ("measured volume", measured_cycles_per_month()),
+            ("cadence floor", cadence_cycles_per_month()),
+        ):
+            m = project_monthly_spend(cost, volume)
+            print(f"    {label}: ${cost:.2f}/cycle x {volume:>7.1f} ({vol_label}) "
+                  f"= ${m['monthly_spend_usd']:>8,.2f}/month")
+    print(f"\n  $3,000/month envelope vs honest base case (${base_cost:.2f}/cycle):")
+    print(f"    binds at {MONTHLY_ENVELOPE_USD / base_cost:,.0f} cycles/month "
+          f"= ~{MONTHLY_ENVELOPE_USD / base_cost / measured_cycles_per_month():.1f}x "
+          f"the measured volume. At today's cadence the decision loop is "
+          f"${project_monthly_spend(base_cost, measured_cycles_per_month())['monthly_spend_usd']:,.0f}/month "
+          f"-- the envelope is not the binding constraint; the loop could run "
+          f"~{(MONTHLY_ENVELOPE_USD / base_cost) / measured_cycles_per_month():.1f}x "
+          f"its current volume before it binds.")
+    print("\n  If no cycle volume were available at all (no measured data and no cadence")
+    print("  config), the projection would refuse to guess rather than fabricate a number:")
+    print(f"    {project_monthly_spend(base_cost, None)}")
 
 
 if __name__ == "__main__":

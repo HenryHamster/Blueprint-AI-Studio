@@ -10,6 +10,12 @@ It derives the projected median from stated inputs, cites each input to its sour
 prices the two caching regimes separately, states every assumption, shows sensitivity,
 and reports the number honestly: **the projected median is above $1.50.**
 
+The same script also projects **monthly spend at a cycle volume** (§7, criterion
+c-3fd62b9d): per-cycle cost × a cited cycle-volume anchor, showing the arithmetic so a
+reader can check it by hand. The honest base case at the measured realized volume lands
+at **~$735/month** — comfortably within the $3,000/month envelope, so the envelope is not
+the binding constraint at today's cadence.
+
 ---
 
 ## 1. Stated inputs (each cited)
@@ -170,6 +176,40 @@ so the target is on the edge of the model's optimistically-parameterized range �
 the mechanism analysis says the share lever is not available at the claimed size. The
 tier-mix lever (PR #16730) is the one reliable cost reduction, and its ceiling alone
 (R = 1) is $2.21/cycle.
+
+---
+
+## 7. Projected monthly spend at a cycle volume (criterion c-3fd62b9d)
+
+`monthly spend = per-cycle cost × cycles/month`. The cycle-volume anchors are read
+from existing configuration / measured data, each cited:
+
+| Anchor | Value | Source |
+|---|---|---|
+| Measured realized volume | **59 cycles / 7 days → ~256.6/month** | Direction d-e860fe17 measured basis ($276.87 total / $261.33 strategic across 59 cycles). Scaled by `DAYS_PER_MONTH / 7` with `DAYS_PER_MONTH = 30.44`. |
+| Cadence-backstop floor | **~30.4/month** | `strategic_max_interval_minutes = 1,440` default (`runtime_config_state.py:830`) — the wall-clock floor that forces a strategic spawn. A floor, not the realized volume. |
+| Target concurrency | **NOT AVAILABLE** | No `target_concurrency` configuration key exists for the strategic decision loop (searched `runtime_config_state.py` defaults and the `ReleaseVersion` model). The projection surfaces this rather than guessing a volume. |
+
+**Concurrency assumption:** cycles run serially — the cadence spawner gates on
+no-active-strategic (`autonomous_research.py:1732-1733`), so at most 1 concurrent
+strategic cycle per project at a time.
+
+```
+Honest base (R=0.70, share 0.55):  $2.87/cycle × 256.6 (measured) = $  735.45/month
+                                   $2.87/cycle ×  30.4 (floor)    = $   87.26/month
+Direction-target (R=0.85, share 0.80): $1.52/cycle × 256.6 = $389.71/month
+```
+
+**Envelope verdict:** the honest base case at the measured volume is **~$735/month** —
+comfortably within the $3,000/month envelope. The envelope binds at **~1,047
+cycles/month** at the honest base case, i.e. ~4.1× the measured volume. The envelope
+is therefore *not* the binding constraint on the decision loop at today's cadence; the
+loop could run ~4× its current volume before the $3,000 budget is reached. (This is
+honest measurement, not target-tuning — the per-cycle number that feeds it is still
+above the $1.50 headline.)
+
+If no cycle volume were available at all (no measured data and no cadence config), the
+script returns `available: False` and a reason instead of fabricating a number.
 
 A falsified target is a real, useful result; a number tuned backwards from $1.50 is
 not. The actionable levers that could actually reach $1.50: fewer/smaller turns
