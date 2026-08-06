@@ -56,15 +56,62 @@ def _limits_json_with_testing(
     )
 
 
+def _rules_json() -> str:
+    """A valid ``branch_literal_allowlist.json`` body.
+
+    Carries the same allowlist entries as the checked-in data file — the
+    evaluator reads this file AT THE CANDIDATE REF, so tests that rely on the
+    real allowlist (e.g. allowlisted entry suppression) get the real content.
+    """
+    return json.dumps(
+        {
+            "backend": {
+                "allowlisted_filenames": [
+                    "admin.py",
+                    "branch_literal_compliance.py",
+                    "payload_schemas.py",
+                ]
+            },
+            "agent": {
+                "allowlist": [
+                    {
+                        "path": "prompts/review-prompt.ts",
+                        "line": 336,
+                        "pattern": "fallback-main",
+                        "rationale": "defensive display default downstream of resolveBaseBranch",
+                    },
+                    {
+                        "path": "prompts/review-prompt.ts",
+                        "line": 121,
+                        "pattern": "fallback-main",
+                        "rationale": "local-variable defensive default",
+                    },
+                ]
+            },
+            "admin-ui": {"allowlist": []},
+        }
+    )
+
+
 def _fake_reader(file_bodies: dict[str, str | None]):
     """Build an async stand-in for ``github.get_file_text_at_ref``.
 
     ``file_bodies`` maps a repo-relative path to the text returned at the ref;
     a missing key (or an explicit ``None``) models a 404 / unreadable file.
+
+    The branch-literal allowlist is served from ``_rules_json()`` unless the
+    test supplies that path explicitly — the evaluator reads it AT THE REF, so
+    every evaluation needs a readable rules file. An explicit ``None`` for the
+    rules path still models an unreadable rules file.
     """
 
+    bodies = dict(file_bodies)
+    bodies.setdefault(
+        ci_compliance.BRANCH_LITERAL_ALLOWLIST_PATH, _rules_json()
+    )
+
     async def _reader(path, *, token, owner, repo, ref, project_id=None):
-        return file_bodies.get(path)
+        return bodies.get(path)
 
     return _reader
 
@@ -656,9 +703,15 @@ def test_ci_compliance_branch_literals_use_shared_scanner():
     """ci_compliance sources branch-literal patterns from branch_literal_compliance.
 
     Asserts that the local duplicate constant names no longer exist and that
-    ci_compliance imports pattern/allowlist objects from the shared module.
-    This is the acceptance gate for the dedup refactor — both production-code
-    and test changes must be present for this test to be meaningful.
+    ci_compliance imports the pattern/helper objects from the shared module.
+    The ALLOWLIST is deliberately NOT imported from the shared module's
+    in-process ``SURFACE_CONFIGS``: ci_compliance reads it AT THE CANDIDATE REF
+    from the checked-in ``branch_literal_allowlist.json`` (the provenance fix),
+    so the local duplicate names must be absent AND the allowlist path must be
+    the shared repo-relative constant.
+    This is the acceptance gate for the dedup + candidate-sourcing refactor —
+    both production-code and test changes must be present for this test to be
+    meaningful.
     """
     from app import branch_literal_compliance
 
@@ -681,7 +734,6 @@ def test_ci_compliance_branch_literals_use_shared_scanner():
 
     # ci_compliance must reference the shared module's objects by identity.
     assert ci_compliance.BACKEND_PATTERNS is branch_literal_compliance.BACKEND_PATTERNS
-    assert ci_compliance.SURFACE_CONFIGS is branch_literal_compliance.SURFACE_CONFIGS
     assert ci_compliance.AGENT_SOURCE_FILES is branch_literal_compliance.AGENT_SOURCE_FILES
     assert ci_compliance.CI_AGENT_FORBIDDEN_RE is branch_literal_compliance.CI_AGENT_FORBIDDEN_RE
     assert (
@@ -691,6 +743,17 @@ def test_ci_compliance_branch_literals_use_shared_scanner():
     assert (
         ci_compliance.strip_typescript_with_linenos
         is branch_literal_compliance.strip_typescript_with_linenos
+    )
+
+    # The allowlist is NOT a process-local import: it is read at the candidate
+    # ref from the same checked-in file the local invariant test scans against.
+    assert (
+        ci_compliance.BRANCH_LITERAL_ALLOWLIST_PATH
+        is branch_literal_compliance.BRANCH_LITERAL_ALLOWLIST_PATH
+    )
+    assert not hasattr(ci_compliance, "SURFACE_CONFIGS"), (
+        "ci_compliance must not hold a process-local SURFACE_CONFIGS allowlist; "
+        "it reads the branch-literal allowlist at the candidate ref"
     )
 
 
@@ -886,13 +949,21 @@ async def test_evaluator_scans_non_listed_agent_ts_file(mocker):
     assert agent_violations[0]["rel"] == "helpers/branch-utils.ts"
 
 
-async def _scan_agent_ts(mocker, agent_path: str, offending_ts: str):
-    """Run the evaluator over a single agent .ts file, returning agent violations."""
+async def _scan_agent_ts(
+    mocker, agent_path: str, offending_ts: str, rules_json: str | None = None
+):
+    """Run the evaluator over a single agent .ts file, returning agent violations.
+
+    ``rules_json`` optionally overrides the branch-literal allowlist served at
+    the ref; ``None`` uses the default (real) allowlist.
+    """
     bodies = {
         ci_compliance._MODULE_SIZE_LIMITS_PATH: _limits_json(),
         f"backend/app/{_CAPPED_REL}": "\n".join("x" for _ in range(_CAP - 50)),
         agent_path: offending_ts,
     }
+    if rules_json is not None:
+        bodies[ci_compliance.BRANCH_LITERAL_ALLOWLIST_PATH] = rules_json
     mocker.patch.object(
         ci_compliance.github, "get_file_text_at_ref", new=_fake_reader(bodies)
     )
@@ -983,46 +1054,48 @@ async def test_supplemental_pattern_respects_allowlist(mocker):
     """An allowlist entry for a supplemental pattern suppresses its violation.
 
     Mirrors the canonical AGENT_PATTERNS allowlist behaviour: a
-    path::line::pattern entry in SURFACE_CONFIGS['agent'].allowlist must
-    suppress a supplemental ('equality-loose-main') match too.
+    path::line::pattern entry in the branch_literal_allowlist.json served AT
+    THE CANDIDATE REF must suppress a supplemental ('equality-loose-main')
+    match too.
     """
-    import dataclasses
-
-    from app.branch_literal_compliance import (
-        SURFACE_CONFIGS,
-        BranchLiteralAllowEntry,
-    )
-
     offending_ts = (
         "function helper(branch: string) {\n"
         "  if (branch == 'main') { return true; }\n"
         "}\n"
     )
     agent_path = "agent/src/helpers/allowlisted.ts"
-    allow_entry = BranchLiteralAllowEntry(
-        path="helpers/allowlisted.ts",
-        line=2,
-        pattern="equality-loose-main",
-        rationale="test allowlist of supplemental pattern",
+    rules = {
+        "agent": {
+            "allowlist": [
+                {
+                    "path": "helpers/allowlisted.ts",
+                    "line": 2,
+                    "pattern": "equality-loose-main",
+                    "rationale": "test allowlist of supplemental pattern",
+                }
+            ]
+        }
+    }
+    agent_violations = await _scan_agent_ts(
+        mocker, agent_path, offending_ts, rules_json=json.dumps(rules)
     )
-    patched_agent = dataclasses.replace(
-        SURFACE_CONFIGS["agent"], allowlist=(allow_entry,)
-    )
-    mocker.patch.dict(
-        ci_compliance.SURFACE_CONFIGS, {"agent": patched_agent}, clear=False
-    )
-
-    agent_violations = await _scan_agent_ts(mocker, agent_path, offending_ts)
     assert agent_violations == []
 
 
 @pytest.mark.asyncio
 async def test_evaluator_allows_agent_allowlisted_entry(mocker):
-    """Violations at allowlisted path+line+pattern in SURFACE_CONFIGS are suppressed."""
+    """Violations at allowlisted path+line+pattern are suppressed.
+
+    The allowlist is read AT THE CANDIDATE REF from branch_literal_allowlist.json
+    (the ``_rules_json()`` default in ``_fake_reader``), so the first real
+    allowlist entry suppresses its violation without any SURFACE_CONFIGS patch.
+    """
     from app.branch_literal_compliance import SURFACE_CONFIGS
 
     agent_config = SURFACE_CONFIGS["agent"]
-    # Pick the first allowlist entry as the test target.
+    # Pick the first allowlist entry as the test target. SURFACE_CONFIGS and
+    # the at-ref rules file both derive from the same checked-in JSON, so the
+    # entry here is present in the default rules body.
     allow_entry = agent_config.allowlist[0]
     # Build a source with the flagged pattern on the exact allowlisted line.
     lines = [""] * allow_entry.line
@@ -1056,6 +1129,116 @@ async def test_evaluator_allows_agent_allowlisted_entry(mocker):
     assert agent_violations == [], (
         f"allowlisted entry at {allow_entry.path}:{allow_entry.line} must not trigger a violation"
     )
+
+
+@pytest.mark.asyncio
+async def test_candidate_ref_only_allowlist_entries_clear_the_gate(mocker):
+    """Files whose allowlist entries ship ONLY at the candidate ref pass.
+
+    Regression for the provenance deadlock: the branch-literal allowlist is
+    read AT THE CANDIDATE REF (``branch_literal_allowlist.json``), so a file
+    whose allowlist entry lands in the SAME commit as the file is evaluable by
+    the deployed gate. The in-process ``SURFACE_CONFIGS`` predecessor could not
+    see an entry that only exists at the candidate ref — a new file + its
+    allowlist entry in one commit could never clear the gate because the
+    deployed backend's allowlist did not know the rule, and the rule only
+    deployed AFTER the promotion the gate was blocking. That is the deadlock
+    this change removes.
+
+    Both halves are exercised: an agent per-line allowlist entry and a backend
+    allowlisted filename, each present ONLY in the candidate-ref rules body.
+    """
+    agent_ts = (
+        "function helper(opts) {\n"
+        "  const base = opts.base ?? 'main';\n"
+        "  return base;\n"
+        "}\n"
+    )
+    agent_path = "agent/src/handlers/new-feature.ts"
+    backend_py = (
+        "def resolve():\n"
+        "    branch = 'main'\n"
+        "    return branch\n"
+    )
+    backend_path = "backend/app/new_feature.py"
+    rules = {
+        "backend": {"allowlisted_filenames": ["new_feature.py"]},
+        "agent": {
+            "allowlist": [
+                {
+                    "path": "handlers/new-feature.ts",
+                    "line": 2,
+                    "pattern": "fallback-main",
+                    "rationale": "shipped in the same commit as the file",
+                }
+            ]
+        },
+    }
+    bodies = {
+        ci_compliance._MODULE_SIZE_LIMITS_PATH: _limits_json(),
+        ci_compliance.BRANCH_LITERAL_ALLOWLIST_PATH: json.dumps(rules),
+        f"backend/app/{_CAPPED_REL}": "\n".join("x" for _ in range(_CAP - 50)),
+        agent_path: agent_ts,
+        backend_path: backend_py,
+    }
+    mocker.patch.object(
+        ci_compliance.github, "get_file_text_at_ref", new=_fake_reader(bodies)
+    )
+    mocker.patch.object(
+        ci_compliance.github,
+        "list_repo_tree_paths_at_ref",
+        new=_fake_tree(
+            [
+                {"path": agent_path, "size": len(agent_ts)},
+                {"path": backend_path, "size": len(backend_py)},
+            ]
+        ),
+    )
+
+    result = await ci_compliance.evaluate_ci_compliance_at_ref(
+        token="t", owner="o", repo="r", ref=_HEAD_SHA, project_id="p"
+    )
+
+    assert result["compliant"] is True
+    assert result["branch_literal_violations"] == []
+    assert result["violations"] == []
+    assert result["rules_status"] == ci_compliance._RULES_STATUS_OK
+
+
+@pytest.mark.asyncio
+async def test_evaluator_fails_closed_on_unreadable_rules(mocker):
+    """An unreadable branch-literal rules file FAILS CLOSED.
+
+    Mirrors the size-limits convention (#16825): when the rules source cannot
+    be read at the ref, the branch-literal guardrail cannot know its allowlist,
+    so the verdict refuses (``compliant=False``) with a rules diagnostic —
+    never a fail-open scan against an in-process allowlist the deployed backend
+    may not know about.
+    """
+    bodies = {
+        ci_compliance._MODULE_SIZE_LIMITS_PATH: _limits_json(),
+        ci_compliance.BRANCH_LITERAL_ALLOWLIST_PATH: None,  # 404 at the ref
+        f"backend/app/{_CAPPED_REL}": "\n".join("x" for _ in range(_CAP - 50)),
+    }
+    mocker.patch.object(
+        ci_compliance.github, "get_file_text_at_ref", new=_fake_reader(bodies)
+    )
+    mocker.patch.object(
+        ci_compliance.github,
+        "list_repo_tree_paths_at_ref",
+        new=_fake_tree(_EMPTY_TREE),
+    )
+
+    result = await ci_compliance.evaluate_ci_compliance_at_ref(
+        token="t", owner="o", repo="r", ref=_HEAD_SHA, project_id="p"
+    )
+
+    assert result["compliant"] is False
+    assert result["rules_available"] is False
+    assert result["rules_status"] == ci_compliance._RULES_STATUS_UNREADABLE
+    assert result["rules_error"] is not None
+    # The size guardrail could not be evaluated either (same fail-closed path).
+    assert result["limits_available"] is True
 
 
 def test_in_flight_evals_dict_exists_and_is_mutable():

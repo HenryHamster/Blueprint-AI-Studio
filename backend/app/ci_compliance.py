@@ -21,22 +21,26 @@ content-injectable source of truth shared with the disk-mode CLI.
 Three public entry points:
 
   * :func:`evaluate_ci_compliance_at_ref` — the async evaluator. Reads the
-    limits file and repo tree at the ref, then checks (a) capped modules for
-    line-count breaches, (b) uncapped source files over the coverage threshold,
-    and (c) backend/agent source files for hardcoded branch-literal patterns.
-    Sections mirror CI: ``backend``, ``agent``, ``frontend``, and ``testing``
-    (``backend/testing/*.py`` per-file caps and the 1500-line uncapped
-    coverage guardrail). The branch-literal scan runs whenever the repo tree is
-    available — even when the limits file is unreadable — because CI's
+    limits file, the branch-literal rules file, and the repo tree at the ref,
+    then checks (a) capped modules for line-count breaches, (b) uncapped source
+    files over the coverage threshold, and (c) backend/agent source files for
+    hardcoded branch-literal patterns. Sections mirror CI: ``backend``,
+    ``agent``, ``frontend``, and ``testing`` (``backend/testing/*.py`` per-file
+    caps and the 1500-line uncapped coverage guardrail). The branch-literal
+    scan runs whenever the repo tree is available AND the rules file is
+    readable — even when the limits file is unreadable — because CI's
     branch-literal invariants run regardless of the limits file's readability.
-    Returns a JSON-serializable result. Fail-safe: a source file that 404s /
-    cannot be read at the ref is SKIPPED (treated as not-a-violation), never
-    crashing the evaluation. The size-limits FILE itself is the deliberate
-    exception: when it cannot be read or parsed, the verdict FAILS CLOSED
-    (``compliant=False`` with a diagnostic) — an unreadable limits config is
-    exactly the circumstance in which the gate is least entitled to pass, so the
-    evaluator refuses instead of skipping the size guardrails and reporting
-    success.
+    The branch-literal ALLOWLIST is read AT THE CANDIDATE REF (the same
+    checked-in file the local invariant test scans against), so a rule that
+    ships in the same commit as the file it describes is observable by this
+    gate. Returns a JSON-serializable result. Fail-safe: a source file that
+    404s / cannot be read at the ref is SKIPPED (treated as not-a-violation),
+    never crashing the evaluation. The size-limits FILE and the branch-literal
+    RULES file are the deliberate exceptions: when either cannot be read or
+    parsed, the verdict FAILS CLOSED (``compliant=False`` with a diagnostic) —
+    an unreadable config is exactly the circumstance in which the gate is least
+    entitled to pass, so the evaluator refuses instead of skipping those
+    guardrails and reporting success.
   * :func:`record_ci_compliance` — persist a result onto ``Project.ci_compliance``
     keyed by its commit SHA.
   * :func:`get_ci_compliance` — read the per-SHA status back.
@@ -54,9 +58,9 @@ from app.branch_literal_compliance import (
     AGENT_PATTERNS,
     AGENT_SOURCE_FILES,  # noqa: F401 — re-exported for module-level identity checks
     BACKEND_PATTERNS,
+    BRANCH_LITERAL_ALLOWLIST_PATH,
     CI_AGENT_FORBIDDEN_RE,  # noqa: F401 — re-exported for module-level identity checks
     CI_AGENT_PAREN_FALLBACK_RE,
-    SURFACE_CONFIGS,
     strip_typescript_with_linenos,
 )
 from app.json_extract import async_json_loads
@@ -213,6 +217,66 @@ async def _load_size_limits_at_ref(
             f"{_where} is a JSON {type(data).__name__}, not an object"
         )
     return data, _LIMITS_STATUS_OK, None
+
+
+# Status values returned by _load_branch_literal_rules_at_ref. Same contract as
+# the size-limits statuses above: ``ok`` means the file was read and parsed as
+# a JSON object (possibly ``{}``); ``unreadable`` and ``malformed`` are genuine
+# failures that FAIL CLOSED. The branch-literal allowlist is read AT THE
+# CANDIDATE REF precisely so a rule that ships in the same commit as the file
+# it describes is observable by the deployed gate — a process-local allowlist
+# cannot see it and deadlocks the gate (the provenance defect this reader
+# fixes).
+_RULES_STATUS_OK = "ok"
+_RULES_STATUS_UNREADABLE = "unreadable"
+_RULES_STATUS_MALFORMED = "malformed"
+
+
+async def _load_branch_literal_rules_at_ref(
+    *, token: str, owner: str, repo: str, ref: str, project_id: str | None
+) -> tuple[dict, str, str | None]:
+    """Read ``branch_literal_allowlist.json`` AT ``ref`` and parse it.
+
+    Mirrors :func:`_load_size_limits_at_ref` for the branch-literal allowlist:
+    returns ``(rules, status, error)`` where ``status`` is ``ok`` /
+    ``unreadable`` / ``malformed``. ``rules`` is the parsed JSON object on
+    ``ok`` (``{}`` for a legitimately-empty config) and ``{}`` otherwise.
+    ``error`` names the path and the failure when ``status != ok``.
+
+    The distinction between a legitimate empty config and a genuine failure is
+    deliberate: only the former may pass, so the caller can FAIL CLOSED on
+    unreadable/malformed rules instead of scanning with an in-process allowlist
+    the deployed backend may not know about.
+    """
+    text = await github.get_file_text_at_ref(
+        BRANCH_LITERAL_ALLOWLIST_PATH,
+        token=token,
+        owner=owner,
+        repo=repo,
+        ref=ref,
+        project_id=project_id,
+    )
+    _where = f"{BRANCH_LITERAL_ALLOWLIST_PATH} at {owner}/{repo}@{ref[:12]}"
+    if text is None:
+        return {}, _RULES_STATUS_UNREADABLE, (
+            f"could not read {_where} (404 / non-file / undecodable)"
+        )
+    if not text:
+        return {}, _RULES_STATUS_MALFORMED, (
+            f"{_where} is empty; expected a JSON object of allowlists"
+        )
+    try:
+        data = await async_json_loads(text)
+    except (ValueError, TypeError) as exc:
+        logger.warning("[CI-COMPLIANCE] could not parse %s: %s", _where, exc)
+        return {}, _RULES_STATUS_MALFORMED, (
+            f"{_where} is not valid JSON: {exc}"
+        )
+    if not isinstance(data, dict):
+        return {}, _RULES_STATUS_MALFORMED, (
+            f"{_where} is a JSON {type(data).__name__}, not an object"
+        )
+    return data, _RULES_STATUS_OK, None
 
 
 def _strip_agent_paren_fallbacks(line: str) -> str:
@@ -382,6 +446,7 @@ async def _scan_uncapped_files(
 
 async def _scan_branch_literals(
     *,
+    rules: dict,
     tree_paths: list[dict],
     token: str,
     owner: str,
@@ -390,6 +455,13 @@ async def _scan_branch_literals(
     project_id: str | None,
 ) -> list[dict]:
     """Scan backend and agent source files for hardcoded branch-literal patterns.
+
+    ``rules`` is the branch-literal allowlist read AT THE CANDIDATE REF (see
+    :func:`_load_branch_literal_rules_at_ref`): ``{"backend":
+    {"allowlisted_filenames": [...]}, "agent": {"allowlist": [{path, line,
+    pattern, rationale}, ...]}}``. Suppressions come from the candidate ref,
+    never from in-process config, so a file whose allowlist entry ships in the
+    same commit can clear the gate.
 
     Mirrors:
       * ``test_invariants.TestHardcodedBranchNames.test_no_hardcoded_main_branch_fallbacks``
@@ -401,7 +473,15 @@ async def _scan_branch_literals(
     Returns a list of ``{section, rel, line, text}`` violation dicts where
     ``line`` is the 1-based line number and ``text`` is the offending line.
     """
-    _backend_allow = SURFACE_CONFIGS["backend"].allowlisted_filenames
+    backend_cfg = rules.get("backend")
+    if not isinstance(backend_cfg, dict):
+        backend_cfg = {}
+    raw_allow = backend_cfg.get("allowlisted_filenames")
+    _backend_allow = (
+        frozenset(f for f in raw_allow if isinstance(f, str))
+        if isinstance(raw_allow, list)
+        else frozenset()
+    )
     _backend_patterns = [p.regex for p in BACKEND_PATTERNS]
 
     # --- Collect backend and agent paths to scan ---
@@ -416,18 +496,34 @@ async def _scan_branch_literals(
         if fname not in _backend_allow:
             backend_entries.append((path, rel))
 
-    agent_config = SURFACE_CONFIGS["agent"]
+    agent_cfg = rules.get("agent")
+    if not isinstance(agent_cfg, dict):
+        agent_cfg = {}
     agent_prefix = _SECTION_PREFIXES["agent"]
-    _agent_allowset = {
-        f"{entry.path}::{entry.line}::{entry.pattern}"
-        for entry in agent_config.allowlist
-    }
+    _agent_allowset: set[str] = set()
+    raw_agent_allow = agent_cfg.get("allowlist")
+    if isinstance(raw_agent_allow, list):
+        for item in raw_agent_allow:
+            if not isinstance(item, dict):
+                continue
+            a_path = item.get("path")
+            a_line = item.get("line")
+            a_pattern = item.get("pattern")
+            if (
+                isinstance(a_path, str)
+                and isinstance(a_line, int)
+                and isinstance(a_pattern, str)
+            ):
+                _agent_allowset.add(f"{a_path}::{a_line}::{a_pattern}")
+    # Scan exclusion suffixes mirror SURFACE_CONFIGS['agent'].exclude_suffixes
+    # (agent/src test/d.ts files are not production sources).
+    agent_exclude_suffixes = (".test.ts", ".d.ts")
     agent_entries: list[tuple[str, str]] = []  # (path, rel)
     for entry in tree_paths:
         path = entry["path"]
         if not path.startswith(agent_prefix) or not path.endswith(".ts"):
             continue
-        if any(path.endswith(suffix) for suffix in agent_config.exclude_suffixes):
+        if any(path.endswith(suffix) for suffix in agent_exclude_suffixes):
             continue
         agent_entries.append((path, path[len(agent_prefix):]))
 
@@ -546,24 +642,36 @@ async def evaluate_ci_compliance_at_ref(
             "limits_available": <bool>,                 # limits file readable?
             "limits_status": <"ok"|"unreadable"|"malformed">,
             "limits_error": <str|None>,                 # diagnostic when status != ok
+            "rules_available": <bool>,                  # branch-literal rules file readable?
+            "rules_status": <"ok"|"unreadable"|"malformed">,
+            "rules_error": <str|None>,                  # diagnostic when status != ok
             "tree_available": <bool>,                   # repo tree listing available?
         }
 
     Fail-safe throughout: a source file that 404s / cannot be read at the ref is
-    SKIPPED (counted as compliant), never raising. The size-limits FILE itself
-    is the deliberate exception — it FAILS CLOSED: when the limits config
-    cannot be read or parsed, ``compliant`` is False with a diagnostic
-    (``limits_status`` / ``limits_error``), because an unreadable config is
-    exactly when the gate is least entitled to pass. A legitimately-empty
-    config (a valid ``{}`` that declares no caps) still passes. The
-    branch-literal scan runs whenever the repo tree is available, even when the
-    limits file is unreadable — CI's branch-literal invariants do not depend on
-    it. An unavailable repo tree yields ``tree_available=False`` and skips
-    guardrails 2 and 3 (branch-literal, uncapped).
+    SKIPPED (counted as compliant), never raising. The size-limits FILE and the
+    branch-literal RULES file are the deliberate exceptions — they FAIL CLOSED:
+    when either config cannot be read or parsed, ``compliant`` is False with a
+    diagnostic (``limits_status`` / ``limits_error`` or ``rules_status`` /
+    ``rules_error``), because an unreadable config is exactly when the gate is
+    least entitled to pass. A legitimately-empty config (a valid ``{}`` that
+    declares no rules) still passes. The branch-literal scan runs whenever the
+    repo tree is available AND the rules file is readable — even when the
+    limits file is unreadable — because CI's branch-literal invariants do not
+    depend on it. An unavailable repo tree yields ``tree_available=False`` and
+    skips guardrails 2 and 3 (branch-literal, uncapped).
     """
-    # Fetch limits and repo tree in parallel — they are independent.
-    (limits, limits_status, limits_error), tree_paths_raw = await asyncio.gather(
+    # Fetch limits, branch-literal rules, and repo tree in parallel — they are
+    # independent.
+    (limits, limits_status, limits_error), (
+        rules,
+        rules_status,
+        rules_error,
+    ), tree_paths_raw = await asyncio.gather(
         _load_size_limits_at_ref(
+            token=token, owner=owner, repo=repo, ref=ref, project_id=project_id
+        ),
+        _load_branch_literal_rules_at_ref(
             token=token, owner=owner, repo=repo, ref=ref, project_id=project_id
         ),
         github.list_repo_tree_paths_at_ref(
@@ -574,18 +682,21 @@ async def evaluate_ci_compliance_at_ref(
     tree_available = tree_paths_raw is not None
     tree_paths: list[dict] = tree_paths_raw if tree_paths_raw is not None else []
 
-    # FAIL CLOSED on an unreadable/malformed limits config. The fail-open
-    # predecessor returned compliant=True here — the size guardrails silently
-    # skipped and the gate reported success, exactly the circumstance in which
-    # it is least entitled to pass. When the limits source cannot be read, the
-    # size guardrails cannot be verified, so the verdict refuses. The
-    # branch-literal scan is independent of the limits file (CI's branch-literal
-    # invariants run regardless of its readability), so its findings are
-    # surfaced too when the tree is available; the verdict stays non-compliant
-    # either way.
-    if limits_status != _LIMITS_STATUS_OK:
+    # FAIL CLOSED on an unreadable/malformed limits config OR branch-literal
+    # rules. The fail-open predecessor returned compliant=True here — the
+    # guardrails silently skipped and the gate reported success, exactly the
+    # circumstance in which it is least entitled to pass. When the limits
+    # source cannot be read, the size guardrails cannot be verified; when the
+    # rules source cannot be read, the branch-literal guardrail cannot know its
+    # allowlist — both refuse the verdict. The branch-literal scan is
+    # independent of the limits file (CI's branch-literal invariants run
+    # regardless of its readability), so its findings are surfaced too when the
+    # tree is available AND the rules are readable; the verdict stays
+    # non-compliant either way.
+    if limits_status != _LIMITS_STATUS_OK or rules_status != _RULES_STATUS_OK:
         branch_literal_violations = (
             await _scan_branch_literals(
+                rules=rules,
                 tree_paths=tree_paths,
                 token=token,
                 owner=owner,
@@ -593,7 +704,7 @@ async def evaluate_ci_compliance_at_ref(
                 ref=ref,
                 project_id=project_id,
             )
-            if tree_available
+            if tree_available and rules_status == _RULES_STATUS_OK
             else []
         )
         return {
@@ -602,9 +713,12 @@ async def evaluate_ci_compliance_at_ref(
             "violations": [],
             "branch_literal_violations": branch_literal_violations,
             "checked": 0,
-            "limits_available": False,
+            "limits_available": limits_status == _LIMITS_STATUS_OK,
             "limits_status": limits_status,
             "limits_error": limits_error,
+            "rules_available": rules_status == _RULES_STATUS_OK,
+            "rules_status": rules_status,
+            "rules_error": rules_error,
             "tree_available": tree_available,
         }
 
@@ -634,6 +748,7 @@ async def evaluate_ci_compliance_at_ref(
     )
     branch_task = (
         _scan_branch_literals(
+            rules=rules,
             tree_paths=tree_paths,
             token=token,
             owner=owner,
@@ -661,6 +776,9 @@ async def evaluate_ci_compliance_at_ref(
         "limits_available": True,
         "limits_status": _LIMITS_STATUS_OK,
         "limits_error": None,
+        "rules_available": True,
+        "rules_status": _RULES_STATUS_OK,
+        "rules_error": None,
         "tree_available": tree_available,
     }
 
@@ -721,6 +839,9 @@ def compact_ci_compliance(result: dict[str, Any] | None) -> dict[str, Any] | Non
         "limits_available": result.get("limits_available"),
         "limits_status": result.get("limits_status"),
         "limits_error": result.get("limits_error"),
+        "rules_available": result.get("rules_available"),
+        "rules_status": result.get("rules_status"),
+        "rules_error": result.get("rules_error"),
         "tree_available": result.get("tree_available"),
     }
 

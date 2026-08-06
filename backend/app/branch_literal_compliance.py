@@ -3,6 +3,17 @@
 The scanner is intentionally small and file-system based so test guards and
 CI-compliance reporting can share one set of branch-literal patterns without
 importing frontend or agent toolchains.
+
+The ALLOWLIST (the enumerated exceptions to the patterns) lives in a
+checked-in JSON data file (``backend/testing/branch_literal_allowlist.json``),
+NOT in this module. That is a deliberate provenance decision: the CI-compliance
+evaluator reads that same file AT THE CANDIDATE REF via GitHub, so a rule
+change made in the same commit as the file/entry it describes is observable by
+both the local invariant test and the remote gate at once. If the allowlist
+were hardcoded in the running process, the deployed backend could not know
+about an entry that ships with the file it describes, deadlocking the gate.
+This module only LOADS the file (for the local filesystem scanner); the
+at-ref reader lives in :mod:`app.ci_compliance`.
 """
 
 from __future__ import annotations
@@ -16,6 +27,108 @@ from pathlib import Path
 from typing import Iterable, Literal
 
 Surface = Literal["backend", "agent", "admin-ui"]
+
+# Repo-relative path of the checked-in branch-literal allowlist. The local
+# filesystem scanner reads this file from the checkout (see
+# ``_allowlist_file_path``) and the CI-compliance evaluator reads it AT THE
+# CANDIDATE REF via ``github.get_file_text_at_ref`` — the SAME file is the
+# single source of truth for both, so a rule change is one edit observed by
+# the local invariant tests and the remote gate together.
+BRANCH_LITERAL_ALLOWLIST_PATH = "backend/testing/branch_literal_allowlist.json"
+
+
+def _allowlist_file_path() -> Path:
+    """Resolve the checked-in allowlist file for this checkout.
+
+    The file sits at ``backend/testing/branch_literal_allowlist.json`` relative
+    to the repo root. Resolving from the module location (not the caller's
+    cwd) works both in a source checkout (``backend/app/..`` → repo root) and
+    in the backend Docker image, where the build context is ``backend/`` and
+    the file lands at ``/app/testing/...`` (module at ``/app/app/...``).
+    ``BLUEPRINT_BRANCH_LITERAL_ALLOWLIST_PATH`` overrides it for forks/tests.
+    """
+    override = os.getenv("BLUEPRINT_BRANCH_LITERAL_ALLOWLIST_PATH")
+    if override:
+        return Path(override)
+    return Path(__file__).resolve().parents[1] / "testing" / "branch_literal_allowlist.json"
+
+
+def _load_allowlist_json() -> dict:
+    """Read + parse the local allowlist data file, failing loudly on absence.
+
+    The file is checked in, so a missing or malformed file in a context where
+    this module is importable is a repo-integrity failure, not a case to scan
+    without the allowlist (that would be fail-open). Raising at import makes
+    the failure impossible to miss.
+    """
+    path = _allowlist_file_path()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(
+            f"branch-literal allowlist {path} could not be read: {exc}"
+        ) from exc
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"branch-literal allowlist {path} is not valid JSON: {exc}"
+        ) from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            f"branch-literal allowlist {path} is a JSON {type(data).__name__}, "
+            "not an object"
+        )
+    return data
+
+
+def _surface_allowlist_from_json(
+    surface: Surface, data: dict
+) -> dict[str, object]:
+    """Extract one surface's allowlist fields from the allowlist JSON.
+
+    Returns ``{"allowlist": tuple[...], "allowlisted_filenames": frozenset}``.
+    Unknown/invalid entries are skipped rather than raising, so a harmless
+    extra field does not make the whole file unusable; a structurally broken
+    section (non-object) simply yields an empty allowlist for that surface.
+    """
+    section = data.get(surface)
+    if not isinstance(section, dict):
+        return {"allowlist": (), "allowlisted_filenames": frozenset()}
+
+    allowlisted_filenames: frozenset[str] = frozenset()
+    raw_filenames = section.get("allowlisted_filenames")
+    if isinstance(raw_filenames, list):
+        allowlisted_filenames = frozenset(
+            f for f in raw_filenames if isinstance(f, str)
+        )
+
+    allowlist: tuple[BranchLiteralAllowEntry, ...] = ()
+    raw_allowlist = section.get("allowlist")
+    if isinstance(raw_allowlist, list):
+        entries: list[BranchLiteralAllowEntry] = []
+        for item in raw_allowlist:
+            if not isinstance(item, dict):
+                continue
+            path = item.get("path")
+            line = item.get("line")
+            pattern = item.get("pattern")
+            if not isinstance(path, str) or not isinstance(line, int) or not isinstance(pattern, str):
+                continue
+            entries.append(
+                BranchLiteralAllowEntry(
+                    path=path,
+                    line=line,
+                    pattern=pattern,
+                    rationale=str(item.get("rationale", "")),
+                )
+            )
+        allowlist = tuple(entries)
+
+    return {
+        "allowlist": allowlist,
+        "allowlisted_filenames": allowlisted_filenames,
+    }
 
 
 @dataclass(frozen=True)
@@ -141,6 +254,13 @@ ADMIN_UI_PATTERNS = (
     BranchLiteralPattern("fallback-blueprint", re.compile(r"(?:\|\||\?\?)\s*['\"]blueprint['\"]")),
 )
 
+# The allowlist fields (``allowlisted_filenames`` / ``allowlist``) come from
+# the checked-in data file at module load — the single source of truth shared
+# with the CI-compliance evaluator's at-ref reader. A missing/malformed file
+# raises here (see ``_load_allowlist_json``) rather than scanning without the
+# allowlist.
+_allow_data = _load_allowlist_json()
+
 SURFACE_CONFIGS: dict[Surface, BranchLiteralSurfaceConfig] = {
     "backend": BranchLiteralSurfaceConfig(
         surface="backend",
@@ -148,9 +268,9 @@ SURFACE_CONFIGS: dict[Surface, BranchLiteralSurfaceConfig] = {
         extensions=(".py",),
         exclude_suffixes=(),
         patterns=BACKEND_PATTERNS,
-        allowlisted_filenames=frozenset(
-            {"admin.py", "branch_literal_compliance.py", "payload_schemas.py"}
-        ),
+        allowlisted_filenames=_surface_allowlist_from_json("backend", _allow_data)[
+            "allowlisted_filenames"
+        ],
         comment_style="python",
     ),
     "agent": BranchLiteralSurfaceConfig(
@@ -159,26 +279,7 @@ SURFACE_CONFIGS: dict[Surface, BranchLiteralSurfaceConfig] = {
         extensions=(".ts",),
         exclude_suffixes=(".test.ts", ".d.ts"),
         patterns=AGENT_PATTERNS,
-        allowlist=(
-            BranchLiteralAllowEntry(
-                path="prompts/review-prompt.ts",
-                line=336,
-                pattern="fallback-main",
-                rationale=(
-                    "buildRollupReviewGuidance is downstream of resolveBaseBranch; the "
-                    "options.baseBranch fallback is a defensive display default."
-                ),
-            ),
-            BranchLiteralAllowEntry(
-                path="prompts/review-prompt.ts",
-                line=121,
-                pattern="fallback-main",
-                rationale=(
-                    "Local-variable defensive default downstream of resolveBaseBranch; "
-                    "live callers supply a resolved baseBranch."
-                ),
-            ),
-        ),
+        allowlist=_surface_allowlist_from_json("agent", _allow_data)["allowlist"],
     ),
     "admin-ui": BranchLiteralSurfaceConfig(
         surface="admin-ui",
@@ -186,26 +287,7 @@ SURFACE_CONFIGS: dict[Surface, BranchLiteralSurfaceConfig] = {
         extensions=(".ts", ".tsx"),
         exclude_suffixes=(".test.ts", ".test.tsx", ".spec.ts", ".spec.tsx", ".d.ts"),
         patterns=ADMIN_UI_PATTERNS,
-        allowlist=(
-            BranchLiteralAllowEntry(
-                path="components/NewTaskModal.tsx",
-                line=434,
-                pattern="fallback-main",
-                rationale=(
-                    "The resolved per-project integrationBranch is preferred; main is "
-                    "only shown as the input placeholder when unavailable."
-                ),
-            ),
-            BranchLiteralAllowEntry(
-                path="components/ProjectBuildConfigSection.tsx",
-                line=688,
-                pattern="fallback-blueprint",
-                rationale=(
-                    "Display-only example prefers the user-entered taskBranchNamespace; "
-                    "blueprint is shown only when that display value is empty."
-                ),
-            ),
-        ),
+        allowlist=_surface_allowlist_from_json("admin-ui", _allow_data)["allowlist"],
     ),
 }
 

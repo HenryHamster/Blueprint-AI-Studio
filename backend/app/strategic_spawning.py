@@ -4670,11 +4670,11 @@ def ci_compliance_qualify_gate(
     """Return whether current CI-compliance violations block qualification.
 
     Fail-closed on DEGRADED evidence: a record whose evaluation ran with an
-    unreadable limits file or an unavailable repo tree
-    (``limits_available`` / ``tree_available`` False) reports 'no violations
-    OBSERVED', not 'compliance verified', so it blocks. That keeps 'verified
-    clean' and 'could not be checked' from reaching the qualification decision
-    as the same verdict.
+    unreadable limits file, unreadable branch-literal rules, or an unavailable
+    repo tree (``limits_available`` / ``rules_available`` / ``tree_available``
+    False) reports 'no violations OBSERVED', not 'compliance verified', so it
+    blocks. That keeps 'verified clean' and 'could not be checked' from
+    reaching the qualification decision as the same verdict.
 
     Fail-OPEN on an EMPTY store: no record for the SHA means no evaluation has
     been stored yet, which is distinct from an evaluation that could not read
@@ -4712,12 +4712,15 @@ def ci_compliance_qualify_gate(
     )
     limits_available = record.get("limits_available")
     tree_available = record.get("tree_available")
-    if limits_available is False or tree_available is False:
-        # The evaluator could not fully verify compliance (limits file or repo
-        # tree unavailable), so a ``compliant: True`` here only means 'no
-        # violations OBSERVED', not 'compliance verified'. Block rather than
-        # passing on incomplete evidence. Any violations that WERE observed are
-        # still surfaced for the strategist.
+    rules_available = record.get("rules_available")
+    if limits_available is False or tree_available is False or rules_available is False:
+        # The evaluator could not fully verify compliance (limits file, repo
+        # tree, or branch-literal rules unavailable), so a ``compliant: True``
+        # here only means 'no violations OBSERVED', not 'compliance verified'.
+        # Block rather than passing on incomplete evidence. Any violations that
+        # WERE observed are still surfaced for the strategist. Records computed
+        # before the rules file existed simply lack ``rules_available`` (None),
+        # which is not a False — behavior for those is unchanged.
         return {
             "blocked": True,
             "head_sha": selected_sha,
@@ -4729,8 +4732,11 @@ def ci_compliance_qualify_gate(
             "compliant": record.get("compliant"),
             "limits_available": limits_available,
             "tree_available": tree_available,
+            "rules_available": rules_available,
             "limits_status": record.get("limits_status"),
             "limits_error": record.get("limits_error"),
+            "rules_status": record.get("rules_status"),
+            "rules_error": record.get("rules_error"),
         }
     blocked = record.get("compliant") is False and (
         bool(violations) or bool(branch_literal_violations)
@@ -4746,6 +4752,9 @@ def ci_compliance_qualify_gate(
         "limits_available": limits_available,
         "limits_status": record.get("limits_status"),
         "limits_error": record.get("limits_error"),
+        "rules_available": rules_available,
+        "rules_status": record.get("rules_status"),
+        "rules_error": record.get("rules_error"),
     }
 
 

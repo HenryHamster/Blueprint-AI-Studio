@@ -49,10 +49,24 @@ def _limits_json_with_testing() -> str:
     )
 
 
+def _rules_json() -> str:
+    """A valid branch_literal_allowlist.json body (the evaluator reads it at
+    the candidate ref; no branch-literal violations are exercised here)."""
+    return json.dumps(
+        {
+            "backend": {"allowlisted_filenames": []},
+            "agent": {"allowlist": []},
+            "admin-ui": {"allowlist": []},
+        }
+    )
+
+
 def _fake_reader(module_line_count: int):
     async def _reader(path, *, token, owner, repo, ref, project_id=None):
         if path == ci_compliance._MODULE_SIZE_LIMITS_PATH:
             return _limits_json()
+        if path == ci_compliance.BRANCH_LITERAL_ALLOWLIST_PATH:
+            return _rules_json()
         if path == f"backend/app/{_CAPPED_REL}":
             return "\n".join("x" for _ in range(module_line_count))
         return None
@@ -64,6 +78,8 @@ def _fake_reader_with_testing(module_line_count: int, testing_line_count: int):
     async def _reader(path, *, token, owner, repo, ref, project_id=None):
         if path == ci_compliance._MODULE_SIZE_LIMITS_PATH:
             return _limits_json_with_testing()
+        if path == ci_compliance.BRANCH_LITERAL_ALLOWLIST_PATH:
+            return _rules_json()
         if path == f"backend/app/{_CAPPED_REL}":
             return "\n".join("x" for _ in range(module_line_count))
         if path == f"backend/testing/{_TESTING_REL}":
@@ -436,6 +452,30 @@ async def test_gate_does_not_pass_on_unavailable_compliance_evidence(
     gate = ci_compliance_qualify_gate(project, _HEAD_SHA)
     assert gate["blocked"] is True
     assert gate["reason"] == "ci_compliance_evidence_unavailable"
+
+    # 3b. Record computed with unreadable branch-literal rules → blocked.
+    ci_compliance.record_ci_compliance(
+        project,
+        {
+            "ref": _HEAD_SHA,
+            "compliant": True,
+            "violations": [],
+            "branch_literal_violations": [],
+            "checked": 1,
+            "limits_available": True,
+            "tree_available": True,
+            "rules_available": False,
+            "rules_status": "unreadable",
+            "rules_error": "could not read branch_literal_allowlist.json",
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    gate = ci_compliance_qualify_gate(project, _HEAD_SHA)
+    assert gate["blocked"] is True
+    assert gate["reason"] == "ci_compliance_evidence_unavailable"
+    assert gate["rules_available"] is False
 
     # 4. Control: a fully-available clean record passes the gate.
     ci_compliance.record_ci_compliance(
