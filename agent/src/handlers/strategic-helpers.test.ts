@@ -72,7 +72,7 @@ describe('writeStrategicHelpers', () => {
       'RESIDENT_REPLY_KEY_PATH="${BLUEPRINT_RESIDENT_REPLY_KEY_PATH:-',
     );
     expect(script).toContain(
-      'RESIDENT_INCARNATION_JSON=$(printf \',\"resident_incarnation_id\":%s\'',
+      'RESIDENT_INCARNATION_JSON=$(printf \',"resident_incarnation_id":%s\'',
     );
   });
 
@@ -790,6 +790,163 @@ describe('writeStrategicHelpers', () => {
     expect(content).not.toContain('[ "$KIND" != "compute-job" ]');
     expect(buildFetchGuidance(STRATEGIC_FETCH_VERBS)).toContain('`./fetch compute-job <job_id>`');
     expect(buildFetchGuidance(STRATEGIC_FETCH_VERBS)).toContain('`./fetch compute-limits`');
+  });
+});
+
+// ── _validate_json python3 fallback (node-less VM survival) ─────────────────
+// The generated ./strategic CLI wedges a whole strategist cycle when node is
+// absent but python3 is present (observed live on the strategist VM). These
+// tests pin the fallback chain: python3 first, node second, and a distinct
+// honest error only when NEITHER runtime exists. Node's absence is simulated by
+// pointing NODE_BINARY at a nonexistent path — exactly the live condition.
+describe('_validate_json python3 fallback (node-less VM survival)', () => {
+  const ws = path.join(os.tmpdir(), 'test-validate-json-workspace');
+
+  beforeEach(() => {
+    if (!fs.existsSync(ws)) fs.mkdirSync(ws, { recursive: true });
+  });
+  afterEach(() => {
+    if (fs.existsSync(ws)) {
+      try { fs.rmSync(ws, { recursive: true }); } catch { /* ignore */ }
+    }
+  });
+
+  const bashPath = (value: string): string => value
+    .replace(/^([A-Za-z]):/, (_m, drive: string) => `/${drive.toLowerCase()}`)
+    .replace(/\\/g, '/');
+  const bashExecutable = process.platform === 'win32'
+    ? 'C:\\Program Files\\Git\\bin\\bash.exe'
+    : 'bash';
+  // Absolute bash path for the controlled-env harnesses: those run with a PATH
+  // that excludes python3/node, so the interpreter must not be resolved via PATH.
+  const bashAbsolute = process.platform === 'win32'
+    ? 'C:\\Program Files\\Git\\bin\\bash.exe'
+    : execFileSync('bash', ['-c', 'command -v bash'], { encoding: 'utf8' }).trim();
+  const executionPath = process.platform === 'win32'
+    ? `${bashPath(path.dirname(process.execPath))}:/usr/bin:/bin`
+    : process.env.PATH ?? '';
+  const NO_NODE = '/nonexistent/node';
+
+  function extractValidateJson(script: string): string {
+    const m = script.match(/_validate_json\(\) \{\n([\s\S]*?)\n\}/);
+    if (!m?.[1]) {
+      throw new Error('generated strategic script is missing the _validate_json function');
+    }
+    return m[1];
+  }
+
+  it('accepts valid JSON via python3 when node is absent (NODE_BINARY=nonexistent)', () => {
+    writeStrategicHelpers('task', 'project', ws);
+    const marker = path.join(ws, 'curl-body.txt');
+    const bashEnv = path.join(ws, 'bash-env-valid');
+    fs.writeFileSync(
+      bashEnv,
+      `curl() {\n  local body\n  body=$(cat)\n  printf '%s' "$body" > '${bashPath(marker)}'\n  printf '%s\\n200\\n' "$body"\n}\n`,
+    );
+    const payload = JSON.stringify({ problem_model: 'node-less-vm' });
+    execFileSync(
+      bashExecutable,
+      [bashPath(path.join(ws, 'strategic')), 'set-problem-model', '--json', payload],
+      {
+        cwd: ws,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ORCHESTRATOR_URL: 'https://orchestrator.invalid',
+          AGENT_API_TOKEN: 'test-token',
+          BASH_ENV: bashPath(bashEnv),
+          NODE_BINARY: NO_NODE,
+          PATH: executionPath,
+        },
+        stdio: 'pipe',
+      },
+    );
+    // The script exited 0 — the valid payload passed the python3 validator and
+    // was POSTed. Assert the request body reached the backend stub intact.
+    const sent = fs.readFileSync(marker, 'utf8');
+    expect(JSON.parse(sent)).toMatchObject({ op: 'set_problem_model' });
+    expect((JSON.parse(sent) as { data: { problem_model: string } }).data.problem_model).toBe('node-less-vm');
+  });
+
+  it('rejects malformed JSON with the existing message + exit 2 via python3 when node is absent', () => {
+    writeStrategicHelpers('task', 'project', ws);
+    const bashEnv = path.join(ws, 'bash-env-invalid');
+    fs.writeFileSync(
+      bashEnv,
+      `curl() {\n  local body\n  body=$(cat)\n  printf '%s\\n200\\n' "$body"\n}\n`,
+    );
+    let err: { status: number | null; stderr: string } | undefined;
+    try {
+      execFileSync(
+        bashExecutable,
+        [bashPath(path.join(ws, 'strategic')), 'set-problem-model', '--json', '{oops'],
+        {
+          cwd: ws,
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            ORCHESTRATOR_URL: 'https://orchestrator.invalid',
+            AGENT_API_TOKEN: 'test-token',
+            BASH_ENV: bashPath(bashEnv),
+            NODE_BINARY: NO_NODE,
+            PATH: executionPath,
+          },
+          stdio: 'pipe',
+        },
+      );
+    } catch (e) {
+      err = e as { status: number | null; stderr: string };
+    }
+    expect(err).toBeTruthy();
+    if (!err) throw new Error('expected execFileSync to fail on malformed JSON');
+    expect(err.status).toBe(2);
+    expect(err.stderr).toContain('[ERROR] set-problem-model requires valid JSON input');
+    expect(err.stderr).toContain("run 'strategic schema set-problem-model' for the accepted shape");
+  });
+
+  it('emits a distinct honest error when neither python3 nor node exists (extracted _validate_json)', () => {
+    writeStrategicHelpers('task', 'project', ws);
+    const script = fs.readFileSync(path.join(ws, 'strategic'), 'utf-8');
+    const body = extractValidateJson(script);
+    const harness = path.join(ws, 'validate-neither');
+    fs.writeFileSync(
+      harness,
+      `#!/bin/bash\nDATA='{"a":1}'\nOP=set-problem-model\nNODE_BIN="\${NODE_BINARY:-node}"\n_validate_json() {\n${body}\n}\n_validate_json\n`,
+    );
+    let err: { status: number | null; stderr: string } | undefined;
+    try {
+      execFileSync(bashAbsolute, [bashPath(harness)], {
+        encoding: 'utf8',
+        env: { ...process.env, NODE_BINARY: NO_NODE, PATH: '/nonexistent' },
+        stdio: 'pipe',
+      });
+    } catch (e) {
+      err = e as { status: number | null; stderr: string };
+    }
+    expect(err).toBeTruthy();
+    if (!err) throw new Error('expected execFileSync to fail when no runtime is available');
+    expect(err.status).toBe(2);
+    expect(err.stderr).toContain('no JSON validator available (python3/node missing)');
+    // It must NOT claim malformed JSON when the real cause is a missing runtime.
+    expect(err.stderr).not.toContain('requires valid JSON input');
+  });
+
+  it('falls back to node via stdin when python3 is absent but node is present (extracted _validate_json)', () => {
+    writeStrategicHelpers('task', 'project', ws);
+    const script = fs.readFileSync(path.join(ws, 'strategic'), 'utf-8');
+    const body = extractValidateJson(script);
+    const harness = path.join(ws, 'validate-node');
+    fs.writeFileSync(
+      harness,
+      `#!/bin/bash\nDATA='{"a":1}'\nOP=set-problem-model\nNODE_BIN="\${NODE_BINARY:-node}"\n_validate_json() {\n${body}\n}\n_validate_json\n`,
+    );
+    // PATH excludes python3; NODE_BINARY points at a real node binary.
+    const out = execFileSync(bashAbsolute, [bashPath(harness)], {
+      encoding: 'utf8',
+      env: { ...process.env, NODE_BINARY: bashPath(process.execPath), PATH: '/nonexistent' },
+      stdio: 'pipe',
+    });
+    expect(out).toBe('');
   });
 });
 

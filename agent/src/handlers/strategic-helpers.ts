@@ -61,7 +61,10 @@ function renderStrategicHelp(): string {
 
 function renderStrategicSchemaCase(): string {
   return cliOps().map(entry => {
-    const input = cliOpInput(entry.op)!;
+    const input = cliOpInput(entry.op);
+    if (!input) {
+      throw new Error(`No input contract for strategic op ${entry.op}`);
+    }
     const schema = JSON.stringify({
       operation: entry.alias,
       backend_op: entry.op,
@@ -159,10 +162,22 @@ NODE_BIN="\${NODE_BINARY:-node}"
 ${boundedRegularReadShellFn()}
 
 _validate_json() {
-  "$NODE_BIN" -e 'JSON.parse(process.argv[1])' "$DATA" >/dev/null 2>&1 || {
-    echo "[ERROR] $OP requires valid JSON input; run 'strategic schema $OP' for the accepted shape" >&2
-    exit 2
-  }
+  if command -v python3 >/dev/null 2>&1; then
+    printf '%s' "$DATA" | python3 -c 'import json,sys; json.load(sys.stdin)' >/dev/null 2>&1 || {
+      echo "[ERROR] $OP requires valid JSON input; run 'strategic schema $OP' for the accepted shape" >&2
+      exit 2
+    }
+    return 0
+  fi
+  if command -v "$NODE_BIN" >/dev/null 2>&1; then
+    printf '%s' "$DATA" | "$NODE_BIN" -e 'const fs=require("fs"); JSON.parse(fs.readFileSync(0,"utf8"));' >/dev/null 2>&1 || {
+      echo "[ERROR] $OP requires valid JSON input; run 'strategic schema $OP' for the accepted shape" >&2
+      exit 2
+    }
+    return 0
+  fi
+  echo "[ERROR] no JSON validator available (python3/node missing)" >&2
+  exit 2
 }
 
 _read_json_input() {
