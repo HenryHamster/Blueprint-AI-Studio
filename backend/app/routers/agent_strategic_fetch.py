@@ -2490,6 +2490,10 @@ SECTION_FETCH_INVENTORY: dict[str, str | None] = {
     "operator_context_refs": None, "cycle_start_reconciliation": None,
     "model_health": None, "prune_candidates": None, "playbook_keys_index": None,
     "staged_directions": None, "retirement_deferrals": None,
+    # Forced saturation dispositions — derived from project.directions at
+    # build time (build_saturation_dispositions), bounded; the underlying
+    # directions are recoverable via the "direction" verb.
+    "saturation_dispositions": None,
     # Direction/criterion-rejection tails — bounded at build time to ≤20/≤5
     # records and carried verbatim in the strategic payload; no recovery path.
     # Forced saturation dispositions — derived from the project at payload build

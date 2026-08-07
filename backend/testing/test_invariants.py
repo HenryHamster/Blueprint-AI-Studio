@@ -12900,11 +12900,11 @@ class TestProblemModelWritePathInvariants:
         # direction_lifecycle.py: reconcile_gap_staffing_raw_result (parses through ProblemModel)
         ("direction_lifecycle.py", 872): "reconcile_gap_staffing_raw_result calls parse_problem_model internally",
         # strategic_completion.py: apply_agent_update (write-back)
-        ("strategic_completion.py", 5068): "apply_agent_update inline-sanitizes both current and proposed",
+        ("strategic_completion.py", 5084): "apply_agent_update inline-sanitizes both current and proposed",
         # strategic_completion.py: apply_agent_update (re-normalized)
-        ("strategic_completion.py", 5105): "apply_agent_update result, then _normalize_active_moves_writeback",
+        ("strategic_completion.py", 5121): "apply_agent_update result, then _normalize_active_moves_writeback",
         # strategic_completion.py: parse_problem_model -> model_dump (fallback gap reconciliation)
-        ("strategic_completion.py", 6788): "parse_problem_model(…) validated pydantic model_dump",
+        ("strategic_completion.py", 6804): "parse_problem_model(…) validated pydantic model_dump",
         # reaper_sweeps.py: parse_problem_model -> model_dump (moot-confirmation sweep)
         ("reaper_sweeps.py", 1253): "parse_problem_model(…) validated pydantic model_dump",
         # reaper_sweeps.py: parse_problem_model -> model_dump (stale-decay sweep)
@@ -12924,13 +12924,13 @@ class TestProblemModelWritePathInvariants:
         ("routers/admin_agent_ops.py", 2818): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
         ("routers/admin_agent_ops.py", 3073): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
         # admin_agent_ops.py: apply_agent_update (op endpoint write-back)
-        ("routers/admin_agent_ops.py", 4672): "apply_agent_update result",
+        ("routers/admin_agent_ops.py", 4699): "apply_agent_update result",
         # admin_agent_ops.py: apply_agent_update (re-normalized after write-back)
-        ("routers/admin_agent_ops.py", 4700): "apply_agent_update result, then _normalize_active_moves_writeback",
+        ("routers/admin_agent_ops.py", 4727): "apply_agent_update result, then _normalize_active_moves_writeback",
         # admin_agent_ops.py: current_model.model_dump() (pending_confirm op)
-        ("routers/admin_agent_ops.py", 5231): "validated current_model pydantic model_dump",
+        ("routers/admin_agent_ops.py", 5258): "validated current_model pydantic model_dump",
         # admin_agent_ops.py: current_model.model_dump() (resolve_pending_confirm op)
-        ("routers/admin_agent_ops.py", 5313): "validated current_model pydantic model_dump",
+        ("routers/admin_agent_ops.py", 5340): "validated current_model pydantic model_dump",
     }
 
     def test_all_problem_model_write_paths_are_sanitized(self):
