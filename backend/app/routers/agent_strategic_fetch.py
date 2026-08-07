@@ -2452,7 +2452,7 @@ SECTION_FETCH_INVENTORY: dict[str, str | None] = {
     # Critical identity/routing — always ships, never dropped
     "type": None, "research_mode": None, "project_name": None, "base_branch": None,
     "is_self_repo": None, "enable_self_improvement": None, "model": None, "effort": None,
-    "vision": None, "effective_purpose": None, "direction_counts": None,
+    "effective_purpose": None, "direction_counts": None,
     "max_active_directions": None,
     "open_message_count": None,
     # Server-owned Fast activation contract — task payload configuration with

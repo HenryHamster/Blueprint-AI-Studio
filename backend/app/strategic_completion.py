@@ -4381,7 +4381,23 @@ async def _handle_strategic_completion(
 
     # Check if the agent used the new incremental API during execution
     task_payload = task.first_payload
+    # The legacy vision body is no longer shipped in the strategic payload, so
+    # the spawn-time vision baseline can no longer be read from
+    # task.first_payload["vision"]. Resolve it from the cycle's durable
+    # baseline_vision snapshot instead (equivalent: the payload used to carry
+    # _agent_visible_vision(project.vision), whose revision equals the snapshot
+    # taken at spawn). Legacy tasks that still carry the payload key keep the
+    # old read; tasks with no cycle row fall back to revision 0.
     spawned_vision_rev = (task_payload.get("vision") or {}).get("revision", 0)
+    _baseline_cycle_id = task.strategic_cycle_id or (task.context or {}).get(
+        "strategic_cycle_id"
+    )
+    if _baseline_cycle_id:
+        _baseline_cycle = await strategic_cycle.get(session, _baseline_cycle_id)
+        if _baseline_cycle is not None:
+            _baseline_vision_snap = strategic_cycle.baseline_vision(_baseline_cycle)
+            if _baseline_vision_snap:
+                spawned_vision_rev = _baseline_vision_snap.get("revision", 0)
     tasks_spawned = (task.context or {}).get("_strategic_tasks_spawned", 0)
     adoption_declared = int((task.context or {}).get("_strategic_adoption_declared", 0))
     api_was_used = (

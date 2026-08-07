@@ -175,7 +175,6 @@ from app.strategic_local_runner import (  # noqa: F401 — re-exported for calle
     _RUNNER_LIVENESS_SECONDS,
     _load_baked_image_ref,
     _load_local_runner_status,
-    _agent_visible_vision,
     _local_runner_handles_task_type,
     _local_runner_is_live,
     _local_runner_agent_available,
@@ -2214,8 +2213,10 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # depth even when ``open_messages`` itself is trimmed/dropped under byte budget.
     "open_message_count": {"priority": "critical"},
     "prompt_suffix": {"priority": "high", "exempt": True},
-    # Vision + intent — small but load-bearing for every decision
-    "vision": {"priority": "critical"},
+    # Effective purpose — the single live intent field shipped to the agent
+    # (the legacy vision body is no longer shipped: at critical priority it
+    # measured ~37 KB and evicted lower-tier sections; problem_model carries
+    # the durable intent).
     "effective_purpose": {"priority": "critical"},
     # User-facing state the agent must respond to. Core section: the open-message
     # inbox has BOTH a summarize fallback AND a floor callback, so at least its
@@ -2514,7 +2515,6 @@ _DESIGN_DOC_UPDATE_SCHEMA: dict[str, dict] = {
     "base_branch": {"priority": "critical"},
     "model": {"priority": "critical"},
     "effort": {"priority": "critical"},
-    "vision": {"priority": "critical"},
     "effective_purpose": {"priority": "critical"},
     # Trim-proof authoritative count of unresolved open operator messages — see
     # _STRATEGIC_REVIEW_SCHEMA["open_message_count"]. Critical tier so the agent
@@ -4314,7 +4314,6 @@ async def _spawn_design_doc_update(
                 session, project.id, "proposed_changes"
             ) or (project.design_doc or {}).get("proposed_changes", []),
             "project_name": project.name,
-            "vision": _agent_visible_vision(project.vision),
             "effective_purpose": resolve_project_purpose(project),
             **(
                 {"missing_capability_demand": _missing_demand}
@@ -5999,7 +5998,7 @@ async def _spawn_strategic_review(
                     "project_name": _project_name,
                     "base_branch": get_project_integration_branch(project),
                     # Cheap in-memory ORM scalars (no I/O).
-                    "vision": _agent_visible_vision(project.vision),
+                    "effective_purpose": resolve_project_purpose(project),
                     "problem_model": _agent_view_problem_model(project.problem_model),
                     "running_update": project.running_update or "",
                     # Pure-computation direction grounding (no I/O).
@@ -8049,7 +8048,6 @@ async def _spawn_strategic_review(
                     _agent_view_design_doc(project.design_doc), **verification_kwargs
                 )
             ),
-            "vision": _agent_visible_vision(project.vision),
             "effective_purpose": resolve_project_purpose(project),
             "problem_model": _verified_problem_model,
             **(
