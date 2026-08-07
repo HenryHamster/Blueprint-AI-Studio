@@ -1140,6 +1140,12 @@ async def get_strategic_debug(
         arch_frequency > 0 and next_cycle_number % arch_frequency == 0
     )
 
+    # No-delta skips — cycles short-circuited by the pre-context gate
+    # (strategic_cycle_gating.py). Surfaced so skipped cycles are visible and
+    # countable rather than reading as the strategist silently stopping.
+    strategic_no_delta_skip_count = vision.get("_strategic_no_delta_skip_count", 0) or 0
+    strategic_no_delta_skips = vision.get("_strategic_no_delta_skips") or []
+
     # Strategic failure state (auto-decays after 48h)
     strategic_failures = vision.get("_strategic_failures", 0) or 0
     failures_at_iso = vision.get("_strategic_failures_at")
@@ -1269,6 +1275,8 @@ async def get_strategic_debug(
         "strategic_failures": strategic_failures,
         "strategic_failures_at": failures_at_iso,
         "strategic_failures_decay_at": failures_decay_at_iso,
+        "strategic_no_delta_skip_count": strategic_no_delta_skip_count,
+        "strategic_no_delta_skips": strategic_no_delta_skips,
         "architecture": architecture_info,
         "active_task": {
             "id": str(active_strategic_task.id),

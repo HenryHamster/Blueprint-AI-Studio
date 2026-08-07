@@ -1853,6 +1853,51 @@ async def _spawn_research_task_inner(
                     is_strategic = False
 
     if is_strategic:
+        # No-delta gate: before assembling the full strategic context (the
+        # expensive ~137KB payload re-sent across ~17 turns), check whether
+        # anything durable changed since the last completed cycle. A genuinely
+        # quiet project skips the cycle entirely — recorded on vision (bounded
+        # skip log + counter) and NEVER advancing the watermark, which stays
+        # derived from the StrategicCycle table so a delta arriving mid-check
+        # is caught on the next tick. The gate is conservative: any ambiguous
+        # signal, or any must-run condition (bootstrap / pending refresh /
+        # open operator message / no purpose / no active directions /
+        # saturation / prior-cycle failure), RUNS the cycle.
+        from app.strategic_cycle_gating import (
+            record_no_delta_skip,
+            should_skip_strategic_cycle,
+        )
+
+        gate_decision = await should_skip_strategic_cycle(session, project)
+        if gate_decision.skip:
+            logger.info(
+                "[STRATEGIC] no-delta gate: skipping strategic cycle for project %s "
+                "(watermark=%s, signals=%s) — nothing meaningful changed since the "
+                "last cycle",
+                project.id,
+                gate_decision.watermark,
+                gate_decision.signals.as_dict(),
+            )
+            await record_no_delta_skip(
+                session,
+                project.id,
+                gate_decision,
+                expected_legacy_generation=legacy_generation,
+            )
+            # The vision write committed and expired `project`; re-load so the
+            # fall-through tactical path reads fresh state.
+            await session.refresh(project)
+            is_strategic = False
+        else:
+            logger.debug(
+                "[STRATEGIC] no-delta gate: running cycle for project %s "
+                "(must_run=%s, signals=%s)",
+                project.id,
+                gate_decision.must_run_reasons,
+                gate_decision.signals.as_dict(),
+            )
+
+    if is_strategic:
         # Determine if this strategic cycle should also include architecture review.
         # Architecture stabilizes faster than strategy, so it runs less frequently.
         # Additionally, if the design_doc is empty (no architecture content), force
