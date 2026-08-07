@@ -165,6 +165,54 @@ def test_chronic_empty_history_not_chronic():
 
 
 # ---------------------------------------------------------------------------
+# is_breach — the guardrail's fundamental predicate (single source of truth)
+# ---------------------------------------------------------------------------
+
+
+def test_is_breach_true_when_count_exceeds_cap():
+    assert slp.is_breach(1200, 1180)
+    assert slp.is_breach(1193, 1180)
+
+
+def test_is_breach_false_when_within_or_at_cap():
+    assert not slp.is_breach(1180, 1180)
+    assert not slp.is_breach(1000, 1180)
+
+
+def test_is_breach_missing_file_never_breaches():
+    """A file absent at the ref (count is None) cannot have grown past its cap."""
+    assert not slp.is_breach(None, 1180)
+
+
+def test_is_breach_missing_cap_never_breaches():
+    """An uncapped file (cap is None) has no limit to breach."""
+    assert not slp.is_breach(1200, None)
+
+
+def test_is_breach_missing_both_never_breaches():
+    assert not slp.is_breach(None, None)
+
+
+def test_classify_size_record_delegates_breach_to_policy():
+    """check_size_limits.classify_size_record must use the production predicate.
+
+    Guards the single-source-of-truth contract: the standalone checker and the
+    CI-compliance evaluator must classify a breach via
+    ``app.size_limit_policy.is_breach`` rather than re-deriving the comparison
+    inline, so a drift between the two is impossible.
+    """
+    from testing.check_size_limits import classify_size_record
+
+    assert classify_size_record("m.py", 1200, 1180, "backend", with_verdict=False)["breach"]
+    assert not classify_size_record(
+        "m.py", 1180, 1180, "backend", with_verdict=False
+    )["breach"]
+    assert not classify_size_record(
+        "m.py", None, 1180, "backend", with_verdict=False
+    )["breach"]
+
+
+# ---------------------------------------------------------------------------
 # _parse_git_diff_output — unit tests (fixture diff text)
 # ---------------------------------------------------------------------------
 

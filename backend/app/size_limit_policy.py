@@ -40,6 +40,20 @@ def bump_size_limit(current_size: int) -> int:
     return ((raw + 49) // 50) * 50
 
 
+def is_breach(count: int | None, cap: int | None) -> bool:
+    """True when ``count`` breaches ``cap`` — the guardrail's fundamental predicate.
+
+    A record is in breach only when BOTH ``count`` and ``cap`` are present AND
+    ``count > cap``. A file absent at the ref (``count is None``) is never a
+    breach — a missing file cannot have grown past its cap. Centralized here in
+    the policy module (the documented single source of truth for the size
+    guardrail) so the standalone checker, the CI-compliance evaluator, and any
+    server-side classification agree on the comparison byte-for-byte instead of
+    re-deriving it inline.
+    """
+    return count is not None and cap is not None and count > cap
+
+
 # ---------------------------------------------------------------------------
 # Chronic-offender governance
 # ---------------------------------------------------------------------------
