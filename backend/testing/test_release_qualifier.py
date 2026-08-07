@@ -2249,3 +2249,87 @@ def test_release_qualifier_module_size_cap_is_governing():
         f"release_qualifier.py cap {cap} is {headroom} lines above the module's "
         f"{count} lines — the cap has drifted into dead headroom and cannot govern"
     )
+
+
+@pytest.mark.asyncio
+async def test_goal_category_grading_uses_full_version_delta_while_audit_stays_incremental(
+    db_session, mocker
+):
+    """The audit child grades goal alignment / acceptance categories over the FULL
+    version delta even when its code-quality review is scoped to an incremental
+    prior-audit base.
+
+    Regression for the requalification ratchet: ``_incremental_audit_base_sha``
+    narrows the release_audit child's reviewed range to the prior clean audit's
+    candidate.  That narrowing is correct for code-quality findings (unchanged
+    paths carry forward from the prior audit fact) but WRONG for goal alignment
+    and acceptance categories, which have NO carry-forward and must grade the
+    whole version the promotion PR would carry (``main...candidate``).  The
+    spawned payload must therefore carry BOTH the incremental ``audit_base_sha``
+    (code-quality stays incremental) AND a ``goal_category_diff_range`` pinned
+    to the full version delta (goal/category grading spans it)."""
+    from app import shared_state
+
+    shared_state.runtime_config["smoketest_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.goal = "STABILIZE — reduce pipeline friction"
+
+    # A prior clean-audited not_promoted verdict at an OLDER candidate.  The
+    # dimension ledger is empty for the new candidate, so
+    # ``_incremental_audit_base_sha`` derives the delta base from
+    # ``last_qualification`` (conclusive status + numeric audit sub-score + zero
+    # findings ⇒ the prior candidate is an eligible incremental baseline).
+    prior_candidate = "1111aaaa" * 5
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": prior_candidate,
+        "sub_scores": {"audit": 0.9},
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    candidate = "bbbb2222" * 5  # 40-char placeholder SHA
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch("app.github.get_branch_sha", new=AsyncMock(return_value=candidate))
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"status": "completed", "conclusion": "success"}),
+    )
+    mocker.patch(
+        "app.release_qualifier.resolve_project_promotion_enabled",
+        return_value=True,
+    )
+
+    result = await rq.run_qualification(
+        db_session, project.id, version, explicit_request=True
+    )
+    await db_session.commit()
+
+    assert result["status"] == "spawned"
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    audit_tasks = [
+        t for t in tasks if (t.first_payload or {}).get("type") == "release_audit"
+    ]
+    assert len(audit_tasks) == 1, (
+        f"expected 1 release_audit task, got {len(audit_tasks)}"
+    )
+    payload = audit_tasks[0].first_payload
+    # The code-quality review stays incremental — scoped to the prior clean
+    # audit's candidate.  The backend's scoped-findings carry-forward merge keys
+    # off this base, so it must survive alongside the full-range goal grading.
+    assert payload.get("audit_base_sha") == prior_candidate
+    # The goal/category grading range spans the FULL version delta — the same
+    # range the promotion PR would carry — independent of the incremental base.
+    full_range = f"main...{candidate}"
+    assert payload.get("diff_range") == full_range
+    assert payload.get("goal_category_diff_range") == full_range

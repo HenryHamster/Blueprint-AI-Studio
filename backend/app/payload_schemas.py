@@ -855,6 +855,15 @@ class SelfAuditPayload(_SystemPopulated):
 class ReleaseAuditPayload(_SystemPopulated):
     diff_range: str | None = None
     prompt: str | None = None
+    # The FULL version delta (base_branch...candidate_sha), pinned separately
+    # from ``diff_range`` so the audit agent can narrow ``diff_range`` to an
+    # incremental ``audit_base_sha..candidate`` window for code-quality findings
+    # while still grading goal alignment and acceptance categories over the full
+    # version delta the promotion PR would carry.  Goal/category verdicts have no
+    # scoped carry-forward, so they must never be graded against a shrinking
+    # incremental window.  Absent on older payloads; the agent falls back to the
+    # full range derived from ``base_branch`` + ``candidate_sha``.
+    goal_category_diff_range: str | None = None
 
 
 class ReleaseAuditChallengePayload(_SystemPopulated):

@@ -629,6 +629,17 @@ export async function handleReleaseAudit(
     && /^[0-9a-f]{40}$/i.test(payload.audit_base_sha.trim())
     ? payload.audit_base_sha.trim()
     : null;
+  // The FULL version delta for goal-alignment and acceptance-category grading.
+  // The backend pins it explicitly (payload.goal_category_diff_range) so it
+  // survives the incremental narrowing of `diffRange` below; absent on older
+  // payloads we fall back to the full base_branch...candidate range.  Goal and
+  // category verdicts have NO scoped carry-forward (unlike code-quality
+  // findings, which merge unchanged paths from the prior audit fact), so they
+  // must always span the full version delta the promotion PR would carry.
+  const goalCategoryDiffRange = typeof payload.goal_category_diff_range === 'string'
+    && payload.goal_category_diff_range.trim().length > 0
+    ? payload.goal_category_diff_range.trim()
+    : fullDiffRange;
   let auditScopeMode: 'full' | 'incremental' = 'full';
   let auditScopeFallbackReason: string | null = requestedAuditBaseSha
     ? 'incremental_base_not_verified'
@@ -893,10 +904,10 @@ export async function handleReleaseAudit(
       ))
     : [];
   const categoryContractSection = categories.length > 0
-    ? `\nAssess each acceptance category below against the same pinned candidate diff. Emit one \`category_verdicts\` entry for every supplied key, with \`status\` (\`met\` | \`partial\` | \`not_met\`), a concrete \`gap\` (null when met), and diff-grounded \`citations\` (file paths or commit/PR references). Also emit \`residual_uncaptured_gap\` for any important goal gap not represented by a category, else null.\n\nAcceptance categories:\n${categories.map((row) => `- ${row.category_key}: ${row.text}`).join('\n')}\n`
+    ? `\nAssess each acceptance category below against the FULL version delta (\`git diff ${goalCategoryDiffRange}\`), NOT the narrowed code-quality range — every supplied criterion grades the whole version the promotion PR would carry. Emit one \`category_verdicts\` entry for every supplied key, with \`status\` (\`met\` | \`partial\` | \`not_met\`), a concrete \`gap\` (null when met), and diff-grounded \`citations\` (file paths or commit/PR references). Also emit \`residual_uncaptured_gap\` for any important goal gap not represented by a category, else null.\n\nAcceptance categories:\n${categories.map((row) => `- ${row.category_key}: ${row.text}`).join('\n')}\n`
     : '';
   const versionGoalSection = versionGoal
-    ? `\n## Version Goal\n\n${versionGoal}\n\nIn addition to the standard quality checks below, assess whether this diff plausibly delivers the version's strategic goal stated above. Emit \`covers_goal\` (boolean), \`coverage_score\` (float 0.0–1.0), \`biggest_gap\` (string or null), and \`goal_alignment\` with \`state\` (\`aligned\` | \`shortfall\` | \`not_applicable\`), \`assessed_grade\`, \`biggest_gap\`, and a diff-grounded \`reasoning_summary\`. These fields are additional to \`audit_score\`, \`test_erosion\`, and \`findings\`.\n${categoryContractSection}\n`
+    ? `\n## Version Goal\n\n${versionGoal}\n\nIn addition to the standard quality checks below (which review the code-quality range \`${diffRange}\`), assess whether the FULL version delta (\`git diff ${goalCategoryDiffRange}\` / \`git log ${goalCategoryDiffRange} --oneline\`) plausibly delivers the version's strategic goal stated above — do NOT limit the goal verdict to the narrowed code-quality range. Emit \`covers_goal\` (boolean), \`coverage_score\` (float 0.0–1.0), \`biggest_gap\` (string or null), and \`goal_alignment\` with \`state\` (\`aligned\` | \`shortfall\` | \`not_applicable\`), \`assessed_grade\`, \`biggest_gap\`, and a diff-grounded \`reasoning_summary\`. These fields are additional to \`audit_score\`, \`test_erosion\`, and \`findings\`.\n${categoryContractSection}\n`
     : '';
 
   const buildConfig = resolveBuildConfig(task);
@@ -1061,6 +1072,7 @@ Rules:
         effective_base_sha: auditScopeMode === 'incremental' ? requestedAuditBaseSha : null,
         candidate_sha: candidateSha,
         diff_range: diffRange,
+        goal_category_diff_range: goalCategoryDiffRange,
         changed_paths: auditedChangedPaths,
         fallback_reason: auditScopeFallbackReason,
       },
