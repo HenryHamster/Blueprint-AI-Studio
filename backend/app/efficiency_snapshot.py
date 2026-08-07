@@ -323,6 +323,18 @@ LAST_ALERTED_SELF_REPAIR_BURN_SHARE_KEY = "last_alerted_self_repair_burn_share"
 # decision-boundary crossing rather than every hourly tick.
 LAST_ALERTED_ROUTING_KEY = "last_alerted_routing_verdict"
 
+# Event type for the overdue daily-snapshot-cadence operator alert (registered
+# in alert_policy.ALERT_EVENT_POLICIES with an operator-fyi audience so the
+# ``should_emit_project_alert`` audience gate lets it through).
+SNAPSHOT_CADENCE_OVERDUE_EVENT_TYPE = "efficiency.snapshot_cadence_overdue"
+
+# Sub-key under the efficiency_baseline container recording whether the last
+# daily-snapshot cadence check alerted on an overdue state. The per-project
+# transition check (:func:`maybe_alert_overdue_snapshot_cadence`) compares the
+# current overdue/healthy state against this marker so it fires once per lapse
+# episode rather than every hourly tick, and re-arms on recovery.
+LAST_ALERTED_OVERDUE_CADENCE_KEY = "last_alerted_overdue_snapshot_cadence"
+
 # Fire the unpriced-models alert when at least this share of attributed
 # (provider+model+token-bearing) tasks ran on combos absent from the pricing
 # table, and at least this many such tasks exist (so a single stray task on a
@@ -4045,6 +4057,13 @@ async def read_baseline_with_drift(
 SNAPSHOT_INTERVAL_SECONDS = 3600
 _DAY_SECONDS = 24 * 3600
 
+# Overdue threshold for the daily-snapshot cadence operator alert. At a healthy
+# one-per-UTC-day cadence with an hourly tick, ``last_run_at`` is at most ~25 h
+# old (24 h cadence + up to 1 h until the next tick writes). Aging past 48 h
+# therefore means at least one full daily write was skipped and never recovered
+# — that is the condition the operator must hear about.
+SNAPSHOT_CADENCE_OVERDUE_SECONDS = 2 * _DAY_SECONDS
+
 
 def _last_run_due(last_run_at_iso: str | None, now: datetime) -> bool:
     """Return True when a new snapshot is due.
@@ -4526,6 +4545,144 @@ async def maybe_alert_provider_routing_transition(
         state,
     )
     return state
+
+
+def _snapshot_cadence_overdue(last_run_at_iso: str | None, now: datetime) -> bool:
+    """Return True when the daily snapshot cadence is overdue for the project.
+
+    Cadence is one snapshot per UTC day. At a healthy cadence with the hourly
+    service tick, ``last_run_at`` is at most ~25 h old. When it has aged past
+    :data:`SNAPSHOT_CADENCE_OVERDUE_SECONDS` (48 h) a full daily write was
+    skipped with no recovery — the condition the operator must hear about. A
+    project that has never written a snapshot (``last_run_at`` is ``None``) is
+    not "overdue": there is no baseline to go stale, and a fresh project would
+    fire a false positive. An unparseable marker is also treated as not overdue
+    (the next successful write overwrites it with a valid ISO timestamp).
+    """
+    if not last_run_at_iso:
+        return False
+    try:
+        last_run = datetime.fromisoformat(last_run_at_iso)
+    except (TypeError, ValueError):
+        return False
+    if last_run.tzinfo is not None:
+        last_run = last_run.replace(tzinfo=None)
+    return (now - last_run).total_seconds() >= SNAPSHOT_CADENCE_OVERDUE_SECONDS
+
+
+async def maybe_alert_overdue_snapshot_cadence(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    now: datetime | None = None,
+) -> bool | None:
+    """Raise an operator Alert when the daily efficiency snapshot cadence is overdue.
+
+    The efficiency-baseline telemetry is the only durable cost time-series the
+    cost-reduction direction reads before/after any lever from; when it stops
+    being written — service crash, leader handoff, or a swallowed per-project
+    write exception in ``_efficiency_snapshot_service`` (lifecycle.py) — nothing
+    pages the operator and ``last_run_at`` just ages silently inside the
+    container. This closes that gap: it fires once per lapse episode, past
+    :data:`SNAPSHOT_CADENCE_OVERDUE_SECONDS`, and re-arms when a snapshot is
+    finally written.
+
+    Edge-triggered against :data:`LAST_ALERTED_OVERDUE_CADENCE_KEY` in the
+    efficiency-baseline container (locked read-modify-write, mirroring
+    :func:`maybe_alert_unpriced_models_coverage`): fires once when the cadence
+    lapses into overdue, does not re-fire while it stays overdue, and re-arms
+    when a fresh snapshot lands. Runs every hourly snapshot tick for every
+    project. Returns ``True`` when an alert fired, else ``None``.
+    """
+    from app.alert_policy import create_project_alert_if_allowed
+    from app.models import AlertSeverity
+    from app.project_telemetry import get_project_telemetry
+    from app.task_locking import with_project_telemetry_locked
+
+    if now is None:
+        now = _utcnow()
+
+    # populate_existing: a caller that left a partial Project in the session
+    # identity map would otherwise return the cached partial here and the
+    # ``design_doc`` access below would fire a sync lazy-load in async context.
+    _proj = await session.get(Project, project_id, populate_existing=True)
+    if _proj is None:
+        return None
+
+    container = dict(
+        await get_project_telemetry(
+            session,
+            project_id,
+            DESIGN_DOC_KEY,
+            design_doc_fallback=_proj.design_doc,
+        )
+        or {}
+    )
+    overdue = _snapshot_cadence_overdue(container.get("last_run_at"), now)
+
+    # Transition edge: fire only when crossing into overdue from a healthy
+    # marker; re-arm the marker on recovery so a future lapse alerts again.
+    # Locked read-modify-write via the dedicated efficiency snapshot helper so a
+    # concurrent snapshot writer cannot clobber the marker.
+    changed = {"fire": False}
+
+    def _advance_marker(c: Dict[str, Any]) -> None:
+        prev = c.get(LAST_ALERTED_OVERDUE_CADENCE_KEY)
+        new_state = "overdue" if overdue else "healthy"
+        if prev == new_state:
+            return  # no transition — leave the marker untouched
+        c[LAST_ALERTED_OVERDUE_CADENCE_KEY] = new_state
+        changed["fire"] = overdue  # only the overdue crossing raises an alert
+        changed["container"] = c
+
+    await with_project_telemetry_locked(
+        session,
+        project_id,
+        DESIGN_DOC_KEY,
+        _advance_marker,
+        design_doc_fallback=_proj.design_doc,
+        skip_locked=False,
+    )
+    if not changed["fire"]:
+        return None
+
+    hours_since = None
+    try:
+        last_run = datetime.fromisoformat(container["last_run_at"])
+        if last_run.tzinfo is not None:
+            last_run = last_run.replace(tzinfo=None)
+        hours_since = max(0, int((now - last_run).total_seconds() // 3600))
+    except (KeyError, TypeError, ValueError):
+        hours_since = None
+
+    alert, created, _decision = await create_project_alert_if_allowed(
+        session,
+        project_id=project_id,
+        event_type=SNAPSHOT_CADENCE_OVERDUE_EVENT_TYPE,
+        severity=AlertSeverity.WARNING,
+        title=f"Daily efficiency snapshot overdue on project {str(project_id)[:8]}",
+        message=(
+            f"No daily efficiency snapshot has been written in "
+            f"{hours_since if hours_since is not None else '?'} hours, so the "
+            f"cost time-series (cost per merged PR, VM reuse rate, LLM cache "
+            f"read share) is stale and no before/after cost-lever comparison is "
+            f"possible. The _efficiency_snapshot_service logs per-project write "
+            f"failures as warnings and continues, so a failing or stopped "
+            f"service leaves no other operator signal. Check lifecycle.py."
+        )[:1000],
+        dedupe_key=f"{SNAPSHOT_CADENCE_OVERDUE_EVENT_TYPE}:{project_id}",
+        broadcast=True,
+    )
+    if alert is None:
+        await session.rollback()
+        return None
+    await session.commit()
+    logger.info(
+        "[SNAPSHOT_CADENCE_ALERT] project=%s overdue_hours=%s",
+        project_id,
+        hours_since,
+    )
+    return True if created else None
 
 
 # ---------------------------------------------------------------------------

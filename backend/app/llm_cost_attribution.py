@@ -127,6 +127,30 @@ NON_ANTHROPIC_LLM_CONSERVATISM_MULTIPLIER: float = 1.25
 MIN_TRUSTWORTHY_PROBE_COVERAGE: float = 0.5
 
 
+def _median_or_zero(values: list[float]) -> float:
+    """Return the median of ``values``, ``0.0`` when the list is empty."""
+    ordered = sorted(values)
+    n = len(ordered)
+    if n == 0:
+        return 0.0
+    if n % 2:
+        return ordered[n // 2]
+    return (ordered[n // 2 - 1] + ordered[n // 2]) / 2.0
+
+
+# Fallback rates used to ESTIMATE the spend of unpriced (provider, model) combos
+# so ``unpriced_coverage_fraction`` can be spend-weighted — the size of the
+# pricing blind spot is otherwise unquantifiable. An unpriced model is estimated
+# as a TYPICAL listed model (the median input/output rate across the pricing
+# table), erring toward neither the cheapest nor the most expensive row.
+UNPRICED_FALLBACK_INPUT_RATE: float = _median_or_zero(
+    [in_rate for in_rate, _ in LLM_TOKEN_PRICING.values()]
+)
+UNPRICED_FALLBACK_OUTPUT_RATE: float = _median_or_zero(
+    [out_rate for _, out_rate in LLM_TOKEN_PRICING.values()]
+)
+
+
 def _bounded_cache_input_counts(
     input_tokens: int,
     cache_creation_input_tokens: int,
@@ -525,7 +549,10 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
     Returns a structured dict with:
       - ``by_provider``: list of provider-level rollups.
       - ``by_model``: list of (provider, model) rollups with a ``priced`` flag.
-      - ``totals``: aggregate totals plus priced/unpriced task counts.
+      - ``totals``: aggregate totals plus priced/unpriced task counts, the
+        spend-weighted ``unpriced_coverage_fraction``, the estimated dollar
+        value of unpriced spend (``estimated_unpriced_cost_usd``), and the
+        unpriced rows' retained token volume.
       - ``unpriced_combos``: capped list of ``provider:model`` strings that
         have non-zero tokens but no entry in :data:`LLM_TOKEN_PRICING`.
       - ``approximate_priced_combos``: capped list of ``provider:model`` strings
@@ -535,10 +562,15 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
     A task contributes one or more attempt rows to a bucket when it has a
     non-null provider, non-null model, and non-zero aggregate tokens across
     its banked retry history plus the live ``api_call_summary`` snapshot.
-    Unpriced (provider, model) combos are still counted in ``task_count`` and feed
-    ``unpriced_coverage_fraction`` but contribute ``0.0`` cost. Cost values
-    are rounded to 6 decimals and shares to 4 decimals, matching the rest of
-    this module.
+    Unpriced (provider, model) combos are still counted in ``task_count`` and
+    ``unpriced_task_count`` but contribute ``0.0`` cost; their token volume is
+    retained (``unpriced_input_tokens`` / ``unpriced_output_tokens``) and their
+    spend is ESTIMATED at :data:`UNPRICED_FALLBACK_INPUT_RATE` /
+    :data:`UNPRICED_FALLBACK_OUTPUT_RATE` so ``unpriced_coverage_fraction`` can
+    be spend-weighted — ``priced_cost / (priced_cost + estimated_unpriced_cost)``
+    — instead of a raw task count that weighs a 1M-token unpriced row the same
+    as a 1K-token priced one. Cost values are rounded to 6 decimals and shares
+    to 4 decimals, matching the rest of this module.
 
     Each provider/model row also carries the merge outcome of its tasks:
     ``merged_count`` (tasks landed on the integration branch per
@@ -596,6 +628,14 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
     total_merged_count = 0
     total_verified_merged_count = 0
     total_tool_result_bytes: int | None = None
+    # Unpriced-rows honesty block: their token volume is retained (the blind
+    # spot stays measurable) and their spend is estimated at the fallback rate
+    # so ``unpriced_coverage_fraction`` can be spend-weighted.
+    estimated_unpriced_cost_usd = 0.0
+    unpriced_input_tokens = 0
+    unpriced_output_tokens = 0
+    unpriced_cache_creation_tokens = 0
+    unpriced_cache_read_tokens = 0
 
     for t in tasks:
         merged = is_merged_completion(t)
@@ -662,6 +702,23 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
                     and len(unpriced_combos) < _UNPRICED_COMBOS_CAP
                 ):
                     unpriced_combos.append(combo)
+                # Retain the unpriced token volume and estimate the row's spend
+                # at the fallback rate so coverage is spend-weighted, not a raw
+                # task count.
+                estimated_unpriced_cost_usd += _price_llm_attempt(
+                    input_tokens,
+                    output_tokens,
+                    cache_creation,
+                    cache_read,
+                    UNPRICED_FALLBACK_INPUT_RATE,
+                    UNPRICED_FALLBACK_OUTPUT_RATE,
+                    provider=provider,
+                    model=model,
+                )
+                unpriced_input_tokens += int(input_tokens)
+                unpriced_output_tokens += int(output_tokens)
+                unpriced_cache_creation_tokens += int(cache_creation)
+                unpriced_cache_read_tokens += int(cache_read)
 
             # fallback_cost_usd is per-attempt (each fallback attempt's spend
             # counts); fallback_task_count is per-task, credited once below.
@@ -824,9 +881,15 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
             model_buckets.items(), key=lambda kv: kv[1]["cost_usd"], reverse=True
         )
     ]
-    priceable = priced_task_count + unpriced_task_count
+    # Spend-weighted coverage: priced spend / (priced spend + estimated unpriced
+    # spend). Unpriced rows' spend is estimated at the fallback rate; the count
+    # of priceable tasks is retained in priced/unpriced_task_count for callers
+    # that want the raw task split. None only when there is no spend at all.
+    estimated_total_spend = total_cost + estimated_unpriced_cost_usd
     unpriced_coverage_fraction: float | None = (
-        round(priced_task_count / priceable, 4) if priceable else None
+        round(total_cost / estimated_total_spend, 4)
+        if estimated_total_spend > 0
+        else None
     )
     return {
         "by_provider": by_provider,
@@ -851,6 +914,11 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
             "priced_task_count": priced_task_count,
             "unpriced_task_count": unpriced_task_count,
             "unpriced_coverage_fraction": unpriced_coverage_fraction,
+            "estimated_unpriced_cost_usd": round(estimated_unpriced_cost_usd, 6),
+            "unpriced_input_tokens": unpriced_input_tokens,
+            "unpriced_output_tokens": unpriced_output_tokens,
+            "unpriced_cache_creation_input_tokens": unpriced_cache_creation_tokens,
+            "unpriced_cache_read_input_tokens": unpriced_cache_read_tokens,
             "fallback_task_count": fallback_task_count,
             "fallback_cost_usd": round(fallback_cost_usd, 6),
             "total_tool_result_bytes": total_tool_result_bytes,
@@ -1541,9 +1609,11 @@ def _compact_llm_cost_attribution(
 
     Calls the three existing pure helpers (compute_llm_cost_breakdown,
     compute_llm_cost_by_task_type, compute_pr_rework_chain_breakdown) and keeps
-    only the dollar-total fields needed for retroactive drift decomposition:
-    per-(provider,model) cost, per-task-type cost, and the first-pass/rework
-    split.  Priced rows only in by_model so zero-cost unpriced combos don't
+    the dollar-total fields needed for retroactive drift decomposition plus the
+    per-task-type turn counts and cache-creation/cache-read token splits that
+    name the real cost driver (per-(provider,model) cost, per-task-type cost,
+    first-pass/rework split, turns per call, cache-read share). Priced rows
+    only in by_model so zero-cost unpriced combos don't
     inflate the block; unpriced_coverage carries the honesty signal.
 
     self_repair_burn_share is computed as a token-cost ratio when repair token
@@ -1576,6 +1646,20 @@ def _compact_llm_cost_attribution(
             "task_type": r["task_type"],
             "cost_usd": r["total_cost_usd"],
             "mean_input_tokens_per_call": r.get("mean_input_tokens_per_call"),
+            # Turn counts — None when no task in the bucket reported num_turns.
+            # These are the per-task-type cost-driver signal that prompt bytes
+            # alone cannot express.
+            "mean_turns_per_call": r.get("mean_turns_per_call"),
+            "mean_input_tokens_per_turn": r.get("mean_input_tokens_per_turn"),
+            # Cache split per task type: creation vs read sub-counts and the
+            # cache-read share of total input, so the visible proxy for the
+            # cost driver is token composition, not just prompt bytes.
+            "total_cache_creation_input_tokens": r["total_cache_creation_input_tokens"],
+            "total_cache_read_input_tokens": r["total_cache_read_input_tokens"],
+            "cache_read_share": r.get("cache_read_share"),
+            "mean_uncached_input_tokens_per_call": r.get(
+                "mean_uncached_input_tokens_per_call"
+            ),
             "total_tool_result_bytes": r.get("total_tool_result_bytes"),
             "total_prompt_size_bytes": r.get("total_prompt_size_bytes"),
             "mean_prompt_size_bytes": r.get("mean_prompt_size_bytes"),
@@ -1651,6 +1735,11 @@ def _compact_llm_cost_attribution(
         "rework_share": rework.get("rework_share_of_total_llm_cost"),
         "total_llm_usd": total_usd,
         "unpriced_coverage": breakdown["totals"].get("unpriced_coverage_fraction"),
+        "estimated_unpriced_cost_usd": breakdown["totals"].get(
+            "estimated_unpriced_cost_usd"
+        ),
+        "unpriced_input_tokens": breakdown["totals"].get("unpriced_input_tokens"),
+        "unpriced_output_tokens": breakdown["totals"].get("unpriced_output_tokens"),
         "unpriced_combos": breakdown.get("unpriced_combos", []),
         SELF_REPAIR_BURN_SHARE_KEY: self_repair_burn_share,
         "strategic_cycle_cost_per_event": strategic_cycle_cost_per_event,

@@ -17,7 +17,7 @@ from sqlmodel import select
 
 from app.broadcast import broadcast_to_project
 from app.deploy_identity import project_is_deploy_repo
-from app.message_audience import is_operator_visible, route_event
+from app.message_audience import OPERATOR_FYI, is_operator_visible, route_event
 from app.models import Alert, AlertSeverity, Project, _utcnow
 
 
@@ -241,6 +241,14 @@ ALERT_EVENT_POLICIES: dict[str, AlertEventPolicy] = {
     ),
     "efficiency.provider_routing_verdict": AlertEventPolicy(
         "efficiency.provider_routing_verdict",
+    ),
+    # The daily efficiency-snapshot cadence lapsed: the only durable cost
+    # time-series (cost per merged PR, VM reuse, LLM cache read share) has gone
+    # stale. The snapshot service swallows per-project write failures with a
+    # warning and continues, so without this alert last_run_at ages invisibly.
+    "efficiency.snapshot_cadence_overdue": AlertEventPolicy(
+        "efficiency.snapshot_cadence_overdue",
+        audience=OPERATOR_FYI,
     ),
     "notification.dead_letter_lost": AlertEventPolicy(
         "notification.dead_letter_lost"
