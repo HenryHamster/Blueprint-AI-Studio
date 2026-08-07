@@ -43,6 +43,21 @@ export interface DirectionProgress {
   cost_budget_usd?: number | null;
   budget_utilization_pct?: number | null;
   budget_exceeded?: boolean;
+  // Lifetime lineage spend — the meter budget_utilization_pct and
+  // budget_exceeded are computed from (lifetime basis: VM + LLM + compute).
+  // Additive fields; absent on legacy snapshots that only carry the
+  // rolling-window figures, so every consumer must degrade gracefully.
+  lineage_spend_usd?: number | null;
+  lineage_vm_cost_usd?: number | null;
+  lineage_llm_cost_usd?: number | null;
+  lineage_compute_cost_usd?: number | null;
+  lineage_task_count?: number | null;
+  lineage_llm_unpriced?: boolean;
+  budget_basis?: string | null;
+  // Rolling-window cost split behind estimated_cost_usd (window basis).
+  window_vm_cost_usd?: number | null;
+  window_llm_cost_usd?: number | null;
+  window_llm_unpriced?: boolean;
   cost_per_merged_pr?: number | null;
   cost_per_merge_exceeds_threshold?: boolean | null;
   avg_time_to_merge_hours?: number | null;
@@ -695,13 +710,33 @@ export function DirectionPortfolioSection({
                     )}
                   </div>
                   {d.cost_budget_usd != null && d.cost_budget_usd > 0 && (() => {
+                    const hasLifetime = d.lineage_spend_usd != null;
+                    const spend = hasLifetime ? d.lineage_spend_usd : d.estimated_cost_usd;
                     const pct = d.budget_utilization_pct != null
                       ? d.budget_utilization_pct
-                      : ((d.estimated_cost_usd ?? 0) / d.cost_budget_usd) * 100;
+                      : ((spend ?? 0) / d.cost_budget_usd) * 100;
                     const clamped = Math.min(100, Math.max(0, pct));
                     const barColor = pct > 80 ? 'bg-red-500' : pct >= 60 ? 'bg-amber-500' : 'bg-emerald-500';
+                    const basisLabel = d.budget_basis
+                      ?? (hasLifetime ? 'lifetime lineage' : 'rolling window');
+                    const prefix = hasLifetime ? 'Lifetime' : 'Window';
+                    const tooltipLines = [
+                      `${prefix} $${(spend ?? 0).toFixed(2)} / $${d.cost_budget_usd.toFixed(2)} budget (${Math.round(pct)}%)`,
+                    ];
+                    if (hasLifetime) {
+                      tooltipLines.push(
+                        `VM $${(d.lineage_vm_cost_usd ?? 0).toFixed(2)} · LLM $${(d.lineage_llm_cost_usd ?? 0).toFixed(2)} · Compute $${(d.lineage_compute_cost_usd ?? 0).toFixed(2)}`
+                      );
+                      if (d.lineage_task_count != null) {
+                        tooltipLines.push(`${d.lineage_task_count} lineage task${d.lineage_task_count === 1 ? '' : 's'}`);
+                      }
+                      if (d.estimated_cost_usd != null) {
+                        tooltipLines.push(`Rolling window: $${d.estimated_cost_usd.toFixed(2)}`);
+                      }
+                    }
+                    tooltipLines.push(`Basis: ${basisLabel}`);
                     return (
-                      <div className="mt-1.5" title={`$${(d.estimated_cost_usd ?? 0).toFixed(2)} / $${d.cost_budget_usd.toFixed(2)} budget (${Math.round(pct)}%)`}>
+                      <div className="mt-1.5" title={tooltipLines.join('\n')}>
                         <div className="h-1 w-full rounded bg-neutral-800 overflow-hidden">
                           <div className={`h-full ${barColor}`} style={{ width: `${clamped}%` }} />
                         </div>

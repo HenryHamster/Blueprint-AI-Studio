@@ -7,7 +7,6 @@
     "task_lifecycle.py": 7750,
     "task_lifecycle_requeue.py": 1250,
     "task_lifecycle_post_commit_terminal.py": 500,
-    "task_lifecycle_completion_dispatch.py": 500,
     "orchestrator.py": 5900,
     "orchestrator_ci_monitor.py": 3550,
     "orchestrator_health.py": 1180,
@@ -163,7 +162,8 @@
     "release_qualifier_audit.py": 2100,
     "conversation_coordinator.py": 1900,
     "routers/agent_warm_continuity.py": 1700,
-    "post_commit_errors.py": 58
+    "post_commit_errors.py": 58,
+    "task_lifecycle_completion_dispatch.py": 500
   },
   "agent": {
     "index.ts": 4600,
@@ -218,7 +218,7 @@
     "components/KanbanColumn.tsx": 1500,
     "App.tsx": 2350,
     "components/TaskCard.tsx": 1500,
-    "components/DirectionCard.tsx": 1650,
+    "components/DirectionCard.tsx": 1900,
     "components/PipelineView.tsx": 1200,
     "components/DashboardHome.tsx": 3050,
     "components/MessagesPanel.tsx": 3800,

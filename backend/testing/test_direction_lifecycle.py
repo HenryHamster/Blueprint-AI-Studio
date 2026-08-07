@@ -9,7 +9,6 @@ import uuid
 
 from app.time_utils import _utcnow
 from app.direction_lifecycle import (
-    _direction_lineage_spend,
     _process_direction_lifecycle,
     _process_direction_lifecycle_locked,
 )
@@ -215,52 +214,57 @@ async def test_process_lifecycle_cost_pause_fires_when_aggregate_pushes_over_bud
 
 
 @pytest.mark.asyncio
-async def test_cost_envelope_counts_attributed_lineage_spend(db_session, mocker):
-    """The cost envelope counts real lineage-task LLM spend, not just research estimates.
+async def test_cost_pause_counts_lineage_llm_spend(db_session, mocker):
+    """A direction under budget on VM-only accounting pauses once its lineage LLM
+    token spend is counted.
 
-    A direction's research_history estimate alone is well within budget, but the
-    implementation/fix/review tasks the research cycle's findings spawned burned
-    real, provider-priced LLM spend that the estimate never captured. The envelope
-    check must attribute that lineage spend to the direction and pause it.
+    The task's VM cost alone (~$0.07 for an hour on the default machine) and the
+    research-history fallback ($0) are both under the $5 envelope. Only the
+    canonical lineage meter — which folds LLM tokens in — crosses the budget, so
+    this proves the auto-pause gate reads the SAME meter the badge shows.
     """
+    from app.vm_cost_rates import get_vm_rate_per_second
+
     mocker.patch(
         "app.direction_lifecycle._compute_direction_error_fingerprint",
         new_callable=AsyncMock,
         return_value=None,
     )
+    direction_id = "d-lineage-llm"
     direction = {
-        "id": "d-lineage-spend",
-        "text": "Direction with expensive spawned lineage",
+        "id": direction_id,
+        "text": "LLM-heavy direction",
         "status": "active",
         "priority": "medium",
         "paths": [],
         "added_at": "2026-01-01T00:00:00",
         "cost_budget_usd": 5.0,
-        # Research-cycle estimate alone: 1.0 — well under the 5.0 budget.
-        "research_history": _cost_history(1.0),
+        "research_history": [],  # fallback alone would be $0 — under budget
     }
     project = await _make_cost_project(db_session, direction)
 
-    # A spawned implementation task attributed to this direction, priced from
-    # real (provider, model, tokens) at anthropic/claude-sonnet-5 ($3/$15 per
-    # MTok): 1,000,000 input + 1,000,000 output = $18.00, far above budget.
-    lineage_task = Task(
-        project_id=project.id,
-        title="Implement finding from direction",
-        payloads=[{"type": "create", "current_direction_id": "d-lineage-spend"}],
-        vm_instance_id="agent-vm-lineage",
-        status=TaskStatus.COMPLETED,
-        created_by="ORCHESTRATOR",
-        provider="anthropic",
-        model="claude-sonnet-5",
+    now = _utcnow()
+    # 1M input @ $5/MTok + 100k output @ $25/MTok on claude-opus-4-7 = $7.50 LLM.
+    db_session.add(
+        Task(
+            project_id=project.id,
+            title="llm-heavy task",
+            payloads=[{"type": "create", "scope": "small"}],
+            context={"direction_id": direction_id},
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            provider="anthropic",
+            model="claude-opus-4-7",
+            api_call_summary={
+                "total_input_tokens": 1_000_000,
+                "total_output_tokens": 100_000,
+                "llm_call_count": 7,
+            },
+            vm_provisioned_at=now - timedelta(hours=1),
+            vm_stopped_at=now,
+            vm_spot=False,
+        )
     )
-    # Banked LLM token counters are context-backed properties, not plain
-    # SQLModel fields — the constructor's pydantic init doesn't route kwargs
-    # through their setters, so they must be assigned post-construction.
-    lineage_task.llm_input_tokens_banked = 1_000_000
-    lineage_task.llm_output_tokens_banked = 1_000_000
-    lineage_task.llm_call_count_banked = 1
-    db_session.add(lineage_task)
     await db_session.commit()
 
     await _process_direction_lifecycle(
@@ -273,16 +277,82 @@ async def test_cost_envelope_counts_attributed_lineage_spend(db_session, mocker)
 
     d = project.directions[0]
     assert d["status"] == "paused", (
-        "direction should be auto-paused once attributed lineage spend pushes "
-        "cumulative cost over budget, even though the research estimate alone is under it"
+        "direction should be auto-paused when lineage spend (incl. LLM) exceeds budget"
     )
     evidence = d.get("cost_pause_evidence", {})
-    assert evidence.get("attributed_lineage_spend_usd") == pytest.approx(18.0), (
-        f"expected attributed lineage spend 18.0, got {evidence.get('attributed_lineage_spend_usd')!r}"
+    vm_only = get_vm_rate_per_second(machine_type=None, spot=False) * 3600
+    llm_only = 7.50
+    # VM-only accounting alone stays under the envelope — only LLM pushes it over.
+    assert vm_only < 5.0, "test precondition: VM-only spend must be under budget"
+    assert evidence.get("spend_basis") == (
+        "lifetime_lineage:vm_banked+llm_tokens+compute_jobs"
+    ), "pause should be measured on the canonical lineage basis"
+    assert evidence.get("lineage_vm_cost_usd") == pytest.approx(vm_only, abs=0.001)
+    assert evidence.get("lineage_llm_cost_usd") == pytest.approx(llm_only, abs=0.001)
+    assert evidence.get("lineage_task_count") == 1
+    assert evidence.get("cumulative_estimated_cost_usd") == pytest.approx(
+        vm_only + llm_only, abs=0.001
+    ), "pause total should be lineage total (VM + LLM), not the history fallback"
+    # The legacy read-model key must stay bound to the canonical meter, not to a
+    # second, separately-computed lineage sum.
+    assert evidence.get("attributed_lineage_spend_usd") == pytest.approx(
+        vm_only + llm_only, abs=0.001
+    ), "attributed lineage spend must equal the canonical lineage total"
+
+
+@pytest.mark.asyncio
+async def test_cost_pause_fallback_basis_labelled_when_no_lineage_rows(db_session, mocker):
+    """When no lineage task rows exist for a direction, the budget gate falls back
+    to research_history + history_aggregate and labels the basis explicitly.
+
+    The research-history sum alone ($6) stays under the budget here; the evicted
+    aggregate pushes it over, and the evidence must say it used the fallback so an
+    operator reconciling the pause against the badge never has to guess.
+    """
+    mocker.patch(
+        "app.direction_lifecycle._compute_direction_error_fingerprint",
+        new_callable=AsyncMock,
+        return_value=None,
     )
-    assert evidence.get("cumulative_estimated_cost_usd") == pytest.approx(19.0), (
-        f"expected cumulative cost 19.0 (1.0 research estimate + 18.0 lineage), "
-        f"got {evidence.get('cumulative_estimated_cost_usd')!r}"
+    direction = {
+        "id": "d-fallback",
+        "text": "Pruned-lineage direction",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "cost_budget_usd": 9.0,
+        # No task rows in the DB for this direction: only the fallback can push
+        # cumulative cost over the envelope (history 6.0 < budget 9.0, but
+        # history 6.0 + aggregate 4.0 = 10.0 > 9.0).
+        "research_history": _cost_history(3.0, 3.0),
+        "history_aggregate": {"total_estimated_cost_usd": 4.0},
+    }
+    project = await _make_cost_project(db_session, direction)
+
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        busy_direction_ids=set(),
+        now=_utcnow(),
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d["status"] == "paused", "fallback spend over budget should still pause"
+    evidence = d.get("cost_pause_evidence", {})
+    assert evidence.get("spend_basis") == "research_history+history_aggregate", (
+        "fallback basis must be explicitly labelled"
+    )
+    assert evidence.get("cumulative_estimated_cost_usd") == 10.0, (
+        f"expected fallback total 10.0, got {evidence.get('cumulative_estimated_cost_usd')!r}"
+    )
+    # No lineage rows were measured, so the VM/LLM terms are a genuine zero.
+    assert evidence.get("lineage_task_count") == 0
+    assert evidence.get("lineage_llm_cost_usd") == 0.0
+    assert evidence.get("lineage_vm_cost_usd") == 0.0
+    assert evidence.get("attributed_lineage_spend_usd") == 0.0, (
+        "no lineage rows means no attributed lineage spend, not the fallback total"
     )
 
 
@@ -4926,120 +4996,3 @@ def test_retired_diagnoses_archive_dedups_by_direction_id():
     assert doc["retired_diagnoses_archive"][0]["direction_id"] == "d-dedup-test-2"
     assert doc["retired_diagnoses_archive"][1]["direction_id"] == "d-dedup-test"
     assert "Third update" in doc["retired_diagnoses_archive"][1]["diagnosis"]
-
-
-@pytest.mark.asyncio
-async def test_direction_lineage_spend_selects_only_the_direction_lineage(db_session):
-    """Attribution/exclusion happens in SQL, and the same rows still price.
-
-    The sum used to load every Task row for the project and filter in Python,
-    which held the project row lock while pulling the whole task table (and its
-    large payloads/context JSON) into the identity map once per budgeted
-    direction. Pushing the predicate down must not change WHICH tasks count:
-    the ``current_direction_id`` match, the ``direction_id`` fallback, and the
-    research exclusion all have to survive the move.
-    """
-    direction = {
-        "id": "d-sql-attribution",
-        "text": "Direction",
-        "status": "active",
-        "priority": "medium",
-        "paths": [],
-        "added_at": "2026-01-01T00:00:00",
-    }
-    project = await _make_cost_project(db_session, direction)
-
-    def _priced(title: str, payload: dict, *, input_tokens: int) -> Task:
-        # anthropic/claude-sonnet-5 is $3/MTok input, $15/MTok output.
-        task = Task(
-            project_id=project.id,
-            title=title,
-            payloads=[payload],
-            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:8]}",
-            status=TaskStatus.COMPLETED,
-            created_by="ORCHESTRATOR",
-            provider="anthropic",
-            model="claude-sonnet-5",
-        )
-        task.llm_input_tokens_banked = input_tokens
-        task.llm_output_tokens_banked = 0
-        task.llm_call_count_banked = 1
-        return task
-
-    rows = [
-        # Counted: primary attribution key. 1M input -> $3.00
-        _priced(
-            "primary key",
-            {"type": "create", "current_direction_id": "d-sql-attribution"},
-            input_tokens=1_000_000,
-        ),
-        # Counted: fallback key when current_direction_id is absent. -> $6.00
-        _priced(
-            "fallback key",
-            {"type": "fix", "direction_id": "d-sql-attribution"},
-            input_tokens=2_000_000,
-        ),
-        # Counted: payload carries no "type" at all (default create). -> $3.00
-        _priced(
-            "typeless payload",
-            {"current_direction_id": "d-sql-attribution"},
-            input_tokens=1_000_000,
-        ),
-        # Excluded: research spend is already counted via research_history.
-        _priced(
-            "research cycle",
-            {"type": "research", "current_direction_id": "d-sql-attribution"},
-            input_tokens=9_000_000,
-        ),
-        # Excluded: same project, a different direction.
-        _priced(
-            "other direction",
-            {"type": "create", "current_direction_id": "d-other"},
-            input_tokens=9_000_000,
-        ),
-        # Excluded: same project, no direction attribution at all.
-        _priced("unattributed", {"type": "create"}, input_tokens=9_000_000),
-    ]
-    for row in rows:
-        db_session.add(row)
-    await db_session.commit()
-
-    spend = await _direction_lineage_spend(
-        project.id, "d-sql-attribution", db_session
-    )
-    assert spend == pytest.approx(12.0), (
-        f"expected 3.00 + 6.00 + 3.00 = 12.00 attributed lineage spend, got {spend!r}"
-    )
-
-
-@pytest.mark.asyncio
-async def test_direction_lineage_spend_is_scoped_to_its_own_project(db_session):
-    """The project predicate survives the push-down."""
-    direction = {
-        "id": "d-scope",
-        "text": "Direction",
-        "status": "active",
-        "priority": "medium",
-        "paths": [],
-        "added_at": "2026-01-01T00:00:00",
-    }
-    project = await _make_cost_project(db_session, direction)
-    other = await _make_cost_project(db_session, dict(direction))
-
-    stranger = Task(
-        project_id=other.id,
-        title="Another project, same direction id",
-        payloads=[{"type": "create", "current_direction_id": "d-scope"}],
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:8]}",
-        status=TaskStatus.COMPLETED,
-        created_by="ORCHESTRATOR",
-        provider="anthropic",
-        model="claude-sonnet-5",
-    )
-    stranger.llm_input_tokens_banked = 1_000_000
-    stranger.llm_output_tokens_banked = 0
-    stranger.llm_call_count_banked = 1
-    db_session.add(stranger)
-    await db_session.commit()
-
-    assert await _direction_lineage_spend(project.id, "d-scope", db_session) == 0.0

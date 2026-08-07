@@ -897,6 +897,57 @@ def _task_llm_cost(task: Task) -> tuple[float, bool]:
     return cost, any_unpriced
 
 
+def task_llm_cost_by_provider_model(task: Task) -> tuple[dict[str, float], bool]:
+    """Return ``({"<provider>|<model>": usd, ...}, any_unpriced)`` for one task.
+
+    Same attempt enumeration and pricing path as :func:`_task_llm_cost` — the
+    only difference is that cost is bucketed per resolved ``(provider, model)``
+    pair instead of collapsed into a single float, so callers that already carry
+    a per-``provider|model`` VM breakdown can fold LLM spend into the same
+    buckets. ``sum(result.values())`` equals ``_task_llm_cost(task)[0]`` by
+    construction.
+
+    Attempts whose pair cannot be resolved atomically (or whose pair has no
+    pricing row) contribute nothing and set ``any_unpriced`` — identical to
+    :func:`_task_llm_cost`, so no bucket is ever half-resolved.
+    """
+    buckets: dict[str, float] = {}
+    any_unpriced = False
+    for (
+        provider,
+        model,
+        input_tokens,
+        output_tokens,
+        _call_count,
+        cache_creation,
+        cache_read,
+    ) in _task_llm_attempts(task):
+        if input_tokens <= 0 and output_tokens <= 0:
+            continue
+        if not provider or not model:
+            any_unpriced = True
+            continue
+        key = (provider.lower(), model.lower())
+        pricing = LLM_TOKEN_PRICING.get(key)
+        if not pricing:
+            any_unpriced = True
+            continue
+        input_rate, output_rate = pricing
+        cost = _price_llm_attempt(
+            input_tokens,
+            output_tokens,
+            cache_creation,
+            cache_read,
+            input_rate,
+            output_rate,
+            provider=key[0],
+            model=key[1],
+        )
+        bucket = f"{provider}|{model}"
+        buckets[bucket] = buckets.get(bucket, 0.0) + cost
+    return buckets, any_unpriced
+
+
 def _task_llm_cost_split(task: Task) -> tuple[float, float, bool]:
     """Return (anthropic_cost, non_anthropic_cost, any_unpriced) for a single task.
 

@@ -22,6 +22,12 @@ from app.direction_outcomes import (
     reachable_merged_count,
     verified_merged_count,
 )
+from app.direction_lineage_spend import (
+    BASIS_LIFETIME,
+    DirectionLineageSpend,
+    load_direction_lineage_spend,
+)
+from app.llm_cost_attribution import task_llm_cost_by_provider_model
 from app.models import Project, Task, TaskStatus, get_task_cost_by_provider_model
 from app.task_evaluators import (
     CHALLENGE_AGREES,
@@ -328,6 +334,18 @@ async def compute_direction_progress(
     ``prev_scope_conversion_rates`` rollups, and a ``dir_id_to_text`` lookup
     used downstream to label failed tasks with their parent direction.
 
+    Cost has two distinct meanings here and they must not be confused:
+
+    * ``estimated_cost_usd`` (and its ``cost_by_*`` breakdowns) is WINDOW-scoped
+      — ``app.digest_metrics`` folds it into ``total_estimated_cost_usd``. It now
+      counts VM *and* LLM token spend for the window; it previously counted VM
+      seconds only.
+    * ``budget_utilization_pct`` / ``budget_exceeded`` / the ``BUDGET_EXCEEDED``
+      notification are LIFETIME-scoped, read from the canonical
+      ``app.direction_lineage_spend`` meter. ``all_tasks`` is window-limited and
+      row-capped, so it cannot produce a lifetime figure; the meter issues one
+      query for every active direction before the loop.
+
     Side effect: when a direction crosses 80% of its ``cost_budget_usd`` for
     the first time, marks ``_budget_alerted`` on the direction entry,
     dispatches a fire-and-forget ``BUDGET_EXCEEDED`` notification, and (once
@@ -351,7 +369,6 @@ async def compute_direction_progress(
     from app.direction_outcomes import synthesize_prompt_quality_patterns
     from app.notification_dispatch import dispatch_external_notification
     from app.routers.admin_analytics import _derive_completed_at  # noqa: PLC0415
-    from app.vm_cost_rates import get_vm_rate_per_second  # noqa: PLC0415
 
     direction_progress_list: List[Dict[str, Any]] = []
     direction_portfolio_composition: List[Dict[str, Any]] = []
@@ -383,6 +400,18 @@ async def compute_direction_progress(
             dir_tasks.setdefault(str(did), []).append(t)
 
     project_id = project.id
+
+    # ONE canonical lifetime lineage-spend read for every active direction. This
+    # is the meter the operator-visible budget badge divides by, so it must cover
+    # the whole lineage (VM incl. banked retries + LLM tokens + compute jobs) —
+    # ``all_tasks`` above is window-limited and row-capped and cannot.
+    lineage_spend_by_direction = await load_direction_lineage_spend(
+        session,
+        project_id=project_id,
+        direction_ids=[
+            str(d.get("id") or d.get("direction_id") or "") for d in active_directions
+        ],
+    )
 
     for d in active_directions:
         did = str(d.get("id") or d.get("direction_id") or "")
@@ -760,6 +789,9 @@ async def compute_direction_progress(
         )
 
         dir_cost = 0.0
+        dir_window_vm_cost = 0.0
+        dir_window_llm_cost = 0.0
+        dir_window_llm_unpriced = False
         dir_spot_cost = 0.0
         dir_on_demand_cost = 0.0
         cost_by_scope: Dict[str, float] = {}
@@ -773,29 +805,37 @@ async def compute_direction_progress(
                 and t.vm_stopped_at >= window_start
             ):
                 continue
-            t_cost = (
-                get_vm_rate_per_second(
-                    machine_type=t.__dict__.get("vm_machine_type"),
-                    spot=bool(t.vm_spot),
-                )
-                * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
-            )
+            # Use pair-atomic helper for provider/model breakdown so chimera keys
+            # (e.g. openai|claude-opus-4-8 from independently-resolved columns)
+            # cannot appear. Banked attempt_history costs are included via
+            # window_start, and the VM total is derived from the SAME helper
+            # output so the breakdown always sums to it.
+            pm_costs = get_task_cost_by_provider_model(t, window_start=window_start)
+            t_vm_cost = sum(pm_costs.values())
+            # LLM token spend — usually the dominant term, and previously absent
+            # from every per-direction cost figure. Bucketed into the same
+            # provider|model keys as VM spend so all four cost axes keep summing
+            # to estimated_cost_usd.
+            llm_costs, t_llm_unpriced = task_llm_cost_by_provider_model(t)
+            t_llm_cost = sum(llm_costs.values())
+            t_cost = t_vm_cost + t_llm_cost
             dir_cost += t_cost
+            dir_window_vm_cost += t_vm_cost
+            dir_window_llm_cost += t_llm_cost
+            if t_llm_unpriced:
+                dir_window_llm_unpriced = True
+            # spot / on-demand are VM-rate axes: they split the VM term only.
             if t.vm_spot:
-                dir_spot_cost += t_cost
+                dir_spot_cost += t_vm_cost
             else:
-                dir_on_demand_cost += t_cost
+                dir_on_demand_cost += t_vm_cost
             scope_key = (t.context or {}).get("scope", "unknown")
             cost_by_scope[scope_key] = cost_by_scope.get(scope_key, 0.0) + t_cost
             status_key = t.status.value if hasattr(t.status, "value") else str(t.status)
             cost_by_status[status_key] = cost_by_status.get(status_key, 0.0) + t_cost
             type_key = (t.first_payload or {}).get("type", "create")
             cost_by_type[type_key] = cost_by_type.get(type_key, 0.0) + t_cost
-            # Use pair-atomic helper for provider/model breakdown so chimera keys
-            # (e.g. openai|claude-opus-4-8 from independently-resolved columns)
-            # cannot appear. Banked attempt_history costs are included via window_start.
-            pm_costs = get_task_cost_by_provider_model(t, window_start=window_start)
-            for pm_key, pm_cost in pm_costs.items():
+            for pm_key, pm_cost in list(pm_costs.items()) + list(llm_costs.items()):
                 cost_by_provider_model[pm_key] = (
                     cost_by_provider_model.get(pm_key, 0.0) + pm_cost
                 )
@@ -1123,11 +1163,20 @@ async def compute_direction_progress(
             research_spawn_gate = None
 
         cost_budget_usd = d.get("cost_budget_usd")
+        # The envelope is a LIFETIME budget, so it must be divided by lifetime
+        # lineage spend. Dividing the rolling-window number by it (the previous
+        # behaviour) was a category error on top of omitting LLM spend entirely.
+        lineage = lineage_spend_by_direction.get(did) or DirectionLineageSpend(
+            basis=BASIS_LIFETIME
+        )
+        lineage_total_usd = lineage.total_usd
         budget_utilization_pct = None
         budget_exceeded = False
         if isinstance(cost_budget_usd, (int, float)) and cost_budget_usd > 0:
-            budget_utilization_pct = round((dir_cost / cost_budget_usd) * 100, 1)
-            budget_exceeded = dir_cost > cost_budget_usd
+            budget_utilization_pct = round(
+                (lineage_total_usd / cost_budget_usd) * 100, 1
+            )
+            budget_exceeded = lineage_total_usd > cost_budget_usd
             if budget_utilization_pct >= 80 and not d.get("_budget_alerted"):
                 _budget_alert_direction_ids.append(did)
                 budget_alert_fired = True
@@ -1138,9 +1187,10 @@ async def compute_direction_progress(
                         {
                             "direction_id": did,
                             "direction_name": direction_text,
-                            "current_spend_usd": round(dir_cost, 2),
+                            "current_spend_usd": round(lineage_total_usd, 2),
                             "budget_limit_usd": float(cost_budget_usd),
                             "utilization_pct": budget_utilization_pct,
+                            "spend_basis": lineage.basis,
                         },
                     )
                 )
@@ -1203,6 +1253,21 @@ async def compute_direction_progress(
                     "type_distribution": agg_type_distribution or None,
                     "type_breakdown": agg_type_breakdown or None,
                     "estimated_cost_usd": round(dir_cost, 2),
+                    # Window split behind estimated_cost_usd, so the badge can be
+                    # explained without re-deriving it.
+                    "window_vm_cost_usd": round(dir_window_vm_cost, 2),
+                    "window_llm_cost_usd": round(dir_window_llm_cost, 2),
+                    "window_llm_unpriced": dir_window_llm_unpriced,
+                    # Lifetime lineage spend — the meter budget_utilization_pct
+                    # and budget_exceeded are computed from. Additive fields; every
+                    # pre-existing key keeps its name, type and nullability.
+                    "lineage_spend_usd": round(lineage_total_usd, 2),
+                    "lineage_vm_cost_usd": round(lineage.vm_usd, 2),
+                    "lineage_llm_cost_usd": round(lineage.llm_usd, 2),
+                    "lineage_compute_cost_usd": round(lineage.compute_usd, 2),
+                    "lineage_task_count": lineage.task_count,
+                    "lineage_llm_unpriced": lineage.llm_unpriced,
+                    "budget_basis": lineage.basis,
                     "spot_cost_usd": round(dir_spot_cost, 2),
                     "on_demand_cost_usd": round(dir_on_demand_cost, 2),
                     "cost_by_scope": cost_by_scope or None,

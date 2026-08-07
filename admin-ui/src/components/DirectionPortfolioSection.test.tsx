@@ -553,4 +553,93 @@ describe('DirectionPortfolioSection', () => {
     expect(screen.queryByText(/SR:/)).not.toBeInTheDocument();
     expect(apiFetchMock).not.toHaveBeenCalled();
   });
+
+  it('mini bar consumes server budget_utilization_pct on the lifetime lineage figure', () => {
+    render(
+      <DirectionPortfolioSection
+        directions={[makeDirection({
+          direction_id: 'dir-1',
+          cost_budget_usd: 5.00,
+          estimated_cost_usd: 0.80,
+          budget_utilization_pct: 20,
+          budget_exceeded: false,
+          lineage_spend_usd: 1.00,
+          lineage_vm_cost_usd: 0.20,
+          lineage_llm_cost_usd: 0.70,
+          lineage_compute_cost_usd: 0.10,
+          lineage_task_count: 6,
+          budget_basis: 'lifetime_lineage:vm_banked+llm_tokens+compute_jobs',
+        })]}
+        loading={false}
+        productPct={null}
+        totalDirPRs={2}
+        hasAttribution={false}
+        totalAutonomousPRs={null}
+        totalAssistedPRs={null}
+        selfSufficientCount={1}
+      />,
+    );
+
+    // Percentage is the server-computed lifetime utilization (20%), not a
+    // client-side division of the window figure.
+    const pct = screen.getByText('20%');
+    expect(pct).toBeInTheDocument();
+    const bar = pct.closest('[title]');
+    expect(bar?.getAttribute('title')).toContain('Lifetime $1.00 / $5.00 budget (20%)');
+    expect(bar?.getAttribute('title')).toContain('VM $0.20 · LLM $0.70 · Compute $0.10');
+    expect(bar?.getAttribute('title')).toContain('6 lineage tasks');
+    expect(bar?.getAttribute('title')).toContain('Rolling window: $0.80');
+    expect(bar?.getAttribute('title')).toContain('Basis: lifetime_lineage:vm_banked+llm_tokens+compute_jobs');
+  });
+
+  it('mini bar shows over-budget marker when server budget_exceeded is set', () => {
+    render(
+      <DirectionPortfolioSection
+        directions={[makeDirection({
+          direction_id: 'dir-1',
+          cost_budget_usd: 5.00,
+          budget_utilization_pct: 120,
+          budget_exceeded: true,
+          lineage_spend_usd: 6.00,
+          lineage_llm_cost_usd: 4.00,
+        })]}
+        loading={false}
+        productPct={null}
+        totalDirPRs={2}
+        hasAttribution={false}
+        totalAutonomousPRs={null}
+        totalAssistedPRs={null}
+        selfSufficientCount={1}
+      />,
+    );
+
+    expect(screen.getByText('120% · over')).toBeInTheDocument();
+    const bar = screen.getByText('120% · over').closest('[title]');
+    expect(bar?.getAttribute('title')).toContain('Lifetime $6.00 / $5.00 budget (120%)');
+  });
+
+  it('mini bar falls back to window numerator when lineage fields are absent', () => {
+    render(
+      <DirectionPortfolioSection
+        directions={[makeDirection({
+          direction_id: 'dir-1',
+          cost_budget_usd: 5.00,
+          estimated_cost_usd: 1.00,
+          budget_utilization_pct: null,
+        })]}
+        loading={false}
+        productPct={null}
+        totalDirPRs={2}
+        hasAttribution={false}
+        totalAutonomousPRs={null}
+        totalAssistedPRs={null}
+        selfSufficientCount={1}
+      />,
+    );
+
+    expect(screen.getByText('20%')).toBeInTheDocument();
+    const bar = screen.getByText('20%').closest('[title]');
+    expect(bar?.getAttribute('title')).toContain('Window $1.00 / $5.00 budget (20%)');
+    expect(bar?.getAttribute('title')).not.toContain('LLM');
+  });
 });
