@@ -151,7 +151,7 @@ async def test_pending_goal_change_supersedes_attempt_before_promotion(
     from app import shared_state
 
     shared_state.runtime_config["promotion_enabled"] = True
-    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    _project, version = await _make_project_and_version(db_session, phase="stabilize")
     launched_goal = "Ship the original goal"
     launched_rubric = []
     rubric_fingerprint = rq._rubric_fingerprint(launched_rubric)
@@ -2145,6 +2145,59 @@ def test_audited_surface_seam_is_reachable_via_rq_and_reuses_verdicts():
         is False
     )
     assert rq._promotion_failed_reuse_eligible(None, "x") is False
+
+
+def test_incremental_audit_base_refuses_dirty_ledger_hint():
+    """A ledger-provided prior-audit SHA hint is only adopted when the prior
+    audit left no verified or unverified findings.
+
+    Regression: the hint branch of ``_incremental_audit_base_sha`` returned the
+    ledger SHA before reaching ANY cleanliness check, so a prior attempt that
+    DID leave findings could be adopted as an incremental base and silently drop
+    those findings from the new audit's view (they sit in the skipped range).
+    The hint must now honor the same precondition as the qualification-sourced
+    base; when it fails, the safe (wider) base is used instead.
+    """
+    OLD = "a" * 40
+    NEW = "b" * 40
+    HINT = "c" * 40
+
+    def clean(**overrides):
+        record = {
+            "status": "not_promoted",
+            "candidate_sha": OLD,
+            "sub_scores": {"audit": 1.0},
+            "audit_findings": [],
+            "excluded_audit_findings": [],
+            "audit_findings_total": 0,
+            "excluded_audit_findings_total": 0,
+        }
+        record.update(overrides)
+        return record
+
+    # Clean prior audit: the hint is safe and is adopted (distinct from the
+    # qualification-sourced base, proving the hint itself is returned).
+    assert (
+        rq._incremental_audit_base_sha(clean(), NEW, prior_audit_candidate_sha=HINT)
+        == HINT
+    )
+
+    # Dirty prior audit: the hint must be refused and the safe wider base used
+    # instead — identical to the no-hint (full-audit) result, never the hint.
+    for dirty in (
+        clean(audit_findings=[{"summary": "x"}]),
+        clean(excluded_audit_findings=[{"summary": "x"}]),
+        clean(audit_findings_total=3),
+    ):
+        assert (
+            rq._incremental_audit_base_sha(
+                dirty, NEW, prior_audit_candidate_sha=HINT
+            )
+            is None
+        )
+        assert rq._incremental_audit_base_sha(
+            dirty, NEW, prior_audit_candidate_sha=HINT
+        ) == rq._incremental_audit_base_sha(dirty, NEW)
 
 
 def test_release_qualifier_module_size_cap_is_governing():

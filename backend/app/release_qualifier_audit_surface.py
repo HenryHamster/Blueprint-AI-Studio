@@ -398,6 +398,41 @@ def _audit_dimension_detail(
         "holistic_contract_fingerprint": holistic_contract_fingerprint,
     }
 
+def _prior_audit_clean_for_incremental_base(
+    prior_qualification: dict[str, Any] | None,
+    candidate_sha: str,
+) -> bool:
+    """True when a prior qualification can anchor an incremental audit base.
+
+    Incremental review is safe only after an audit left no verified *or*
+    unverified findings; missing or inconclusive evidence fails closed.  This is
+    the single cleanliness predicate behind BOTH the qualification-sourced base
+    and the ledger-hint base below, so the two adoption paths cannot diverge.
+    """
+    if not isinstance(prior_qualification, dict):
+        return False
+    if prior_qualification.get("status") not in {
+        *_CONCLUSIVE_VERDICT_STATUSES,
+        "promotion_failed",
+    }:
+        return False
+    prior_sha = str(prior_qualification.get("candidate_sha") or "").strip()
+    if not prior_sha or prior_sha == candidate_sha:
+        return False
+    sub_scores = prior_qualification.get("sub_scores")
+    if not isinstance(sub_scores, dict) or not isinstance(
+        sub_scores.get("audit"), (int, float)
+    ):
+        return False
+    if prior_qualification.get("audit_findings"):
+        return False
+    if prior_qualification.get("excluded_audit_findings"):
+        return False
+    return (
+        prior_qualification.get("audit_findings_total") in (0, None)
+        and prior_qualification.get("excluded_audit_findings_total") in (0, None)
+    )
+
 def _incremental_audit_base_sha(
     prior_qualification: dict[str, Any] | None,
     candidate_sha: str,
@@ -416,34 +451,20 @@ def _incremental_audit_base_sha(
     stores it in ``last_qualification`` until that ledger is backmerged.
     """
     ledger_sha = str(prior_audit_candidate_sha or "").strip()
-    if ledger_sha and ledger_sha != candidate_sha:
+    if (
+        ledger_sha
+        and ledger_sha != candidate_sha
+        and _prior_audit_clean_for_incremental_base(prior_qualification, candidate_sha)
+    ):
         # The agent treats this as a hint and independently verifies ancestry
         # and range resolvability before selecting its incremental two-dot diff.
+        # It is adopted only when the prior audit left no verified or unverified
+        # findings — the same precondition enforced below — so a dirty prior
+        # audit cannot silently drop findings from the new audit's view.
         return ledger_sha
-    if not isinstance(prior_qualification, dict):
+    if not _prior_audit_clean_for_incremental_base(prior_qualification, candidate_sha):
         return None
-    if prior_qualification.get("status") not in {
-        *_CONCLUSIVE_VERDICT_STATUSES,
-        "promotion_failed",
-    }:
-        return None
-    prior_sha = str(prior_qualification.get("candidate_sha") or "").strip()
-    if not prior_sha or prior_sha == candidate_sha:
-        return None
-    sub_scores = prior_qualification.get("sub_scores")
-    if not isinstance(sub_scores, dict) or not isinstance(
-        sub_scores.get("audit"), (int, float)
-    ):
-        return None
-    if prior_qualification.get("audit_findings"):
-        return None
-    if prior_qualification.get("excluded_audit_findings"):
-        return None
-    if prior_qualification.get("audit_findings_total") not in (0, None):
-        return None
-    if prior_qualification.get("excluded_audit_findings_total") not in (0, None):
-        return None
-    return prior_sha
+    return str(prior_qualification.get("candidate_sha") or "").strip()
 
 def _promotion_failed_reuse_eligible(
     qual: dict[str, Any] | None, candidate_diff_hash: str | None

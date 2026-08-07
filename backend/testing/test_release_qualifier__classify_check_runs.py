@@ -2882,11 +2882,13 @@ async def test_delta_scoped_audit_reuses_unchanged_surface_without_respawn(
     db_session,
     mocker,
 ):
-    """Cross-SHA audit facts reuse identical trees and scope changed trees.
+    """Cross-SHA audit facts reuse identical trees and refuse dirty bases.
 
     An excluded-only advance copies the prior fact without an audit spawn; a
-    one-file change uses the prior candidate as its incremental base and carries
-    only findings from unchanged paths.
+    one-file change against a prior audit that LEFT findings does NOT adopt
+    that prior as an incremental base — the ledger hint is refused and the
+    audit runs the safe wider (full) range, so the dirty prior's findings
+    cannot be silently dropped from the new audit's view.
     """
     project, version = await _make_project_and_version(db_session, phase="stabilize")
     old_sha = "0ldaudit" * 5
@@ -3046,7 +3048,11 @@ async def test_delta_scoped_audit_reuses_unchanged_surface_without_respawn(
 
     assert changed_result["status"] == "spawned"
     audit_spawn.assert_awaited_once()
-    assert audit_spawn.await_args.kwargs["audit_base_sha"] == same_surface_sha
+    # The prior audit left findings (unchanged_finding + superseded_finding), so
+    # the ledger hint must be refused and the audit runs the safe wider (full)
+    # range — never an incremental base that would skip the dirty prior's
+    # findings. changed_audited_paths is still recorded for the spawn.
+    assert audit_spawn.await_args.kwargs["audit_base_sha"] is None
     assert version.last_qualification["changed_audited_paths"] == [
         "backend/app/changed.py"
     ]
