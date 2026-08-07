@@ -314,6 +314,133 @@ def test_uncapped_scan_skips_already_capped_files(tmp_path):
     assert [rec["rel"] for rec in offenders] == ["uncapped.py"]
 
 
+# ── Merge-duplicated bump-pair dedup (cap_bump_history generator) ─────────────
+
+
+def test_parse_git_diff_dedups_merge_duplicated_bump_pairs():
+    """Merge-duplicated bump pairs collapse to the earliest-dated commit.
+
+    The same cap change (old_cap -> new_cap) appears twice in ``git log --all``
+    output — once on the commit that first introduced the new limit value and
+    again on a sibling/promotion commit that re-applied the identical value.
+    git log emits commits newest-first, so the later duplicate appears FIRST in
+    the output. The dedup must keep the earliest-dated record of each pair by
+    timestamp (not position), and must not collapse distinct later bumps.
+    """
+    log = """\
+COMMIT bbb222 2026-05-22T22:49:42+00:00
+
+diff --git a/backend/testing/module_size_limits.json b/backend/testing/module_size_limits.json
+--- a/backend/testing/module_size_limits.json
++++ b/backend/testing/module_size_limits.json
+@@ -1,5 +1,5 @@
+   "backend": {
+-    "main.py": 3700,
++    "main.py": 3800,
+   }
+
+COMMIT aaa111 2026-05-22T03:27:04+00:00
+
+diff --git a/backend/testing/module_size_limits.json b/backend/testing/module_size_limits.json
+--- a/backend/testing/module_size_limits.json
++++ b/backend/testing/module_size_limits.json
+@@ -1,5 +1,5 @@
+   "backend": {
+-    "main.py": 3700,
++    "main.py": 3800,
+   }
+
+COMMIT ccc333 2026-06-01T10:00:00+00:00
+
+diff --git a/backend/testing/module_size_limits.json b/backend/testing/module_size_limits.json
+--- a/backend/testing/module_size_limits.json
++++ b/backend/testing/module_size_limits.json
+@@ -1,5 +1,5 @@
+   "backend": {
+-    "main.py": 3800,
++    "main.py": 3900,
+   }
+"""
+    records = slp._parse_git_diff_output(log, "main.py")
+    # (3700, 3800) appeared twice — collapsed to the earlier commit (aaa111),
+    # even though the later duplicate (bbb222) appears first in the output.
+    # (3800, 3900) is a distinct later bump and survives.
+    assert [(r["commit_sha"], r["old_cap"], r["new_cap"]) for r in records] == [
+        ("aaa111", 3700, 3800),
+        ("ccc333", 3800, 3900),
+    ]
+
+
+def test_parse_git_diff_does_not_dedup_distinct_pairs():
+    """A module's distinct bumps all survive; only identical pairs collapse."""
+    log = """\
+COMMIT bbb222 2026-06-01T10:00:00+00:00
+
+diff --git a/backend/testing/module_size_limits.json b/backend/testing/module_size_limits.json
+--- a/backend/testing/module_size_limits.json
++++ b/backend/testing/module_size_limits.json
+@@ -1,5 +1,5 @@
+   "backend": {
+-    "m.py": 1000,
++    "m.py": 1200,
+   }
+
+COMMIT aaa111 2026-05-01T10:00:00+00:00
+
+diff --git a/backend/testing/module_size_limits.json b/backend/testing/module_size_limits.json
+--- a/backend/testing/module_size_limits.json
++++ b/backend/testing/module_size_limits.json
+@@ -1,5 +1,5 @@
+   "backend": {
+-    "m.py": 800,
++    "m.py": 1000,
+   }
+"""
+    records = slp._parse_git_diff_output(log, "m.py")
+    assert [(r["commit_sha"], r["old_cap"], r["new_cap"]) for r in records] == [
+        ("aaa111", 800, 1000),
+        ("bbb222", 1000, 1200),
+    ]
+
+
+def test_parse_git_diff_dedup_keeps_earliest_across_offsets():
+    """The earliest survivor is chosen by actual timestamp, not ISO-string order.
+
+    ``-07:00`` is later in the day than ``+00:00`` for the same clock time; a
+    raw string sort would mis-order ``22:00-07:00`` (== 05:00 UTC next day)
+    before ``00:30+00:00``. Dedup must treat them by their true UTC instant.
+    """
+    log = """\
+COMMIT aaa111 2026-05-22T00:30:00+00:00
+
+diff --git a/backend/testing/module_size_limits.json b/backend/testing/module_size_limits.json
+--- a/backend/testing/module_size_limits.json
++++ b/backend/testing/module_size_limits.json
+@@ -1,5 +1,5 @@
+   "backend": {
+-    "main.py": 3700,
++    "main.py": 3800,
+   }
+
+COMMIT bbb222 2026-05-21T22:00:00-07:00
+
+diff --git a/backend/testing/module_size_limits.json b/backend/testing/module_size_limits.json
+--- a/backend/testing/module_size_limits.json
++++ b/backend/testing/module_size_limits.json
+@@ -1,5 +1,5 @@
+   "backend": {
+-    "main.py": 3700,
++    "main.py": 3800,
+   }
+"""
+    records = slp._parse_git_diff_output(log, "main.py")
+    # bbb222 (-07:00) is 2026-05-22T05:00:00+00:00 — LATER than aaa111's
+    # 00:30+00:00, so aaa111 wins even though "22:00-07:00" < "00:30+00:00"
+    # as a raw string.
+    assert len(records) == 1
+    assert records[0]["commit_sha"] == "aaa111"
+
+
 # ── Chronic-offender gate in --fix mode ─────────────────────────────────────
 
 

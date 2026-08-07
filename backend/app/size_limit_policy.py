@@ -258,7 +258,10 @@ def _read_cap_bump_history_ledger(section: str, module_key: str) -> list[BumpRec
             )
             err.__cause__ = exc
             raise err
-    records.sort(key=lambda r: r["commit_date"])
+    # Sort by actual timestamp, matching _parse_git_diff_output — the ledger
+    # stores records in that order, so a re-read must reproduce it even for
+    # records whose mixed UTC offsets would reorder under a raw string sort.
+    records.sort(key=lambda r: _parse_iso(r["commit_date"]))
     return records
 
 
@@ -463,7 +466,7 @@ def _merge_bump_histories(
             for r in records:
                 existing.setdefault((r["old_cap"], r["new_cap"]), r)
         merged[section] = {
-            key: sorted(records.values(), key=lambda r: r["commit_date"])
+            key: sorted(records.values(), key=lambda r: _parse_iso(r["commit_date"]))
             for key, records in by_key.items()
             if records
         }
@@ -477,6 +480,21 @@ def _parse_git_diff_output(output: str, module_key: str) -> list[BumpRecord]:
     commit's diff looks for ``-    "<key>": <int>`` (removed) and
     ``+    "<key>": <int>`` (added) lines.  Records only increases
     (new_cap > old_cap) — a decrease or reset is not a bump.
+
+    Merge-duplicated bump pairs are collapsed: the same cap change
+    (old_cap -> new_cap) is frequently recorded twice in ``git log --all`` —
+    once on the commit that first introduced the new limit value (typically an
+    integration-branch rollup) and again on a sibling/promotion commit that
+    re-applied the identical value (e.g. a main-side "adopt automain" fix).
+    Both diffs carry the exact same -/+ pair, so a naive parse would count one
+    logical bump twice and inflate the chronic-offender window/growth triggers.
+    Rule: for each (old_cap, new_cap) pair keep ONLY the record with the
+    earliest commit_date — the commit that first introduced the new limit
+    value — and drop the later duplicate(s).  Records are sorted by actual
+    timestamp (not the ISO string, which mis-orders mixed-offset commits).
+    This keeps regeneration stable and idempotent: the surviving records depend
+    only on the content of the history, not on which refs happen to be fetched
+    or on git's traversal order.
     """
     records: list[BumpRecord] = []
     # Matches +/- diff lines containing the key and a numeric cap value.
@@ -522,8 +540,22 @@ def _parse_git_diff_output(output: str, module_key: str) -> list[BumpRecord]:
                 )
             )
 
-    records.sort(key=lambda r: r["commit_date"])
-    return records
+    # Collapse merge-duplicated bump pairs to the earliest-dated survivor (see
+    # the docstring for the rule). git log emits commits newest-first, so the
+    # sibling/promotion duplicate of a bump appears BEFORE the commit that
+    # introduced it — the survivor must be chosen by timestamp, not position.
+    earliest_by_pair: dict[tuple[int, int], BumpRecord] = {}
+    for record in records:
+        pair = (record["old_cap"], record["new_cap"])
+        prior = earliest_by_pair.get(pair)
+        if prior is None or _parse_iso(record["commit_date"]) < _parse_iso(
+            prior["commit_date"]
+        ):
+            earliest_by_pair[pair] = record
+    return sorted(
+        earliest_by_pair.values(),
+        key=lambda r: _parse_iso(r["commit_date"]),
+    )
 
 
 def _is_chronic_offender(history: list[BumpRecord]) -> bool:

@@ -51,7 +51,11 @@ async def test_size_breach_creates_structured_message_and_returns_new_limit(
         json={
             "task_id": str(task.id),
             "annotation_type": "size_breach",
-            "file_path": "components/DashboardHome.tsx",
+            # AlertsBanner.tsx has no cap-bump history, so this deterministically
+            # exercises the routine path in both full and shallow checkouts.
+            # (A historically-bumped file like DashboardHome.tsx is a genuine
+            # chronic offender once full history is visible.)
+            "file_path": "components/AlertsBanner.tsx",
             "current_size": 1720,
             "change_summary": "Added telemetry panel for token usage per task type",
         },
@@ -77,7 +81,7 @@ async def test_size_breach_creates_structured_message_and_returns_new_limit(
     assert msg.message_type == MessageType.FEEDBACK
     assert msg.from_type == "agent"
     assert msg.context["annotation_type"] == "size_breach"
-    assert msg.context["file_path"] == "components/DashboardHome.tsx"
+    assert msg.context["file_path"] == "components/AlertsBanner.tsx"
     assert msg.context["current_size"] == 1720
     assert msg.context["new_limit"] == body["new_limit"]
     assert "telemetry panel" in msg.context["change_summary"]
