@@ -3385,6 +3385,108 @@ async def test_propagate_landed_descendants_no_parent_changed_files_noop(cleanup
     assert PARENT_DERIVED_CHANGED_FILES_KEY not in child_ctx
 
 
+@pytest.mark.asyncio
+async def test_propagate_landed_re_evaluates_already_landed_child_when_parent_changed_files_arrive(
+    cleanup_db,
+):
+    """Late-arriving parent changed files reach an ALREADY-landed rollup child
+    and re-record its frozen declared_unsatisfied (missing-from-diff) verdict as
+    satisfied_unproven.
+
+    Regression test for the frozen-verdict gap: the BFS sweep used to run the
+    parent-derived changed-file propagation + acceptance verdict re-record ONLY
+    inside the ``not has_landed_signal(row)`` branch, so a child that landed
+    before the parent's ``_pr_changed_files`` arrived was skipped forever and
+    its verdict could never flip."""
+    from app.acceptance_gate import (
+        CODE_ACCEPTANCE_VERDICT_KEY,
+        PARENT_DERIVED_CHANGED_FILES_KEY,
+        stamp_changed_files_signal,
+    )
+    from app.landed_signal import has_landed_signal
+    from app.rollup_management import _propagate_landed_to_staging_merged_descendants
+
+    project = await _make_project(cleanup_db, integration_branch="main")
+
+    # Parent lands on integration but its changed files arrive LATER.
+    parent = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="research",
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "landed_on_integration": True},
+    )
+    child = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="create",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=parent.id,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+        },
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "do the thing",
+                "acceptance_evidence": {
+                    "kind": "named_test",
+                    "test_path": "backend/testing/test_widget.py",
+                },
+            }
+        ],
+    )
+
+    # First propagation: parent has no changed files → child lands but its
+    # verdict is frozen at declared_unsatisfied (missing-from-diff).
+    stamped = await _propagate_landed_to_staging_merged_descendants(
+        parent.id, cleanup_db
+    )
+    await cleanup_db.commit()
+    await cleanup_db.refresh(child)
+    assert child.id in {t.id for t in stamped}
+    assert has_landed_signal(child)
+    recorded = (child.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+    assert recorded is not None
+    assert recorded.get("satisfied") is False
+    assert "is not among the PR's changed files" in (recorded.get("reason") or "")
+
+    # Parent's GitHub-verified changed files arrive late.
+    parent_ctx = dict(parent.context or {})
+    parent_ctx.update(
+        stamp_changed_files_signal(
+            ["backend/app/widget.py", "backend/testing/test_widget.py"],
+            github_verified=True,
+        )
+    )
+    parent.context = parent_ctx
+    await cleanup_db.commit()
+
+    # Second propagation: child is ALREADY landed, but the propagation must still
+    # reach it and re-record its verdict.
+    again = await _propagate_landed_to_staging_merged_descendants(
+        parent.id, cleanup_db
+    )
+    await cleanup_db.commit()
+    assert again == [], "no newly-landed descendants — the child was already landed"
+
+    await cleanup_db.refresh(child)
+    child_ctx = child.context or {}
+    assert child_ctx.get("_pr_changed_files") == [
+        "backend/app/widget.py",
+        "backend/testing/test_widget.py",
+    ]
+    assert child_ctx.get(PARENT_DERIVED_CHANGED_FILES_KEY) is True
+    re_recorded = child_ctx.get(CODE_ACCEPTANCE_VERDICT_KEY)
+    assert re_recorded is not None
+    assert re_recorded.get("satisfied") is True
+    assert re_recorded.get("proven") is False, (
+        "parent-derived credit is capped below machine proof"
+    )
+
+
 # ---------------------------------------------------------------------------
 # _do_rollup_post_merge_housekeeping: multi-direction refresh
 # ---------------------------------------------------------------------------
