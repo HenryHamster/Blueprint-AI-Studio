@@ -45,6 +45,7 @@ from app.models import (
     TaskWakeRegistration,
     WakeAction,
     WakeDeliveryState,
+    MigrationReservationStatus,
 )
 from app.schemas import AgentStatusPayload
 from app.task_lifecycle import (
@@ -7959,6 +7960,45 @@ async def test_post_commit_strategic_backstop_raise_does_not_500(tl_db, mocker):
     result = await _process_post_commit(task.id, payload, _session_factory=factory)
     assert result["status"] == "received"
     assert captured["session"] is not session
+
+
+@pytest.mark.asyncio
+async def test_post_commit_terminal_expires_migration_reservation_on_failure(
+    tl_db, mocker
+):
+    """T4 (fdd07b88 §6.2 gap): a FAILED task holding an ACTIVE migration
+    reservation must have it expired by the terminal-tail stage
+    (run_post_commit_terminal -> _expire_migration_reservation_if_terminal),
+    freeing the provisional revision id for re-allocation. Exercises the
+    extracted app.task_lifecycle_post_commit_terminal module end-to-end via
+    _process_post_commit rather than mocking the helper out."""
+    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
+    session, factory = tl_db
+    project = await _make_project(session)
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="create",
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+    task.payloads = [{"type": "create", "prompt": "x", "base_branch": "main"}]
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    reservation = await allocate_migration_reservation(session, task)
+    assert reservation.status == MigrationReservationStatus.ACTIVE
+
+    task.status = TaskStatus.FAILED
+    session.add(task)
+    await session.commit()
+
+    payload = AgentStatusPayload(task_id=task.id, status=TaskStatus.FAILED)
+    result = await _process_post_commit(task.id, payload, _session_factory=factory)
+    assert result["status"] == "received"
+
+    await session.refresh(reservation)
+    assert reservation.status == MigrationReservationStatus.EXPIRED
 
 
 @pytest.mark.asyncio

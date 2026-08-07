@@ -15,9 +15,13 @@ from __future__ import annotations
 import inspect
 import types
 
+from app import task_lifecycle_post_commit_terminal
+
 # Stage modules registered here are appended to _post_commit_sources() output.
 # Mutable list so extraction steps can append without re-importing this module.
-_POST_COMMIT_STAGE_REGISTRY: list[types.ModuleType] = []
+_POST_COMMIT_STAGE_REGISTRY: list[types.ModuleType] = [
+    task_lifecycle_post_commit_terminal,
+]
 
 
 def _post_commit_sources() -> str:
