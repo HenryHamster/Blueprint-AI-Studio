@@ -4,17 +4,23 @@ The v28 stabilisation work measured the strategic decision-loop payload and
 found its largest section is ``problem_model`` at 27.6% of the mean prompt
 bytes (37,196 bytes of a 134,842-byte prompt). This test builds the
 agent-view ``problem_model`` section from a deterministic, realistic fixture
-and asserts the STRUCTURAL byte reductions that keep the section bounded —
-chiefly that ``revision_log`` (the durable model-write history, which the
-schema marks "Not auto-injected into prompts — accessible via tool call") is
-no longer shipped inside the problem_model section.
+and asserts the STRUCTURAL byte reductions that keep the section bounded:
+
+- ``revision_log`` (the durable model-write history, which the schema marks
+  "Not auto-injected into prompts — accessible via tool call") is no longer
+  shipped inside the problem_model section;
+- low-value provenance/detail fields (``source``, ``evidence_refs``, friction
+  ``mitigations_tried``) are compacted out of every agent-owned entry by
+  ``_agent_view_problem_model`` — recoverable via ``./fetch problem-model`` and
+  restored on write-back, never a silent drop (see ``test_strategic_payload.py``
+  for the recoverability/non-destructive assertions).
 
 It asserts measured byte sizes, not just structure: total section bytes, the
 per-section bytes of the sections the builder ships, and the exact bytes
 saved by dropping the revision log. The byte ceilings are sized to the
 fixture with headroom; a regression that re-ships the revision log (the
-single largest structurally-redundant slice, ~18% of the section) trips the
-total-bytes ceiling.
+single largest structurally-redundant slice) OR re-ships the compacted
+provenance fields trips the total-bytes ceiling.
 """
 
 import json
@@ -23,13 +29,14 @@ from app.payload_schemas import _serialized_size, pack_under_budget
 from app.strategic_problem_view import _agent_view_problem_model
 
 # Byte ceilings for the fixture below, measured from the fixture's serialized
-# agent-view output with headroom. Total is deliberately tight: re-shipping
-# the ~4.9 KB revision_log pushes the total over it.
-_PROBLEM_MODEL_VIEW_MAX_BYTES = 39_000
+# compacted agent-view output (23,496 B) with headroom. Total is deliberately
+# tight: re-shipping the ~4.9 KB revision_log (→ 28,451 B) or re-shipping the
+# compacted provenance fields (→ 35,097 B) both push the total over it.
+_PROBLEM_MODEL_VIEW_MAX_BYTES = 28_000
 _PER_SECTION_MAX_BYTES = {
-    "gaps": 18_000,
-    "capabilities": 15_000,
-    "friction": 5_000,
+    "gaps": 15_000,
+    "capabilities": 8_000,
+    "friction": 3_000,
     "intent": 2_000,
 }
 
