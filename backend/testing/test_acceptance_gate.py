@@ -70,6 +70,7 @@ def _make_code_task(
     changed_files: list[str] | None = None,
     unverified_reason: str | None = None,
     targeted_green: bool = False,
+    merge_test_block: dict | None = None,
     task_type: str = "create",
 ) -> Task:
     payload: dict = {"type": task_type, "prompt": "do the thing"}
@@ -86,6 +87,17 @@ def _make_code_task(
     elif acceptance_evidence is not None and acceptance_evidence.get("kind") == "named_test":
         # named_test requires verification; set empty review_loop to indicate verified
         context[REVIEW_LOOP_KEY] = {}
+    # A MERGE_TEST_RESULT-shaped verdict carrying the ``acceptanceTest`` block.
+    # Forward-compatible read the gate supports: the no-CI monitor today distills
+    # the block into ``acceptance_test_targeted_green``, but a task whose
+    # review_loop persists the verdict dict itself exposes the block directly.
+    if merge_test_block is not None:
+        rl = context.setdefault(REVIEW_LOOP_KEY, {})
+        rl["verify_tests_verdict"] = {
+            "detected": True,
+            "passed": True,
+            "acceptanceTest": merge_test_block,
+        }
     # The no-CI monitor stamps this durable signal when it independently ran the
     # declared acceptance test as a TARGETED run and it exited green. It rides on
     # the same review_loop the merge-verification reason lives on.
@@ -285,11 +297,13 @@ def test_targeted_named_test_execution_earns_proven_under_unverified_merge():
     assert acceptance_blocks_success(stamped) is False
 
 
-def test_targeted_green_but_test_absent_still_fails_closed():
-    # Even with the targeted-green signal, the declared test must be among the
-    # PR's changed files. A targeted-green flag with the test absent (never added
-    # in this PR) still fails closed — the signal relaxes ONLY the full-suite
-    # verification requirement, not the "test was actually added" requirement.
+def test_targeted_green_existing_test_absent_from_diff_earns_proven():
+    # The no-CI monitor physically ran the declared test as a TARGETED run and it
+    # exited green (``acceptance_test_targeted_green=True``) — that is existence
+    # evidence at the merge commit PLUS per-test green proof. A behaviour-
+    # preserving refactor that re-verifies a pre-existing test it did NOT modify
+    # therefore mints machine proof even though the test is absent from the PR's
+    # diff: existence-at-merge replaces presence-in-diff as the anti-fraud guard.
     task = _make_code_task(
         acceptance_evidence={
             "kind": "named_test",
@@ -300,9 +314,19 @@ def test_targeted_green_but_test_absent_still_fails_closed():
         targeted_green=True,
     )
     verdict = evaluate_code_acceptance(task)
-    assert verdict.satisfied is False
-    assert verdict.proven is False
-    assert "not among" in verdict.reason
+    assert verdict.declared is True
+    assert verdict.satisfied is True
+    assert verdict.proven is True
+    assert verdict.kind == "named_test"
+    assert "NOT modified by this PR but EXISTS" in verdict.reason
+    assert verdict.proof_ref == "backend/testing/test_acceptance_gate.py"
+
+    recorded = record_code_acceptance_verdict(task)
+    assert recorded is not None
+    stamped = task.context[CODE_ACCEPTANCE_VERDICT_KEY]
+    assert stamped["satisfied"] is True
+    assert stamped["proven"] is True
+    assert acceptance_is_proven(stamped) is True
 
 
 def test_targeted_green_test_only_diff_still_fails_closed():
@@ -322,6 +346,144 @@ def test_targeted_green_test_only_diff_still_fails_closed():
     assert verdict.satisfied is False
     assert verdict.proven is False
     assert "test-only" in verdict.reason
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# named_test — pre-existing test proven at the merge commit (existence-at-merge)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_existing_test_present_and_green_in_merge_verdict_earns_proven():
+    # A merge-test verdict that records the declared acceptance test as present
+    # AND ran-green is a real merge-test verdict proving the exact claim — even
+    # when the test file is absent from the PR's diff (a behaviour-preserving
+    # refactor re-verifying a pre-existing test) and even when the agent's own
+    # block says ``in_diff: False``. Existence-at-merge replaces presence-in-diff
+    # as the anti-fraud guard for this shape.
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+        },
+        changed_files=["backend/app/widget.py"],  # test file absent from diff
+        unverified_reason=None,  # full-suite merge was verified
+        merge_test_block={
+            "declared": True,
+            "descriptor": "test_widget.py",
+            "present": True,
+            "ran": True,
+            "status": "ran",
+            "passed": True,
+            "in_diff": False,
+        },
+    )
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.declared is True
+    assert verdict.satisfied is True
+    assert verdict.proven is True
+    assert verdict.kind == "named_test"
+    assert "NOT modified by this PR but EXISTS" in verdict.reason
+    assert verdict.proof_ref == "backend/testing/test_widget.py"
+
+    recorded = record_code_acceptance_verdict(task)
+    assert recorded is not None
+    stamped = task.context[CODE_ACCEPTANCE_VERDICT_KEY]
+    assert stamped["satisfied"] is True
+    assert stamped["proven"] is True
+    assert acceptance_is_proven(stamped) is True
+
+
+def test_existing_green_test_ungrounded_seam_fails_closed():
+    # Existence + greenness alone is NOT the anti-fraud guard: a pre-existing
+    # test that ran green but is NOT semantically grounded to any changed
+    # production file is a name-drop of an unrelated test. Still rejected.
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_acceptance_gate.py",
+        },
+        changed_files=["backend/app/widget.py"],  # unrelated seam
+        unverified_reason="no_detectable_test_command",
+        targeted_green=True,  # the test exists and ran green...
+    )
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.satisfied is False
+    assert verdict.proven is False
+    assert "does not semantically correspond" in verdict.reason
+
+    # Classification maps the rejection to the ungrounded-seam cause, not the
+    # missing-from-diff cause — the test WAS found green, it just exercises
+    # nothing the PR changed.
+    recorded = record_code_acceptance_verdict(task)
+    assert recorded is not None
+    assert classify_unsatisfied_reason(task.context[CODE_ACCEPTANCE_VERDICT_KEY]) == (
+        "named_test_ungrounded_seam"
+    )
+
+
+def test_named_test_present_false_in_merge_verdict_still_fails_closed():
+    # A merge-test verdict that records the declared test as ABSENT
+    # (``present=False``) is definitive proof the test does NOT exist at the
+    # merge commit — the anti-fraud guard holds: a declared test that exists
+    # nowhere is never credited, even though a merge verdict was recorded.
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+        },
+        changed_files=["backend/app/widget.py"],
+        unverified_reason=None,
+        merge_test_block={
+            "declared": True,
+            "descriptor": "test_widget.py",
+            "present": False,
+            "ran": False,
+            "status": "absent",
+            "passed": False,
+        },
+    )
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.satisfied is False
+    assert verdict.proven is False
+    assert "not among" in verdict.reason
+
+    recorded = record_code_acceptance_verdict(task)
+    assert recorded is not None
+    assert classify_unsatisfied_reason(task.context[CODE_ACCEPTANCE_VERDICT_KEY]) == (
+        "named_test_missing_from_diff"
+    )
+
+
+def test_existing_green_test_only_diff_still_fails_closed():
+    # Even a pre-existing test confirmed present and green in the merge-test
+    # verdict fails closed when the PR ships NO production seam: a test-only diff
+    # has nothing for the test to exercise.
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+        },
+        changed_files=["backend/testing/test_widget.py"],
+        unverified_reason=None,
+        merge_test_block={
+            "declared": True,
+            "descriptor": "test_widget.py",
+            "present": True,
+            "ran": True,
+            "status": "ran",
+            "passed": True,
+        },
+    )
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.satisfied is False
+    assert verdict.proven is False
+    assert "test-only" in verdict.reason
+
+    recorded = record_code_acceptance_verdict(task)
+    assert recorded is not None
+    assert classify_unsatisfied_reason(task.context[CODE_ACCEPTANCE_VERDICT_KEY]) == (
+        "named_test_test_only_diff"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

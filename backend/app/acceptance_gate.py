@@ -484,6 +484,66 @@ def _acceptance_test_targeted_green(task: Task) -> bool:
     return review_loop.get(ACCEPTANCE_TEST_TARGETED_GREEN_KEY) is True
 
 
+def _merge_acceptance_test_block(task: Task) -> dict | None:
+    """Read the declared acceptance test's merge-test verdict block, defensively.
+
+    Forward-compatible read: when a verdict-shaped dict carrying a normalized
+    ``acceptanceTest`` block is present on the task's ``review_loop``, return the
+    block; else return ``None``. The no-CI monitor currently distills the block
+    into the durable ``acceptance_test_targeted_green`` /
+    ``acceptance_test_targeted_descriptor`` signals (see ``orchestrator_ci_monitor``)
+    rather than persisting the block itself, so this degrades to ``None`` for
+    every legacy / older-agent task — every caller MUST fall back to
+    :func:`_acceptance_test_targeted_green`.
+    """
+    review_loop = (task.context or {}).get(REVIEW_LOOP_KEY)
+    if not isinstance(review_loop, dict):
+        return None
+    verdict = review_loop.get("verify_tests_verdict")
+    if not isinstance(verdict, dict):
+        return None
+    block = verdict.get("acceptanceTest")
+    return block if isinstance(block, dict) else None
+
+
+def _acceptance_test_exists_at_merge(task: Task) -> bool:
+    """Whether the declared acceptance test is confirmed to EXIST in the repo at
+    the merge commit — independent of whether the PR's diff touches it.
+
+    True when the merge gate physically executed the declared test as a targeted
+    run (``acceptance_test_targeted_green`` — a test that ran must exist), or a
+    merge-test verdict block records the test as ``present``. Defensive: absent /
+    malformed evidence yields False, so a name-dropped test that can be shown to
+    exist nowhere is never credited.
+    """
+    if _acceptance_test_targeted_green(task):
+        return True
+    block = _merge_acceptance_test_block(task)
+    return bool(block and block.get("present") is True)
+
+
+def _acceptance_test_ran_green_at_merge(task: Task) -> bool:
+    """Whether the declared acceptance test is confirmed to have RAN GREEN under a
+    real merge-test verdict — independent of the PR's diff.
+
+    True when the targeted-green signal was stamped (the merge gate independently
+    executed ONLY the declared test and it exited green), or a merge-test verdict
+    block records the declared test as present, ran, with status ``"ran"`` and
+    ``passed``. A test that exists but did not run green (skipped / absent /
+    failed) yields False.
+    """
+    if _acceptance_test_targeted_green(task):
+        return True
+    block = _merge_acceptance_test_block(task)
+    return bool(
+        block
+        and block.get("present") is True
+        and block.get("ran") is True
+        and block.get("status") == "ran"
+        and block.get("passed") is True
+    )
+
+
 def _evaluate_named_test(
     evidence: AcceptanceEvidence,
     changed: list[str],
@@ -491,17 +551,32 @@ def _evaluate_named_test(
     truncated: bool = False,
     parent_derived: bool = False,
     targeted_green: bool = False,
+    test_exists: bool = False,
+    ran_green: bool = False,
 ) -> AcceptanceGateVerdict:
     """Fail-closed gate for a ``named_test`` acceptance declaration.
 
     Passes only when the named test (1) is among the PR's changed files — it was
-    actually added/modified by this PR rather than merely claimed — (2) ran green
-    under a real merge-test verdict, and (3) the PR also ships a NON-test
-    production change for the test to exercise (the changed seam). A test-only
-    diff fails: a test that ships no changed production code cannot be exercising
-    the changed seam, and an always-true assertion added in isolation is exactly
-    that shape. Trivial / placeholder test references are already rejected
-    fail-closed at declaration time by ``AcceptanceEvidence`` validation.
+    actually added/modified by this PR rather than merely claimed — OR is
+    confirmed to EXIST in the repo at the merge commit with a green merge-test
+    run (see ``test_exists`` / ``ran_green``), (2) ran green under a real
+    merge-test verdict, and (3) the PR also ships a NON-test production change
+    for the test to exercise (the changed seam). A test-only diff fails: a test
+    that ships no changed production code cannot be exercising the changed seam,
+    and an always-true assertion added in isolation is exactly that shape.
+    Trivial / placeholder test references are already rejected fail-closed at
+    declaration time by ``AcceptanceEvidence`` validation.
+
+    The presence-in-diff check is the FIRST anti-fraud guard and stays intact: a
+    declared test that is neither in the diff NOR confirmed to exist at the merge
+    commit is a name-drop and hard-fails. ``test_exists`` (confirmed existence at
+    the merge commit) REPLACES presence-in-diff as the anti-fraud guard for the
+    behaviour-preserving-refactor shape: a pre-existing test that the PR re-verifies
+    without modifying is honest machine-checked evidence when the merge gate
+    physically ran it green. ``ran_green`` confirms the SPECIFIC declared test ran
+    green under a real merge-test verdict — for a test the PR did NOT modify, the
+    full-suite ``verified`` flag is not per-test evidence, so the existence path
+    additionally requires ``ran_green`` (or ``targeted_green``).
 
     ``targeted_green`` is the ONE relaxation of requirement (2): when the
     full-suite merge fell open UNVERIFIED (``verified is False``) but the merge
@@ -512,12 +587,15 @@ def _evaluate_named_test(
     closed at the verification step — the targeted green run is honest
     machine-checked proof of the exact claim, so it continues to the proven
     branch and mints ``proven=True``. This does NOT require running the whole
-    suite. When BOTH ``verified`` and ``targeted_green`` are False the gate keeps
-    today's fail-closed outcome. ``targeted_green`` never overrides the
-    parent-derived soft cap or the truncation / github-verified handling — those
-    stay as-is (a parent-derived match is still capped at satisfied/unproven even
-    when the declared test ran green, because the match may live in a sibling's
-    slice of the combined diff).
+    suite. ``ran_green`` is the same proof read directly from a merge-test verdict
+    block when one is persisted (forward-compatible; see
+    :func:`_acceptance_test_ran_green_at_merge`). When ``verified``,
+    ``targeted_green``, and ``ran_green`` are ALL False the gate keeps today's
+    fail-closed outcome. Neither relaxation ever overrides the parent-derived soft
+    cap or the truncation / github-verified handling — those stay as-is (a
+    parent-derived match is still capped at satisfied/unproven even when the
+    declared test ran green, because the match may live in a sibling's slice of
+    the combined diff).
 
     ``truncated`` marks that the changed-file list was capped (a >50-file PR): the
     declared test may have shipped beyond the truncation point, so its absence
@@ -560,14 +638,35 @@ def _evaluate_named_test(
                 "test may ship beyond the stored prefix, so absence is "
                 "inconclusive; crediting soft without machine proof",
             )
-        return AcceptanceGateVerdict(
-            True,
-            False,
-            evidence.kind,
-            f"declared named_test {declared_path!r} is not among the PR's "
-            "changed files — the claimed test was not added or modified here",
-        )
-    if not verified and not targeted_green:
+        # A declared test the PR did NOT modify can still be PROVEN when it EXISTS
+        # at the merge commit and RAN GREEN: a behaviour-preserving refactor that
+        # re-verifies a pre-existing test (rather than adding a new one) is honest
+        # machine-checked evidence even though the test is absent from the diff.
+        # Existence-at-merge replaces presence-in-diff as the anti-fraud guard — a
+        # test the merge gate physically executed green cannot be a fabricated
+        # name-drop. Absent existence evidence keeps the hard fail below, so
+        # name-dropping a test that exists nowhere is never credited.
+        if not test_exists:
+            return AcceptanceGateVerdict(
+                True,
+                False,
+                evidence.kind,
+                f"declared named_test {declared_path!r} is not among the PR's "
+                "changed files — the claimed test was not added or modified here",
+            )
+        # The test exists at the merge commit. For a test the PR did NOT modify,
+        # the full-suite ``verified`` flag is not per-test evidence — only a green
+        # run recorded for THIS test (targeted execution or a merge-test verdict
+        # block) proves it ran green, so the existence path requires it explicitly.
+        if not targeted_green and not ran_green:
+            return AcceptanceGateVerdict(
+                True,
+                False,
+                evidence.kind,
+                f"declared named_test {declared_path!r} did not run green under a "
+                "real merge-test verdict (the merge fell open without verification)",
+            )
+    if not verified and not targeted_green and not ran_green:
         return AcceptanceGateVerdict(
             True,
             False,
@@ -575,11 +674,11 @@ def _evaluate_named_test(
             f"declared named_test {declared_path!r} did not run green under a "
             "real merge-test verdict (the merge fell open without verification)",
         )
-    # When ``verified`` is False but ``targeted_green`` is True, the merge gate
-    # ran ONLY the declared test as a targeted run and it exited green — honest
-    # machine-checked proof of the exact claim, so we continue past the
+    # When ``verified`` is False but ``targeted_green``/``ran_green`` is True, the
+    # merge gate ran ONLY the declared test as a targeted run and it exited green —
+    # honest machine-checked proof of the exact claim, so we continue past the
     # verification step to the proven branch below rather than failing closed.
-    via_targeted = targeted_green and not verified
+    via_targeted = (targeted_green or ran_green) and not verified
     seam_files = [cf for cf in changed if not _is_test_path(cf)]
     if not seam_files:
         return AcceptanceGateVerdict(
@@ -614,18 +713,35 @@ def _evaluate_named_test(
             "sibling's slice of the union diff",
         )
     if via_targeted:
-        reason = (
-            f"named_test {declared_path!r} was added/modified and ran GREEN via a "
-            f"TARGETED execution of the declared test (the full-suite merge fell "
-            f"open unverified), and exercises a semantically grounded production "
-            f"seam ({len(seam_files)} non-test file(s))"
-        )
+        if test_present:
+            reason = (
+                f"named_test {declared_path!r} was added/modified and ran GREEN via "
+                f"a TARGETED execution of the declared test (the full-suite merge "
+                f"fell open unverified), and exercises a semantically grounded "
+                f"production seam ({len(seam_files)} non-test file(s))"
+            )
+        else:
+            reason = (
+                f"named_test {declared_path!r} was NOT modified by this PR but "
+                f"EXISTS in the repo at the merge commit and ran GREEN via a "
+                f"TARGETED execution of the declared test, and exercises a "
+                f"semantically grounded production seam ({len(seam_files)} non-test "
+                f"file(s))"
+            )
     else:
-        reason = (
-            f"named_test {declared_path!r} was added/modified, ran green under a "
-            f"verified merge, and exercises a semantically grounded production seam "
-            f"({len(seam_files)} non-test file(s))"
-        )
+        if test_present:
+            reason = (
+                f"named_test {declared_path!r} was added/modified, ran green under "
+                f"a verified merge, and exercises a semantically grounded production "
+                f"seam ({len(seam_files)} non-test file(s))"
+            )
+        else:
+            reason = (
+                f"named_test {declared_path!r} was NOT modified by this PR but "
+                f"EXISTS in the repo at the merge commit, ran green under a "
+                f"verified merge, and exercises a semantically grounded production "
+                f"seam ({len(seam_files)} non-test file(s))"
+            )
     return AcceptanceGateVerdict(
         True,
         True,
@@ -934,6 +1050,8 @@ def evaluate_code_acceptance(task: Task) -> AcceptanceGateVerdict:
         (task.context or {}).get(PARENT_DERIVED_CHANGED_FILES_KEY)
     )
     targeted_green = _acceptance_test_targeted_green(task)
+    test_exists = _acceptance_test_exists_at_merge(task)
+    ran_green = _acceptance_test_ran_green_at_merge(task)
 
     if evidence.kind == "named_test":
         return _evaluate_named_test(
@@ -943,6 +1061,8 @@ def evaluate_code_acceptance(task: Task) -> AcceptanceGateVerdict:
             truncated,
             parent_derived=parent_derived_files,
             targeted_green=targeted_green,
+            test_exists=test_exists,
+            ran_green=ran_green,
         )
 
     if evidence.kind == "downstream_artifact":
