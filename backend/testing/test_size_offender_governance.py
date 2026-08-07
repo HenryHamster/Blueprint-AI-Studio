@@ -605,9 +605,17 @@ def test_cap_bump_history_ledger_matches_git():
     repo_root = _real_repo_checkout()
     if repo_root is None:
         pytest.skip("no git checkout of this repo available for the ledger guard")
+    # The CI backend shards bind the checkout read-only at /repo into a root
+    # container while the runner user owns the files, so git inside the
+    # container refuses every command with "detected dubious ownership" (exit
+    # 128) unless the path is marked safe.  ``-c safe.directory=<repo_root>``
+    # is the same injection runner_isolation.py performs via GIT_CONFIG_* for
+    # cloned workspaces — without it this guard dies before reading history.
     git_out = subprocess.run(
         [
             "git",
+            "-c",
+            f"safe.directory={repo_root}",
             "log",
             "--all",
             "--format=COMMIT %H %aI",

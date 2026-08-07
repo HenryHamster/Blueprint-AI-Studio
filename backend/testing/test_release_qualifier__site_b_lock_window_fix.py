@@ -1998,7 +1998,8 @@ async def test_sweep_starts_initial_qualification_when_auto_trigger_fires(
     never-attempted version but nothing executed that decision — the agent-emitted
     qualify_request path was the only starter, so the trigger engine "decided but
     never fired".  With the knob defaulting to "on", the sweep's auto-trigger leg
-    now starts the initial qualification with ``explicit_request=True``.
+    now starts the initial qualification through its sanctioned automatic path
+    (``auto_trigger=True``).
     """
     from app import shared_state
 
@@ -2026,12 +2027,15 @@ async def test_sweep_starts_initial_qualification_when_auto_trigger_fires(
     )
 
     # Auto-fires are not counted as finalized; the assertion that matters is that
-    # the armed never-attempted version's decision was executed explicitly.
+    # the armed never-attempted version's decision was executed. The sweep's
+    # auto-trigger is automatic machinery: it must use the distinct sanctioned
+    # auto_trigger path, not claim explicit-request status.
     assert count == 0
     run_qual_mock.assert_awaited_once()
     call = run_qual_mock.await_args
     assert call.args[1] == project.id
-    assert call.kwargs.get("explicit_request") is True
+    assert call.kwargs.get("explicit_request") is not True
+    assert call.kwargs.get("auto_trigger") is True
 
 
 # Named acceptance test: test_drift_sentinel_runs_by_default_without_build_config_flag
