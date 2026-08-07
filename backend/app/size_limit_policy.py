@@ -127,6 +127,98 @@ def _git_reads_history_here() -> bool:
     )
 
 
+# Ref scope for cap-bump history: the mainline integration branch's ancestry,
+# NEVER ``--all``.  The ledger mirrors only mainline bumps — cap bumps recorded
+# on abandoned task/research branches never merged and must not enter
+# chronic-offender classification — so every git read of this history must be
+# scoped to a single mainline branch.  Candidates are ordered to prefer the
+# remote-tracking integration branch (deterministic across clones regardless of
+# the checked-out local branch), then the local branch, then ``HEAD``.
+_MAINLINE_BRANCH_CANDIDATES: tuple[str, ...] = (
+    "origin/automain",
+    "automain",
+    "origin/main",
+    "main",
+)
+
+
+def _mainline_git_ref(repo_root: str | None = None) -> str:
+    """Resolve the ref whose ancestry is the cap-bump-history source of truth.
+
+    Returns the first ``_MAINLINE_BRANCH_CANDIDATES`` ref that exists in the
+    checkout, falling back to ``HEAD`` (the only ref guaranteed to resolve).
+    ``HEAD`` is a fallback only: on a feature branch it scopes history to that
+    branch's own ancestors, which can miss mainline bumps merged after the
+    branch forked — the preferred candidates are the mainline branches.  All
+    three call sites (the production read, the ``--fix`` regenerator, and the
+    guard test) must use this same helper so the ledger and its checker cannot
+    disagree by construction.
+    """
+    root = repo_root or _REPO_ROOT
+    for candidate in _MAINLINE_BRANCH_CANDIDATES:
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "--verify", "--quiet", candidate],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                cwd=root,
+            )
+        except Exception:  # noqa: BLE001 — a probe; unresolved ref falls through
+            continue
+        if result.returncode == 0:
+            return candidate
+    return "HEAD"
+
+
+def _git_history_is_truncated(repo_root: str | None = None) -> bool:
+    """True when the MAINLINE history source is truncated by a shallow boundary.
+
+    A depth-limited clone (CI's depth-1 checkout, a task-VM shallow clone) has a
+    ``.git/shallow`` boundary file and ``git log`` silently returns a partial
+    history — treating that as complete would let the guard pass without
+    evaluating it and let the chronic-offender classifier read a truncated bump
+    history, both fail-open.  Callers fail closed instead: the production read
+    raises, the guard test skips.
+
+    The presence of ``.git/shallow`` ALONE does not mean the mainline ancestry
+    is truncated: the backend test harness runs ``git fetch --depth=1 origin
+    testmon-cache``, which drops a shallow boundary on that unrelated branch
+    while the mainline history stays complete.  Only when the mainline ref's
+    ancestry actually crosses a shallow boundary is the source of truth
+    truncated.  A boundary on an unrelated branch must not fail closed.
+    """
+    root = repo_root or _REPO_ROOT
+    shallow_path = os.path.join(root, ".git", "shallow")
+    if not os.path.isfile(shallow_path):
+        return False
+    try:
+        with open(shallow_path, encoding="utf-8") as f:
+            boundaries = [line.strip() for line in f if line.strip()]
+    except OSError:
+        # Unreadable boundary list — cannot prove the history is complete.
+        return True
+    if not boundaries:
+        return False
+    ref = _mainline_git_ref(root)
+    for boundary in boundaries:
+        try:
+            result = subprocess.run(
+                ["git", "merge-base", "--is-ancestor", boundary, ref],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                cwd=root,
+            )
+        except Exception:  # noqa: BLE001 — probe; unresolvable boundary falls through
+            continue
+        if result.returncode == 0:
+            # A shallow boundary commit is in the mainline ancestry, so the
+            # mainline history is truncated.
+            return True
+    return False
+
+
 def parse_bump_history(module_key: str, section: str = "backend") -> list[BumpRecord]:
     """Return the cap-bump history for ``module_key``.
 
@@ -186,20 +278,31 @@ def _read_git_bump_history(module_key: str) -> list[BumpRecord] | None:
     or ``_REPO_ROOT`` is not a git checkout.  The caller then falls back to the
     committed ledger mirror.
 
-    Any other failure to read git history — a subprocess error, or a non-zero
-    ``git log`` exit (a truncated/shallow task-VM clone, a corrupt repo) —
+    The history is read from the MAINLINE branch's ancestry
+    (:func:`_mainline_git_ref`), never ``--all`` — bumps on abandoned
+    task/research branches never merged and must not enter the chronic-offender
+    classification.
+
+    Any other failure to read git history — a subprocess error, a shallow/
+    truncated clone (a depth-limited ``.git/shallow``, so ``git log`` would
+    silently return a partial history), or a non-zero ``git log`` exit —
     raises :class:`BumpHistoryUnavailableError`.  In a real checkout that is
     genuine evidence loss and must stay fail-closed rather than silently degrade
     to "no bump history".
     """
     if not _git_reads_history_here():
         return None
+    if _git_history_is_truncated():
+        raise BumpHistoryUnavailableError(
+            f"git history is truncated (shallow checkout at {_REPO_ROOT}); "
+            f"cannot read bump history for {module_key!r}"
+        )
     try:
         result = subprocess.run(
             [
                 "git",
                 "log",
-                "--all",
+                _mainline_git_ref(),
                 "--format=COMMIT %H %aI",
                 "-p",
                 "--",
@@ -323,19 +426,25 @@ def rebuild_cap_bump_history_ledger(
     """Regenerate the cap-bump-history ledger and write it; return the dict.
 
     The ledger mirrors the bump records ``git log -p -- module_size_limits.json``
-    would produce, so the deployed backend (no git) classifies from the same
-    history it would read in a checkout.  Every cap-bump path must keep it in
-    sync: ``check_size_limits.py --fix`` passes the bumps it applies as
-    ``pending``, and the rollup size preflight appends its auto-bumps via
+    scoped to the MAINLINE branch's ancestry (:func:`_mainline_git_ref`) would
+    produce, so the deployed backend (no git) classifies from the same history
+    it would read in a checkout — and never from ``--all`` bumps on abandoned,
+    never-merged branches.  Every cap-bump path must keep it in sync:
+    ``check_size_limits.py --fix`` passes the bumps it applies as ``pending``,
+    and the rollup size preflight appends its auto-bumps via
     :func:`ledger_with_pending_bumps` before committing both files together.
 
-    The git-derived base is rebuilt only when the readable git history is not
-    missing any record the existing ledger already holds.  When git is absent
-    or truncated (a shallow task-VM clone), the existing ledger is preserved and
-    only git-visible records not already present are merged in — a truncated
-    ``git log`` must never truncate the mirror.  ``caps_json_path`` /
-    ``ledger_path`` default to the shipped files (under ``backend/testing/``);
-    callers with a hermetic fixture repo pass the fixture paths.
+    When git is absent or the checkout is truncated (the mainline ancestry
+    crosses a ``.git/shallow`` boundary — a shallow task-VM clone, CI's depth-1
+    checkout — so ``git log`` would silently return a partial history), the
+    existing ledger is preserved rather than regenerated — a truncated ``git
+    log`` must never truncate the mirror.  In a complete checkout the mirror is
+    rebuilt from the mainline ancestry, and only if that would not drop a
+    record the existing ledger already holds for a current key is the mirror
+    replaced outright (the merge path keeps both).  ``git log`` itself never
+    runs on a truncated checkout.  ``caps_json_path`` / ``ledger_path``
+    default to the shipped files (under ``backend/testing/``); callers with a
+    hermetic fixture repo pass the fixture paths.
     """
     caps_path = caps_json_path or _MODULE_SIZE_LIMITS_PATH
     out_path = ledger_path or _CAP_BUMP_HISTORY_LEDGER_PATH
@@ -350,13 +459,13 @@ def rebuild_cap_bump_history_ledger(
     )
 
     git_output = None
-    if _git_reads_history_here():
+    if _git_reads_history_here() and not _git_history_is_truncated():
         try:
             result = subprocess.run(
                 [
                     "git",
                     "log",
-                    "--all",
+                    _mainline_git_ref(),
                     "--format=COMMIT %H %aI",
                     "-p",
                     "--",
@@ -430,9 +539,11 @@ def _git_would_drop_ledger_records(
 
     Only current-caps keys are consulted (removed keys can no longer breach, so
     their records may be dropped safely).  If the existing ledger holds a record
-    for a current key that the readable git history does not show, git is
-    truncated (e.g. a shallow task-VM clone) and the mirror must be merged, not
-    regenerated, or history would be silently lost.
+    for a current key that the readable git history does not show, the mirror
+    must be merged, not regenerated, or history would be silently lost.  The
+    primary truncated-history guard is :func:`_git_history_is_truncated` (git is
+    not even run on a shallow checkout); this is the secondary safety net for a
+    checkout that is not marked shallow yet still lacks a ledger record.
     """
     for section, section_records in existing_history.items():
         if not isinstance(section_records, dict):
