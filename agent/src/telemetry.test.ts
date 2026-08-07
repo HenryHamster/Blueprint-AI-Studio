@@ -6,6 +6,7 @@ import {
   getCurrentPromptFingerprint,
   recordLlmCallStart,
   recordLlmTokens,
+  recordProviderReportedUsage,
   recordNumTurns,
   recordViewportScreenshotDownload,
   recordToolResultBytes,
@@ -103,7 +104,32 @@ describe('LLM telemetry', () => {
       prompt_size_bytes: null,
       prompt_section_count: null,
       prompt_section_sizes: null,
-      provider_reported_usage: null,
+      // LLM calls happened but no provider usage block was observed → the
+      // explicit not-reported marker, never a silent null.
+      provider_reported_usage: { reported: false },
+    });
+  });
+  it('marks provider-reported usage as reported when a usage block is observed', () => {
+    recordLlmCallStart();
+    recordProviderReportedUsage(1000, 500, 200, 300);
+    const telemetry = getLlmTelemetry();
+    expect(telemetry.provider_reported_usage).toEqual({
+      input_tokens: 1000,
+      output_tokens: 500,
+      cache_creation_input_tokens: 200,
+      cache_read_input_tokens: 300,
+      reported: true,
+    });
+  });
+  it('reports a zero-token usage block as reported rather than not-reported', () => {
+    recordLlmCallStart();
+    recordProviderReportedUsage(0, 0);
+    expect(getLlmTelemetry().provider_reported_usage).toEqual({
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+      reported: true,
     });
   });
   it('ignores invalid token values (NaN, negative, Infinity)', () => {

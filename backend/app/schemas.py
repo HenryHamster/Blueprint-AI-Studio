@@ -420,10 +420,13 @@ class HeartbeatRequest(BaseModel):
     # (Component B of cost-telemetry reconciliation). Raw provider response.usage
     # fields accumulated independently from api_call_summary. The reconciliation
     # cross-checks this against api_call_summary to detect accumulation bugs.
-    # Shape: {"input_tokens": int, "output_tokens": int,
-    #         "cache_creation_input_tokens": int, "cache_read_input_tokens": int}.
+    # Shape (reported): {"input_tokens": int, "output_tokens": int,
+    #         "cache_creation_input_tokens": int, "cache_read_input_tokens": int,
+    #         "reported": true}.
+    # Shape (not reported — LLM calls made but no usage block observed):
+    #         {"reported": false} — an explicit marker, never a silent null.
     # Optional/backwards-compatible — agents that don't emit this leave it NULL.
-    provider_reported_usage: Dict[str, int] | None = None
+    provider_reported_usage: Dict[str, Any] | None = None
     # Cumulative per-task structured-output format-compliance telemetry, sibling
     # to the LLM fields above. Optional/backwards-compatible — older agents that
     # don't emit these leave Task.format_compliance_summary NULL. format_miss_by_reason

@@ -2506,7 +2506,9 @@ describe('LLM telemetry counters', () => {
       prompt_size_bytes: null,
       prompt_section_count: null,
       prompt_section_sizes: null,
-      provider_reported_usage: null,
+      // CLI invocations happened but no provider usage block was observed →
+      // the explicit not-reported marker, never a silent null.
+      provider_reported_usage: { reported: false },
     });
   });
 

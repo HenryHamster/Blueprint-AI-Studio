@@ -1492,12 +1492,16 @@ class Task(SQLModel, table=True):
     )
     # Provider-reported token usage from the agent's independent accumulator
     # (Component B of cost-telemetry reconciliation). Sourced from the raw
-    # Anthropic messages.create() response.usage object, accumulated through a
-    # SEPARATE code path from api_call_summary so the reconciliation can
-    # cross-check the two paths and detect accumulation bugs. Backwards-
-    # compatible — agents that don't ship this field leave it NULL.
-    # Shape: {"input_tokens": int, "output_tokens": int,
-    #         "cache_creation_input_tokens": int, "cache_read_input_tokens": int}
+    # provider response.usage object (Anthropic Messages API, OpenAI/Codex,
+    # DeepSeek), accumulated through a SEPARATE code path from api_call_summary
+    # so the reconciliation can cross-check the two paths and detect
+    # accumulation bugs. Backwards-compatible — agents that don't ship this
+    # field leave it NULL.
+    # Shape (reported): {"input_tokens": int, "output_tokens": int,
+    #         "cache_creation_input_tokens": int, "cache_read_input_tokens": int,
+    #         "reported": true}.
+    # Shape (not reported — LLM calls made but no usage block observed):
+    #         {"reported": false} — an explicit marker, never a silent null.
     provider_reported_usage: Dict[str, Any] | None = Field(
         default=None, sa_column=Column(JSONB, nullable=True)
     )
@@ -2303,6 +2307,13 @@ def bank_task_current_attempt(
     if cache_creation_tokens > 0 or cache_read_tokens > 0:
         snapshot["llm_cache_creation_input_tokens"] = cache_creation_tokens
         snapshot["llm_cache_read_input_tokens"] = cache_read_tokens
+    # Carry the attempt's provider-reported usage probe (Component B) so
+    # reconciliation accumulates across retried attempts instead of overwriting.
+    # Omit the key for attempts without a probe or marker so legacy banked rows
+    # stay byte-identical to pre-feature rows.
+    attempt_provider_usage = task.provider_reported_usage
+    if isinstance(attempt_provider_usage, dict) and attempt_provider_usage:
+        snapshot["provider_reported_usage"] = dict(attempt_provider_usage)
     # Carry num_turns only when the agent reported it; older agents that omit the
     # field produce banked rows without this key so per-turn metrics stay None.
     num_turns_val = (task.api_call_summary or {}).get("num_turns")
@@ -2336,6 +2347,10 @@ def bank_task_current_attempt(
         task.vm_started_at = None
         task.vm_stopped_at = None
         task.api_call_summary = None
+        # The attempt's provider-reported usage was banked into the snapshot
+        # above; clear the live column so the next attempt's heartbeat starts
+        # fresh instead of double-counting the closed attempt.
+        task.provider_reported_usage = None
 
     return snapshot
 

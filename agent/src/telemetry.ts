@@ -56,6 +56,11 @@ let _providerInputTokens = 0;
 let _providerOutputTokens = 0;
 let _providerCacheCreationInputTokens = 0;
 let _providerCacheReadInputTokens = 0;
+// Set whenever recordProviderReportedUsage is called (i.e. an actual provider
+// response.usage block was observed for this role). Distinct from the counters:
+// a usage block with zero token fields is still "reported", whereas an LLM call
+// that never produced a usage block is "not reported" — the silent-null defect.
+let _providerUsageReported = false; // @per-role
 let _viewportScreenshotForwardedCount = 0; // @per-role
 let _totalNumTurns = 0; // @per-role
 let _totalToolResultBytes = 0; // @per-role
@@ -106,13 +111,17 @@ export function recordLlmTokens(
  *  - `inputTokens` = raw response.usage.input_tokens (uncached input only)
  *  - `outputTokens` = raw response.usage.output_tokens
  *  - `cacheCreationTokens` = raw response.usage.cache_creation_input_tokens
- *  - `cacheReadTokens` = raw response.usage.cache_read_input_tokens */
+ *  - `cacheReadTokens` = raw response.usage.cache_read_input_tokens
+ *
+ *  Marking the role as having observed a usage block (even when every field is
+ *  zero) is what distinguishes "reported" from "not reported" downstream. */
 export function recordProviderReportedUsage(
   inputTokens: number,
   outputTokens: number,
   cacheCreationTokens = 0,
   cacheReadTokens = 0,
 ): void {
+  _providerUsageReported = true;
   if (Number.isFinite(inputTokens) && inputTokens > 0) {
     _providerInputTokens += Math.floor(inputTokens);
   }
@@ -202,20 +211,20 @@ export function getLlmTelemetry(): {
   prompt_section_sizes: Array<{ name: string; bytes: number }> | null;
   /** Provider-reported usage from response.usage objects (Component B).
    *  Nested object so the backend can structure-parse it independently from the
-   *  flat-spread api_call_summary fields. Absent when no LLM calls were made
-   *  (all zeroes) or when only character-estimated tokens exist. */
+   *  flat-spread api_call_summary fields.
+   *  - A usage block was observed for this role: object with `reported: true`
+   *    plus the four token counters (all-zero is a legitimate reported-zero).
+   *  - LLM calls were made but no usage block arrived: `{reported: false}` —
+   *    the explicit not-reported marker (never a silent null).
+   *  - No LLM calls were made for this role: null. */
   provider_reported_usage?: {
     input_tokens: number;
     output_tokens: number;
     cache_creation_input_tokens: number;
     cache_read_input_tokens: number;
-  } | null;
+    reported: true;
+  } | { reported: false } | null;
 } {
-  const hasProviderReportedUsage =
-    _providerInputTokens > 0
-    || _providerOutputTokens > 0
-    || _providerCacheCreationInputTokens > 0
-    || _providerCacheReadInputTokens > 0;
   return {
     llm_call_count: _llmCallCount,
     total_input_tokens: _totalInputTokens,
@@ -228,14 +237,17 @@ export function getLlmTelemetry(): {
     prompt_size_bytes: _promptSizeBytes,
     prompt_section_count: _promptSectionCount,
     prompt_section_sizes: _promptSectionSizes,
-    provider_reported_usage: hasProviderReportedUsage
+    provider_reported_usage: _providerUsageReported
       ? {
           input_tokens: _providerInputTokens,
           output_tokens: _providerOutputTokens,
           cache_creation_input_tokens: _providerCacheCreationInputTokens,
           cache_read_input_tokens: _providerCacheReadInputTokens,
+          reported: true,
         }
-      : null,
+      : _llmCallCount > 0
+        ? { reported: false }
+        : null,
   };
 }
 
@@ -250,6 +262,7 @@ export function resetLlmTelemetry(): void {
   _providerOutputTokens = 0;
   _providerCacheCreationInputTokens = 0;
   _providerCacheReadInputTokens = 0;
+  _providerUsageReported = false;
   _viewportScreenshotForwardedCount = 0;
   _totalNumTurns = 0;
   _totalToolResultBytes = 0;
