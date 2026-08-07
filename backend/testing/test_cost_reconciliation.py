@@ -38,11 +38,14 @@ _SCRIPT_PATH = (
     Path(__file__).parent.parent / "scripts" / "cost_reconciliation.py"
 )
 
-# DeepSeek V4 Flash billing rates (api-docs.deepseek.com, 2026-07), mirrored
-# from app/llm_cost_attribution.py -- the exact rates the ledger uses.
+# DeepSeek V4 billing rates (api-docs.deepseek.com, 2026-07), mirrored from
+# app/llm_cost_attribution.py -- the exact rates the ledger uses.
 _FLASH_INPUT_RATE = 0.14e-6
 _FLASH_OUTPUT_RATE = 0.28e-6
 _FLASH_CACHE_READ_RATE = 0.0028e-6
+_PRO_INPUT_RATE = 0.435e-6
+_PRO_OUTPUT_RATE = 0.87e-6
+_PRO_CACHE_READ_RATE = 0.003625e-6
 
 _PRICING = {
     ("deepseek", "deepseek-v4-flash"): (_FLASH_INPUT_RATE, _FLASH_OUTPUT_RATE),
@@ -393,6 +396,114 @@ def test_unpriced_model_records_count_usage_but_zero_cost():
     assert report["export"]["unpriced_record_count"] == 1
 
 
+def test_mixed_tier_attempts_price_each_at_its_own_model():
+    """DEFECT 1 regression: a task whose attempts ran on DIFFERENT models
+    prices each attempt at its OWN recorded rate, not the task-level model.
+
+    Attempt 1 (deepseek-v4-flash): 1M input + 100K output
+      uncached = 1_000_000 x $0.14/M   = $0.14
+      output   =   100_000 x $0.28/M   = $0.028
+      total                               $0.168
+    Attempt 2 (deepseek-v4-pro): 1M input + 100K output
+      uncached = 1_000_000 x $0.435/M  = $0.435
+      output   =   100_000 x $0.87/M   = $0.087
+      total                               $0.522
+    Combined = $0.69. Pricing BOTH attempts at the task-level flash model
+    would give $0.336 -- the assertion below fails against today's code.
+    """
+    mod = _load_module()
+    pricing = {
+        ("deepseek", "deepseek-v4-flash"): (_FLASH_INPUT_RATE, _FLASH_OUTPUT_RATE),
+        ("deepseek", "deepseek-v4-pro"): (_PRO_INPUT_RATE, _PRO_OUTPUT_RATE),
+    }
+    cache_pricing = {
+        ("deepseek", "deepseek-v4-flash"): _FLASH_CACHE_READ_RATE,
+        ("deepseek", "deepseek-v4-pro"): _PRO_CACHE_READ_RATE,
+    }
+    row = _task_row(
+        "t-mixed",
+        model="deepseek-v4-flash",  # task-level model
+        attempts=[
+            {
+                "provider": "deepseek",
+                "model": "deepseek-v4-flash",
+                "input_tokens": 1_000_000,
+                "output_tokens": 100_000,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "call_count": 1,
+            },
+            {
+                "provider": "deepseek",
+                "model": "deepseek-v4-pro",
+                "input_tokens": 1_000_000,
+                "output_tokens": 100_000,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "call_count": 1,
+            },
+        ],
+    )
+    export = _export([], start="2026-08-05", end="2026-08-05")
+    report = mod.reconcile_provider_cost(
+        [row], export, "deepseek", pricing=pricing, cache_read_pricing=cache_pricing
+    )
+    assert report["internal"]["total_cost_usd"] == pytest.approx(0.69, abs=1e-9)
+    # The all-attempts-at-task-model computation would be $0.336; the report
+    # must differ from it, proving each attempt was priced at its own model.
+    assert report["internal"]["total_cost_usd"] != pytest.approx(0.336, abs=1e-9)
+    # Both attempts carried their own model, so no task-level fallback ran.
+    assert report["internal"]["task_model_fallback_attempt_count"] == 0
+
+
+def test_attempt_without_model_falls_back_to_task_model_and_is_counted():
+    """An attempt whose per-attempt provider/model is genuinely absent is
+    priced at the task-level model AND that fallback is OBSERVABLE in the
+    report (not silent) -- the fallback counter is the visibility the defect
+    was missing."""
+    mod = _load_module()
+    row = _task_row(
+        "t-fallback",
+        model="deepseek-v4-flash",
+        attempts=[_usage_attempt()],  # no per-attempt provider/model
+    )
+    export = _export([], start="2026-08-05", end="2026-08-05")
+    report = mod.reconcile_provider_cost(
+        [row],
+        export,
+        "deepseek",
+        pricing=_PRICING,
+        cache_read_pricing=_CACHE_READ_PRICING,
+    )
+    assert report["internal"]["total_cost_usd"] == pytest.approx(0.04452, abs=1e-9)
+    assert report["internal"]["task_model_fallback_attempt_count"] == 1
+
+
+def test_half_filled_attempt_is_unpriced_not_blended_with_task_model():
+    """An attempt with a provider but no model (or vice versa) is NOT priced
+    at the task-level model -- that would manufacture a chimera combo. It is
+    unpriced, matching ``app.llm_cost_attribution._resolve_pair``."""
+    mod = _load_module()
+    half_filled = _usage_attempt()
+    half_filled["provider"] = "deepseek"  # model absent -> half-filled
+    row = _task_row(
+        "t-half",
+        model="deepseek-v4-flash",
+        attempts=[half_filled],
+    )
+    export = _export([], start="2026-08-05", end="2026-08-05")
+    report = mod.reconcile_provider_cost(
+        [row],
+        export,
+        "deepseek",
+        pricing=_PRICING,
+        cache_read_pricing=_CACHE_READ_PRICING,
+    )
+    assert report["internal"]["total_cost_usd"] == pytest.approx(0.0, abs=1e-12)
+    assert report["tasks"]["with_usage"] == 1  # recorded usage, just unpriced
+    assert report["internal"]["task_model_fallback_attempt_count"] == 0
+
+
 def test_sample_export_fixture_loads_and_reconciles():
     """The checked-in sample DeepSeek export loads, its records sum to the
     declared total, and the window carries a large residual when no internal
@@ -450,6 +561,46 @@ def test_report_printer_shows_the_residual_without_a_db():
     assert "MISSING usage" in text
     assert "NEVER estimated_cost_usd" in text
     assert "the finding, not a pass/fail" in text
+
+
+def test_no_module_level_pricing_mirror_and_defaults_resolve_through_canonical():
+    """DEFECT 2 regression: the script has NO module-level copy of the pricing
+    tables (a hand-maintained mirror would drift from the ledger), and the
+    default pricing source resolves to the canonical ``app.llm_cost_attribution``
+    tables by identity. This test fails if a mirror is reintroduced."""
+    mod = _load_module()
+    # No module-level mirror to silently read stale prices from.
+    assert not hasattr(mod, "LLM_TOKEN_PRICING")
+    assert not hasattr(mod, "LLM_CACHE_READ_INPUT_PRICING")
+    assert not hasattr(mod, "CACHE_READ_INPUT_RATE_MULTIPLIER")
+    assert not hasattr(mod, "CACHE_CREATION_INPUT_RATE_MULTIPLIER")
+
+    from app.llm_cost_attribution import (
+        CACHE_CREATION_INPUT_RATE_MULTIPLIER,
+        CACHE_READ_INPUT_RATE_MULTIPLIER,
+        LLM_CACHE_READ_INPUT_PRICING,
+        LLM_TOKEN_PRICING,
+    )
+
+    ctx = mod._default_pricing_context()
+    # Identity (not a copy): the script's default source IS the canonical table.
+    assert ctx["token_pricing"] is LLM_TOKEN_PRICING
+    assert ctx["cache_read_pricing"] is LLM_CACHE_READ_INPUT_PRICING
+    assert ctx["cache_read_multiplier"] == CACHE_READ_INPUT_RATE_MULTIPLIER
+    assert ctx["cache_creation_multiplier"] == CACHE_CREATION_INPUT_RATE_MULTIPLIER
+
+
+def test_default_pricing_resolves_through_canonical_app_table():
+    """Calling ``reconcile_provider_cost`` WITHOUT explicit pricing prices
+    through the canonical ``app.llm_cost_attribution`` table (a deepseek-v4-flash
+    attempt costs the flash rate), so the CLI's default path can never silently
+    read a stale local mirror."""
+    mod = _load_module()
+    row = _task_row("t-default", attempts=[_usage_attempt()])
+    export = _export([], start="2026-08-05", end="2026-08-05")
+    report = mod.reconcile_provider_cost([row], export, "deepseek")
+    assert report["internal"]["total_cost_usd"] == pytest.approx(0.04452, abs=1e-9)
+    assert report["tasks"]["with_usage"] == 1
 
 
 @pytest.mark.asyncio

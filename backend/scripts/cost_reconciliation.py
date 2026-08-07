@@ -64,19 +64,25 @@ The export fixture
   No credential is hardcoded and no billing API is called from this module.
 
 Pricing
-  The internal side is priced with the SAME tables the ledger uses
-  (``app.llm_cost_attribution.LLM_TOKEN_PRICING`` /
-  ``LLM_CACHE_READ_INPUT_PRICING``). ``main()`` passes those live tables in so
-  production runs cannot drift from the ledger; the module-level mirrors below
-  keep the module importable without the app package (the convention used by
-  the sibling strategic_* scripts) and serve as the standalone fallback.
+  There is exactly ONE pricing source: ``app.llm_cost_attribution``. The
+  internal side is priced with the SAME tables and prompt-cache multipliers the
+  ledger uses (``LLM_TOKEN_PRICING`` / ``LLM_CACHE_READ_INPUT_PRICING`` and the
+  ``CACHE_*_INPUT_RATE_MULTIPLIER`` constants), resolved lazily through
+  ``_default_pricing_context()`` so the module stays stdlib-only at import time
+  (the convention used by the sibling strategic_* scripts). ``main()``
+  additionally passes those live tables in explicitly so production runs are
+  priced exactly as the ledger prices them. There is deliberately NO module-level
+  copy of the pricing tables: a hand-maintained mirror would drift from the
+  ledger and let the CLI report stale prices while claiming otherwise.
   The export-side per-class cost estimates price the provider's token counts
   with the same rates; the export's own ``cost_usd`` is authoritative for the
   headline totals.
 
 Convention: this module is stdlib-only at import time (no ``app.*`` import at
 module level) so the reconciliation functions load and can be tested without a
-database. The DB read lives in ``main()`` behind a lazy import.
+database. Both the DB read (``_load_task_rows``) and the default pricing source
+(``_default_pricing_context``) live behind lazy ``app.*`` imports resolved at
+first use.
 """
 
 from __future__ import annotations
@@ -89,57 +95,29 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-# Mirrors app/llm_cost_attribution.py LLM_TOKEN_PRICING and
-# LLM_CACHE_READ_INPUT_PRICING (kept local so the module loads without the
-# app package). main() passes the app's live tables in so the internal side is
-# priced exactly as the ledger prices it.
-LLM_TOKEN_PRICING: dict[tuple[str, str], tuple[float, float]] = {
-    ("anthropic", "claude-fable-5"): (10e-6, 50e-6),
-    ("anthropic", "claude-opus-5"): (5e-6, 25e-6),
-    ("anthropic", "claude-opus-4-8"): (5e-6, 25e-6),
-    ("anthropic", "claude-opus-4-7"): (5e-6, 25e-6),
-    ("anthropic", "claude-opus-4-6"): (5e-6, 25e-6),
-    ("anthropic", "claude-sonnet-5"): (3e-6, 15e-6),
-    ("anthropic", "claude-sonnet-4-6"): (3e-6, 15e-6),
-    ("anthropic", "claude-haiku-4-5-20251001"): (1e-6, 5e-6),
-    ("openai", "gpt-5.6-sol"): (5e-6, 30e-6),
-    ("openai", "gpt-5.6-terra"): (2.5e-6, 15e-6),
-    ("openai", "gpt-5.6-luna"): (1e-6, 6e-6),
-    ("openai", "gpt-5.5"): (5e-6, 30e-6),
-    ("openai", "gpt-5.4"): (2.5e-6, 15e-6),
-    ("openai", "gpt-5.4-mini"): (0.75e-6, 4.5e-6),
-    ("openai", "gpt-5.3-codex"): (1.75e-6, 14e-6),
-    ("openai", "gpt-5.3-codex-spark"): (1.75e-6, 14e-6),
-    ("openai", "gpt-5.2"): (2e-6, 8e-6),
-    ("gemini", "gemini-2.5-pro"): (1.25e-6, 10e-6),
-    ("gemini", "gemini-2.5-flash"): (0.30e-6, 2.5e-6),
-    ("gemini", "gemini-2.5-flash-lite"): (0.10e-6, 0.40e-6),
-    ("gemini", "gemini-3.1-pro-preview"): (1.25e-6, 10e-6),
-    ("gemini", "gemini-3-flash-preview"): (0.30e-6, 2.5e-6),
-    ("gemini", "gemini-3.1-flash-lite-preview"): (0.10e-6, 0.40e-6),
-    ("zai", "glm-5.2"): (1.40e-6, 4.40e-6),
-    ("deepseek", "deepseek-v4-flash"): (0.14e-6, 0.28e-6),
-    ("deepseek", "deepseek-v4-pro"): (0.435e-6, 0.87e-6),
-}
+def _default_pricing_context() -> dict[str, Any]:
+    """Lazily load the ledger's canonical pricing tables and multipliers.
 
-LLM_CACHE_READ_INPUT_PRICING: dict[tuple[str, str], float] = {
-    ("openai", "gpt-5.6-sol"): 0.50e-6,
-    ("openai", "gpt-5.6-terra"): 0.25e-6,
-    ("openai", "gpt-5.6-luna"): 0.10e-6,
-    ("openai", "gpt-5.5"): 0.50e-6,
-    ("openai", "gpt-5.4"): 0.25e-6,
-    ("openai", "gpt-5.4-mini"): 0.075e-6,
-    ("openai", "gpt-5.3-codex"): 0.175e-6,
-    ("openai", "gpt-5.3-codex-spark"): 0.175e-6,
-    ("openai", "gpt-5.2"): 0.20e-6,
-    ("deepseek", "deepseek-v4-flash"): 0.0028e-6,
-    ("deepseek", "deepseek-v4-pro"): 0.003625e-6,
-    ("zai", "glm-5.2"): 0.26e-6,
-}
+    There is deliberately NO module-level copy of the pricing tables: a
+    hand-maintained mirror would drift from ``app.llm_cost_attribution`` and
+    let the CLI report stale prices while claiming otherwise. The ``app.*``
+    import is deferred so the module stays stdlib-only at import time (the
+    convention used by the sibling ``strategic_*`` scripts); it is resolved on
+    first pricing use, exactly like the lazy DB import in ``_load_task_rows``.
+    """
+    from app.llm_cost_attribution import (
+        CACHE_CREATION_INPUT_RATE_MULTIPLIER,
+        CACHE_READ_INPUT_RATE_MULTIPLIER,
+        LLM_CACHE_READ_INPUT_PRICING,
+        LLM_TOKEN_PRICING,
+    )
 
-# Prompt-cache pricing multipliers, mirroring app/llm_cost_attribution.py.
-CACHE_READ_INPUT_RATE_MULTIPLIER = 0.1
-CACHE_CREATION_INPUT_RATE_MULTIPLIER = 1.25
+    return {
+        "token_pricing": LLM_TOKEN_PRICING,
+        "cache_read_pricing": LLM_CACHE_READ_INPUT_PRICING,
+        "cache_read_multiplier": CACHE_READ_INPUT_RATE_MULTIPLIER,
+        "cache_creation_multiplier": CACHE_CREATION_INPUT_RATE_MULTIPLIER,
+    }
 
 # Checked-in sample of the DeepSeek platform billing export schema.
 SAMPLE_EXPORT_PATH = Path(__file__).resolve().parent / "deepseek_billing_export_sample.json"
@@ -233,14 +211,19 @@ def _price_attempt(
     model: str | None,
     pricing: Mapping[tuple[str, str], tuple[float, float]],
     cache_read_pricing: Mapping[tuple[str, str], float],
+    cache_read_multiplier: float,
+    cache_creation_multiplier: float,
 ) -> dict[str, float | int] | None:
     """Price one attempt's recorded tokens, charging cache classes truthfully.
 
     ``input_tokens`` is the INCLUSIVE input total (uncached + cache-creation +
     cache-read), mirroring ``app.llm_cost_attribution._price_llm_attempt``.
-    Returns ``None`` when the (provider, model) combo has no pricing row (the
-    tokens are still "recorded usage" for the with/missing-usage count, but
-    contribute 0 cost -- the same behavior as the ledger's unpriced combos).
+    The prompt-cache multipliers come from the caller, which resolves them from
+    the canonical ``app.llm_cost_attribution`` source (there is deliberately no
+    module-level copy to drift). Returns ``None`` when the (provider, model)
+    combo has no pricing row (the tokens are still "recorded usage" for the
+    with/missing-usage count, but contribute 0 cost -- the same behavior as the
+    ledger's unpriced combos).
     """
     input_tokens = int(attempt.get("input_tokens", 0) or 0)
     output_tokens = int(attempt.get("output_tokens", 0) or 0)
@@ -256,8 +239,8 @@ def _price_attempt(
         return None
     input_rate, output_rate = rate
     if provider_key == "anthropic":
-        cache_creation_rate = input_rate * CACHE_CREATION_INPUT_RATE_MULTIPLIER
-        cache_read_rate = input_rate * CACHE_READ_INPUT_RATE_MULTIPLIER
+        cache_creation_rate = input_rate * cache_creation_multiplier
+        cache_read_rate = input_rate * cache_read_multiplier
     else:
         cache_creation_rate = input_rate
         cache_read_rate = cache_read_pricing.get((provider_key, model_key), input_rate)
@@ -278,15 +261,29 @@ def _aggregate_task_row(
     row: Mapping[str, Any],
     pricing: Mapping[tuple[str, str], tuple[float, float]],
     cache_read_pricing: Mapping[tuple[str, str], float],
-) -> tuple[dict[str, float | int], bool]:
-    """Price a task row's recorded attempts; returns (totals, has_usage).
+    cache_read_multiplier: float,
+    cache_creation_multiplier: float,
+) -> tuple[dict[str, float | int], bool, int]:
+    """Price a task row's recorded attempts; returns
+    (totals, has_usage, task_model_fallback_count).
+
+    Each attempt is priced with ITS OWN recorded provider/model (the per-attempt
+    pair ``_task_to_row`` stores from ``_task_llm_attempts``), so a task whose
+    attempts ran on different tiers prices each attempt at its own rate. The
+    task-level provider/model is used ONLY when the per-attempt pair is
+    genuinely absent, and every such fallback is counted so silent task-level
+    pricing is observable. A half-filled attempt (provider without model, or
+    vice versa) is deliberately unpriced rather than blended with the task-level
+    values -- matching ``app.llm_cost_attribution._resolve_pair``, which
+    degrades such rows to ``(None, None)`` instead of manufacturing chimera
+    combos.
 
     ``has_usage`` is True when ANY attempt recorded positive tokens, whether
     or not its (provider, model) combo is priced -- a task with unpriced tokens
     has recorded usage, it just contributes 0 cost.
     """
-    provider = row.get("provider")
-    model = row.get("model")
+    task_provider = row.get("provider")
+    task_model = row.get("model")
     attempts = row.get("attempts") or []
     totals: dict[str, float | int] = {
         "uncached_input_tokens": 0,
@@ -307,8 +304,30 @@ def _aggregate_task_row(
         )
         for a in attempts
     )
+    task_model_fallback_count = 0
     for attempt in attempts:
-        priced = _price_attempt(attempt, provider, model, pricing, cache_read_pricing)
+        attempt_provider = attempt.get("provider")
+        attempt_model = attempt.get("model")
+        if attempt_provider and attempt_model:
+            eff_provider, eff_model = attempt_provider, attempt_model
+        elif not attempt_provider and not attempt_model:
+            # Per-attempt pair genuinely absent: fall back to the task-level
+            # pair and make the fallback observable to the caller.
+            eff_provider, eff_model = task_provider, task_model
+            task_model_fallback_count += 1
+        else:
+            # Half-filled: one source has a provider, the other a model.
+            # Blending across sources manufactures chimera combos; degrade.
+            eff_provider, eff_model = None, None
+        priced = _price_attempt(
+            attempt,
+            eff_provider,
+            eff_model,
+            pricing,
+            cache_read_pricing,
+            cache_read_multiplier,
+            cache_creation_multiplier,
+        )
         if priced is None:
             continue
         for key in _INTERNAL_TOKEN_KEYS:
@@ -318,7 +337,7 @@ def _aggregate_task_row(
     totals["total_cost_usd"] = round(
         sum(float(totals[k]) for k in _INTERNAL_COST_KEYS), COST_ROUND
     )
-    return totals, has_usage
+    return totals, has_usage, task_model_fallback_count
 
 
 def _aggregate_export_records(
@@ -393,6 +412,8 @@ def reconcile_provider_cost(
     end: str | None = None,
     pricing: Mapping[tuple[str, str], tuple[float, float]] | None = None,
     cache_read_pricing: Mapping[tuple[str, str], float] | None = None,
+    cache_read_multiplier: float | None = None,
+    cache_creation_multiplier: float | None = None,
 ) -> dict[str, Any]:
     """Reconcile internally attributed cost against a provider billing export.
 
@@ -401,7 +422,10 @@ def reconcile_provider_cost(
             ``id``, ``provider``, ``model``, ``created_at`` (ISO), the
             ``estimated_cost_usd`` field (deliberately IGNORED -- the report
             is computed from recorded usage, never from the estimator), and
-            ``attempts`` (a list of per-attempt token dicts).
+            ``attempts`` (a list of per-attempt token dicts). Each attempt
+            carries its OWN ``provider``/``model`` (from ``_task_to_row``),
+            so a task with mixed-tier attempts prices each attempt at its own
+            rate.
         export: The provider billing export JSON document (see module
             docstring for the schema). Only its ``window`` and ``records``
             are read.
@@ -409,18 +433,33 @@ def reconcile_provider_cost(
             rows whose ``provider`` matches are included.
         start/end: ``YYYY-MM-DD`` window bounds (inclusive). When omitted,
             the export's declared ``window`` is used.
-        pricing / cache_read_pricing: Rate tables keyed by
-            ``(provider.lower(), model.lower())``. Default to the module-level
-            mirrors; ``main()`` passes the app's live tables.
+        pricing / cache_read_pricing / cache_read_multiplier /
+        cache_creation_multiplier: The pricing tables and prompt-cache
+            multipliers, keyed by ``(provider.lower(), model.lower())`` for
+            the tables. When omitted, they resolve lazily to the SINGLE
+            canonical source ``app.llm_cost_attribution`` -- there is no
+            module-level mirror to silently read stale prices from. ``main()``
+            passes the app's live tables in explicitly.
 
     Returns:
         A structured report dict (the artifact). It NEVER asserts agreement --
         the residual IS the finding.
     """
-    if pricing is None:
-        pricing = LLM_TOKEN_PRICING
-    if cache_read_pricing is None:
-        cache_read_pricing = LLM_CACHE_READ_INPUT_PRICING
+    if (
+        pricing is None
+        or cache_read_pricing is None
+        or cache_read_multiplier is None
+        or cache_creation_multiplier is None
+    ):
+        canonical = _default_pricing_context()
+        if pricing is None:
+            pricing = canonical["token_pricing"]
+        if cache_read_pricing is None:
+            cache_read_pricing = canonical["cache_read_pricing"]
+        if cache_read_multiplier is None:
+            cache_read_multiplier = canonical["cache_read_multiplier"]
+        if cache_creation_multiplier is None:
+            cache_creation_multiplier = canonical["cache_creation_multiplier"]
 
     window = export.get("window") or {}
     start_date = _parse_date(start if start is not None else window.get("start"))
@@ -438,6 +477,10 @@ def reconcile_provider_cost(
         "cache_creation_cost_usd": 0.0,
         "output_cost_usd": 0.0,
         "task_count_with_usage": 0,
+        # Number of attempts priced at the TASK-level model because the
+        # per-attempt pair was genuinely absent. Surfaced so silent task-level
+        # pricing (the defect this module fixed) cannot hide in the report.
+        "task_model_fallback_attempt_count": 0,
     }
     task_counts = {"total": 0, "with_usage": 0, "missing_usage": 0}
     provider_key = (provider or "").lower()
@@ -453,7 +496,16 @@ def reconcile_provider_cost(
         if end_date is not None and created.date() > end_date:
             continue
         task_counts["total"] += 1
-        totals, has_usage = _aggregate_task_row(row, pricing, cache_read_pricing)
+        totals, has_usage, fallback_count = _aggregate_task_row(
+            row,
+            pricing,
+            cache_read_pricing,
+            cache_read_multiplier,
+            cache_creation_multiplier,
+        )
+        internal["task_model_fallback_attempt_count"] = (
+            int(internal["task_model_fallback_attempt_count"]) + fallback_count
+        )
         if has_usage:
             task_counts["with_usage"] += 1
             for key in _INTERNAL_TOKEN_KEYS:
@@ -661,6 +713,9 @@ def _print_report(
     print(f"  cache-creation input tokens: {internal['cache_creation_input_tokens']}")
     print(f"  output tokens              : {internal['output_tokens']}")
     print(f"  tasks with recorded usage  : {tasks['with_usage']}")
+    fallback_count = internal.get("task_model_fallback_attempt_count", 0)
+    if fallback_count:
+        print(f"  task-model pricing fallback: {fallback_count} attempts priced at the task-level model")
 
     print("\n[2] Provider export (operator-supplied, ground truth for the window)\n")
     print(f"  total_cost_usd             : {_fmt_usd(export_totals['total_cost_usd'])}")
@@ -750,8 +805,25 @@ def main() -> None:
         )
 
     task_rows = asyncio.run(_load_task_rows(provider, start, end))
+    # Pass the ledger's LIVE pricing tables in explicitly (matching the
+    # module docstring): the CLI is priced exactly as the ledger prices it.
+    from app.llm_cost_attribution import (
+        CACHE_CREATION_INPUT_RATE_MULTIPLIER,
+        CACHE_READ_INPUT_RATE_MULTIPLIER,
+        LLM_CACHE_READ_INPUT_PRICING,
+        LLM_TOKEN_PRICING,
+    )
+
     report = reconcile_provider_cost(
-        task_rows, export, provider, start=start, end=end
+        task_rows,
+        export,
+        provider,
+        start=start,
+        end=end,
+        pricing=LLM_TOKEN_PRICING,
+        cache_read_pricing=LLM_CACHE_READ_INPUT_PRICING,
+        cache_read_multiplier=CACHE_READ_INPUT_RATE_MULTIPLIER,
+        cache_creation_multiplier=CACHE_CREATION_INPUT_RATE_MULTIPLIER,
     )
     _print_report(report, task_rows, export)
 
