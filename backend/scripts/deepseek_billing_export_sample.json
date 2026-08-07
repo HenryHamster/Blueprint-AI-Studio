@@ -1,0 +1,72 @@
+{
+  "provider": "deepseek",
+  "currency": "USD",
+  "exported_at": "2026-08-06T00:00:00Z",
+  "window": {"start": "2026-07-31", "end": "2026-08-06"},
+  "records": [
+    {
+      "timestamp": "2026-07-31T23:58:00Z",
+      "model": "deepseek-v4-flash",
+      "input_tokens": 1500000,
+      "cache_read_input_tokens": 42000000,
+      "output_tokens": 6000000,
+      "cost_usd": 2.0076
+    },
+    {
+      "timestamp": "2026-08-01T23:59:00Z",
+      "model": "deepseek-v4-flash",
+      "input_tokens": 1800000,
+      "cache_read_input_tokens": 50000000,
+      "output_tokens": 7000000,
+      "cost_usd": 2.3520
+    },
+    {
+      "timestamp": "2026-08-02T23:59:00Z",
+      "model": "deepseek-v4-pro",
+      "input_tokens": 1200000,
+      "cache_read_input_tokens": 35000000,
+      "output_tokens": 6500000,
+      "cost_usd": 6.3039
+    },
+    {
+      "timestamp": "2026-08-03T23:59:00Z",
+      "model": "deepseek-v4-flash",
+      "input_tokens": 2000000,
+      "cache_read_input_tokens": 55000000,
+      "output_tokens": 8000000,
+      "cost_usd": 2.6740
+    },
+    {
+      "timestamp": "2026-08-04T23:59:00Z",
+      "model": "deepseek-v4-pro",
+      "input_tokens": 1500000,
+      "cache_read_input_tokens": 40000000,
+      "output_tokens": 8000000,
+      "cost_usd": 7.7575
+    },
+    {
+      "timestamp": "2026-08-05T23:59:00Z",
+      "model": "deepseek-v4-flash",
+      "input_tokens": 5000000,
+      "cache_read_input_tokens": 150000000,
+      "output_tokens": 25000000,
+      "cost_usd": 8.1200
+    },
+    {
+      "timestamp": "2026-08-05T23:59:00Z",
+      "model": "deepseek-v4-pro",
+      "input_tokens": 4000000,
+      "cache_read_input_tokens": 100000000,
+      "output_tokens": 11000000,
+      "cost_usd": 11.6725
+    },
+    {
+      "timestamp": "2026-08-06T23:59:00Z",
+      "model": "deepseek-v4-flash",
+      "input_tokens": 1600000,
+      "cache_read_input_tokens": 46000000,
+      "output_tokens": 6200000,
+      "cost_usd": 2.0888
+    }
+  ]
+}
