@@ -4143,6 +4143,18 @@ async def strategic_operation(
                     status_code=400,
                     detail="depends_on must be a non-empty list of task UUIDs",
                 )
+            # This spawn always cuts from the project integration branch (see
+            # spawn_payload below). Reject a dependency whose own base branch
+            # differs: the dispatch loop only waits on a dependency matching
+            # _same_base_branch (orchestrator_health.py), so a cross-base edge
+            # would be silently skipped and the dependent would dispatch against
+            # a base missing the dependency's landed code. Mirrors the
+            # operator-facing depends_on gate in admin_task_mutations.py.
+            from app.orchestrator_health import (
+                _same_base_branch_value as _same_base_value,
+            )
+
+            _new_task_base = _get_project_integration_branch(project)
             for _dep in raw_depends_on:
                 _dep_text = str(_dep).strip()
                 try:
@@ -4162,6 +4174,21 @@ async def strategic_operation(
                         detail=(
                             "depends_on references a task outside this "
                             f"project: {_dep_text}"
+                        ),
+                    )
+                _dep_base = (_dep_task.first_payload or {}).get("base_branch")
+                if not _same_base_value(_new_task_base, _dep_base):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "Cross-base dependency rejected: this spawn's base "
+                            f"branch '{_new_task_base or '(default)'}' differs "
+                            f"from dependency {_dep_text}'s base "
+                            f"'{_dep_base or '(default)'}'. A dependency only "
+                            f"propagates its landed code when both share a base "
+                            f"branch; otherwise the dependent would dispatch "
+                            f"without the prerequisite's changes. Align the base "
+                            f"branches or re-point the dependency."
                         ),
                     )
                 if _dep_text not in depends_on_ids:

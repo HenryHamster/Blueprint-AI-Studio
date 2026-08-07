@@ -476,6 +476,18 @@ def get_confirmed_down_critical_deps() -> list:
     return [d for d in _CRITICAL_EXTERNAL_DEPS if consec.get(d, 0) >= 2]
 
 
+def _same_base_branch_value(a_base: str | None, b_base: str | None) -> bool:
+    """True when two base-branch strings resolve to the same integration base.
+
+    None/"" both normalize to the project integration branch, so two default-base
+    values count as same-base. This is the value-level core of
+    :func:`_same_base_branch`, shared with the strategist spawn validator so it
+    can compare a would-be task's base against an existing dependency without a
+    Task row for the dependent yet.
+    """
+    return (a_base or None) == (b_base or None)
+
+
 def _same_base_branch(a: Task, b: Task) -> bool:
     """True when two tasks share a base branch.
 
@@ -488,9 +500,10 @@ def _same_base_branch(a: Task, b: Task) -> bool:
     buys no propagation, only serialization. None/"" both normalize to the
     project integration branch, so two default-base tasks count as same-base.
     """
-    a_base = (a.first_payload or {}).get("base_branch") or None
-    b_base = (b.first_payload or {}).get("base_branch") or None
-    return a_base == b_base
+    return _same_base_branch_value(
+        (a.first_payload or {}).get("base_branch"),
+        (b.first_payload or {}).get("base_branch"),
+    )
 
 
 async def _effective_dep_task(dt: Task, session: AsyncSession) -> Task:
