@@ -4345,6 +4345,7 @@ async def _run_request_changes_branch(
     ci_check_runs,
     original_context=None,
     review_history=None,
+    pr_files=None,
 ):
     """Drive _process_post_commit through the review-verdict handling.
 
@@ -4403,12 +4404,15 @@ async def _run_request_changes_branch(
         "app.github.submit_pr_review", new_callable=AsyncMock, return_value={"id": 1}
     )
     mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
-    # Empty-PR check returns a non-empty file list so the empty-PR short-circuit
-    # is NOT taken in the still-blocks scenarios.
+    # Empty-PR check. Default: a non-empty file list so the empty-PR
+    # short-circuit is NOT taken in the still-blocks scenarios. Callers
+    # exercising the empty-PR cleanup path pass pr_files=[].
     mocker.patch(
         "app.github.get_pr_files",
         new_callable=AsyncMock,
-        return_value=[{"filename": "app/x.py"}],
+        return_value=(
+            [{"filename": "app/x.py"}] if pr_files is None else pr_files
+        ),
     )
     # get_check_runs_cached is called twice in the branch with different args:
     #   1) the downgrade gate (treat_missing_as_success=False)
@@ -4860,6 +4864,125 @@ async def test_request_changes_no_blocking_issue_ci_pending_still_blocks(tl_db, 
         "No-blocking-issue + non-green CI must keep REQUEST_CHANGES blocking"
     )
     merge_mock.assert_not_awaited()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# REQUEST_CHANGES empty-PR short-circuit (X2 of the fdd07b88 plan) — extracted
+# into app/review_request_changes.run_request_changes
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_request_changes_empty_pr_closes_and_marks_parent_non_terminal(
+    tl_db, mocker
+):
+    """Empty-PR short-circuit: REQUEST_CHANGES on a PR with no file changes
+    closes the PR instead of spawning a futile fix, and classifies the rollup
+    parent's landing so intermediate staged targets keep waiting downstream.
+
+    With ``classify_rollup_merge_outcome`` reporting a NON-terminal landing
+    (branch equivalent to ``main`` but not an integration landing), the
+    original task stays EVALUATING with ``pr_closed_empty`` set and the
+    broadcast carries that status. No fix is spawned.
+    """
+    close_mock = mocker.patch(
+        "app.github.close_pull_request", new_callable=AsyncMock
+    )
+    classify_mock = mocker.patch(
+        "app.review_request_changes.classify_rollup_merge_outcome",
+        new_callable=AsyncMock,
+        return_value=(False, False, "main"),
+    )
+    captured, merge_mock, review_task = await _run_request_changes_branch(
+        tl_db,
+        mocker,
+        verdict_json=_CONCRETE_DEFECT_VERDICT,
+        ci_check_runs={
+            "status": "completed",
+            "conclusion": "success",
+            "failed_logs": "",
+            "details": [],
+        },
+        pr_files=[],
+    )
+    assert captured == [], "Empty PR must NOT spawn a futile fix"
+    merge_mock.assert_not_awaited()
+    close_mock.assert_awaited_once()
+    classify_mock.assert_awaited_once()
+    assert review_task.status == TaskStatus.COMPLETED
+    assert "closed as empty" in review_task.latest_status_message
+
+    session, _factory = tl_db
+    original_id = uuid.UUID(review_task.first_payload["original_task_id"])
+    original = await session.get(Task, original_id)
+    await session.refresh(original)
+    assert (original.context or {}).get("pr_closed_empty") is True
+    assert original.status == TaskStatus.EVALUATING
+
+    import app.task_lifecycle as _tl_mod
+
+    broadcast_mock = _tl_mod.broadcast_to_project
+    broadcast_mock.assert_awaited()
+    _call = broadcast_mock.await_args
+    assert _call.args[1] == "task_updated"
+    assert _call.args[2]["task_id"] == str(original.id)
+    assert _call.args[2]["status"] == TaskStatus.EVALUATING
+
+
+@pytest.mark.asyncio
+async def test_request_changes_empty_pr_terminal_merge_unblocks_dependents(
+    tl_db, mocker
+):
+    """Terminal variant of the empty-PR cleanup: when the closed PR's branch is
+    an integration landing, the original task completes, its direction merge
+    counts heal, and its dependents are unblocked
+    (``event_driven_unblock_dependents``).
+    """
+    close_mock = mocker.patch(
+        "app.github.close_pull_request", new_callable=AsyncMock
+    )
+    classify_mock = mocker.patch(
+        "app.review_request_changes.classify_rollup_merge_outcome",
+        new_callable=AsyncMock,
+        return_value=(True, True, "main"),
+    )
+    landed_mock = mocker.patch(
+        "app.review_request_changes.apply_merged_landed_signal"
+    )
+    refresh_mock = mocker.patch(
+        "app.direction_outcomes.refresh_direction_outcomes_after_merge",
+        new_callable=AsyncMock,
+    )
+    unblock_mock = mocker.patch(
+        "app.reaper_sweeps.event_driven_unblock_dependents",
+        new_callable=AsyncMock,
+    )
+    captured, merge_mock, review_task = await _run_request_changes_branch(
+        tl_db,
+        mocker,
+        verdict_json=_CONCRETE_DEFECT_VERDICT,
+        ci_check_runs={
+            "status": "completed",
+            "conclusion": "success",
+            "failed_logs": "",
+            "details": [],
+        },
+        pr_files=[],
+    )
+    assert captured == [], "Empty PR must NOT spawn a futile fix"
+    merge_mock.assert_not_awaited()
+    close_mock.assert_awaited_once()
+    classify_mock.assert_awaited_once()
+    landed_mock.assert_called_once()
+    refresh_mock.assert_awaited_once()
+    unblock_mock.assert_awaited_once()
+
+    session, _factory = tl_db
+    original_id = uuid.UUID(review_task.first_payload["original_task_id"])
+    original = await session.get(Task, original_id)
+    await session.refresh(original)
+    assert (original.context or {}).get("pr_closed_empty") is True
+    assert original.status == TaskStatus.COMPLETED
 
 
 @pytest.mark.asyncio

@@ -16,6 +16,7 @@ import inspect
 import types
 
 from app import (
+    review_request_changes,
     task_lifecycle_completion_dispatch,
     task_lifecycle_fix_completion,
     task_lifecycle_post_commit_terminal,
@@ -24,6 +25,7 @@ from app import (
 # Stage modules registered here are appended to _post_commit_sources() output.
 # Mutable list so extraction steps can append without re-importing this module.
 _POST_COMMIT_STAGE_REGISTRY: list[types.ModuleType] = [
+    review_request_changes,
     task_lifecycle_completion_dispatch,
     task_lifecycle_fix_completion,
     task_lifecycle_post_commit_terminal,

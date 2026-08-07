@@ -212,6 +212,7 @@ WEBSOCKET_EMITTER_INVENTORY = {
         "backend/app/research_direction_state.py",
         "backend/app/strategic_completion.py",
         "backend/app/review_pipeline.py",
+        "backend/app/review_request_changes.py",
         "backend/app/rollup_management.py",
         "backend/app/routers/admin_agent_ops.py",
         "backend/app/routers/admin_debug.py",
