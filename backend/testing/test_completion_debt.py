@@ -20,7 +20,9 @@ from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel
 
+from app import category_verdict_ledger as cvl
 from app import ci_resolution, completion_debt as cd
+from app import release_version as rv
 from app.capability_trial_verdict import persist_trial_verdicts_in_transaction
 from app.models import CompletionDebtEntry, Project, Task
 from app.runtime_config_state import (
@@ -1991,3 +1993,124 @@ async def test_no_ci_gate_verified_run_does_not_affect_dismissed_debt(db_session
     assert row.resolution_reason == "operator:accepted-risk", (
         "operator dismissal reason must be preserved"
     )
+
+
+# ── Objective-completion increment 1: category verdict -> objective_gap debt ──
+
+
+async def _setup_version(db_session, name="objgap-proj"):
+    project = Project(name=name, user_id="objgap-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+    await db_session.refresh(version)
+    return project, version
+
+
+@pytest.mark.asyncio
+async def test_unmet_category_opens_exactly_one_objective_gap_debt(db_session):
+    """An UNMET category verdict opens exactly one open objective_gap entry."""
+    project, version = await _setup_version(db_session)
+    key = cd.objective_gap_dedupe_key(version.id, "cat-1")
+
+    await cvl.upsert_category_verdict(
+        db_session,
+        version_id=version.id,
+        candidate_sha="a" * 40,
+        category_key="cat-1",
+        status="not_met",
+        tier="judged",
+        gap="feature X is missing",
+        citations=[],
+        grader_run_id="run-1",
+        project_id=project.id,
+    )
+    await db_session.commit()
+
+    assert await _acount(
+        db_session, dedupe_key=key, status=cd.STATUS_OPEN
+    ) == 1
+    row = (
+        await db_session.execute(
+            select(CompletionDebtEntry).where(CompletionDebtEntry.dedupe_key == key)
+        )
+    ).scalar_one()
+    assert row.kind == cd.KIND_OBJECTIVE_GAP
+    assert row.project_id == project.id
+
+
+@pytest.mark.asyncio
+async def test_repeat_unmet_run_does_not_duplicate_objective_gap_debt(db_session):
+    """A second grade run reporting the SAME category still unmet must not
+    create a second row — the dedupe key upserts the existing open entry."""
+    project, version = await _setup_version(db_session)
+    key = cd.objective_gap_dedupe_key(version.id, "cat-1")
+
+    for sha, gap in (("a" * 40, "missing thing v1"), ("b" * 40, "missing thing v2")):
+        await cvl.upsert_category_verdict(
+            db_session,
+            version_id=version.id,
+            candidate_sha=sha,
+            category_key="cat-1",
+            status="not_met",
+            tier="judged",
+            gap=gap,
+            citations=[],
+            grader_run_id="run",
+            project_id=project.id,
+        )
+        await db_session.commit()
+
+    assert await _acount(db_session, dedupe_key=key) == 1, (
+        "repeated unmet grade runs for the same category must not duplicate "
+        "the objective_gap debt row"
+    )
+    assert await _acount(db_session, dedupe_key=key, status=cd.STATUS_OPEN) == 1
+
+
+@pytest.mark.asyncio
+async def test_later_met_verdict_resolves_open_objective_gap_debt(db_session):
+    """A subsequent MET verdict for the previously-unmet category resolves the
+    open objective_gap entry."""
+    project, version = await _setup_version(db_session)
+    key = cd.objective_gap_dedupe_key(version.id, "cat-1")
+
+    await cvl.upsert_category_verdict(
+        db_session,
+        version_id=version.id,
+        candidate_sha="a" * 40,
+        category_key="cat-1",
+        status="not_met",
+        tier="judged",
+        gap="missing thing",
+        citations=[],
+        grader_run_id="run-1",
+        project_id=project.id,
+    )
+    await db_session.commit()
+    assert await _acount(db_session, dedupe_key=key, status=cd.STATUS_OPEN) == 1
+
+    await cvl.upsert_category_verdict(
+        db_session,
+        version_id=version.id,
+        candidate_sha="b" * 40,
+        category_key="cat-1",
+        status="met",
+        tier="judged",
+        gap=None,
+        citations=["src/foo.py"],
+        grader_run_id="run-2",
+        project_id=project.id,
+    )
+    await db_session.commit()
+
+    row = (
+        await db_session.execute(
+            select(CompletionDebtEntry).where(CompletionDebtEntry.dedupe_key == key)
+        )
+    ).scalar_one()
+    assert row.status == cd.STATUS_RESOLVED
+    assert await _acount(db_session, dedupe_key=key, status=cd.STATUS_OPEN) == 0

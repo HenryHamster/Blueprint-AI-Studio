@@ -61,6 +61,7 @@ async def upsert_category_verdict(
     citations: Any | None,
     grader_run_id: str | None,
     qualification_attempt_id: uuid.UUID | None = None,
+    project_id: uuid.UUID | None = None,
 ) -> CategoryVerdict:
     """UPSERT the verdict for ONE ``(version_id, candidate_sha, category_key,
     qualification_attempt_id)``.
@@ -69,6 +70,13 @@ async def upsert_category_verdict(
     category rewrites ONLY its own row (latest write wins) and never touches
     another category's verdict for the same candidate (within-candidate
     isolation).  Flushes but does not commit; returns the persisted row.
+
+    Also gives the verdict a durable consequence in the completion-debt ledger
+    (best-effort, never raises): a ``not_met``/``partial`` status opens (or
+    keeps open) an ``objective_gap`` debt entry keyed on ``(version_id,
+    category_key)``; a ``met`` status resolves it.  ``project_id`` scopes the
+    entry to its owning project when the caller has it; omitted, the entry is
+    deployment-global (still uniquely identified by its dedupe key).
     """
     existing = (
         await session.execute(
@@ -91,6 +99,15 @@ async def upsert_category_verdict(
         existing.graded_at = _utcnow()
         session.add(existing)
         await session.flush()
+        await _sync_objective_gap_debt(
+            session,
+            version_id=version_id,
+            category_key=category_key,
+            status=status,
+            gap=gap,
+            candidate_sha=candidate_sha,
+            project_id=project_id,
+        )
         return existing
 
     row = CategoryVerdict(
@@ -107,7 +124,72 @@ async def upsert_category_verdict(
     )
     session.add(row)
     await session.flush()
+    await _sync_objective_gap_debt(
+        session,
+        version_id=version_id,
+        category_key=category_key,
+        status=status,
+        gap=gap,
+        candidate_sha=candidate_sha,
+        project_id=project_id,
+    )
     return row
+
+
+async def _sync_objective_gap_debt(
+    session: AsyncSession,
+    *,
+    version_id: uuid.UUID,
+    category_key: str | None,
+    status: str,
+    gap: str | None,
+    candidate_sha: str | None,
+    project_id: uuid.UUID | None,
+) -> None:
+    """Give a category verdict its completion-debt consequence (best-effort).
+
+    ``status == "met"`` resolves the open ``objective_gap`` debt for this
+    category (if any).  Any other status (``not_met`` / ``partial``) opens —
+    or keeps open — the debt.  Never raises: a debt-ledger hiccup must not
+    break grading.
+    """
+    if not category_key:
+        return
+    try:
+        from app import completion_debt
+
+        dedupe_key = completion_debt.objective_gap_dedupe_key(version_id, category_key)
+        if status == "met":
+            await completion_debt.aresolve_completion_debt(
+                session,
+                dedupe_key,
+                reason=f"category '{category_key}' graded met on candidate {candidate_sha}",
+            )
+        else:
+            await completion_debt.arecord_completion_debt(
+                session,
+                dedupe_key=dedupe_key,
+                kind=completion_debt.KIND_OBJECTIVE_GAP,
+                title=f"Acceptance category '{category_key}' unmet",
+                project_id=project_id,
+                source="release_merge_grade",
+                detail={
+                    "version_id": str(version_id),
+                    "category_key": category_key,
+                    "status": status,
+                    "gap": gap,
+                    "candidate_sha": candidate_sha,
+                },
+            )
+    except Exception:  # noqa: BLE001 — ledger consequence must not break grading
+        logger.warning(
+            "[CATEGORY_VERDICT_LEDGER] failed to sync objective_gap debt "
+            "(version=%s category=%s status=%s)",
+            version_id,
+            category_key,
+            status,
+            exc_info=True,
+        )
 
 
 async def get_category_verdicts(

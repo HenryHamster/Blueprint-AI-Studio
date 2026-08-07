@@ -7816,6 +7816,7 @@ async def _finalize_qualification(
                         citations=_v.get("citations") or [],
                         grader_run_id=merge_grade_task_id,
                         qualification_attempt_id=attempt_id,
+                        project_id=version.project_id,
                     )
                 await _category_ledger.upsert_residual(
                     session,
