@@ -208,6 +208,147 @@ async def test_include_failed_logs_default_true_still_fans_out():
     assert "testing/test_x.py::test_y" in result["failed_logs"]
 
 
+# ---------------------------------------------------------------------------
+# _details_have_genuine_failure — aggregate-gate laundering
+#
+# A GitHub Actions aggregate ``needs`` job (``CI / Backend``) reports
+# ``failure`` whenever ONE matrix shard is infrastructure-cancelled, even
+# though no shard genuinely failed — the confirmed v28 attempt-6 promotion
+# failure on PR #16885.  The helper discounts aggregate-parent failures and
+# only counts LEAF (non-parent) checks.
+# ---------------------------------------------------------------------------
+
+
+def test_details_have_genuine_failure_ignores_laundered_aggregate_gate():
+    """An aggregate parent concluding failure only because its matrix children
+    are cancelled/timed_out must NOT count as a genuine failure."""
+    details = [
+        {"name": "CI / Backend", "status": "completed", "conclusion": "failure"},
+        {"name": "CI / Backend (shard 1)", "status": "completed", "conclusion": "success"},
+        {"name": "CI / Backend (shard 2)", "status": "completed", "conclusion": "cancelled"},
+        {"name": "CI / Backend (shard 3)", "status": "completed", "conclusion": "timed_out"},
+        {"name": "CI / Frontend", "status": "completed", "conclusion": "success"},
+        {"name": "security", "status": "completed", "conclusion": "neutral"},
+    ]
+    assert github_checks._details_have_genuine_failure(details) is False
+
+
+def test_details_have_genuine_failure_counts_real_leaf_and_child_failures():
+    """A plain leaf check with a genuine failure, or a genuinely failed matrix
+    CHILD, still counts — the discount only removes laundered parents."""
+    assert github_checks._details_have_genuine_failure(
+        [{"name": "backend", "status": "completed", "conclusion": "failure"}]
+    ) is True
+    assert github_checks._details_have_genuine_failure(
+        [{"name": "security", "status": "completed", "conclusion": "action_required"}]
+    ) is True
+    # The parent's failure is backed by a genuinely failed shard.
+    assert github_checks._details_have_genuine_failure(
+        [
+            {"name": "CI / Backend", "status": "completed", "conclusion": "failure"},
+            {
+                "name": "CI / Backend (shard 2)",
+                "status": "completed",
+                "conclusion": "failure",
+            },
+        ]
+    ) is True
+
+
+def test_details_have_genuine_failure_discounts_nested_parents():
+    """A parent-of-parent whose leaf children are all transient is still
+    laundered — only leaf conclusions are authoritative."""
+    details = [
+        {"name": "CI / Backend", "status": "completed", "conclusion": "failure"},
+        {"name": "CI / Backend (Linux)", "status": "completed", "conclusion": "failure"},
+        {
+            "name": "CI / Backend (Linux) (shard 1)",
+            "status": "completed",
+            "conclusion": "cancelled",
+        },
+    ]
+    assert github_checks._details_have_genuine_failure(details) is False
+
+
+@pytest.mark.asyncio
+async def test_get_check_runs_red_laundered_aggregate_reports_genuine_failure_false():
+    """A RED sha whose only ``failure`` is an aggregate gate over transient
+    matrix shards must report ``genuine_failure=False``."""
+    check_runs_resp = _make_response(
+        200,
+        json_data={
+            "check_runs": [
+                {
+                    "name": "CI / Backend",
+                    "status": "completed",
+                    "conclusion": "failure",
+                },
+                {
+                    "name": "CI / Backend (shard 1)",
+                    "status": "completed",
+                    "conclusion": "success",
+                },
+                {
+                    "name": "CI / Backend (shard 2)",
+                    "status": "completed",
+                    "conclusion": "cancelled",
+                },
+                {
+                    "name": "CI / Backend (shard 3)",
+                    "status": "completed",
+                    "conclusion": "timed_out",
+                },
+            ]
+        },
+    )
+    with patch.object(
+        github_checks, "_github_request", new=AsyncMock(return_value=check_runs_resp)
+    ):
+        result = await github_checks.get_check_runs(
+            "tok", "o", "r", "sha123abc", include_failed_logs=False
+        )
+
+    assert result["conclusion"] == "failure"
+    assert result["genuine_failure"] is False
+
+
+@pytest.mark.asyncio
+async def test_get_check_runs_red_genuine_shard_reports_genuine_failure_true():
+    """A RED sha whose ``failure`` is backed by a genuinely failed matrix shard
+    must report ``genuine_failure=True``."""
+    check_runs_resp = _make_response(
+        200,
+        json_data={
+            "check_runs": [
+                {
+                    "name": "CI / Backend",
+                    "status": "completed",
+                    "conclusion": "failure",
+                },
+                {
+                    "name": "CI / Backend (shard 1)",
+                    "status": "completed",
+                    "conclusion": "success",
+                },
+                {
+                    "name": "CI / Backend (shard 2)",
+                    "status": "completed",
+                    "conclusion": "failure",
+                },
+            ]
+        },
+    )
+    with patch.object(
+        github_checks, "_github_request", new=AsyncMock(return_value=check_runs_resp)
+    ):
+        result = await github_checks.get_check_runs(
+            "tok", "o", "r", "sha123abc", include_failed_logs=False
+        )
+
+    assert result["conclusion"] == "failure"
+    assert result["genuine_failure"] is True
+
+
 @pytest.mark.asyncio
 async def test_check_runs_cache_does_not_serve_logsfree_result_to_a_logs_caller():
     """include_failed_logs is part of the CACHE KEY.

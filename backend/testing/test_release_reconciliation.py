@@ -5360,7 +5360,14 @@ async def test_managed_check_wait_ci_red_reports_cancelled_and_action_required_n
     db_session, mocker
 ):
     """When the PR's CI is red, the reconciler records required_check_failed with
-    the failing check names so retry machinery applies."""
+    the failing check names so retry machinery applies.
+
+    The red is backed only by infrastructure conclusions — ``cancelled`` /
+    ``timed_out`` shards and an ``action_required`` human gate — with ZERO
+    genuinely failing tests.  The reconciler still tears the PR down (CI is
+    definitively red), but the promotion-CI harvest must record the failure as
+    infrastructure and skip spawning a code-fix task that has nothing to
+    remediate (``_handle_main_branch_ci_failure`` must not be invoked)."""
     mocker.patch(
         "app.github.get_repo_installation_token",
         new=AsyncMock(return_value="tok"),
@@ -5378,6 +5385,8 @@ async def test_managed_check_wait_ci_red_reports_cancelled_and_action_required_n
             }
         ),
     )
+    # Every non-green conclusion is infrastructure or a human gate — NO check has
+    # a genuine `failure` test, so the harvest must not spawn a fix.
     mocker.patch(
         "app.github.get_check_runs_cached",
         new=AsyncMock(
@@ -5385,7 +5394,11 @@ async def test_managed_check_wait_ci_red_reports_cancelled_and_action_required_n
                 "status": "completed",
                 "conclusion": "failure",
                 "details": [
-                    {"name": "backend", "status": "completed", "conclusion": "failure"},
+                    {
+                        "name": "backend",
+                        "status": "completed",
+                        "conclusion": "cancelled",
+                    },
                     {
                         "name": "deploy",
                         "status": "completed",
@@ -5411,6 +5424,14 @@ async def test_managed_check_wait_ci_red_reports_cancelled_and_action_required_n
                 ],
             }
         ),
+    )
+    handle_mock = mocker.patch(
+        "app.auto_remediation._handle_main_branch_ci_failure",
+        new=AsyncMock(),
+    )
+    refresh_mock = mocker.patch(
+        "app.strategic_trigger.request_strategic_refresh",
+        new=AsyncMock(return_value=True),
     )
 
     _project, version = await _make_project_and_version(
@@ -5441,19 +5462,27 @@ async def test_managed_check_wait_ci_red_reports_cancelled_and_action_required_n
     assert "docs" not in detail
     assert "smoke" not in detail
     assert "promotion_pending" not in version.last_qualification
+    # Zero genuinely failing tests → the harvest records the failure as
+    # infrastructure (Strategic refresh armed) and spawns NO code-fix task.
+    refresh_mock.assert_awaited_once()
+    handle_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_managed_check_wait_transient_cancellation_left_pending(
     db_session, mocker
 ):
-    """Core acceptance test: when CI is red but ALL check conclusions are
-    transient (cancelled/timed_out) the reconciler must NOT tear down the
-    promotion PR or record a terminal failure — it leaves the version pending
-    so the candidate can recover when CI re-runs.
+    """Core acceptance test: an aggregate gate that launders a cancelled matrix
+    shard must NOT tear down the promotion PR.
 
-    This exercises the ``_check_result_has_genuine_failure`` guard introduced
-    to fix the v10 promoter misclassification.
+    A ``CI / Backend`` aggregate job reports conclusion ``failure`` whenever ONE
+    backend shard is infrastructure-cancelled, even though no shard genuinely
+    failed — the confirmed v28 attempt-6 promotion failure on PR #16885, where
+    the promotion died on ``CI / Backend`` with zero failing tests.  The
+    reconciler's genuine-failure guard must recognize the laundering (via the
+    aggregate-parent-aware ``_details_have_genuine_failure`` / the boundary
+    ``genuine_failure`` signal) and leave the version pending so the candidate
+    can recover when CI re-runs.
     """
     mocker.patch(
         "app.github.get_repo_installation_token",
@@ -5472,21 +5501,34 @@ async def test_managed_check_wait_transient_cancellation_left_pending(
             }
         ),
     )
-    # All checks are transient — no genuine failure present.
+    # The aggregate gate reports `failure` only because one shard was cancelled /
+    # timed out — `genuine_failure` is False (the signal the get_check_runs
+    # boundary computes from these same details in production).
     mocker.patch(
         "app.github.get_check_runs_cached",
         new=AsyncMock(
             return_value={
                 "status": "completed",
                 "conclusion": "failure",
+                "genuine_failure": False,
                 "details": [
                     {
-                        "name": "ci/backend-shard-4",
+                        "name": "CI / Backend",
+                        "status": "completed",
+                        "conclusion": "failure",
+                    },
+                    {
+                        "name": "CI / Backend (shard 1)",
+                        "status": "completed",
+                        "conclusion": "success",
+                    },
+                    {
+                        "name": "CI / Backend (shard 2)",
                         "status": "completed",
                         "conclusion": "cancelled",
                     },
                     {
-                        "name": "ci/backend-shard-5",
+                        "name": "CI / Backend (shard 3)",
                         "status": "completed",
                         "conclusion": "timed_out",
                     },
@@ -5519,7 +5561,8 @@ async def test_managed_check_wait_transient_cancellation_left_pending(
     )
 
     assert reconciled is False, (
-        "Transient-only CI red must NOT drive the version to a terminal state"
+        "A laundered aggregate gate (cancelled shard) must NOT drive the version "
+        "to a terminal state"
     )
     cleanup.assert_not_called()
     await db_session.refresh(version)
@@ -5529,6 +5572,178 @@ async def test_managed_check_wait_transient_cancellation_left_pending(
     pending = version.last_qualification["promotion_pending"]
     assert pending.get("transient_red_count") == 1
     assert pending.get("managed_check_wait") is True
+
+
+@pytest.mark.asyncio
+async def test_managed_check_wait_aggregate_gate_laundered_cancelled_shard_left_pending(
+    db_session, mocker
+):
+    """The same laundered-aggregate scenario WITHOUT the boundary ``genuine_failure``
+    field: the reconciler must still discount the aggregate gate by falling back
+    to the details-based ``_details_have_genuine_failure`` (covers hand-built
+    fixtures and callers that pre-date the field)."""
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    pr_head = "d00dbeef" * 5
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "head": {"ref": "release-v1", "sha": pr_head},
+                "base": {"ref": "release", "sha": "base0001"},
+            }
+        ),
+    )
+    # No `genuine_failure` key — the details-only fallback must apply the same
+    # aggregate-parent discount.
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={
+                "status": "completed",
+                "conclusion": "failure",
+                "details": [
+                    {
+                        "name": "CI / Backend",
+                        "status": "completed",
+                        "conclusion": "failure",
+                    },
+                    {
+                        "name": "CI / Backend (shard 1)",
+                        "status": "completed",
+                        "conclusion": "success",
+                    },
+                    {
+                        "name": "CI / Backend (shard 2)",
+                        "status": "completed",
+                        "conclusion": "cancelled",
+                    },
+                ],
+            }
+        ),
+    )
+    mocker.patch(
+        "app.release_reconciliation._max_transient_ci_red_sweeps",
+        return_value=5,
+    )
+    cleanup = mocker.patch(
+        "app.release_reconciliation._cleanup_managed_check_wait_failure_artifacts",
+        new=AsyncMock(),
+    )
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="release"
+    )
+    version.last_qualification = _managed_check_wait_qual(pr_head)
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_managed_check_wait(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is False
+    cleanup.assert_not_called()
+    await db_session.refresh(version)
+    assert version.status == "open"
+    assert version.last_qualification["status"] == "pending"
+    pending = version.last_qualification["promotion_pending"]
+    assert pending.get("transient_red_count") == 1
+
+
+@pytest.mark.asyncio
+async def test_managed_check_wait_aggregate_gate_with_genuine_shard_records_required_check_failed(
+    db_session, mocker
+):
+    """When a matrix CHILD genuinely fails, the aggregate parent's ``failure`` is
+    not laundered — the reconciler must still tear down and record
+    ``required_check_failed`` (a real failing test is not transient)."""
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    pr_head = "bad5c0de" * 5
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "head": {"ref": "release-v1", "sha": pr_head},
+                "base": {"ref": "release", "sha": "base0001"},
+            }
+        ),
+    )
+    # Shard 4 genuinely failed (e.g. a real test failure) — the gate failure is
+    # backed by a genuine child, so this is a real red CI.
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={
+                "status": "completed",
+                "conclusion": "failure",
+                "details": [
+                    {
+                        "name": "CI / Backend",
+                        "status": "completed",
+                        "conclusion": "failure",
+                    },
+                    {
+                        "name": "CI / Backend (shard 1)",
+                        "status": "completed",
+                        "conclusion": "success",
+                    },
+                    {
+                        "name": "CI / Backend (shard 2)",
+                        "status": "completed",
+                        "conclusion": "success",
+                    },
+                    {
+                        "name": "CI / Backend (shard 4)",
+                        "status": "completed",
+                        "conclusion": "failure",
+                    },
+                ],
+            }
+        ),
+    )
+    mocker.patch(
+        "app.release_reconciliation._max_transient_ci_red_sweeps",
+        return_value=5,
+    )
+    cleanup = mocker.patch(
+        "app.release_reconciliation._cleanup_managed_check_wait_failure_artifacts",
+        new=AsyncMock(return_value=True),
+    )
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="release"
+    )
+    version.last_qualification = _managed_check_wait_qual(pr_head)
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_managed_check_wait(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is True
+    cleanup.assert_called_once()
+    await db_session.refresh(version)
+    assert version.phase == "stabilize"
+    assert version.last_qualification["status"] == "promotion_failed"
+    assert version.last_qualification["error"] == "required_check_failed"
+    detail = version.last_qualification.get("detail", "")
+    assert "CI / Backend (shard 4)" in detail
+    assert "promotion_pending" not in version.last_qualification
 
 
 @pytest.mark.asyncio

@@ -243,6 +243,43 @@ def _unique(*values: int | None) -> list[int]:
     return result
 
 
+def _details_have_genuine_failure(details: list) -> bool:
+    """Return True when per-check *details* contain a genuinely failed check.
+
+    GitHub Actions matrix shards emit their own check runs (``CI / Backend
+    (shard N)``) AND the workflow's aggregate ``needs`` job (``CI / Backend``).
+    When a shard is infrastructure-cancelled (or timed out / skipped) the
+    aggregate job exits non-zero and reports ``failure`` even though NO shard
+    genuinely failed — the aggregate conclusion launders the transient child.
+    This is the confirmed v28 attempt-6 promotion failure: PR #16885 reported
+    ``CI / Backend`` conclusion ``failure`` with zero failing backend tests.
+
+    A check name ``X`` is treated as an aggregate parent when some OTHER name
+    startswith ``X + " ("`` — the GitHub Actions matrix naming convention.
+    Parent conclusions are derived from their children and are NOT trusted;
+    only LEAF (non-parent) checks count their own ``failure`` /
+    ``action_required``.  This discounts a laundered aggregate in one pass and
+    also composes across nesting (a parent-of-parent still resolves to its
+    leaf children).  A misclassification here only ever discounts a ``failure``
+    that looks like a matrix aggregate — it can never invent one — and the
+    release reconciler bounds any residual false-negative by escalating after
+    its transient-red sweep cap.
+    """
+    names = [str(d.get("name") or "") for d in details if isinstance(d, dict)]
+    genuine = {"failure", "action_required"}
+    for d in details:
+        if not isinstance(d, dict):
+            continue
+        if d.get("conclusion") not in genuine:
+            continue
+        name = str(d.get("name") or "")
+        if any(other != name and other.startswith(f"{name} (") for other in names):
+            # Aggregate parent — its failure is derived from its matrix children.
+            continue
+        return True
+    return False
+
+
 async def get_check_runs(
     token: str,
     owner: str,
@@ -259,7 +296,16 @@ async def get_check_runs(
         {"status": "completed"|"in_progress"|"pending"|"no_checks",
          "conclusion": "success"|"failure"|None,
          "details": [{"name": str, "status": str, "conclusion": str|None}],
-         "failed_logs": str}
+         "failed_logs": str,
+         "genuine_failure": bool}
+
+    ``genuine_failure`` (additive — consumers use ``.get``): whether the
+    completed checks contain at least one genuinely failed check
+    (``failure``/``action_required``), computed by
+    :func:`_details_have_genuine_failure` so an aggregate ``needs`` gate whose
+    ``failure`` merely launders a cancelled/timed_out matrix shard reports
+    ``False``.  The release reconciler uses this signal to keep a transient-red
+    promotion pending instead of tearing it down.
 
     ``treat_missing_as_success`` (opt-in, default True — preserves the historic
     behaviour for every existing caller): when a commit has NO check-runs at
@@ -307,6 +353,7 @@ async def get_check_runs(
                 "conclusion": None,
                 "details": [],
                 "failed_logs": "",
+                "genuine_failure": False,
                 "_from_api_error": True,
             }
 
@@ -328,6 +375,7 @@ async def get_check_runs(
                 "conclusion": None,
                 "details": [],
                 "failed_logs": "",
+                "genuine_failure": False,
             }
         # No CI configured on this repo — treat as passed so the
         # orchestrator doesn't wait 30 min for checks that will never arrive.
@@ -336,6 +384,7 @@ async def get_check_runs(
             "conclusion": "success",
             "details": [],
             "failed_logs": "",
+            "genuine_failure": False,
         }
 
     details = []
@@ -390,6 +439,7 @@ async def get_check_runs(
             "failed_logs": "",
             "setup_phase_failure": False,
             "failed_run_ids": [],
+            "genuine_failure": _details_have_genuine_failure(details),
         }
     if failed_names and _deferrable_quota_active():
         logger.warning(
@@ -403,6 +453,7 @@ async def get_check_runs(
             "failed_logs": "",
             "setup_phase_failure": False,
             "failed_run_ids": [],
+            "genuine_failure": _details_have_genuine_failure(details),
         }
     if failed_names:
         log_lines = []
@@ -555,6 +606,7 @@ async def get_check_runs(
         "failed_logs": failed_logs,
         "setup_phase_failure": setup_phase_failure,
         "failed_run_ids": failed_run_ids,
+        "genuine_failure": _details_have_genuine_failure(details),
     }
 
 
