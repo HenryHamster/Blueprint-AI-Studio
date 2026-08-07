@@ -2881,6 +2881,27 @@ async def compute_current_axes(
         session, project_id
     )
 
+    # Merged-work origination split (direction d-197325ef / criterion
+    # c-09d49820): what share of work that LANDED in the window was originated
+    # by the autonomous research loop versus commissioned directly by the
+    # strategist. Computed straight from the durable Task.origination column
+    # with a server-side GROUP BY over the landing timestamp — deliberately NOT
+    # derived from the 5000-row `tasks` cohort above, which is created_at-ordered
+    # and capped, so it would answer a different (and biased) question.
+    from app.research_completion import (  # noqa: PLC0415 — avoids an import cycle
+        merged_work_origination_reading,
+        merged_work_origination_split,
+    )
+
+    merged_work_origination = merged_work_origination_reading(
+        await merged_work_origination_split(
+            session,
+            project_id,
+            since=_utcnow() - timedelta(days=_AXIS_WINDOW_DAYS),
+        )
+    )
+    merged_work_origination["window_days"] = _AXIS_WINDOW_DAYS
+
     # Provider routing A/B verdict (direction d-cf39cb40): derive from the
     # per-model efficiency breakdown so the verdict carries BOTH cost ratio AND
     # verified-merge-rate delta — the two halves of the A/B guardrail.
@@ -3037,6 +3058,11 @@ async def compute_current_axes(
         # more tasks than the cap and totals are cohort-scoped, not window-complete).
         "cohort_task_count": cohort_task_count,
         "cohort_capped": cohort_capped,
+        # Merged-work origination split (direction d-197325ef, criterion
+        # c-09d49820): research-vs-strategist attribution of everything that
+        # landed in the window, plus the size of the unattributed SYSTEM
+        # residual. Persisted daily so the share is a trend, not a one-off read.
+        "merged_work_origination": merged_work_origination,
         # Effective window actually covered by the loaded cohort (as opposed
         # to the requested _AXIS_WINDOW_DAYS window). When cohort_capped is
         # True this is narrower than the requested window and is the only

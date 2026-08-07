@@ -484,25 +484,28 @@ def _acceptance_test_targeted_green(task: Task) -> bool:
     return review_loop.get(ACCEPTANCE_TEST_TARGETED_GREEN_KEY) is True
 
 
-def _merge_acceptance_test_block(task: Task) -> dict | None:
-    """Read the declared acceptance test's merge-test verdict block, defensively.
+# Durable NORMALIZED acceptance-test block the no-CI merge monitor persists onto
+# ``review_loop`` (see ``orchestrator_ci_monitor``). Distinct from
+# ``review_loop['verify_tests_verdict']``, which holds the classifier's outcome
+# STRING ("pass"/"fail"/"undetected") and therefore can never carry the block.
+MERGE_ACCEPTANCE_BLOCK_KEY = "verify_tests_acceptance_block"
 
-    Forward-compatible read: when a verdict-shaped dict carrying a normalized
-    ``acceptanceTest`` block is present on the task's ``review_loop``, return the
-    block; else return ``None``. The no-CI monitor currently distills the block
-    into the durable ``acceptance_test_targeted_green`` /
-    ``acceptance_test_targeted_descriptor`` signals (see ``orchestrator_ci_monitor``)
-    rather than persisting the block itself, so this degrades to ``None`` for
-    every legacy / older-agent task — every caller MUST fall back to
-    :func:`_acceptance_test_targeted_green`.
+
+def _merge_acceptance_test_block(task: Task) -> dict | None:
+    """Read the declared acceptance test's normalized merge-test block, defensively.
+
+    Returns the block the no-CI monitor persisted under
+    ``review_loop['verify_tests_acceptance_block']`` (the output of
+    :func:`ci_resolution.acceptance_test_block`, carrying
+    ``present``/``ran``/``status``/``passed``), else ``None``. A missing /
+    malformed / non-dict review_loop, or a legacy task merged before the monitor
+    persisted the block, yields ``None`` — so every caller MUST still fall back to
+    :func:`_acceptance_test_targeted_green`, which those tasks do carry.
     """
     review_loop = (task.context or {}).get(REVIEW_LOOP_KEY)
     if not isinstance(review_loop, dict):
         return None
-    verdict = review_loop.get("verify_tests_verdict")
-    if not isinstance(verdict, dict):
-        return None
-    block = verdict.get("acceptanceTest")
+    block = review_loop.get(MERGE_ACCEPTANCE_BLOCK_KEY)
     return block if isinstance(block, dict) else None
 
 

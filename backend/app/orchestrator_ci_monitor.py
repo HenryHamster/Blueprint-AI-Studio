@@ -2249,6 +2249,14 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                     # green signal (acceptance_test_is_green returns False) and
                     # today's behavior is preserved. Never blocks; only records.
                     _accept_block = ci_resolution.acceptance_test_block(_verdict)
+                    # Persist the NORMALIZED block itself alongside the distilled
+                    # boolean. ``verify_tests_verdict`` above holds the classifier's
+                    # outcome STRING ("pass"/"fail"/"undetected"), so it can never
+                    # carry the block; without this key
+                    # ``acceptance_gate._merge_acceptance_test_block`` has no writer
+                    # and its present/ran/status/passed evidence path is dead code.
+                    if _accept_block is not None:
+                        ci_loop["verify_tests_acceptance_block"] = _accept_block
                     if ci_resolution.acceptance_test_is_green(_accept_block):
                         ci_loop["acceptance_test_targeted_green"] = True
                         _accept_desc = str(

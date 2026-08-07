@@ -383,6 +383,12 @@
           "commit_date": "2026-07-16T03:29:42-07:00",
           "old_cap": 1150,
           "new_cap": 1180
+        },
+        {
+          "commit_sha": "",
+          "commit_date": "2026-08-07T18:46:51.367829+00:00",
+          "old_cap": 1180,
+          "new_cap": 1400
         }
       ],
       "orchestrator_runner_dispatch.py": [

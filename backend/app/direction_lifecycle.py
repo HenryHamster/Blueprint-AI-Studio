@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
-from app.models import Project, Task, TaskStatus
+from app.models import Project, TASK_ORIGINATION_RESEARCH, Task, TaskStatus
 from app.direction_lineage_spend import (
     DirectionLineageSpend,
     load_direction_lineage_spend,
@@ -2034,6 +2034,7 @@ async def _process_direction_lifecycle_locked(
                         },
                         status=TaskStatus.QUEUED,
                         created_by="ORCHESTRATOR",
+                        origination=TASK_ORIGINATION_RESEARCH,
                         priority=TASK_PRIORITY_MAP.get("low", 0),
                     )
                     session.add(_scaffolding_memo)

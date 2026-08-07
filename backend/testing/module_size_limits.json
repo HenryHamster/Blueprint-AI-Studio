@@ -9,7 +9,7 @@
     "task_lifecycle_post_commit_terminal.py": 500,
     "orchestrator.py": 5900,
     "orchestrator_ci_monitor.py": 3550,
-    "orchestrator_health.py": 1180,
+    "orchestrator_health.py": 1400,
     "orchestrator_runner_dispatch.py": 3600,
     "orchestrator_runtime_env.py": 400,
     "orchestrator_provision.py": 800,

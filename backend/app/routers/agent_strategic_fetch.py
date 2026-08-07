@@ -2262,7 +2262,8 @@ async def agent_fetch_efficiency_snapshot(
     token: dict = Depends(verify_agent_token),
 ):
     """Return the current efficiency snapshot for the project: cost_per_merged_pr,
-    vm_reuse_rate, llm_cost_per_merged_pr, format_compliance, and window metadata.
+    vm_reuse_rate, llm_cost_per_merged_pr, format_compliance, merged-work
+    origination split, and window metadata.
     Reuses the same compute path as the operator dashboard so numbers are consistent.
     Read-only; cross-project access returns 404."""
     from app.efficiency_snapshot import (  # noqa: PLC0415
@@ -2286,11 +2287,27 @@ async def agent_fetch_efficiency_snapshot(
         _compute_llm_cost_per_verified_task,
     )
     from app.digest_metrics import compute_format_compliance_metrics  # noqa: PLC0415
+    from app.research_completion import (  # noqa: PLC0415
+        merged_work_origination_reading,
+        merged_work_origination_split,
+    )
+    from app.time_utils import _utcnow  # noqa: PLC0415
 
     await _resolve_agent_project(project_id, token, session)
     tasks = await _load_recent_tasks(session, project_id)
     format_compliance = compute_format_compliance_metrics(tasks)
     llm_cost_attribution = _compact_llm_cost_attribution(tasks)
+    # Research-vs-strategist attribution of work that LANDED in the window
+    # (direction d-197325ef, criterion c-09d49820). Computed by its own
+    # GROUP BY over the landing timestamp rather than from the created_at-ordered,
+    # 5000-row-capped `tasks` cohort, which would answer a biased question.
+    merged_work_origination = merged_work_origination_reading(
+        await merged_work_origination_split(
+            session,
+            project_id,
+            since=_utcnow() - timedelta(days=_AXIS_WINDOW_DAYS),
+        )
+    )
 
     return {
         "status": "success",
@@ -2303,6 +2320,7 @@ async def agent_fetch_efficiency_snapshot(
             AXIS_LLM_CACHE_HIT_RATE: _compute_llm_cache_hit_rate(tasks),
             FORMAT_COMPLIANCE_KEY: format_compliance,
             "llm_cost_attribution": llm_cost_attribution,
+            "merged_work_origination": merged_work_origination,
             "window_days": _AXIS_WINDOW_DAYS,
         },
     }
@@ -2469,6 +2487,10 @@ SECTION_FETCH_INVENTORY: dict[str, str | None] = {
     "staged_directions": None, "retirement_deferrals": None,
     # Direction/criterion-rejection tails — bounded at build time to ≤20/≤5
     # records and carried verbatim in the strategic payload; no recovery path.
+    # Forced saturation dispositions — derived from the project at payload build
+    # time by build_saturation_dispositions and already bounded there; carried
+    # verbatim with no independent fetch verb.
+    "saturation_dispositions": None,
     "criterion_link_conflicts": None, "rejected_direction_ops": None,
     "payload_staleness": None, "deployment_state": None,
     "operator_overrides": None, "missing_capability_demand": None,

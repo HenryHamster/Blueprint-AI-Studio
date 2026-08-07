@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.models import (
+    TASK_ORIGINATION_RESEARCH,
     Task,
     Project,
     TaskHistory,
@@ -3137,6 +3138,7 @@ async def _spawn_research_task_inner(
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
             status=TaskStatus.QUEUED,
             created_by="ORCHESTRATOR",
+            origination=TASK_ORIGINATION_RESEARCH,
             # Atomic per-direction claim (ux_task_active_idempotency_key):
             # see research_direction_claim_key.
             idempotency_key=research_direction_claim_key(

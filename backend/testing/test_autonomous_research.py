@@ -30,6 +30,9 @@ from app.models import (
     MessageType,
     Project,
     ProjectMessage,
+    TASK_ORIGINATION_RESEARCH,
+    TASK_ORIGINATION_STRATEGIST,
+    TASK_ORIGINATION_SYSTEM,
     Task,
     TaskStatus,
 )
@@ -18352,3 +18355,274 @@ async def test_cycle_blocked_direction_keys_excludes_unadmittable_directions(
     assert "d-reviewed" not in blocked
     # Everything a spawn-time admission check would reject is excluded upfront.
     assert {"d-open-bound", "d-review-pending", "d-review-blocked"} <= blocked
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. Durable task-origination + merged-work origination split
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_merged_work_origination_split_counts_by_class(db_session):
+    """Merged completions are counted by durable Task.origination.
+
+    'What share of merged work did research originate' is answered as
+    ``split[RESEARCH] / sum(split.values())`` without walking parent lineage —
+    the durable record does that walking at spawn time. A completed task that
+    does NOT carry the landed signal is not a merged completion.
+    """
+    project = Project(
+        name="Origination Split",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-origin01", "Origin split direction")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    def _merged_task(title: str, *, origination: str, merged: bool) -> Task:
+        t = Task(
+            project_id=project.id,
+            title=title,
+            payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
+            context={"pr_merged": merged},
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            origination=origination,
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(t)
+        return t
+
+    _merged_task("Research A", origination=TASK_ORIGINATION_RESEARCH, merged=True)
+    _merged_task("Research B", origination=TASK_ORIGINATION_RESEARCH, merged=True)
+    _merged_task(
+        "Strategist commission",
+        origination=TASK_ORIGINATION_STRATEGIST,
+        merged=True,
+    )
+    _merged_task("Other automation", origination=TASK_ORIGINATION_SYSTEM, merged=True)
+    # Completed but lacking the landed signal — NOT a merged completion.
+    _merged_task("Research not merged", origination=TASK_ORIGINATION_RESEARCH, merged=False)
+    await db_session.commit()
+
+    from app.research_completion import (
+        merged_work_origination_reading,
+        merged_work_origination_split,
+    )
+
+    split = await merged_work_origination_split(db_session, project.id)
+
+    assert split == {
+        TASK_ORIGINATION_RESEARCH: 2,
+        TASK_ORIGINATION_STRATEGIST: 1,
+        TASK_ORIGINATION_SYSTEM: 1,
+    }
+    reading = merged_work_origination_reading(split)
+    assert reading["merged_total"] == 4
+    # SYSTEM is a residual, not a described class: it is excluded from the
+    # commissioned denominator, so the headline is 2/3 rather than 2/4.
+    assert reading["commissioned_total"] == 3
+    assert reading["research_share_of_commissioned"] == round(2 / 3, 4)
+    assert reading["strategist_share_of_commissioned"] == round(1 / 3, 4)
+    # The residual stays visible alongside the headline.
+    assert reading["research_share_of_merged"] == 0.5
+    assert reading["unattributed_merged"] == 1
+
+
+@pytest.mark.asyncio
+async def test_merged_work_origination_split_windows_on_landing_time(db_session):
+    """``since`` bounds the LANDING time, not the creation time.
+
+    The question is 'of tasks that MERGED over a recent window'. Filtering on
+    created_at would drop a task created before the window that landed inside
+    it — and the drop is biased along the exact axis being measured, because
+    research work is created as a research parent, then a plan, then children,
+    and lands days later, whereas a strategist commission is created and lands
+    close together.
+    """
+    project = Project(
+        name="Origination Window",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-origin02", "Origin window direction")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    def _merged(title: str, *, created_days_ago: int, landed_days_ago: int) -> Task:
+        t = Task(
+            project_id=project.id,
+            title=title,
+            payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
+            context={"pr_merged": True},
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            origination=TASK_ORIGINATION_RESEARCH,
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        t.created_at = _utcnow() - timedelta(days=created_days_ago)
+        t.completed_at = _utcnow() - timedelta(days=landed_days_ago)
+        t.updated_at = t.completed_at
+        db_session.add(t)
+        return t
+
+    # Long-lineage research work: created well before the window, landed inside
+    # it. A created_at window would silently drop exactly this row.
+    _merged("Long lineage research merge", created_days_ago=30, landed_days_ago=2)
+    # Created and landed inside the window.
+    _merged("Fresh research merge", created_days_ago=1, landed_days_ago=1)
+    # Landed before the window — genuinely out of scope.
+    _merged("Old research merge", created_days_ago=40, landed_days_ago=30)
+    await db_session.commit()
+
+    from app.research_completion import merged_work_origination_split
+
+    since = _utcnow() - timedelta(days=7)
+    split = await merged_work_origination_split(db_session, project.id, since=since)
+
+    assert split == {TASK_ORIGINATION_RESEARCH: 2}
+
+
+@pytest.mark.asyncio
+async def test_merged_work_origination_split_is_project_scoped(db_session):
+    """The split never mixes tenants: another project's merges are excluded."""
+    projects = []
+    for name, direction_id in (
+        ("Origination Mine", "d-origin03"),
+        ("Origination Theirs", "d-origin04"),
+    ):
+        p = Project(
+            name=name,
+            user_id="test-user-123",
+            autonomous_enabled=True,
+            directions=[_active_direction(direction_id, f"{name} direction")],
+        )
+        db_session.add(p)
+        await db_session.commit()
+        await db_session.refresh(p)
+        projects.append(p)
+    mine, theirs = projects
+
+    for owner, origination in (
+        (mine, TASK_ORIGINATION_RESEARCH),
+        (theirs, TASK_ORIGINATION_STRATEGIST),
+        (theirs, TASK_ORIGINATION_RESEARCH),
+    ):
+        db_session.add(
+            Task(
+                project_id=owner.id,
+                title=f"Merged for {owner.name}",
+                payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
+                context={"pr_merged": True},
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                origination=origination,
+                vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+            )
+        )
+    await db_session.commit()
+
+    from app.research_completion import merged_work_origination_split
+
+    assert await merged_work_origination_split(db_session, mine.id) == {
+        TASK_ORIGINATION_RESEARCH: 1
+    }
+    assert await merged_work_origination_split(db_session, theirs.id) == {
+        TASK_ORIGINATION_RESEARCH: 1,
+        TASK_ORIGINATION_STRATEGIST: 1,
+    }
+
+
+def test_every_origination_class_has_a_live_stamping_site():
+    """No TASK_ORIGINATION_* constant may be declared without a spawn site.
+
+    A class with no stamping site is worse than no class at all: its work lands
+    silently in the SYSTEM residual while the taxonomy in ``app.models`` claims
+    it is separately attributed, so every share computed from the split is off
+    by an unknown amount while reading as a precise measurement. Either stamp
+    it or delete it.
+    """
+    from pathlib import Path
+
+    import app.models as models_module
+
+    app_dir = Path(models_module.__file__).resolve().parent
+    sources = {
+        path: path.read_text()
+        for path in app_dir.rglob("*.py")
+        if path.name != "models.py"
+    }
+
+    declared = [
+        name
+        for name in dir(models_module)
+        if name.startswith("TASK_ORIGINATION_")
+    ]
+    assert declared, "expected TASK_ORIGINATION_* constants on app.models"
+
+    unstamped = []
+    for name in declared:
+        if name.endswith("_SYSTEM"):
+            # SYSTEM is the column default / residual — it is never stamped.
+            continue
+        # Either stamped directly (``origination=TASK_ORIGINATION_X``) or fed
+        # through a computed stamp — plan children stamp
+        # ``origination=_child_origination``, which resolves to
+        # TASK_ORIGINATION_PLAN. Requiring the constant to be referenced by a
+        # module under app/ at all is what separates a live class from a dead
+        # one; the reference sites are named in the app.models doc block.
+        stamped = any(name in text for text in sources.values())
+        if not stamped:
+            unstamped.append(name)
+
+    assert not unstamped, (
+        f"origination classes declared but never stamped at a spawn site: "
+        f"{unstamped}. Every declared class must be referenced by a spawn path "
+        f"under app/ (grep the constant name), or it silently collapses into "
+        f"the SYSTEM residual and inflates the denominator of "
+        f"merged_work_origination_split. Stamp it or delete the constant."
+    )
+
+
+@pytest.mark.asyncio
+async def test_research_completion_spawns_research_originated_children(
+    db_session, mocker
+):
+    """Children spawned from research findings carry origination=RESEARCH.
+
+    ``created_by`` alone collapses these children to ORCHESTRATOR; the durable
+    origination class is what lets merged-work analytics attribute a
+    finding-derived PR to the autonomous research loop.
+    """
+    direction = _active_direction("d-origin03", "Origin child direction")
+    project = Project(
+        name="Research Origination Child",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_make_finding(direction_id=direction["id"])],
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id, Task.parent_task_id == task.id
+        )
+    )
+    children = result.scalars().all()
+    assert len(children) == 1
+    assert children[0].origination == TASK_ORIGINATION_RESEARCH

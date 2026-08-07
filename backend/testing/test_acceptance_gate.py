@@ -87,17 +87,13 @@ def _make_code_task(
     elif acceptance_evidence is not None and acceptance_evidence.get("kind") == "named_test":
         # named_test requires verification; set empty review_loop to indicate verified
         context[REVIEW_LOOP_KEY] = {}
-    # A MERGE_TEST_RESULT-shaped verdict carrying the ``acceptanceTest`` block.
-    # Forward-compatible read the gate supports: the no-CI monitor today distills
-    # the block into ``acceptance_test_targeted_green``, but a task whose
-    # review_loop persists the verdict dict itself exposes the block directly.
+    # The NORMALIZED acceptance-test block the no-CI monitor persists onto
+    # review_loop (orchestrator_ci_monitor writes ci_resolution.acceptance_test_block's
+    # output under this key). ``verify_tests_verdict`` is NOT it — that key holds
+    # the classifier's outcome STRING ("pass"/"fail"/"undetected").
     if merge_test_block is not None:
         rl = context.setdefault(REVIEW_LOOP_KEY, {})
-        rl["verify_tests_verdict"] = {
-            "detected": True,
-            "passed": True,
-            "acceptanceTest": merge_test_block,
-        }
+        rl["verify_tests_acceptance_block"] = merge_test_block
     # The no-CI monitor stamps this durable signal when it independently ran the
     # declared acceptance test as a TARGETED run and it exited green. It rides on
     # the same review_loop the merge-verification reason lives on.
@@ -4298,3 +4294,141 @@ async def test_landed_rollup_child_regrades_after_parent_changed_files_arrive(db
         "parent-derived credit is capped below machine proof"
     )
     assert classify_merged_acceptance_context(child_ctx) == "satisfied_unproven"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Writer/reader contract for the merge-time acceptance-test evidence
+#
+# Both evidence paths this gate reads were once dead against the real writer:
+# the normalized block had NO writer at all, and the targeted-green stamp was
+# withheld for exactly the not-in-diff shape the gate wants to credit. These
+# tests bind the reader to the writer so neither can silently go dead again.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_merge_acceptance_block_reads_the_key_the_monitor_writes():
+    """The gate reads the SAME review_loop key orchestrator_ci_monitor writes."""
+    import inspect
+
+    from app import orchestrator_ci_monitor
+    from app.acceptance_gate import (
+        MERGE_ACCEPTANCE_BLOCK_KEY,
+        _merge_acceptance_test_block,
+    )
+
+    src = inspect.getsource(orchestrator_ci_monitor)
+    assert f'ci_loop["{MERGE_ACCEPTANCE_BLOCK_KEY}"]' in src, (
+        f"no writer for review_loop[{MERGE_ACCEPTANCE_BLOCK_KEY!r}] in "
+        "orchestrator_ci_monitor — the gate's merge-block evidence path is dead"
+    )
+
+    block = {
+        "declared": True,
+        "descriptor": "the seam test",
+        "present": True,
+        "ran": True,
+        "status": "ran",
+        "passed": True,
+    }
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "testing/test_seam.py",
+            "test_id": "test_x",
+        },
+        merge_test_block=block,
+    )
+    assert _merge_acceptance_test_block(task) == block
+    # The outcome STRING the monitor also stores must never be mistaken for it.
+    task.context[REVIEW_LOOP_KEY]["verify_tests_verdict"] = "pass"
+    assert _merge_acceptance_test_block(task) == block
+    # Defensive: absent / malformed → None (legacy tasks fall back to the stamp).
+    del task.context[REVIEW_LOOP_KEY][MERGE_ACCEPTANCE_BLOCK_KEY]
+    assert _merge_acceptance_test_block(task) is None
+    task.context[REVIEW_LOOP_KEY][MERGE_ACCEPTANCE_BLOCK_KEY] = "not a dict"
+    assert _merge_acceptance_test_block(task) is None
+
+
+def test_not_in_diff_green_run_flows_writer_to_gate_as_proven():
+    """End-to-end: a pre-existing test run green with in_diff=False now earns
+    proven — the exact behaviour-preserving-refactor case the gate must credit.
+
+    Exercises the real writer predicate (``acceptance_test_is_green``) rather than
+    hand-stamping the signal, so a re-introduced ``in_diff`` short-circuit in
+    ci_resolution turns this red instead of passing on a fabricated stamp.
+    """
+    from app import ci_resolution
+    from app.acceptance_gate import (
+        _acceptance_test_exists_at_merge,
+        _acceptance_test_ran_green_at_merge,
+        _evaluate_named_test,
+    )
+
+    verdict = {
+        "detected": True,
+        "passed": True,
+        "acceptanceTest": {
+            "declared": True,
+            "descriptor": "the seam test",
+            "selector": "testing/test_seam.py::test_x",
+            "present": True,
+            "ran": True,
+            "status": "ran",
+            "passed": True,
+            "in_diff": False,
+        },
+    }
+    # 1. The merge gate does not block it pre-merge.
+    assert ci_resolution.classify_merge_test_verdict(verdict)[0] == "pass"
+    # 2. The writer mints the targeted-green signal for it.
+    accept_block = ci_resolution.acceptance_test_block(verdict)
+    assert ci_resolution.acceptance_test_is_green(accept_block) is True
+
+    # 3. Replay what orchestrator_ci_monitor persists onto review_loop.
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "testing/test_seam.py",
+            "test_id": "test_x",
+        },
+        changed_files=["app/seam.py"],  # production change, test NOT in diff
+        targeted_green=True,
+        merge_test_block=accept_block,
+    )
+    assert _acceptance_test_exists_at_merge(task) is True
+    assert _acceptance_test_ran_green_at_merge(task) is True
+
+    # 4. The gate credits it as PROVEN.
+    verdict_out = _evaluate_named_test(
+        AcceptanceEvidence(
+            kind="named_test", test_path="testing/test_seam.py", test_id="test_x"
+        ),
+        ["app/seam.py"],
+        verified=False,
+        targeted_green=True,
+        test_exists=True,
+        ran_green=True,
+    )
+    assert verdict_out.satisfied is True
+    assert verdict_out.proven is True, (
+        f"not-in-diff green test still not credited: {verdict_out.reason}"
+    )
+
+
+def test_name_dropped_test_with_no_existence_evidence_still_hard_fails():
+    """The anti-fraud guard survives: a declared test absent from the diff AND
+    with no existence/green evidence is still a hard fail."""
+    from app.acceptance_gate import _evaluate_named_test
+
+    verdict_out = _evaluate_named_test(
+        AcceptanceEvidence(
+            kind="named_test", test_path="testing/test_nowhere.py"
+        ),
+        ["app/seam.py"],
+        verified=True,
+        targeted_green=False,
+        test_exists=False,
+        ran_green=False,
+    )
+    assert verdict_out.proven is False
+    assert "not among the PR's changed files" in verdict_out.reason

@@ -73,3 +73,24 @@ describe('research-plan.ts shared-block references', () => {
     );
   });
 });
+
+describe('research-plan.ts finding-volume guidance (no self-contradiction)', () => {
+  it('does not cap yield at a preset count that contradicts "output ALL meaningful findings"', () => {
+    // The IMPROVE branch used to say "Quality over quantity — 2 real findings
+    // beats 10 incremental ones", a hard count ceiling that directly contradicts
+    // the SCOPE GUIDANCE directive to "Output ALL meaningful findings you
+    // discover" and drove measured yield down to ~2.96 findings/cycle. The
+    // numeric cap must be gone from the source.
+    expect(RESEARCH_PLAN_SRC).not.toContain('2 real findings beats 10 incremental ones');
+  });
+
+  it('reconciles quality with volume: no padding and no preset count ceiling', () => {
+    // The reconciled guidance still demands real, decision-relevant findings
+    // (never inflate with trivial filler) while explicitly forbidding both a
+    // preset count cap and withholding a genuine finding to hit a small quota.
+    const src = RESEARCH_PLAN_SRC.toLowerCase();
+    expect(src).toContain('output all meaningful findings you discover');
+    expect(src).toContain('never inflate with trivial incremental filler');
+    expect(src).toContain('never withhold a genuine finding to hit a small quota');
+  });
+});
