@@ -27,6 +27,16 @@ import { playwright } from '@vitest/browser-playwright';
 // would not match production.
 export default defineConfig({
   plugins: [react(), tailwindcss()],
+  server: {
+    fs: {
+      // The capture harness writes one PNG per (test, width) to the shot dir
+      // configured by scripts/viewport-snapshot.sh, which lives under /tmp
+      // (never the repo tree). Vite's dev-server fs allowlist defaults to the
+      // workspace root and would deny those writes — but only page.screenshot's
+      // path is checked, so allowing the temp shot root is safe and required.
+      allow: ['/tmp'],
+    },
+  },
   test: {
     include: ['src/**/*.viewport.test.{ts,tsx}'],
     fileParallelism: false,

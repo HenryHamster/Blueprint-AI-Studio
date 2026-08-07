@@ -7424,27 +7424,47 @@ async def _spawn_strategic_review(
             # prior blanket re-qualify steer so the strategic spawn never breaks.
             _readiness: dict | None = None
             _requal_ready = True
-            if _candidate_behind:
-                try:
-                    from app.release_readiness import (
-                        compute_requalification_readiness,
-                    )
+            try:
+                from app.release_readiness import (
+                    compute_requalification_readiness,
+                )
 
-                    _readiness = await compute_requalification_readiness(
-                        session, project.id
-                    )
-                    _requal_ready = bool(_readiness.get("requalification_ready"))
-                except Exception:
-                    logger.exception(
-                        "[STRATEGIC] requalification readiness compute failed; "
-                        "defaulting to blanket re-qualify steer"
-                    )
-                    _readiness = None
-                    _requal_ready = True
+                _readiness = await compute_requalification_readiness(
+                    session, project.id
+                )
+                _requal_ready = bool(_readiness.get("requalification_ready"))
+            except Exception:
+                logger.exception(
+                    "[STRATEGIC] requalification readiness compute failed; "
+                    "defaulting to blanket re-qualify steer"
+                )
+                _readiness = None
+                _requal_ready = True
             # Re-qualification is the highest-leverage steer ONLY on the behind-head
             # path with the readiness trigger met; everywhere else there is fix work
             # to dispatch (so the create-a-direction escalation below should fire).
             _prefer_requalify = _candidate_behind and _requal_ready
+            # Surface the finding-resolution block — per-finding keys + ledger
+            # states — so the steer can point the agent at a payload block that
+            # ACTUALLY carries the finding keys. The compact qualification
+            # serializer strips ``last_qualification.audit_findings`` down to a
+            # count, so that path is empty in the delivered payload.
+            if _version_phase_block is not None and _readiness is not None:
+                _version_phase_block["finding_resolution"] = {
+                    key: _readiness[key]
+                    for key in (
+                        "requalification_ready",
+                        "gating_total",
+                        "gating_resolved",
+                        "audit_findings_truncated",
+                        "reason",
+                    )
+                    if _readiness.get(key) is not None
+                }
+                if isinstance(_readiness.get("findings"), list):
+                    _version_phase_block["finding_resolution"]["findings"] = (
+                        _readiness["findings"]
+                    )
             if _candidate_behind:
                 _cand_short = _currency["candidate_sha"][:8]
                 _head_short = _currency["head_sha"][:8]
@@ -7467,7 +7487,7 @@ async def _spawn_strategic_review(
                         f"current HEAD; a new audit against the current snapshot will "
                         f"report which finding(s), if any, genuinely remain. Prior "
                         f"list (against {_cand_short}) in "
-                        f"version_phase.last_qualification.audit_findings. Top prior "
+                        f"version_phase.finding_resolution. Top prior "
                         f"findings: {_top}."
                     )
                 elif _requal_ready:
@@ -7480,7 +7500,7 @@ async def _spawn_strategic_review(
                         f"qualify_request to re-qualify the current HEAD; a new audit "
                         f"against the current snapshot will confirm the findings are "
                         f"cleared. Prior list (against {_cand_short}) in "
-                        f"version_phase.last_qualification.audit_findings. Top prior "
+                        f"version_phase.finding_resolution. Top prior "
                         f"findings: {_top}."
                     )
                 else:
@@ -7495,18 +7515,23 @@ async def _spawn_strategic_review(
                         f"re-flag the unresolved finding(s). Instead, prioritize the "
                         f"outstanding fix-first work: scope audit/fundamentals-mode "
                         f"remediation at the unresolved finding(s) and record each as "
-                        f"resolved or code-verified stale in the resolution ledger. "
+                        f"resolved or code-verified stale in the resolution ledger "
+                        f"via the record_finding_resolution op (finding_key from "
+                        f"version_phase.finding_resolution.findings[].key) — that "
+                        f"explicit, evidence-bearing call is the ONLY thing that "
+                        f"advances gating_resolved; merging a PR does not credit "
+                        f"findings on its own. "
                         f"Once every gating finding is resolved-or-stale the readiness "
                         f"signal flips and a fresh qualify_request becomes the right "
                         f"move. Prior list (against {_cand_short}) in "
-                        f"version_phase.last_qualification.audit_findings. Top prior "
+                        f"version_phase.finding_resolution. Top prior "
                         f"findings: {_top}."
                     )
             else:
                 _stabilize_hint += (
                     f" The last qualification's audit flagged "
-                    f"{len(_carried_findings)} finding(s) — full list in "
-                    f"version_phase.last_qualification.audit_findings — and "
+                    f"{len(_carried_findings)} finding(s) — finding keys and "
+                    f"resolution states in version_phase.finding_resolution — and "
                     f"{_binding_desc}. Top findings: {_top}."
                 )
                 if not _currency_resolved:

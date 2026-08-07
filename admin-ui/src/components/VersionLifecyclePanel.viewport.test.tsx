@@ -57,6 +57,10 @@ vi.mock('../api', () => ({
   // both must be present in the mock or browser-mode ESM link fails at import time.
   getHotfixPreview: vi.fn(async () => ({})),
   triggerHotfixPromote: vi.fn(async () => ({ status: 'ok' })),
+  // Re-qualification readiness UI (ReleaseQualificationFindings) imports
+  // recordFindingResolution as a static import; must be present in the mock or
+  // browser-mode ESM link fails at import time.
+  recordFindingResolution: vi.fn(async () => ({ id: 'row-1', project_id: 'p', release_version_id: 'v', finding_key: 'k', state: 'resolved', severity: null, note: null, resolving_ref: null, verified_against_sha: null })),
 }));
 
 const QUALIFYING_DATA: VersionLifecycleResponse = {

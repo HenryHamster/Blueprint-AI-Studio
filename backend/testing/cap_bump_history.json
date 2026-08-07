@@ -3377,6 +3377,12 @@
           "commit_date": "2026-07-08T01:22:28-07:00",
           "old_cap": 650,
           "new_cap": 900
+        },
+        {
+          "commit_sha": "",
+          "commit_date": "2026-08-07T07:03:17.626156+00:00",
+          "old_cap": 900,
+          "new_cap": 1200
         }
       ],
       "handlers/research-plan.ts": [
@@ -4308,6 +4314,14 @@
           "old_cap": 2350,
           "new_cap": 2750
         }
+      ],
+      "api/projects.ts": [
+        {
+          "commit_sha": "",
+          "commit_date": "2026-08-07T05:36:48.751786+00:00",
+          "old_cap": 1750,
+          "new_cap": 2100
+        }
       ]
     },
     "testing": {
@@ -4489,6 +4503,14 @@
           "commit_date": "2026-08-06T21:01:19+00:00",
           "old_cap": 2350,
           "new_cap": 2750
+        }
+      ],
+      "test_ci_completion.py": [
+        {
+          "commit_sha": "314909775df9eb80a5801f33a2479abcf7428caa",
+          "commit_date": "2026-08-07T06:47:47+00:00",
+          "old_cap": 7300,
+          "new_cap": 8450
         }
       ]
     }

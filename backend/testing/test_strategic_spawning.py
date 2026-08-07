@@ -8216,11 +8216,14 @@ async def test_stabilize_hint_points_at_carried_audit_findings(
 ):
     """A stabilize version whose last_qualification carries audit findings gets
     a prompt_suffix that names the findings and tells the agent to target them
-    with an audit-mode direction — and the findings ride through in
-    version_phase.last_qualification.audit_findings."""
+    with an audit-mode direction — and the steer points at
+    version_phase.finding_resolution (the block that actually carries the
+    finding keys + ledger states), not the stripped
+    last_qualification.audit_findings list."""
     from app.models import ReleaseVersion
 
     await _ensure_releaseversion_table(db_session)
+    await _ensure_audit_finding_resolution_table(db_session)
 
     project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
     db_session.add(project)
@@ -8263,7 +8266,8 @@ async def test_stabilize_hint_points_at_carried_audit_findings(
     payload = tasks[0].payloads[0]
 
     suffix = payload.get("prompt_suffix", "")
-    assert "audit_findings" in suffix, f"Expected findings pointer; got: {suffix}"
+    assert "finding_resolution" in suffix, f"Expected findings pointer; got: {suffix}"
+    assert "last_qualification.audit_findings" not in suffix
     assert "Token baked into VM image" in suffix
     assert "recommended_mode='audit'" in suffix
     # The project has no active audit/fundamentals-mode direction, so the hint
@@ -8281,9 +8285,94 @@ async def test_stabilize_hint_points_at_carried_audit_findings(
         {"severity": "high", "summary": "Token baked into VM image."},
         {"severity": "low", "summary": "Private cross-module import."},
     ]
+    # The finding-resolution block carries the carried finding's key + ledger
+    # state even though the raw audit_findings list is stripped to a count by the
+    # compact qualification serializer.
+    fr = vp.get("finding_resolution")
+    assert fr is not None, "finding_resolution block should carry the finding keys"
+    assert fr["gating_total"] == 1
+    gating = fr["findings"][0]
+    assert gating["severity"] == "high"
+    assert gating["state"] == "unresolved"
+    assert gating["key"]
     # Audit (0.74) is the lowest active sub-score here, so it IS the binding
     # constraint and the hint should frame it that way.
     assert "the audit sub-score is the binding constraint on promotion" in suffix
+
+
+@pytest.mark.asyncio
+async def test_stabilize_hint_points_at_finding_resolution_block(
+    db_session, mocker, _lts_split_active
+):
+    """When carried audit findings block re-qualification, the stabilize steer
+    points the agent at version_phase.finding_resolution — the block that
+    ACTUALLY carries the per-finding keys + ledger states — instead of
+    version_phase.last_qualification.audit_findings, which the compact
+    qualification serializer strips down to a count. The finding_resolution
+    block also survives budget-trim compaction, so the pointer stays valid even
+    when last_qualification.audit_findings has been removed from the payload."""
+    from app.release_scoring import _audit_finding_key
+    from app.strategic_spawning import _summarize_version_phase
+
+    await _ensure_releaseversion_table(db_session)
+    await _ensure_audit_finding_resolution_table(db_session)
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    candidate = "a" * 40
+    version = _make_stabilize_version_with_candidate(candidate)
+    version.project_id = project.id
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # The gating (high) finding is left UNRESOLVED — no ledger row — so the
+    # carried findings genuinely block re-qualification on the behind-head path.
+    _patch_spawning_deps(mocker)
+    _patch_candidate_currency(
+        mocker, resolved=("tok", "owner", "repo"), head_sha="b" * 40
+    )
+    suffix = await _spawn_and_get_stabilize_suffix(project, db_session)
+
+    # The steer points at the block that carries the finding keys, not the
+    # stripped audit_findings list.
+    assert "version_phase.finding_resolution" in suffix, (
+        f"Expected finding_resolution pointer; got: {suffix}"
+    )
+    assert "version_phase.last_qualification.audit_findings" not in suffix
+    assert "UNRESOLVED" in suffix
+    assert "fix-first work" in suffix
+
+    result = await db_session.execute(_select_agent_tasks(project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    vp = tasks[0].payloads[0].get("version_phase")
+    assert vp is not None
+
+    # The payload block carries each gating finding's key + resolution state.
+    fr = vp.get("finding_resolution")
+    assert fr is not None, "finding_resolution block must be present"
+    assert fr["gating_total"] == 1
+    assert fr["gating_resolved"] == 0
+    by_key = {f["key"]: f for f in fr["findings"]}
+    high_key = _audit_finding_key("Token baked into VM image.", None)
+    assert high_key in by_key, f"finding keys missing from block: {list(by_key)}"
+    assert by_key[high_key]["state"] == "unresolved"
+    assert by_key[high_key]["severity"] == "high"
+
+    # The compact version_phase serializer strips last_qualification.audit_findings
+    # to a count but keeps the finding_resolution block — proving it is the durable
+    # carrier of the keys the steer points at.
+    compacted = _summarize_version_phase(vp)
+    assert "audit_findings" not in (compacted.get("last_qualification") or {})
+    assert compacted["finding_resolution"]["findings"]
+    assert compacted["finding_resolution"]["findings"][0]["key"] == high_key
 
 
 async def _spawn_and_get_stabilize_suffix(project, db_session):
@@ -8583,6 +8672,13 @@ async def test_stabilize_hint_requalify_only_when_readiness_signaled(
     assert "Ensure one durable direction owns the outcome" in notready_suffix
     assert "otherwise create one" in notready_suffix
     assert "MUST create a new direction" not in notready_suffix
+    # The ledger only advances on an explicit, evidence-bearing declaration —
+    # a merged PR does NOT credit carried findings (see
+    # test_ci_completion.test_merge_auto_resolve_no_keys_writes_no_rows). Name
+    # the op and where the finding_key comes from so the steer is actionable.
+    assert "record_finding_resolution" in notready_suffix
+    assert "version_phase.finding_resolution.findings[].key" in notready_suffix
+    assert "merging a PR does not credit" in notready_suffix
 
 
 @pytest.mark.asyncio
