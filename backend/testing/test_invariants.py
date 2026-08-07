@@ -1448,6 +1448,13 @@ class TestSchemaRevisionSync:
         rollup auto-merge guard consumes, so the invariant test and the
         runtime guard assert against identical revision/down_revision
         resolution.
+
+        Enumerates every ``.py`` file in the versions directory (the same
+        predicate the post-merge guard uses) — NOT just files whose ``NNNN``
+        filename prefix is all-digits. A migration like
+        ``0612b_fix_checkpoint_clear_fk_cascade.py`` has a non-numeric prefix
+        but is a real chain member; a guard that silently drops it on filename
+        grounds orphans ``0612`` into a phantom head.
         """
         import glob as globmod
 
@@ -1456,7 +1463,7 @@ class TestSchemaRevisionSync:
         migrations_dir = os.path.join(
             os.path.dirname(__file__), "..", "alembic", "versions"
         )
-        files = globmod.glob(os.path.join(migrations_dir, "[0-9]*.py"))
+        files = globmod.glob(os.path.join(migrations_dir, "*.py"))
 
         sources: dict[str, str] = {}
         for path in files:
@@ -1498,6 +1505,123 @@ class TestSchemaRevisionSync:
         assert len(heads) == 1, (
             f"Expected exactly 1 head migration, found {len(heads)}: {heads}"
         )
+
+    def test_post_merge_guard_keeps_non_numeric_prefix_migration_in_chain(self):
+        """The post-merge Alembic head guard must include non-numeric-prefix
+        migrations when building the chain.
+
+        ``0612b_fix_checkpoint_clear_fk_cascade.py`` declares
+        ``revision = "0612b"`` with ``down_revision = "0612"`` — a valid chain
+        member whose filename prefix the ``NNNN``-only filter cannot parse. The
+        pre-fix guard silently dropped it, orphaning ``0612`` into a phantom
+        head and reporting a false block ("2 Alembic heads (0612, 0725)") on a
+        healthy single-head chain. This drives the guard's real post-merge code
+        path over the on-disk migration set and asserts the healthy verdict.
+        """
+        import asyncio
+        import glob as globmod
+        from unittest.mock import AsyncMock, patch
+
+        from app import rollup_migration_validation as rmv
+        from app.migration_chain import build_migration_chain, find_heads
+
+        migrations_dir = os.path.join(
+            os.path.dirname(__file__), "..", "alembic", "versions"
+        )
+        basenames = [
+            os.path.basename(p)
+            for p in globmod.glob(os.path.join(migrations_dir, "*.py"))
+        ]
+        sources = {
+            os.path.basename(p): open(p).read()
+            for p in globmod.glob(os.path.join(migrations_dir, "*.py"))
+        }
+        assert "0612b_fix_checkpoint_clear_fk_cascade.py" in basenames
+
+        # Pin 0612b into the computed chain and assert the single-head set.
+        chain, duplicates, unparseable = build_migration_chain(sources)
+        assert not duplicates and not unparseable
+        assert "0612b" in chain
+        heads = find_heads(chain)
+        assert heads == ["0725"], (
+            f"expected single head ['0725'] with 0612b in the chain, got "
+            f"{sorted(heads)}"
+        )
+
+        async def _file_text(path, *, token, owner, repo, ref, **kwargs):
+            return sources.get(os.path.basename(path))
+
+        with patch(
+            "app.github.get_pr_files",
+            new=AsyncMock(
+                return_value=[
+                    {
+                        "filename": (
+                            "backend/alembic/versions/"
+                            "0612b_fix_checkpoint_clear_fk_cascade.py"
+                        ),
+                        "status": "added",
+                    }
+                ]
+            ),
+        ), patch(
+            "app.github.list_versions_at_ref",
+            new=AsyncMock(return_value=basenames),
+        ), patch(
+            "app.github.get_file_text_at_ref",
+            new=AsyncMock(side_effect=_file_text),
+        ):
+            verdict, reason = asyncio.run(
+                rmv._validate_migration_chain_post_merge(
+                    "tok", "acme", "widget", 424242, "deadbeef"
+                )
+            )
+        assert verdict == "ok", (
+            "post-merge Alembic guard blocked a healthy single-head chain: "
+            f"{reason!r}"
+        )
+
+    def test_post_merge_guard_and_invariant_enumerate_identical_migration_set(self):
+        """The post-merge Alembic guard and the chain invariant must enumerate the
+        IDENTICAL migration file set.
+
+        The 0612b defect was not a bad head-count assertion — it was the two
+        enumerations of the migration set disagreeing on exactly one silently-
+        dropped file. Assert set equality (not counts) so any future divergence
+        between the guard's enumeration and the invariant's is caught directly.
+        """
+        import glob as globmod
+
+        from app.migration_chain import migration_chain_versions
+
+        migrations_dir = os.path.join(
+            os.path.dirname(__file__), "..", "alembic", "versions"
+        )
+        # The guard's enumeration over the versions-directory listing (what the
+        # post-merge guard feeds into build_migration_chain). Mirrors the GitHub
+        # contents listing that list_versions_at_ref returns: files only.
+        disk_entries = [
+            entry
+            for entry in os.listdir(migrations_dir)
+            if os.path.isfile(os.path.join(migrations_dir, entry))
+        ]
+        guard_set = set(migration_chain_versions(disk_entries))
+        # The invariant test's enumeration (test_migration_chain_is_linear globs
+        # `*.py` — every migration file, numeric-prefix or not).
+        invariant_set = {
+            os.path.basename(p)
+            for p in globmod.glob(os.path.join(migrations_dir, "*.py"))
+        }
+        assert guard_set == invariant_set, (
+            "the post-merge Alembic guard and the chain invariant enumerate "
+            "different migration sets — the two enumerations diverging is the "
+            "bug class that silently dropped 0612b. "
+            f"guard-only={sorted(guard_set - invariant_set)} "
+            f"invariant-only={sorted(invariant_set - guard_set)}"
+        )
+        # The non-numeric-prefix migration that used to be dropped must be in
+        # both enumerations.
+        assert "0612b_fix_checkpoint_clear_fk_cascade.py" in guard_set
 
     def test_migration_chain_is_monotonic(self):
         """The on-disk migration chain must be monotonic: the migration with the

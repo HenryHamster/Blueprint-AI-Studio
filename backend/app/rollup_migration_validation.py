@@ -14,6 +14,7 @@ from app.migration_chain import (
     find_deployed_migration_content_edits,
     find_filename_revision_mismatches,
     find_heads,
+    migration_chain_versions,
     plan_integration_side_renumber,
     plan_migration_reconciliation,
     validate_added_migrations,
@@ -993,10 +994,15 @@ async def _validate_migration_chain_post_merge(
     # added-vs-existing here would falsely flag the candidate's own just-merged
     # revisions (#7731), so we deliberately build one combined chain instead.
     sources: dict[str, str] = {}
-    for fn in existing_filenames:
-        if _filename_revision_prefix(fn) is None:
-            # Not a migration-style NNNN file — skip rather than fetch/parse it.
-            continue
+    for fn in migration_chain_versions(existing_filenames):
+        # Every `.py` file in the versions directory participates in the chain —
+        # Alembic loads them all. The `NNNN` filename-prefix filter was a fetch
+        # optimization that must NEVER determine chain membership: a migration
+        # whose prefix is not all-digits (e.g. `0612b_fix_checkpoint_clear_fk_cascade.py`)
+        # was silently dropped, orphaning its `down_revision` into a phantom head
+        # and reporting a false dual-head block on a healthy chain. The in-file
+        # `revision`/`down_revision` parse (build_migration_chain below) decides;
+        # an unparseable file still blocks loudly via the `unparseable` check.
         path = f"{_ALEMBIC_VERSIONS_DIR}/{fn}"
         try:
             text = await github.get_file_text_at_ref(
