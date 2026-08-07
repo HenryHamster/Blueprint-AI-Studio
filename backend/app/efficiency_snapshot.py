@@ -334,6 +334,13 @@ UNPRICED_ALERT_MIN_TASKS = 3
 # Window over which "current" axes are computed for each daily snapshot.
 _AXIS_WINDOW_DAYS = 7
 
+# Row cap applied to _load_recent_tasks. Past this many terminal tasks in the
+# requested window, the loaded cohort is a recency SAMPLE (most-recently-
+# updated first) rather than the full window — every aggregate computed from
+# it describes that narrower, undeclared span unless the cohort_* fields
+# below are surfaced alongside it.
+_COHORT_CAP = 5000
+
 # Cap snapshot history length (reduced from 14 to 7 to keep the
 # efficiency_baseline blob bounded — each snapshot is ~17–21 KB, so 7
 # entries keeps it at roughly 147 KB plus baseline, leaving more room
@@ -576,7 +583,7 @@ async def _load_recent_tasks(
             )
         )
         .order_by(Task.updated_at.desc())
-        .limit(5000)
+        .limit(_COHORT_CAP)
     )
     result = await session.execute(stmt)
     if not use_payload_projection:
@@ -587,6 +594,24 @@ async def _load_recent_tasks(
         object.__setattr__(task, "_projected_first_payload", first_payload or {})
         tasks.append(task)
     return tasks
+
+
+def _cohort_effective_window(tasks: list[Task]) -> dict[str, str | None]:
+    """Return the actual [oldest, newest] ``updated_at`` span covered by a
+    loaded task cohort.
+
+    When ``_load_recent_tasks`` hits ``_COHORT_CAP``, the requested window
+    (``_AXIS_WINDOW_DAYS`` days back from now) is no longer what the loaded
+    rows actually span — the most-recent-first cap narrows it. This is the
+    span every aggregate below the cohort_* fields actually measures.
+    """
+    timestamps = [t.updated_at for t in tasks if t.updated_at is not None]
+    if not timestamps:
+        return {"start": None, "end": None}
+    return {
+        "start": min(timestamps).isoformat(),
+        "end": max(timestamps).isoformat(),
+    }
 
 
 async def _compute_blocked_vm_spend(
@@ -2830,9 +2855,9 @@ async def compute_current_axes(
     )
 
     tasks = await _load_recent_tasks(session, project_id)
-    _COHORT_CAP = 5000
     cohort_task_count = len(tasks)
     cohort_capped = cohort_task_count >= _COHORT_CAP
+    cohort_window = _cohort_effective_window(tasks)
     blocked_vm_spend = await _compute_blocked_vm_spend(session, project_id)
     lanes = await _load_project_lanes(session, project_id)
     pool_metrics = await compute_pool_idle_cost(session, project_id)
@@ -3000,6 +3025,13 @@ async def compute_current_axes(
         # more tasks than the cap and totals are cohort-scoped, not window-complete).
         "cohort_task_count": cohort_task_count,
         "cohort_capped": cohort_capped,
+        # Effective window actually covered by the loaded cohort (as opposed
+        # to the requested _AXIS_WINDOW_DAYS window). When cohort_capped is
+        # True this is narrower than the requested window and is the only
+        # honest description of what the aggregates above actually measure.
+        "cohort_requested_window_days": _AXIS_WINDOW_DAYS,
+        "cohort_effective_window_start": cohort_window["start"],
+        "cohort_effective_window_end": cohort_window["end"],
         # BLOCKED provisioned spend: VM cost incurred by BLOCKED tasks whose VM
         # was provisioned within the window. BLOCKED tasks are excluded from the
         # terminal cohort but still consumed real VM spend; surfaced separately

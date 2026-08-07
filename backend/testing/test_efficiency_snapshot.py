@@ -5456,11 +5456,12 @@ def test_playbook_guidance_trigger_bullets_condensed():
     """PLAYBOOK_GUIDANCE must stay condensed (no trigger-bullet re-expansion).
 
     PR #11033 condensed the 10 original trigger bullets to 5; the guidance was
-    later condensed further into a single-paragraph "**When to save:**" form
-    (mirrored by the agent-side guard in prompt.test.ts, which caps the
-    constant under 800 bytes). This test guards against re-expansion of the
-    prompt-budget-sensitive constant from the backend side, using the same
-    template-literal extraction the prompt_static_bytes axis uses.
+    later condensed further into a single-paragraph "Before completing, save
+    concise reusable facts..." form (mirrored by the agent-side guard in
+    prompt.test.ts, which caps the constant under 800 bytes). This test
+    guards against re-expansion of the prompt-budget-sensitive constant from
+    the backend side, using the same template-literal extraction the
+    prompt_static_bytes axis uses.
     """
     import os
 
@@ -5480,10 +5481,10 @@ def test_playbook_guidance_trigger_bullets_condensed():
     assert length is not None, (
         "PLAYBOOK_GUIDANCE template literal not found in prompt.ts"
     )
-    assert "**When to save:**" in src, (
-        "PLAYBOOK_GUIDANCE condensed '**When to save:**' paragraph not found "
-        "in prompt.ts — the trigger guidance was removed or restructured; "
-        "update this guard alongside it."
+    assert "Before completing, save concise reusable facts" in src, (
+        "PLAYBOOK_GUIDANCE condensed 'Before completing, save concise "
+        "reusable facts' paragraph not found in prompt.ts — the trigger "
+        "guidance was removed or restructured; update this guard alongside it."
     )
     assert length < 800, (
         f"PLAYBOOK_GUIDANCE is {length} bytes (max 800, matching the agent-side "
@@ -11341,6 +11342,63 @@ async def test_compute_current_axes_exposes_cohort_coverage(db_session):
     # With only 2 tasks in the window, the cap is not reached.
     assert axes["cohort_task_count"] == 2
     assert axes["cohort_capped"] is False
+    # Uncapped cohort: effective window equals the full requested span (both
+    # tasks are in-window) and cohort_requested_window_days is reported.
+    assert axes["cohort_requested_window_days"] == 7
+    assert axes["cohort_effective_window_start"] is not None
+    assert axes["cohort_effective_window_end"] is not None
+
+
+@pytest.mark.asyncio
+async def test_capped_cohort_reports_provenance_and_effective_window(db_session, monkeypatch):
+    """When the cohort hits the row cap, cohort_capped must be True and the
+    reported effective window must be the actual (narrower) span of the
+    loaded rows, not the full requested _AXIS_WINDOW_DAYS window.
+    """
+    import app.efficiency_snapshot as efficiency_snapshot_module
+
+    # Shrink the cap so three tasks trip it without seeding 5000 rows.
+    monkeypatch.setattr(efficiency_snapshot_module, "_COHORT_CAP", 2)
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    # Three tasks spread across the requested window: oldest is 6 days back,
+    # middle 3 days back, newest just now. With the cap at 2, only the two
+    # most-recently-updated tasks (middle, newest) are loaded.
+    oldest = _make_efficient_task(project.id, updated_at=now - timedelta(days=6))
+    middle = _make_efficient_task(project.id, updated_at=now - timedelta(days=3))
+    newest = _make_efficient_task(project.id, updated_at=now)
+    db_session.add(oldest)
+    db_session.add(middle)
+    db_session.add(newest)
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+
+    assert axes["cohort_task_count"] == 2, (
+        "cap of 2 must limit the loaded cohort to the 2 most-recently-updated tasks"
+    )
+    assert axes["cohort_capped"] is True
+    assert axes["cohort_requested_window_days"] == 7
+
+    effective_start = datetime.fromisoformat(axes["cohort_effective_window_start"])
+    effective_end = datetime.fromisoformat(axes["cohort_effective_window_end"])
+
+    # The effective window must reflect only the loaded (middle, newest)
+    # rows -- NOT the oldest task, which the cap excluded.
+    oldest_updated_at = oldest.updated_at
+    if oldest_updated_at.tzinfo is None:
+        oldest_updated_at = oldest_updated_at.replace(tzinfo=effective_start.tzinfo)
+    assert effective_start > oldest_updated_at, (
+        "capped effective window must NOT reach back to the excluded oldest task"
+    )
+    assert (effective_end - effective_start) < timedelta(days=6), (
+        "capped effective window must be narrower than the full requested span"
+    )
 
 
 @pytest.mark.asyncio
