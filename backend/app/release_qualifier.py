@@ -7824,6 +7824,7 @@ async def _finalize_qualification(
                     candidate_sha,
                     merge_grade_cert.get("residual_uncaptured_gap"),
                     qualification_attempt_id=attempt_id,
+                    project_id=version.project_id,
                 )
             except Exception:  # noqa: BLE001 — ledger write failure must not crash finalize
                 logger.warning(

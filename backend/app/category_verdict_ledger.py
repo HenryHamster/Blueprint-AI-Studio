@@ -273,12 +273,20 @@ async def upsert_residual(
     candidate_sha: str | None,
     uncaptured_gap: str | None,
     qualification_attempt_id: uuid.UUID | None = None,
+    project_id: uuid.UUID | None = None,
 ) -> None:
     """UPSERT the residual "uncaptured goal aspect" for one candidate tree.
 
     SELECT-then-INSERT/UPDATE on the unique ``(version_id, candidate_sha,
     qualification_attempt_id)`` key.  Passing ``uncaptured_gap=None`` records/clears
     the residual to "no gap".  Flushes but does not commit.
+
+    Also gives the residual its completion-debt consequence (best-effort,
+    never raises), mirroring ``upsert_category_verdict``'s per-category
+    ``objective_gap`` sync: a non-empty ``uncaptured_gap`` opens — or keeps
+    open — an ``objective_gap`` debt entry keyed on the residual sentinel
+    category; an empty/None gap resolves it. ``project_id`` scopes the entry
+    to its owning project when the caller has it.
     """
     existing = (
         await session.execute(
@@ -290,12 +298,23 @@ async def upsert_residual(
         )
     ).scalar_one_or_none()
 
+    from app.completion_debt import OBJECTIVE_GAP_RESIDUAL_KEY as _residual_key
+
     if existing is not None:
         existing.uncaptured_gap = uncaptured_gap
         existing.qualification_attempt_id = qualification_attempt_id
         existing.graded_at = _utcnow()
         session.add(existing)
         await session.flush()
+        await _sync_objective_gap_debt(
+            session,
+            version_id=version_id,
+            category_key=_residual_key,
+            status="met" if not uncaptured_gap else "residual",
+            gap=uncaptured_gap,
+            candidate_sha=candidate_sha,
+            project_id=project_id,
+        )
         return
 
     session.add(
@@ -308,6 +327,15 @@ async def upsert_residual(
         )
     )
     await session.flush()
+    await _sync_objective_gap_debt(
+        session,
+        version_id=version_id,
+        category_key=_residual_key,
+        status="met" if not uncaptured_gap else "residual",
+        gap=uncaptured_gap,
+        candidate_sha=candidate_sha,
+        project_id=project_id,
+    )
 
 
 async def get_residual(

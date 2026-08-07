@@ -107,6 +107,12 @@ def objective_gap_dedupe_key(version_id: Any, category_key: Any) -> str:
     return f"objective_gap:{version_id}:{category_key}"
 
 
+# Sentinel "category" identifying the holistic merge-grade residual ("gap no
+# criterion captures") in the objective_gap debt ledger — never a real
+# criterion_key (those are ``c-<8hex>``), so it can't collide with one.
+OBJECTIVE_GAP_RESIDUAL_KEY = "__residual__"
+
+
 def _is_async_session(session: Any) -> bool:
     """True for an ``AsyncSession`` (which exposes ``.sync_session``).
 
