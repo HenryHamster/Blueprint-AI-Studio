@@ -2263,7 +2263,9 @@ async def agent_fetch_efficiency_snapshot(
 ):
     """Return the current efficiency snapshot for the project: cost_per_merged_pr,
     vm_reuse_rate, llm_cost_per_merged_pr, format_compliance, merged-work
-    origination split, and window metadata.
+    origination split, window metadata, and cohort coverage (cohort_task_count /
+    cohort_capped flag so a truncated sample is distinguishable from a complete
+    window).
     Reuses the same compute path as the operator dashboard so numbers are consistent.
     Read-only; cross-project access returns 404."""
     from app.efficiency_snapshot import (  # noqa: PLC0415
@@ -2275,6 +2277,7 @@ async def agent_fetch_efficiency_snapshot(
         AXIS_VM_REUSE_RATE,
         FORMAT_COMPLIANCE_KEY,
         _AXIS_WINDOW_DAYS,
+        _COHORT_CAP,
         _compute_cost_per_merged_pr,
         _compute_cost_per_verified_task,
         _compute_llm_cache_hit_rate,
@@ -2322,6 +2325,8 @@ async def agent_fetch_efficiency_snapshot(
             "llm_cost_attribution": llm_cost_attribution,
             "merged_work_origination": merged_work_origination,
             "window_days": _AXIS_WINDOW_DAYS,
+            "cohort_task_count": len(tasks),
+            "cohort_capped": len(tasks) >= _COHORT_CAP,
         },
     }
 

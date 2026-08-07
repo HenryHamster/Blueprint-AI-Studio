@@ -11597,6 +11597,94 @@ async def test_capped_cohort_reports_provenance_and_effective_window(db_session,
 
 
 @pytest.mark.asyncio
+async def test_agent_efficiency_snapshot_exposes_cohort_provenance(
+    client: AsyncClient, db_session
+):
+    """GET /api/agent/projects/{id}/efficiency-snapshot surfaces the cohort
+    coverage fields (cohort_task_count + cohort_capped) on the agent-facing
+    payload, so a reader can see whether metrics describe the full window or a
+    capped sample."""
+    from app.auth import create_agent_token
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # A QUEUED (non-terminal) task provides a valid agent token without joining
+    # the terminal cohort itself.
+    token_task = make_task(project_id=project.id)
+    db_session.add(token_task)
+    db_session.add(_make_efficient_task(project.id))
+    db_session.add(_make_efficient_task(project.id, vm_warm_start=True))
+    await db_session.commit()
+    await db_session.refresh(token_task)
+
+    token = create_agent_token(str(token_task.id), "agent-vm-cohort-read")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/efficiency-snapshot",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+
+    # Uncapped cohort: two terminal tasks in the window, flag reads False.
+    assert "cohort_task_count" in data, (
+        "agent efficiency-snapshot must include cohort_task_count"
+    )
+    assert "cohort_capped" in data, (
+        "agent efficiency-snapshot must include cohort_capped"
+    )
+    assert isinstance(data["cohort_task_count"], int)
+    assert isinstance(data["cohort_capped"], bool)
+    assert data["cohort_task_count"] == 2
+    assert data["cohort_capped"] is False
+
+
+@pytest.mark.asyncio
+async def test_agent_efficiency_snapshot_cohort_capped_flag(
+    client: AsyncClient, db_session, monkeypatch
+):
+    """When the terminal cohort hits the row cap, the agent-facing
+    efficiency-snapshot payload must report cohort_capped=True so a reader can
+    distinguish a truncated sample from a complete window without summing
+    by_failure_class counts by hand."""
+    import app.efficiency_snapshot as efficiency_snapshot_module
+
+    from app.auth import create_agent_token
+
+    # Shrink the cap so three tasks trip it without seeding 5000 rows.
+    monkeypatch.setattr(efficiency_snapshot_module, "_COHORT_CAP", 2)
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    token_task = make_task(project_id=project.id)
+    db_session.add(token_task)
+    now = _utcnow()
+    db_session.add(_make_efficient_task(project.id, updated_at=now - timedelta(days=6)))
+    db_session.add(_make_efficient_task(project.id, updated_at=now - timedelta(days=3)))
+    db_session.add(_make_efficient_task(project.id, updated_at=now))
+    await db_session.commit()
+    await db_session.refresh(token_task)
+
+    token = create_agent_token(str(token_task.id), "agent-vm-cohort-capped")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/efficiency-snapshot",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+
+    assert data["cohort_task_count"] == 2, (
+        "cap of 2 must limit the loaded cohort to the 2 most-recently-updated tasks"
+    )
+    assert data["cohort_capped"] is True
+
+
+@pytest.mark.asyncio
 async def test_compute_current_axes_exposes_blocked_vm_spend(db_session):
     """compute_current_axes must include blocked_provisioned_vm_spend_usd as a non-negative float."""
     project = make_project()
