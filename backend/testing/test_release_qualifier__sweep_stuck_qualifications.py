@@ -5604,3 +5604,218 @@ async def test_auto_trigger_fires_post_dry_run_advance(db_session, mocker):
     assert run_mock.await_count == 1
     assert run_mock.await_args.kwargs.get("explicit_request") is not True
     assert run_mock.await_args.kwargs.get("auto_trigger") is True
+
+
+# ---------------------------------------------------------------------------
+# Rubric-change re-driver (_redrive_rubric_changed_qualification)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_rubric_changed_below_cap_relaunches_exactly_once(db_session, mocker):
+    """A rubric_changed hold BELOW the re-drive cap is auto-relaunched exactly
+    once against the current rubric: the re-driver re-enters run_qualification
+    with auto_trigger=True (a FRESH attempt — no attempt id carried), and the
+    per-episode counter advances post-commit.  This is the regression for the
+    silent stall: a mid-flight rubric change previously parked the version with
+    no scheduled relaunch."""
+    from app.release_qualifier_redrive import _redrive_rubric_changed_qualification
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "rubric_changed",
+        "blocker": "rubric_changed",
+        "candidate_sha": "beefcafe" * 5,
+        "qualification_attempt_id": str(uuid.uuid4()),
+        "requested_probes": [],
+        "retry_episode": 0,
+        "rubric_redrive_count": 0,  # below _MAX_RUBRIC_REDRIVE_ATTEMPTS
+        "merge_grade": {"status": "rubric_changed", "blocked": True},
+        "rubric_drift": {"total_changes": 3},
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mock_run_qual = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    result = await _redrive_rubric_changed_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert result is True, (
+        "a rubric_changed hold below the cap must auto-relaunch (fresh grade "
+        "against the current rubric), not stall"
+    )
+    mock_run_qual.assert_called_once()
+    call_kwargs = mock_run_qual.await_args.kwargs
+    assert call_kwargs.get("auto_trigger") is True, (
+        "the rubric re-drive is the sweep's sanctioned attempt-scoped recovery "
+        "path, never a claim of explicit_request"
+    )
+    assert call_kwargs.get("explicit_request") is not True
+    # A FRESH attempt, not a continuation of the superseded one.
+    assert call_kwargs.get("qualification_attempt_id") is None
+
+    await db_session.refresh(version)
+    assert version.last_qualification["rubric_redrive_count"] == 1, (
+        "a successful relaunch must advance the per-episode re-drive counter "
+        "so the cap holds under repeated changes"
+    )
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(Alert.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert alerts == [], "a below-cap relaunch must not raise an Alert"
+
+
+@pytest.mark.asyncio
+async def test_rubric_changed_cap_halted_with_operator_alert(db_session, mocker):
+    """The re-drive bound holds under repeated changes: once the per-episode
+    counter reaches the cap, the re-driver halts (no relaunch) and raises an
+    operator Alert (once) instead of spinning attempts indefinitely.  This is
+    the explicit operator-actionable state the bound requires."""
+    from app.release_qualifier_redrive import (
+        _MAX_RUBRIC_REDRIVE_ATTEMPTS,
+        _redrive_rubric_changed_qualification,
+    )
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "rubric_changed",
+        "blocker": "rubric_changed",
+        "candidate_sha": "beefcafe" * 5,
+        "qualification_attempt_id": str(uuid.uuid4()),
+        "requested_probes": [],
+        "retry_episode": _MAX_RUBRIC_REDRIVE_ATTEMPTS,
+        "rubric_redrive_count": _MAX_RUBRIC_REDRIVE_ATTEMPTS,  # at the cap
+        "merge_grade": {"status": "rubric_changed", "blocked": True},
+        "rubric_drift": {"total_changes": 3},
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mock_run_qual = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    result = await _redrive_rubric_changed_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert result is False, (
+        "a rubric_changed hold AT the cap must halt the auto-relaunch"
+    )
+    mock_run_qual.assert_not_called()
+
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(Alert.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1, (
+        "reaching the re-drive cap must raise exactly one operator Alert"
+    )
+    assert "rubric" in alerts[0].title.lower()
+    await db_session.refresh(version)
+    assert version.last_qualification.get("rubric_redrive_loop_escalated") is True
+
+    # The Alert is deduped: a second sweep cycle does not spam another Alert.
+    result_again = await _redrive_rubric_changed_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert result_again is False
+    alerts_again = (
+        (
+            await db_session.execute(
+                select(Alert).where(Alert.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts_again) == 1
+
+
+@pytest.mark.asyncio
+async def test_rubric_changed_spawn_failure_not_counted_as_redrive(db_session, mocker):
+    """A relaunch attempt that does NOT actually spawn (transient GitHub outage,
+    spawn_failed, ...) is not counted as a performed re-drive: the counter only
+    advances on a genuine fresh spawn, so the cap is not burned on failed
+    attempts."""
+    from app.release_qualifier_redrive import _redrive_rubric_changed_qualification
+
+    _project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "rubric_changed",
+        "blocker": "rubric_changed",
+        "candidate_sha": "beefcafe" * 5,
+        "qualification_attempt_id": str(uuid.uuid4()),
+        "requested_probes": [],
+        "retry_episode": 0,
+        "rubric_redrive_count": 0,
+        "merge_grade": {"status": "rubric_changed", "blocked": True},
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mock_run_qual = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "sha_error"}),
+    )
+
+    result = await _redrive_rubric_changed_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert result is False
+    mock_run_qual.assert_called_once()
+    await db_session.refresh(version)
+    assert version.last_qualification["rubric_redrive_count"] == 0, (
+        "a failed relaunch must NOT advance the re-drive counter"
+    )
+
+
+@pytest.mark.asyncio
+async def test_rubric_unknown_is_redriven_like_rubric_changed(db_session, mocker):
+    """rubric_provenance_unknown (the launched rubric could not be
+    reconstructed) is the same recoverable hold as rubric_changed: it relaunches
+    against the current rubric."""
+    from app.release_qualifier_redrive import _redrive_rubric_changed_qualification
+
+    _project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "rubric_provenance_unknown",
+        "blocker": "rubric_provenance_unknown",
+        "candidate_sha": "beefcafe" * 5,
+        "qualification_attempt_id": str(uuid.uuid4()),
+        "requested_probes": [],
+        "retry_episode": 0,
+        "rubric_redrive_count": 0,
+        "merge_grade": {"status": "rubric_provenance_unknown", "blocked": True},
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mock_run_qual = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    result = await _redrive_rubric_changed_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert result is True
+    mock_run_qual.assert_called_once()

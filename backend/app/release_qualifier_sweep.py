@@ -57,9 +57,11 @@ from app.release_qualifier_redrive import (
     _MAX_ERROR_REDRIVE_ATTEMPTS,  # noqa: F401 — re-exported for tests
     _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS,  # noqa: F401 — re-exported for tests
     _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS,  # noqa: F401 — re-exported for release_qualifier
+    _MAX_RUBRIC_REDRIVE_ATTEMPTS,  # noqa: F401 — re-exported for tests
     _TRANSIENT_ERROR_CODES,  # noqa: F401 — re-exported for tests
     _redrive_error_qualification,
     _redrive_infra_failure_qualification,
+    _redrive_rubric_changed_qualification,
 )
 
 logger = logging.getLogger(__name__)
@@ -1160,6 +1162,9 @@ async def _fire_auto_triggered_qualification(
       * Verdict re-drives are NOT auto-trigger work: ``error`` / ``infra_failure``
         are owned by the dedicated re-drivers above (which re-enter
         ``run_qualification`` with a bounded attempt cap), and
+        ``rubric_changed`` / ``rubric_provenance_unknown`` are owned by the
+        dedicated rubric re-driver above (``_redrive_rubric_changed_qualification``)
+        — auto-firing them here would bypass its re-drive cap.  And
         ``deferred_unsynced`` / ``promotion_failed`` / ``not_promoted`` with any
         blocker other than the acceptance grade are Strategic qualify_request
         decisions — the existing contract forbids the scheduler from starting a
@@ -1213,8 +1218,9 @@ async def _fire_auto_triggered_qualification(
             )
             return False
         # Verdict re-drives the scheduler must NOT execute.  ``error`` /
-        # ``infra_failure`` are owned by the dedicated re-drivers above (which
-        # re-enter ``run_qualification`` with a bounded attempt cap); the rest are
+        # ``infra_failure`` / ``rubric_changed`` / ``rubric_provenance_unknown``
+        # are owned by the dedicated re-drivers above (which re-enter
+        # ``run_qualification`` with a bounded attempt cap); the rest are
         # Strategic delivery decisions — the existing contract is explicit that the
         # sweep must leave them for Strategic to re-issue ("Resolved findings do
         # not authorize the scheduler to start a new review", "A cleared deferral
@@ -1222,13 +1228,15 @@ async def _fire_auto_triggered_qualification(
         # evidence for Strategic, not scheduler qualification authority").  The
         # resolver surfaces these to Strategic via the read surfaces; the sweep's
         # auto-trigger authority is the INITIAL start (status None) plus
-        # attempt-scoped recovery (rubric changes, dry-run advance, and the
-        # acceptance-grade ``criterion_coverage_incomplete`` re-grade).
+        # attempt-scoped recovery (dry-run advance, and the acceptance-grade
+        # ``criterion_coverage_incomplete`` re-grade).
         if status in (
             "error",
             "infra_failure",
             "deferred_unsynced",
             "promotion_failed",
+            "rubric_changed",
+            "rubric_provenance_unknown",
         ):
             return False
         if status == "not_promoted" and qual.get("blocker") != "criterion_coverage_incomplete":
@@ -1308,6 +1316,7 @@ async def _fire_auto_triggered_qualification(
             in_flight=status == "pending",
             promotion_check_wait=bool(qual.get("promotion_pending")),
             consecutive_infra_errors=int(qual.get("consecutive_infra_errors") or 0),
+            rubric_redrive_count=int(qual.get("rubric_redrive_count") or 0),
         )
         if not decision.fire:
             return False
@@ -1598,6 +1607,38 @@ async def sweep_stuck_qualifications(
             logger.info(
                 "[RELEASE_QUALIFIER] sweep re-drove infra_failure version %s "
                 "(transient infra cleared — qualification spawned)",
+                version_id,
+            )
+
+    # Re-drive qualifications stranded at ``status=rubric_changed`` /
+    # ``rubric_provenance_unknown``.  A mid-flight rubric change invalidates the
+    # in-flight attempt — it measured nothing under the final rubric — so a
+    # FRESH grade against the CURRENT rubric is the recovery path.  Until now
+    # the only resume path was the knob-gated auto-trigger leg (``observe`` in
+    # production), so a rubric hold parked silently with no self-heal.  This
+    # loop is the unconditional relaunch, bounded by
+    # _MAX_RUBRIC_REDRIVE_ATTEMPTS so a rubric that keeps changing cannot spin
+    # attempts indefinitely (the cap raises an operator Alert and halts).  Runs
+    # AFTER the error/infra re-drivers (same version_ids snapshot) and BEFORE
+    # the auto-trigger leg, which explicitly excludes rubric holds — the bespoke
+    # re-driver owns them now.
+    for version_id in version_ids:
+        try:
+            redriven = await _redrive_rubric_changed_qualification(
+                version_id,
+                session_factory=session_factory,
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: rubric_changed re-drive failed "
+                "for version %s",
+                version_id,
+            )
+            continue
+        if redriven:
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep re-drove rubric_changed version %s "
+                "(fresh grade spawned against the current rubric)",
                 version_id,
             )
 

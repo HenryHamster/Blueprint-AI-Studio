@@ -647,6 +647,7 @@ async def get_version_lifecycle(
                     blocker=_lq.get("blocker"),
                     in_flight=_lq_status == "pending",
                     promotion_check_wait=bool(_lq.get("promotion_pending")),
+                    rubric_redrive_count=int(_lq.get("rubric_redrive_count") or 0),
                     last_attempt=_lq if _lq else None,
                     knob=_get_trigger_mode(),
                     evaluated_at=_utcnow().isoformat(),

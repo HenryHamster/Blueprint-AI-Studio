@@ -1304,6 +1304,11 @@ async def test_in_flight_rubric_lifecycle_changes_require_fresh_grade(
     await db_session.refresh(version)
     assert version.last_qualification["category_verdicts"] is None
     assert version.last_qualification["rubric_fingerprint"] == first_fingerprint
+    # A rubric_changed attempt measured nothing under the final rubric: it is
+    # NEVER ledgered as an immutable QualificationVerdict row (mirrors
+    # infra_failure's "HOLD, no verdict recorded"), so it cannot be counted as a
+    # failed attempt by the readiness aggregation.  The hold's durable record is
+    # last_qualification itself, which carries the rubric-drift detail.
     verdict = (
         await db_session.execute(
             select(QualificationVerdict)
@@ -1311,10 +1316,14 @@ async def test_in_flight_rubric_lifecycle_changes_require_fresh_grade(
             .order_by(QualificationVerdict.created_at.desc())
         )
     ).scalars().first()
-    assert verdict is not None
-    assert verdict.terminal_status == "rubric_changed"
-    assert verdict.blocker == "rubric_changed"
-    assert verdict.merge_grade_detail["rubric_drift"]["total_changes"] >= 1
+    assert verdict is None, (
+        "rubric_changed must not write a QualificationVerdict row — it is a "
+        "recoverable hold, not a failed attempt"
+    )
+    assert (
+        version.last_qualification["merge_grade"]["rubric_drift"]["total_changes"]
+        >= 1
+    )
 
     redrive = await rq.run_qualification(
         db_session, project.id, version, explicit_request=True

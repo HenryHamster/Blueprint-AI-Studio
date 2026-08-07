@@ -187,6 +187,20 @@ _READINESS_GROUND_TRUTH_CAVEAT = (
 # ``ground_truth_validated`` stays False and the caveat keeps self-approval framing.
 _READINESS_MIN_RESOLVED_OUTCOMES = 5
 
+# Qualification terminal statuses that recorded NO quality finding and must never
+# be aggregated as failed attempts in the readiness track record.
+# ``infra_failure`` was already excluded; rubric holds complete the set.  A
+# rubric_changed / rubric_provenance_unknown attempt did not measure anything
+# under the final rubric (its in-flight grade was invalidated by a mid-flight
+# acceptance-contract change), so it must not lower the would-promote rate, break
+# the clean streak, or surface its blocker as recurring.  Both ``rubric_changed``
+# and ``rubric_unknown`` are listed because the latter is the terminal_status
+# written for the unknown-provenance hold (see release_qualifier._record_rubric_
+# provenance_outcome).
+_NON_FINDING_VERDICT_STATUSES: frozenset[str] = frozenset(
+    {"infra_failure", "rubric_changed", "rubric_unknown"}
+)
+
 # Governance manifest for the promotion-gate readiness block emitted by
 # ``compute_promotion_readiness``.  Every field the function returns must have an
 # entry here with a named ground-truth source and consumer, or a dated
@@ -686,7 +700,9 @@ async def get_challenged_vs_unchallenged_telemetry(
         select(QualificationVerdict)
         .where(
             QualificationVerdict.project_id == project_id,
-            QualificationVerdict.terminal_status != "infra_failure",
+            QualificationVerdict.terminal_status.not_in(
+                _NON_FINDING_VERDICT_STATUSES
+            ),
         )
         .order_by(QualificationVerdict.created_at.desc())
         .limit(window)
@@ -762,7 +778,9 @@ async def compute_promotion_readiness(
         .where(
             QualificationVerdict.project_id == project_id,
             QualificationVerdict.promotion_enabled.is_(False),
-            QualificationVerdict.terminal_status != "infra_failure",
+            QualificationVerdict.terminal_status.not_in(
+                _NON_FINDING_VERDICT_STATUSES
+            ),
         )
         .order_by(QualificationVerdict.created_at.desc())
         .limit(_READINESS_HISTORY_WINDOW)

@@ -3460,6 +3460,14 @@ async def run_qualification(
         "previous_infra_failure_candidate_sha": prior_infra_failure_candidate_sha,
         "infra_attempt_history": infra_attempt_history,
         "prior_superseded": prior_superseded,
+        # Per-rubric-episode re-drive counter, carried forward from the prior
+        # rubric hold (0 when the prior outcome was not a rubric hold).  The
+        # rubric re-driver (_redrive_rubric_changed_qualification) increments
+        # this POST-commit after each successful relaunch so the cap advances
+        # across the spawn→finalize→relaunch cycle; stamping it here keeps the
+        # pending record carrying the accumulated count even if that post-commit
+        # write is lost to a crash.
+        "rubric_redrive_count": int(prior_qual.get("rubric_redrive_count") or 0),
         "keyless_requalification_consumed_at": prior_qual.get(
             "keyless_requalification_consumed_at"
         ),
@@ -5682,6 +5690,12 @@ async def _record_rubric_provenance_outcome(
         "merge_grade_status": verdict_status,
         "merge_grade_coverage": None,
         "merge_grade_biggest_gap": None,
+        # Per-rubric-episode re-drive counter, carried forward so the rubric
+        # re-driver (_redrive_rubric_changed_qualification) can enforce its
+        # bounded relaunch cap across the spawn→finalize→relaunch cycle.  Resets
+        # to 0 naturally when a NON-rubric verdict lands (that record carries no
+        # counter).
+        "rubric_redrive_count": int(qual.get("rubric_redrive_count") or 0),
     }
     version.last_qualification = record
     flag_modified(version, "last_qualification")
@@ -5701,14 +5715,13 @@ async def _record_rubric_provenance_outcome(
         ),
     )
     session.add(version)
-    await _record_qualification_verdict(
-        session,
-        version,
-        record,
-        terminal_status=verdict_status,
-        would_promote=False,
-        promotion_enabled=resolve_project_promotion_enabled(version.project_id),
-    )
+    # Deliberately NO _record_qualification_verdict here (mirrors
+    # _handle_infra_failure: "HOLD, no verdict recorded").  A rubric_changed /
+    # rubric_provenance_unknown attempt measured nothing under the final
+    # rubric — it must never be scored, ledgered as an immutable
+    # QualificationVerdict row, or counted as a failed attempt in the readiness
+    # aggregation.  last_qualification itself IS the hold's durable record; the
+    # operator is notified below.
     await _notify_operator(
         session,
         version,

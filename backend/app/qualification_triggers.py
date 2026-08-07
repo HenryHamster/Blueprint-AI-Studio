@@ -43,6 +43,17 @@ _MAX_ERROR_REDRIVE_ATTEMPTS: int = 5
 # persistently broken infra path does not retry forever.
 _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS: int = 3
 
+# Maximum number of automatic relaunches for a ``status=rubric_changed`` /
+# ``rubric_provenance_unknown`` version.  Mirrors
+# ``release_qualifier_redrive._MAX_RUBRIC_REDRIVE_ATTEMPTS``: a mid-flight
+# rubric change invalidates the in-flight attempt, so a fresh grade is the
+# recovery path — but a rubric that keeps changing must not spin attempts
+# indefinitely.  The dedicated re-driver
+# (``release_qualifier_redrive._redrive_rubric_changed_qualification``) enforces
+# the cap; this resolver mirror keeps the read surfaces ("capped", not "armed")
+# consistent with that enforcement.
+_MAX_RUBRIC_REDRIVE_ATTEMPTS: int = 2
+
 # CI state string representing a known-red build (from ci_resolution.py).
 _CI_RED = "red"
 
@@ -107,6 +118,7 @@ def resolve_qualification_trigger(
     in_flight: bool,
     promotion_check_wait: bool,
     consecutive_infra_errors: int = 0,
+    rubric_redrive_count: int = 0,
 ) -> TriggerDecision:
     """Return a fire/hold decision for the open version.
 
@@ -273,8 +285,23 @@ def resolve_qualification_trigger(
         )
 
     # T2 — rubric_redrive: these attempt-scoped outcomes prove no mutable
-    # contract, so a fresh snapshot/grade is always the recovery path.
+    # contract, so a fresh snapshot/grade is always the recovery path.  The
+    # dedicated re-driver enforces the cap; the resolver mirrors it so read
+    # surfaces report "capped" instead of "armed" once the bound is hit (the
+    # sweep's auto-trigger executor never fires these statuses — the bespoke
+    # re-driver owns them).
     if status in {"rubric_changed", "rubric_provenance_unknown"}:
+        if rubric_redrive_count >= _MAX_RUBRIC_REDRIVE_ATTEMPTS:
+            return TriggerDecision(
+                fire=False,
+                trigger="none",
+                reason="rubric_redrive_cap",
+                blocking=[
+                    f"rubric redrive cap reached ({rubric_redrive_count}/"
+                    f"{_MAX_RUBRIC_REDRIVE_ATTEMPTS} relaunches) — "
+                    "stabilize the rubric, then request a fresh qualification"
+                ],
+            )
         return TriggerDecision(
             fire=True,
             trigger="rubric_redrive",
@@ -448,6 +475,7 @@ def explain_qualification_trigger(
     evaluated_at: str,
     qualification_provenance: dict[str, Any] | None = None,
     consecutive_infra_errors: int = 0,
+    rubric_redrive_count: int = 0,
 ) -> dict[str, Any]:
     """Return an operator-facing explanation of the qualification trigger state.
 
@@ -492,6 +520,7 @@ def explain_qualification_trigger(
         in_flight=in_flight,
         promotion_check_wait=promotion_check_wait,
         consecutive_infra_errors=consecutive_infra_errors,
+        rubric_redrive_count=rubric_redrive_count,
     )
 
     # Map decision to auto_trigger label
@@ -501,7 +530,11 @@ def explain_qualification_trigger(
         auto_trigger = "observe"
     elif in_flight:
         auto_trigger = "in_flight"
-    elif decision.reason in ("error_attempt_cap", "infra_failure_attempt_cap"):
+    elif decision.reason in (
+        "error_attempt_cap",
+        "infra_failure_attempt_cap",
+        "rubric_redrive_cap",
+    ):
         auto_trigger = "capped"
     elif decision.reason == "not_applicable":
         auto_trigger = "settled"
@@ -521,6 +554,7 @@ def explain_qualification_trigger(
         "criterion_not_met": "new_candidate_commit",
         "error_attempt_cap": "operator_or_strategist_only",
         "infra_failure_attempt_cap": "operator_or_strategist_only",
+        "rubric_redrive_cap": "operator_or_strategist_only",
         "ci_red": "new_candidate_commit",
         "findings_unresolved": "findings_resolved",
         "not_applicable": "operator_or_strategist_only",
@@ -539,6 +573,10 @@ def explain_qualification_trigger(
         "error_retry_episode": {
             "count": error_redrive_count,
             "cap": _MAX_ERROR_REDRIVE_ATTEMPTS,
+        },
+        "rubric_redrive_episode": {
+            "count": rubric_redrive_count,
+            "cap": _MAX_RUBRIC_REDRIVE_ATTEMPTS,
         },
         "knob": knob,
         "evaluated_at": evaluated_at,

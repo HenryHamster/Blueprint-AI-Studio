@@ -12,6 +12,7 @@ import pytest
 from app.qualification_triggers import (
     _MAX_ERROR_REDRIVE_ATTEMPTS,
     _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS,
+    _MAX_RUBRIC_REDRIVE_ATTEMPTS,
     _TRANSIENT_ERROR_CODES,
     explain_qualification_trigger,
     resolve_qualification_trigger,
@@ -181,6 +182,17 @@ def test_rubric_outcomes_redrive_with_a_fresh_snapshot(status):
     d = _resolve(status=status)
     assert d.fire
     assert d.trigger == "rubric_redrive"
+
+
+@pytest.mark.parametrize("status", ["rubric_changed", "rubric_provenance_unknown"])
+def test_rubric_redrive_cap_holds(status):
+    """A rubric that keeps changing cannot spin attempts indefinitely: once the
+    per-episode ``rubric_redrive_count`` reaches the cap, T2 holds (read
+    surfaces report "capped", not "armed").  The dedicated re-driver enforces
+    the same bound."""
+    d = _resolve(status=status, rubric_redrive_count=_MAX_RUBRIC_REDRIVE_ATTEMPTS)
+    assert not d.fire
+    assert d.reason == "rubric_redrive_cap"
 
 
 class TestT2ErrorRedrive:

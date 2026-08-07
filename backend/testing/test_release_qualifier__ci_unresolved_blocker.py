@@ -5927,3 +5927,67 @@ class TestRecoverConfidenceFromCiUnresolved:
         assert recovered["confidence"] == pytest.approx(normal_result["confidence"])
         assert recovered.get("confidence_recovered_from_ci_unresolved") is True
         assert recovered.get("blocker") is None
+
+
+@pytest.mark.asyncio
+async def test_readiness_excludes_rubric_holds_from_failed_attempts(db_session):
+    """A rubric_changed hold measured nothing under the final rubric — legacy
+    QualificationVerdict rows for it must never be counted as failed attempts in
+    the promotion-readiness aggregation (mirrors infra_failure's exclusion).
+
+    Without the exclusion these three rows would break the clean streak, drag
+    the would-promote rate to 5/8, and surface "rubric_changed" as a recurring
+    blocker — i.e. the gate would read a rubric hold as a quality failure."""
+    project, _version = await _make_project_and_version(db_session)
+
+    # Five clean self-approval verdicts: with rubric holds excluded this clears
+    # the min-verdicts threshold and every readiness gate.
+    for _ in range(5):
+        db_session.add(
+            QualificationVerdict(
+                project_id=project.id,
+                release_version_id=_version.id,
+                candidate_sha="abc1234",
+                confidence=0.95,
+                sub_scores={},
+                blocker=None,
+                would_promote=True,
+                promotion_enabled=False,
+                terminal_status="not_promoted",
+                threshold=0.9,
+            )
+        )
+    # Three rubric_changed holds, inserted LAST so they are the most-recent rows
+    # (the query reads most-recent-first — exactly where they would break the
+    # clean streak if they were counted).
+    for _ in range(3):
+        db_session.add(
+            QualificationVerdict(
+                project_id=project.id,
+                release_version_id=_version.id,
+                candidate_sha="abc1234",
+                confidence=0.0,
+                sub_scores={},
+                blocker="rubric_changed",
+                would_promote=False,
+                promotion_enabled=False,
+                terminal_status="rubric_changed",
+                threshold=0.9,
+            )
+        )
+    await db_session.commit()
+
+    result = await rq.compute_promotion_readiness(
+        db_session, project.id, promotion_enabled=False
+    )
+
+    assert result["verdicts_evaluated"] == 5, (
+        "rubric_changed holds must not be evaluated as failed attempts"
+    )
+    assert result["would_promote_count"] == 5
+    assert result["would_promote_rate"] == 1.0
+    assert result["consecutive_clean_passes"] == 5, (
+        "rubric_changed holds must not break the consecutive-clean streak"
+    )
+    assert "rubric_changed" not in result["blocker_counts"]
+    assert result["ready"] is True
