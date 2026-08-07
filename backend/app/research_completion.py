@@ -3986,6 +3986,22 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         except Exception:
             logger.debug("[RESEARCH] directions_repo import failed; criterion cache empty")
 
+    # Empty/near-empty repo provenance captured at spawn time. A research child
+    # spawned while the project's durable build_config reported the repo empty
+    # must carry that greenfield origin on its own row: the project-level signal
+    # is mutable (re-detection flips repo_is_empty once the first scaffolding
+    # lands), so the child cannot rely on reading it later at claim time. Stamped
+    # onto every spawned child's context below so the agent's greenfield guidance
+    # survives the parent->child handoff.
+    _empty_repo_provenance: Dict[str, Any] = {}
+    if project_obj is not None:
+        _proj_build_cfg = project_obj.build_config or {}
+        if _proj_build_cfg.get("repo_is_empty") is True:
+            _empty_repo_provenance = {
+                "repo_is_empty": True,
+                "source_file_count": _proj_build_cfg.get("source_file_count", 0) or 0,
+            }
+
     for orig_i, finding, fhash in deduplicated:
         scope = finding.get("scope", DEFAULT_TASK_SCOPE)
         risk = finding.get("risk", "low")
@@ -5256,6 +5272,12 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 "claims": (finding.get("claims") or [])[:8],
                 "finding_hash": fhash,
                 "finding_lineage": sorted(_finding_lineage),
+                # Durable greenfield provenance (stamped above from the project's
+                # build_config when the repo was empty at spawn time). Consumed by
+                # the agent-claim path so a child spawned on an empty repo keeps
+                # its greenfield guidance even if the project build_config is
+                # later re-detected as non-empty.
+                **_empty_repo_provenance,
                 **(
                     {"acceptance_evidence": _acceptance_evidence}
                     if _acceptance_evidence
