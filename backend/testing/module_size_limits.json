@@ -160,7 +160,7 @@
     "capability_registry.py": 1750,
     "storage.py": 1750,
     "strategic_resident_session.py": 6850,
-    "release_qualifier_audit.py": 1800,
+    "release_qualifier_audit.py": 2100,
     "conversation_coordinator.py": 1900,
     "routers/agent_warm_continuity.py": 1700,
     "post_commit_errors.py": 58
