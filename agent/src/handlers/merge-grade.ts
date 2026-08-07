@@ -57,9 +57,58 @@ export interface CategoryCitation {
   ref: string;
 }
 
+// ── blocked_by triage taxonomy (design edcc1e6a §3.4) ───────────────────────
+// WHY a category is unmet, so a residual can say so instead of every unmet
+// residual looking identical.  Only `unbuilt` may consume campaign rung
+// budget; `out_of_scope` and `blocked_external` are terminal for the
+// commissioning loop.  An unclassified non-met residual defaults to `unbuilt`
+// so existing records do NOT silently leave the budget.
+export type BlockedBy = 'unbuilt' | 'out_of_scope' | 'blocked_external';
+
+export const BLOCKED_BY_VALUES: readonly BlockedBy[] = [
+  'unbuilt',
+  'out_of_scope',
+  'blocked_external',
+];
+
+const DEFAULT_BLOCKED_BY: BlockedBy = 'unbuilt';
+
+/**
+ * Coerce a category verdict's `blocked_by` to a canonical triage value.
+ *
+ * `met` categories have no blocker → null.  A non-met category whose
+ * `blocked_by` is absent or unrecognized defaults to `unbuilt` — the
+ * conservative value that keeps the residual inside the campaign rung budget
+ * (an unclassified residual must not silently become `out_of_scope` and
+ * vanish from the budget).
+ */
+export function normalizeBlockedBy(raw: unknown, status: CategoryStatus): BlockedBy | null {
+  if (status === 'met') return null;
+  if (typeof raw === 'string') {
+    const value = raw.trim();
+    if ((BLOCKED_BY_VALUES as readonly string[]).includes(value)) {
+      return value as BlockedBy;
+    }
+  }
+  return DEFAULT_BLOCKED_BY;
+}
+
+/**
+ * True only for residuals that commission campaign rung work.  `unbuilt`
+ * (and the absent default, which normalizes to `unbuilt`) consumes rung
+ * budget; the other two triage values are terminal for the commissioning
+ * loop.
+ */
+export function blockedByConsumesRungBudget(blockedBy: BlockedBy | null | undefined): boolean {
+  return blockedBy == null || blockedBy === 'unbuilt';
+}
+
 export interface CategoryVerdict {
   category_key: string;
   status: CategoryStatus;
+  // Why the category is unmet (design edcc1e6a §3.4): `unbuilt` |
+  // `out_of_scope` | `blocked_external`.  Always null when status is `met`.
+  blocked_by: BlockedBy | null;
   gap: string | null;
   citations: CategoryCitation[];
 }
@@ -185,6 +234,9 @@ export function normalizeCategoryVerdicts(raw: unknown): CategoryVerdict[] {
     out.push({
       category_key: categoryKey,
       status,
+      // blocked_by is required on every non-met verdict; absent/unrecognized
+      // values default to `unbuilt` (see normalizeBlockedBy).
+      blocked_by: normalizeBlockedBy(o.blocked_by, status),
       gap: gapStr !== '' ? gapStr : null,
       citations: normalizeCitations(o.citations),
     });
@@ -457,7 +509,7 @@ ${goalSection}${mergedPrsSection}${categoriesSection}## Your task
 
 2. **Grade goal coverage.** Decompose the version goal into the concrete things it requires. For each, check the merged diff for code that actually delivers it (read the changed files; do not trust commit messages or PR titles). Decide how much of the goal the merged diff genuinely covers.
 ${hasCategories ? `
-3. **Grade EACH acceptance-criterion category.** For every category listed above, read the merged diff and decide \`met\` / \`partial\` / \`not_met\`. You MUST cite the concrete diff location(s) (file path, ideally file:line, that you actually read) that justify a \`met\` or \`partial\` verdict — an uncited "it looks fine" counts as \`not_met\`. For anything not fully \`met\`, write the specific gap. Echo the exact \`category_key\` for each. When a specific AUTOMATED TEST in the merged diff actually proves a category is \`met\` (the test exercises the behaviour the criterion requires), ALSO add a \`{"kind": "test", "ref": "<test file path, e.g. backend/testing/test_foo.py, or a pytest node id path::test_name>"}\` citation for that category alongside the diff citation — the backend validates that the cited test really shipped and ran green under CI on this candidate and, if so, upgrades that category to a higher machine-verified tier. Only cite a test that genuinely covers the criterion; do NOT invent or pad test citations.
+3. **Grade EACH acceptance-criterion category.** For every category listed above, read the merged diff and decide \`met\` / \`partial\` / \`not_met\`. You MUST cite the concrete diff location(s) (file path, ideally file:line, that you actually read) that justify a \`met\` or \`partial\` verdict — an uncited "it looks fine" counts as \`not_met\`. For anything not fully \`met\`, write the specific gap AND classify WHY it is unmet in \`blocked_by\`: \`"unbuilt"\` (the capability genuinely does not exist yet and is buildable within this version's scope — this is the default when you are not sure), \`"out_of_scope"\` (deliberately not part of this version/objective; needs a scope decision, not a build), or \`"blocked_external"\` (real work, but gated on something outside this repo — a deploy, a credential, an upstream dependency). Only \`unbuilt\` residuals commission follow-up build work. Echo the exact \`category_key\` for each. When a specific AUTOMATED TEST in the merged diff actually proves a category is \`met\` (the test exercises the behaviour the criterion requires), ALSO add a \`{"kind": "test", "ref": "<test file path, e.g. backend/testing/test_foo.py, or a pytest node id path::test_name>"}\` citation for that category alongside the diff citation — the backend validates that the cited test really shipped and ran green under CI on this candidate and, if so, upgrades that category to a higher machine-verified tier. Only cite a test that genuinely covers the criterion; do NOT invent or pad test citations.
 
 4. **Answer the residual question.** After grading every category, ask: is there any part of the version goal that NONE of these categories captures? If yes, put that single uncaptured aspect in \`residual_uncaptured_gap\` (a non-empty sentence). If the categories fully decompose the goal, set \`residual_uncaptured_gap\` to null.
 
@@ -476,12 +528,14 @@ ${hasCategories ? `
     {
       "category_key": "<echo the exact key from the category list>",
       "status": "met",
+      "blocked_by": null,
       "gap": null,
       "citations": [{"kind": "diff", "ref": "path/to/file.py:42"}, {"kind": "test", "ref": "backend/testing/test_file.py"}]
     },
     {
       "category_key": "<another key>",
       "status": "not_met",
+      "blocked_by": "unbuilt",
       "gap": "The merged diff does not add <the thing this criterion requires>.",
       "citations": [{"kind": "diff", "ref": "path/to/other.py"}]
     }
@@ -510,7 +564,7 @@ Field semantics:
 - \`coverage_score\`: float in [0, 1] — 0.0 = the merged diff does nothing toward the goal, 1.0 = the goal is fully delivered by the merged diff.
 - \`biggest_gap\`: REQUIRED, a single non-empty sentence naming the SINGLE biggest thing the goal still requires that the merged diff does not deliver. Must be specific (cite the missing capability), never empty.
 - \`rationale\`: a short justification citing the specific files/changes you read.${hasCategories ? `
-- \`category_verdicts\`: REQUIRED array — one entry per acceptance-criterion category above. Each entry: \`category_key\` (echo the exact key), \`status\` ("met" | "partial" | "not_met"), \`gap\` (a specific sentence when not fully met, else null), and \`citations\` (array of {"kind": "diff" | "test", "ref": "<file or file:line you actually read; for "test", the test file path or pytest node id>"}). A \`met\` verdict MUST carry at least one citation. Add a \`"kind": "test"\` citation ONLY when a real automated test in the diff proves the criterion — it earns that category the machine-verified tier when the backend confirms the test shipped and ran green under CI on this candidate.
+- \`category_verdicts\`: REQUIRED array — one entry per acceptance-criterion category above. Each entry: \`category_key\` (echo the exact key), \`status\` ("met" | "partial" | "not_met"), \`blocked_by\` (REQUIRED whenever status is not "met": "unbuilt" | "out_of_scope" | "blocked_external"; null when "met"), \`gap\` (a specific sentence when not fully met, else null), and \`citations\` (array of {"kind": "diff" | "test", "ref": "<file or file:line you actually read; for "test", the test file path or pytest node id>"}). A \`met\` verdict MUST carry at least one citation. Add a \`"kind": "test"\` citation ONLY when a real automated test in the diff proves the criterion — it earns that category the machine-verified tier when the backend confirms the test shipped and ran green under CI on this candidate.
 - \`residual_uncaptured_gap\`: a single sentence naming any goal aspect NO category captures, or null when the categories fully decompose the goal.` : ''}
 
 Rules:

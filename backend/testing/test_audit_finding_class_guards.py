@@ -1883,3 +1883,90 @@ class TestCommitFlowSafetyRegressionCheck:
                     "in it — the production remediation was reverted or is "
                     "incomplete. Restore the pre-capture / re-fetch fix."
                 )
+
+
+# ---------------------------------------------------------------------------
+# 7. blocked_by triage taxonomy — cross-language contract drift guard
+# ---------------------------------------------------------------------------
+
+
+class TestBlockedByTaxonomyCrossLanguageDrift:
+    """The merge-grade ``blocked_by`` triage taxonomy (design edcc1e6a §3.4) is a
+    TWO-LANGUAGE contract: the agent producer (``agent/src/handlers/merge-grade.ts``)
+    emits it, the backend consumer (``backend/app/release_scoring.py``, re-exported
+    by ``release_qualifier_audit.py``) parses it verbatim.  A value added on one
+    side without the other silently widens the contract; this guard fails on
+    reintroduction.  Source-inspection only (no app imports) so it runs in the
+    ``--standalone --no-postgres`` roster."""
+
+    _CANONICAL: frozenset[str] = frozenset({"unbuilt", "out_of_scope", "blocked_external"})
+
+    _BACKEND_SCORING = _BACKEND_ROOT / "app" / "release_scoring.py"
+
+    @staticmethod
+    def _agent_merge_grade_ts() -> Path | None:
+        candidates = [
+            _REPO_ROOT / "agent" / "src" / "handlers" / "merge-grade.ts",
+            Path("/agent/src/handlers/merge-grade.ts"),
+        ]
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate
+        return None
+
+    def _python_taxonomy_values(self) -> frozenset[str]:
+        source = self._BACKEND_SCORING.read_text()
+        constants = set(
+            re.findall(r'_BLOCKED_BY_\w+ = "([a-z_]+)"', source)
+        )
+        return frozenset(v for v in constants if v in self._CANONICAL)
+
+    def _typescript_taxonomy_values(self, source: str) -> frozenset[str]:
+        literals = set(re.findall(r"'([a-z_]+)'", source))
+        return frozenset(v for v in literals if v in self._CANONICAL)
+
+    def test_python_defines_exactly_the_three_canonical_values(self):
+        assert self._python_taxonomy_values() == self._CANONICAL, (
+            f"backend/app/release_scoring.py defines blocked_by values "
+            f"{sorted(self._python_taxonomy_values())}, expected {sorted(self._CANONICAL)}"
+        )
+
+    def test_typescript_matches_the_python_taxonomy(self):
+        ts_path = self._agent_merge_grade_ts()
+        if ts_path is None:
+            pytest.skip(
+                "agent/src/handlers/merge-grade.ts not available in this "
+                "environment (CI backend-only Docker context)"
+            )
+        ts_values = self._typescript_taxonomy_values(ts_path.read_text())
+        py_values = self._python_taxonomy_values()
+        assert ts_values == py_values == self._CANONICAL, (
+            "blocked_by triage taxonomy drifted across the contract boundary: "
+            f"agent={sorted(ts_values)} backend={sorted(py_values)}"
+        )
+
+    def test_default_is_unbuilt_on_both_sides(self):
+        py_src = self._BACKEND_SCORING.read_text()
+        assert "_DEFAULT_BLOCKED_BY = _BLOCKED_BY_UNBUILT" in py_src, (
+            "backend default for an unclassified non-met residual must be "
+            "unbuilt (never silently out_of_scope)"
+        )
+        ts_path = self._agent_merge_grade_ts()
+        if ts_path is not None:
+            ts_src = ts_path.read_text()
+            assert re.search(r"DEFAULT_BLOCKED_BY: BlockedBy = 'unbuilt'", ts_src), (
+                "agent default for an unclassified non-met residual must be "
+                "'unbuilt' (never silently out_of_scope)"
+            )
+
+    def test_only_unbuilt_consumes_rung_budget_on_both_sides(self):
+        py_src = self._BACKEND_SCORING.read_text()
+        assert "return blocked_by in (None, _BLOCKED_BY_UNBUILT)" in py_src, (
+            "blocked_by_consumes_rung_budget must be True only for None/unbuilt"
+        )
+        ts_path = self._agent_merge_grade_ts()
+        if ts_path is not None:
+            ts_src = ts_path.read_text()
+            assert "blockedBy === 'unbuilt'" in ts_src, (
+                "blockedByConsumesRungBudget must consume budget only for 'unbuilt'"
+            )

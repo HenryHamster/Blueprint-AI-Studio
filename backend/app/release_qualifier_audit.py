@@ -49,6 +49,27 @@ from app.time_utils import _utcnow
 from app.json_extract import async_json_loads
 from app.deployed_sha import get_serving_sha
 
+# ── blocked_by triage taxonomy (design edcc1e6a §3.4) ────────────────────────
+# The Python side of the merge-grade contract.  Canonically defined in
+# app.release_scoring (where the RELEASE_MERGE_GRADE artifact is parsed);
+# re-exported here so the audit/spawn module and its contract guards have one
+# import surface for the triage enum and the rung-budget predicate.  Only
+# ``unbuilt`` consumes campaign rung budget; ``out_of_scope`` and
+# ``blocked_external`` are terminal for the commissioning loop.  An unclassified
+# non-met residual defaults to ``unbuilt`` so it never silently leaves the budget.
+# (The names re-exported below are the module's PUBLIC contract surface — the
+# consumer contract guard imports them from here — so each re-export line that
+# is not used within this module carries a F401 suppression.)
+from app.release_scoring import (
+    _BLOCKED_BY_EXTERNAL as BLOCKED_BY_EXTERNAL,  # noqa: F401
+    _BLOCKED_BY_OUT_OF_SCOPE as BLOCKED_BY_OUT_OF_SCOPE,  # noqa: F401
+    _BLOCKED_BY_UNBUILT as BLOCKED_BY_UNBUILT,  # noqa: F401
+    _BLOCKED_BY_VALUES as BLOCKED_BY_VALUES,
+    _DEFAULT_BLOCKED_BY as DEFAULT_BLOCKED_BY,  # noqa: F401
+    blocked_by_consumes_rung_budget,  # noqa: F401
+    normalize_blocked_by,  # noqa: F401
+)
+
 # Preserve the historical logger name so existing caplog filters and log
 # processing continue to see these events under release_qualifier.
 logger = logging.getLogger("backend.app.release_qualifier")
@@ -780,6 +801,12 @@ async def _spawn_release_merge_grade_task(
         # partial + cited diff evidence + gap).  Empty list ⇒ no rubric; the agent
         # then grades only the holistic goal coverage.
         "categories": list(categories or []),
+        # blocked_by triage taxonomy (design edcc1e6a §3.4): the valid values for
+        # each non-met category verdict's ``blocked_by``.  Only ``unbuilt``
+        # consumes campaign rung budget; the other two are terminal.  Threaded
+        # into the payload so the agent's emitted enum and the backend's canonical
+        # set stay in sync at the contract boundary.
+        "blocked_by_triage": sorted(BLOCKED_BY_VALUES),
         "rubric_fingerprint": rubric_fingerprint,
         # Explicitly pin to Opus — regression guard against silent downgrade
         # (mirrors release_audit / release_audit_challenge).

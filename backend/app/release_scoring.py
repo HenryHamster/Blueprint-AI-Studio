@@ -68,6 +68,48 @@ JUDGED_TIER_PENALTY_WEIGHT = 0.05
 # Recognised per-category verdict statuses.  ``partial`` gates identically to
 # ``not_met`` (only ``met`` clears the gate); the distinction is informational.
 _CATEGORY_STATUSES: frozenset[str] = frozenset({"met", "not_met", "partial"})
+
+# blocked_by triage taxonomy (design edcc1e6a §3.4) — WHY a category is unmet,
+# so a residual can say so instead of every unmet residual looking identical.
+# Only ``unbuilt`` may consume campaign rung budget; ``out_of_scope`` and
+# ``blocked_external`` are terminal for the commissioning loop.  An unclassified
+# non-met residual defaults to ``unbuilt`` so existing records do NOT silently
+# become ``out_of_scope`` and vanish from the budget.
+_BLOCKED_BY_UNBUILT = "unbuilt"
+_BLOCKED_BY_OUT_OF_SCOPE = "out_of_scope"
+_BLOCKED_BY_EXTERNAL = "blocked_external"
+_BLOCKED_BY_VALUES: frozenset[str] = frozenset(
+    {_BLOCKED_BY_UNBUILT, _BLOCKED_BY_OUT_OF_SCOPE, _BLOCKED_BY_EXTERNAL}
+)
+_DEFAULT_BLOCKED_BY = _BLOCKED_BY_UNBUILT
+
+
+def normalize_blocked_by(raw: Any, status: str) -> str | None:
+    """Coerce a category verdict's ``blocked_by`` to the canonical triage value.
+
+    ``met`` categories have no blocker → ``None``.  Any non-met category whose
+    ``blocked_by`` is absent or unrecognized defaults to ``unbuilt`` — the
+    conservative value that keeps the residual inside the campaign rung budget
+    (an unclassified residual must not silently become ``out_of_scope`` and
+    vanish from the budget).
+    """
+    if status == "met":
+        return None
+    if isinstance(raw, str):
+        value = raw.strip()
+        if value in _BLOCKED_BY_VALUES:
+            return value
+    return _DEFAULT_BLOCKED_BY
+
+
+def blocked_by_consumes_rung_budget(blocked_by: str | None) -> bool:
+    """True only for residuals that commission campaign rung work.
+
+    ``unbuilt`` (and the ``None``/absent value, which normalizes to ``unbuilt``)
+    consumes rung budget; ``out_of_scope`` and ``blocked_external`` are terminal
+    for the commissioning loop.
+    """
+    return blocked_by in (None, _BLOCKED_BY_UNBUILT)
 # Recognised citation kinds.  v1 emits only ``diff`` citations (the grader reads
 # the merged diff); ``test`` is reserved for the v2 machine/test-citation tier.
 _CITATION_KINDS: frozenset[str] = frozenset({"diff", "test"})
@@ -252,6 +294,12 @@ def _normalize_category_verdicts(
     category at ``judged`` — machine tier is never granted on an unvalidated claim.
     ``not_met`` / ``partial`` verdicts are always ``judged``.
 
+    ``blocked_by`` triage (design edcc1e6a §3.4): every non-``met`` verdict carries
+    WHY it is unmet — ``unbuilt`` | ``out_of_scope`` | ``blocked_external``.
+    Absent/unrecognized values and never-graded categories default to ``unbuilt``
+    (see :func:`normalize_blocked_by`) so an unclassified residual never silently
+    leaves the campaign rung budget.
+
     Returns ``(category_verdicts, residual_uncaptured_gap)`` where
     ``residual_uncaptured_gap`` is the grader's answer to "is there a goal aspect
     that NONE of the categories capture?" (a non-empty string hard-blocks).
@@ -277,6 +325,8 @@ def _normalize_category_verdicts(
                     "category_key": key,
                     "status": "not_met",
                     "tier": "judged",
+                    # Never graded → the capability was never built: unbuilt.
+                    "blocked_by": _DEFAULT_BLOCKED_BY,
                     "gap": "Not graded by the blind merge-grade against the merged diff.",
                     "citations": [],
                 }
@@ -313,6 +363,10 @@ def _normalize_category_verdicts(
                 "category_key": key,
                 "status": status,
                 "tier": tier,
+                # blocked_by triage: required on every non-met verdict; absent /
+                # unrecognized values default to ``unbuilt`` (never silently
+                # out_of_scope, which would drop the residual from the budget).
+                "blocked_by": normalize_blocked_by(raw.get("blocked_by"), status),
                 # ``met`` may legitimately carry no gap; not_met/partial always do.
                 "gap": gap if status != "met" else (gap or None),
                 "citations": citations,
@@ -1090,6 +1144,17 @@ def compute_composite(
         sub_scores["met_category_count"] = len(category_verdicts) - len(_unmet)
         if _unmet:
             sub_scores["unmet_categories"] = [k for k in _unmet if k]
+            # blocked_by triage distribution among the UNMET categories (design
+            # edcc1e6a §3.4): only the ``unbuilt`` bucket consumes campaign rung
+            # budget, so operators can see at a glance how much of the residual
+            # is genuinely buildable work vs terminal triage.
+            _unmet_triage: dict[str, int] = {}
+            for _v in category_verdicts:
+                if (_v or {}).get("status") == "met":
+                    continue
+                _bt = str((_v or {}).get("blocked_by") or _DEFAULT_BLOCKED_BY)
+                _unmet_triage[_bt] = _unmet_triage.get(_bt, 0) + 1
+            sub_scores["unmet_by_triage"] = _unmet_triage
         # Fraction of MET categories still resting on the judged tier (v1 = all).
         _met = [v for v in category_verdicts if (v or {}).get("status") == "met"]
         if _met:

@@ -92,7 +92,10 @@ vi.mock('ws', () => ({
 // ── Imports under test ───────────────────────────────────────────────────────
 import './index.js';
 import {
+  BLOCKED_BY_VALUES,
+  blockedByConsumesRungBudget,
   handleReleaseMergeGrade,
+  normalizeBlockedBy,
   normalizeMergeGradeOutput,
   validateMergeGradeShape,
 } from './merge-grade.js';
@@ -239,11 +242,89 @@ describe('normalizeMergeGradeOutput — stable contract shape', () => {
       CANDIDATE_SHA,
     );
     expect(out.category_verdicts).toEqual([
-      { category_key: 'c-1', status: 'met', gap: null, citations: [{ kind: 'diff', ref: 'api.py:3' }] },
+      { category_key: 'c-1', status: 'met', blocked_by: null, gap: null, citations: [{ kind: 'diff', ref: 'api.py:3' }] },
       // unknown status coerces to not_met; bare-string citation → diff kind
-      { category_key: 'c-2', status: 'not_met', gap: 'not done', citations: [{ kind: 'diff', ref: 'ui.tsx' }] },
+      { category_key: 'c-2', status: 'not_met', blocked_by: 'unbuilt', gap: 'not done', citations: [{ kind: 'diff', ref: 'ui.tsx' }] },
     ]);
     expect(out.residual_uncaptured_gap).toBe('no migration for the widget table');
+  });
+
+  it('coerces blocked_by triage on non-met category verdicts (all three values)', () => {
+    const out = normalizeMergeGradeOutput(
+      {
+        covers_goal: false,
+        coverage_score: 0.2,
+        biggest_gap: 'gaps below',
+        category_verdicts: [
+          { category_key: 'c-unbuilt', status: 'not_met', blocked_by: 'unbuilt', gap: 'not built' },
+          { category_key: 'c-scope', status: 'not_met', blocked_by: 'out_of_scope', gap: 'descope' },
+          { category_key: 'c-external', status: 'partial', blocked_by: 'blocked_external', gap: 'waiting on deploy' },
+        ],
+      },
+      CANDIDATE_SHA,
+    );
+    expect(out.category_verdicts.map(v => v.blocked_by)).toEqual([
+      'unbuilt',
+      'out_of_scope',
+      'blocked_external',
+    ]);
+  });
+
+  it('defaults absent/invalid blocked_by on non-met to unbuilt (never silently out_of_scope)', () => {
+    const out = normalizeMergeGradeOutput(
+      {
+        covers_goal: false,
+        coverage_score: 0.2,
+        biggest_gap: 'gaps below',
+        category_verdicts: [
+          { category_key: 'c-absent', status: 'not_met', gap: 'no triage' },
+          { category_key: 'c-invalid', status: 'not_met', blocked_by: 'bogus', gap: 'bad triage' },
+        ],
+      },
+      CANDIDATE_SHA,
+    );
+    for (const v of out.category_verdicts) {
+      expect(v.blocked_by).toBe('unbuilt');
+    }
+    // And the budget predicate: only unbuilt consumes rung budget.
+    expect(out.category_verdicts.every(v => v.blocked_by === 'unbuilt')).toBe(true);
+  });
+});
+
+// ── blocked_by triage taxonomy ───────────────────────────────────────────────
+describe('blocked_by triage taxonomy (design edcc1e6a §3.4)', () => {
+  it('exposes exactly the three canonical triage values', () => {
+    expect([...BLOCKED_BY_VALUES].sort()).toEqual([
+      'blocked_external',
+      'out_of_scope',
+      'unbuilt',
+    ]);
+  });
+
+  it('normalizeBlockedBy returns null for met categories', () => {
+    expect(normalizeBlockedBy('unbuilt', 'met')).toBeNull();
+    expect(normalizeBlockedBy(undefined, 'met')).toBeNull();
+    expect(normalizeBlockedBy('out_of_scope', 'met')).toBeNull();
+  });
+
+  it('normalizeBlockedBy preserves each valid triage value on non-met', () => {
+    expect(normalizeBlockedBy('unbuilt', 'not_met')).toBe('unbuilt');
+    expect(normalizeBlockedBy('out_of_scope', 'not_met')).toBe('out_of_scope');
+    expect(normalizeBlockedBy('blocked_external', 'partial')).toBe('blocked_external');
+  });
+
+  it('normalizeBlockedBy defaults absent/unrecognized non-met to unbuilt', () => {
+    expect(normalizeBlockedBy(undefined, 'not_met')).toBe('unbuilt');
+    expect(normalizeBlockedBy('', 'not_met')).toBe('unbuilt');
+    expect(normalizeBlockedBy('bogus', 'partial')).toBe('unbuilt');
+  });
+
+  it('blockedByConsumesRungBudget is true only for unbuilt (and the null/absent default)', () => {
+    expect(blockedByConsumesRungBudget('unbuilt')).toBe(true);
+    expect(blockedByConsumesRungBudget(null)).toBe(true);
+    expect(blockedByConsumesRungBudget(undefined)).toBe(true);
+    expect(blockedByConsumesRungBudget('out_of_scope')).toBe(false);
+    expect(blockedByConsumesRungBudget('blocked_external')).toBe(false);
   });
 });
 
@@ -308,6 +389,19 @@ describe('handleReleaseMergeGrade — pinned candidate + diff-range pre-flight',
     const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
     expect(prompt).toContain('#11076 add merge-grade backend gate');
     expect(prompt).toContain('#11078 add fetch verb');
+  });
+
+  it('documents the blocked_by triage taxonomy in the per-category prompt', async () => {
+    const payload = {
+      ...RELEASE_PAYLOAD,
+      categories: [{ category_key: 'c-1', text: 'widget table migration' }],
+    };
+    await handleReleaseMergeGrade(TASK_ID, payload, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain('"blocked_by"');
+    expect(prompt).toContain('unbuilt');
+    expect(prompt).toContain('out_of_scope');
+    expect(prompt).toContain('blocked_external');
   });
 
   it('is BLIND: never interpolates a strategist running_update into the prompt', async () => {

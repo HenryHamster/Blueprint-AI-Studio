@@ -62,6 +62,7 @@ async def upsert_category_verdict(
     grader_run_id: str | None,
     qualification_attempt_id: uuid.UUID | None = None,
     project_id: uuid.UUID | None = None,
+    blocked_by: str | None = None,
 ) -> CategoryVerdict:
     """UPSERT the verdict for ONE ``(version_id, candidate_sha, category_key,
     qualification_attempt_id)``.
@@ -74,8 +75,11 @@ async def upsert_category_verdict(
     Also gives the verdict a durable consequence in the completion-debt ledger
     (best-effort, never raises): a ``not_met``/``partial`` status opens (or
     keeps open) an ``objective_gap`` debt entry keyed on ``(version_id,
-    category_key)``; a ``met`` status resolves it.  ``project_id`` scopes the
-    entry to its owning project when the caller has it; omitted, the entry is
+    category_key)``; a ``met`` status resolves it.  ``blocked_by`` (the triage
+    classification from the merge-grade contract, design edcc1e6a §3.4) is
+    carried into that debt entry's ``detail`` so downstream knows whether the
+    residual consumes campaign rung budget.  ``project_id`` scopes the entry to
+    its owning project when the caller has it; omitted, the entry is
     deployment-global (still uniquely identified by its dedupe key).
     """
     existing = (
@@ -107,6 +111,7 @@ async def upsert_category_verdict(
             gap=gap,
             candidate_sha=candidate_sha,
             project_id=project_id,
+            blocked_by=blocked_by,
         )
         return existing
 
@@ -132,6 +137,7 @@ async def upsert_category_verdict(
         gap=gap,
         candidate_sha=candidate_sha,
         project_id=project_id,
+        blocked_by=blocked_by,
     )
     return row
 
@@ -145,13 +151,15 @@ async def _sync_objective_gap_debt(
     gap: str | None,
     candidate_sha: str | None,
     project_id: uuid.UUID | None,
+    blocked_by: str | None = None,
 ) -> None:
     """Give a category verdict its completion-debt consequence (best-effort).
 
     ``status == "met"`` resolves the open ``objective_gap`` debt for this
     category (if any).  Any other status (``not_met`` / ``partial``) opens —
-    or keeps open — the debt.  Never raises: a debt-ledger hiccup must not
-    break grading.
+    or keeps open — the debt.  ``blocked_by`` is recorded in the debt ``detail``
+    so the commissioning loop can tell which residuals consume rung budget.
+    Never raises: a debt-ledger hiccup must not break grading.
     """
     if not category_key:
         return
@@ -177,6 +185,7 @@ async def _sync_objective_gap_debt(
                     "version_id": str(version_id),
                     "category_key": category_key,
                     "status": status,
+                    "blocked_by": blocked_by,
                     "gap": gap,
                     "candidate_sha": candidate_sha,
                 },

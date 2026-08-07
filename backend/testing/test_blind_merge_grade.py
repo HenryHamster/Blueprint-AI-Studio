@@ -309,6 +309,118 @@ class TestEvaluateMergeGrade:
         assert result["status"] == "fail"
         assert result["blocked"] is True
 
+    # --- blocked_by triage taxonomy (design edcc1e6a §3.4) -------------------
+
+    @staticmethod
+    def _triage_artifact() -> dict:
+        return {
+            "covers_goal": False,
+            "coverage_score": 0.3,
+            "biggest_gap": "X is missing.",
+            "category_verdicts": [
+                {
+                    "category_key": "c-1",
+                    "status": "met",
+                    "blocked_by": None,
+                    "gap": None,
+                    "citations": [{"kind": "diff", "ref": "backend/app/a.py:1"}],
+                },
+                {
+                    "category_key": "c-2",
+                    "status": "not_met",
+                    "blocked_by": "unbuilt",
+                    "gap": "Z is not wired up.",
+                    "citations": [{"kind": "diff", "ref": "backend/app/b.py"}],
+                },
+                {
+                    "category_key": "c-3",
+                    "status": "not_met",
+                    "blocked_by": "out_of_scope",
+                    "gap": "Deferred.",
+                    "citations": [{"kind": "diff", "ref": "backend/app/c.py"}],
+                },
+                {
+                    "category_key": "c-4",
+                    "status": "partial",
+                    "blocked_by": "blocked_external",
+                    "gap": "Gated on a deploy.",
+                    "citations": [{"kind": "diff", "ref": "backend/app/d.py"}],
+                },
+            ],
+            "residual_uncaptured_gap": None,
+        }
+
+    def test_category_verdicts_preserve_blocked_by_triage(self):
+        """evaluate_merge_grade keeps each non-met verdict's blocked_by triage."""
+        result = rs.evaluate_merge_grade(
+            _GOOD_GOAL,
+            self._triage_artifact(),
+            active_categories=[
+                {"category_key": k, "text": k}
+                for k in ("c-1", "c-2", "c-3", "c-4")
+            ],
+        )
+        verdicts = {
+            v["category_key"]: v
+            for v in result["category_verdicts"]
+            if isinstance(v, dict)
+        }
+        assert verdicts["c-1"]["blocked_by"] is None
+        assert verdicts["c-2"]["blocked_by"] == "unbuilt"
+        assert verdicts["c-3"]["blocked_by"] == "out_of_scope"
+        assert verdicts["c-4"]["blocked_by"] == "blocked_external"
+
+    def test_absent_blocked_by_defaults_to_unbuilt_on_not_met(self):
+        """An unclassified non-met verdict must default to unbuilt — it must
+        never silently become out_of_scope and vanish from the rung budget."""
+        artifact = self._triage_artifact()
+        artifact["category_verdicts"][1].pop("blocked_by")  # c-2 loses its triage
+        result = rs.evaluate_merge_grade(
+            _GOOD_GOAL,
+            artifact,
+            active_categories=[
+                {"category_key": k, "text": k}
+                for k in ("c-1", "c-2", "c-3", "c-4")
+            ],
+        )
+        c2 = next(v for v in result["category_verdicts"] if v["category_key"] == "c-2")
+        assert c2["blocked_by"] == "unbuilt"
+
+    def test_invalid_blocked_by_defaults_to_unbuilt_on_not_met(self):
+        """An unrecognized blocked_by value on a non-met verdict defaults to
+        unbuilt (conservative — keeps the residual inside the budget)."""
+        artifact = self._triage_artifact()
+        artifact["category_verdicts"][1]["blocked_by"] = "maybe-later"
+        result = rs.evaluate_merge_grade(
+            _GOOD_GOAL,
+            artifact,
+            active_categories=[
+                {"category_key": k, "text": k}
+                for k in ("c-1", "c-2", "c-3", "c-4")
+            ],
+        )
+        c2 = next(v for v in result["category_verdicts"] if v["category_key"] == "c-2")
+        assert c2["blocked_by"] == "unbuilt"
+
+    def test_never_graded_category_is_unbuilt_not_out_of_scope(self):
+        """A category the artifact never graded is not_met with blocked_by
+        defaulting to unbuilt — it was never built, not deliberately deferred."""
+        result = rs.evaluate_merge_grade(
+            _GOOD_GOAL,
+            self._triage_artifact(),
+            active_categories=[
+                {"category_key": k, "text": k}
+                for k in ("c-1", "c-2", "c-3", "c-4", "c-5-never-graded")
+            ],
+        )
+        never = next(
+            v
+            for v in result["category_verdicts"]
+            if v["category_key"] == "c-5-never-graded"
+        )
+        assert never["status"] == "not_met"
+        assert never["blocked_by"] == "unbuilt"
+
 
 # ===========================================================================
 # _spawn_release_merge_grade_task — payload / blindness contract
