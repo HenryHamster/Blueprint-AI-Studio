@@ -98,11 +98,21 @@ const MAX_PRIOR_OUTPUT_CHARS = 4000;
 // re-derivation (the first pass is often expensive multi-paragraph reasoning). When missReason is
 // null (shouldn't happen on the repair path but defensive), the prior context
 // is still included when non-empty so the caller's prompt gets full context.
+//
+// `missDetail` carries a caller-supplied `validateParsedValue` verdict's exact
+// `detail` string (e.g. "missing required fields: severity, confidence") when
+// the miss came from schema validation rather than raw extraction. Extraction
+// misses are bucketed by the static `requiredKeys` list, but a validator can
+// enforce a DIFFERENT (often conditional, e.g. verdict-dependent) field set —
+// falling back to the static `requiredKeys` list in the preamble would name
+// the wrong fields or omit ones the validator actually flagged, so prefer
+// `missDetail` whenever a validator supplied one.
 function buildMissAwarePrompt(
   missReason: FormatMissReason | null,
   requiredKeys: string[],
   callerPrompt: string,
   priorOutput: string,
+  missDetail: string | null = null,
 ): string {
   let preamble: string;
   switch (missReason) {
@@ -117,13 +127,19 @@ function buildMissAwarePrompt(
     case 'no_matching_candidate':
     case 'parsed_object_missing_key':
     case 'parsed_array_missing_key':
-      preamble = `Your previous response was missing required keys: ${requiredKeys.map(k => `"${k}"`).join(', ')} — include all required keys.`;
+      preamble = missDetail
+        ? `Your previous response failed schema validation: ${missDetail} — include those fields.`
+        : `Your previous response was missing required keys: ${requiredKeys.map(k => `"${k}"`).join(', ')} — include all required keys.`;
       break;
     case 'parsed_object_schema_mismatch':
-      preamble = 'Your previous response parsed as JSON, but the top-level object shape did not match the required schema — fix the object shape and include all required keys.';
+      preamble = missDetail
+        ? `Your previous response parsed as JSON, but failed schema validation: ${missDetail} — fix the object shape.`
+        : 'Your previous response parsed as JSON, but the top-level object shape did not match the required schema — fix the object shape and include all required keys.';
       break;
     case 'parsed_array_invalid_value':
-      preamble = 'Your previous response parsed as JSON, but the array elements\' field values did not match the required schema — the shape did not match what was expected. Fix the field values to conform to the required format.';
+      preamble = missDetail
+        ? `Your previous response parsed as JSON, but failed schema validation: ${missDetail} — fix the field values.`
+        : 'Your previous response parsed as JSON, but the array elements\' field values did not match the required schema — the shape did not match what was expected. Fix the field values to conform to the required format.';
       break;
     default:
       if (priorOutput) {
@@ -206,11 +222,13 @@ export async function repairStructuredOutput<T = unknown>(
   let firstAttempt = tryExtract(
     mode, requiredKeys, buildSources(first.lastResultText, first.allOutput), ws,
   );
+  let firstMissDetail: string | null = null;
   if (firstAttempt.value !== null && validateParsedValue) {
     const validation = validateParsedValue(firstAttempt.value);
     if (!validation.ok) {
       sendLog(ws, `[WARNING] Structured ${mode} parsed output failed schema validation: ${validation.detail}\n`);
       firstAttempt = { value: null, missReason: validation.reason };
+      firstMissDetail = validation.detail;
     }
   }
   let value = firstAttempt.value as T | null;
@@ -226,7 +244,7 @@ export async function repairStructuredOutput<T = unknown>(
     if (retryStatus) statusRef.value = retryStatus;
 
     const priorOutput = first.lastResultText || first.allOutput || '';
-    const missAwarePrompt = buildMissAwarePrompt(firstAttempt.missReason, requiredKeys, reopenPrompt, priorOutput);
+    const missAwarePrompt = buildMissAwarePrompt(firstAttempt.missReason, requiredKeys, reopenPrompt, priorOutput, firstMissDetail);
     const tokensBefore = getLlmTelemetry();
     const retryRun = await run(
       missAwarePrompt, ws, statusRef, model, effort, disallowedTools,

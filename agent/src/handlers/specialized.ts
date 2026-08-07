@@ -1072,26 +1072,40 @@ IMPORTANT:
 
   let investigationResult = readHandlerOutput(taskId, 'investigation_report', ws);
   if (investigationResult === null) {
-    const requiredFields = ['summary', 'root_cause', 'affected_files', 'recommended_fix', 'severity', 'confidence'];
+    // `recommended_fix` is conditionally meaningful: the prompt (line ~1027)
+    // instructs the model to leave it empty — not to fabricate one — when
+    // verdict='not_a_regression'. Treating it as unconditionally required
+    // here made every not_a_regression investigation that fell through to
+    // the repair path un-repairable (the model correctly keeps omitting the
+    // key on retry, matching its own instructions), burning a guaranteed-fail
+    // reopen. `unconditionalFields` are always required; `recommended_fix` is
+    // only required when the (possibly still-unknown) verdict is not
+    // 'not_a_regression'.
+    const unconditionalFields = ['summary', 'root_cause', 'affected_files', 'severity', 'confidence'];
+    const isNotARegression = (obj: Record<string, unknown>): boolean => obj.verdict === 'not_a_regression';
     const repaired = await repairStructuredOutput<Record<string, unknown>>({
       mode: 'object',
-      requiredKeys: ['root_cause', 'recommended_fix'],
+      requiredKeys: ['root_cause'],
       schemaLabel: 'specialized_result',
       first: { exitCode, allOutput, lastResultText },
       reopenPrompt: `${(lastResultText || allOutput || '').slice(-8000) ? `${(lastResultText || allOutput || '').slice(-8000)}\n\n` : ''}Your prior investigation response did not end with a parseable JSON diagnosis object.
-Output ONLY the JSON object now — with top-level "summary", "root_cause", "affected_files", "recommended_fix", "severity", and "confidence". Include verdict fields when relevant. No markdown, no code fences, no prose.`,
+Output ONLY the JSON object now — with top-level "summary", "root_cause", "affected_files", "recommended_fix" (leave empty and set verdict "not_a_regression" if this is not a real regression — do NOT fabricate a fix), "severity", and "confidence". Include verdict fields when relevant. No markdown, no code fences, no prose.`,
       ws,
       statusRef,
       model,
       effort,
       disallowedTools,
       retryStatus: 'Repairing investigation report JSON...',
-      // Enforce the full 6-field contract here so recordFormatRepairSuccess only
-      // fires when the caller will actually accept the value (not merely when the
-      // two extractor keys root_cause + recommended_fix happen to parse).
+      // Enforce the unconditional fields plus a verdict-conditioned
+      // recommended_fix so recordFormatRepairSuccess only fires when the
+      // caller will actually accept the value (not merely when the extractor's
+      // ground-truth key root_cause happens to parse).
       validateParsedValue: (value) => {
         const obj = value as Record<string, unknown>;
-        const missingFields = requiredFields.filter(k => !(k in obj));
+        const requiredNow = isNotARegression(obj)
+          ? unconditionalFields
+          : [...unconditionalFields, 'recommended_fix'];
+        const missingFields = requiredNow.filter(k => !(k in obj));
         if (missingFields.length > 0) {
           return {
             ok: false,
@@ -1103,7 +1117,10 @@ Output ONLY the JSON object now — with top-level "summary", "root_cause", "aff
       },
     });
     const repairedValue = repaired.value;
-    if (repairedValue !== null && requiredFields.every(k => k in repairedValue)) {
+    const repairedRequiredFields = repairedValue !== null && isNotARegression(repairedValue)
+      ? unconditionalFields
+      : [...unconditionalFields, 'recommended_fix'];
+    if (repairedValue !== null && repairedRequiredFields.every(k => k in repairedValue)) {
       investigationResult = repairedValue;
       sendLog(ws, `[WARNING] Investigation JSON recovered from transcript or focused retry rather than file.\n`);
     }

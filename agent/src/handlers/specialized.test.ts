@@ -1102,8 +1102,9 @@ describe('handleInvestigate — adversarial grader self-repair', () => {
     const reaskPrompt = vi.mocked(runClaudeCode).mock.calls[1][0];
     // The re-ask preamble must NOT claim keys are missing when only values are wrong.
     expect(reaskPrompt).not.toContain('missing required keys');
-    // The preamble must tell the agent the field values did not match the schema.
-    expect(reaskPrompt).toContain('shape did not match');
+    // The preamble must tell the agent specifically what was wrong with the values
+    // (the validator's detail), not fall back to a generic "missing keys" message.
+    expect(reaskPrompt).toContain('unrecognized verdict strings: uncertain');
     // The schema restatement from the reopenPrompt must still appear.
     expect(reaskPrompt).toContain('MUST be exactly "pass" or "fail"');
   });
