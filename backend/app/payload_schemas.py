@@ -132,8 +132,33 @@ class BasePayload(BaseModel):
             "Undeclared (None) tasks are unaffected."
         ),
     )
+    require_deps_landed_on: str | None = Field(
+        default=None,
+        description=(
+            "Branch every ``depends_on`` dependency must have LANDED on before "
+            "this task dispatches. Declares a deterministic sequencing edge: the "
+            "task holds until each dependency is COMPLETED and its merged work "
+            "is on the named branch — bypassing the genuine-code-dependency "
+            "file-overlap heuristic and the merged-anywhere PR check, so "
+            "'build B on top of A' is expressible regardless of task types or "
+            "declared files. Undeclared (None) tasks keep the existing "
+            "heuristic gating unchanged."
+        ),
+    )
+    release_base_branch: str | None = Field(
+        default=None,
+        description=(
+            "Branch this task's ``base_branch`` is repointed to at dependency "
+            "release time (just before dispatch, once its ``depends_on`` gate "
+            "opens). The agent clones the branch TIP at claim, so the task "
+            "starts from this branch's state INCLUDING everything its "
+            "dependencies merged — starting state, not just scheduling. Only "
+            "takes effect on the dependency-release path; a task with no "
+            "``depends_on`` should set ``base_branch`` directly."
+        ),
+    )
 
-    @field_validator("base_branch")
+    @field_validator("base_branch", "require_deps_landed_on", "release_base_branch")
     @classmethod
     def _check_base_branch(cls, v: str | None) -> str | None:
         return _validate_branch_name(v)

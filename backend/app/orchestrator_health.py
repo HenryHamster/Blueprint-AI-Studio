@@ -26,6 +26,8 @@ from app.landed_signal import (
     NON_MERGE_UNBLOCK_REASON_KEY,
     has_landed_signal,
     has_merge_unblock_signal,
+    landed_on_branch,
+    suppresses_redispatch,
 )
 from app.rollup_management import _FORCE_DROP_REASONS
 from app.models import Project, Task, TaskStatus
@@ -773,6 +775,32 @@ async def ensure_dependent_base_recut(
     if project is None:
         # Cannot resolve the integration branch — hold to be safe.
         return False
+    # Declared release-time repoint: a task whose payload names a
+    # ``release_base_branch`` has its ``base_branch`` rewritten to it HERE — the
+    # single chokepoint every dependency-release path (dispatch driver,
+    # completion-side warm-claim, reaper resume) already funnels through, and
+    # which the dispatch loop runs BEFORE stamping ``_deps_satisfied``, so a
+    # warm claim can never read the pre-repoint base. The agent resolves the
+    # branch TIP at claim, so the repointed task starts from the named branch's
+    # state INCLUDING its dependencies' merged work. When the repointed base
+    # equals the recut source, ``recut_dependent_base_from_branch`` returns
+    # ``"ok"`` without a merge call, so the repoint keeps the recut a no-op and
+    # never arms the recut backoff. Idempotent: a no-change repoint writes
+    # nothing; creation-time base inheritance (``_maybe_inherit_base``) is
+    # suppressed for these tasks so nothing fights the declared pin.
+    payload = dependent.first_payload or {}
+    release_base = payload.get("release_base_branch") or None
+    if release_base and (payload.get("base_branch") or None) != release_base:
+        dependent.payloads[0]["base_branch"] = release_base
+        flag_modified(dependent, "payloads")
+        session.add(dependent)
+        await session.commit()
+        logger.info(
+            "[CROSS-BASE] Repointed task %s base_branch to declared "
+            "release_base_branch %r at dependency release",
+            dependent.id,
+            release_base,
+        )
     recut_sources = await _cross_base_recut_sources(
         dependent, dep_tasks, project, session
     )
@@ -1068,6 +1096,21 @@ async def _check_candidate_task_deps(
         for _t in _rows.scalars().all():
             _replacement_cache[_t.id] = _t
 
+    # Declared sequencing gate: when the candidate names a branch its deps must
+    # have LANDED on, every dependency edge is held deterministically until the
+    # dep is COMPLETED and its merged work is on that branch — regardless of the
+    # genuine-code-dependency file-overlap heuristic, task types, or same-base
+    # classification. This is what makes "build B on top of A's merged state"
+    # expressible: an ordering-only cross-base dep is non-blocking by design in
+    # the heuristic path below, and the same-base path only waits for the merge
+    # of create-type deps.
+    required_landing_branch = (task.first_payload or {}).get(
+        "require_deps_landed_on"
+    ) or None
+    _gate_project = None
+    if required_landing_branch:
+        _gate_project = await session.get(Project, task.project_id)
+
     for dt in dep_tasks:
         effective_dt = dt
         if dt.status == TaskStatus.CANCELLED:
@@ -1103,6 +1146,29 @@ async def _check_candidate_task_deps(
                 continue
             any_failed = True
             break
+        if required_landing_branch:
+            # Declared sequencing edge (see above): hold until this dependency
+            # is COMPLETED and landed on the named branch. Non-death
+            # cancellations already `continue`d as satisfied above, so a clean
+            # SCOPE_EMPTY dep can never wedge the sequence; a dead dep still
+            # cascade-cancels above. A no-op completion that affirmatively
+            # determined its change ALREADY EXISTS on HEAD
+            # (suppresses_redispatch) is satisfied too — it will never land
+            # anywhere, and holding on it is the known COMPLETED-non-landed
+            # permanent-wedge class. `continue` skips the heuristic path — the
+            # declared gate REPLACES it for this candidate's edges (it is
+            # strictly stronger than the same-base wait, and deliberately
+            # overrides the ordering-only non-blocking classification).
+            if effective_dt.status == TaskStatus.COMPLETED and suppresses_redispatch(
+                effective_dt
+            ):
+                continue
+            if effective_dt.status != TaskStatus.COMPLETED or not landed_on_branch(
+                effective_dt, required_landing_branch, _gate_project
+            ):
+                all_met = False
+            continue
+
         # A cross-base dependency only reaches the dependent's base when it lands
         # on the SHARED integration trunk. Distinguish a GENUINE code-dependency
         # (whose landed code the dependent must build on — HOLD until it lands,

@@ -94,6 +94,39 @@ def has_landed_signal(task: Task) -> bool:
     )
 
 
+def landed_on_branch(task: Task, branch: str, project: Any = None) -> bool:
+    """True when *task*'s merged work landed on *branch*.
+
+    Generalizes :func:`has_landed_signal` from "landed on the project's
+    integration branch" to an arbitrary caller-named branch, for the
+    ``require_deps_landed_on`` dispatch gate (sequenced campaign tasks that
+    build on a prerequisite's merged state).
+
+      * *branch* == the project's integration branch → delegate to
+        :func:`has_landed_signal`, the canonical (rollup-propagation-aware)
+        integration signal.
+      * any other branch (e.g. a campaign/staging branch) → require the
+        merge-equivalent unblock signal AND that the canonical landing-branch
+        resolver reports the PR landed on *branch*. Uses the same
+        :func:`branch_resolution.resolve_pr_landing_branch` every other
+        ``pr_merged`` decision uses, so the two cannot drift.
+
+    Deferred imports keep this module a leaf (branch_resolution imports it).
+    """
+    if not branch:
+        return has_landed_signal(task)
+    if project is not None:
+        from app.shared_state import get_project_integration_branch
+
+        if branch == get_project_integration_branch(project):
+            return has_landed_signal(task)
+    if not has_merge_unblock_signal(task):
+        return False
+    from app.branch_resolution import resolve_pr_landing_branch
+
+    return resolve_pr_landing_branch(task, project) == branch
+
+
 def is_merged_completion(task: Task) -> bool:
     """The canonical "shipped" predicate for analytics.
 

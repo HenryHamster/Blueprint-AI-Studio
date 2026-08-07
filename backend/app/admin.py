@@ -2435,6 +2435,19 @@ class CreateTaskPayload(BaseModel):
     base_branch: str | None = Field(
         default=None, max_length=255, pattern=r"^[a-zA-Z0-9_./-]*[a-zA-Z0-9_.-]$"
     )
+    # Sequenced-task (campaign) fields, mirrored into payloads[0] verbatim.
+    # require_deps_landed_on: hold dispatch until every depends_on dependency
+    # has LANDED on the named branch (deterministic, heuristic-free gate).
+    # release_base_branch: repoint base_branch to the named branch when the
+    # dependency gate opens, so the task starts FROM that branch's state
+    # including its dependencies' merged work. depends_on edges themselves are
+    # attached via PATCH /tasks/{id} (cycle-checked there).
+    require_deps_landed_on: str | None = Field(
+        default=None, max_length=255, pattern=r"^[a-zA-Z0-9_./-]*[a-zA-Z0-9_.-]$"
+    )
+    release_base_branch: str | None = Field(
+        default=None, max_length=255, pattern=r"^[a-zA-Z0-9_./-]*[a-zA-Z0-9_.-]$"
+    )
     task_type: TaskType = Field(default=TaskType.create)
     pr_number: int | None = None
     branch: str | None = Field(
@@ -2484,7 +2497,9 @@ class CreateTaskPayload(BaseModel):
             return normalized
         return v
 
-    @field_validator("base_branch", "branch")
+    @field_validator(
+        "base_branch", "branch", "require_deps_landed_on", "release_base_branch"
+    )
     @classmethod
     def validate_branch_name(cls, v: str | None) -> str | None:
         if v is None:
@@ -2793,6 +2808,10 @@ async def create_task_manually(
     }
     if payload.acceptance_evidence is not None:
         task_payload["acceptance_evidence"] = payload.acceptance_evidence
+    if payload.require_deps_landed_on is not None:
+        task_payload["require_deps_landed_on"] = payload.require_deps_landed_on
+    if payload.release_base_branch is not None:
+        task_payload["release_base_branch"] = payload.release_base_branch
     if payload.model is not None:
         task_payload["model"] = payload.model
     if payload.effort is not None:
