@@ -1686,6 +1686,221 @@ def test_diagnose_strict_pin_hold_reports_legacy_single_volume_floor():
     assert "legacy workspace/disk measurement" in detail
 
 
+# ── Image-aware disk floor: a cached image needs no pull ──────────────────────
+
+
+def test_runner_container_image_present_normalizes_refs():
+    """Presence matching handles implicit Docker Hub prefixes and :latest."""
+    from app.runner_eligibility import (
+        _runner_container_image_present,
+        RunnerDispatchSnapshot,
+    )
+
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(), project_id=uuid.uuid4(),
+        capabilities={
+            "container_images_present": [
+                "nvcr.io/nvidia/tensorflow:24.12-tf2-py3",
+                "python:3.12-slim",
+                "redis",
+            ],
+        },
+    )
+    # Explicit-registry refs (docker image ls reports the full form) match exactly.
+    assert _runner_container_image_present(
+        runner, "nvcr.io/nvidia/tensorflow:24.12-tf2-py3"
+    ) is True
+    # docker image ls omits the implicit docker.io/library/ Hub prefix.
+    assert _runner_container_image_present(
+        runner, "docker.io/library/python:3.12-slim"
+    ) is True
+    # An untagged ref means :latest on both sides.
+    assert _runner_container_image_present(runner, "redis:latest") is True
+    # A different tag of a present repository is NOT present.
+    assert _runner_container_image_present(runner, "python:3.13") is False
+    assert _runner_container_image_present(runner, None) is False
+
+    no_field = RunnerDispatchSnapshot(
+        id=uuid.uuid4(), project_id=uuid.uuid4(), capabilities={},
+    )
+    # Absence of the capability means UNKNOWN, never "present".
+    assert _runner_container_image_present(
+        no_field, "nvcr.io/nvidia/tensorflow:24.12-tf2-py3"
+    ) is False
+
+
+def _dgx_shape_capabilities(free_bytes, images_present=None):
+    """The live dgx-1 shape: legacy single-volume telemetry, no separate
+    image-store measurement, docker usable."""
+    caps = {
+        "task_types": "all",
+        "isolation_backends": {"docker_usable": True},
+        "disk_free_bytes": free_bytes,
+        "workspace_free_bytes": free_bytes,
+    }
+    if images_present is not None:
+        caps["container_images_present"] = images_present
+    return caps
+
+
+def test_select_eligible_runner_image_present_waives_image_store_floor():
+    """A runner below the multi-GB pull floor whose local store ALREADY holds
+    the requested image is eligible — the guarded pull is a no-op, and only the
+    (smaller) workspace scratch floor still applies."""
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    image_floor = _disk_floor_bytes()
+    workspace_floor = _workspace_floor_bytes()
+    assert workspace_floor < image_floor - 1  # the test needs the gap to exist
+    image = "nvcr.io/nvidia/tensorflow:24.12-tf2-py3"
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        # ~7.4 GiB live shape: above the workspace floor, below the pull floor.
+        capabilities=_dgx_shape_capabilities(
+            image_floor - 1, images_present=[image]
+        ),
+    )
+    selected = _select_eligible_runner(
+        active_runners_cache={project_id: [runner]},
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator=None,
+        runner_pins_this_cycle={},
+        container_image=image,
+    )
+    assert selected is not None, (
+        "a runner whose local store already holds the requested image must not "
+        "be excluded by the image-pull disk floor — no pull will happen"
+    )
+    assert selected.id == runner.id
+
+
+def test_select_eligible_runner_image_present_still_requires_workspace_floor():
+    """A cached image waives only the pull floor: workspace scratch below its
+    reserve still excludes the runner (checkout/artifact work needs space)."""
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    workspace_floor = _workspace_floor_bytes()
+    image = "nvcr.io/nvidia/tensorflow:24.12-tf2-py3"
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities=_dgx_shape_capabilities(
+            workspace_floor - 1, images_present=[image]
+        ),
+    )
+    selected = _select_eligible_runner(
+        active_runners_cache={project_id: [runner]},
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator=None,
+        runner_pins_this_cycle={},
+        container_image=image,
+    )
+    assert selected is None
+
+
+def test_select_eligible_runner_image_absent_keeps_full_floor():
+    """A store list that does NOT name the requested image waives nothing."""
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    image_floor = _disk_floor_bytes()
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities=_dgx_shape_capabilities(
+            image_floor - 1, images_present=["some-other/image:tag"]
+        ),
+    )
+    selected = _select_eligible_runner(
+        active_runners_cache={project_id: [runner]},
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator=None,
+        runner_pins_this_cycle={},
+        container_image="nvcr.io/nvidia/tensorflow:24.12-tf2-py3",
+    )
+    assert selected is None
+
+
+def test_select_eligible_runner_no_presence_capability_keeps_full_floor():
+    """A runner that does not report container_images_present behaves exactly
+    as before this capability existed (absence means unknown, never cached)."""
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    image_floor = _disk_floor_bytes()
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities=_dgx_shape_capabilities(image_floor - 1),
+    )
+    selected = _select_eligible_runner(
+        active_runners_cache={project_id: [runner]},
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator=None,
+        runner_pins_this_cycle={},
+        container_image="nvcr.io/nvidia/tensorflow:24.12-tf2-py3",
+    )
+    assert selected is None
+
+
+def test_diagnose_strict_pin_hold_image_present_reports_workspace_floor():
+    """When the image is cached and only workspace scratch is short, the hold
+    detail must say so — not claim a multi-GB pull that would never happen."""
+    from app.orchestrator_runner_dispatch import (
+        _diagnose_strict_runner_pin_hold,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    runner_id = uuid.uuid4()
+    workspace_floor = _workspace_floor_bytes()
+    image = "nvcr.io/nvidia/tensorflow:24.12-tf2-py3"
+    runner = RunnerDispatchSnapshot(
+        id=runner_id,
+        project_id=project_id,
+        capabilities=_dgx_shape_capabilities(
+            workspace_floor - 1, images_present=[image]
+        ),
+    )
+    reason, detail = asyncio.run(
+        _diagnose_strict_runner_pin_hold(
+            session=None,
+            active_runners_cache={project_id: [runner]},
+            project_id=project_id,
+            pinned_runner_id=str(runner_id),
+            task_type="compute_experiment",
+            accelerator=None,
+            container_image=image,
+            runner_pins_this_cycle={},
+        )
+    )
+    assert reason == "insufficient_disk", (
+        f"expected insufficient_disk, got {reason!r}: {detail}"
+    )
+    assert "already present" in detail
+    assert f"workspace to clear {workspace_floor} bytes" in detail
+    assert "multi-GB" not in detail
+
+
 # ── GPU-in-container-capability gating (image + accelerator) ──────────────────
 
 
@@ -2320,6 +2535,74 @@ def test_runner_has_free_vram_any_gpu_sufficient():
     assert _runner_has_free_vram(multi_gpu, required_mib=32768) is False, (
         "runner where no GPU meets the requirement must not be eligible"
     )
+
+
+def test_runner_has_free_vram_tolerates_marketing_size_gap():
+    """A vram_gb requirement equal to the card's marketing size must accept
+    that card despite the driver/ECC reserve gap (a "16 GB" V100-SXM2 reports
+    16145 MiB, not 16384), while a meaningfully busy GPU is still excluded."""
+    from app.orchestrator_runner_dispatch import (
+        _runner_has_free_vram,
+        RunnerDispatchSnapshot,
+    )
+
+    v100_16gb = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        capabilities={"task_types": "all", "gpu_free_vram_mib": [16145] * 8},
+    )
+    assert _runner_has_free_vram(v100_16gb, required_mib=16 * 1024) is True, (
+        "an idle 16 GB card must satisfy a 16 GB requirement — the reserve "
+        "gap is not real occupancy"
+    )
+    busy = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        capabilities={"task_types": "all", "gpu_free_vram_mib": [15200] * 8},
+    )
+    assert _runner_has_free_vram(busy, required_mib=16 * 1024) is False, (
+        "a GPU missing more than the tolerance is genuinely busy and must "
+        "not be admitted"
+    )
+
+
+async def test_strict_pin_hold_diagnosis_reports_insufficient_vram():
+    """The strict-pin hold diagnostician must surface the VRAM gate rather
+    than the generic not_eligible: a permanently unsatisfiable requirement
+    was invisible to operators (observed live: dgx-1 held for days with
+    'runner failed dispatch eligibility this cycle')."""
+    from app.orchestrator_runner_dispatch import (
+        _diagnose_strict_runner_pin_hold,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "has_gpu": True,
+            "gpu_count": 8,
+            "gpu_names": ["Tesla V100-SXM2-16GB"] * 8,
+            "gpu_free_vram_mib": [8000] * 8,
+        },
+    )
+    # session is only consulted on the not-in-cache path; the runner is in the
+    # live cache here, so the diagnosis must not touch the DB at all.
+    code, detail = await _diagnose_strict_runner_pin_hold(
+        None,
+        active_runners_cache={project_id: [runner]},
+        project_id=project_id,
+        pinned_runner_id=str(runner.id),
+        task_type="compute_experiment",
+        accelerator=None,
+        container_image=None,
+        runner_pins_this_cycle={},
+        vram_gb=16.0,
+    )
+    assert code == "insufficient_vram", detail
+    assert "16.0 GB" in detail and "8000" in detail
 
 
 # ── Forced (hard) runner pin: _select_eligible_runner ──────────────────────────

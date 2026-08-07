@@ -52,7 +52,7 @@ def test_strategist_dispatch_policy_uses_one_spawn_task_contract():
         "refactor",
         "qa",
     }.issubset(STRATEGIST_SPAWNABLE_TASK_TYPES)
-    assert STRATEGIST_CONTEXTUAL_TASK_TYPES == {"fix"}
+    assert STRATEGIST_CONTEXTUAL_TASK_TYPES == frozenset()
 
 
 def test_task_capability_registry_covers_task_type_enum():
@@ -147,6 +147,7 @@ def test_completion_handler_declarations_match_legacy_dispatch():
         "design": "design",
         "repo_bootstrap": "repo_bootstrap",
         "capability_proof_trial": "capability_proof_trial",
+        "criterion_named_test_trial": "criterion_named_test_trial",
         "walkthrough_e2e": "walkthrough_e2e",
     }
     # Only the two strategic completion handlers consume the pre-locked Project.
@@ -538,6 +539,10 @@ def test_registry_does_not_constrain_payload_extension_fields():
             "type": "create",
             "prompt": "build it",
             "future_capability_field": {"nested": ["still", "allowed"]},
+            "acceptance_evidence": {
+                "kind": "observable_behavior",
+                "description": "ships a real, testable change",
+            },
         }
     )
 

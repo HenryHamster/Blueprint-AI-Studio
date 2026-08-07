@@ -3,6 +3,7 @@ import {
   apiFetch,
   previewOnboardProject,
   createComputeExperiment,
+  rerunComputeExperiment,
   fetchComputeJobs,
   fetchComputeJobsPaged,
   analyzeComputeJob,
@@ -234,6 +235,55 @@ describe('createComputeExperiment', () => {
         deadline_seconds: 1800,
       }),
     ).rejects.toThrow('spend cap exceeds approval threshold');
+  });
+});
+
+describe('rerunComputeExperiment', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('POSTs the rerun contract to the rerun endpoint', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ id: 'task-rerun-1' }), { status: 200 }),
+    );
+
+    const result = await rerunComputeExperiment('task-ce-1', {
+      spend_cap_usd: 8,
+      deadline_seconds: 3600,
+    });
+
+    expect(result).toEqual({ id: 'task-rerun-1' });
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(String(url)).toContain('/api/admin/tasks/task-ce-1/rerun');
+    expect((init as RequestInit).method).toBe('POST');
+    expect(JSON.parse(String((init as RequestInit).body))).toMatchObject({
+      spend_cap_usd: 8,
+      deadline_seconds: 3600,
+    });
+  });
+
+  it('surfaces the backend error-envelope message on a non-2xx response', async () => {
+    // HTTPException detail travels inside {"error": {"message"}} — the rerun
+    // surface must read it so the operator sees the authored validation reason
+    // (e.g. an invalid re-run payload) rather than a bare status text.
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          error: {
+            code: 422,
+            message: 'Invalid re-run payload: command: command must be non-empty',
+          },
+        }),
+        { status: 422 },
+      ),
+    );
+
+    await expect(
+      rerunComputeExperiment('task-ce-1', { spend_cap_usd: 8 }),
+    ).rejects.toThrow(
+      'Invalid re-run payload: command: command must be non-empty',
+    );
   });
 });
 

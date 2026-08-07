@@ -333,7 +333,12 @@ def spend_confidence_label(
     return "verified"
 
 
-def assess_ceiling_gate_trustworthiness(tasks) -> dict:
+def assess_ceiling_gate_trustworthiness(
+    tasks,
+    *,
+    min_coverage_fraction: float | None = None,
+    provider_capture_fractions: dict[str, float] | None = None,
+) -> dict:
     """Verify the weighted ceiling-gate spend figure against real recorded spend.
 
     Given a list of real :class:`~app.models.Task` rows this returns a structured
@@ -349,12 +354,29 @@ def assess_ceiling_gate_trustworthiness(tasks) -> dict:
           ``(multiplier - 1.0) * priced-non-Anthropic cost``.
       (c) for the Anthropic portion — the one component with an independent probe —
           it runs :func:`reconcile_provider_reported_usage` and reports whether it
-          is within tolerance.
+          is within tolerance. A window with zero usable probes (``coverage_fraction
+          == 0.0``) is NOT trustworthy: its tolerance verdict is unproven, and the
+          verdict dict surfaces ``provider_reported_verified`` so operators can tell
+          "failed" from "nothing independently verified".
       (d) it reports the self-reported (non-Anthropic) share of total LLM cost and
           the reconciliation ``coverage_fraction``.
+      (e) probe coverage gate: the window must have ``coverage_fraction`` >=
+          ``min_coverage_fraction`` (default ``MIN_TRUSTWORTHY_PROBE_COVERAGE``).
+          ``provider_reported_verified`` only proves SOMETHING was checked; a thin
+          probe slice (e.g. ~10% of a DeepSeek-heavy window) cannot certify the
+          weighted figure as a conservative upper bound on REAL spend when internal
+          attribution captures only ~22-25% of the provider bill.
+      (f) buffer adequacy gate: when ``provider_capture_fractions`` (provider ->
+          measured internal/export capture ratio, e.g. from a checked-in billing
+          export residual) is supplied, the flat conservatism multiplier must be
+          large enough to cover the WORST capture ratio — otherwise the buffer
+          itself under-states real spend. Defaults to adequate when no capture
+          measurement is wired; ``coverage_sufficient`` then carries the honesty
+          load.
     """
     from app.cost_telemetry_reconciliation import reconcile_provider_reported_usage
     from app.llm_cost_attribution import (
+        MIN_TRUSTWORTHY_PROBE_COVERAGE,
         NON_ANTHROPIC_LLM_CONSERVATISM_MULTIPLIER,
         _task_llm_cost_split,
     )
@@ -388,7 +410,42 @@ def assess_ceiling_gate_trustworthiness(tasks) -> dict:
     provider_reported_within_tolerance = bool(
         reconciliation.provider_reported_within_tolerance
     )
+    # A window with no usable provider-reported probe (e.g. all tasks are
+    # non-Anthropic or ran an agent that never captured usage) has NO evidence
+    # to reconcile. Its tolerance verdict is unproven, not "passing" — treating
+    # a zero-coverage window as trustworthy is exactly the false confidence
+    # that let a ~10% sampled run pass as clean.
+    provider_reported_verified = reconciliation.provider_reported_task_count > 0
     coverage_fraction = reconciliation.coverage_fraction
+
+    # (e) Probe-coverage gate. ``provider_reported_verified`` only proves SOMETHING
+    # was independently checked; a thin slice (1 probed task out of hundreds) must
+    # not certify the weighted figure as a conservative upper bound on REAL spend.
+    threshold = (
+        min_coverage_fraction
+        if min_coverage_fraction is not None
+        else MIN_TRUSTWORTHY_PROBE_COVERAGE
+    )
+    coverage_sufficient = (
+        coverage_fraction is not None
+        and coverage_fraction >= threshold
+    )
+
+    # (f) Buffer-adequacy gate. When the operator has measured how much real
+    # provider spend internal attribution captures (e.g. a checked-in billing
+    # export residual), the flat conservatism multiplier must cover the WORST
+    # capture ratio — a 1.25x buffer cannot absorb a ~22-25% capture. Defaults
+    # to adequate when no capture measurement is wired (coverage_sufficient
+    # then carries the honesty load).
+    if provider_capture_fractions:
+        min_capture = min(provider_capture_fractions.values())
+        buffer_adequate = (
+            min_capture > 0
+            and 1.0 / min_capture <= NON_ANTHROPIC_LLM_CONSERVATISM_MULTIPLIER
+        )
+    else:
+        min_capture = None
+        buffer_adequate = True
 
     # (d) Self-reported (non-Anthropic) share of total LLM cost.
     non_anthropic_share = (
@@ -398,14 +455,31 @@ def assess_ceiling_gate_trustworthiness(tasks) -> dict:
     trustworthy = (
         conservative_upper_bound
         and buffer_exact
+        and provider_reported_verified
         and provider_reported_within_tolerance
+        and coverage_sufficient
+        and buffer_adequate
     )
     if not conservative_upper_bound:
         reason = "ceiling_gate_total under-counts recorded spend"
     elif not buffer_exact:
         reason = "non_anthropic_buffer does not match the conservatism multiplier"
+    elif not provider_reported_verified:
+        reason = "no task carried provider-reported usage — nothing independently verified"
     elif not provider_reported_within_tolerance:
         reason = "anthropic provider-reported usage failed reconciliation"
+    elif not coverage_sufficient:
+        reason = (
+            f"probe coverage {coverage_fraction:.0%} below the "
+            f"{threshold:.0%} minimum — cannot certify the gate as a "
+            "conservative upper bound on real spend"
+        )
+    elif not buffer_adequate:
+        reason = (
+            f"measured provider capture {min_capture:.0%} is below what the "
+            f"{NON_ANTHROPIC_LLM_CONSERVATISM_MULTIPLIER:.2f}x conservatism "
+            "buffer covers"
+        )
     else:
         reason = "weighted figure is a conservative upper bound of recorded spend"
 
@@ -422,7 +496,12 @@ def assess_ceiling_gate_trustworthiness(tasks) -> dict:
         "conservative_upper_bound": conservative_upper_bound,
         "buffer_exact": buffer_exact,
         "provider_reported_within_tolerance": provider_reported_within_tolerance,
+        "provider_reported_verified": provider_reported_verified,
         "coverage_fraction": coverage_fraction,
+        "coverage_sufficient": coverage_sufficient,
+        "min_coverage_fraction": threshold,
+        "buffer_adequate": buffer_adequate,
+        "min_provider_capture_fraction": min_capture,
         "confidence": spend_confidence_label(
             non_anthropic_llm=non_anthropic_llm,
             any_unpriced=any_unpriced,

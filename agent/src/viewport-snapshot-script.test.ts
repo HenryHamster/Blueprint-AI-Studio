@@ -127,7 +127,11 @@ describe('scripts/viewport-snapshot.sh — committed snapshot tooling', () => {
   });
 });
 
-describe('writeViewportSnapshotHelper — generated ./viewport-snapshot wrapper', () => {
+// Spawns a real `bash -n` on the generated wrapper, so wall-clock is dominated
+// by process startup on a loaded VM rather than by the assertions. Vitest's 5s
+// default kills it mid-spawn under ./check's cold-cache contention.
+// Same convention as handlers/bake-smoke-run.test.ts:63.
+describe('writeViewportSnapshotHelper — generated ./viewport-snapshot wrapper', { timeout: 120_000 }, () => {
   let tmpDir: string;
 
   beforeEach(() => {

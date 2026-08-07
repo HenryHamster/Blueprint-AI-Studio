@@ -4253,6 +4253,119 @@ async def sweep_backfill_merged_named_test_coverage(session, now=None) -> int:
     return total
 
 
+# Hourly cadence for the acceptance-verdict healing backfill sweep (Step 21b).
+# Independent timer so it is not suppressed by another sweep's timer stamp
+# earlier in the same reaper cycle.
+_ACCEPTANCE_HEALING_BACKFILL_INTERVAL_SECONDS = 3600
+_last_acceptance_healing_backfill_sweep: datetime | None = None
+
+
+async def sweep_acceptance_verdict_healing_backfills(session, now=None) -> int:
+    """Step 21b: Heal stale declared_unsatisfied acceptance verdicts on the sweep.
+
+    Runs the two reconcile-only backfills that heal stale acceptance verdicts for
+    already-landed rollup children and unverified merges —
+    :func:`app.acceptance_criteria.backfill_rollup_child_changed_files` then
+    :func:`app.acceptance_criteria.backfill_unverified_merge_evidence` — followed
+    by the acceptance-window evidence minter
+    (:func:`app.acceptance_criteria.record_acceptance_window_coverage_evidence`),
+    for every project with an open release version.
+
+    These passes were previously reachable only from the manual
+    ``reconcile-backfill`` admin endpoint, so a project's acceptance window could
+    sit permanently at a false 0.0 verified until an operator POSTed it by hand —
+    the exact deadlock that blocks qualification when the acceptance-window metric
+    is the binding criterion.  Running them on the sweep unblocks that window
+    automatically while the minter's idempotency / fingerprint guards keep
+    repeated cycles cheap.
+
+    Ordering mirrors the reconcile endpoint: rollup-changed-files runs BEFORE the
+    unverified-merge backfill so a child newly stamped here is picked up by that
+    pass in the SAME sweep and earns criterion evidence, and the window minter
+    runs LAST so a healed merge window re-scores non-zero and records its probe
+    evidence.
+
+    Hourly cadence-gated on an independent timer.  Returns the total number of new
+    ``CriterionEvidence`` rows recorded across all projects (the unverified-merge
+    backfill + window-minter passes; rollup stamping is a context fix, not
+    evidence).
+    """
+    global _last_acceptance_healing_backfill_sweep
+    from app.models import Project
+    from app.release_version import current_open_version as _cur_open_ver
+    from app.acceptance_criteria import (
+        backfill_rollup_child_changed_files as _backfill_rollup,
+        backfill_unverified_merge_evidence as _backfill_unverified,
+        record_acceptance_window_coverage_evidence as _record_window_evidence,
+    )
+
+    _now = now or _utcnow()
+    if not _is_cadence_due(
+        _last_acceptance_healing_backfill_sweep,
+        _ACCEPTANCE_HEALING_BACKFILL_INTERVAL_SECONDS,
+        _now,
+    ):
+        return 0
+    _last_acceptance_healing_backfill_sweep = _now
+
+    # Find projects that have an open release version — only they have active
+    # criteria whose acceptance window can be healed.
+    _BATCH = 50
+    total = 0
+    last_id: uuid.UUID | None = None
+    while True:
+        query = select(Project.id).order_by(Project.id).limit(_BATCH)
+        if last_id is not None:
+            query = query.where(Project.id > last_id)
+
+        rows = (await session.execute(query)).scalars().all()
+        if not rows:
+            break
+        last_id = rows[-1]
+
+        for pid in rows:
+            try:
+                open_ver = await _cur_open_ver(session, pid)
+                if open_ver is None:
+                    continue
+                stamped = await _backfill_rollup(session, pid)
+                unverified = await _backfill_unverified(session, pid)
+                window_evidence = await _record_window_evidence(session, open_ver)
+                # Each pass commits internally per batch; this commit flushes the
+                # window-minter rows (already persisted by record_evidence) and
+                # keeps the per-project transaction clean for the next project.
+                await session.commit()
+                if stamped or unverified or window_evidence:
+                    logger.info(
+                        "[REAPER] Step 21b: acceptance-verdict healing project=%s "
+                        "children_stamped=%d unverified_evidence=%d window_evidence=%d",
+                        pid,
+                        stamped,
+                        unverified,
+                        window_evidence,
+                    )
+                total += unverified + window_evidence
+            except Exception:
+                logger.warning(
+                    "[REAPER] Step 21b: acceptance-verdict healing backfills failed "
+                    "for project %s:",
+                    pid,
+                    exc_info=True,
+                )
+                with contextlib.suppress(Exception):
+                    await session.rollback()
+
+        if len(rows) < _BATCH:
+            break
+
+    if total:
+        logger.info(
+            "[REAPER] Step 21b: acceptance-verdict healing total=%d",
+            total,
+        )
+    return total
+
+
 __all__ = [
     # Re-exported from app.blocked_task_unblock_sweeps (constants)
     "_BLOCKED_ESCALATE_AFTER",
@@ -4316,4 +4429,6 @@ __all__ = [
     "MESSAGE_ATTACHMENT_RETENTION_DAYS",
     "sweep_retire_consumed_message_attachments",
     "sweep_backfill_merged_named_test_coverage",
+    "sweep_acceptance_verdict_healing_backfills",
+    "_ACCEPTANCE_HEALING_BACKFILL_INTERVAL_SECONDS",
 ]

@@ -9781,6 +9781,40 @@ async def test_qualify_request_flows_end_to_end(client, db_session, mocker):
     await db_session.commit()
     await db_session.refresh(task)
 
+    # The qualify gate is fail-CLOSED on unavailable compliance evidence, so the
+    # flow under test (qualify_request → run_qualification) needs a fully-available
+    # clean compliance record. Stub the GitHub-backed evaluation as success and
+    # persist the result exactly as production ensure_current_ci_compliance does
+    # (the gate reads project.ci_compliance for the envelope's head_sha).
+    from app import ci_compliance as _ci_mod
+
+    _head_sha = "c" * 40
+    _compliant_data = {
+        "ref": _head_sha,
+        "compliant": True,
+        "violations": [],
+        "branch_literal_violations": [],
+        "checked": 0,
+        "limits_available": True,
+        "tree_available": True,
+    }
+    mocker.patch(
+        "app.ci_compliance.ensure_current_ci_compliance",
+        new=AsyncMock(
+            return_value={
+                "status": "success",
+                "integration_branch": "automain",
+                "head_sha": _head_sha,
+                "data": _compliant_data,
+                "computed": False,
+            }
+        ),
+    )
+    _ci_mod.record_ci_compliance(project, _compliant_data)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
     token = create_agent_token(str(task.id), "vm-qr-e2e", task_type="strategic_review")
 
     # The agent embeds qualify_request as a TOP-LEVEL SIBLING of the
@@ -10121,6 +10155,40 @@ async def test_qualify_request_failure_recorded_on_release_version(
     db_session.add(task)
     await db_session.commit()
     await db_session.refresh(task)
+
+    # The qualify gate is fail-CLOSED on unavailable compliance evidence, so this
+    # test needs a fully-available clean record to reach run_qualification (the
+    # seam under test is the durable error write, not the gate). Stub the
+    # GitHub-backed evaluation as success and persist the result exactly as
+    # production ensure_current_ci_compliance does.
+    from app import ci_compliance as _ci_mod
+
+    _head_sha = "d" * 40
+    _compliant_data = {
+        "ref": _head_sha,
+        "compliant": True,
+        "violations": [],
+        "branch_literal_violations": [],
+        "checked": 0,
+        "limits_available": True,
+        "tree_available": True,
+    }
+    mocker.patch(
+        "app.ci_compliance.ensure_current_ci_compliance",
+        new=AsyncMock(
+            return_value={
+                "status": "success",
+                "integration_branch": "automain",
+                "head_sha": _head_sha,
+                "data": _compliant_data,
+                "computed": False,
+            }
+        ),
+    )
+    _ci_mod.record_ci_compliance(project, _compliant_data)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
 
     # Force run_qualification to raise — simulates any unexpected failure
     # (DB error, network blip, unhandled edge case inside the qualifier).
@@ -14400,6 +14468,280 @@ async def test_fallback_update_direction_persists_and_clears_criterion_keys(
         "fallback update_direction must clear criterion_keys on empty list"
     )
     assert "criterion_release_version_id" not in updated
+
+
+@pytest.mark.asyncio
+async def test_update_direction_invalid_criterion_keys_surfaces_rejection(
+    db_session, mocker
+):
+    """Fallback update_direction with invalid criterion_keys must surface the
+    rejection instead of silently dropping the op.
+
+    The op is refused (the direction never receives the dangling key), and the
+    rejection is recorded on task.context[REJECTED_DIRECTION_OPS_CONTEXT_KEY] so
+    it flows into the completion summary and the next cycle's strategist payload
+    — closing the loop where the strategist previously saw only a log line.
+    """
+    from app.strategic_completion import (
+        _handle_strategic_completion,
+        REJECTED_DIRECTION_OPS_CONTEXT_KEY,
+    )
+    from app import release_version as rv
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="RejectedCriterionUpdate",
+        user_id="u-rejected-criterion-update",
+        vision={"purpose": "test", "revision": 0},
+        directions=[
+            {
+                "id": "d-rejected-criterion-update",
+                "text": "Own acceptance evidence",
+                "status": "active",
+                "priority": "medium",
+                "research_history": [],
+                "notes": [],
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    criterion = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-active-key",
+        text="Active criterion",
+        created_by="test",
+    )
+    db_session.add(criterion)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 0}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "direction_operations": [
+                {
+                    "op": "update_direction",
+                    "direction_id": "d-rejected-criterion-update",
+                    "changes": {"criterion_keys": ["c-unknown-key"]},
+                    "rationale": "link a dangling criterion",
+                }
+            ],
+        }
+    )
+    await _handle_strategic_completion(task, logs, db_session)
+    await db_session.refresh(project)
+
+    # The op was refused: the direction never receives the dangling key.
+    updated = next(
+        d
+        for d in project.directions
+        if d.get("id") == "d-rejected-criterion-update"
+    )
+    assert updated.get("criterion_keys") not in (["c-unknown-key"],), (
+        "invalid criterion_keys must not be persisted onto the direction"
+    )
+
+    # The rejection is surfaced on task.context with enough detail to remap.
+    rejected = (task.context or {}).get(REJECTED_DIRECTION_OPS_CONTEXT_KEY) or []
+    assert rejected, "invalid criterion_keys rejection must be surfaced"
+    entry = next(
+        (
+            r
+            for r in rejected
+            if r.get("direction_id") == "d-rejected-criterion-update"
+        ),
+        None,
+    )
+    assert entry is not None, "rejection must reference the target direction"
+    assert entry["reason"] == "invalid_criterion_keys"
+    assert "c-unknown-key" in entry["invalid_criterion_keys"]
+    assert "c-active-key" in entry["active_criterion_keys"]
+
+
+@pytest.mark.asyncio
+async def test_create_direction_invalid_criterion_keys_surfaces_rejection(
+    db_session, mocker
+):
+    """Fallback create_direction with invalid criterion_keys must surface the
+    rejection the same way update_direction does (no direction created, rejection
+    recorded on task.context)."""
+    from app.strategic_completion import (
+        _handle_strategic_completion,
+        REJECTED_DIRECTION_OPS_CONTEXT_KEY,
+    )
+    from app import release_version as rv
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="RejectedCriterionCreate",
+        user_id="u-rejected-criterion-create",
+        vision={"purpose": "test", "revision": 0},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    criterion = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-active-create",
+        text="Active criterion",
+        created_by="test",
+    )
+    db_session.add(criterion)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 0}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "direction_operations": [
+                {
+                    "op": "create_direction",
+                    "text": "A brand-new direction",
+                    "success_evidence": "tests pass and build is green",
+                    "retirement_condition": "the capability ships",
+                    "criterion_keys": ["c-ghost-key"],
+                    "rationale": "new work",
+                }
+            ],
+        }
+    )
+    await _handle_strategic_completion(task, logs, db_session)
+    await db_session.refresh(project)
+
+    assert not any(
+        d.get("text") == "A brand-new direction" for d in (project.directions or [])
+    ), "create_direction with invalid criterion_keys must not create a direction"
+
+    rejected = (task.context or {}).get(REJECTED_DIRECTION_OPS_CONTEXT_KEY) or []
+    entry = next(
+        (r for r in rejected if r.get("text") == "A brand-new direction"), None
+    )
+    assert entry is not None, "create_direction rejection must be surfaced"
+    assert entry["op"] == "create_direction"
+    assert "c-ghost-key" in entry["invalid_criterion_keys"]
+    assert "c-active-create" in entry["active_criterion_keys"]
+
+
+def test_build_rejected_direction_ops_surfaces_cycle_metadata():
+    """_build_rejected_direction_ops must surface bounded cycle_metadata
+    records (already normalized upstream) and skip failed/empty cycles."""
+    from app.strategic_spawning import _build_rejected_direction_ops
+
+    cycle_history = [
+        {
+            "outcome": "completed",
+            "rejected_direction_ops": [
+                {
+                    "op": "update_direction",
+                    "direction_id": "d-one",
+                    "text": "",
+                    "invalid_criterion_keys": ["c-ghost"],
+                    "active_criterion_keys": ["c-live", "c-other"],
+                    "rejected_at": "2026-08-01T00:00:00+00:00",
+                }
+            ],
+        },
+        {"outcome": "completed"},
+        {
+            "outcome": "failed",
+            "rejected_direction_ops": [
+                {"op": "create_direction", "direction_id": None}
+            ],
+        },
+    ]
+    result = _build_rejected_direction_ops(cycle_history, n=5)
+    assert len(result) == 1, "only completed cycles with records surface"
+    assert result[0]["direction_id"] == "d-one"
+    assert result[0]["invalid_criterion_keys"] == ["c-ghost"]
+    assert result[0]["active_criterion_keys"] == ["c-live", "c-other"]
+    assert result[0]["op"] == "update_direction"
+
+
+@pytest.mark.asyncio
+async def test_build_criterion_link_conflicts_detects_dangling_keys(db_session):
+    """_build_criterion_link_conflicts must reuse the read-model classifier to
+    flag active directions whose criterion_keys are unknown in the open version,
+    and return None for a clean model."""
+    from app.strategic_spawning import _build_criterion_link_conflicts
+    from app import release_version as rv
+
+    project = Project(
+        name="CriterionLinkConflicts",
+        user_id="u-criterion-link-conflicts",
+        vision={"purpose": "test", "revision": 0},
+        directions=[
+            {
+                "id": "d-dangling",
+                "text": "Bad link",
+                "status": "active",
+                "criterion_keys": ["c-ghost-key"],
+                "research_history": [],
+                "notes": [],
+            },
+            {
+                "id": "d-clean",
+                "text": "Good link",
+                "status": "active",
+                "criterion_keys": ["c-active-key"],
+                "research_history": [],
+                "notes": [],
+            },
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    criterion = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-active-key",
+        text="Active criterion",
+        created_by="test",
+    )
+    db_session.add(criterion)
+    await db_session.commit()
+
+    conflicts = await _build_criterion_link_conflicts(db_session, project)
+    assert conflicts is not None
+    assert any(
+        c.get("direction_id") == "d-dangling"
+        and c.get("criterion_key") == "c-ghost-key"
+        for c in conflicts
+    )
+    assert not any(
+        c.get("direction_id") == "d-clean" for c in conflicts
+    ), "a valid criterion link must not be flagged"
 
 
 @pytest.mark.asyncio

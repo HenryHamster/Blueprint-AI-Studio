@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+from pathlib import Path
 
 import pytest
 from sqlalchemy import select
 
 from app import ci_compliance
 from app.auth import create_agent_token
-from app.models import Project, Task, TaskStatus
+from app.models import Alert, Project, Task, TaskStatus
 from app.strategic_spawning import (
     _maybe_spawn_ci_compliance_cap_bump_fix,
     _spawn_strategic_review,
@@ -18,21 +20,71 @@ from app.strategic_spawning import (
 )
 from testing import check_size_limits as csl
 
+
+def _shared_session_factory(db_session):
+    @contextlib.asynccontextmanager
+    async def _factory():
+        yield db_session
+
+    return _factory
+
 _HEAD_SHA = "a" * 40
 _CAPPED_REL = "main.py"
 _CAP = 10
+_TESTING_REL = "test_fake_module.py"
+_TESTING_CAP = 50
 
 
 def _limits_json(cap: int = _CAP) -> str:
     return json.dumps({"backend": {_CAPPED_REL: cap}})
 
 
+def _limits_json_with_testing() -> str:
+    """A limits JSON that also caps a backend/testing/ file, mirroring CI's
+    TestTestFileSizeGuardrails over the enforced ``testing`` section."""
+    return json.dumps(
+        {
+            "backend": {_CAPPED_REL: _CAP},
+            "testing": {_TESTING_REL: _TESTING_CAP},
+        }
+    )
+
+
+def _rules_json() -> str:
+    """A valid branch_literal_allowlist.json body (the evaluator reads it at
+    the candidate ref; no branch-literal violations are exercised here)."""
+    return json.dumps(
+        {
+            "backend": {"allowlisted_filenames": []},
+            "agent": {"allowlist": []},
+            "admin-ui": {"allowlist": []},
+        }
+    )
+
+
 def _fake_reader(module_line_count: int):
     async def _reader(path, *, token, owner, repo, ref, project_id=None):
         if path == ci_compliance._MODULE_SIZE_LIMITS_PATH:
             return _limits_json()
+        if path == ci_compliance.BRANCH_LITERAL_ALLOWLIST_PATH:
+            return _rules_json()
         if path == f"backend/app/{_CAPPED_REL}":
             return "\n".join("x" for _ in range(module_line_count))
+        return None
+
+    return _reader
+
+
+def _fake_reader_with_testing(module_line_count: int, testing_line_count: int):
+    async def _reader(path, *, token, owner, repo, ref, project_id=None):
+        if path == ci_compliance._MODULE_SIZE_LIMITS_PATH:
+            return _limits_json_with_testing()
+        if path == ci_compliance.BRANCH_LITERAL_ALLOWLIST_PATH:
+            return _rules_json()
+        if path == f"backend/app/{_CAPPED_REL}":
+            return "\n".join("x" for _ in range(module_line_count))
+        if path == f"backend/testing/{_TESTING_REL}":
+            return "\n".join("x" for _ in range(testing_line_count))
         return None
 
     return _reader
@@ -147,6 +199,21 @@ async def test_ci_compliance_fetch_gate_and_cap_bump_spawn(
     assert gate["blocked"] is True
     assert gate["violation_count"] == 1
 
+    # Pin a deterministic ROUTINE verdict: a fresh project on a task VM has no
+    # readable bump history, which classify_breach FAILS CLOSED as chronic
+    # (decomposition prompt, no --fix). The routine cap-bump prompt is what this
+    # test exercises, so classify the breach as routine up front.
+    mocker.patch(
+        "app.strategic_spawning.classify_breach",
+        return_value={
+            "is_chronic": False,
+            "suggested_new_limit": _CAP + 3,
+            "bump_count": 0,
+            "history_unavailable": False,
+            "reason": "Routine breach (0 prior bumps).",
+        },
+    )
+
     spawned = await _maybe_spawn_ci_compliance_cap_bump_fix(db_session, project, gate)
     await db_session.commit()
     assert spawned is not None
@@ -161,6 +228,124 @@ async def test_ci_compliance_fetch_gate_and_cap_bump_spawn(
     assert cap_bump_task.first_payload["type"] == "create"
     assert "python3 backend/testing/check_size_limits.py --fix" in cap_bump_task.first_payload[
         "prompt"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_branch_literal_only_violation_spawns_literal_remediation(
+    db_session, mocker
+):
+    """A HEAD blocked purely on branch-literal violations spawns a branch-name
+    remediation task — not a mislabeled size-cap-bump task.
+
+    Regression for the title/description that told the agent to run
+    ``check_size_limits.py --fix`` on a violation that has nothing to do with
+    size caps (observed on a real spawn for gitRefs.ts:71, which surfaced as
+    "Fix CI-compliance cap bump for <sha>" despite containing only a branch
+    literal, not a size breach).
+    """
+    project, _agent_task = await _make_project_with_agent_task(
+        db_session, module_line_count=_CAP - 1, mocker=mocker
+    )
+    ci_compliance.record_ci_compliance(
+        project,
+        {
+            "ref": _HEAD_SHA,
+            "compliant": False,
+            "violations": [],
+            "branch_literal_violations": [
+                {
+                    "section": "agent",
+                    "rel": "gitRefs.ts",
+                    "line": 71,
+                    "text": (
+                        "return process.env.BLUEPRINT_SELF_REPO_INTEGRATION_BRANCH"
+                        " || 'automain';"
+                    ),
+                }
+            ],
+            "checked": 1,
+            "limits_available": True,
+            "tree_available": True,
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    gate = ci_compliance_qualify_gate(project, _HEAD_SHA)
+    assert gate["blocked"] is True
+    assert gate["violation_count"] == 0
+    assert gate["branch_literal_violation_count"] == 1
+
+    spawned = await _maybe_spawn_ci_compliance_cap_bump_fix(db_session, project, gate)
+    await db_session.commit()
+    assert spawned is not None
+
+    repair_task = (
+        await db_session.execute(select(Task).where(Task.id == spawned.id))
+    ).scalar_one()
+    assert repair_task.status == TaskStatus.QUEUED
+    assert repair_task.title.startswith("Fix CI-compliance branch literals")
+    # The branch-literal remediation must NOT instruct a size-cap bump.
+    assert "check_size_limits.py --fix" not in repair_task.first_payload["prompt"]
+    assert "gitRefs.ts:71" in repair_task.first_payload["prompt"]
+    assert "Remove hardcoded branch names" in repair_task.description
+
+
+@pytest.mark.asyncio
+async def test_ci_compliance_fetch_and_gate_surface_testing_section_breach(
+    client, db_session, mocker
+):
+    """A testing-section breach at automain HEAD surfaces and blocks the gate.
+
+    The evaluator scans the enforced ``testing`` section of
+    module_size_limits.json (mirroring CI's TestTestFileSizeGuardrails), so a
+    backend/testing/*.py file over its cap must appear in the fetch response as
+    a section-``testing`` violation and block ``ci_compliance_qualify_gate``.
+    """
+    project, agent_task = await _make_project_with_agent_task(
+        db_session, module_line_count=_CAP - 1, mocker=mocker
+    )
+    # Re-point the reader at a limits file that also caps a testing file, which
+    # is over its cap (backend file stays within cap to isolate the testing breach).
+    mocker.patch.object(
+        ci_compliance.github,
+        "get_file_text_at_ref",
+        new=_fake_reader_with_testing(_CAP - 1, _TESTING_CAP + 3),
+    )
+
+    token = create_agent_token(str(agent_task.id), "agent-vm-ci-compliance")
+    response = await client.get(
+        f"/api/agent/projects/{project.id}/ci-compliance",
+        headers={"x-agent-token": token},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()["data"]
+    assert body["head_sha"] == _HEAD_SHA
+    assert body["compliant"] is False
+    assert body["violation_count"] == 1
+    assert body["violations"] == [
+        {
+            "section": "testing",
+            "rel": _TESTING_REL,
+            "count": _TESTING_CAP + 3,
+            "cap": _TESTING_CAP,
+        }
+    ]
+
+    await db_session.refresh(project)
+    gate = ci_compliance_qualify_gate(project, _HEAD_SHA)
+    assert gate["blocked"] is True
+    assert gate["violation_count"] == 1
+    assert gate["violations"] == [
+        {
+            "section": "testing",
+            "rel": _TESTING_REL,
+            "count": _TESTING_CAP + 3,
+            "cap": _TESTING_CAP,
+        }
     ]
 
 
@@ -257,6 +442,333 @@ async def test_compliant_head_fetch_gate_and_spawn_are_noops(client, db_session,
 
 
 @pytest.mark.asyncio
+async def test_gate_does_not_pass_on_unavailable_compliance_evidence(
+    db_session, mocker
+):
+    """The qualify gate fails CLOSED when compliance evidence is DEGRADED.
+
+    'Compliance verified clean' and 'compliance could not be checked' must not
+    reach the qualification decision as the same verdict: a record computed
+    with an unreadable limits file or an unavailable repo tree
+    (``limits_available`` / ``tree_available`` False) blocks qualification. A
+    fully-available clean record is the only pass.
+
+    An EMPTY store is deliberately NOT in that class. This assertion previously
+    demanded ``blocked is True`` for a missing per-SHA record, which conflated
+    'unreadable evidence' with 'no evaluation stored yet' and refused every
+    first-ever qualification — it broke the operator force-qualify lever
+    (``admin_operator_triggers.trigger_qualify`` returned 409 for any project
+    with no record) and the sweep's initial auto-trigger. The
+    unverifiable-evidence refusal lives at the caller that can tell the
+    difference: see
+    ``test_qualify_request_blocked_when_compliance_evidence_unavailable`` and
+    ``test_qualify_request_blocked_when_compliance_gate_raises``, which still
+    prove the qualifier never runs when the evaluation could not be performed.
+    """
+    project, agent_task = await _make_project_with_agent_task(
+        db_session, module_line_count=_CAP - 1, mocker=mocker
+    )
+
+    # 1. No record for the SHA → NOT blocked here (empty store ≠ unreadable
+    #    evidence); the unavailable-evidence refusal is asserted by the
+    #    _apply_qualify_request tests named in the docstring.
+    gate = ci_compliance_qualify_gate(project, _HEAD_SHA)
+    assert gate["blocked"] is False
+    assert gate["reason"] == "ci_compliance_record_missing"
+
+    # 2. Record computed with an unreadable limits file → blocked.
+    ci_compliance.record_ci_compliance(
+        project,
+        {
+            "ref": _HEAD_SHA,
+            "compliant": True,
+            "violations": [],
+            "branch_literal_violations": [],
+            "checked": 0,
+            "limits_available": False,
+            "tree_available": True,
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    gate = ci_compliance_qualify_gate(project, _HEAD_SHA)
+    assert gate["blocked"] is True
+    assert gate["reason"] == "ci_compliance_evidence_unavailable"
+
+    # 3. Record computed without a repo tree → blocked.
+    ci_compliance.record_ci_compliance(
+        project,
+        {
+            "ref": _HEAD_SHA,
+            "compliant": True,
+            "violations": [],
+            "branch_literal_violations": [],
+            "checked": 1,
+            "limits_available": True,
+            "tree_available": False,
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    gate = ci_compliance_qualify_gate(project, _HEAD_SHA)
+    assert gate["blocked"] is True
+    assert gate["reason"] == "ci_compliance_evidence_unavailable"
+
+    # 3b. Record computed with unreadable branch-literal rules → blocked.
+    ci_compliance.record_ci_compliance(
+        project,
+        {
+            "ref": _HEAD_SHA,
+            "compliant": True,
+            "violations": [],
+            "branch_literal_violations": [],
+            "checked": 1,
+            "limits_available": True,
+            "tree_available": True,
+            "rules_available": False,
+            "rules_status": "unreadable",
+            "rules_error": "could not read branch_literal_allowlist.json",
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    gate = ci_compliance_qualify_gate(project, _HEAD_SHA)
+    assert gate["blocked"] is True
+    assert gate["reason"] == "ci_compliance_evidence_unavailable"
+    assert gate["rules_available"] is False
+
+    # 4. Control: a fully-available clean record passes the gate.
+    ci_compliance.record_ci_compliance(
+        project,
+        {
+            "ref": _HEAD_SHA,
+            "compliant": True,
+            "violations": [],
+            "branch_literal_violations": [],
+            "checked": 1,
+            "limits_available": True,
+            "tree_available": True,
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    gate = ci_compliance_qualify_gate(project, _HEAD_SHA)
+    assert gate["blocked"] is False
+
+
+@pytest.mark.asyncio
+async def test_qualify_request_blocked_when_compliance_evidence_unavailable(
+    db_session, mocker
+):
+    """A qualify_request is blocked (qualifier not run) when CI-compliance
+    evidence is unavailable — GitHub credentials or HEAD unresolvable."""
+    from app import release_version as rv
+    from app.strategic_completion import _apply_qualify_request
+
+    project, agent_task = await _make_project_with_agent_task(
+        db_session, module_line_count=_CAP - 1, mocker=mocker
+    )
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    rv.set_version_phase(version, "stabilize", reasoning="ready to qualify")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    run_qualification = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=mocker.AsyncMock(return_value={"status": "spawned"}),
+    )
+    mocker.patch(
+        "app.ci_compliance.ensure_current_ci_compliance",
+        new=mocker.AsyncMock(
+            return_value={
+                "status": "unavailable",
+                "reason": "github_credentials_unavailable",
+                "integration_branch": "automain",
+                "head_sha": None,
+                "data": None,
+            }
+        ),
+    )
+
+    refresh_required = await _apply_qualify_request(
+        {"reason": "ready"},
+        agent_task,
+        project,
+        db_session,
+        path="test",
+    )
+    await db_session.commit()
+
+    # The qualifier was never reached — fail-closed on unverifiable evidence.
+    run_qualification.assert_not_awaited()
+    assert refresh_required is True
+    await db_session.refresh(version)
+    blocked = version.last_qualification["qualify_request_blocked"]
+    assert blocked["blocker"] == "ci_compliance"
+    assert blocked["blocker_class"] == "unavailable_evidence"
+    assert blocked["head_sha"] is None
+    assert "qualify_request_blocked_at" in version.last_qualification
+
+
+@pytest.mark.asyncio
+async def test_qualify_request_blocked_when_compliance_gate_raises(
+    db_session, mocker
+):
+    """An exception OUT of the CI-compliance gate is the same
+    evidence-unavailable class as an ``unavailable`` status: the qualifier must
+    not run on unverified evidence, and the blocker must be recorded durably.
+
+    Regression guard for the fail-OPEN ``except Exception`` that used to log
+    "failing open" and fall straight through to ``run_qualification``.
+    """
+    from app import release_version as rv
+    from app.strategic_completion import _apply_qualify_request
+
+    project, agent_task = await _make_project_with_agent_task(
+        db_session, module_line_count=_CAP - 1, mocker=mocker
+    )
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    rv.set_version_phase(version, "stabilize", reasoning="ready to qualify")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    run_qualification = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=mocker.AsyncMock(return_value={"status": "spawned"}),
+    )
+    mocker.patch(
+        "app.ci_compliance.ensure_current_ci_compliance",
+        new=mocker.AsyncMock(side_effect=RuntimeError("github unreachable")),
+    )
+
+    refresh_required = await _apply_qualify_request(
+        {"reason": "ready"},
+        agent_task,
+        project,
+        db_session,
+        path="test",
+    )
+    await db_session.commit()
+
+    run_qualification.assert_not_awaited()
+    assert refresh_required is True
+    await db_session.refresh(version)
+    blocked = version.last_qualification["qualify_request_blocked"]
+    assert blocked["blocker"] == "ci_compliance"
+    assert blocked["blocker_class"] == "unavailable_evidence"
+    assert "qualify_request_blocked_at" in version.last_qualification
+
+
+@pytest.mark.asyncio
+async def test_qualify_gate_blocks_when_limits_unreadable(client, db_session, mocker):
+    """A HEAD whose size-limits config is unreadable blocks the qualify gate.
+
+    The evaluator fails closed (compliant=False, limits_available=False, no
+    violations), and the qualify gate must refuse — an unreadable config is
+    exactly when the gate is least entitled to pass. No cap-bump repair is
+    spawned because there is no cap to bump.
+    """
+    project, agent_task = await _make_project_with_agent_task(
+        db_session, module_line_count=_CAP - 1, mocker=mocker
+    )
+    # Everything 404s, including the limits file.
+    mocker.patch.object(
+        ci_compliance.github,
+        "get_file_text_at_ref",
+        new=mocker.AsyncMock(return_value=None),
+    )
+
+    token = create_agent_token(str(agent_task.id), "agent-vm-ci-compliance")
+    response = await client.get(
+        f"/api/agent/projects/{project.id}/ci-compliance",
+        headers={"x-agent-token": token},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()["data"]
+    assert body["compliant"] is False
+    assert body["limits_available"] is False
+    assert body["violation_count"] == 0
+
+    await db_session.refresh(project)
+    gate = ci_compliance_qualify_gate(project, _HEAD_SHA)
+    assert gate["blocked"] is True
+    assert gate["violation_count"] == 0
+    assert gate["limits_available"] is False
+
+    spawned = await _maybe_spawn_ci_compliance_cap_bump_fix(db_session, project, gate)
+    await db_session.commit()
+    assert spawned is None
+
+
+@pytest.mark.asyncio
+async def test_healed_degraded_record_unblocks_gate(db_session, mocker):
+    """A healed degraded record re-opens the qualify gate.
+
+    A degraded per-SHA record (limits file unreadable at the ref — a transient
+    GitHub read failure) blocks the gate fail-closed. Once
+    ``ensure_current_ci_compliance`` re-evaluates with healthy reads, the
+    degraded record is a cache miss, is replaced by a fully-available clean
+    one, and the gate no longer blocks — previously the degraded record was
+    served from cache forever and every entry path for the SHA stayed refused.
+
+    The seeded record carries no ``degraded_evaluated_at`` stamp, so the
+    per-SHA re-check bound (``_degraded_recheck_is_due``) reports it due: the
+    bound rate-limits REPEATED re-evaluation of a degraded ref, it never delays
+    the first self-heal.
+    """
+    project, _agent_task = await _make_project_with_agent_task(
+        db_session, module_line_count=_CAP - 1, mocker=mocker
+    )
+
+    # Seed a degraded record: non-compliant ONLY because the limits file was
+    # unreadable at the ref.
+    ci_compliance.record_ci_compliance(
+        project,
+        {
+            "ref": _HEAD_SHA,
+            "compliant": False,
+            "violations": [],
+            "branch_literal_violations": [],
+            "checked": 0,
+            "limits_available": False,
+            "limits_status": "unreadable",
+            "limits_error": "could not read backend/testing/module_size_limits.json",
+            "rules_available": True,
+            "rules_status": "ok",
+            "rules_error": None,
+            "tree_available": True,
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # The degraded record blocks the gate fail-closed.
+    gate = ci_compliance_qualify_gate(project, _HEAD_SHA)
+    assert gate["blocked"] is True
+    assert gate["reason"] == "ci_compliance_evidence_unavailable"
+
+    # Re-evaluate with healthy reads (module within cap): the degraded record
+    # is a cache miss and is replaced by the healed record.
+    healed = await ci_compliance.ensure_current_ci_compliance(db_session, project)
+    assert healed["status"] == "success"
+    assert healed["computed"] is True
+    assert healed["head_sha"] == _HEAD_SHA
+    assert healed["data"]["compliant"] is True
+
+    # The gate now passes.
+    gate = ci_compliance_qualify_gate(project, _HEAD_SHA)
+    assert gate["blocked"] is False
+
+
+@pytest.mark.asyncio
 async def test_noncompliant_qualify_request_is_blocked_and_spawns_cap_bump(
     db_session, mocker
 ):
@@ -300,10 +812,13 @@ async def test_noncompliant_qualify_request_is_blocked_and_spawns_cap_bump(
         for task in tasks
         if (task.context or {}).get("spawned_by") == "ci_compliance_cap_bump_gate"
     ]
-    # Qualification reports the blocker to Strategic; it does not hard-code a
-    # release-specific repair task. Strategic retains normal task-spawning
-    # authority and can choose the appropriate repair from this evidence.
-    assert cap_bump_tasks == []
+    # The block site spawns the cap-bump repair directly so the blocked
+    # qualification always leaves a queued repair behind — Strategic never has
+    # to discover the breach on its own for the loop to close.
+    assert len(cap_bump_tasks) == 1
+    repair_task = cap_bump_tasks[0]
+    assert repair_task.status == TaskStatus.QUEUED
+    assert repair_task.context["head_sha"] == _HEAD_SHA
 
     # Observability: the CI-compliance block is recorded durably on the version
     # row (queryable via the strategic payload / version fetch), not just logged.
@@ -312,9 +827,310 @@ async def test_noncompliant_qualify_request_is_blocked_and_spawns_cap_bump(
     blocked_trace = version.last_qualification["qualify_request_blocked"]
     assert blocked_trace["blocker"] == "ci_compliance"
     assert blocked_trace["head_sha"] == _HEAD_SHA
-    assert blocked_trace["repair_task"] is None
+    assert blocked_trace["repair_task"] == str(repair_task.id)
     assert "qualify_request_blocked_at" in version.last_qualification
     assert refresh_required is True
+
+    # The operator is notified through the alert policy (FAIL-CLOSED route_event
+    # is overridden by the explicit registration in message_audience).
+    alerts = (
+        await db_session.execute(select(Alert).where(Alert.project_id == project.id))
+    ).scalars().all()
+    assert len(alerts) == 1
+    assert alerts[0].event_type == "release.qualification_ci_compliance_block"
+    assert alerts[0].task_id == repair_task.id
+
+
+@pytest.mark.asyncio
+async def test_sweep_rechecks_still_blocked_and_backstops_repair(db_session, mocker):
+    """A still-violating HEAD keeps its block marker and gets a repair task.
+
+    Covers the pre-fix gap directly: a version blocked when the block site had
+    no spawn (repair_task=None, nothing queued) is re-evaluated by the sweep,
+    which backstops a cap-bump repair so the loop is not dead.
+    """
+    from app import release_version as rv
+    from app.release_qualifier_sweep import _recheck_ci_compliance_blocked_version
+
+    project, agent_task = await _make_project_with_agent_task(
+        db_session, module_line_count=_CAP + 4, mocker=mocker
+    )
+    stored_result = _violation_result(_CAP + 4)
+    ci_compliance.record_ci_compliance(project, stored_result)
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    rv.set_version_phase(version, "stabilize", reasoning="ready to qualify")
+    version.last_qualification = {
+        "qualify_request_blocked": {
+            "blocker": "ci_compliance",
+            "blocker_class": "actionable",
+            "violation_count": 1,
+            "head_sha": _HEAD_SHA,
+            "repair_task": None,
+        },
+        "qualify_request_blocked_at": "2026-08-06T00:00:00+00:00",
+    }
+    db_session.add(version)
+    db_session.add(project)
+    await db_session.commit()
+
+    async def _stored_current(_session, _project):
+        return {
+            "status": "success",
+            "integration_branch": "automain",
+            "head_sha": _HEAD_SHA,
+            "data": stored_result,
+            "computed": False,
+        }
+
+    mocker.patch(
+        "app.ci_compliance.ensure_current_ci_compliance",
+        new=_stored_current,
+    )
+
+    cleared = await _recheck_ci_compliance_blocked_version(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert cleared is False
+
+    # The durable block marker survives the re-check.
+    await db_session.refresh(version)
+    assert (
+        version.last_qualification["qualify_request_blocked"]["blocker"]
+        == "ci_compliance"
+    )
+
+    # The backstop queued exactly one cap-bump repair task.
+    tasks = (
+        await db_session.execute(select(Task).where(Task.project_id == project.id))
+    ).scalars().all()
+    cap_bump_tasks = [
+        task
+        for task in tasks
+        if (task.context or {}).get("spawned_by") == "ci_compliance_cap_bump_gate"
+    ]
+    assert len(cap_bump_tasks) == 1
+    assert cap_bump_tasks[0].context["head_sha"] == _HEAD_SHA
+
+
+@pytest.mark.asyncio
+async def test_sweep_rechecks_cleared_block_drops_marker_and_rearms_strategic(
+    db_session, mocker
+):
+    """Once HEAD is compliant the sweep drops the stale block and re-arms Strategic.
+
+    The requalify half of the loop: the sweep re-evaluates the blocked version,
+    sees the guardrail is clean, clears the durable marker, and asks the
+    strategist to re-issue its deferred qualify_request.
+    """
+    from app import release_version as rv
+    from app.release_qualifier_sweep import _recheck_ci_compliance_blocked_version
+
+    project, agent_task = await _make_project_with_agent_task(
+        db_session, module_line_count=_CAP - 1, mocker=mocker
+    )
+    compliant_result = {
+        "ref": _HEAD_SHA,
+        "compliant": True,
+        "violations": [],
+        "checked": 1,
+        "limits_available": True,
+    }
+    ci_compliance.record_ci_compliance(project, compliant_result)
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    rv.set_version_phase(version, "stabilize", reasoning="ready to qualify")
+    version.last_qualification = {
+        "qualify_request_blocked": {
+            "blocker": "ci_compliance",
+            "blocker_class": "actionable",
+            "violation_count": 1,
+            "head_sha": _HEAD_SHA,
+            "repair_task": str(agent_task.id),
+        },
+        "qualify_request_blocked_at": "2026-08-06T00:00:00+00:00",
+    }
+    db_session.add(version)
+    db_session.add(project)
+    await db_session.commit()
+
+    async def _stored_current(_session, _project):
+        return {
+            "status": "success",
+            "integration_branch": "automain",
+            "head_sha": _HEAD_SHA,
+            "data": compliant_result,
+            "computed": False,
+        }
+
+    mocker.patch(
+        "app.ci_compliance.ensure_current_ci_compliance",
+        new=_stored_current,
+    )
+    refreshed = []
+
+    async def _fake_refresh(session, project_id, reason, *, skip_locked=True):
+        refreshed.append((project_id, reason))
+        return True
+
+    mocker.patch(
+        "app.strategic_trigger.request_strategic_refresh",
+        new=_fake_refresh,
+    )
+
+    cleared = await _recheck_ci_compliance_blocked_version(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert cleared is True
+
+    await db_session.refresh(version)
+    assert "qualify_request_blocked" not in version.last_qualification
+    assert "qualify_request_blocked_at" not in version.last_qualification
+    assert refreshed and refreshed[0][0] == project.id
+    assert "CI-compliance" in refreshed[0][1]
+
+
+@pytest.mark.asyncio
+async def test_redrive_defers_error_qualification_while_gate_blocked(
+    db_session, mocker
+):
+    """The sweep error re-driver does not spawn a fresh qualification while the
+    stored CI-compliance gate is red — the block→repair→requalify loop owns the
+    version until the guardrail is clean."""
+    from app import release_version as rv
+    from app.release_qualifier_redrive import _redrive_error_qualification
+
+    project, agent_task = await _make_project_with_agent_task(
+        db_session, module_line_count=_CAP + 4, mocker=mocker
+    )
+    stored_result = _violation_result(_CAP + 4)
+    ci_compliance.record_ci_compliance(project, stored_result)
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    rv.set_version_phase(version, "stabilize", reasoning="ready to qualify")
+    version.last_qualification = {
+        "status": "error",
+        "error": "sha_error",
+        "error_redrive_count": 0,
+        "qualification_attempt_id": "attempt-1",
+    }
+    db_session.add(version)
+    db_session.add(project)
+    await db_session.commit()
+
+    run_qualification = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=mocker.AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    redriven = await _redrive_error_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert redriven is False
+    run_qualification.assert_not_awaited()
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_operator_qualify_respects_ci_compliance_gate(db_session, client, mocker):
+    """The operator /qualify lever returns 409 while the stored gate is red.
+
+    Previously the operator lever called run_qualification directly and bypassed
+    the CI-compliance gate entirely; a 409 keeps the gate invariant consistent
+    across the strategic, sweep, and operator paths.
+    """
+    from app import release_version as rv
+    from app.models import ProjectMember
+
+    project, agent_task = await _make_project_with_agent_task(
+        db_session, module_line_count=_CAP + 4, mocker=mocker
+    )
+    stored_result = _violation_result(_CAP + 4)
+    ci_compliance.record_ci_compliance(project, stored_result)
+    db_session.add(
+        ProjectMember(project_id=project.id, user_id="test-user-123", role="owner")
+    )
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    rv.set_version_phase(version, "stabilize", reasoning="ready to qualify")
+    db_session.add(version)
+    db_session.add(project)
+    await db_session.commit()
+
+    resp = await client.post(f"/api/admin/projects/{project.id}/qualify")
+    assert resp.status_code == 409
+    assert "CI-compliance" in resp.text
+
+
+@pytest.mark.asyncio
+async def test_operator_409_distinguishes_unavailable_evidence_from_violations(
+    db_session, client, mocker
+):
+    """The operator /qualify 409 body reflects the blocker class the gate returned.
+
+    A block caused by UNAVAILABLE compliance evidence (limits file / branch-literal
+    rules / repo tree could not be read) fails closed with zero observed
+    violations: the operator must be told compliance could not be evaluated, not
+    that violations exist — no violation count, no cap-bump promise. A block
+    caused by REAL detected violations keeps today's message, including the count
+    and the remediation pointer. Both cases still return 409.
+    """
+    from app import release_version as rv
+    from app.models import ProjectMember
+
+    project, _agent_task = await _make_project_with_agent_task(
+        db_session, module_line_count=_CAP - 1, mocker=mocker
+    )
+    db_session.add(
+        ProjectMember(project_id=project.id, user_id="test-user-123", role="owner")
+    )
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    rv.set_version_phase(version, "stabilize", reasoning="ready to qualify")
+    db_session.add(version)
+    db_session.add(project)
+    await db_session.commit()
+
+    # (a) Unavailable evidence: the evaluator could not read its inputs, so the
+    # gate fails closed with no observed violations.
+    ci_compliance.record_ci_compliance(
+        project,
+        {
+            "ref": _HEAD_SHA,
+            "compliant": True,
+            "violations": [],
+            "branch_literal_violations": [],
+            "checked": 0,
+            "limits_available": False,
+            "tree_available": True,
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    gate = ci_compliance_qualify_gate(project, _HEAD_SHA)
+    assert gate["blocked"] is True
+    assert gate["reason"] == "ci_compliance_evidence_unavailable"
+    assert gate["violation_count"] == 0
+
+    resp = await client.post(f"/api/admin/projects/{project.id}/qualify")
+    assert resp.status_code == 409
+    assert "could not be evaluated" in resp.text
+    assert "violation" not in resp.text.lower()
+    assert "cap-bump" not in resp.text.lower()
+
+    # (b) Real violations: the stored record is non-compliant with an observed
+    # breach; the block keeps the count and the remediation pointer.
+    ci_compliance.record_ci_compliance(project, _violation_result(_CAP + 2))
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    gate = ci_compliance_qualify_gate(project, _HEAD_SHA)
+    assert gate["blocked"] is True
+    assert gate["violation_count"] == 1
+
+    resp = await client.post(f"/api/admin/projects/{project.id}/qualify")
+    assert resp.status_code == 409
+    assert "1 violation(s)" in resp.text
+    assert "cap-bump task is typically queued" in resp.text
 
 
 def test_cap_bump_resolves_orchestrator_runner_dispatch_breach():
@@ -1403,6 +2219,55 @@ def test_cap_bump_resolves_discovery_review_breach():
     )
 
 
+def test_cap_bump_resolves_task_lifecycle_breach():
+    """task_lifecycle.py must be within its cap on the real file tree.
+
+    This guards the cap that was raised 7750 -> 8950 WITHOUT operator approval
+    on Blueprint's worst chronic offender (PR #16787) — the failure mode the
+    chronic-offender governance guard exists to refuse. That bump is reversed
+    here: the approved cap is 7750. The old assertion of >= 8950 was written
+    alongside the unapproved bump, so it encoded the defect rather than the
+    intent. task_lifecycle.py is well under 7750 lines, so this merge-test gate
+    still proves the JSON is consistent with the actual file size on disk and
+    fails if the cap ever rises above the approved figure without an explicit
+    decision, or the file grows past it before the CI invariant suite runs.
+    """
+    json_path = os.path.join(os.path.dirname(__file__), "module_size_limits.json")
+    data = csl.load_limits(json_path)
+    backend_caps = data.get("backend", {})
+
+    target_rel = "task_lifecycle.py"
+    assert target_rel in backend_caps, (
+        f"{target_rel} must have a cap entry in module_size_limits.json"
+    )
+    assert backend_caps[target_rel] == 7750, (
+        f"{target_rel} cap must be the approved figure 7750 (unapproved bump to "
+        f"8950 reverted); got {backend_caps[target_rel]}"
+    )
+
+    # Resolve app/ as testing/'s sibling, matching the Docker harness layout
+    # (see test_cap_bump_resolves_orchestrator_runner_dispatch_breach above).
+    backend_root = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "app")
+    )
+    assert os.path.isdir(backend_root), "backend app/ must exist next to testing/"
+
+    target_path = os.path.join(backend_root, target_rel)
+    assert os.path.isfile(target_path), f"{target_path} must exist on disk"
+
+    actual_count = csl.count_lines(target_path)
+    cap = backend_caps[target_rel]
+    result = csl.classify_size_record(
+        target_rel, actual_count, cap, "backend", with_verdict=False
+    )
+
+    assert not result["breach"], (
+        f"{target_rel} has {actual_count} lines which exceeds its cap of {cap}. "
+        "Run `python3 backend/testing/check_size_limits.py --fix` and commit "
+        "the updated module_size_limits.json."
+    )
+
+
 def test_test_files_within_size_limits():
     """Prove that the ``testing`` section of module_size_limits.json exists and
     is non-empty, and that every test file listed there is actually within its
@@ -1445,4 +2310,53 @@ def test_test_files_within_size_limits():
         )
         + "\nRun `python3 backend/testing/check_size_limits.py --fix --sections testing` "
         "and commit the updated module_size_limits.json."
+    )
+
+
+def test_git_refs_has_no_ci_compliance_branch_literal_fallback():
+    """agent/src/gitRefs.ts must stay clean under the CI-compliance agent scan.
+
+    automain HEAD c783ca41 failed the CI-compliance branch-literal guard on
+    gitRefs.ts:71 (``... || 'automain'`` — a fallback-main pattern the deployed
+    evaluator's allowlist did not carry). The remediation removes the inline
+    fallback literal from the source; this merge-test gate proves it against the
+    real file tree using the SAME patterns and comment-stripping the CI-compliance
+    evaluator applies (AGENT_PATTERNS + the supplemental equality patterns), so a
+    regression — re-introducing the literal or any other branch-decision pattern —
+    fails here before the invariant suite runs.
+
+    The scan deliberately does NOT consult SURFACE_CONFIGS['agent'].allowlist: the
+    deployed CI-compliance evaluator's allowlist lags the tree, so gitRefs.ts must
+    be clean without any allowlist exemption.
+
+    Skips when agent/src is absent (CI's backend-only Docker build context that
+    mounts neither /agent/src nor the repo), mirroring the agent-section skips in
+    this file.
+    """
+    from app.branch_literal_compliance import AGENT_PATTERNS, strip_typescript_with_linenos
+
+    agent_root = _resolve_agent_src_root()
+    if agent_root is None:
+        pytest.skip("agent/src not available in this test environment")
+
+    gitrefs_path = Path(agent_root) / "gitRefs.ts"
+    assert gitrefs_path.is_file(), f"{gitrefs_path} must exist on disk"
+
+    src = gitrefs_path.read_text(encoding="utf-8")
+    violations = []
+    for lineno, line in strip_typescript_with_linenos(src):
+        cleaned = ci_compliance._strip_agent_paren_fallbacks(line)
+        for pat in AGENT_PATTERNS:
+            if pat.regex.search(cleaned):
+                violations.append(f"{lineno} [{pat.name}]: {line.strip()}")
+        for pat_name, pat_re in ci_compliance._AGENT_SUPPLEMENTAL_PATTERNS:
+            if pat_re.search(cleaned):
+                violations.append(f"{lineno} [{pat_name}]: {line.strip()}")
+
+    assert not violations, (
+        "agent/src/gitRefs.ts contains a hardcoded branch literal the "
+        "CI-compliance agent scan flags; no allowlist entry may exempt it "
+        "(the deployed evaluator's allowlist lags the tree):\n"
+        + "\n".join(violations)
+        + "\nResolve the branch through a named constant or per-project config."
     )

@@ -1304,6 +1304,11 @@ async def test_in_flight_rubric_lifecycle_changes_require_fresh_grade(
     await db_session.refresh(version)
     assert version.last_qualification["category_verdicts"] is None
     assert version.last_qualification["rubric_fingerprint"] == first_fingerprint
+    # A rubric_changed attempt measured nothing under the final rubric: it is
+    # NEVER ledgered as an immutable QualificationVerdict row (mirrors
+    # infra_failure's "HOLD, no verdict recorded"), so it cannot be counted as a
+    # failed attempt by the readiness aggregation.  The hold's durable record is
+    # last_qualification itself, which carries the rubric-drift detail.
     verdict = (
         await db_session.execute(
             select(QualificationVerdict)
@@ -1311,10 +1316,14 @@ async def test_in_flight_rubric_lifecycle_changes_require_fresh_grade(
             .order_by(QualificationVerdict.created_at.desc())
         )
     ).scalars().first()
-    assert verdict is not None
-    assert verdict.terminal_status == "rubric_changed"
-    assert verdict.blocker == "rubric_changed"
-    assert verdict.merge_grade_detail["rubric_drift"]["total_changes"] >= 1
+    assert verdict is None, (
+        "rubric_changed must not write a QualificationVerdict row — it is a "
+        "recoverable hold, not a failed attempt"
+    )
+    assert (
+        version.last_qualification["merge_grade"]["rubric_drift"]["total_changes"]
+        >= 1
+    )
 
     redrive = await rq.run_qualification(
         db_session, project.id, version, explicit_request=True
@@ -2873,11 +2882,13 @@ async def test_delta_scoped_audit_reuses_unchanged_surface_without_respawn(
     db_session,
     mocker,
 ):
-    """Cross-SHA audit facts reuse identical trees and scope changed trees.
+    """Cross-SHA audit facts reuse identical trees and refuse dirty bases.
 
     An excluded-only advance copies the prior fact without an audit spawn; a
-    one-file change uses the prior candidate as its incremental base and carries
-    only findings from unchanged paths.
+    one-file change against a prior audit that LEFT findings does NOT adopt
+    that prior as an incremental base — the ledger hint is refused and the
+    audit runs the safe wider (full) range, so the dirty prior's findings
+    cannot be silently dropped from the new audit's view.
     """
     project, version = await _make_project_and_version(db_session, phase="stabilize")
     old_sha = "0ldaudit" * 5
@@ -3037,7 +3048,11 @@ async def test_delta_scoped_audit_reuses_unchanged_surface_without_respawn(
 
     assert changed_result["status"] == "spawned"
     audit_spawn.assert_awaited_once()
-    assert audit_spawn.await_args.kwargs["audit_base_sha"] == same_surface_sha
+    # The prior audit left findings (unchanged_finding + superseded_finding), so
+    # the ledger hint must be refused and the audit runs the safe wider (full)
+    # range — never an incremental base that would skip the dirty prior's
+    # findings. changed_audited_paths is still recorded for the spawn.
+    assert audit_spawn.await_args.kwargs["audit_base_sha"] is None
     assert version.last_qualification["changed_audited_paths"] == [
         "backend/app/changed.py"
     ]

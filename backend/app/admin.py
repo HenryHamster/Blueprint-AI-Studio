@@ -62,6 +62,7 @@ from app.task_locking import task_lock
 from app.payload_schemas import (
     ComputeSuccessCriterion,
     TaskType,
+    format_payload_validation_error,
     validate_task_payload,
 )
 from app.task_capabilities import (
@@ -76,6 +77,7 @@ from app.compute_experiment_contract import (
 from app.compute_jobs import clamp_spend_cap_usd, clamp_deadline_seconds
 from app.vm_cost_rates import (
     get_compute_rate_per_second,
+    resolve_accelerator_spec,
     resolve_compute_machine_type,
     validate_compute_request,
 )
@@ -2451,6 +2453,13 @@ class CreateTaskPayload(BaseModel):
     # The agent handler branches hotfix/* off main and the orchestrator
     # back-merges main → automain after the hotfix lands.
     hotfix: bool = False
+    # Plan-time acceptance_evidence declaration for code-producing task types
+    # (create / fix / refactor / qa / migrate / deps / docs). Required for those
+    # types: validate_task_payload rejects a code payload that omits it, so a
+    # merged task has a proof the acceptance gate can check and mint criterion
+    # credit from. The raw dict is validated strictly against
+    # payload_schemas.AcceptanceEvidence at validate_task_payload time.
+    acceptance_evidence: dict[str, Any] | None = None
     # Optional originating ProjectMessage (e.g. a BUG_REPORT) this task is being
     # spawned from. Additive and backward compatible — omitted by existing
     # callers. When provided for an ``investigate`` task, the message's citations
@@ -2782,6 +2791,8 @@ async def create_task_manually(
         "prompt": payload.prompt,
         "base_branch": resolved_base_branch,
     }
+    if payload.acceptance_evidence is not None:
+        task_payload["acceptance_evidence"] = payload.acceptance_evidence
     if payload.model is not None:
         task_payload["model"] = payload.model
     if payload.effort is not None:
@@ -2920,7 +2931,9 @@ async def create_task_manually(
         logger.warning(
             "Validation error in task payload: %s: %s", type(exc).__name__, exc
         )
-        raise HTTPException(status_code=422, detail="Invalid request")
+        raise HTTPException(
+            status_code=422, detail=format_payload_validation_error(exc)
+        )
 
     # Guard: cap active tasks per project to prevent queue explosion
     active_count = (
@@ -3723,13 +3736,34 @@ async def create_compute_experiment_task(
         launch_contract.get("machine_type"),
     )
     if gpu_reason is not None:
-        raise HTTPException(status_code=422, detail=gpu_reason)
+        # Runner-pinned contracts execute on operator hardware whose GPUs are
+        # not in the GCP-shaped catalog (e.g. RTX 5080); create_compute_job
+        # accepts any non-empty accelerator name for the runner-subprocess
+        # backend, so don't pre-reject those here. Everything else (unpinned
+        # contracts, catalog names with shape mismatches) stays strict.
+        _raw_accel = str(launch_contract.get("accelerator") or "").strip()
+        _pinned_noncatalog_accel = (
+            payload.runner_target is not None
+            and bool(_raw_accel)
+            and resolve_accelerator_spec(_raw_accel) is None
+        )
+        if not _pinned_noncatalog_accel:
+            raise HTTPException(status_code=422, detail=gpu_reason)
 
     # Enforce the project's hardware policy before persisting the Task so a
     # project-disallowed accelerator or machine type fails at dispatch time
     # rather than silently passing the form and dying later in create_compute_job.
     _lc_accelerator = launch_contract.get("accelerator")
-    _canonical_accelerator = accel_spec.name if accel_spec is not None else None
+    # Non-catalog names (runner-pinned only — anything else raised above) keep
+    # the raw trimmed name so GPU contracts are checked against
+    # allowed_accelerator_types, mirroring _check_project_hardware_policy.
+    _canonical_accelerator = (
+        accel_spec.name
+        if accel_spec is not None
+        else (str(_lc_accelerator).strip() or None)
+        if _lc_accelerator
+        else None
+    )
     _resolved_mt = resolve_compute_machine_type(
         accelerator=_lc_accelerator,
         machine_type=launch_contract.get("machine_type"),
@@ -3824,7 +3858,9 @@ async def create_compute_experiment_task(
         logger.warning(
             "Validation error in task payload: %s: %s", type(exc).__name__, exc
         )
-        raise HTTPException(status_code=422, detail="Invalid request")
+        raise HTTPException(
+            status_code=422, detail=format_payload_validation_error(exc)
+        )
 
     active_count = (
         await session.execute(
@@ -4054,7 +4090,10 @@ async def rerun_compute_experiment(
         task_payload = validate_task_payload(new_payload_raw)
     except ValueError as exc:
         logger.warning("Rerun payload validation error: %s: %s", type(exc).__name__, exc)
-        raise HTTPException(status_code=422, detail="Invalid re-run payload")
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid re-run payload: {format_payload_validation_error(exc)}",
+        )
 
     # Load the project to check spend-approval threshold.
     project = await session.get(Project, source.project_id)

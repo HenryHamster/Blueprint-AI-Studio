@@ -14,7 +14,16 @@ import { createRequire } from 'module';
 
 const _require = createRequire(import.meta.url);
 
-const { computeGates, CRITERION_STEP_REQUIREMENTS } = _require(
+const {
+  computeGates,
+  CRITERION_STEP_REQUIREMENTS,
+  resolveCriterionResults,
+  shouldEmitResolvedRows,
+  WALKTHROUGH_FLOW_GROUPS,
+  WALKTHROUGH_E2E_LEGACY_HARNESS_KEYS,
+  WALKTHROUGH_E2E_SUBSTANTIVE_LEGACY_KEYS,
+  WALKTHROUGH_META_CRITERION_KEY,
+} = _require(
   '../../../scripts/walkthrough/criterion-gates.cjs',
 ) as {
   computeGates: (
@@ -27,6 +36,18 @@ const { computeGates, CRITERION_STEP_REQUIREMENTS } = _require(
     walkthroughMetaPassed: boolean;
   };
   CRITERION_STEP_REQUIREMENTS: Record<string, string[]>;
+  resolveCriterionResults: (
+    activeCriteria: Array<{ criterion_key: string; text: string }>,
+    results: Array<{ name: string; verdict: string }>,
+    shaValid: boolean,
+  ) => Array<{ criterion_key: string; passed: boolean; notes: string }>;
+  shouldEmitResolvedRows: (
+    resolvedRows: Array<{ criterion_key: string; passed: boolean; notes: string }>,
+  ) => boolean;
+  WALKTHROUGH_FLOW_GROUPS: Array<{ flow: string; markers: string[]; steps: string[] }>;
+  WALKTHROUGH_E2E_LEGACY_HARNESS_KEYS: string[];
+  WALKTHROUGH_E2E_SUBSTANTIVE_LEGACY_KEYS: string[];
+  WALKTHROUGH_META_CRITERION_KEY: string;
 };
 
 /** Build a synthetic results array with the given step-name prefixes passing. */
@@ -229,5 +250,214 @@ describe('meta criterion (c-5214996f)', () => {
     const withoutClickToTalk = ALL_STEPS.filter((s) => s !== '5f.');
     const { walkthroughMetaPassed } = computeGates(makeResults(withoutClickToTalk), true);
     expect(walkthroughMetaPassed).toBe(false);
+  });
+});
+
+// ── Open-rubric resolution (resolveCriterionResults) ────────────────────────────
+
+/** The frozen four-row report key contract (legacy harness output). */
+const FOUR_LEGACY_KEYS = [
+  'c-dfdc9d82',
+  'c-f52fd975',
+  'c-workday-session-lifecycle',
+  'c-5214996f',
+];
+
+/** A rubric that re-minted every walkthrough criterion under fresh keys. */
+const FRESH_RUBRIC = [
+  { criterion_key: 'c-runner-42', text: 'Runner enrollment proves the daemon heartbeats' },
+  { criterion_key: 'c-iframe-42', text: 'Iframe subresource token and project tools lifecycle' },
+  { criterion_key: 'c-workday-42', text: 'Workday session lifecycle' },
+];
+
+/** The legacy v26 rubric verbatim (all four legacy criteria active). */
+const LEGACY_RUBRIC = [
+  { criterion_key: 'c-dfdc9d82', text: 'Runner enrollment' },
+  { criterion_key: 'c-f52fd975', text: 'Iframe subresource token and project tools' },
+  { criterion_key: 'c-workday-session-lifecycle', text: 'Workday session lifecycle' },
+  { criterion_key: 'c-5214996f', text: 'Real walkthrough criterion' },
+];
+
+describe('resolveCriterionResults — open-rubric criteria resolution', () => {
+  it('test_open_rubric_criteria_resolution_emits_fresh_keys', () => {
+    const rows = resolveCriterionResults(FRESH_RUBRIC, makeResults(ALL_STEPS), true);
+    // The report is keyed by the rubric's ACTIVE walkthrough-provable criteria,
+    // not the retired v26 keys.
+    expect(rows.map((r) => r.criterion_key)).toEqual([
+      'c-runner-42',
+      'c-iframe-42',
+      'c-workday-42',
+    ]);
+    for (const row of rows) {
+      expect(row.passed).toBe(true);
+      expect(typeof row.notes).toBe('string');
+      expect(row.notes.length).toBeGreaterThan(0);
+    }
+  });
+
+  it('fresh keys: per-flow pass booleans track their flow gates', () => {
+    const withoutHeartbeat = ALL_STEPS.filter((s) => s !== '1d.');
+    const rows = resolveCriterionResults(FRESH_RUBRIC, makeResults(withoutHeartbeat), true);
+    expect(rows.find((r) => r.criterion_key === 'c-runner-42')?.passed).toBe(false);
+    expect(rows.find((r) => r.criterion_key === 'c-iframe-42')?.passed).toBe(true);
+    expect(rows.find((r) => r.criterion_key === 'c-workday-42')?.passed).toBe(true);
+  });
+
+  it('legacy keys still resolve to the complete four-row legacy report', () => {
+    const rows = resolveCriterionResults(LEGACY_RUBRIC, makeResults(ALL_STEPS), true);
+    expect(rows.map((r) => r.criterion_key)).toEqual(FOUR_LEGACY_KEYS);
+    expect(rows.every((r) => r.passed)).toBe(true);
+  });
+
+  it('meta c-5214996f passes only when every substantive sub-criterion passes in the same batch', () => {
+    const rubric = [
+      { criterion_key: 'c-dfdc9d82', text: 'Runner enrollment' },
+      { criterion_key: 'c-f52fd975', text: 'Iframe subresource token' },
+      { criterion_key: 'c-5214996f', text: 'Real walkthrough criterion' },
+    ];
+    const allPassRows = resolveCriterionResults(rubric, makeResults(ALL_STEPS), true);
+    expect(allPassRows.find((r) => r.criterion_key === 'c-5214996f')?.passed).toBe(true);
+
+    const withoutHeartbeat = resolveCriterionResults(
+      rubric,
+      makeResults(ALL_STEPS.filter((s) => s !== '1d.')),
+      true,
+    );
+    expect(withoutHeartbeat.find((r) => r.criterion_key === 'c-5214996f')?.passed).toBe(false);
+  });
+
+  it('meta c-5214996f fails closed with zero substantive sub-criteria', () => {
+    const rows = resolveCriterionResults(
+      [{ criterion_key: 'c-5214996f', text: 'Real walkthrough criterion' }],
+      makeResults(ALL_STEPS),
+      true,
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0].criterion_key).toBe(WALKTHROUGH_META_CRITERION_KEY);
+    expect(rows[0].passed).toBe(false);
+  });
+
+  it('all rows fail when shaValid is false, regardless of step verdicts', () => {
+    const rows = resolveCriterionResults(FRESH_RUBRIC, makeResults(ALL_STEPS), false);
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows.every((r) => r.passed)).toBe(false);
+  });
+
+  it('omits active criteria whose text matches no flow marker and whose key is not legacy', () => {
+    const rows = resolveCriterionResults(
+      [{ criterion_key: 'c-compute-1', text: 'Compute viewable artifacts' }],
+      makeResults(ALL_STEPS),
+      true,
+    );
+    expect(rows).toHaveLength(0);
+  });
+
+  it('matches flow markers case-insensitively', () => {
+    const rows = resolveCriterionResults(
+      [{ criterion_key: 'c-runner-99', text: 'RUNNER ENROLLMENT end-to-end' }],
+      makeResults(['1a.', '1b.', '1d.', '6a.', '6b.']),
+      true,
+    );
+    expect(rows.map((r) => r.criterion_key)).toEqual(['c-runner-99']);
+    expect(rows[0].passed).toBe(true);
+  });
+
+  it('exports the flow groups, legacy keys, and meta key the resolver mirrors', () => {
+    // Mirrors backend/app/acceptance_criteria.py WALKTHROUGH_E2E_FLOW_MARKERS.
+    expect(WALKTHROUGH_FLOW_GROUPS.map((g) => g.flow)).toEqual(['runner', 'iframe', 'workday']);
+    expect(WALKTHROUGH_FLOW_GROUPS.find((g) => g.flow === 'runner')?.markers).toEqual([
+      'runner enroll',
+      'runner enrollment',
+    ]);
+    expect(WALKTHROUGH_FLOW_GROUPS.find((g) => g.flow === 'iframe')?.markers).toEqual([
+      'iframe',
+      'subresource token',
+      'project tool',
+    ]);
+    expect(WALKTHROUGH_FLOW_GROUPS.find((g) => g.flow === 'workday')?.markers).toEqual([
+      'workday',
+    ]);
+    // Mirrors backend WALKTHROUGH_E2E_LEGACY_HARNESS_KEYS + _WALKTHROUGH_META_CRITERION_KEY.
+    expect(WALKTHROUGH_E2E_LEGACY_HARNESS_KEYS).toEqual([
+      'c-dfdc9d82',
+      'c-f52fd975',
+      'c-5214996f',
+    ]);
+    // Mirrors backend _WALKTHROUGH_E2E_SUBSTANTIVE_LEGACY_RAW_KEYS: the meta key
+    // is NOT a legacy signal, so it is absent from the substantive subset.
+    expect(WALKTHROUGH_E2E_SUBSTANTIVE_LEGACY_KEYS).toEqual([
+      'c-dfdc9d82',
+      'c-f52fd975',
+      'c-workday-session-lifecycle',
+    ]);
+    expect(WALKTHROUGH_META_CRITERION_KEY).toBe('c-5214996f');
+  });
+
+  it('fresh-substantive + active-meta rubric: emits the fresh rows AND the meta row', () => {
+    // The exact shape from backend test_meta_criterion_gate_resolves_active_rubric:
+    // substantive walkthrough criteria re-minted under fresh keys while the
+    // canonical meta criterion c-5214996f stays active. The resolved report must
+    // carry the fresh rows + the meta row — NOT the legacy four-row report.
+    const freshWithMeta = [
+      { criterion_key: 'c-fresh-runner-enroll', text: 'Runner enrollment validates credentials against the fleet' },
+      { criterion_key: 'c-fresh-iframe-token', text: 'Project Tools iframe subresource token is minted and served' },
+      { criterion_key: 'c-5214996f', text: 'Workday click-to-talk session lifecycle (re-walk)' },
+    ];
+    const rows = resolveCriterionResults(freshWithMeta, makeResults(ALL_STEPS), true);
+    expect(rows.map((r) => r.criterion_key)).toEqual([
+      'c-fresh-runner-enroll',
+      'c-fresh-iframe-token',
+      'c-5214996f',
+    ]);
+    expect(rows.every((r) => r.passed)).toBe(true);
+    // The meta row is the conjunction: it fails when a fresh substantive row fails.
+    const withoutHeartbeat = resolveCriterionResults(
+      freshWithMeta,
+      makeResults(ALL_STEPS.filter((s) => s !== '1d.')),
+      true,
+    );
+    expect(withoutHeartbeat.find((r) => r.criterion_key === 'c-fresh-runner-enroll')?.passed).toBe(false);
+    expect(withoutHeartbeat.find((r) => r.criterion_key === 'c-5214996f')?.passed).toBe(false);
+  });
+});
+
+// ── writeJsonResult fallback decision (shouldEmitResolvedRows) ───────────────────
+
+describe('shouldEmitResolvedRows — writeJsonResult fallback decision', () => {
+  const FRESH_WITH_META = [
+    { criterion_key: 'c-fresh-runner-enroll', text: 'Runner enrollment validates credentials against the fleet' },
+    { criterion_key: 'c-fresh-iframe-token', text: 'Project Tools iframe subresource token is minted and served' },
+    { criterion_key: 'c-5214996f', text: 'Workday click-to-talk session lifecycle (re-walk)' },
+  ];
+
+  it('emits resolved rows for a fresh-substantive + active-meta rubric (meta is NOT a legacy signal)', () => {
+    const resolved = resolveCriterionResults(FRESH_WITH_META, makeResults(ALL_STEPS), true);
+    expect(shouldEmitResolvedRows(resolved)).toBe(true);
+  });
+
+  it('emits resolved rows for a pure fresh rubric with no meta row', () => {
+    const resolved = resolveCriterionResults(FRESH_RUBRIC, makeResults(ALL_STEPS), true);
+    expect(shouldEmitResolvedRows(resolved)).toBe(true);
+  });
+
+  it('falls back to the legacy report when the rubric still carries a substantive legacy key', () => {
+    const resolved = resolveCriterionResults(LEGACY_RUBRIC, makeResults(ALL_STEPS), true);
+    expect(resolved.some((r) => WALKTHROUGH_E2E_SUBSTANTIVE_LEGACY_KEYS.includes(r.criterion_key))).toBe(true);
+    expect(shouldEmitResolvedRows(resolved)).toBe(false);
+  });
+
+  it('falls back to the legacy report on an empty resolved batch (no walkthrough-provable criteria)', () => {
+    expect(shouldEmitResolvedRows([])).toBe(false);
+    expect(shouldEmitResolvedRows(null as unknown as never[])).toBe(false);
+  });
+
+  it('falls back when a resolved batch is entirely non-walkthrough criteria', () => {
+    const resolved = resolveCriterionResults(
+      [{ criterion_key: 'c-compute-1', text: 'Compute viewable artifacts' }],
+      makeResults(ALL_STEPS),
+      true,
+    );
+    expect(resolved).toHaveLength(0);
+    expect(shouldEmitResolvedRows(resolved)).toBe(false);
   });
 });

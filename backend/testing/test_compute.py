@@ -5605,6 +5605,215 @@ async def test_create_compute_job_selects_gcp_when_no_gpu(db_session, monkeypatc
     assert job.backend == "gcp"
 
 
+async def _make_runner_pinned_compute_task(db_session):
+    """A compute_experiment task pinned to a (fictional) registered runner."""
+    project = Project(name="Pinned GPU Compute Job", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+        context={
+            "runner_target_id": str(uuid.uuid4()),
+            "runner_hostname": "hamsterwheel",
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_runner_pinned_accepts_noncatalog_accelerator(
+    db_session, monkeypatch
+):
+    """A runner-pinned job with an operator-hardware GPU name (not in the GCP
+    catalog) launches on the runner-subprocess backend with the raw name."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", False)
+    # No local GPU on the orchestrator host: if the pin did not drive backend
+    # prediction, the job would route to gcp and be catalog-rejected.
+    monkeypatch.setattr(compute_jobs, "detect_local_gpu", lambda: None)
+    task = await _make_runner_pinned_compute_task(db_session)
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        spend_cap_usd=5.0,
+        deadline_seconds=600,
+        accelerator="RTX 5080",
+    )
+    assert job.backend == RUNNER_SUBPROCESS_BACKEND_NAME
+    assert job.accelerator_type == "RTX 5080"
+    assert job.accelerator_count == 1
+    # Operator hardware accrues no cloud cost — the GPU surcharge path is never
+    # consulted for a non-catalog name.
+    assert job.polling_metadata["cost_rate_per_second"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_runner_pinned_trims_noncatalog_accelerator(
+    db_session, monkeypatch
+):
+    """Whitespace around a non-catalog accelerator name is trimmed on persist."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", False)
+    monkeypatch.setattr(compute_jobs, "detect_local_gpu", lambda: None)
+    task = await _make_runner_pinned_compute_task(db_session)
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        spend_cap_usd=5.0,
+        deadline_seconds=600,
+        accelerator="  RTX 5080  ",
+    )
+    assert job.accelerator_type == "RTX 5080"
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_runner_pinned_canonicalizes_catalog_accelerator(
+    db_session, monkeypatch
+):
+    """A runner-pinned job whose accelerator DOES resolve in the catalog keeps
+    today's canonicalization (name and machine-type pairing)."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", False)
+    monkeypatch.setattr(compute_jobs, "detect_local_gpu", lambda: None)
+    task = await _make_runner_pinned_compute_task(db_session)
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        spend_cap_usd=5.0,
+        deadline_seconds=600,
+        accelerator="nvidia-tesla-v100",
+    )
+    assert job.backend == RUNNER_SUBPROCESS_BACKEND_NAME
+    assert job.accelerator_type == "V100"
+    assert job.machine_type == "n1-standard-1"
+    assert job.polling_metadata["cost_rate_per_second"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_gcp_fallback_still_rejects_noncatalog_accelerator(
+    db_session, monkeypatch
+):
+    """No pin, no explicit backend, no local GPU → gcp routing keeps the strict
+    catalog gate for a non-catalog accelerator name."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", False)
+    monkeypatch.setattr(compute_jobs, "detect_local_gpu", lambda: None)
+    task = await _make_compute_task(db_session)
+    with pytest.raises(ValueError, match=r"unsupported accelerator 'RTX 5080'"):
+        await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="python train.py",
+            spend_cap_usd=5.0,
+            deadline_seconds=600,
+            accelerator="RTX 5080",
+        )
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_explicit_gcp_rejects_noncatalog_accelerator(
+    db_session, monkeypatch
+):
+    """backend_name='gcp' + non-catalog accelerator is rejected loudly."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", False)
+    task = await _make_compute_task(db_session)
+    with pytest.raises(ValueError, match=r"unsupported accelerator 'RTX 5080'"):
+        await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="python train.py",
+            spend_cap_usd=5.0,
+            deadline_seconds=600,
+            backend_name="gcp",
+            accelerator="RTX 5080",
+        )
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_local_gpu_backend_accepts_noncatalog_accelerator(
+    db_session, monkeypatch
+):
+    """Explicit local-gpu backend accepts a non-catalog accelerator name at $0."""
+    from app import compute_backends as cb
+
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    gpu = {"name": "NVIDIA GeForce RTX 5080", "memory_mib": 16384}
+    monkeypatch.setattr(cb, "detect_local_gpu", lambda: gpu)
+    monkeypatch.setattr(compute_jobs, "detect_local_gpu", lambda: gpu)
+    task = await _make_compute_task(db_session)
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        spend_cap_usd=5.0,
+        deadline_seconds=600,
+        backend_name="local-gpu",
+        accelerator="RTX 5080",
+    )
+    assert job.backend == "local-gpu"
+    assert job.accelerator_type == "RTX 5080"
+    assert job.polling_metadata["cost_rate_per_second"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_rejects_multi_gpu_on_every_backend(
+    db_session, monkeypatch
+):
+    """count != 1 is rejected on every backend, catalog and non-catalog alike."""
+    from app import compute_backends as cb
+
+    monkeypatch.setattr(compute, "LOCAL_MODE", False)
+    gpu = {"name": "NVIDIA GeForce RTX 5080", "memory_mib": 16384}
+    monkeypatch.setattr(cb, "detect_local_gpu", lambda: gpu)
+    monkeypatch.setattr(compute_jobs, "detect_local_gpu", lambda: gpu)
+
+    # Runner-pinned, non-catalog name.
+    pinned = await _make_runner_pinned_compute_task(db_session)
+    with pytest.raises(ValueError, match="only single-GPU"):
+        await compute_jobs.create_compute_job(
+            db_session,
+            pinned,
+            command="python train.py",
+            spend_cap_usd=5.0,
+            deadline_seconds=600,
+            accelerator="RTX 5080",
+            accelerator_count=2,
+        )
+
+    # Explicit local-gpu backend, non-catalog name.
+    task_local = await _make_compute_task(db_session)
+    with pytest.raises(ValueError, match="only single-GPU"):
+        await compute_jobs.create_compute_job(
+            db_session,
+            task_local,
+            command="python train.py",
+            spend_cap_usd=5.0,
+            deadline_seconds=600,
+            backend_name="local-gpu",
+            accelerator="RTX 5080",
+            accelerator_count=2,
+        )
+
+    # GCP, catalog name.
+    task_gcp = await _make_compute_task(db_session)
+    with pytest.raises(ValueError, match="only single-GPU"):
+        await compute_jobs.create_compute_job(
+            db_session,
+            task_gcp,
+            command="python train.py",
+            spend_cap_usd=5.0,
+            deadline_seconds=600,
+            backend_name="gcp",
+            accelerator="T4",
+            accelerator_count=2,
+        )
+
+
 @pytest.mark.asyncio
 async def test_local_subprocess_still_rejected_for_gpu(db_session, monkeypatch):
     """Explicitly requesting local-subprocess with a GPU job raises ValueError."""

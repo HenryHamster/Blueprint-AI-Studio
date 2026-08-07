@@ -3538,6 +3538,35 @@ def _parse_capability_proof_trial_result(task: Task, logs: str) -> dict | None:
     return None
 
 
+def _parse_criterion_named_test_trial_result(task: Task, logs: str) -> dict | None:
+    """Extract a ``criterion_named_test_trial`` agent-reported result dict.
+
+    The agent's bespoke handler reports
+    ``{type, criterion_key, head_sha, queued_head_sha, test_refs, ran, passed,
+    skipped_summary?, could_not_run}``. We accept it from either the durable
+    ``task.plan_output`` (a dict) or the raw reported ``logs`` (JSON, optionally
+    wrapped under a ``criterion_named_test_trial_result`` key). Returns the
+    result dict, or ``None`` when nothing parseable is present. Never raises.
+    """
+    po = getattr(task, "plan_output", None)
+    if isinstance(po, dict) and (
+        "ran" in po or po.get("type") == "criterion_named_test_trial"
+    ):
+        return po
+    if isinstance(logs, str) and logs.strip():
+        try:
+            parsed = json.loads(logs)
+        except (ValueError, TypeError):
+            parsed = None
+        if isinstance(parsed, dict):
+            inner = parsed.get("criterion_named_test_trial_result")
+            if isinstance(inner, dict):
+                return inner
+            if "ran" in parsed or parsed.get("type") == "criterion_named_test_trial":
+                return parsed
+    return None
+
+
 async def _handle_capability_proof_trial_completion(
     task: Task, logs: str, session: AsyncSession
 ) -> None:
@@ -3814,6 +3843,292 @@ async def _handle_capability_proof_trial_completion(
         except Exception:  # noqa: BLE001
             logger.debug(
                 "[CAP_TRIAL] rollback after ingestion failure also failed",
+                exc_info=True,
+            )
+
+
+async def _handle_criterion_named_test_trial_completion(
+    task: Task, logs: str, session: AsyncSession
+) -> None:
+    """Ingest a ``criterion_named_test_trial``'s executed-test result as evidence.
+
+    The agent handler runs a merged task's declared covering tests as a targeted
+    runner job at the pinned head and reports
+    ``{type, criterion_key, head_sha, queued_head_sha, test_refs, ran, passed,
+    skipped_summary?, could_not_run}``. This handler is the INGESTION half of the
+    executed-named-test evidence lane:
+
+      * On a GREEN result (:func:`ci_resolution.capability_proof_trial_is_green` —
+        the tests actually ran and passed and the suite verified something), it
+        mints machine-verified ``covered`` criterion evidence via
+        :func:`app.acceptance_criteria.record_named_test_execution_evidence`,
+        which itself FAIL-CLOSES unless the executed SHA matches the version's
+        qualifying candidate SHA.
+      * On a RED / skipped / could-not-run result, or on ANY receipt-contract
+        mismatch (criterion key / test_refs / head_sha), it mints NOTHING and
+        stamps a ``criterion_named_test_trial_contradiction`` on ``task.context``
+        for strategist visibility only — it NEVER demotes existing evidence.
+
+    **Receipt completeness requirement**: a GREEN receipt must name the enrolled
+    criterion, the *complete* enrolled test suite (``test_refs`` must equal the
+    enrolled set exactly — neither a strict subset nor a superset) and the
+    *actual checkout revision* (``head_sha`` must match the enrolled SHA when one
+    was enrolled). Any mismatch records NO evidence.
+
+    Operator-disableable: the ``criterion_named_test_trials_enabled`` runtime
+    flag defaults to True, and any parse/lookup/record error leaves the
+    criterion at its existing evidence, never worse. Non-raising (the post-commit
+    dispatcher already guards, but the contract here is explicitly no-raise so a
+    malformed trial can never strand the surrounding commit).
+    """
+    try:
+        if not _runtime_config.get("criterion_named_test_trials_enabled", True):
+            logger.info(
+                "[CRITERION_TRIAL] flag off — ingestion skipped for task %s", task.id
+            )
+            return
+
+        from app.ci_resolution import (
+            capability_proof_trial_is_green,
+        )
+
+        result = _parse_criterion_named_test_trial_result(task, logs)
+        if result is None:
+            logger.warning(
+                "[CRITERION_TRIAL] no parseable trial result for task %s — ingesting nothing",
+                task.id,
+            )
+            return
+
+        criterion_key = result.get("criterion_key")
+        if not isinstance(criterion_key, str) or not criterion_key.strip():
+            logger.warning(
+                "[CRITERION_TRIAL] trial result for task %s missing 'criterion_key' "
+                "— ingesting nothing",
+                task.id,
+            )
+            return
+        head_sha = result.get("head_sha")
+        refs = [
+            r for r in (result.get("test_refs") or []) if isinstance(r, str) and r.strip()
+        ]
+
+        async def _record_receipt_contradiction(reason: str) -> None:
+            """Persist an auditable rejection without changing evidence state.
+
+            A receipt-contract failure is neither a test failure nor authority to
+            demote existing evidence. It must nevertheless be visible to the
+            stalled-trial health surface rather than disappearing into logs.
+            """
+            ctx = dict(task.context or {})
+            ctx["criterion_named_test_trial_contradiction"] = {
+                "reason": reason,
+                "criterion_key": criterion_key,
+                "ran": bool(result.get("ran")),
+                "passed": bool(result.get("passed")),
+                "could_not_run": bool(result.get("could_not_run")),
+                "recorded_at": _utcnow().isoformat(),
+            }
+            task.context = ctx
+            flag_modified(task, "context")
+            await session.commit()
+
+        # --- Validate agent-reported result against enrollment contract ---
+        # The enrollment (task.first_payload) is the orchestrator-authored contract
+        # written by the earn-loop enroller. The agent must not be able to mint
+        # evidence for a different criterion, unenrolled test_refs, or a revision
+        # that was never enrolled. On ANY mismatch, record NO evidence and surface
+        # the contradiction on the task context for strategist visibility
+        # (mirroring the non-green fail-open branch).
+        enrolled = task.first_payload
+        if not isinstance(enrolled, dict):
+            logger.warning(
+                "[CRITERION_TRIAL] no enrollment payload for task %s — ingesting nothing",
+                task.id,
+            )
+            return
+
+        enrolled_key = str(enrolled.get("criterion_key") or "").strip()
+        criterion_ids = [
+            k for k in (task.criterion_ids or []) if isinstance(k, str) and k.strip()
+        ]
+        # The reported criterion must be the one the task was enrolled to prove.
+        # The enrollment carries the key directly; legacy/bare enrollments fall
+        # back to the task's bound criterion_ids (which must contain the key).
+        if enrolled_key:
+            if criterion_key != enrolled_key:
+                logger.warning(
+                    "[CRITERION_TRIAL] criterion_key mismatch for task %s — "
+                    "reported=%r enrolled=%r — ingesting nothing",
+                    task.id,
+                    criterion_key,
+                    enrolled_key,
+                )
+                await _record_receipt_contradiction("criterion_key_mismatch")
+                return
+        elif criterion_key not in criterion_ids:
+            logger.warning(
+                "[CRITERION_TRIAL] criterion_key %r not among task %s criterion_ids=%s "
+                "— ingesting nothing",
+                criterion_key,
+                task.id,
+                criterion_ids,
+            )
+            await _record_receipt_contradiction("criterion_key_mismatch")
+            return
+
+        # (2) The receipt must name exactly the enrolled target set.  A subset
+        #     would let a compromised runner omit a hard test, then have its
+        #     green aggregate recorded as though the complete suite had run.
+        #     Belt-and-suspenders: guard empty refs explicitly.
+        refs_enrolled = [
+            r
+            for r in (enrolled.get("test_refs") or [])
+            if isinstance(r, str) and r.strip()
+        ]
+        reported_refs_set = set(refs)
+        enrolled_refs_set = set(refs_enrolled)
+        if not refs or reported_refs_set != enrolled_refs_set:
+            extra = sorted(reported_refs_set - enrolled_refs_set)
+            missing = sorted(enrolled_refs_set - reported_refs_set)
+            logger.warning(
+                "[CRITERION_TRIAL] test_refs mismatch for task %s — "
+                "extra=%s missing=%s — ingesting nothing",
+                task.id,
+                extra,
+                missing,
+            )
+            await _record_receipt_contradiction("test_refs_mismatch")
+            return
+
+        # (3) Reported head_sha must exactly match the enrolled revision.  In
+        #     particular, an empty/missing reported SHA cannot turn an enrolled
+        #     revision-bound trial into an unbound evidence receipt.
+        head_sha_enrolled = (
+            enrolled.get("head_sha") if isinstance(enrolled.get("head_sha"), str) else None
+        )
+        reported_sha = head_sha if isinstance(head_sha, str) else None
+        if head_sha_enrolled and reported_sha != head_sha_enrolled:
+            logger.warning(
+                "[CRITERION_TRIAL] head_sha mismatch for task %s — "
+                "reported=%s, enrolled=%s — ingesting nothing",
+                task.id,
+                reported_sha,
+                head_sha_enrolled,
+            )
+            await _record_receipt_contradiction("head_sha_mismatch")
+            return
+
+        if not capability_proof_trial_is_green(result):
+            # Non-green: NEVER demote on ambiguity (mirrors the capability-proof
+            # design). Surface the contradiction on the task context for the
+            # strategist; no evidence is minted.
+            ctx = dict(task.context or {})
+            ctx["criterion_named_test_trial_contradiction"] = {
+                "criterion_key": criterion_key,
+                "head_sha": head_sha_enrolled,
+                "test_refs": refs_enrolled,
+                "ran": bool(result.get("ran")),
+                "passed": bool(result.get("passed")),
+                "could_not_run": bool(result.get("could_not_run")),
+                "recorded_at": _utcnow().isoformat(),
+            }
+            task.context = ctx
+            flag_modified(task, "context")
+            await session.commit()
+            logger.info(
+                "[CRITERION_TRIAL] non-green trial for criterion=%s (task %s) — "
+                "no evidence minted",
+                criterion_key,
+                task.id,
+            )
+            return
+
+        # --- GREEN receipt — resolve the bound release version and record ---
+        from app.acceptance_criteria import (
+            record_named_test_execution_evidence,
+            task_criterion_release_version_id,
+        )
+        from app.release_version import ReleaseVersion
+
+        if not criterion_ids:
+            logger.warning(
+                "[CRITERION_TRIAL] GREEN trial for task %s but no criterion_ids — "
+                "nothing to record",
+                task.id,
+            )
+            return
+        bound_version_id = task_criterion_release_version_id(task)
+        if bound_version_id is None:
+            logger.warning(
+                "[CRITERION_TRIAL] GREEN trial for task %s has no bound release "
+                "version (context[%s]) — nothing recorded",
+                task.id,
+                "criterion_release_version_id",
+            )
+            return
+        version = await session.get(ReleaseVersion, bound_version_id)
+        if version is None:
+            logger.warning(
+                "[CRITERION_TRIAL] bound release version %s gone for trial task %s "
+                "— nothing recorded",
+                bound_version_id,
+                task.id,
+            )
+            return
+
+        executed_sha = reported_sha or head_sha_enrolled or ""
+        summary = await record_named_test_execution_evidence(
+            session,
+            version,
+            criterion_keys=[criterion_key],
+            executed_sha=executed_sha,
+            test_refs=refs_enrolled,
+            trial_task_id=str(task.id),
+            # Anchor the evidence on the orchestrator-enrolled revision, not the
+            # version's *current* qualifying candidate SHA: that scratch field is
+            # re-pinned by many call sites, so a trial that finishes after any
+            # re-pin would otherwise mint zero evidence even though it ran the
+            # exact enrolled commit.
+            enrolled_sha=head_sha_enrolled,
+        )
+        if summary.get("recorded", 0) > 0:
+            await session.commit()
+            logger.info(
+                "[CRITERION_TRIAL] GREEN trial — recorded covered evidence for "
+                "criterion=%s (task %s, sha=%s, refs=%s, recorded=%s)",
+                criterion_key,
+                task.id,
+                executed_sha[:12] if executed_sha else "",
+                refs_enrolled,
+                summary.get("recorded"),
+            )
+        else:
+            logger.info(
+                "[CRITERION_TRIAL] GREEN trial for criterion=%s (task %s) but recorder "
+                "minted nothing (status=%s reason=%s unmatched=%s) — no evidence",
+                criterion_key,
+                task.id,
+                summary.get("status"),
+                summary.get("rejected_reason"),
+                summary.get("unmatched_keys"),
+            )
+        # NOTE: no event-driven wake here — the codebase has no
+        # acceptance-evidence unblock helper to mirror the capability-proof
+        # completion's wake pattern, so the periodic blocked-task sweep remains
+        # authoritative for any waiters.
+    except Exception:  # noqa: BLE001 — ingestion must fail open, never raise
+        logger.warning(
+            "[CRITERION_TRIAL] ingestion failed for task %s (fail-open — criterion "
+            "left at existing evidence)",
+            getattr(task, "id", None),
+            exc_info=True,
+        )
+        try:
+            await session.rollback()
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[CRITERION_TRIAL] rollback after ingestion failure also failed",
                 exc_info=True,
             )
 

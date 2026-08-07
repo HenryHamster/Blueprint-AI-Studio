@@ -42,8 +42,8 @@
     if [ -n "$_it_all" ]; then
       _it_count=$(printf '%s\n' "$_it_all" | grep -c '^' || true)
       if [ "$_it_count" -gt "$IMPACTED_TEST_CAP" ]; then
-        echo "[check] impacted-test gate: $_it_count impacted test file(s); running first $IMPACTED_TEST_CAP under Postgres, CI verifies the rest:"
-        printf '%s\n' "$_it_all" | tail -n +$((IMPACTED_TEST_CAP + 1)) | sed 's|^|[check]   deferred-to-CI: |'
+        echo "[check] impacted-test gate: $_it_count impacted test file(s); running the $IMPACTED_TEST_CAP most diff-relevant under Postgres. The remainder are NOT covered by this gate or by automain-targeting PR CI — only the promotion-PR full matrix runs them:"
+        printf '%s\n' "$_it_all" | tail -n +$((IMPACTED_TEST_CAP + 1)) | sed 's|^|[check]   deferred-unverified: |'
       fi
       # Strip the backend/ prefix: scripts/test-backend.sh runs from backend/ and
       # expects testing/test_x.py selectors.

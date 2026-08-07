@@ -1215,7 +1215,11 @@ def release(image_ref: str, revision: str) -> Path:
         _atomic_write(
             worker_path,
             _replace_role_values(
-                snapshots[worker_path], {"BLUEPRINT_WORKER_IMAGE_ID": image_id}
+                snapshots[worker_path],
+                {
+                    "BLUEPRINT_WORKER_IMAGE_ID": image_id,
+                    "BLUEPRINT_WORKER_DEPLOY_SHA": revision,
+                },
             ),
         )
         for unit in _ACTIVATION_ORDER:

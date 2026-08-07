@@ -8,7 +8,18 @@ v28's headline goal promises a **median strategist cycle under $1.50**, down fro
 measured **$4.41/cycle**. Nothing in the repo computed that number — this artifact does.
 It derives the projected median from stated inputs, cites each input to its source,
 prices the two caching regimes separately, states every assumption, shows sensitivity,
-and reports the number honestly: **the projected median is above $1.50.**
+and reports the number honestly: **the projected median is above $1.50, and the
+>=30%-below-baseline headline is UNVERIFIED unless the effort-tier split carries a
+measured share or a replayed fail-closed lower bound that itself clears the
+threshold.**
+
+The same script also projects **monthly spend** (§7, criterion c-3fd62b9d): the
+monthly TOTAL is the decision-loop term (per-cycle cost × a cited cycle-volume anchor)
+plus the task-execution term (per-task cost × a cited task-volume anchor), both sourced
+from measured data and shown separately so the split is auditable. At the R=0.70
+sensitivity point and the measured realized volume the total lands at **~$837/month**
+($735 decision loop + $102 task execution) — comfortably within the $3,000/month
+envelope, so the envelope is not the binding constraint at today's cadence.
 
 ---
 
@@ -22,7 +33,7 @@ and reports the number honestly: **the projected median is above $1.50.**
 | Stable prefix rendered | **42,073 bytes ≈ 10,518 tokens** | Measured statically: `buildStrategicStablePrefix` in `agent/src/prompts/thinker.ts` with representative params (`projectName='Blueprint AI Studio'`, `isSelfRepo=true`, 355-byte `selfImprovementBlock` from `agent/src/handlers/strategic.ts`, `PLAYBOOK_GUIDANCE`/`DEFAULT_TOOL_GUIDANCE`/`READ_ONLY_BASH_WRITE_NOTE` from `agent/src/prompt.ts`). |
 | Volatile instruction text | **2,666 bytes ≈ 666 tokens** | Same static render, every per-cycle payload field set to `''`, with the largest conditional instruction blocks active (recover `798 B` + gap-memory trim `687 B` + design-doc overview `626 B` + current-activity intro `383 B` + 591 B direct literal + structural headers — the 2,666 B figure is the exact stripped render, not the author's byte estimate). |
 | Volatile total (representative cycle) | **≈ 104 KB ≈ 26,000 tokens** | 2,666 B instruction + ~100 KB per-cycle payload (large `problem_model` JSON, direction portfolio, context blocks — see the payload pack in `backend/app/strategic_spawning.py`). |
-| Tier mix | Routine → `gpt-5.6-terra` (medium), Consequential → `gpt-5.6-sol` (max) | PR #16730 (`backend/app/strategic_review_effort.py`). **Routine share R is unobserved** — the classifier is inert until v28 promotes. |
+| Tier mix | Routine → `gpt-5.6-terra` (medium), Consequential → `gpt-5.6-sol` (max) | PR #16730 (`backend/app/strategic_review_effort.py`). **Routine share R is read from the effort-tier split** checked in at `backend/scripts/measured_effort_tier_split.json` (written by `strategic_effort_tier_evidence.py --write-json`). The split is accepted in **three states**: **`measured`** (a realised split over stamped cycles), **`replayed`** (the fail-closed replayed **LOWER BOUND**, produced with `--replay`, labelled `measurement_status 'replayed'` / `bound_kind 'fail_closed_lower_bound'` — a lower bound on the classifier's share, never a realised split), and **`unmeasured`** (neither available). The headline reports UNVERIFIED rather than substituting an assumed 0.70 — the fail-closed wiring that replaces the old constant; a measured share is preferred over a replayed lower bound **only when its stamped basis (`measured_denominator_cycles`) covers the whole replayed basis (`denominator_cycles`)** — a stamped SUBSET is strictly narrower evidence than the bound, which already folds those stamps in, so the bound wins there rather than letting one stamped cycle flip the headline. Whichever view drives it, the reported denominator is that share's own basis, never the other view's. A replayed lower bound is never presented as measured. |
 | Pricing (per 1M tokens) | sol: in `$5` / out `$30` / read `$0.50`; terra: in `$2.5` / out `$15` / read `$0.25`; cache create = 1.25× input, cache read = 0.1× input | `backend/app/llm_cost_attribution.py:50-51,89-96`. |
 
 **Tokens are estimated from measured bytes at 4 bytes/token** (standard English-text
@@ -97,9 +108,14 @@ projected cost = $4.41 · (1 − 0.5R) · [ φ_in · m(ρ_after)/m(ρ_before) + 
                 − cross_cycle_saving(R, survival)
 ```
 
-Base assumptions: `R = 0.70`, `φ_in = 0.90`, `survival = 0`.
+Base assumptions: `φ_in = 0.90`, `survival = 0`. Routine share `R` is **not assumed** —
+it is read from the effort-tier split (`backend/scripts/measured_effort_tier_split.json`):
+a **measured** realised share, or the **replayed fail-closed LOWER BOUND** (`--replay`).
+When neither is available R is UNMEASURED and the headline is reported **UNVERIFIED**;
+the R = 0.70 figure that previously anchored the "honest base" is now a sensitivity
+scenario, not an input.
 
-### Honest case — the reorder alone
+### Scenario — tier mix at R = 0.70 (the old assumed base, for reference)
 
 The reorder does not move the intra-cycle share (`ρ` stays 0.55), and cross-cycle
 survival is 0:
@@ -107,6 +123,9 @@ survival is 0:
 ```
 $4.41 · (1 − 0.35) = $2.87/cycle
 ```
+
+This is a **scenario label, not the headline**: the >=30%-below-baseline claim built
+on it is UNVERIFIED until a measured routine share is checked in.
 
 ### Direction-target case — cache share genuinely reaches 0.80
 
@@ -142,7 +161,10 @@ Input-cost share (φ_in) shifts everything proportionally on the input side; the
 0.80-2.87 spread in the table is driven far more by `R` and `ρ` than by `φ_in` in the
 plausible 0.80-0.95 range.
 
-**Routine share R is the swing factor.** The fail-closed classifier
+**Routine share R is the swing factor.** The >=30%-below-baseline headline requires
+R ≥ 0.60 (tier-only `$4.41·(1 − 0.5R) ≤ $3.087 ⇔ R ≥ 0.60`). The table shows why R
+matters: at R = 0.30 the tier-only cost is $3.75 — only ~15% below baseline — so the
+claim flips within the assumption's range. The fail-closed classifier
 (`strategic_review_effort.py`) routes any open message, version decision pending,
 integrity conflict, prior-dirty cycle, or recent failure to consequential — so
 dirty/recovering periods (like the recent 1/11 and 0/3 merge records) push R well
@@ -152,9 +174,37 @@ below 0.7. The direction's own health depends on R being high.
 
 ## 6. Verdict
 
-**The projected median per-cycle strategist cost is $2.87/cycle in the honest base
-case — above the $1.50 headline.** The full tier-only range across R = 0.3-0.9 is
-$2.43-$3.75.
+**The >=30%-below-baseline headline is UNVERIFIED unless the effort-tier split carries a
+measured share or a replayed fail-closed LOWER BOUND that itself clears the threshold.**
+The projection fails closed: no assumed routine share is substituted (the old R = 0.70
+constant was the defect). The checked-in address
+`backend/scripts/measured_effort_tier_split.json` records the honest state and the
+regeneration command.
+
+The **replayed lower bound** is an available, explicitly-labelled input and is how the
+measurement deadlock is broken: `--replay` re-runs the checked-in classifier
+(`strategic_review_effort.py`) on signals reconstructed from historical
+`StrategicCycle` rows, so it needs **only the historical rows plus the checked-in
+classifier code — no serving stamps** (stamps cannot exist until promotion, which the
+criterion that needs the measurement itself blocks). An unavailable signal a ROUTINE
+verdict needs (most load-bearing: `open_message_count`) resolves to CONSEQUENTIAL, so
+the replayed share is a strict **LOWER BOUND** on the classifier's full-signals share,
+never the realized split. When it drives the headline, the headline is reported **AT
+that bound**, labelled "at the fail-closed replayed lower bound (replayed split, NOT a
+measured realized split)", and `claim_verified` is True ONLY when the bound itself
+clears the >=30% threshold (R ≥ 0.60 tier-only). A bound below it is reported
+UNVERIFIED with the lower-bound caveat — never an over-claim. Regenerate it with (run
+with DB access):
+
+```
+python3 backend/scripts/strategic_effort_tier_evidence.py --replay --days 7 \
+  --write-json backend/scripts/measured_effort_tier_split.json
+```
+
+At the measured-R boundary, the tier-only cost is $3.09/cycle at R = 0.60 (exactly 30%
+below baseline) — the claim needs R ≥ 0.60. The full tier-only range across
+R = 0.3-0.9 is $2.43-$3.75, and the projected median stays above the $1.50 headline
+across the entire range (even R = 1.0 is $2.21/cycle tier-only).
 
 Reaching $1.50 requires **both** of these to hold simultaneously:
 
@@ -170,6 +220,78 @@ so the target is on the edge of the model's optimistically-parameterized range �
 the mechanism analysis says the share lever is not available at the claimed size. The
 tier-mix lever (PR #16730) is the one reliable cost reduction, and its ceiling alone
 (R = 1) is $2.21/cycle.
+
+---
+
+## 7. Projected monthly spend (criterion c-3fd62b9d)
+
+The monthly TOTAL is **decision-loop term + task-execution term**:
+
+```
+monthly total = (per-cycle cost × cycles/month) + (per-task cost × tasks/month)
+```
+
+The inputs are read from existing configuration / measured data, each cited:
+
+| Anchor | Value | Source |
+|---|---|---|
+| Measured cycle volume | **59 cycles / 7 days → ~256.6/month** | Direction d-e860fe17 measured basis ($276.87 total / $261.33 strategic across 59 cycles). Scaled by `DAYS_PER_MONTH / 7` with `DAYS_PER_MONTH = 30.44`. |
+| Cadence-backstop floor | **~30.4 cycles/month** | `strategic_max_interval_minutes = 1,440` default (`runtime_config_state.py:830`) — the wall-clock floor that forces a strategic spawn. A floor, not the realized volume. |
+| Measured task volume | **75 tasks / 7 days → ~326.1 tasks/month** | Direction d-e860fe17 measured basis (75 merged PRs over the window). Same 30.44-day month convention. |
+| Per-task execution cost | **~$0.3128/task** | Direction d-e860fe17 measured basis: non-strategic fleet cost **$15.46 LLM + $8.00 VM** over 75 tasks. This is the same VM/LLM cost accounting that backs the existing per-task cost reporting (`cost_per_verified_task` / `total_cost_per_verified_task`, built from `get_task_total_vm_cost_usd` + `_task_llm_cost`). |
+| Target concurrency | **NOT AVAILABLE** | No `target_concurrency` configuration key exists for the strategic decision loop (searched `runtime_config_state.py` defaults and the `ReleaseVersion` model). The projection surfaces this rather than guessing a volume. |
+
+**Concurrency assumption:** cycles run serially — the cadence spawner gates on
+no-active-strategic (`autonomous_research.py:1732-1733`), so at most 1 concurrent
+strategic cycle per project at a time.
+
+**Task-slot concurrency is measured, not simulated (fleet sizing).** The 50-slot
+fleet-sizing claim no longer rests on the mocked vitest FIFO simulation
+(`agent/src/index.pool-mode.test.ts`, retained only as a scheduler-starvation
+regression). Peak and time-weighted percentile concurrent task-slot occupancy
+(p50 / p90 / p99, plus p95) are computed directly from the task table's
+slot-occupancy intervals via `get_fleet_utilization_snapshot`
+(`backend/app/fleet_utilization.py`) and surfaced on `/api/admin/fleet-utilization`
+as `concurrent_peak` / `concurrent_p50` / `concurrent_p90` / `concurrent_p95` /
+`concurrent_p99`. Both that endpoint and `get_task_concurrency_snapshot` read
+the single `_overlap_stats_from_task_rows` sweep, so they cannot disagree.
+**Denominator:** `concurrent_peak` is the maximum simultaneous slot occupancy
+in the window; the percentiles are seconds-weighted over the **active window**
+(first slot start to last slot end, with interior idle gaps counted at level 0)
+— *not* over the full `window_hours`, so leading/trailing idle does not drag the
+distribution toward 0. The slot itself is
+`vm_dispatched_at`/`vm_provisioned_at` → `vm_stopped_at` (still-active tasks
+extend to now); terminal tasks that never recorded a VM stamp hold no slot.
+This is *task-slot* concurrency — the number of fleet slots
+busy at once — and is distinct from the *strategic decision-loop* cadence in the
+'Target concurrency' row above (which remains unavailable and is not replaced by
+this measurement).
+
+```
+Scenario R=0.70 (sensitivity point), share 0.55:
+  decision loop : $2.87/cycle × 256.6 (measured) = $  735.45/month
+  task execution: $0.3128/task × 326.1 tasks     = $  102.02/month
+  TOTAL                                        = $  837.47/month
+Direction-target (R=0.85, share 0.80):
+  decision loop : $1.52/cycle × 256.6 (measured) = $  389.71/month
+  task execution: $0.3128/task × 326.1 tasks     = $  102.02/month
+  TOTAL                                        = $  491.73/month
+```
+
+**Envelope verdict:** at the R=0.70 sensitivity point the TOTAL at the measured volume is
+**~$837/month** — **27.9%** of the $3,000/month envelope, comfortably within it. The
+decision-loop-only half binds at **~1,047 cycles/month** (~4.1× the measured volume);
+the combined envelope binds at a lower volume, but task volume does not scale with
+cycle volume at the measured basis, so the script asserts no combined binds-at figure
+(rather than fabricating a scaling assumption). The envelope is therefore *not* the
+binding constraint at today's cadence. (The per-cycle number that feeds it is still
+above the $1.50 headline, and the >=30%-below-baseline claim is UNVERIFIED until a
+measured share — or a replayed fail-closed lower bound that itself clears the
+threshold — is checked in.)
+
+If any input were unavailable (no cycle volume, or no per-task cost/volume), the script
+returns `available: False` with a reason naming the missing input instead of
+fabricating a number — it never silently drops the task term to a zero.
 
 A falsified target is a real, useful result; a number tuned backwards from $1.50 is
 not. The actionable levers that could actually reach $1.50: fewer/smaller turns

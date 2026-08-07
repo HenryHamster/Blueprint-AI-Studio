@@ -16,6 +16,8 @@ All pure / mocked — no DB.
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pytest
 
 from app import release_artifacts as artifact_registry
@@ -73,6 +75,30 @@ class _Artifact:
         self.served_at = kw.get("served_at")
         self.reason_code = kw.get("reason_code")
         self.confirmation_deadline = kw.get("confirmation_deadline")
+
+
+class _DeployState:
+    """Minimal DeploymentState stand-in for the pure (no-DB) provider tests."""
+
+    def __init__(self, *, status, current_sha, deployed_at, halted_at=None):
+        self.status = status
+        self.current_sha = current_sha
+        self.deployed_at = deployed_at
+        self.halted_at = halted_at
+
+
+class _DispatchSession:
+    """Fake AsyncSession that routes DeploymentState lookups to a deploy-state
+    stand-in and every other model lookup (e.g. Project) to the given project."""
+
+    def __init__(self, project, ds):
+        self._project = project
+        self._ds = ds
+
+    async def get(self, model, _pk):
+        if model.__name__ == "DeploymentState":
+            return self._ds
+        return self._project
 
 
 # ---------------------------------------------------------------------------
@@ -473,6 +499,205 @@ async def test_promotion_merge_deadline_from_version_when_artifact_has_none(mock
     version = _Version(deploy_confirm_deadline=_past_deadline())
     out = await _check_promotion_merge_serving(_FakeSession(project), version, artifact, _now())
     assert out == ("confirmation_timed_out", "promotion_merge_indeterminate", None)
+
+
+# ---------------------------------------------------------------------------
+# _effective_confirm_deadline — the shared promoted_at backstop
+# ---------------------------------------------------------------------------
+
+
+def test_effective_confirm_deadline_backstops_null_from_promoted_at():
+    from app.release_promotion import _DEPLOY_CONFIRM_WINDOW_SECONDS
+
+    promoted_at = _now()
+    window = timedelta(seconds=_DEPLOY_CONFIRM_WINDOW_SECONDS)
+    # No stamped deadline anywhere → backstop off promoted_at + window.
+    assert artifact_registry._effective_confirm_deadline(None, None, promoted_at) == (
+        promoted_at + window
+    )
+    # Artifact deadline wins over a NULL version deadline.
+    artifact_dl = _now() + timedelta(hours=1)
+    assert artifact_registry._effective_confirm_deadline(
+        artifact_dl, None, promoted_at
+    ) == artifact_dl
+    # Version deadline wins over a NULL artifact deadline.
+    version_dl = _now() + timedelta(hours=2)
+    assert artifact_registry._effective_confirm_deadline(
+        None, version_dl, promoted_at
+    ) == version_dl
+    # No promoted_at to derive a window from → None (the degenerate case).
+    assert artifact_registry._effective_confirm_deadline(None, None, None) is None
+
+
+# ---------------------------------------------------------------------------
+# Supersession reclassification — NULL deadline must time out, not defer
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("ancestry", "deployed_at_delta", "promotion_age", "expected"),
+    [
+        # Past the derived window + ancestry indeterminate (compare API
+        # unavailable) → the soft ancestry timeout, never an infinite defer.
+        (None, timedelta(minutes=5), timedelta(hours=2), ("confirmation_timed_out", "backend_revision_ancestry_indeterminate", None)),
+        # Past the derived window + determinately NOT a descendant, and the live
+        # revision predates the promotion → the honest no_new_revision timeout.
+        (False, timedelta(minutes=-5), timedelta(hours=2), ("confirmation_timed_out", "no_new_revision", None)),
+        # Within the derived window → still defers; the backstop bounds the
+        # wait, it does not make the reclassifier eager.
+        (None, timedelta(minutes=5), timedelta(minutes=30), None),
+    ],
+)
+async def test_supersession_null_deadline_times_out_not_defers(
+    mocker, ancestry, deployed_at_delta, promotion_age, expected
+):
+    """A STABLE sha_mismatch whose version has NO stamped confirmation deadline
+    must still time out once the promoted_at-backed window elapses instead of
+    deferring forever — the supersession reclassifier applies the same backstop
+    as the sibling serving providers.  The within-window case is the control:
+    the backstop bounds the wait, it never makes the reclassifier eager."""
+    from unittest.mock import AsyncMock
+
+    from app.models import DeploymentStatus
+    from app.release_artifacts import _check_backend_revision_serving
+
+    promoted_at = _now() - promotion_age
+    version = _Version(
+        promoted_sha=_SHA,
+        promoted_at=promoted_at,
+        deploy_confirm_deadline=None,
+    )
+    ds = _DeployState(
+        status=DeploymentStatus.STABLE,
+        current_sha="b" * 40,
+        deployed_at=promoted_at + deployed_at_delta,
+    )
+    project = _Proj(github_owner="acme", github_repo="widget")
+    session = _DispatchSession(project=project, ds=ds)
+    mocker.patch(
+        "app.release_promotion._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "acme", "widget")),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=ancestry))
+
+    out = await _check_backend_revision_serving(
+        session,
+        version,
+        _Artifact(BACKEND_REVISION_ARTIFACT_KIND, None),
+        _now(),
+    )
+    assert out == expected
+
+
+@pytest.mark.asyncio
+async def test_redetection_tick_cannot_latch_deploy_failed(mocker):
+    """The periodic re-detection tick (app.main._reconcile_deploy_state_health_tick)
+    must stamp DeploymentState.deployed_at with this process's actual boot time,
+    not the tick's fire time — otherwise a tick that only now notices (or
+    finally commits, after an earlier degraded write) a revision that has been
+    serving since BEFORE the promotion was stamped fabricates a deployed_at
+    that postdates promoted_at. That flips the supersession reclassifier's
+    "predates promotion, still waiting" branch into "wrong deploy after
+    promotion", latching a healthy in-flight promotion to deploy_failed."""
+    from unittest.mock import AsyncMock
+
+    from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+    from sqlmodel import SQLModel
+
+    import app.main as _main
+    from app.models import DeploymentState, DeploymentStatus
+    from app.release_artifacts import _check_backend_revision_serving
+
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    async with engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.create_all)
+    Session = sessionmaker(
+        bind=engine,
+        class_=AsyncSession,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
+    )
+    mocker.patch("app.main.AsyncSessionLocal", Session)
+
+    try:
+        # This process actually started serving the current revision 10
+        # minutes BEFORE the promotion was stamped — the promoted deploy has
+        # not landed yet, the old revision is still live.
+        promoted_at = _now()
+        real_boot_time = promoted_at - timedelta(minutes=10)
+        mocker.patch.object(_main, "_process_boot_time", real_boot_time)
+
+        # Seed a stale singleton (a prior degraded boot commit never landed)
+        # and let the health tick fire long AFTER boot — simulating a tick
+        # that only now notices the drift, well past the promotion.
+        async with Session() as session:
+            session.add(
+                DeploymentState(
+                    id=1,
+                    current_revision="old-rev",
+                    current_sha="old-sha",
+                    last_known_good_revision="old-rev",
+                    last_known_good_sha="old-sha",
+                    status=DeploymentStatus.STABLE,
+                )
+            )
+            await session.commit()
+
+        mocker.patch.object(_main, "_current_revision", "new-rev")
+        mocker.patch.object(_main, "_current_sha", "unknown")
+        mocker.patch.object(
+            _main, "resolve_deployed_sha", new=AsyncMock(return_value="cccccccccc")
+        )
+
+        reconciled = await _main._reconcile_deploy_state_health_tick()
+        assert reconciled is True
+
+        async with Session() as session:
+            ds = await session.get(DeploymentState, 1)
+            assert ds is not None
+            # The bug this test guards against: deployed_at stamped with
+            # "now" (well after promoted_at) instead of the real boot time.
+            assert ds.deployed_at == real_boot_time
+            assert ds.deployed_at < promoted_at
+
+        # Feed the reconciled row into the actual serving-confirmation
+        # consumer: a STABLE sha_mismatch (observed revision diverged, not a
+        # descendant of the promoted commit) whose deployed_at PREDATES the
+        # promotion must defer/time out, never latch deploy_failed.
+        version = _Version(
+            promoted_sha=_SHA,
+            promoted_at=promoted_at,
+            deploy_confirm_deadline=None,
+        )
+        project = _Proj(github_owner="acme", github_repo="widget")
+        session_dispatch = _DispatchSession(project=project, ds=ds)
+        mocker.patch(
+            "app.release_promotion._resolve_github_with_session",
+            new=AsyncMock(return_value=("tok", "acme", "widget")),
+        )
+        mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+
+        out = await _check_backend_revision_serving(
+            session_dispatch,
+            version,
+            _Artifact(BACKEND_REVISION_ARTIFACT_KIND, None),
+            promoted_at + timedelta(hours=2),  # well past the derived deadline
+        )
+        assert out is not None
+        assert out[0] != "deploy_failed"
+        assert out == ("confirmation_timed_out", "no_new_revision", None)
+    finally:
+        async with engine.begin() as conn:
+            await conn.run_sync(SQLModel.metadata.drop_all)
+        await engine.dispose()
 
 
 # The promotion_merge provider must be registered REQUIRED + merge-observable so

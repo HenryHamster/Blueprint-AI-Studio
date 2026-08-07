@@ -1,5 +1,5 @@
 import { useState, type JSX } from 'react';
-import type { ChangelogEntry, VersionCriterionCoverage, CriterionCoverageEntry, EvidencePreviewEntry } from '../api';
+import type { ChangelogEntry, VersionCriterionCoverage, CriterionCoverageEntry, EvidencePreviewEntry, QualificationCategoryVerdict } from '../api';
 import { isSafeUrl } from './TaskCard';
 import { EvidenceTierBadge } from './EvidenceTierBadge';
 
@@ -403,6 +403,56 @@ function CriterionCoveragePanel({ coverage, onReinstate, onAttest, onLinkDirecti
   );
 }
 
+const CATEGORY_VERDICT_STATUS: Record<string, { label: string; className: string }> = {
+  not_met:    { label: 'not met',    className: 'bg-red-500/15 text-red-300 border border-red-500/30' },
+  partial:    { label: 'partial',    className: 'bg-amber-500/15 text-amber-300 border border-amber-500/30' },
+  unverified: { label: 'unverified', className: 'bg-orange-500/15 text-orange-300 border border-orange-500/30' },
+  met:        { label: 'met',        className: 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30' },
+};
+
+function QualificationCategoryVerdictsBlock({
+  verdicts,
+  residualGap,
+}: {
+  verdicts?: QualificationCategoryVerdict[] | null;
+  residualGap?: string | null;
+}): JSX.Element | null {
+  const unmet = (verdicts ?? []).filter((v) => v.status !== 'met');
+  if (unmet.length === 0 && !residualGap) return null;
+  return (
+    <div className="mb-3" data-testid="qualification-category-verdicts">
+      <div className="text-ui-sm font-semibold uppercase tracking-wide text-slate-500 mb-1">
+        Why promotion is blocked — category verdicts
+      </div>
+      <ul className="space-y-0.5">
+        {unmet.map((v) => {
+          const statusBadge = CATEGORY_VERDICT_STATUS[v.status] ?? {
+            label: v.status,
+            className: 'bg-slate-700/50 text-slate-400 border border-slate-600/40',
+          };
+          return (
+            <li key={v.category_key} className="flex items-start gap-2" data-testid={`category-verdict-${v.category_key}`}>
+              <span className={`shrink-0 rounded px-1.5 py-0.5 text-ui-sm font-medium ${statusBadge.className}`}>
+                {statusBadge.label}
+              </span>
+              {v.tier != null && v.tier !== 'judged' && (
+                <span className="shrink-0 text-ui-sm text-slate-500">{v.tier}</span>
+              )}
+              <span className="font-mono text-ui-sm text-slate-400 shrink-0">{v.category_key}</span>
+              {v.gap && <span className="text-xs text-slate-300 break-words min-w-0">{v.gap}</span>}
+            </li>
+          );
+        })}
+      </ul>
+      {residualGap && (
+        <p className="text-ui-sm text-amber-400/80" data-testid="residual-uncaptured-gap">
+          Residual gap (no criterion captures this): {residualGap}
+        </p>
+      )}
+    </div>
+  );
+}
+
 function AcceptanceBucketBreakdown({ aggregate }: { aggregate: Record<string, number> }): JSX.Element | null {
   const entries = Object.entries(BUCKET_META)
     .map(([key, meta]) => ({ key, count: aggregate[key] ?? 0, ...meta }))
@@ -424,6 +474,8 @@ export function VersionSummaryPanel({
   heading,
   acceptanceAggregate,
   criterionCoverage,
+  categoryVerdicts,
+  residualUncapturedGap,
   onReinstate,
   onAttest,
   onLinkDirection,
@@ -432,6 +484,8 @@ export function VersionSummaryPanel({
   heading?: string;
   acceptanceAggregate?: Record<string, number> | null;
   criterionCoverage?: VersionCriterionCoverage | null;
+  categoryVerdicts?: QualificationCategoryVerdict[] | null;
+  residualUncapturedGap?: string | null;
   onReinstate?: (criterionKey: string) => Promise<void>;
   onAttest?: (criterionKey: string) => void;
   onLinkDirection?: (criterionKey: string) => void;
@@ -448,6 +502,7 @@ export function VersionSummaryPanel({
         className="mt-3 rounded border border-slate-700/60 bg-slate-800/40 px-3 py-2"
       >
         {criterionCoverage != null && <CriterionCoveragePanel coverage={criterionCoverage} onReinstate={onReinstate} onAttest={onAttest} onLinkDirection={onLinkDirection} />}
+        <QualificationCategoryVerdictsBlock verdicts={categoryVerdicts} residualGap={residualUncapturedGap} />
         <div className="text-ui-md text-slate-500 italic">No tasks merged into this version yet.</div>
       </div>
     );
@@ -494,6 +549,7 @@ export function VersionSummaryPanel({
         </button>
       </div>
       {criterionCoverage != null && <CriterionCoveragePanel coverage={criterionCoverage} onReinstate={onReinstate} onAttest={onAttest} onLinkDirection={onLinkDirection} />}
+      <QualificationCategoryVerdictsBlock verdicts={categoryVerdicts} residualGap={residualUncapturedGap} />
       {acceptanceAggregate && <AcceptanceBucketBreakdown aggregate={acceptanceAggregate} />}
       {/* Per-type count summary — lets operator grasp shape of release at a glance */}
       <div className="flex flex-wrap gap-1 mb-2" data-testid="type-count-summary">

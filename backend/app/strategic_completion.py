@@ -291,6 +291,12 @@ def _strategic_event_completion_summary(
     _retirement_deferrals = meta.get("retirement_deferrals")
     if isinstance(_retirement_deferrals, list) and _retirement_deferrals:
         summary["retirement_deferrals"] = _retirement_deferrals
+    # Direction ops dropped for invalid criterion_keys — surfaced so the
+    # rejection reaches the operator (websocket payload + digest) instead of
+    # vanishing as a log line. Bounded at record time; capped again here.
+    _rejected_ops = ctx.get(REJECTED_DIRECTION_OPS_CONTEXT_KEY)
+    if isinstance(_rejected_ops, list) and _rejected_ops:
+        summary["rejected_direction_ops"] = _rejected_ops[-_REJECTED_DIRECTION_OPS_MAX:]
     return summary
 
 
@@ -515,6 +521,20 @@ _VALID_EVIDENCE_PROGRESS = frozenset({"advancing", "stalled", "met"})
 _EVIDENCE_PROGRESS_SUPPRESSING = frozenset({"advancing", "met"})
 _EVIDENCE_PROGRESS_RATIONALE_MAX = 300
 EVIDENCE_PROGRESS_CONTEXT_KEY = "_strategic_evidence_progress"
+
+# Transient task.context key carrying direction create/update ops that were
+# REJECTED because their criterion_keys reference unknown (dangling) or
+# retracted/superseded (inactive) acceptance criteria. The fallback parse path
+# used to drop these ops with only a log line, so the strategist never learned
+# the link was refused. The bounded list is recorded on task.context, surfaced
+# in the completion summary and cycle_metadata, and re-surfaced in the next
+# cycle's payload so the strategist can remap to an active criterion.
+REJECTED_DIRECTION_OPS_CONTEXT_KEY = "_strategic_rejected_direction_ops"
+_REJECTED_DIRECTION_OPS_MAX = 10
+# Per-entry field caps so the recorded list stays bounded regardless of the
+# agent's proposed text/keys (mirrors the API validation error surface).
+_REJECTED_OP_TEXT_MAX = 120
+_REJECTED_OP_KEYS_MAX = 20
 
 
 # ── Strategic judgment challenge record ──────────────────────────────────────
@@ -1435,11 +1455,17 @@ async def _apply_qualify_request(
     by CI-compliance violations, and calls ``release_qualifier.run_qualification``
     (which snapshots the candidate SHA + spawns the active qualifier children;
     the caller's surrounding commit persists its version-row writes). When
-    CI-compliance blocks qualification, durable blocker evidence is recorded and
-    the durable blocker is staged and ``True`` is returned. The post-commit
-    wrapper then arms a coalesced Strategic refresh in a separate transaction,
-    after blocker durability is established. Strategic uses its ordinary task
-    authority to choose any repair; this path never hard-codes one.
+    CI-compliance blocks qualification — either an observed violation or
+    evidence that is unavailable/degraded (GitHub credentials, HEAD, limits
+    file, or repo tree) — durable blocker evidence is recorded and ``True`` is
+    returned. The gate is fail-CLOSED: a qualify_request never proceeds on the
+    assumption that compliance is clean when it could not be verified — an
+    exception raised BY the gate itself (network error, unexpected shape) is
+    the same evidence-unavailable class and is recorded and blocked too. The
+    post-commit wrapper then arms a coalesced Strategic refresh in a separate
+    transaction, after blocker durability is established. Strategic uses its
+    ordinary task authority to choose any repair; this path never hard-codes
+    one.
 
     Silently no-ops when ``request`` is None/not a dict, there is no open
     ``ReleaseVersion``, or that version is not in ``stabilize``. All errors are
@@ -1494,6 +1520,7 @@ async def _apply_qualify_request(
         try:
             from app import ci_compliance as _ci_compliance
             from app.strategic_spawning import (
+                _maybe_spawn_ci_compliance_cap_bump_fix,
                 ci_compliance_qualify_gate,
             )
 
@@ -1507,7 +1534,7 @@ async def _apply_qualify_request(
                         "[STRATEGIC] Task %s (%s path): qualify_request for "
                         "project %s version v%d blocked by CI-compliance "
                         "violations=%s head=%s; returning evidence to Strategic "
-                        "without spawning a release-specific repair (reason=%r)",
+                        "(reason=%r)",
                         task.id,
                         path,
                         project.id,
@@ -1516,18 +1543,36 @@ async def _apply_qualify_request(
                         gate.get("head_sha"),
                         reason,
                     )
+                    # Spawn the cap-bump repair HERE so the block path is
+                    # self-sufficient. The strategic-review payload build is the
+                    # only other spawner; if it never runs (no strategic cycle)
+                    # the repair would otherwise never be queued. The spawn is
+                    # deduped per project+HEAD, so an already-queued repair is
+                    # returned rather than duplicated.
+                    try:
+                        repair_task = await _maybe_spawn_ci_compliance_cap_bump_fix(
+                            session, project, gate
+                        )
+                    except Exception:
+                        logger.exception(
+                            "[STRATEGIC] Task %s (%s path): failed to spawn "
+                            "CI-compliance cap-bump repair for project %s",
+                            task.id,
+                            path,
+                            project.id,
+                        )
+                        repair_task = None
                     # Record the CI-compliance block durably on the version row
                     # so the resident strategist can see WHY a requested
-                    # qualification never started. The previous path only
-                    # spawned a cap-bump task and logged, leaving
+                    # qualification never started (and which repair task is
+                    # addressing it). The previous path only spawned a cap-bump
+                    # task from the payload build and logged, leaving
                     # last_qualification null and therefore indistinguishable
                     # from "never requested" without log access.
                     # Merged under a dedicated key (like the qualify_request_error
                     # trace on the failure path below) so it never overwrites a
                     # prior verdict's "status" and cannot perturb
-                    # run_qualification's cached-verdict guard. Strategic sees
-                    # the actionable evidence on its next state-change wake and
-                    # may use its ordinary task authority to choose a repair.
+                    # run_qualification's cached-verdict guard.
                     try:
                         open_ver.last_qualification = {
                             **(open_ver.last_qualification or {}),
@@ -1536,7 +1581,11 @@ async def _apply_qualify_request(
                                 "blocker_class": "actionable",
                                 "violation_count": gate.get("violation_count", 0),
                                 "head_sha": gate.get("head_sha"),
-                                "repair_task": None,
+                                "repair_task": (
+                                    str(repair_task.id)
+                                    if repair_task is not None
+                                    else None
+                                ),
                             },
                             "qualify_request_blocked_at": _utcnow().isoformat(),
                         }
@@ -1550,25 +1599,132 @@ async def _apply_qualify_request(
                             path,
                         )
                         return False
+                    # Notify the operator (deduped per project + HEAD) so the
+                    # block is not silent. The strategist payload also surfaces
+                    # the evidence, but a durable Alert is the operator-facing
+                    # signal. Policy fail-closed is fine: if the event type is
+                    # not operator-visible the alert is a no-op, never a crash.
+                    try:
+                        from app.alert_policy import (
+                            create_project_alert_if_allowed,
+                        )
+                        from app.models import AlertSeverity
+
+                        await create_project_alert_if_allowed(
+                            session,
+                            project_id=project.id,
+                            event_type="release.qualification_ci_compliance_block",
+                            severity=AlertSeverity.WARNING,
+                            task_id=(
+                                repair_task.id
+                                if repair_task is not None
+                                else None
+                            ),
+                            title=(
+                                f"Release v{open_ver.version_number} blocked by "
+                                "CI-compliance violations"
+                            ),
+                            message=(
+                                f"qualify_request for release "
+                                f"v{open_ver.version_number} was blocked by "
+                                f"{gate.get('violation_count', 0)} CI-compliance "
+                                f"violation(s) at HEAD "
+                                f"{str(gate.get('head_sha') or '')[:12]}. "
+                                f"Repair task "
+                                f"{repair_task.id if repair_task is not None else 'spawn failed'} "
+                                "queued; qualification resumes once the guardrail "
+                                "is clean."
+                            ),
+                            dedupe_key=(
+                                f"ci_compliance_block:{project.id}:"
+                                f"{str(gate.get('head_sha') or 'unknown')[:12]}"
+                            ),
+                        )
+                    except Exception:
+                        logger.exception(
+                            "[STRATEGIC] Task %s (%s path): failed to raise "
+                            "CI-compliance block alert for project %s",
+                            task.id,
+                            path,
+                            project.id,
+                        )
                     return True
             else:
+                # CI-compliance evidence is UNAVAILABLE (GitHub credentials or
+                # HEAD unresolvable). Fail CLOSED: a qualify_request must not
+                # proceed on the assumption that compliance is clean when it
+                # could not be checked. Record the block durably so Strategic
+                # can act on the root cause (e.g. re-authorize GitHub) instead
+                # of silently qualifying on unverified evidence.
                 logger.info(
                     "[STRATEGIC] Task %s (%s path): CI-compliance status "
                     "unavailable for project %s before qualify_request "
-                    "(reason=%s); failing open",
+                    "(reason=%s); blocking qualification",
                     task.id,
                     path,
                     project.id,
                     status.get("reason"),
                 )
+                try:
+                    open_ver.last_qualification = {
+                        **(open_ver.last_qualification or {}),
+                        "qualify_request_blocked": {
+                            "blocker": "ci_compliance",
+                            "blocker_class": "unavailable_evidence",
+                            "violation_count": 0,
+                            "head_sha": None,
+                            "repair_task": None,
+                        },
+                        "qualify_request_blocked_at": _utcnow().isoformat(),
+                    }
+                    flag_modified(open_ver, "last_qualification")
+                    session.add(open_ver)
+                except Exception:
+                    logger.exception(
+                        "[STRATEGIC] Task %s (%s path): failed to record "
+                        "qualify_request CI-compliance unavailability block",
+                        task.id,
+                        path,
+                    )
+                    return False
+                return True
         except Exception:
+            # The gate itself raised (network error from the compliance fetch,
+            # unexpected payload shape, import failure). That is the SAME
+            # evidence-unavailable class as the `status != success` branch
+            # above: we do not know whether compliance is clean. Fail CLOSED —
+            # record the blocker durably and return without qualifying, rather
+            # than proceeding on unverified evidence.
             logger.exception(
                 "[STRATEGIC] Task %s (%s path): CI-compliance qualify gate "
-                "failed for project %s; failing open",
+                "raised for project %s; blocking qualification (fail-closed)",
                 task.id,
                 path,
                 project.id,
             )
+            try:
+                open_ver.last_qualification = {
+                    **(open_ver.last_qualification or {}),
+                    "qualify_request_blocked": {
+                        "blocker": "ci_compliance",
+                        "blocker_class": "unavailable_evidence",
+                        "violation_count": 0,
+                        "head_sha": None,
+                        "repair_task": None,
+                    },
+                    "qualify_request_blocked_at": _utcnow().isoformat(),
+                }
+                flag_modified(open_ver, "last_qualification")
+                session.add(open_ver)
+            except Exception:
+                logger.exception(
+                    "[STRATEGIC] Task %s (%s path): failed to record "
+                    "qualify_request CI-compliance gate-error block",
+                    task.id,
+                    path,
+                )
+                return False
+            return True
         result = await _rq.run_qualification(
             session,
             project.id,
@@ -4105,6 +4261,50 @@ def _merge_rejected_proposals(vision: dict, batch: list) -> None:
     vision["rejected_proposals"] = _rp[-30:]
 
 
+def _record_rejected_direction_op(
+    task: Task,
+    *,
+    op: str,
+    direction_id: str | None,
+    text: str,
+    invalid_criterion_keys: list[str],
+    active_criterion_keys=None,
+) -> None:
+    """Record a create/update_direction op dropped for invalid criterion_keys.
+
+    The fallback parse path previously dropped these ops with only a log line,
+    so the strategist never saw the rejection and the proposed criterion link
+    was lost silently. This appends a bounded entry to
+    ``task.context[REJECTED_DIRECTION_OPS_CONTEXT_KEY]`` — newest last, capped
+    at ``_REJECTED_DIRECTION_OPS_MAX`` — which then flows into the completion
+    summary, the cycle's ``cycle_metadata``, and the next cycle's payload so the
+    strategist can remap to an active criterion.
+
+    ``active_criterion_keys`` carries the current valid keys for the open
+    version so the record is actionable, not just a refusal.
+    """
+    ctx = dict(task.context or {})
+    rejected = list(ctx.get(REJECTED_DIRECTION_OPS_CONTEXT_KEY) or [])
+    rejected.append(
+        {
+            "op": str(op)[:32],
+            "direction_id": str(direction_id)[:64] if direction_id else None,
+            "text": str(text or "")[: _REJECTED_OP_TEXT_MAX],
+            "reason": "invalid_criterion_keys",
+            "invalid_criterion_keys": [
+                str(k)[:80] for k in (invalid_criterion_keys or [])
+            ][:_REJECTED_OP_KEYS_MAX],
+            "active_criterion_keys": sorted(
+                str(k) for k in (active_criterion_keys or [])
+            )[:_REJECTED_OP_KEYS_MAX],
+            "rejected_at": _utcnow().isoformat(),
+        }
+    )
+    ctx[REJECTED_DIRECTION_OPS_CONTEXT_KEY] = rejected[-_REJECTED_DIRECTION_OPS_MAX:]
+    task.context = ctx
+    flag_modified(task, "context")
+
+
 def strategic_completion_message_count(logs: str) -> int:
     """Return a bounded reservation covering every fallback message emission."""
 
@@ -4242,6 +4442,16 @@ async def _handle_strategic_completion(
                 "created_predictions": created_predictions,
                 "retired_final_metrics": retired_final_metrics,
             }
+            # Direction ops dropped for invalid criterion_keys — copied into
+            # cycle_metadata so the next cycle's payload producer can re-surface
+            # them to the strategist (durable across the transaction boundary).
+            _api_rejected_ops = (task.context or {}).get(
+                REJECTED_DIRECTION_OPS_CONTEXT_KEY
+            )
+            if _api_rejected_ops:
+                _extra["rejected_direction_ops"] = _api_rejected_ops[
+                    -_REJECTED_DIRECTION_OPS_MAX:
+                ]
             try:
                 _extra["model_gc_telemetry"] = _compute_model_gc_telemetry(
                     project, task
@@ -5350,6 +5560,14 @@ async def _handle_strategic_completion(
                                 text[:60],
                                 invalid_criterion_keys,
                             )
+                            _record_rejected_direction_op(
+                                task,
+                                op=op,
+                                direction_id=None,
+                                text=text,
+                                invalid_criterion_keys=invalid_criterion_keys,
+                                active_criterion_keys=active_keys,
+                            )
                             continue
                         criterion_release_version_id = criterion_version.id
 
@@ -5671,6 +5889,14 @@ async def _handle_strategic_completion(
                                 task.id,
                                 dir_id,
                                 invalid_criterion_keys,
+                            )
+                            _record_rejected_direction_op(
+                                task,
+                                op=op,
+                                direction_id=str(dir_id),
+                                text=str(changes.get("text") or ""),
+                                invalid_criterion_keys=invalid_criterion_keys,
+                                active_criterion_keys=active_keys,
                             )
                             continue
                         update_criterion_release_version_id = criterion_version.id
@@ -6681,6 +6907,16 @@ async def _handle_strategic_completion(
             _fb_challenge = (task.context or {}).get(STRATEGIC_CHALLENGE_CONTEXT_KEY)
             if _fb_challenge is not None:
                 _fb_extra["strategic_judgment_challenge"] = _fb_challenge
+            # Direction ops dropped for invalid criterion_keys — copied into
+            # cycle_metadata so the next cycle's payload producer can re-surface
+            # them to the strategist (durable across the transaction boundary).
+            _fb_rejected_ops = (task.context or {}).get(
+                REJECTED_DIRECTION_OPS_CONTEXT_KEY
+            )
+            if _fb_rejected_ops:
+                _fb_extra["rejected_direction_ops"] = _fb_rejected_ops[
+                    -_REJECTED_DIRECTION_OPS_MAX:
+                ]
             fallback_cycle = await strategic_cycle.mark_phase2_completed(
                 session,
                 cycle_id,

@@ -18301,7 +18301,17 @@ async def test_spawn_strips_warm_target_keys(client: AsyncClient, db_session):
         headers={"x-agent-token": token},
         json={
             "task_id": str(parent_task.id),
-            "payloads": [{"type": "create", "title": "child-1", "prompt": "test"}],
+            "payloads": [
+                {
+                    "type": "create",
+                    "title": "child-1",
+                    "prompt": "test",
+                    "acceptance_evidence": {
+                        "kind": "observable_behavior",
+                        "description": "agent-spawned child ships a real change",
+                    },
+                }
+            ],
             "context": forbidden_context,
         },
     )

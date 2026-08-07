@@ -21,12 +21,26 @@ content-injectable source of truth shared with the disk-mode CLI.
 Three public entry points:
 
   * :func:`evaluate_ci_compliance_at_ref` — the async evaluator. Reads the
-    limits file and repo tree at the ref, then checks (a) capped modules for
-    line-count breaches, (b) uncapped source files over the coverage threshold,
-    and (c) backend/agent source files for hardcoded branch-literal patterns.
-    Returns a JSON-serializable result. Fail-safe: a file that 404s / cannot be
-    read at the ref is SKIPPED (treated as not-a-violation), never crashing the
-    evaluation.
+    limits file, the branch-literal rules file, and the repo tree at the ref,
+    then checks (a) capped modules for line-count breaches, (b) uncapped source
+    files over the coverage threshold, and (c) backend/agent source files for
+    hardcoded branch-literal patterns. Sections mirror CI: ``backend``,
+    ``agent``, ``frontend``, and ``testing`` (``backend/testing/*.py`` per-file
+    caps and the 1500-line uncapped coverage guardrail). The branch-literal
+    scan runs whenever the repo tree is available AND the rules file is
+    readable — even when the limits file is unreadable — because CI's
+    branch-literal invariants run regardless of the limits file's readability.
+    The branch-literal ALLOWLIST is read AT THE CANDIDATE REF (the same
+    checked-in file the local invariant test scans against), so a rule that
+    ships in the same commit as the file it describes is observable by this
+    gate. Returns a JSON-serializable result. Fail-safe: a source file that
+    404s / cannot be read at the ref is SKIPPED (treated as not-a-violation),
+    never crashing the evaluation. The size-limits FILE and the branch-literal
+    RULES file are the deliberate exceptions: when either cannot be read or
+    parsed, the verdict FAILS CLOSED (``compliant=False`` with a diagnostic) —
+    an unreadable config is exactly the circumstance in which the gate is least
+    entitled to pass, so the evaluator refuses instead of skipping those
+    guardrails and reporting success.
   * :func:`record_ci_compliance` — persist a result onto ``Project.ci_compliance``
     keyed by its commit SHA.
   * :func:`get_ci_compliance` — read the per-SHA status back.
@@ -37,6 +51,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from app import github
@@ -44,12 +59,13 @@ from app.branch_literal_compliance import (
     AGENT_PATTERNS,
     AGENT_SOURCE_FILES,  # noqa: F401 — re-exported for module-level identity checks
     BACKEND_PATTERNS,
+    BRANCH_LITERAL_ALLOWLIST_PATH,
     CI_AGENT_FORBIDDEN_RE,  # noqa: F401 — re-exported for module-level identity checks
     CI_AGENT_PAREN_FALLBACK_RE,
-    SURFACE_CONFIGS,
     strip_typescript_with_linenos,
 )
 from app.json_extract import async_json_loads
+from app.time_utils import _coerce_naive_utc, _is_cadence_due, _utcnow
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -65,11 +81,14 @@ _MODULE_SIZE_LIMITS_PATH = "backend/testing/module_size_limits.json"
 
 # Maps a module_size_limits.json section to the repo-relative path prefix its
 # ``rel`` keys are rooted at. Mirrors hotfix_backmerge._FILE_PREFIX_MAP (inverted
-# direction) and check_size_limits.resolve_section_root's section roots.
+# direction) and check_size_limits.resolve_section_root's section roots. The
+# ``testing`` section is enforced by CI's TestTestFileSizeGuardrails /
+# test_testing_no_uncapped_large_file and must be scanned exactly like CI does.
 _SECTION_PREFIXES: dict[str, str] = {
     "backend": "backend/app/",
     "agent": "agent/src/",
     "frontend": "admin-ui/src/",
+    "testing": "backend/testing/",
 }
 
 # Bound the per-SHA history so the JSONB column cannot grow without limit across
@@ -84,6 +103,36 @@ _MAX_RECORDED_SHAS = 50
 # full-evaluation round-trips to GitHub (which are expensive: 200+ file reads).
 # Entries are removed once the task completes (success or exception).
 _in_flight_evals: dict[str, asyncio.Task[dict[str, Any]]] = {}
+
+# Minimum wall-clock spacing between re-evaluations of the SAME SHA whose stored
+# verdict is DEGRADED (see _verdict_is_authoritative / _degraded_recheck_is_due).
+#
+# Re-evaluating a degraded verdict is what lets a TRANSIENT GitHub read failure
+# self-heal — but not every degraded status is transient. The evaluator's own
+# taxonomy distinguishes them: ``malformed`` means the file WAS read and its
+# bytes are not a JSON object, and ``unreadable`` on the hardcoded
+# _MODULE_SIZE_LIMITS_PATH / BRANCH_LITERAL_ALLOWLIST_PATH usually means a 404
+# — both are DETERMINISTIC at a fixed ref and can never heal without a new
+# commit. Re-evaluating unconditionally would make such a SHA a permanent cache
+# miss that re-runs the FULL evaluation (limits read + rules read + tree listing
+# + a 200-file branch-literal scan) on EVERY call, spending the project owner's
+# GitHub token against the 60/minute agent endpoint until the branch tip moves.
+# _in_flight_evals coalesces only CONCURRENT calls, never sequential ones.
+#
+# So the re-check is rate-limited per SHA rather than disabled: the first call
+# after a degraded verdict lands still re-evaluates immediately (fast self-heal
+# for the transient case), and subsequent re-evaluations happen at most once per
+# this interval. A deterministically-degraded ref therefore keeps producing a
+# fresh diagnostic, just boundedly.
+_DEGRADED_RECHECK_INTERVAL_SECONDS = 300.0
+
+# Key stamped onto a stored DEGRADED result recording when its evaluation ran,
+# so the rate limit above survives a backend restart (the per-SHA map lives in
+# the Project.ci_compliance JSONB column, not in process memory). AUTHORITATIVE
+# results are never stamped — they are cache hits and never re-evaluated. A
+# degraded record without the key (written before this field existed, or seeded
+# by another writer) is always due, preserving self-heal-on-next-call.
+_DEGRADED_EVALUATED_AT_KEY = "degraded_evaluated_at"
 
 # Maximum concurrent GitHub API requests for file reads. The three scan helpers
 # (_scan_capped_files, _scan_uncapped_files, _scan_branch_literals) parallelize
@@ -102,15 +151,18 @@ _semaphore = asyncio.Semaphore(_DEFAULT_CONCURRENCY)
 _UNCAPPED_THRESHOLD = 1500
 
 # Per-section source file extensions for the uncapped-coverage guardrail.
-# Mirrors check_size_limits._SECTION_SCAN.
+# Mirrors check_size_limits._SECTION_SCAN (backend/app .py, agent .ts,
+# frontend .ts/.tsx, testing .py).
 _SECTION_EXTENSIONS: dict[str, tuple[str, ...]] = {
     "backend": (".py",),
     "agent": (".ts",),
     "frontend": (".ts", ".tsx"),
+    "testing": (".py",),
 }
 
 # Files excluded from the uncapped-coverage guardrail per section.
-# Mirrors check_size_limits._is_frontend_excluded / _is_agent_excluded.
+# Mirrors check_size_limits._is_frontend_excluded / _is_agent_excluded /
+# _no_exclusion (testing scans every .py like the backend section).
 def _is_frontend_excluded(rel: str) -> bool:
     return rel.endswith((".test.ts", ".test.tsx", ".d.ts")) or rel.startswith("test/")
 
@@ -123,6 +175,7 @@ _SECTION_EXCLUDED: dict[str, Any] = {
     "backend": lambda rel: False,
     "agent": _is_agent_excluded,
     "frontend": _is_frontend_excluded,
+    "testing": lambda rel: False,
 }
 
 # Supplemental agent patterns: extend canonical AGENT_PATTERNS with loose
@@ -135,14 +188,37 @@ _AGENT_SUPPLEMENTAL_PATTERNS: list[tuple[str, re.Pattern]] = [
 ]
 
 
+# Status values returned by _load_size_limits_at_ref. ``ok`` means the limits
+# file was read and parsed as a JSON object — possibly ``{}``, a legitimate
+# empty config that simply declares no caps. The other two are genuine
+# read/parse failures and FAIL CLOSED: an unreadable size-limits config is
+# exactly the circumstance in which the compliance gate is least entitled to
+# pass, because the size guardrails cannot be verified at all.
+_LIMITS_STATUS_OK = "ok"
+_LIMITS_STATUS_UNREADABLE = "unreadable"
+_LIMITS_STATUS_MALFORMED = "malformed"
+
+
 async def _load_size_limits_at_ref(
     *, token: str, owner: str, repo: str, ref: str, project_id: str | None
-) -> dict:
-    """Read ``module_size_limits.json`` AT ``ref`` and parse it; ``{}`` on failure.
+) -> tuple[dict, str, str | None]:
+    """Read ``module_size_limits.json`` AT ``ref`` and parse it.
 
-    Fail-safe: a 404 / non-file / undecodable / unparseable limits file yields
-    an empty dict so the evaluator reports no discoverable violations rather
-    than crashing the per-merge producer.
+    Returns ``(limits, status, error)``:
+
+      * ``status == "ok"`` — the file was read and parsed as a JSON object.
+        ``limits`` is that object (``{}`` when the config legitimately declares
+        no caps); ``error`` is None.
+      * ``status == "unreadable"`` — the file could not be read at the ref
+        (404 / non-file / undecodable transport outcome). ``limits`` is ``{}``
+        and ``error`` names the path and the failure.
+      * ``status == "malformed"`` — the file was read but its body is not a
+        JSON object (unparseable JSON or a non-dict top-level value).
+        ``limits`` is ``{}`` and ``error`` names the path and the failure.
+
+    The distinction between a legitimate empty config and a genuine failure is
+    deliberate: only the former may pass, so the caller can fail closed on the
+    latter instead of silently skipping the size guardrails.
     """
     text = await github.get_file_text_at_ref(
         _MODULE_SIZE_LIMITS_PATH,
@@ -152,20 +228,87 @@ async def _load_size_limits_at_ref(
         ref=ref,
         project_id=project_id,
     )
+    _where = f"{_MODULE_SIZE_LIMITS_PATH} at {owner}/{repo}@{ref[:12]}"
+    if text is None:
+        return {}, _LIMITS_STATUS_UNREADABLE, (
+            f"could not read {_where} (404 / non-file / undecodable)"
+        )
     if not text:
-        return {}
+        return {}, _LIMITS_STATUS_MALFORMED, (
+            f"{_where} is empty; expected a JSON object of size caps"
+        )
     try:
         data = await async_json_loads(text)
-    except (ValueError, TypeError):
-        logger.warning(
-            "[CI-COMPLIANCE] could not parse %s at %s/%s@%s — treating as empty",
-            _MODULE_SIZE_LIMITS_PATH,
-            owner,
-            repo,
-            ref,
+    except (ValueError, TypeError) as exc:
+        logger.warning("[CI-COMPLIANCE] could not parse %s: %s", _where, exc)
+        return {}, _LIMITS_STATUS_MALFORMED, (
+            f"{_where} is not valid JSON: {exc}"
         )
-        return {}
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        return {}, _LIMITS_STATUS_MALFORMED, (
+            f"{_where} is a JSON {type(data).__name__}, not an object"
+        )
+    return data, _LIMITS_STATUS_OK, None
+
+
+# Status values returned by _load_branch_literal_rules_at_ref. Same contract as
+# the size-limits statuses above: ``ok`` means the file was read and parsed as
+# a JSON object (possibly ``{}``); ``unreadable`` and ``malformed`` are genuine
+# failures that FAIL CLOSED. The branch-literal allowlist is read AT THE
+# CANDIDATE REF precisely so a rule that ships in the same commit as the file
+# it describes is observable by the deployed gate — a process-local allowlist
+# cannot see it and deadlocks the gate (the provenance defect this reader
+# fixes).
+_RULES_STATUS_OK = "ok"
+_RULES_STATUS_UNREADABLE = "unreadable"
+_RULES_STATUS_MALFORMED = "malformed"
+
+
+async def _load_branch_literal_rules_at_ref(
+    *, token: str, owner: str, repo: str, ref: str, project_id: str | None
+) -> tuple[dict, str, str | None]:
+    """Read ``branch_literal_allowlist.json`` AT ``ref`` and parse it.
+
+    Mirrors :func:`_load_size_limits_at_ref` for the branch-literal allowlist:
+    returns ``(rules, status, error)`` where ``status`` is ``ok`` /
+    ``unreadable`` / ``malformed``. ``rules`` is the parsed JSON object on
+    ``ok`` (``{}`` for a legitimately-empty config) and ``{}`` otherwise.
+    ``error`` names the path and the failure when ``status != ok``.
+
+    The distinction between a legitimate empty config and a genuine failure is
+    deliberate: only the former may pass, so the caller can FAIL CLOSED on
+    unreadable/malformed rules instead of scanning with an in-process allowlist
+    the deployed backend may not know about.
+    """
+    text = await github.get_file_text_at_ref(
+        BRANCH_LITERAL_ALLOWLIST_PATH,
+        token=token,
+        owner=owner,
+        repo=repo,
+        ref=ref,
+        project_id=project_id,
+    )
+    _where = f"{BRANCH_LITERAL_ALLOWLIST_PATH} at {owner}/{repo}@{ref[:12]}"
+    if text is None:
+        return {}, _RULES_STATUS_UNREADABLE, (
+            f"could not read {_where} (404 / non-file / undecodable)"
+        )
+    if not text:
+        return {}, _RULES_STATUS_MALFORMED, (
+            f"{_where} is empty; expected a JSON object of allowlists"
+        )
+    try:
+        data = await async_json_loads(text)
+    except (ValueError, TypeError) as exc:
+        logger.warning("[CI-COMPLIANCE] could not parse %s: %s", _where, exc)
+        return {}, _RULES_STATUS_MALFORMED, (
+            f"{_where} is not valid JSON: {exc}"
+        )
+    if not isinstance(data, dict):
+        return {}, _RULES_STATUS_MALFORMED, (
+            f"{_where} is a JSON {type(data).__name__}, not an object"
+        )
+    return data, _RULES_STATUS_OK, None
 
 
 def _strip_agent_paren_fallbacks(line: str) -> str:
@@ -335,6 +478,7 @@ async def _scan_uncapped_files(
 
 async def _scan_branch_literals(
     *,
+    rules: dict,
     tree_paths: list[dict],
     token: str,
     owner: str,
@@ -343,6 +487,13 @@ async def _scan_branch_literals(
     project_id: str | None,
 ) -> list[dict]:
     """Scan backend and agent source files for hardcoded branch-literal patterns.
+
+    ``rules`` is the branch-literal allowlist read AT THE CANDIDATE REF (see
+    :func:`_load_branch_literal_rules_at_ref`): ``{"backend":
+    {"allowlisted_filenames": [...]}, "agent": {"allowlist": [{path, line,
+    pattern, rationale}, ...]}}``. Suppressions come from the candidate ref,
+    never from in-process config, so a file whose allowlist entry ships in the
+    same commit can clear the gate.
 
     Mirrors:
       * ``test_invariants.TestHardcodedBranchNames.test_no_hardcoded_main_branch_fallbacks``
@@ -354,7 +505,15 @@ async def _scan_branch_literals(
     Returns a list of ``{section, rel, line, text}`` violation dicts where
     ``line`` is the 1-based line number and ``text`` is the offending line.
     """
-    _backend_allow = SURFACE_CONFIGS["backend"].allowlisted_filenames
+    backend_cfg = rules.get("backend")
+    if not isinstance(backend_cfg, dict):
+        backend_cfg = {}
+    raw_allow = backend_cfg.get("allowlisted_filenames")
+    _backend_allow = (
+        frozenset(f for f in raw_allow if isinstance(f, str))
+        if isinstance(raw_allow, list)
+        else frozenset()
+    )
     _backend_patterns = [p.regex for p in BACKEND_PATTERNS]
 
     # --- Collect backend and agent paths to scan ---
@@ -369,18 +528,34 @@ async def _scan_branch_literals(
         if fname not in _backend_allow:
             backend_entries.append((path, rel))
 
-    agent_config = SURFACE_CONFIGS["agent"]
+    agent_cfg = rules.get("agent")
+    if not isinstance(agent_cfg, dict):
+        agent_cfg = {}
     agent_prefix = _SECTION_PREFIXES["agent"]
-    _agent_allowset = {
-        f"{entry.path}::{entry.line}::{entry.pattern}"
-        for entry in agent_config.allowlist
-    }
+    _agent_allowset: set[str] = set()
+    raw_agent_allow = agent_cfg.get("allowlist")
+    if isinstance(raw_agent_allow, list):
+        for item in raw_agent_allow:
+            if not isinstance(item, dict):
+                continue
+            a_path = item.get("path")
+            a_line = item.get("line")
+            a_pattern = item.get("pattern")
+            if (
+                isinstance(a_path, str)
+                and isinstance(a_line, int)
+                and isinstance(a_pattern, str)
+            ):
+                _agent_allowset.add(f"{a_path}::{a_line}::{a_pattern}")
+    # Scan exclusion suffixes mirror SURFACE_CONFIGS['agent'].exclude_suffixes
+    # (agent/src test/d.ts files are not production sources).
+    agent_exclude_suffixes = (".test.ts", ".d.ts")
     agent_entries: list[tuple[str, str]] = []  # (path, rel)
     for entry in tree_paths:
         path = entry["path"]
         if not path.startswith(agent_prefix) or not path.endswith(".ts"):
             continue
-        if any(path.endswith(suffix) for suffix in agent_config.exclude_suffixes):
+        if any(path.endswith(suffix) for suffix in agent_exclude_suffixes):
             continue
         agent_entries.append((path, path[len(agent_prefix):]))
 
@@ -472,13 +647,15 @@ async def evaluate_ci_compliance_at_ref(
     1. **Capped-file size breach** — for every capped key in
        ``module_size_limits.json``, reads that file at the ref, line-counts it,
        and classifies the breach via
-       :func:`testing.check_size_limits.classify_size_record`.
+       :func:`testing.check_size_limits.classify_size_record`. Covers the
+       ``backend``, ``agent``, ``frontend``, and ``testing`` sections exactly as
+       CI's per-file size guardrails do.
 
     2. **Uncapped large file** — uses the GitHub recursive tree API to enumerate
-       ALL source files in backend/app/, agent/src/, and admin-ui/src/. Any file
-       over ``_UNCAPPED_THRESHOLD`` lines that has NO cap entry in the limits JSON
-       is reported as a violation (it would fail the ``test_*_no_uncapped_large_file``
-       coverage meta-tests in CI).
+       ALL source files in backend/app/, agent/src/, admin-ui/src/, and
+       backend/testing/. Any file over ``_UNCAPPED_THRESHOLD`` lines that has NO
+       cap entry in the limits JSON is reported as a violation (it would fail
+       the ``test_*_no_uncapped_large_file`` coverage meta-tests in CI).
 
     3. **Branch-literal regression** — scans backend/app/*.py for the hardcoded
        branch-fallback patterns from
@@ -495,18 +672,38 @@ async def evaluate_ci_compliance_at_ref(
             "branch_literal_violations": [{section, rel, line, text}],
             "checked": <int>,                           # capped files actually read
             "limits_available": <bool>,                 # limits file readable?
+            "limits_status": <"ok"|"unreadable"|"malformed">,
+            "limits_error": <str|None>,                 # diagnostic when status != ok
+            "rules_available": <bool>,                  # branch-literal rules file readable?
+            "rules_status": <"ok"|"unreadable"|"malformed">,
+            "rules_error": <str|None>,                  # diagnostic when status != ok
             "tree_available": <bool>,                   # repo tree listing available?
         }
 
-    Fail-safe throughout: a file that 404s / cannot be read at the ref is
-    SKIPPED (counted as compliant), never raising. An unreadable limits file
-    yields ``compliant=True`` with ``limits_available=False`` (nothing to
-    evaluate, never a crash). An unavailable repo tree yields ``tree_available=False``
-    and skips guardrails 2 and 3 (branch-literal, uncapped).
+    Fail-safe throughout: a source file that 404s / cannot be read at the ref is
+    SKIPPED (counted as compliant), never raising. The size-limits FILE and the
+    branch-literal RULES file are the deliberate exceptions — they FAIL CLOSED:
+    when either config cannot be read or parsed, ``compliant`` is False with a
+    diagnostic (``limits_status`` / ``limits_error`` or ``rules_status`` /
+    ``rules_error``), because an unreadable config is exactly when the gate is
+    least entitled to pass. A legitimately-empty config (a valid ``{}`` that
+    declares no rules) still passes. The branch-literal scan runs whenever the
+    repo tree is available AND the rules file is readable — even when the
+    limits file is unreadable — because CI's branch-literal invariants do not
+    depend on it. An unavailable repo tree yields ``tree_available=False`` and
+    skips guardrails 2 and 3 (branch-literal, uncapped).
     """
-    # Fetch limits and repo tree in parallel — they are independent.
-    limits, tree_paths_raw = await asyncio.gather(
+    # Fetch limits, branch-literal rules, and repo tree in parallel — they are
+    # independent.
+    (limits, limits_status, limits_error), (
+        rules,
+        rules_status,
+        rules_error,
+    ), tree_paths_raw = await asyncio.gather(
         _load_size_limits_at_ref(
+            token=token, owner=owner, repo=repo, ref=ref, project_id=project_id
+        ),
+        _load_branch_literal_rules_at_ref(
             token=token, owner=owner, repo=repo, ref=ref, project_id=project_id
         ),
         github.list_repo_tree_paths_at_ref(
@@ -514,19 +711,48 @@ async def evaluate_ci_compliance_at_ref(
         ),
     )
 
-    if not limits:
-        return {
-            "ref": ref,
-            "compliant": True,
-            "violations": [],
-            "branch_literal_violations": [],
-            "checked": 0,
-            "limits_available": False,
-            "tree_available": tree_paths_raw is not None,
-        }
-
     tree_available = tree_paths_raw is not None
     tree_paths: list[dict] = tree_paths_raw if tree_paths_raw is not None else []
+
+    # FAIL CLOSED on an unreadable/malformed limits config OR branch-literal
+    # rules. The fail-open predecessor returned compliant=True here — the
+    # guardrails silently skipped and the gate reported success, exactly the
+    # circumstance in which it is least entitled to pass. When the limits
+    # source cannot be read, the size guardrails cannot be verified; when the
+    # rules source cannot be read, the branch-literal guardrail cannot know its
+    # allowlist — both refuse the verdict. The branch-literal scan is
+    # independent of the limits file (CI's branch-literal invariants run
+    # regardless of its readability), so its findings are surfaced too when the
+    # tree is available AND the rules are readable; the verdict stays
+    # non-compliant either way.
+    if limits_status != _LIMITS_STATUS_OK or rules_status != _RULES_STATUS_OK:
+        branch_literal_violations = (
+            await _scan_branch_literals(
+                rules=rules,
+                tree_paths=tree_paths,
+                token=token,
+                owner=owner,
+                repo=repo,
+                ref=ref,
+                project_id=project_id,
+            )
+            if tree_available and rules_status == _RULES_STATUS_OK
+            else []
+        )
+        return {
+            "ref": ref,
+            "compliant": False,
+            "violations": [],
+            "branch_literal_violations": branch_literal_violations,
+            "checked": 0,
+            "limits_available": limits_status == _LIMITS_STATUS_OK,
+            "limits_status": limits_status,
+            "limits_error": limits_error,
+            "rules_available": rules_status == _RULES_STATUS_OK,
+            "rules_status": rules_status,
+            "rules_error": rules_error,
+            "tree_available": tree_available,
+        }
 
     # Run all three guardrails in parallel: capped-file reads (guardrail 1),
     # uncapped large-file reads (guardrail 2), and branch-literal scans
@@ -554,6 +780,7 @@ async def evaluate_ci_compliance_at_ref(
     )
     branch_task = (
         _scan_branch_literals(
+            rules=rules,
             tree_paths=tree_paths,
             token=token,
             owner=owner,
@@ -579,6 +806,11 @@ async def evaluate_ci_compliance_at_ref(
         "branch_literal_violations": branch_literal_violations,
         "checked": checked,
         "limits_available": True,
+        "limits_status": _LIMITS_STATUS_OK,
+        "limits_error": None,
+        "rules_available": True,
+        "rules_status": _RULES_STATUS_OK,
+        "rules_error": None,
         "tree_available": tree_available,
     }
 
@@ -618,6 +850,81 @@ def get_ci_compliance(project: "Project", sha: str | None = None) -> Any:
     return data.get(sha)
 
 
+def _verdict_is_authoritative(stored: Any) -> bool:
+    """Whether a stored per-SHA result reflects evidence that was actually READ.
+
+    The per-SHA cache is safe to reuse only for verdicts whose evaluation READ
+    the guardrails' evidence: the size-limits file, the branch-literal rules
+    file, and the repo tree. A stored result missing any of those channels is
+    DEGRADED — it failed closed (or skipped guardrails) because the system could
+    not verify compliance, not because it observed a violation. A degraded
+    verdict must be re-evaluated on a subsequent call rather than replayed for
+    that SHA forever: one transient GitHub read failure must not wedge every
+    qualification entry path (the qualify_request / re-driver / sweep /
+    force-qualify surfaces all read this cache). A verdict that read the
+    evidence and found a REAL violation (``compliant=False`` with all channels
+    ``ok``) IS authoritative: it is reused and keeps refusing, exactly as
+    today. A non-dict stored value (no record / a legacy non-JSON shape) is
+    never authoritative.
+    """
+    if not isinstance(stored, dict):
+        return False
+    return (
+        stored.get("limits_status") == _LIMITS_STATUS_OK
+        and stored.get("rules_status") == _RULES_STATUS_OK
+        and stored.get("tree_available") is True
+    )
+
+
+def _degraded_recheck_is_due(stored: Any, now: datetime | None = None) -> bool:
+    """Whether a non-authoritative stored verdict may be re-evaluated NOW.
+
+    Only consulted for verdicts :func:`_verdict_is_authoritative` rejects, so a
+    ``True`` here never causes an authoritative verdict to be re-scanned.
+
+    Returns True (re-evaluate) when there is no usable prior-attempt stamp — no
+    record at all, a non-dict record, a record predating
+    :data:`_DEGRADED_EVALUATED_AT_KEY`, or an unparseable stamp. That keeps the
+    self-heal fast: the FIRST call after a degraded verdict lands always
+    re-evaluates. Thereafter the stamp rate-limits re-evaluation to once per
+    :data:`_DEGRADED_RECHECK_INTERVAL_SECONDS`, so a DETERMINISTICALLY degraded
+    ref (a malformed limits/rules blob, or a 404 on their hardcoded paths — both
+    of which cannot heal without a new commit) can no longer turn every call
+    into a full GitHub re-scan.
+
+    A stamp in the FUTURE (clock skew between writers, or a backward clock
+    step) is not due: ``_is_cadence_due`` computes a negative elapsed time,
+    which is below the interval. It expires naturally once wall clock passes
+    it, so a skewed stamp delays the next re-check by at most the skew rather
+    than wedging the SHA.
+    """
+    if not isinstance(stored, dict):
+        return True
+    raw = stored.get(_DEGRADED_EVALUATED_AT_KEY)
+    if not isinstance(raw, str):
+        return True
+    try:
+        last = _coerce_naive_utc(datetime.fromisoformat(raw))
+    except (ValueError, TypeError):
+        return True
+    return _is_cadence_due(last, _DEGRADED_RECHECK_INTERVAL_SECONDS, now)
+
+
+def _stamp_degraded_evaluation(result: Any) -> Any:
+    """Return ``result`` with the degraded re-check stamp applied when needed.
+
+    A DEGRADED result gets a copy carrying :data:`_DEGRADED_EVALUATED_AT_KEY`
+    set to now, so :func:`_degraded_recheck_is_due` can rate-limit the next
+    re-evaluation of the same SHA. An AUTHORITATIVE result is returned
+    unchanged (never stamped — it is a cache hit and is never re-evaluated), as
+    is a non-dict. A copy is made rather than a mutation because the input may
+    be the shared object returned by a coalesced ``_in_flight_evals`` task.
+    """
+    if not isinstance(result, dict) or _verdict_is_authoritative(result):
+        return result
+    return {**result, _DEGRADED_EVALUATED_AT_KEY: _utcnow().isoformat()}
+
+
 def compact_ci_compliance(result: dict[str, Any] | None) -> dict[str, Any] | None:
     """Return the small strategist/fetch shape for one compliance result."""
     if not isinstance(result, dict):
@@ -637,6 +944,11 @@ def compact_ci_compliance(result: dict[str, Any] | None) -> dict[str, Any] | Non
         "branch_literal_violations": branch_literal_violations,
         "checked": result.get("checked"),
         "limits_available": result.get("limits_available"),
+        "limits_status": result.get("limits_status"),
+        "limits_error": result.get("limits_error"),
+        "rules_available": result.get("rules_available"),
+        "rules_status": result.get("rules_status"),
+        "rules_error": result.get("rules_error"),
         "tree_available": result.get("tree_available"),
     }
 
@@ -650,6 +962,26 @@ async def ensure_current_ci_compliance(
     The evaluator still reads all repo contents through GitHub at the resolved
     SHA; this helper only coordinates credential resolution, branch-tip lookup,
     per-SHA cache reuse, and JSONB persistence.
+
+    A stored per-SHA result is reused only when it is AUTHORITATIVE — computed
+    from evidence the evaluator actually read (size-limits file, branch-literal
+    rules file, and repo tree all available; see
+    :func:`_verdict_is_authoritative`). A DEGRADED stored verdict (one of those
+    evidence channels was unreadable/unavailable, so the evaluator failed
+    closed rather than verifying) is re-evaluated on this call instead of being
+    replayed for the SHA forever, so a transient GitHub read failure self-heals
+    and never permanently wedges the qualification entry paths that read this
+    cache. An authoritative verdict that found a REAL violation is reused and
+    keeps refusing.
+
+    That degraded re-evaluation is RATE-LIMITED per SHA (see
+    :func:`_degraded_recheck_is_due`): the first call after a degraded verdict
+    lands re-evaluates immediately, then at most once per
+    :data:`_DEGRADED_RECHECK_INTERVAL_SECONDS`. Without the bound a
+    deterministically degraded ref — a malformed limits/rules blob, or a 404 on
+    their hardcoded paths, neither of which can heal without a new commit —
+    would be a permanent cache miss re-running the full ~200-file GitHub scan on
+    every call.
 
     Returns ``{"status": "success", "head_sha": ..., "data": result, ...}`` on
     success. When GitHub credentials or the branch SHA cannot be resolved it
@@ -698,7 +1030,28 @@ async def ensure_current_ci_compliance(
 
     stored = get_ci_compliance(project, head_sha)
     computed = False
-    if not isinstance(stored, dict):
+    if not _verdict_is_authoritative(stored) and _degraded_recheck_is_due(stored):
+        # Re-evaluate on a cache miss AND on a DEGRADED stored verdict. A
+        # verdict persisted from evidence the system could not read (unreadable
+        # size-limits file, unreadable branch-literal rules, or unavailable repo
+        # tree) must not be replayed for this SHA forever — the next call
+        # re-runs the evaluator so a transient GitHub read failure self-heals
+        # instead of permanently refusing every qualification entry path. A
+        # verdict that READ the evidence and found a real violation is
+        # authoritative (``_verdict_is_authoritative`` True) and is reused to
+        # keep refusing.
+        #
+        # ``_degraded_recheck_is_due`` BOUNDS that re-evaluation. A degraded
+        # status is not necessarily transient: a malformed limits/rules blob, or
+        # a 404 on their hardcoded repo paths, is deterministic at a fixed ref
+        # and cannot heal without a new commit. Without the bound such a SHA is
+        # a permanent cache miss that re-runs the full ~200-file scan on EVERY
+        # call (``_in_flight_evals`` coalesces concurrent calls only, not
+        # sequential ones), burning the owner's GitHub token behind the
+        # 60/minute agent endpoint until the branch tip moves. The first call
+        # after a degraded verdict lands is always due, so a genuinely transient
+        # failure still self-heals immediately; further re-checks are spaced by
+        # _DEGRADED_RECHECK_INTERVAL_SECONDS and still emit a fresh diagnostic.
         flight_key = f"{project.id}:{head_sha}"
         if flight_key in _in_flight_evals:
             # Another coroutine is already computing this SHA — await its result
@@ -722,6 +1075,11 @@ async def ensure_current_ci_compliance(
                 stored = await task
             finally:
                 _in_flight_evals.pop(flight_key, None)
+        # Stamp a still-degraded verdict with this attempt's timestamp so the
+        # next re-check is spaced by _DEGRADED_RECHECK_INTERVAL_SECONDS. A
+        # healed (authoritative) verdict is returned unstamped — it is a cache
+        # hit from here on and is never re-evaluated for this SHA.
+        stored = _stamp_degraded_evaluation(stored)
         record_ci_compliance(project, stored)
         session.add(project)
         await session.flush()

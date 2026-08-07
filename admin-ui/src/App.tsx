@@ -1670,6 +1670,8 @@ export default function App() {
           setNewTaskEffort={s.setNewTaskEffort}
           computeExperiment={s.computeExperiment}
           setComputeExperiment={s.setComputeExperiment}
+          acceptanceEvidence={s.acceptanceEvidence}
+          setAcceptanceEvidence={s.setAcceptanceEvidence}
           getDefaultModelForType={s.getDefaultModelForType}
           getDefaultEffortForType={s.getDefaultEffortForType}
           preflightResult={s.preflightResult}

@@ -244,6 +244,47 @@ class WorkerServiceTests(unittest.TestCase):
     @patch.object(worker, "_wait_for_proxy")
     @patch.object(worker, "_assert_no_active_user_worker_service")
     @patch.object(worker, "_assert_no_host_ci_runner")
+    def test_worker_forwards_deploy_sha_to_container(
+        self, _ci_guard, _user_worker_guard, _wait, _network_probe, _gateway
+    ):
+        env = {
+            "BLUEPRINT_WORKER_IMAGE_ID": f"sha256:{'a' * 64}",
+            "BLUEPRINT_CONTROL_PLANE_NETWORK": "blueprint-control-plane",
+            "BLUEPRINT_WORKER_SECRETS_FILE": str(self.secrets),
+            "BLUEPRINT_WORKER_GOOGLE_CREDENTIALS_FILE": str(self.google_credentials),
+            "BLUEPRINT_DATABASE_MODE": "local-postgres",
+        }
+        # Absent: DEPLOY_SHA is neither set nor forwarded.
+        with patch.dict(os.environ, env, clear=True):
+            argv, child_env = worker.command()
+        self.assertNotIn("DEPLOY_SHA", child_env)
+        self.assertNotIn("DEPLOY_SHA", argv)
+
+        # Present and valid: exported to the container so the leader's
+        # deploy-state health tick can reconcile DeploymentState.current_sha.
+        with patch.dict(
+            os.environ,
+            {**env, "BLUEPRINT_WORKER_DEPLOY_SHA": "b" * 40},
+            clear=True,
+        ):
+            argv, child_env = worker.command()
+        self.assertEqual(child_env["DEPLOY_SHA"], "b" * 40)
+        self.assertIn("DEPLOY_SHA", argv)
+
+        # Malformed values fail closed rather than stamping a bogus SHA.
+        with patch.dict(
+            os.environ,
+            {**env, "BLUEPRINT_WORKER_DEPLOY_SHA": "not-a-sha"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ValueError, "full git SHA"):
+                worker.command()
+
+    @patch.object(worker, "_network_gateway", return_value="172.20.0.1")
+    @patch.object(worker, "_assert_proxy_reachable_from_network")
+    @patch.object(worker, "_wait_for_proxy")
+    @patch.object(worker, "_assert_no_active_user_worker_service")
+    @patch.object(worker, "_assert_no_host_ci_runner")
     def test_local_postgres_mode_never_uses_proxy_or_host_gateway(
         self, _ci_guard, _user_worker_guard, wait, network_probe, _gateway
     ):

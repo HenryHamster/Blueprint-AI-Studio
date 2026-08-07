@@ -17,12 +17,14 @@ Exercises :mod:`app.ci_compliance`:
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 
 import pytest
 from sqlmodel import select
 
 from app import ci_compliance
 from app.models import Project
+from app.time_utils import _utcnow
 
 # A capped backend module guaranteed to exist in module_size_limits.json with a
 # small cap, so an over-cap body is easy to synthesise.
@@ -36,15 +38,82 @@ def _limits_json(cap: int = _CAP) -> str:
     return json.dumps({"backend": {_CAPPED_REL: cap}})
 
 
+# A capped backend/testing/ file guaranteed to be exercised once the evaluator
+# scans the enforced ``testing`` section (mirroring CI's TestTestFileSizeGuardrails).
+_TESTING_REL = "test_fake_module.py"
+_TESTING_CAP = 100
+
+
+def _limits_json_with_testing(
+    cap: int = _CAP,
+    testing_cap: int = _TESTING_CAP,
+    testing_rel: str = _TESTING_REL,
+) -> str:
+    """A limits JSON with capped backend + testing sections."""
+    return json.dumps(
+        {
+            "backend": {_CAPPED_REL: cap},
+            "testing": {testing_rel: testing_cap},
+        }
+    )
+
+
+def _rules_json() -> str:
+    """A valid ``branch_literal_allowlist.json`` body.
+
+    Carries the same allowlist entries as the checked-in data file — the
+    evaluator reads this file AT THE CANDIDATE REF, so tests that rely on the
+    real allowlist (e.g. allowlisted entry suppression) get the real content.
+    """
+    return json.dumps(
+        {
+            "backend": {
+                "allowlisted_filenames": [
+                    "admin.py",
+                    "branch_literal_compliance.py",
+                    "payload_schemas.py",
+                ]
+            },
+            "agent": {
+                "allowlist": [
+                    {
+                        "path": "prompts/review-prompt.ts",
+                        "line": 336,
+                        "pattern": "fallback-main",
+                        "rationale": "defensive display default downstream of resolveBaseBranch",
+                    },
+                    {
+                        "path": "prompts/review-prompt.ts",
+                        "line": 121,
+                        "pattern": "fallback-main",
+                        "rationale": "local-variable defensive default",
+                    },
+                ]
+            },
+            "admin-ui": {"allowlist": []},
+        }
+    )
+
+
 def _fake_reader(file_bodies: dict[str, str | None]):
     """Build an async stand-in for ``github.get_file_text_at_ref``.
 
     ``file_bodies`` maps a repo-relative path to the text returned at the ref;
     a missing key (or an explicit ``None``) models a 404 / unreadable file.
+
+    The branch-literal allowlist is served from ``_rules_json()`` unless the
+    test supplies that path explicitly — the evaluator reads it AT THE REF, so
+    every evaluation needs a readable rules file. An explicit ``None`` for the
+    rules path still models an unreadable rules file.
     """
 
+    bodies = dict(file_bodies)
+    bodies.setdefault(
+        ci_compliance.BRANCH_LITERAL_ALLOWLIST_PATH, _rules_json()
+    )
+
     async def _reader(path, *, token, owner, repo, ref, project_id=None):
-        return file_bodies.get(path)
+        return bodies.get(path)
 
     return _reader
 
@@ -161,8 +230,15 @@ async def test_evaluator_skips_unreadable_file(mocker):
 
 
 @pytest.mark.asyncio
-async def test_evaluator_compliant_when_limits_unreadable(mocker):
-    """An unreadable limits file is fail-safe: compliant, limits_available=False."""
+async def test_unreadable_limits_fails_closed(mocker):
+    """An unreadable limits config fails closed: compliant=False + diagnostic.
+
+    The fail-open behavior this replaces reported compliant=True when the
+    size-limits file could not be read — the guard silently stopped guarding
+    and reported success. Fail-closed discipline: when the limits source is
+    unreadable, the gate must refuse with a diagnostic naming the path it tried
+    to read.
+    """
     mocker.patch.object(
         ci_compliance.github,
         "get_file_text_at_ref",
@@ -178,9 +254,186 @@ async def test_evaluator_compliant_when_limits_unreadable(mocker):
         token="t", owner="o", repo="r", ref=_HEAD_SHA, project_id="p"
     )
 
-    assert result["compliant"] is True
+    assert result["compliant"] is False
     assert result["violations"] == []
     assert result["limits_available"] is False
+    assert result["limits_status"] == "unreadable"
+    assert ci_compliance._MODULE_SIZE_LIMITS_PATH in result["limits_error"]
+    assert result["tree_available"] is True
+    assert result["checked"] == 0
+    assert result["branch_literal_violations"] == []
+
+
+@pytest.mark.asyncio
+async def test_evaluator_fails_closed_when_limits_malformed(mocker):
+    """A malformed limits config (bad JSON / non-object) fails closed too."""
+    for bad_body in ("not json", "[1, 2, 3]"):
+        bodies = {ci_compliance._MODULE_SIZE_LIMITS_PATH: bad_body}
+        mocker.patch.object(
+            ci_compliance.github,
+            "get_file_text_at_ref",
+            new=_fake_reader(bodies),
+        )
+        mocker.patch.object(
+            ci_compliance.github,
+            "list_repo_tree_paths_at_ref",
+            new=_fake_tree(_EMPTY_TREE),
+        )
+
+        result = await ci_compliance.evaluate_ci_compliance_at_ref(
+            token="t", owner="o", repo="r", ref=_HEAD_SHA, project_id="p"
+        )
+
+        assert result["compliant"] is False, f"body {bad_body!r} must fail closed"
+        assert result["violations"] == []
+        assert result["limits_available"] is False
+        assert result["limits_status"] == "malformed"
+        assert ci_compliance._MODULE_SIZE_LIMITS_PATH in result["limits_error"]
+        assert result["branch_literal_violations"] == []
+
+
+@pytest.mark.asyncio
+async def test_evaluator_compliant_when_limits_legitimately_empty(mocker):
+    """A valid config declaring no limits ({}) still passes.
+
+    Distinguishes 'unreadable' from 'legitimately empty': an empty-but-valid
+    caps object means the size guardrails have nothing to enforce, and the
+    branch-literal scan (independent of the limits file) still runs.
+    """
+    bodies = {ci_compliance._MODULE_SIZE_LIMITS_PATH: "{}"}
+    mocker.patch.object(
+        ci_compliance.github,
+        "get_file_text_at_ref",
+        new=_fake_reader(bodies),
+    )
+    mocker.patch.object(
+        ci_compliance.github,
+        "list_repo_tree_paths_at_ref",
+        new=_fake_tree(_EMPTY_TREE),
+    )
+
+    result = await ci_compliance.evaluate_ci_compliance_at_ref(
+        token="t", owner="o", repo="r", ref=_HEAD_SHA, project_id="p"
+    )
+
+    assert result["compliant"] is True
+    assert result["violations"] == []
+    assert result["limits_available"] is True
+    assert result["limits_status"] == "ok"
+    assert result["limits_error"] is None
+    assert result["checked"] == 0
+    assert result["branch_literal_violations"] == []
+
+
+@pytest.mark.asyncio
+async def test_evaluator_flags_testing_section_breach(mocker):
+    """A capped backend/testing/ file over its cap is a section-'testing' violation."""
+    testing_body = "\n".join("x" for _ in range(_TESTING_CAP + 5))
+    bodies = {
+        ci_compliance._MODULE_SIZE_LIMITS_PATH: _limits_json_with_testing(),
+        f"backend/app/{_CAPPED_REL}": "\n".join("x" for _ in range(_CAP - 100)),
+        f"backend/testing/{_TESTING_REL}": testing_body,
+    }
+    mocker.patch.object(
+        ci_compliance.github, "get_file_text_at_ref", new=_fake_reader(bodies)
+    )
+    mocker.patch.object(
+        ci_compliance.github, "list_repo_tree_paths_at_ref", new=_fake_tree(_EMPTY_TREE)
+    )
+
+    result = await ci_compliance.evaluate_ci_compliance_at_ref(
+        token="t", owner="o", repo="r", ref=_HEAD_SHA, project_id="p"
+    )
+
+    assert result["compliant"] is False
+    assert result["limits_available"] is True
+    testing_violations = [
+        v for v in result["violations"] if v.get("section") == "testing"
+    ]
+    assert len(testing_violations) == 1
+    assert testing_violations[0] == {
+        "section": "testing",
+        "rel": _TESTING_REL,
+        "count": _TESTING_CAP + 5,
+        "cap": _TESTING_CAP,
+    }
+
+
+@pytest.mark.asyncio
+async def test_evaluator_flags_testing_uncapped_large_file(mocker):
+    """An uncapped backend/testing/*.py over the threshold is an uncapped violation."""
+    big_body = "\n".join("x" for _ in range(ci_compliance._UNCAPPED_THRESHOLD + 10))
+    big_body_bytes = len(big_body.encode())
+    testing_rel = "test_large_module.py"
+    testing_path = f"backend/testing/{testing_rel}"
+
+    bodies = {
+        ci_compliance._MODULE_SIZE_LIMITS_PATH: _limits_json_with_testing(),
+        f"backend/app/{_CAPPED_REL}": "\n".join("x" for _ in range(_CAP - 100)),
+        testing_path: big_body,
+    }
+    tree = [
+        {"path": testing_path, "size": big_body_bytes},
+        {"path": f"backend/app/{_CAPPED_REL}", "size": 10000},
+    ]
+    mocker.patch.object(
+        ci_compliance.github, "get_file_text_at_ref", new=_fake_reader(bodies)
+    )
+    mocker.patch.object(
+        ci_compliance.github, "list_repo_tree_paths_at_ref", new=_fake_tree(tree)
+    )
+
+    result = await ci_compliance.evaluate_ci_compliance_at_ref(
+        token="t", owner="o", repo="r", ref=_HEAD_SHA, project_id="p"
+    )
+
+    assert result["compliant"] is False
+    uncapped_violations = [v for v in result["violations"] if v.get("cap") is None]
+    assert len(uncapped_violations) == 1
+    assert uncapped_violations[0]["section"] == "testing"
+    assert uncapped_violations[0]["rel"] == testing_rel
+    assert uncapped_violations[0]["count"] == ci_compliance._UNCAPPED_THRESHOLD + 10
+
+
+@pytest.mark.asyncio
+async def test_evaluator_runs_branch_literal_scan_when_limits_unreadable(mocker):
+    """Unreadable limits still surface branch-literal violations from the tree.
+
+    The limits file 404s (not in ``bodies``), so the size scans are skipped and
+    ``limits_available`` is False — but the branch-literal scan depends only on
+    the repo tree (as CI's branch-literal invariants do), so an offending
+    backend/app/ file must still be reported even while the verdict fails
+    closed on the unreadable limits.
+    """
+    offending_body = (
+        "def get_branch(config):\n"
+        "    return config.get('integration_branch') else 'main'\n"
+    )
+    tree = [{"path": "backend/app/some_module.py", "size": 100}]
+    bodies = {
+        # limits file intentionally ABSENT -> unreadable
+        "backend/app/some_module.py": offending_body,
+    }
+    mocker.patch.object(
+        ci_compliance.github, "get_file_text_at_ref", new=_fake_reader(bodies)
+    )
+    mocker.patch.object(
+        ci_compliance.github, "list_repo_tree_paths_at_ref", new=_fake_tree(tree)
+    )
+
+    result = await ci_compliance.evaluate_ci_compliance_at_ref(
+        token="t", owner="o", repo="r", ref=_HEAD_SHA, project_id="p"
+    )
+
+    assert result["compliant"] is False
+    assert result["violations"] == []
+    assert result["checked"] == 0
+    assert result["limits_available"] is False
+    assert result["tree_available"] is True
+    assert len(result["branch_literal_violations"]) >= 1
+    offender = result["branch_literal_violations"][0]
+    assert offender["section"] == "backend"
+    assert offender["rel"] == "some_module.py"
 
 
 @pytest.mark.asyncio
@@ -452,9 +705,15 @@ def test_ci_compliance_branch_literals_use_shared_scanner():
     """ci_compliance sources branch-literal patterns from branch_literal_compliance.
 
     Asserts that the local duplicate constant names no longer exist and that
-    ci_compliance imports pattern/allowlist objects from the shared module.
-    This is the acceptance gate for the dedup refactor — both production-code
-    and test changes must be present for this test to be meaningful.
+    ci_compliance imports the pattern/helper objects from the shared module.
+    The ALLOWLIST is deliberately NOT imported from the shared module's
+    in-process ``SURFACE_CONFIGS``: ci_compliance reads it AT THE CANDIDATE REF
+    from the checked-in ``branch_literal_allowlist.json`` (the provenance fix),
+    so the local duplicate names must be absent AND the allowlist path must be
+    the shared repo-relative constant.
+    This is the acceptance gate for the dedup + candidate-sourcing refactor —
+    both production-code and test changes must be present for this test to be
+    meaningful.
     """
     from app import branch_literal_compliance
 
@@ -477,7 +736,6 @@ def test_ci_compliance_branch_literals_use_shared_scanner():
 
     # ci_compliance must reference the shared module's objects by identity.
     assert ci_compliance.BACKEND_PATTERNS is branch_literal_compliance.BACKEND_PATTERNS
-    assert ci_compliance.SURFACE_CONFIGS is branch_literal_compliance.SURFACE_CONFIGS
     assert ci_compliance.AGENT_SOURCE_FILES is branch_literal_compliance.AGENT_SOURCE_FILES
     assert ci_compliance.CI_AGENT_FORBIDDEN_RE is branch_literal_compliance.CI_AGENT_FORBIDDEN_RE
     assert (
@@ -487,6 +745,17 @@ def test_ci_compliance_branch_literals_use_shared_scanner():
     assert (
         ci_compliance.strip_typescript_with_linenos
         is branch_literal_compliance.strip_typescript_with_linenos
+    )
+
+    # The allowlist is NOT a process-local import: it is read at the candidate
+    # ref from the same checked-in file the local invariant test scans against.
+    assert (
+        ci_compliance.BRANCH_LITERAL_ALLOWLIST_PATH
+        is branch_literal_compliance.BRANCH_LITERAL_ALLOWLIST_PATH
+    )
+    assert not hasattr(ci_compliance, "SURFACE_CONFIGS"), (
+        "ci_compliance must not hold a process-local SURFACE_CONFIGS allowlist; "
+        "it reads the branch-literal allowlist at the candidate ref"
     )
 
 
@@ -503,6 +772,139 @@ def test_record_ci_compliance_bounds_history():
     # Oldest evicted, newest retained.
     assert "sha0000" not in stored
     assert f"sha{total - 1:04d}" in stored
+
+
+@pytest.mark.asyncio
+async def test_degraded_ci_compliance_verdict_is_reevaluated_not_replayed(
+    db_session, mocker
+):
+    """A stored DEGRADED verdict is re-evaluated; an authoritative one is reused.
+
+    Regression for the permanent-block defect: ``ensure_current_ci_compliance``
+    reused ANY stored per-SHA dict, including a DEGRADED verdict persisted when
+    the size-limits or branch-literal rules file could not be read at the ref
+    (or the repo tree was unavailable). One transient GitHub read failure
+    therefore replayed that verdict for the SHA forever, wedging every
+    qualification entry path with no self-heal. The reuse decision must consider
+    whether the evaluation READ its evidence, not just the stored value's type:
+    a verdict produced from evidence the system could not read must be
+    re-evaluated on a subsequent call; a verdict produced from evidence that
+    WAS read and found a REAL violation must be reused and keep refusing.
+
+    (a) A verdict persisted from unreadable evidence IS re-evaluated on the
+        next call for the same SHA (``computed=True``; the fresh verdict is
+        returned and stored).
+    (b) A verdict persisted from successfully-read evidence that found a REAL
+        violation is NOT re-evaluated (``computed=False``; the refusing verdict
+        is returned unchanged).
+    """
+    project = Project(
+        name="CI-Compliance Reuse",
+        user_id="test-user-123",
+        github_owner="owner",
+        github_repo="repo",
+        integration_branch="automain",
+    )
+    db_session.add(project)
+    await db_session.flush()
+    project_id = project.id
+
+    async def _resolve(_session, _project):
+        return ("token", "owner", "repo")
+
+    mocker.patch(
+        "app.release_promotion._resolve_github_with_session", new=_resolve
+    )
+    mocker.patch.object(
+        ci_compliance.github,
+        "get_branch_sha",
+        new=mocker.AsyncMock(return_value=_HEAD_SHA),
+    )
+
+    # (a) DEGRADED verdict: the size-limits file could not be read at the ref,
+    # so the evaluator FAILED CLOSED rather than verifying compliance. Such a
+    # verdict must not be replayed forever — the next call re-evaluates.
+    degraded = {
+        "ref": _HEAD_SHA,
+        "compliant": False,
+        "violations": [],
+        "branch_literal_violations": [],
+        "checked": 0,
+        "limits_available": False,
+        "limits_status": ci_compliance._LIMITS_STATUS_UNREADABLE,
+        "limits_error": "could not read backend/testing/module_size_limits.json",
+        "rules_available": True,
+        "rules_status": ci_compliance._RULES_STATUS_OK,
+        "rules_error": None,
+        "tree_available": True,
+    }
+    fresh = {
+        "ref": _HEAD_SHA,
+        "compliant": True,
+        "violations": [],
+        "branch_literal_violations": [],
+        "checked": 1,
+        "limits_available": True,
+        "limits_status": ci_compliance._LIMITS_STATUS_OK,
+        "limits_error": None,
+        "rules_available": True,
+        "rules_status": ci_compliance._RULES_STATUS_OK,
+        "rules_error": None,
+        "tree_available": True,
+    }
+    ci_compliance.record_ci_compliance(project, degraded)
+    await db_session.flush()
+    eval_mock = mocker.patch.object(
+        ci_compliance,
+        "evaluate_ci_compliance_at_ref",
+        new=mocker.AsyncMock(return_value=fresh),
+    )
+
+    result = await ci_compliance.ensure_current_ci_compliance(db_session, project)
+    assert result["computed"] is True
+    assert result["data"] == fresh
+    eval_mock.assert_awaited_once_with(
+        token="token",
+        owner="owner",
+        repo="repo",
+        ref=_HEAD_SHA,
+        project_id=str(project_id),
+    )
+    assert ci_compliance.get_ci_compliance(project, sha=_HEAD_SHA) == fresh
+
+    # (b) AUTHORITATIVE verdict: the evaluation READ the evidence and found a
+    # real violation. It must be reused (no re-evaluation) and keep refusing.
+    violating = {
+        "ref": _HEAD_SHA,
+        "compliant": False,
+        "violations": [
+            {
+                "section": "backend",
+                "rel": _CAPPED_REL,
+                "count": _CAP + 5,
+                "cap": _CAP,
+            }
+        ],
+        "branch_literal_violations": [],
+        "checked": 1,
+        "limits_available": True,
+        "limits_status": ci_compliance._LIMITS_STATUS_OK,
+        "limits_error": None,
+        "rules_available": True,
+        "rules_status": ci_compliance._RULES_STATUS_OK,
+        "rules_error": None,
+        "tree_available": True,
+    }
+    ci_compliance.record_ci_compliance(project, violating)
+    await db_session.flush()
+    eval_mock.reset_mock()
+
+    result = await ci_compliance.ensure_current_ci_compliance(db_session, project)
+    assert result["computed"] is False
+    assert result["data"] == violating
+    eval_mock.assert_not_awaited()
+    # The refusing verdict is still the stored one — the gate keeps blocking.
+    assert ci_compliance.get_ci_compliance(project, sha=_HEAD_SHA) == violating
 
 
 @pytest.mark.asyncio
@@ -682,13 +1084,21 @@ async def test_evaluator_scans_non_listed_agent_ts_file(mocker):
     assert agent_violations[0]["rel"] == "helpers/branch-utils.ts"
 
 
-async def _scan_agent_ts(mocker, agent_path: str, offending_ts: str):
-    """Run the evaluator over a single agent .ts file, returning agent violations."""
+async def _scan_agent_ts(
+    mocker, agent_path: str, offending_ts: str, rules_json: str | None = None
+):
+    """Run the evaluator over a single agent .ts file, returning agent violations.
+
+    ``rules_json`` optionally overrides the branch-literal allowlist served at
+    the ref; ``None`` uses the default (real) allowlist.
+    """
     bodies = {
         ci_compliance._MODULE_SIZE_LIMITS_PATH: _limits_json(),
         f"backend/app/{_CAPPED_REL}": "\n".join("x" for _ in range(_CAP - 50)),
         agent_path: offending_ts,
     }
+    if rules_json is not None:
+        bodies[ci_compliance.BRANCH_LITERAL_ALLOWLIST_PATH] = rules_json
     mocker.patch.object(
         ci_compliance.github, "get_file_text_at_ref", new=_fake_reader(bodies)
     )
@@ -779,46 +1189,48 @@ async def test_supplemental_pattern_respects_allowlist(mocker):
     """An allowlist entry for a supplemental pattern suppresses its violation.
 
     Mirrors the canonical AGENT_PATTERNS allowlist behaviour: a
-    path::line::pattern entry in SURFACE_CONFIGS['agent'].allowlist must
-    suppress a supplemental ('equality-loose-main') match too.
+    path::line::pattern entry in the branch_literal_allowlist.json served AT
+    THE CANDIDATE REF must suppress a supplemental ('equality-loose-main')
+    match too.
     """
-    import dataclasses
-
-    from app.branch_literal_compliance import (
-        SURFACE_CONFIGS,
-        BranchLiteralAllowEntry,
-    )
-
     offending_ts = (
         "function helper(branch: string) {\n"
         "  if (branch == 'main') { return true; }\n"
         "}\n"
     )
     agent_path = "agent/src/helpers/allowlisted.ts"
-    allow_entry = BranchLiteralAllowEntry(
-        path="helpers/allowlisted.ts",
-        line=2,
-        pattern="equality-loose-main",
-        rationale="test allowlist of supplemental pattern",
+    rules = {
+        "agent": {
+            "allowlist": [
+                {
+                    "path": "helpers/allowlisted.ts",
+                    "line": 2,
+                    "pattern": "equality-loose-main",
+                    "rationale": "test allowlist of supplemental pattern",
+                }
+            ]
+        }
+    }
+    agent_violations = await _scan_agent_ts(
+        mocker, agent_path, offending_ts, rules_json=json.dumps(rules)
     )
-    patched_agent = dataclasses.replace(
-        SURFACE_CONFIGS["agent"], allowlist=(allow_entry,)
-    )
-    mocker.patch.dict(
-        ci_compliance.SURFACE_CONFIGS, {"agent": patched_agent}, clear=False
-    )
-
-    agent_violations = await _scan_agent_ts(mocker, agent_path, offending_ts)
     assert agent_violations == []
 
 
 @pytest.mark.asyncio
 async def test_evaluator_allows_agent_allowlisted_entry(mocker):
-    """Violations at allowlisted path+line+pattern in SURFACE_CONFIGS are suppressed."""
+    """Violations at allowlisted path+line+pattern are suppressed.
+
+    The allowlist is read AT THE CANDIDATE REF from branch_literal_allowlist.json
+    (the ``_rules_json()`` default in ``_fake_reader``), so the first real
+    allowlist entry suppresses its violation without any SURFACE_CONFIGS patch.
+    """
     from app.branch_literal_compliance import SURFACE_CONFIGS
 
     agent_config = SURFACE_CONFIGS["agent"]
-    # Pick the first allowlist entry as the test target.
+    # Pick the first allowlist entry as the test target. SURFACE_CONFIGS and
+    # the at-ref rules file both derive from the same checked-in JSON, so the
+    # entry here is present in the default rules body.
     allow_entry = agent_config.allowlist[0]
     # Build a source with the flagged pattern on the exact allowlisted line.
     lines = [""] * allow_entry.line
@@ -854,6 +1266,116 @@ async def test_evaluator_allows_agent_allowlisted_entry(mocker):
     )
 
 
+@pytest.mark.asyncio
+async def test_candidate_ref_only_allowlist_entries_clear_the_gate(mocker):
+    """Files whose allowlist entries ship ONLY at the candidate ref pass.
+
+    Regression for the provenance deadlock: the branch-literal allowlist is
+    read AT THE CANDIDATE REF (``branch_literal_allowlist.json``), so a file
+    whose allowlist entry lands in the SAME commit as the file is evaluable by
+    the deployed gate. The in-process ``SURFACE_CONFIGS`` predecessor could not
+    see an entry that only exists at the candidate ref — a new file + its
+    allowlist entry in one commit could never clear the gate because the
+    deployed backend's allowlist did not know the rule, and the rule only
+    deployed AFTER the promotion the gate was blocking. That is the deadlock
+    this change removes.
+
+    Both halves are exercised: an agent per-line allowlist entry and a backend
+    allowlisted filename, each present ONLY in the candidate-ref rules body.
+    """
+    agent_ts = (
+        "function helper(opts) {\n"
+        "  const base = opts.base ?? 'main';\n"
+        "  return base;\n"
+        "}\n"
+    )
+    agent_path = "agent/src/handlers/new-feature.ts"
+    backend_py = (
+        "def resolve():\n"
+        "    branch = 'main'\n"
+        "    return branch\n"
+    )
+    backend_path = "backend/app/new_feature.py"
+    rules = {
+        "backend": {"allowlisted_filenames": ["new_feature.py"]},
+        "agent": {
+            "allowlist": [
+                {
+                    "path": "handlers/new-feature.ts",
+                    "line": 2,
+                    "pattern": "fallback-main",
+                    "rationale": "shipped in the same commit as the file",
+                }
+            ]
+        },
+    }
+    bodies = {
+        ci_compliance._MODULE_SIZE_LIMITS_PATH: _limits_json(),
+        ci_compliance.BRANCH_LITERAL_ALLOWLIST_PATH: json.dumps(rules),
+        f"backend/app/{_CAPPED_REL}": "\n".join("x" for _ in range(_CAP - 50)),
+        agent_path: agent_ts,
+        backend_path: backend_py,
+    }
+    mocker.patch.object(
+        ci_compliance.github, "get_file_text_at_ref", new=_fake_reader(bodies)
+    )
+    mocker.patch.object(
+        ci_compliance.github,
+        "list_repo_tree_paths_at_ref",
+        new=_fake_tree(
+            [
+                {"path": agent_path, "size": len(agent_ts)},
+                {"path": backend_path, "size": len(backend_py)},
+            ]
+        ),
+    )
+
+    result = await ci_compliance.evaluate_ci_compliance_at_ref(
+        token="t", owner="o", repo="r", ref=_HEAD_SHA, project_id="p"
+    )
+
+    assert result["compliant"] is True
+    assert result["branch_literal_violations"] == []
+    assert result["violations"] == []
+    assert result["rules_status"] == ci_compliance._RULES_STATUS_OK
+
+
+@pytest.mark.asyncio
+async def test_evaluator_fails_closed_on_unreadable_rules(mocker):
+    """An unreadable branch-literal rules file FAILS CLOSED.
+
+    Mirrors the size-limits convention (#16825): when the rules source cannot
+    be read at the ref, the branch-literal guardrail cannot know its allowlist,
+    so the verdict refuses (``compliant=False``) with a rules diagnostic —
+    never a fail-open scan against an in-process allowlist the deployed backend
+    may not know about.
+    """
+    bodies = {
+        ci_compliance._MODULE_SIZE_LIMITS_PATH: _limits_json(),
+        ci_compliance.BRANCH_LITERAL_ALLOWLIST_PATH: None,  # 404 at the ref
+        f"backend/app/{_CAPPED_REL}": "\n".join("x" for _ in range(_CAP - 50)),
+    }
+    mocker.patch.object(
+        ci_compliance.github, "get_file_text_at_ref", new=_fake_reader(bodies)
+    )
+    mocker.patch.object(
+        ci_compliance.github,
+        "list_repo_tree_paths_at_ref",
+        new=_fake_tree(_EMPTY_TREE),
+    )
+
+    result = await ci_compliance.evaluate_ci_compliance_at_ref(
+        token="t", owner="o", repo="r", ref=_HEAD_SHA, project_id="p"
+    )
+
+    assert result["compliant"] is False
+    assert result["rules_available"] is False
+    assert result["rules_status"] == ci_compliance._RULES_STATUS_UNREADABLE
+    assert result["rules_error"] is not None
+    # The size guardrail could not be evaluated either (same fail-closed path).
+    assert result["limits_available"] is True
+
+
 def test_in_flight_evals_dict_exists_and_is_mutable():
     """_in_flight_evals is a module-level dict used for in-flight coalescing.
 
@@ -872,3 +1394,221 @@ def test_in_flight_evals_dict_exists_and_is_mutable():
     assert "_test_key" in d
     del d["_test_key"]
     assert len(d) == original_len
+
+
+# ---------------------------------------------------------------------------
+# Bounded re-check of DEGRADED verdicts
+# ---------------------------------------------------------------------------
+
+
+def _degraded_verdict(**overrides) -> dict:
+    """A verdict that FAILED CLOSED because the limits file was unreadable."""
+    verdict = {
+        "ref": _HEAD_SHA,
+        "compliant": False,
+        "violations": [],
+        "branch_literal_violations": [],
+        "checked": 0,
+        "limits_available": False,
+        "limits_status": ci_compliance._LIMITS_STATUS_MALFORMED,
+        "limits_error": "backend/testing/module_size_limits.json is not valid JSON",
+        "rules_available": True,
+        "rules_status": ci_compliance._RULES_STATUS_OK,
+        "rules_error": None,
+        "tree_available": True,
+    }
+    verdict.update(overrides)
+    return verdict
+
+
+def test_degraded_recheck_is_due_only_when_interval_elapsed():
+    """The per-SHA re-check bound: due with no usable stamp, else once per interval.
+
+    A degraded status is not necessarily transient — ``malformed`` (the config
+    WAS read and is not a JSON object) and ``unreadable`` (a 404 on a hardcoded
+    repo path) are deterministic at a fixed ref and cannot heal without a new
+    commit. Re-evaluating them on every call makes the SHA a permanent cache
+    miss that re-runs the full GitHub scan forever. The bound must still let
+    the FIRST call after a degraded verdict lands re-evaluate (fast self-heal
+    for the genuinely transient case).
+    """
+    interval = ci_compliance._DEGRADED_RECHECK_INTERVAL_SECONDS
+    key = ci_compliance._DEGRADED_EVALUATED_AT_KEY
+
+    # No usable prior-attempt stamp => due (self-heal on the very next call).
+    assert ci_compliance._degraded_recheck_is_due(None) is True
+    assert ci_compliance._degraded_recheck_is_due("not-a-dict") is True
+    assert ci_compliance._degraded_recheck_is_due(_degraded_verdict()) is True
+    assert (
+        ci_compliance._degraded_recheck_is_due(_degraded_verdict(**{key: 12345}))
+        is True
+    )
+    assert (
+        ci_compliance._degraded_recheck_is_due(
+            _degraded_verdict(**{key: "not-a-timestamp"})
+        )
+        is True
+    )
+
+    now = _utcnow()
+    # Stamped just now => NOT due; the SHA is not re-scanned on every call.
+    fresh_stamp = _degraded_verdict(**{key: now.isoformat()})
+    assert ci_compliance._degraded_recheck_is_due(fresh_stamp, now=now) is False
+    # Still inside the interval => NOT due.
+    inside = _degraded_verdict(
+        **{key: (now - timedelta(seconds=interval - 1)).isoformat()}
+    )
+    assert ci_compliance._degraded_recheck_is_due(inside, now=now) is False
+    # Interval elapsed => due again, so a fresh diagnostic is still produced.
+    elapsed = _degraded_verdict(
+        **{key: (now - timedelta(seconds=interval + 1)).isoformat()}
+    )
+    assert ci_compliance._degraded_recheck_is_due(elapsed, now=now) is True
+    # A future stamp (clock skew) is not due, and expires on its own rather
+    # than wedging the SHA.
+    skewed = _degraded_verdict(**{key: (now + timedelta(seconds=30)).isoformat()})
+    assert ci_compliance._degraded_recheck_is_due(skewed, now=now) is False
+
+
+def test_stamp_degraded_evaluation_never_stamps_an_authoritative_verdict():
+    """Only DEGRADED results carry the attempt stamp; authoritative ones are untouched.
+
+    An authoritative verdict is a permanent cache hit for its SHA and is never
+    re-evaluated, so it needs no stamp — and stamping it would pollute the
+    operator-visible record and the strategist payload with cache bookkeeping.
+    """
+    key = ci_compliance._DEGRADED_EVALUATED_AT_KEY
+
+    authoritative = {
+        "ref": _HEAD_SHA,
+        "compliant": False,
+        "violations": [{"section": "backend", "rel": _CAPPED_REL, "count": 1, "cap": 0}],
+        "branch_literal_violations": [],
+        "checked": 1,
+        "limits_available": True,
+        "limits_status": ci_compliance._LIMITS_STATUS_OK,
+        "limits_error": None,
+        "rules_available": True,
+        "rules_status": ci_compliance._RULES_STATUS_OK,
+        "rules_error": None,
+        "tree_available": True,
+    }
+    assert ci_compliance._verdict_is_authoritative(authoritative) is True
+    assert ci_compliance._stamp_degraded_evaluation(authoritative) == authoritative
+    assert key not in ci_compliance._stamp_degraded_evaluation(authoritative)
+
+    degraded = _degraded_verdict()
+    stamped = ci_compliance._stamp_degraded_evaluation(degraded)
+    assert isinstance(stamped[key], str)
+    # The input is not mutated — it may be the shared object handed to every
+    # coalesced _in_flight_evals awaiter.
+    assert key not in degraded
+    # Every non-bookkeeping field survives the stamp.
+    assert {k: v for k, v in stamped.items() if k != key} == degraded
+
+    assert ci_compliance._stamp_degraded_evaluation(None) is None
+
+
+@pytest.mark.asyncio
+async def test_deterministically_degraded_sha_is_not_rescanned_every_call(
+    db_session, mocker
+):
+    """A degraded SHA re-evaluates once, then at most once per interval.
+
+    Regression for the unbounded-rescan defect: treating EVERY non-authoritative
+    stored verdict as a cache miss made a deterministically degraded ref (a
+    malformed config blob, or a 404 on the hardcoded config path — neither of
+    which can heal without a new commit) re-run the full evaluation on every
+    single call, with no possibility of healing until the branch tip moved.
+    ``_in_flight_evals`` coalesces only CONCURRENT calls, so sequential polls of
+    the 60/minute agent endpoint each paid a full GitHub scan.
+
+    (a) First call re-evaluates (self-heal stays fast for transient failures).
+    (b) The immediately-following call does NOT re-evaluate; the stored degraded
+        verdict is served and keeps failing closed.
+    (c) Once the interval has elapsed, re-evaluation resumes, so the ref still
+        gets a fresh diagnostic and a healed read still re-opens the gate.
+    """
+    project = Project(
+        name="CI-Compliance Recheck Bound",
+        user_id="test-user-123",
+        github_owner="owner",
+        github_repo="repo",
+        integration_branch="automain",
+    )
+    db_session.add(project)
+    await db_session.flush()
+
+    async def _resolve(_session, _project):
+        return ("token", "owner", "repo")
+
+    mocker.patch("app.release_promotion._resolve_github_with_session", new=_resolve)
+    mocker.patch.object(
+        ci_compliance.github,
+        "get_branch_sha",
+        new=mocker.AsyncMock(return_value=_HEAD_SHA),
+    )
+    eval_mock = mocker.patch.object(
+        ci_compliance,
+        "evaluate_ci_compliance_at_ref",
+        new=mocker.AsyncMock(return_value=_degraded_verdict()),
+    )
+
+    key = ci_compliance._DEGRADED_EVALUATED_AT_KEY
+
+    # (a) Cache miss -> evaluate. The still-degraded verdict is stamped so the
+    # next re-check is bounded.
+    first = await ci_compliance.ensure_current_ci_compliance(db_session, project)
+    assert first["computed"] is True
+    assert eval_mock.await_count == 1
+    assert first["data"]["compliant"] is False
+    assert first["data"]["limits_available"] is False
+    stored = ci_compliance.get_ci_compliance(project, sha=_HEAD_SHA)
+    assert isinstance(stored[key], str)
+
+    # (b) Immediately again: NOT re-evaluated. The degraded verdict is served
+    # from cache and still fails closed.
+    second = await ci_compliance.ensure_current_ci_compliance(db_session, project)
+    assert second["computed"] is False
+    assert eval_mock.await_count == 1, "degraded SHA was re-scanned within the interval"
+    assert second["data"]["compliant"] is False
+    assert second["data"]["limits_available"] is False
+    assert second["data"][key] == stored[key]
+
+    # (c) Interval elapsed: due again. A healed read re-opens the gate, proving
+    # the bound delays re-evaluation rather than disabling it.
+    aged = dict(stored)
+    aged[key] = (
+        _utcnow()
+        - timedelta(seconds=ci_compliance._DEGRADED_RECHECK_INTERVAL_SECONDS + 1)
+    ).isoformat()
+    ci_compliance.record_ci_compliance(project, aged)
+    await db_session.flush()
+
+    healed = {
+        "ref": _HEAD_SHA,
+        "compliant": True,
+        "violations": [],
+        "branch_literal_violations": [],
+        "checked": 1,
+        "limits_available": True,
+        "limits_status": ci_compliance._LIMITS_STATUS_OK,
+        "limits_error": None,
+        "rules_available": True,
+        "rules_status": ci_compliance._RULES_STATUS_OK,
+        "rules_error": None,
+        "tree_available": True,
+    }
+    eval_mock.return_value = healed
+
+    third = await ci_compliance.ensure_current_ci_compliance(db_session, project)
+    assert third["computed"] is True
+    assert eval_mock.await_count == 2
+    # The healed verdict is authoritative, so it is stored unstamped and every
+    # later call is a plain cache hit.
+    assert third["data"] == healed
+    assert ci_compliance.get_ci_compliance(project, sha=_HEAD_SHA) == healed
+
+    fourth = await ci_compliance.ensure_current_ci_compliance(db_session, project)
+    assert fourth["computed"] is False
+    assert eval_mock.await_count == 2

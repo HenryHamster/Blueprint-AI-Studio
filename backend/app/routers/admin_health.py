@@ -1426,11 +1426,25 @@ async def get_fleet_utilization(
 
 
 async def _compute_fleet_utilization(*, session: AsyncSession) -> Dict[str, Any]:
-    """Compute the fleet-utilization payload (cached by caller)."""
+    """Compute the fleet-utilization payload (cached by caller).
+
+    Appends the latest persisted fleet-sizing reading (the durable measured
+    record written by ``record_fleet_sizing_reading``) so the dashboard can
+    render the measured concurrency/disk readings alongside the live snapshot.
+    ``None`` until the leader's periodic recorder has written a row.
+    """
     now = _utcnow()
     snapshot = await get_fleet_utilization_snapshot(session)
     saturation = _derive_saturation(snapshot.get("util_avg"), snapshot.get("util_now"))
-    return {**snapshot, "saturation": saturation, "generated_at": now.isoformat()}
+    from app.fleet_utilization import read_latest_fleet_sizing_reading
+
+    latest_reading = await read_latest_fleet_sizing_reading(session)
+    return {
+        **snapshot,
+        "saturation": saturation,
+        "generated_at": now.isoformat(),
+        "fleet_sizing_reading": latest_reading,
+    }
 
 
 @router.get("/evergreen-fill")

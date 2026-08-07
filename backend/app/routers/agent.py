@@ -64,7 +64,7 @@ from app.schemas import (
     SpawnTaskRequest,
 )
 from pydantic import BaseModel, ConfigDict, Field
-from app.payload_schemas import validate_task_payload
+from app.payload_schemas import format_payload_validation_error, validate_task_payload
 from app.shared_state import (
     limiter,
     get_project_promotion_target,
@@ -94,7 +94,6 @@ from app.claim_analytics import ClaimResponseTiming, stamp_cold_claim_timing
 from app.sr_blind_spots import (
     aggregate_sr_blind_spot_themes,
     aggregate_sr_co_failure_pairs,
-    safe_check_results,
 )
 from app.pipeline_health import compute_pipeline_health_summary
 from app.sr_analytics_store import read_project_sr_analytics
@@ -5586,7 +5585,9 @@ async def spawn_subtask(
             logger.warning(
                 "Validation error in task payload: %s: %s", type(exc).__name__, exc
             )
-            raise HTTPException(status_code=422, detail="Invalid request") from exc
+            raise HTTPException(
+                status_code=422, detail=format_payload_validation_error(exc)
+            ) from exc
         parent_payload = parent_task.first_payload
         parent_context = {
             "parent_task_id": str(parent_task.id),

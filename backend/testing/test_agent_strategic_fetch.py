@@ -1644,6 +1644,116 @@ async def test_agent_fetch_qualification_returns_latest_verdict_findings(
 
 
 @pytest.mark.asyncio
+async def test_agent_fetch_qualification_surfaces_category_verdicts(
+    client: AsyncClient, db_session
+):
+    """The verdict path names WHY each category is unmet: category_verdicts +
+    residual_uncaptured_gap are carried from the immutable verdict row instead
+    of dropped at the API boundary."""
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-qual-catverdict"
+    )
+
+    verdict = QualificationVerdict(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="abc12345def6789012345678901234567890abcd",
+        confidence=0.62,
+        terminal_status="not_promoted",
+        finalized_at=datetime(2026, 6, 2, 12, 0, 0),
+        category_verdicts=[
+            {
+                "category_key": "merge_grade",
+                "status": "not_met",
+                "tier": "judged",
+                "gap": "Merge grade below threshold.",
+                "citations": ["backend/app/release_promotion.py"],
+            },
+            {"category_key": "ci", "status": "met", "tier": "machine", "gap": None},
+        ],
+        residual_uncaptured_gap="Nothing covers the rollback path.",
+    )
+    db_session.add(verdict)
+    await db_session.commit()
+    await db_session.refresh(verdict)
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/qualification",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+
+    assert body["source"] == "qualification_verdict"
+    assert body["category_verdicts"] == [
+        {
+            "category_key": "merge_grade",
+            "status": "not_met",
+            "tier": "judged",
+            "gap": "Merge grade below threshold.",
+            "citations": ["backend/app/release_promotion.py"],
+        },
+        {"category_key": "ci", "status": "met", "tier": "machine", "gap": None},
+    ]
+    assert body["residual_uncaptured_gap"] == "Nothing covers the rollback path."
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_qualification_category_verdicts_in_fallback(
+    client: AsyncClient, db_session
+):
+    """Legacy last_qualification blobs carry the same category_verdicts +
+    residual_uncaptured_gap through the fallback path."""
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-qual-catverdict-fb"
+    )
+
+    from sqlalchemy.orm.attributes import flag_modified
+
+    version.last_qualification = {
+        "status": "not_promoted",
+        "confidence": 0.45,
+        "candidate_sha": "deadbeef" * 5,
+        "finalized_at": "2026-05-01T10:00:00",
+        "category_verdicts": [
+            {
+                "category_key": "merge_grade",
+                "status": "partial",
+                "tier": "judged",
+                "gap": "Only the happy path is covered.",
+                "citations": [],
+            }
+        ],
+        "residual_uncaptured_gap": "Rollback is unproven.",
+    }
+    flag_modified(version, "last_qualification")
+    db_session.add(version)
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/qualification",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+
+    assert body["source"] == "last_qualification"
+    assert body["category_verdicts"] == [
+        {
+            "category_key": "merge_grade",
+            "status": "partial",
+            "tier": "judged",
+            "gap": "Only the happy path is covered.",
+            "citations": [],
+        }
+    ]
+    assert body["residual_uncaptured_gap"] == "Rollback is unproven."
+
+
+@pytest.mark.asyncio
 async def test_agent_fetch_qualification_surfaces_finding_resolution_states(
     client: AsyncClient, db_session
 ):
@@ -3663,6 +3773,62 @@ async def test_fetch_efficiency_snapshot_rejects_cross_project(
     token = create_agent_token(str(task_a.id), "agent-vm-effa")
     res = await client.get(
         f"/api/agent/projects/{project_b.id}/efficiency-snapshot",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_fleet_sizing_readings(
+    client: AsyncClient, db_session, monkeypatch
+):
+    """GET /api/agent/projects/{id}/fleet-sizing serves the three readings.
+
+    The endpoint is the agent-reachable read path for the recorded fleet-sizing
+    numbers (workspace_footprint, concurrency, target_concurrency_key), so a
+    task agent on a VM with no production DB can pull them when committing an
+    evidence artifact. Cross-project access is fenced to 404 by
+    ``_resolve_agent_project``."""
+    import app.vm_lifecycle as vm_lifecycle
+    import app.warm_pool as warm_pool
+
+    from app import max_plan_pool
+
+    monkeypatch.setattr(max_plan_pool, "_all_accounts", lambda: [])
+    monkeypatch.setattr(
+        max_plan_pool, "_account_available_for_model", lambda acct, model: True
+    )
+    monkeypatch.setattr(vm_lifecycle, "_last_gcp_vm_count", 6)
+    monkeypatch.setattr(vm_lifecycle, "_last_gcp_vm_check", float("inf"))
+    monkeypatch.setattr(warm_pool, "is_warm_pool_enabled", lambda: False)
+
+    project, task = await _make_project_task(db_session, vm="agent-vm-fleetsz")
+    token = create_agent_token(str(task.id), "agent-vm-fleetsz")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/fleet-sizing",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "success"
+    data = body["data"]
+    assert set(data.keys()) == {
+        "workspace_footprint",
+        "concurrency",
+        "target_concurrency_key",
+    }
+    assert data["concurrency"]["window_hours"] == 24
+    assert data["concurrency"]["slot_definition"]
+    assert data["workspace_footprint"]["target_slots"] == 50
+    assert data["workspace_footprint"]["per_workspace_bytes"] == 2 * 1024**3
+
+    # A token for another project cannot read this project's readings (404).
+    other = Project(name="FS Other", user_id="test-user-fso")
+    db_session.add(other)
+    await db_session.commit()
+    await db_session.refresh(other)
+    res = await client.get(
+        f"/api/agent/projects/{other.id}/fleet-sizing",
         headers={"x-agent-token": token},
     )
     assert res.status_code == 404

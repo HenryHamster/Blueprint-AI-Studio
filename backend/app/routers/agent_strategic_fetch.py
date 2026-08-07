@@ -599,6 +599,10 @@ def _compact_last_qualification(qual: dict[str, Any] | None) -> dict[str, Any] |
         "merge_grade_biggest_gap",
         "debt_enforce_confidence_preview",
         "debt_enforce_weight_preview",
+        # Per-category goal-verification verdicts + residual gap so the compact
+        # lifecycle view also names WHY each category is unmet (additive).
+        "category_verdicts",
+        "residual_uncaptured_gap",
     )
     out = {key: qual.get(key) for key in keys if qual.get(key) is not None}
 
@@ -1801,6 +1805,7 @@ async def agent_fetch_qualification(
             in_flight=_status == "pending",
             promotion_check_wait=bool(_lq.get("promotion_pending")),
             consecutive_infra_errors=_infra_streak,
+            rubric_redrive_count=int(_lq.get("rubric_redrive_count") or 0),
             last_attempt=_lq if _lq else None,
             knob=get_auto_qualification_triggers_mode(),
             evaluated_at=_utcnow().isoformat(),
@@ -1909,6 +1914,20 @@ async def agent_fetch_qualification(
                 if evidence_verdict is not None
                 else verdict.goal_alignment
             ),
+            # Per-category goal-verification verdicts + residual gap that drove
+            # the criterion_coverage gate. Prefer the immutable verdict row's
+            # snapshot; fall back to the mutable last_qualification blob for
+            # legacy rows that predate the verdict columns.
+            "category_verdicts": (
+                verdict.category_verdicts
+                if verdict is not None and verdict.category_verdicts is not None
+                else lq.get("category_verdicts")
+            ),
+            "residual_uncaptured_gap": (
+                verdict.residual_uncaptured_gap
+                if verdict is not None and verdict.residual_uncaptured_gap is not None
+                else lq.get("residual_uncaptured_gap")
+            ),
             "error": lq.get("error") or None,
             "detail": lq.get("detail") or None,
             "blocker": lq.get("blocker") or None,
@@ -1971,6 +1990,8 @@ async def agent_fetch_qualification(
         "challenger_refuted_findings": qual.get("challenger_refuted_audit_findings")
         or [],
         "goal_alignment": qual.get("goal_alignment"),
+        "category_verdicts": qual.get("category_verdicts"),
+        "residual_uncaptured_gap": qual.get("residual_uncaptured_gap"),
         "error": qual.get("error") or None,
         "detail": qual.get("detail") or None,
         "blocker": qual.get("blocker") or None,
@@ -2287,6 +2308,43 @@ async def agent_fetch_efficiency_snapshot(
     }
 
 
+@router.get("/projects/{project_id}/fleet-sizing")
+@limiter.limit("60/minute")
+async def agent_fetch_fleet_sizing_readings(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+    window_hours: int = Query(24, ge=1, le=24 * 7),
+):
+    """Return the recorded fleet-sizing readings for the project.
+
+    This is the agent-reachable read path for the fleet-sizing numbers that
+    ``get_recorded_fleet_sizing_readings`` composes from existing instruments:
+
+    * ``concurrency`` — peak + time-weighted percentiles of simultaneous
+      task-slot occupancy from the one task-table sweep.
+    * ``workspace_footprint`` — the du-measured per-workspace disk footprint
+      scaled to the 50-slot target, compared against the live runner disk
+      inventory (``fits`` / ``shortfall_bytes``).
+    * ``target_concurrency_key`` — whether a 'target_concurrency' config key
+      exists (criterion c-3fd62b9d's input).
+
+    A task agent running on a VM with no production database still needs these
+    recorded readings when it must commit an evidence artifact; this endpoint
+    is that surface. Read-only; cross-project access returns 404.
+    """
+    await _resolve_agent_project(project_id, token, session)
+    from app.fleet_utilization import (  # noqa: PLC0415
+        get_recorded_fleet_sizing_readings,
+    )
+
+    readings = await get_recorded_fleet_sizing_readings(
+        session, window_hours=window_hours
+    )
+    return {"status": "success", "data": readings}
+
+
 @router.get("/projects/{project_id}/capability-trials")
 @limiter.limit("60/minute")
 async def agent_fetch_capability_trials(
@@ -2409,6 +2467,9 @@ SECTION_FETCH_INVENTORY: dict[str, str | None] = {
     "operator_context_refs": None, "cycle_start_reconciliation": None,
     "model_health": None, "prune_candidates": None, "playbook_keys_index": None,
     "staged_directions": None, "retirement_deferrals": None,
+    # Direction/criterion-rejection tails — bounded at build time to ≤20/≤5
+    # records and carried verbatim in the strategic payload; no recovery path.
+    "criterion_link_conflicts": None, "rejected_direction_ops": None,
     "payload_staleness": None, "deployment_state": None,
     "operator_overrides": None, "missing_capability_demand": None,
     "available_capabilities": None, "local_runner_status": None,

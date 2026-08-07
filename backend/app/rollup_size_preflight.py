@@ -36,11 +36,12 @@ from app.github import (
     get_pr_files,
 )
 from app.json_extract import async_json_loads
-from app.size_limit_policy import classify_breach
+from app.size_limit_policy import classify_breach, ledger_with_pending_bumps
 
 logger = logging.getLogger(__name__)
 
 _CAPS_JSON_PATH = "backend/testing/module_size_limits.json"
+_CAP_BUMP_HISTORY_LEDGER_RELPATH = "backend/testing/cap_bump_history.json"
 
 # HTTP status codes surfaced by a failed auto-bump commit that are transient
 # and clear on a later cycle, so they must DEFER (retry) rather than HOLD
@@ -327,13 +328,81 @@ async def preflight_rollup_size_caps(
         f"auto-bump module size caps for rollup PR #{rollup_pr_number}: {summary}"
     )
 
+    # Keep the committed cap-bump-history ledger in sync: the deployed backend
+    # reads the ledger (not git), so an auto-bump must be recorded there too or
+    # production would classify from a stale history. A repo whose staging
+    # branch has no ledger yet (pre-feature baseline) simply skips the ledger
+    # write — a partial ledger with only pending records would be worse. A
+    # transient read failure defers the whole bump so the mirror never goes
+    # stale silently.
+    upserts: dict[str, str] = {_CAPS_JSON_PATH: updated_json}
+    try:
+        ledger_text = await get_file_text_at_ref(
+            _CAP_BUMP_HISTORY_LEDGER_RELPATH,
+            token=gh_token,
+            owner=owner,
+            repo=repo,
+            ref=observed_head_sha,
+            project_id=project_id,
+        )
+    except Exception as exc:
+        return (
+            "defer",
+            f"could not fetch cap-bump-history ledger before auto-bump commit: {exc}",
+        )
+    if ledger_text is None:
+        # ``get_file_text_at_ref`` collapses "file genuinely absent (404)" and
+        # "transient read failure" both to None (its contract: None means
+        # "could not read", never "empty"). Disambiguate with the tri-state
+        # existence probe, mirroring the caps-file handling above: a repo
+        # whose staging branch has no ledger yet (pre-feature baseline) simply
+        # skips the ledger write, while a transient read blip DEFERS the whole
+        # bump so the ledger mirror never goes stale silently — a caps bump
+        # committed without its ledger record would leave production
+        # classifying from a stale history.
+        ledger_exists, _ = await get_file_content_at_ref(
+            _CAP_BUMP_HISTORY_LEDGER_RELPATH,
+            token=gh_token,
+            owner=owner,
+            repo=repo,
+            ref=observed_head_sha,
+            project_id=project_id,
+        )
+        if ledger_exists is False:
+            logger.info(
+                "[ROLLUP-SIZE] PR #%s: no %s at %s — skipping ledger write "
+                "(pre-feature baseline)",
+                rollup_pr_number,
+                _CAP_BUMP_HISTORY_LEDGER_RELPATH,
+                staging_branch,
+            )
+        else:
+            return (
+                "defer",
+                "cap-bump-history ledger present but unreadable at staging branch tip",
+            )
+    else:
+        try:
+            ledger_data = json.loads(ledger_text)
+        except Exception as exc:
+            return ("defer", f"could not parse cap-bump-history ledger: {exc}")
+        pending = [
+            (section, key, cap, new_cap)
+            for section, key, _count, cap, new_cap in breaches
+        ]
+        ledger_data = ledger_with_pending_bumps(ledger_data, pending)
+        upserts[_CAP_BUMP_HISTORY_LEDGER_RELPATH] = (
+            json.dumps(ledger_data, indent=2, ensure_ascii=False) + "\n"
+        )
+        commit_msg += "; record bumps in cap-bump-history ledger"
+
     try:
         committed_sha = await commit_file_changes(
             gh_token,
             owner,
             repo,
             staging_branch,
-            upserts={_CAPS_JSON_PATH: updated_json},
+            upserts=upserts,
             message=commit_msg,
             project_id=project_id,
             expected_head_sha=observed_head_sha,

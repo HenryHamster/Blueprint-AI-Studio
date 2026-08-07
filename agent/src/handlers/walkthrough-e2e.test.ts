@@ -306,6 +306,117 @@ describe('handleWalkthroughE2e — flow-to-criterion mapping', () => {
   });
 });
 
+// ── Open-rubric report acceptance ───────────────────────────────────────────────
+
+describe('handleWalkthroughE2e — open-rubric report acceptance', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    teardownMock.mockResolvedValue(undefined);
+    vi.mocked(apiPost).mockResolvedValue({ recorded: 2, skipped_not_passed: 1 });
+    process.env.ORCHESTRATOR_URL = DEPLOYED_URL;
+    process.env.ADMIN_API_KEY = 'agent-vm-admin-key';
+  });
+
+  it('test_walkthrough_result_accepts_open_rubric_keys', async () => {
+    bootMock.mockResolvedValue(STACK);
+    const openRubricResult = {
+      git_sha: CANDIDATE_SHA,
+      run_timestamp: '2026-08-06T00:00:00Z',
+      results: [
+        { criterion_key: 'c-a1b2c3d4', passed: true, notes: 'flow 1 ok' },
+        { criterion_key: 'c-e5f6a7b8', passed: false, notes: 'flow 2 gate failed' },
+      ],
+    };
+    // The fresh keys are re-minted open-rubric keys, NOT the frozen legacy set.
+    for (const key of openRubricResult.results.map((r) => r.criterion_key)) {
+      expect(WALKTHROUGH_V26_RESULT_KEYS).not.toContain(key);
+    }
+    vi.mocked(readHandlerOutput).mockReturnValue(openRubricResult);
+
+    await handleWalkthroughE2e(TASK_ID, PAYLOAD, TASK, GH_TOKEN, OWNER, REPO, WS, { value: '' });
+
+    // The mocked harness was still driven against the candidate stack.
+    expect(harnessCall()).toBeDefined();
+
+    // The evidence POST carries the fresh open-rubric keys verbatim — a report
+    // with none of the legacy keys is NOT pinned to the frozen four-key set.
+    const evidenceCalls = vi.mocked(apiPost).mock.calls.filter((c) =>
+      c[0].includes('walkthrough-e2e-evidence'),
+    );
+    expect(evidenceCalls).toHaveLength(1);
+    const body = evidenceCalls[0][1] as {
+      results: Array<{ criterion_key: string; passed: boolean; notes: string | null }>;
+    };
+    expect(body.results.map((r) => r.criterion_key)).toEqual(['c-a1b2c3d4', 'c-e5f6a7b8']);
+    expect(body.results[0]).toEqual({ criterion_key: 'c-a1b2c3d4', passed: true, notes: 'flow 1 ok' });
+    expect(body.results[1]).toEqual({ criterion_key: 'c-e5f6a7b8', passed: false, notes: 'flow 2 gate failed' });
+
+    // The task completes with a durable candidate-SHA report artifact.
+    const status = lastStatus();
+    expect(status.status).toBe('COMPLETED');
+    expect(status.artifact_type).toBe('WALKTHROUGH_E2E_REPORT');
+    expect(status.logs).toBe(
+      JSON.stringify({ ...openRubricResult, exercised_engine_sha: CANDIDATE_SHA }),
+    );
+  });
+
+  it('accepts an open-rubric report with a single fresh criterion key', async () => {
+    bootMock.mockResolvedValue(STACK);
+    vi.mocked(readHandlerOutput).mockReturnValue({
+      git_sha: CANDIDATE_SHA,
+      run_timestamp: '2026-08-06T00:00:00Z',
+      results: [{ criterion_key: 'c-fresh-minimal', passed: true }],
+    });
+
+    await handleWalkthroughE2e(TASK_ID, PAYLOAD, TASK, GH_TOKEN, OWNER, REPO, WS, { value: '' });
+
+    const evidenceCalls = vi.mocked(apiPost).mock.calls.filter((c) =>
+      c[0].includes('walkthrough-e2e-evidence'),
+    );
+    const body = evidenceCalls[0][1] as {
+      results: Array<{ criterion_key: string; passed: boolean; notes: string | null }>;
+    };
+    expect(body.results).toEqual([{ criterion_key: 'c-fresh-minimal', passed: true, notes: null }]);
+    expect(lastStatus().status).toBe('COMPLETED');
+  });
+
+  it('test_walkthrough_result_accepts_fresh_substantive_keys_with_active_meta', async () => {
+    bootMock.mockResolvedValue(STACK);
+    // The canonical meta c-5214996f participates in BOTH the retired v26 report
+    // and the open rubric: a report carrying it alongside fresh substantive keys
+    // is an OPEN-rubric report, not a partial legacy report (the meta key is not
+    // a legacy signal).
+    const freshWithMeta = {
+      git_sha: CANDIDATE_SHA,
+      run_timestamp: '2026-08-06T00:00:00Z',
+      results: [
+        { criterion_key: 'c-fresh-runner-enroll', passed: true, notes: 'runner ok' },
+        { criterion_key: 'c-fresh-iframe-token', passed: true, notes: 'tools ok' },
+        { criterion_key: 'c-5214996f', passed: true, notes: 'meta ok' },
+      ],
+    };
+    vi.mocked(readHandlerOutput).mockReturnValue(freshWithMeta);
+
+    await handleWalkthroughE2e(TASK_ID, PAYLOAD, TASK, GH_TOKEN, OWNER, REPO, WS, { value: '' });
+
+    const evidenceCalls = vi.mocked(apiPost).mock.calls.filter((c) =>
+      c[0].includes('walkthrough-e2e-evidence'),
+    );
+    expect(evidenceCalls).toHaveLength(1);
+    const body = evidenceCalls[0][1] as {
+      results: Array<{ criterion_key: string; passed: boolean; notes: string | null }>;
+    };
+    // The fresh substantive rows AND the canonical meta row are posted verbatim —
+    // the report is NOT collapsed to the legacy four-row set.
+    expect(body.results.map((r) => r.criterion_key)).toEqual([
+      'c-fresh-runner-enroll',
+      'c-fresh-iframe-token',
+      'c-5214996f',
+    ]);
+    expect(lastStatus().status).toBe('COMPLETED');
+  });
+});
+
 // ── Error paths ────────────────────────────────────────────────────────────────
 
 describe('handleWalkthroughE2e — error paths', () => {
@@ -417,6 +528,116 @@ describe('handleWalkthroughE2e — error paths', () => {
         ...VALID_RESULT.results.slice(0, 3),
         { criterion_key: 'c-workday-session-lifecycle', passed: 'true' },
       ],
+    });
+
+    await handleWalkthroughE2e(TASK_ID, PAYLOAD, TASK, GH_TOKEN, OWNER, REPO, WS, { value: '' });
+
+    expect(evidencePosted()).toBe(false);
+    expect(lastStatus().status).toBe('FAILED');
+    expect(lastStatus().failure_category).toBe('walkthrough_result_unparseable');
+  });
+
+  it('rejects an empty results array as a truncated report before posting evidence', async () => {
+    bootMock.mockResolvedValue(STACK);
+    vi.mocked(readHandlerOutput).mockReturnValue({ ...VALID_RESULT, results: [] });
+
+    await handleWalkthroughE2e(TASK_ID, PAYLOAD, TASK, GH_TOKEN, OWNER, REPO, WS, { value: '' });
+
+    expect(evidencePosted()).toBe(false);
+    expect(lastStatus().status).toBe('FAILED');
+    expect(lastStatus().failure_category).toBe('walkthrough_result_unparseable');
+    expect(teardownMock).toHaveBeenCalled();
+  });
+
+  it('rejects duplicate criterion keys in an open-rubric report', async () => {
+    bootMock.mockResolvedValue(STACK);
+    vi.mocked(readHandlerOutput).mockReturnValue({
+      ...VALID_RESULT,
+      results: [
+        { criterion_key: 'c-fresh-dup', passed: true },
+        { criterion_key: 'c-fresh-dup', passed: false },
+      ],
+    });
+
+    await handleWalkthroughE2e(TASK_ID, PAYLOAD, TASK, GH_TOKEN, OWNER, REPO, WS, { value: '' });
+
+    expect(evidencePosted()).toBe(false);
+    expect(lastStatus().status).toBe('FAILED');
+    expect(lastStatus().failure_category).toBe('walkthrough_result_unparseable');
+  });
+
+  it('rejects a partial-legacy report: legacy keys mixed with fresh keys', async () => {
+    bootMock.mockResolvedValue(STACK);
+    vi.mocked(readHandlerOutput).mockReturnValue({
+      ...VALID_RESULT,
+      results: [
+        ...VALID_RESULT.results,
+        { criterion_key: 'c-fresh-mixed', passed: true },
+      ],
+    });
+
+    await handleWalkthroughE2e(TASK_ID, PAYLOAD, TASK, GH_TOKEN, OWNER, REPO, WS, { value: '' });
+
+    expect(evidencePosted()).toBe(false);
+    expect(lastStatus().status).toBe('FAILED');
+    expect(lastStatus().failure_category).toBe('walkthrough_result_unparseable');
+  });
+
+  it('rejects a non-boolean passed in an open-rubric entry', async () => {
+    bootMock.mockResolvedValue(STACK);
+    vi.mocked(readHandlerOutput).mockReturnValue({
+      ...VALID_RESULT,
+      results: [{ criterion_key: 'c-fresh-passed-str', passed: 'true' }],
+    });
+
+    await handleWalkthroughE2e(TASK_ID, PAYLOAD, TASK, GH_TOKEN, OWNER, REPO, WS, { value: '' });
+
+    expect(evidencePosted()).toBe(false);
+    expect(lastStatus().status).toBe('FAILED');
+    expect(lastStatus().failure_category).toBe('walkthrough_result_unparseable');
+  });
+
+  it('rejects a non-string notes in an open-rubric entry', async () => {
+    bootMock.mockResolvedValue(STACK);
+    vi.mocked(readHandlerOutput).mockReturnValue({
+      ...VALID_RESULT,
+      results: [{ criterion_key: 'c-fresh-notes-num', passed: true, notes: 42 }],
+    });
+
+    await handleWalkthroughE2e(TASK_ID, PAYLOAD, TASK, GH_TOKEN, OWNER, REPO, WS, { value: '' });
+
+    expect(evidencePosted()).toBe(false);
+    expect(lastStatus().status).toBe('FAILED');
+    expect(lastStatus().failure_category).toBe('walkthrough_result_unparseable');
+  });
+
+  it('rejects an empty git_sha provenance', async () => {
+    bootMock.mockResolvedValue(STACK);
+    vi.mocked(readHandlerOutput).mockReturnValue({ ...VALID_RESULT, git_sha: '   ' });
+
+    await handleWalkthroughE2e(TASK_ID, PAYLOAD, TASK, GH_TOKEN, OWNER, REPO, WS, { value: '' });
+
+    expect(evidencePosted()).toBe(false);
+    expect(lastStatus().status).toBe('FAILED');
+    expect(lastStatus().failure_category).toBe('walkthrough_result_unparseable');
+  });
+
+  it('rejects an empty run_timestamp provenance', async () => {
+    bootMock.mockResolvedValue(STACK);
+    vi.mocked(readHandlerOutput).mockReturnValue({ ...VALID_RESULT, run_timestamp: '' });
+
+    await handleWalkthroughE2e(TASK_ID, PAYLOAD, TASK, GH_TOKEN, OWNER, REPO, WS, { value: '' });
+
+    expect(evidencePosted()).toBe(false);
+    expect(lastStatus().status).toBe('FAILED');
+    expect(lastStatus().failure_category).toBe('walkthrough_result_unparseable');
+  });
+
+  it('rejects a criterion_key longer than 120 chars', async () => {
+    bootMock.mockResolvedValue(STACK);
+    vi.mocked(readHandlerOutput).mockReturnValue({
+      ...VALID_RESULT,
+      results: [{ criterion_key: `c-${'x'.repeat(121)}`, passed: true }],
     });
 
     await handleWalkthroughE2e(TASK_ID, PAYLOAD, TASK, GH_TOKEN, OWNER, REPO, WS, { value: '' });

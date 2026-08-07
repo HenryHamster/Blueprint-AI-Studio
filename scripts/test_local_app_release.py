@@ -933,6 +933,19 @@ class LocalAppReleaseTests(unittest.TestCase):
                     "/etc/blueprint/nodes/henry_hamster/roles/worker/role.env",
                 },
             )
+            payloads = {
+                item.args[0].as_posix(): item.args[1].decode()
+                for item in mocks["atomic"].call_args_list
+            }
+            worker_env = payloads[
+                "/etc/blueprint/nodes/henry_hamster/roles/worker/role.env"
+            ]
+            self.assertIn(f"BLUEPRINT_WORKER_IMAGE_ID={NEW_IMAGE}\n", worker_env)
+            self.assertIn(f"BLUEPRINT_WORKER_DEPLOY_SHA={REVISION}\n", worker_env)
+            api_env = payloads[
+                "/etc/blueprint/nodes/henry_hamster/roles/api/role.env"
+            ]
+            self.assertIn(f"BLUEPRINT_API_DEPLOY_SHA={REVISION}\n", api_env)
             self.assertEqual(
                 mocks["restart"].call_args_list,
                 [

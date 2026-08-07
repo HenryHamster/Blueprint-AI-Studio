@@ -49,6 +49,7 @@ class TaskType(str, Enum):
     repo_bootstrap = "repo_bootstrap"
     salvage_bundle = "salvage_bundle"
     capability_proof_trial = "capability_proof_trial"
+    criterion_named_test_trial = "criterion_named_test_trial"
     walkthrough_e2e = "walkthrough_e2e"
     memory_consolidation = "memory_consolidation"
 
@@ -297,7 +298,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         default_category="review",
         user_launchable=True,
         delivers_product=True,
-        strategist_dispatch="requires_context",
+        strategist_dispatch="disabled",
         description="Fix a PR from review feedback or CI failures.",
         run_shape="workflow",
         output_kind="pr",
@@ -778,6 +779,42 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         run_shape="single_agent",
     ),
     TaskCapability(
+        TaskType.criterion_named_test_trial,
+        "Criterion Named Test Trial",
+        "read_only",
+        default_category="ops",
+        user_launchable=False,
+        # No LLM provider runs — the handler runs a bounded, targeted test suite
+        # (the merged task's declared covering tests) against the pinned candidate
+        # SHA and reports a pass/fail verdict; it never selects a model/account.
+        provider_configurable=False,
+        # Not operator/strategist-spawnable and not a plan child: it is enrolled
+        # programmatically by the earn loop's backfill (via
+        # ``acceptance_criteria.enroll_criterion_named_test_trial``), never authored
+        # by an agent or operator.
+        description=(
+            "Machine-verified criterion named-test trial: run ONLY the declared "
+            "covering tests of a merged task as a targeted runner job at the "
+            "version's qualifying candidate SHA, decoupled from the merge gate. A "
+            "green run mints genuine ``covered`` named_test_execution criterion "
+            "evidence; a red run records nothing and NEVER demotes existing "
+            "evidence. Operators can pause it with "
+            "``criterion_named_test_trials_enabled``."
+        ),
+        # A single targeted agent run produces the verdict; it needs a code
+        # checkout to run the tests, but opens no PR — its durable product is the
+        # ingested criterion evidence, so output_kind is ``none`` and there is no
+        # forward merge gate (``evaluation="none"``). The ingestion completion
+        # handler consumes the reported result.
+        output_kind="none",
+        requires_code=True,
+        evaluation_strategy="metric",
+        cost_ceiling_usd=2.0,
+        completion_handler="criterion_named_test_trial",
+        evaluation="none",
+        run_shape="single_agent",
+    ),
+    TaskCapability(
         TaskType.walkthrough_e2e,
         "Walkthrough E2E",
         "read_only",
@@ -951,7 +988,11 @@ STRATEGIST_SPAWNABLE_TASK_TYPES: frozenset[str] = frozenset(
 )
 # Task types accepted by spawn_task only when their normal launch context is
 # present. Kept separate from the direct set so the router can emit a precise
-# validation error rather than silently constructing an unusable task.
+# validation error rather than silently constructing an unusable task. This is
+# currently EMPTY: ``fix`` — the sole former member — needs a live-PR target
+# (pr_number + branch) bound by the normal review pipeline, which the strategist
+# cannot resolve at spawn, so it is ``disabled`` and flows through the normal
+# direction → research → plan → create path instead.
 STRATEGIST_CONTEXTUAL_TASK_TYPES: frozenset[str] = frozenset(
     capability.id.value
     for capability in TASK_CAPABILITIES
@@ -1073,6 +1114,7 @@ AUTONOMOUS_SPAWN_SERVICING_TASK_TYPES: frozenset[str] = frozenset(
         TaskType.discovery_review.value,
         TaskType.salvage_bundle.value,
         TaskType.capability_proof_trial.value,
+        TaskType.criterion_named_test_trial.value,
         TaskType.walkthrough_e2e.value,
         TaskType.memory_consolidation.value,
     }

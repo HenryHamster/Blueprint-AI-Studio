@@ -811,6 +811,96 @@ def test_walkthrough_e2e_none_detail_not_trusted():
 
 
 # ---------------------------------------------------------------------------
+# _evidence_is_named_test_execution_covered + named_test_execution coverage tier
+# ---------------------------------------------------------------------------
+
+
+def test_named_test_execution_evidence_covers_only_when_fresh_sha_pinned_and_passed():
+    """A ``named_test_execution`` row is 'covered' ONLY when fresh AND SHA-pinned AND passed.
+
+    This mirrors the walkthrough_e2e lane: a GREEN targeted run of a merged
+    task's declared covering tests earns genuine machine-verified ``covered``
+    coverage — but stale or unpinned trial evidence must stop counting, and a
+    non-passed row (e.g. a RED receipt that should never have been recorded)
+    must not forge coverage.
+
+      (a) fresh + SHA-pinned + passed        => 'covered'
+      (b) stale (older than the window)      => NOT covered (falls back to 'partial')
+      (c) missing/blank executed_sha         => NOT covered (falls back to 'partial')
+      (d) fresh + pinned but passed=False    => NOT covered (falls back to 'partial')
+    """
+    sha = "a" * 40
+
+    # (a) fresh + SHA-pinned + passed → covered. One day of slack keeps the
+    # predicate's slightly-later _utcnow() from tipping the exact-boundary
+    # comparison.
+    fresh_pinned = _make_evidence(
+        ac.NAMED_TEST_EXECUTION_EVIDENCE_KIND,
+        detail={
+            "executed_sha": sha,
+            "evaluated_at": _utcnow().isoformat(),
+            "passed": True,
+            "test_refs": ["testing/test_foo.py"],
+        },
+        recorded_at=_utcnow() - timedelta(days=ac.NAMED_TEST_EXECUTION_WINDOW_DAYS - 1),
+    )
+    assert ac._evidence_is_named_test_execution_covered(fresh_pinned) is True
+    assert ac._evidence_proves_covered(fresh_pinned) is True
+    assert ac.compute_criterion_coverage([fresh_pinned]) == "covered"
+
+    # (b) stale but SHA-pinned + passed → NOT covered; the only evidence present
+    # is non-covering, so coverage falls back to 'partial'.
+    stale_pinned = _make_evidence(
+        ac.NAMED_TEST_EXECUTION_EVIDENCE_KIND,
+        detail={"executed_sha": sha, "passed": True},
+        recorded_at=_utcnow() - timedelta(days=ac.NAMED_TEST_EXECUTION_WINDOW_DAYS + 1),
+    )
+    assert ac._evidence_is_named_test_execution_covered(stale_pinned) is False
+    assert ac._evidence_proves_covered(stale_pinned) is False
+    assert ac.compute_criterion_coverage([stale_pinned]) == "partial"
+
+    # (c) fresh but missing/blank executed_sha → NOT covered → 'partial'. Cover
+    # the blank-string, absent-key, and non-dict-detail variants.
+    for bad_detail in ({"executed_sha": "", "passed": True}, {"passed": True}, None):
+        fresh_unpinned = _make_evidence(
+            ac.NAMED_TEST_EXECUTION_EVIDENCE_KIND,
+            detail=bad_detail,
+            recorded_at=_utcnow() - timedelta(days=1),
+        )
+        assert ac._evidence_is_named_test_execution_covered(fresh_unpinned) is False
+        assert ac.compute_criterion_coverage([fresh_unpinned]) == "partial"
+
+    # (d) fresh + pinned but passed=False → NOT covered → 'partial'.
+    not_passed = _make_evidence(
+        ac.NAMED_TEST_EXECUTION_EVIDENCE_KIND,
+        detail={"executed_sha": sha, "passed": False},
+        recorded_at=_utcnow() - timedelta(days=1),
+    )
+    assert ac._evidence_is_named_test_execution_covered(not_passed) is False
+    assert ac.compute_criterion_coverage([not_passed]) == "partial"
+
+    # A row with no recorded_at at all cannot grant perpetual trust.
+    no_ts = _make_evidence(
+        ac.NAMED_TEST_EXECUTION_EVIDENCE_KIND,
+        detail={"executed_sha": sha, "passed": True},
+        recorded_at=None,
+    )
+    assert ac._evidence_is_named_test_execution_covered(no_ts) is False
+    assert ac.compute_criterion_coverage([no_ts]) == "partial"
+
+
+def test_named_test_execution_evidence_wrong_source_kind_rejected():
+    """_evidence_is_named_test_execution_covered rejects non-named_test_execution rows."""
+    not_named_test = _make_evidence(
+        "walkthrough_e2e",
+        detail={"executed_sha": "a" * 40, "passed": True},
+        recorded_at=_utcnow() - timedelta(days=1),
+    )
+    assert ac._evidence_is_named_test_execution_covered(not_named_test) is False
+    assert ac._evidence_proves_covered(not_named_test) is False
+
+
+# ---------------------------------------------------------------------------
 # criterion_evidence_status (pure function, Component 1)
 # ---------------------------------------------------------------------------
 
@@ -10078,6 +10168,159 @@ async def test_reconcile_backfill_skips_child_without_github_verified_ancestor(
 
 
 # ---------------------------------------------------------------------------
+# Reaper Step 21b: acceptance-verdict healing backfill sweep
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sweep_heals_rollup_child_acceptance_verdict(db_session):
+    """The reaper's acceptance-verdict healing sweep (Step 21b) unblocks a
+    deadlocked acceptance window without an operator reconcile-backfill POST.
+
+    An open version whose only write-task merge is an already-landed rollup child
+    with no changed-file context is stuck: the child's declared ``named_test``
+    cannot be located in any diff (``declared_unsatisfied``), so the
+    acceptance-window aggregate scores ``verified=0`` and the evidence minter
+    refuses to record on its false-zero guard. The sweep runs the reconcile-only
+    backfills automatically — rollup-child changed-files stamping first, then the
+    unverified-merge backfill — and finally the window minter, flipping the child
+    to ``satisfied_unproven`` so the window re-scores non-zero and criterion
+    evidence is recorded. A second sweep pass (past the cadence window) records
+    nothing.
+    """
+    from datetime import timedelta
+
+    from app import release_version as rv
+    import app.reaper_sweeps as rsw
+    from app.acceptance_gate import (
+        CODE_ACCEPTANCE_VERDICT_KEY,
+        classify_merged_acceptance_context,
+        record_code_acceptance_verdict,
+        stamp_changed_files_signal,
+    )
+    from app.time_utils import _utcnow
+
+    prod_seam = "backend/app/widgetflow.py"
+    declared_test = "backend/testing/test_widgetflow.py"
+
+    project = await _make_project(db_session, name="SweepHealsRollupChild")
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+
+    criterion = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="The false acceptance-coverage 0/346 is fixed (acceptance_window_fraction non-zero)",
+        created_by="operator",
+    )
+
+    # Rollup parent landed on integration carrying the GitHub-verified combined
+    # diff (a production seam + the declared test).
+    parent_ctx = {"pr_merged": True, "landed_on_integration": True}
+    parent_ctx.update(
+        stamp_changed_files_signal([prod_seam, declared_test], github_verified=True)
+    )
+    parent = Task(
+        project_id=project.id,
+        title="rollup parent",
+        payloads=[{"type": "research", "prompt": "rollup"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context=parent_ctx,
+    )
+    db_session.add(parent)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    # Already-landed rollup child: completed in this version's window, declares the
+    # named_test, but carries NO changed-file context (merged via the parent's PR).
+    child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        title="rollup child",
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "child",
+                "acceptance_evidence": {
+                    "kind": "named_test",
+                    "test_path": declared_test,
+                },
+            }
+        ],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        criterion_ids=[criterion.criterion_key],
+        completed_at=version.opened_at + timedelta(seconds=1),
+        context={"pr_merged": True, "landed_on_integration": True, "review_loop": {}},
+    )
+    db_session.add(child)
+    await db_session.commit()
+    await db_session.refresh(child)
+
+    # BEFORE: with no changed-file context the child fails closed as
+    # declared_unsatisfied (the declared test cannot be located in any diff).
+    assert record_code_acceptance_verdict(child) is not None
+    assert classify_merged_acceptance_context(child.context) == "declared_unsatisfied"
+    await db_session.commit()
+
+    summary_before = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary_before["uncovered"] == 1
+    assert summary_before["probed"] == 0
+
+    # Run the sweep. Reset the cadence timer so the first call always executes
+    # regardless of prior tests' runs; restore afterward for process isolation.
+    _prev_cadence = rsw._last_acceptance_healing_backfill_sweep
+    rsw._last_acceptance_healing_backfill_sweep = None
+    try:
+        total = await rsw.sweep_acceptance_verdict_healing_backfills(
+            db_session, now=_utcnow()
+        )
+    finally:
+        rsw._last_acceptance_healing_backfill_sweep = _prev_cadence
+    assert total >= 1, (
+        "the sweep must record acceptance-window criterion evidence for the "
+        "healed window"
+    )
+
+    # The child healed: verdict flipped off declared_unsatisfied to
+    # satisfied_unproven, and the acceptance window now scores verified > 0.
+    await db_session.refresh(child)
+    healed_ctx = child.context or {}
+    assert healed_ctx.get("_pr_changed_files") == [prod_seam, declared_test]
+    assert classify_merged_acceptance_context(healed_ctx) == "satisfied_unproven"
+    verdict = healed_ctx.get(CODE_ACCEPTANCE_VERDICT_KEY) or {}
+    assert verdict.get("satisfied") is True
+    assert verdict.get("proven") is False, (
+        "parent-derived credit must cap at satisfied/unproven, never machine-proven"
+    )
+
+    evidence = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert any(
+        e.source_kind == "acceptance_window_recompute" for e in evidence
+    ), "window minter must record probe evidence for the healed window"
+    summary_after = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary_after["probed"] == 1
+    assert summary_after["uncovered"] == 0
+
+    # A second sweep pass (past the cadence window) is a no-op: rollup stamping is
+    # setdefault-idempotent, the unverified-merge backfill finds nothing new, and
+    # the minter's durable evidence row suppresses a duplicate mint.
+    second_now = _utcnow() + timedelta(
+        seconds=rsw._ACCEPTANCE_HEALING_BACKFILL_INTERVAL_SECONDS + 1
+    )
+    rsw._last_acceptance_healing_backfill_sweep = None
+    try:
+        total_second = await rsw.sweep_acceptance_verdict_healing_backfills(
+            db_session, now=second_now
+        )
+    finally:
+        rsw._last_acceptance_healing_backfill_sweep = _prev_cadence
+    assert total_second == 0
+
+
+# ---------------------------------------------------------------------------
 # Evidence summary tier + provenance fields
 # ---------------------------------------------------------------------------
 
@@ -10384,6 +10627,203 @@ async def test_record_walkthrough_e2e_evidence_rejects_missing_sha(db_session):
     )
     assert summary["status"] == "rejected"
     assert summary["rejected_reason"] == "missing_candidate_sha"
+    assert await ac.get_evidence_for_criterion(db_session, crit.id) == []
+
+
+# ---------------------------------------------------------------------------
+# record_named_test_execution_evidence — executed-named-test trial ingestion
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_record_named_test_execution_evidence_writes_covered_when_sha_matches(db_session):
+    """A matching executed_sha writes covered-tier evidence and coverage flips."""
+    project = await _make_project_with_member(db_session, name="NamedTest-Match")
+    sha = "b" * 40
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"status": "scoring", "candidate_sha": sha},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = await ac.create_criterion(db_session, project.id, version.id, "Trial covered")
+
+    summary = await ac.record_named_test_execution_evidence(
+        db_session,
+        version,
+        criterion_keys=[crit.criterion_key],
+        executed_sha=sha,
+        test_refs=["testing/test_foo.py", "testing/test_bar.py"],
+        trial_task_id="trial-1",
+    )
+    assert summary["status"] == "recorded"
+    assert summary["recorded"] == 1
+    assert summary["unmatched_keys"] == []
+
+    ev = await ac.get_evidence_for_criterion(db_session, crit.id)
+    assert len(ev) == 1
+    assert ev[0].source_kind == ac.NAMED_TEST_EXECUTION_EVIDENCE_KIND
+    assert ev[0].source_id == f"named_test_exec:trial-1:{crit.criterion_key}"
+    assert ev[0].detail["executed_sha"] == sha
+    assert ev[0].detail["passed"] is True
+    assert ev[0].detail["test_refs"] == ["testing/test_foo.py", "testing/test_bar.py"]
+    assert "evaluated_at" in ev[0].detail
+    assert ac.compute_criterion_coverage(ev) == "covered"
+
+    # Re-ingestion with the same trial_task_id is an idempotent no-op.
+    summary2 = await ac.record_named_test_execution_evidence(
+        db_session,
+        version,
+        criterion_keys=[crit.criterion_key],
+        executed_sha=sha,
+        test_refs=["testing/test_foo.py", "testing/test_bar.py"],
+        trial_task_id="trial-1",
+    )
+    assert summary2["recorded"] == 0
+    assert len(await ac.get_evidence_for_criterion(db_session, crit.id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_record_named_test_execution_evidence_rejects_mismatched_sha(db_session):
+    """An executed_sha that does not match the qualifying SHA writes NOTHING."""
+    project = await _make_project_with_member(db_session, name="NamedTest-Mismatch")
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"candidate_sha": "c" * 40},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = await ac.create_criterion(db_session, project.id, version.id, "Meta")
+
+    summary = await ac.record_named_test_execution_evidence(
+        db_session,
+        version,
+        criterion_keys=[crit.criterion_key],
+        executed_sha="d" * 40,  # wrong commit
+        test_refs=["testing/test_foo.py"],
+        trial_task_id="trial-2",
+    )
+    assert summary["status"] == "rejected"
+    assert summary["rejected_reason"] == "executed_sha_mismatch"
+    assert summary["recorded"] == 0
+    # A run against the wrong commit forged no coverage.
+    assert await ac.get_evidence_for_criterion(db_session, crit.id) == []
+
+
+@pytest.mark.asyncio
+async def test_record_named_test_execution_evidence_rejects_missing_sha(db_session):
+    """An empty executed_sha is rejected outright (cannot pin coverage)."""
+    project = await _make_project_with_member(db_session, name="NamedTest-MissingSha")
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"candidate_sha": "e" * 40},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = await ac.create_criterion(db_session, project.id, version.id, "Meta")
+    summary = await ac.record_named_test_execution_evidence(
+        db_session,
+        version,
+        criterion_keys=[crit.criterion_key],
+        executed_sha="   ",
+        test_refs=["testing/test_foo.py"],
+        trial_task_id="trial-3",
+    )
+    assert summary["status"] == "rejected"
+    assert summary["rejected_reason"] == "missing_executed_sha"
+    assert await ac.get_evidence_for_criterion(db_session, crit.id) == []
+
+
+@pytest.mark.asyncio
+async def test_record_named_test_execution_evidence_accepts_enrolled_sha_after_candidate_moves(db_session):
+    """An enrollment-pinned SHA stays authoritative after the version re-pins.
+
+    Regression for the volatile-SHA-anchor bug: the version's qualifying
+    candidate SHA is a mutable scratch field rewritten by many call sites. When
+    the recorder is given the orchestrator-enrolled ``enrolled_sha``, a green
+    run of that exact commit must still mint covered evidence even though the
+    version's ``last_qualification["candidate_sha"]`` has since advanced.
+    """
+    project = await _make_project_with_member(db_session, name="NamedTest-PinnedMove")
+    enrolled_sha = "a" * 40
+    advanced_sha = "b" * 40
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"status": "scoring", "candidate_sha": advanced_sha},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = await ac.create_criterion(db_session, project.id, version.id, "Trial covered")
+
+    summary = await ac.record_named_test_execution_evidence(
+        db_session,
+        version,
+        criterion_keys=[crit.criterion_key],
+        executed_sha=enrolled_sha,
+        test_refs=["testing/test_foo.py"],
+        trial_task_id="trial-pinned-move",
+        enrolled_sha=enrolled_sha,
+    )
+    assert summary["status"] == "recorded"
+    assert summary["recorded"] == 1
+    ev = await ac.get_evidence_for_criterion(db_session, crit.id)
+    assert len(ev) == 1
+    assert ev[0].detail["executed_sha"] == enrolled_sha
+    assert ev[0].detail["passed"] is True
+    assert ac.compute_criterion_coverage(ev) == "covered"
+
+
+@pytest.mark.asyncio
+async def test_record_named_test_execution_evidence_rejects_executed_sha_not_matching_enrolled(db_session):
+    """executed_sha must match the enrollment pin even when it is the current SHA.
+
+    Anti-forgery stays intact: a runner that reports a different commit than the
+    one the orchestrator enrolled cannot mint evidence by coincidentally naming
+    the version's *current* qualifying candidate SHA.
+    """
+    project = await _make_project_with_member(db_session, name="NamedTest-PinnedReject")
+    enrolled_sha = "a" * 40
+    current_sha = "c" * 40  # current qualifying SHA — NOT the enrolled pin
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={"status": "scoring", "candidate_sha": current_sha},
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = await ac.create_criterion(db_session, project.id, version.id, "Meta")
+
+    summary = await ac.record_named_test_execution_evidence(
+        db_session,
+        version,
+        criterion_keys=[crit.criterion_key],
+        executed_sha=current_sha,  # matches current qualifying SHA...
+        test_refs=["testing/test_foo.py"],
+        trial_task_id="trial-pinned-reject",
+        enrolled_sha=enrolled_sha,  # ...but NOT the enrolled pin
+    )
+    assert summary["status"] == "rejected"
+    assert summary["rejected_reason"] == "executed_sha_mismatch"
+    assert summary["recorded"] == 0
     assert await ac.get_evidence_for_criterion(db_session, crit.id) == []
 
 
@@ -10948,6 +11388,407 @@ async def test_backfill_merged_named_test_skips_no_seam_files(db_session):
     assert recorded == 0, "Test-only diff must not get backfill evidence"
 
 
+async def _select_criterion_trials(db_session, project_id):
+    """Return every ``criterion_named_test_trial`` Task for ``project_id``.
+
+    Filters in Python rather than using a JSON containment query so the helper
+    works on both the SQLite and PostgreSQL test dialects.
+    """
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project_id)
+    )
+    return [
+        t for t in result.scalars().all()
+        if t.first_payload.get("type") == "criterion_named_test_trial"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_backfill_merged_named_test_enrolls_trial_at_candidate_sha(db_session):
+    """A qualifying merged task enrolls a trial pinned to the candidate SHA.
+
+    For every active criterion that received merged-named-test backfill
+    evidence, the backfill enrolls a QUEUED ``criterion_named_test_trial`` with
+    ``test_refs`` equal to the covering test it discovered and ``head_sha``
+    pinned to the version's qualifying candidate SHA — replacing the old
+    research corroboration spawn for this lane.
+    """
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    project = await _make_project(db_session, "MergedNamedTestEnrollTrial")
+    version = await _make_version(db_session, project)
+    sha = "b" * 40
+    version.last_qualification = {"status": "scoring", "candidate_sha": sha}
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id,
+        "Merged named-test trial criterion",
+        created_by="strategist",
+    )
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "create",
+            "prompt": "add the test",
+            "acceptance_evidence": {
+                "kind": "named_test",
+                "test_path": "testing/test_merged_backfill.py",
+            },
+        }],
+        context={
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            "_pr_changed_files": [
+                "testing/test_merged_backfill.py",
+                "backend/app/target_module.py",
+            ],
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    rc = {"criterion_named_test_trials_enabled": True}
+    with patch("app.shared_state.runtime_config", new=rc):
+        recorded = await ac.backfill_merged_named_test_coverage(db_session, project.id)
+    assert recorded == 1, (
+        f"Expected 1 backfilled evidence row; got {recorded}"
+    )
+
+    trials = await _select_criterion_trials(db_session, project.id)
+    assert len(trials) == 1, f"expected one enrolled trial, got {len(trials)}"
+    trial = trials[0]
+    payload = trial.first_payload
+    assert payload["type"] == "criterion_named_test_trial"
+    assert payload["criterion_key"] == criterion.criterion_key
+    assert payload["criterion_text"] == "Merged named-test trial criterion"
+    assert payload["test_refs"] == ["testing/test_merged_backfill.py"]
+    assert payload["head_sha"] == sha
+    assert payload["max_test_files"] == ac.MAX_CRITERION_NAMED_TEST_TRIAL_TEST_FILES
+    assert payload["wall_clock_seconds"] == ac.CRITERION_NAMED_TEST_TRIAL_WALL_CLOCK_SECONDS
+    assert trial.title == f"Criterion named-test trial: {criterion.criterion_key}"
+    assert trial.criterion_ids == [criterion.criterion_key]
+    assert trial.status == TaskStatus.QUEUED
+    assert trial.created_by == "SYSTEM_AUTO_REVIEW"
+    ctx = trial.context or {}
+    assert ctx["corroboration_of"] == criterion.criterion_key
+    assert ctx["spawned_by"] == ac.NAMED_TEST_EXECUTION_EVIDENCE_KIND
+    assert ctx[ac.CRITERION_RELEASE_VERSION_CONTEXT_KEY] == str(version.id)
+
+
+@pytest.mark.asyncio
+async def test_backfill_merged_named_test_trial_suppressed_by_in_flight_trial(db_session):
+    """An in-flight trial for the same criterion + release version is NOT re-enrolled.
+
+    The enroller's dedup guard must skip a fresh enrollment while a
+    non-terminal ``criterion_named_test_trial`` already exists for the same
+    criterion_key and release version — the backfill evidence still records.
+    """
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    project = await _make_project(db_session, "MergedNamedTestDedup")
+    version = await _make_version(db_session, project)
+    sha = "b" * 40
+    version.last_qualification = {"status": "scoring", "candidate_sha": sha}
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id,
+        "Merged named-test dedup criterion",
+        created_by="strategist",
+    )
+
+    # An in-flight (QUEUED) trial already exists for this criterion + version.
+    existing = Task(
+        project_id=project.id,
+        title=f"Criterion named-test trial: {criterion.criterion_key}",
+        criterion_ids=[criterion.criterion_key],
+        context={
+            "corroboration_of": criterion.criterion_key,
+            "spawned_by": ac.NAMED_TEST_EXECUTION_EVIDENCE_KIND,
+            ac.CRITERION_RELEASE_VERSION_CONTEXT_KEY: str(version.id),
+        },
+        payloads=[{
+            "type": "criterion_named_test_trial",
+            "criterion_key": criterion.criterion_key,
+            "test_refs": ["testing/test_merged_backfill.py"],
+            "head_sha": sha,
+        }],
+        status=TaskStatus.QUEUED,
+        created_by="SYSTEM_AUTO_REVIEW",
+    )
+    db_session.add(existing)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "create",
+            "prompt": "add the test",
+            "acceptance_evidence": {
+                "kind": "named_test",
+                "test_path": "testing/test_merged_backfill.py",
+            },
+        }],
+        context={
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            "_pr_changed_files": [
+                "testing/test_merged_backfill.py",
+                "backend/app/target_module.py",
+            ],
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    rc = {"criterion_named_test_trials_enabled": True}
+    with patch("app.shared_state.runtime_config", new=rc):
+        recorded = await ac.backfill_merged_named_test_coverage(db_session, project.id)
+
+    # Backfill evidence still records for the criterion.
+    assert recorded == 1, (
+        f"Expected 1 backfilled evidence row; got {recorded}"
+    )
+    # But no second trial is enrolled.
+    trials = await _select_criterion_trials(db_session, project.id)
+    assert len(trials) == 1, "in-flight trial must suppress re-enrollment"
+    assert trials[0].id == existing.id, "the pre-existing trial is the only one"
+
+
+@pytest.mark.asyncio
+async def test_backfill_merged_named_test_no_qualifying_sha_enrolls_nothing(db_session):
+    """Without a qualifying candidate SHA the backfill enrolls no trial.
+
+    The trial must be pinned to a qualifying candidate revision — without one,
+    ``enroll_criterion_named_test_trial`` is a no-op, but the ``backfilled``
+    evidence row still records (the floor tier stays).
+    """
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    project = await _make_project(db_session, "MergedNamedTestNoSHA")
+    version = await _make_version(db_session, project)
+    # No last_qualification => no qualifying candidate SHA.
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id,
+        "Merged named-test no-sha criterion",
+        created_by="strategist",
+    )
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "create",
+            "prompt": "add the test",
+            "acceptance_evidence": {
+                "kind": "named_test",
+                "test_path": "testing/test_merged_backfill.py",
+            },
+        }],
+        context={
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            "_pr_changed_files": [
+                "testing/test_merged_backfill.py",
+                "backend/app/target_module.py",
+            ],
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    rc = {"criterion_named_test_trials_enabled": True}
+    with patch("app.shared_state.runtime_config", new=rc):
+        recorded = await ac.backfill_merged_named_test_coverage(db_session, project.id)
+
+    assert recorded == 1, "backfill evidence records even without a qualifying SHA"
+    trials = await _select_criterion_trials(db_session, project.id)
+    assert trials == [], "no trial may be enrolled without a pinned candidate SHA"
+
+
+@pytest.mark.asyncio
+async def test_enroll_criterion_named_test_trial_defaults_on_when_flag_key_absent(db_session):
+    """Enrollment stays live when the runtime-config dict omits the flag key.
+
+    ``enroll_criterion_named_test_trial`` must default the
+    ``criterion_named_test_trials_enabled`` gate to True (matching the ingester
+    and the runtime-config default). A config dict that simply lacks the key
+    must not silently darken the enroll half while ingestion stays live.
+    """
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    project = await _make_project(db_session, "MergedNamedTestFlagAbsent")
+    version = await _make_version(db_session, project)
+    sha = "e" * 40
+    version.last_qualification = {"status": "scoring", "candidate_sha": sha}
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id,
+        "Merged named-test flag-absent criterion",
+        created_by="strategist",
+    )
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "create",
+            "prompt": "add the test",
+            "acceptance_evidence": {
+                "kind": "named_test",
+                "test_path": "testing/test_flag_absent.py",
+            },
+        }],
+        context={
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            "_pr_changed_files": [
+                "testing/test_flag_absent.py",
+                "backend/app/target_module.py",
+            ],
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    # No flag key at all — the enroller must still enroll (default ON).
+    with patch("app.shared_state.runtime_config", new={}):
+        recorded = await ac.backfill_merged_named_test_coverage(db_session, project.id)
+    assert recorded == 1, "backfill evidence must still record"
+
+    trials = await _select_criterion_trials(db_session, project.id)
+    assert len(trials) == 1, (
+        "enrollment must NOT darken when the flag key is absent from the config dict"
+    )
+    assert trials[0].first_payload["criterion_key"] == criterion.criterion_key
+    assert trials[0].status == TaskStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_post_merge_earn_loop_executes_covering_test_and_mints_covered(db_session):
+    """ACCEPTANCE: the post-merge earn loop executes the covering test to reach covered.
+
+    Full-loop integration of the executed-named-test earn path: the backfill
+    records ``backfilled`` evidence AND enrolls a ``criterion_named_test_trial``
+    pinned to the version's qualifying candidate SHA; the agent's GREEN executed
+    receipt is ingested by the completion handler; and the criterion reaches
+    machine-verified ``'covered'`` via a fresh, SHA-pinned
+    ``named_test_execution`` evidence row.
+    """
+    import json as _json
+
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+    from app.task_completion import _handle_criterion_named_test_trial_completion
+
+    project = await _make_project(db_session, "PostMergeEarnLoopCovered")
+    version = await _make_version(db_session, project)
+    sha = "d" * 40
+    version.last_qualification = {"status": "scoring", "candidate_sha": sha}
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id,
+        "Post-merge earn-loop criterion",
+        created_by="strategist",
+    )
+
+    # A merged task shipped its declared covering test alongside production code.
+    task = Task(
+        project_id=project.id,
+        payloads=[{
+            "type": "create",
+            "prompt": "implement + test",
+            "acceptance_evidence": {
+                "kind": "named_test",
+                "test_path": "testing/test_post_merge_earn.py",
+            },
+        }],
+        context={
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            "_pr_changed_files": [
+                "testing/test_post_merge_earn.py",
+                "backend/app/target_module.py",
+            ],
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    # Step 1 — the earn loop records backfilled evidence + enrolls the trial.
+    rc = {"criterion_named_test_trials_enabled": True}
+    with patch("app.shared_state.runtime_config", new=rc):
+        recorded = await ac.backfill_merged_named_test_coverage(db_session, project.id)
+    assert recorded == 1
+
+    ev_backfill = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert ac.compute_criterion_coverage(ev_backfill) == "backfilled", (
+        "the floor tier after backfill is 'backfilled'"
+    )
+
+    trials = await _select_criterion_trials(db_session, project.id)
+    assert len(trials) == 1, "the earn loop must enroll exactly one trial"
+    trial = trials[0]
+    payload = trial.first_payload
+    assert payload["head_sha"] == sha
+    assert payload["test_refs"] == ["testing/test_post_merge_earn.py"]
+    assert trial.status == TaskStatus.QUEUED
+    trial_id = trial.id
+
+    # Step 2 — the agent runs the covering test at the pinned SHA and reports GREEN.
+    trial.status = TaskStatus.COMPLETED
+    await db_session.commit()
+    logs = _json.dumps({
+        "criterion_named_test_trial_result": {
+            "type": "criterion_named_test_trial",
+            "criterion_key": criterion.criterion_key,
+            "head_sha": sha,
+            "queued_head_sha": sha,
+            "test_refs": ["testing/test_post_merge_earn.py"],
+            "ran": True,
+            "passed": True,
+            "skipped_summary": {"total": 1, "skipped": 0},
+        }
+    })
+
+    # Step 3 — ingestion mints covered evidence from the green executed receipt.
+    await _handle_criterion_named_test_trial_completion(trial, logs, db_session)
+
+    ev = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert len(ev) == 2, "backfilled + named_test_execution evidence rows"
+    kinds = {e.source_kind for e in ev}
+    assert kinds == {
+        ac.UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND,
+        ac.NAMED_TEST_EXECUTION_EVIDENCE_KIND,
+    }, f"unexpected evidence kinds: {sorted(kinds)}"
+    exec_ev = next(
+        e for e in ev if e.source_kind == ac.NAMED_TEST_EXECUTION_EVIDENCE_KIND
+    )
+    assert exec_ev.source_id == f"named_test_exec:{trial_id}:{criterion.criterion_key}"
+    assert exec_ev.detail["executed_sha"] == sha
+    assert exec_ev.detail["passed"] is True
+    assert exec_ev.detail["test_refs"] == ["testing/test_post_merge_earn.py"]
+    assert ac.compute_criterion_coverage(ev) == "covered", (
+        "a green executed named-test trial upgrades the criterion to covered"
+    )
+
+
 # ---------------------------------------------------------------------------
 # _handle_walkthrough_e2e_completion — log format alignment
 # ---------------------------------------------------------------------------
@@ -11083,6 +11924,500 @@ async def test_handle_walkthrough_e2e_completion_skips_missing_results_key(db_se
 
     evidence = await ac.get_evidence_for_criterion(db_session, crit.id)
     assert evidence == [], "Old 'flows' format must not produce any evidence rows"
+
+
+# ---------------------------------------------------------------------------
+# _handle_criterion_named_test_trial_completion — executed-named-test ingestion
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_named_test_execution_completion_mints_covered_evidence(db_session):
+    """A GREEN validated receipt mints covered evidence for the bound criterion."""
+    import json as _json
+    from app.task_completion import _handle_criterion_named_test_trial_completion
+
+    project = await _make_project(db_session, name="CriterionTrial-Green")
+    version = await _make_version(db_session, project)
+    sha = "a" * 40
+    version.last_qualification = {"status": "scoring", "candidate_sha": sha}
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = await ac.create_criterion(db_session, project.id, version.id, "Trial covered")
+    refs = ["testing/test_foo.py", "testing/test_bar.py"]
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "criterion_named_test_trial",
+                "criterion_key": crit.criterion_key,
+                "test_refs": refs,
+                "head_sha": sha,
+            }
+        ],
+        criterion_ids=[crit.criterion_key],
+        status=TaskStatus.COMPLETED,
+        context={"criterion_release_version_id": str(version.id)},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Receipt wrapped under the "criterion_named_test_trial_result" key.
+    logs = _json.dumps({
+        "criterion_named_test_trial_result": {
+            "type": "criterion_named_test_trial",
+            "criterion_key": crit.criterion_key,
+            "head_sha": sha,
+            "queued_head_sha": sha,
+            "test_refs": refs,
+            "ran": True,
+            "passed": True,
+            "skipped_summary": {"total": 2, "skipped": 0},
+        }
+    })
+
+    await _handle_criterion_named_test_trial_completion(task, logs, db_session)
+
+    ev = await ac.get_evidence_for_criterion(db_session, crit.id)
+    assert len(ev) == 1, "a GREEN validated receipt must mint exactly one evidence row"
+    assert ev[0].source_kind == ac.NAMED_TEST_EXECUTION_EVIDENCE_KIND
+    assert ev[0].source_id == f"named_test_exec:{task.id}:{crit.criterion_key}"
+    assert ev[0].detail["executed_sha"] == sha
+    assert ev[0].detail["passed"] is True
+    assert ev[0].detail["test_refs"] == refs
+    assert ac.compute_criterion_coverage(ev) == "covered"
+
+
+@pytest.mark.asyncio
+async def test_named_test_execution_evidence_accepted_when_candidate_advanced_to_descendant(db_session):
+    """A GREEN trial at the enrolled SHA mints evidence after a descendant re-pin.
+
+    End-to-end regression for the volatile-SHA-anchor bug: the trial is enrolled
+    pinned to SHA X, the version's qualifying candidate SHA advances to a
+    descendant SHA Y before the runner's green receipt is ingested, and the
+    receipt reporting X must still mint ``covered`` evidence — the work is not
+    silently thrown away because a scratch field was re-pinned mid-flight.
+    """
+    import json as _json
+    from app.task_completion import _handle_criterion_named_test_trial_completion
+
+    project = await _make_project(db_session, name="CriterionTrial-AdvancedCandidate")
+    version = await _make_version(db_session, project)
+    enrolled_sha = "a" * 40
+    advanced_sha = "b" * 40
+    version.last_qualification = {"status": "scoring", "candidate_sha": enrolled_sha}
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = await ac.create_criterion(db_session, project.id, version.id, "Trial covered")
+    refs = ["testing/test_foo.py"]
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "criterion_named_test_trial",
+                "criterion_key": crit.criterion_key,
+                "test_refs": refs,
+                "head_sha": enrolled_sha,
+            }
+        ],
+        criterion_ids=[crit.criterion_key],
+        status=TaskStatus.COMPLETED,
+        context={"criterion_release_version_id": str(version.id)},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # The qualifying candidate advances to a descendant commit between
+    # enrollment and ingestion — the volatile scratch field moves under the
+    # trial, which must not invalidate the enrolled run.
+    version.last_qualification = {"status": "scoring", "candidate_sha": advanced_sha}
+    await db_session.commit()
+
+    logs = _json.dumps({
+        "criterion_named_test_trial_result": {
+            "type": "criterion_named_test_trial",
+            "criterion_key": crit.criterion_key,
+            "head_sha": enrolled_sha,
+            "queued_head_sha": enrolled_sha,
+            "test_refs": refs,
+            "ran": True,
+            "passed": True,
+            "skipped_summary": {"total": 1, "skipped": 0},
+        }
+    })
+
+    await _handle_criterion_named_test_trial_completion(task, logs, db_session)
+
+    ev = await ac.get_evidence_for_criterion(db_session, crit.id)
+    assert len(ev) == 1, "a GREEN run of the enrolled SHA must mint evidence after a re-pin"
+    assert ev[0].source_kind == ac.NAMED_TEST_EXECUTION_EVIDENCE_KIND
+    assert ev[0].source_id == f"named_test_exec:{task.id}:{crit.criterion_key}"
+    assert ev[0].detail["executed_sha"] == enrolled_sha
+    assert ev[0].detail["passed"] is True
+    assert ev[0].detail["test_refs"] == refs
+    assert ac.compute_criterion_coverage(ev) == "covered"
+
+
+@pytest.mark.asyncio
+async def test_named_test_execution_completion_mints_evidence_only_for_reported_criterion(db_session):
+    """A GREEN receipt mints covered evidence ONLY for the criterion that ran.
+
+    The trial task may be bound to several criteria (``criterion_ids``), but an
+    executed-named-test trial proves exactly one: the ``criterion_key`` named in
+    the enrollment and validated against the receipt. Covered evidence must not
+    be minted for sibling bound criteria that never ran.
+    """
+    import json as _json
+    from app.task_completion import _handle_criterion_named_test_trial_completion
+
+    project = await _make_project(db_session, name="CriterionTrial-NoOverCredit")
+    version = await _make_version(db_session, project)
+    sha = "f" * 40
+    version.last_qualification = {"status": "scoring", "candidate_sha": sha}
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit_ran = await ac.create_criterion(db_session, project.id, version.id, "Ran crit")
+    crit_sibling = await ac.create_criterion(
+        db_session, project.id, version.id, "Sibling crit"
+    )
+    refs = ["testing/test_foo.py"]
+
+    # The trial is bound to TWO criteria but enrolled to prove only crit_ran.
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "criterion_named_test_trial",
+                "criterion_key": crit_ran.criterion_key,
+                "test_refs": refs,
+                "head_sha": sha,
+            }
+        ],
+        criterion_ids=[crit_ran.criterion_key, crit_sibling.criterion_key],
+        status=TaskStatus.COMPLETED,
+        context={"criterion_release_version_id": str(version.id)},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # GREEN receipt naming the enrolled criterion.
+    logs = _json.dumps({
+        "criterion_named_test_trial_result": {
+            "type": "criterion_named_test_trial",
+            "criterion_key": crit_ran.criterion_key,
+            "head_sha": sha,
+            "queued_head_sha": sha,
+            "test_refs": refs,
+            "ran": True,
+            "passed": True,
+            "skipped_summary": {"total": 1, "skipped": 0},
+        }
+    })
+
+    await _handle_criterion_named_test_trial_completion(task, logs, db_session)
+
+    ev_ran = await ac.get_evidence_for_criterion(db_session, crit_ran.id)
+    assert len(ev_ran) == 1, (
+        "the reported criterion must get exactly one named_test_execution row"
+    )
+    assert ev_ran[0].source_kind == ac.NAMED_TEST_EXECUTION_EVIDENCE_KIND
+    assert ev_ran[0].detail["criterion_key"] == crit_ran.criterion_key
+    assert ac.compute_criterion_coverage(ev_ran) == "covered"
+
+    ev_sibling = await ac.get_evidence_for_criterion(db_session, crit_sibling.id)
+    assert ev_sibling == [], (
+        "a sibling bound criterion that never ran must NOT receive covered evidence"
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_criterion_named_test_trial_completion_green_via_plan_output(db_session):
+    """A GREEN receipt carried on task.plan_output mints covered evidence too."""
+    from app.task_completion import _handle_criterion_named_test_trial_completion
+
+    project = await _make_project(db_session, name="CriterionTrial-PlanOutput")
+    version = await _make_version(db_session, project)
+    sha = "c" * 40
+    version.last_qualification = {"status": "scoring", "candidate_sha": sha}
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = await ac.create_criterion(db_session, project.id, version.id, "PlanOutput crit")
+    refs = ["testing/test_foo.py"]
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "criterion_named_test_trial",
+                "criterion_key": crit.criterion_key,
+                "test_refs": refs,
+                "head_sha": sha,
+            }
+        ],
+        criterion_ids=[crit.criterion_key],
+        status=TaskStatus.COMPLETED,
+        context={"criterion_release_version_id": str(version.id)},
+        plan_output={
+            "type": "criterion_named_test_trial",
+            "criterion_key": crit.criterion_key,
+            "head_sha": sha,
+            "test_refs": refs,
+            "ran": True,
+            "passed": True,
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    await _handle_criterion_named_test_trial_completion(task, "irrelevant-logs", db_session)
+
+    ev = await ac.get_evidence_for_criterion(db_session, crit.id)
+    assert len(ev) == 1
+    assert ac.compute_criterion_coverage(ev) == "covered"
+
+
+@pytest.mark.asyncio
+async def test_handle_criterion_named_test_trial_completion_test_refs_subset_mints_nothing(db_session):
+    """A test_refs strict subset of the enrolled set mints nothing + stamps contradiction."""
+    import json as _json
+    from app.task_completion import _handle_criterion_named_test_trial_completion
+
+    project = await _make_project(db_session, name="CriterionTrial-RefsSubset")
+    version = await _make_version(db_session, project)
+    sha = "a" * 40
+    version.last_qualification = {"status": "scoring", "candidate_sha": sha}
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = await ac.create_criterion(db_session, project.id, version.id, "Subset crit")
+    enrolled_refs = ["testing/test_foo.py", "testing/test_bar.py"]
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "criterion_named_test_trial",
+                "criterion_key": crit.criterion_key,
+                "test_refs": enrolled_refs,
+                "head_sha": sha,
+            }
+        ],
+        criterion_ids=[crit.criterion_key],
+        status=TaskStatus.COMPLETED,
+        context={"criterion_release_version_id": str(version.id)},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = _json.dumps({
+        "type": "criterion_named_test_trial",
+        "criterion_key": crit.criterion_key,
+        "head_sha": sha,
+        "test_refs": ["testing/test_foo.py"],  # strict subset — omitted a hard test
+        "ran": True,
+        "passed": True,
+    })
+
+    await _handle_criterion_named_test_trial_completion(task, logs, db_session)
+
+    assert await ac.get_evidence_for_criterion(db_session, crit.id) == []
+    ctx = dict(task.context or {})
+    assert "criterion_named_test_trial_contradiction" in ctx
+    assert ctx["criterion_named_test_trial_contradiction"]["reason"] == "test_refs_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_handle_criterion_named_test_trial_completion_test_refs_superset_mints_nothing(db_session):
+    """A test_refs strict superset of the enrolled set mints nothing + stamps contradiction."""
+    import json as _json
+    from app.task_completion import _handle_criterion_named_test_trial_completion
+
+    project = await _make_project(db_session, name="CriterionTrial-RefsSuperset")
+    version = await _make_version(db_session, project)
+    sha = "a" * 40
+    version.last_qualification = {"status": "scoring", "candidate_sha": sha}
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = await ac.create_criterion(db_session, project.id, version.id, "Superset crit")
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "criterion_named_test_trial",
+                "criterion_key": crit.criterion_key,
+                "test_refs": ["testing/test_foo.py"],
+                "head_sha": sha,
+            }
+        ],
+        criterion_ids=[crit.criterion_key],
+        status=TaskStatus.COMPLETED,
+        context={"criterion_release_version_id": str(version.id)},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = _json.dumps({
+        "type": "criterion_named_test_trial",
+        "criterion_key": crit.criterion_key,
+        "head_sha": sha,
+        "test_refs": ["testing/test_foo.py", "testing/test_extra.py"],  # superset
+        "ran": True,
+        "passed": True,
+    })
+
+    await _handle_criterion_named_test_trial_completion(task, logs, db_session)
+
+    assert await ac.get_evidence_for_criterion(db_session, crit.id) == []
+    ctx = dict(task.context or {})
+    assert ctx["criterion_named_test_trial_contradiction"]["reason"] == "test_refs_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_handle_criterion_named_test_trial_completion_head_sha_mismatch_mints_nothing(db_session):
+    """A head_sha that does not match the enrolled revision mints nothing + stamps contradiction."""
+    import json as _json
+    from app.task_completion import _handle_criterion_named_test_trial_completion
+
+    project = await _make_project(db_session, name="CriterionTrial-HashMismatch")
+    version = await _make_version(db_session, project)
+    sha = "a" * 40
+    version.last_qualification = {"status": "scoring", "candidate_sha": sha}
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = await ac.create_criterion(db_session, project.id, version.id, "SHA crit")
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "criterion_named_test_trial",
+                "criterion_key": crit.criterion_key,
+                "test_refs": ["testing/test_foo.py"],
+                "head_sha": sha,
+            }
+        ],
+        criterion_ids=[crit.criterion_key],
+        status=TaskStatus.COMPLETED,
+        context={"criterion_release_version_id": str(version.id)},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = _json.dumps({
+        "type": "criterion_named_test_trial",
+        "criterion_key": crit.criterion_key,
+        "head_sha": "d" * 40,  # wrong revision — cannot turn a SHA-bound trial unbound
+        "test_refs": ["testing/test_foo.py"],
+        "ran": True,
+        "passed": True,
+    })
+
+    await _handle_criterion_named_test_trial_completion(task, logs, db_session)
+
+    assert await ac.get_evidence_for_criterion(db_session, crit.id) == []
+    ctx = dict(task.context or {})
+    assert ctx["criterion_named_test_trial_contradiction"]["reason"] == "head_sha_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_handle_criterion_named_test_trial_completion_non_green_mints_nothing(db_session):
+    """A non-green receipt (ran but failed) mints nothing + stamps a contradiction."""
+    import json as _json
+    from app.task_completion import _handle_criterion_named_test_trial_completion
+
+    project = await _make_project(db_session, name="CriterionTrial-NonGreen")
+    version = await _make_version(db_session, project)
+    sha = "a" * 40
+    version.last_qualification = {"status": "scoring", "candidate_sha": sha}
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    crit = await ac.create_criterion(db_session, project.id, version.id, "Red crit")
+    refs = ["testing/test_foo.py"]
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "criterion_named_test_trial",
+                "criterion_key": crit.criterion_key,
+                "test_refs": refs,
+                "head_sha": sha,
+            }
+        ],
+        criterion_ids=[crit.criterion_key],
+        status=TaskStatus.COMPLETED,
+        context={"criterion_release_version_id": str(version.id)},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = _json.dumps({
+        "type": "criterion_named_test_trial",
+        "criterion_key": crit.criterion_key,
+        "head_sha": sha,
+        "test_refs": refs,
+        "ran": True,
+        "passed": False,
+        "could_not_run": False,
+    })
+
+    await _handle_criterion_named_test_trial_completion(task, logs, db_session)
+
+    assert await ac.get_evidence_for_criterion(db_session, crit.id) == []
+    ctx = dict(task.context or {})
+    assert "criterion_named_test_trial_contradiction" in ctx
+    assert ctx["criterion_named_test_trial_contradiction"]["passed"] is False
+
+
+@pytest.mark.asyncio
+async def test_handle_criterion_named_test_trial_completion_malformed_logs_swallowed(db_session):
+    """Malformed or empty logs are swallowed without raising and mint nothing."""
+    from app.task_completion import _handle_criterion_named_test_trial_completion
+
+    project = await _make_project(db_session, name="CriterionTrial-Malformed")
+    version = await _make_version(db_session, project)
+    crit = await ac.create_criterion(db_session, project.id, version.id, "Malformed crit")
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "criterion_named_test_trial",
+                "criterion_key": crit.criterion_key,
+                "test_refs": ["testing/test_foo.py"],
+            }
+        ],
+        criterion_ids=[crit.criterion_key],
+        status=TaskStatus.COMPLETED,
+        context={"criterion_release_version_id": str(version.id)},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    for bad_logs in ("not json at all", "[]", "", "null"):
+        # Must never raise, and must never mint evidence.
+        await _handle_criterion_named_test_trial_completion(task, bad_logs, db_session)
+
+    assert await ac.get_evidence_for_criterion(db_session, crit.id) == []
 
 
 # ---------------------------------------------------------------------------

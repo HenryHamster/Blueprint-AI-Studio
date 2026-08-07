@@ -1,5 +1,6 @@
 node_modules/
 .venv/
+.venv-test/
 *.exe
 *.pem
 __pycache__/
@@ -56,3 +57,9 @@ research-*.md
 # Local git worktrees spawned by Claude Code — never commit as gitlinks
 .claude/worktrees/
 .claude/bin/
+
+# Local task-tooling (ruff binary shim, ruff python module, backend venv, postgres binaries)
+.local-bin/
+.ruff-module/
+.backend-venv/
+.pgbin/

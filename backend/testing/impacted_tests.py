@@ -32,10 +32,16 @@ Contract
       (``patch("app.foo.bar")``, ``mocker.patch('app.foo...')``,
       ``patch.object(app.foo, ...)``) are detected. Matching respects module
       boundaries: ``app.foo`` must NOT match a longer sibling ``app.foobar``.
-* Emitted deduped + stable-sorted to STDOUT, one repo-relative path per line.
-  Empty set -> no output, exit 0. Optional ``--limit N`` truncates to the first N
-  (sorted); the overflow is reported to STDERR as ``deferred-to-CI:`` lines
-  (never silently dropped).
+* Emitted deduped to STDOUT, one repo-relative path per line, ranked by
+  relevance to the diff: directly changed/added test files first, then test
+  files ordered by how close their referenced modules sit to the change (an
+  import-hop distance from a changed module, with within-tier tiebreakers for
+  mock-patch coupling, direct changed-module references, and closure breadth),
+  and surface-glob drift sentinels last. This is what lets the merge gate's
+  ``--limit``-style cap keep the tests most likely to catch a contract break.
+  Empty set -> no output, exit 0. Optional ``--limit N`` truncates to the first
+  N (most relevant); the overflow is reported to STDERR as
+  ``deferred-unverified:`` lines (never silently dropped).
 * Robust on partial trees: any listed path absent on disk is skipped (deletions),
   and the reverse-dep scan is skipped gracefully when ``backend/testing`` is
   absent.
@@ -172,6 +178,42 @@ def _referenced_app_modules(content: str, known_modules) -> "set[str]":
             if candidate in known:
                 referenced.add(candidate)
     return referenced
+
+
+# A string mock-patch target: ``patch("app.foo.bar", ...)``,
+# ``mocker.patch('app.foo.baz', ...)`` or ``unittest.mock.patch(...)``. Capture
+# the first dotted argument. ``patch.object(app.foo, ...)`` does not match
+# (no quoted dotted target), and ``monkeypatch`` is not ``patch`` (the ``\b``
+# requires a word boundary before ``patch``).
+_PATCH_TARGET_RE = re.compile(
+    r"""\b(?:unittest\.mock\.)?patch\s*\(\s*["']([A-Za-z0-9_.]+)["']"""
+)
+
+
+def _count_patch_targets(content: str, modules: "set[str]") -> int:
+    """Count string mock-patch targets in ``content`` that name one of ``modules``.
+
+    A test that string-patches ``app.<module>.<attr>`` is coupled to that
+    module's runtime surface: a behavior/signature change in the module — or in
+    one of its transitive importers, when the patch names a closure module —
+    breaks the patch (and often the assertion right under it) silently. Used as
+    the primary within-tier tiebreaker when ranking impacted tests by
+    relevance, because a patched call-site is a stronger drift signal than a
+    bare import.
+    """
+    count = 0
+    for match in _PATCH_TARGET_RE.finditer(content):
+        target = match.group(1)
+        if target.startswith("backend."):
+            target = target[len("backend.") :]
+        if not target.startswith("app."):
+            continue
+        parts = target.split(".")
+        for end in range(2, len(parts) + 1):
+            if ".".join(parts[:end]) in modules:
+                count += 1
+                break
+    return count
 
 
 def _index_app_importers(
@@ -335,18 +377,43 @@ def _surface_sentinels(changed_paths, repo_root: str) -> "set[str]":
     return selected
 
 
+def _rank_key(entry: "tuple[int, int, int, int, str]"):
+    """Sort key for a ranked entry: ``(tier, -n_patch, -n_direct, -n_closure, path)``.
+
+    Tier first (directly changed tests < import-hop tiers < drift sentinels),
+    then relevance counts descending (mock-patch coupling, direct changed-module
+    references, closure references), then path ascending for determinism.
+    """
+    tier, n_patch, n_direct, n_closure, path = entry
+    return (tier, -n_patch, -n_direct, -n_closure, path)
+
+
 def resolve_impacted(changed_paths, repo_root: str) -> "list[str]":
-    """Compute the impacted ``backend/testing/test_*.py`` set (sorted, deduped).
+    """Compute the impacted ``backend/testing/test_*.py`` set, ranked by relevance.
 
     ``changed_paths`` is any iterable of repo-relative paths. ``repo_root`` roots
     the on-disk existence checks and the reverse-dep scan.
+
+    The emitted order is ranked by relevance to the diff — NOT alphabetical — so
+    that a bounded selection (the merge gate caps the run) keeps the tests most
+    likely to catch a contract break on the changed surface:
+
+    * tier -1: directly changed/added ``test_*.py`` files (the PR's own tests);
+    * tier 0..MAX_HOPS: test files that reference a closure module (a changed
+      module or a transitive importer of one), ordered by the minimum import-hop
+      distance from a changed module — hop 0 references a changed module
+      directly, hop N references a module N import-hops away;
+    * tier MAX_HOPS + 1: surface-glob drift sentinels (no import path at all).
+    Within a tier, tests that mock-patch the closure surface (most patch targets
+    first), reference more changed modules directly, or reference more closure
+    modules rank first; ``path`` breaks remaining ties deterministically.
     """
     # Materialize once: ``changed_paths`` may be a single-use iterable, and it is
     # scanned both here and by the surface-glob sentinel pass below.
     changed_list = list(changed_paths)
     testing_dir = os.path.join(repo_root, "backend", "testing")
-    impacted: "set[str]" = set()
     initial_changed_modules: "list[str]" = []
+    directly_changed_tests: "list[str]" = []
 
     for raw in changed_list:
         path = raw.strip()
@@ -354,13 +421,22 @@ def resolve_impacted(changed_paths, repo_root: str) -> "list[str]":
             continue
         if _TEST_PY_RE.match(path):
             # A directly changed/added test file — include it (if it exists on
-            # disk, so a deletion doesn't select a vanished file).
+            # disk, so a deletion doesn't select a vanished file). It ranks at
+            # tier -1, ahead of any reference-matched file.
             if os.path.isfile(os.path.join(repo_root, path)):
-                impacted.add(path)
+                directly_changed_tests.append(path)
             continue
         dotted = app_module_for_path(path)
         if dotted is not None:
             initial_changed_modules.append(dotted)
+
+    ranked: "list[tuple[int, int, int, int, str]]" = []
+    emitted: "set[str]" = set()
+    for path in directly_changed_tests:
+        if path in emitted:
+            continue
+        emitted.add(path)
+        ranked.append((-1, 0, 0, 0, path))
 
     if initial_changed_modules and os.path.isdir(testing_dir):
         reverse_importers, known_modules = _index_app_importers(
@@ -368,23 +444,32 @@ def resolve_impacted(changed_paths, repo_root: str) -> "list[str]":
         )
         # Transitive closure (BFS, bounded by MAX_HOPS): app modules that
         # import a changed module — directly or indirectly — are also relevant.
-        # ``seen_mods`` provides dedup and guarantees termination even without
-        # the cap; the cap bounds scan cost on pathologically deep or cyclic
-        # import graphs.
-        seen_mods: "set[str]" = set(initial_changed_modules)
-        frontier = list(initial_changed_modules)
-        for _ in range(MAX_HOPS):
+        # ``depth`` records the hop distance from the nearest changed module at
+        # first discovery (BFS first-visit = minimum), giving both dedup /
+        # termination and the relevance tier for referencing tests.
+        depth: "dict[str, int]" = {}
+        frontier: "list[str]" = []
+        for mod in initial_changed_modules:
+            if mod not in depth:
+                depth[mod] = 0
+                frontier.append(mod)
+        for hop in range(1, MAX_HOPS + 1):
             if not frontier:
                 break
             next_frontier: "list[str]" = []
             for mod in frontier:
                 for importer in reverse_importers.get(mod, ()):
-                    if importer not in seen_mods:
-                        seen_mods.add(importer)
+                    if importer not in depth:
+                        depth[importer] = hop
                         next_frontier.append(importer)
             frontier = next_frontier
+        changed_set: "set[str]" = set(initial_changed_modules)
+        closure = set(depth)
         for name in os.listdir(testing_dir):
             if not (name.startswith("test_") and name.endswith(".py")):
+                continue
+            rel = "backend/testing/" + name
+            if rel in emitted:
                 continue
             abs_path = os.path.join(testing_dir, name)
             if not os.path.isfile(abs_path):
@@ -396,15 +481,28 @@ def resolve_impacted(changed_paths, repo_root: str) -> "list[str]":
                 # Unreadable file: skip rather than crash the whole gate.
                 continue
             referenced = _referenced_app_modules(content, known_modules)
-            if referenced & seen_mods:
-                impacted.add("backend/testing/" + name)
+            matching = referenced & closure
+            if not matching:
+                continue
+            min_hop = min(depth[m] for m in matching)
+            n_direct = len(matching & changed_set)
+            n_closure = len(matching)
+            n_patch = _count_patch_targets(content, closure)
+            emitted.add(rel)
+            ranked.append((min_hop, n_patch, n_direct, n_closure, rel))
 
     # Surface-glob drift sentinels: select whole-tree/fixed-set sentinels the
-    # dotted-import scan structurally cannot reach. Merged into the same set so
-    # dedup + stable-sort still hold.
-    impacted |= _surface_sentinels(changed_list, repo_root)
+    # dotted-import scan structurally cannot reach. They have no import path, so
+    # they rank at the last tier (MAX_HOPS + 1) unless a direct change or a
+    # reference match already emitted the file.
+    for sentinel in _surface_sentinels(changed_list, repo_root):
+        if sentinel in emitted:
+            continue
+        emitted.add(sentinel)
+        ranked.append((MAX_HOPS + 1, 0, 0, 0, sentinel))
 
-    return sorted(impacted)
+    ranked.sort(key=_rank_key)
+    return [entry[-1] for entry in ranked]
 
 
 def collect_first_party_patch_targets(testing_dir: str) -> "list[str]":
@@ -568,7 +666,7 @@ def main(argv=None) -> int:
         overflow = impacted[args.limit :]
         impacted = impacted[: args.limit]
         for rel in overflow:
-            print(f"deferred-to-CI: {rel}", file=sys.stderr)
+            print(f"deferred-unverified: {rel}", file=sys.stderr)
 
     for rel in impacted:
         print(rel)

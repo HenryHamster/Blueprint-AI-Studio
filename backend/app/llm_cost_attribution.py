@@ -116,6 +116,15 @@ SELF_REPAIR_BURN_SHARE_KEY = "self_repair_burn_share"
 # toward earlier deferral rather than silent overspend.
 NON_ANTHROPIC_LLM_CONSERVATISM_MULTIPLIER: float = 1.25
 
+# Minimum fraction of a spend window's tasks that must carry an independent
+# provider-reported usage probe before the weighted ceiling-gate figure may be
+# certified trustworthy. A single probed task out of hundreds satisfies the
+# "something was verified" flag but certifies a verdict from a thin slice of
+# real spend; the operator's provider billing export shows internal attribution
+# capturing only ~22-25% of real DeepSeek spend, so a probe that barely samples
+# the window cannot support a claim that the gate is a conservative upper bound.
+MIN_TRUSTWORTHY_PROBE_COVERAGE: float = 0.5
+
 
 def _bounded_cache_input_counts(
     input_tokens: int,

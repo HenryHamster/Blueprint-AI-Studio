@@ -1535,6 +1535,11 @@ class TestNotificationConfigStartupRestore:
                 assert row is not None
                 assert row.current_sha == "cafebabe123"
                 assert row.current_revision == "new-rev"
+                # deployed_at must reflect this process's actual boot time,
+                # not the moment the health tick happened to fire — the tick
+                # can run long after boot, and stamping "now" would fabricate
+                # a deploy time that postdates an in-flight promotion.
+                assert row.deployed_at == _main._process_boot_time
 
             # No drift — the row already matches the observed serving state, so
             # the tick must be a no-op (conservative: never churn an up-to-date row).

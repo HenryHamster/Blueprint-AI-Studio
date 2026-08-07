@@ -73,6 +73,7 @@ import {
   getLastWorkspacePrepOutcome, resetWorkspacePrepOutcome,
 } from './workspacePrep.js';
 import {
+  DEFAULT_AGENT_DISK_RESERVATION_BYTES,
   reserveWorkspaceDisk, releaseWorkspaceDiskReservation,
   getWorkspaceDiskReservation, getWorkspaceDiskAccounting,
   resetWorkspaceDiskReservations, DiskReservationError,
@@ -250,6 +251,148 @@ describe('prepareWorkspaceForRole', () => {
     // The sizecap merge driver is registered after the clone so the
     // .gitattributes mapping is actually active.
     expect(registerSizeCapMergeDriverMock).toHaveBeenCalledWith('/ws');
+  });
+
+  it('cold path: baseBranch present → fetch base into a remote-tracking ref so ./check can compute its diff', async () => {
+    await prepareWorkspaceForRole({
+      workspace: '/ws',
+      repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+      githubToken: 'tok',
+      branch: 'feature/x',
+      baseBranch: 'main',
+      depth: 50,
+    });
+
+    // The ./check gate fails closed when the base ref is absent, so a cold
+    // clone must fetch the base branch. The explicit refspec guarantees the
+    // remote-tracking ref exists even in a single-branch shallow clone where
+    // `git fetch origin main` would only update FETCH_HEAD.
+    const gitCalls = execFileSyncMock.mock.calls
+      .filter(c => c[0] === 'git')
+      .map(c => (c[1] as string[]).join(' '));
+    expect(gitCalls).toContain('-C /ws fetch origin main:refs/remotes/origin/main');
+    expect(registerSizeCapMergeDriverMock).toHaveBeenCalledWith('/ws');
+  });
+
+  it('cold path: baseBranch === branch → no separate base fetch (already cloned)', async () => {
+    await prepareWorkspaceForRole({
+      workspace: '/ws',
+      repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+      githubToken: 'tok',
+      branch: 'main',
+      baseBranch: 'main',
+      depth: 50,
+    });
+
+    const gitCalls = execFileSyncMock.mock.calls
+      .filter(c => c[0] === 'git')
+      .map(c => (c[1] as string[]).join(' '));
+    expect(gitCalls.some(a => a.includes('fetch origin main:refs/remotes/origin/main'))).toBe(false);
+  });
+
+  it('cold path: base-branch fetch failure is non-fatal (gate will surface the missing base)', async () => {
+    // Scope the failure to the git fetch. reserveWorkspaceDisk probes the
+    // filesystem via execFileSync('df', ...) before any clone work, so a
+    // one-shot mockImplementationOnce would be consumed by the df probe and
+    // the base fetch would silently succeed. Throwing on every git fetch is
+    // still precise here: the only fetch on this non-self-repo cold path is
+    // the base-branch fetch this test targets.
+    execFileSyncMock.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === 'git' && Array.isArray(args) && args.includes('fetch')) {
+        throw new Error('fatal: couldn\'t find remote ref main');
+      }
+      return '';
+    });
+
+    await expect(
+      prepareWorkspaceForRole({
+        workspace: '/ws',
+        repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+        githubToken: 'tok',
+        branch: 'feature/x',
+        baseBranch: 'main',
+        depth: 50,
+      }),
+    ).resolves.toBeUndefined();
+    // The failure is logged, not thrown — the ./check gate is what fails closed.
+    expect(logMock).toHaveBeenCalledWith(expect.stringContaining('fetch base-branch main failed'));
+  });
+
+  it('cold path: Blueprint self-repo → fetches automain so the committed ./check can compute its diff', async () => {
+    await prepareWorkspaceForRole({
+      workspace: '/ws',
+      repoUrl: 'https://x-access-token:tok@github.com/HenryHamster/BlueprintAIStudio.git',
+      githubToken: 'tok',
+      branch: 'research/task-x',
+      baseBranch: 'research/task-base',
+      depth: 50,
+    });
+
+    const gitCalls = execFileSyncMock.mock.calls
+      .filter(c => c[0] === 'git')
+      .map(c => (c[1] as string[]).join(' '));
+    // The self-repo's committed `./check` diffs against origin/automain, which a
+    // cold PR-branch clone does not carry — the refspec form guarantees the
+    // remote-tracking ref exists in a single-branch shallow clone.
+    expect(gitCalls).toContain('-C /ws fetch origin automain:refs/remotes/origin/automain');
+  });
+
+  it('cold path: self-repo with baseBranch=automain → base fetch already covers it, no separate automain fetch', async () => {
+    await prepareWorkspaceForRole({
+      workspace: '/ws',
+      repoUrl: 'https://x-access-token:tok@github.com/HenryHamster/BlueprintAIStudio.git',
+      githubToken: 'tok',
+      branch: 'blueprint/task-x',
+      baseBranch: 'automain',
+      depth: 50,
+    });
+
+    const gitCalls = execFileSyncMock.mock.calls
+      .filter(c => c[0] === 'git')
+      .map(c => (c[1] as string[]).join(' '));
+    expect(gitCalls).toContain('-C /ws fetch origin automain:refs/remotes/origin/automain');
+    // Exactly one automain fetch (the base fetch); no redundant second fetch.
+    expect(gitCalls.filter(a => a.includes('origin automain:')).length).toBe(1);
+  });
+
+  it('cold path: non-self repo → no automain fetch', async () => {
+    await prepareWorkspaceForRole({
+      workspace: '/ws',
+      repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+      githubToken: 'tok',
+      branch: 'feature/x',
+      baseBranch: 'main',
+      depth: 50,
+    });
+
+    const gitCalls = execFileSyncMock.mock.calls
+      .filter(c => c[0] === 'git')
+      .map(c => (c[1] as string[]).join(' '));
+    expect(gitCalls.some(a => a.includes('fetch origin automain'))).toBe(false);
+  });
+
+  it('cold path: self-repo automain fetch failure is non-fatal (gate will surface the missing base)', async () => {
+    execFileSyncMock.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === 'git' && args.some(a => a.includes('automain'))) {
+        throw new Error('fatal: couldn\'t find remote ref automain');
+      }
+      return '';
+    });
+
+    await expect(
+      prepareWorkspaceForRole({
+        workspace: '/ws',
+        repoUrl: 'https://x-access-token:tok@github.com/HenryHamster/BlueprintAIStudio.git',
+        githubToken: 'tok',
+        branch: 'research/task-x',
+        baseBranch: 'research/task-base',
+        depth: 50,
+      }),
+    ).resolves.toBeUndefined();
+    // The failure is logged, not thrown — the ./check gate is what fails closed.
+    expect(logMock).toHaveBeenCalledWith(
+      expect.stringContaining('fetch self-repo integration branch failed'),
+    );
   });
 
   it('cold path clone failure sets failureCategory to clone_failed', async () => {
@@ -520,6 +663,130 @@ describe('prepareWorkspaceForRole', () => {
     // Exactly one fetch (the branch fetch); no separate baseBranch fetch.
     expect(fetchCalls.length).toBe(1);
     expect(fetchCalls[0]).toContain('fetch origin main');
+  });
+
+  it('warm path: base-branch fetch uses the refspec form so origin/<base> actually exists', async () => {
+    process.env.BLUEPRINT_WARM_HANDOFF = '1';
+    fsMocks.existsSync.mockReturnValue(true);
+
+    await prepareWorkspaceForRole({
+      workspace: '/ws',
+      repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+      githubToken: 'tok',
+      branch: 'feature/x',
+      baseBranch: 'main',
+    });
+
+    const fetchCalls = execFileSyncMock.mock.calls
+      .filter(c => c[0] === 'git' && (c[1] as string[]).includes('fetch'))
+      .map(c => (c[1] as string[]).join(' '));
+    // A warm workspace may have been cloned for a DIFFERENT base, so
+    // refs/remotes/origin/main can be missing entirely. `git fetch origin main`
+    // only updates FETCH_HEAD in a single-branch shallow clone — the explicit
+    // refspec is what creates the remote-tracking ref the fail-closed ./check
+    // needs.
+    expect(fetchCalls).toContain('-C /ws fetch origin main:refs/remotes/origin/main');
+  });
+
+  it('warm path: base-branch fetch failure is non-fatal (gate surfaces the missing base)', async () => {
+    process.env.BLUEPRINT_WARM_HANDOFF = '1';
+    fsMocks.existsSync.mockReturnValue(true);
+    execFileSyncMock.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === 'git' && args.some(a => a.includes('refs/remotes/origin/main'))) {
+        throw new Error('fatal: couldn\'t find remote ref main');
+      }
+      return '';
+    });
+
+    await expect(
+      prepareWorkspaceForRole({
+        workspace: '/ws',
+        repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+        githubToken: 'tok',
+        branch: 'feature/x',
+        baseBranch: 'main',
+      }),
+    ).resolves.toBeUndefined();
+    // Logged, not thrown, and NOT a cold-path fallback trigger — unchanged from
+    // the previous inline try/catch.
+    expect(logMock).toHaveBeenCalledWith(expect.stringContaining('fetch base-branch main failed'));
+  });
+
+  it('warm path: Blueprint self-repo → fetches automain so the committed ./check can compute its diff', async () => {
+    process.env.BLUEPRINT_WARM_HANDOFF = '1';
+    fsMocks.existsSync.mockReturnValue(true);
+
+    await prepareWorkspaceForRole({
+      workspace: '/ws',
+      repoUrl: 'https://x-access-token:tok@github.com/HenryHamster/BlueprintAIStudio.git',
+      githubToken: 'tok',
+      branch: 'research/task-x',
+      baseBranch: 'research/task-base',
+    });
+
+    const fetchCalls = execFileSyncMock.mock.calls
+      .filter(c => c[0] === 'git' && (c[1] as string[]).includes('fetch'))
+      .map(c => (c[1] as string[]).join(' '));
+    // Branch fetch + base fetch + the self-repo automain refspec fetch.
+    expect(fetchCalls).toContain('-C /ws fetch origin automain:refs/remotes/origin/automain');
+  });
+
+  it('warm path: self-repo baseBranch===branch===automain still fetches automain (presentRefs skip must verify the tracking ref resolves)', async () => {
+    process.env.BLUEPRINT_WARM_HANDOFF = '1';
+    fsMocks.existsSync.mockReturnValue(true);
+    // The wedge this regression covers: a warm workspace running ON the
+    // integration branch itself (branch === baseBranch === automain, e.g. the
+    // strategic handler). The base fetch is skipped (baseBranch === branch), the
+    // warm branch fetch (`git fetch origin automain`) only updates FETCH_HEAD in
+    // a single-branch shallow clone, and presentRefs=['automain','automain']
+    // would otherwise claim the ref present while refs/remotes/origin/automain
+    // is genuinely missing — wedging the fail-closed ./check that this very
+    // fetch could have repaired. So the presentRefs skip must verify the
+    // tracking ref actually resolves before honoring the claim.
+    execFileSyncMock.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === 'git' && args.includes('rev-parse')) {
+        // refs/remotes/origin/automain does NOT resolve on this warm workspace.
+        throw new Error('fatal: Needed a single revision');
+      }
+      return '';
+    });
+
+    await prepareWorkspaceForRole({
+      workspace: '/ws',
+      repoUrl: 'https://x-access-token:tok@github.com/HenryHamster/BlueprintAIStudio.git',
+      githubToken: 'tok',
+      branch: 'automain',
+      baseBranch: 'automain',
+    });
+
+    const fetchCalls = execFileSyncMock.mock.calls
+      .filter(c => c[0] === 'git' && (c[1] as string[]).includes('fetch'))
+      .map(c => (c[1] as string[]).join(' '));
+    // Base fetch is skipped here, so the self-repo integration fetch is the only
+    // way origin/automain can exist — and it must NOT be skipped by the
+    // presentRefs claim when the tracking ref is absent.
+    expect(fetchCalls).toContain('-C /ws fetch origin automain:refs/remotes/origin/automain');
+  });
+
+  it('warm path: self-repo presentRefs skip is honored when the tracking ref already resolves', async () => {
+    process.env.BLUEPRINT_WARM_HANDOFF = '1';
+    fsMocks.existsSync.mockReturnValue(true);
+
+    await prepareWorkspaceForRole({
+      workspace: '/ws',
+      repoUrl: 'https://x-access-token:tok@github.com/HenryHamster/BlueprintAIStudio.git',
+      githubToken: 'tok',
+      branch: 'automain',
+      baseBranch: 'automain',
+    });
+
+    const fetchCalls = execFileSyncMock.mock.calls
+      .filter(c => c[0] === 'git' && (c[1] as string[]).includes('fetch'))
+      .map(c => (c[1] as string[]).join(' '));
+    // The default mock makes `rev-parse --verify refs/remotes/origin/automain`
+    // succeed, so presentRefs=['automain','automain'] is a true claim — only the
+    // single branch fetch runs, no redundant automain refspec fetch.
+    expect(fetchCalls.some(a => a.includes('fetch origin automain:refs/remotes/origin/automain'))).toBe(false);
   });
 
   it('warm path: checkout fallback via -B when direct checkout fails', async () => {
@@ -1264,8 +1531,9 @@ describe('prepareWorkspaceForRole', () => {
         checkpoint_reset_applied: true,
         cold_fallback_reason: null,
         lane_phase: true,
-        // Reservation env unset in this test → 0, still carried in the outcome.
-        disk_reserved_bytes: 0,
+        // Reservation env unset in this test → the measured default, still
+        // carried in the outcome.
+        disk_reserved_bytes: DEFAULT_AGENT_DISK_RESERVATION_BYTES,
       });
     });
   });
@@ -1314,7 +1582,14 @@ describe('workspaceDisk reservation ledger', () => {
         : '');
   }
 
-  it('reservation disabled (env unset) → no-op, nothing held', () => {
+  it('reservation uses the measured default when the env is unset', () => {
+    mockDfFreeKb(4 * 1024 * 1024); // 4 GiB free ≥ 2 GiB default reservation.
+    expect(reserveWorkspaceDisk('/ws')).toBe(DEFAULT_AGENT_DISK_RESERVATION_BYTES);
+    expect(getWorkspaceDiskReservation('/ws')).toBe(DEFAULT_AGENT_DISK_RESERVATION_BYTES);
+  });
+
+  it('reservation disabled (env explicitly 0) → no-op, nothing held', () => {
+    process.env.BLUEPRINT_RUNNER_AGENT_DISK_RESERVATION_BYTES = '0';
     expect(reserveWorkspaceDisk('/ws')).toBe(0);
     expect(getWorkspaceDiskReservation('/ws')).toBeNull();
   });

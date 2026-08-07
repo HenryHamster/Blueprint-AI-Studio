@@ -18,7 +18,14 @@ import re
 import uuid
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from app.task_capabilities import ALL_TASK_TYPES, TaskType
 from app.viewport_evidence import VIEWPORT_WIDTH_MAX, VIEWPORT_WIDTH_MIN
@@ -46,6 +53,16 @@ _PYDANTIC_V2_ONLY = True
 # leaves ~5 KB of slack for the list-wrapper + UTF-8 multi-byte quirks.
 # When raising this, raise the DB constraint in a new migration first.
 _MAX_PAYLOAD_BYTES = 190 * 1024
+
+# Task payload types that ship a code-producing PR, which the acceptance gate
+# scores (:mod:`app.acceptance_gate` documents the same set — create / fix /
+# refactor / qa / migrate / deps / docs). These must declare acceptance_evidence
+# at authoring time so a merged task has a proof the merge gate can check and
+# mint CriterionEvidence credit from; a code payload authored through the
+# strict validation surface without a declaration is rejected.
+_CODE_PRODUCING_TASK_TYPES: frozenset[str] = frozenset(
+    {"create", "fix", "refactor", "qa", "migrate", "deps", "docs"}
+)
 
 
 class PayloadTooLargeError(ValueError):
@@ -838,6 +855,15 @@ class SelfAuditPayload(_SystemPopulated):
 class ReleaseAuditPayload(_SystemPopulated):
     diff_range: str | None = None
     prompt: str | None = None
+    # The FULL version delta (base_branch...candidate_sha), pinned separately
+    # from ``diff_range`` so the audit agent can narrow ``diff_range`` to an
+    # incremental ``audit_base_sha..candidate`` window for code-quality findings
+    # while still grading goal alignment and acceptance categories over the full
+    # version delta the promotion PR would carry.  Goal/category verdicts have no
+    # scoped carry-forward, so they must never be graded against a shrinking
+    # incremental window.  Absent on older payloads; the agent falls back to the
+    # full range derived from ``base_branch`` + ``candidate_sha``.
+    goal_category_diff_range: str | None = None
 
 
 class ReleaseAuditChallengePayload(_SystemPopulated):
@@ -1395,6 +1421,13 @@ _MODEL_FOR_TYPE: dict[TaskType, type[BasePayload]] = {
     # salvage_bundle). The bounded caps are enforced at enrollment + in the agent
     # handler, not by the schema.
     TaskType.capability_proof_trial: BasePayload,
+    # criterion_named_test_trial carries a small free-form payload
+    # ({criterion_key, criterion_text, test_refs, head_sha, max_test_files,
+    # wall_clock_seconds}); the extra-field-tolerant BasePayload validates it
+    # without constraining the shape (mirrors capability_proof_trial). The
+    # bounded caps are enforced at enrollment + in the agent handler, not by the
+    # schema.
+    TaskType.criterion_named_test_trial: BasePayload,
     TaskType.memory_consolidation: MemoryConsolidationPayload,
 }
 
@@ -1862,7 +1895,9 @@ def pack_under_budget(
     return packed
 
 
-def validate_task_payload(raw: dict) -> dict:
+def validate_task_payload(
+    raw: dict, *, require_acceptance_evidence: bool = True
+) -> dict:
     """Validate *raw* against the per-type schema.
 
     Returns a plain dict (model_dump).  Raises ValueError on any violation
@@ -1873,6 +1908,15 @@ def validate_task_payload(raw: dict) -> dict:
     payload-model dispatch table, falls back to BasePayload (extra='allow' +
     shared constraints). This enables a new task type to be runnable by
     registration alone, without requiring a parallel edit to the dispatch dict.
+
+    ``require_acceptance_evidence`` — ``True`` for the strict external authoring
+    surface (operator / agent / project APIs): a code-producing payload type
+    (create / fix / refactor / qa / migrate / deps / docs) that omits the
+    ``acceptance_evidence`` declaration is rejected here, so a merged task always
+    has a plan-time proof for the acceptance gate to evaluate and mint criterion
+    credit from. Internal spawn sites (``validate_internal_payload``) pass
+    ``False`` because they are system-generated tasks with a known purpose, not
+    authoring-time declarations — the gate treats them exactly as today.
     """
     type_value = raw.get("type")
     if not type_value:
@@ -1897,7 +1941,20 @@ def validate_task_payload(raw: dict) -> dict:
     result: dict[str, Any] = instance.model_dump(exclude_none=True)
     # Re-inject 'type' — it lives on the raw dict but not on the Pydantic model
     result["type"] = type_value
+    # Size check first: an oversized payload is rejected as oversized, not as
+    # undeclared, so callers relying on PayloadTooLargeError keep their contract.
     _enforce_payload_size(result)
+    if (
+        require_acceptance_evidence
+        and type_value in _CODE_PRODUCING_TASK_TYPES
+        and result.get("acceptance_evidence") is None
+    ):
+        raise ValueError(
+            f"Payload of code-producing task type {type_value!r} requires an "
+            "'acceptance_evidence' declaration (kind: named_test, "
+            "observable_behavior, downstream_artifact, visual, or "
+            "coverage_delta)"
+        )
     return result
 
 
@@ -1915,9 +1972,16 @@ def validate_internal_payload(payload: dict, context: str) -> dict:
 
     Other exceptions still log a WARNING and return the original payload so a
     truly unexpected error can't take down all spawns at once.
+
+    The code-producing ``acceptance_evidence`` requirement is intentionally NOT
+    enforced here: internal spawns are system-generated tasks whose proof is
+    evaluated by the acceptance gate exactly as today (a system task that cannot
+    name a test at spawn time is not an authoring-time omission). The strict
+    requirement applies only to the external authoring surface
+    (``validate_task_payload`` with ``require_acceptance_evidence=True``).
     """
     try:
-        return validate_task_payload(payload)
+        return validate_task_payload(payload, require_acceptance_evidence=False)
     except (PayloadTooLargeError, ValueError):
         # Schema/size errors are caller bugs, not deployment skew.
         raise
@@ -1928,3 +1992,41 @@ def validate_internal_payload(payload: dict, context: str) -> dict:
             exc,
         )
         return payload
+
+
+def format_payload_validation_error(exc: Exception) -> str:
+    """One-line, actionable reason for a :func:`validate_task_payload` failure.
+
+    The external authoring surfaces (operator create-task / agent spawn / project
+    deploy) used to collapse every schema failure into an opaque ``"Invalid
+    request"`` 422 detail, hiding the authored validator message from the
+    operator UI toast and from an autonomously spawning agent. This helper
+    recovers that message for the HTTP ``detail``.
+
+    ``validate_task_payload`` raises either a plain ``ValueError`` (missing /
+    unknown ``type``, undeclared ``acceptance_evidence`` on a code task) or a
+    ``PayloadTooLargeError``; when the failure is a pydantic schema violation
+    the ``ValueError``'s ``__cause__`` is the pydantic ``ValidationError``.
+    That cause's ``str()`` is a verbose multi-line block (``1 validation error
+    for CreatePayload`` / field / indented message) whose message pydantic v2
+    prefixes with ``Value error, `` for validator-authored errors. Collapse the
+    first error to ``loc: message`` so the surfaced detail is one line. Plain
+    ``ValueError`` and ``PayloadTooLargeError`` messages pass through unchanged
+    — they are already single-line and actionable.
+    """
+    cause = getattr(exc, "__cause__", None)
+    if isinstance(cause, ValidationError):
+        try:
+            errors = cause.errors()
+        except Exception:  # noqa: BLE001 — formatting must never fail the HTTP path
+            errors = None
+        if errors:
+            first = errors[0]
+            loc = ".".join(str(part) for part in first.get("loc", ()))
+            msg = first.get("msg", str(exc))
+            if isinstance(msg, str) and msg.startswith("Value error, "):
+                msg = msg[len("Value error, ") :]
+            if loc:
+                return f"{loc}: {msg}"
+            return msg
+    return str(exc)

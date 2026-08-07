@@ -1163,6 +1163,129 @@ class TestContainerImageStore(unittest.TestCase):
         )
 
 
+class TestContainerImagesPresent(unittest.TestCase):
+    def test_docker_images_reported_skipping_dangling(self):
+        """Present images are listed by full ref; <none> dangling rows are skipped."""
+        result = MagicMock(
+            returncode=0,
+            stdout=(
+                "nvcr.io/nvidia/tensorflow:24.12-tf2-py3\n"
+                "<none>:<none>\n"
+                "python:3.12-slim\n"
+                "\n"
+            ),
+        )
+        images = local_runner._container_images_present(
+            _docker_caps(), _run=lambda *args, **kwargs: result
+        )
+        self.assertEqual(
+            images,
+            ["nvcr.io/nvidia/tensorflow:24.12-tf2-py3", "python:3.12-slim"],
+        )
+
+    def test_image_list_is_capped(self):
+        """A hoarder store cannot bloat the heartbeat past the entry cap."""
+        cap = local_runner._CONTAINER_IMAGES_PRESENT_MAX_ENTRIES
+        result = MagicMock(
+            returncode=0,
+            stdout="".join(f"repo/image:{i}\n" for i in range(cap + 50)),
+        )
+        images = local_runner._container_images_present(
+            _docker_caps(), _run=lambda *args, **kwargs: result
+        )
+        self.assertEqual(len(images), cap)
+        self.assertEqual(images[0], "repo/image:0")
+
+    def test_probe_failure_returns_none_not_empty(self):
+        """Any probe error means UNKNOWN (None) — never a false empty store."""
+        nonzero = MagicMock(returncode=1, stdout="")
+        self.assertIsNone(
+            local_runner._container_images_present(
+                _docker_caps(), _run=lambda *args, **kwargs: nonzero
+            )
+        )
+
+        def boom(*_args, **_kwargs):
+            raise OSError("docker missing")
+
+        self.assertIsNone(
+            local_runner._container_images_present(_docker_caps(), _run=boom)
+        )
+        # No capabilities / no container runtime ⇒ nothing to probe.
+        self.assertIsNone(local_runner._container_images_present(None))
+
+    def test_empty_store_reports_empty_list(self):
+        """A successful probe of an empty store is a truthful [] (known-empty)."""
+        result = MagicMock(returncode=0, stdout="")
+        self.assertEqual(
+            local_runner._container_images_present(
+                _docker_caps(), _run=lambda *args, **kwargs: result
+            ),
+            [],
+        )
+
+    def test_heartbeat_reports_present_images(self):
+        """The heartbeat body carries container_images_present when probed."""
+        posted_bodies = []
+
+        def fake_post(url, token, body, **kwargs):
+            posted_bodies.append(body)
+            local_runner._shutdown_event.set()
+            return 200, {"ok": True}
+
+        local_runner._shutdown_event.clear()
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_locate_agent_binary", return_value=None), \
+                 patch.object(
+                     local_runner,
+                     "_container_images_present",
+                     return_value=["nvcr.io/nvidia/tensorflow:24.12-tf2-py3"],
+                 ):
+                local_runner._heartbeat_loop(
+                    "https://api",
+                    "tok",
+                    {},
+                    threading.Lock(),
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        self.assertEqual(
+            posted_bodies[0]["container_images_present"],
+            ["nvcr.io/nvidia/tensorflow:24.12-tf2-py3"],
+        )
+
+    def test_heartbeat_omits_present_images_on_probe_failure(self):
+        """A failed probe omits the field entirely — absence means unknown."""
+        posted_bodies = []
+
+        def fake_post(url, token, body, **kwargs):
+            posted_bodies.append(body)
+            local_runner._shutdown_event.set()
+            return 200, {"ok": True}
+
+        local_runner._shutdown_event.clear()
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_locate_agent_binary", return_value=None), \
+                 patch.object(
+                     local_runner, "_container_images_present", return_value=None
+                 ):
+                local_runner._heartbeat_loop(
+                    "https://api",
+                    "tok",
+                    {},
+                    threading.Lock(),
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        self.assertNotIn("container_images_present", posted_bodies[0])
+
+
 class TestLowDiskGuard(unittest.TestCase):
     def test_min_free_disk_bytes_parses_env(self):
         with patch.dict(os.environ, {"BLUEPRINT_RUNNER_MIN_DISK_BYTES": "2048"}):

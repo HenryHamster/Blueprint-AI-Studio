@@ -53,6 +53,74 @@ async def test_fresh_qualification_requires_strategic_or_operator_request():
 
 
 @pytest.mark.asyncio
+async def test_sweep_auto_trigger_is_not_an_explicit_request(monkeypatch):
+    """The sweep's sanctioned auto-trigger is automatic machinery, NOT a caller
+    request — it must be admitted through its own ``auto_trigger`` path rather
+    than the ``explicit_request`` flag that Strategic and the operator endpoint
+    use.
+
+    The auto-trigger fires fresh qualifications legitimately (the trigger resolver
+    plus the ``auto_qualification_triggers`` knob sanction it), so the ownership
+    guard must admit ``auto_trigger=True`` without the caller claiming
+    explicit-request status.  The same call with no sanctioned source at all
+    stays refused — the guard keeps its teeth for undifferentiated machinery.
+    """
+    project_id = uuid.uuid4()
+    version = ReleaseVersion(
+        project_id=project_id,
+        version_number=1,
+        phase="stabilize",
+    )
+    session = _RecordingSession(version)
+    monkeypatch.setattr(
+        release_qualifier,
+        "resolve_project_promotion_enabled",
+        lambda _project_id: False,
+    )
+    monkeypatch.setattr(
+        release_qualifier,
+        "_qualification_in_flight",
+        AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(
+        "app.qualification_state_resolver.resolve_newest_qualification_verdict",
+        AsyncMock(return_value=None),
+    )
+
+    # The sweep auto-trigger reaches the cheap external-blocker guard (proving it
+    # PASSED the ownership guard) without ever claiming explicit_request.
+    result = await release_qualifier.run_qualification(
+        session,
+        project_id,
+        version,
+        explicit_request=False,
+        auto_trigger=True,
+    )
+    assert result == {
+        "status": "external_blocker",
+        "blocker": "promotion_disabled",
+        "blocker_class": "external_delivery",
+    }
+    assert version.last_qualification["status"] == "external_blocker"
+
+    # Undifferentiated automatic machinery (no explicit_request, no auto_trigger,
+    # no attempt id to continue) is still refused — the ownership guard remains
+    # closed to it.
+    refused = await release_qualifier.run_qualification(
+        _RecordingSession(),  # type: ignore[arg-type]
+        project_id,
+        ReleaseVersion(
+            project_id=project_id,
+            version_number=2,
+            phase="stabilize",
+        ),
+        explicit_request=False,
+        auto_trigger=False,
+    )
+    assert refused == {"status": "explicit_request_required"}
+
+
+@pytest.mark.asyncio
 async def test_promotion_disabled_returns_cheap_external_blocker(monkeypatch):
     project_id = uuid.uuid4()
     version = ReleaseVersion(

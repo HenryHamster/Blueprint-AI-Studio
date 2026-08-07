@@ -1358,14 +1358,25 @@ async def _compute_digest(
         if _reconciliation_window
         else None
     )
-    if _provider_recon is not None and not _provider_recon.provider_reported_within_tolerance and _provider_recon.task_count > 0:
-        logger.warning(
-            "cost_telemetry_reconciliation provider_reported FAILED — "
-            "delta=%.4f (tolerance=%.4f) over %d task(s) with provider data",
-            _provider_recon.provider_reported_delta,
-            _provider_recon.provider_reported_tolerance,
-            _provider_recon.task_count,
-        )
+    if _provider_recon is not None and not _provider_recon.provider_reported_within_tolerance:
+        if _provider_recon.task_count > 0:
+            logger.warning(
+                "cost_telemetry_reconciliation provider_reported FAILED — "
+                "delta=%.4f (tolerance=%.4f) over %d task(s) with provider data",
+                _provider_recon.provider_reported_delta,
+                _provider_recon.provider_reported_tolerance,
+                _provider_recon.task_count,
+            )
+        else:
+            # A zero-coverage window is no longer silently green: its tolerance
+            # verdict is unproven, so surface it instead of letting the
+            # task_count > 0 guard swallow the non-passing result.
+            logger.warning(
+                "cost_telemetry_reconciliation provider_reported has NO verified tasks — "
+                "%d task(s) in window carried no provider-reported usage; "
+                "the tolerance verdict is unproven, not passing",
+                _provider_recon.total_task_count,
+            )
     effort_model_efficiency["cost_telemetry_reconciliation_provider_reported"] = (
         _provider_recon.asdict() if _provider_recon is not None else None
     )

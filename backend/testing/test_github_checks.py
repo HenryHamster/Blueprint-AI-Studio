@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -279,3 +280,111 @@ async def test_invalidate_check_runs_cache_drops_every_variant():
         assert inner.await_count == 4
 
     github_checks._check_runs_cache.clear()
+
+
+# ---------------------------------------------------------------------------
+# get_latest_inflight_workflow_run_for_branch — branch-level dispatch coalescing
+#
+# ci.yml is keyed to a branch-level cancel-in-progress concurrency group, so a
+# fresh dispatch for a NEW integration HEAD cancels whatever full-suite run is
+# already in flight.  The promotion CI gate uses this helper as its coalescing
+# seam: before dispatching, it asks whether a run is already queued/in_progress
+# on the branch and waits for that run to conclude instead of cancelling it.
+# ---------------------------------------------------------------------------
+
+
+def _run(
+    run_id: int,
+    *,
+    status: str,
+    conclusion=None,
+    head_sha: str = "abc123",
+    created_at: str | None = None,
+):
+    if created_at is None:
+        created_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return {
+        "id": run_id,
+        "status": status,
+        "conclusion": conclusion,
+        "head_sha": head_sha,
+        "html_url": f"https://gh/run/{run_id}",
+        "created_at": created_at,
+    }
+
+
+@pytest.mark.asyncio
+async def test_inflight_run_picks_newest_queued_or_in_progress():
+    """Only queued/in-progress runs qualify; the newest (by created_at) wins.
+    Completed/cancelled runs are skipped so a stale run cannot be mistaken for
+    an in-flight full-suite signal."""
+    now = datetime.now(timezone.utc)
+    recent = now.isoformat().replace("+00:00", "Z")
+    older = (now - timedelta(minutes=10)).isoformat().replace("+00:00", "Z")
+    response = _make_response(
+        200,
+        json_data={
+            "workflow_runs": [
+                _run(3, status="completed", conclusion="success", created_at=recent),
+                _run(2, status="in_progress", created_at=older),
+                _run(1, status="queued", created_at=recent),
+            ]
+        },
+    )
+    with patch.object(github_checks, "_github_request", new=AsyncMock(return_value=response)):
+        result = await github_checks.get_latest_inflight_workflow_run_for_branch(
+            "tok", "o", "r", "automain"
+        )
+    assert result is not None
+    assert result["run_id"] == 1  # newest qualifying run (id 3 is completed)
+    assert result["status"] == "queued"
+    assert result["head_sha"] == "abc123"
+    assert result["created_at"] == recent
+
+
+@pytest.mark.asyncio
+async def test_inflight_run_ignores_aged_runs():
+    """A run created before ``max_age_seconds`` (a stuck/zombie run) must NOT
+    block a fresh dispatch — the gate would otherwise coalesce onto a dead run
+    forever and never dispatch."""
+    aged = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat().replace(
+        "+00:00", "Z"
+    )
+    response = _make_response(
+        200,
+        json_data={"workflow_runs": [_run(7, status="in_progress", created_at=aged)]},
+    )
+    with patch.object(github_checks, "_github_request", new=AsyncMock(return_value=response)):
+        result = await github_checks.get_latest_inflight_workflow_run_for_branch(
+            "tok", "o", "r", "automain", max_age_seconds=60 * 60
+        )
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_inflight_run_none_on_api_error():
+    """A non-200 (e.g. 403/500) response degrades to None — the gate falls back
+    to dispatching rather than blocking on a failed coalescing lookup."""
+    with patch.object(
+        github_checks, "_github_request", new=AsyncMock(return_value=_make_response(500))
+    ):
+        result = await github_checks.get_latest_inflight_workflow_run_for_branch(
+            "tok", "o", "r", "automain"
+        )
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_inflight_run_none_when_no_qualifying_run():
+    """An empty run list or all-completed runs → None (nothing in flight to
+    coalesce onto)."""
+    for payload in ({"workflow_runs": []}, {"workflow_runs": [_run(9, status="completed", conclusion="failure")]}):
+        with patch.object(
+            github_checks,
+            "_github_request",
+            new=AsyncMock(return_value=_make_response(200, json_data=payload)),
+        ):
+            result = await github_checks.get_latest_inflight_workflow_run_for_branch(
+                "tok", "o", "r", "automain"
+            )
+        assert result is None

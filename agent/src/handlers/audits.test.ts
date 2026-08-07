@@ -371,6 +371,7 @@ describe('handleReleaseAudit — pinned candidate + diff-range pre-flight', () =
       mode: string;
       effective_base_sha: string | null;
       diff_range: string;
+      goal_category_diff_range: string;
       changed_paths: string[];
       fallback_reason: string | null;
     };
@@ -487,16 +488,102 @@ describe('handleReleaseAudit — pinned candidate + diff-range pre-flight', () =
     );
 
     const deltaRange = `${auditBaseSha}..${CANDIDATE_SHA}`;
-    expect(vi.mocked(runClaudeCode).mock.calls[0][0]).toContain(`git diff ${deltaRange}`);
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain(`git diff ${deltaRange}`);
+    // The goal/category grading range is the FULL version delta even though the
+    // code-quality review is scoped to the incremental delta (the backend pins
+    // goal_category_diff_range in the payload; the handler falls back to the
+    // full base_branch...candidate range when the field is absent).
+    expect(prompt).not.toContain(`git diff ${DIFF_RANGE}`);
     const call = vi.mocked(persistAndPostStatus).mock.calls.at(-1)?.[1];
     const report = JSON.parse(call?.logs as string) as AuditReport;
     expect(report.audit_scope).toMatchObject({
       mode: 'incremental',
       effective_base_sha: auditBaseSha,
       diff_range: deltaRange,
+      goal_category_diff_range: DIFF_RANGE,
       changed_paths: ['backend/app/main.py'],
       fallback_reason: null,
     });
+  });
+
+  it('grades goal alignment and acceptance categories over the FULL version delta even in incremental mode', async () => {
+    const auditBaseSha = '0123456789abcdef0123456789abcdef01234567';
+    const VERSION_GOAL = 'STABILIZE v28 — make the grader read the full version delta';
+    const categories = [
+      { category_key: 'goal_alignment', text: 'The candidate advances the version goal' },
+      { category_key: 'ship_safety', text: 'Promotion stays safe' },
+    ];
+    vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
+      const a = args as string[];
+      if (a[0] === 'diff' && a[1] === '--name-status') return 'M\tbackend/app/main.py\n';
+      if (a[0] === 'diff') return '';
+      return '';
+    });
+
+    await handleReleaseAudit(
+      TASK_ID, {
+        ...RELEASE_PAYLOAD,
+        audit_base_sha: auditBaseSha,
+        version_goal: VERSION_GOAL,
+        categories,
+      }, BASE_TASK,
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    const deltaRange = `${auditBaseSha}..${CANDIDATE_SHA}`;
+    // The code-quality review stays scoped to the incremental delta.
+    expect(prompt).toContain(`git diff ${deltaRange}`);
+    // The goal/category grading is explicitly pinned to the FULL version delta
+    // (the whole range the promotion PR would carry), not the incremental one.
+    expect(prompt).toContain(`FULL version delta (\`git diff ${DIFF_RANGE}\`)`);
+    expect(prompt).toContain(`git log ${DIFF_RANGE} --oneline`);
+    const call = vi.mocked(persistAndPostStatus).mock.calls.at(-1)?.[1];
+    const report = JSON.parse(call?.logs as string) as AuditReport;
+    expect(report.audit_scope).toMatchObject({
+      mode: 'incremental',
+      effective_base_sha: auditBaseSha,
+      diff_range: deltaRange,
+      goal_category_diff_range: DIFF_RANGE,
+    });
+  });
+
+  it('grades goal alignment and acceptance categories over a payload-pinned goal_category_diff_range', async () => {
+    // The backend explicitly pins the full version delta as
+    // payload.goal_category_diff_range; the handler must use THAT range for the
+    // goal/category sections even when the code-quality range narrows.
+    const auditBaseSha = '0123456789abcdef0123456789abcdef01234567';
+    const explicitFullRange = 'main...fedcba98765432100123456789abcdef01234567';
+    const VERSION_GOAL = 'Grade the whole version';
+    const categories = [{ category_key: 'goal_alignment', text: 'Advances the goal' }];
+    vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
+      const a = args as string[];
+      if (a[0] === 'diff' && a[1] === '--name-status') return 'M\tbackend/app/main.py\n';
+      if (a[0] === 'diff') return '';
+      return '';
+    });
+
+    await handleReleaseAudit(
+      TASK_ID, {
+        ...RELEASE_PAYLOAD,
+        audit_base_sha: auditBaseSha,
+        goal_category_diff_range: explicitFullRange,
+        version_goal: VERSION_GOAL,
+        categories,
+      }, BASE_TASK,
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    const deltaRange = `${auditBaseSha}..${CANDIDATE_SHA}`;
+    expect(prompt).toContain(`git diff ${deltaRange}`);
+    expect(prompt).toContain(`FULL version delta (\`git diff ${explicitFullRange}\`)`);
+    expect(prompt).not.toContain(`git diff ${DIFF_RANGE}`);
+    const call = vi.mocked(persistAndPostStatus).mock.calls.at(-1)?.[1];
+    const report = JSON.parse(call?.logs as string) as AuditReport;
+    expect(report.audit_scope.goal_category_diff_range).toBe(explicitFullRange);
+    expect(report.audit_scope.diff_range).toBe(deltaRange);
   });
 
   it('falls back to the full range when the requested baseline is not an ancestor', async () => {

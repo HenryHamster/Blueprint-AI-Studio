@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 from unittest.mock import AsyncMock
 
 import pytest
@@ -300,9 +299,12 @@ def _patch_gate_github(
     head_sha: str = "abc123def456",
     resolved=("tok", "acme", "widget"),
     dispatch_ok: bool = True,
+    inflight: dict | None = None,
 ):
     """Monkeypatch the github helpers the CI green gate consults — no live network.
 
+    ``inflight`` is what ``get_latest_inflight_workflow_run_for_branch`` returns
+    (default None → no in-flight branch run, so the gate dispatches as before).
     Returns the ``dispatch_workflow_run`` mock so tests can assert on it.
     """
     mocker.patch(
@@ -312,6 +314,10 @@ def _patch_gate_github(
     mocker.patch("app.github.get_branch_sha", new=AsyncMock(return_value=head_sha))
     mocker.patch(
         "app.github.get_workflow_run_for_sha", new=AsyncMock(return_value=run)
+    )
+    mocker.patch(
+        "app.github.get_latest_inflight_workflow_run_for_branch",
+        new=AsyncMock(return_value=inflight),
     )
     return mocker.patch(
         "app.github.dispatch_workflow_run", new=AsyncMock(return_value=dispatch_ok)
@@ -418,6 +424,69 @@ class TestPromotionCiGreenGate:
         args = disp.await_args.args
         assert args[3] == "ci.yml"
         assert args[4] == "automain"
+
+    @pytest.mark.asyncio
+    async def test_no_run_with_dispatch_coalesces_onto_inflight_branch_run(
+        self, db_session, mocker
+    ):
+        """No run for HEAD but a ci.yml run is in flight on the branch → the gate
+        coalesces onto it (``pending``) instead of dispatching a fresh run that
+        the branch's ``cancel-in-progress`` concurrency group would promptly
+        cancel.  This is the seam that lets a run on an actively-merging branch
+        conclude (and green become reachable) instead of churning dispatches."""
+        project, _ = await _make_project_and_version(db_session)
+        inflight = {
+            "run_id": 99,
+            "status": "in_progress",
+            "conclusion": None,
+            "html_url": "https://gh/run/99",
+            "head_sha": "abe1234",
+            "created_at": "2026-08-06T12:00:00Z",
+        }
+        disp = _patch_gate_github(
+            mocker, run=None, head_sha="cafe1234", inflight=inflight
+        )
+        gate = await compute_promotion_ci_green_gate(
+            db_session, project.id, dispatch=True
+        )
+        assert gate["gate_state"] == "pending"
+        assert gate["run_id"] == 99
+        assert gate["html_url"] == "https://gh/run/99"
+        assert gate["head_sha"] == "cafe1234"
+        assert "in flight on the integration branch" in gate["reason"]
+        # Coalescing must NOT dispatch — a fresh dispatch is what cancels the
+        # in-flight run in the first place.
+        disp.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_with_dispatch_coalesces_onto_inflight_branch_run(
+        self, db_session, mocker
+    ):
+        """A cancelled run for HEAD with ``dispatch=True`` coalesces onto an
+        in-flight branch run instead of re-dispatching (which would cancel the
+        in-flight run).  The drift sentinel's cancelled-run re-arm passes through
+        this exact path, so the coalescing must apply here too."""
+        project, _ = await _make_project_and_version(db_session)
+        inflight = {
+            "run_id": 100,
+            "status": "queued",
+            "conclusion": None,
+            "html_url": "https://gh/run/100",
+            "head_sha": "beef1234",
+            "created_at": "2026-08-06T12:00:00Z",
+        }
+        disp = _patch_gate_github(
+            mocker,
+            run={"run_id": 15, "status": "completed", "conclusion": "cancelled"},
+            head_sha="cafe5678",
+            inflight=inflight,
+        )
+        gate = await compute_promotion_ci_green_gate(
+            db_session, project.id, dispatch=True
+        )
+        assert gate["gate_state"] == "pending"
+        assert gate["run_id"] == 100
+        disp.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_no_run_without_dispatch_maps_to_no_signal(self, db_session, mocker):
@@ -567,6 +636,124 @@ class TestChallengeRefutedRate:
 
         # Verify the correct calculation: 10 / (5+4+3 + 3+4+3 + 2+2+4) = 10/30
         assert rate == pytest.approx(10 / 30, abs=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# Qualification payload names WHY each category is unmet
+# ---------------------------------------------------------------------------
+
+
+class TestFormatQualificationApiCategoryVerdicts:
+    """format_qualification_for_api / format_verdict_for_api surface the
+    per-category verdicts + residual gap that drove the criterion_coverage gate
+    instead of dropping them at the API boundary."""
+
+    def test_format_qualification_for_api_includes_unmet_category_gaps(self):
+        """A refused promotion carries the grader's per-category status/tier/gap
+        and the residual gap so operators/agents don't need to dig into the
+        database to learn what is actually missing."""
+        from app.release_readiness import format_qualification_for_api
+
+        qual = {
+            "status": "not_promoted",
+            "confidence": 0.62,
+            "threshold": 0.90,
+            "category_verdicts": [
+                {
+                    "category_key": "c-1",
+                    "status": "not_met",
+                    "tier": "judged",
+                    "gap": "No end-to-end test proves the promote path.",
+                    "citations": ["backend/app/release_promotion.py"],
+                },
+                {
+                    "category_key": "c-2",
+                    "status": "met",
+                    "tier": "machine",
+                    "gap": None,
+                    "citations": ["backend/testing/test_release_promotion.py"],
+                },
+            ],
+            "residual_uncaptured_gap": "Nothing covers the rollback path.",
+        }
+        out = format_qualification_for_api(qual)
+
+        assert out["category_verdicts"] == qual["category_verdicts"]
+        assert out["category_verdicts"][0]["category_key"] == "c-1"
+        assert out["category_verdicts"][0]["status"] == "not_met"
+        assert out["category_verdicts"][0]["tier"] == "judged"
+        assert "end-to-end test" in out["category_verdicts"][0]["gap"]
+        assert out["category_verdicts"][1]["status"] == "met"
+        assert out["residual_uncaptured_gap"] == "Nothing covers the rollback path."
+
+    def test_missing_category_verdicts_return_none(self):
+        """Legacy / rubric-less qualification records return None for both keys,
+        so callers can distinguish 'no data' from an unmet category."""
+        from app.release_readiness import format_qualification_for_api
+
+        out = format_qualification_for_api({"status": "pending"})
+        assert out["category_verdicts"] is None
+        assert out["residual_uncaptured_gap"] is None
+        out_empty = format_qualification_for_api({})
+        assert out_empty["category_verdicts"] is None
+        assert out_empty["residual_uncaptured_gap"] is None
+
+    def test_format_verdict_for_api_surfaces_category_verdicts(self):
+        """The immutable QualificationVerdict row carries the same per-attempt
+        category_verdicts / residual snapshot so the verdict-history boundary
+        also names WHY each category is unmet."""
+        import uuid
+
+        from app.release_models import QualificationVerdict
+        from app.release_readiness import format_verdict_for_api
+
+        verdict = QualificationVerdict(
+            project_id=uuid.uuid4(),
+            release_version_id=uuid.uuid4(),
+            candidate_sha="abc123",
+            confidence=0.7,
+            blocker=None,
+            would_promote=False,
+            promotion_enabled=False,
+            terminal_status="not_promoted",
+            threshold=0.9,
+            category_verdicts=[
+                {
+                    "category_key": "c-7",
+                    "status": "partial",
+                    "tier": "judged",
+                    "gap": "Only the happy path is covered.",
+                    "citations": [],
+                }
+            ],
+            residual_uncaptured_gap="Rollback is unproven.",
+        )
+        out = format_verdict_for_api(verdict)
+        assert out["category_verdicts"] == [
+            {
+                "category_key": "c-7",
+                "status": "partial",
+                "tier": "judged",
+                "gap": "Only the happy path is covered.",
+                "citations": [],
+            }
+        ]
+        assert out["residual_uncaptured_gap"] == "Rollback is unproven."
+
+        legacy = QualificationVerdict(
+            project_id=uuid.uuid4(),
+            release_version_id=uuid.uuid4(),
+            candidate_sha="legacy",
+            confidence=0.9,
+            blocker=None,
+            would_promote=True,
+            promotion_enabled=True,
+            terminal_status="promoted",
+            threshold=0.8,
+        )
+        out_legacy = format_verdict_for_api(legacy)
+        assert out_legacy["category_verdicts"] is None
+        assert out_legacy["residual_uncaptured_gap"] is None
 
 
 # ---------------------------------------------------------------------------

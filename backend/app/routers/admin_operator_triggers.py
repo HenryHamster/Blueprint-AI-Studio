@@ -297,7 +297,7 @@ async def trigger_qualify(
     Validation is owned by ``_normalize_qualification_probes``; an invalid
     selection surfaces as a 422 instead of a silent probe-less run.
     """
-    await _get_user_project_with_role(
+    project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
 
@@ -307,6 +307,34 @@ async def trigger_qualify(
             status_code=404,
             detail="No open release version found for this project.",
         )
+
+    # Respect the CI-compliance qualify gate: the strategic qualify_request path
+    # refuses to start a qualification while the integration HEAD breaches the
+    # module-size guardrails, and the operator lever must not silently bypass
+    # that.  The check reads the latest stored evaluation (no fresh GitHub scan
+    # in the request path); a stale/empty store fails open so the operator can
+    # still force a qualification if the recorded evidence is outdated.  The
+    # strategic payload / ci-compliance fetch endpoint surfaces the full detail.
+    from app.strategic_spawning import ci_compliance_qualify_gate
+
+    gate = ci_compliance_qualify_gate(project)
+    if gate.get("blocked"):
+        head_sha = str(gate.get("head_sha") or "")[:12] or "unknown"
+        if gate.get("reason") == "ci_compliance_evidence_unavailable":
+            detail = (
+                f"CI-compliance could not be evaluated at HEAD {head_sha}: the "
+                f"guardrail evidence is unavailable, so compliance is not "
+                f"verified. Qualification is blocked until compliance can be "
+                f"checked; re-trigger once the integration HEAD is evaluable."
+            )
+        else:
+            detail = (
+                f"CI-compliance violations block qualification: "
+                f"{gate.get('violation_count', 0)} violation(s) at HEAD {head_sha}. "
+                f"Repair the guardrails (a cap-bump task is typically queued) and "
+                f"re-trigger once the integration HEAD is compliant."
+            )
+        raise HTTPException(status_code=409, detail=detail)
 
     result = await release_qualifier.run_qualification(
         session,

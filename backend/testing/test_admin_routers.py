@@ -8363,6 +8363,52 @@ class TestComputeExperimentTaskLaunch:
         assert count == 0
 
     @pytest.mark.asyncio
+    async def test_runner_pinned_contract_accepts_noncatalog_accelerator(
+        self, client: AsyncClient, db_session
+    ):
+        """A runner-pinned contract may name an operator-hardware GPU that is
+        not in the GCP catalog (e.g. RTX 5080) — the runner dispatch gate checks
+        verified capability, not the name."""
+        project = await self._project_with_repo(db_session)
+        runner = await self._enrolled_runner(db_session, project.id)
+        payload = self._valid_payload(
+            runner_target={"runner_id": str(runner.id), "strict": True},
+            accelerator="RTX 5080",
+        )
+        payload.pop("machine_type", None)
+
+        resp = await client.post("/api/admin/tasks/compute-experiment", json=payload)
+
+        assert resp.status_code == 200, resp.text
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.id == uuid.UUID(resp.json()["id"]))
+            )
+        ).scalar_one()
+        assert task.payloads[0]["accelerator"] == "RTX 5080"
+        assert task.payloads[0]["runner_target"] == {
+            "runner_id": str(runner.id),
+            "strict": True,
+        }
+
+    @pytest.mark.asyncio
+    async def test_unpinned_contract_still_rejects_noncatalog_accelerator(
+        self, client: AsyncClient, db_session
+    ):
+        """Without a runner pin the contract would provision on GCP, so a
+        non-catalog accelerator name keeps the strict 422 rejection."""
+        await self._project_with_repo(db_session)
+        payload = self._valid_payload(accelerator="RTX 5080")
+        payload.pop("machine_type", None)
+
+        resp = await client.post("/api/admin/tasks/compute-experiment", json=payload)
+
+        assert resp.status_code == 422, resp.text
+        assert "unsupported accelerator" in resp.text
+        tasks = (await db_session.execute(select(Task))).scalars().all()
+        assert tasks == []
+
+    @pytest.mark.asyncio
     async def test_require_durable_artifact_persists_in_payload(
         self, client: AsyncClient, db_session
     ):
@@ -9276,7 +9322,7 @@ class TestStrategistSpawnableRegistry:
         )
         assert direct == STRATEGIST_SPAWNABLE_TASK_TYPES
         assert contextual == STRATEGIST_CONTEXTUAL_TASK_TYPES
-        assert STRATEGIST_CONTEXTUAL_TASK_TYPES == frozenset({"fix"})
+        assert STRATEGIST_CONTEXTUAL_TASK_TYPES == frozenset()
 
     @pytest.mark.asyncio
     async def test_strategist_spawn_compute_experiment_persists_launch_contract(
@@ -10109,6 +10155,11 @@ class TestFleetUtilizationEndpoint:
             "util_now",
             "util_avg",
             "window_hours",
+            "concurrent_peak",
+            "concurrent_p50",
+            "concurrent_p90",
+            "concurrent_p95",
+            "concurrent_p99",
         ):
             assert field in data, f"missing field: {field}"
         # Derived saturation field must be present (may be None when no accounts)

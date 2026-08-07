@@ -187,6 +187,20 @@ _READINESS_GROUND_TRUTH_CAVEAT = (
 # ``ground_truth_validated`` stays False and the caveat keeps self-approval framing.
 _READINESS_MIN_RESOLVED_OUTCOMES = 5
 
+# Qualification terminal statuses that recorded NO quality finding and must never
+# be aggregated as failed attempts in the readiness track record.
+# ``infra_failure`` was already excluded; rubric holds complete the set.  A
+# rubric_changed / rubric_provenance_unknown attempt did not measure anything
+# under the final rubric (its in-flight grade was invalidated by a mid-flight
+# acceptance-contract change), so it must not lower the would-promote rate, break
+# the clean streak, or surface its blocker as recurring.  Both ``rubric_changed``
+# and ``rubric_unknown`` are listed because the latter is the terminal_status
+# written for the unknown-provenance hold (see release_qualifier._record_rubric_
+# provenance_outcome).
+_NON_FINDING_VERDICT_STATUSES: frozenset[str] = frozenset(
+    {"infra_failure", "rubric_changed", "rubric_unknown"}
+)
+
 # Governance manifest for the promotion-gate readiness block emitted by
 # ``compute_promotion_readiness``.  Every field the function returns must have an
 # entry here with a named ground-truth source and consumer, or a dated
@@ -461,6 +475,12 @@ def format_qualification_for_api(qual: dict[str, Any]) -> dict[str, Any]:
         # is already enforce, a hard blocker fired, or debt pressure was unavailable).
         "debt_enforce_confidence_preview": qual.get("debt_enforce_confidence_preview"),
         "debt_enforce_weight_preview": qual.get("debt_enforce_weight_preview"),
+        # Per-category goal-verification verdicts + residual gap that drove the
+        # criterion_coverage gate at finalize time (additive; None when no rubric
+        # or grade was issued). Names WHY each category is unmet so operators and
+        # agents don't have to dig into the ledger/database.
+        "category_verdicts": qual.get("category_verdicts"),
+        "residual_uncaptured_gap": qual.get("residual_uncaptured_gap"),
     }
 
 
@@ -585,9 +605,11 @@ def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
         "acceptance_window_total_all_merges": _sub(verdict, "acceptance_window_total_all_merges"),
         # Additive per-bucket / per-reason breakdown of the write-task window (None on
         # legacy rows without the aggregate). Makes the fraction auditable: operators see
-        # which buckets contribute to `verified` and why undeclared merges stayed undeclared.
+        # which buckets contribute to `verified`, why undeclared merges stayed undeclared,
+        # and why each declared-but-unsatisfied verdict failed.
         "acceptance_window_buckets": _sub(verdict, "acceptance_window_buckets"),
         "acceptance_window_undeclared_reasons": _sub(verdict, "acceptance_window_undeclared_reasons"),
+        "acceptance_window_declared_unsatisfied_reasons": _sub(verdict, "acceptance_window_declared_unsatisfied_reasons"),
         # Goal-alignment cert (additive; None on legacy rows predating migration 0328).
         "goal_alignment": verdict.goal_alignment,
         # Blind merge-grade cert (additive; None on legacy rows predating migration 0327).
@@ -598,6 +620,12 @@ def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
         # Observe-mode preview of the enforce-path confidence / weight.
         "debt_enforce_confidence_preview": debt_enforce_confidence_preview,
         "debt_enforce_weight_preview": debt_enforce_weight_preview,
+        # Per-category goal-verification verdicts + residual gap persisted on the
+        # immutable verdict row (additive; None on legacy rows that predate the
+        # columns). Mirrors format_qualification_for_api so the verdict history
+        # boundary also names WHY each category is unmet.
+        "category_verdicts": verdict.category_verdicts,
+        "residual_uncaptured_gap": verdict.residual_uncaptured_gap,
     }
 
 
@@ -672,7 +700,9 @@ async def get_challenged_vs_unchallenged_telemetry(
         select(QualificationVerdict)
         .where(
             QualificationVerdict.project_id == project_id,
-            QualificationVerdict.terminal_status != "infra_failure",
+            QualificationVerdict.terminal_status.not_in(
+                _NON_FINDING_VERDICT_STATUSES
+            ),
         )
         .order_by(QualificationVerdict.created_at.desc())
         .limit(window)
@@ -748,7 +778,9 @@ async def compute_promotion_readiness(
         .where(
             QualificationVerdict.project_id == project_id,
             QualificationVerdict.promotion_enabled.is_(False),
-            QualificationVerdict.terminal_status != "infra_failure",
+            QualificationVerdict.terminal_status.not_in(
+                _NON_FINDING_VERDICT_STATUSES
+            ),
         )
         .order_by(QualificationVerdict.created_at.desc())
         .limit(_READINESS_HISTORY_WINDOW)
@@ -1211,8 +1243,18 @@ async def compute_requalification_readiness(
 # Gate-state vocabulary emitted by ``compute_promotion_ci_green_gate``.  Only
 # ``green`` clears the promotion_failed re-driver; every other state defers.
 _PROMOTION_CI_GATE_STATES = frozenset(
-    {"green", "pending", "red", "dispatched", "no_signal", "unavailable"}
+    {"green", "pending", "red", "cancelled", "dispatched", "no_signal", "unavailable"}
 )
+
+# Branch-level dispatch coalescing window for the promotion CI gate.  ci.yml is
+# keyed to a branch-level ``cancel-in-progress`` concurrency group, so a fresh
+# dispatch for a NEW integration HEAD cancels whatever full-suite run is already
+# in flight on the branch.  On an actively-merging branch that churns full
+# 8-shard dispatches (each new HEAD's dispatch kills the prior run before it
+# concludes) and starves the branch of a green conclusion — the very signal the
+# standing drift sentinel needs.  When a ci.yml run is already queued/in_progress
+# on the branch within this window, the gate waits for it instead of dispatching.
+_PROMOTION_CI_BRANCH_COALESCE_WINDOW_SECONDS = 60 * 60
 
 
 def _promotion_ci_gate_verdict(
@@ -1238,6 +1280,7 @@ async def compute_promotion_ci_green_gate(
     project_id: uuid.UUID,
     *,
     dispatch: bool = True,
+    dispatch_on_cancelled: bool = True,
 ) -> dict[str, Any]:
     """Resolve whether the integration-branch HEAD has a green full-suite CI run.
 
@@ -1253,15 +1296,32 @@ async def compute_promotion_ci_green_gate(
       * ``green``      — a COMPLETED ``ci.yml`` run for the current HEAD concluded success
       * ``pending``    — a run for HEAD is queued / in_progress (not yet concluded)
       * ``red``        — a run for HEAD concluded non-success
+      * ``cancelled``  — a run for HEAD concluded cancelled and
+                         ``dispatch_on_cancelled=False`` (surfaced as a distinct
+                         signal; the caller decides whether a fresh dispatch is
+                         warranted — used by the drift sentinel to stop churn)
       * ``dispatched`` — no run existed for HEAD, so one was just dispatched
       * ``no_signal``  — ``dispatch=False`` and no run exists for HEAD, or a
                          cancelled run exists with ``dispatch=False``
       * ``unavailable``— GitHub creds / HEAD / API unavailable (or an error occurred)
 
-    When ``dispatch=True`` and there is no run for the current HEAD, dispatches a
-    fresh ``ci.yml`` run on the integration branch (the full 8-shard backend +
-    frontend + agent matrix, since ci.yml's ``detect`` job forces all-true on a
-    ``workflow_dispatch``) and returns ``dispatched``.
+    When ``dispatch=True`` and there is no run for the current HEAD, first checks
+    whether a ci.yml run is already queued/in-progress ANYWHERE on the
+    integration branch within ``_PROMOTION_CI_BRANCH_COALESCE_WINDOW_SECONDS``.
+    Because ci.yml's concurrency policy is keyed on the branch ref
+    (``cancel-in-progress``), a fresh dispatch for a new HEAD would cancel the
+    in-flight run before it concludes — on an actively-merging branch that
+    churns full 8-shard dispatches and starves the branch of a green conclusion.
+    When such a run exists the gate returns ``pending`` (coalescing onto it)
+    instead of dispatching; otherwise it dispatches a fresh ``ci.yml`` run on the
+    integration branch (the full 8-shard backend + frontend + agent matrix, since
+    ci.yml's ``detect`` job forces all-true on a ``workflow_dispatch``) and
+    returns ``dispatched``.  A completed run whose conclusion is ``cancelled`` is
+    treated as absent when ``dispatch=True`` (the concurrency policy routinely
+    cancels superseded integration-branch runs), UNLESS ``dispatch_on_cancelled=False``,
+    in which case it surfaces as ``cancelled`` without dispatching so a caller
+    that wants to avoid dispatch churn can react instead of re-dispatching the
+    full matrix on every sweep.
 
     IMPORTANT: this performs a GitHub round-trip and is DELIBERATELY separate from
     :func:`compute_requalification_readiness`, which stays DB-only and
@@ -1318,6 +1378,18 @@ async def compute_promotion_ci_green_gate(
                         reason="ci.yml run for integration HEAD concluded success",
                     )
                 if conclusion == "cancelled":
+                    if not dispatch_on_cancelled:
+                        return _promotion_ci_gate_verdict(
+                            "cancelled",
+                            head_sha=head_sha,
+                            run_id=run_id,
+                            html_url=html_url,
+                            reason=(
+                                "ci.yml run for integration HEAD was cancelled — "
+                                "surfaced as a distinct signal; caller decides "
+                                "whether a fresh dispatch is warranted"
+                            ),
+                        )
                     if not dispatch:
                         return _promotion_ci_gate_verdict(
                             "no_signal",
@@ -1362,6 +1434,38 @@ async def compute_promotion_ci_green_gate(
                     "(read-only gate, no run dispatched)"
                 ),
             )
+
+        # Branch-level dispatch coalescing.  ci.yml is keyed to a branch
+        # ``cancel-in-progress`` concurrency group, so dispatching a fresh run
+        # for this NEW HEAD would cancel whatever full-suite run is already in
+        # flight on the integration branch.  On an actively-merging branch that
+        # churns 8-shard dispatches (each new HEAD's dispatch kills the prior
+        # run before it concludes) and starves the branch of a green conclusion.
+        # If a run is already queued/in_progress within the coalesce window,
+        # wait for it to conclude instead of cancelling it — the sentinel reads
+        # ``pending`` and re-checks once the run resolves.
+        inflight = await github.get_latest_inflight_workflow_run_for_branch(
+            token,
+            owner,
+            repo,
+            integration_branch,
+            workflow_file=CI_WORKFLOW_FILE,
+            project_id=str(project_id),
+            max_age_seconds=_PROMOTION_CI_BRANCH_COALESCE_WINDOW_SECONDS,
+        )
+        if inflight is not None:
+            return _promotion_ci_gate_verdict(
+                "pending",
+                head_sha=head_sha,
+                run_id=inflight["run_id"],
+                html_url=inflight["html_url"],
+                reason=(
+                    "a ci.yml run is already in flight on the integration "
+                    "branch — coalescing onto it instead of cancelling it "
+                    "with a fresh dispatch"
+                ),
+            )
+
         dispatched = await github.dispatch_workflow_run(
             token,
             owner,

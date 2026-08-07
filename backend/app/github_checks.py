@@ -7,6 +7,7 @@ existing imports keep working.
 import asyncio
 import re
 import time
+from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException, status
 
@@ -700,6 +701,135 @@ async def get_workflow_run_for_sha(
         "status": run.get("status"),
         "conclusion": run.get("conclusion"),
         "html_url": run.get("html_url", ""),
+    }
+
+
+def _parse_github_timestamp(value) -> datetime | None:
+    """Parse GitHub's ISO-8601 UTC timestamp (``…T…Z``) defensively.
+
+    Returns ``None`` on any unparseable / missing value so callers degrade
+    gracefully instead of raising.  ``Z`` is replaced with ``+00:00`` so the
+    parse works on Python versions where ``datetime.fromisoformat`` does not yet
+    accept the trailing ``Z``.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    text = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        return datetime.fromisoformat(text)
+    except (ValueError, TypeError):
+        return None
+
+
+async def get_latest_inflight_workflow_run_for_branch(
+    token: str,
+    owner: str,
+    repo: str,
+    branch: str,
+    *,
+    workflow_file: str = CI_WORKFLOW_FILE,
+    project_id: str | None = None,
+    max_age_seconds: int | None = None,
+) -> dict | None:
+    """Return the newest queued/in-progress ``workflow_file`` run on ``branch``.
+
+    ci.yml is keyed to a branch-level ``concurrency`` group
+    (``cancel-in-progress``), so on an actively-merging integration branch a
+    fresh ``workflow_dispatch`` cancels whatever full-suite run is already in
+    flight.  This helper is the coalescing seam for that policy: before
+    dispatching a run for a NEW integration HEAD, the caller asks whether a
+    full-suite run is ALREADY queued/in-progress on the branch and, if so, waits
+    for that run to conclude instead of cancelling it with yet another dispatch.
+    Without this, dispatched runs on a busy branch rarely survive to a
+    conclusion and the full-suite signal can never turn green.
+
+    Wraps ``GET /repos/{owner}/{repo}/actions/workflows/{workflow_file}/runs?branch={branch}``
+    and returns the newest run whose ``status`` is ``queued`` or ``in_progress``,
+    optionally restricted to runs created within the last ``max_age_seconds``
+    (so a stuck / zombie run cannot block fresh dispatches forever).
+
+    Returns a small dict::
+
+        {"run_id": int, "status": str, "conclusion": str | None,
+         "html_url": str, "head_sha": str, "created_at": str}
+
+    or ``None`` when no qualifying run exists, or on any API error / unparseable
+    body — graceful degradation, never raises (mirrors the sibling read-only
+    github helpers).
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if _deferrable_quota_active():
+        logger.warning(
+            "[GITHUB] get_latest_inflight_workflow_run_for_branch: quota floor "
+            "active — returning None for %s/%s branch=%s",
+            owner,
+            repo,
+            branch,
+        )
+        return None
+    response = await _github_request(
+        "GET",
+        f"https://api.github.com/repos/{owner}/{repo}/actions/workflows/"
+        f"{workflow_file}/runs?branch={branch}&per_page=20",
+        headers,
+        project_id=project_id,
+    )
+    if response.status_code != 200:
+        logger.warning(
+            "[GITHUB] get_latest_inflight_workflow_run_for_branch: %s/%s "
+            "workflow=%s branch=%s returned %s",
+            owner,
+            repo,
+            workflow_file,
+            branch,
+            response.status_code,
+        )
+        return None
+    try:
+        runs = response.json().get("workflow_runs", [])
+    except (ValueError, TypeError):
+        logger.warning(
+            "[GITHUB] get_latest_inflight_workflow_run_for_branch: unparseable "
+            "body for %s/%s branch=%s",
+            owner,
+            repo,
+            branch,
+        )
+        return None
+    now = datetime.now(timezone.utc)
+    cutoff = (
+        now - timedelta(seconds=max_age_seconds) if max_age_seconds else None
+    )
+    candidates = []
+    for run in runs or []:
+        if run.get("status") not in ("queued", "in_progress"):
+            continue
+        created_at = _parse_github_timestamp(run.get("created_at"))
+        if created_at is None:
+            continue
+        if cutoff is not None and created_at < cutoff:
+            continue
+        candidates.append(run)
+    if not candidates:
+        return None
+    # GitHub returns most-recent-first, but sort defensively by created_at
+    # (ISO-8601 sorts lexically) so a re-run / dispatch can't surface an older run.
+    candidates.sort(
+        key=lambda r: _parse_github_timestamp(r.get("created_at")) or datetime.min,
+        reverse=True,
+    )
+    run = candidates[0]
+    return {
+        "run_id": run.get("id"),
+        "status": run.get("status"),
+        "conclusion": run.get("conclusion"),
+        "html_url": run.get("html_url", ""),
+        "head_sha": run.get("head_sha") or "",
+        "created_at": run.get("created_at") or "",
     }
 
 

@@ -22,7 +22,6 @@ from app import strategic_cycle
 from app.strategic_review_effort import (
     CONSEQUENTIAL_EFFORT,
     CONSEQUENTIAL_TIER,
-    ROUTINE_EFFORT,
     ROUTINE_TIER,
     classify_strategic_review_effort,
 )
@@ -874,7 +873,11 @@ def _format_fleet_utilization_axis(fleet: dict | None) -> str | None:
     breakdown is appended only when accounts are actually cooled, keeping the
     common (healthy) case terse — the cause of low utilization (idle headroom
     vs rate-limit cooldown) is what would otherwise mislead the strategist into
-    manufacturing work.
+    manufacturing work. When present, the measured task-slot concurrency
+    (``concurrent_peak`` / ``concurrent_p90`` from the fleet snapshot — peak
+    simultaneous slot occupancy, and the p90 of the concurrency distribution
+    weighted over the active window) is appended as ``peak N, p90 M``; it is
+    omitted entirely when absent.
     """
     if not fleet:
         return None
@@ -889,6 +892,12 @@ def _format_fleet_utilization_axis(fleet: dict | None) -> str | None:
     line = f"now {active}/{cap} ({now_pct})"
     if util_avg is not None:
         line += f", {window}h-avg {round(util_avg * 100)}%"
+    peak = fleet.get("concurrent_peak")
+    p90 = fleet.get("concurrent_p90")
+    if peak:
+        line += f", peak {peak}"
+        if p90 is not None:
+            line += f", p90 {round(p90)}"
     cooled = fleet.get("cooled_accounts") or 0
     usable = fleet.get("usable_capacity")
     if cooled and usable is not None and usable != cap:
@@ -2480,6 +2489,15 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # condition for the direction-gap referential-integrity work. Fetchable on
     # demand via ./fetch integrity-conflict-trend.
     "integrity_conflict_trend": {"priority": "low", "exempt": True},
+    # Active-direction criterion_link_conflicts for the open version (dangling
+    # or inactive criterion_keys). Low priority, exempt: bounded at build time
+    # to 20 entries; absent when the model is clean. Lets the strategist remap
+    # before a create/update op gets dropped for an invalid key.
+    "criterion_link_conflicts": {"priority": "low", "exempt": True},
+    # create/update_direction ops dropped for invalid criterion_keys in recent
+    # completed cycles. Low priority, exempt: bounded at build time to 5
+    # records. Surfaces the rejection the fallback path used to log-only.
+    "rejected_direction_ops": {"priority": "low", "exempt": True},
 }
 
 
@@ -3742,6 +3760,81 @@ def _build_past_retirement_deferrals(
     return results[:n]
 
 
+def _build_rejected_direction_ops(
+    cycle_history: list, n: int = 5
+) -> list[dict[str, Any]]:
+    """Collect recent create/update_direction ops dropped for invalid criterion_keys.
+
+    Walks ``cycle_history`` newest-first for completed cycles whose
+    ``cycle_metadata`` carried a bounded ``rejected_direction_ops`` list (see
+    ``strategic_completion._record_rejected_direction_op`` — the records are
+    already normalized + capped at record time, so they pass through verbatim).
+    The strategist sees exactly which ops were refused and which criterion keys
+    are currently active, so it can remap instead of re-proposing a bad key.
+    """
+    results: list[dict[str, Any]] = []
+    for entry in cycle_history:
+        if entry.get("outcome") != "completed":
+            continue
+        rejected = entry.get("rejected_direction_ops")
+        if not isinstance(rejected, list):
+            continue
+        for record in rejected:
+            if isinstance(record, dict):
+                results.append(record)
+            if len(results) >= n:
+                return results[:n]
+    return results[:n]
+
+
+async def _build_criterion_link_conflicts(
+    session: AsyncSession,
+    project: Project,
+) -> list[dict[str, Any]] | None:
+    """Compute active-direction criterion_link_conflicts for the open version.
+
+    Reuses the read model's conflict classifier
+    (``strategic_state_read_model.compute_model_integrity_conflicts``) so the
+    strategist sees the SAME dangling/inactive criterion-key conflicts the admin
+    workspace panel shows — a chance to remap before the completion path drops a
+    later op that re-proposes the bad key. Returns None when the model is clean
+    or there is no open version, so the payload key is omitted entirely.
+    """
+    from app.release_version import current_open_version
+
+    open_version = await current_open_version(session, project.id)
+    if open_version is None:
+        return None
+
+    from app.direction_referential_guard import load_version_criterion_key_sets
+    from app.strategic_state_read_model import compute_model_integrity_conflicts
+
+    active_keys, inactive_keys = await load_version_criterion_key_sets(
+        session, project.id, open_version.id
+    )
+    criterion_links = [
+        {
+            "id": str(d.get("id") or ""),
+            "text": str(d.get("text") or ""),
+            "status": d.get("status") or "active",
+            "criterion_keys": list(d.get("criterion_keys") or []),
+        }
+        for d in (project.directions or [])
+        if d.get("criterion_keys")
+    ]
+    conflicts = compute_model_integrity_conflicts(
+        project.problem_model,
+        project.directions,
+        criterion_links=criterion_links,
+        active_criterion_keys=active_keys,
+        inactive_criterion_keys=inactive_keys,
+    )
+    if not conflicts:
+        return None
+    link_conflicts = conflicts.get("criterion_link_conflicts") or []
+    return link_conflicts[:20] or None
+
+
 def _build_anomaly_summary(project: Project) -> dict[str, Any] | None:
     """Summarize high-occurrence persistent anomalies for the strategic agent.
 
@@ -4584,7 +4677,27 @@ def ci_compliance_qualify_gate(
     project: Project,
     head_sha: str | None = None,
 ) -> dict[str, Any]:
-    """Return whether current CI-compliance violations block qualification."""
+    """Return whether current CI-compliance violations block qualification.
+
+    Fail-closed on DEGRADED evidence: a record whose evaluation ran with an
+    unreadable limits file, unreadable branch-literal rules, or an unavailable
+    repo tree (``limits_available`` / ``rules_available`` / ``tree_available``
+    False) reports 'no violations OBSERVED', not 'compliance verified', so it
+    blocks. That keeps 'verified clean' and 'could not be checked' from
+    reaching the qualification decision as the same verdict.
+
+    Fail-OPEN on an EMPTY store: no record for the SHA means no evaluation has
+    been stored yet, which is distinct from an evaluation that could not read
+    its inputs. Blocking here would refuse every first-ever qualification and
+    strand the operator lever (``admin_operator_triggers.trigger_qualify``
+    documents the empty store as fail-open precisely so a force-qualify stays
+    possible). The callers that KNOW an evaluation was attempted and failed —
+    ``strategic_completion._apply_qualify_request`` on
+    ``ensure_current_ci_compliance`` returning ``status != "success"`` or
+    raising — already fail closed with ``blocker_class="unavailable_evidence"``,
+    so unverifiable evidence is refused at the site that can tell the
+    difference.
+    """
     records = project.ci_compliance or {}
     selected_sha = head_sha
     if selected_sha is None and isinstance(records, dict) and records:
@@ -4599,6 +4712,7 @@ def ci_compliance_qualify_gate(
             "branch_literal_violations": [],
             "branch_literal_violation_count": 0,
             "reason": "ci_compliance_record_missing",
+            "compliant": None,
         }
     violations = record.get("violations") if isinstance(record.get("violations"), list) else []
     branch_literal_violations = (
@@ -4606,6 +4720,34 @@ def ci_compliance_qualify_gate(
         if isinstance(record.get("branch_literal_violations"), list)
         else []
     )
+    limits_available = record.get("limits_available")
+    tree_available = record.get("tree_available")
+    rules_available = record.get("rules_available")
+    if limits_available is False or tree_available is False or rules_available is False:
+        # The evaluator could not fully verify compliance (limits file, repo
+        # tree, or branch-literal rules unavailable), so a ``compliant: True``
+        # here only means 'no violations OBSERVED', not 'compliance verified'.
+        # Block rather than passing on incomplete evidence. Any violations that
+        # WERE observed are still surfaced for the strategist. Records computed
+        # before the rules file existed simply lack ``rules_available`` (None),
+        # which is not a False — behavior for those is unchanged.
+        return {
+            "blocked": True,
+            "head_sha": selected_sha,
+            "violations": violations,
+            "violation_count": len(violations),
+            "branch_literal_violations": branch_literal_violations,
+            "branch_literal_violation_count": len(branch_literal_violations),
+            "reason": "ci_compliance_evidence_unavailable",
+            "compliant": record.get("compliant"),
+            "limits_available": limits_available,
+            "tree_available": tree_available,
+            "rules_available": rules_available,
+            "limits_status": record.get("limits_status"),
+            "limits_error": record.get("limits_error"),
+            "rules_status": record.get("rules_status"),
+            "rules_error": record.get("rules_error"),
+        }
     blocked = record.get("compliant") is False and (
         bool(violations) or bool(branch_literal_violations)
     )
@@ -4617,6 +4759,12 @@ def ci_compliance_qualify_gate(
         "branch_literal_violations": branch_literal_violations,
         "branch_literal_violation_count": len(branch_literal_violations),
         "compliant": record.get("compliant"),
+        "limits_available": limits_available,
+        "limits_status": record.get("limits_status"),
+        "limits_error": record.get("limits_error"),
+        "rules_available": rules_available,
+        "rules_status": record.get("rules_status"),
+        "rules_error": record.get("rules_error"),
     }
 
 
@@ -4627,6 +4775,11 @@ async def _maybe_spawn_ci_compliance_cap_bump_fix(
 ) -> Task | None:
     """Spawn one cap-bump remediation task for a non-compliant HEAD."""
     if not gate.get("blocked"):
+        return None
+    if not gate.get("violations") and not gate.get("branch_literal_violations"):
+        # Blocked because compliance evidence is missing/degraded, not because an
+        # actual violation was observed — there is nothing to fix yet. Let the
+        # strategist react to the root cause instead of spawning a no-op task.
         return None
     head_sha = gate.get("head_sha")
     if not isinstance(head_sha, str) or not head_sha:
@@ -4688,8 +4841,18 @@ async def _maybe_spawn_ci_compliance_cap_bump_fix(
                 current_size=v["count"],
                 section=v.get("section", "backend"),
             )
-        except Exception:  # noqa: BLE001 — advisory; fall back to routine
-            verdict = {"is_chronic": False}
+        except Exception:  # noqa: BLE001
+            # Never silently permit a bump when classification fails; route to
+            # decomposition (fail-closed) instead of a false routine verdict.
+            verdict = {
+                "is_chronic": True,
+                "suggested_new_limit": None,
+                "bump_count": 0,
+                "reason": (
+                    "Bump history unavailable — refusing cap bump; "
+                    "decomposition required."
+                ),
+            }
         if verdict.get("is_chronic"):
             chronic_violations.append(v)
         else:
@@ -4758,12 +4921,25 @@ async def _maybe_spawn_ci_compliance_cap_bump_fix(
             "Extract cohesive clusters into sibling modules to bring them under "
             "the existing caps — do NOT bump the caps."
         )
-    else:
+    elif violations:
         task_title_payload = "Bump CI-compliance size caps"
         task_title = f"Fix CI-compliance cap bump for {head_sha[:8]}"
         task_description = (
             "Run backend/testing/check_size_limits.py --fix and commit the "
             "resulting size-cap update."
+        )
+    else:
+        # No size violations — the gate is blocked purely on hardcoded branch
+        # literals, so the remediation is a branch-name removal, NOT a cap bump.
+        # The old single else-branch titled/described this as a size-cap bump and
+        # told the agent to run check_size_limits.py --fix, which cannot fix a
+        # branch-literal violation and mislabels the task (observed 2026-08-06:
+        # a branch-literal-only spawn surfaced as "Fix CI-compliance cap bump").
+        task_title_payload = "Remove hardcoded branch literals"
+        task_title = f"Fix CI-compliance branch literals for {head_sha[:8]}"
+        task_description = (
+            "Remove hardcoded branch names from the listed source files. "
+            "No size-cap bump is involved."
         )
 
     payload = validate_internal_payload(
@@ -5703,6 +5879,22 @@ async def _spawn_strategic_review(
             session.add(project)
         _res_retired_summary = _build_retired_directions_summary(project)
         _res_prev_outcomes = _build_previous_decision_outcomes(project, cycle_history)
+        _res_criterion_conflicts: list[dict] | None = None
+        if get_project_integration_branch(project) != get_project_promotion_target(project):
+            # Criterion-link conflicts are version-lifecycle context (they key off
+            # the open version's active criterion keys), so they are meaningful
+            # only under an LTS split — the same gate the version-phase block
+            # uses. When integration == promotion there is no open version, so
+            # skip the lookup instead of invoking the version lifecycle.
+            try:
+                _res_criterion_conflicts = await _build_criterion_link_conflicts(
+                    session, project
+                )
+            except Exception:
+                logger.exception(
+                    "[STRATEGIC] criterion_link_conflicts fetch failed; continuing"
+                )
+        _res_rejected_ops = _build_rejected_direction_ops(cycle_history, n=5)
         _res_open_messages = await _fetch_open_messages(session, project.id)
         # Recently-answered operator conversation tail — DB-only, bounded, and
         # explicitly non-actionable. Surfaces a correction the operator just made
@@ -5804,6 +5996,16 @@ async def _spawn_strategic_review(
                     "running_update": project.running_update or "",
                     # Pure-computation direction grounding (no I/O).
                     "directions_summary": _res_direction_stats,
+                    **(
+                        {"criterion_link_conflicts": _res_criterion_conflicts}
+                        if _res_criterion_conflicts
+                        else {}
+                    ),
+                    **(
+                        {"rejected_direction_ops": _res_rejected_ops}
+                        if _res_rejected_ops
+                        else {}
+                    ),
                     "direction_counts": _res_direction_counts,
                     "max_active_directions": _res_direction_counts["max_active"],
                     **(
@@ -6756,6 +6958,30 @@ async def _spawn_strategic_review(
             _integrity_trend = _trend_result
     except Exception:
         logger.exception("[STRATEGIC] integrity_conflict_trend fetch failed; continuing")
+    # Criterion-link integrity for the open version — active directions whose
+    # criterion_keys are dangling or inactive. Reuses the admin read model's
+    # classifier so the strategist sees the same conflicts the workspace panel
+    # shows and can remap before the completion path drops a re-proposed key.
+    # Best-effort: absent when clean, no open version, or the query fails.
+    _criterion_link_conflicts: list[dict] | None = None
+    if _integration_branch != _promotion_target:
+        # Criterion-link conflicts are version-lifecycle context (they key off
+        # the open version's active criterion keys), so they are meaningful only
+        # under an LTS split — the same gate the version-phase block uses. When
+        # integration == promotion there is no open version, so skip the lookup
+        # instead of invoking the version lifecycle.
+        try:
+            _criterion_link_conflicts = await _build_criterion_link_conflicts(
+                session, project
+            )
+        except Exception:
+            logger.exception(
+                "[STRATEGIC] criterion_link_conflicts fetch failed; continuing"
+            )
+    # Direction ops dropped for invalid criterion_keys in recent completed
+    # cycles (cycle_metadata.rejected_direction_ops) — surfaced so the
+    # strategist sees the exact refusal instead of a silent skip.
+    _rejected_ops_block = _build_rejected_direction_ops(cycle_history, n=5)
     # Pre-spawn effort-classifier inputs: was the prior COMPLETED cycle dirty,
     # and did any of the last 3 cycles fail/stall? Both flag this cycle as a
     # recovery decision rather than a routine heartbeat.
@@ -7866,6 +8092,16 @@ async def _spawn_strategic_review(
             "direction_counts": _direction_counts,
             "max_active_directions": _max_active_directions,
             "directions_summary": direction_stats,
+            **(
+                {"criterion_link_conflicts": _criterion_link_conflicts}
+                if _criterion_link_conflicts
+                else {}
+            ),
+            **(
+                {"rejected_direction_ops": _rejected_ops_block}
+                if _rejected_ops_block
+                else {}
+            ),
             **(
                 {"staged_directions": _staged_directions}
                 if (_staged_directions := _build_staged_directions_summary(project))

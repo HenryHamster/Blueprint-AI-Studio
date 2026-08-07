@@ -82,6 +82,17 @@ def _agent_view_problem_model(pm: dict | None) -> dict:
     # :func:`_build_operator_overrides_summary`) — strip it here so the raw,
     # unbounded ledger is not double-shipped inside problem_model.
     trimmed.pop("rejected_agent_edits", None)
+    # The revision_log is the durable record of every model write, capped at
+    # REVISION_LOG_MAX. It is explicitly NOT for prompt injection — its schema
+    # docstring marks it "Not auto-injected into prompts — accessible via tool
+    # call" — and no strategic-agent code reads it, so shipping it inside
+    # problem_model makes the revision log the largest structurally-redundant
+    # slice of the strategic prompt (measured ~18% of the problem_model
+    # section). Dropping it is non-destructive: apply_agent_update preserves it
+    # unconditionally (proposed.revision_log = current.revision_log) and the
+    # agent can recover it via ./fetch problem-model when it ever needs the
+    # historical deltas.
+    trimmed.pop("revision_log", None)
     gaps = trimmed.get("gaps") or []
     if gaps:
         new_gaps = []

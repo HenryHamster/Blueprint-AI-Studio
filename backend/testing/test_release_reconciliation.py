@@ -982,6 +982,7 @@ from app.release_artifacts import (  # noqa: E402
     AGENT_IMAGE_ARTIFACT_KIND,
     BACKEND_REVISION_ARTIFACT_KIND,
     PROMOTION_MERGE_ARTIFACT_KIND,
+    ReleaseArtifactEvidence,
     ReleaseArtifactProvider,
     SUPERSEDED_BY_DESCENDANT_REASON,
     _previously_deployed_sha,
@@ -3565,6 +3566,71 @@ async def _aggregate_serving_status(db_session, version_id):
     ]
     status, _reason = aggregate_required_artifact_status(rows)
     return status
+
+
+def _timed_out_row(
+    artifact_kind: str, reason_code: str | None
+) -> tuple[ReleaseArtifactProvider, ReleaseArtifactEvidence]:
+    """Build a (provider, evidence) pair for a confirmation_timed_out artifact."""
+    provider = ReleaseArtifactProvider(
+        artifact_kind=artifact_kind, check=_async_noop
+    )
+    evidence = ReleaseArtifactEvidence(
+        artifact_kind=artifact_kind,
+        required=True,
+        serving_status="confirmation_timed_out",
+        served_identifier=None,
+        served_at=None,
+        reason_code=reason_code,
+    )
+    return provider, evidence
+
+
+async def _async_noop(*_args, **_kwargs):  # pragma: no cover - callable shape only
+    return None
+
+
+def test_aggregate_reason_reports_actual_blocking_gate():
+    """When several required artifacts time out together, the aggregate reason
+    must reflect the REAL unsatisfied gate, not registry-first ordering.  A
+    backend ``no_new_revision`` (the registry-first artifact) is a
+    low-information backstop that must not mask a concrete blocker like
+    ``agent_image_fleet_not_yet_serving`` — otherwise a live-serving backend
+    gets mislabeled ``no_new_revision`` and the operator cannot see the fleet
+    gate that is actually blocking confirmation."""
+    rows = [
+        _timed_out_row(BACKEND_REVISION_ARTIFACT_KIND, "no_new_revision"),
+        _timed_out_row(AGENT_IMAGE_ARTIFACT_KIND, "agent_image_fleet_not_yet_serving"),
+        (
+            ReleaseArtifactProvider(
+                artifact_kind=PROMOTION_MERGE_ARTIFACT_KIND, check=_async_noop
+            ),
+            ReleaseArtifactEvidence(
+                artifact_kind=PROMOTION_MERGE_ARTIFACT_KIND,
+                required=True,
+                serving_status="serving_confirmed",
+                served_identifier=None,
+                served_at=None,
+                reason_code=None,
+            ),
+        ),
+    ]
+    status, reason = aggregate_required_artifact_status(rows)
+    assert status == "confirmation_timed_out"
+    # The concrete fleet gate surfaces over the registry-first no_new_revision
+    # backstop — the actual blocker, not the first-timed-out artifact.
+    assert reason == "agent_image_fleet_not_yet_serving"
+
+
+def test_aggregate_reason_falls_back_to_backstop_when_all_no_new_revision():
+    """When every timed-out artifact is the low-information backstop (no more
+    specific signal exists), the aggregate falls back to the first reason
+    rather than inventing one — single-gate and all-backstop cases keep their
+    historical reason."""
+    rows = [_timed_out_row(BACKEND_REVISION_ARTIFACT_KIND, "no_new_revision")]
+    status, reason = aggregate_required_artifact_status(rows)
+    assert status == "confirmation_timed_out"
+    assert reason == "no_new_revision"
 
 
 def test_previously_deployed_sha_uses_prior_when_current_advanced():
@@ -7344,6 +7410,81 @@ async def test_harvest_real_failure_spawns_fix(db_session, mocker):
 
     rerun_mock.assert_not_awaited()
     handle_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_harvest_flake_budget_tristate(db_session, mocker):
+    """``flake_rerun_budget`` is the bound on the live-branch rerun loop.
+
+    ``>0`` re-runs and reports ``flake_rerun`` so the caller can consume budget;
+    ``0`` (budget spent, gate still red) stops re-running and escalates the
+    flake to a fix spawn instead of looping the full matrix forever.
+    """
+    from app.release_reconciliation import _harvest_promotion_ci_failures
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="main"
+    )
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={
+                "status": "completed",
+                "conclusion": "failure",
+                "details": [{"name": "build", "conclusion": "failure"}],
+                "failed_logs": "npm error code ECONNREFUSED registry.npmjs.org",
+                "setup_phase_failure": False,
+                "failed_run_ids": [777],
+            }
+        ),
+    )
+    rerun_mock = mocker.patch(
+        "app.github_checks.rerun_failed_jobs", new=AsyncMock(return_value=True)
+    )
+    mocker.patch(
+        "app.strategic_trigger.request_strategic_refresh",
+        new=AsyncMock(return_value=True),
+    )
+    handle_mock = mocker.patch(
+        "app.auto_remediation._handle_main_branch_ci_failure", new=AsyncMock()
+    )
+
+    kwargs = dict(
+        project_id=_project.id,
+        version_id=version.id,
+        version_number=version.version_number,
+        owner="acme",
+        repo="widget",
+        ci_source_sha="dead" * 10,
+        integration_branch="automain",
+        auto_remediation_config={"enabled": True},
+        selfheal_enabled=True,
+    )
+
+    assert (
+        await _harvest_promotion_ci_failures(**kwargs, flake_rerun_budget=1)
+        == "flake_rerun"
+    )
+    rerun_mock.assert_awaited_once_with("tok", "acme", "widget", 777)
+    handle_mock.assert_not_awaited()
+
+    # Budget exhausted: no further rerun, escalate to the fix path.
+    assert (
+        await _harvest_promotion_ci_failures(**kwargs, flake_rerun_budget=0)
+        == "fix_spawned"
+    )
+    assert rerun_mock.await_count == 1
+    handle_mock.assert_awaited_once()
+
+    # The promotion re-driver entry point (None) is unchanged: hand off, never
+    # rerun the dead release branch's workflow, never spawn a fix.
+    assert await _harvest_promotion_ci_failures(**kwargs) == "flake_handoff"
+    assert rerun_mock.await_count == 1
+    assert handle_mock.await_count == 1
 
 
 # ===========================================================================

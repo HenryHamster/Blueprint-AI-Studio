@@ -24,7 +24,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app import release_version
 from app.database import AsyncSessionLocal
-from app.models import Alert, AlertSeverity
+from app.models import Alert, AlertSeverity, Project
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -199,6 +199,16 @@ _RUBRIC_REDRIVE_STATUSES: frozenset[str] = frozenset(
     {"rubric_changed", "rubric_provenance_unknown"}
 )
 
+# Maximum number of sweep-driven re-launches for a version whose acceptance
+# rubric changed (or could not be reconstructed) mid-flight.  A rubric change
+# invalidates the in-flight attempt — it measured nothing under the final
+# rubric — so a FRESH grade against the CURRENT rubric is always the recovery
+# path.  But a rubric that keeps changing must not spin attempts indefinitely:
+# cap the automatic relaunches so the second rubric-change re-drive (count == 2)
+# raises an operator Alert and halts.  Mirrors ``qualification_triggers._MAX_
+# RUBRIC_REDRIVE_ATTEMPTS`` (the resolver's cap for the read surfaces).
+_MAX_RUBRIC_REDRIVE_ATTEMPTS = 2
+
 # Transient error codes the sweep is allowed to re-drive.  Permanent errors
 # (e.g. project misconfiguration) should not be blindly retried.
 #
@@ -318,6 +328,22 @@ async def _redrive_error_qualification(
                 error_redrive_count = 0
             else:
                 return False
+        # The CI-compliance qualify gate must not be bypassed by a re-drive.  If
+        # the integration HEAD currently breaches the guardrails (per the latest
+        # stored evaluation), defer until a repair lands — the sweep's
+        # ``_recheck_ci_compliance_blocked_version`` keeps re-evaluating.  Uses
+        # the stored record (no fresh GitHub scan under the sweep session); an
+        # empty/stale store fails open to the existing re-drive behavior.
+        from app.strategic_spawning import ci_compliance_qualify_gate
+
+        project = await redrive_session.get(Project, version.project_id)
+        if project is not None and ci_compliance_qualify_gate(project).get("blocked"):
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep: deferring error re-drive for v%d — "
+                "integration HEAD breaches CI-compliance guardrails",
+                version.version_number,
+            )
+            return False
         result = await release_qualifier.run_qualification(
             redrive_session,
             version.project_id,
@@ -637,6 +663,20 @@ async def _redrive_infra_failure_qualification(
                         return False
                 except (ValueError, TypeError):
                     pass  # malformed timestamp → do not gate, allow redrive
+        # Same CI-compliance gate as the error re-driver: never spawn a fresh
+        # qualification while the integration HEAD breaches the guardrails (per
+        # the latest stored evaluation).  The sweep's block re-check re-evaluates
+        # until the guardrail is clean, then this re-drive resumes normally.
+        from app.strategic_spawning import ci_compliance_qualify_gate
+
+        project = await redrive_session.get(Project, version.project_id)
+        if project is not None and ci_compliance_qualify_gate(project).get("blocked"):
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep: deferring infra_failure re-drive for "
+                "v%d — integration HEAD breaches CI-compliance guardrails",
+                version.version_number,
+            )
+            return False
         result = await release_qualifier.run_qualification(
             redrive_session,
             version.project_id,
@@ -654,4 +694,173 @@ async def _redrive_infra_failure_qualification(
         # discard those writes and leave the version in the old infra_failure
         # state.
         await redrive_session.commit()
+        return bool(result and result.get("status") == "spawned")
+
+
+async def _redrive_rubric_changed_qualification(
+    version_id,
+    *,
+    session_factory=None,
+) -> bool:
+    """Auto-relaunch a qualification held because the acceptance rubric changed.
+
+    A mid-flight rubric change (or an unreconstructable launched rubric)
+    records ``last_qualification.status == "rubric_changed"`` /
+    ``"rubric_provenance_unknown"`` and parks the version at phase
+    ``stabilize``: the attempt measured nothing under the final rubric, so a
+    FRESH grade against the CURRENT rubric is always the recovery path.  But
+    nothing scheduled that relaunch — the strategist reads a standing rubric
+    hold as settled, and the auto-trigger executor is knob-gated (``observe``
+    in production) — so a version stranded silently until an operator manually
+    re-requested.  This re-driver is the missing scheduled relaunch.
+
+    It re-enters ``run_qualification`` (with ``auto_trigger=True``, the sweep's
+    sanctioned path for attempt-scoped recovery — NOT by claiming
+    ``explicit_request``) for each open, stabilize-phase version whose
+    ``last_qualification.status`` is a rubric hold, subject to a bounded
+    re-drive cap (``_MAX_RUBRIC_REDRIVE_ATTEMPTS``).  The relaunch is a FRESH
+    attempt (no attempt id is carried forward): the superseded attempt's rubric
+    contract is invalid, so a new snapshot under the current rubric is required.
+
+    The cap counts rubric-change re-drives PERFORMED, tracked in
+    ``last_qualification["rubric_redrive_count"]`` (a per-rubric-episode
+    counter): ``run_qualification`` carries it forward into the pending record
+    and ``_record_rubric_provenance_outcome`` carries it into the next rubric
+    hold, so the cap advances across the spawn→finalize→relaunch cycle.  The
+    counter resets to 0 naturally when a NON-rubric verdict lands (that record
+    carries no counter).  A rubric that keeps changing cannot spin attempts
+    forever: when the cap is hit the re-driver raises an operator Alert (once,
+    deduped on ``rubric_redrive_loop_escalated``) and halts — the explicit
+    operator-actionable state instead of silence.
+
+    A rubric_changed attempt is NEVER scored, ledgered, or counted as a failed
+    attempt — it did not measure anything (``_record_rubric_provenance_outcome``
+    records no category verdicts, no ``QualificationVerdict`` row, and
+    ``compute_promotion_readiness`` excludes rubric holds from its aggregation).
+
+    Commit behavior: COMMIT on every outcome, same as the error/infra re-drivers.
+    ``run_qualification`` writes a new ``last_qualification`` (and bumps
+    ``qualification_attempts``) on every path it takes; rolling back would
+    discard those writes.  The re-drive counter is incremented POST-commit so a
+    failed spawn is NOT counted as a performed re-drive.
+
+    Returns True only when the relaunch actually STARTED a new qualification
+    (``status == "spawned"``).  Any guard no-op or cap hit returns False.
+    """
+    from app import release_qualifier
+
+    factory = session_factory or AsyncSessionLocal
+    async with factory() as redrive_session:
+        # Row-lock the version (same as the infra re-driver) so this autonomous
+        # re-drive serializes against a concurrently-committing explicit
+        # qualification instead of reading a stale rubric marker mid-flight.
+        version = (
+            await redrive_session.execute(
+                select(release_version.ReleaseVersion)
+                .where(release_version.ReleaseVersion.id == version_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if version is None:
+            return False
+        qual = version.last_qualification
+        if (
+            not isinstance(qual, dict)
+            or qual.get("status") not in _RUBRIC_REDRIVE_STATUSES
+            or version.phase != "stabilize"
+        ):
+            return False
+        # Bounded relaunches: a rubric that keeps changing must not spin
+        # attempts indefinitely.  Use the per-rubric-episode counter carried on
+        # last_qualification — NOT the lifetime qualification_attempts column,
+        # which accrues across ALL episodes and would silently block re-drives
+        # for long-lived versions.
+        rubric_redrive_count = int(qual.get("rubric_redrive_count") or 0)
+        if rubric_redrive_count >= _MAX_RUBRIC_REDRIVE_ATTEMPTS:
+            # Raise an operator Alert (once) so the cap is visible.  Guard
+            # against duplicate alerts with a flag on last_qualification.
+            if not qual.get("rubric_redrive_loop_escalated"):
+                alert = Alert(
+                    project_id=version.project_id,
+                    severity=AlertSeverity.ERROR,
+                    title=(
+                        f"Release v{version.version_number} rubric redrive "
+                        f"loop halted"
+                    ),
+                    message=(
+                        f"Release v{version.version_number} has had "
+                        f"{rubric_redrive_count} consecutive rubric-change "
+                        f"re-drive(s) while the acceptance rubric kept "
+                        f"changing — autonomous re-qualification halted. "
+                        f"Stabilize the rubric, then request a fresh "
+                        f"qualification."
+                    ),
+                    event_type="release.qualification_crash_loop",
+                )
+                redrive_session.add(alert)
+                version.last_qualification = {
+                    **qual,
+                    "rubric_redrive_loop_escalated": True,
+                }
+                flag_modified(version, "last_qualification")
+                redrive_session.add(version)
+                await redrive_session.commit()
+                logger.warning(
+                    "[RELEASE_QUALIFIER] sweep: v%d rubric_redrive_count=%d "
+                    "reached cap=%d — raised operator Alert and halted "
+                    "auto-relaunch",
+                    version.version_number,
+                    rubric_redrive_count,
+                    _MAX_RUBRIC_REDRIVE_ATTEMPTS,
+                )
+            return False
+        # The CI-compliance qualify gate must not be bypassed by a re-drive.  If
+        # the integration HEAD currently breaches the guardrails (per the latest
+        # stored evaluation), defer until a repair lands — the sweep's
+        # ``_recheck_ci_compliance_blocked_version`` keeps re-evaluating.  Uses
+        # the stored record (no fresh GitHub scan under the sweep session).
+        from app.strategic_spawning import ci_compliance_qualify_gate
+
+        project = await redrive_session.get(Project, version.project_id)
+        if project is not None and ci_compliance_qualify_gate(project).get("blocked"):
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep: deferring rubric_changed re-drive "
+                "for v%d — integration HEAD breaches CI-compliance guardrails",
+                version.version_number,
+            )
+            return False
+        # A fresh attempt against the CURRENT rubric.  Deliberately NO
+        # qualification_attempt_id: the superseded attempt is invalid and must
+        # not be continued; auto_trigger=True is the sweep's sanctioned path for
+        # attempt-scoped recovery (mirrors the auto-trigger executor's fire).
+        result = await release_qualifier.run_qualification(
+            redrive_session,
+            version.project_id,
+            version,
+            retry_episode=int(qual.get("retry_episode") or 0) + 1,
+            retry_episode_cap=_MAX_RUBRIC_REDRIVE_ATTEMPTS,
+            requested_probes=qual.get("requested_probes"),
+            auto_trigger=True,
+        )
+        # COMMIT on every outcome — do NOT roll back the non-spawned paths.
+        # run_qualification writes a new last_qualification (and bumps
+        # qualification_attempts) on every path it takes; rolling back would
+        # discard those writes and leave the version in the old rubric hold.
+        await redrive_session.commit()
+        # If the relaunch actually STARTED, persist the per-episode re-drive
+        # counter so the cap advances across sweeps.  A non-spawned result is
+        # NOT counted as a performed re-drive.  The pending record already
+        # carries the prior counter (run_qualification stamps it from the prior
+        # record), so the increment survives even if this post-commit write is
+        # lost to a crash.
+        if result and result.get("status") == "spawned":
+            await redrive_session.refresh(version)
+            new_qual = version.last_qualification
+            if isinstance(new_qual, dict):
+                version.last_qualification = {
+                    **new_qual,
+                    "rubric_redrive_count": rubric_redrive_count + 1,
+                }
+                flag_modified(version, "last_qualification")
+                await redrive_session.commit()
         return bool(result and result.get("status") == "spawned")

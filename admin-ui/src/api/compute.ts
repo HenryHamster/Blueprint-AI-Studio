@@ -125,7 +125,10 @@ export async function rerunComputeExperiment(
   });
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
-    const msg = (data?.detail as string | undefined) || `Error ${res.status}`;
+    const msg =
+      (data?.error?.message as string | undefined) ||
+      (data?.detail as string | undefined) ||
+      `Error ${res.status}`;
     throw new Error(msg);
   }
   return res.json();

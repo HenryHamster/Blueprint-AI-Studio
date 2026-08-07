@@ -100,7 +100,7 @@ _READ_ONLY_TASK_TYPES = frozenset({
     "release_audit", "release_audit_challenge", "release_merge_grade",
     "memo", "verify_tests", "compute_experiment", "web_research",
     "design", "repo_bootstrap", "perf",
-    "capability_proof_trial", "walkthrough_e2e",
+    "capability_proof_trial", "criterion_named_test_trial", "walkthrough_e2e",
 })
 
 _ALL_TASK_TYPES = _READ_ONLY_TASK_TYPES | {

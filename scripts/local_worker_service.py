@@ -16,6 +16,7 @@ from pathlib import Path
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 _IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_DEPLOY_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _NETWORK_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$")
 _DATABASE_MODES = frozenset({"cloudsql-proxy", "local-postgres"})
 _LOCAL_POSTGRES_ALIAS = "blueprint-postgres"
@@ -452,17 +453,27 @@ def command() -> tuple[list[str], dict[str, str]]:
             "GOOGLE_APPLICATION_CREDENTIALS": "/var/run/blueprint/gcp.json",
         }
     )
-    forwarded = sorted(
-        _ALLOWED_SECRETS
-        | {
-            "BLUEPRINT_PROCESS_ROLE",
-            "BLUEPRINT_DEPLOYMENT_MODE",
-            "PYTHONDONTWRITEBYTECODE",
-            "HOME",
-            "PORT",
-            "GOOGLE_APPLICATION_CREDENTIALS",
-        }
-    )
+    # The worker is the leader for singleton background services, including the
+    # deploy-state health tick that reconciles DeploymentState.current_sha from
+    # DEPLOY_SHA. Off Cloud Run there is no image-lookup fallback, so without
+    # this the singleton stays "unknown" and post-promotion serving
+    # confirmation reads a stale row forever.
+    deploy_sha = os.environ.get("BLUEPRINT_WORKER_DEPLOY_SHA", "").strip()
+    if deploy_sha:
+        if not _DEPLOY_SHA_RE.fullmatch(deploy_sha):
+            raise ValueError("BLUEPRINT_WORKER_DEPLOY_SHA must be a full git SHA")
+        environment["DEPLOY_SHA"] = deploy_sha
+    runtime_environment = {
+        "BLUEPRINT_PROCESS_ROLE",
+        "BLUEPRINT_DEPLOYMENT_MODE",
+        "PYTHONDONTWRITEBYTECODE",
+        "HOME",
+        "PORT",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+    }
+    if deploy_sha:
+        runtime_environment.add("DEPLOY_SHA")
+    forwarded = sorted(_ALLOWED_SECRETS | runtime_environment)
     argv = [
         "docker",
         "run",

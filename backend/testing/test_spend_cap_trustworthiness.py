@@ -18,6 +18,7 @@ from __future__ import annotations
 from testing.factories import make_project, make_task
 
 from app.llm_cost_attribution import (
+    MIN_TRUSTWORTHY_PROBE_COVERAGE,
     NON_ANTHROPIC_LLM_CONSERVATISM_MULTIPLIER,
     _task_llm_cost_split,
 )
@@ -39,18 +40,18 @@ def _make_task(project_id, *, provider, model, input_tokens, output_tokens,
                with_probe=False, **kw):
     """Create a COMPLETED task with LLM token totals, optionally carrying a
     matching provider-reported probe (for Anthropic reconciliation)."""
-    defaults = dict(
-        project_id=project_id,
-        status=TaskStatus.COMPLETED,
-        context={"pr_merged": True},
-        api_call_summary={
+    defaults = {
+        "project_id": project_id,
+        "status": TaskStatus.COMPLETED,
+        "context": {"pr_merged": True},
+        "api_call_summary": {
             "total_input_tokens": input_tokens,
             "total_output_tokens": output_tokens,
             "llm_call_count": 5,
         },
-        provider=provider,
-        model=model,
-    )
+        "provider": provider,
+        "model": model,
+    }
     if with_probe:
         # No cache sub-counts, so provider input == inclusive api_call_summary input.
         defaults["provider_reported_usage"] = {
@@ -176,7 +177,12 @@ def test_partial_coverage_reports_self_reported_share():
 
 def test_all_non_anthropic_has_zero_coverage():
     """An all-self-reported window reports 0.0 coverage (not None) so the operator
-    can see the figure is entirely unverified."""
+    can see the figure is entirely unverified.
+
+    Zero coverage means the Anthropic probe (the only independent component) was
+    verified against NOTHING — the weighted figure is a conservative bound, but
+    it is NOT a trustworthy verdict from zero evidence.
+    """
     pid = make_project().id
     tasks = [_openai_task(pid), _openai_task(pid)]
 
@@ -184,17 +190,131 @@ def test_all_non_anthropic_has_zero_coverage():
 
     assert verdict["coverage_fraction"] == 0.0
     assert verdict["non_anthropic_share"] == 1.0
-    # Still a conservative upper bound, so still 'trustworthy' as a ceiling.
+    # Still a conservative upper bound...
     assert verdict["conservative_upper_bound"] is True
+    # ...but NOT trustworthy: no task carried an independent probe.
+    assert verdict["provider_reported_verified"] is False
+    assert verdict["trustworthy"] is False
+    assert (
+        verdict["reason"]
+        == "no task carried provider-reported usage — nothing independently verified"
+    )
 
 
 def test_empty_task_set_coverage_is_none():
-    """No tasks → coverage_fraction is None and totals are zero."""
+    """No tasks → coverage_fraction is None and totals are zero.
+
+    An empty window verified nothing, so it must not report trustworthy.
+    """
     verdict = assess_ceiling_gate_trustworthiness([])
     assert verdict["coverage_fraction"] is None
     assert verdict["total"] == 0.0
     assert verdict["ceiling_gate_total"] == 0.0
     assert verdict["conservative_upper_bound"] is True
+    assert verdict["provider_reported_verified"] is False
+    assert verdict["trustworthy"] is False
+
+
+def test_mixed_probe_coverage_is_trustworthy_when_all_probed_reconcile():
+    """A mixed window where the probed Anthropic tasks reconcile within tolerance
+    IS trustworthy despite partial coverage — the non-Anthropic share is buffered
+    and the independent portion was genuinely verified."""
+    pid = make_project().id
+    tasks = [_anthropic_task(pid), _openai_task(pid)]
+
+    verdict = assess_ceiling_gate_trustworthiness(tasks)
+
+    assert verdict["coverage_fraction"] == 0.5
+    assert verdict["provider_reported_verified"] is True
+    assert verdict["provider_reported_within_tolerance"] is True
+    assert verdict["coverage_sufficient"] is True
+    assert verdict["trustworthy"] is True
+
+
+# ── Probe-coverage gate (e) ────────────────────────────────────────────────
+
+
+def test_thin_probe_coverage_is_not_trustworthy():
+    """A window with ~10% probe coverage must NOT report trustworthy.
+
+    ``provider_reported_verified`` only proves SOMETHING was independently
+    checked; one probed task out of ten still lets the gate claim to be a
+    conservative upper bound on real spend. Coverage must be sufficient too —
+    the operator's billing export shows internal attribution capturing only
+    ~22-25% of real DeepSeek spend, so a verdict certified from a thin probe
+    slice is exactly the false confidence that let a ~10% sampled run pass.
+    """
+    pid = make_project().id
+    tasks = [_anthropic_task(pid)] + [_openai_task(pid) for _ in range(9)]
+
+    verdict = assess_ceiling_gate_trustworthiness(tasks)
+
+    assert verdict["coverage_fraction"] == 0.1
+    assert verdict["provider_reported_verified"] is True
+    assert verdict["provider_reported_within_tolerance"] is True
+    assert verdict["coverage_sufficient"] is False
+    assert verdict["min_coverage_fraction"] == MIN_TRUSTWORTHY_PROBE_COVERAGE
+    assert verdict["trustworthy"] is False
+    assert "coverage" in verdict["reason"].lower()
+    assert "below" in verdict["reason"].lower()
+
+
+def test_coverage_threshold_parameter_raises_requirement():
+    """A window that passes the default bar can still fail a stricter one."""
+    pid = make_project().id
+    # 1 probed Anthropic task of 2 → 50% coverage, exactly at the default bar.
+    tasks = [_anthropic_task(pid), _openai_task(pid)]
+
+    default_verdict = assess_ceiling_gate_trustworthiness(tasks)
+    assert default_verdict["coverage_sufficient"] is True
+    assert default_verdict["trustworthy"] is True
+
+    strict_verdict = assess_ceiling_gate_trustworthiness(
+        tasks, min_coverage_fraction=0.9
+    )
+    assert strict_verdict["coverage_sufficient"] is False
+    assert strict_verdict["min_coverage_fraction"] == 0.9
+    assert strict_verdict["trustworthy"] is False
+    assert "coverage" in strict_verdict["reason"].lower()
+
+
+# ── Buffer-adequacy gate (f) ───────────────────────────────────────────────
+
+
+def test_buffer_adequate_fails_when_measured_capture_below_multiplier():
+    """A measured capture ratio the flat buffer cannot cover must fail.
+
+    The operator's billing export shows internal attribution capturing only
+    ~22-25% of real DeepSeek spend; a 1.25x buffer cannot absorb a ~4x
+    under-count, so the verdict must not certify the gate as a conservative
+    upper bound.
+    """
+    pid = make_project().id
+    tasks = [_anthropic_task(pid), _openai_task(pid)]
+
+    verdict = assess_ceiling_gate_trustworthiness(
+        tasks, provider_capture_fractions={"deepseek": 0.25}
+    )
+
+    assert verdict["buffer_adequate"] is False
+    assert verdict["min_provider_capture_fraction"] == 0.25
+    assert verdict["coverage_sufficient"] is True
+    assert verdict["trustworthy"] is False
+    assert "capture" in verdict["reason"].lower()
+
+
+def test_buffer_adequate_passes_when_capture_covered():
+    """A capture ratio inside the buffer's reach keeps the verdict green."""
+    pid = make_project().id
+    tasks = [_anthropic_task(pid), _openai_task(pid)]
+
+    verdict = assess_ceiling_gate_trustworthiness(
+        tasks, provider_capture_fractions={"deepseek": 0.9}
+    )
+
+    assert verdict["buffer_adequate"] is True
+    assert verdict["min_provider_capture_fraction"] == 0.9
+    assert verdict["trustworthy"] is True
 
 
 # ── Confidence label transitions ───────────────────────────────────────────

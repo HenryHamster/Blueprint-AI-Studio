@@ -144,7 +144,6 @@ from app.strategic_constants import (
 )
 from app.task_capabilities import (
     STRATEGIC_TASK_TYPES,
-    STRATEGIST_CONTEXTUAL_TASK_TYPES,
     STRATEGIST_SPAWNABLE_TASK_TYPES,
 )
 from app.strategic_spawn_requests import (
@@ -4076,15 +4075,29 @@ async def strategic_operation(
                 detail="project is paused; strategic spawning is disabled",
             )
         spawn_type = data.get("type")
-        allowed_spawn_types = (
-            STRATEGIST_SPAWNABLE_TASK_TYPES | STRATEGIST_CONTEXTUAL_TASK_TYPES
-        )
-        if spawn_type not in allowed_spawn_types:
+        # ``fix`` is intentionally NOT strategist-spawnable: it requires an
+        # immutable PR target (pr_number + branch) that the normal review
+        # pipeline binds into review_loop.fix_target / reviewed_head_sha before
+        # execution. The strategist cannot resolve that binding at spawn, so a
+        # spawn here would only be cancelled at the PR-execution fence. Reject it
+        # loudly and route existing-PR work through the normal pipeline instead.
+        if spawn_type == "fix":
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "fix is not spawnable via spawn_task: it needs a live-PR "
+                    "target (pr_number + branch) resolved by the normal review "
+                    "pipeline, which the strategist cannot bind at spawn. Route "
+                    "existing-PR work through direction → research → plan → "
+                    "create instead."
+                ),
+            )
+        if spawn_type not in STRATEGIST_SPAWNABLE_TASK_TYPES:
             raise HTTPException(
                 status_code=400,
                 detail=(
                     "spawn_task type must be one of "
-                    f"{sorted(allowed_spawn_types)}; got '{spawn_type}'"
+                    f"{sorted(STRATEGIST_SPAWNABLE_TASK_TYPES)}; got '{spawn_type}'"
                 ),
             )
         raw_prompt = str(data.get("prompt", "")).strip()
@@ -4171,15 +4184,6 @@ async def strategic_operation(
             "title": title,
             "base_branch": _get_project_integration_branch(project),
         }
-        if spawn_type in STRATEGIST_CONTEXTUAL_TASK_TYPES:
-            for context_field in (
-                "pr_number",
-                "branch",
-                "original_task_id",
-                "original_prompt",
-            ):
-                if data.get(context_field) is not None:
-                    spawn_payload[context_field] = data[context_field]
         if direction_id:
             spawn_payload["direction_id"] = direction_id
 

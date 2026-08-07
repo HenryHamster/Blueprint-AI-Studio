@@ -18,6 +18,209 @@ interface RepoOption {
 // contract endpoint instead of the generic POST /api/admin/tasks.
 export const COMPUTE_EXPERIMENT_TASK_TYPE = 'compute_experiment';
 
+// Code-producing task payload types — mirrors backend payload_schemas
+// _CODE_PRODUCING_TASK_TYPES. The backend hard-requires an acceptance_evidence
+// declaration on these at authoring time (validate_task_payload with
+// require_acceptance_evidence=True), so the operator launcher must collect and
+// send one; a code payload submitted without it is rejected with a 422.
+export const CODE_PRODUCING_TASK_TYPES: readonly string[] = [
+  'create', 'fix', 'refactor', 'qa', 'migrate', 'deps', 'docs',
+];
+
+export function isCodeProducingTaskType(taskType: string): boolean {
+  return CODE_PRODUCING_TASK_TYPES.includes(taskType);
+}
+
+// Acceptance-evidence kind options rendered by the New Task modal, mirroring the
+// backend AcceptanceEvidence kind vocabulary (payload_schemas.py).
+export const ACCEPTANCE_EVIDENCE_KINDS = [
+  { value: 'named_test', label: 'Named test', description: 'A test that exercises the changed seam' },
+  { value: 'observable_behavior', label: 'Observable behavior', description: 'A behavior to verify' },
+  { value: 'downstream_artifact', label: 'Downstream artifact', description: 'An artifact a later task consumes' },
+  { value: 'visual', label: 'Visual', description: 'Before/after screenshot' },
+  { value: 'coverage_delta', label: 'Coverage delta', description: 'Coverage percentage improvement' },
+] as const;
+
+export type AcceptanceEvidenceKind = typeof ACCEPTANCE_EVIDENCE_KINDS[number]['value'];
+
+// Operator-facing form state for the acceptance_evidence declaration, held as
+// strings (raw input) and validated/coerced at submit time — mirroring the
+// compute_experiment contract form pattern.
+export interface AcceptanceEvidenceForm {
+  kind: AcceptanceEvidenceKind;
+  testPath: string;
+  testId: string;
+  description: string;
+  artifactId: string;
+  component: string;
+  viewportWidth: string;
+  assertionType: string;
+  threshold: string;
+}
+
+export function defaultAcceptanceEvidenceForm(): AcceptanceEvidenceForm {
+  return {
+    kind: 'named_test',
+    testPath: '',
+    testId: '',
+    description: '',
+    artifactId: '',
+    component: '',
+    viewportWidth: '375',
+    assertionType: '',
+    threshold: '',
+  };
+}
+
+// Light mirror of the backend test-file heuristic (payload_schemas
+// _looks_like_test_file): a path under a tests/testing-style directory OR a
+// basename matching the repo's test-file naming, with a real extension. Used to
+// guide the operator before round-tripping a doomed declaration.
+const TEST_DIR_SEGMENTS = new Set(['tests', 'testing', 'test', '__tests__', '__test__', 'spec']);
+const TEST_FILE_BASENAME_RE = /^(?:test_.*\.py|.*_test\.py|.*\.test\.[cm]?[jt]sx?|.*\.spec\.[cm]?[jt]sx?|.*_test\.go|.*_test\.exs?|.*_spec\.rb|test_.*\.rb)$/;
+
+export function looksLikeTestFile(path: string): boolean {
+  const candidate = path.trim();
+  if (!candidate) return false;
+  const segments = candidate.replace(/\\/g, '/').split('/').filter(Boolean);
+  if (segments.length === 0) return false;
+  const basename = segments[segments.length - 1];
+  if (!basename.includes('.')) return false;
+  const inTestDir = segments.slice(0, -1).some(seg => TEST_DIR_SEGMENTS.has(seg.toLowerCase()));
+  const nameMatches = TEST_FILE_BASENAME_RE.test(basename.toLowerCase());
+  return inTestDir || nameMatches;
+}
+
+// Mirror of the backend _TRIVIAL_EVIDENCE_TOKENS (payload_schemas.py): tokens
+// the backend rejects as always-true placeholders. Kept in sync so a doomed
+// declaration is caught inline instead of round-tripping a 422.
+const TRIVIAL_EVIDENCE_TOKENS = new Set([
+  'test', 'test_true', 'test_truth', 'test_always_true', 'always_true',
+  'assert true', 'assert_true', 'asserttrue', 'assert true == true',
+  'true', 'pass', 'test_pass', 'noop', 'test_noop', 'placeholder',
+  'test_placeholder', 'dummy', 'test_dummy', 'todo', 'tbd', 'n/a', 'na', 'none',
+]);
+
+// Mirrors _normalize_evidence_token: trim, lowercase, collapse whitespace.
+function isTrivialEvidence(value: string): boolean {
+  return TRIVIAL_EVIDENCE_TOKENS.has(value.trim().toLowerCase().replace(/\s+/g, ' '));
+}
+
+// Mirrors the backend _split_test_reference / _check_kind_shape partition: the
+// operator may embed the node id inline as `path::test_fn`, so the test-file
+// heuristic applies to the PATH part only.
+function splitTestReference(value: string): { path: string; nodeRef: string } {
+  const [path, ...rest] = value.split('::');
+  return { path: path.trim(), nodeRef: rest.join('::').trim() };
+}
+
+// Client-side mirror of the backend AcceptanceEvidence._check_kind_shape rules.
+// Returns null when the declaration is valid, else an actionable message shown
+// inline so a code-producing submission is never sent with a partial field.
+export function validateAcceptanceEvidenceForm(form: AcceptanceEvidenceForm): string | null {
+  switch (form.kind) {
+    case 'named_test': {
+      const { path, nodeRef } = splitTestReference(form.testPath);
+      if (!looksLikeTestFile(path)) {
+        return 'Name a real test file (e.g. tests/test_foo.py or src/foo.test.ts) that exercises the change.';
+      }
+      for (const ref of [nodeRef, form.testId.trim()]) {
+        if (ref && isTrivialEvidence(ref)) {
+          return `Test reference "${ref}" is a placeholder — name a real test target (e.g. test_rate_limiter_locks_account).`;
+        }
+      }
+      return null;
+    }
+    case 'observable_behavior':
+      if (form.description.trim().length < 10) {
+        return 'Describe the observable behavior to verify (at least 10 characters).';
+      }
+      return null;
+    case 'downstream_artifact':
+      if (!form.artifactId.trim()) {
+        return 'Name the downstream artifact a later task consumes (e.g. gs://bucket/path or a job id).';
+      }
+      return null;
+    case 'visual': {
+      const width = Number(form.viewportWidth);
+      if (!form.component.trim()) {
+        return 'Name the UI component to capture.';
+      }
+      if (!Number.isInteger(width) || width < 1 || width > 4096) {
+        return 'Viewport width must be an integer between 1 and 4096.';
+      }
+      return null;
+    }
+    case 'coverage_delta': {
+      const threshold = Number(form.threshold);
+      if (!Number.isFinite(threshold) || threshold < 0 || threshold > 100) {
+        return 'Coverage threshold must be a number between 0 and 100.';
+      }
+      return null;
+    }
+    default:
+      return 'Select an acceptance-evidence kind.';
+  }
+}
+
+// Build the wire shape from the form; returns null when the declaration is
+// incomplete so a code-producing submission is blocked rather than sent with a
+// partial field (the backend would reject it with a 422).
+export function buildAcceptanceEvidence(form: AcceptanceEvidenceForm): Record<string, unknown> | null {
+  if (validateAcceptanceEvidenceForm(form) !== null) return null;
+  switch (form.kind) {
+    case 'named_test': {
+      const evidence: Record<string, unknown> = { kind: 'named_test', test_path: form.testPath.trim() };
+      const testId = form.testId.trim();
+      if (testId) evidence.test_id = testId;
+      return evidence;
+    }
+    case 'observable_behavior':
+      return { kind: 'observable_behavior', description: form.description.trim() };
+    case 'downstream_artifact':
+      return { kind: 'downstream_artifact', artifact_id: form.artifactId.trim() };
+    case 'visual': {
+      const evidence: Record<string, unknown> = {
+        kind: 'visual',
+        component: form.component.trim(),
+        viewport_width: Number(form.viewportWidth),
+      };
+      const assertionType = form.assertionType.trim();
+      if (assertionType) evidence.assertion_type = assertionType;
+      return evidence;
+    }
+    case 'coverage_delta':
+      return { kind: 'coverage_delta', threshold: Number(form.threshold) };
+    default:
+      return null;
+  }
+}
+
+// Rehydrate the form from a stored task payload's acceptance_evidence dict.
+export function acceptanceEvidenceFormFromPayload(raw: unknown): AcceptanceEvidenceForm {
+  const base = defaultAcceptanceEvidenceForm();
+  if (!raw || typeof raw !== 'object') return base;
+  const ae = raw as Record<string, unknown>;
+  const kind = ae.kind;
+  if (
+    kind !== 'named_test' && kind !== 'observable_behavior' && kind !== 'downstream_artifact'
+    && kind !== 'visual' && kind !== 'coverage_delta'
+  ) {
+    return base;
+  }
+  return {
+    kind,
+    testPath: typeof ae.test_path === 'string' ? ae.test_path : '',
+    testId: typeof ae.test_id === 'string' ? ae.test_id : '',
+    description: typeof ae.description === 'string' ? ae.description : '',
+    artifactId: typeof ae.artifact_id === 'string' ? ae.artifact_id : '',
+    component: typeof ae.component === 'string' ? ae.component : '',
+    viewportWidth: typeof ae.viewport_width === 'number' ? String(ae.viewport_width) : '375',
+    assertionType: typeof ae.assertion_type === 'string' ? ae.assertion_type : '',
+    threshold: typeof ae.threshold === 'number' ? String(ae.threshold) : '',
+  };
+}
+
 // Operator-facing form state for the compute_experiment launch contract. Held
 // as strings (raw input) and validated/coerced at submit time, mirroring how
 // the PR-number field is kept as a string. The success-criterion sub-fields are
@@ -151,6 +354,13 @@ export function useTaskModal(
   // newTaskType === 'compute_experiment'; otherwise inert.
   const [computeExperiment, setComputeExperiment] =
     useState<ComputeExperimentForm>(defaultComputeExperimentForm);
+
+  // acceptance_evidence declaration state. Only consumed when newTaskType is a
+  // code-producing type (create / fix / refactor / migrate / ...); otherwise
+  // inert. The backend hard-requires this field on those types, so the modal
+  // collects it and handleCreateTask refuses to submit without a valid one.
+  const [acceptanceEvidence, setAcceptanceEvidence] =
+    useState<AcceptanceEvidenceForm>(defaultAcceptanceEvidenceForm);
 
   // Draft provenance — lifted from NewTaskModal so the hook can include them in
   // the launch request without prop threading through submit.
@@ -412,6 +622,7 @@ export function useTaskModal(
     setBranchOptions([]);
     setBranchError(null);
     setComputeExperiment(defaultComputeExperimentForm());
+    setAcceptanceEvidence(defaultAcceptanceEvidenceForm());
     setCameFromDraft(false);
     restoreDraft();
     fetchRepoOptions();
@@ -624,6 +835,21 @@ export function useTaskModal(
         return;
       }
     }
+    // Code-producing task types hard-require an acceptance_evidence declaration
+    // (backend validate_task_payload). Build + validate it client-side so a
+    // submission without a valid declaration is blocked with an actionable
+    // inline message instead of round-tripping a doomed 422.
+    let acceptanceEvidencePayload: Record<string, unknown> | null = null;
+    if (isCodeProducingTaskType(newTaskType)) {
+      acceptanceEvidencePayload = buildAcceptanceEvidence(acceptanceEvidence);
+      if (acceptanceEvidencePayload === null) {
+        addToast(
+          'Acceptance evidence is required for code-producing tasks — describe what would prove this change worked (e.g. a named test).',
+          'error',
+        );
+        return;
+      }
+    }
     try {
       const res = await fetch(`${API_BASE_URL}/api/admin/tasks`, {
         method: 'POST',
@@ -638,14 +864,16 @@ export function useTaskModal(
             pr_number: parseInt(newTaskPrNumber, 10),
             branch: normalizedPrBranch || undefined,
           } : {}),
+          ...(acceptanceEvidencePayload ? { acceptance_evidence: acceptanceEvidencePayload } : {}),
           ...(newTaskModel ? { model: newTaskModel } : {}),
           ...(newTaskEffort ? { effort: newTaskEffort } : {}),
         }),
       });
       if (!res.ok) {
         const errData = await res.json();
-        addToast(`Failed to create task: ${errData?.detail || errData?.error?.message || res.statusText}`, 'error');
-        return;
+        // Propagate the server's actual reason so the NewTaskModal can render it
+        // inline (a blanket 'Invalid request' hides the diagnosis).
+        throw new Error(errData?.detail || errData?.error?.message || res.statusText);
       }
       setShowNewTaskModal(false);
       setNewTaskTitle('');
@@ -656,8 +884,10 @@ export function useTaskModal(
       addToast('Task created successfully', 'success');
       fetchTasksRef.current();
     } catch (error) {
+      const message = error instanceof Error ? error.message : 'unknown error';
       console.error('Failed to create task:', error);
-      addToast('Failed to create task', 'error');
+      addToast(`Failed to create task: ${message}`, 'error');
+      throw error;
     }
   };
 
@@ -694,6 +924,7 @@ export function useTaskModal(
     setUseManualBranch(false);
     setBranchOptions([]);
     setBranchError(null);
+    setAcceptanceEvidence(defaultAcceptanceEvidenceForm());
     fetchRepoOptions();
     fetchLaunchableTaskTypeOptions();
     if (repo) fetchBranchOptions(repo);
@@ -799,6 +1030,9 @@ export function useTaskModal(
     } else {
       setComputeExperiment(defaultComputeExperimentForm());
     }
+    // Carry the source task's declared acceptance evidence into the clone so a
+    // duplicated code-producing task does not start from a blank declaration.
+    setAcceptanceEvidence(acceptanceEvidenceFormFromPayload(payload.acceptance_evidence));
 
     fetchRepoOptions();
     fetchLaunchableTaskTypeOptions();
@@ -813,6 +1047,7 @@ export function useTaskModal(
     setNewTaskRepo, setNewTaskBranch, setNewTaskTitle, setNewTaskPrompt,
     setNewTaskType, setNewTaskPrNumber, setNewTaskPrBranch, setNewTaskModel, setNewTaskEffort,
     computeExperiment, setComputeExperiment,
+    acceptanceEvidence, setAcceptanceEvidence,
     ideaText, setIdeaText, draftNotes, setDraftNotes, cameFromDraft, onDraftApplied,
     preflightResult, preflightLoading, preflightError,
     repoOptions, repoLoading, repoError, useManualRepo, setUseManualRepo,

@@ -1081,6 +1081,10 @@ describe('writeCheckHelper — required backend-authoring verification', () => {
       ruffExit: number; docker: boolean; harnessExit: number; skipped?: number;
       changedPath?: string; changedPaths?: string[]; missingPaths?: string[];
       harnessPath?: string;
+      /** Whether the baked sandbox interpreter exists (defaults to `docker`). */
+      sandboxPython?: boolean;
+      /** Whether a usable PostgreSQL server bindir exists (defaults to `docker`). */
+      pgBindir?: 'present' | 'missing';
     },
   ): Promise<{
     status: number;
@@ -1124,6 +1128,18 @@ describe('writeCheckHelper — required backend-authoring verification', () => {
       const changedPaths = scenario.changedPaths ?? [scenario.changedPath ?? 'backend/x.py'];
       const missingPaths = new Set(scenario.missingPaths ?? []);
       const harnessPath = scenario.harnessPath ?? 'scripts/test-backend.sh';
+      // The gate now requires BOTH a usable PostgreSQL server bindir AND the
+      // baked sandbox interpreter before selecting --sandbox-postgres. The
+      // runtime mock cannot write /opt, so model the baked venv inside the
+      // sandbox dir and pin BLUEPRINT_SANDBOX_PYTHON to it in the exec env.
+      const pgBindirPresent = scenario.pgBindir ?? scenario.docker;
+      const sandboxPythonPresent = scenario.sandboxPython ?? scenario.docker;
+      const sandboxPythonDir = realPath.join(dir, 'sandbox-venv', 'bin');
+      const sandboxPythonPath = realPath.join(sandboxPythonDir, 'python');
+      if (sandboxPythonPresent) {
+        realFs.mkdirSync(sandboxPythonDir, { recursive: true });
+        realFs.writeFileSync(sandboxPythonPath, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      }
       realFs.mkdirSync(bin, { recursive: true });
       realFs.mkdirSync(realPath.join(dir, 'backend', 'testing'), { recursive: true });
       realFs.mkdirSync(realPath.join(dir, 'scripts'), { recursive: true });
@@ -1164,7 +1180,7 @@ exec "${realPython}" "$@"
       realFs.writeFileSync(realPath.join(bin, 'npm'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
       realFs.writeFileSync(
         realPath.join(bin, 'pg_config'),
-        `#!/bin/sh\n[ "$1" = "--bindir" ] && echo "${scenario.docker ? posix(bin) : '/missing/postgres/bin'}"\n`,
+        `#!/bin/sh\n[ "$1" = "--bindir" ] && echo "${pgBindirPresent ? posix(bin) : '/missing/postgres/bin'}"\n`,
         { mode: 0o755 },
       );
       realFs.writeFileSync(realPath.join(bin, 'initdb'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
@@ -1197,6 +1213,14 @@ exit ${scenario.harnessExit}
             WORKSPACE: posix(dir),
             LOGFILE: posix(logPath),
             HOME: process.env.HOME ?? '',
+            // Pin the baked-sandbox-interpreter path to a deterministic
+            // location inside this sandbox (the runtime mock cannot write /opt):
+            // when sandboxPython is present the shim exists so the
+            // --sandbox-postgres branch is reachable; when absent the env var
+            // points at a missing file so the gate deterministically falls
+            // through to --postgres / fail-closed regardless of whether this
+            // host happens to have /opt/blueprint-backend-venv installed.
+            BLUEPRINT_SANDBOX_PYTHON: posix(sandboxPythonPath),
           },
           encoding: 'utf8',
           stdio: ['ignore', 'pipe', 'pipe'],
@@ -1341,6 +1365,65 @@ exit ${scenario.harnessExit}
     expect(result.status, result.stdout).not.toBe(0);
     expect(result.receipt).toBeUndefined();
     expect(result.stdout).toContain('FAIL');
+  });
+  it('runtime: baked sandbox venv + PG bindir select --sandbox-postgres without Docker', async () => {
+    const result = await runRequiredCheck(await render(), {
+      ruffExit: 0,
+      docker: false,
+      harnessExit: 0,
+      pgBindir: 'present',
+      sandboxPython: true,
+    });
+    expect(result.status, result.stdout).toBe(0);
+    expect(result.log).toContain(
+      'harness USE_TEST_POSTGRES=true --sandbox-postgres testing/test_x.py',
+    );
+    expect(result.receipt).toMatchObject({
+      pytest: {
+        selectors: ['testing/test_x.py'],
+        targeted: true,
+        use_test_postgres: true,
+        postgres_sidecar: true,
+        skipped: 0,
+        exit_code: 0,
+      },
+    });
+  });
+  it('runtime: PG bindir present but baked venv missing falls back to the Docker --postgres sidecar', async () => {
+    const result = await runRequiredCheck(await render(), {
+      ruffExit: 0,
+      docker: true,
+      harnessExit: 0,
+      pgBindir: 'present',
+      sandboxPython: false,
+    });
+    expect(result.status, result.stdout).toBe(0);
+    expect(result.log).toContain(
+      'harness USE_TEST_POSTGRES=true --postgres testing/test_x.py',
+    );
+    expect(result.log).not.toContain('--sandbox-postgres');
+    expect(result.receipt).toMatchObject({
+      pytest: {
+        selectors: ['testing/test_x.py'],
+        targeted: true,
+        use_test_postgres: true,
+        postgres_sidecar: true,
+        skipped: 0,
+        exit_code: 0,
+      },
+    });
+  });
+  it('runtime: PG bindir present but baked venv missing and no Docker fails closed', async () => {
+    const result = await runRequiredCheck(await render(), {
+      ruffExit: 0,
+      docker: false,
+      harnessExit: 0,
+      pgBindir: 'present',
+      sandboxPython: false,
+    });
+    expect(result.status, result.stdout).not.toBe(0);
+    expect(result.stdout).toContain('PostgreSQL runtime unavailable');
+    expect(result.receipt).toBeUndefined();
   });
 });
 
@@ -1503,6 +1586,7 @@ describe('writeCheckHelper — ci_failure selector verify gate (runtime)', () =>
   const runCheck = async (
     script: string,
     scenario: { harnessExit: number; docker: boolean },
+    gitShim?: string,
   ): Promise<{ status: number; stdout: string; log: string }> => {
     const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
     const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
@@ -1517,7 +1601,9 @@ describe('writeCheckHelper — ci_failure selector verify gate (runtime)', () =>
       realFs.mkdirSync(realPath.join(dir, 'scripts'), { recursive: true });
       realFs.mkdirSync(realPath.join(dir, 'backend', 'testing'), { recursive: true });
       // git shim: valid repo whose diff vs origin/main touched backend/x.py.
-      realFs.writeFileSync(realPath.join(bin, 'git'), `#!/bin/sh
+      // A caller-supplied shim replaces it (e.g. to simulate the base diff
+      // source being UNAVAILABLE so the gate must fail closed).
+      realFs.writeFileSync(realPath.join(bin, 'git'), gitShim ?? `#!/bin/sh
 case "$*" in
   *"rev-parse --git-dir"*) echo .git; exit 0 ;;
   *"rev-parse --verify origin/main"*) exit 0 ;;
@@ -1625,6 +1711,67 @@ esac
     expect(r.stdout).toContain('Docker unavailable');
     expect(r.stdout).toContain('PASS — all checks green');
   });
+
+  it('check gate fails closed when the base diff source is unavailable', async () => {
+    const script = await selfRepoCheck(['testing/test_x.py::test_y'], 'rt-nobase');
+    // The generated script must carry the fail-closed guard.
+    expect(script).toContain('BASE_DIFF_OK');
+    expect(script).toContain('base diff unavailable');
+    // A valid repo whose base ref (origin/main AND main) does NOT exist — the
+    // cold-clone scenario where the diff source is unavailable. Every git
+    // invocation except the repo sanity check fails, so CHANGED can never be
+    // computed. This used to swallow the error and exit PASS having run nothing.
+    const noBaseShim = `#!/bin/sh
+case "$*" in
+  *"rev-parse --git-dir"*) echo .git; exit 0 ;;
+  *) exit 1 ;;
+esac
+`;
+    const r = await runCheck(script, { harnessExit: 1, docker: false }, noBaseShim);
+    // Fail closed, loudly: a silently-empty CHANGED must not read as "PASS".
+    expect(r.status).not.toBe(0);
+    expect(r.stdout).toContain('base diff source unavailable');
+    expect(r.stdout).toContain('FAIL');
+    expect(r.stdout).not.toContain('PASS — all checks green');
+  });
+
+  it('generated check repairs a shallow clone before failing the base-diff gate', async () => {
+    const script = await selfRepoCheck([], 'rt-repair');
+    // The generated script must carry the shallow-clone repair: deepen a
+    // truncated clone, unshallow, and — the decisive step — fetch the base ref
+    // with the EXPLICIT refspec so refs/remotes/origin/main actually exists in a
+    // single-branch shallow clone (a plain `git fetch origin main` there only
+    // updates FETCH_HEAD, leaving origin/main unresolvable and the gate wedged).
+    expect(script).toContain('git fetch --deepen=200 origin "$BASE"');
+    expect(script).toContain('git fetch --unshallow origin');
+    expect(script).toContain('git fetch origin "$BASE":refs/remotes/origin/$BASE');
+    // The base refs do NOT resolve on this (shallow) clone, and only the
+    // explicit-refspec fetch creates the tracking ref — so a regression back to
+    // the plain fetch form (which never touches .shim_refspec_fetched) fails the
+    // re-verify and re-wedges the gate. Every other git call is inert.
+    const repairShim = `#!/bin/sh
+case "$*" in
+  *"rev-parse --git-dir"*) echo .git; exit 0 ;;
+  *"rev-parse --verify origin/main"*|*"rev-parse --verify main"*)
+    [ -f "$WORKSPACE/.shim_refspec_fetched" ] && exit 0 || exit 1 ;;
+  *"diff --name-only origin/main...HEAD"*) printf '%s\\n' 'backend/x.py'; exit 0 ;;
+  *"fetch --deepen=200"*) exit 0 ;;
+  *"fetch --unshallow"*) exit 0 ;;
+  *"fetch origin main:refs/remotes/origin/main"*) touch "$WORKSPACE/.shim_refspec_fetched"; exit 0 ;;
+  *) exit 0 ;;
+esac
+`;
+    const r = await runCheck(script, { harnessExit: 0, docker: false }, repairShim);
+    // The repair turned a would-be fail-closed gate (base refs absent) into a
+    // genuine green run scoped to the repaired diff. The "skipping ruff" line
+    // only appears inside `if touches backend/` — so it proves CHANGED carried
+    // the repaired backend/x.py diff (a failed repair would leave CHANGED empty
+    // and the whole backend stack block skipped, then fail closed).
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('PASS — all checks green');
+    expect(r.stdout).not.toContain('base diff source unavailable');
+    expect(r.stdout).toContain('skipping ruff');
+  });
 });
 
 // ── impacted-test merge-time gate ────────────────────────────────────────────
@@ -1636,7 +1783,7 @@ esac
 // blocks ./pr open instead of leaking to the promotion-PR full matrix. The set
 // is derived from $CHANGED via the committed reverse-dep resolver
 // (backend/testing/impacted_tests.py), invoked BY REFERENCE (no embedded Python
-// heredoc, per CLAUDE.md), capped, with overflow deferred-to-CI, and degrading
+// heredoc, per CLAUDE.md), capped, with overflow deferred-unverified, and degrading
 // gracefully (GATE-ENVIRONMENT marker, non-blocking) when Docker is absent.
 describe('writeCheckHelper — impacted-test merge-time gate', () => {
   let capturedScripts: Record<string, string> = {};
@@ -1665,11 +1812,13 @@ describe('writeCheckHelper — impacted-test merge-time gate', () => {
     // committed resolver, invoked BY REFERENCE (no embedded Python heredoc).
     expect(script).toContain('impacted-test merge-time gate');
     expect(script).toContain('python3 backend/testing/impacted_tests.py');
-    // Capped run, overflow deferred to CI (never silently dropped).
+    // Capped run, overflow logged as unverified (never silently dropped).
     expect(script).toContain('IMPACTED_TEST_CAP=8');
     expect(script).toContain('IMPACTED_RESOLVER_TIMEOUT_SECS=30');
     expect(script).toContain('IMPACTED_GATE_TIMEOUT_SECS=120');
-    expect(script).toContain('deferred-to-CI:');
+    expect(script).toContain('deferred-unverified:');
+    // Overflow is NOT covered by this gate or automain PR CI — the old "CI verifies the rest" claim must not return.
+    expect(script).not.toContain('CI verifies the rest');
     // Both resolver and sanctioned Postgres harness are bounded; the harness
     // emits progress while it runs so an operator can distinguish work from a wedge.
     expect(script).toContain('timeout --foreground --signal=TERM');

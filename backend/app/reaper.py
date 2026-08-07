@@ -322,6 +322,7 @@ from app.reaper_sweeps import (
     sweep_retire_viewable_artifacts,
     sweep_retire_consumed_message_attachments,
     sweep_backfill_merged_named_test_coverage,
+    sweep_acceptance_verdict_healing_backfills,
     _sweep_strategic_cycle_starvation,
 )
 from app.acceptance_gate import backfill_acceptance_verdicts
@@ -3309,6 +3310,25 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Backfill-merged-named-test-coverage sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 21b: Acceptance-verdict healing backfills.  Runs the two
+                # reconcile-only passes that heal stale declared_unsatisfied
+                # acceptance verdicts (rollup-child changed-files stamping, then the
+                # unverified-merge backfill) followed by the acceptance-window
+                # evidence minter, for every project with an open version — so the
+                # acceptance window can no longer sit at a false 0.0 verified while
+                # waiting for a manual reconcile-backfill POST.  Hourly
+                # cadence-gated; independent timer.
+                _mark_reaper_progress()
+                try:
+                    await sweep_acceptance_verdict_healing_backfills(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Acceptance-verdict healing backfills sweep error: {e}",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):

@@ -1794,10 +1794,10 @@ describe('unified spawn-task guidance', () => {
     efficiencySnapshotSection: '',
   };
 
-  it('routes bounded implementation and contextual fix work through spawn-task', () => {
+  it('routes bounded implementation through spawn-task and keeps fix out', () => {
     const prompt = buildThinkerPrompt(base);
     expect(prompt).toContain('dispatch `create`/`refactor`/`qa` directly');
-    expect(prompt).toContain('`fix` work also uses `spawn-task`');
+    expect(prompt).not.toContain('`fix` work also uses `spawn-task`');
     expect(prompt).not.toContain('`spawn-fix`');
   });
 });

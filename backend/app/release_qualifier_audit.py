@@ -344,6 +344,16 @@ async def _spawn_release_audit_task(
         "type": "release_audit",
         "base_branch": base_branch,
         "diff_range": diff_range,
+        # The FULL version delta (base_branch...candidate_sha), pinned
+        # separately from ``diff_range`` so the agent can narrow the latter to
+        # an incremental ``audit_base_sha..candidate`` window for code-quality
+        # findings while STILL grading goal alignment and acceptance categories
+        # over the full version delta the promotion PR would carry.  Goal and
+        # category verdicts have no scoped carry-forward (unlike code-quality
+        # findings, which merge unchanged paths from the prior audit fact), so
+        # grading them against a shrinking incremental window ratchets every
+        # requalification worse.  See dir task-7602202a.
+        "goal_category_diff_range": diff_range,
         # Audit C4: pin the audit to the exact qualified commit.  The agent
         # reads this from the payload and checks out this SHA.
         "candidate_sha": candidate_sha,
@@ -403,6 +413,7 @@ async def _spawn_release_audit_task(
                 "spawned_by": "RELEASE_QUALIFIER",
                 "task_type": "release_audit",
                 "diff_range": diff_range,
+                "goal_category_diff_range": diff_range,
                 "audit_base_sha": audit_base_sha,
                 "rubric_fingerprint": rubric_fingerprint,
                 "release_version_id": str(version_id),

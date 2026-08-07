@@ -57,6 +57,7 @@ VALID_TASK_TYPES: set[str] = {
     "repo_bootstrap",
     "salvage_bundle",
     "capability_proof_trial",
+    "criterion_named_test_trial",
     "walkthrough_e2e",
     "memory_consolidation",
 }
@@ -394,12 +395,25 @@ def _validate_spec(data: dict[str, Any]) -> list[str]:
     return errors
 
 
+# Task types that ship a code-producing PR and therefore must carry an
+# acceptance_evidence declaration to pass validate_task_payload (mirrors
+# payload_schemas._CODE_PRODUCING_TASK_TYPES).
+_CODE_PRODUCING_TYPES = frozenset(
+    {"create", "fix", "refactor", "qa", "migrate", "deps", "docs"}
+)
+
+
 def _to_task_payload(data: dict[str, Any]) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "type": str(data.get("task_type", "")),
         "prompt": str(data.get("prompt", "")),
         "title": str(data.get("name", "")),
     }
+    if payload["type"] in _CODE_PRODUCING_TYPES:
+        payload["acceptance_evidence"] = {
+            "kind": "observable_behavior",
+            "description": "golden spec task ships a real, testable change",
+        }
     effort = data.get("effort")
     if effort:
         payload["effort"] = effort

@@ -5054,3 +5054,768 @@ async def test_sweep_triggers_calcification_check(db_session, mocker):
     )
     assert len(alerts) == 1
     assert "calcifying" in alerts[0].title
+
+
+# ===========================================================================
+# Drift sentinel — cancelled-run cooldown-bounded re-dispatch + red-only reaction
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_drift_sentinel_rearms_quiet_head_after_cancellation(
+    db_session, mocker
+):
+    """A cancelled full-suite run re-arms a fresh dispatch so a quiet HEAD can
+    reach green.
+
+    The old behaviour raised an operator Alert and never re-dispatched for the
+    HEAD, so on an actively-merging integration branch the sentinel could never
+    report green: every fresh dispatch was promptly cancelled by the next merge
+    and the sentinel had already given up on that SHA.  The sentinel now
+    re-dispatches (re-arms) once per HEAD per cooldown window; a quiet window
+    lets the fresh run conclude and the next sweep reads ``green``.
+    """
+    from app.project_telemetry import read_telemetry
+    from app.release_qualifier_sweep import (
+        _DRIFT_SENTINEL_CANCELLED_REDISPATCH_KEY,
+        _check_full_suite_drift_sentinel,
+    )
+
+    HEAD_SHA = "cance11ed" * 5
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    async def _gate(session, project_id, *, dispatch=True, dispatch_on_cancelled=True):
+        if not dispatch_on_cancelled:
+            # First gate call: surface the cancelled run as its own state.
+            return {
+                "gate_state": "cancelled",
+                "head_sha": HEAD_SHA,
+                "run_id": 777,
+                "html_url": "https://github.com/runs/777",
+                "reason": "ci.yml run was cancelled — surfaced as a distinct signal",
+            }
+        # Re-dispatch call: a fresh run is now in flight for the SAME HEAD.
+        return {
+            "gate_state": "dispatched",
+            "head_sha": HEAD_SHA,
+            "run_id": 778,
+            "html_url": "https://github.com/runs/778",
+            "reason": "cancelled run treated as absent — fresh run dispatched",
+        }
+
+    gate_mock = mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(side_effect=_gate),
+    )
+
+    # Sweep 1: the run for HEAD reads back cancelled.  The sentinel RE-ARMS —
+    # it asks the gate for a dispatch_on_cancelled re-dispatch instead of
+    # giving up on the SHA.
+    assert await _check_full_suite_drift_sentinel(
+        version.id, session_factory=_shared_session_factory(db_session)
+    ) is True
+
+    assert gate_mock.call_count == 2
+    assert gate_mock.await_args.kwargs["dispatch_on_cancelled"] is True
+    assert gate_mock.await_args.kwargs["dispatch"] is True
+
+    # No operator alert while a fresh run is in flight, and the re-arm marker
+    # is persisted for the HEAD (the cooldown anchor).
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(Alert.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert alerts == []
+    marker = await read_telemetry(
+        db_session, project.id, _DRIFT_SENTINEL_CANCELLED_REDISPATCH_KEY
+    )
+    assert marker is not None
+    assert marker["head_sha"] == HEAD_SHA
+    assert marker["redispatched_at"]
+
+    # Quiet window: the re-dispatched run concludes green.  The next sweep
+    # reads green and the sentinel reports nothing outstanding — the HEAD
+    # reached the state the old give-up behaviour could never observe.
+    gate_mock.reset_mock()
+    gate_mock.side_effect = None
+    gate_mock.return_value = {
+        "gate_state": "green",
+        "head_sha": HEAD_SHA,
+        "run_id": 778,
+        "html_url": "https://github.com/runs/778",
+        "reason": "ci.yml run for integration HEAD concluded success",
+    }
+    assert await _check_full_suite_drift_sentinel(
+        version.id, session_factory=_shared_session_factory(db_session)
+    ) is False
+    gate_mock.assert_called_once()
+    assert gate_mock.await_args.kwargs["dispatch_on_cancelled"] is False
+
+
+@pytest.mark.asyncio
+async def test_drift_sentinel_cancelled_redispatch_is_cooldown_bounded(
+    db_session, mocker
+):
+    """A cancelled HEAD is re-dispatched at most once per cooldown window.
+
+    The first cancelled pass re-arms a fresh dispatch; a second pass for the
+    same HEAD within the cooldown does NOT re-dispatch and instead raises a
+    deduplicated operator Alert; once the cooldown elapses the sentinel
+    re-dispatches again.  This bounds dispatch churn to one full 8-shard run per
+    HEAD per 30 minutes while still letting a quiet HEAD reach green.
+    """
+    from datetime import datetime, timedelta
+
+    from app.project_telemetry import read_telemetry
+    from app.release_qualifier_sweep import (
+        _DRIFT_SENTINEL_CANCELLED_REDISPATCH_KEY,
+        _check_full_suite_drift_sentinel,
+    )
+
+    HEAD_SHA = "coo1down" * 5
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    fake_now = datetime(2026, 8, 6, 12, 0, 0)
+    utcnow_mock = mocker.patch(
+        "app.release_qualifier_sweep._utcnow", return_value=fake_now
+    )
+
+    async def _gate(session, project_id, *, dispatch=True, dispatch_on_cancelled=True):
+        if not dispatch_on_cancelled:
+            return {
+                "gate_state": "cancelled",
+                "head_sha": HEAD_SHA,
+                "run_id": 777,
+                "html_url": "https://github.com/runs/777",
+                "reason": "ci.yml run was cancelled — surfaced as a distinct signal",
+            }
+        return {
+            "gate_state": "dispatched",
+            "head_sha": HEAD_SHA,
+            "run_id": 778,
+            "html_url": "https://github.com/runs/778",
+            "reason": "cancelled run treated as absent — fresh run dispatched",
+        }
+
+    gate_mock = mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(side_effect=_gate),
+    )
+
+    # Pass 1: cancelled -> re-dispatch (2nd gate call) -> marker persisted, no
+    # alert (a fresh run is in flight).
+    assert await _check_full_suite_drift_sentinel(
+        version.id, session_factory=_shared_session_factory(db_session)
+    ) is True
+    assert gate_mock.call_count == 2
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(Alert.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert alerts == []
+    marker = await read_telemetry(
+        db_session, project.id, _DRIFT_SENTINEL_CANCELLED_REDISPATCH_KEY
+    )
+    assert marker is not None
+    assert marker["head_sha"] == HEAD_SHA
+
+    def _redispatch_calls():
+        return [
+            c
+            for c in gate_mock.call_args_list
+            if c.kwargs.get("dispatch_on_cancelled") is True
+        ]
+
+    # Pass 2 (same fake_now, same HEAD): cooldown NOT elapsed -> no re-dispatch
+    # (only the state-discovery gate call), deduplicated WARNING alert instead.
+    assert await _check_full_suite_drift_sentinel(
+        version.id, session_factory=_shared_session_factory(db_session)
+    ) is True
+    assert gate_mock.call_count == 3  # 2 (pass 1) + 1 discovery call
+    assert len(_redispatch_calls()) == 1  # no re-dispatch in pass 2
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(Alert.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert HEAD_SHA[:8] in alerts[0].title
+    assert "cancelled" in alerts[0].title.lower()
+
+    # Cooldown elapsed: the sentinel re-arms a fresh dispatch for the SAME HEAD
+    # (no new alert — the dedupe key is still the same HEAD).
+    utcnow_mock.return_value = fake_now + timedelta(minutes=31)
+    assert await _check_full_suite_drift_sentinel(
+        version.id, session_factory=_shared_session_factory(db_session)
+    ) is True
+    assert gate_mock.call_count == 5  # 3 + discovery + re-dispatch
+    assert len(_redispatch_calls()) == 2
+    marker = await read_telemetry(
+        db_session, project.id, _DRIFT_SENTINEL_CANCELLED_REDISPATCH_KEY
+    )
+    assert marker["redispatched_at"] == (fake_now + timedelta(minutes=31)).isoformat()
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(Alert.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+
+
+@pytest.mark.asyncio
+async def test_promotion_ci_gate_cancelled_run_surfaces_without_dispatch(
+    db_session, mocker
+):
+    """``compute_promotion_ci_green_gate(dispatch_on_cancelled=False)`` maps a
+    completed-cancelled run to the distinct ``cancelled`` state and does NOT
+    dispatch a fresh run — the caller decides.  The default
+    (``dispatch_on_cancelled=True``) still re-dispatches, preserving the
+    promotion_failed re-driver's existing behaviour."""
+    from app.release_readiness import compute_promotion_ci_green_gate
+
+    project, _ = await _make_project_and_version(db_session)
+    mocker.patch(
+        "app.release_promotion._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "acme", "widget")),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha", new=AsyncMock(return_value="deadbeef")
+    )
+    mocker.patch(
+        "app.github.get_workflow_run_for_sha",
+        new=AsyncMock(
+            return_value={
+                "run_id": 15,
+                "status": "completed",
+                "conclusion": "cancelled",
+                "html_url": "https://gh/run/15",
+            }
+        ),
+    )
+    # No in-flight branch run, so the dispatch_on_cancelled=True path falls
+    # through to a real dispatch (the coalescing seam is exercised but idle).
+    mocker.patch(
+        "app.github.get_latest_inflight_workflow_run_for_branch",
+        new=AsyncMock(return_value=None),
+    )
+    dispatch_mock = mocker.patch(
+        "app.github.dispatch_workflow_run", new=AsyncMock(return_value=True)
+    )
+
+    # dispatch_on_cancelled=False: surface the cancellation, dispatch nothing.
+    gate = await compute_promotion_ci_green_gate(
+        db_session, project.id, dispatch=True, dispatch_on_cancelled=False
+    )
+    assert gate["gate_state"] == "cancelled"
+    assert gate["run_id"] == 15
+    assert gate["head_sha"] == "deadbeef"
+    dispatch_mock.assert_not_awaited()
+
+    # Default dispatch_on_cancelled=True keeps the old re-dispatch contract.
+    gate = await compute_promotion_ci_green_gate(
+        db_session, project.id, dispatch=True
+    )
+    assert gate["gate_state"] == "dispatched"
+    dispatch_mock.assert_awaited_once()
+
+
+# ===========================================================================
+# Qualification auto-trigger — the resolver decides AND the sweep fires
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_sweep_auto_trigger_fires_never_attempted_qualification(
+    db_session, mocker
+):
+    """The sweep executes the trigger resolver's fire decision.
+
+    A never-attempted (status=None) stabilize version is armed by T1
+    (coverage_complete) and — with the ``auto_qualification_triggers`` knob "on"
+    — the sweep's auto-trigger leg fires ``run_qualification`` through the sweep's
+    OWN sanctioned path (``auto_trigger=True``), NOT by claiming
+    ``explicit_request``.  This is the fix for "decides but never fires": before
+    the auto-trigger leg, the resolver returned armed forever and no sweep step
+    ever called run_qualification (and a plain non-explicit call would have been
+    refused as ``explicit_request_required`` anyway).
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["auto_qualification_triggers"] = "on"
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    assert version.last_qualification is None  # never attempted
+    await db_session.commit()
+
+    # Deterministic no-GitHub environment: credentials resolve to None so every
+    # best-effort gate degrades to "unavailable" instead of touching the API.
+    mocker.patch(
+        "app.release_promotion._resolve_github_with_session",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
+    run_mock = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    # Auto-fires are not counted as finalized (finalized tracks stuck-qualification
+    # reaping); the assertion that matters is that run_qualification FIRED for the
+    # never-attempted version with an explicit request.
+    assert count == 0
+    assert run_mock.await_count == 1
+    call = run_mock.await_args
+    assert call.args[1] == project.id
+    # The sweep auto-trigger is automatic machinery: it must use the distinct
+    # sanctioned auto_trigger path, not claim explicit-request status.
+    assert call.kwargs.get("explicit_request") is not True
+    assert call.kwargs.get("auto_trigger") is True
+
+
+@pytest.mark.asyncio
+async def test_auto_trigger_knob_off_does_not_fire(db_session, mocker):
+    """knob="off" makes the auto-trigger a complete no-op."""
+    from app import shared_state
+
+    shared_state.runtime_config["auto_qualification_triggers"] = "off"
+
+    _, version = await _make_project_and_version(db_session, phase="stabilize")
+    await db_session.commit()
+
+    run_mock = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    from app.release_qualifier_sweep import _fire_auto_triggered_qualification
+
+    fired = await _fire_auto_triggered_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert fired is False
+    run_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_auto_trigger_observe_logs_but_does_not_fire(db_session, mocker):
+    """knob="observe" resolves the decision and logs would-fire without spawning."""
+    from app import shared_state
+
+    shared_state.runtime_config["auto_qualification_triggers"] = "observe"
+
+    _, version = await _make_project_and_version(db_session, phase="stabilize")
+    await db_session.commit()
+
+    mocker.patch(
+        "app.release_promotion._resolve_github_with_session",
+        new=AsyncMock(return_value=None),
+    )
+    run_mock = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    from app.release_qualifier_sweep import _fire_auto_triggered_qualification
+
+    fired = await _fire_auto_triggered_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert fired is False
+    run_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_auto_trigger_skips_ci_compliance_blocked_marker(db_session, mocker):
+    """A durable ci_compliance qualify_request_blocked marker defers the version
+    to _recheck_ci_compliance_blocked_version — the auto-trigger never bypasses
+    the CI-compliance guardrail."""
+    from app import shared_state
+
+    shared_state.runtime_config["auto_qualification_triggers"] = "on"
+
+    _, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "dry_run",
+        "candidate_sha": "cand0" * 6 + "00",
+        "qualify_request_blocked": {
+            "blocker": "ci_compliance",
+            "violation_count": 2,
+            "head_sha": "cand0" * 6 + "00",
+        },
+        "qualify_request_blocked_at": "2026-08-01T00:00:00+00:00",
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    run_mock = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    from app.release_qualifier_sweep import _fire_auto_triggered_qualification
+
+    fired = await _fire_auto_triggered_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert fired is False
+    run_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_auto_trigger_skips_bespoke_redriver_statuses(db_session, mocker):
+    """status=error and status=infra_failure are owned by the dedicated re-drivers
+    (which run first and re-enter run_qualification under a bounded attempt cap);
+    the auto-trigger must not double-fire them."""
+    from app import shared_state
+
+    shared_state.runtime_config["auto_qualification_triggers"] = "on"
+    run_mock = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    from app.release_qualifier_sweep import _fire_auto_triggered_qualification
+
+    for status in ("error", "infra_failure"):
+        _, version = await _make_project_and_version(db_session, phase="stabilize")
+        version.last_qualification = {
+            "status": status,
+            "error": "sha_error" if status == "error" else None,
+            "error_redrive_count": 0,
+        }
+        db_session.add(version)
+        await db_session.commit()
+
+        fired = await _fire_auto_triggered_qualification(
+            version.id, session_factory=_shared_session_factory(db_session)
+        )
+        assert fired is False
+
+    run_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_auto_trigger_holds_when_qualification_in_flight(db_session, mocker):
+    """A pending qualification (in flight) is held by the resolver — no double-fire."""
+    from app import shared_state
+
+    shared_state.runtime_config["auto_qualification_triggers"] = "on"
+
+    _, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {"status": "pending", "candidate_sha": "cand0" * 6 + "00"}
+    db_session.add(version)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.release_promotion._resolve_github_with_session",
+        new=AsyncMock(return_value=None),
+    )
+    run_mock = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    from app.release_qualifier_sweep import _fire_auto_triggered_qualification
+
+    fired = await _fire_auto_triggered_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert fired is False
+    run_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_auto_trigger_fires_post_dry_run_advance(db_session, mocker):
+    """T4: a dry_run version whose automain HEAD advanced past the evaluated
+    candidate fires when CI for the new HEAD is not red.
+
+    This exercises the advanced-candidate leg, which requires the sweep to resolve
+    the automain HEAD/CI state (unlike the read surfaces, which pass None).  The
+    candidate advanced (new_sha != candidate_sha) and CI is green, so the resolver
+    returns armed and run_qualification fires with auto_trigger=True.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["auto_qualification_triggers"] = "on"
+
+    candidate_sha = "oldsha0" * 5 + "00000"
+    new_sha = "newsha0" * 5 + "00000"
+    _, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "dry_run",
+        "candidate_sha": candidate_sha,
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(
+            return_value={
+                "gate_state": "green",
+                "head_sha": new_sha,
+                "run_id": 5,
+                "html_url": "http://gh/run/5",
+                "reason": "ci.yml run for integration HEAD concluded success",
+            }
+        ),
+    )
+    run_mock = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    from app.release_qualifier_sweep import _fire_auto_triggered_qualification
+
+    fired = await _fire_auto_triggered_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert fired is True
+    assert run_mock.await_count == 1
+    assert run_mock.await_args.kwargs.get("explicit_request") is not True
+    assert run_mock.await_args.kwargs.get("auto_trigger") is True
+
+
+# ---------------------------------------------------------------------------
+# Rubric-change re-driver (_redrive_rubric_changed_qualification)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_rubric_changed_below_cap_relaunches_exactly_once(db_session, mocker):
+    """A rubric_changed hold BELOW the re-drive cap is auto-relaunched exactly
+    once against the current rubric: the re-driver re-enters run_qualification
+    with auto_trigger=True (a FRESH attempt — no attempt id carried), and the
+    per-episode counter advances post-commit.  This is the regression for the
+    silent stall: a mid-flight rubric change previously parked the version with
+    no scheduled relaunch."""
+    from app.release_qualifier_redrive import _redrive_rubric_changed_qualification
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "rubric_changed",
+        "blocker": "rubric_changed",
+        "candidate_sha": "beefcafe" * 5,
+        "qualification_attempt_id": str(uuid.uuid4()),
+        "requested_probes": [],
+        "retry_episode": 0,
+        "rubric_redrive_count": 0,  # below _MAX_RUBRIC_REDRIVE_ATTEMPTS
+        "merge_grade": {"status": "rubric_changed", "blocked": True},
+        "rubric_drift": {"total_changes": 3},
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mock_run_qual = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    result = await _redrive_rubric_changed_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert result is True, (
+        "a rubric_changed hold below the cap must auto-relaunch (fresh grade "
+        "against the current rubric), not stall"
+    )
+    mock_run_qual.assert_called_once()
+    call_kwargs = mock_run_qual.await_args.kwargs
+    assert call_kwargs.get("auto_trigger") is True, (
+        "the rubric re-drive is the sweep's sanctioned attempt-scoped recovery "
+        "path, never a claim of explicit_request"
+    )
+    assert call_kwargs.get("explicit_request") is not True
+    # A FRESH attempt, not a continuation of the superseded one.
+    assert call_kwargs.get("qualification_attempt_id") is None
+
+    await db_session.refresh(version)
+    assert version.last_qualification["rubric_redrive_count"] == 1, (
+        "a successful relaunch must advance the per-episode re-drive counter "
+        "so the cap holds under repeated changes"
+    )
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(Alert.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert alerts == [], "a below-cap relaunch must not raise an Alert"
+
+
+@pytest.mark.asyncio
+async def test_rubric_changed_cap_halted_with_operator_alert(db_session, mocker):
+    """The re-drive bound holds under repeated changes: once the per-episode
+    counter reaches the cap, the re-driver halts (no relaunch) and raises an
+    operator Alert (once) instead of spinning attempts indefinitely.  This is
+    the explicit operator-actionable state the bound requires."""
+    from app.release_qualifier_redrive import (
+        _MAX_RUBRIC_REDRIVE_ATTEMPTS,
+        _redrive_rubric_changed_qualification,
+    )
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "rubric_changed",
+        "blocker": "rubric_changed",
+        "candidate_sha": "beefcafe" * 5,
+        "qualification_attempt_id": str(uuid.uuid4()),
+        "requested_probes": [],
+        "retry_episode": _MAX_RUBRIC_REDRIVE_ATTEMPTS,
+        "rubric_redrive_count": _MAX_RUBRIC_REDRIVE_ATTEMPTS,  # at the cap
+        "merge_grade": {"status": "rubric_changed", "blocked": True},
+        "rubric_drift": {"total_changes": 3},
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mock_run_qual = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    result = await _redrive_rubric_changed_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert result is False, (
+        "a rubric_changed hold AT the cap must halt the auto-relaunch"
+    )
+    mock_run_qual.assert_not_called()
+
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(Alert.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1, (
+        "reaching the re-drive cap must raise exactly one operator Alert"
+    )
+    assert "rubric" in alerts[0].title.lower()
+    await db_session.refresh(version)
+    assert version.last_qualification.get("rubric_redrive_loop_escalated") is True
+
+    # The Alert is deduped: a second sweep cycle does not spam another Alert.
+    result_again = await _redrive_rubric_changed_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert result_again is False
+    alerts_again = (
+        (
+            await db_session.execute(
+                select(Alert).where(Alert.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts_again) == 1
+
+
+@pytest.mark.asyncio
+async def test_rubric_changed_spawn_failure_not_counted_as_redrive(db_session, mocker):
+    """A relaunch attempt that does NOT actually spawn (transient GitHub outage,
+    spawn_failed, ...) is not counted as a performed re-drive: the counter only
+    advances on a genuine fresh spawn, so the cap is not burned on failed
+    attempts."""
+    from app.release_qualifier_redrive import _redrive_rubric_changed_qualification
+
+    _project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "rubric_changed",
+        "blocker": "rubric_changed",
+        "candidate_sha": "beefcafe" * 5,
+        "qualification_attempt_id": str(uuid.uuid4()),
+        "requested_probes": [],
+        "retry_episode": 0,
+        "rubric_redrive_count": 0,
+        "merge_grade": {"status": "rubric_changed", "blocked": True},
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mock_run_qual = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "sha_error"}),
+    )
+
+    result = await _redrive_rubric_changed_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert result is False
+    mock_run_qual.assert_called_once()
+    await db_session.refresh(version)
+    assert version.last_qualification["rubric_redrive_count"] == 0, (
+        "a failed relaunch must NOT advance the re-drive counter"
+    )
+
+
+@pytest.mark.asyncio
+async def test_rubric_unknown_is_redriven_like_rubric_changed(db_session, mocker):
+    """rubric_provenance_unknown (the launched rubric could not be
+    reconstructed) is the same recoverable hold as rubric_changed: it relaunches
+    against the current rubric."""
+    from app.release_qualifier_redrive import _redrive_rubric_changed_qualification
+
+    _project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "rubric_provenance_unknown",
+        "blocker": "rubric_provenance_unknown",
+        "candidate_sha": "beefcafe" * 5,
+        "qualification_attempt_id": str(uuid.uuid4()),
+        "requested_probes": [],
+        "retry_episode": 0,
+        "rubric_redrive_count": 0,
+        "merge_grade": {"status": "rubric_provenance_unknown", "blocked": True},
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mock_run_qual = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    result = await _redrive_rubric_changed_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert result is True
+    mock_run_qual.assert_called_once()

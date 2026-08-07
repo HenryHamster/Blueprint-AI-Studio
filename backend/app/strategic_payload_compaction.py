@@ -63,6 +63,32 @@ def _compact_scalar_mapping(value: Any, *, text_cap: int) -> dict | None:
     return out or None
 
 
+def _compact_category_verdicts(value: Any, *, text_cap: int) -> list[dict] | None:
+    """Compact per-category grader verdicts to their load-bearing fields.
+
+    Each CategoryVerdict carries a status/tier/gap the strategist needs to know
+    WHY a category is unmet, plus bulky citations that stay in the database.
+    Keep the identity + status + tier + bounded gap text; drop citations and any
+    other nested bodies so the payload stays small under budget pressure.
+    """
+    if not isinstance(value, list):
+        return None
+    out: list[dict] = []
+    for row in value:
+        if not isinstance(row, dict):
+            continue
+        compact: dict[str, Any] = {}
+        for key in ("category_key", "status", "tier"):
+            if key in row:
+                compact[key] = row[key]
+        gap = _bounded_text(row.get("gap"), text_cap)
+        if gap:
+            compact["gap"] = gap
+        if compact:
+            out.append(compact)
+    return out or None
+
+
 def _compact_qualification_provenance(value: Any, *, text_cap: int) -> dict | None:
     """Keep bounded scalar attempt provenance while dropping arbitrary bodies."""
     if not isinstance(value, dict):
@@ -295,6 +321,17 @@ def _compact_last_qualification(value: Any, *, floor: bool = False) -> dict | No
     sub_scores = _compact_scalar_mapping(value.get("sub_scores"), text_cap=text_cap)
     if sub_scores:
         out["sub_scores"] = sub_scores
+    # Per-category grader verdicts — WHY each category is unmet. Bounded to the
+    # load-bearing identity/status/tier/gap fields so the strategist sees the
+    # grader's reason without a fetch round-trip (citations stay in the DB).
+    category_verdicts = _compact_category_verdicts(
+        value.get("category_verdicts"), text_cap=text_cap
+    )
+    if category_verdicts:
+        out["category_verdicts"] = category_verdicts
+    residual_gap = _bounded_text(value.get("residual_uncaptured_gap"), text_cap)
+    if residual_gap:
+        out["residual_uncaptured_gap"] = residual_gap
     acceptance = value.get("acceptance_aggregate")
     if isinstance(acceptance, dict):
         out["acceptance_aggregate"] = acceptance

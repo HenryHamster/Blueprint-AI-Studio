@@ -789,6 +789,10 @@ class TestUpdateProject:
                     "github_repo": "acme/develop-repo",
                     "title": "First task",
                     "prompt": "Do the thing",
+                    "acceptance_evidence": {
+                        "kind": "observable_behavior",
+                        "description": "first task ships a real, testable change",
+                    },
                 },
             )
         assert resp.status_code == 200, resp.text

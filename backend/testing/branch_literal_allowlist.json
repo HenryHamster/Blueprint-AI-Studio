@@ -1,0 +1,41 @@
+{
+  "backend": {
+    "allowlisted_filenames": [
+      "admin.py",
+      "branch_literal_compliance.py",
+      "payload_schemas.py"
+    ]
+  },
+  "agent": {
+    "allowlist": [
+      {
+        "path": "prompts/review-prompt.ts",
+        "line": 336,
+        "pattern": "fallback-main",
+        "rationale": "buildRollupReviewGuidance is downstream of resolveBaseBranch; the options.baseBranch fallback is a defensive display default."
+      },
+      {
+        "path": "prompts/review-prompt.ts",
+        "line": 121,
+        "pattern": "fallback-main",
+        "rationale": "Local-variable defensive default downstream of resolveBaseBranch; live callers supply a resolved baseBranch."
+      }
+    ]
+  },
+  "admin-ui": {
+    "allowlist": [
+      {
+        "path": "components/NewTaskModal.tsx",
+        "line": 434,
+        "pattern": "fallback-main",
+        "rationale": "The resolved per-project integrationBranch is preferred; main is only shown as the input placeholder when unavailable."
+      },
+      {
+        "path": "components/ProjectBuildConfigSection.tsx",
+        "line": 688,
+        "pattern": "fallback-blueprint",
+        "rationale": "Display-only example prefers the user-entered taskBranchNamespace; blueprint is shown only when that display value is empty."
+      }
+    ]
+  }
+}

@@ -418,6 +418,7 @@ const TASK_CLASS_MAP = {
   compute_experiment:'read-only',
   repo_bootstrap:    'read-only',
   capability_proof_trial:  'read-only',
+  criterion_named_test_trial: 'read-only',
   walkthrough_e2e:       'read-only',
   memory_consolidation:  'read-only',
   // Research / planning (7): read-heavy, no code shipped

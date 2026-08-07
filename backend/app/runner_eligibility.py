@@ -328,6 +328,15 @@ def _runner_chromium_usable(runner: LocalRunner | RunnerDispatchSnapshot) -> boo
     return backends.get("playwright_chromium_usable") is True
 
 
+# A card's marketing size overstates what nvidia-smi reports: driver/ECC
+# reserves shave 1–2% off the visible total (a "16 GB" V100-SXM2 reports
+# 16145 MiB, not 16384). vram_gb requirements are authored in marketing GB,
+# so without slack a job naming exactly the card it needs (vram_gb=16 on a
+# 16 GB card) is PERMANENTLY undispatchable. 3% covers observed reserve
+# overhead without admitting a meaningfully busy GPU.
+_VRAM_REQUIREMENT_TOLERANCE = 0.97
+
+
 def _runner_has_free_vram(
     runner: LocalRunner | RunnerDispatchSnapshot,
     required_mib: int,
@@ -339,12 +348,17 @@ def _runner_has_free_vram(
     this field (older runners, or a runner that does not expose nvidia-smi)
     the check is skipped and the runner is treated as eligible — we only
     gate dispatch when we have real data, not on absence of telemetry.
+
+    The comparison allows ``_VRAM_REQUIREMENT_TOLERANCE`` slack so a
+    marketing-GB requirement matches the card class it names despite the
+    driver/ECC reserve gap.
     """
     caps = runner.capabilities or {}
     free_mib_list = caps.get("gpu_free_vram_mib")
     if not isinstance(free_mib_list, list) or not free_mib_list:
         return True
-    return any(mib >= required_mib for mib in free_mib_list)
+    effective_floor = required_mib * _VRAM_REQUIREMENT_TOLERANCE
+    return any(mib >= effective_floor for mib in free_mib_list)
 
 
 def _known_free_bytes(value: object) -> int | None:
@@ -389,11 +403,62 @@ def _runner_container_image_storage(
     }
 
 
+def _normalized_container_image_ref(ref: object) -> str | None:
+    """Canonical form of a container image reference for presence comparison.
+
+    ``docker image ls`` reports Docker Hub refs WITHOUT the implicit
+    ``docker.io/library/`` prefix (``python:3.12-slim``) while refs on an
+    explicit registry (``nvcr.io/nvidia/tensorflow:24.12-tf2-py3``) keep their
+    full form. Strip the implicit Hub prefixes and default the ``:latest`` tag
+    so a job naming either spelling matches the runner's reported store
+    contents. Digest refs (``@sha256:...``) compare verbatim.
+    """
+    if not isinstance(ref, str):
+        return None
+    normalized = ref.strip()
+    if not normalized:
+        return None
+    for prefix in ("docker.io/library/", "docker.io/", "library/"):
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix):]
+            break
+    if "@" not in normalized:
+        last_segment = normalized.rsplit("/", 1)[-1]
+        if ":" not in last_segment:
+            normalized = f"{normalized}:latest"
+    return normalized
+
+
+def _runner_container_image_present(
+    runner: LocalRunner | RunnerDispatchSnapshot,
+    container_image: str | None,
+) -> bool:
+    """Whether the runner's heartbeat says *container_image* is already local.
+
+    Reads the ``container_images_present`` capability list the runner reports
+    from its own image store. Absence of the field means UNKNOWN (older
+    runner, or a failed probe) and returns False — callers then apply the full
+    image-pull disk floor, exactly the historical behavior. Only a positive,
+    normalized-exact match ever waives anything.
+    """
+    requested = _normalized_container_image_ref(container_image)
+    if requested is None:
+        return False
+    caps = runner.capabilities or {}
+    present = caps.get("container_images_present")
+    if not isinstance(present, list):
+        return False
+    return any(
+        _normalized_container_image_ref(entry) == requested for entry in present
+    )
+
+
 def _runner_has_free_disk(
     runner: LocalRunner | RunnerDispatchSnapshot,
     image_store_required_bytes: int,
     *,
     workspace_required_bytes: int | None = None,
+    container_image: str | None = None,
 ) -> bool:
     """Whether a container-image job fits each known required filesystem.
 
@@ -403,12 +468,27 @@ def _runner_has_free_disk(
     reserve. Applying the image-pull floor to both filesystems unnecessarily
     strands runners whose container store lives on a large separate volume.
 
+    When ``container_image`` is given and the runner reports that exact image
+    in its local store (``container_images_present``), the image-pull floor is
+    waived entirely — the guarded multi-GB pull is a no-op — while the
+    workspace scratch floor still applies. A runner that does not report the
+    capability keeps the full floor (absence means unknown, never "cached").
+
     ``workspace_required_bytes=None`` preserves the historical equal-floor
     behavior for direct callers. Production container dispatch passes both
     floors explicitly. Missing/malformed telemetry remains backward-compatible
     eligible, matching the other runner-capability predicates.
     """
     image_floor = max(0, image_store_required_bytes)
+    if image_floor > 0 and _runner_container_image_present(
+        runner, container_image
+    ):
+        # No pull will happen: the requested image is already in the local
+        # store. Zeroing the floor here also releases the legacy single-volume
+        # escalation in _runner_effective_workspace_disk_floor, so a dgx-class
+        # runner permanently below the pull floor can still run its cached
+        # image (the workspace floor below remains fully enforced).
+        image_floor = 0
     workspace_floor = (
         image_floor
         if workspace_required_bytes is None

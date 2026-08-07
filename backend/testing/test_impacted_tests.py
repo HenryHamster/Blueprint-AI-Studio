@@ -10,6 +10,8 @@ changed/added test file. These tests build a hermetic fixture tree under
 import io
 import os
 
+import pytest
+
 from testing import impacted_tests
 
 
@@ -147,7 +149,7 @@ def test_empty_input_yields_empty_output(tmp_path):
     assert impacted_tests.resolve_impacted([], root) == []
 
 
-def test_dedup_and_stable_sort(tmp_path):
+def test_dedup_and_relevance_rank(tmp_path):
     root = str(tmp_path)
     _make_tree(root)
     # One test references BOTH changed modules — it must appear exactly once.
@@ -164,10 +166,12 @@ def test_dedup_and_stable_sort(tmp_path):
     result = impacted_tests.resolve_impacted(
         ["backend/app/foo.py", "backend/app/routers/agent.py"], root
     )
-    # Deduped (test_both counted once) and sorted lexicographically.
+    # Deduped (test_both counted once) and ranked by relevance: both sit at hop
+    # 0, but test_both references TWO changed modules (n_direct=2) while
+    # test_alpha references one, so test_both ranks first.
     assert result == [
-        "backend/testing/test_alpha.py",
         "backend/testing/test_both.py",
+        "backend/testing/test_alpha.py",
     ]
 
 
@@ -562,9 +566,180 @@ def test_main_limit_defers_overflow_to_stderr(tmp_path, capsys):
     captured = capsys.readouterr()
     stdout = captured.out.splitlines()
     stderr = captured.err.splitlines()
-    # First 2 (sorted) emitted; the 3rd deferred to CI on stderr.
+    # First 2 (most relevant) emitted; the 3rd deferred as unverified on stderr.
     assert stdout == [
         "backend/testing/test_mod0.py",
         "backend/testing/test_mod1.py",
     ]
-    assert stderr == ["deferred-to-CI: backend/testing/test_mod2.py"]
+    assert stderr == ["deferred-unverified: backend/testing/test_mod2.py"]
+
+
+def test_directly_changed_tests_rank_first(tmp_path):
+    root = str(tmp_path)
+    _make_tree(root)
+    # A PR that both adds its own test and changes an app module: the direct
+    # test must run before any reference-matched file, regardless of alphabet.
+    _write(root, "backend/testing/test_zzz_direct.py", "def test_new(): assert True\n")
+    _write(
+        root,
+        "backend/testing/test_aaa_user.py",
+        "from app.foo import bar\n",
+    )
+    result = impacted_tests.resolve_impacted(
+        ["backend/app/foo.py", "backend/testing/test_zzz_direct.py"], root
+    )
+    assert result == [
+        "backend/testing/test_zzz_direct.py",
+        "backend/testing/test_aaa_user.py",
+    ]
+
+
+def test_hop_zero_ranks_before_hop_one(tmp_path):
+    root = str(tmp_path)
+    _make_tree(root)
+    # service.py imports the changed core.py; a test that references the changed
+    # module directly (hop 0) ranks above one that reaches it only via the
+    # importer (hop 1) — the direct contract is what the change exercises.
+    _write(root, "backend/app/core.py", "def logic(): pass\n")
+    _write(
+        root,
+        "backend/app/service.py",
+        "from app.core import logic\n\ndef svc(): return logic()\n",
+    )
+    _write(
+        root,
+        "backend/testing/test_core_user.py",
+        "from app.core import logic\n",
+    )
+    _write(
+        root,
+        "backend/testing/test_via_service.py",
+        "from app.service import svc\n",
+    )
+    result = impacted_tests.resolve_impacted(["backend/app/core.py"], root)
+    assert result == [
+        "backend/testing/test_core_user.py",
+        "backend/testing/test_via_service.py",
+    ]
+
+
+def test_mock_patch_coupling_ranks_within_hop(tmp_path):
+    root = str(tmp_path)
+    _make_tree(root)
+    # Two tests both reference the changed module (hop 0, same reference
+    # breadth); the one that string-patches its internals is more coupled to the
+    # change — a behavior/signature drift breaks the patch — so it ranks first.
+    _write(
+        root,
+        "backend/testing/test_foo_patcher.py",
+        "from unittest.mock import patch\n\n\n"
+        "def test_x():\n"
+        '    with patch("app.foo.bar", return_value=9):\n'
+        "        assert True\n",
+    )
+    _write(
+        root,
+        "backend/testing/test_foo_importer.py",
+        "from app.foo import bar\n",
+    )
+    result = impacted_tests.resolve_impacted(["backend/app/foo.py"], root)
+    assert result == [
+        "backend/testing/test_foo_patcher.py",
+        "backend/testing/test_foo_importer.py",
+    ]
+
+
+def test_broader_direct_reference_ranks_within_hop(tmp_path):
+    root = str(tmp_path)
+    _make_tree(root)
+    # Same hop, no patch coupling: the test that references BOTH changed modules
+    # directly (n_direct=2) ranks above the one referencing a single module.
+    _write(root, "backend/app/other.py", "def q(): pass\n")
+    _write(
+        root,
+        "backend/testing/test_both_direct.py",
+        "from app.foo import bar\nfrom app.other import q\n",
+    )
+    _write(
+        root,
+        "backend/testing/test_foo_only.py",
+        "from app.foo import bar\n",
+    )
+    result = impacted_tests.resolve_impacted(
+        ["backend/app/foo.py", "backend/app/other.py"], root
+    )
+    assert result == [
+        "backend/testing/test_both_direct.py",
+        "backend/testing/test_foo_only.py",
+    ]
+
+
+def test_drift_sentinel_ranks_last(tmp_path):
+    root = str(tmp_path)
+    _make_tree(root)
+    # A reference-matched test (hop 0) must outrank a surface-glob drift sentinel
+    # selected for the same change — the sentinel has no import path and is only
+    # a whole-tree guard, not a direct contract test.
+    _write(
+        root,
+        "backend/testing/test_foo_user.py",
+        "from app.foo import bar\n",
+    )
+    _write(
+        root,
+        "backend/testing/test_tree_sentinel.py",
+        "from websocket_event_inventory import build\n",
+    )
+    _write_surface_manifest(
+        root,
+        [
+            {
+                "glob": "backend/app/**/*.py",
+                "sentinels": ["backend/testing/test_tree_sentinel.py"],
+            }
+        ],
+    )
+    result = impacted_tests.resolve_impacted(["backend/app/foo.py"], root)
+    assert result == [
+        "backend/testing/test_foo_user.py",
+        "backend/testing/test_tree_sentinel.py",
+    ]
+
+
+def test_live_redrive_change_ranks_finalize_qualification_test_in_top_cap(tmp_path):
+    """Regression for promotion PR #16761: relevance ranking surfaces the stale test.
+
+    The merge gate caps the impacted-test run at 8 files. Alphabetically,
+    ``test_release_qualifier__finalize_qualification_2.py`` sat at ~rank 331 of
+    the 464-file impacted set for a change to
+    ``backend/app/release_qualifier_redrive.py``, so the cap silently dropped it
+    and the stale test merged green. Relevance ranking must place it inside the
+    cap.
+
+    The real tree is read through a ``backend/`` symlink so the assertion runs
+    identically on a dev checkout and inside the Docker harness (where the
+    backend tree is bind-mounted at /app with app/ and testing/ as siblings of
+    the repo root, and the resolver's repo-relative paths do not resolve).
+    """
+    root = impacted_tests._DEFAULT_REPO_ROOT
+    real_backend = os.path.join(root, "backend")
+    if not os.path.isdir(real_backend):
+        # Docker harness: _DEFAULT_REPO_ROOT resolves to /; the tree is /app.
+        candidate = os.path.normpath(
+            os.path.join(os.path.dirname(os.path.abspath(impacted_tests.__file__)), "..")
+        )
+        if os.path.isdir(os.path.join(candidate, "app")) and os.path.isdir(
+            os.path.join(candidate, "testing")
+        ):
+            real_backend = candidate
+        else:
+            pytest.skip("backend tree not found in this layout")
+    fake_root = os.path.join(str(tmp_path), "repo")
+    os.makedirs(fake_root, exist_ok=True)
+    os.symlink(real_backend, os.path.join(fake_root, "backend"), target_is_directory=True)
+    target = "backend/testing/test_release_qualifier__finalize_qualification_2.py"
+    ranked = impacted_tests.resolve_impacted(
+        ["backend/app/release_qualifier_redrive.py"], fake_root
+    )
+    assert target in ranked
+    assert ranked.index(target) < 8

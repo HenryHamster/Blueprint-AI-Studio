@@ -120,7 +120,7 @@ logger = logging.getLogger(__name__)
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0724"
+EXPECTED_SCHEMA_REVISION = "0725"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -178,6 +178,16 @@ _current_revision: str = os.getenv("K_REVISION", "local-dev")
 # Cloud Run (DEPLOY_SHA is never set by the deploy pipeline, so this is "unknown"
 # until _init_deployment_state resolves the real serving SHA from the revision).
 _current_sha: str = os.getenv("DEPLOY_SHA", "unknown")
+
+# When this process actually started serving the current revision — captured
+# once at import time. _reconcile_deploy_state_health_tick fires on a periodic
+# schedule and may only be *detecting* (or finally committing, after an
+# earlier degraded commit) a revision this process has been serving all
+# along; stamping DeploymentState.deployed_at with the tick's fire time in
+# that case fabricates a deploy time in the future relative to when the
+# revision actually went live, which can flip a healthy in-flight promotion's
+# deployed_at > promoted_at serving-confirmation check to a hard failure.
+_process_boot_time: datetime = _utcnow()
 
 
 # Webhook dedup state moved to app.routers.github
@@ -926,7 +936,14 @@ async def _reconcile_deploy_state_health_tick() -> bool:
         _current_sha = resolved
         state.current_sha = resolved
         state.current_revision = _current_revision
-        state.deployed_at = _utcnow()
+        # This process has been serving `_current_revision` since it booted —
+        # the tick is only now detecting (or finally committing) that fact, so
+        # stamp deployed_at with the actual boot time, not the tick's fire
+        # time. Using _utcnow() here would key deploy-hard-fail detection off
+        # when the drift was *noticed* instead of when the revision actually
+        # went live, which can misclassify a healthy already-serving revision
+        # as deployed after promoted_at.
+        state.deployed_at = _process_boot_time
         session.add(state)
         return await _best_effort_deploy_state_commit(session)
 

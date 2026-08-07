@@ -121,7 +121,12 @@ describe('SettingsOrchestratorSection', () => {
   it('shows the confirmed fleet-wide managed compute state from settings', async () => {
     render(<SettingsOrchestratorSection {...baseProps} />);
 
-    expect(await screen.findByTestId('managed-compute-state')).toHaveTextContent('Managed compute enabled');
+    // managed-compute-state renders with "Loading…" before the settings fetch
+    // settles, so findByTestId alone can observe the intermediate state. Wait
+    // for the confirmed text so the assertion is deterministic under load.
+    await waitFor(() => {
+      expect(screen.getByTestId('managed-compute-state')).toHaveTextContent('Managed compute enabled');
+    });
     expect(screen.getByTestId('managed-compute-boundary')).toHaveTextContent('fleet-wide');
   });
 
@@ -132,7 +137,11 @@ describe('SettingsOrchestratorSection', () => {
     } as unknown as Response);
     render(<SettingsOrchestratorSection {...baseProps} />);
 
-    expect(await screen.findByTestId('managed-compute-state')).toHaveTextContent('Managed compute disabled');
+    // Same as above: the state badge starts at "Loading…"; wait for the
+    // disabled text instead of matching the element before the fetch settles.
+    await waitFor(() => {
+      expect(screen.getByTestId('managed-compute-state')).toHaveTextContent('Managed compute disabled');
+    });
     expect(screen.getByTestId('managed-compute-boundary')).toHaveTextContent('Existing work is not forcibly terminated');
   });
 

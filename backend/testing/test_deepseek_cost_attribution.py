@@ -611,7 +611,11 @@ def test_deepseek_skipped_by_provider_reported_reconciliation_without_data():
         "DeepSeek tasks without provider_reported_usage must be skipped — "
         "their token counts are entirely self-reported by the agent"
     )
-    assert result.provider_reported_within_tolerance is True
+    # Zero checked tasks → tolerance verdict is unproven, not passing (a green
+    # verdict from zero evidence is exactly the false confidence this check
+    # exists to prevent).
+    assert result.provider_reported_within_tolerance is False
+    assert result.provider_reported_verified is False
 
 
 def test_deepseek_with_provider_reported_usage_is_checked():

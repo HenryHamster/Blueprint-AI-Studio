@@ -1345,6 +1345,118 @@ describe('setupWorkspace reference-cache reuse', () => {
     expect(cloneArgs.some(a => a.startsWith('credential.https://github.com.helper='))).toBe(true);
   });
 
+  it('does not re-fetch the base branch when the clone already created origin/<base>', async () => {
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    stubExecFileSyncNoStaleBranch(); // rev-parse succeeds → ref present
+
+    await setupWorkspace('owner', 'repo', 'ghtoken', 'main', 'prefix', 'task-id', null, { value: '' }, 'blueprint');
+
+    const fetchCalls = vi.mocked(execFileSync).mock.calls.filter(
+      c => c[0] === 'git' && Array.isArray(c[1]) && (c[1] as string[]).includes('fetch'),
+    );
+    expect(fetchCalls.length).toBe(0);
+  });
+
+  it('fetches origin/<base> with the refspec form when the clone left the ref missing', async () => {
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    stubExecFileSyncNoStaleBranch();
+    // Layer a rev-parse failure on top: the base remote-tracking ref is absent,
+    // so the fail-closed ./check would have nothing to diff against. The repair
+    // goes through the shared gitRefs primitive (not mocked here), so it lands
+    // on the same mocked child_process.execFileSync.
+    const inner = vi.mocked(execFileSync).getMockImplementation();
+    vi.mocked(execFileSync).mockImplementation((cmd: unknown, args: unknown) => {
+      const a = Array.isArray(args) ? (args as string[]) : [];
+      if (String(cmd) === 'git' && a.includes('rev-parse') && a.includes('refs/remotes/origin/main')) {
+        throw new Error('fatal: Needed a single revision');
+      }
+      return inner?.(cmd as never, args as never) ?? '';
+    });
+
+    await setupWorkspace('owner', 'repo', 'ghtoken', 'main', 'prefix', 'task-id', null, { value: '' }, 'blueprint');
+
+    const fetchCalls = vi.mocked(execFileSync).mock.calls
+      .filter(c => c[0] === 'git' && Array.isArray(c[1]) && (c[1] as string[]).includes('fetch'))
+      .map(c => (c[1] as string[]).join(' '));
+    // Explicit refspec — `git fetch origin main` alone only moves FETCH_HEAD in
+    // a single-branch shallow clone.
+    expect(
+      fetchCalls.some(c => c.endsWith('fetch origin main:refs/remotes/origin/main')),
+    ).toBe(true);
+  });
+
+  /** All `git fetch` invocations issued during the call, as joined arg strings. */
+  function fetchArgStrings(): string[] {
+    return vi.mocked(execFileSync).mock.calls
+      .filter(c => c[0] === 'git' && Array.isArray(c[1]) && (c[1] as string[]).includes('fetch'))
+      .map(c => (c[1] as string[]).join(' '));
+  }
+
+  it('self-repo + non-integration base: fetches the integration branch with the refspec form', async () => {
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    stubExecFileSyncNoStaleBranch(); // rev-parse succeeds → origin/<base> present
+
+    // The create/fix/refactor lane runs the TRACKED `check`, whose BASE is the
+    // integration branch — NOT this task's base. A direction-branch subtask
+    // clones `--branch research/<id>`, so without this fetch the fail-closed
+    // gate has no base to diff against and can never go green.
+    await setupWorkspace(
+      'HenryHamster', 'BlueprintAIStudio', 'ghtoken', 'research/1bf4773e',
+      'prefix', 'task-id', null, { value: '' }, 'blueprint',
+    );
+
+    // Explicit refspec — `git fetch origin automain` alone only moves
+    // FETCH_HEAD in a `--branch <base>` single-branch clone.
+    expect(fetchArgStrings().some(
+      c => c.endsWith('fetch origin automain:refs/remotes/origin/automain'),
+    )).toBe(true);
+  });
+
+  it('non-self repo: does NOT fetch the integration branch', async () => {
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    stubExecFileSyncNoStaleBranch();
+
+    await setupWorkspace(
+      'someone', 'other-repo', 'ghtoken', 'release/2.0',
+      'prefix', 'task-id', null, { value: '' }, 'blueprint',
+    );
+
+    // An onboarded project resolves its base via resolveBaseBranch; the
+    // self-repo integration constant must never leak into it.
+    expect(fetchArgStrings().some(c => c.includes('automain'))).toBe(false);
+  });
+
+  it('self-repo whose base IS the integration branch: no redundant fetch', async () => {
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    stubExecFileSyncNoStaleBranch();
+
+    await setupWorkspace(
+      'HenryHamster', 'BlueprintAIStudio', 'ghtoken', 'automain',
+      'prefix', 'task-id', null, { value: '' }, 'blueprint',
+    );
+
+    // `git clone --branch automain` already created the tracking ref.
+    expect(fetchArgStrings()).toEqual([]);
+  });
+
+  it('self-repo integration fetch failure is non-fatal (gate surfaces it loudly)', async () => {
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    stubExecFileSyncNoStaleBranch();
+    const inner = vi.mocked(execFileSync).getMockImplementation();
+    vi.mocked(execFileSync).mockImplementation((cmd: unknown, args: unknown) => {
+      const a = Array.isArray(args) ? (args as string[]) : [];
+      if (String(cmd) === 'git' && a.includes('fetch') && a.some(x => x.includes('automain'))) {
+        throw new Error("fatal: couldn't find remote ref automain");
+      }
+      return inner?.(cmd as never, args as never) ?? '';
+    });
+
+    await expect(setupWorkspace(
+      'HenryHamster', 'BlueprintAIStudio', 'ghtoken', 'research/1bf4773e',
+      'prefix', 'task-id', null, { value: '' }, 'blueprint',
+    )).resolves.toBeTruthy();
+  });
+
   it('registers the sizecap merge driver after configuring user.* git config', async () => {
     vi.mocked(fs.existsSync).mockReturnValue(false);
     stubExecFileSyncNoStaleBranch();

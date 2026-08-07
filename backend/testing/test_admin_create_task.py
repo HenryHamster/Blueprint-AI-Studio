@@ -17,6 +17,15 @@ from httpx import AsyncClient
 
 from app.models import Project, ProjectMember, ProjectStatus
 
+# Code-producing tasks now require an acceptance_evidence declaration at
+# validation (validate_task_payload). These tests exercise the operator
+# create-task surface, so every create/fix body that must reach a 200 carries a
+# minimal valid observable_behavior declaration.
+_CODE_EVIDENCE = {
+    "kind": "observable_behavior",
+    "description": "operator-spawned task ships a real, testable change",
+}
+
 
 async def _make_project_with_member(db_session, repo="acme/widget", role="owner"):
     """Project for the given owner/repo with test-user-123 as a member.
@@ -151,6 +160,7 @@ async def test_omitted_base_branch_uses_project_promotion_target(
             "title": "Task without base_branch",
             "prompt": "do something useful",
             "task_type": "create",
+            "acceptance_evidence": _CODE_EVIDENCE,
             # base_branch intentionally omitted
         },
     )
@@ -194,6 +204,7 @@ async def test_explicit_base_branch_preserved(client: AsyncClient, db_session):
             "prompt": "work on main",
             "task_type": "create",
             "base_branch": "main",
+            "acceptance_evidence": _CODE_EVIDENCE,
         },
     )
 
@@ -222,6 +233,7 @@ async def test_non_hotfix_create_task_still_works(client: AsyncClient, db_sessio
             "prompt": "build the feature",
             "base_branch": "main",
             "task_type": "create",
+            "acceptance_evidence": _CODE_EVIDENCE,
         },
     )
 
@@ -356,6 +368,7 @@ async def test_idempotency_key_dedupes_duplicate_submit(
             "title": "Idempotent task",
             "prompt": "do something",
             "task_type": "create",
+            "acceptance_evidence": _CODE_EVIDENCE,
             "idempotency_key": key,
         },
     )
@@ -373,6 +386,7 @@ async def test_idempotency_key_dedupes_duplicate_submit(
             "title": "Idempotent task",
             "prompt": "do something",
             "task_type": "create",
+            "acceptance_evidence": _CODE_EVIDENCE,
             "idempotency_key": key,
         },
     )
@@ -400,6 +414,7 @@ async def test_idempotency_key_no_second_task_created(
             "title": "First request",
             "prompt": "do work",
             "task_type": "create",
+            "acceptance_evidence": _CODE_EVIDENCE,
             "idempotency_key": key,
         },
     )
@@ -411,6 +426,7 @@ async def test_idempotency_key_no_second_task_created(
             "title": "First request",
             "prompt": "do work",
             "task_type": "create",
+            "acceptance_evidence": _CODE_EVIDENCE,
             "idempotency_key": key,
         },
     )
@@ -436,6 +452,7 @@ async def test_without_idempotency_key_creates_duplicates(
             "title": "Unprotected task",
             "prompt": "do something",
             "task_type": "create",
+            "acceptance_evidence": _CODE_EVIDENCE,
         },
     )
 
@@ -450,6 +467,7 @@ async def test_without_idempotency_key_creates_duplicates(
             "title": "Unprotected task",
             "prompt": "do something",
             "task_type": "create",
+            "acceptance_evidence": _CODE_EVIDENCE,
         },
     )
 
@@ -485,6 +503,7 @@ async def test_idempotency_key_scoped_per_project(client: AsyncClient, db_sessio
             "title": "Task in project A",
             "prompt": "do A",
             "task_type": "create",
+            "acceptance_evidence": _CODE_EVIDENCE,
             "idempotency_key": key,
         },
     )
@@ -498,6 +517,7 @@ async def test_idempotency_key_scoped_per_project(client: AsyncClient, db_sessio
             "title": "Task in project B",
             "prompt": "do B",
             "task_type": "create",
+            "acceptance_evidence": _CODE_EVIDENCE,
             "idempotency_key": key,
         },
     )
@@ -577,6 +597,7 @@ async def test_member_can_create_task_on_existing_project(
             "prompt": "do the work",
             "base_branch": "main",
             "task_type": "create",
+            "acceptance_evidence": _CODE_EVIDENCE,
         },
     )
 
@@ -617,6 +638,7 @@ async def test_ambiguous_repo_prefers_writable_project_over_viewer_one(
                 "prompt": "do the work",
                 "base_branch": "main",
                 "task_type": "create",
+                "acceptance_evidence": _CODE_EVIDENCE,
             },
         )
         assert resp.status_code == 200, resp.text
@@ -627,3 +649,38 @@ async def test_ambiguous_repo_prefers_writable_project_over_viewer_one(
     assert await _count_tasks(db_session, viewer_project.id) == 0
     # ...and no shadow project was minted.
     assert await _count_projects_for_repo(db_session, "acme", "widget") == 2
+
+
+@pytest.mark.asyncio
+async def test_create_validation_reason_surfaces_in_422(
+    client: AsyncClient, db_session
+):
+    """A schema-validation failure on the operator create surface returns the
+    authored reason instead of the opaque 'Invalid request'.
+
+    Regression for the payload-validation 422 opacity fix: submitting a
+    code-producing task without an acceptance_evidence declaration must surface
+    WHY it was rejected (the field/validator message), so the operator UI toast
+    and an autonomously spawning agent can see the reason and self-correct.
+    """
+    await _make_project_with_member(db_session, "acme/widget")
+
+    resp = await client.post(
+        "/api/admin/tasks",
+        json={
+            "github_repo": "acme/widget",
+            "title": "Missing evidence",
+            "prompt": "patch the bug",
+            "base_branch": "main",
+            "task_type": "create",
+        },
+    )
+
+    assert resp.status_code == 422, resp.text
+    # The app wraps HTTPException as {"error": {"code", "message"}} (main.py
+    # http_exception_handler) — there is no top-level "detail" key.
+    message = resp.json()["error"]["message"]
+    assert "acceptance_evidence" in message
+    assert "Invalid request" not in message
+    # The reason must survive end-to-end (no multi-line pydantic block).
+    assert "\n" not in message

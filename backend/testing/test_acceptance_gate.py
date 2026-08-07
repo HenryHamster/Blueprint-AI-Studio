@@ -21,6 +21,7 @@ from sqlmodel import select
 from app.acceptance_gate import (
     CODE_ACCEPTANCE_VERDICT_KEY,
     CRITERION_OPS,
+    PREMERGE_ACCEPTANCE_FINDING_KEY,
     TEST_COVERAGE_RESULT_KEY,
     acceptance_blocks_success,
     acceptance_is_proven,
@@ -30,11 +31,16 @@ from app.acceptance_gate import (
     classify_merged_acceptance,
     classify_merged_acceptance_context,
     classify_undeclared_reason,
+    classify_unsatisfied_reason,
     coerce_number,
     criterion_met,
     evaluate_code_acceptance,
+    evaluate_premerge_acceptance,
+    format_premerge_acceptance_finding,
+    premerge_acceptance_finding,
     record_artifact_consumptions_for_task,
     record_code_acceptance_verdict,
+    stamp_premerge_acceptance_finding,
     summarize_version_acceptance_aggregate,
     _evaluate_coverage_delta,
 )
@@ -316,6 +322,174 @@ def test_targeted_green_test_only_diff_still_fails_closed():
     assert verdict.satisfied is False
     assert verdict.proven is False
     assert "test-only" in verdict.reason
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pre-merge acceptance: judge the structurally-checkable half while PR is open
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_premerge_acceptance_failure_reaches_review_loop():
+    # A PR whose declared named_test is NOT among its changed files is
+    # structurally unsatisfiable BEFORE the merge: the test was never added to
+    # the diff, so no merge-time green run can ever satisfy the declaration.
+    # The pre-merge gate must route that failure into the review/fix loop (a
+    # durable, readable finding) so the task can correct the code or the
+    # declaration while the PR is still open — instead of discovering it only
+    # at merge-landing, when nothing can be done.
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+            "test_id": "test_widget_handles_empty",
+        },
+        changed_files=["backend/app/widget.py"],  # declared test absent
+        unverified_reason=None,
+    )
+    verdict = evaluate_premerge_acceptance(task)
+    assert verdict is not None
+    assert verdict.declared is True
+    assert verdict.satisfied is False
+    assert "not among" in verdict.reason
+    assert verdict.proven is False
+
+    # The structural failure is stamped as a durable finding and read back by
+    # the review/fix pipeline's reader.
+    finding = stamp_premerge_acceptance_finding(task)
+    assert finding is not None
+    assert finding["satisfied"] is False
+    assert finding["kind"] == "named_test"
+    assert finding["cause"] == "named_test_missing_from_diff"
+    assert finding["reason"] == verdict.reason
+    assert premerge_acceptance_finding(task) == finding
+    assert (task.context or {}).get(PREMERGE_ACCEPTANCE_FINDING_KEY) == finding
+
+    # The finding renders as a fix-prompt block naming the defect and cause, so
+    # a fix agent corrects it in the same pass as the review feedback.
+    block = format_premerge_acceptance_finding(finding)
+    assert "PRE-MERGE ACCEPTANCE FAILURE" in block
+    assert "not among" in block
+    assert "named_test_missing_from_diff" in block
+    assert format_premerge_acceptance_finding(None) == ""
+    assert format_premerge_acceptance_finding({"satisfied": True}) == ""
+
+    # Self-healing: once the agent adds the declared test to the diff (a new
+    # status POST with corrected changed files), re-stamping clears the finding.
+    task.context = {
+        **(task.context or {}),
+        "_pr_changed_files": [
+            "backend/app/widget.py",
+            "backend/testing/test_widget.py",
+        ],
+    }
+    assert stamp_premerge_acceptance_finding(task) is None
+    assert premerge_acceptance_finding(task) is None
+    assert PREMERGE_ACCEPTANCE_FINDING_KEY not in (task.context or {})
+
+    # The green-run half is NOT pre-merge checkable: a structurally sound
+    # named_test (test present + non-test seam + semantically grounded) is
+    # satisfied/unproven pre-merge and produces no finding.
+    sound = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+        },
+        changed_files=["backend/app/widget.py", "backend/testing/test_widget.py"],
+        unverified_reason=None,
+    )
+    sound_verdict = evaluate_premerge_acceptance(sound)
+    assert sound_verdict is not None
+    assert sound_verdict.satisfied is True
+    assert sound_verdict.proven is False
+    assert stamp_premerge_acceptance_finding(sound) is None
+    assert premerge_acceptance_finding(sound) is None
+
+    # A task that declared NO acceptance evidence is never judged pre-merge and
+    # never produces a finding.
+    undeclared = _make_code_task(
+        acceptance_evidence=None,
+        changed_files=["backend/app/widget.py"],
+    )
+    assert evaluate_premerge_acceptance(undeclared) is None
+    assert stamp_premerge_acceptance_finding(undeclared) is None
+    assert premerge_acceptance_finding(undeclared) is None
+
+
+def test_premerge_acceptance_other_kinds_structural_only():
+    # downstream_artifact: grounded delivery is structural; an artifact id with
+    # no grounded changed path fails closed pre-merge with the same actionable
+    # cause as the merge-time gate.
+    artifact_task = _make_code_task(
+        acceptance_evidence={
+            "kind": "downstream_artifact",
+            "artifact_id": "deploy-pipeline-registry",
+        },
+        changed_files=["backend/app/other_module.py"],  # unrelated diff
+        unverified_reason=None,
+    )
+    assert evaluate_premerge_acceptance(artifact_task) is not None
+    finding = stamp_premerge_acceptance_finding(artifact_task)
+    assert finding is not None
+    assert finding["cause"] == "artifact_not_in_diff"
+
+    # visual: a well-formed declaration (component + viewport_width) is
+    # satisfied/unproven pre-merge — the uploaded screenshot is a merge-time
+    # artifact, so no finding is stamped. A malformed declaration reads as
+    # undeclared at the fail-soft read layer (indistinguishable from no
+    # declaration), so it produces no finding either.
+    sound_visual = _make_code_task(
+        acceptance_evidence={
+            "kind": "visual",
+            "component": "ComputeJobsPanel",
+            "viewport_width": 1280,
+        },
+        changed_files=["admin-ui/src/ComputeJobsPanel.tsx"],
+        unverified_reason=None,
+    )
+    visual_verdict = evaluate_premerge_acceptance(sound_visual)
+    assert visual_verdict is not None and visual_verdict.satisfied is True
+    assert visual_verdict.proven is False
+    assert stamp_premerge_acceptance_finding(sound_visual) is None
+
+    malformed_visual = _make_code_task(
+        acceptance_evidence={
+            "kind": "visual",
+            "component": "ComputeJobsPanel",
+            # viewport_width omitted → malformed declaration
+        },
+        changed_files=["admin-ui/src/ComputeJobsPanel.tsx"],
+        unverified_reason=None,
+    )
+    assert evaluate_premerge_acceptance(malformed_visual) is None
+    assert stamp_premerge_acceptance_finding(malformed_visual) is None
+
+    # coverage_delta: a well-formed declaration (numeric threshold) is
+    # satisfied/unproven pre-merge — the measurement is produced only by a real
+    # test run, so it is verified at merge. A missing threshold reads as
+    # undeclared (fail-soft), so it produces no finding.
+    sound_coverage = _make_code_task(
+        acceptance_evidence={
+            "kind": "coverage_delta",
+            "threshold": 80.0,
+        },
+        changed_files=["backend/app/widget.py"],
+        unverified_reason=None,
+    )
+    coverage_verdict = evaluate_premerge_acceptance(sound_coverage)
+    assert coverage_verdict is not None and coverage_verdict.satisfied is True
+    assert coverage_verdict.proven is False
+    assert stamp_premerge_acceptance_finding(sound_coverage) is None
+
+    missing_threshold = _make_code_task(
+        acceptance_evidence={
+            "kind": "coverage_delta",
+            # threshold omitted → malformed declaration
+        },
+        changed_files=["backend/app/widget.py"],
+        unverified_reason=None,
+    )
+    assert evaluate_premerge_acceptance(missing_threshold) is None
+    assert stamp_premerge_acceptance_finding(missing_threshold) is None
 
 
 def test_targeted_green_parent_derived_capped_at_soft():
@@ -1405,6 +1579,215 @@ def test_classify_undeclared_reason_partitions_undeclared_bucket():
     assert reasons == set(_UNDECLARED_REASON_KEYS)
 
 
+# The persisted per-verdict ``reason`` strings the fail-closed gate emits, one
+# per canonical cause. Kept as real strings (with the same repr-quoted paths the
+# gate formats) so the classifier is tested against what actually lands in
+# task.context[CODE_ACCEPTANCE_VERDICT_KEY], not a hand-rolled reimplementation.
+_REASONED_UNSATISFIED_SAMPLES = {
+    "named_test_missing_from_diff": (
+        "named_test",
+        "declared named_test 'backend/testing/test_widget.py' is not among the "
+        "PR's changed files — the claimed test was not added or modified here",
+    ),
+    "named_test_not_run_green": (
+        "named_test",
+        "declared named_test 'backend/testing/test_widget.py' did not run green "
+        "under a real merge-test verdict (the merge fell open without verification)",
+    ),
+    "named_test_test_only_diff": (
+        "named_test",
+        "declared named_test 'backend/testing/test_widget.py' ships no production "
+        "code change it could exercise (the diff is test-only)",
+    ),
+    "named_test_ungrounded_seam": (
+        "named_test",
+        "declared named_test 'backend/testing/test_widget.py' exercises a "
+        "production seam that does not semantically correspond to the declared "
+        "test module — none of the changed production files match the test file's "
+        "module name",
+    ),
+    "artifact_empty_diff": (
+        "downstream_artifact",
+        "declared downstream_artifact acceptance evidence but the task shipped "
+        "no changed files to deliver it",
+    ),
+    "artifact_not_in_diff": (
+        "downstream_artifact",
+        "declared downstream_artifact 'release-deploy-artifact-registry' is not "
+        "reflected in any of the 3 shipped changed file(s) — the diff does not "
+        "deliver the named artifact",
+    ),
+    "visual_malformed": (
+        "visual",
+        "declared visual acceptance evidence is malformed or incomplete",
+    ),
+    "visual_no_screenshot": (
+        "visual",
+        "declared visual acceptance evidence but no matching viewport screenshot "
+        "was uploaded for component 'MetricsDashboard' at 375px",
+    ),
+    "coverage_missing_threshold": (
+        "coverage_delta",
+        "coverage_delta acceptance evidence requires a numeric threshold "
+        "(coverage percentage 0–100)",
+    ),
+    "coverage_missing_result_no_result": (
+        "coverage_delta",
+        "coverage_delta acceptance evidence requires a test coverage result in "
+        "task context (test_coverage_result) — no result found",
+    ),
+    "coverage_missing_result_no_pct": (
+        "coverage_delta",
+        "coverage_delta acceptance evidence: coverage result is missing numeric "
+        "coverage_pct",
+    ),
+    "coverage_below_threshold": (
+        "coverage_delta",
+        "coverage_delta acceptance evidence: achieved 55.0% coverage < 80% "
+        "threshold",
+    ),
+    "observable_empty_diff": (
+        "observable_behavior",
+        "declared observable_behavior acceptance evidence but the task shipped "
+        "no changed files to exercise it",
+    ),
+    "unrecognized_kind": (
+        "future_kind",
+        "unrecognized acceptance kind 'future_kind'",
+    ),
+}
+
+# The two coverage_missing_result variants collapse to one canonical cause.
+_COVERAGE_MISSING_RESULT_SAMPLES = {
+    "coverage_missing_result_no_result",
+    "coverage_missing_result_no_pct",
+}
+
+
+@pytest.mark.parametrize(
+    "expected,kind,reason",
+    [
+        (key, kind, reason)
+        for key, (kind, reason) in _REASONED_UNSATISFIED_SAMPLES.items()
+    ],
+)
+def test_classify_unsatisfied_reason_maps_recorded_reason(expected, kind, reason):
+    """Every fail-closed verdict reason maps to exactly one canonical cause."""
+    recorded = {"satisfied": False, "proven": False, "kind": kind, "reason": reason}
+    if expected in _COVERAGE_MISSING_RESULT_SAMPLES:
+        expected = "coverage_missing_result"
+    assert classify_unsatisfied_reason(recorded) == expected
+
+
+def test_classify_unsatisfied_reason_partitions_known_causes():
+    """The canonical causes partition the declared_unsatisfied bucket.
+
+    Each ``_UNSATISFIED_REASON_KEYS`` key is reachable from a verdict the gate
+    can actually emit (plus the ``unknown`` catch-all for unreasoned rows), and
+    the two coverage_missing_result variants collapse onto the single canonical
+    key, so tallies always partition.
+    """
+    from app.acceptance_gate import _UNSATISFIED_REASON_KEYS
+
+    outputs = set()
+    for key, (kind, reason) in _REASONED_UNSATISFIED_SAMPLES.items():
+        canonical = (
+            "coverage_missing_result"
+            if key in _COVERAGE_MISSING_RESULT_SAMPLES
+            else key
+        )
+        recorded = {"satisfied": False, "proven": False, "kind": kind, "reason": reason}
+        assert classify_unsatisfied_reason(recorded) == canonical
+        outputs.add(canonical)
+    outputs.add(classify_unsatisfied_reason({"satisfied": False, "kind": "named_test"}))
+    assert outputs == set(_UNSATISFIED_REASON_KEYS)
+
+
+def test_classify_unsatisfied_reason_missing_reason_falls_back_unknown():
+    """Verdicts stamped without a reason (legacy / manually-written rows) are
+    classified ``unknown`` deterministically rather than raising or inventing a
+    cause — the split still sums to the declared_unsatisfied bucket."""
+    assert (
+        classify_unsatisfied_reason(
+            {"satisfied": False, "proven": False, "kind": "named_test"}
+        )
+        == "unknown"
+    )
+    assert classify_unsatisfied_reason({"satisfied": False, "kind": "visual"}) == "unknown"
+    assert classify_unsatisfied_reason({"satisfied": False}) == "unknown"
+    assert classify_unsatisfied_reason(None) == "unknown"
+    assert classify_unsatisfied_reason("not-a-dict") == "unknown"
+
+
+def test_classify_unsatisfied_reason_matches_gate_recorded_verdicts():
+    """Drive the REAL gate: a declared-but-unsatisfied task's recorded verdict
+    reason classifies to the same cause the reason text describes.
+
+    Connects the classifier to what :func:`record_code_acceptance_verdict`
+    actually stamps, for each distinct fail-closed branch of the gate."""
+    unsatisfied_cases = [
+        (  # named_test absent from the diff
+            {
+                "acceptance_evidence": {
+                    "kind": "named_test",
+                    "test_path": "backend/testing/test_widget.py",
+                },
+                "changed_files": ["backend/app/widget.py"],
+                "unverified_reason": None,
+            },
+            "named_test_missing_from_diff",
+        ),
+        (  # named_test that never ran green
+            {
+                "acceptance_evidence": {
+                    "kind": "named_test",
+                    "test_path": "backend/testing/test_widget.py",
+                },
+                "changed_files": [
+                    "backend/app/widget.py",
+                    "backend/testing/test_widget.py",
+                ],
+                "unverified_reason": "no_detectable_test_command",
+            },
+            "named_test_not_run_green",
+        ),
+        (  # named_test with a test-only diff (no production seam)
+            {
+                "acceptance_evidence": {
+                    "kind": "named_test",
+                    "test_path": "backend/testing/test_widget.py",
+                },
+                "changed_files": ["backend/testing/test_widget.py"],
+                "unverified_reason": None,
+            },
+            "named_test_test_only_diff",
+        ),
+        (  # observable_behavior with an empty diff
+            {
+                "acceptance_evidence": {
+                    "kind": "observable_behavior",
+                    "description": "the dashboard shows the live serving SHA banner",
+                },
+                "changed_files": [],
+                "unverified_reason": None,
+            },
+            "observable_empty_diff",
+        ),
+    ]
+    for kwargs, expected in unsatisfied_cases:
+        task = _make_code_task(**kwargs)
+        verdict = evaluate_code_acceptance(task)
+        assert verdict.satisfied is False, expected
+        assert classify_unsatisfied_reason(
+            {
+                "satisfied": verdict.satisfied,
+                "proven": verdict.proven,
+                "kind": verdict.kind,
+                "reason": verdict.reason,
+            }
+        ) == expected
+
+
 def test_degraded_unverified_test_cochange_stays_degraded():
     """A degraded fall-open overrides inference → merged_unverified_degraded."""
     ctx = _inferred_ctx(
@@ -2444,75 +2827,93 @@ def test_aggregate_invariant_coverage_never_exceeds_bounds():
             assert coverage <= 1.0
 
 
-def test_missing_review_loop_not_scored_as_proven():
-    """Missing/malformed review_loop fails closed: unverified merge not scored as proven.
+def test_missing_review_loop_matches_canonical_verified_merge_predicate():
+    """Missing/malformed review_loop defaults to VERIFIED, matching is_verified_merge.
 
-    The _merge_was_test_verified helper must fail closed when review_loop context
-    is absent or malformed (like all other evidence checks in the module), NOT
-    return True and give an unverified merge a free pass to proven scoring.
-    An absent review_loop means we cannot attest the merge was verified —
-    the safe default is unverified.
+    The acceptance gate's _merge_was_test_verified helper must use the SAME
+    fail-safe default as the canonical landed_signal.is_verified_merge predicate
+    (and this module's own _context_merge_verification_status): an ABSENT or
+    malformed review_loop carries no unverified_merge_reason, so the merge was
+    genuinely verified. A landed task whose context simply lacks a review_loop
+    dict must NOT be scored declared_unsatisfied — it must earn machine proof.
+    Only an explicit unverified_merge_reason makes the merge unverified.
     """
-    # Case 1: completely missing review_loop context
-    task_no_context = _make_code_task(
-        acceptance_evidence={
-            "kind": "named_test",
-            "test_path": "backend/testing/test_widget.py",
-        },
-        changed_files=["backend/app/widget.py", "backend/testing/test_widget.py"],
-        unverified_reason=None,  # Context dict has no review_loop at all
-    )
-    # Explicitly clear the context to simulate no review_loop key
-    task_no_context.context = {"_pr_changed_files": task_no_context.context["_pr_changed_files"]}
+    from app.landed_signal import is_verified_merge
 
-    verdict_no_context = evaluate_code_acceptance(task_no_context)
-    # Missing review_loop should fail closed: NOT proven, not satisfied for named_test
-    assert verdict_no_context.declared is True
-    assert verdict_no_context.satisfied is False
-    assert verdict_no_context.proven is False
-    assert "did not run green" in verdict_no_context.reason
+    def _landed(task: Task) -> Task:
+        # Stamp the integration-landing signal so the canonical
+        # is_merged_completion gate (status COMPLETED + landed signal) is met,
+        # exactly as a real landed task would carry it.
+        task.context = {
+            **(task.context or {}),
+            "pr_merged": True,
+            "landed_on_integration": True,
+        }
+        return task
 
-    # Case 2: malformed review_loop (not a dict)
-    task_malformed = _make_code_task(
+    # Case 1: completely missing review_loop context. The canonical predicate
+    # treats this as a VERIFIED merge, so the acceptance gate must agree and
+    # mint machine proof instead of scoring declared_unsatisfied.
+    task_no_context = _landed(_make_code_task(
         acceptance_evidence={
             "kind": "named_test",
             "test_path": "backend/testing/test_widget.py",
         },
         changed_files=["backend/app/widget.py", "backend/testing/test_widget.py"],
         unverified_reason=None,
-    )
+    ))
+    # Explicitly drop review_loop to simulate a context that simply lacks it.
+    task_no_context.context.pop(REVIEW_LOOP_KEY, None)
+
+    assert is_verified_merge(task_no_context) is True
+    verdict_no_context = evaluate_code_acceptance(task_no_context)
+    assert verdict_no_context.declared is True
+    assert verdict_no_context.satisfied is True
+    assert verdict_no_context.proven is True
+
+    record_code_acceptance_verdict(task_no_context)
+    stamped = task_no_context.context[CODE_ACCEPTANCE_VERDICT_KEY]
+    assert acceptance_blocks_success(stamped) is False
+    assert acceptance_is_proven(stamped) is True
+    assert classify_merged_acceptance(task_no_context) == "proven"
+
+    # Case 2: malformed review_loop (not a dict) — same verified default.
+    task_malformed = _landed(_make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+        },
+        changed_files=["backend/app/widget.py", "backend/testing/test_widget.py"],
+        unverified_reason=None,
+    ))
     task_malformed.context[REVIEW_LOOP_KEY] = "not a dict"  # Malformed
 
+    assert is_verified_merge(task_malformed) is True
     verdict_malformed = evaluate_code_acceptance(task_malformed)
-    assert verdict_malformed.declared is True
-    assert verdict_malformed.satisfied is False
-    assert verdict_malformed.proven is False
-    assert "did not run green" in verdict_malformed.reason
+    assert verdict_malformed.satisfied is True
+    assert verdict_malformed.proven is True
 
-    # Case 3: with explicit unverified_reason (control — should already fail)
-    task_explicit_unverified = _make_code_task(
+    # Case 3: explicit unverified_merge_reason — the ONLY fail-closed case; both
+    # predicates agree the merge was NOT verified.
+    task_explicit_unverified = _landed(_make_code_task(
         acceptance_evidence={
             "kind": "named_test",
             "test_path": "backend/testing/test_widget.py",
         },
         changed_files=["backend/app/widget.py", "backend/testing/test_widget.py"],
         unverified_reason="no_runnable_suite",  # Explicit fall-open
-    )
-
+    ))
+    assert is_verified_merge(task_explicit_unverified) is False
     verdict_explicit = evaluate_code_acceptance(task_explicit_unverified)
     assert verdict_explicit.declared is True
     assert verdict_explicit.satisfied is False
     assert verdict_explicit.proven is False
+    assert "did not run green" in verdict_explicit.reason
 
-    # All three (missing, malformed, explicit unverified) fail closed identically
-    # when a named_test is declared with a real changed seam.
-    record_code_acceptance_verdict(task_no_context)
-    record_code_acceptance_verdict(task_malformed)
     record_code_acceptance_verdict(task_explicit_unverified)
-
-    assert acceptance_blocks_success(task_no_context.context[CODE_ACCEPTANCE_VERDICT_KEY]) is True
-    assert acceptance_blocks_success(task_malformed.context[CODE_ACCEPTANCE_VERDICT_KEY]) is True
-    assert acceptance_blocks_success(task_explicit_unverified.context[CODE_ACCEPTANCE_VERDICT_KEY]) is True
+    assert acceptance_blocks_success(
+        task_explicit_unverified.context[CODE_ACCEPTANCE_VERDICT_KEY]
+    ) is True
 
 
 @pytest.mark.asyncio
@@ -2628,6 +3029,99 @@ async def test_backfill_acceptance_verdicts_upgrades_frontend_named_test(db_sess
     assert updated is not None
     assert updated.get("proven") is True, "frontend verdict should upgrade to proven"
     assert updated.get("backfilled") is True
+
+
+@pytest.mark.asyncio
+async def test_backfill_acceptance_verdicts_heals_missing_review_loop_misscoring(
+    db_session,
+):
+    """A pre-fix named_test verdict recorded unsatisfied with the 'did not run
+    green' reason — because _merge_was_test_verified treated an ABSENT
+    review_loop as unverified — is upgraded to proven=True by the backfill once
+    the verified-merge default matches is_verified_merge. A genuinely-unverified
+    verdict carrying the same reason stays unsatisfied.
+    """
+    from datetime import datetime, timezone
+
+    from testing.factories import make_project
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.flush()
+
+    # Mis-scored task: the named_test shipped with a real production seam, but
+    # the recorded verdict is unsatisfied because the merge context simply
+    # lacked a review_loop dict (the pre-fix fail-closed default).
+    mis_scored = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+        },
+        changed_files=["backend/app/widget.py", "backend/testing/test_widget.py"],
+        unverified_reason=None,
+    )
+    mis_scored.project_id = project.id
+    mis_scored.completed_at = datetime(2026, 8, 5, 0, 0, 0, tzinfo=timezone.utc)
+    ctx = dict(mis_scored.context or {})
+    # Simulate the pre-fix shape: NO review_loop key + recorded "did not run green".
+    ctx.pop(REVIEW_LOOP_KEY, None)
+    ctx[CODE_ACCEPTANCE_VERDICT_KEY] = {
+        "satisfied": False,
+        "proven": False,
+        "kind": "named_test",
+        "reason": (
+            "declared named_test 'backend/testing/test_widget.py' did not run green "
+            "under a real merge-test verdict (the merge fell open without verification)"
+        ),
+    }
+    mis_scored.context = ctx
+    db_session.add(mis_scored)
+
+    # Genuinely-unverified task: the same verdict shape but an explicit
+    # unverified_merge_reason remains — must NOT be upgraded.
+    genuinely_unverified = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+        },
+        changed_files=["backend/app/widget.py", "backend/testing/test_widget.py"],
+        unverified_reason="no_runnable_suite",
+    )
+    genuinely_unverified.project_id = project.id
+    genuinely_unverified.completed_at = datetime(
+        2026, 8, 5, 1, 0, 0, tzinfo=timezone.utc
+    )
+    gctx = dict(genuinely_unverified.context or {})
+    gctx[CODE_ACCEPTANCE_VERDICT_KEY] = {
+        "satisfied": False,
+        "proven": False,
+        "kind": "named_test",
+        "reason": (
+            "declared named_test 'backend/testing/test_widget.py' did not run green "
+            "under a real merge-test verdict (the merge fell open without verification)"
+        ),
+    }
+    genuinely_unverified.context = gctx
+    db_session.add(genuinely_unverified)
+    await db_session.flush()
+
+    result = await backfill_acceptance_verdicts(db_session)
+    assert result >= 1, "backfill should heal the missing-review_loop mis-scored verdict"
+
+    await db_session.refresh(mis_scored)
+    updated = (mis_scored.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+    assert updated is not None
+    assert updated.get("satisfied") is True
+    assert updated.get("proven") is True, "mis-scored verdict should upgrade to proven"
+    assert updated.get("backfilled") is True
+
+    await db_session.refresh(genuinely_unverified)
+    kept = (genuinely_unverified.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+    assert kept is not None
+    assert kept.get("satisfied") is False
+    assert kept.get("proven") is False, (
+        "a genuinely-unverified merge must stay unsatisfied, not be upgraded"
+    )
 
 
 @pytest.mark.asyncio
