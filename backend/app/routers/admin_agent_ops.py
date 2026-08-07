@@ -4443,7 +4443,7 @@ async def strategic_operation(
         if direction_id:
             from app.direction_saturation import clear_saturation_disposition
 
-            async def _apply_spawn_clear(fresh: list) -> list | None:
+            def _apply_spawn_clear(fresh: list) -> list | None:
                 _target = next(
                     (d for d in fresh if d.get("id") == direction_id), None
                 )

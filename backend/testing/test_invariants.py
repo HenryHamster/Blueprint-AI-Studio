@@ -1539,13 +1539,18 @@ class TestSchemaRevisionSync:
         assert "0612b_fix_checkpoint_clear_fk_cascade.py" in basenames
 
         # Pin 0612b into the computed chain and assert the single-head set.
+        # The head itself moves with every new migration, so compare against
+        # EXPECTED_SCHEMA_REVISION (kept in lockstep with the latest migration
+        # by its own guard) instead of a hardcoded revision.
+        from app.main import EXPECTED_SCHEMA_REVISION
+
         chain, duplicates, unparseable = build_migration_chain(sources)
         assert not duplicates and not unparseable
         assert "0612b" in chain
         heads = find_heads(chain)
-        assert heads == ["0725"], (
-            f"expected single head ['0725'] with 0612b in the chain, got "
-            f"{sorted(heads)}"
+        assert heads == [EXPECTED_SCHEMA_REVISION], (
+            f"expected single head [{EXPECTED_SCHEMA_REVISION!r}] with 0612b "
+            f"in the chain, got {sorted(heads)}"
         )
 
         async def _file_text(path, *, token, owner, repo, ref, **kwargs):
@@ -12917,18 +12922,18 @@ class TestProblemModelWritePathInvariants:
         ("routers/admin_onboard.py", 915): "pm parsed from ProblemModel, model_dump",
         # admin_agent_ops.py: reconcile_gap_staffing_raw_result -> problem_model key (5 sites)
         ("routers/admin_agent_ops.py", 1832): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 2250): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 2690): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 2803): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 3058): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 2258): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 2705): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 2818): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 3073): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
         # admin_agent_ops.py: apply_agent_update (op endpoint write-back)
-        ("routers/admin_agent_ops.py", 4589): "apply_agent_update result",
+        ("routers/admin_agent_ops.py", 4623): "apply_agent_update result",
         # admin_agent_ops.py: apply_agent_update (re-normalized after write-back)
-        ("routers/admin_agent_ops.py", 4617): "apply_agent_update result, then _normalize_active_moves_writeback",
+        ("routers/admin_agent_ops.py", 4651): "apply_agent_update result, then _normalize_active_moves_writeback",
         # admin_agent_ops.py: current_model.model_dump() (pending_confirm op)
-        ("routers/admin_agent_ops.py", 5148): "validated current_model pydantic model_dump",
+        ("routers/admin_agent_ops.py", 5182): "validated current_model pydantic model_dump",
         # admin_agent_ops.py: current_model.model_dump() (resolve_pending_confirm op)
-        ("routers/admin_agent_ops.py", 5230): "validated current_model pydantic model_dump",
+        ("routers/admin_agent_ops.py", 5264): "validated current_model pydantic model_dump",
     }
 
     def test_all_problem_model_write_paths_are_sanitized(self):
