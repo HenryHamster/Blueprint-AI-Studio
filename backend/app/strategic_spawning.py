@@ -38,6 +38,7 @@ from app.direction_outcomes import (
     verified_merged_count,
 )
 from app.direction_mode import mode_prompt_hint, normalized_recommended_mode
+from app.direction_saturation import build_saturation_dispositions
 from app.knowledge_query import build_knowledge_index, build_compute_sweep_groups, fetch_direction_knowledge_index, build_pending_followups, build_strategic_memory_index
 from app.models import (
     Task,
@@ -2202,6 +2203,12 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # heavier ``directions_summary`` detail list is trimmed or dropped for budget.
     "direction_counts": {"priority": "critical"},
     "max_active_directions": {"priority": "critical"},
+    # Forced strategist dispositions for saturated directions. High priority and
+    # exempt: a pending saturation item is a bounded small list and the strategist
+    # MUST answer it (commission work / narrow scope / retire), so it must never be
+    # trimmed or dropped under byte budget. Built from the durable per-direction
+    # ``saturation_disposition`` item, never re-emitted across cycles.
+    "saturation_dispositions": {"priority": "high", "exempt": True},
     # Trim-proof authoritative count of unresolved open operator messages computed
     # BEFORE packing. Critical tier (tiny scalar) so the agent sees the true inbox
     # depth even when ``open_messages`` itself is trimmed/dropped under byte budget.
@@ -5879,6 +5886,7 @@ async def _spawn_strategic_review(
             session.add(project)
         _res_retired_summary = _build_retired_directions_summary(project)
         _res_prev_outcomes = _build_previous_decision_outcomes(project, cycle_history)
+        _res_saturation_dispositions = build_saturation_dispositions(project)
         _res_criterion_conflicts: list[dict] | None = None
         if get_project_integration_branch(project) != get_project_promotion_target(project):
             # Criterion-link conflicts are version-lifecycle context (they key off
@@ -6008,6 +6016,11 @@ async def _spawn_strategic_review(
                     ),
                     "direction_counts": _res_direction_counts,
                     "max_active_directions": _res_direction_counts["max_active"],
+                    **(
+                        {"saturation_dispositions": _res_saturation_dispositions}
+                        if _res_saturation_dispositions
+                        else {}
+                    ),
                     **(
                         {"retired_directions_summary": _res_retired_summary}
                         if _res_retired_summary
@@ -7723,6 +7736,10 @@ async def _spawn_strategic_review(
     _direction_counts = _build_direction_counts(project)
     _active_directions_count = _direction_counts["active"]
     _max_active_directions = _direction_counts["max_active"]
+    # Durable forced-disposition items for saturated directions. Pure over
+    # project.directions; computed once and conditionally shipped so an empty
+    # list never becomes a payload key.
+    _saturation_dispositions = build_saturation_dispositions(project)
     # Keep runtime capacity subordinate to portfolio coherence. Directions are
     # durable outcomes; bounded parallel work belongs in tasks beneath them.
     _portfolio_coherence_hint = _build_portfolio_coherence_hint(
@@ -8091,6 +8108,11 @@ async def _spawn_strategic_review(
             # true active set even when ``directions_summary`` is trimmed/dropped.
             "direction_counts": _direction_counts,
             "max_active_directions": _max_active_directions,
+            **(
+                {"saturation_dispositions": _saturation_dispositions}
+                if _saturation_dispositions
+                else {}
+            ),
             "directions_summary": direction_stats,
             **(
                 {"criterion_link_conflicts": _criterion_link_conflicts}

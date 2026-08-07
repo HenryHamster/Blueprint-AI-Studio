@@ -274,6 +274,7 @@ const {
     'buildPayloadStalenessSection',
     'buildPruneCandidatesSection',
     'buildQuestionSection',
+    'buildSaturationDispositionsSection',
     'buildSweepComparisonSection',
     'buildSystemMaturitySection',
     'fmtScalar',
@@ -557,6 +558,8 @@ vi.mock('./strategic-sections.js', () => ({
     staleness && staleness.stale === true ? 'STALENESS(stale)' : '',
   buildHeldDirectionsSection: (held: Array<Record<string, unknown>> | undefined) =>
     held && held.length ? `HELD(${held.length})` : '',
+  buildSaturationDispositionsSection: (disps: Array<Record<string, unknown>> | undefined) =>
+    disps && disps.length ? `SATDISPS(${disps.length})` : '',
 }));
 
 vi.mock('../telemetry.js', () => ({

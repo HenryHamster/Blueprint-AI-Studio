@@ -1022,6 +1022,20 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
                         "total_cycles": total_cycles,
                     }
                 )
+        # A zero-findings direction that is STILL active after the terminal
+        # resolution paths has no automatic way out — the same silent-back-off
+        # case as the findings path. Escalate it into a durable strategist
+        # disposition item so the strategist is forced to answer instead of the
+        # direction quietly idling on its longer saturation refractory.
+        if target.get("possibly_saturated") and target.get("status") == "active":
+            from app.direction_saturation import flag_saturation_disposition
+
+            flag_saturation_disposition(
+                target,
+                now_iso=now_iso,
+                findings_produced=0,
+                tasks_created=0,
+            )
 
     await with_directions_locked(
         session, task.project_id, _apply_no_findings_refractory

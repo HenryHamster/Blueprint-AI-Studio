@@ -72,6 +72,7 @@ import {
   buildCompletionDebtSection,
   buildPendingFollowupsSection,
   buildPayloadStalenessSection,
+  buildSaturationDispositionsSection,
 } from './strategic-sections.js';
 import { buildStallAdvisorySection } from './strategic-stall-advisory.js';
 
@@ -559,6 +560,16 @@ export async function handleStrategic(
     const driftSection = buildDriftSection(driftSignals);
     const heldDirectionsSection = buildHeldDirectionsSection(heldDirections);
 
+    // Forced strategist dispositions for saturated directions (backend-built
+    // `saturation_dispositions`). Rendered as a REQUIRED section the thinker
+    // MUST answer each cycle with a bounded disposition (commission/narrow/
+    // retire); the item persists on the backend until one of the strategic ops
+    // resolves it, so it keeps surfacing here if skipped.
+    const saturationDispositions = Array.isArray(payload.saturation_dispositions)
+      ? payload.saturation_dispositions as Array<Record<string, unknown>>
+      : [];
+    const saturationDispositionsSection = buildSaturationDispositionsSection(saturationDispositions);
+
     const efficiencySnapshotSection = buildEfficiencySnapshotSection(payload.efficiency_snapshot);
     const ciComplianceSection = buildCiComplianceSection(payload.ci_compliance);
     const completionDebtSection = buildCompletionDebtSection(payload.open_completion_debt);
@@ -968,6 +979,7 @@ prompts, schemas, tools, or orchestration.` : '';
       systemMaturitySection,
       driftSection,
       heldDirectionsSection,
+      saturationDispositionsSection,
       recentWorkSection,
       feedbackSection,
       questionSection,
@@ -1044,6 +1056,7 @@ prompts, schemas, tools, or orchestration.` : '';
       ['system_maturity', thinkerParams.systemMaturitySection],
       ['drift', thinkerParams.driftSection],
       ['held_directions', thinkerParams.heldDirectionsSection || ''],
+      ['saturation_dispositions', thinkerParams.saturationDispositionsSection || ''],
       ['recent_work', thinkerParams.recentWorkSection],
       ['feedback', thinkerParams.feedbackSection],
       ['question', thinkerParams.questionSection],

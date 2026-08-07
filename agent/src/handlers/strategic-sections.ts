@@ -120,6 +120,55 @@ export function buildHeldDirectionsSection(heldDirections: Array<Record<string, 
   return lines.join('\n');
 }
 
+/**
+ * Render the backend-computed forced-strategist-disposition block (payload field
+ * `saturation_dispositions`, built by `build_saturation_dispositions` in
+ * backend/app/direction_saturation.py). Each entry is a direction whose research
+ * keeps producing findings but spawns no work — the prior behavior was a silent
+ * longer refractory wait; this block forces an explicit bounded disposition:
+ * `commission work` (spawn concrete tasks in the direction), `narrow scope`
+ * (tighten the direction's contract so it can produce work again), or `retire`
+ * (take the direction off the board as exhausted).
+ *
+ * Unlike ordinary advisory sections, a pending item here is NOT optional — the
+ * strategist MUST emit a disposition this cycle. Resolving happens via the
+ * existing strategic ops: `spawn-task` (commission), `update-direction`
+ * (narrow), or `retire-direction` (retire). The item persists on the backend
+ * until one of those answers it. Returns '' when the block is absent/empty.
+ */
+export function buildSaturationDispositionsSection(
+  saturationDispositions: Array<Record<string, unknown>> | undefined,
+): string {
+  if (!saturationDispositions || saturationDispositions.length === 0) return '';
+  const lines: string[] = ['\n## REQUIRED — saturated direction dispositions'];
+  lines.push(
+    'The following direction(s) keep producing research findings but have spawned no ' +
+    'work, so they saturate: research output accumulates with nothing to show for it. ' +
+    'This is NOT an advisory section — you MUST pick a bounded disposition for each ' +
+    'listed direction THIS CYCLE and carry it out with the matching strategic op:',
+  );
+  lines.push('  - `spawn-task` with the direction\'s `direction_id` → **commission work** (concrete tasks now exist in the direction).');
+  lines.push('  - `update-direction` narrowing the direction\'s scope/success_evidence/retirement_condition → **narrow scope** (make the direction produce work again).');
+  lines.push('  - `retire-direction` → **retire** (the outcome is exhausted or no longer worth staffing).');
+  lines.push('A direction left unaddressed stays flagged and will keep surfacing here every cycle until you dispose of it.');
+  for (const entry of saturationDispositions) {
+    const did = strVal(entry.id, '?');
+    const text = strVal(entry.text, '?');
+    const priority = strVal(entry.priority, 'unknown');
+    const flaggedAt = strVal(entry.flagged_at, '?');
+    const cycles = fmtScalar(entry.cycles_researched);
+    const findings = fmtScalar(entry.findings_produced);
+    const tasks = fmtScalar(entry.recent_tasks_created);
+    lines.push(`\n### ${text} (id: ${did})`);
+    lines.push(
+      `Priority: ${priority}  Flagged: ${flaggedAt}  Cycles researched: ${cycles}  ` +
+      `Accumulated findings: ${findings}  Recent tasks spawned: ${tasks}`,
+    );
+    lines.push('Required disposition: commission work | narrow scope | retire');
+  }
+  return lines.join('\n');
+}
+
 export function buildCapabilityVerificationSection(problemModel: Record<string, unknown> | undefined): string {
   if (!problemModel || typeof problemModel !== 'object') return '';
   const capabilities = Array.isArray(problemModel.capabilities)

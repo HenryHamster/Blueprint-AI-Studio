@@ -2220,6 +2220,14 @@ async def strategic_operation(
                     != _pre_constraints
                 ):
                     _reset_outcome_detection_state(d)
+                # Any successful strategist update to the direction answers a
+                # pending saturation-disposition item (the strategist acted:
+                # narrowed scope, changed priority/status, rewrote the contract).
+                # Drop the durable item so a future NEW saturation episode can
+                # re-flag cleanly instead of re-surfacing a stale decision.
+                from app.direction_saturation import clear_saturation_disposition
+
+                clear_saturation_disposition(d)
                 updated = True
                 break
         if not updated:
@@ -2373,6 +2381,13 @@ async def strategic_operation(
             return _blk
 
         matched_direction["status"] = "expired"
+        # A retire disposition answers any pending saturation-disposition item:
+        # the direction is being taken off the board, so there is nothing left to
+        # commission or narrow. Drop the durable item so it is not re-flagged on
+        # a stale read and a future NEW saturation episode can re-flag cleanly.
+        from app.direction_saturation import clear_saturation_disposition
+
+        clear_saturation_disposition(matched_direction)
         if terminal_reason:
             matched_direction["terminal_reason"] = str(terminal_reason).strip().lower()
         notes = matched_direction.get("notes", [])
@@ -4419,6 +4434,25 @@ async def strategic_operation(
                 ),
                 status_code=202,
             )
+        # An accepted spawn targeting the direction is the strategist's
+        # ``commission_work`` disposition: concrete work now exists in the
+        # direction, so the pending saturation item is answered. Clear it under
+        # the directions lock (mirrors every other direction mutation in this
+        # handler) so the drop persists and cannot be lost to a concurrent
+        # directions write; a future NEW saturation episode can re-flag cleanly.
+        if direction_id:
+            from app.direction_saturation import clear_saturation_disposition
+
+            async def _apply_spawn_clear(fresh: list) -> list | None:
+                _target = next(
+                    (d for d in fresh if d.get("id") == direction_id), None
+                )
+                if _target is not None:
+                    clear_saturation_disposition(_target)
+                return None
+
+            await _with_directions_locked(session, project.id, _apply_spawn_clear)
+            await session.commit()
         logger.info(
             f"[STRATEGIC API] Accepted {spawn_type} task {new_task.id} "
             f"(priority={spawn_priority}) from strategic review {task.id} "
