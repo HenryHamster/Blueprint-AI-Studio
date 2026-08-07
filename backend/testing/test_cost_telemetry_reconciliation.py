@@ -731,7 +731,10 @@ async def test_provider_reported_skips_null(db_session):
     # Skipped — task_count=0 because no task had provider_reported_usage data.
     assert result.source == "provider_reported"
     assert result.task_count == 0
-    assert result.provider_reported_within_tolerance is True
+    # A zero-checked window is UNPROVEN, not "passing": the tolerance verdict
+    # must not go green from evidence that was never read.
+    assert result.provider_reported_within_tolerance is False
+    assert result.provider_reported_verified is False
     assert result.provider_reported_delta == 0.0
 
 
@@ -782,7 +785,9 @@ async def test_provider_reported_empty_task_list(db_session):
 
     assert result.source == "provider_reported"
     assert result.task_count == 0
-    assert result.provider_reported_within_tolerance is True
+    # Empty window → no evidence → tolerance verdict is unproven.
+    assert result.provider_reported_within_tolerance is False
+    assert result.provider_reported_verified is False
     assert result.provider_reported_delta == 0.0
 
 
@@ -1126,7 +1131,9 @@ async def test_provider_reported_skip_task_with_all_zero_provider_tokens(db_sess
     # All-zero provider counts → skipped (same condition as no data).
     assert result.task_count == 0
     assert result.agent_accumulated_output_tokens == 0
-    assert result.provider_reported_within_tolerance is True
+    # Zero checked tasks → tolerance verdict is unproven, not passing.
+    assert result.provider_reported_within_tolerance is False
+    assert result.provider_reported_verified is False
 
 
 @pytest.mark.asyncio
@@ -1623,6 +1630,9 @@ async def test_coverage_fraction_zero_when_no_task_has_probe(db_session):
     assert result.total_task_count == 1
     assert result.provider_reported_task_count == 0
     assert result.coverage_fraction == 0.0
+    # Zero-coverage window → no evidence → tolerance verdict is unproven.
+    assert result.provider_reported_within_tolerance is False
+    assert result.provider_reported_verified is False
 
 
 def test_coverage_fraction_none_on_empty_task_list():
@@ -1631,6 +1641,45 @@ def test_coverage_fraction_none_on_empty_task_list():
     assert result.total_task_count == 0
     assert result.provider_reported_task_count == 0
     assert result.coverage_fraction is None
+    # Empty window → no evidence → tolerance verdict is unproven.
+    assert result.provider_reported_within_tolerance is False
+    assert result.provider_reported_verified is False
+
+
+def test_zero_coverage_window_is_not_reported_within_tolerance():
+    """A window where NO task carries a usable provider-reported probe must NOT
+    report within_tolerance.
+
+    Every task is skipped, so the aggregated delta collapses to 0.0 by
+    construction — but that is the ABSENCE of evidence, not agreement. Reporting
+    it as green is exactly the false confidence that let a ~10% sampled run
+    pass as clean. The tolerance verdict is only green when at least one task
+    was actually checked.
+    """
+    from types import SimpleNamespace
+
+    tasks = [
+        SimpleNamespace(
+            id=f"t{i}",
+            provider_reported_usage=None,
+            api_call_summary={
+                "total_input_tokens": 1000,
+                "total_output_tokens": 500,
+            },
+        )
+        for i in range(3)
+    ]
+
+    result = reconcile_provider_reported_usage(tasks)
+
+    assert result.source == "provider_reported"
+    assert result.total_task_count == 3
+    assert result.provider_reported_task_count == 0
+    assert result.coverage_fraction == 0.0
+    assert result.provider_reported_delta == 0.0
+    # Core regression guard: zero verified tasks is NOT within tolerance.
+    assert result.provider_reported_within_tolerance is False
+    assert result.provider_reported_verified is False
 
 
 def test_coverage_fields_serialize_in_asdict():

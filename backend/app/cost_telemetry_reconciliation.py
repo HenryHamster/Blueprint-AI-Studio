@@ -129,6 +129,12 @@ class ReconciliationResult:
     provider_reported_output_delta: float = 0.0
     provider_reported_within_tolerance: bool = True
     provider_reported_tolerance: float = PROVIDER_REPORTED_TOLERANCE
+    # Whether at least one task in the window actually carried a usable
+    # provider-reported probe. A zero-coverage window reports
+    # ``provider_reported_within_tolerance=False`` (the verdict is UNPROVEN, not
+    # "passing"), and this flag lets callers distinguish "failed" from
+    # "nothing was independently verified".
+    provider_reported_verified: bool = False
 
     # ── Common fields ──────────────────────────────────────────────────────
     # ``task_count`` is the number of tasks that CONTRIBUTED to this result:
@@ -200,6 +206,7 @@ class ReconciliationResult:
             "provider_reported_input_delta": self.provider_reported_input_delta,
             "provider_reported_output_delta": self.provider_reported_output_delta,
             "provider_reported_within_tolerance": self.provider_reported_within_tolerance,
+            "provider_reported_verified": self.provider_reported_verified,
             "provider_reported_tolerance": self.provider_reported_tolerance,
             "task_count": self.task_count,
             "total_task_count": self.total_task_count,
@@ -427,7 +434,12 @@ def reconcile_provider_reported_usage(tasks: List[Task]) -> ReconciliationResult
     Returns:
         A ``ReconciliationResult`` with ``source="provider_reported"``,
         aggregated across all tasks that had both provider-reported and
-        agent-accumulated token data.
+        agent-accumulated token data. When NO task carried a usable probe
+        (``provider_reported_task_count == 0``), the tolerance verdict is
+        unproven and therefore reports ``provider_reported_within_tolerance
+        == False`` with ``provider_reported_verified == False`` — a green
+        verdict from zero evidence would be exactly the false confidence this
+        reconciliation exists to prevent.
     """
     total_provider_input = 0
     total_provider_output = 0
@@ -535,7 +547,14 @@ def reconcile_provider_reported_usage(tasks: List[Task]) -> ReconciliationResult
         else 0.0
     )
     delta = max(input_delta, output_delta)
-    within_tolerance = delta <= PROVIDER_REPORTED_TOLERANCE
+    # A zero-coverage window (checked_count == 0) yields delta 0.0 by
+    # construction — no provider data means no comparison was made. Reporting
+    # that as "within tolerance" would certify evidence that was never read,
+    # which is exactly how a ~10% sampled run passed as clean. The verdict is
+    # only green when at least one task actually carried a probe.
+    within_tolerance = (
+        checked_count > 0 and delta <= PROVIDER_REPORTED_TOLERANCE
+    )
 
     return ReconciliationResult(
         source="provider_reported",
@@ -551,6 +570,7 @@ def reconcile_provider_reported_usage(tasks: List[Task]) -> ReconciliationResult
         provider_reported_input_delta=input_delta,
         provider_reported_output_delta=output_delta,
         provider_reported_within_tolerance=within_tolerance,
+        provider_reported_verified=checked_count > 0,
         provider_reported_tolerance=PROVIDER_REPORTED_TOLERANCE,
         task_count=checked_count,
         total_task_count=len(tasks),

@@ -176,7 +176,12 @@ def test_partial_coverage_reports_self_reported_share():
 
 def test_all_non_anthropic_has_zero_coverage():
     """An all-self-reported window reports 0.0 coverage (not None) so the operator
-    can see the figure is entirely unverified."""
+    can see the figure is entirely unverified.
+
+    Zero coverage means the Anthropic probe (the only independent component) was
+    verified against NOTHING — the weighted figure is a conservative bound, but
+    it is NOT a trustworthy verdict from zero evidence.
+    """
     pid = make_project().id
     tasks = [_openai_task(pid), _openai_task(pid)]
 
@@ -184,17 +189,44 @@ def test_all_non_anthropic_has_zero_coverage():
 
     assert verdict["coverage_fraction"] == 0.0
     assert verdict["non_anthropic_share"] == 1.0
-    # Still a conservative upper bound, so still 'trustworthy' as a ceiling.
+    # Still a conservative upper bound...
     assert verdict["conservative_upper_bound"] is True
+    # ...but NOT trustworthy: no task carried an independent probe.
+    assert verdict["provider_reported_verified"] is False
+    assert verdict["trustworthy"] is False
+    assert (
+        verdict["reason"]
+        == "no task carried provider-reported usage — nothing independently verified"
+    )
 
 
 def test_empty_task_set_coverage_is_none():
-    """No tasks → coverage_fraction is None and totals are zero."""
+    """No tasks → coverage_fraction is None and totals are zero.
+
+    An empty window verified nothing, so it must not report trustworthy.
+    """
     verdict = assess_ceiling_gate_trustworthiness([])
     assert verdict["coverage_fraction"] is None
     assert verdict["total"] == 0.0
     assert verdict["ceiling_gate_total"] == 0.0
     assert verdict["conservative_upper_bound"] is True
+    assert verdict["provider_reported_verified"] is False
+    assert verdict["trustworthy"] is False
+
+
+def test_mixed_probe_coverage_is_trustworthy_when_all_probed_reconcile():
+    """A mixed window where the probed Anthropic tasks reconcile within tolerance
+    IS trustworthy despite partial coverage — the non-Anthropic share is buffered
+    and the independent portion was genuinely verified."""
+    pid = make_project().id
+    tasks = [_anthropic_task(pid), _openai_task(pid)]
+
+    verdict = assess_ceiling_gate_trustworthiness(tasks)
+
+    assert verdict["coverage_fraction"] == 0.5
+    assert verdict["provider_reported_verified"] is True
+    assert verdict["provider_reported_within_tolerance"] is True
+    assert verdict["trustworthy"] is True
 
 
 # ── Confidence label transitions ───────────────────────────────────────────

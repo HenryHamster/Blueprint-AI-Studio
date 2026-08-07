@@ -349,7 +349,10 @@ def assess_ceiling_gate_trustworthiness(tasks) -> dict:
           ``(multiplier - 1.0) * priced-non-Anthropic cost``.
       (c) for the Anthropic portion — the one component with an independent probe —
           it runs :func:`reconcile_provider_reported_usage` and reports whether it
-          is within tolerance.
+          is within tolerance. A window with zero usable probes (``coverage_fraction
+          == 0.0``) is NOT trustworthy: its tolerance verdict is unproven, and the
+          verdict dict surfaces ``provider_reported_verified`` so operators can tell
+          "failed" from "nothing independently verified".
       (d) it reports the self-reported (non-Anthropic) share of total LLM cost and
           the reconciliation ``coverage_fraction``.
     """
@@ -388,6 +391,12 @@ def assess_ceiling_gate_trustworthiness(tasks) -> dict:
     provider_reported_within_tolerance = bool(
         reconciliation.provider_reported_within_tolerance
     )
+    # A window with no usable provider-reported probe (e.g. all tasks are
+    # non-Anthropic or ran an agent that never captured usage) has NO evidence
+    # to reconcile. Its tolerance verdict is unproven, not "passing" — treating
+    # a zero-coverage window as trustworthy is exactly the false confidence
+    # that let a ~10% sampled run pass as clean.
+    provider_reported_verified = reconciliation.provider_reported_task_count > 0
     coverage_fraction = reconciliation.coverage_fraction
 
     # (d) Self-reported (non-Anthropic) share of total LLM cost.
@@ -398,12 +407,15 @@ def assess_ceiling_gate_trustworthiness(tasks) -> dict:
     trustworthy = (
         conservative_upper_bound
         and buffer_exact
+        and provider_reported_verified
         and provider_reported_within_tolerance
     )
     if not conservative_upper_bound:
         reason = "ceiling_gate_total under-counts recorded spend"
     elif not buffer_exact:
         reason = "non_anthropic_buffer does not match the conservatism multiplier"
+    elif not provider_reported_verified:
+        reason = "no task carried provider-reported usage — nothing independently verified"
     elif not provider_reported_within_tolerance:
         reason = "anthropic provider-reported usage failed reconciliation"
     else:
@@ -422,6 +434,7 @@ def assess_ceiling_gate_trustworthiness(tasks) -> dict:
         "conservative_upper_bound": conservative_upper_bound,
         "buffer_exact": buffer_exact,
         "provider_reported_within_tolerance": provider_reported_within_tolerance,
+        "provider_reported_verified": provider_reported_verified,
         "coverage_fraction": coverage_fraction,
         "confidence": spend_confidence_label(
             non_anthropic_llm=non_anthropic_llm,
