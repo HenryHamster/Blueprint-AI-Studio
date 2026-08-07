@@ -38,6 +38,9 @@ from app.llm_cost_attribution import (
     CACHE_READ_INPUT_RATE_MULTIPLIER,
     LLM_CACHE_READ_INPUT_PRICING,
     LLM_TOKEN_PRICING,
+    UNPRICED_FALLBACK_INPUT_RATE,
+    UNPRICED_FALLBACK_OUTPUT_RATE,
+    _compact_llm_cost_attribution,
     _price_llm_attempt,
     _task_llm_attempts,
     compute_llm_cost_breakdown,
@@ -389,7 +392,7 @@ def test_openai_banked_attempt_preserves_cache_subcounts():
 
     attempts = _task_llm_attempts(task)
     assert len(attempts) == 1
-    provider, model, inp, out, calls, cc, cr = attempts[0]
+    provider, model, inp, out, _calls, cc, cr = attempts[0]
     assert provider == "openai"
     assert model == "gpt-5.6-sol"
     assert inp == 5_000_000
@@ -405,3 +408,120 @@ def test_openai_banked_attempt_preserves_cache_subcounts():
     result = compute_llm_cost_breakdown([task])
     assert result["totals"]["total_cache_read_input_tokens"] == 4_500_000
     assert result["totals"]["total_cost_usd"] == pytest.approx(expected_cost, rel=1e-6)
+
+
+# ── 7. Compact attribution surfaces turns + cache split per task type ──────
+
+
+def test_compact_attribution_surfaces_turns_and_cache_split_per_task_type():
+    """The compact attribution block's per-task-type rows must carry turn counts
+    and the cache-creation/cache-read token split, not just prompt bytes.
+
+    ``compute_llm_cost_by_task_type`` already computes these per-bucket fields;
+    ``_compact_llm_cost_attribution`` previously dropped them, leaving
+    prompt_size_bytes as the only visible cost driver. Prompt bytes are ~5% of
+    strategic_review's mean per-call input, so the visible proxy pointed at the
+    wrong lever. These fields flow through to the agent efficiency-snapshot
+    endpoint and the strategic payload's ``dominant_task_type`` row."""
+    import uuid
+
+    project_id = uuid.uuid4()
+
+    task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        payloads=[{"type": "create"}],
+        api_call_summary={
+            "total_input_tokens": 1_000_000,
+            "total_output_tokens": 100_000,
+            "llm_call_count": 10,
+            "total_cache_creation_input_tokens": 50_000,
+            "total_cache_read_input_tokens": 800_000,
+            "num_turns": 20,
+        },
+        provider="openai",
+        model="gpt-5.6-sol",
+    )
+
+    result = _compact_llm_cost_attribution([task])
+    by_type = {r["task_type"]: r for r in result["by_task_type"]}
+    assert "create" in by_type, f"create row missing: {list(by_type)}"
+    row = by_type["create"]
+
+    # Turn counts — 20 turns across 10 calls; 1M input tokens across 20 turns.
+    assert row["mean_turns_per_call"] == 2.0
+    assert row["mean_input_tokens_per_turn"] == 50_000
+
+    # Cache split — 800k/1M (80%) cache-read, 50k cache-creation, 150k uncached.
+    assert row["total_cache_creation_input_tokens"] == 50_000
+    assert row["total_cache_read_input_tokens"] == 800_000
+    assert row["cache_read_share"] == 0.8
+    assert row["mean_uncached_input_tokens_per_call"] == 15_000
+
+
+# ── 8. Spend-weighted unpriced coverage + retained unpriced token volume ─────
+
+
+def test_unpriced_coverage_is_spend_weighted_and_retains_unpriced_token_volume():
+    """``unpriced_coverage_fraction`` must be spend-weighted, not a task count,
+    and the unpriced rows' token volume must be retained so the pricing blind
+    spot is measurable: a 1M-token unpriced row depresses coverage far below the
+    2/3 task-count, and a 1K-token one barely moves it off the 1/2 task-count."""
+
+    def _unpriced(in_tok: int, out_tok: int) -> object:
+        return make_task(
+            status=TaskStatus.COMPLETED,
+            api_call_summary={
+                "total_input_tokens": in_tok,
+                "total_output_tokens": out_tok,
+                "llm_call_count": 1,
+            },
+            provider="fakeprovider",
+            model="mystery-model",
+        )
+
+    # 1) A 1M-token unpriced row among small priced rows: spend-weighted coverage
+    #    must be far below the task-count 2/3 (the unpriced row dominates spend).
+    priced = [
+        _make_openai_task(model="gpt-5.6-sol", input_tokens=1_000, output_tokens=100)
+        for _ in range(2)
+    ]
+    totals = compute_llm_cost_breakdown(
+        [*priced, _unpriced(1_000_000, 100_000)]
+    )["totals"]
+    priced_cost = 2 * (1_000 * _SOL_INPUT_RATE + 100 * _SOL_OUTPUT_RATE)
+    est_unpriced = (
+        1_000_000 * UNPRICED_FALLBACK_INPUT_RATE
+        + 100_000 * UNPRICED_FALLBACK_OUTPUT_RATE
+    )
+    assert (totals["priced_task_count"], totals["unpriced_task_count"]) == (2, 1)
+    assert totals["unpriced_coverage_fraction"] == round(
+        priced_cost / (priced_cost + est_unpriced), 4
+    )
+    assert totals["unpriced_coverage_fraction"] != round(2 / 3, 4)
+    assert totals["estimated_unpriced_cost_usd"] == round(est_unpriced, 6)
+    # Retained unpriced token volume — the blind spot is measurable.
+    assert totals["unpriced_input_tokens"] == 1_000_000
+    assert totals["unpriced_output_tokens"] == 100_000
+    assert totals["total_cost_usd"] == round(priced_cost, 6)
+
+    # 2) A 1K-token unpriced row among a large priced row: coverage near 1.0, not
+    #    the task-count 1/2 (the blind spot is a sliver of the spend).
+    totals2 = compute_llm_cost_breakdown(
+        [
+            _make_openai_task(
+                model="gpt-5.6-sol", input_tokens=1_000_000, output_tokens=100_000
+            ),
+            _unpriced(1_000, 100),
+        ]
+    )["totals"]
+    priced_cost2 = 1_000_000 * _SOL_INPUT_RATE + 100_000 * _SOL_OUTPUT_RATE
+    est_unpriced2 = 1_000 * UNPRICED_FALLBACK_INPUT_RATE + 100 * UNPRICED_FALLBACK_OUTPUT_RATE
+    assert totals2["unpriced_coverage_fraction"] == round(
+        priced_cost2 / (priced_cost2 + est_unpriced2), 4
+    )
+    assert totals2["unpriced_coverage_fraction"] != round(1 / 2, 4)
+    assert totals2["unpriced_input_tokens"] == 1_000
+    assert totals2["unpriced_output_tokens"] == 100
+

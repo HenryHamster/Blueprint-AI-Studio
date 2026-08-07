@@ -24,6 +24,7 @@ from app.database import get_session
 from app.models import (
     Task,
     TaskStatus,
+    TASK_ORIGINATION_USER,
     Project,
     ProjectSRAnalytics,
     Artifact,
@@ -1032,6 +1033,7 @@ async def spawn_sr_investigation(
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
         created_by="USER",
+        origination=TASK_ORIGINATION_USER,
         launched_by_user_id=current_user["user_id"],
         context={
             "spawned_by": _SR_INVESTIGATION_SPAWNED_BY,

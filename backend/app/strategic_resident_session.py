@@ -5692,8 +5692,8 @@ async def agent_fetch_checkpoint_state(
     """Return current project state for the resident agent's compaction checkpoint.
 
     Called only at compaction time (context-window pressure). Returns the freshest
-    strategic state — problem model, memory notes, running update, and vision —
-    so the compaction checkpoint carries current data rather than the session-start
+    strategic state — problem model, memory notes, and running update — so the
+    compaction checkpoint carries current data rather than the session-start
     bootstrap snapshot, which would be stale after mid-session mutations
     (set-problem-model, set-memory, set-running-update).
     """
@@ -5708,19 +5708,17 @@ async def agent_fetch_checkpoint_state(
     # Apply the SAME agent-view trims the session bootstrap applies so the
     # refreshed compaction grounding matches the shape the session started from.
     # The bootstrap ships _agent_view_problem_model(project.problem_model) and
-    # _agent_visible_vision(project.vision) (strategic_spawning.py:5711-5712);
-    # returning the raw project.problem_model / project.vision here would make a
-    # successful refresh re-bloat the checkpoint with archived_gaps,
-    # rejected_agent_edits, unwindowed per-gap memory, and the internal vision
-    # continuation blob — the opposite of the coherence the refresh preserves.
-    from app.strategic_local_runner import _agent_visible_vision
+    # effective_purpose; returning the raw project.problem_model / project.vision
+    # here would make a successful refresh re-bloat the checkpoint with
+    # archived_gaps, rejected_agent_edits, unwindowed per-gap memory, and the
+    # internal vision continuation blob — the opposite of the coherence the
+    # refresh preserves.
     from app.strategic_problem_view import _agent_view_problem_model
 
     return {
         "problem_model": _agent_view_problem_model(project.problem_model),
         "strategic_memory_notes": await build_strategic_memory_index(session, project.id),
         "running_update": project.running_update or "",
-        "vision": _agent_visible_vision(project.vision),
         "open_messages": open_messages,
         "recent_handled_conversation": recent_handled_conversation,
     }

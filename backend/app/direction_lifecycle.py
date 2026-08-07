@@ -13,7 +13,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
-from app.models import Project, Task, TaskStatus
+from app.models import Project, TASK_ORIGINATION_RESEARCH, Task, TaskStatus
+from app.direction_lineage_spend import (
+    DirectionLineageSpend,
+    load_direction_lineage_spend,
+)
 from app.direction_terminal_guard import mark_auto_direction_terminal
 from app.payload_schemas import validate_internal_payload
 from app.shared_state import (
@@ -59,6 +63,13 @@ _REMEDIATION_MONITOR_EXPIRY_DAYS = 7
 # Investigations typically finish in minutes; 4h is a safety ceiling to recover from reaped/timed-out tasks.
 _DIAGNOSIS_STALE_HOURS = 4
 
+# Budget-pause evidence basis used when the lineage-spend query finds no task
+# rows for a direction (e.g. archived/pruned lineage). The research-history +
+# history_aggregate sum is an EXPLICIT labelled fallback — it is never silently
+# conflated with the canonical lifetime lineage meter the badge reads, so an
+# operator can always tell which dollars a pause was computed from.
+_BUDGET_BASIS_RESEARCH_HISTORY = "research_history+history_aggregate"
+
 # Recent failed tasks to scan when computing the dominant error fingerprint
 _FINGERPRINT_SAMPLE_SIZE = 10
 # Min matching failures required for a fingerprint to count as "dominant" for the direction
@@ -94,6 +105,23 @@ _OUTCOME_DETECTION_KEYS = (
     "outcome_scaffolding_flagged_at",
     "outcome_scaffolding_flagged_cycles",
 )
+
+
+def _direction_budget_usd(direction: dict) -> float | None:
+    """Positive float envelope for a direction, or None when not configured.
+
+    Mirrors the budget gate's parsing so the batched lineage query covers
+    exactly the directions the gate could pause. A zero/negative/unparseable
+    ``cost_budget_usd`` means no envelope and needs no spend query.
+    """
+    budget = direction.get("cost_budget_usd")
+    if budget is None:
+        return None
+    try:
+        budget_f = float(budget)
+    except (TypeError, ValueError):
+        return None
+    return budget_f if budget_f and budget_f > 0 else None
 
 
 def _reset_outcome_detection_state(d: dict) -> None:
@@ -1274,6 +1302,22 @@ async def _process_direction_lifecycle_locked(
         if cpm is not None and cpm > 0
     ]
     project_cpm_median = median(project_cpms) if project_cpms else None
+    # ONE canonical lifetime lineage-spend read per tick, covering every
+    # direction that declares a cost envelope. This is the SAME meter the
+    # operator-visible budget badge divides by (app.direction_lineage_spend),
+    # so the auto-pause gate and the card agree on what "spend" means. Batched
+    # once for all budgeted directions — a tick never fans out into per-direction
+    # round trips.
+    budgeted_ids = [
+        str(d.get("id") or d.get("direction_id") or "")
+        for d in (project.directions or [])
+        if _direction_budget_usd(d) is not None
+    ]
+    lineage_spend_by_direction: dict[str, DirectionLineageSpend] = {}
+    if budgeted_ids:
+        lineage_spend_by_direction = await load_direction_lineage_spend(
+            session, project_id=project.id, direction_ids=budgeted_ids
+        )
     for d in project.directions or []:
         if d.get("status") != "active":
             continue
@@ -1425,38 +1469,76 @@ async def _process_direction_lifecycle_locked(
         # Auto-pause check — must come after cooldown to only evaluate directions eligible for research
         pause_reason = _check_direction_health(d)
         cumulative_cost = 0.0
-        for entry in d.get("research_history") or []:
-            try:
-                cumulative_cost += max(
-                    0.0, float(entry.get("estimated_cost_usd") or 0.0)
-                )
-            except (TypeError, ValueError):  # noqa: PERF203
-                continue
-        # Include evicted cycles folded into history_aggregate so the budget
-        # check fires correctly for long-lived directions past the 10-cycle window.
-        try:  # noqa: SIM105
-            cumulative_cost += max(
-                0.0,
-                float(
-                    (d.get("history_aggregate") or {}).get("total_estimated_cost_usd")
-                    or 0.0
-                ),
+        budget_f = _direction_budget_usd(d)
+        spend_basis = ""
+        spend_terms: dict[str, object] = {}
+        # Spend actually attributed to the direction's task lineage. Under the
+        # canonical basis this IS the whole envelope; under the labelled
+        # research-history fallback no lineage rows were found, so it is 0.
+        lineage_spend = 0.0
+        if budget_f is not None:
+            # Canonical basis: the SAME lifetime lineage spend the badge reads.
+            # A direction with real lineage rows is measured on that meter; the
+            # research-history sum below is only an explicit labelled fallback.
+            lineage = lineage_spend_by_direction.get(
+                str(d.get("id") or d.get("direction_id") or "")
             )
-        except (TypeError, ValueError):
-            pass
-        budget = d.get("cost_budget_usd")
-        try:
-            budget_f = float(budget) if budget is not None else None
-        except (TypeError, ValueError):
-            budget_f = None
-        if budget_f and cumulative_cost > budget_f:
+            if lineage is not None and lineage.task_count > 0:
+                cumulative_cost = lineage.total_usd
+                lineage_spend = lineage.total_usd
+                spend_basis = lineage.basis
+                spend_terms = {
+                    "lineage_vm_cost_usd": round(lineage.vm_usd, 4),
+                    "lineage_llm_cost_usd": round(lineage.llm_usd, 4),
+                    "lineage_compute_cost_usd": round(lineage.compute_usd, 4),
+                    "lineage_task_count": lineage.task_count,
+                    "lineage_llm_unpriced": lineage.llm_unpriced,
+                }
+            else:
+                # Fallback basis: research_history + history_aggregate, used only
+                # when the lineage query found no task rows for this direction
+                # (e.g. archived/pruned lineage).
+                for entry in d.get("research_history") or []:
+                    try:
+                        cumulative_cost += max(
+                            0.0, float(entry.get("estimated_cost_usd") or 0.0)
+                        )
+                    except (TypeError, ValueError):  # noqa: PERF203
+                        continue
+                # Include evicted cycles folded into history_aggregate so the
+                # budget check fires correctly for long-lived directions past
+                # the 10-cycle eviction window.
+                try:  # noqa: SIM105
+                    cumulative_cost += max(
+                        0.0,
+                        float(
+                            (d.get("history_aggregate") or {}).get(
+                                "total_estimated_cost_usd"
+                            )
+                            or 0.0
+                        ),
+                    )
+                except (TypeError, ValueError):
+                    pass
+                spend_basis = _BUDGET_BASIS_RESEARCH_HISTORY
+                spend_terms = {
+                    "lineage_vm_cost_usd": 0.0,
+                    "lineage_llm_cost_usd": 0.0,
+                    "lineage_compute_cost_usd": 0.0,
+                    "lineage_task_count": 0,
+                    "lineage_llm_unpriced": False,
+                }
+        if budget_f is not None and cumulative_cost > budget_f:
             pause_reason = (
                 f"Budget exceeded: cumulative estimated cost ${cumulative_cost:.2f} "
                 f"> cost budget ${budget_f:.2f}"
             )
             d["cost_pause_evidence"] = {
+                "attributed_lineage_spend_usd": round(lineage_spend, 4),
                 "cumulative_estimated_cost_usd": round(cumulative_cost, 4),
                 "cost_budget_usd": round(budget_f, 4),
+                "spend_basis": spend_basis,
+                **spend_terms,
             }
         # Fix #3: route "already-built" directions to completion instead of a
         # churn / zero-merge auto-pause. When the pending pause is a cumulative
@@ -1952,6 +2034,7 @@ async def _process_direction_lifecycle_locked(
                         },
                         status=TaskStatus.QUEUED,
                         created_by="ORCHESTRATOR",
+                        origination=TASK_ORIGINATION_RESEARCH,
                         priority=TASK_PRIORITY_MAP.get("low", 0),
                     )
                     session.add(_scaffolding_memo)

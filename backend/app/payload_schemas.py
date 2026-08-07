@@ -1671,8 +1671,8 @@ def pack_under_budget(
             continue
         floors[p["key"]] = {"value": floored, "size": floored_size, "source": "floor"}
     reserved_remaining = sum(f["size"] for f in floors.values())
-    # Critical-tier keys without their own floor reservation (e.g. identity /
-    # vision) MUST ship at full size — they raise PayloadTooLargeError rather
+    # Critical-tier keys without their own floor reservation (e.g. identity
+    # scalars) MUST ship at full size — they raise PayloadTooLargeError rather
     # than drop. They are not protected by the reservation mechanism, so they
     # compete against ``budget - reserved_remaining``. If the floor reservations
     # leave no room for them, honoring the floor guarantee would starve a

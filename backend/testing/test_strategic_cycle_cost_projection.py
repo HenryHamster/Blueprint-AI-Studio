@@ -68,6 +68,8 @@ def test_script_is_importable_and_exposes_the_model_functions():
         "mean_task_execution_cost_usd",
         "measured_tasks_per_month",
         "target_concurrency_status",
+        "cohort_capped",
+        "baseline_record",
         "project_monthly_spend",
         "project_monthly_spend_with_tasks",
         "load_measured_split",
@@ -647,3 +649,160 @@ def test_monthly_spend_with_tasks_preserves_cycle_volume_refusal():
     assert gap["available"] is False
     assert "cycle volume" in gap["reason"]
     assert gap["total_monthly_spend_usd"] is None
+
+
+# --- Baseline measurement record (fc135ee2) ------------------------------
+
+def test_baseline_record_carries_cohort_provenance_for_both_readings():
+    """Both 2026-08-07 baseline readings surface verbatim with cohort
+    provenance: a 5000-task cohort at _COHORT_CAP, capped=True.
+
+    docs/strategic-cycle-cost-baseline.md is the narrative form of this exact
+    record; the field mapping against the agent efficiency-snapshot read
+    surface is documented there.
+    """
+    mod = _load_module()
+    record = mod.baseline_record()
+    assert record["available"] is True
+    assert record["cohort_cap"] == mod.COHORT_CAP == 5000
+    assert record["requested_window_days"] == mod.AXIS_WINDOW_DAYS == 7
+    assert record["cost_arithmetic_consistent"] is True
+    assert len(record["readings"]) == 2
+
+    reading_1, reading_2 = record["readings"]
+    assert reading_1["reading"] == 1
+    assert reading_1["date"] == "2026-08-07"
+    assert reading_1["integration_head"] == "9e25341c"
+    assert reading_1["cycle_count"] == 212
+    assert reading_1["strategic_cycle_cost_usd"] == pytest.approx(1610.081459)
+    assert reading_1["cost_per_cycle"] == pytest.approx(7.594724)
+    assert reading_1["total_llm_usd"] == pytest.approx(3439.92)
+    assert reading_1["unpriced_coverage"] == pytest.approx(0.9752)
+    assert reading_1["cohort_task_count"] == 5000
+    assert reading_1["cohort_capped"] is True
+    assert reading_1["requested_window_days"] == 7
+    assert reading_1["cohort_cap"] == 5000
+    assert reading_1["cost_per_cycle_consistent"] is True
+
+    assert reading_2["reading"] == 2
+    assert reading_2["date"] == "2026-08-07"
+    assert reading_2["integration_head"] == "83813e87"
+    assert reading_2["cycle_count"] == 212
+    assert reading_2["strategic_cycle_cost_usd"] == pytest.approx(1618.175162)
+    assert reading_2["cost_per_cycle"] == pytest.approx(7.632902)
+    assert reading_2["total_llm_usd"] == pytest.approx(3446.586451)
+    assert reading_2["unpriced_coverage"] == pytest.approx(0.9752)
+    assert reading_2["cohort_task_count"] == 5000
+    assert reading_2["cohort_capped"] is True
+    assert reading_2["requested_window_days"] == 7
+    assert reading_2["cohort_cap"] == 5000
+    assert reading_2["cost_per_cycle_consistent"] is True
+
+
+def test_cohort_capped_flag_matches_the_task_count_cap():
+    """cohort_capped is True exactly when the cohort reached the 5000-row cap.
+
+    Mirrors the agent read surface (`cohort_task_count >= _COHORT_CAP`): a
+    4999-task cohort is provably uncapped, 5000 is capped, and beyond the cap
+    stays capped.
+    """
+    mod = _load_module()
+    assert mod.cohort_capped(4999) is False
+    assert mod.cohort_capped(4999.99) is False
+    assert mod.cohort_capped(5000) is True
+    assert mod.cohort_capped(5000.0) is True
+    assert mod.cohort_capped(5001) is True
+
+
+def test_cohort_capped_fails_closed_on_unknown_count():
+    """A missing or non-numeric cohort count reports None, never False.
+
+    None means "unknown provenance", not "uncapped" — a caller must not
+    mistake an uncaptured count for a cohort that provably stayed under the
+    cap.
+    """
+    mod = _load_module()
+    for unknown in (None, "5000", True, False, ""):
+        assert mod.cohort_capped(unknown) is None, repr(unknown)
+
+
+def test_baseline_record_derives_cost_per_cycle_and_flags_disagreement():
+    """cost_per_cycle is derived when omitted and validated when recorded.
+
+    A recorded value that disagrees with strategic_cycle_cost_usd/cycle_count
+    beyond tolerance sets cost_per_cycle_consistent=False instead of silently
+    printing a number that does not add up.
+    """
+    mod = _load_module()
+    derived = mod.baseline_record(
+        [
+            {
+                "reading": 1,
+                "date": "2026-08-07",
+                "integration_head": "abc123",
+                "cycle_count": 212,
+                "strategic_cycle_cost_usd": 1610.081459,
+                "total_llm_usd": 3439.92,
+                "unpriced_coverage": 0.9752,
+                "cohort_task_count": 5000,
+            }
+        ]
+    )
+    reading = derived["readings"][0]
+    assert reading["cost_per_cycle"] == pytest.approx(1610.081459 / 212)
+    assert reading["cost_per_cycle_consistent"] is True
+    assert derived["cost_arithmetic_consistent"] is True
+
+    inconsistent = mod.baseline_record(
+        [
+            {
+                "reading": 1,
+                "date": "2026-08-07",
+                "integration_head": "abc123",
+                "cycle_count": 212,
+                "strategic_cycle_cost_usd": 1610.081459,
+                "cost_per_cycle": 9.99,
+                "cohort_task_count": 5000,
+            }
+        ]
+    )
+    assert inconsistent["readings"][0]["cost_per_cycle_consistent"] is False
+    assert inconsistent["cost_arithmetic_consistent"] is False
+
+
+def test_baseline_record_fails_closed_on_missing_cohort_count():
+    """A reading that lacks a numeric cohort_task_count keeps cohort_capped
+    None — provenance unknown is reported as unknown, never as uncapped."""
+    mod = _load_module()
+    record = mod.baseline_record(
+        [
+            {
+                "reading": 1,
+                "date": "2026-08-07",
+                "integration_head": "abc123",
+                "cycle_count": 212,
+                "strategic_cycle_cost_usd": 1610.081459,
+                "cost_per_cycle": 7.594724,
+                "cohort_task_count": None,
+            }
+        ]
+    )
+    reading = record["readings"][0]
+    assert reading["cohort_capped"] is None
+    assert reading["requested_window_days"] == 7
+    assert reading["cohort_cap"] == 5000
+    assert reading["cost_per_cycle_consistent"] is True
+
+
+def test_main_output_includes_the_baseline_record():
+    """Section [8] prints both dated readings and the flat-cohort caveat."""
+    mod = _load_module()
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        mod.main()
+    out = buf.getvalue()
+    assert "[8] Baseline measurement record" in out
+    assert "integration HEAD 9e25341c" in out
+    assert "integration HEAD 83813e87" in out
+    assert "both readings share cycle_count 212" in out
+    assert "not evidence about the levers" in out

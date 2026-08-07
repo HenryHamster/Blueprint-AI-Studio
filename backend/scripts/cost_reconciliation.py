@@ -473,7 +473,7 @@ def reconcile_provider_cost(
     end_date = _parse_date(end if end is not None else window.get("end"))
 
     # ── Internal side: price recorded per-attempt usage ───────────────────
-    internal: dict[str, float | int] = {
+    internal: dict[str, Any] = {
         "total_cost_usd": 0.0,
         "uncached_input_tokens": 0,
         "cache_read_input_tokens": 0,
@@ -546,6 +546,7 @@ def reconcile_provider_cost(
     # the provider/window.
     inline_cost_usd = 0.0
     inline_call_count = 0
+    inline_unpriced_call_count = 0
     for row in inline_llm_rows or []:
         if (row.get("provider") or "").lower() != provider_key:
             continue
@@ -556,10 +557,20 @@ def reconcile_provider_cost(
             continue
         if end_date is not None and created.date() > end_date:
             continue
-        inline_cost_usd += float(row.get("cost_usd", 0.0) or 0.0)
         inline_call_count += 1
+        status = (row.get("pricing_status") or "").strip().lower()
+        cost_usd = row.get("cost_usd")
+        if status == "unpriced" or cost_usd is None:
+            # Unknown-cost call: counted, but its cost is NOT summed — a
+            # NULL/absent cost must never silently coerce to zero, which would
+            # understate the internal total exactly like the drop it replaces.
+            inline_unpriced_call_count += 1
+        else:
+            inline_cost_usd += float(cost_usd)
     internal["inline_cost_usd"] = round(inline_cost_usd, COST_ROUND)
     internal["inline_call_count"] = inline_call_count
+    internal["inline_unpriced_call_count"] = inline_unpriced_call_count
+    internal["inline_cost_is_floor"] = inline_unpriced_call_count > 0
     internal["total_cost_usd"] = round(
         float(internal["total_cost_usd"]) + inline_cost_usd, COST_ROUND
     )
@@ -745,6 +756,9 @@ async def _load_inline_llm_spend_rows(
             "provider": r.provider,
             "created_at": r.created_at.isoformat() if r.created_at else None,
             "cost_usd": r.cost_usd,
+            # "unpriced" rows carry cost_usd NULL; consumers must count them
+            # separately and label any summed total a FLOOR.
+            "pricing_status": r.pricing_status,
         }
         for r in rows
     ]
@@ -839,6 +853,12 @@ def _print_report(
             f"  inline LLM spend (backend calls): {_fmt_usd(internal.get('inline_cost_usd'))}"
             f" across {inline_calls} calls"
         )
+        unpriced_inline = internal.get("inline_unpriced_call_count", 0)
+        if unpriced_inline:
+            print(
+                f"    of which {unpriced_inline} call(s) carry UNPRICED usage; "
+                f"the inline total above is a FLOOR"
+            )
 
     print("\n[2] Provider export (operator-supplied, ground truth for the window)\n")
     print(f"  total_cost_usd             : {_fmt_usd(export_totals['total_cost_usd'])}")

@@ -416,6 +416,11 @@ async def _stamp_github_verified_changed_files(
         ]
         ctx = dict(pr_task.context or {})
         ctx.update(stamp_changed_files_signal(file_paths, github_verified=True))
+        # Fresh provenance re-admits the task to the acceptance backfill sweep
+        # (this path stamps files without re-recording a verdict, so the
+        # markers must be cleared here).
+        ctx.pop("_backfill_checked_at", None)
+        ctx.pop("_backfill_missing_diff_terminal_at", None)
         pr_task.context = ctx
         logger.info(
             "[WEBHOOK] Stamped %d GitHub-verified changed files for task %s (PR #%s)",

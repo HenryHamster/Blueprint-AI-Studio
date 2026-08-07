@@ -45,7 +45,7 @@ from typing import Any, Callable, Iterable, Mapping
 from app.ci_resolution import is_degraded_unverified_reason
 from app.landed_signal import REVIEW_LOOP_KEY, UNVERIFIED_MERGE_REASON_KEY
 from app.landed_signal import merge_verification_status
-from sqlalchemy import String, cast, exists, not_
+from sqlalchemy import String, and_, cast, exists, not_, or_
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
@@ -130,6 +130,16 @@ CODE_ACCEPTANCE_VERDICT_KEY = "code_acceptance_verdict"
 # ``review_loop``) so it can never flip the merge-verification semantics that an
 # empty ``review_loop`` dict signals. Absence means no structural defect recorded.
 PREMERGE_ACCEPTANCE_FINDING_KEY = "premerge_acceptance_finding"
+
+# Terminal marker for the missing-from-diff backfill class: stamped by the
+# backfill sweep when changed-file provenance WAS present at examination time
+# and re-evaluation still could not locate the declared test (the task declared
+# a named_test it genuinely never shipped). Without it, permanently-unprovable
+# tasks are re-selected by every sweep and — being among the oldest rows —
+# eventually consume the entire LIMIT-200 window. Cleared alongside
+# ``_backfill_checked_at`` whenever fresh provenance arrives, so a late
+# re-stamp still re-admits the task.
+BACKFILL_MISSING_DIFF_TERMINAL_KEY = "_backfill_missing_diff_terminal_at"
 
 # Context key where the verify-tests handler stores the coverage measurement
 # result for the coverage_delta acceptance gate to consume. The value is a dict
@@ -335,8 +345,13 @@ def _test_module_stem(test_basename: str) -> str | None:
     the vitest/jest ``<module>.test.tsx`` / ``<module>.spec.ts`` conventions
     (→ ``module``), and the suffix conventions ``<module>_test.py`` /
     ``<module>_test.go`` / ``<module>_test.exs`` / ``<module>_spec.rb``
-    (→ ``module``) — every shape test-file detection already recognizes.
-    ``test_basename`` is the file basename *including* its extension.
+    (→ ``module``) — every shape test-file detection already recognizes. For the
+    Python prefix and suffix conventions, a double-underscore variant qualifier
+    (``test_<module>__<variant>.py`` / ``<module>__<variant>_test.py``) is
+    truncated at the first ``__`` so the stem names the BASE module under test:
+    ``test_release_qualifier__sweep_stuck_qualifications.py`` →
+    ``release_qualifier``. ``test_basename`` is the file basename *including*
+    its extension.
 
     Returns ``None`` (fail closed) for any name that follows no recognized
     convention (e.g. ``random.py``), so the caller cannot grant machine-checked
@@ -349,13 +364,40 @@ def _test_module_stem(test_basename: str) -> str | None:
     py_stem = test_basename.rsplit(".", 1)[0]
     if py_stem.startswith("test_"):
         module = py_stem[len("test_"):]
-        return module or None
+        # A ``test_<module>__<variant>.py`` name names its BASE module — the
+        # focus qualifier after the first ``__`` is not the module under test.
+        return (module.split("__", 1)[0]) or None
     # Suffix convention: ``<module>_test.<ext>`` / ``<module>_spec.rb`` — a real,
     # detection-recognized test-file shape the prefix branch cannot capture.
     suffix_match = _SUFFIX_TEST_BASENAME_RE.match(test_basename)
     if suffix_match:
-        return suffix_match.group("stem") or None
+        return (suffix_match.group("stem") or "").split("__", 1)[0] or None
     return None
+
+
+def _stem_family_matches(stem: str, prod_basename: str) -> bool:
+    """Whether a test module ``stem`` and a changed production ``prod_basename``
+    belong to the same underscore-prefix family.
+
+    Three relations count as the same family:
+
+      * exact equality (``release_qualifier`` vs ``release_qualifier``);
+      * the production basename extends the stem with an underscore suffix
+        (``release_qualifier`` vs ``release_qualifier_sweep``) — a base-named
+        test co-changed with an extracted submodule;
+      * the stem extends the production basename with an underscore suffix
+        (``release_qualifier_sweep`` vs ``release_qualifier``) — a
+        submodule-named test co-changed with the surviving base.
+
+    A shared short prefix alone is NOT a match unless one side is an
+    underscore-prefix extension of the other, so unrelated modules with an
+    accidental common prefix still fail closed.
+    """
+    if stem == prod_basename:
+        return True
+    if prod_basename.startswith(stem + "_"):
+        return True
+    return bool(stem.startswith(prod_basename + "_"))
 
 
 def _test_semantically_grounded(
@@ -363,13 +405,19 @@ def _test_semantically_grounded(
 ) -> bool:
     """Whether a declared test path semantically corresponds to a changed seam.
 
-    A heuristic that the test file's module stem must match at least one changed
-    non-test file's module name exactly. The stem is derived from the Python
-    ``test_<module>.py`` prefix convention, the vitest/jest
+    A heuristic that the test file's module stem must family-match at least one
+    changed non-test file's module name. The stem is derived from the Python
+    ``test_<module>.py`` prefix convention (with ``test_<module>__<variant>.py``
+    truncating at the first ``__`` to the base module), the vitest/jest
     ``<module>.test.tsx`` / ``<module>.spec.ts`` conventions, or the suffix
     conventions ``<module>_test.py`` / ``<module>_spec.rb`` (see
-    :func:`_test_module_stem`). A declaration of ``test_acceptance_gate.py``
+    :func:`_test_module_stem`). Family-match is exact equality OR an
+    underscore-prefix extension in either direction (see
+    :func:`_stem_family_matches`): a declaration of ``test_acceptance_gate.py``
     must co-occur with a change to ``acceptance_gate.py``; a declaration of
+    ``test_release_qualifier__sweep_stuck_qualifications.py`` may co-occur with
+    a change to ``release_qualifier.py`` (its base module) or an extracted
+    ``release_qualifier_sweep.py`` submodule; a declaration of
     ``ComputeJobsPanel.test.tsx`` must co-occur with a change to
     ``ComputeJobsPanel.tsx`` (or ``.ts``) — not just any production file.
 
@@ -382,7 +430,7 @@ def _test_semantically_grounded(
     if test_stem:
         for path in seam_files:
             prod_basename = path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
-            if prod_basename == test_stem:
+            if _stem_family_matches(test_stem, prod_basename):
                 return True
     # Cross-cutting test files (e.g., test_invariants.py) do not map to a
     # single production module — accept them as intrinsically grounded when
@@ -436,6 +484,69 @@ def _acceptance_test_targeted_green(task: Task) -> bool:
     return review_loop.get(ACCEPTANCE_TEST_TARGETED_GREEN_KEY) is True
 
 
+# Durable NORMALIZED acceptance-test block the no-CI merge monitor persists onto
+# ``review_loop`` (see ``orchestrator_ci_monitor``). Distinct from
+# ``review_loop['verify_tests_verdict']``, which holds the classifier's outcome
+# STRING ("pass"/"fail"/"undetected") and therefore can never carry the block.
+MERGE_ACCEPTANCE_BLOCK_KEY = "verify_tests_acceptance_block"
+
+
+def _merge_acceptance_test_block(task: Task) -> dict | None:
+    """Read the declared acceptance test's normalized merge-test block, defensively.
+
+    Returns the block the no-CI monitor persisted under
+    ``review_loop['verify_tests_acceptance_block']`` (the output of
+    :func:`ci_resolution.acceptance_test_block`, carrying
+    ``present``/``ran``/``status``/``passed``), else ``None``. A missing /
+    malformed / non-dict review_loop, or a legacy task merged before the monitor
+    persisted the block, yields ``None`` — so every caller MUST still fall back to
+    :func:`_acceptance_test_targeted_green`, which those tasks do carry.
+    """
+    review_loop = (task.context or {}).get(REVIEW_LOOP_KEY)
+    if not isinstance(review_loop, dict):
+        return None
+    block = review_loop.get(MERGE_ACCEPTANCE_BLOCK_KEY)
+    return block if isinstance(block, dict) else None
+
+
+def _acceptance_test_exists_at_merge(task: Task) -> bool:
+    """Whether the declared acceptance test is confirmed to EXIST in the repo at
+    the merge commit — independent of whether the PR's diff touches it.
+
+    True when the merge gate physically executed the declared test as a targeted
+    run (``acceptance_test_targeted_green`` — a test that ran must exist), or a
+    merge-test verdict block records the test as ``present``. Defensive: absent /
+    malformed evidence yields False, so a name-dropped test that can be shown to
+    exist nowhere is never credited.
+    """
+    if _acceptance_test_targeted_green(task):
+        return True
+    block = _merge_acceptance_test_block(task)
+    return bool(block and block.get("present") is True)
+
+
+def _acceptance_test_ran_green_at_merge(task: Task) -> bool:
+    """Whether the declared acceptance test is confirmed to have RAN GREEN under a
+    real merge-test verdict — independent of the PR's diff.
+
+    True when the targeted-green signal was stamped (the merge gate independently
+    executed ONLY the declared test and it exited green), or a merge-test verdict
+    block records the declared test as present, ran, with status ``"ran"`` and
+    ``passed``. A test that exists but did not run green (skipped / absent /
+    failed) yields False.
+    """
+    if _acceptance_test_targeted_green(task):
+        return True
+    block = _merge_acceptance_test_block(task)
+    return bool(
+        block
+        and block.get("present") is True
+        and block.get("ran") is True
+        and block.get("status") == "ran"
+        and block.get("passed") is True
+    )
+
+
 def _evaluate_named_test(
     evidence: AcceptanceEvidence,
     changed: list[str],
@@ -443,17 +554,32 @@ def _evaluate_named_test(
     truncated: bool = False,
     parent_derived: bool = False,
     targeted_green: bool = False,
+    test_exists: bool = False,
+    ran_green: bool = False,
 ) -> AcceptanceGateVerdict:
     """Fail-closed gate for a ``named_test`` acceptance declaration.
 
     Passes only when the named test (1) is among the PR's changed files — it was
-    actually added/modified by this PR rather than merely claimed — (2) ran green
-    under a real merge-test verdict, and (3) the PR also ships a NON-test
-    production change for the test to exercise (the changed seam). A test-only
-    diff fails: a test that ships no changed production code cannot be exercising
-    the changed seam, and an always-true assertion added in isolation is exactly
-    that shape. Trivial / placeholder test references are already rejected
-    fail-closed at declaration time by ``AcceptanceEvidence`` validation.
+    actually added/modified by this PR rather than merely claimed — OR is
+    confirmed to EXIST in the repo at the merge commit with a green merge-test
+    run (see ``test_exists`` / ``ran_green``), (2) ran green under a real
+    merge-test verdict, and (3) the PR also ships a NON-test production change
+    for the test to exercise (the changed seam). A test-only diff fails: a test
+    that ships no changed production code cannot be exercising the changed seam,
+    and an always-true assertion added in isolation is exactly that shape.
+    Trivial / placeholder test references are already rejected fail-closed at
+    declaration time by ``AcceptanceEvidence`` validation.
+
+    The presence-in-diff check is the FIRST anti-fraud guard and stays intact: a
+    declared test that is neither in the diff NOR confirmed to exist at the merge
+    commit is a name-drop and hard-fails. ``test_exists`` (confirmed existence at
+    the merge commit) REPLACES presence-in-diff as the anti-fraud guard for the
+    behaviour-preserving-refactor shape: a pre-existing test that the PR re-verifies
+    without modifying is honest machine-checked evidence when the merge gate
+    physically ran it green. ``ran_green`` confirms the SPECIFIC declared test ran
+    green under a real merge-test verdict — for a test the PR did NOT modify, the
+    full-suite ``verified`` flag is not per-test evidence, so the existence path
+    additionally requires ``ran_green`` (or ``targeted_green``).
 
     ``targeted_green`` is the ONE relaxation of requirement (2): when the
     full-suite merge fell open UNVERIFIED (``verified is False``) but the merge
@@ -464,12 +590,15 @@ def _evaluate_named_test(
     closed at the verification step — the targeted green run is honest
     machine-checked proof of the exact claim, so it continues to the proven
     branch and mints ``proven=True``. This does NOT require running the whole
-    suite. When BOTH ``verified`` and ``targeted_green`` are False the gate keeps
-    today's fail-closed outcome. ``targeted_green`` never overrides the
-    parent-derived soft cap or the truncation / github-verified handling — those
-    stay as-is (a parent-derived match is still capped at satisfied/unproven even
-    when the declared test ran green, because the match may live in a sibling's
-    slice of the combined diff).
+    suite. ``ran_green`` is the same proof read directly from a merge-test verdict
+    block when one is persisted (forward-compatible; see
+    :func:`_acceptance_test_ran_green_at_merge`). When ``verified``,
+    ``targeted_green``, and ``ran_green`` are ALL False the gate keeps today's
+    fail-closed outcome. Neither relaxation ever overrides the parent-derived soft
+    cap or the truncation / github-verified handling — those stay as-is (a
+    parent-derived match is still capped at satisfied/unproven even when the
+    declared test ran green, because the match may live in a sibling's slice of
+    the combined diff).
 
     ``truncated`` marks that the changed-file list was capped (a >50-file PR): the
     declared test may have shipped beyond the truncation point, so its absence
@@ -512,14 +641,35 @@ def _evaluate_named_test(
                 "test may ship beyond the stored prefix, so absence is "
                 "inconclusive; crediting soft without machine proof",
             )
-        return AcceptanceGateVerdict(
-            True,
-            False,
-            evidence.kind,
-            f"declared named_test {declared_path!r} is not among the PR's "
-            "changed files — the claimed test was not added or modified here",
-        )
-    if not verified and not targeted_green:
+        # A declared test the PR did NOT modify can still be PROVEN when it EXISTS
+        # at the merge commit and RAN GREEN: a behaviour-preserving refactor that
+        # re-verifies a pre-existing test (rather than adding a new one) is honest
+        # machine-checked evidence even though the test is absent from the diff.
+        # Existence-at-merge replaces presence-in-diff as the anti-fraud guard — a
+        # test the merge gate physically executed green cannot be a fabricated
+        # name-drop. Absent existence evidence keeps the hard fail below, so
+        # name-dropping a test that exists nowhere is never credited.
+        if not test_exists:
+            return AcceptanceGateVerdict(
+                True,
+                False,
+                evidence.kind,
+                f"declared named_test {declared_path!r} is not among the PR's "
+                "changed files — the claimed test was not added or modified here",
+            )
+        # The test exists at the merge commit. For a test the PR did NOT modify,
+        # the full-suite ``verified`` flag is not per-test evidence — only a green
+        # run recorded for THIS test (targeted execution or a merge-test verdict
+        # block) proves it ran green, so the existence path requires it explicitly.
+        if not targeted_green and not ran_green:
+            return AcceptanceGateVerdict(
+                True,
+                False,
+                evidence.kind,
+                f"declared named_test {declared_path!r} did not run green under a "
+                "real merge-test verdict (the merge fell open without verification)",
+            )
+    if not verified and not targeted_green and not ran_green:
         return AcceptanceGateVerdict(
             True,
             False,
@@ -527,11 +677,11 @@ def _evaluate_named_test(
             f"declared named_test {declared_path!r} did not run green under a "
             "real merge-test verdict (the merge fell open without verification)",
         )
-    # When ``verified`` is False but ``targeted_green`` is True, the merge gate
-    # ran ONLY the declared test as a targeted run and it exited green — honest
-    # machine-checked proof of the exact claim, so we continue past the
+    # When ``verified`` is False but ``targeted_green``/``ran_green`` is True, the
+    # merge gate ran ONLY the declared test as a targeted run and it exited green —
+    # honest machine-checked proof of the exact claim, so we continue past the
     # verification step to the proven branch below rather than failing closed.
-    via_targeted = targeted_green and not verified
+    via_targeted = (targeted_green or ran_green) and not verified
     seam_files = [cf for cf in changed if not _is_test_path(cf)]
     if not seam_files:
         return AcceptanceGateVerdict(
@@ -566,18 +716,35 @@ def _evaluate_named_test(
             "sibling's slice of the union diff",
         )
     if via_targeted:
-        reason = (
-            f"named_test {declared_path!r} was added/modified and ran GREEN via a "
-            f"TARGETED execution of the declared test (the full-suite merge fell "
-            f"open unverified), and exercises a semantically grounded production "
-            f"seam ({len(seam_files)} non-test file(s))"
-        )
+        if test_present:
+            reason = (
+                f"named_test {declared_path!r} was added/modified and ran GREEN via "
+                f"a TARGETED execution of the declared test (the full-suite merge "
+                f"fell open unverified), and exercises a semantically grounded "
+                f"production seam ({len(seam_files)} non-test file(s))"
+            )
+        else:
+            reason = (
+                f"named_test {declared_path!r} was NOT modified by this PR but "
+                f"EXISTS in the repo at the merge commit and ran GREEN via a "
+                f"TARGETED execution of the declared test, and exercises a "
+                f"semantically grounded production seam ({len(seam_files)} non-test "
+                f"file(s))"
+            )
     else:
-        reason = (
-            f"named_test {declared_path!r} was added/modified, ran green under a "
-            f"verified merge, and exercises a semantically grounded production seam "
-            f"({len(seam_files)} non-test file(s))"
-        )
+        if test_present:
+            reason = (
+                f"named_test {declared_path!r} was added/modified, ran green under "
+                f"a verified merge, and exercises a semantically grounded production "
+                f"seam ({len(seam_files)} non-test file(s))"
+            )
+        else:
+            reason = (
+                f"named_test {declared_path!r} was NOT modified by this PR but "
+                f"EXISTS in the repo at the merge commit, ran green under a "
+                f"verified merge, and exercises a semantically grounded production "
+                f"seam ({len(seam_files)} non-test file(s))"
+            )
     return AcceptanceGateVerdict(
         True,
         True,
@@ -886,6 +1053,8 @@ def evaluate_code_acceptance(task: Task) -> AcceptanceGateVerdict:
         (task.context or {}).get(PARENT_DERIVED_CHANGED_FILES_KEY)
     )
     targeted_green = _acceptance_test_targeted_green(task)
+    test_exists = _acceptance_test_exists_at_merge(task)
+    ran_green = _acceptance_test_ran_green_at_merge(task)
 
     if evidence.kind == "named_test":
         return _evaluate_named_test(
@@ -895,6 +1064,8 @@ def evaluate_code_acceptance(task: Task) -> AcceptanceGateVerdict:
             truncated,
             parent_derived=parent_derived_files,
             targeted_green=targeted_green,
+            test_exists=test_exists,
+            ran_green=ran_green,
         )
 
     if evidence.kind == "downstream_artifact":
@@ -1033,6 +1204,14 @@ def record_code_acceptance_verdict(task: Task) -> AcceptanceGateVerdict | None:
         "reason": verdict.reason,
         "proof_ref": verdict.proof_ref,
     }
+    # A re-recorded verdict means new provenance arrived (parent-derived changed
+    # files, a GitHub-verified diff, etc.) AFTER the one-shot backfill sweep had
+    # already examined this task. Clear the marker so the task re-enters the
+    # sweep pool and can earn criterion evidence if it flips to proven — or a
+    # soft satisfied flip in the missing-from-diff class. Absent on first
+    # recording; popping a missing key is a no-op.
+    ctx.pop("_backfill_checked_at", None)
+    ctx.pop(BACKFILL_MISSING_DIFF_TERMINAL_KEY, None)
     task.context = ctx
     return verdict
 
@@ -1634,7 +1813,7 @@ def summarize_version_acceptance_aggregate(
 
 async def backfill_acceptance_verdicts(session) -> int:
     """Re-evaluate pre-fix named_test acceptance verdicts that may have been
-    false-negatives. Two historical failure classes are healed:
+    false-negatives. Three historical failure classes are healed:
 
     1. ``satisfied=True, proven=False`` — recorded before the
        ``_CROSS_CUTTING_TEST_FILES`` semantic-grounding fix (8acdd3780,
@@ -1643,9 +1822,23 @@ async def backfill_acceptance_verdicts(session) -> int:
        merge-test verdict" reason — recorded while ``_merge_was_test_verified``
        treated an ABSENT/malformed ``review_loop`` as unverified, so a landed
        task whose context simply lacked a ``review_loop`` dict was scored
-       unsatisfied even though the merge was genuinely verified.
+       unsatisfied even though the merge was genuinely verified;
+    3. ``satisfied=False`` with the "is not among the PR's changed files"
+       reason — recorded when changed-file provenance was absent or late
+       (rollup children merge via the PARENT's single PR, so a verdict stamped
+       before the parent's ``_pr_changed_files`` arrived reads as missing-from-
+       diff). Late-arriving provenance flips these to satisfied (proven when
+       the task's own PR files are GitHub-verified, else capped at
+       satisfied_unproven for the parent-derived union diff). Candidates of
+       this class are re-admitted to the sweep once changed-file provenance
+       has arrived — even when an OLD run already stamped the one-shot
+       ``_backfill_checked_at`` marker on them — and leave the window
+       terminally (``_backfill_missing_diff_terminal_at``) when provenance
+       was in hand yet re-evaluation still failed. Fresh provenance clears
+       both markers, so late re-stamps always re-admit the task without the
+       class ever monopolizing the LIMIT-200 window.
 
-    Both classes are re-evaluated with the current (fixed) logic, and
+    Each class is re-evaluated with the current (fixed) logic, and
     :class:`~app.models.CriterionEvidence` is recorded via
     :func:`~app.acceptance_criteria.record_task_merge_evidence` when the new
     verdict is ``proven=True``.
@@ -1672,30 +1865,86 @@ async def backfill_acceptance_verdicts(session) -> int:
     # idempotent, so the window always advances.
     FIX_TIMESTAMP = datetime.now(timezone.utc)
 
-    # Exclude tasks that already have a proven CriterionEvidence row from a
-    # prior backfill run so the LIMIT window advances to unprocessed tasks.
-    _proven_exists = (
-        exists(
-            select(1).where(
-                CriterionEvidence.source_kind == "task_merge",
-                CriterionEvidence.source_id == cast(Task.id, String),
-                CriterionEvidence.detail["proven"].astext == "true",
-            )
-        )
-        .correlate(Task)
-    )
-    # Use a portable JSON key-existence check: ``has_key`` (Postgres ``?``)
-    # on Postgres, ``func.json_extract`` on SQLite, so the standalone smoke
-    # gate (which runs against SQLite) does not fail.
     from app.database import resolve_dialect_name
     _dialect = resolve_dialect_name(session)
     if _dialect == "sqlite":
         from sqlalchemy import func
+        # Use a portable JSON key-existence check: ``has_key`` (Postgres ``?``)
+        # on Postgres, ``func.json_extract`` on SQLite, so the standalone smoke
+        # gate (which runs against SQLite) does not fail.
         _backfill_checked = func.json_extract(
             Task.context, "$._backfill_checked_at"
         ).is_(None)
+        # A portable nested-path extraction of the persisted verdict reason —
+        # ``context -> 'code_acceptance_verdict' -> 'reason'`` on Postgres,
+        # ``$.code_acceptance_verdict.reason`` on SQLite. NULL when the verdict
+        # or reason is absent, so a LIKE on the result selects only the
+        # missing-from-diff class.
+        _missing_from_diff_verdict = func.json_extract(
+            Task.context, "$.code_acceptance_verdict.reason"
+        ).like("%is not among the PR's changed files%")
+        # Re-admission gate for the missing-from-diff class: changed-file
+        # provenance has arrived (``_pr_changed_files`` is always a list when
+        # stamped, so NULL means absent) and no sweep has yet found the task
+        # unprovable WITH that provenance in hand (terminal marker absent).
+        _missing_diff_readmit = and_(
+            _missing_from_diff_verdict,
+            func.json_extract(
+                Task.context, "$._pr_changed_files"
+            ).is_not(None),
+            func.json_extract(
+                Task.context, "$." + BACKFILL_MISSING_DIFF_TERMINAL_KEY
+            ).is_(None),
+        )
     else:
         _backfill_checked = not_(Task.context.has_key("_backfill_checked_at"))
+        _missing_from_diff_verdict = (
+            Task.context["code_acceptance_verdict"]["reason"].astext.like(
+                "%is not among the PR's changed files%"
+            )
+        )
+        _missing_diff_readmit = and_(
+            _missing_from_diff_verdict,
+            Task.context.has_key("_pr_changed_files"),
+            not_(Task.context.has_key(BACKFILL_MISSING_DIFF_TERMINAL_KEY)),
+        )
+    # Exclude tasks that already have a proven CriterionEvidence row from a
+    # prior backfill run so the LIMIT window advances to unprocessed tasks.
+    # The ``proven`` flag is read via ``detail ->> 'proven'`` on Postgres but
+    # ``func.json_extract`` on SQLite (which returns 1 for a JSON ``true``) —
+    # portable so the standalone smoke gate stays green.
+    if _dialect == "sqlite":
+        from sqlalchemy import func
+        _proven_exists = exists(
+            select(1).where(
+                CriterionEvidence.source_kind == "task_merge",
+                CriterionEvidence.source_id == cast(Task.id, String),
+                func.json_extract(CriterionEvidence.detail, "$.proven") == 1,
+            )
+        ).correlate(Task)
+    else:
+        _proven_exists = (
+            exists(
+                select(1).where(
+                    CriterionEvidence.source_kind == "task_merge",
+                    CriterionEvidence.source_id == cast(Task.id, String),
+                    CriterionEvidence.detail["proven"].astext == "true",
+                )
+            )
+            .correlate(Task)
+        )
+    # Candidates are tasks the sweep has not examined yet, OR tasks whose
+    # persisted verdict is the missing-from-diff class AND whose changed-file
+    # provenance has since arrived — even if an OLD sweep run already stamped
+    # the one-shot ``_backfill_checked_at`` marker on them (those markers were
+    # stamped before the missing-from-diff class was re-evaluable, so honoring
+    # them would leave the exact verdicts this sweep exists to heal permanently
+    # frozen). The provenance-arrived condition is what keeps the class from
+    # monopolizing the window: a task with NO provenance is examined once,
+    # marked, and only re-admitted when provenance actually shows up; a task
+    # whose provenance was present yet still unprovable earns the terminal
+    # marker below and leaves the window for good (until fresh provenance
+    # clears the markers and re-admits it).
     # Collect IDs only, then batch-fetch Task objects with a single
     # SELECT ... WHERE id IN (...) — eliminates up to 200 individual
     # session.get() calls (PERF finding M-P6). The initial ID-only query
@@ -1707,7 +1956,7 @@ async def backfill_acceptance_verdicts(session) -> int:
             Task.status == TaskStatus.COMPLETED,
             Task.completed_at < FIX_TIMESTAMP,
             not_(_proven_exists),
-            _backfill_checked,
+            or_(_backfill_checked, _missing_diff_readmit),
         ).order_by(Task.completed_at.asc()).limit(200)
     )
     task_ids = list(result.scalars().all())
@@ -1726,6 +1975,9 @@ async def backfill_acceptance_verdicts(session) -> int:
     try:
         upgraded = 0
         marked_ids: list = []
+        # Subset of marked_ids that ALSO earn the terminal missing-from-diff
+        # marker: provenance was present, re-evaluation still failed.
+        terminal_ids: list = []
 
         # Batch-fetch all candidate tasks in one query (eliminates N+1).
         _batch_result = await session.execute(
@@ -1761,22 +2013,33 @@ async def backfill_acceptance_verdicts(session) -> int:
                 marked_ids.append(task_id)
                 continue
             satisfied = verdict_data.get("satisfied")
+            missing_from_diff = False
             if satisfied is True:
                 pass
             elif satisfied is False:
-                # Pre-fix verified-merge mis-scoring: the old
-                # _merge_was_test_verified treated an absent/malformed
-                # review_loop as UNVERIFIED, so a landed task whose context
-                # simply lacked a review_loop dict was recorded unsatisfied
-                # with the "did not run green" reason even though the merge was
-                # genuinely verified. Only re-evaluate verdicts whose persisted
-                # reason matches that exact mis-scoring; a genuinely-unverified
-                # or otherwise-unsatisfied verdict re-evaluates to not-proven
-                # and stays untouched.
+                # Two re-evaluable unsatisfied classes:
+                #   (a) Pre-fix verified-merge mis-scoring: the old
+                #       _merge_was_test_verified treated an absent/malformed
+                #       review_loop as UNVERIFIED, so a landed task whose context
+                #       simply lacked a review_loop dict was recorded unsatisfied
+                #       with the "did not run green" reason even though the merge
+                #       was genuinely verified.
+                #   (b) Missing-from-diff: the declared named_test was not in the
+                #       recorded changed-file list — often because rollup children
+                #       never owned a PR and the parent's changed files arrived
+                #       LATE. Late-arriving provenance can flip this class, so it
+                #       is admitted to re-evaluation; when still unprovable it is
+                #       marked (terminally so when provenance was already in hand)
+                #       and re-admitted only when fresh provenance clears the
+                #       markers (see the ``missing_from_diff`` handling below).
                 reason = verdict_data.get("reason")
+                reason_str = reason if isinstance(reason, str) else ""
+                missing_from_diff = (
+                    "is not among the PR's changed files" in reason_str
+                )
                 if not isinstance(reason, str) or (
-                    "did not run green under a real merge-test verdict"
-                    not in reason
+                    "did not run green under a real merge-test verdict" not in reason
+                    and not missing_from_diff
                 ):
                     marked_ids.append(task_id)
                     continue
@@ -1813,6 +2076,41 @@ async def backfill_acceptance_verdicts(session) -> int:
                     )
                     _batch_dirty = True  # rollback expired ORM objects
                 upgraded += 1
+            elif missing_from_diff:
+                # Late-arriving provenance (parent-derived rollup diff or a
+                # GitHub-verified list stamped after landing) may have flipped the
+                # recorded verdict. A satisfied-but-unproven re-evaluation is a
+                # SOFT flip out of declared_unsatisfied (parent-derived credit is
+                # deliberately capped below machine proof) — re-record it so the
+                # acceptance window counts the task in the satisfied_unproven
+                # bucket. When re-evaluation STILL cannot locate the test, mark
+                # the task so the LIMIT-200 window advances past it: terminally
+                # when changed-file provenance was already present (the declared
+                # test genuinely never shipped — nothing left to wait for),
+                # ordinarily when provenance has not arrived yet (the candidate
+                # query re-admits the class as soon as it does). Fresh provenance
+                # clears both markers (record_code_acceptance_verdict and the
+                # changed-file stamping sites), so re-admission never depends on
+                # staying unmarked — which previously let unprovable rows occupy
+                # the window forever.
+                if re_eval.satisfied:
+                    ctx = dict(task.context or {})
+                    ctx[CODE_ACCEPTANCE_VERDICT_KEY] = {
+                        "satisfied": True,
+                        "proven": False,
+                        "kind": "named_test",
+                        "reason": re_eval.reason,
+                        "proof_ref": re_eval.proof_ref,
+                        "backfilled": True,
+                    }
+                    task.context = ctx
+                    session.add(task)
+                    await session.commit()
+                    upgraded += 1
+                else:
+                    marked_ids.append(task_id)
+                    if "_pr_changed_files" in (task.context or {}):
+                        terminal_ids.append(task_id)
             else:
                 # Re-evaluation could not prove — stamp marker so the
                 # LIMIT-200 window advances past this task in future calls.
@@ -1826,6 +2124,7 @@ async def backfill_acceptance_verdicts(session) -> int:
         # from ever being examined.
         if marked_ids:
             now_ts = datetime.now(timezone.utc).isoformat()
+            _terminal_set = set(terminal_ids)
             # Batch-fetch all marked tasks in one query (eliminates N+1).
             _marked_result = await session.execute(
                 select(Task).where(Task.id.in_(marked_ids))
@@ -1837,6 +2136,8 @@ async def backfill_acceptance_verdicts(session) -> int:
                     continue
                 ctx = dict(t.context or {})
                 ctx["_backfill_checked_at"] = now_ts
+                if mid in _terminal_set:
+                    ctx[BACKFILL_MISSING_DIFF_TERMINAL_KEY] = now_ts
                 t.context = ctx
                 session.add(t)
             await session.commit()

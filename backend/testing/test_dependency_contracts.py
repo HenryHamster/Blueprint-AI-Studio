@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import json
 import time
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import jwt as pyjwt
 import pytest
@@ -370,3 +370,501 @@ class TestPayloadSerializationSizeDeterminism:
         assert result["prompt"] == "do the thing"
         # Exactly one 'type' key
         assert list(result).count("type") == 1 if "type" in result else True
+
+
+class TestCodeProducingDependencyMergeWait:
+    """``_check_candidate_task_deps`` (orchestrator_health.py) must hold a
+    same-base dependent behind ANY code-producing prerequisite type — not just
+    ``create`` — until that prerequisite's PR is merged, since the dependent's
+    base only ever sees the prerequisite's code once its PR lands. Widening
+    the gate must not deadlock a dependent behind a prerequisite type that
+    never ships a PR (pure-sequencing types keep releasing on COMPLETED)."""
+
+    async def _verify_true(self, _task, _session):
+        return True
+
+    async def _verify_false(self, _task, _session):
+        return False
+
+    @pytest.mark.asyncio
+    async def test_refactor_prerequisite_holds_dependent_until_pr_merged(
+        self, db_session
+    ):
+        from app.orchestrator import _check_candidate_task_deps
+        from testing.factories import make_project, make_task
+        from app.models import TaskStatus
+
+        project = make_project(name="RefactorMergeWait", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "refactor", "base_branch": "research/aaa"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.COMPLETED,
+        )
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "research/aaa"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add_all([dep, dependent])
+        await db_session.commit()
+
+        # A COMPLETED but unmerged refactor prerequisite must still hold the
+        # dependent — this is the defect: before the fix the merge-wait was
+        # gated on dt_type in ("create", ""), so a refactor dep released the
+        # dependent as soon as it completed, regardless of PR state.
+        waiting, _ = await _check_candidate_task_deps(
+            dependent, [dep], [dep.id], db_session, self._verify_false
+        )
+        assert waiting == "waiting"
+
+        # Once its PR is merged, the dependent becomes eligible.
+        eligible, _ = await _check_candidate_task_deps(
+            dependent, [dep], [dep.id], db_session, self._verify_true
+        )
+        assert eligible == "eligible"
+
+    @pytest.mark.asyncio
+    async def test_research_prerequisite_releases_dependent_on_completion(
+        self, db_session
+    ):
+        """Pure-sequencing prerequisite types (research, plan, review, ...)
+        never ship a PR, so they must keep releasing their dependent as soon
+        as they COMPLETE — widening the merge-wait to more code-producing
+        types must not regress this."""
+        from app.orchestrator import _check_candidate_task_deps
+        from testing.factories import make_project, make_task
+        from app.models import TaskStatus
+
+        project = make_project(name="ResearchNoMergeWait", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "research", "base_branch": "research/aaa"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.COMPLETED,
+        )
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "research/aaa"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add_all([dep, dependent])
+        await db_session.commit()
+
+        # verify_false would fail the test if the research dep were (wrongly)
+        # routed through the PR-merge wait; it must never even be consulted.
+        eligible, _ = await _check_candidate_task_deps(
+            dependent, [dep], [dep.id], db_session, self._verify_false
+        )
+        assert eligible == "eligible"
+
+    @pytest.mark.asyncio
+    async def test_qa_prerequisite_with_no_pr_artifact_does_not_deadlock(
+        self, db_session
+    ):
+        """A code-producing (qa) prerequisite that completed WITHOUT ever
+        opening a PR (e.g. no diff was needed) must not wedge its dependent
+        forever — ``verify_pr_merged`` treats a missing PR artifact as done,
+        and that must still apply once the gate covers qa, not just create."""
+        from app.orchestrator import _check_candidate_task_deps
+        from testing.factories import make_project, make_task
+        from app.models import TaskStatus
+
+        project = make_project(name="QANoPRArtifact", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "qa", "base_branch": "research/aaa"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.COMPLETED,
+        )
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "research/aaa"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add_all([dep, dependent])
+        await db_session.commit()
+
+        # No PULL_REQUEST artifact was created for dep — the real
+        # verify_pr_merged (not a stub) must treat that as "done" rather than
+        # holding the dependent indefinitely.
+        from app.rollup_pr_verification import _verify_pr_merged
+
+        eligible, _ = await _check_candidate_task_deps(
+            dependent, [dep], [dep.id], db_session, _verify_pr_merged
+        )
+        assert eligible == "eligible"
+
+
+# ---------------------------------------------------------------------------
+# Helper: fake async session factory (mirrors test_orchestrator._FakeSessionFactory)
+# ---------------------------------------------------------------------------
+
+
+class _FakeSessionFactory:
+    """Replaces AsyncSessionLocal so background services use the test session."""
+
+    def __init__(self, session):
+        self._session = session
+
+    def __call__(self):
+        return self
+
+    async def __aenter__(self):
+        return self._session
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        return False
+
+
+# ---------------------------------------------------------------------------
+# 4. Warm-VM ordering: ensure_dependent_base_recut BEFORE _deps_satisfied
+# ---------------------------------------------------------------------------
+
+
+class TestDependentWorkspaceContainsPrerequisiteMergedCode:
+    """Pin the ORDERING invariant that guards the campaign sequencing contract:
+
+      ``ensure_dependent_base_recut`` MUST return True before the
+      ``_deps_satisfied`` warm-claim marker is ever stamped on a cross-base
+      dependent.
+
+    Chain under test (links verified by reading at HEAD, not assumed):
+
+      1. ``_inject_build_on_deps`` auto-authors the dependency edge when a
+         later subtask's prompt references a file a prior subtask produces
+         (plan_completion.py:158-205).
+      2. ``_maybe_inherit_base`` gives a cross-base code-dependent the
+         foundation's base_branch so same-base merge-wait logic applies
+         (plan_completion.py:1254-1279).
+      3. ``_check_candidate_task_deps`` holds the dependent until the
+         prerequisite's PR is merged (same-base) or its code has landed on
+         integration (cross-base, via ``has_landed_signal``)
+         (orchestrator_health.py:1122-1180).
+      4. ``ensure_dependent_base_recut`` merges current integration into the
+         dependent's base BEFORE ``_deps_satisfied`` is stamped; if it fails,
+         the marker is withheld and a warm VM cannot claim the task
+         (dep_lifecycle.py:509-531, orchestrator.py:2442-2480).
+      5. Agent resolves base_branch as a NAME and fetches origin/<branch>
+         fresh at run time (agent/src/workspacePrep.ts:302-325 — out of scope
+         for this Python suite; covered by workspacePrep.test.ts).
+
+    Fragility notes (not fixed here — recorded for downstream reviewers):
+      * The ``_deps_satisfied`` marker is the sole mechanism a warm VM uses to
+        skip full dep-resolution on the /next-role hot path. Any path that
+        stamps the marker without a preceding recut check lets a warm VM
+        dispatch against a stale base. There are TWO independent stamp sites:
+        ``dep_lifecycle._mark_unblocked_dependents`` (completion-side trigger)
+        and the main dispatch loop in ``orchestrator.py``. Drift between them
+        is not detected by existing tests — a refactor that adds a third site
+        must also add a recut guard.
+      * ``_check_candidate_task_deps`` (orchestrator_health.py:1156-1173) uses
+        ``_is_code_producing_task`` to decide whether a same-base COMPLETED dep
+        needs its PR merged.  Cross-base deps are routed differently (via
+        ``has_landed_signal``).  Adding a new code-producing task type to
+        either branch but not the other would silently create a blind spot.
+      * The dt_type gate for same-base merge-wait was widened from ``('create',
+        '')`` to all code-producing types in PR #16936. The cross-base
+        ``has_landed_signal`` gate is not type-gated and is therefore
+        unaffected. Out of scope for the dt_type extension: ordering-only
+        cross-base deps (no file overlap) continue to release immediately.
+    """
+
+    async def _verify_true(self, _task, _session):
+        return True
+
+    # ------------------------------------------------------------------
+    # Link 1: _inject_build_on_deps auto-authors the dep edge at plan time
+    # ------------------------------------------------------------------
+
+    def test_inject_build_on_deps_adds_edge_when_prompt_references_producer_file(self):
+        """A consumer subtask whose prompt mentions a producer's related_file gets
+        a depends_on_indices edge pointing at the producer, enabling the
+        dispatch merge-wait to hold it until the producer's code is merged.
+
+        This exercises link 1 of the chain: plan_completion._inject_build_on_deps.
+        """
+        from app.plan_completion import _inject_build_on_deps
+
+        subtasks = [
+            {
+                "title": "create new_module",
+                "related_files": ["backend/app/new_module.py"],
+                "prompt": "Create the new_module.py module.",
+            },
+            {
+                "title": "integrate new_module",
+                "related_files": ["backend/app/integration.py"],
+                "prompt": "Update integration.py to import backend/app/new_module.py.",
+            },
+        ]
+        added = _inject_build_on_deps(subtasks)
+
+        assert len(added) == 1, (
+            f"Expected one build-on edge from producer→consumer, got {added!r}"
+        )
+        producer_idx, consumer_idx, path = added[0]
+        assert producer_idx == 0
+        assert consumer_idx == 1
+        assert path == "backend/app/new_module.py"
+        assert subtasks[1].get("depends_on_indices") == [0], (
+            "consumer must carry depends_on_indices=[0] after injection; "
+            "without it the dispatch engine sees no ordering constraint and "
+            "may dispatch both subtasks in parallel"
+        )
+
+    def test_inject_build_on_deps_skips_shared_file(self):
+        """When consumer already lists the file in related_files, the same-file
+        overlap pass handles it; _inject_build_on_deps must NOT add a duplicate edge.
+        """
+        from app.plan_completion import _inject_build_on_deps
+
+        subtasks = [
+            {
+                "title": "modify shared.py",
+                "related_files": ["backend/app/shared.py"],
+                "prompt": "Refactor shared.py.",
+            },
+            {
+                "title": "also modify shared.py",
+                "related_files": ["backend/app/shared.py"],
+                "prompt": "Also touch backend/app/shared.py for a follow-up.",
+            },
+        ]
+        added = _inject_build_on_deps(subtasks)
+
+        assert added == [], (
+            "_inject_build_on_deps must not duplicate same-file edges; "
+            "_inject_file_overlap_deps already owns that case"
+        )
+
+    def test_inject_build_on_deps_no_edge_when_prompt_does_not_reference_file(self):
+        """Independent subtasks (prompt does not mention the producer's file)
+        must NOT receive an artificial ordering constraint.
+        """
+        from app.plan_completion import _inject_build_on_deps
+
+        subtasks = [
+            {
+                "title": "create alpha.py",
+                "related_files": ["backend/app/alpha.py"],
+                "prompt": "Create the alpha module.",
+            },
+            {
+                "title": "create beta.py",
+                "related_files": ["backend/app/beta.py"],
+                "prompt": "Create the beta module independently.",
+            },
+        ]
+        added = _inject_build_on_deps(subtasks)
+
+        assert added == [], (
+            "Independent subtasks must stay parallel; adding a spurious dep "
+            "would serialize unrelated work and reduce plan throughput"
+        )
+
+    # ------------------------------------------------------------------
+    # Link 2: _maybe_inherit_base (cross-base base_branch propagation)
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_check_candidate_task_deps_cross_base_held_until_landed(
+        self, db_session
+    ):
+        """Link 2+3 combined: a cross-base genuine code dep holds the dependent
+        until ``has_landed_signal`` is True on the prerequisite.
+
+        Verifies that a COMPLETED cross-base code dep WITHOUT the landed signal
+        keeps the dependent waiting, and becomes eligible once the signal is set.
+        """
+        from app.orchestrator import _check_candidate_task_deps
+        from app.landed_signal import mark_landed_on_integration
+        from testing.factories import make_project, make_task
+        from app.models import TaskStatus
+
+        project = make_project(name="CrossBaseHoldTest", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+
+        prereq = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "plan/feat-a"}],
+            context={"related_files": ["backend/app/new_module.py"]},
+            status=TaskStatus.COMPLETED,
+        )
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "fix", "base_branch": "plan/feat-b"}],
+            context={"related_files": ["backend/app/new_module.py"]},
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add_all([prereq, dependent])
+        await db_session.commit()
+
+        async def _verify_false(t, s):
+            return False
+
+        # COMPLETED but not landed → still waiting.
+        waiting, _ = await _check_candidate_task_deps(
+            dependent, [prereq], [prereq.id], db_session, _verify_false
+        )
+        assert waiting == "waiting", (
+            "cross-base code dep COMPLETED but not landed must keep the "
+            "dependent waiting; dispatching now would put B against a base "
+            "that does NOT yet contain A's merged code"
+        )
+
+        # Once the dep has landed, the dependent becomes eligible.
+        mark_landed_on_integration(prereq)
+        db_session.add(prereq)
+        await db_session.commit()
+
+        eligible, _ = await _check_candidate_task_deps(
+            dependent, [prereq], [prereq.id], db_session, _verify_false
+        )
+        assert eligible == "eligible", (
+            "cross-base code dep with has_landed_signal must release the "
+            "dependent so it can be dispatched against an updated base"
+        )
+
+    # ------------------------------------------------------------------
+    # Link 4 (THE NAMED TEST): ordering invariant — recut before marker
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_dependent_workspace_contains_prerequisite_merged_code(
+        self, db_session, mocker
+    ):
+        """``_deps_satisfied`` is stamped ONLY AFTER ``ensure_dependent_base_recut``
+        returns True for a cross-base genuine code dependency.
+
+        Scenario: prerequisite A is COMPLETED and has landed on integration;
+        dependent B has a cross-base genuine code dependency on A (different
+        base_branch, overlapping related_files). When the completion-side
+        trigger ``_mark_unblocked_dependents`` fires:
+
+          (a) If the re-cut FAILS (returns False), ``_deps_satisfied`` is NOT
+              stamped. A warm VM polling via the /next-role backlog scan cannot
+              see B as warm-claimable, so it cannot dispatch B against a base
+              that is still MISSING A's landed code.
+
+          (b) If the re-cut SUCCEEDS (returns True), ``_deps_satisfied`` IS
+              stamped. B is now safely warm-claimable: its base has been
+              updated from integration and provably contains A's code.
+
+        This directly exercises the ordering invariant described in
+        orchestrator.py:2440-2480 and dep_lifecycle.py:509-531.
+
+        A regression that stamps the marker before the re-cut (or skips the
+        re-cut entirely) would allow a warm VM to claim B and run it against
+        a stale base — producing a silently-broken build that bypasses both
+        the file-overlap conflict guard and the deploy-time integration test.
+        """
+        from app.dep_lifecycle import _mark_unblocked_dependents
+        from app.landed_signal import mark_landed_on_integration
+        from testing.factories import make_project, make_task
+        from app.models import TaskStatus
+
+        project = make_project(
+            name="WarmVMOrderingTest", user_id="u1", integration_branch="main"
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Prerequisite A: COMPLETED and landed on integration.
+        # base_branch "plan/feat-a" differs from the dependent's "plan/feat-b".
+        prereq = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "plan/feat-a"}],
+            context={"related_files": ["backend/app/new_module.py"]},
+            status=TaskStatus.COMPLETED,
+        )
+        mark_landed_on_integration(prereq)
+        db_session.add(prereq)
+        await db_session.commit()
+        await db_session.refresh(prereq)
+
+        # Trigger task: same base as dependent, just completed — fires the sweep.
+        trigger = make_task(
+            project_id=project.id,
+            payloads=[{"type": "research", "base_branch": "plan/feat-b"}],
+            status=TaskStatus.COMPLETED,
+        )
+        db_session.add(trigger)
+        await db_session.commit()
+        await db_session.refresh(trigger)
+
+        # Dependent B: cross-base genuine code dep on A.
+        # related_files overlaps prereq → is_genuine_code_dependency = True.
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "fix", "base_branch": "plan/feat-b"}],
+            context={"related_files": ["backend/app/new_module.py"]},
+            status=TaskStatus.QUEUED,
+            depends_on=[str(prereq.id), str(trigger.id)],
+        )
+        db_session.add(dependent)
+        await db_session.commit()
+        await db_session.refresh(dependent)
+
+        mocker.patch(
+            "app.dep_lifecycle.AsyncSessionLocal",
+            _FakeSessionFactory(db_session),
+        )
+
+        # (a) Re-cut FAILS → _deps_satisfied must NOT be set.
+        # Patching app.orchestrator_health.ensure_dependent_base_recut
+        # intercepts the lazy import inside _mark_unblocked_dependents.
+        mocker.patch(
+            "app.orchestrator_health.ensure_dependent_base_recut",
+            new_callable=AsyncMock,
+            return_value=False,
+        )
+        marked = await _mark_unblocked_dependents(trigger, self._verify_true)
+        assert marked == 0, (
+            "warm-claim count must be 0 when ensure_dependent_base_recut "
+            f"returns False (got {marked}); the dependent must remain "
+            "unheld so a warm VM cannot dispatch it against a stale base"
+        )
+        db_session.expire(dependent)
+        await db_session.refresh(dependent)
+        assert not (dependent.context or {}).get("_deps_satisfied"), (
+            "_deps_satisfied must be ABSENT when the re-cut is incomplete; "
+            "stamping it before the re-cut succeeds violates the ordering "
+            "invariant (orchestrator.py:2447, dep_lifecycle.py:528) and "
+            "would let a warm VM run dependent B against a base that is "
+            "missing prerequisite A's landed code"
+        )
+
+        # (b) Re-cut SUCCEEDS → _deps_satisfied MUST be set.
+        mocker.patch(
+            "app.orchestrator_health.ensure_dependent_base_recut",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        marked = await _mark_unblocked_dependents(trigger, self._verify_true)
+        assert marked == 1, (
+            "warm-claim count must be 1 when ensure_dependent_base_recut "
+            f"returns True (got {marked}); the dependent is now safe to "
+            "dispatch against its re-cut base"
+        )
+        db_session.expire(dependent)
+        await db_session.refresh(dependent)
+        assert (dependent.context or {}).get("_deps_satisfied") is True, (
+            "_deps_satisfied must be present after ensure_dependent_base_recut "
+            "succeeds; its absence would force cold provisioning for every "
+            "follow-on task even when a warm VM is available"
+        )

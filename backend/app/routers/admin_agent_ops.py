@@ -4128,6 +4128,71 @@ async def strategic_operation(
         # Cap to prevent runaway prompts consuming token budget
         prompt = _cap_str(raw_prompt, 10_000, "prompt", warnings)
         title = _cap_str(raw_title, 200, "title", warnings)
+        # Optional intra-batch ordering: a list of same-project task UUIDs
+        # (siblings previously spawned by this strategic review) this task
+        # must run after. Expresses the build-on ordering the plan spawner
+        # authors between subtasks — each spawn_task call resolves the prior
+        # spawn's returned task_id into a durable depends_on edge, so a
+        # multi-task decision can sequence its work instead of only emitting
+        # independent parallel siblings.
+        raw_depends_on = data.get("depends_on")
+        depends_on_ids: list[str] = []
+        if raw_depends_on is not None:
+            if not isinstance(raw_depends_on, list) or not raw_depends_on:
+                raise HTTPException(
+                    status_code=400,
+                    detail="depends_on must be a non-empty list of task UUIDs",
+                )
+            # This spawn always cuts from the project integration branch (see
+            # spawn_payload below). Reject a dependency whose own base branch
+            # differs: the dispatch loop only waits on a dependency matching
+            # _same_base_branch (orchestrator_health.py), so a cross-base edge
+            # would be silently skipped and the dependent would dispatch against
+            # a base missing the dependency's landed code. Mirrors the
+            # operator-facing depends_on gate in admin_task_mutations.py.
+            from app.orchestrator_health import (
+                _same_base_branch_value as _same_base_value,
+            )
+
+            _new_task_base = _get_project_integration_branch(project)
+            for _dep in raw_depends_on:
+                _dep_text = str(_dep).strip()
+                try:
+                    _dep_uuid = uuid.UUID(_dep_text)
+                except (ValueError, AttributeError):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "depends_on entries must be task UUIDs; got "
+                            f"{_dep!r}"
+                        ),
+                    ) from None
+                _dep_task = await session.get(Task, _dep_uuid)
+                if _dep_task is None or _dep_task.project_id != project.id:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "depends_on references a task outside this "
+                            f"project: {_dep_text}"
+                        ),
+                    )
+                _dep_base = (_dep_task.first_payload or {}).get("base_branch")
+                if not _same_base_value(_new_task_base, _dep_base):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "Cross-base dependency rejected: this spawn's base "
+                            f"branch '{_new_task_base or '(default)'}' differs "
+                            f"from dependency {_dep_text}'s base "
+                            f"'{_dep_base or '(default)'}'. A dependency only "
+                            f"propagates its landed code when both share a base "
+                            f"branch; otherwise the dependent would dispatch "
+                            f"without the prerequisite's changes. Align the base "
+                            f"branches or re-point the dependency."
+                        ),
+                    )
+                if _dep_text not in depends_on_ids:
+                    depends_on_ids.append(_dep_text)
         direction_id = data.get("direction_id")
         direction_entry = next(
             (
@@ -4394,6 +4459,9 @@ async def strategic_operation(
                 "requires_approval": spawn_requires_approval,
                 "watch": data.get("watch", default_watch),
                 "watch_purpose": str(data.get("watch_purpose") or "")[:1000],
+                # Carried in the spec so idempotency hashing covers the
+                # declared edges; applied to the task below on creation.
+                "depends_on": depends_on_ids,
             }
         }
         try:
@@ -4434,6 +4502,13 @@ async def strategic_operation(
                 ),
                 status_code=202,
             )
+        # NOTE: the declared intra-batch ordering is applied inside
+        # ``_task_from_specification`` (app/strategic_spawn_requests.py) at Task
+        # construction, so the edge lands in the SAME transaction as the QUEUED
+        # row and every creation path — immediate dispatch here and the deferred
+        # drain — carries it. Do not re-patch it here: a create-then-patch would
+        # expose a window in which the orchestrator sees a dependency-free
+        # QUEUED successor and dispatches it ahead of its prerequisite.
         # An accepted spawn targeting the direction is the strategist's
         # ``commission_work`` disposition: concrete work now exists in the
         # direction, so the pending saturation item is answered. Clear it under
@@ -4443,7 +4518,7 @@ async def strategic_operation(
         if direction_id:
             from app.direction_saturation import clear_saturation_disposition
 
-            async def _apply_spawn_clear(fresh: list) -> list | None:
+            def _apply_spawn_clear(fresh: list) -> list | None:
                 _target = next(
                     (d for d in fresh if d.get("id") == direction_id), None
                 )
@@ -4472,6 +4547,7 @@ async def strategic_operation(
                     if submission.linked_debt_id
                     else {}
                 ),
+                **({"depends_on": depends_on_ids} if depends_on_ids else {}),
             }
         )
 

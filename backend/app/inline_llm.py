@@ -31,31 +31,42 @@ async def _record_inline_llm_spend(
     Advisory and never-raises: a DB or pricing failure must not break the
     caller's parsed-JSON result, matching the advisory pattern used elsewhere
     at this call boundary (e.g. the rate-limit usage probe).
+
+    A (provider, model) with no entry in ``LLM_TOKEN_PRICING`` is recorded with
+    its usage and ``pricing_status="unpriced"`` (``cost_usd`` left NULL) rather
+    than dropped, so the spend boundary stays visible even before a price row is
+    added. Consumers that sum ``cost_usd`` must treat the total as a FLOOR when
+    any unpriced rows exist — a fabricated fallback price would be
+    indistinguishable from a real measurement downstream.
     """
     if not usage_data or not usage_data.get("reported"):
         return
     try:
         from app.llm_cost_attribution import LLM_TOKEN_PRICING, _price_llm_attempt
 
-        pricing = LLM_TOKEN_PRICING.get((provider.lower(), model.lower()))
-        if pricing is None:
-            return
-        input_rate, output_rate = pricing
         input_tokens = int(usage_data.get("input_tokens") or 0)
         output_tokens = int(usage_data.get("output_tokens") or 0)
         cache_creation = int(usage_data.get("cache_creation_input_tokens") or 0)
         cache_read = int(usage_data.get("cache_read_input_tokens") or 0)
         inclusive_input = input_tokens + cache_creation + cache_read
-        cost_usd = _price_llm_attempt(
-            inclusive_input,
-            output_tokens,
-            cache_creation,
-            cache_read,
-            input_rate,
-            output_rate,
-            provider=provider,
-            model=model,
-        )
+
+        pricing = LLM_TOKEN_PRICING.get((provider.lower(), model.lower()))
+        if pricing is None:
+            cost_usd = None
+            pricing_status = "unpriced"
+        else:
+            input_rate, output_rate = pricing
+            cost_usd = _price_llm_attempt(
+                inclusive_input,
+                output_tokens,
+                cache_creation,
+                cache_read,
+                input_rate,
+                output_rate,
+                provider=provider,
+                model=model,
+            )
+            pricing_status = "priced"
 
         from app.database import closing_session
         from app.models import InlineLlmSpendLog
@@ -71,6 +82,7 @@ async def _record_inline_llm_spend(
                     cache_creation_input_tokens=cache_creation,
                     cache_read_input_tokens=cache_read,
                     cost_usd=cost_usd,
+                    pricing_status=pricing_status,
                 )
             )
             await session.commit()

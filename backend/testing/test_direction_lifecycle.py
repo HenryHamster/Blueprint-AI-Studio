@@ -214,6 +214,149 @@ async def test_process_lifecycle_cost_pause_fires_when_aggregate_pushes_over_bud
 
 
 @pytest.mark.asyncio
+async def test_cost_pause_counts_lineage_llm_spend(db_session, mocker):
+    """A direction under budget on VM-only accounting pauses once its lineage LLM
+    token spend is counted.
+
+    The task's VM cost alone (~$0.07 for an hour on the default machine) and the
+    research-history fallback ($0) are both under the $5 envelope. Only the
+    canonical lineage meter — which folds LLM tokens in — crosses the budget, so
+    this proves the auto-pause gate reads the SAME meter the badge shows.
+    """
+    from app.vm_cost_rates import get_vm_rate_per_second
+
+    mocker.patch(
+        "app.direction_lifecycle._compute_direction_error_fingerprint",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    direction_id = "d-lineage-llm"
+    direction = {
+        "id": direction_id,
+        "text": "LLM-heavy direction",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "cost_budget_usd": 5.0,
+        "research_history": [],  # fallback alone would be $0 — under budget
+    }
+    project = await _make_cost_project(db_session, direction)
+
+    now = _utcnow()
+    # 1M input @ $5/MTok + 100k output @ $25/MTok on claude-opus-4-7 = $7.50 LLM.
+    db_session.add(
+        Task(
+            project_id=project.id,
+            title="llm-heavy task",
+            payloads=[{"type": "create", "scope": "small"}],
+            context={"direction_id": direction_id},
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            provider="anthropic",
+            model="claude-opus-4-7",
+            api_call_summary={
+                "total_input_tokens": 1_000_000,
+                "total_output_tokens": 100_000,
+                "llm_call_count": 7,
+            },
+            vm_provisioned_at=now - timedelta(hours=1),
+            vm_stopped_at=now,
+            vm_spot=False,
+        )
+    )
+    await db_session.commit()
+
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        busy_direction_ids=set(),
+        now=_utcnow(),
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d["status"] == "paused", (
+        "direction should be auto-paused when lineage spend (incl. LLM) exceeds budget"
+    )
+    evidence = d.get("cost_pause_evidence", {})
+    vm_only = get_vm_rate_per_second(machine_type=None, spot=False) * 3600
+    llm_only = 7.50
+    # VM-only accounting alone stays under the envelope — only LLM pushes it over.
+    assert vm_only < 5.0, "test precondition: VM-only spend must be under budget"
+    assert evidence.get("spend_basis") == (
+        "lifetime_lineage:vm_banked+llm_tokens+compute_jobs"
+    ), "pause should be measured on the canonical lineage basis"
+    assert evidence.get("lineage_vm_cost_usd") == pytest.approx(vm_only, abs=0.001)
+    assert evidence.get("lineage_llm_cost_usd") == pytest.approx(llm_only, abs=0.001)
+    assert evidence.get("lineage_task_count") == 1
+    assert evidence.get("cumulative_estimated_cost_usd") == pytest.approx(
+        vm_only + llm_only, abs=0.001
+    ), "pause total should be lineage total (VM + LLM), not the history fallback"
+    # The legacy read-model key must stay bound to the canonical meter, not to a
+    # second, separately-computed lineage sum.
+    assert evidence.get("attributed_lineage_spend_usd") == pytest.approx(
+        vm_only + llm_only, abs=0.001
+    ), "attributed lineage spend must equal the canonical lineage total"
+
+
+@pytest.mark.asyncio
+async def test_cost_pause_fallback_basis_labelled_when_no_lineage_rows(db_session, mocker):
+    """When no lineage task rows exist for a direction, the budget gate falls back
+    to research_history + history_aggregate and labels the basis explicitly.
+
+    The research-history sum alone ($6) stays under the budget here; the evicted
+    aggregate pushes it over, and the evidence must say it used the fallback so an
+    operator reconciling the pause against the badge never has to guess.
+    """
+    mocker.patch(
+        "app.direction_lifecycle._compute_direction_error_fingerprint",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    direction = {
+        "id": "d-fallback",
+        "text": "Pruned-lineage direction",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "cost_budget_usd": 9.0,
+        # No task rows in the DB for this direction: only the fallback can push
+        # cumulative cost over the envelope (history 6.0 < budget 9.0, but
+        # history 6.0 + aggregate 4.0 = 10.0 > 9.0).
+        "research_history": _cost_history(3.0, 3.0),
+        "history_aggregate": {"total_estimated_cost_usd": 4.0},
+    }
+    project = await _make_cost_project(db_session, direction)
+
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        busy_direction_ids=set(),
+        now=_utcnow(),
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d["status"] == "paused", "fallback spend over budget should still pause"
+    evidence = d.get("cost_pause_evidence", {})
+    assert evidence.get("spend_basis") == "research_history+history_aggregate", (
+        "fallback basis must be explicitly labelled"
+    )
+    assert evidence.get("cumulative_estimated_cost_usd") == 10.0, (
+        f"expected fallback total 10.0, got {evidence.get('cumulative_estimated_cost_usd')!r}"
+    )
+    # No lineage rows were measured, so the VM/LLM terms are a genuine zero.
+    assert evidence.get("lineage_task_count") == 0
+    assert evidence.get("lineage_llm_cost_usd") == 0.0
+    assert evidence.get("lineage_vm_cost_usd") == 0.0
+    assert evidence.get("attributed_lineage_spend_usd") == 0.0, (
+        "no lineage rows means no attributed lineage spend, not the fallback total"
+    )
+
+
+@pytest.mark.asyncio
 async def test_process_lifecycle_flags_retirement_consideration_for_high_cost_per_merge(
     db_session, mocker
 ):

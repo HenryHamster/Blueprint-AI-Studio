@@ -241,8 +241,70 @@ async def test_call_inline_llm_json_records_spend_log_from_provider_usage(
     assert len(rows) == 1
     row = rows[0]
     assert row.model == "deepseek-v4-flash"
+    assert row.pricing_status == "priced"
+    assert row.cost_usd is not None
     # deepseek-v4-flash pricing: (0.14e-6, 0.28e-6) $/token
     assert row.cost_usd == pytest.approx(100 * 0.14e-6 + 50 * 0.28e-6)
+
+
+@pytest.mark.asyncio
+async def test_call_inline_llm_json_records_unpriced_model_usage_as_unpriced(
+    monkeypatch, db_session
+):
+    """A call whose (provider, model) has no pricing row is RECORDED with its
+    usage and marked unpriced (cost_usd NULL) rather than silently dropped —
+    the dark-spend hole in the cost-capture seam this ledger exists to close.
+    A consumer summing this ledger must read the total as a floor, not an exact
+    figure, because the row's cost is unknown, not zero."""
+    monkeypatch.setitem(
+        runtime_config,
+        "inline_llm",
+        {"compute_qa": {"model": "deepseek-v999"}},
+    )
+
+    mock_content = MagicMock()
+    mock_content.text = json.dumps({"answer": "yes"})
+    mock_resp = MagicMock()
+    mock_resp.content = [mock_content]
+    mock_resp.usage = SimpleNamespace(
+        input_tokens=200,
+        output_tokens=60,
+        cache_creation_input_tokens=10,
+        cache_read_input_tokens=5,
+    )
+
+    mock_create = AsyncMock(return_value=mock_resp)
+    mock_client = MagicMock()
+    mock_client.messages.create = mock_create
+
+    with (
+        patch.dict(os.environ, {"DEEPSEEK_API_KEY": "deepseek-test-key"}),
+        patch("anthropic.AsyncAnthropic", MagicMock(return_value=mock_client)),
+    ):
+        result = await call_inline_llm_json(
+            "compute_qa",
+            "Is this working?",
+            required_keys=("answer",),
+        )
+
+    assert result == {"answer": "yes"}
+
+    rows = (
+        await db_session.execute(
+            select(InlineLlmSpendLog).where(
+                InlineLlmSpendLog.provider == "deepseek",
+                InlineLlmSpendLog.model == "deepseek-v999",
+                InlineLlmSpendLog.input_tokens == 215,  # 200 uncached + 10 cc + 5 cr
+            )
+        )
+    ).scalars().all()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.pricing_status == "unpriced"
+    assert row.cost_usd is None
+    assert row.output_tokens == 60
+    assert row.cache_creation_input_tokens == 10
+    assert row.cache_read_input_tokens == 5
 
 
 @pytest.mark.asyncio

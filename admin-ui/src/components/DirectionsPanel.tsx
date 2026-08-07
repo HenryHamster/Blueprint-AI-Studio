@@ -121,6 +121,21 @@ export interface Direction {
   estimated_cost_usd?: number | null;
   budget_utilization_pct?: number | null;
   budget_exceeded?: boolean;
+  // Lifetime lineage spend — the meter budget_utilization_pct and
+  // budget_exceeded are computed from (lifetime basis: VM + LLM + compute).
+  // Additive fields; absent on legacy snapshots that only carry the
+  // rolling-window figures, so every consumer must degrade gracefully.
+  lineage_spend_usd?: number | null;
+  lineage_vm_cost_usd?: number | null;
+  lineage_llm_cost_usd?: number | null;
+  lineage_compute_cost_usd?: number | null;
+  lineage_task_count?: number | null;
+  lineage_llm_unpriced?: boolean;
+  budget_basis?: string | null;
+  // Rolling-window cost split behind estimated_cost_usd (window basis).
+  window_vm_cost_usd?: number | null;
+  window_llm_cost_usd?: number | null;
+  window_llm_unpriced?: boolean;
   quality_score?: number | null;
   // Generalized cross-task-type success metrics, emitted by GET /directions
   // alongside the legacy PR-merge counters. `outcome_kind_breakdown` is keyed

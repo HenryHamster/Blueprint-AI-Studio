@@ -534,11 +534,22 @@ async def _propagate_landed_to_staging_merged_descendants(
             visited.add(row.id)
 
             ctx = row.context or {}
+            # Every non-force-dropped, staging-merged descendant participates in
+            # the parent-derived coverage + changed-file propagation and verdict
+            # re-record — whether or not it ALREADY carries the landed signal. A
+            # child that landed BEFORE the parent's ``_pr_changed_files`` arrived
+            # (the parent's single PR is the child's only changed-file source)
+            # would otherwise be skipped here forever and stay frozen at
+            # declared_unsatisfied, even once late-arriving provenance could flip
+            # it. Only the landing stamp itself is gated on ``not
+            # has_landed_signal`` so the ``stamped`` return contract (descendants
+            # newly landed by THIS call) is preserved.
             if (
                 ctx.get(NON_MERGE_UNBLOCK_REASON_KEY) not in _FORCE_DROP_REASONS
                 and has_merge_unblock_signal(row)
-                and not has_landed_signal(row)
             ):
+                _propagated = False
+
                 # Propagate test_coverage_result from the root parent to this
                 # descendant so the coverage_delta acceptance gate
                 # (_evaluate_coverage_delta) can find measured coverage data
@@ -549,6 +560,7 @@ async def _propagate_landed_to_staging_merged_descendants(
                     _desc_ctx = dict(row.context or {})
                     _desc_ctx.setdefault("test_coverage_result", _parent_coverage)
                     row.context = _desc_ctx
+                    _propagated = True
 
                 # Propagate the parent's changed-file context to descendants that
                 # lack their own self-reported ``_pr_changed_files`` so a declared
@@ -567,10 +579,17 @@ async def _propagate_landed_to_staging_merged_descendants(
                     )
                     row.context = _cf_ctx
                     _acceptance_gate.record_code_acceptance_verdict(row)
+                    _propagated = True
 
-                mark_landed_on_integration(row)
-                session.add(row)
-                stamped.append(row)
+                if not has_landed_signal(row):
+                    mark_landed_on_integration(row)
+                    session.add(row)
+                    stamped.append(row)
+                elif _propagated:
+                    # Already-landed descendant that received fresh parent-derived
+                    # provenance: persist the re-stamped context + verdict so the
+                    # flip survives the caller's commit.
+                    session.add(row)
 
             next_queue.append(row.id)
 

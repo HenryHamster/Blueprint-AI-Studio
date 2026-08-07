@@ -14,6 +14,7 @@ import json
 import os
 import subprocess
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -162,6 +163,54 @@ def test_chronic_growth_trigger_needs_3_bumps():
 
 def test_chronic_empty_history_not_chronic():
     assert not _is_chronic_offender([])
+
+
+# ---------------------------------------------------------------------------
+# is_breach — the guardrail's fundamental predicate (single source of truth)
+# ---------------------------------------------------------------------------
+
+
+def test_is_breach_true_when_count_exceeds_cap():
+    assert slp.is_breach(1200, 1180)
+    assert slp.is_breach(1193, 1180)
+
+
+def test_is_breach_false_when_within_or_at_cap():
+    assert not slp.is_breach(1180, 1180)
+    assert not slp.is_breach(1000, 1180)
+
+
+def test_is_breach_missing_file_never_breaches():
+    """A file absent at the ref (count is None) cannot have grown past its cap."""
+    assert not slp.is_breach(None, 1180)
+
+
+def test_is_breach_missing_cap_never_breaches():
+    """An uncapped file (cap is None) has no limit to breach."""
+    assert not slp.is_breach(1200, None)
+
+
+def test_is_breach_missing_both_never_breaches():
+    assert not slp.is_breach(None, None)
+
+
+def test_classify_size_record_delegates_breach_to_policy():
+    """check_size_limits.classify_size_record must use the production predicate.
+
+    Guards the single-source-of-truth contract: the standalone checker and the
+    CI-compliance evaluator must classify a breach via
+    ``app.size_limit_policy.is_breach`` rather than re-deriving the comparison
+    inline, so a drift between the two is impossible.
+    """
+    from testing.check_size_limits import classify_size_record
+
+    assert classify_size_record("m.py", 1200, 1180, "backend", with_verdict=False)["breach"]
+    assert not classify_size_record(
+        "m.py", 1180, 1180, "backend", with_verdict=False
+    )["breach"]
+    assert not classify_size_record(
+        "m.py", None, 1180, "backend", with_verdict=False
+    )["breach"]
 
 
 # ---------------------------------------------------------------------------
@@ -596,15 +645,26 @@ def test_cap_bump_history_ledger_matches_git():
 
     The deployed backend reads the ledger (not git), so a ledger that drifts
     from git history would change chronic-offender classification between dev
-    and production. Every bump the readable git history shows must be present in
-    the ledger (git ⊆ ledger). In a full (non-shallow) checkout the reverse is
-    checked too — the two must agree exactly. This is the guard that keeps
-    ``check_size_limits.py --fix`` and the rollup preflight honest about
-    updating the mirror.
+    and production. Every bump the readable MAINLINE git history shows must be
+    present in the ledger (git ⊆ ledger); in a full checkout the reverse is
+    checked too — the two must agree exactly. The scope is the mainline
+    integration branch's ancestry (``slp._mainline_git_ref``), never ``--all``:
+    bumps on abandoned task/research branches never merged and must not enter
+    the mirror. This is the guard that keeps ``check_size_limits.py --fix`` and
+    the rollup preflight honest about updating the mirror.
+
+    A shallow/truncated checkout (CI's depth-1 clone) cannot evaluate the
+    full-history invariant, so the guard SKIPS there rather than silently
+    passing a check it cannot actually evaluate — the same fail-closed stance
+    the chronic-offender classifier takes on unreadable history.
     """
     repo_root = _real_repo_checkout()
     if repo_root is None:
         pytest.skip("no git checkout of this repo available for the ledger guard")
+    if slp._git_history_is_truncated(repo_root):
+        pytest.skip(
+            "shallow/truncated checkout cannot evaluate the full-history ledger guard"
+        )
     # The CI backend shards bind the checkout read-only at /repo into a root
     # container while the runner user owns the files, so git inside the
     # container refuses every command with "detected dubious ownership" (exit
@@ -617,7 +677,7 @@ def test_cap_bump_history_ledger_matches_git():
             "-c",
             f"safe.directory={repo_root}",
             "log",
-            "--all",
+            slp._mainline_git_ref(repo_root),
             "--format=COMMIT %H %aI",
             "-p",
             "--",
@@ -657,21 +717,242 @@ def test_cap_bump_history_ledger_matches_git():
         "(regenerate with check_size_limits.py --fix): " + repr(mismatches)
     )
 
-    # In a full-history checkout the mirror must also not contain phantom
+    # In a full-history checkout (the shallow skip above guarantees we only get
+    # here with complete history) the mirror must also not contain phantom
     # records — the ledger and git must agree exactly.
-    if not os.path.exists(os.path.join(repo_root, ".git", "shallow")):
-        for section, keys in caps.items():
-            if not isinstance(keys, dict):
-                continue
-            for key in keys:
-                git_pairs = sorted(
-                    (r["old_cap"], r["new_cap"])
-                    for r in _parse_git_diff_output(git_out, key)
-                )
-                ledger_pairs = sorted(
-                    (r["old_cap"], r["new_cap"])
-                    for r in ledger_history.get(section, {}).get(key, [])
-                )
-                assert git_pairs == ledger_pairs, (
-                    f"ledger drifted from git for {section}/{key}"
-                )
+    for section, keys in caps.items():
+        if not isinstance(keys, dict):
+            continue
+        for key in keys:
+            git_pairs = sorted(
+                (r["old_cap"], r["new_cap"])
+                for r in _parse_git_diff_output(git_out, key)
+            )
+            ledger_pairs = sorted(
+                (r["old_cap"], r["new_cap"])
+                for r in ledger_history.get(section, {}).get(key, [])
+            )
+            assert git_pairs == ledger_pairs, (
+                f"ledger drifted from git for {section}/{key}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Ref-scope regression tests — the cap-bump ledger must mirror the MAINLINE
+# branch's ancestry, never ``--all`` (abandoned task/research branches' bumps
+# never merged and must not enter chronic-offender classification), and a
+# shallow/truncated checkout must fail closed rather than read partial history.
+# ---------------------------------------------------------------------------
+
+
+def _init_hermetic_repo(tmp_path, branch: str = "main") -> str:
+    """Create a git repo with a single ``module_size_limits.json`` at the root.
+
+    Returns the repo path.  Callers write cap values and commit with the
+    ``_hermetic_commit`` helper.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", branch], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    return str(repo)
+
+
+def _hermetic_write_cap(repo: str, value: int) -> None:
+    # Pretty-print exactly like the shipped module_size_limits.json so git diff
+    # hunks carry each key on its own line, which _parse_git_diff_output needs.
+    (Path(repo) / "module_size_limits.json").write_text(
+        json.dumps({"backend": {"m.py": value}}, indent=2), encoding="utf-8"
+    )
+
+
+def _hermetic_commit(repo: str, msg: str, date: str | None = None) -> None:
+    subprocess.run(["git", "add", "module_size_limits.json"], cwd=repo, check=True)
+    env = dict(os.environ)
+    if date is not None:
+        # Pin the author date so _parse_git_diff_output's ascending timestamp
+        # sort is deterministic even when two commits land in the same second.
+        env["GIT_AUTHOR_DATE"] = date
+        env["GIT_COMMITTER_DATE"] = date
+    subprocess.run(
+        ["git", "commit", "-q", "-m", msg], cwd=repo, env=env, check=True
+    )
+
+
+def _init_shallow_repo(tmp_path) -> str:
+    """Create a REAL depth-1 shallow clone whose tip is a shallow boundary.
+
+    ``git clone --depth=1`` writes the fetched tip into ``.git/shallow``, so
+    ``git log`` would silently return a partial history for that clone.  This
+    is the faithful way to exercise the truncated-history paths (a fake
+    ``.git/shallow`` entry is not in any ref's ancestry, so the
+    mainline-ancestry truncation check would not fire on it).
+    """
+    src = tmp_path / "src"
+    src.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=src, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=src, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=src, check=True)
+    _hermetic_write_cap(str(src), 100)
+    _hermetic_commit(str(src), "init", date="2026-01-01T00:00:00+00:00")
+    clone = tmp_path / "shallow"
+    # file:// protocol is required: git ignores --depth for plain local-path
+    # clones, which would silently produce a full clone instead of a shallow one.
+    subprocess.run(
+        ["git", "clone", "-q", "--depth=1", f"file://{src}", str(clone)],
+        check=True,
+    )
+    return str(clone)
+
+
+def test_mainline_ref_scope_excludes_non_ancestor_bumps(tmp_path, mocker):
+    """The ledger's ref scope is the mainline branch's ancestry, never --all.
+
+    Regression for the permanently-red guard: every git read used ``git log
+    --all``, which pulls in cap bumps from abandoned task/research branches
+    that NEVER merged into the mainline — the 24 modules' "missing" bumps in
+    the diagnosis were all non-ancestor commits.  A bump that exists only on an
+    abandoned branch must not enter the history the ledger mirrors.
+    """
+    repo = _init_hermetic_repo(tmp_path)
+    _hermetic_write_cap(repo, 100)
+    _hermetic_commit(repo, "init", date="2026-01-01T00:00:00+00:00")
+    _hermetic_write_cap(repo, 200)
+    _hermetic_commit(repo, "mainline bump", date="2026-01-02T00:00:00+00:00")
+    # Abandoned branch bump (200 -> 300) is never merged back to mainline.
+    subprocess.run(["git", "checkout", "-q", "-b", "abandoned"], cwd=repo, check=True)
+    _hermetic_write_cap(repo, 300)
+    _hermetic_commit(repo, "abandoned bump", date="2026-01-03T00:00:00+00:00")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=repo, check=True)
+
+    slp._bump_history_cache.clear()
+    with patch("app.size_limit_policy._REPO_ROOT", repo), patch(
+        "app.size_limit_policy._MODULE_SIZE_LIMITS_RELPATH", "module_size_limits.json"
+    ):
+        assert slp._mainline_git_ref() == "main"
+        records = slp._read_git_bump_history("m.py")
+        assert records is not None
+        assert [(r["old_cap"], r["new_cap"]) for r in records] == [(100, 200)]
+
+        # Prove the test would have caught the old --all behavior: the abandoned
+        # branch bump is visible under --all but must stay out of the
+        # mainline-scoped history.
+        all_out = subprocess.run(
+            [
+                "git",
+                "-c",
+                f"safe.directory={repo}",
+                "log",
+                "--all",
+                "--format=COMMIT %H %aI",
+                "-p",
+                "--",
+                "module_size_limits.json",
+            ],
+            capture_output=True,
+            text=True,
+            cwd=repo,
+            check=True,
+        ).stdout
+        all_records = slp._parse_git_diff_output(all_out, "m.py")
+        assert [(r["old_cap"], r["new_cap"]) for r in all_records] == [
+            (100, 200),
+            (200, 300),
+        ]
+
+
+def test_rebuild_ledger_uses_mainline_scope(tmp_path, mocker):
+    """The regenerator builds the ledger from mainline ancestry only.
+
+    The ``--fix`` regenerator and the production read must share the same
+    scope, or the ledger and its checker drift apart.  A bump on an abandoned
+    branch must never enter the regenerated mirror.
+    """
+    repo = _init_hermetic_repo(tmp_path)
+    _hermetic_write_cap(repo, 100)
+    _hermetic_commit(repo, "init", date="2026-01-01T00:00:00+00:00")
+    _hermetic_write_cap(repo, 200)
+    _hermetic_commit(repo, "mainline bump", date="2026-01-02T00:00:00+00:00")
+    subprocess.run(["git", "checkout", "-q", "-b", "abandoned"], cwd=repo, check=True)
+    _hermetic_write_cap(repo, 300)
+    _hermetic_commit(repo, "abandoned bump", date="2026-01-03T00:00:00+00:00")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=repo, check=True)
+
+    ledger_path = tmp_path / "cap_bump_history.json"
+    with patch("app.size_limit_policy._REPO_ROOT", repo), patch(
+        "app.size_limit_policy._MODULE_SIZE_LIMITS_RELPATH", "module_size_limits.json"
+    ):
+        ledger = slp.rebuild_cap_bump_history_ledger(
+            caps_json_path=str(Path(repo) / "module_size_limits.json"),
+            ledger_path=str(ledger_path),
+        )
+
+    records = ledger["history"]["backend"]["m.py"]
+    assert [(r["old_cap"], r["new_cap"]) for r in records] == [(100, 200)]
+
+
+def test_rebuild_ledger_preserves_existing_on_truncated_git(tmp_path, mocker):
+    """The regenerator must not replace the mirror with a truncated git view.
+
+    On a shallow checkout (a real depth-1 clone), git is not even run and the
+    existing ledger is preserved — a truncated ``git log`` must never truncate
+    the mirror (fail-closed, never fail-open).
+    """
+    repo = _init_shallow_repo(tmp_path)
+
+    ledger_path = tmp_path / "cap_bump_history.json"
+    ledger_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "history": {
+                    "backend": {
+                        "m.py": [
+                            {
+                                "commit_sha": "s1",
+                                "commit_date": "2026-01-01T00:00:00+00:00",
+                                "old_cap": 100,
+                                "new_cap": 200,
+                            }
+                        ]
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    with patch("app.size_limit_policy._REPO_ROOT", repo), patch(
+        "app.size_limit_policy._MODULE_SIZE_LIMITS_RELPATH", "module_size_limits.json"
+    ):
+        ledger = slp.rebuild_cap_bump_history_ledger(
+            caps_json_path=str(Path(repo) / "module_size_limits.json"),
+            ledger_path=str(ledger_path),
+        )
+
+    # Existing record preserved unchanged (git never ran on the truncated checkout).
+    records = ledger["history"]["backend"]["m.py"]
+    assert [(r["old_cap"], r["new_cap"]) for r in records] == [(100, 200)]
+
+
+def test_parse_bump_history_raises_on_shallow_checkout(tmp_path, mocker):
+    """A shallow/truncated checkout is unreadable history.
+
+    ``parse_bump_history`` must raise BumpHistoryUnavailableError — never
+    return a partial history that could misclassify a chronic offender as
+    routine.  This is the same fail-closed stance the governance guard takes on
+    unreadable history (direction d-edea3732, gap g-governance-guard-fails-open).
+    """
+    checkout = _init_shallow_repo(tmp_path)
+    mocker.patch("app.size_limit_policy._REPO_ROOT", checkout)
+    slp._bump_history_cache.clear()
+    with pytest.raises(BumpHistoryUnavailableError):
+        parse_bump_history("shallow_git.py", "backend")
+
+
+def test_mainline_git_ref_falls_back_to_head(tmp_path, mocker):
+    """With no mainline branch present, the ref helper falls back to HEAD —
+    still a single branch's ancestry, never ``--all``."""
+    repo = _init_hermetic_repo(tmp_path, branch="dev")
+    mocker.patch("app.size_limit_policy._REPO_ROOT", repo)
+    assert slp._mainline_git_ref() == "HEAD"

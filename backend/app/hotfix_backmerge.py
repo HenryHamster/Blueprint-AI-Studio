@@ -85,6 +85,7 @@ from app.models import (
     Artifact,
     ArtifactType,
     Project,
+    TASK_ORIGINATION_HOTFIX,
     Task,
     TaskHistory,
     TaskStatus,
@@ -1461,6 +1462,7 @@ async def _spawn_resolution_task(
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
+        origination=TASK_ORIGINATION_HOTFIX,
     )
     session.add(task)
     await session.flush()
@@ -1741,6 +1743,7 @@ async def _spawn_ci_fix_task(
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
+        origination=TASK_ORIGINATION_HOTFIX,
     )
     session.add(task)
     await session.flush()
@@ -2093,6 +2096,7 @@ async def _spawn_migration_resolution_task(
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
+        origination=TASK_ORIGINATION_HOTFIX,
     )
     session.add(task)
     await session.flush()
