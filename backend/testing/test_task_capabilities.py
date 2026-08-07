@@ -4,6 +4,7 @@ import os
 import re
 
 import pytest
+from testing._post_commit_test_helpers import _post_commit_sources
 from httpx import ASGITransport, AsyncClient
 
 from app.payload_schemas import TaskType, validate_task_payload
@@ -235,11 +236,7 @@ def test_task_lifecycle_binds_every_declared_completion_handler():
     """task_lifecycle must bind a concrete function for every logical handler
     name the registry declares — a declared-but-unbound name would raise KeyError
     at dispatch time. This keeps the registry and its bindings in lockstep."""
-    import inspect
-
-    from app import task_lifecycle
-
-    source = inspect.getsource(task_lifecycle._process_post_commit)
+    source = _post_commit_sources()
     for handler_name in set(COMPLETION_HANDLER_BY_TASK_TYPE.values()):
         assert f'"{handler_name}":' in source, (
             f"completion handler {handler_name!r} declared in the registry is "

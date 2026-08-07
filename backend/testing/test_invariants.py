@@ -4109,60 +4109,118 @@ class TestPreMergeDualHeadGuardCoverage:
 
     def test_process_post_commit_exempt_sites_carry_marker(self):
         """The two intentionally-exempt merge sites in the real
-        ``task_lifecycle.py:_process_post_commit`` must each carry the inline
-        marker.
+        ``task_lifecycle.py:_process_post_commit`` (and any registered stage
+        modules) must each carry the inline marker.
+
+        Registry-driven: as S2-S12 extract stages into sibling modules and
+        register them in ``_POST_COMMIT_STAGE_REGISTRY``, those modules are
+        automatically included in the scan. The total expected count stays 2
+        until a new exempt site is intentionally added.
 
         If a marker is removed (or a third, unmarked merge is added) this test
         — together with ``test_all_pr_merge_sites_guarded`` — fails, so the
         exemption cannot be silently dropped or silently widened.
         """
         import ast
+        import inspect as _inspect
 
+        from testing._post_commit_test_helpers import _POST_COMMIT_STAGE_REGISTRY
+
+        def _count_merges_in_function(source, source_lines, tree, func_name):
+            """Count (total, marked) merge sites in a named function in tree."""
+            total = 0
+            marked = 0
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if node.name != func_name:
+                    continue
+                for call in ast.walk(node):
+                    if not isinstance(call, ast.Call):
+                        continue
+                    func = call.func
+                    name = (
+                        func.id
+                        if isinstance(func, ast.Name)
+                        else func.attr
+                        if isinstance(func, ast.Attribute)
+                        else None
+                    )
+                    if name not in self._MERGE_NAMES:
+                        continue
+                    total += 1
+                    end = getattr(call, "end_lineno", None) or call.lineno
+                    span = source_lines[call.lineno - 1 : end]
+                    has_marker = any(
+                        (idx := line.find(self._EXEMPT_MARKER)) != -1
+                        and line[idx + len(self._EXEMPT_MARKER) :].strip()
+                        for line in span
+                    )
+                    if has_marker:
+                        marked += 1
+            return total, marked
+
+        def _count_merges_in_module(source, source_lines, tree):
+            """Count (total, marked) merge sites across ALL functions in tree."""
+            total = 0
+            marked = 0
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                for call in ast.walk(node):
+                    if not isinstance(call, ast.Call):
+                        continue
+                    func = call.func
+                    name = (
+                        func.id
+                        if isinstance(func, ast.Name)
+                        else func.attr
+                        if isinstance(func, ast.Attribute)
+                        else None
+                    )
+                    if name not in self._MERGE_NAMES:
+                        continue
+                    total += 1
+                    end = getattr(call, "end_lineno", None) or call.lineno
+                    span = source_lines[call.lineno - 1 : end]
+                    has_marker = any(
+                        (idx := line.find(self._EXEMPT_MARKER)) != -1
+                        and line[idx + len(self._EXEMPT_MARKER) :].strip()
+                        for line in span
+                    )
+                    if has_marker:
+                        marked += 1
+            return total, marked
+
+        # Scan _process_post_commit in task_lifecycle.py
         app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
         fpath = os.path.join(app_dir, "task_lifecycle.py")
         with open(fpath, encoding="utf-8") as f:
             source = f.read()
         source_lines = source.splitlines()
         tree = ast.parse(source, filename=fpath)
+        total_merges, marked = _count_merges_in_function(
+            source, source_lines, tree, "_process_post_commit"
+        )
 
-        marked = 0
-        total_merges = 0
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            if node.name != "_process_post_commit":
-                continue
-            for call in ast.walk(node):
-                if not isinstance(call, ast.Call):
-                    continue
-                func = call.func
-                name = (
-                    func.id
-                    if isinstance(func, ast.Name)
-                    else func.attr
-                    if isinstance(func, ast.Attribute)
-                    else None
-                )
-                if name not in self._MERGE_NAMES:
-                    continue
-                total_merges += 1
-                end = getattr(call, "end_lineno", None) or call.lineno
-                span = source_lines[call.lineno - 1 : end]
-                has_marker = any(
-                    (idx := line.find(self._EXEMPT_MARKER)) != -1
-                    and line[idx + len(self._EXEMPT_MARKER) :].strip()
-                    for line in span
-                )
-                if has_marker:
-                    marked += 1
+        # Scan every registered stage module (added by S2-S12 extractions)
+        for stage_module in _POST_COMMIT_STAGE_REGISTRY:
+            mod_file = getattr(stage_module, "__file__", None) or _inspect.getfile(stage_module)
+            with open(mod_file, encoding="utf-8") as f:
+                mod_source = f.read()
+            mod_lines = mod_source.splitlines()
+            mod_tree = ast.parse(mod_source, filename=mod_file)
+            t, m = _count_merges_in_module(mod_source, mod_lines, mod_tree)
+            total_merges += t
+            marked += m
 
         assert total_merges == 2, (
-            f"Expected exactly 2 merge sites in _process_post_commit, found "
-            f"{total_merges}. If the function's merge sites changed, update this "
-            "test and the inline markers accordingly."
+            f"Expected exactly 2 merge sites across _process_post_commit and all "
+            f"registered stage modules, found {total_merges}. If the merge sites "
+            "changed, update this test and the inline markers accordingly."
         )
         assert marked == 2, (
-            f"Expected both _process_post_commit merge sites to carry the "
+            f"Expected all _process_post_commit merge sites to carry the "
             f"'{self._EXEMPT_MARKER} <reason>' inline marker; only {marked} do. "
             "Each staging-only / non-migration auto-merge must declare its "
             "exemption inline so the coverage invariant stays green."

@@ -6,6 +6,7 @@
     "task_completion_self_audit.py": 600,
     "task_lifecycle.py": 7750,
     "task_lifecycle_requeue.py": 1250,
+    "post_commit_errors.py": 58,
     "orchestrator.py": 5900,
     "orchestrator_ci_monitor.py": 3550,
     "orchestrator_health.py": 1180,

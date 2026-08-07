@@ -63,6 +63,7 @@ from app.task_lifecycle import (
 )
 from app.reaper_sweeps import sweep_deliver_task_wakes
 from app.time_utils import _utcnow
+from testing._post_commit_test_helpers import _post_commit_sources
 from app.retry_prompt import (
     _extract_failing_tests,
     _extract_error_files,
@@ -3713,7 +3714,7 @@ async def test_childless_recovery_current_handler_failure_propagates(tl_db, mock
 
 
 def test_strategic_completion_reserves_message_block_before_authority_locks():
-    source = inspect.getsource(_process_post_commit)
+    source = _post_commit_sources()
     reserve_at = source.index("await reserve_project_message_sequences(")
     reservation_commit_at = source.index("await session.commit()", reserve_at)
     authority_lock_at = source.index("async with lock_project_then_task(")
@@ -5562,7 +5563,7 @@ async def test_process_post_commit_review_approve_merge_proceeds_when_guard_ok(
 
 def test_rollup_handoff_log_uses_precommit_parent_id_snapshot():
     """The post-commit log must not dereference an expired rollup parent."""
-    source = inspect.getsource(_process_post_commit)
+    source = _post_commit_sources()
     assert "(parent {_orig_id_str})" in source
     assert "(parent {_orig.id})" not in source
 
