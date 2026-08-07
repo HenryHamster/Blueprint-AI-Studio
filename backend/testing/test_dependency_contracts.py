@@ -370,3 +370,139 @@ class TestPayloadSerializationSizeDeterminism:
         assert result["prompt"] == "do the thing"
         # Exactly one 'type' key
         assert list(result).count("type") == 1 if "type" in result else True
+
+
+class TestCodeProducingDependencyMergeWait:
+    """``_check_candidate_task_deps`` (orchestrator_health.py) must hold a
+    same-base dependent behind ANY code-producing prerequisite type — not just
+    ``create`` — until that prerequisite's PR is merged, since the dependent's
+    base only ever sees the prerequisite's code once its PR lands. Widening
+    the gate must not deadlock a dependent behind a prerequisite type that
+    never ships a PR (pure-sequencing types keep releasing on COMPLETED)."""
+
+    async def _verify_true(self, _task, _session):
+        return True
+
+    async def _verify_false(self, _task, _session):
+        return False
+
+    @pytest.mark.asyncio
+    async def test_refactor_prerequisite_holds_dependent_until_pr_merged(
+        self, db_session
+    ):
+        from app.orchestrator import _check_candidate_task_deps
+        from testing.factories import make_project, make_task
+        from app.models import TaskStatus
+
+        project = make_project(name="RefactorMergeWait", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "refactor", "base_branch": "research/aaa"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.COMPLETED,
+        )
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "research/aaa"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add_all([dep, dependent])
+        await db_session.commit()
+
+        # A COMPLETED but unmerged refactor prerequisite must still hold the
+        # dependent — this is the defect: before the fix the merge-wait was
+        # gated on dt_type in ("create", ""), so a refactor dep released the
+        # dependent as soon as it completed, regardless of PR state.
+        waiting, _ = await _check_candidate_task_deps(
+            dependent, [dep], [dep.id], db_session, self._verify_false
+        )
+        assert waiting == "waiting"
+
+        # Once its PR is merged, the dependent becomes eligible.
+        eligible, _ = await _check_candidate_task_deps(
+            dependent, [dep], [dep.id], db_session, self._verify_true
+        )
+        assert eligible == "eligible"
+
+    @pytest.mark.asyncio
+    async def test_research_prerequisite_releases_dependent_on_completion(
+        self, db_session
+    ):
+        """Pure-sequencing prerequisite types (research, plan, review, ...)
+        never ship a PR, so they must keep releasing their dependent as soon
+        as they COMPLETE — widening the merge-wait to more code-producing
+        types must not regress this."""
+        from app.orchestrator import _check_candidate_task_deps
+        from testing.factories import make_project, make_task
+        from app.models import TaskStatus
+
+        project = make_project(name="ResearchNoMergeWait", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "research", "base_branch": "research/aaa"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.COMPLETED,
+        )
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "research/aaa"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add_all([dep, dependent])
+        await db_session.commit()
+
+        # verify_false would fail the test if the research dep were (wrongly)
+        # routed through the PR-merge wait; it must never even be consulted.
+        eligible, _ = await _check_candidate_task_deps(
+            dependent, [dep], [dep.id], db_session, self._verify_false
+        )
+        assert eligible == "eligible"
+
+    @pytest.mark.asyncio
+    async def test_qa_prerequisite_with_no_pr_artifact_does_not_deadlock(
+        self, db_session
+    ):
+        """A code-producing (qa) prerequisite that completed WITHOUT ever
+        opening a PR (e.g. no diff was needed) must not wedge its dependent
+        forever — ``verify_pr_merged`` treats a missing PR artifact as done,
+        and that must still apply once the gate covers qa, not just create."""
+        from app.orchestrator import _check_candidate_task_deps
+        from testing.factories import make_project, make_task
+        from app.models import TaskStatus
+
+        project = make_project(name="QANoPRArtifact", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "qa", "base_branch": "research/aaa"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.COMPLETED,
+        )
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "research/aaa"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add_all([dep, dependent])
+        await db_session.commit()
+
+        # No PULL_REQUEST artifact was created for dep — the real
+        # verify_pr_merged (not a stub) must treat that as "done" rather than
+        # holding the dependent indefinitely.
+        from app.rollup_pr_verification import _verify_pr_merged
+
+        eligible, _ = await _check_candidate_task_deps(
+            dependent, [dep], [dep.id], db_session, _verify_pr_merged
+        )
+        assert eligible == "eligible"
