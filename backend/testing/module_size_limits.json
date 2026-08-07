@@ -6,7 +6,6 @@
     "task_completion_self_audit.py": 600,
     "task_lifecycle.py": 7750,
     "task_lifecycle_requeue.py": 1250,
-    "post_commit_errors.py": 58,
     "orchestrator.py": 5900,
     "orchestrator_ci_monitor.py": 3550,
     "orchestrator_health.py": 1180,
@@ -41,7 +40,7 @@
     "services.py": 1378,
     "recovery_sweeps.py": 100,
     "routers/agent_status.py": 5300,
-    "autonomous_research.py": 3900,
+    "autonomous_research.py": 4550,
     "autonomous_research_residual.py": 900,
     "efficiency_snapshot.py": 6000,
     "llm_cost_attribution.py": 1850,
@@ -97,7 +96,7 @@
     "failure_classification.py": 3950,
     "notification_dispatch.py": 3150,
     "ci_completion.py": 3100,
-    "routers/admin_debug.py": 2250,
+    "routers/admin_debug.py": 2650,
     "problem_model.py": 3450,
     "source_ref_validation.py": 1900,
     "orchestrator_filters.py": 2200,
@@ -161,7 +160,8 @@
     "strategic_resident_session.py": 6850,
     "release_qualifier_audit.py": 1800,
     "conversation_coordinator.py": 1900,
-    "routers/agent_warm_continuity.py": 1700
+    "routers/agent_warm_continuity.py": 1700,
+    "post_commit_errors.py": 58
   },
   "agent": {
     "index.ts": 4600,

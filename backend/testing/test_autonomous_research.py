@@ -1942,6 +1942,142 @@ async def test_spawn_skipped_when_research_task_in_progress(db_session):
         _runtime_config["max_parallel_research_per_project"] = old_val
 
 
+@pytest.mark.asyncio
+async def test_research_admission_ignores_evaluating_parents_with_active_children(
+    db_session,
+):
+    """An EVALUATING research parent whose children are still running is
+    productive in-flight work, not congestion: it must NOT count against the
+    total-research admission cap (``max_total_research_per_project``).
+
+    A research parent flips to EVALUATING atomically with its child-task
+    INSERTs (research_completion) and only leaves EVALUATING once those
+    children resolve into a rollup PR. Counting such parents against the total
+    cap throttles the system harder the more work it ships — the direct cause
+    of directions sitting at zero tasks in flight against an idle fleet."""
+    from app.shared_state import runtime_config as _runtime_config
+
+    old_total = _runtime_config.get("max_total_research_per_project", 5)
+    old_parallel = _runtime_config.get("max_parallel_research_per_project", 6)
+    _runtime_config["max_total_research_per_project"] = 1
+    _runtime_config["max_parallel_research_per_project"] = 6
+    try:
+        project = Project(
+            name="Admission Ignores Productive EVALUATING",
+            user_id="test-user-123",
+            autonomous_enabled=True,
+            directions=[_active_direction("d-admission1")],
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # EVALUATING research parent (no current_direction_id so it doesn't
+        # block the direction chooser — isolates the total-cap behavior).
+        parent = Task(
+            project_id=project.id,
+            title="Research: parent waiting on its children",
+            payloads=[{"type": "research", "directions": [], "base_branch": "main"}],
+            status=TaskStatus.EVALUATING,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(parent)
+        await db_session.commit()
+
+        # A child finding still mid-flight — the parent is progressing, not stuck.
+        child = Task(
+            project_id=project.id,
+            parent_task_id=parent.id,
+            title="feat: a finding spawned by the parent research",
+            payloads=[{"type": "create", "base_branch": "main"}],
+            status=TaskStatus.IN_PROGRESS,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(child)
+        await db_session.commit()
+
+        await _spawn_research_task(project, db_session)
+
+        result = await db_session.execute(
+            select(Task).where(Task.project_id == project.id)
+        )
+        all_tasks = result.scalars().all()
+        research = [
+            t
+            for t in all_tasks
+            if (t.payloads or [{}])[0].get("type") == "research"
+        ]
+        assert len(research) == 2, (
+            "EVALUATING parent with active children is productive work and must "
+            "NOT count against the total-research admission cap (max_total=1) — "
+            f"expected the parent + a fresh research spawn, got {len(research)}"
+        )
+    finally:
+        _runtime_config["max_total_research_per_project"] = old_total
+        _runtime_config["max_parallel_research_per_project"] = old_parallel
+
+
+@pytest.mark.asyncio
+async def test_research_admission_counts_evaluating_parent_without_active_children(
+    db_session,
+):
+    """An EVALUATING parent with NO active children is a pending rollup — the
+    genuine merge-complexity case the total cap exists for — and must still
+    count against ``max_total_research_per_project``. Guards the exemption
+    against over-excluding: only parents with active children are ignored."""
+    from app.shared_state import runtime_config as _runtime_config
+
+    old_total = _runtime_config.get("max_total_research_per_project", 5)
+    old_parallel = _runtime_config.get("max_parallel_research_per_project", 6)
+    _runtime_config["max_total_research_per_project"] = 1
+    _runtime_config["max_parallel_research_per_project"] = 6
+    try:
+        project = Project(
+            name="Admission Counts Pending EVALUATING",
+            user_id="test-user-123",
+            autonomous_enabled=True,
+            directions=[_active_direction("d-admission2")],
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # EVALUATING parent with NO children — all its work is terminal, so the
+        # pending rollup still occupies a total-cap slot.
+        parent = Task(
+            project_id=project.id,
+            title="Research: parent with no active children",
+            payloads=[{"type": "research", "directions": [], "base_branch": "main"}],
+            status=TaskStatus.EVALUATING,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(parent)
+        await db_session.commit()
+
+        await _spawn_research_task(project, db_session)
+
+        result = await db_session.execute(
+            select(Task).where(Task.project_id == project.id)
+        )
+        all_tasks = result.scalars().all()
+        research = [
+            t
+            for t in all_tasks
+            if (t.payloads or [{}])[0].get("type") == "research"
+        ]
+        assert len(research) == 1, (
+            "EVALUATING parent with no active children is a pending rollup and "
+            "must still count against the total-research admission cap "
+            f"(max_total=1) — expected only the parent, got {len(research)}"
+        )
+    finally:
+        _runtime_config["max_total_research_per_project"] = old_total
+        _runtime_config["max_parallel_research_per_project"] = old_parallel
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 3b. Per-project parallelism overrides (build_config caps)
 # ─────────────────────────────────────────────────────────────────────────────
