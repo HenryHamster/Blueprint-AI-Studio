@@ -559,6 +559,37 @@ async def get_or_create_release_deploy_artifact(
     return artifact, created
 
 
+def _effective_confirm_deadline(
+    confirmation_deadline: datetime | None,
+    deploy_confirm_deadline: datetime | None,
+    promoted_at: datetime | None,
+) -> datetime | None:
+    """Resolve the effective serving-confirmation deadline for a provider check.
+
+    Order of precedence — mirrors ``_classify_serving_outcome``'s backstop and
+    the (now unified) inline copies this helper replaces:
+
+      * ``artifact.confirmation_deadline`` wins when stamped;
+      * else ``version.deploy_confirm_deadline`` (the legacy scalar, kept
+        mirrored to artifact rows by the backend-revision projection);
+      * else ``promoted_at + _DEPLOY_CONFIRM_WINDOW_SECONDS`` — the backstop
+        that keeps a promotion recorded WITHOUT a stamped deadline from
+        deferring forever.
+
+    Returns ``None`` only when there is no ``promoted_at`` to derive a window
+    from.  The result is naive UTC (``_to_naive_utc``) so callers can compare it
+    directly against their ``now``.
+    """
+    from app.release_reconciliation import _to_naive_utc
+
+    deadline = confirmation_deadline or deploy_confirm_deadline
+    if deadline is None and promoted_at is not None:
+        from app.release_promotion import _DEPLOY_CONFIRM_WINDOW_SECONDS
+
+        deadline = promoted_at + timedelta(seconds=_DEPLOY_CONFIRM_WINDOW_SECONDS)
+    return _to_naive_utc(deadline)
+
+
 async def _reclassify_sha_mismatch_if_superseded(
     session: AsyncSession,
     version: ReleaseVersion,
@@ -659,7 +690,9 @@ async def _reclassify_sha_mismatch_if_superseded(
             # couldn't verify descendant vs. diverged but never observed an
             # active failure — mirrors the _defer_or_timeout() pattern in the
             # promotion_merge provider.
-            _deadline = _to_naive_utc(version.deploy_confirm_deadline)
+            _deadline = _effective_confirm_deadline(
+                None, version.deploy_confirm_deadline, version.promoted_at
+            )
             _now_naive = _to_naive_utc(now) or now
             if _deadline is None or _now_naive < _deadline:
                 return None  # within window — defer, retry on next sweep
@@ -694,7 +727,9 @@ async def _reclassify_sha_mismatch_if_superseded(
             and _promoted_at_naive is not None
             and _deployed_at > _promoted_at_naive
         ):
-            _deadline = _to_naive_utc(version.deploy_confirm_deadline)
+            _deadline = _effective_confirm_deadline(
+                None, version.deploy_confirm_deadline, version.promoted_at
+            )
             _now_naive = _to_naive_utc(now) or now
             if _deadline is None or _now_naive < _deadline:
                 return None  # within window — defer, retry on next sweep
@@ -825,25 +860,22 @@ async def _check_agent_image_serving(
     """
     from app import compute, github_refs
     from app.models import Project
-    from app.release_promotion import (
-        _DEPLOY_CONFIRM_WINDOW_SECONDS,
-        _resolve_github_with_session,
-    )
+    from app.release_promotion import _resolve_github_with_session
     from app.release_reconciliation import _to_naive_utc
 
     promoted_sha = version.promoted_sha
     if not promoted_sha:
         return None
 
-    # Effective confirmation deadline — mirrors the backstop in
-    # _classify_serving_outcome and _check_promotion_merge_serving so every
-    # indeterminate path is bounded, never waited on forever.
-    _raw_deadline = artifact.confirmation_deadline or version.deploy_confirm_deadline
-    if _raw_deadline is None and version.promoted_at is not None:
-        _raw_deadline = version.promoted_at + timedelta(
-            seconds=_DEPLOY_CONFIRM_WINDOW_SECONDS
-        )
-    _deadline = _to_naive_utc(_raw_deadline)
+    # Effective confirmation deadline — shared backstop (artifact → version →
+    # promoted_at + window) so every indeterminate path is bounded, never waited
+    # on forever.  Mirrors _classify_serving_outcome and the promotion_merge
+    # provider, now unified in one resolver.
+    _deadline = _effective_confirm_deadline(
+        artifact.confirmation_deadline,
+        version.deploy_confirm_deadline,
+        version.promoted_at,
+    )
     _now_naive = _to_naive_utc(now) or now
 
     def _defer_or_timeout(reason: str) -> ServingDecision | None:
@@ -1009,7 +1041,6 @@ async def _check_promotion_merge_serving(
     """
     from app import github
     from app.release_promotion import (
-        _DEPLOY_CONFIRM_WINDOW_SECONDS,
         _lts_branch_names,
         _resolve_github_with_session,
     )
@@ -1024,14 +1055,15 @@ async def _check_promotion_merge_serving(
     if project is None:
         return None
 
-    # Effective confirmation deadline — mirrors the backstop in _classify_serving_outcome.
-    # Used below to time out bounded-defer (indeterminate) paths instead of waiting forever.
-    _raw_deadline = artifact.confirmation_deadline or version.deploy_confirm_deadline
-    if _raw_deadline is None and version.promoted_at is not None:
-        _raw_deadline = version.promoted_at + timedelta(
-            seconds=_DEPLOY_CONFIRM_WINDOW_SECONDS
-        )
-    _deadline = _to_naive_utc(_raw_deadline)
+    # Effective confirmation deadline — shared backstop (artifact → version →
+    # promoted_at + window), unified with the backend_revision / agent_image
+    # providers via _effective_confirm_deadline.  Used below to time out
+    # bounded-defer (indeterminate) paths instead of waiting forever.
+    _deadline = _effective_confirm_deadline(
+        artifact.confirmation_deadline,
+        version.deploy_confirm_deadline,
+        version.promoted_at,
+    )
     _now_naive = _to_naive_utc(now) or now
 
     def _defer_or_timeout() -> ServingDecision | None:
