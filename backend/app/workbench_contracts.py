@@ -232,6 +232,8 @@ WEBSOCKET_EMITTER_INVENTORY = {
         "backend/app/task_completion.py",
         "backend/app/task_completion_self_audit.py",
         "backend/app/task_lifecycle.py",
+        "backend/app/task_lifecycle_fix_completion.py",
+        "backend/app/task_lifecycle_post_commit_terminal.py",
         "backend/app/task_lifecycle_requeue.py",
         "backend/app/warm_pool_maintainer.py",
     ),

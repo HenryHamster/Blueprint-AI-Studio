@@ -7143,6 +7143,187 @@ async def test_fix_completion_spawn_failure_creates_alert(tl_db, mocker):
     )
 
 
+# ── Fix-task base_branch fallback chain + original_task_id recovery ──────────
+
+
+async def _make_fix_task_with_payload(
+    session,
+    project,
+    *,
+    base_branch: str | None = None,
+    original_task_id: str | None = None,
+    review_loop: dict | None = None,
+) -> Task:
+    """Create a COMPLETED fix task with a custom first_payload (optionally
+    carrying ``base_branch`` / ``original_task_id``) and review_loop context."""
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="fix",
+        status=TaskStatus.COMPLETED,
+        context={"review_loop": review_loop or {}},
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+    payload: dict = {"type": "fix", "prompt": "do fix"}
+    if base_branch is not None:
+        payload["base_branch"] = base_branch
+    if original_task_id is not None:
+        payload["original_task_id"] = original_task_id
+    task.payloads = [payload]
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    return task
+
+
+def _patch_fix_completion_github(mocker, spawned_review):
+    """Patch the GitHub/security/spawn surface used by the fix-completion branch."""
+    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "merged": False,
+            "state": "open",
+            "base": {"sha": "live-base"},
+            "head": {"sha": "live-head"},
+        },
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={
+            "blocked": False,
+            "findings": [],
+            "summary": "clean",
+            "report": "",
+        },
+    )
+    spawn_mock = mocker.patch(
+        "app.task_lifecycle._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(spawned_review, True),
+    )
+    return spawn_mock
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "rl_base_branch,payload_base_branch,project_integration,expected_base_branch",
+    [
+        # Branch 1: review_loop.base_branch wins over everything.
+        ("rl-main", "payload-main", None, "rl-main"),
+        # Branch 2: task_payload.base_branch fallback when review_loop lacks it.
+        (None, "payload-main", None, "payload-main"),
+        # Branch 3 (terminal/default arm): falls through to
+        # _shared_state.get_project_integration_branch(_fix_project).
+        (None, None, "project-integration", "project-integration"),
+    ],
+    ids=["review_loop", "task_payload", "project_integration_default"],
+)
+async def test_fix_completion_base_branch_fallback_chain(
+    tl_db,
+    mocker,
+    rl_base_branch,
+    payload_base_branch,
+    project_integration,
+    expected_base_branch,
+):
+    """Every arm of the base_branch fallback chain is exercised, including the
+    terminal/default arm that resolves from the project's integration branch."""
+    spawned_review = mocker.Mock(id=uuid.uuid4())
+    spawn_mock = _patch_fix_completion_github(mocker, spawned_review)
+
+    session, factory = tl_db
+    project = await _make_project(session)
+    if project_integration is not None:
+        project.integration_branch = project_integration
+        session.add(project)
+        await session.commit()
+
+    review_loop = {"pr_number": 50, "branch": "blueprint/test-branch"}
+    if rl_base_branch is not None:
+        review_loop["base_branch"] = rl_base_branch
+    task = await _make_fix_task_with_payload(
+        session,
+        project,
+        base_branch=payload_base_branch,
+        review_loop=review_loop,
+    )
+
+    payload = AgentStatusPayload(task_id=task.id, status=TaskStatus.COMPLETED)
+    await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    spawn_mock.assert_awaited_once()
+    # _spawn_pipeline_task(task, "review", session, pr_number, branch, base_branch, ...)
+    spawn_args = spawn_mock.await_args.args
+    assert spawn_args[1] == "review"
+    assert spawn_args[5] == expected_base_branch, (
+        f"expected base_branch {expected_base_branch!r}, got {spawn_args[5]!r}"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "rl_original_task_id,payload_original_task_id,expected_original_task_id",
+    [
+        # Found: review_loop.original_task_id is passed through to the spawn.
+        ("ci-task-rl", None, "ci-task-rl"),
+        # Found: task_payload.original_task_id fallback when review_loop lacks it.
+        (None, "ci-task-payload", "ci-task-payload"),
+        # Not found: neither review_loop nor task_payload carries it — the
+        # spawn receives an empty string (no stale value leaking through).
+        (None, None, ""),
+    ],
+    ids=["review_loop", "task_payload", "not_found"],
+)
+async def test_fix_completion_original_task_id_recovery(
+    tl_db,
+    mocker,
+    rl_original_task_id,
+    payload_original_task_id,
+    expected_original_task_id,
+):
+    """The original CI task id is recovered from review_loop / first_payload and
+    forwarded to the re-review spawn; when absent it resolves to an empty string."""
+    spawned_review = mocker.Mock(id=uuid.uuid4())
+    spawn_mock = _patch_fix_completion_github(mocker, spawned_review)
+
+    session, factory = tl_db
+    project = await _make_project(session)
+
+    review_loop = {
+        "pr_number": 51,
+        "branch": "blueprint/test-branch",
+        "base_branch": "main",
+    }
+    if rl_original_task_id is not None:
+        review_loop["original_task_id"] = rl_original_task_id
+    task = await _make_fix_task_with_payload(
+        session,
+        project,
+        original_task_id=payload_original_task_id,
+        review_loop=review_loop,
+    )
+
+    payload = AgentStatusPayload(task_id=task.id, status=TaskStatus.COMPLETED)
+    await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    spawn_mock.assert_awaited_once()
+    spawn_kwargs = spawn_mock.await_args.kwargs
+    assert spawn_kwargs["original_task_id"] == expected_original_task_id, (
+        f"expected original_task_id {expected_original_task_id!r}, "
+        f"got {spawn_kwargs['original_task_id']!r}"
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Exact-target merge authority
 # ══════════════════════════════════════════════════════════════════════════════
