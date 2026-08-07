@@ -133,6 +133,12 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 # one failed helper (rollup, direction outcomes, remediation, qualifier
 # finalize, strategic backstop) never poisons the shared session for the rest.
 "app/task_lifecycle_post_commit_terminal.py" = ["BLE001"]
+# task_lifecycle_completion_dispatch.py was extracted from task_lifecycle.py
+# (S3 of the fdd07b88 decomposition plan); it carries the same log-and-continue
+# / catch-classify-recover pattern around the completion-handler dispatch, so a
+# handler failure is classified and requeued/failed rather than crashing the
+# post-commit pipeline.
+"app/task_lifecycle_completion_dispatch.py" = ["BLE001"]
 # agent_status.py is the /api/agent/status endpoint — same log-and-continue
 # policy: each transient lookup (PR state, account info, alerts, post-commit)
 # must not 500 the status POST or the agent's failure surface gets lost.

@@ -8002,6 +8002,75 @@ async def test_post_commit_terminal_expires_migration_reservation_on_failure(
 
 
 @pytest.mark.asyncio
+async def test_completion_dispatch_requeues_on_transient_handler_error(
+    tl_db, mocker
+):
+    """S3 (fdd07b88): a completion handler raising a transient error (matches
+    the keyword allowlist) must requeue the task rather than fail it.
+    Exercises the extracted app.task_lifecycle_completion_dispatch module
+    end-to-end via _process_post_commit rather than mocking the stage out."""
+    session, factory = tl_db
+    project = await _make_project(session)
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="memo",
+        status=TaskStatus.COMPLETED,
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+    mocker.patch(
+        "app.task_completion._handle_memo_completion",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("connection refused while posting result"),
+    )
+    payload = AgentStatusPayload(
+        task_id=task.id, status=TaskStatus.COMPLETED, logs="done"
+    )
+
+    result = await _process_post_commit(task.id, payload, _session_factory=factory)
+    assert result["status"] == "received"
+
+    await session.refresh(task)
+    assert task.status == TaskStatus.QUEUED
+    assert task.attempt_count == 1
+
+
+@pytest.mark.asyncio
+async def test_completion_dispatch_fails_task_on_non_transient_handler_error(
+    tl_db, mocker
+):
+    """S3 (fdd07b88): a completion handler raising a non-transient error must
+    mark the task FAILED with a classified failure category rather than
+    requeue. Exercises the extracted app.task_lifecycle_completion_dispatch
+    module end-to-end via _process_post_commit rather than mocking the stage
+    out."""
+    session, factory = tl_db
+    project = await _make_project(session)
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="memo",
+        status=TaskStatus.COMPLETED,
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+    mocker.patch(
+        "app.task_completion._handle_memo_completion",
+        new_callable=AsyncMock,
+        side_effect=ValueError("malformed memo payload"),
+    )
+    payload = AgentStatusPayload(
+        task_id=task.id, status=TaskStatus.COMPLETED, logs="done"
+    )
+
+    result = await _process_post_commit(task.id, payload, _session_factory=factory)
+    assert result["status"] == "received"
+
+    await session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    assert "Completed but handler failed" in (task.latest_status_message or "")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "cycle_outcome,expect_failure",
     [
