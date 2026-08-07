@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.models import (
+    TASK_ORIGINATION_RESEARCH,
     Task,
     Project,
     TaskHistory,
@@ -2118,12 +2119,25 @@ async def _spawn_research_task_inner(
         )
     ).scalar() or 0
     if active_research_count >= max_parallel:
+        logger.info(
+            f"[AUTONOMOUS] Parallel research cap reached: {active_research_count}/{max_parallel} "
+            f"— skipping spawn for project {project.id}"
+        )
         return
-    # Second cap: total research in any non-terminal state (including
-    # EVALUATING). Pending rollups in EVALUATING accumulate merge complexity
-    # — each new spawn produces another rollup branch competing for the same
-    # base. This cap prevents the pile-up that makes downstream merges
-    # incrementally more conflict-prone.
+    # Second cap: total research in any non-terminal state. Pending rollups in
+    # EVALUATING accumulate merge complexity — each new spawn produces another
+    # rollup branch competing for the same base. This cap prevents the pile-up
+    # that makes downstream merges incrementally more conflict-prone. BUT an
+    # EVALUATING research parent parks atomically with its child-task INSERTs
+    # (research_completion flips to EVALUATING in the same commit that spawns
+    # children) and only leaves EVALUATING once those children resolve into a
+    # rollup PR. Counting such parents against the admission cap throttles the
+    # system harder the more work it ships: the more productive research is,
+    # the less new research can start. Exclude EVALUATING parents that still
+    # have active children (productive in-flight work, mirrored by the
+    # parents_with_active_children set computed for the pipelining guard above);
+    # genuinely-stuck parents — EVALUATING with all children terminal — still
+    # count, so the merge-complexity rationale survives.
     max_total = project_parallelism_cap(
         project, "max_total_research", "max_total_research_per_project", 5
     )
@@ -2145,10 +2159,25 @@ async def _spawn_research_task_inner(
             )
         )
     ).scalar() or 0
+    if parents_with_active_children:
+        productive_evaluating = (
+            await session.execute(
+                select(func.count())
+                .select_from(Task)
+                .where(
+                    Task.project_id == project.id,
+                    Task.status == TaskStatus.EVALUATING,
+                    Task.payloads[0]["type"].as_string() == "research",
+                    Task.id.in_(parents_with_active_children),
+                )
+            )
+        ).scalar() or 0
+        total_research_count = max(0, total_research_count - productive_evaluating)
     if total_research_count >= max_total:
         logger.info(
             f"[AUTONOMOUS] Total research cap reached: {total_research_count}/{max_total} "
-            f"(includes EVALUATING) — skipping spawn for project {project.id}"
+            f"(excluding EVALUATING parents with active children) — skipping spawn "
+            f"for project {project.id}"
         )
         return
     # Reduce chosen_directions to the smaller of the two remaining budgets
@@ -2237,6 +2266,10 @@ async def _spawn_research_task_inner(
         project, "max_autonomous_tasks_per_hour", "max_autonomous_tasks_per_hour", 12
     )
     if recent_research_count >= per_hour_cap:
+        logger.info(
+            f"[AUTONOMOUS] Per-hour research cap reached: {recent_research_count}/{per_hour_cap} "
+            f"— skipping spawn for project {project.id}"
+        )
         return
 
     # Also cap by per-project rate limit
@@ -3105,6 +3138,7 @@ async def _spawn_research_task_inner(
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
             status=TaskStatus.QUEUED,
             created_by="ORCHESTRATOR",
+            origination=TASK_ORIGINATION_RESEARCH,
             # Atomic per-direction claim (ux_task_active_idempotency_key):
             # see research_direction_claim_key.
             idempotency_key=research_direction_claim_key(
@@ -3364,9 +3398,14 @@ async def _spawn_periodic_task(
             )
         )
     ).scalar() or 0
-    if recent_auto >= project_parallelism_cap(
+    _periodic_per_hour_cap = project_parallelism_cap(
         project, "max_autonomous_tasks_per_hour", "max_autonomous_tasks_per_hour", 12
-    ):
+    )
+    if recent_auto >= _periodic_per_hour_cap:
+        logger.info(
+            f"[AUTONOMOUS] Per-hour cap reached: {recent_auto}/{_periodic_per_hour_cap} "
+            f"— skipping periodic spawn (type={task_type}) for project {project.id}"
+        )
         return
 
     # Check when this type last ran (most recent completed task of this type)

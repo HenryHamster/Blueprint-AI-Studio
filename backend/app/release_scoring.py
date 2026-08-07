@@ -68,6 +68,7 @@ JUDGED_TIER_PENALTY_WEIGHT = 0.05
 # Recognised per-category verdict statuses.  ``partial`` gates identically to
 # ``not_met`` (only ``met`` clears the gate); the distinction is informational.
 _CATEGORY_STATUSES: frozenset[str] = frozenset({"met", "not_met", "partial"})
+
 # Recognised citation kinds.  v1 emits only ``diff`` citations (the grader reads
 # the merged diff); ``test`` is reserved for the v2 machine/test-citation tier.
 _CITATION_KINDS: frozenset[str] = frozenset({"diff", "test"})

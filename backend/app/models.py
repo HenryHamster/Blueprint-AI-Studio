@@ -213,6 +213,55 @@ def task_status_releases_agent_resources(status: TaskStatus | str | None) -> boo
     return status in TASK_AGENT_RELEASE_STATUSES
 
 
+# Durable task-origination classes (see ``Task.origination``). Distinct from
+# ``Task.created_by``, which collapses research spawns, rollup spawns, review
+# spawns and every other automatic spawn into the single 'ORCHESTRATOR' value —
+# so the originating flow can only be recovered by walking parent lineage,
+# which nothing does. These constants are stamped AT SPAWN TIME so merged-work
+# analytics can attribute each landed PR to its origin without a lineage walk.
+#
+# EVERY class below is stamped by at least one live spawn site — a class with no
+# stamping site is a lie in the denominator, because its work silently lands in
+# SYSTEM while the taxonomy claims it is separately attributed. The stamping
+# sites are:
+#   USER       — operator-created task (admin.py task/retry/clone spawns,
+#                sr_diagnostics_endpoints.py investigation spawn)
+#   STRATEGIST — directly commissioned by the strategist (strategic_spawn_requests)
+#   RESEARCH   — spawned by the autonomous research loop: the research parent
+#                task itself (autonomous_research / direction_lifecycle) or a
+#                finding/memo/salvage child of one
+#   PLAN       — child subtask of a plan task (plan_completion; inherits
+#                RESEARCH / STRATEGIST / USER when the plan parent is that class)
+#   REVIEW     — review-pipeline child: fix, lane recovery, verify_tests
+#                (review_pipeline)
+#   HOTFIX     — hotfix backmerge child (hotfix_backmerge)
+#   SYSTEM     — the default, and the honest name for "everything not classified
+#                above": ordinary orchestrator automation such as rollups,
+#                audit-finding follow-ups, requeues, evergreen backlog and
+#                release-qualifier side-cars, plus every row that predates this
+#                column. NEVER research- or strategist-attributed. Because SYSTEM
+#                is a residual rather than a described class, treat it as such
+#                when computing shares — see
+#                ``research_completion.merged_work_origination_split``.
+TASK_ORIGINATION_USER = "USER"
+TASK_ORIGINATION_STRATEGIST = "STRATEGIST"
+TASK_ORIGINATION_RESEARCH = "RESEARCH"
+TASK_ORIGINATION_PLAN = "PLAN"
+TASK_ORIGINATION_REVIEW = "REVIEW"
+TASK_ORIGINATION_HOTFIX = "HOTFIX"
+TASK_ORIGINATION_SYSTEM = "SYSTEM"
+# Origination classes a child task inherits from its parent when the parent is
+# that class (used by plan_completion subtask spawning). Everything else on a
+# plan child falls back to PLAN.
+_INHERITABLE_ORIGINATIONS = frozenset(
+    {
+        TASK_ORIGINATION_USER,
+        TASK_ORIGINATION_STRATEGIST,
+        TASK_ORIGINATION_RESEARCH,
+    }
+)
+
+
 class WakeAction(str, Enum):
     """What the wake-delivery worker does with a PARKED task when its source fires.
 
@@ -1290,6 +1339,12 @@ class Task(SQLModel, table=True):
     # introduced in production code paths. Enforced server-side by
     # ``chk_task_created_by`` (alembic 0065 / audit L-S1, Postgres-only).
     created_by: str = Field(default="USER", index=True)
+    # Durable origination class, distinct from created_by. created_by collapses
+    # every automatic spawn into 'ORCHESTRATOR', so the originating flow is
+    # otherwise unrecoverable without walking parent lineage. Stamped at spawn
+    # time with the TASK_ORIGINATION_* constants; unstamped rows read SYSTEM
+    # (ordinary orchestration). Backed by migration 0735.
+    origination: str = Field(default="SYSTEM")
     launched_by_user_id: str | None = Field(
         default=None
     )  # Firebase UID of the launcher for attribution; project owner funds execution.
@@ -8373,7 +8428,15 @@ class InlineLlmSpendLog(SQLModel, table=True):
     cache_read_input_tokens: int = Field(
         default=0, sa_column=Column(Integer, nullable=False, server_default="0")
     )
-    cost_usd: float = Field(sa_column=Column(Float, nullable=False))
+    # "priced" rows carry a real cost_usd; "unpriced" rows (model has no
+    # LLM_TOKEN_PRICING entry) are recorded with their usage and cost_usd NULL
+    # rather than silently dropped — a consumer summing cost_usd must treat the
+    # total as a FLOOR when any unpriced rows exist.
+    pricing_status: str = Field(
+        default="priced",
+        sa_column=Column(String(16), nullable=False, server_default="priced"),
+    )
+    cost_usd: float | None = Field(sa_column=Column(Float, nullable=True))
 
     __table_args__ = (
         Index(

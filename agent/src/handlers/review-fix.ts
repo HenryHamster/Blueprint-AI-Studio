@@ -67,6 +67,7 @@ export {
   buildTypeCheckInstructions,
 } from '../prompts/review-prompt.js';
 import { repairStructuredOutput } from './structured-output-repair.js';
+import { extractJsonObjectDetailed } from '../json-extract.js';
 import { providerAutoInjectsClaudeMd } from '../providers/runners.js';
 
 // ── Extracted helper modules ──────────────────────────────────────────────────
@@ -978,9 +979,13 @@ ${reviewScopeBudgetForPrompt}${reviewScopePreamble}${taskTypeFocusHint}${reviewC
     const verdictPath = `/tmp/review_verdict_${taskId}.json`;
     if (!fs.existsSync(verdictPath)) return null;
     try {
-      const verdictJson = fs.readFileSync(verdictPath, 'utf-8').trim();
-      const parsed = JSON.parse(verdictJson) as Record<string, unknown>;
-      return parsed.verdict ? parsed : null;
+      const verdictJson = fs.readFileSync(verdictPath, 'utf-8');
+      // Reuse the string-aware extraction the repair path uses so a verdict
+      // wrapped in markdown fences / prose is accepted on the FIRST pass;
+      // strict JSON.parse rejects the wrapping and forces a wasted repair.
+      const result = extractJsonObjectDetailed(verdictJson, 'verdict');
+      if (!result.ok) return null;
+      return result.value.verdict ? result.value : null;
     } catch {
       return null;
     }

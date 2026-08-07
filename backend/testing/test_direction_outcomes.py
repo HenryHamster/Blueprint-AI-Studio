@@ -4064,6 +4064,83 @@ async def test_update_outcomes_writes_cost_by_provider_model(db_session: AsyncSe
 
 
 @pytest.mark.asyncio
+async def test_update_outcomes_counts_llm_token_spend_in_cycle_cost(
+    db_session: AsyncSession,
+):
+    """The per-cycle estimated_cost_usd includes LLM token spend, not VM dollars
+    only.
+
+    A task with priced token usage contributes LLM dollars into the SAME
+    provider|model bucket as its VM spend, so ``sum(cost_by_provider_model)``
+    keeps equalling ``estimated_cost_usd`` while the total now reflects the real
+    cycle bill — the quantity the cost-budget auto-pause envelope is built from.
+    """
+    from app.vm_cost_rates import get_vm_rate_per_second
+
+    direction_id = "d-llm-cycle-cost"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=1)
+    ]
+    await db_session.flush()
+
+    now = _utcnow()
+    # 1M input @ $5/MTok + 100k output @ $25/MTok on claude-opus-4-7 = $7.50 LLM.
+    llm_child = await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"direction_id": direction_id},
+        payloads=[{"type": "create", "scope": "small"}],
+        title="llm-heavy-child",
+    )
+    llm_child.provider = "anthropic"
+    llm_child.model = "claude-opus-4-7"
+    llm_child.api_call_summary = {
+        "total_input_tokens": 1_000_000,
+        "total_output_tokens": 100_000,
+        "llm_call_count": 7,
+    }
+    llm_child.vm_provisioned_at = now - timedelta(hours=1)
+    llm_child.vm_stopped_at = now
+    llm_child.vm_spot = False
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+    await db_session.refresh(project)
+
+    entry = project.directions[0]["research_history"][0]
+    expected_vm = get_vm_rate_per_second(machine_type=None, spot=False) * 3600
+    expected_llm = 7.50
+    assert entry["estimated_cost_usd"] == pytest.approx(
+        expected_vm + expected_llm, abs=0.001
+    ), (
+        f"estimated_cost_usd must include LLM tokens: "
+        f"expected ≈ {expected_vm + expected_llm:.4f}, "
+        f"got {entry['estimated_cost_usd']!r}"
+    )
+    by_pm = entry.get("cost_by_provider_model") or {}
+    assert "anthropic|claude-opus-4-7" in by_pm, (
+        f"LLM dollars must land in the provider|model bucket: {by_pm!r}"
+    )
+    assert by_pm["anthropic|claude-opus-4-7"] == pytest.approx(
+        expected_vm + expected_llm, abs=0.001
+    ), (
+        "the provider|model bucket must carry VM + LLM spend so the breakdown "
+        "keeps summing exactly to estimated_cost_usd"
+    )
+    assert abs(sum(by_pm.values()) - entry["estimated_cost_usd"]) < 1e-3
+
+
+@pytest.mark.asyncio
 async def test_update_outcomes_cost_provider_switch_retry_no_chimera(
     db_session: AsyncSession,
 ):

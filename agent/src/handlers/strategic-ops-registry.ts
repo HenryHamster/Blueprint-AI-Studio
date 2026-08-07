@@ -156,7 +156,7 @@ const INPUTS = {
       'watch_purpose', 'preview_only', 'command', 'hypothesis', 'spend_cap_usd',
       'deadline_seconds', 'success_criterion', 'success_criteria', 'machine_type',
       'runner_target', 'accelerator', 'vram_gb', 'min_compute_capability',
-      'cwd', 'env', 'container_image', 'allow_host_fallback',
+      'cwd', 'env', 'container_image', 'allow_host_fallback', 'depends_on',
     ],
     example: {
       type: 'create',
@@ -168,6 +168,7 @@ const INPUTS = {
     notes: [
       'Use this operation for bounded implementation, research, plan, design, and compute work under an existing strategic outcome.',
       'Parallelize independent implementation with multiple tasks under one direction; do not create file-, PR-, or phase-sharded directions.',
+      'To author an ORDERED sequence instead of independent parallel siblings, spawn the foundation first, then pass depends_on: [<foundation task_id>] on each successor spawn. The edge waits for the foundation to complete AND merge before the successor dispatches (same-base dependency semantics).',
       'fix is not spawnable: it needs a live-PR target (pr_number + branch) bound by the normal review pipeline, which the strategist cannot resolve at spawn — route existing-PR work through direction → research → plan → create.',
       'Write/plan/design tasks and standalone research are watched by default. Direction-linked research is filtered through discovery review; set watch=true only when its raw completion itself needs Resident attention.',
       'Exceptional project bursts return a durable deferred request instead of HTTP 429.',

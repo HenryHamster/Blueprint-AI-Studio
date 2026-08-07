@@ -1539,18 +1539,15 @@ class TestSchemaRevisionSync:
         assert "0612b_fix_checkpoint_clear_fk_cascade.py" in basenames
 
         # Pin 0612b into the computed chain and assert the single-head set.
-        # The head itself moves with every new migration, so compare against
-        # EXPECTED_SCHEMA_REVISION (kept in lockstep with the latest migration
-        # by its own guard) instead of a hardcoded revision.
-        from app.main import EXPECTED_SCHEMA_REVISION
-
         chain, duplicates, unparseable = build_migration_chain(sources)
         assert not duplicates and not unparseable
         assert "0612b" in chain
+        from app.main import EXPECTED_SCHEMA_REVISION
+
         heads = find_heads(chain)
         assert heads == [EXPECTED_SCHEMA_REVISION], (
-            f"expected single head [{EXPECTED_SCHEMA_REVISION!r}] with 0612b "
-            f"in the chain, got {sorted(heads)}"
+            f"expected single head [{EXPECTED_SCHEMA_REVISION!r}] with 0612b in "
+            f"the chain, got {sorted(heads)}"
         )
 
         async def _file_text(path, *, token, owner, repo, ref, **kwargs):
@@ -12899,9 +12896,9 @@ class TestProblemModelWritePathInvariants:
         # lifecycle.py: sanitize_problem_model_raw -> startup healing write-back
         ("lifecycle.py", 505): "sanitize_problem_model_raw(...) strips packer markers before startup healing write-back",
         # direction_lifecycle.py: sanitize_problem_model_raw -> reconcile_gaps_for_retired_directions
-        ("direction_lifecycle.py", 816): "sanitize_problem_model_raw input -> reconcile_gaps_for_retired_directions mutates raw dict in place",
+        ("direction_lifecycle.py", 844): "sanitize_problem_model_raw input -> reconcile_gaps_for_retired_directions mutates raw dict in place",
         # direction_lifecycle.py: reconcile_gap_staffing_raw_result (parses through ProblemModel)
-        ("direction_lifecycle.py", 844): "reconcile_gap_staffing_raw_result calls parse_problem_model internally",
+        ("direction_lifecycle.py", 872): "reconcile_gap_staffing_raw_result calls parse_problem_model internally",
         # strategic_completion.py: apply_agent_update (write-back)
         ("strategic_completion.py", 5068): "apply_agent_update inline-sanitizes both current and proposed",
         # strategic_completion.py: apply_agent_update (re-normalized)
@@ -12927,13 +12924,13 @@ class TestProblemModelWritePathInvariants:
         ("routers/admin_agent_ops.py", 2818): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
         ("routers/admin_agent_ops.py", 3073): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
         # admin_agent_ops.py: apply_agent_update (op endpoint write-back)
-        ("routers/admin_agent_ops.py", 4623): "apply_agent_update result",
+        ("routers/admin_agent_ops.py", 4672): "apply_agent_update result",
         # admin_agent_ops.py: apply_agent_update (re-normalized after write-back)
-        ("routers/admin_agent_ops.py", 4651): "apply_agent_update result, then _normalize_active_moves_writeback",
+        ("routers/admin_agent_ops.py", 4700): "apply_agent_update result, then _normalize_active_moves_writeback",
         # admin_agent_ops.py: current_model.model_dump() (pending_confirm op)
-        ("routers/admin_agent_ops.py", 5182): "validated current_model pydantic model_dump",
+        ("routers/admin_agent_ops.py", 5231): "validated current_model pydantic model_dump",
         # admin_agent_ops.py: current_model.model_dump() (resolve_pending_confirm op)
-        ("routers/admin_agent_ops.py", 5264): "validated current_model pydantic model_dump",
+        ("routers/admin_agent_ops.py", 5313): "validated current_model pydantic model_dump",
     }
 
     def test_all_problem_model_write_paths_are_sanitized(self):

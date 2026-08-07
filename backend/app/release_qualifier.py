@@ -862,7 +862,11 @@ def _fail_closed_category_verdicts(
     ``None`` only when there are genuinely no active criterion keys to gate on.
     """
     verdicts = [
-        {"category_key": k, "status": "unverified", "tier": "unverified"}
+        {
+            "category_key": k,
+            "status": "unverified",
+            "tier": "unverified",
+        }
         for k in sorted(k for k in active_keys if k)
     ]
     return verdicts or None
@@ -7816,6 +7820,7 @@ async def _finalize_qualification(
                         citations=_v.get("citations") or [],
                         grader_run_id=merge_grade_task_id,
                         qualification_attempt_id=attempt_id,
+                        project_id=version.project_id,
                     )
                 await _category_ledger.upsert_residual(
                     session,
@@ -7823,6 +7828,7 @@ async def _finalize_qualification(
                     candidate_sha,
                     merge_grade_cert.get("residual_uncaptured_gap"),
                     qualification_attempt_id=attempt_id,
+                    project_id=version.project_id,
                 )
             except Exception:  # noqa: BLE001 — ledger write failure must not crash finalize
                 logger.warning(

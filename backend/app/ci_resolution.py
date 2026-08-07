@@ -903,18 +903,14 @@ def classify_merge_test_verdict(
     # degraded reason via :func:`classify_unverified_fall_open_reason`.
     if acceptance_test_is_clear_failure(acceptance_test_block(verdict)):
         return ("fail", _acceptance_test_failure_detail(acceptance_test_block(verdict)))
-    # HIGH precedence: a DECLARED acceptance test that RAN GREEN but whose test
-    # FILE is NOT among the PR's changed files. It name-drops a pre-existing,
-    # unmodified test, so the post-merge named_test gate would mint proven=False
-    # and the coverage surface never flips — yet nothing warned pre-merge. Block
-    # the merge so the failure is visible and fixable (co-modify the declared
-    # test file) BEFORE the merge. Only fires on a definitive ``in_diff is False``;
-    # an absent ``in_diff`` (older agent / diff unavailable) keeps today's behavior.
-    if acceptance_test_not_in_diff_is_clear_failure(acceptance_test_block(verdict)):
-        return (
-            "fail",
-            _acceptance_test_not_in_diff_detail(acceptance_test_block(verdict)),
-        )
+    # NOTE: a DECLARED acceptance test that RAN GREEN but whose test FILE is not
+    # among the PR's changed files used to be blocked here, on the rationale that
+    # the post-merge named_test gate would mint proven=False anyway. That gate now
+    # credits the shape (existence-at-merge + a green run replaces presence-in-diff
+    # as the anti-fraud guard — see ``acceptance_gate._evaluate_named_test``), so
+    # blocking it pre-merge would strand every behaviour-preserving refactor whose
+    # strongest evidence is a pre-existing test still passing. The block is gone;
+    # an absent/false ``in_diff`` no longer affects the merge decision.
     # HIGH precedence: the operator's OWN declared build command CLEARLY failed.
     # A green unit suite must NOT mask a broken declared build (bundled frontends,
     # tests that exercise source without the build step), so a declared-build
@@ -1129,16 +1125,14 @@ def acceptance_test_block(verdict: Any) -> dict[str, Any] | None:
     selector = raw.get("selector")
     if isinstance(selector, str) and selector.strip():
         block["selector"] = selector.strip()
-    # Optional pre-merge cross-check the agent computes against the PR's own
-    # changed files — the SAME changed-files requirement the acceptance gate
-    # (``acceptance_gate._evaluate_named_test``) checks FIRST. Carried through
-    # ONLY when the agent emitted a literal bool: ``True``/``False`` are surfaced,
-    # a missing / non-bool value (older agent) is left absent so the gate is
-    # unchanged. A green run reported with ``in_diff=False`` can never earn
-    # machine-proven coverage, so :func:`acceptance_test_is_green` withholds the
-    # targeted-green mint for it, and
-    # :func:`acceptance_test_not_in_diff_is_clear_failure` surfaces it as a CLEAR
-    # pre-merge failure rather than letting it merge badge-only.
+    # Optional cross-check the agent computes against the PR's own changed files.
+    # Carried through ONLY when the agent emitted a literal bool: ``True``/``False``
+    # are surfaced, a missing / non-bool value (older agent) is left absent.
+    # INFORMATIONAL ONLY — it no longer gates anything. A green run reported with
+    # ``in_diff=False`` is the behaviour-preserving-refactor shape, which
+    # ``acceptance_gate._evaluate_named_test`` credits via existence-at-merge, so
+    # neither :func:`acceptance_test_is_green` nor
+    # :func:`classify_merge_test_verdict` consults this field.
     in_diff = raw.get("in_diff")
     if isinstance(in_diff, bool):
         block["in_diff"] = in_diff
@@ -1181,71 +1175,25 @@ def acceptance_test_is_green(block: Any) -> bool:
     False): all yield False, so today's behavior is preserved and no green signal
     is minted on absence.
 
-    A block that EXPLICITLY reports ``in_diff=False`` — the declared test is not
-    among the PR's own changed files — is NOT green here even if it ran and passed:
-    the acceptance gate checks the changed-files requirement FIRST and would
-    hard-fail ``proven=False`` regardless of a targeted-green run, so minting a
-    targeted-green signal for it would advertise a green the gate rejects and mask
-    the real (pre-merge) verdict. An older agent that omits ``in_diff`` is
-    unaffected (the key is absent, not ``False``), preserving today's behavior.
+    ``in_diff`` is DELIBERATELY not consulted. A declared test that ran green but
+    is not among the PR's own changed files is the behaviour-preserving-refactor
+    shape: its strongest possible evidence IS a pre-existing test still passing.
+    ``acceptance_gate._evaluate_named_test`` now credits that shape — confirmed
+    existence at the merge commit plus a green run REPLACES presence-in-diff as
+    the anti-fraud guard — so withholding the targeted-green mint here would strand
+    exactly the case the gate wants to credit. (Historically this returned False on
+    ``in_diff is False`` because the gate hard-failed a not-in-diff test; that
+    hard-fail is gone, so the short-circuit went with it.)
     """
     if not isinstance(block, dict):
         return False
     if block.get("declared") is not True:
-        return False
-    if block.get("in_diff") is False:
         return False
     if block.get("ran") is not True:
         return False
     if block.get("status") != "ran":
         return False
     return block.get("passed") is True
-
-
-def acceptance_test_not_in_diff_is_clear_failure(block: Any) -> bool:
-    """Whether a declared acceptance-test block names a test that RAN GREEN but
-    whose test FILE is NOT among the PR's own changed files — a name-dropped,
-    pre-existing/unmodified test that would silently merge badge-only.
-
-    This is the gap the post-merge ``acceptance_gate._evaluate_named_test`` gate
-    leaves invisible pre-merge: that gate mints ``proven=True`` ONLY when the
-    declared test is among the changed files, so a PR that references a green but
-    UNMODIFIED test merges with ``proven=False`` and never flips the coverage
-    surface — yet nothing warns before merge. Surfacing this as a CLEAR failure
-    lets the merge gate block-and-fix it (co-modify the declared test) BEFORE the
-    merge instead of after.
-
-    True only when the block is the declared acceptance test, it actually RAN
-    (``ran is True`` AND ``status == "ran"`` — an ``absent``/``skipped`` test is
-    already a clear failure via :func:`acceptance_test_is_clear_failure`), AND
-    ``in_diff`` is definitively ``False``. An ABSENT ``in_diff`` (older agent, or
-    the PR diff could not be computed) is indeterminate and never blocks — the
-    merge keeps today's behavior. Defensive about a missing / non-dict / old-shape
-    block (returns False).
-    """
-    if not isinstance(block, dict):
-        return False
-    if block.get("declared") is not True:
-        return False
-    if block.get("ran") is not True:
-        return False
-    if block.get("status") != "ran":
-        return False
-    return block.get("in_diff") is False
-
-
-def _acceptance_test_not_in_diff_detail(block: dict[str, Any]) -> str:
-    """Build the operator-facing ``detail`` for a declared acceptance test that
-    ran green but is not among the PR's changed files, so the spawned fix task
-    knows it must co-modify the declared test file to earn proven coverage."""
-    name = str(block.get("selector") or block.get("descriptor") or "").strip()
-    label = f"`{name}` " if name else ""
-    return (
-        f"Declared acceptance test {label}ran green but its test file is NOT among "
-        "this PR's changed files — the merge would earn only a badge "
-        "(proven=False) and never flip the coverage surface. Co-modify (add or "
-        "edit) the declared test file in THIS PR so its coverage is proven."
-    ).replace("  ", " ")
 
 
 def _acceptance_test_failure_detail(block: dict[str, Any]) -> str:

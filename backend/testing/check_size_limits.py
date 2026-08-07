@@ -108,14 +108,18 @@ def classify_size_record(
     Returns ``{rel, count, cap, breach, verdict}``:
 
       * ``breach`` — True only when BOTH ``count`` and ``cap`` are present and
-        ``count > cap``. A file absent at the ref (``count is None``) is never a
-        breach (a missing file cannot have grown past its cap).
+        ``count > cap`` (delegated to ``app.size_limit_policy.is_breach``, the
+        single source of truth for the comparison). A file absent at the ref
+        (``count is None``) is never a breach (a missing file cannot have grown
+        past its cap).
       * ``verdict`` — the ``BreachVerdict`` from :func:`_classify_breach` when
         ``breach`` (and ``with_verdict``), else ``None``. ``with_verdict=False``
         skips the (git-touching) chronic lookup for the plain check path, which
         only needs the breach flag.
     """
-    breach = count is not None and cap is not None and count > cap
+    from app.size_limit_policy import is_breach
+
+    breach = is_breach(count, cap)
     verdict = None
     if breach and with_verdict:
         verdict = _classify_breach(

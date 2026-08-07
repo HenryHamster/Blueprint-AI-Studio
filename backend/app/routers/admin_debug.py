@@ -898,13 +898,76 @@ async def get_autonomy_debug(
             }
         )
 
-    # Guard 5: rate_limit_exceeded
-    one_hour_ago = now - timedelta(hours=1)
+    # Guard 4b: total_research_active — mirrors _spawn_research_task_inner's
+    # second cap (autonomous_research.py:2091-2132): total non-terminal research
+    # (QUEUED/PROVISIONING/IN_PROGRESS/EVALUATING), excluding EVALUATING parents
+    # that still have active (non-terminal) children — those are productive
+    # in-flight work, not stuck parents piling up merge complexity.
+    max_total_research = project_parallelism_cap(
+        project, "max_total_research", "max_total_research_per_project", 5
+    )
+    # Dialect-aware research-type predicate: the `.as_string()` form
+    # JSON_QUOTE-double-quotes on SQLite and never matches, so build the
+    # json_extract form there (see ci_merge_helpers.py:31-43). Shared with the
+    # rate-limit guard below.
     dialect_name = resolve_dialect_name(session)
     if dialect_name == "sqlite":
         type_is_research = func.json_extract(Task.payloads, "$[0].type") == "research"
     else:
         type_is_research = Task.payloads[0]["type"].as_string() == "research"
+    total_research_result = await session.execute(
+        select(Task.id, Task.status)
+        .where(
+            Task.project_id == project_id,
+            Task.status.in_(
+                [
+                    TaskStatus.QUEUED,
+                    TaskStatus.PROVISIONING,
+                    TaskStatus.IN_PROGRESS,
+                    TaskStatus.EVALUATING,
+                ]
+            ),
+            type_is_research,
+        )
+    )
+    total_research_rows = total_research_result.all()
+    total_research_count = len(total_research_rows)
+    evaluating_research_ids = [
+        row[0] for row in total_research_rows if row[1] == TaskStatus.EVALUATING
+    ]
+    if evaluating_research_ids:
+        productive_evaluating_result = await session.execute(
+            select(func.count(func.distinct(Task.parent_task_id))).where(
+                Task.parent_task_id.in_(evaluating_research_ids),
+                Task.status.in_(
+                    [
+                        TaskStatus.QUEUED,
+                        TaskStatus.PROVISIONING,
+                        TaskStatus.IN_PROGRESS,
+                        TaskStatus.EVALUATING,
+                        TaskStatus.BLOCKED,
+                    ]
+                ),
+            )
+        )
+        productive_evaluating = productive_evaluating_result.scalar() or 0
+        total_research_count = max(0, total_research_count - productive_evaluating)
+    if total_research_count >= max_total_research:
+        blocking_guards.append(
+            {
+                "guard": "total_research_active",
+                "reason": (
+                    f"Total research ({total_research_count}) >= max_total_research "
+                    f"({max_total_research}) (excluding EVALUATING parents with "
+                    "active children)"
+                ),
+                "total_research_count": total_research_count,
+                "max_total_research": max_total_research,
+            }
+        )
+
+    # Guard 5: rate_limit_exceeded
+    one_hour_ago = now - timedelta(hours=1)
     tasks_this_hour = (
         await session.execute(
             select(func.count()).where(
@@ -916,7 +979,7 @@ async def get_autonomy_debug(
         )
     ).scalar() or 0
     max_per_hour = project_parallelism_cap(
-        project, "max_autonomous_tasks_per_hour", "max_autonomous_tasks_per_hour", 5
+        project, "max_autonomous_tasks_per_hour", "max_autonomous_tasks_per_hour", 12
     )
     if tasks_this_hour >= max_per_hour:
         blocking_guards.append(

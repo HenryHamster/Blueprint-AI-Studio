@@ -260,7 +260,6 @@ def test_strategic_payload_total_packs_under_budget_with_compacted_model():
                 {"key": "systems/release-pipeline", "summary": "Architecture section summary"},
             ]
         },
-        "vision": {"_strategic_cycle_history": []},
         "effective_purpose": "Blueprint keeps itself ahead of relevant advances with minimal attention",
         "direction_counts": {"active": 4, "max_active": 6},
         "max_active_directions": 6,

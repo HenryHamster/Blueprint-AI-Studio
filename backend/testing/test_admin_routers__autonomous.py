@@ -686,3 +686,65 @@ class TestAutonomyDebug:
         assert guards["global_rate_limit_exceeded"]["limit"] == 1
         assert data["global_rate_limit"]["global_cap"] == 1
         assert data["global_rate_limit"]["global_headroom"] == 0
+
+    @pytest.mark.asyncio
+    async def test_autonomy_debug_reports_total_research_guard(
+        self, client: AsyncClient, db_session
+    ):
+        """total_research_active mirrors _spawn_research_task_inner's second cap:
+        it fires once total non-terminal research reaches max_total_research, but
+        excludes EVALUATING parents that still have active (non-terminal)
+        children — those are productive in-flight work, not stuck backlog.
+        """
+        project = await _make_project(db_session, name="AutonomyDebug Total Research")
+        project.build_config = {"max_total_research": 1}
+        await db_session.commit()
+
+        # A genuinely-stuck EVALUATING research parent with no active children —
+        # counts against the cap and alone should trip it (cap == 1).
+        stuck_parent = Task(
+            project_id=project.id,
+            payloads=[{"type": "research", "current_direction_id": "d-stuck"}],
+            status=TaskStatus.EVALUATING,
+            created_by="ORCHESTRATOR",
+        )
+        db_session.add(stuck_parent)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/projects/{project.id}/autonomy-debug")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        guards = {guard["guard"]: guard for guard in data["blocking_guards"]}
+        assert "total_research_active" in guards, (
+            "Expected total_research_active guard with a stuck EVALUATING parent "
+            f"and max_total_research=1. Got guards: {list(guards)}"
+        )
+        assert guards["total_research_active"]["total_research_count"] == 1
+        assert guards["total_research_active"]["max_total_research"] == 1
+
+        # Now give the EVALUATING parent an active (non-terminal) child — it
+        # becomes productive in-flight work and must be excluded from the count,
+        # dropping total_research_count back to 0 and clearing the guard.
+        db_session.add(
+            Task(
+                project_id=project.id,
+                parent_task_id=stuck_parent.id,
+                payloads=[{"type": "create"}],
+                status=TaskStatus.IN_PROGRESS,
+                created_by="ORCHESTRATOR",
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/projects/{project.id}/autonomy-debug")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        guards = {guard["guard"]: guard for guard in data["blocking_guards"]}
+        assert "total_research_active" not in guards, (
+            "EVALUATING parent with an active child is productive in-flight work "
+            f"and must not count against max_total_research. Got guards: {list(guards)}"
+        )
+
+        # And the endpoint's max_per_hour default must match enforcement's 12,
+        # not the stale 5 the debug endpoint previously reported.
+        assert data["rate_limit"]["max_per_hour"] == 12

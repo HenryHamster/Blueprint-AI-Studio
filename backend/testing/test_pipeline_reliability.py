@@ -522,6 +522,18 @@ async def test_stale_provisioning_captures_serial_before_vm_delete(orch_db, mock
         "app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock
     )
 
+    # The dispatcher runs in the SAME orchestrator cycle as the stale-PROVISIONING
+    # reaper. With free fleet slots (the orch_db fixture mocks
+    # _get_actual_gcp_vm_count to 0) it would immediately re-claim the requeued
+    # task back to PROVISIONING in the same cycle, so the QUEUED state asserted
+    # below would never be observable. Pin the fleet to full so the requeued task
+    # actually waits in QUEUED — the scenario this test targets (serial capture
+    # before VM delete on requeue).
+    mocker.patch(
+        "app.vm_lifecycle._get_actual_gcp_vm_count",
+        return_value=_shared_state.runtime_config.get("max_concurrent_vms", 8),
+    )
+
     await _run_one_cycle(mocker)
 
     # --- 1. Serial capture happened with the right (vm_id, zone) ---

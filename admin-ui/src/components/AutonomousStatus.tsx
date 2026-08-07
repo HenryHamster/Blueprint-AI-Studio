@@ -54,6 +54,9 @@ interface BlockingGuard {
   task_id?: string;
   active_research_count?: number;
   max_parallel?: number;
+  // total_research_active
+  total_research_count?: number;
+  max_total_research?: number;
   // rate_limit_exceeded
   tasks_this_hour?: number;
   max_per_hour?: number;
@@ -193,7 +196,7 @@ const LIFECYCLE_STEPS = ['Idle', 'Checking', 'Running', 'Waiting'] as const;
 function getLifecyclePhase(debug: AutonomyDebug): number {
   const guards = debug.blocking_guards.map(g => g.guard);
   // Autonomy's OWN research is running — genuine progress.
-  if (guards.includes('research_task_active')) return 2; // Running
+  if (guards.includes('research_task_active') || guards.includes('total_research_active')) return 2; // Running
   // Any other blocker: autonomy is waiting on something external. Show as
   // Waiting so the user can read the guard reason to learn why.
   if (guards.some(g => g !== 'waiting_for_interval')) return 3; // Waiting
@@ -233,6 +236,8 @@ function GuardIcon({ guard }: { guard: string }) {
       return <Clock className="w-3 h-3 shrink-0 text-amber-400" />;
     case 'research_task_active':
       return <PlayCircle className="w-3 h-3 shrink-0 text-blue-400" />;
+    case 'total_research_active':
+      return <PlayCircle className="w-3 h-3 shrink-0 text-blue-400" />;
     case 'rate_limit_exceeded':
       return <Gauge className="w-3 h-3 shrink-0 text-orange-400" />;
     case 'waiting_for_interval':
@@ -254,6 +259,7 @@ function guardColor(guard: string): string {
     case 'circuit_breaker_open': return 'text-red-400';
     case 'no_eligible_directions': return 'text-amber-400';
     case 'research_task_active': return 'text-blue-400';
+    case 'total_research_active': return 'text-blue-400';
     case 'rate_limit_exceeded': return 'text-orange-400';
     case 'waiting_for_interval': return 'text-neutral-400';
     case 'vm_slots_full': return 'text-blue-400';
@@ -286,6 +292,8 @@ function guardLabel(g: BlockingGuard): string {
     }
     case 'research_task_active':
       return `Parallel research cap reached (${g.active_research_count ?? '?'}/${g.max_parallel ?? '?'})`;
+    case 'total_research_active':
+      return `Total research cap reached (${g.total_research_count ?? '?'}/${g.max_total_research ?? '?'})`;
     case 'rate_limit_exceeded':
       return `Rate limit: ${g.tasks_this_hour ?? '?'}/${g.max_per_hour ?? '?'} tasks this hour`;
     case 'waiting_for_interval': {

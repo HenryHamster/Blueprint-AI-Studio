@@ -374,10 +374,21 @@ describe('DirectionCard budget utilization indicator', () => {
     expect(screen.queryByText(/over budget/)).not.toBeInTheDocument();
   });
 
-  it('renders spend-only badge when spend is present but no budget', () => {
+  it('labels a legacy spend-only badge as window and surfaces no split', () => {
     const d = makeDirection({ estimated_cost_usd: 1.23 });
     render(<DirectionCard {...makeProps(d)} />);
-    expect(screen.getByText('$1.23 spent')).toBeInTheDocument();
+    const badge = screen.getByText('Window $1.23 spent');
+    expect(badge).toBeInTheDocument();
+    expect(badge.title).toContain('basis: rolling window');
+    expect(badge.title).not.toContain('LLM');
+  });
+
+  it('renders lifetime spend-only badge when lineage is present but no budget', () => {
+    const d = makeDirection({ lineage_spend_usd: 2.50, estimated_cost_usd: 1.23 });
+    render(<DirectionCard {...makeProps(d)} />);
+    const badge = screen.getByText('Lifetime $2.50 spent');
+    expect(badge).toBeInTheDocument();
+    expect(badge.title).toContain('basis:');
   });
 
   it('renders budget-only badge when budget is present but no spend', () => {
@@ -389,7 +400,7 @@ describe('DirectionCard budget utilization indicator', () => {
   it('renders emerald badge with percentage when utilization is low (<80%)', () => {
     const d = makeDirection({ estimated_cost_usd: 1.00, cost_budget_usd: 5.00, budget_utilization_pct: 20 });
     render(<DirectionCard {...makeProps(d)} />);
-    const badge = screen.getByText('$1.00 / $5.00 · 20%');
+    const badge = screen.getByText('Window $1.00 / $5.00 · 20%');
     expect(badge).toBeInTheDocument();
     expect(badge.className).toMatch(/emerald/);
   });
@@ -397,7 +408,7 @@ describe('DirectionCard budget utilization indicator', () => {
   it('renders amber badge when utilization is high (>80%) but not exceeded', () => {
     const d = makeDirection({ estimated_cost_usd: 4.50, cost_budget_usd: 5.00, budget_utilization_pct: 90 });
     render(<DirectionCard {...makeProps(d)} />);
-    const badge = screen.getByText('$4.50 / $5.00 · 90%');
+    const badge = screen.getByText('Window $4.50 / $5.00 · 90%');
     expect(badge).toBeInTheDocument();
     expect(badge.className).toMatch(/amber/);
   });
@@ -405,9 +416,69 @@ describe('DirectionCard budget utilization indicator', () => {
   it('renders red over-budget badge when budget_exceeded is true', () => {
     const d = makeDirection({ estimated_cost_usd: 6.00, cost_budget_usd: 5.00, budget_exceeded: true });
     render(<DirectionCard {...makeProps(d)} />);
-    const badge = screen.getByText('$6.00 · over budget');
+    const badge = screen.getByText('Window $6.00 · over budget');
     expect(badge).toBeInTheDocument();
     expect(badge.className).toMatch(/red/);
+  });
+
+  it('renders lifetime lineage spend and LLM term in the budget badge', () => {
+    const d = makeDirection({
+      estimated_cost_usd: 1.00,
+      cost_budget_usd: 5.00,
+      budget_utilization_pct: 120,
+      budget_exceeded: true,
+      lineage_spend_usd: 6.00,
+      lineage_vm_cost_usd: 2.00,
+      lineage_llm_cost_usd: 3.50,
+      lineage_compute_cost_usd: 0.50,
+      lineage_task_count: 12,
+      budget_basis: 'lifetime_lineage:vm_banked+llm_tokens+compute_jobs',
+    });
+    render(<DirectionCard {...makeProps(d)} />);
+    const badge = screen.getByText('Lifetime $6.00 · over budget');
+    expect(badge).toBeInTheDocument();
+    expect(badge.className).toMatch(/red/);
+    // The lifetime amount is the number the budget pause gate reads.
+    expect(badge.title).toContain('Lifetime $6.00 spent of $5.00 budget');
+    // VM/LLM/compute split + basis are surfaced in the tooltip so the operator
+    // can see WHY the number moved (LLM token spend is typically dominant).
+    expect(badge.title).toContain('VM $2.00 · LLM $3.50 · Compute $0.50');
+    expect(badge.title).toContain('12 lineage tasks');
+    expect(badge.title).toContain('Basis: lifetime_lineage:vm_banked+llm_tokens+compute_jobs');
+    // The rolling-window figure is a distinct, secondary reading, not the
+    // primary amount.
+    expect(screen.getByText('window $1.00')).toBeInTheDocument();
+    expect(badge.title).toContain('Rolling window: $1.00');
+  });
+
+  it('drives colour from server budget_exceeded on the lifetime figure', () => {
+    const d = makeDirection({
+      estimated_cost_usd: 0.50,
+      cost_budget_usd: 5.00,
+      budget_utilization_pct: 20,
+      budget_exceeded: false,
+      lineage_spend_usd: 1.00,
+      lineage_llm_cost_usd: 0.75,
+    });
+    render(<DirectionCard {...makeProps(d)} />);
+    const badge = screen.getByText('Lifetime $1.00 / $5.00 · 20%');
+    expect(badge).toBeInTheDocument();
+    expect(badge.className).toMatch(/emerald/);
+    expect(badge.className).not.toMatch(/red/);
+  });
+
+  it('falls back to window rendering when the lineage fields are absent', () => {
+    const d = makeDirection({ estimated_cost_usd: 1.00, cost_budget_usd: 5.00, budget_utilization_pct: 20 });
+    render(<DirectionCard {...makeProps(d)} />);
+    const badge = screen.getByText('Window $1.00 / $5.00 · 20%');
+    expect(badge).toBeInTheDocument();
+    // Legacy payloads carry no lineage split; the tooltip must not invent a
+    // lifetime provenance for a window number — it labels the window basis
+    // explicitly and surfaces no VM/LLM/compute split.
+    expect(badge.title).toContain('Basis: rolling window');
+    expect(badge.title).not.toContain('Lifetime');
+    expect(badge.title).not.toContain('LLM');
+    expect(screen.queryByText(/^window \$/)).not.toBeInTheDocument();
   });
 });
 

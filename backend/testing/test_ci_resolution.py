@@ -2326,12 +2326,17 @@ def test_acceptance_test_block_carries_in_diff():
     assert malformed is not None and "in_diff" not in malformed
 
 
-def test_acceptance_test_not_in_diff_is_not_green():
+def test_acceptance_test_not_in_diff_is_still_green():
     # A declared test that ran green but is NOT among the PR's changed files
-    # (in_diff=False) can never earn machine-proven coverage — the gate hard-fails
-    # proven=False on the changed-files check FIRST — so no targeted-green is minted.
-    assert not ci_resolution.acceptance_test_is_green(
+    # (in_diff=False) is the behaviour-preserving-refactor shape: the acceptance
+    # gate credits it via existence-at-merge, so the targeted-green mint MUST fire.
+    # Withholding it here is what previously made that whole path dead.
+    assert ci_resolution.acceptance_test_is_green(
         {"declared": True, "ran": True, "status": "ran", "passed": True, "in_diff": False}
+    )
+    # A test that did not actually pass is still not green, in_diff notwithstanding.
+    assert not ci_resolution.acceptance_test_is_green(
+        {"declared": True, "ran": True, "status": "ran", "passed": False, "in_diff": False}
     )
     # in_diff=True keeps the green mint.
     assert ci_resolution.acceptance_test_is_green(
@@ -2343,9 +2348,10 @@ def test_acceptance_test_not_in_diff_is_not_green():
     )
 
 
-def test_acceptance_test_not_in_diff_end_to_end_withholds_green():
+def test_acceptance_test_not_in_diff_end_to_end_mints_green():
     # A full verdict whose acceptanceTest ran green but reports in_diff=False
-    # flows through acceptance_test_block → acceptance_test_is_green as NOT green.
+    # flows through acceptance_test_block → acceptance_test_is_green as GREEN, so
+    # the no-CI monitor stamps the targeted-green signal the acceptance gate reads.
     verdict = {
         "detected": False,
         "acceptanceTest": {
@@ -2360,10 +2366,10 @@ def test_acceptance_test_not_in_diff_end_to_end_withholds_green():
         },
     }
     block = ci_resolution.acceptance_test_block(verdict)
+    # in_diff is still PARSED and surfaced — it is informational, not a gate.
     assert block is not None and block["in_diff"] is False
-    assert ci_resolution.acceptance_test_is_green(block) is False
-    # It is also NOT a clear failure — the test DID run; the changed-files gap is a
-    # proven-credit issue, not an absent/skipped block.
+    assert ci_resolution.acceptance_test_is_green(block) is True
+    # It is also NOT a clear failure — the test DID run.
     assert ci_resolution.acceptance_test_is_clear_failure(block) is False
 
 
@@ -2494,36 +2500,18 @@ def test_acceptance_test_block_parses_in_diff_field():
     assert "in_diff" not in non_bool
 
 
-def test_acceptance_test_not_in_diff_is_clear_failure_predicate():
-    # Ran green but file not in the PR diff → clear failure.
-    assert ci_resolution.acceptance_test_not_in_diff_is_clear_failure(
-        {"declared": True, "ran": True, "status": "ran", "in_diff": False}
-    )
-    # In the diff → not a failure.
-    assert not ci_resolution.acceptance_test_not_in_diff_is_clear_failure(
-        {"declared": True, "ran": True, "status": "ran", "in_diff": True}
-    )
-    # in_diff absent (indeterminate) → never blocks.
-    assert not ci_resolution.acceptance_test_not_in_diff_is_clear_failure(
-        {"declared": True, "ran": True, "status": "ran"}
-    )
-    # Absent/skipped are handled by acceptance_test_is_clear_failure, not here.
-    assert not ci_resolution.acceptance_test_not_in_diff_is_clear_failure(
-        {"declared": True, "ran": False, "status": "absent", "in_diff": False}
-    )
-    assert not ci_resolution.acceptance_test_not_in_diff_is_clear_failure(
-        {"declared": True, "ran": False, "status": "skipped", "in_diff": False}
-    )
-    # Non-declared / non-dict / None → not a failure.
-    assert not ci_resolution.acceptance_test_not_in_diff_is_clear_failure(
-        {"declared": False, "ran": True, "status": "ran", "in_diff": False}
-    )
-    assert not ci_resolution.acceptance_test_not_in_diff_is_clear_failure(None)
+def test_acceptance_test_not_in_diff_predicate_is_retired():
+    # The not-in-diff CLEAR-FAILURE predicate is GONE, together with the pre-merge
+    # block it fed. Its rationale ("the post-merge gate mints proven=False anyway")
+    # stopped being true once _evaluate_named_test began crediting
+    # existence-at-merge, so keeping it would block the very shape the gate credits.
+    assert not hasattr(ci_resolution, "acceptance_test_not_in_diff_is_clear_failure")
 
 
-def test_classify_verdict_ran_green_test_not_in_diff_blocks_passing_suite():
-    # A declared test that name-drops a PRE-EXISTING, unmodified test runs green
-    # but would merge proven=False — block it PRE-merge so it can be fixed.
+def test_classify_verdict_ran_green_test_not_in_diff_keeps_pass():
+    # A declared test that ran GREEN but lives outside the PR's own diff is the
+    # behaviour-preserving-refactor shape. It must NOT be blocked pre-merge —
+    # blocking here strands the merge before the acceptance gate can credit it.
     outcome, detail = ci_resolution.classify_merge_test_verdict(
         {
             "detected": True,
@@ -2540,12 +2528,27 @@ def test_classify_verdict_ran_green_test_not_in_diff_blocks_passing_suite():
             },
         }
     )
-    assert outcome == "fail"
-    assert "not among" in detail.lower()
-    assert "testing/test_seam.py::test_x" in detail
-    assert "proven=false" in detail.lower()
+    assert outcome == "pass"
+    assert detail == ""
     ci_result = ci_resolution.build_no_ci_gate_ci_result(outcome, detail)
-    assert ci_result["conclusion"] == "failure"
+    assert ci_result["conclusion"] == "success"
+    # An ABSENT or SKIPPED declared test is still a hard block — removing the
+    # not-in-diff branch must not weaken the absent/skipped guard next to it.
+    absent_outcome, _ = ci_resolution.classify_merge_test_verdict(
+        {
+            "detected": True,
+            "passed": True,
+            "acceptanceTest": {
+                "declared": True,
+                "descriptor": "the seam test",
+                "present": False,
+                "ran": False,
+                "status": "absent",
+                "in_diff": False,
+            },
+        }
+    )
+    assert absent_outcome == "fail"
 
 
 def test_classify_verdict_ran_green_test_in_diff_keeps_pass():

@@ -3643,7 +3643,9 @@ async def test_design_doc_update_uses_live_local_continuation_runner_affinity(
         == "workbench_continuous"
     )
     assert task.context.get("preferred_runner_target_id") == str(runner.id)
-    assert STRATEGIC_LOCAL_CONTINUATION_KEY not in task.payloads[0]["vision"]
+    # The legacy vision body is no longer shipped, so the internal
+    # local-continuation marker cannot leak into the agent-visible payload.
+    assert "vision" not in task.payloads[0]
     assert "runner_target_id" not in task.context
     assert not (task.vm_instance_id or "").startswith("runner:")
 
@@ -3700,7 +3702,9 @@ async def test_strategic_review_uses_live_local_continuation_runner_affinity(
         == "workbench_continuous"
     )
     assert task.context.get("preferred_runner_target_id") == str(live_runner.id)
-    assert STRATEGIC_LOCAL_CONTINUATION_KEY not in task.payloads[0]["vision"]
+    # The legacy vision body is no longer shipped, so the internal
+    # local-continuation marker cannot leak into the agent-visible payload.
+    assert "vision" not in task.payloads[0]
     assert "runner_target_id" not in task.context
     assert not (task.vm_instance_id or "").startswith("runner:")
 
@@ -3940,7 +3944,9 @@ async def test_local_continuation_affinity_reads_current_db_marker(
     task = result.scalars().one()
     assert STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY not in task.context
     assert "preferred_runner_target_id" not in task.context
-    assert STRATEGIC_LOCAL_CONTINUATION_KEY not in task.payloads[0]["vision"]
+    # The legacy vision body is no longer shipped, so the internal
+    # local-continuation marker cannot leak into the agent-visible payload.
+    assert "vision" not in task.payloads[0]
 
 
 def test_phase_runner_affinity_falls_back_to_preferred_runner_target_id():
@@ -17177,7 +17183,6 @@ def test_pathological_problem_model_degrades_loudly_when_it_cannot_fit():
         "base_branch": "main",
         "model": "claude-opus-4-8",
         "effort": "medium",
-        "vision": {"purpose": "small"},
         "problem_model": pm,
         "model_health": {"model_size_status": "oversized", "gap_count": 400},
     }
@@ -17337,39 +17342,43 @@ def test_strategic_review_ships_whole_problem_model_under_contention():
 
 def test_strategic_review_degrades_loudly_in_near_budget_band():
     """The NEAR-BUDGET band: a problem_model that fits the budget on its OWN, but
-    whose bytes plus the always-critical identity/vision keys exceed it. The
+    whose bytes plus the always-critical identity scalars exceed it. The
     full-model floor reservation is ``<= budget`` (so the old drop condition kept
-    the guarantee), yet the critical ``vision`` key sorts first and would be
-    starved into a hard PayloadTooLargeError. The reworked packer accounts for
-    non-floored critical keys' bytes and drops the floor guarantee, so the model
-    degrades LOUDLY via summarize (marker + _packer_meta record) and the cycle
-    still runs — it must NOT raise or silently drop the model."""
+    the guarantee), yet the critical identity keys' bytes starve it. The reworked
+    packer accounts for non-floored critical keys' bytes and drops the floor
+    guarantee, so the model degrades LOUDLY via summarize (marker + _packer_meta
+    record) and the cycle still runs — it must NOT raise or silently drop the
+    model."""
     pm = _mature_agent_view_problem_model()
     model_bytes = len(json.dumps(pm, default=str).encode())
-    # A large but load-bearing critical vision. model alone fits the budget;
-    # model + vision does not.
-    vision = {"purpose": "p" * 12000}
-    vision_bytes = len(json.dumps(vision, default=str).encode())
-    # Budget fits the model alone (reservation <= budget) but NOT model + vision.
-    budget = model_bytes + vision_bytes - 2000
-    assert model_bytes <= budget < model_bytes + vision_bytes
-
-    payload = {
+    # Always-critical identity scalars (the legacy vision body was removed from
+    # the payload, so it no longer competes for budget at critical priority).
+    # The model alone fits the budget; model + critical identity keys does not.
+    identity = {
         "type": "strategic_review",
         "research_mode": "strategic",
         "project_name": "p",
         "base_branch": "main",
         "model": "claude-opus-4-8",
         "effort": "medium",
-        "vision": vision,
+    }
+    # The packer measures each key's size individually, so the critical-full
+    # byte count is the SUM of the per-key sizes, not the serialized dict.
+    critical_bytes = sum(
+        len(json.dumps(v, default=str).encode()) for v in identity.values()
+    )
+    # Budget fits the model alone (reservation <= budget) but NOT model + critical.
+    budget = model_bytes + critical_bytes - 1
+    assert model_bytes <= budget < model_bytes + critical_bytes
+
+    payload = {
+        **identity,
         "problem_model": pm,
         "model_health": {"model_size_status": "healthy", "gap_count": 12},
     }
     # Must NOT raise PayloadTooLargeError — the cycle still runs.
     packed = pack_under_budget(payload, _STRATEGIC_REVIEW_SCHEMA, budget=budget)
 
-    # The critical vision shipped intact.
-    assert packed["vision"] == vision
     meta = packed["_packer_meta"]
     dropped_keys = {d["key"] for d in meta["dropped"]}
 
@@ -19572,7 +19581,6 @@ _CRITICAL_IDENTITY_PAYLOAD = {
     "enable_self_improvement": True,
     "model": "m",
     "effort": "medium",
-    "vision": "V",
     "direction_counts": {"active": 1},
     "max_active_directions": 5,
     "open_message_count": 0,

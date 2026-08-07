@@ -88,6 +88,10 @@ from app.models import (
     TaskStatus,
     bank_task_current_attempt,
 )
+from app.llm_cost_attribution import (
+    UNPRICED_FALLBACK_INPUT_RATE,
+    UNPRICED_FALLBACK_OUTPUT_RATE,
+)
 from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
 from testing.factories import _utcnow, make_membership, make_project, make_task
 
@@ -3331,7 +3335,18 @@ def test_compute_llm_cost_breakdown_priced_and_unpriced():
     assert totals["priced_task_count"] == 3
     # unattributed tasks are unpriced (no pricing entry for sentinel key)
     assert totals["unpriced_task_count"] == 2
-    assert totals["unpriced_coverage_fraction"] == round(3 / 5, 4)
+    # Coverage is spend-weighted: priced spend / (priced + estimated unpriced).
+    # Priced spend is 0.037; unpriced rows carry 600 in / 150 out tokens priced
+    # at the documented fallback rate (was a task-count 3/5 before the fix).
+    est_unpriced = (
+        600 * UNPRICED_FALLBACK_INPUT_RATE + 150 * UNPRICED_FALLBACK_OUTPUT_RATE
+    )
+    assert totals["unpriced_coverage_fraction"] == round(
+        0.037 / (0.037 + est_unpriced), 4
+    )
+    assert totals["estimated_unpriced_cost_usd"] == round(est_unpriced, 6)
+    assert totals["unpriced_input_tokens"] == 600
+    assert totals["unpriced_output_tokens"] == 150
     assert totals["total_cost_usd"] == round(0.0315 + 0.0055, 6)
 
     assert "fakeprovider:mystery-model" in result["unpriced_combos"]
@@ -4173,9 +4188,13 @@ from unittest.mock import AsyncMock  # noqa: E402
 from sqlmodel import select as _sql_select  # noqa: E402
 
 from app.efficiency_snapshot import (  # noqa: E402
+    LAST_ALERTED_OVERDUE_CADENCE_KEY,
     LAST_ALERTED_PAYOFF_KEY,
     LAST_ALERTED_SELF_REPAIR_BURN_SHARE_KEY,
     POOL_PAYOFF_PROVEN_MIN_WARM_STARTS,
+    SNAPSHOT_CADENCE_OVERDUE_SECONDS,
+    _snapshot_cadence_overdue,
+    maybe_alert_overdue_snapshot_cadence,
     maybe_alert_pool_payoff_transition,
     maybe_alert_self_repair_burn_share,
 )
@@ -5041,6 +5060,182 @@ async def test_unpriced_alert_ignores_tokenless_and_unattributed(db_session, moc
     assert await _unpriced_alerts(db_session, project.id) == []
 
 
+# ---------------------------------------------------------------------------
+# maybe_alert_overdue_snapshot_cadence — daily-snapshot-cadence operator alert
+# ---------------------------------------------------------------------------
+
+async def _snapshot_cadence_alerts(db_session, project_id):
+    stmt = _sql_select(Alert).where(
+        Alert.project_id == project_id,
+        Alert.title.contains("efficiency snapshot overdue"),
+    )
+    return (await db_session.execute(stmt)).scalars().all()
+
+
+def _overdue_container(*, days_ago: float) -> dict:
+    """A design-doc efficiency container whose last_run_at is ``days_ago`` old."""
+    return {
+        DESIGN_DOC_KEY: {
+            "baseline": {"captured_at": _utcnow().isoformat()},
+            "snapshots": [{"captured_at": _utcnow().isoformat()}],
+            "last_run_at": (_utcnow() - timedelta(days=days_ago)).isoformat(),
+        }
+    }
+
+
+async def _set_container_last_run(db_session, project_id, last_run_at_iso):
+    """Rewrite ``last_run_at`` in the project's efficiency telemetry container.
+
+    Simulates a fresh snapshot landing (recovery) or a further lapse using the
+    same locked container path the snapshot writer and alert share, so the
+    re-arm test exercises the real marker lifecycle.
+    """
+    from app.task_locking import with_project_telemetry_locked
+
+    def _mutate(container):
+        container["last_run_at"] = last_run_at_iso
+
+    wrote = await with_project_telemetry_locked(
+        db_session,
+        project_id,
+        DESIGN_DOC_KEY,
+        _mutate,
+        design_doc_fallback={},
+        skip_locked=False,
+    )
+    await db_session.commit()
+    return wrote
+
+
+def test_snapshot_cadence_overdue_helper():
+    now = _utcnow()
+    # Never written (fresh project) and unparseable markers are not overdue.
+    assert _snapshot_cadence_overdue(None, now) is False
+    assert _snapshot_cadence_overdue("not-a-date", now) is False
+    # Healthy cadence: a few hours old is fine; lapsed: 3 days is overdue.
+    assert (
+        _snapshot_cadence_overdue(
+            (now - timedelta(hours=5)).isoformat(), now
+        )
+        is False
+    )
+    assert _snapshot_cadence_overdue((now - timedelta(days=3)).isoformat(), now) is True
+    # Threshold boundary: just under is fine, at/over is overdue.
+    edge = (now - timedelta(seconds=SNAPSHOT_CADENCE_OVERDUE_SECONDS - 1)).isoformat()
+    assert _snapshot_cadence_overdue(edge, now) is False
+    at_edge = (now - timedelta(seconds=SNAPSHOT_CADENCE_OVERDUE_SECONDS)).isoformat()
+    assert _snapshot_cadence_overdue(at_edge, now) is True
+
+
+@pytest.mark.asyncio
+async def test_overdue_snapshot_cadence_raises_operator_alert(db_session, mocker):
+    """A project whose daily snapshot cadence has lapsed raises an operator alert."""
+    mocker.patch("app.alert_policy.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project(design_doc=_overdue_container(days_ago=3))
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fired = await maybe_alert_overdue_snapshot_cadence(db_session, project.id)
+    assert fired is True
+
+    alerts = await _snapshot_cadence_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.WARNING
+    assert "efficiency snapshot overdue" in alerts[0].title
+    assert "hours" in alerts[0].message
+
+    await db_session.refresh(project)
+    container = await _require_container(db_session, project)
+    assert container[LAST_ALERTED_OVERDUE_CADENCE_KEY] == "overdue"
+
+
+@pytest.mark.asyncio
+async def test_overdue_snapshot_cadence_no_alert_when_recent(db_session, mocker):
+    """A project whose last daily snapshot is recent does not alert."""
+    mocker.patch("app.alert_policy.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project(design_doc=_overdue_container(days_ago=0.2))
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fired = await maybe_alert_overdue_snapshot_cadence(db_session, project.id)
+    assert fired is None
+    assert await _snapshot_cadence_alerts(db_session, project.id) == []
+    # Marker re-arms to healthy so a future lapse can fire.
+    await db_session.refresh(project)
+    container = await _require_container(db_session, project)
+    assert container[LAST_ALERTED_OVERDUE_CADENCE_KEY] == "healthy"
+
+
+@pytest.mark.asyncio
+async def test_overdue_snapshot_cadence_no_alert_without_baseline(db_session, mocker):
+    """A project that never wrote a snapshot (no last_run_at) is not overdue."""
+    mocker.patch("app.alert_policy.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fired = await maybe_alert_overdue_snapshot_cadence(db_session, project.id)
+    assert fired is None
+    assert await _snapshot_cadence_alerts(db_session, project.id) == []
+
+
+@pytest.mark.asyncio
+async def test_overdue_snapshot_cadence_dedups_on_stable_overdue(db_session, mocker):
+    """A second hourly tick while still overdue does not fire a second alert."""
+    mocker.patch("app.alert_policy.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project(design_doc=_overdue_container(days_ago=3))
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    first = await maybe_alert_overdue_snapshot_cadence(db_session, project.id)
+    second = await maybe_alert_overdue_snapshot_cadence(db_session, project.id)
+    assert first is True
+    assert second is None  # deduped on the persisted marker
+    assert len(await _snapshot_cadence_alerts(db_session, project.id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_overdue_snapshot_cadence_reaarms_after_recovery(db_session, mocker):
+    """A fresh snapshot flips the marker back to healthy; a later lapse fires again."""
+    mocker.patch("app.alert_policy.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project(design_doc=_overdue_container(days_ago=3))
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    first = await maybe_alert_overdue_snapshot_cadence(db_session, project.id)
+    assert first is True
+    await db_session.refresh(project)
+    assert (
+        await _require_container(db_session, project)
+    )[LAST_ALERTED_OVERDUE_CADENCE_KEY] == "overdue"
+
+    # A snapshot lands (recovery): last_run_at refreshes, marker re-arms.
+    await _set_container_last_run(
+        db_session, project.id, (_utcnow() - timedelta(hours=3)).isoformat()
+    )
+    fired_recovered = await maybe_alert_overdue_snapshot_cadence(db_session, project.id)
+    assert fired_recovered is None
+    await db_session.refresh(project)
+    assert (
+        await _require_container(db_session, project)
+    )[LAST_ALERTED_OVERDUE_CADENCE_KEY] == "healthy"
+
+    # The cadence lapses again -> marker transitions to overdue once more.
+    await _set_container_last_run(
+        db_session, project.id, (_utcnow() - timedelta(days=5)).isoformat()
+    )
+    await maybe_alert_overdue_snapshot_cadence(db_session, project.id)
+    await db_session.refresh(project)
+    assert (
+        await _require_container(db_session, project)
+    )[LAST_ALERTED_OVERDUE_CADENCE_KEY] == "overdue"
+
+
 def _make_timeout_task(project_id, subtype: str):
     """A terminal FAILED task with persisted AGENT_TIMEOUT ground truth + started_at."""
     from app.failure_classification import AGENT_TIMEOUT
@@ -5456,11 +5651,12 @@ def test_playbook_guidance_trigger_bullets_condensed():
     """PLAYBOOK_GUIDANCE must stay condensed (no trigger-bullet re-expansion).
 
     PR #11033 condensed the 10 original trigger bullets to 5; the guidance was
-    later condensed further into a single-paragraph "**When to save:**" form
-    (mirrored by the agent-side guard in prompt.test.ts, which caps the
-    constant under 800 bytes). This test guards against re-expansion of the
-    prompt-budget-sensitive constant from the backend side, using the same
-    template-literal extraction the prompt_static_bytes axis uses.
+    later condensed further into a single-paragraph "Before completing, save
+    concise reusable facts..." form (mirrored by the agent-side guard in
+    prompt.test.ts, which caps the constant under 800 bytes). This test
+    guards against re-expansion of the prompt-budget-sensitive constant from
+    the backend side, using the same template-literal extraction the
+    prompt_static_bytes axis uses.
     """
     import os
 
@@ -5480,10 +5676,10 @@ def test_playbook_guidance_trigger_bullets_condensed():
     assert length is not None, (
         "PLAYBOOK_GUIDANCE template literal not found in prompt.ts"
     )
-    assert "**When to save:**" in src, (
-        "PLAYBOOK_GUIDANCE condensed '**When to save:**' paragraph not found "
-        "in prompt.ts — the trigger guidance was removed or restructured; "
-        "update this guard alongside it."
+    assert "Before completing, save concise reusable facts" in src, (
+        "PLAYBOOK_GUIDANCE condensed 'Before completing, save concise "
+        "reusable facts' paragraph not found in prompt.ts — the trigger "
+        "guidance was removed or restructured; update this guard alongside it."
     )
     assert length < 800, (
         f"PLAYBOOK_GUIDANCE is {length} bytes (max 800, matching the agent-side "
@@ -11341,6 +11537,151 @@ async def test_compute_current_axes_exposes_cohort_coverage(db_session):
     # With only 2 tasks in the window, the cap is not reached.
     assert axes["cohort_task_count"] == 2
     assert axes["cohort_capped"] is False
+    # Uncapped cohort: effective window equals the full requested span (both
+    # tasks are in-window) and cohort_requested_window_days is reported.
+    assert axes["cohort_requested_window_days"] == 7
+    assert axes["cohort_effective_window_start"] is not None
+    assert axes["cohort_effective_window_end"] is not None
+
+
+@pytest.mark.asyncio
+async def test_capped_cohort_reports_provenance_and_effective_window(db_session, monkeypatch):
+    """When the cohort hits the row cap, cohort_capped must be True and the
+    reported effective window must be the actual (narrower) span of the
+    loaded rows, not the full requested _AXIS_WINDOW_DAYS window.
+    """
+    import app.efficiency_snapshot as efficiency_snapshot_module
+
+    # Shrink the cap so three tasks trip it without seeding 5000 rows.
+    monkeypatch.setattr(efficiency_snapshot_module, "_COHORT_CAP", 2)
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    # Three tasks spread across the requested window: oldest is 6 days back,
+    # middle 3 days back, newest just now. With the cap at 2, only the two
+    # most-recently-updated tasks (middle, newest) are loaded.
+    oldest = _make_efficient_task(project.id, updated_at=now - timedelta(days=6))
+    middle = _make_efficient_task(project.id, updated_at=now - timedelta(days=3))
+    newest = _make_efficient_task(project.id, updated_at=now)
+    db_session.add(oldest)
+    db_session.add(middle)
+    db_session.add(newest)
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+
+    assert axes["cohort_task_count"] == 2, (
+        "cap of 2 must limit the loaded cohort to the 2 most-recently-updated tasks"
+    )
+    assert axes["cohort_capped"] is True
+    assert axes["cohort_requested_window_days"] == 7
+
+    effective_start = datetime.fromisoformat(axes["cohort_effective_window_start"])
+    effective_end = datetime.fromisoformat(axes["cohort_effective_window_end"])
+
+    # The effective window must reflect only the loaded (middle, newest)
+    # rows -- NOT the oldest task, which the cap excluded.
+    oldest_updated_at = oldest.updated_at
+    if oldest_updated_at.tzinfo is None:
+        oldest_updated_at = oldest_updated_at.replace(tzinfo=effective_start.tzinfo)
+    assert effective_start > oldest_updated_at, (
+        "capped effective window must NOT reach back to the excluded oldest task"
+    )
+    assert (effective_end - effective_start) < timedelta(days=6), (
+        "capped effective window must be narrower than the full requested span"
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_efficiency_snapshot_exposes_cohort_provenance(
+    client: AsyncClient, db_session
+):
+    """GET /api/agent/projects/{id}/efficiency-snapshot surfaces the cohort
+    coverage fields (cohort_task_count + cohort_capped) on the agent-facing
+    payload, so a reader can see whether metrics describe the full window or a
+    capped sample."""
+    from app.auth import create_agent_token
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # A QUEUED (non-terminal) task provides a valid agent token without joining
+    # the terminal cohort itself.
+    token_task = make_task(project_id=project.id)
+    db_session.add(token_task)
+    db_session.add(_make_efficient_task(project.id))
+    db_session.add(_make_efficient_task(project.id, vm_warm_start=True))
+    await db_session.commit()
+    await db_session.refresh(token_task)
+
+    token = create_agent_token(str(token_task.id), "agent-vm-cohort-read")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/efficiency-snapshot",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+
+    # Uncapped cohort: two terminal tasks in the window, flag reads False.
+    assert "cohort_task_count" in data, (
+        "agent efficiency-snapshot must include cohort_task_count"
+    )
+    assert "cohort_capped" in data, (
+        "agent efficiency-snapshot must include cohort_capped"
+    )
+    assert isinstance(data["cohort_task_count"], int)
+    assert isinstance(data["cohort_capped"], bool)
+    assert data["cohort_task_count"] == 2
+    assert data["cohort_capped"] is False
+
+
+@pytest.mark.asyncio
+async def test_agent_efficiency_snapshot_cohort_capped_flag(
+    client: AsyncClient, db_session, monkeypatch
+):
+    """When the terminal cohort hits the row cap, the agent-facing
+    efficiency-snapshot payload must report cohort_capped=True so a reader can
+    distinguish a truncated sample from a complete window without summing
+    by_failure_class counts by hand."""
+    import app.efficiency_snapshot as efficiency_snapshot_module
+
+    from app.auth import create_agent_token
+
+    # Shrink the cap so three tasks trip it without seeding 5000 rows.
+    monkeypatch.setattr(efficiency_snapshot_module, "_COHORT_CAP", 2)
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    token_task = make_task(project_id=project.id)
+    db_session.add(token_task)
+    now = _utcnow()
+    db_session.add(_make_efficient_task(project.id, updated_at=now - timedelta(days=6)))
+    db_session.add(_make_efficient_task(project.id, updated_at=now - timedelta(days=3)))
+    db_session.add(_make_efficient_task(project.id, updated_at=now))
+    await db_session.commit()
+    await db_session.refresh(token_task)
+
+    token = create_agent_token(str(token_task.id), "agent-vm-cohort-capped")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/efficiency-snapshot",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+
+    assert data["cohort_task_count"] == 2, (
+        "cap of 2 must limit the loaded cohort to the 2 most-recently-updated tasks"
+    )
+    assert data["cohort_capped"] is True
 
 
 @pytest.mark.asyncio

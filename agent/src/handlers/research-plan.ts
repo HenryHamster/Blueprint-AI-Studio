@@ -1067,7 +1067,7 @@ ${researchEmptyRepoGuidance}
 **If a direction targets something EXISTING** (the design document shows it as partial, functional,
 or mature): your job is to IMPROVE it. Find specific, high-impact changes — missing capabilities,
 broken assumptions, architectural bottlenecks, or small fixes that prevent cascade failures.
-Quality over quantity — 2 real findings beats 10 incremental ones.
+Quality over padding — a real, decision-relevant finding beats a padded one. Do not cap the count at a preset number: output ALL meaningful findings you discover (see SCOPE GUIDANCE). Never inflate with trivial incremental filler, and never withhold a genuine finding to hit a small quota.
 (Note: any entry tagged with a "[reconciled: …]" / "presence_warning" annotation has been
 downgraded to "missing" because its referenced module files are absent on this branch — treat it
 as MISSING to DESIGN, never as something to IMPROVE, and do not confabulate its behavior.)

@@ -1689,6 +1689,177 @@ async def test_digest_direction_progress_no_budget_fields(
 
 
 @pytest.mark.asyncio
+async def test_direction_budget_utilization_includes_llm_spend(
+    client: AsyncClient, db_session
+):
+    """The budget badge counts LLM token spend, not VM seconds only.
+
+    LLM tokens are usually the dominant term, and the per-direction cost path
+    counted none of them: a direction could report "under envelope" while its
+    real bill had blown past it. The direction below burns ~$0.07 of VM and
+    $7.50 of priced Anthropic tokens against a $100 envelope, so utilization
+    must be driven by the LLM term and must be STRICTLY larger than the
+    VM-only figure the old meter produced.
+    """
+    now = _utcnow()
+    budget = 100.0
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-llm",
+                "text": "LLM-heavy direction",
+                "status": "active",
+                "cost_budget_usd": budget,
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="token-heavy",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-llm", "scope": "small"},
+            provider="anthropic",
+            model="claude-opus-4-7",
+            # 1M input @ $5/MTok + 100k output @ $25/MTok = $7.50
+            api_call_summary={
+                "total_input_tokens": 1_000_000,
+                "total_output_tokens": 100_000,
+                "llm_call_count": 9,
+            },
+            vm_provisioned_at=now - timedelta(hours=2),
+            vm_stopped_at=now - timedelta(hours=1),
+            vm_spot=False,
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    dp = response.json()["direction_progress"][0]
+
+    # The LLM term is real and priced.
+    assert dp["lineage_llm_cost_usd"] == pytest.approx(7.50, abs=0.01)
+    assert dp["lineage_llm_unpriced"] is False
+    assert dp["lineage_vm_cost_usd"] > 0
+    assert dp["lineage_task_count"] == 1
+    assert dp["lineage_spend_usd"] == pytest.approx(
+        dp["lineage_vm_cost_usd"] + dp["lineage_llm_cost_usd"], abs=0.02
+    )
+
+    # Utilization is driven by VM + LLM, and is strictly above VM-only.
+    vm_only_pct = round((dp["lineage_vm_cost_usd"] / budget) * 100, 1)
+    assert dp["budget_utilization_pct"] == pytest.approx(
+        (dp["lineage_spend_usd"] / budget) * 100, abs=0.1
+    )
+    assert dp["budget_utilization_pct"] > vm_only_pct
+    assert dp["budget_utilization_pct"] == pytest.approx(7.6, abs=0.15)
+    assert dp["budget_exceeded"] is False
+    assert "llm_tokens" in dp["budget_basis"]
+
+    # The WINDOW badge (estimated_cost_usd) now carries the LLM term too, and
+    # still equals the sum of its own VM/LLM split.
+    assert dp["window_llm_cost_usd"] == pytest.approx(7.50, abs=0.01)
+    assert dp["estimated_cost_usd"] == pytest.approx(
+        dp["window_vm_cost_usd"] + dp["window_llm_cost_usd"], abs=0.02
+    )
+    assert dp["estimated_cost_usd"] > dp["window_vm_cost_usd"]
+
+    # Every cost axis still sums to estimated_cost_usd after the LLM fold.
+    assert round(sum(dp["cost_by_scope"].values()), 2) == dp["estimated_cost_usd"]
+    assert round(sum(dp["cost_by_type"].values()), 2) == dp["estimated_cost_usd"]
+    assert (
+        round(sum(dp["cost_by_provider_model"].values()), 2)
+        == dp["estimated_cost_usd"]
+    )
+    assert dp["cost_by_provider_model"]["anthropic|claude-opus-4-7"] > 7.0
+
+
+@pytest.mark.asyncio
+async def test_direction_budget_utilization_uses_lifetime_lineage_not_window(
+    client: AsyncClient, db_session
+):
+    """The envelope is lifetime, so the badge must divide lifetime spend by it.
+
+    Dividing a ROLLING-WINDOW number by a LIFETIME budget was a category error:
+    spend aged out of the window and utilization silently fell back toward zero.
+    Here all the money was spent 60 days ago — outside the 24h digest window —
+    so window cost is $0 while utilization must still report the real burn.
+    """
+    now = _utcnow()
+    budget = 10.0
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-old",
+                "text": "Long-running direction",
+                "status": "active",
+                "cost_budget_usd": budget,
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Spend that predates the digest window by two months.
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="old-spend",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={"direction_id": "dir-old", "scope": "small"},
+            provider="anthropic",
+            model="claude-opus-4-7",
+            api_call_summary={
+                "total_input_tokens": 1_000_000,
+                "total_output_tokens": 100_000,
+            },
+            created_at=now - timedelta(days=60),
+            vm_provisioned_at=now - timedelta(days=60, hours=1),
+            vm_stopped_at=now - timedelta(days=60),
+            vm_spot=False,
+        )
+    )
+    # A recent, zero-cost task so the direction isn't skipped as quiet.
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="recent-no-vm",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-old", "scope": "small"},
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    dp = response.json()["direction_progress"][0]
+
+    # Nothing at all was spent inside the rolling window.
+    assert dp["estimated_cost_usd"] == 0.0
+    assert dp["window_llm_cost_usd"] == 0.0
+    assert dp["window_vm_cost_usd"] == 0.0
+
+    # ...yet the envelope still sees the lifetime burn.
+    assert dp["lineage_task_count"] == 2
+    assert dp["lineage_spend_usd"] == pytest.approx(7.57, abs=0.05)
+    assert dp["budget_utilization_pct"] == pytest.approx(
+        (dp["lineage_spend_usd"] / budget) * 100, abs=0.1
+    )
+    assert dp["budget_utilization_pct"] > 70
+    assert dp["budget_exceeded"] is False
+    assert dp["budget_basis"].startswith("lifetime_lineage")
+
+
+@pytest.mark.asyncio
 async def test_digest_direction_progress_cost_by_provider_model(
     client: AsyncClient, db_session
 ):

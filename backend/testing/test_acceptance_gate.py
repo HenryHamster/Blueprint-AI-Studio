@@ -70,6 +70,7 @@ def _make_code_task(
     changed_files: list[str] | None = None,
     unverified_reason: str | None = None,
     targeted_green: bool = False,
+    merge_test_block: dict | None = None,
     task_type: str = "create",
 ) -> Task:
     payload: dict = {"type": task_type, "prompt": "do the thing"}
@@ -86,6 +87,13 @@ def _make_code_task(
     elif acceptance_evidence is not None and acceptance_evidence.get("kind") == "named_test":
         # named_test requires verification; set empty review_loop to indicate verified
         context[REVIEW_LOOP_KEY] = {}
+    # The NORMALIZED acceptance-test block the no-CI monitor persists onto
+    # review_loop (orchestrator_ci_monitor writes ci_resolution.acceptance_test_block's
+    # output under this key). ``verify_tests_verdict`` is NOT it — that key holds
+    # the classifier's outcome STRING ("pass"/"fail"/"undetected").
+    if merge_test_block is not None:
+        rl = context.setdefault(REVIEW_LOOP_KEY, {})
+        rl["verify_tests_acceptance_block"] = merge_test_block
     # The no-CI monitor stamps this durable signal when it independently ran the
     # declared acceptance test as a TARGETED run and it exited green. It rides on
     # the same review_loop the merge-verification reason lives on.
@@ -285,11 +293,13 @@ def test_targeted_named_test_execution_earns_proven_under_unverified_merge():
     assert acceptance_blocks_success(stamped) is False
 
 
-def test_targeted_green_but_test_absent_still_fails_closed():
-    # Even with the targeted-green signal, the declared test must be among the
-    # PR's changed files. A targeted-green flag with the test absent (never added
-    # in this PR) still fails closed — the signal relaxes ONLY the full-suite
-    # verification requirement, not the "test was actually added" requirement.
+def test_targeted_green_existing_test_absent_from_diff_earns_proven():
+    # The no-CI monitor physically ran the declared test as a TARGETED run and it
+    # exited green (``acceptance_test_targeted_green=True``) — that is existence
+    # evidence at the merge commit PLUS per-test green proof. A behaviour-
+    # preserving refactor that re-verifies a pre-existing test it did NOT modify
+    # therefore mints machine proof even though the test is absent from the PR's
+    # diff: existence-at-merge replaces presence-in-diff as the anti-fraud guard.
     task = _make_code_task(
         acceptance_evidence={
             "kind": "named_test",
@@ -300,9 +310,19 @@ def test_targeted_green_but_test_absent_still_fails_closed():
         targeted_green=True,
     )
     verdict = evaluate_code_acceptance(task)
-    assert verdict.satisfied is False
-    assert verdict.proven is False
-    assert "not among" in verdict.reason
+    assert verdict.declared is True
+    assert verdict.satisfied is True
+    assert verdict.proven is True
+    assert verdict.kind == "named_test"
+    assert "NOT modified by this PR but EXISTS" in verdict.reason
+    assert verdict.proof_ref == "backend/testing/test_acceptance_gate.py"
+
+    recorded = record_code_acceptance_verdict(task)
+    assert recorded is not None
+    stamped = task.context[CODE_ACCEPTANCE_VERDICT_KEY]
+    assert stamped["satisfied"] is True
+    assert stamped["proven"] is True
+    assert acceptance_is_proven(stamped) is True
 
 
 def test_targeted_green_test_only_diff_still_fails_closed():
@@ -322,6 +342,144 @@ def test_targeted_green_test_only_diff_still_fails_closed():
     assert verdict.satisfied is False
     assert verdict.proven is False
     assert "test-only" in verdict.reason
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# named_test — pre-existing test proven at the merge commit (existence-at-merge)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_existing_test_present_and_green_in_merge_verdict_earns_proven():
+    # A merge-test verdict that records the declared acceptance test as present
+    # AND ran-green is a real merge-test verdict proving the exact claim — even
+    # when the test file is absent from the PR's diff (a behaviour-preserving
+    # refactor re-verifying a pre-existing test) and even when the agent's own
+    # block says ``in_diff: False``. Existence-at-merge replaces presence-in-diff
+    # as the anti-fraud guard for this shape.
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+        },
+        changed_files=["backend/app/widget.py"],  # test file absent from diff
+        unverified_reason=None,  # full-suite merge was verified
+        merge_test_block={
+            "declared": True,
+            "descriptor": "test_widget.py",
+            "present": True,
+            "ran": True,
+            "status": "ran",
+            "passed": True,
+            "in_diff": False,
+        },
+    )
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.declared is True
+    assert verdict.satisfied is True
+    assert verdict.proven is True
+    assert verdict.kind == "named_test"
+    assert "NOT modified by this PR but EXISTS" in verdict.reason
+    assert verdict.proof_ref == "backend/testing/test_widget.py"
+
+    recorded = record_code_acceptance_verdict(task)
+    assert recorded is not None
+    stamped = task.context[CODE_ACCEPTANCE_VERDICT_KEY]
+    assert stamped["satisfied"] is True
+    assert stamped["proven"] is True
+    assert acceptance_is_proven(stamped) is True
+
+
+def test_existing_green_test_ungrounded_seam_fails_closed():
+    # Existence + greenness alone is NOT the anti-fraud guard: a pre-existing
+    # test that ran green but is NOT semantically grounded to any changed
+    # production file is a name-drop of an unrelated test. Still rejected.
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_acceptance_gate.py",
+        },
+        changed_files=["backend/app/widget.py"],  # unrelated seam
+        unverified_reason="no_detectable_test_command",
+        targeted_green=True,  # the test exists and ran green...
+    )
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.satisfied is False
+    assert verdict.proven is False
+    assert "does not semantically correspond" in verdict.reason
+
+    # Classification maps the rejection to the ungrounded-seam cause, not the
+    # missing-from-diff cause — the test WAS found green, it just exercises
+    # nothing the PR changed.
+    recorded = record_code_acceptance_verdict(task)
+    assert recorded is not None
+    assert classify_unsatisfied_reason(task.context[CODE_ACCEPTANCE_VERDICT_KEY]) == (
+        "named_test_ungrounded_seam"
+    )
+
+
+def test_named_test_present_false_in_merge_verdict_still_fails_closed():
+    # A merge-test verdict that records the declared test as ABSENT
+    # (``present=False``) is definitive proof the test does NOT exist at the
+    # merge commit — the anti-fraud guard holds: a declared test that exists
+    # nowhere is never credited, even though a merge verdict was recorded.
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+        },
+        changed_files=["backend/app/widget.py"],
+        unverified_reason=None,
+        merge_test_block={
+            "declared": True,
+            "descriptor": "test_widget.py",
+            "present": False,
+            "ran": False,
+            "status": "absent",
+            "passed": False,
+        },
+    )
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.satisfied is False
+    assert verdict.proven is False
+    assert "not among" in verdict.reason
+
+    recorded = record_code_acceptance_verdict(task)
+    assert recorded is not None
+    assert classify_unsatisfied_reason(task.context[CODE_ACCEPTANCE_VERDICT_KEY]) == (
+        "named_test_missing_from_diff"
+    )
+
+
+def test_existing_green_test_only_diff_still_fails_closed():
+    # Even a pre-existing test confirmed present and green in the merge-test
+    # verdict fails closed when the PR ships NO production seam: a test-only diff
+    # has nothing for the test to exercise.
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+        },
+        changed_files=["backend/testing/test_widget.py"],
+        unverified_reason=None,
+        merge_test_block={
+            "declared": True,
+            "descriptor": "test_widget.py",
+            "present": True,
+            "ran": True,
+            "status": "ran",
+            "passed": True,
+        },
+    )
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.satisfied is False
+    assert verdict.proven is False
+    assert "test-only" in verdict.reason
+
+    recorded = record_code_acceptance_verdict(task)
+    assert recorded is not None
+    assert classify_unsatisfied_reason(task.context[CODE_ACCEPTANCE_VERDICT_KEY]) == (
+        "named_test_test_only_diff"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -754,7 +912,8 @@ def test_named_test_suffix_convention_stem_mismatch_fails_closed():
 
 def test_test_module_stem_covers_suffix_conventions():
     """``_test_module_stem`` extracts the module from every detection-recognized
-    suffix shape, and still fails closed on a non-test basename."""
+    suffix shape, truncates ``test_<module>__<variant>.py`` double-underscore
+    qualifiers to the base module, and still fails closed on a non-test basename."""
     from app.acceptance_gate import _test_module_stem
 
     assert _test_module_stem("local_runner_test.py") == "local_runner"
@@ -764,8 +923,148 @@ def test_test_module_stem_covers_suffix_conventions():
     # Prefix and JS/TS shapes are unchanged.
     assert _test_module_stem("test_acceptance_gate.py") == "acceptance_gate"
     assert _test_module_stem("ComputeJobsPanel.test.tsx") == "ComputeJobsPanel"
+    # The test_<module>__<variant>.py convention truncates at the first ``__``
+    # to the BASE module — the variant qualifier is a focus, not the module.
+    assert (
+        _test_module_stem("test_release_qualifier__sweep_stuck_qualifications.py")
+        == "release_qualifier"
+    )
+    assert _test_module_stem("test_admin_routers__messages.py") == "admin_routers"
+    assert _test_module_stem("test_compute__experiments.py") == "compute"
+    # The suffix convention truncates an equivalent ``__`` qualifier too.
+    assert _test_module_stem("widget__variant_test.py") == "widget"
     # A bare, non-test basename still fails closed (no machine proof granted).
     assert _test_module_stem("random.py") is None
+
+
+def test_variant_suffixed_test_module_grounds_against_base_module():
+    """A ``test_<module>__<variant>.py`` test grounds against its BASE module's
+    changed production seam.
+
+    The repo names focused test modules with a double-underscore variant
+    qualifier (e.g. ``test_release_qualifier__sweep_stuck_qualifications.py``).
+    Before the stem-grounding fix, ``_test_module_stem`` returned the full
+    variant-laden stem, which matched no production basename, so a legitimately
+    declared variant test co-changed with its base module failed closed to
+    satisfied/unproven. The stem now truncates at the first ``__``, so the
+    variant test grounds against the base module and earns machine-checked
+    proof under a real merge verdict.
+    """
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": (
+                "backend/testing/test_release_qualifier__sweep_stuck_qualifications.py"
+            ),
+        },
+        changed_files=[
+            "backend/app/release_qualifier.py",
+            "backend/testing/test_release_qualifier__sweep_stuck_qualifications.py",
+        ],
+        unverified_reason=None,
+    )
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.declared is True
+    assert verdict.satisfied is True
+    assert verdict.proven is True
+    assert "semantically grounded" in verdict.reason
+    assert verdict.proof_ref == (
+        "backend/testing/test_release_qualifier__sweep_stuck_qualifications.py"
+    )
+
+    # The pre-merge structural gate agrees: the variant test is grounded against
+    # the base module before the green run is verified at merge.
+    pre = evaluate_premerge_acceptance(task)
+    assert pre is not None
+    assert pre.satisfied is True
+
+
+def test_variant_suffixed_test_module_stem_mismatch_fails_closed():
+    """A ``test_<module>__<variant>.py`` test whose BASE module matches no
+    changed seam still fails closed — the variant truncation grants proof only
+    on a real base-module (or underscore-family) match, not to any variant-named
+    test with an unrelated production change."""
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": (
+                "backend/testing/test_release_qualifier__sweep_stuck_qualifications.py"
+            ),
+        },
+        changed_files=[
+            "backend/app/acceptance_gate.py",
+            "backend/testing/test_release_qualifier__sweep_stuck_qualifications.py",
+        ],
+        unverified_reason=None,
+    )
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.declared is True
+    assert verdict.satisfied is False
+    assert verdict.proven is False
+    assert "does not semantically correspond" in verdict.reason
+
+
+def test_extracted_submodule_rename_grounds_against_base_and_vice_versa():
+    """Extracted-submodule renames ground in BOTH directions.
+
+    A test named for the surviving base module co-changes with an extracted
+    submodule (``test_release_qualifier.py`` + ``release_qualifier_redrive.py``),
+    and a submodule-named test co-changes with the surviving base
+    (``test_release_qualifier_sweep.py`` + ``release_qualifier.py``). Neither is
+    an exact basename match, so before the underscore-family broadening both
+    failed closed; both now earn machine-checked proof.
+    """
+    base_test = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_release_qualifier.py",
+        },
+        changed_files=[
+            "backend/app/release_qualifier_redrive.py",
+            "backend/testing/test_release_qualifier.py",
+        ],
+        unverified_reason=None,
+    )
+    base_verdict = evaluate_code_acceptance(base_test)
+    assert base_verdict.satisfied is True, (
+        "base-named test must ground against an extracted submodule seam"
+    )
+    assert base_verdict.proven is True
+
+    submodule_test = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_release_qualifier_sweep.py",
+        },
+        changed_files=[
+            "backend/app/release_qualifier.py",
+            "backend/testing/test_release_qualifier_sweep.py",
+        ],
+        unverified_reason=None,
+    )
+    sub_verdict = evaluate_code_acceptance(submodule_test)
+    assert sub_verdict.satisfied is True, (
+        "submodule-named test must ground against the surviving base seam"
+    )
+    assert sub_verdict.proven is True
+
+    # A submodule-named test whose changed seam is in a DIFFERENT family still
+    # fails closed — the family match is strictly an underscore-prefix relation.
+    unrelated = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_release_qualifier_sweep.py",
+        },
+        changed_files=[
+            "backend/app/acceptance_gate.py",
+            "backend/testing/test_release_qualifier_sweep.py",
+        ],
+        unverified_reason=None,
+    )
+    unrelated_verdict = evaluate_code_acceptance(unrelated)
+    assert unrelated_verdict.satisfied is False
+    assert unrelated_verdict.proven is False
+    assert "does not semantically correspond" in unrelated_verdict.reason
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3444,3 +3743,692 @@ async def test_backfill_verdicts_advances_past_unprovable(db_session):
     # Confirm idempotent: a final pass returns 0
     final = await backfill_acceptance_verdicts(db_session)
     assert final == 0, "No false negatives should remain after full sweep"
+
+
+@pytest.mark.asyncio
+async def test_backfill_missing_from_diff_failure_stays_re_examinable(db_session):
+    """A missing-from-diff named_test verdict that STILL cannot be proven (no
+    changed-file provenance has arrived) is stamped with the ordinary one-shot
+    ``_backfill_checked_at`` marker — freeing the LIMIT-200 window — but NOT
+    the terminal marker: the candidate query re-admits the class as soon as
+    provenance arrives, so marking never freezes the verdict. (Pre-fix the
+    class was left unmarked to stay re-examinable, which let permanently
+    unprovable rows occupy the window forever.)"""
+    from datetime import datetime, timezone
+
+    from testing.factories import make_project
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.flush()
+
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+        },
+        changed_files=None,  # provenance has not arrived yet
+    )
+    task.project_id = project.id
+    task.completed_at = datetime(2026, 7, 9, 8, 0, 0, tzinfo=timezone.utc)
+    ctx = dict(task.context or {})
+    ctx[CODE_ACCEPTANCE_VERDICT_KEY] = {
+        "satisfied": False,
+        "proven": False,
+        "kind": "named_test",
+        "reason": (
+            "declared named_test 'backend/testing/test_widget.py' is not among the "
+            "PR's changed files — the claimed test was not added or modified here"
+        ),
+    }
+    task.context = ctx
+    db_session.add(task)
+    await db_session.flush()
+
+    result = await backfill_acceptance_verdicts(db_session)
+    assert result == 0, "no provenance yet — the verdict cannot be upgraded"
+
+    await db_session.refresh(task)
+    assert "_backfill_checked_at" in (task.context or {}), (
+        "an unprovable candidate must be marked so the window advances past it"
+    )
+    assert "_backfill_missing_diff_terminal_at" not in (task.context or {}), (
+        "no provenance was in hand — the verdict is not terminal, and the "
+        "provenance-arrived re-admission clause must still apply later"
+    )
+    recorded = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+    assert recorded is not None
+    assert recorded.get("satisfied") is False, "verdict is untouched until it flips"
+
+    # ── Late-arriving GitHub-verified provenance re-admits DESPITE the marker ─
+    from app.acceptance_gate import stamp_changed_files_signal
+
+    task_ctx = dict(task.context or {})
+    task_ctx.update(
+        stamp_changed_files_signal(
+            ["backend/app/widget.py", "backend/testing/test_widget.py"],
+            github_verified=True,
+        )
+    )
+    task.context = task_ctx
+    db_session.add(task)
+    await db_session.commit()
+
+    result2 = await backfill_acceptance_verdicts(db_session)
+    assert result2 >= 1, (
+        "a marked missing-from-diff verdict must still upgrade once provenance "
+        "arrives — the marker frees the window, it must not freeze the class"
+    )
+
+
+@pytest.mark.asyncio
+async def test_backfill_terminal_marks_unprovable_missing_from_diff_with_provenance(
+    db_session,
+):
+    """A missing-from-diff task whose changed-file provenance IS present but
+    still does not contain the declared test (the test genuinely never shipped)
+    is terminally marked by the sweep and stops consuming the LIMIT-200 window:
+    a second sweep does not re-examine it. Fresh provenance (stamped by a
+    changed-file site, which clears both markers) re-admits it. Regression test
+    for the window-stall: pre-fix such a task was re-selected by every sweep
+    forever, and 200 of them would starve all other candidates permanently."""
+    from datetime import datetime, timezone
+
+    from app.acceptance_gate import stamp_changed_files_signal
+    from testing.factories import make_project
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.flush()
+
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+        },
+        # Provenance present — and the declared test is NOT in it.
+        changed_files=["backend/app/widget.py"],
+    )
+    task.project_id = project.id
+    task.completed_at = datetime(2026, 7, 9, 8, 0, 0, tzinfo=timezone.utc)
+    ctx = dict(task.context or {})
+    ctx["_pr_changed_files_github_verified"] = True
+    ctx[CODE_ACCEPTANCE_VERDICT_KEY] = {
+        "satisfied": False,
+        "proven": False,
+        "kind": "named_test",
+        "reason": (
+            "declared named_test 'backend/testing/test_widget.py' is not among the "
+            "PR's changed files — the claimed test was not added or modified here"
+        ),
+    }
+    task.context = ctx
+    db_session.add(task)
+    await db_session.flush()
+
+    # First sweep: examined, unprovable WITH provenance in hand → terminal.
+    result = await backfill_acceptance_verdicts(db_session)
+    assert result == 0
+    await db_session.refresh(task)
+    checked_ts = (task.context or {}).get("_backfill_checked_at")
+    terminal_ts = (task.context or {}).get("_backfill_missing_diff_terminal_at")
+    assert checked_ts, "unprovable candidate must be marked"
+    assert terminal_ts, (
+        "provenance was present yet re-evaluation failed — the terminal marker "
+        "must be stamped so the task leaves the sweep window"
+    )
+
+    # Second sweep: the task is no longer a candidate. If it were re-selected,
+    # the sweep would re-stamp both markers with a fresh timestamp.
+    result2 = await backfill_acceptance_verdicts(db_session)
+    assert result2 == 0
+    await db_session.refresh(task)
+    assert (task.context or {}).get("_backfill_checked_at") == checked_ts, (
+        "a terminally-marked task must stop consuming the sweep window"
+    )
+    assert (
+        (task.context or {}).get("_backfill_missing_diff_terminal_at")
+        == terminal_ts
+    )
+
+    # Fresh provenance NOW containing the test arrives via a changed-file
+    # stamping site — which clears both markers — and re-admits the task.
+    task_ctx = dict(task.context or {})
+    task_ctx.update(
+        stamp_changed_files_signal(
+            ["backend/app/widget.py", "backend/testing/test_widget.py"],
+            github_verified=True,
+        )
+    )
+    task_ctx.pop("_backfill_checked_at", None)
+    task_ctx.pop("_backfill_missing_diff_terminal_at", None)
+    task.context = task_ctx
+    db_session.add(task)
+    await db_session.commit()
+
+    result3 = await backfill_acceptance_verdicts(db_session)
+    assert result3 >= 1, "cleared markers + fresh provenance must re-admit and heal"
+    await db_session.refresh(task)
+    updated = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+    assert updated is not None
+    assert updated.get("proven") is True
+
+
+@pytest.mark.asyncio
+async def test_backfill_re_examines_pre_marked_missing_from_diff_once_provenance_arrives(
+    db_session,
+):
+    """A missing-from-diff verdict that an OLD sweep already stamped with the
+    one-shot ``_backfill_checked_at`` marker is still re-admitted once
+    provenance arrives. Pre-fix the marker filter would permanently exclude the
+    task — freezing the declared_unsatisfied verdict even after GitHub-verified
+    changed files land. The sweep now ORs in the missing-from-diff reason class,
+    so the marker is no longer a hard exclusion for the exact verdicts this
+    sweep exists to heal."""
+    from datetime import datetime, timezone
+
+    from app.acceptance_gate import stamp_changed_files_signal
+    from testing.factories import make_project
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.flush()
+
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+        },
+        changed_files=None,  # provenance has not arrived yet
+    )
+    task.project_id = project.id
+    task.completed_at = datetime(2026, 7, 9, 8, 0, 0, tzinfo=timezone.utc)
+    ctx = dict(task.context or {})
+    ctx[CODE_ACCEPTANCE_VERDICT_KEY] = {
+        "satisfied": False,
+        "proven": False,
+        "kind": "named_test",
+        "reason": (
+            "declared named_test 'backend/testing/test_widget.py' is not among the "
+            "PR's changed files — the claimed test was not added or modified here"
+        ),
+    }
+    # Simulate the pre-fix sweep: it stamped the one-shot marker on this class.
+    ctx["_backfill_checked_at"] = "2026-07-09T09:00:00+00:00"
+    task.context = ctx
+    db_session.add(task)
+    await db_session.flush()
+
+    # No provenance yet — the MARKED task is still admitted (missing-from-diff
+    # OR clause) but cannot flip.
+    result = await backfill_acceptance_verdicts(db_session)
+    assert result == 0, "no provenance yet — the verdict cannot be upgraded"
+    await db_session.refresh(task)
+    assert (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY, {}).get(
+        "satisfied"
+    ) is False
+
+    # ── Late-arriving GitHub-verified provenance ──────────────────────────
+    task_ctx = dict(task.context or {})
+    task_ctx.update(
+        stamp_changed_files_signal(
+            ["backend/app/widget.py", "backend/testing/test_widget.py"],
+            github_verified=True,
+        )
+    )
+    task.context = task_ctx
+    db_session.add(task)
+    await db_session.commit()
+
+    result2 = await backfill_acceptance_verdicts(db_session)
+    assert result2 >= 1, (
+        "a pre-fix-marked missing-from-diff verdict must upgrade once "
+        "provenance arrives"
+    )
+
+    await db_session.refresh(task)
+    updated = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+    assert updated is not None
+    assert updated.get("satisfied") is True
+    assert updated.get("proven") is True, "own GitHub-verified diff earns machine proof"
+
+
+@pytest.mark.asyncio
+async def test_backfill_acceptance_verdicts_heals_missing_from_diff_with_verified_provenance(
+    db_session,
+):
+    """A missing-from-diff verdict is healed to proven=True by the backfill once
+    GitHub-verified changed files arrive on the task's own context (the ordinary
+    PR-owning task case). The first sweep marks the task (freeing the window);
+    the provenance-arrived re-admission clause brings it back for the second."""
+    from datetime import datetime, timezone
+
+    from app.acceptance_gate import stamp_changed_files_signal
+    from testing.factories import make_project
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.flush()
+
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+        },
+        changed_files=None,
+    )
+    task.project_id = project.id
+    task.completed_at = datetime(2026, 7, 9, 8, 0, 0, tzinfo=timezone.utc)
+    ctx = dict(task.context or {})
+    ctx[CODE_ACCEPTANCE_VERDICT_KEY] = {
+        "satisfied": False,
+        "proven": False,
+        "kind": "named_test",
+        "reason": (
+            "declared named_test 'backend/testing/test_widget.py' is not among the "
+            "PR's changed files — the claimed test was not added or modified here"
+        ),
+    }
+    task.context = ctx
+    db_session.add(task)
+    await db_session.flush()
+
+    # First sweep: no provenance, cannot prove — marked (non-terminally) so
+    # the window advances past it until provenance arrives.
+    result = await backfill_acceptance_verdicts(db_session)
+    assert result == 0
+    await db_session.refresh(task)
+    assert "_backfill_checked_at" in (task.context or {})
+    assert "_backfill_missing_diff_terminal_at" not in (task.context or {})
+
+    # ── Late-arriving GitHub-verified provenance ──────────────────────────
+    task_ctx = dict(task.context or {})
+    task_ctx.update(
+        stamp_changed_files_signal(
+            ["backend/app/widget.py", "backend/testing/test_widget.py"],
+            github_verified=True,
+        )
+    )
+    task.context = task_ctx
+    db_session.add(task)
+    await db_session.commit()
+
+    result2 = await backfill_acceptance_verdicts(db_session)
+    assert result2 >= 1, "missing-from-diff verdict should upgrade once provenance arrives"
+
+    await db_session.refresh(task)
+    updated = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+    assert updated is not None
+    assert updated.get("satisfied") is True
+    assert updated.get("proven") is True, "own GitHub-verified diff earns machine proof"
+    assert updated.get("backfilled") is True
+
+
+@pytest.mark.asyncio
+async def test_backfill_acceptance_verdicts_flips_missing_from_diff_to_satisfied_unproven(
+    db_session,
+):
+    """A rollup child's missing-from-diff verdict flips to satisfied_unproven
+    (a SOFT upgrade) once parent-derived changed files arrive. Parent-derived
+    credit is capped below machine proof, so the verdict moves out of
+    declared_unsatisfied into the acceptance window's verified numerator without
+    minting a proven row."""
+    from datetime import datetime, timezone
+
+    from app.acceptance_gate import stamp_parent_derived_changed_files_signal
+    from testing.factories import make_project
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.flush()
+
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+        },
+        changed_files=None,
+    )
+    task.project_id = project.id
+    task.completed_at = datetime(2026, 7, 9, 8, 0, 0, tzinfo=timezone.utc)
+    ctx = dict(task.context or {})
+    ctx[CODE_ACCEPTANCE_VERDICT_KEY] = {
+        "satisfied": False,
+        "proven": False,
+        "kind": "named_test",
+        "reason": (
+            "declared named_test 'backend/testing/test_widget.py' is not among the "
+            "PR's changed files — the claimed test was not added or modified here"
+        ),
+    }
+    task.context = ctx
+    db_session.add(task)
+    await db_session.flush()
+
+    # Parent-derived union diff arrives (rollup child inherits the parent's list).
+    task_ctx = dict(task.context or {})
+    task_ctx.update(
+        stamp_parent_derived_changed_files_signal(
+            ["backend/app/widget.py", "backend/testing/test_widget.py"],
+        )
+    )
+    task.context = task_ctx
+    db_session.add(task)
+    await db_session.commit()
+
+    result = await backfill_acceptance_verdicts(db_session)
+    assert result >= 1, "missing-from-diff verdict should soft-flip to satisfied_unproven"
+
+    await db_session.refresh(task)
+    updated = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+    assert updated is not None
+    assert updated.get("satisfied") is True
+    assert updated.get("proven") is False, (
+        "parent-derived credit is capped at the satisfied/unproven tier"
+    )
+    assert updated.get("backfilled") is True
+    assert classify_merged_acceptance_context(task.context) == "satisfied_unproven"
+
+
+@pytest.mark.asyncio
+async def test_record_code_acceptance_verdict_clears_stale_backfill_marker(db_session):
+    """Re-recording a verdict (new provenance arrived) clears the one-shot
+    ``_backfill_checked_at`` marker so the task re-enters the backfill sweep
+    pool instead of being permanently excluded by the sweep's idempotency
+    filter."""
+    from datetime import datetime, timezone
+
+    from testing.factories import make_project
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.flush()
+
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+        },
+        changed_files=["backend/app/widget.py", "backend/testing/test_widget.py"],
+    )
+    task.project_id = project.id
+    task.completed_at = datetime(2026, 7, 9, 8, 0, 0, tzinfo=timezone.utc)
+    ctx = dict(task.context or {})
+    ctx["_backfill_checked_at"] = "2026-07-09T09:00:00+00:00"
+    ctx["_backfill_missing_diff_terminal_at"] = "2026-07-09T09:00:00+00:00"
+    ctx[CODE_ACCEPTANCE_VERDICT_KEY] = {
+        "satisfied": False,
+        "proven": False,
+        "kind": "named_test",
+        "reason": (
+            "declared named_test 'backend/testing/test_widget.py' is not among the "
+            "PR's changed files — the claimed test was not added or modified here"
+        ),
+    }
+    task.context = ctx
+    db_session.add(task)
+    await db_session.flush()
+
+    record_code_acceptance_verdict(task)
+
+    assert "_backfill_checked_at" not in (task.context or {}), (
+        "a re-recorded verdict must clear the one-shot backfill marker"
+    )
+    assert "_backfill_missing_diff_terminal_at" not in (task.context or {}), (
+        "a re-recorded verdict must clear the terminal missing-from-diff marker"
+    )
+    updated = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+    assert updated is not None
+    assert updated.get("satisfied") is True
+    assert updated.get("proven") is True
+
+
+@pytest.mark.asyncio
+async def test_landed_rollup_child_regrades_after_parent_changed_files_arrive(db_session):
+    """A rollup child whose acceptance verdict was recorded declared_unsatisfied
+    (missing-from-diff) BEFORE the parent's changed files arrived re-grades to
+    satisfied_unproven once the parent's ``_pr_changed_files`` propagate down —
+    even though the child already carries the landed signal.
+
+    Regression test for the frozen-verdict gap: the rollup propagation used to
+    run the changed-file propagation + verdict re-record ONLY inside the
+    ``not has_landed_signal(row)`` branch, so an already-landed child was
+    skipped forever and late-arriving provenance could never flip it.
+    """
+    from app.acceptance_gate import (
+        PARENT_DERIVED_CHANGED_FILES_KEY,
+        stamp_changed_files_signal,
+    )
+    from app.landed_signal import has_landed_signal
+    from app.rollup_management import (
+        _propagate_landed_to_staging_merged_descendants,
+    )
+    from testing.factories import make_project
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.flush()
+
+    # Rollup parent: landed on integration, but its changed-file list arrives LATER.
+    parent = Task(
+        project_id=project.id,
+        title="rollup parent",
+        payloads=[{"type": "research", "prompt": "plan the work"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True, "landed_on_integration": True},
+    )
+    db_session.add(parent)
+    await db_session.flush()
+
+    # Child create task that merged via the parent's staging branch. It never
+    # owns a PR, so without the parent's files its declared named_test cannot be
+    # located in any diff.
+    child = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+        },
+        changed_files=None,
+    )
+    child.project_id = project.id
+    child.parent_task_id = parent.id
+    child.context = {
+        "pr_merged": True,
+        "landed_on_integration": False,
+        "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+    }
+    db_session.add(child)
+    await db_session.flush()
+
+    # First propagation: parent has NO changed files → child lands but its verdict
+    # is frozen at declared_unsatisfied (missing-from-diff).
+    stamped = await _propagate_landed_to_staging_merged_descendants(
+        parent.id, db_session
+    )
+    await db_session.commit()
+    assert child.id in {t.id for t in stamped}
+
+    await db_session.refresh(child)
+    assert has_landed_signal(child)
+    recorded = (child.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+    assert recorded is not None
+    assert recorded.get("satisfied") is False
+    assert "is not among the PR's changed files" in (recorded.get("reason") or "")
+
+    # ── Late arrival: the parent's GitHub-verified changed files land. ─────
+    parent_ctx = dict(parent.context or {})
+    parent_ctx.update(
+        stamp_changed_files_signal(
+            ["backend/app/widget.py", "backend/testing/test_widget.py"],
+            github_verified=True,
+        )
+    )
+    parent.context = parent_ctx
+    db_session.add(parent)
+    await db_session.commit()
+
+    # Second propagation: the child is ALREADY landed, but the changed-file
+    # propagation must still reach it and re-record its verdict.
+    again = await _propagate_landed_to_staging_merged_descendants(
+        parent.id, db_session
+    )
+    await db_session.commit()
+    assert again == [], "no NEWLY-landed descendants — the child was already landed"
+
+    await db_session.refresh(child)
+    child_ctx = child.context or {}
+    assert child_ctx.get("_pr_changed_files") == [
+        "backend/app/widget.py",
+        "backend/testing/test_widget.py",
+    ]
+    assert child_ctx.get(PARENT_DERIVED_CHANGED_FILES_KEY) is True
+    # The parent's union diff is deliberately NOT marked github-verified on a child.
+    assert "_pr_changed_files_github_verified" not in child_ctx
+
+    # The frozen verdict flipped: declared_unsatisfied -> satisfied_unproven.
+    re_recorded = child_ctx.get(CODE_ACCEPTANCE_VERDICT_KEY)
+    assert re_recorded is not None
+    assert re_recorded.get("satisfied") is True
+    assert re_recorded.get("proven") is False, (
+        "parent-derived credit is capped below machine proof"
+    )
+    assert classify_merged_acceptance_context(child_ctx) == "satisfied_unproven"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Writer/reader contract for the merge-time acceptance-test evidence
+#
+# Both evidence paths this gate reads were once dead against the real writer:
+# the normalized block had NO writer at all, and the targeted-green stamp was
+# withheld for exactly the not-in-diff shape the gate wants to credit. These
+# tests bind the reader to the writer so neither can silently go dead again.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_merge_acceptance_block_reads_the_key_the_monitor_writes():
+    """The gate reads the SAME review_loop key orchestrator_ci_monitor writes."""
+    import inspect
+
+    from app import orchestrator_ci_monitor
+    from app.acceptance_gate import (
+        MERGE_ACCEPTANCE_BLOCK_KEY,
+        _merge_acceptance_test_block,
+    )
+
+    src = inspect.getsource(orchestrator_ci_monitor)
+    assert f'ci_loop["{MERGE_ACCEPTANCE_BLOCK_KEY}"]' in src, (
+        f"no writer for review_loop[{MERGE_ACCEPTANCE_BLOCK_KEY!r}] in "
+        "orchestrator_ci_monitor — the gate's merge-block evidence path is dead"
+    )
+
+    block = {
+        "declared": True,
+        "descriptor": "the seam test",
+        "present": True,
+        "ran": True,
+        "status": "ran",
+        "passed": True,
+    }
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "testing/test_seam.py",
+            "test_id": "test_x",
+        },
+        merge_test_block=block,
+    )
+    assert _merge_acceptance_test_block(task) == block
+    # The outcome STRING the monitor also stores must never be mistaken for it.
+    task.context[REVIEW_LOOP_KEY]["verify_tests_verdict"] = "pass"
+    assert _merge_acceptance_test_block(task) == block
+    # Defensive: absent / malformed → None (legacy tasks fall back to the stamp).
+    del task.context[REVIEW_LOOP_KEY][MERGE_ACCEPTANCE_BLOCK_KEY]
+    assert _merge_acceptance_test_block(task) is None
+    task.context[REVIEW_LOOP_KEY][MERGE_ACCEPTANCE_BLOCK_KEY] = "not a dict"
+    assert _merge_acceptance_test_block(task) is None
+
+
+def test_not_in_diff_green_run_flows_writer_to_gate_as_proven():
+    """End-to-end: a pre-existing test run green with in_diff=False now earns
+    proven — the exact behaviour-preserving-refactor case the gate must credit.
+
+    Exercises the real writer predicate (``acceptance_test_is_green``) rather than
+    hand-stamping the signal, so a re-introduced ``in_diff`` short-circuit in
+    ci_resolution turns this red instead of passing on a fabricated stamp.
+    """
+    from app import ci_resolution
+    from app.acceptance_gate import (
+        _acceptance_test_exists_at_merge,
+        _acceptance_test_ran_green_at_merge,
+        _evaluate_named_test,
+    )
+
+    verdict = {
+        "detected": True,
+        "passed": True,
+        "acceptanceTest": {
+            "declared": True,
+            "descriptor": "the seam test",
+            "selector": "testing/test_seam.py::test_x",
+            "present": True,
+            "ran": True,
+            "status": "ran",
+            "passed": True,
+            "in_diff": False,
+        },
+    }
+    # 1. The merge gate does not block it pre-merge.
+    assert ci_resolution.classify_merge_test_verdict(verdict)[0] == "pass"
+    # 2. The writer mints the targeted-green signal for it.
+    accept_block = ci_resolution.acceptance_test_block(verdict)
+    assert ci_resolution.acceptance_test_is_green(accept_block) is True
+
+    # 3. Replay what orchestrator_ci_monitor persists onto review_loop.
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "testing/test_seam.py",
+            "test_id": "test_x",
+        },
+        changed_files=["app/seam.py"],  # production change, test NOT in diff
+        targeted_green=True,
+        merge_test_block=accept_block,
+    )
+    assert _acceptance_test_exists_at_merge(task) is True
+    assert _acceptance_test_ran_green_at_merge(task) is True
+
+    # 4. The gate credits it as PROVEN.
+    verdict_out = _evaluate_named_test(
+        AcceptanceEvidence(
+            kind="named_test", test_path="testing/test_seam.py", test_id="test_x"
+        ),
+        ["app/seam.py"],
+        verified=False,
+        targeted_green=True,
+        test_exists=True,
+        ran_green=True,
+    )
+    assert verdict_out.satisfied is True
+    assert verdict_out.proven is True, (
+        f"not-in-diff green test still not credited: {verdict_out.reason}"
+    )
+
+
+def test_name_dropped_test_with_no_existence_evidence_still_hard_fails():
+    """The anti-fraud guard survives: a declared test absent from the diff AND
+    with no existence/green evidence is still a hard fail."""
+    from app.acceptance_gate import _evaluate_named_test
+
+    verdict_out = _evaluate_named_test(
+        AcceptanceEvidence(
+            kind="named_test", test_path="testing/test_nowhere.py"
+        ),
+        ["app/seam.py"],
+        verified=True,
+        targeted_green=False,
+        test_exists=False,
+        ran_green=False,
+    )
+    assert verdict_out.proven is False
+    assert "not among the PR's changed files" in verdict_out.reason

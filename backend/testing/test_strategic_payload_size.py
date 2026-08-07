@@ -363,7 +363,6 @@ def test_strategic_payload_total_bytes_under_budget():
                 {"key": "systems/release-pipeline", "summary": "Architecture section summary"},
             ]
         },
-        "vision": {"_strategic_cycle_history": []},
         "effective_purpose": "Blueprint keeps itself ahead of relevant advances with minimal attention",
         "direction_counts": {"active": 4, "max_active": 6},
         "max_active_directions": 6,
@@ -382,3 +381,59 @@ def test_strategic_payload_total_bytes_under_budget():
     assert "problem_model" in packed
     assert packed["problem_model"] == problem_model
     assert "revision_log" not in packed["problem_model"]
+
+
+def test_strategic_payload_drops_legacy_vision_keeps_effective_purpose():
+    """The legacy vision body is no longer shipped in the strategic payload:
+    the section-priority tables carry no vision entry at ANY tier (the critical
+    pin — and its ~37KB eviction of lower-tier sections — is gone from both
+    strategic surfaces), the payload exposes ``effective_purpose`` (the single
+    live intent field) instead, and a caller that still passes a vision body is
+    NOT treated as a critical-tier section — an oversized body drops under
+    budget rather than raising PayloadTooLargeError."""
+    from app.strategic_spawning import (
+        _DESIGN_DOC_UPDATE_SCHEMA,
+        _STRATEGIC_REVIEW_SCHEMA,
+    )
+
+    # No critical-tier vision entry — no vision entry at all — in either
+    # strategic section-priority table.
+    assert "vision" not in _STRATEGIC_REVIEW_SCHEMA
+    assert "vision" not in _DESIGN_DOC_UPDATE_SCHEMA
+
+    pm = _build_problem_model_fixture()
+    problem_model = _agent_view_problem_model(pm)
+    effective_purpose = (
+        "Blueprint keeps itself ahead of relevant advances with minimal attention"
+    )
+    payload = {
+        "type": "strategic_review",
+        "research_mode": "strategic",
+        "problem_model": problem_model,
+        "effective_purpose": effective_purpose,
+        "direction_counts": {"active": 4, "max_active": 6},
+        "max_active_directions": 6,
+        "project_name": "Blueprint",
+        "open_message_count": 0,
+        "open_messages": [],
+        "conversation_thread": [],
+    }
+
+    # The packed strategic payload carries no legacy vision body…
+    packed = pack_under_budget(payload, _STRATEGIC_REVIEW_SCHEMA)
+    assert "vision" not in packed
+    # …while effective_purpose — the single live intent field — still ships.
+    assert packed["effective_purpose"] == effective_purpose
+
+    # A caller that still passes a legacy vision body gets it treated as an
+    # ordinary unregistered low-priority key, never a critical-tier section:
+    # an oversized body drops under budget instead of hard-failing the pack.
+    packed_with_vision = pack_under_budget(
+        {**payload, "vision": {"purpose": "x" * 200_000}},
+        _STRATEGIC_REVIEW_SCHEMA,
+    )
+    assert "vision" not in packed_with_vision, (
+        "the oversized legacy vision body must be dropped as unregistered "
+        "low-priority, never shipped or hard-failed as critical"
+    )
+    assert packed_with_vision["effective_purpose"] == effective_purpose

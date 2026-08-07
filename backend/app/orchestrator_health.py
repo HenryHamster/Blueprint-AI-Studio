@@ -476,6 +476,18 @@ def get_confirmed_down_critical_deps() -> list:
     return [d for d in _CRITICAL_EXTERNAL_DEPS if consec.get(d, 0) >= 2]
 
 
+def _same_base_branch_value(a_base: str | None, b_base: str | None) -> bool:
+    """True when two base-branch strings resolve to the same integration base.
+
+    None/"" both normalize to the project integration branch, so two default-base
+    values count as same-base. This is the value-level core of
+    :func:`_same_base_branch`, shared with the strategist spawn validator so it
+    can compare a would-be task's base against an existing dependency without a
+    Task row for the dependent yet.
+    """
+    return (a_base or None) == (b_base or None)
+
+
 def _same_base_branch(a: Task, b: Task) -> bool:
     """True when two tasks share a base branch.
 
@@ -488,9 +500,10 @@ def _same_base_branch(a: Task, b: Task) -> bool:
     buys no propagation, only serialization. None/"" both normalize to the
     project integration branch, so two default-base tasks count as same-base.
     """
-    a_base = (a.first_payload or {}).get("base_branch") or None
-    b_base = (b.first_payload or {}).get("base_branch") or None
-    return a_base == b_base
+    return _same_base_branch_value(
+        (a.first_payload or {}).get("base_branch"),
+        (b.first_payload or {}).get("base_branch"),
+    )
 
 
 async def _effective_dep_task(dt: Task, session: AsyncSession) -> Task:
@@ -1154,12 +1167,19 @@ async def _check_candidate_task_deps(
             continue
 
         # Same-base (or ordering-only cross-base) COMPLETED dependency. For
-        # create tasks, also require PR to be merged — but only when the dep
-        # shares this task's base (else the merge lands where the dependent can't
-        # see it, so the merge requirement is meaningless).
-        dt_type = (effective_dt.first_payload).get("type", "create")
+        # code-producing tasks (create/fix/refactor/migrate/qa/deps/docs — the
+        # same set is_genuine_code_dependency already treats as capable of a
+        # real code relationship), also require PR to be merged — but only
+        # when the dep shares this task's base (else the merge lands where the
+        # dependent can't see it, so the merge requirement is meaningless).
+        # Pure-sequencing types (research/plan/review/...) never ship a PR, so
+        # they release the dependent on COMPLETED as before. A code-producing
+        # dep that completed with no PR at all (e.g. no diff was needed) is
+        # NOT held forever either: verify_pr_merged treats a missing PR
+        # artifact as "done" (rollup_pr_verification._verify_pr_merged), so
+        # this branch converges instead of deadlocking the dependent.
         if (
-            dt_type in ("create", "")
+            _is_code_producing_task(effective_dt)
             and same_base
             and not await verify_pr_merged(effective_dt, session)
         ):
