@@ -525,6 +525,75 @@ async def test_preflight_auto_bump_records_ledger_bump():
 
 
 @pytest.mark.asyncio
+async def test_preflight_ledger_transient_read_failure_defers():
+    """Ledger read is indeterminate (transient, not a definite 404) → defer.
+
+    Committing a caps bump without mirroring it into the cap-bump-history
+    ledger would leave the deployed backend classifying from a stale history,
+    so a transient ledger read must defer the whole bump — mirroring the
+    caps-file handling (a definite 404 skips the write, an indeterminate read
+    defers).
+    """
+    file_content = "line\n" * 600  # 600 lines, cap 500
+
+    with (
+        patch("app.rollup_size_preflight.get_file_text_at_ref", new_callable=AsyncMock) as mock_fetch,
+        patch("app.rollup_size_preflight.get_pr_files", new_callable=AsyncMock) as mock_pr_files,
+        patch("app.rollup_size_preflight.get_file_content_at_ref", new_callable=AsyncMock) as mock_exists,
+        patch("app.rollup_size_preflight.commit_file_changes", new_callable=AsyncMock) as mock_commit,
+        patch("app.size_limit_policy.parse_bump_history", return_value=[]),
+    ):
+        mock_pr_files.return_value = _pr_files("backend/app/models.py")
+        # caps JSON, models.py content, then ledger text fetch returns None.
+        mock_fetch.side_effect = [_CAPS_JSON, file_content, None]
+        mock_exists.return_value = (None, None)  # tri-state: indeterminate/transient
+
+        verdict, reason = await preflight_rollup_size_caps(
+            "tok", "owner", "repo", 42, "staging/branch-1"
+        )
+
+    assert verdict == "defer"
+    assert reason is not None
+    assert "ledger" in reason
+    mock_commit.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_preflight_ledger_genuinely_absent_skips_ledger_write():
+    """A staging branch with no ledger yet (definite 404) skips the ledger write.
+
+    The pre-feature baseline must still auto-bump the caps file — a repo that
+    has not shipped the ledger feature must not be livelocked on defer — but
+    the commit must not fabricate a ledger either.
+    """
+    file_content = "line\n" * 600  # 600 lines, cap 500
+
+    with (
+        patch("app.rollup_size_preflight.get_file_text_at_ref", new_callable=AsyncMock) as mock_fetch,
+        patch("app.rollup_size_preflight.get_pr_files", new_callable=AsyncMock) as mock_pr_files,
+        patch("app.rollup_size_preflight.get_file_content_at_ref", new_callable=AsyncMock) as mock_exists,
+        patch("app.rollup_size_preflight.commit_file_changes", new_callable=AsyncMock) as mock_commit,
+        patch("app.size_limit_policy.parse_bump_history", return_value=[]),
+    ):
+        mock_pr_files.return_value = _pr_files("backend/app/models.py")
+        # caps JSON, models.py content, then ledger text fetch returns None.
+        mock_fetch.side_effect = [_CAPS_JSON, file_content, None]
+        mock_exists.return_value = (False, None)  # tri-state: unambiguous 404
+
+        verdict, reason = await preflight_rollup_size_caps(
+            "tok", "owner", "repo", 42, "staging/branch-1"
+        )
+
+    assert verdict == "bumped"
+    assert reason is not None
+    mock_commit.assert_awaited_once()
+    from app.rollup_size_preflight import _CAP_BUMP_HISTORY_LEDGER_RELPATH
+
+    upserts = mock_commit.call_args.kwargs["upserts"]
+    assert _CAP_BUMP_HISTORY_LEDGER_RELPATH not in upserts
+
+
+@pytest.mark.asyncio
 async def test_preflight_mixed_chronic_and_routine_holds_without_commit():
     """A rollup with both a chronic and a routine breach must hold — no partial commit."""
     chronic_content = "line\n" * 600   # models.py: 600 lines, cap 500 — chronic

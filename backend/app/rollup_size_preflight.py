@@ -350,7 +350,38 @@ async def preflight_rollup_size_caps(
             "defer",
             f"could not fetch cap-bump-history ledger before auto-bump commit: {exc}",
         )
-    if ledger_text is not None:
+    if ledger_text is None:
+        # ``get_file_text_at_ref`` collapses "file genuinely absent (404)" and
+        # "transient read failure" both to None (its contract: None means
+        # "could not read", never "empty"). Disambiguate with the tri-state
+        # existence probe, mirroring the caps-file handling above: a repo
+        # whose staging branch has no ledger yet (pre-feature baseline) simply
+        # skips the ledger write, while a transient read blip DEFERS the whole
+        # bump so the ledger mirror never goes stale silently — a caps bump
+        # committed without its ledger record would leave production
+        # classifying from a stale history.
+        ledger_exists, _ = await get_file_content_at_ref(
+            _CAP_BUMP_HISTORY_LEDGER_RELPATH,
+            token=gh_token,
+            owner=owner,
+            repo=repo,
+            ref=observed_head_sha,
+            project_id=project_id,
+        )
+        if ledger_exists is False:
+            logger.info(
+                "[ROLLUP-SIZE] PR #%s: no %s at %s — skipping ledger write "
+                "(pre-feature baseline)",
+                rollup_pr_number,
+                _CAP_BUMP_HISTORY_LEDGER_RELPATH,
+                staging_branch,
+            )
+        else:
+            return (
+                "defer",
+                "cap-bump-history ledger present but unreadable at staging branch tip",
+            )
+    else:
         try:
             ledger_data = json.loads(ledger_text)
         except Exception as exc:
