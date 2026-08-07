@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { normalizeProviderTokenUsage } from './usage.js';
+import {
+  normalizeProviderTokenUsage,
+  extractProviderReportedUsage,
+} from './usage.js';
 
 describe('normalizeProviderTokenUsage', () => {
   it('normalizes Anthropic-style cache classes into inclusive input tokens', () => {
@@ -82,5 +85,63 @@ describe('normalizeProviderTokenUsage', () => {
       prompt_cache_hit_tokens: 0,
       prompt_cache_miss_tokens: 0,
     })).toBeUndefined();
+  });
+
+  it('normalizes Codex CLI cached_input_tokens as cache reads', () => {
+    // Codex CLI emits usage as {input_tokens, cached_input_tokens, output_tokens}
+    // where input_tokens is the INCLUSIVE total and cached_input_tokens the
+    // sub-count served from prompt cache. Without handling this shape the cache
+    // hits fall through to the Anthropic branch and are priced as uncached.
+    expect(normalizeProviderTokenUsage({
+      input_tokens: 24_763,
+      cached_input_tokens: 24_448,
+      output_tokens: 122,
+    })).toEqual({
+      inputTokens: 24_763,
+      outputTokens: 122,
+      cacheCreationTokens: 0,
+      cacheReadTokens: 24_448,
+    });
+  });
+
+  it('normalizes zero-codex-cache usage as fully uncached input', () => {
+    expect(normalizeProviderTokenUsage({
+      input_tokens: 500,
+      cached_input_tokens: 0,
+      output_tokens: 80,
+    })).toEqual({
+      inputTokens: 500,
+      outputTokens: 80,
+      cacheCreationTokens: 0,
+      cacheReadTokens: 0,
+    });
+  });
+});
+
+describe('extractProviderReportedUsage', () => {
+  it('preserves the uncached/cache-read split for Codex CLI usage', () => {
+    expect(extractProviderReportedUsage({
+      input_tokens: 24_763,
+      cached_input_tokens: 24_448,
+      output_tokens: 122,
+    })).toEqual({
+      inputTokens: 315,
+      outputTokens: 122,
+      cacheCreationTokens: 0,
+      cacheReadTokens: 24_448,
+    });
+  });
+
+  it('preserves prompt_tokens_details.cached_tokens into cache_read_input_tokens', () => {
+    expect(extractProviderReportedUsage({
+      prompt_tokens: 100,
+      completion_tokens: 40,
+      prompt_tokens_details: { cached_tokens: 25 },
+    })).toEqual({
+      inputTokens: 75,
+      outputTokens: 40,
+      cacheCreationTokens: 0,
+      cacheReadTokens: 25,
+    });
   });
 });

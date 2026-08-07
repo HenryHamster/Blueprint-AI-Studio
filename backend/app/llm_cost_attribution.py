@@ -175,6 +175,14 @@ def _price_llm_attempt(
     elif (provider_key, model_key) in LLM_CACHE_READ_INPUT_PRICING:
         cache_creation_rate = input_rate
         cache_read_rate = LLM_CACHE_READ_INPUT_PRICING[(provider_key, model_key)]
+    elif provider_key == "openai":
+        # Every OpenAI model in LLM_CACHE_READ_INPUT_PRICING is exactly 0.1x its
+        # base input rate. Default unlisted/new OpenAI models to the same 0.1x
+        # relationship so a model added to LLM_TOKEN_PRICING without a cache row
+        # is never silently full-billed for cache reads — the zero-cache-read
+        # defect this capture fix eliminates.
+        cache_creation_rate = input_rate
+        cache_read_rate = input_rate * CACHE_READ_INPUT_RATE_MULTIPLIER
     else:
         cache_creation_rate = input_rate
         cache_read_rate = input_rate
