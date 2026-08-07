@@ -2145,3 +2145,54 @@ def test_audited_surface_seam_is_reachable_via_rq_and_reuses_verdicts():
         is False
     )
     assert rq._promotion_failed_reuse_eligible(None, "x") is False
+
+
+def test_release_qualifier_module_size_cap_is_governing():
+    """release_qualifier.py's size cap is a governing value, not dead headroom.
+
+    The cap was loosened 10300 -> 11900 when the module briefly touched 10309
+    lines (rollup #16848), then d68d3e1 extracted the audited-surface cluster and
+    the module dropped to ~9890 lines while the loosened cap stayed. A cap with
+    ~2k lines of dead headroom cannot fire the guardrail until the file grows to
+    an unreasonable size, so this test pins the module's own declared governing
+    cap and cross-checks the JSON entry against it. The JSON cap and the module
+    constant must stay in sync (change both together), and the headroom must stay
+    a small explicit margin — an over-loosened cap regresses red instead of
+    silently widening the gap.
+    """
+    import json
+    import os
+
+    testing_dir = os.path.dirname(__file__)
+    with open(
+        os.path.join(testing_dir, "module_size_limits.json"), encoding="utf-8"
+    ) as fh:
+        limits = json.load(fh)
+    cap = limits["backend"]["release_qualifier.py"]
+
+    assert cap == rq._MODULE_SIZE_GOVERNANCE_CAP, (
+        f"release_qualifier.py cap {cap} drifted from the module's declared "
+        f"governing cap {rq._MODULE_SIZE_GOVERNANCE_CAP} — keep "
+        "backend/testing/module_size_limits.json and the module constant in sync"
+    )
+
+    with open(
+        os.path.join(testing_dir, "..", "app", "release_qualifier.py"),
+        encoding="utf-8",
+    ) as fh:
+        count = len(fh.readlines())
+
+    assert count <= cap, (
+        f"release_qualifier.py has {count} lines (cap: {cap}) — the module "
+        "exceeds its governing cap"
+    )
+
+    # A governing cap sits close to the actual size. The 11900 value left ~2000
+    # lines of dead headroom (~20% of the module), so the guardrail could not
+    # fire until the file grew to an unreasonable size; require the headroom
+    # under the governing cap to stay a small explicit margin (<10% of the cap).
+    headroom = cap - count
+    assert headroom < cap * 0.10, (
+        f"release_qualifier.py cap {cap} is {headroom} lines above the module's "
+        f"{count} lines — the cap has drifted into dead headroom and cannot govern"
+    )

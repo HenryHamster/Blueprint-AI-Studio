@@ -288,6 +288,14 @@ from app.release_qualifier_audit_surface import (
     compute_audited_surface_hash,  # noqa: F401 — re-exported for callers/tests
 )
 
+# Size governance: this module's cap in backend/testing/module_size_limits.json.
+# Restored to the historically governing 10300 after d68d3e1 extracted the
+# audited-surface cluster (the module now sits ~500 lines under it). Keep the
+# JSON entry in sync with this constant — the governance test in
+# test_release_qualifier.py cross-checks them, so an over-loosened cap regresses
+# red instead of silently widening headroom past the point the guardrail fires.
+_MODULE_SIZE_GOVERNANCE_CAP: int = 10300
+
 # Product probes are opt-in parts of a qualification attempt's decision
 # contract. Keep the set closed: silently dropping an unknown value would let a
 # caller believe an important/costly check ran when the verdict ignored it.
