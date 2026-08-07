@@ -772,3 +772,183 @@ describe('writeDoneHelper — zero-effective-diff guard', () => {
     }
   });
 });
+
+// ── Regression: ./done --warn-out-of-scope cannot bypass a failing ./check ────
+//
+// Root cause (PR #16801 / task b9a990ed): ./done itself does not run ./check.
+// It relies on ./pr open having gated on ./check before writing the PR URL file.
+// Two bypass paths existed in run_pr_gate (the gate inside ./pr open):
+//   1. ./check times out (exit 124/137) → was treated as pass-through (return 0)
+//   2. timeout not installed → GATE_STATUS was set to 127 without running ./check,
+//      then 127 was treated as "unavailable" (return 0)
+// In both cases ./pr open wrote the PR URL file, which ./done reads to proceed.
+// --warn-out-of-scope was then used to complete the submission with a failing check.
+//
+// The fix (in pr-helper.ts run_pr_gate): timeout now blocks; timeout-absent now
+// runs ./check directly without a deadline. These tests assert that ./done (and
+// specifically --warn-out-of-scope) CANNOT complete when no PR URL file exists,
+// which is the state produced by a failing ./pr open gate.
+describe('writeDoneHelper — --warn-out-of-scope does not bypass the check gate', () => {
+  let capturedScripts: Record<string, string> = {};
+
+  beforeEach(() => {
+    capturedScripts = {};
+    vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
+      const [path, content] = args as [string, string];
+      capturedScripts[path] = content;
+    });
+  });
+
+  // Verify the generated script contains the PR URL requirement BEFORE the
+  // --warn-out-of-scope message is posted. This confirms that --warn-out-of-scope
+  // does not create a separate bypass path around the PR URL gate.
+  it('generated ./done places --warn-out-of-scope FEEDBACK post AFTER the PR URL requirement', async () => {
+    const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
+    writeCodeChangeHelpers({
+      taskId: 'woos-static-1',
+      workBranch: 'blueprint/woos-static-1',
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: false,
+    });
+
+    const doneScript = capturedScripts['/tmp/workspace/done'];
+    expect(doneScript).toBeDefined();
+
+    // The PR URL file check must precede the --warn-out-of-scope FEEDBACK post.
+    const prFileIdx = doneScript.indexOf('PR_FILE="/tmp/pr_url_woos-static-1"');
+    const warnPostIdx = doneScript.indexOf('warn-out-of-scope FEEDBACK message post');
+    expect(prFileIdx).toBeGreaterThan(-1);
+    expect(warnPostIdx).toBeGreaterThan(-1);
+    expect(prFileIdx).toBeLessThan(warnPostIdx);
+
+    // The PR URL check exits non-zero when the file is missing — --warn-out-of-scope
+    // cannot proceed past that barrier.
+    const prFileBlock = doneScript.slice(prFileIdx, prFileIdx + 200);
+    expect(prFileBlock).toContain('run ./pr open first');
+    expect(prFileBlock).toContain('exit 2');
+  });
+
+  it('--warn-out-of-scope flag is parsed but does not skip the PR URL file requirement', async () => {
+    const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
+    writeCodeChangeHelpers({
+      taskId: 'woos-static-2',
+      workBranch: 'blueprint/woos-static-2',
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: false,
+    });
+
+    const doneScript = capturedScripts['/tmp/workspace/done'];
+    expect(doneScript).toBeDefined();
+
+    // --warn-out-of-scope is parsed into WARN_OUT_OF_SCOPE_REASON.
+    expect(doneScript).toContain('WARN_OUT_OF_SCOPE_REASON');
+    expect(doneScript).toContain('--warn-out-of-scope');
+
+    // The flag is processed on the --already-done path (which runs before PR URL check)
+    // and on the main path (which runs after PR URL check). Verify that NO branch exists
+    // that sets WARN_OUT_OF_SCOPE_REASON before the PR file gate and then skips it.
+    const alreadyDoneExitIdx = doneScript.indexOf('exit 0\n', doneScript.indexOf('ALREADY_DONE_REASON'));
+    const prFileIdx = doneScript.indexOf('PR_FILE="/tmp/pr_url_woos-static-2"');
+    // The --already-done branch has its own exit; the PR file check must still be
+    // present and must come after that branch exits cleanly.
+    expect(alreadyDoneExitIdx).toBeGreaterThan(-1);
+    expect(prFileIdx).toBeGreaterThan(-1);
+    // The PR file check must occur after the already-done branch.
+    expect(prFileIdx).toBeGreaterThan(alreadyDoneExitIdx);
+  });
+
+  // Execution test: ./done --warn-out-of-scope must block (exit non-zero) when
+  // the PR URL file does not exist. This is the state left by a failing ./pr open
+  // (which happens when ./check fails, times out, or yields no verdict).
+  it.skipIf(process.platform === 'win32')(
+    'blocks (exit 2) when PR URL file is absent — same behavior with or without --warn-out-of-scope',
+    async () => {
+      const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+      const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+      const realOs = await vi.importActual<typeof import('node:os')>('node:os');
+      const realPath = await vi.importActual<typeof import('node:path')>('node:path');
+      const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
+
+      const taskId = `woos-exec-${process.pid}`;
+      writeCodeChangeHelpers({
+        taskId,
+        workBranch: `blueprint/${taskId}`,
+        baseBranch: 'main',
+        owner: 'test-owner',
+        repo: 'test-repo',
+        testsOnMainBranch: false,
+      });
+      const doneScript = capturedScripts['/tmp/workspace/done'];
+      const dir = realFs.mkdtempSync(realPath.join(realOs.tmpdir(), 'done-woos-'));
+      const prUrlFile = `/tmp/pr_url_${taskId}`;
+      try {
+        const scriptPath = realPath.join(dir, 'done');
+        realFs.writeFileSync(scriptPath, doneScript, { mode: 0o755 });
+        // Ensure no PR URL file exists (simulates ./pr open having been blocked by check).
+        try { realFs.unlinkSync(prUrlFile); } catch { /* ok */ }
+
+        const runDone = (extraArgs: string[]): { exit: number; stderr: string } => {
+          let exit = 0;
+          let stderr = '';
+          try {
+            realCp.execFileSync('bash', [scriptPath, ...extraArgs], {
+              stdio: 'pipe',
+              env: {
+                ...process.env,
+                ORCHESTRATOR_URL: 'http://orchestrator.test',
+                AGENT_API_TOKEN: 'test-token',
+              },
+            });
+          } catch (err: unknown) {
+            const e = err as { status?: number; stderr?: Buffer };
+            exit = e.status ?? -1;
+            stderr = e.stderr?.toString() ?? '';
+          }
+          return { exit, stderr };
+        };
+
+        // Without --warn-out-of-scope: must block.
+        const plain = runDone([]);
+        expect(plain.exit).toBe(2);
+        expect(plain.stderr).toContain('run ./pr open first');
+
+        // With --warn-out-of-scope: must ALSO block — the flag does not bypass the
+        // PR URL requirement that ./pr open writes after a passing ./check gate.
+        const reason = 'pre-existing ruff failures in unrelated module — out of scope';
+        const woos = runDone(['--warn-out-of-scope', reason]);
+        expect(woos.exit).toBe(2);
+        expect(woos.stderr).toContain('run ./pr open first');
+
+        // The COMPLETED post must never have been attempted.
+        expect(realFs.existsSync(`/tmp/done_${taskId}`)).toBe(false);
+      } finally {
+        realFs.rmSync(dir, { recursive: true, force: true });
+        try { realFs.unlinkSync(prUrlFile); } catch { /* ok */ }
+        try { realFs.unlinkSync(`/tmp/done_${taskId}`); } catch { /* ok */ }
+      }
+    },
+  );
+
+  it('--warn-out-of-scope reason must be at least 30 chars (existing gate still applies)', async () => {
+    const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
+    writeCodeChangeHelpers({
+      taskId: 'woos-static-3',
+      workBranch: 'blueprint/woos-static-3',
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: false,
+    });
+
+    const doneScript = capturedScripts['/tmp/workspace/done'];
+    expect(doneScript).toBeDefined();
+    // The minimum-length guard is in place — a short reason can't launder a check failure.
+    expect(doneScript).toContain('--warn-out-of-scope reason must be at least 30 chars');
+    expect(doneScript).toContain('lt 30');
+    expect(doneScript).toContain('exit 2');
+  });
+});

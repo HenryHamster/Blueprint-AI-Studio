@@ -267,7 +267,12 @@ run_pr_gate() {
   GATE_COMMAND="./check"
   [ "$#" -gt 0 ] && GATE_COMMAND="./check $*"
   if ! command -v timeout >/dev/null 2>&1; then
-    GATE_STATUS=127
+    # timeout not installed: run ./check directly without a deadline.
+    # A missing verdict (check never ran) must not be treated as a pass;
+    # running the check unbounded ensures it can produce an explicit exit code.
+    echo "[pr] WARNING: timeout not available — running $GATE_COMMAND without deadline" >&2
+    ./check "$@"
+    GATE_STATUS=$?
   else
     echo "[pr] Running bounded local gate: $GATE_COMMAND (deadline \${GATE_TIMEOUT_SECONDS}s)"
     timeout --signal=TERM --kill-after=10s "\${GATE_TIMEOUT_SECONDS}s" ./check "$@"
@@ -279,16 +284,12 @@ run_pr_gate() {
       return 0
       ;;
     124|137)
-      write_gate_receipt timed_out "$GATE_STATUS" true
+      write_gate_receipt timed_out "$GATE_STATUS" false
       echo "[pr] $GATE_COMMAND exceeded its bounded \${GATE_TIMEOUT_SECONDS}s local deadline and was terminated." >&2
-      echo "[pr] Publishing with a timeout receipt; authoritative CI must decide the gate." >&2
-      return 0
-      ;;
-    125|126|127)
-      write_gate_receipt unavailable "$GATE_STATUS" true
-      echo "[pr] The bounded local gate could not execute (exit $GATE_STATUS)." >&2
-      echo "[pr] Publishing with an unavailable receipt; authoritative CI must decide the gate." >&2
-      return 0
+      echo "[pr] ./check did not complete within the time limit — no verdict was produced." >&2
+      echo "[pr] Increase PR_GATE_TIMEOUT_SECONDS, fix the underlying slowness, or resolve" >&2
+      echo "[pr] the failures, then re-run ./pr open." >&2
+      return "$GATE_STATUS"
       ;;
     *)
       write_gate_receipt failed "$GATE_STATUS" false
