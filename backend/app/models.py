@@ -8373,7 +8373,15 @@ class InlineLlmSpendLog(SQLModel, table=True):
     cache_read_input_tokens: int = Field(
         default=0, sa_column=Column(Integer, nullable=False, server_default="0")
     )
-    cost_usd: float = Field(sa_column=Column(Float, nullable=False))
+    # "priced" rows carry a real cost_usd; "unpriced" rows (model has no
+    # LLM_TOKEN_PRICING entry) are recorded with their usage and cost_usd NULL
+    # rather than silently dropped — a consumer summing cost_usd must treat the
+    # total as a FLOOR when any unpriced rows exist.
+    pricing_status: str = Field(
+        default="priced",
+        sa_column=Column(String(16), nullable=False, server_default="priced"),
+    )
+    cost_usd: float | None = Field(sa_column=Column(Float, nullable=True))
 
     __table_args__ = (
         Index(

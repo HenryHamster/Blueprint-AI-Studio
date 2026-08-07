@@ -1335,7 +1335,7 @@ def test_backfill_0707_chains_from_0702_and_declares_kv_keys():
         )
 
 
-def test_schema_head_chains_through_0727_inline_llm_spend_log():
+def test_schema_head_chains_through_0728_inline_llm_pricing_status():
     """Service-credential migrations follow admission removal as one linear chain.
 
     Historical contracts preserved:
@@ -1343,7 +1343,8 @@ def test_schema_head_chains_through_0727_inline_llm_spend_log():
     - 0723 (service credential) revises 0722
     - 0724 (name reuse after revocation) revises 0723
     - 0725 (fleet-sizing reading) revises 0724
-    - 0727 (inline LLM spend log) revises 0725 — current schema head
+    - 0727 (inline LLM spend log) revises 0725
+    - 0728 (inline LLM spend pricing status) revises 0727 — current schema head
     """
     versions_dir = Path(__file__).resolve().parents[1] / "alembic" / "versions"
     operability = (
@@ -1401,6 +1402,9 @@ def test_schema_head_chains_through_0727_inline_llm_spend_log():
     inline_llm_spend_log = (
         versions_dir / "0727_inline_llm_spend_log.py"
     ).read_text()
+    inline_llm_pricing_status = (
+        versions_dir / "0728_inline_llm_spend_pricing_status.py"
+    ).read_text()
     assert parse_revision_identifiers(operability) == ("0708", "0707")
     assert parse_revision_identifiers(claims) == ("0709", "0708")
     assert parse_revision_identifiers(incarnation) == ("0710", "0709")
@@ -1430,10 +1434,13 @@ def test_schema_head_chains_through_0727_inline_llm_spend_log():
     assert parse_revision_identifiers(fleet_sizing_reading) == ("0725", "0724")
     # 0727 chains from 0725: append-only inline LLM spend log table.
     assert parse_revision_identifiers(inline_llm_spend_log) == ("0727", "0725")
+    # 0728 chains from 0727: pricing_status column + nullable cost_usd — the
+    # record-unpriced-spend change that makes the ledger honest about floors.
+    assert parse_revision_identifiers(inline_llm_pricing_status) == ("0728", "0727")
 
     from app.main import EXPECTED_SCHEMA_REVISION
 
-    assert EXPECTED_SCHEMA_REVISION == "0727", (
-        f"Expected EXPECTED_SCHEMA_REVISION == '0727', got {EXPECTED_SCHEMA_REVISION!r}. "
+    assert EXPECTED_SCHEMA_REVISION == "0728", (
+        f"Expected EXPECTED_SCHEMA_REVISION == '0728', got {EXPECTED_SCHEMA_REVISION!r}. "
         "Bump EXPECTED_SCHEMA_REVISION in backend/app/main.py."
     )

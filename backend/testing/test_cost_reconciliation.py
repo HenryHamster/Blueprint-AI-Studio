@@ -534,13 +534,21 @@ def _inline_row(
     provider: str = "deepseek",
     created_at: str = "2026-08-05T12:00:00Z",
     cost_usd: float = 0.25,
+    pricing_status: str | None = None,
 ) -> dict:
-    """One ``inline_llm_spend_log`` row as ``_load_inline_llm_spend_rows`` emits it."""
-    return {
+    """One ``inline_llm_spend_log`` row as ``_load_inline_llm_spend_rows`` emits it.
+
+    ``pricing_status`` is omitted by default to keep legacy fixtures (which
+    predate the column) exercising the absent-key tolerance in the consumer.
+    """
+    row = {
         "provider": provider,
         "created_at": created_at,
         "cost_usd": cost_usd,
     }
+    if pricing_status is not None:
+        row["pricing_status"] = pricing_status
+    return row
 
 
 def test_inline_llm_spend_is_a_separate_bucket_folded_into_the_internal_total():
@@ -633,6 +641,58 @@ def test_inline_llm_spend_filters_by_provider_and_window():
     # The in-window rows are both counted; only the priced one adds cost.
     assert internal["inline_call_count"] == 2
     assert internal["total_cost_usd"] == pytest.approx(1.5, abs=1e-9)
+
+
+def test_inline_llm_spend_unpriced_rows_label_the_total_as_a_floor():
+    """Unpriced inline calls (no pricing row, cost_usd NULL) are counted
+    separately and excluded from inline_cost_usd — a NULL/unknown cost must
+    never silently coerce to zero, which would be the dropped-spend bug wearing
+    a different hat. When any exist, the report flags the total as a FLOOR so a
+    reader never mistakes it for an exact figure."""
+    mod = _load_module()
+    report = mod.reconcile_provider_cost(
+        [],
+        _export([], start="2026-08-05", end="2026-08-05"),
+        "deepseek",
+        start="2026-08-05",
+        end="2026-08-05",
+        pricing=_PRICING,
+        cache_read_pricing=_CACHE_READ_PRICING,
+        inline_llm_rows=[
+            _inline_row(cost_usd=0.5, pricing_status="priced"),
+            _inline_row(cost_usd=None, pricing_status="unpriced"),
+            _inline_row(cost_usd=0.25),  # legacy row: no status key -> priced
+        ],
+    )
+    internal = report["internal"]
+    assert internal["inline_call_count"] == 3
+    assert internal["inline_cost_usd"] == pytest.approx(0.75, abs=1e-9)
+    assert internal["inline_unpriced_call_count"] == 1
+    assert internal["inline_cost_is_floor"] is True
+    assert internal["total_cost_usd"] == pytest.approx(0.75, abs=1e-9)
+
+
+def test_inline_llm_spend_fully_priced_total_is_not_a_floor():
+    """With every inline call priced, the report's floor flag stays False."""
+    mod = _load_module()
+    report = mod.reconcile_provider_cost(
+        [],
+        _export([], start="2026-08-05", end="2026-08-05"),
+        "deepseek",
+        start="2026-08-05",
+        end="2026-08-05",
+        pricing=_PRICING,
+        cache_read_pricing=_CACHE_READ_PRICING,
+        inline_llm_rows=[
+            _inline_row(cost_usd=0.5),
+            _inline_row(cost_usd=0.25, pricing_status="priced"),
+        ],
+    )
+    internal = report["internal"]
+    assert internal["inline_call_count"] == 2
+    assert internal["inline_cost_usd"] == pytest.approx(0.75, abs=1e-9)
+    assert internal["inline_unpriced_call_count"] == 0
+    assert internal["inline_cost_is_floor"] is False
 
 
 def test_inline_llm_spend_provider_match_is_case_insensitive():
