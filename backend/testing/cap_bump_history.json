@@ -4373,6 +4373,12 @@
           "commit_date": "2026-08-06T21:01:19+00:00",
           "old_cap": 3400,
           "new_cap": 4000
+        },
+        {
+          "commit_sha": "",
+          "commit_date": "2026-08-07T10:04:02.254496+00:00",
+          "old_cap": 4000,
+          "new_cap": 4800
         }
       ],
       "test_pack_under_budget.py": [

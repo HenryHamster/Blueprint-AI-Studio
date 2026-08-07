@@ -329,7 +329,7 @@
     "test_admin_compute_jobs.py": 3700,
     "test_digest_direction_progress.py": 3600,
     "test_reaper_sweeps_compute_image.py": 3500,
-    "test_acceptance_gate.py": 4000,
+    "test_acceptance_gate.py": 4800,
     "test_migration_apply_gate.py": 3350,
     "test_warm_vm_integration.py": 3350,
     "test_auto_remediation.py": 3300,

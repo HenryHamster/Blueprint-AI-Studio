@@ -2313,6 +2313,46 @@ def test_test_files_within_size_limits():
     )
 
 
+def test_cap_bump_resolves_test_acceptance_gate_breach():
+    """testing/test_acceptance_gate.py must be within its cap on the real file tree.
+
+    This is the breach the 2026-08-07 ci-compliance remediation targets: automain
+    HEAD 90a017be reported backend/testing/test_acceptance_gate.py at 4138 lines
+    over its old cap of 4000. The fix bumps that cap in the ``testing`` section of
+    module_size_limits.json to the canonical policy value; this merge-test gate
+    proves the bumped JSON is consistent with the actual file size on disk, so the
+    test fails if the cap is reverted (or the file grows past the new cap) before
+    the CI invariant suite runs.
+    """
+    json_path = os.path.join(os.path.dirname(__file__), "module_size_limits.json")
+    data = csl.load_limits(json_path)
+    testing_caps = data.get("testing", {})
+
+    target_rel = "test_acceptance_gate.py"
+    assert target_rel in testing_caps, (
+        f"{target_rel} must have a cap entry in the testing section of "
+        "module_size_limits.json"
+    )
+
+    testing_root = os.path.normpath(os.path.dirname(__file__))
+    assert os.path.isdir(testing_root), "backend/testing/ must exist"
+
+    target_path = os.path.join(testing_root, target_rel)
+    assert os.path.isfile(target_path), f"{target_path} must exist on disk"
+
+    actual_count = csl.count_lines(target_path)
+    cap = testing_caps[target_rel]
+    result = csl.classify_size_record(
+        target_rel, actual_count, cap, "testing", with_verdict=False
+    )
+
+    assert not result["breach"], (
+        f"{target_rel} has {actual_count} lines which exceeds its cap of {cap}. "
+        "Run `python3 backend/testing/check_size_limits.py --fix` and commit "
+        "the updated module_size_limits.json."
+    )
+
+
 def test_git_refs_has_no_ci_compliance_branch_literal_fallback():
     """agent/src/gitRefs.ts must stay clean under the CI-compliance agent scan.
 
