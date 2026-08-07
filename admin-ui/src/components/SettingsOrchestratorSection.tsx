@@ -509,7 +509,7 @@ export function SettingsOrchestratorSection({
           </div>
           <div className="shrink-0">
             <span
-              data-testid="managed-compute-state"
+              data-testid={managedComputeLoading ? undefined : 'managed-compute-state'}
               className={`inline-flex rounded-full border px-2 py-1 text-xs font-medium ${
                 managedComputeEnabled
                   ? 'border-emerald-700/70 bg-emerald-950/50 text-emerald-300'
