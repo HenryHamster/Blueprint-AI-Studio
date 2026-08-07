@@ -8342,3 +8342,43 @@ class ProjectTelemetry(SQLModel, table=True):
         ),
         Index("ix_project_telemetry_project_id", "project_id"),
     )
+
+
+class InlineLlmSpendLog(SQLModel, table=True):
+    """Append-only ledger of backend-initiated inline LLM calls (``app.inline_llm``).
+
+    ``call_inline_llm_json`` calls (compute_qa, compute_analysis, compute_draft,
+    review_categorize) run outside the agent/Task attempt-history path, so their
+    provider-reported usage previously never reached any cost ledger. One row
+    is written per successful call, priced from the provider-reported
+    ``resp.usage`` probe with the same tables ``app.llm_cost_attribution`` uses,
+    so ``cost_reconciliation.py`` can fold this spend into its internal total.
+    """
+
+    __tablename__ = "inline_llm_spend_log"
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    purpose: str = Field(sa_column=Column(String(32), nullable=False))
+    provider: str = Field(sa_column=Column(String(32), nullable=False))
+    model: str = Field(sa_column=Column(String(64), nullable=False))
+    input_tokens: int = Field(sa_column=Column(Integer, nullable=False))
+    output_tokens: int = Field(sa_column=Column(Integer, nullable=False))
+    cache_creation_input_tokens: int = Field(
+        default=0, sa_column=Column(Integer, nullable=False, server_default="0")
+    )
+    cache_read_input_tokens: int = Field(
+        default=0, sa_column=Column(Integer, nullable=False, server_default="0")
+    )
+    cost_usd: float = Field(sa_column=Column(Float, nullable=False))
+
+    __table_args__ = (
+        Index(
+            "ix_inline_llm_spend_log_provider_created_at",
+            "provider",
+            "created_at",
+        ),
+    )

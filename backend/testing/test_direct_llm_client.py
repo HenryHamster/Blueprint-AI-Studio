@@ -232,6 +232,67 @@ def test_normalize_rate_limit_data_with_both_unified_windows():
 
 
 # ---------------------------------------------------------------------------
+# extract_usage_data
+# ---------------------------------------------------------------------------
+
+
+def test_extract_usage_data_reads_real_usage_block():
+    from app.direct_llm_client import extract_usage_data
+
+    resp = SimpleNamespace(
+        usage=SimpleNamespace(
+            input_tokens=120,
+            output_tokens=45,
+            cache_creation_input_tokens=10,
+            cache_read_input_tokens=5,
+        )
+    )
+    result = extract_usage_data(resp)
+
+    assert result == {
+        "input_tokens": 120,
+        "output_tokens": 45,
+        "cache_creation_input_tokens": 10,
+        "cache_read_input_tokens": 5,
+        "reported": True,
+    }
+
+
+def test_extract_usage_data_missing_usage_attribute_returns_none():
+    from app.direct_llm_client import extract_usage_data
+
+    assert extract_usage_data(SimpleNamespace(content=[])) is None
+
+
+def test_extract_usage_data_none_usage_returns_none():
+    from app.direct_llm_client import extract_usage_data
+
+    assert extract_usage_data(SimpleNamespace(usage=None)) is None
+
+
+def test_extract_usage_data_defaults_missing_fields_to_zero():
+    from app.direct_llm_client import extract_usage_data
+
+    resp = SimpleNamespace(usage=SimpleNamespace(input_tokens=7, output_tokens=3))
+    result = extract_usage_data(resp)
+
+    assert result == {
+        "input_tokens": 7,
+        "output_tokens": 3,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "reported": True,
+    }
+
+
+def test_extract_usage_data_non_numeric_field_returns_none():
+    from app.direct_llm_client import extract_usage_data
+
+    resp = SimpleNamespace(usage=SimpleNamespace(input_tokens="not-a-number"))
+    assert extract_usage_data(resp) is None
+
+
+# ---------------------------------------------------------------------------
 # call_direct_llm — rate-limit header extraction
 # ---------------------------------------------------------------------------
 
@@ -256,7 +317,7 @@ async def test_call_direct_llm_returns_rate_limit_data():
     mock_client.messages.create = mock_create
 
     with patch("anthropic.AsyncAnthropic", MagicMock(return_value=mock_client)):
-        text, rate_limit_data = await call_direct_llm(
+        text, rate_limit_data, _usage_data = await call_direct_llm(
             "sk-test",
             messages=[{"role": "user", "content": "hi"}],
             max_tokens=100,
@@ -288,7 +349,7 @@ async def test_call_direct_llm_no_headers_on_mock():
     mock_client.messages.create = mock_create
 
     with patch("anthropic.AsyncAnthropic", MagicMock(return_value=mock_client)):
-        text, rate_limit_data = await call_direct_llm(
+        text, rate_limit_data, _usage_data = await call_direct_llm(
             "sk-test",
             messages=[{"role": "user", "content": "hi"}],
             max_tokens=100,
@@ -315,7 +376,7 @@ async def test_call_direct_llm_returns_text():
     mock_client_cls = MagicMock(return_value=mock_client)
 
     with patch("anthropic.AsyncAnthropic", mock_client_cls):
-        result, _ = await call_direct_llm(
+        result, _, _usage_data = await call_direct_llm(
             "sk-test",
             messages=[{"role": "user", "content": "hi"}],
             max_tokens=100,
@@ -346,7 +407,7 @@ async def test_call_direct_llm_skips_non_text_blocks():
     mock_client.messages.create = mock_create
 
     with patch("anthropic.AsyncAnthropic", MagicMock(return_value=mock_client)):
-        result, _ = await call_direct_llm(
+        result, _, _usage_data = await call_direct_llm(
             "sk-test",
             messages=[{"role": "user", "content": "hi"}],
             max_tokens=100,

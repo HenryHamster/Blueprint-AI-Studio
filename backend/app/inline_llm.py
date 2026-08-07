@@ -18,6 +18,65 @@ from app.shared_state import runtime_config
 
 logger = logging.getLogger(__name__)
 
+
+async def _record_inline_llm_spend(
+    *,
+    purpose: str,
+    provider: str,
+    model: str,
+    usage_data: dict[str, Any] | None,
+) -> None:
+    """Price a provider-reported usage probe and persist one spend-log row.
+
+    Advisory and never-raises: a DB or pricing failure must not break the
+    caller's parsed-JSON result, matching the advisory pattern used elsewhere
+    at this call boundary (e.g. the rate-limit usage probe).
+    """
+    if not usage_data or not usage_data.get("reported"):
+        return
+    try:
+        from app.llm_cost_attribution import LLM_TOKEN_PRICING, _price_llm_attempt
+
+        pricing = LLM_TOKEN_PRICING.get((provider.lower(), model.lower()))
+        if pricing is None:
+            return
+        input_rate, output_rate = pricing
+        input_tokens = int(usage_data.get("input_tokens") or 0)
+        output_tokens = int(usage_data.get("output_tokens") or 0)
+        cache_creation = int(usage_data.get("cache_creation_input_tokens") or 0)
+        cache_read = int(usage_data.get("cache_read_input_tokens") or 0)
+        inclusive_input = input_tokens + cache_creation + cache_read
+        cost_usd = _price_llm_attempt(
+            inclusive_input,
+            output_tokens,
+            cache_creation,
+            cache_read,
+            input_rate,
+            output_rate,
+            provider=provider,
+            model=model,
+        )
+
+        from app.database import closing_session
+        from app.models import InlineLlmSpendLog
+
+        async with closing_session() as session:
+            session.add(
+                InlineLlmSpendLog(
+                    purpose=purpose,
+                    provider=provider,
+                    model=model,
+                    input_tokens=inclusive_input,
+                    output_tokens=output_tokens,
+                    cache_creation_input_tokens=cache_creation,
+                    cache_read_input_tokens=cache_read,
+                    cost_usd=cost_usd,
+                )
+            )
+            await session.commit()
+    except Exception as exc:  # noqa: BLE001 — advisory, never breaks the caller
+        logger.info("[INLINE_LLM] %s spend-log write failed (%s)", purpose, exc)
+
 INLINE_LLM_PURPOSES = (
     "compute_qa",
     "compute_analysis",
@@ -413,7 +472,10 @@ async def call_inline_llm_json(
             # data for the ORG-LEVEL env credential these inline calls use —
             # it cannot be attributed to any MaxPlanAccount, so the account
             # usage meter is fed by the OAuth probe instead (max_plan_pool).
-            raw, _ = await call_direct_llm(
+            # The third element is the provider-reported token usage probe,
+            # captured into inline_llm_spend_log so this spend boundary stops
+            # being dark to cost attribution and reconciliation.
+            raw, _, usage_data = await call_direct_llm(
                 target.api_key,
                 messages=payload_messages,
                 max_tokens=settings.max_tokens,
@@ -421,6 +483,12 @@ async def call_inline_llm_json(
                 model=target.model,
                 system=system,
                 base_url=target.base_url,
+            )
+            await _record_inline_llm_spend(
+                purpose=purpose,
+                provider=target.provider,
+                model=target.model,
+                usage_data=usage_data,
             )
             data = _parse_inline_llm_json(raw)
             if not isinstance(data, dict) or any(

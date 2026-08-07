@@ -1335,14 +1335,15 @@ def test_backfill_0707_chains_from_0702_and_declares_kv_keys():
         )
 
 
-def test_schema_head_chains_through_0725_fleet_sizing_reading():
+def test_schema_head_chains_through_0727_inline_llm_spend_log():
     """Service-credential migrations follow admission removal as one linear chain.
 
     Historical contracts preserved:
     - 0722 (admission removal) revises 0721 (invited role)
     - 0723 (service credential) revises 0722
     - 0724 (name reuse after revocation) revises 0723
-    - 0725 (fleet-sizing reading) revises 0724 — current schema head
+    - 0725 (fleet-sizing reading) revises 0724
+    - 0727 (inline LLM spend log) revises 0725 — current schema head
     """
     versions_dir = Path(__file__).resolve().parents[1] / "alembic" / "versions"
     operability = (
@@ -1397,6 +1398,9 @@ def test_schema_head_chains_through_0725_fleet_sizing_reading():
     fleet_sizing_reading = (
         versions_dir / "0725_fleet_sizing_reading.py"
     ).read_text()
+    inline_llm_spend_log = (
+        versions_dir / "0727_inline_llm_spend_log.py"
+    ).read_text()
     assert parse_revision_identifiers(operability) == ("0708", "0707")
     assert parse_revision_identifiers(claims) == ("0709", "0708")
     assert parse_revision_identifiers(incarnation) == ("0710", "0709")
@@ -1424,10 +1428,12 @@ def test_schema_head_chains_through_0725_fleet_sizing_reading():
     assert parse_revision_identifiers(name_reuse) == ("0724", "0723")
     # 0725 chains from 0724: append-only fleet-sizing reading table.
     assert parse_revision_identifiers(fleet_sizing_reading) == ("0725", "0724")
+    # 0727 chains from 0725: append-only inline LLM spend log table.
+    assert parse_revision_identifiers(inline_llm_spend_log) == ("0727", "0725")
 
     from app.main import EXPECTED_SCHEMA_REVISION
 
-    assert EXPECTED_SCHEMA_REVISION == "0725", (
-        f"Expected EXPECTED_SCHEMA_REVISION == '0725', got {EXPECTED_SCHEMA_REVISION!r}. "
+    assert EXPECTED_SCHEMA_REVISION == "0727", (
+        f"Expected EXPECTED_SCHEMA_REVISION == '0727', got {EXPECTED_SCHEMA_REVISION!r}. "
         "Bump EXPECTED_SCHEMA_REVISION in backend/app/main.py."
     )

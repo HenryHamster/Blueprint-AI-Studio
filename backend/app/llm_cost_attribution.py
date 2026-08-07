@@ -10,13 +10,14 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
+import sqlalchemy
+
 from app.landed_signal import is_merged_completion, is_verified_merge
 from app.models import (
     Task,
     TaskStatus,
     get_task_current_attempt_cache_input_tokens,
     get_task_current_attempt_llm_totals,
-    get_task_total_llm_totals,
     get_task_total_vm_cost_usd,
 )
 
@@ -293,6 +294,84 @@ def _llm_attempt_nonnegative_int(value: Any) -> int:
     return int(value) if isinstance(value, (int, float)) and value >= 0 else 0
 
 
+def _coerce_probe_int(value: Any) -> int:
+    """Coerce a provider-usage token field to int, ``None``/non-numeric -> 0.
+
+    Matches the tolerant coercion ``cost_telemetry_reconciliation`` applied to
+    these fields historically (``int(value or 0)``), so the shared probe helper
+    below is behavior-identical to the module-local one it replaces.
+    """
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _is_provider_probe(usage: Any) -> bool:
+    """True when a ``provider_reported_usage`` dict carries a genuine probe.
+
+    A probe is a non-empty dict that is NOT the explicit not-reported marker
+    (``{"reported": false}``). Dicts carrying ``reported: true`` are probes even
+    when every token count is zero (a real usage block reported zero tokens —
+    distinct from not-reported). Legacy dicts from pre-marker agents have no
+    ``reported`` key and are probes only when at least one token field is
+    non-zero, preserving the historical all-zero skip. ``None`` / ``{}`` is
+    never a probe.
+    """
+    if not isinstance(usage, dict) or not usage:
+        return False
+    if usage.get("reported") is False:
+        return False
+    if usage.get("reported") is True:
+        return True
+    # Legacy dict without a ``reported`` key: preserve the historical rule that
+    # an all-zero dict is treated as "no data" and skipped.
+    return any(
+        _coerce_probe_int(usage.get(key)) > 0
+        for key in (
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        )
+    )
+
+
+def _provider_probe_token_counts(usage: Any) -> tuple[int, int, int, int] | None:
+    """Return ``(inclusive_input, output, cache_creation, cache_read)`` for a
+    genuine provider-reported usage probe, or ``None`` when ``usage`` carries no
+    probe.
+
+    The probe's ``input_tokens`` is the UNCACHED input; the inclusive input
+    total equals ``input_tokens + cache_creation + cache_read`` (matching
+    :func:`reconcile_provider_reported_usage`, which sums all three classes).
+    """
+    if not _is_provider_probe(usage):
+        return None
+    uncached = max(0, _coerce_probe_int(usage.get("input_tokens")))
+    output = max(0, _coerce_probe_int(usage.get("output_tokens")))
+    cc = max(0, _coerce_probe_int(usage.get("cache_creation_input_tokens")))
+    cr = max(0, _coerce_probe_int(usage.get("cache_read_input_tokens")))
+    inclusive = uncached + cc + cr
+    cc, cr = _bounded_cache_input_counts(inclusive, cc, cr)
+    return inclusive, output, cc, cr
+
+
+def _task_provider_reported_usage(task: Task) -> Any:
+    """Safely read ``task.provider_reported_usage`` when the column may be deferred.
+
+    Callers that load Task rows with ``load_only(..., raiseload=True)`` (e.g.
+    efficiency_snapshot) never load this column; a direct attribute access then
+    raises ``InvalidRequestError``. Treat the unloaded column as absent so the
+    pricing path falls back to agent counters, which is the correct behavior for
+    a Task row that was not selected for probe-based pricing.
+    """
+    try:
+        return task.provider_reported_usage
+    except sqlalchemy.exc.InvalidRequestError:
+        return None
+
+
 def _task_llm_attempts(
     task: Task,
 ) -> list[tuple[str | None, str | None, int, int, int, int, int]]:
@@ -302,29 +381,61 @@ def _task_llm_attempts(
     ``input`` is the INCLUSIVE input total; ``cache_creation`` / ``cache_read``
     are provider-reported cache sub-counts (``0`` for attempts that predate cache
     tracking, which makes the pricing helper fall back to the base input rate).
+
+    Pricing source: an attempt's PROVIDER-REPORTED usage probe (the raw provider
+    ``response.usage`` captured at the LLM-call boundary) is the canonical token
+    source whenever a genuine probe exists; the agent-accumulated ``llm_*`` /
+    ``api_call_summary`` counters are the fallback for attempts that carry no
+    probe. ``call_count`` always comes from the agent counters (probes carry no
+    call count).
     """
     history = task.attempt_history or []
     if not history:
-        input_tokens, output_tokens, call_count = get_task_total_llm_totals(task)
-        cache_creation, cache_read = get_task_current_attempt_cache_input_tokens(task)
-        cache_creation, cache_read = _bounded_cache_input_counts(
-            input_tokens, cache_creation, cache_read
-        )
-        return (
-            [
+        # No banked history: the live attempt is priced from its probe when one
+        # exists. Legacy pre-banking retry spend in the banked columns carries no
+        # probe, so it stays a separate row priced from agent counters rather than
+        # being silently merged into (or dropped by) the probe row.
+        banked_input = int(task.llm_input_tokens_banked or 0)
+        banked_output = int(task.llm_output_tokens_banked or 0)
+        banked_calls = int(task.llm_call_count_banked or 0)
+        probe = _provider_probe_token_counts(_task_provider_reported_usage(task))
+        if probe is not None:
+            current_input, current_output, current_cc, current_cr = probe
+            current_calls = get_task_current_attempt_llm_totals(task)[2]
+        else:
+            current_input, current_output, current_calls = (
+                get_task_current_attempt_llm_totals(task)
+            )
+            current_cc, current_cr = get_task_current_attempt_cache_input_tokens(task)
+            current_cc, current_cr = _bounded_cache_input_counts(
+                current_input, current_cc, current_cr
+            )
+        rows = []
+        if banked_input > 0 or banked_output > 0:
+            rows.append(
                 (
                     task.provider,
                     task.model,
-                    input_tokens,
-                    output_tokens,
-                    call_count,
-                    cache_creation,
-                    cache_read,
+                    banked_input,
+                    banked_output,
+                    banked_calls,
+                    0,
+                    0,
                 )
-            ]
-            if input_tokens > 0 or output_tokens > 0
-            else []
-        )
+            )
+        if current_input > 0 or current_output > 0:
+            rows.append(
+                (
+                    task.provider,
+                    task.model,
+                    current_input,
+                    current_output,
+                    current_calls,
+                    current_cc,
+                    current_cr,
+                )
+            )
+        return rows
 
     def _resolve_pair(attempt: dict) -> tuple[str | None, str | None]:
         ap = attempt.get("provider")
@@ -339,32 +450,44 @@ def _task_llm_attempts(
 
     attempts = []
     for attempt in history:
-        input_tokens = _llm_attempt_nonnegative_int(attempt.get("llm_input_tokens"))
-        cache_creation, cache_read = _bounded_cache_input_counts(
-            input_tokens,
-            _llm_attempt_nonnegative_int(
-                attempt.get("llm_cache_creation_input_tokens")
-            ),
-            _llm_attempt_nonnegative_int(attempt.get("llm_cache_read_input_tokens")),
-        )
+        probe = _provider_probe_token_counts(attempt.get("provider_reported_usage"))
+        if probe is not None:
+            input_tokens, output_tokens, cache_creation, cache_read = probe
+            call_count = _llm_attempt_nonnegative_int(attempt.get("llm_call_count"))
+        else:
+            input_tokens = _llm_attempt_nonnegative_int(attempt.get("llm_input_tokens"))
+            output_tokens = _llm_attempt_nonnegative_int(attempt.get("llm_output_tokens"))
+            call_count = _llm_attempt_nonnegative_int(attempt.get("llm_call_count"))
+            cache_creation, cache_read = _bounded_cache_input_counts(
+                input_tokens,
+                _llm_attempt_nonnegative_int(
+                    attempt.get("llm_cache_creation_input_tokens")
+                ),
+                _llm_attempt_nonnegative_int(attempt.get("llm_cache_read_input_tokens")),
+            )
         attempts.append(
             (
                 *_resolve_pair(attempt),
                 input_tokens,
-                _llm_attempt_nonnegative_int(attempt.get("llm_output_tokens")),
-                _llm_attempt_nonnegative_int(attempt.get("llm_call_count")),
+                output_tokens,
+                call_count,
                 cache_creation,
                 cache_read,
             )
         )
-    current_input, current_output, current_calls = get_task_current_attempt_llm_totals(
-        task
-    )
-    if current_input > 0 or current_output > 0:
+    current_probe = _provider_probe_token_counts(_task_provider_reported_usage(task))
+    if current_probe is not None:
+        current_input, current_output, current_cc, current_cr = current_probe
+        current_calls = get_task_current_attempt_llm_totals(task)[2]
+    else:
+        current_input, current_output, current_calls = (
+            get_task_current_attempt_llm_totals(task)
+        )
         current_cc, current_cr = get_task_current_attempt_cache_input_tokens(task)
         current_cc, current_cr = _bounded_cache_input_counts(
             current_input, current_cc, current_cr
         )
+    if current_input > 0 or current_output > 0:
         attempts.append(
             (
                 task.provider,
@@ -377,6 +500,23 @@ def _task_llm_attempts(
             )
         )
     return attempts
+
+
+def _provider_priced_attempt_count(task: Task) -> int:
+    """Count attempts priced from a genuine provider-reported usage probe.
+
+    Mirrors :func:`_task_llm_attempts` source selection: each banked attempt
+    carrying a probe and the live attempt carrying a probe count once. Used by
+    the billing reconciliation so the canonical-vs-fallback split is observable
+    in its report (``internal.provider_priced_attempt_count``).
+    """
+    count = 0
+    for attempt in task.attempt_history or []:
+        if _is_provider_probe(attempt.get("provider_reported_usage")):
+            count += 1
+    if _is_provider_probe(_task_provider_reported_usage(task)):
+        count += 1
+    return count
 
 
 def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:

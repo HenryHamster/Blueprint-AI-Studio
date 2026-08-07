@@ -35,6 +35,7 @@ from typing import Any, Dict, List
 
 from app.llm_cost_attribution import (
     LLM_TOKEN_PRICING,
+    _is_provider_probe,
     _price_llm_attempt,
     _task_llm_attempts,
     compute_llm_cost_breakdown,
@@ -410,36 +411,6 @@ def _coerce_reconcile_int(value: Any) -> int:
         return int(value or 0)
     except (TypeError, ValueError):
         return 0
-
-
-def _is_provider_probe(usage: Any) -> bool:
-    """True when a ``provider_reported_usage`` dict carries a genuine probe.
-
-    A probe is a non-empty dict that is NOT the explicit not-reported marker
-    (``{"reported": false}``). Dicts carrying ``reported: true`` are probes even
-    when every token count is zero (a real usage block reported zero tokens —
-    distinct from not-reported). Legacy dicts from pre-marker agents have no
-    ``reported`` key and are probes only when at least one token field is
-    non-zero, preserving the historical all-zero skip. ``None`` / ``{}`` is
-    never a probe.
-    """
-    if not isinstance(usage, dict) or not usage:
-        return False
-    if usage.get("reported") is False:
-        return False
-    if usage.get("reported") is True:
-        return True
-    # Legacy dict without a ``reported`` key: preserve the historical rule that
-    # an all-zero dict is treated as "no data" and skipped.
-    return any(
-        _coerce_reconcile_int(usage.get(key)) > 0
-        for key in (
-            "input_tokens",
-            "output_tokens",
-            "cache_creation_input_tokens",
-            "cache_read_input_tokens",
-        )
-    )
 
 
 def reconcile_provider_reported_usage(tasks: List[Task]) -> ReconciliationResult:

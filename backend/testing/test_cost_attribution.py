@@ -22,9 +22,24 @@ These tests pin the fix:
    skips the marker (``task_count == 0``) without a false failure. A
    ``reported: true`` all-zero dict is a genuine probe (counted) — the marker
    distinguishes "reported zero tokens" from "not reported at all".
+
+The pricing half (provider truth is canonical):
+4. The ledger prices each attempt from its provider-reported probe when one
+   exists — the agent-accumulated ``api_call_summary`` / ``llm_*`` counters are
+   only the fallback for attempts that carry no probe. A probe with cache
+   sub-counts is priced at the discounted cache classes; a ``reported: false``
+   marker is NOT a probe and falls back to the agent counters.
+5. A task whose agent counters carry zero tokens but whose probe is genuine is
+   STILL priced from the probe (the probe makes it visible to the ledger).
+6. The billing reconciliation surfaces how many attempts were priced from a
+   probe (``internal.provider_priced_attempt_count``), so the canonical-vs-
+   fallback split is observable.
 """
 
 from __future__ import annotations
+
+import importlib.util
+from pathlib import Path
 
 import pytest
 from testing.factories import _utcnow, make_project, make_task
@@ -32,6 +47,18 @@ from testing.factories import _utcnow, make_project, make_task
 from app.auth import create_agent_token
 from app.cost_telemetry_reconciliation import reconcile_provider_reported_usage
 from app.models import TaskStatus, bank_task_current_attempt
+
+
+def _load_cost_reconciliation_module():
+    """Load backend/scripts/cost_reconciliation.py (stdlib-only at import)."""
+    spec = importlib.util.spec_from_file_location(
+        "cost_reconciliation",
+        Path(__file__).parent.parent / "scripts" / "cost_reconciliation.py",
+    )
+    assert spec is not None, "Could not locate scripts/cost_reconciliation.py"
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    return mod
 
 
 # Every provider the runner can invoke. DeepSeek is included because it was the
@@ -371,3 +398,288 @@ def test_reported_true_all_zero_probe_is_counted():
     )
     assert result.provider_reported_within_tolerance is True
     assert result.provider_reported_delta == 0.0
+
+
+# ── 4. Provider truth is the canonical pricing input ──────────────────────
+
+# DeepSeek flash rates, mirrored from LLM_TOKEN_PRICING / LLM_CACHE_READ_INPUT_PRICING.
+_FLASH_INPUT_RATE = 0.14e-6
+_FLASH_OUTPUT_RATE = 0.28e-6
+_FLASH_CACHE_READ_RATE = 0.0028e-6
+
+
+def test_ledger_prices_from_provider_probe_over_agent_counters():
+    """The ledger prices the live attempt from the PROVIDER-REPORTED probe when
+    one exists, not the agent-accumulated ``api_call_summary`` counters. Provider
+    truth is the canonical input; agent counters are only the fallback.
+
+    Probe: 300 uncached + 200 cache-creation + 500 cache-read = 1000 inclusive.
+    Agent counters claim 1500 inclusive + 200 output — must be ignored.
+    Cost = 300 x $0.14/M + 200 x $0.14/M + 500 x $0.0028/M + 100 x $0.28/M.
+    """
+    from app.llm_cost_attribution import compute_llm_cost_breakdown
+
+    task = make_task(
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        api_call_summary=_summary(
+            input_tokens=1500, output_tokens=200, cache_creation=100, cache_read=400
+        ),
+        provider_reported_usage=_probe(
+            input_tokens=300, output_tokens=100, cache_creation=200, cache_read=500
+        ),
+    )
+
+    result = compute_llm_cost_breakdown([task])
+
+    # The probe's inclusive input (300+200+500=1000) wins over the agent's 1500.
+    assert result["totals"]["total_input_tokens"] == 1000
+    assert result["totals"]["total_output_tokens"] == 100
+    assert result["totals"]["total_cache_creation_input_tokens"] == 200
+    assert result["totals"]["total_cache_read_input_tokens"] == 500
+    # Exact cost exercises the discounted deepseek cache-read rate. The
+    # breakdown rounds total_cost_usd to 6 decimals, so round the expectation
+    # to match (9.94e-5 -> 9.9e-5).
+    expected_cost = (
+        300 * _FLASH_INPUT_RATE
+        + 200 * _FLASH_INPUT_RATE
+        + 500 * _FLASH_CACHE_READ_RATE
+        + 100 * _FLASH_OUTPUT_RATE
+    )
+    assert result["totals"]["total_cost_usd"] == pytest.approx(
+        round(expected_cost, 6), abs=1e-12
+    )
+
+
+def test_banked_attempt_probe_prices_from_provider_usage():
+    """A banked attempt in ``attempt_history`` carrying a provider-reported probe
+    prices from the probe, not the agent-side ``llm_*`` snapshot counters."""
+    from app.llm_cost_attribution import _task_llm_attempts, compute_llm_cost_breakdown
+
+    task = make_task(
+        status=TaskStatus.IN_PROGRESS,
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        api_call_summary=None,
+    )
+    task.attempt_history = [
+        {
+            "provider": "deepseek",
+            "model": "deepseek-v4-flash",
+            "llm_input_tokens": 500,
+            "llm_output_tokens": 200,
+            "llm_call_count": 3,
+            "provider_reported_usage": {
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "cache_creation_input_tokens": 20,
+                "cache_read_input_tokens": 30,
+                "reported": True,
+            },
+        }
+    ]
+
+    attempts = _task_llm_attempts(task)
+    assert len(attempts) == 1
+    _provider, _model, inp, out, calls, cc, cr = attempts[0]
+    # Probe inclusive input = 100 + 20 + 30 = 150, NOT the agent-side 500.
+    assert inp == 150
+    assert out == 50
+    assert cc == 20
+    assert cr == 30
+    # call_count always comes from the agent counters (probes carry no calls).
+    assert calls == 3
+
+    result = compute_llm_cost_breakdown([task])
+    assert result["totals"]["total_input_tokens"] == 150
+    assert result["totals"]["total_output_tokens"] == 50
+    assert result["totals"]["total_cache_creation_input_tokens"] == 20
+    assert result["totals"]["total_cache_read_input_tokens"] == 30
+
+
+def test_no_probe_falls_back_to_agent_counters():
+    """Tasks without any provider-reported probe keep pricing from the
+    agent-accumulated counters — the required fallback for pre-probe rows."""
+    from app.llm_cost_attribution import compute_llm_cost_breakdown
+
+    task = make_task(
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        api_call_summary=_summary(input_tokens=1000, output_tokens=200),
+        provider_reported_usage=None,
+    )
+
+    result = compute_llm_cost_breakdown([task])
+
+    assert result["totals"]["total_input_tokens"] == 1000
+    assert result["totals"]["total_output_tokens"] == 200
+    expected_cost = 1000 * _FLASH_INPUT_RATE + 200 * _FLASH_OUTPUT_RATE
+    assert result["totals"]["total_cost_usd"] == pytest.approx(expected_cost, rel=1e-9)
+
+
+def test_not_reported_marker_falls_back_to_agent_counters():
+    """The explicit ``{"reported": false}`` marker is NOT a probe: pricing falls
+    back to the agent-accumulated counters instead of zeroing the attempt."""
+    from app.llm_cost_attribution import compute_llm_cost_breakdown
+
+    task = make_task(
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        api_call_summary=_summary(input_tokens=1000, output_tokens=200),
+        provider_reported_usage={"reported": False},
+    )
+
+    result = compute_llm_cost_breakdown([task])
+
+    assert result["totals"]["total_input_tokens"] == 1000
+    expected_cost = 1000 * _FLASH_INPUT_RATE + 200 * _FLASH_OUTPUT_RATE
+    assert result["totals"]["total_cost_usd"] == pytest.approx(expected_cost, rel=1e-9)
+
+
+def test_zero_agent_counters_with_probe_produce_priced_row():
+    """Root-cause fix: when the agent's ``api_call_summary`` carries no tokens
+    but a provider-reported probe exists, the task is STILL priced from the probe
+    — previously it was invisible to the ledger (zero tokens == no attempt row)."""
+    from app.llm_cost_attribution import _task_llm_attempts, compute_llm_cost_breakdown
+
+    task = make_task(
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        api_call_summary=_summary(input_tokens=0, output_tokens=0),
+        provider_reported_usage=_probe(
+            input_tokens=300, output_tokens=100, cache_creation=200, cache_read=500
+        ),
+    )
+
+    attempts = _task_llm_attempts(task)
+    assert len(attempts) == 1
+    assert attempts[0][2] == 1000  # inclusive input from the probe
+
+    result = compute_llm_cost_breakdown([task])
+    assert result["totals"]["total_cost_usd"] > 0
+    assert result["totals"]["total_input_tokens"] == 1000
+    assert result["totals"]["total_output_tokens"] == 100
+
+
+def test_provider_probe_cache_breakout_uses_discounted_rate():
+    """A probe whose input is entirely cache-read is priced at the deepseek
+    discounted cache-read rate ($0.0028/M), not the $0.14/M base input rate."""
+    from app.llm_cost_attribution import compute_llm_cost_breakdown
+
+    task = make_task(
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        api_call_summary=_summary(input_tokens=0, output_tokens=0),
+        provider_reported_usage=_probe(
+            input_tokens=0, output_tokens=0, cache_creation=0, cache_read=1_000_000
+        ),
+    )
+
+    result = compute_llm_cost_breakdown([task])
+
+    assert result["totals"]["total_cache_read_input_tokens"] == 1_000_000
+    assert result["totals"]["total_cost_usd"] == pytest.approx(
+        1_000_000 * _FLASH_CACHE_READ_RATE, rel=1e-9
+    )
+
+
+def test_no_history_banked_columns_stay_separate_from_probe_row():
+    """Legacy no-attempt-history tasks with banked retry spend (no probe) keep
+    the banked row priced from agent counters while the live probe row prices
+    from provider truth — banked spend is not dropped when a probe exists."""
+    from app.llm_cost_attribution import _task_llm_attempts, compute_llm_cost_breakdown
+
+    task = make_task(
+        status=TaskStatus.IN_PROGRESS,
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        api_call_summary=_summary(input_tokens=400, output_tokens=50),
+        provider_reported_usage=_probe(
+            input_tokens=300, output_tokens=100, cache_creation=0, cache_read=100
+        ),
+    )
+    # Banked columns are hybrid properties, not constructor fields.
+    task.llm_input_tokens_banked = 600
+    task.llm_output_tokens_banked = 100
+    task.llm_call_count_banked = 3
+
+    attempts = _task_llm_attempts(task)
+    # Banked row (agent counters, no cache) + probe row.
+    assert len(attempts) == 2
+    banked = attempts[0]
+    assert banked[2] == 600
+    assert banked[3] == 100
+    assert banked[5] == 0 and banked[6] == 0  # no cache breakdown on banked spend
+    probe = attempts[1]
+    assert probe[2] == 400  # 300 uncached + 0 cc + 100 cr
+    assert probe[3] == 100
+    assert probe[5] == 0 and probe[6] == 100
+
+    result = compute_llm_cost_breakdown([task])
+    assert result["totals"]["total_input_tokens"] == 1000  # 600 + 400
+    assert result["totals"]["total_output_tokens"] == 200  # 100 + 100
+
+
+def test_billing_reconciliation_counts_provider_priced_attempts():
+    """The billing reconciliation's internal report counts attempts priced from
+    a provider-reported probe (``internal.provider_priced_attempt_count``), so
+    the canonical-vs-fallback split is observable."""
+    from datetime import datetime, timezone
+
+    from app.llm_cost_attribution import _task_llm_attempts
+
+    mod = _load_cost_reconciliation_module()
+    task = make_task(
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        created_at=datetime(2026, 8, 5, 0, 0, 0, tzinfo=timezone.utc).replace(
+            tzinfo=None
+        ),
+        api_call_summary=_summary(
+            input_tokens=1500, output_tokens=200, cache_creation=100, cache_read=400
+        ),
+        provider_reported_usage=_probe(
+            input_tokens=300, output_tokens=100, cache_creation=200, cache_read=500
+        ),
+    )
+
+    row = mod._task_to_row(task, _task_llm_attempts(task))
+    assert row["provider_priced_attempt_count"] == 1
+
+    report = mod.reconcile_provider_cost(
+        [row],
+        {
+            "provider": "deepseek",
+            "window": {"start": "2026-08-05", "end": "2026-08-05"},
+            "records": [],
+        },
+        "deepseek",
+    )
+    # The attempt was priced from the probe (inclusive 1000, uncached 300).
+    assert report["internal"]["provider_priced_attempt_count"] == 1
+    assert report["internal"]["uncached_input_tokens"] == 300
+    assert report["internal"]["cache_creation_input_tokens"] == 200
+    assert report["internal"]["cache_read_input_tokens"] == 500
+    assert report["internal"]["output_tokens"] == 100
+
+
+def test_reconciliation_uses_shared_probe_helper():
+    """``cost_telemetry_reconciliation`` imports the probe helper from
+    ``llm_cost_attribution`` (single source of truth — a divergent copy would
+    drift and let pricing and reconciliation disagree on what a probe is)."""
+    import app.cost_telemetry_reconciliation as ctr
+    import app.llm_cost_attribution as lca
+
+    assert ctr._is_provider_probe is lca._is_provider_probe

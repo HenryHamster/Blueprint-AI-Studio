@@ -381,7 +381,7 @@ class AnthropicProvider(LLMProvider):
             logger.warning("[ANTHROPIC] direct_llm_client unavailable; skipping API-key usage probe")
             return UsageSnapshot.unknown(probed_at, failure_kind="unsupported")
         try:
-            _text, rate_limit_data = await call_direct_llm(
+            _text, rate_limit_data, _usage_data = await call_direct_llm(
                 api_key,
                 messages=[{"role": "user", "content": "1"}],
                 max_tokens=1,
