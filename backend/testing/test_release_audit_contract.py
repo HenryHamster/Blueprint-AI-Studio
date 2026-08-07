@@ -23,38 +23,6 @@ from app.release_scoring import (
 _FIXTURE_PATH = pathlib.Path(__file__).parent / "fixtures" / "release_audit_sample.json"
 
 
-def _resolve_merge_grade_ts_path() -> "str | None":
-    """Locate ``agent/src/handlers/merge-grade.ts`` across local + Docker envs.
-
-    Mirrors ``_resolve_audits_ts_path``: CI runs pytest inside the backend Docker
-    image (built from ./backend only), so the agent tree is not on the filesystem
-    unless ``scripts/test-backend.sh`` mounts it at ``/agent/src``.  Returns the
-    first existing path or ``None`` to let the test skip rather than error.
-    """
-    env_override = os.getenv("AGENT_MERGE_GRADE_TS")
-    candidates = []
-    if env_override:
-        candidates.append(env_override)
-    candidates.append("/agent/src/handlers/merge-grade.ts")
-    candidates.append(
-        os.path.normpath(
-            os.path.join(
-                os.path.dirname(__file__),
-                "..",
-                "..",
-                "agent",
-                "src",
-                "handlers",
-                "merge-grade.ts",
-            )
-        )
-    )
-    for candidate in candidates:
-        if os.path.isfile(candidate):
-            return candidate
-    return None
-
-
 @pytest.fixture(scope="module")
 def audit_fixture() -> dict:
     return json.loads(_FIXTURE_PATH.read_text())
@@ -784,86 +752,14 @@ def test_default_quality_tier_is_opus():
     )
 
 
-# ===========================================================================
-# blocked_by triage taxonomy (design edcc1e6a §3.4) — merge-grade contract
-# ===========================================================================
-
-
-class TestMergeGradeBlockedByTaxonomy:
-    """Pin the canonical blocked_by triage taxonomy on the backend side.
-
-    The merge-grade contract (design edcc1e6a §3.4) lets a residual say WHY it
-    is unmet: ``unbuilt`` | ``out_of_scope`` | ``blocked_external``.  Only
-    ``unbuilt`` may consume campaign rung budget.  These tests pin the canonical
-    values, the defaulting rule (an unclassified non-met residual defaults to
-    ``unbuilt`` so it never silently leaves the budget), and the budget rule.
-    """
-
-    def test_blocked_by_values_are_exactly_the_three_triage_values(self):
-        from app.release_scoring import _BLOCKED_BY_VALUES
-
-        assert frozenset(
-            {"unbuilt", "out_of_scope", "blocked_external"}
-        ) == _BLOCKED_BY_VALUES, (
-            "The canonical blocked_by triage taxonomy drifted — expected exactly "
-            f"{{'unbuilt', 'out_of_scope', 'blocked_external'}}, got {_BLOCKED_BY_VALUES}"
-        )
-
-    def test_release_qualifier_audit_re_exports_the_canonical_taxonomy(self):
-        """release_qualifier_audit must re-export the canonical values so the
-        merge-grade contract's two sides cannot drift apart."""
-        from app import release_qualifier_audit as rqa
-        from app import release_scoring as rs
-
-        assert rqa.BLOCKED_BY_VALUES == rs._BLOCKED_BY_VALUES
-        assert rqa.DEFAULT_BLOCKED_BY == rs._DEFAULT_BLOCKED_BY
-        assert rqa.normalize_blocked_by is rs.normalize_blocked_by
-        assert rqa.blocked_by_consumes_rung_budget is rs.blocked_by_consumes_rung_budget
-
-    def test_normalize_blocked_by_met_returns_none(self):
-        from app.release_scoring import normalize_blocked_by
-
-        assert normalize_blocked_by("unbuilt", "met") is None
-        assert normalize_blocked_by(None, "met") is None
-        assert normalize_blocked_by("out_of_scope", "met") is None
-
-    def test_normalize_blocked_by_preserves_all_three_triage_values(self):
-        from app.release_scoring import normalize_blocked_by
-
-        for value in ("unbuilt", "out_of_scope", "blocked_external"):
-            assert normalize_blocked_by(value, "not_met") == value, value
-            assert normalize_blocked_by(value, "partial") == value, value
-
-    def test_normalize_blocked_by_defaults_absent_or_invalid_to_unbuilt(self):
-        from app.release_scoring import normalize_blocked_by
-
-        for raw in (None, "", "  ", "unknown", 42, {"a": 1}):
-            assert normalize_blocked_by(raw, "not_met") == "unbuilt", (
-                f"absent/invalid blocked_by {raw!r} must default to unbuilt, not "
-                "silently become out_of_scope (which would drop the residual from "
-                "the campaign rung budget)"
-            )
-
-    def test_only_unbuilt_consumes_rung_budget(self):
-        from app.release_scoring import blocked_by_consumes_rung_budget
-
-        # Only unbuilt (and the absent default, which normalizes to unbuilt)
-        # consumes campaign rung budget.
-        assert blocked_by_consumes_rung_budget("unbuilt") is True
-        assert blocked_by_consumes_rung_budget(None) is True
-        # The two terminal triage values must NOT consume budget.
-        assert blocked_by_consumes_rung_budget("out_of_scope") is False
-        assert blocked_by_consumes_rung_budget("blocked_external") is False
-
-
-class TestMergeGradeBlockedByRealVerdict:
-    """Drive a REAL merge-test verdict through ``evaluate_merge_grade`` and assert
-    the normalized per-category verdicts carry the blocked_by triage.
+class TestMergeGradeRealVerdict:
+    """Drive a REAL merge-test verdict through ``evaluate_merge_grade`` and the
+    per-category gate in ``compute_composite``.
 
     This is the acceptance-evidence path: the test produces an actual merge-grade
-    verdict (pure, no DB) from an artifact whose category verdicts use each triage
-    value, then asserts the normalized output preserves the triage and that only
-    ``unbuilt`` residuals consume the campaign rung budget.
+    verdict (pure, no DB) from a real artifact, then asserts the normalized
+    per-category verdicts (status / tier / gap / citations) and the composite
+    sub-scores operators rely on to see WHY the gate fired.
     """
 
     @staticmethod
@@ -877,28 +773,18 @@ class TestMergeGradeBlockedByRealVerdict:
                 {
                     "category_key": "c-1",
                     "status": "met",
-                    "blocked_by": None,
                     "gap": None,
                     "citations": [{"kind": "diff", "ref": "backend/app/foo.py:12"}],
                 },
                 {
                     "category_key": "c-2",
                     "status": "not_met",
-                    "blocked_by": "unbuilt",
                     "gap": "Capability Z is not wired up.",
                     "citations": [{"kind": "diff", "ref": "backend/app/bar.py"}],
                 },
                 {
                     "category_key": "c-3",
-                    "status": "not_met",
-                    "blocked_by": "out_of_scope",
-                    "gap": "Deliberately deferred to a later version.",
-                    "citations": [{"kind": "diff", "ref": "backend/app/baz.py"}],
-                },
-                {
-                    "category_key": "c-4",
                     "status": "partial",
-                    "blocked_by": "blocked_external",
                     "gap": "Gated on an upstream deploy.",
                     "citations": [{"kind": "diff", "ref": "backend/app/qux.py"}],
                 },
@@ -912,11 +798,10 @@ class TestMergeGradeBlockedByRealVerdict:
             {"category_key": "c-1", "text": "First"},
             {"category_key": "c-2", "text": "Second"},
             {"category_key": "c-3", "text": "Third"},
-            {"category_key": "c-4", "text": "Fourth"},
-            {"category_key": "c-5", "text": "Never graded"},
+            {"category_key": "c-4", "text": "Never graded"},
         ]
 
-    def test_evaluate_merge_grade_preserves_triage_on_each_verdict(self):
+    def test_evaluate_merge_grade_returns_a_fail_verdict_with_normalized_categories(self):
         from app.release_scoring import evaluate_merge_grade
 
         result = evaluate_merge_grade(
@@ -931,54 +816,23 @@ class TestMergeGradeBlockedByRealVerdict:
             for v in result["category_verdicts"]
             if isinstance(v, dict)
         }
+        # c-1 is met and cited (judged tier — no machine evidence supplied).
         assert verdicts["c-1"]["status"] == "met"
-        assert verdicts["c-1"]["blocked_by"] is None
-        assert verdicts["c-2"]["blocked_by"] == "unbuilt"
-        assert verdicts["c-3"]["blocked_by"] == "out_of_scope"
-        assert verdicts["c-4"]["blocked_by"] == "blocked_external"
-
-    def test_never_graded_category_defaults_to_unbuilt(self):
-        from app.release_scoring import evaluate_merge_grade
-
-        result = evaluate_merge_grade(
-            "Deliver X, Y, and Z.",
-            self._verdict_artifact(),
-            active_categories=self._active_categories(),
-        )
-        never_graded = next(
-            v
-            for v in result["category_verdicts"]
-            if v["category_key"] == "c-5"
-        )
-        assert never_graded["status"] == "not_met"
-        assert never_graded["blocked_by"] == "unbuilt", (
-            "A category the grader never assessed is 'not_met' with blocked_by "
-            "defaulting to unbuilt — the capability was never built."
-        )
-
-    def test_only_unbuilt_verdicts_consume_rung_budget_from_a_real_verdict(self):
-        from app.release_scoring import (
-            blocked_by_consumes_rung_budget,
-            evaluate_merge_grade,
-        )
-
-        result = evaluate_merge_grade(
-            "Deliver X, Y, and Z.",
-            self._verdict_artifact(),
-            active_categories=self._active_categories(),
-        )
-        consumers = [
-            v["category_key"]
-            for v in result["category_verdicts"]
-            if v["status"] != "met" and blocked_by_consumes_rung_budget(v.get("blocked_by"))
+        assert verdicts["c-1"]["tier"] == "judged"
+        assert verdicts["c-1"]["gap"] is None
+        assert verdicts["c-1"]["citations"] == [
+            {"kind": "diff", "ref": "backend/app/foo.py:12"}
         ]
-        # c-2 is unbuilt; c-5 was never graded (→ unbuilt).  c-3 (out_of_scope)
-        # and c-4 (blocked_external) are terminal and must NOT consume budget.
-        assert consumers == ["c-2", "c-5"], (
-            f"only unbuilt residuals may consume campaign rung budget, got {consumers}"
-        )
+        # c-2 is not_met and carries its gap.
+        assert verdicts["c-2"]["status"] == "not_met"
+        assert verdicts["c-2"]["gap"] == "Capability Z is not wired up."
+        # c-3 partial is preserved (gates identically to not_met downstream).
+        assert verdicts["c-3"]["status"] == "partial"
+        # A category the artifact never graded is fail-closed to not_met.
+        assert verdicts["c-4"]["status"] == "not_met"
+        assert "Not graded" in (verdicts["c-4"]["gap"] or "")
 
-    def test_unmet_by_triage_sub_score_buckets_are_correct(self):
+    def test_compute_composite_surfaces_the_category_gate_sub_scores(self):
         from app.release_scoring import compute_composite
         from app.release_scoring import evaluate_merge_grade
 
@@ -999,67 +853,8 @@ class TestMergeGradeBlockedByRealVerdict:
             merge_grade_exempt=False,
         )
         sub_scores = composite["sub_scores"]
-        assert sub_scores.get("unmet_by_triage") == {
-            "unbuilt": 2,
-            "out_of_scope": 1,
-            "blocked_external": 1,
-        }, (
-            "unmet_by_triage must bucket the UNMET categories by their blocked_by "
-            f"triage, got {sub_scores.get('unmet_by_triage')}"
-        )
-
-
-class TestMergeGradeTsBlockedByContract:
-    """Introspect agent/src/handlers/merge-grade.ts to ensure the agent side of
-    the merge-grade contract still documents the blocked_by triage taxonomy and
-    the default-unbuilt / only-unbuilt-consumes-budget rules."""
-
-    @pytest.fixture(scope="class")
-    def ts_source(self) -> str:
-        path = _resolve_merge_grade_ts_path()
-        if path is None:
-            pytest.skip(
-                "agent/src/handlers/merge-grade.ts not available in this test "
-                "environment (CI docker context builds from ./backend; run via "
-                "scripts/test-backend.sh from a checkout for enforcement)"
-            )
-        return pathlib.Path(path).read_text()
-
-    def test_documents_all_three_blocked_by_values(self, ts_source):
-        for value in ("unbuilt", "out_of_scope", "blocked_external"):
-            assert repr(value) in ts_source or f"'{value}'" in ts_source, (
-                f"agent/src/handlers/merge-grade.ts does not reference "
-                f"blocked_by value {value!r} — the triage taxonomy drifted"
-            )
-
-    def test_defaults_to_unbuilt(self, ts_source):
-        assert "DEFAULT_BLOCKED_BY: BlockedBy = 'unbuilt'" in ts_source, (
-            "agent/src/handlers/merge-grade.ts must default an unclassified "
-            "non-met residual to 'unbuilt' (never silently out_of_scope)"
-        )
-
-    def test_only_unbuilt_consumes_rung_budget_in_ts(self, ts_source):
-        assert "blockedBy === 'unbuilt'" in ts_source, (
-            "blockedByConsumesRungBudget must consume budget only for 'unbuilt'"
-        )
-        assert "blockedBy == null" in ts_source, (
-            "the absent/NULL blocked_by default must also consume budget"
-        )
-
-    def test_category_verdict_interface_carries_blocked_by(self, ts_source):
-        assert "blocked_by: BlockedBy | null;" in ts_source, (
-            "agent/src/handlers/merge-grade.ts CategoryVerdict interface must "
-            "declare 'blocked_by: BlockedBy | null'"
-        )
-
-    def test_prompt_documents_blocked_by_semantics(self, ts_source):
-        assert '"blocked_external"' in ts_source, (
-            "the merge-grade agent prompt must teach the grader the "
-            "blocked_external triage value"
-        )
-        # The prompt lives inside a TS template literal, so backticks appear
-        # escaped as `\`` in the raw source — match them with a raw string.
-        assert r"Only \`unbuilt\` residuals commission follow-up build work" in ts_source, (
-            "the merge-grade agent prompt must state the budget rule (only unbuilt "
-            "commissions follow-up build work)"
-        )
+        assert sub_scores.get("category_count") == 4
+        assert sub_scores.get("met_category_count") == 1
+        assert sorted(sub_scores.get("unmet_categories", [])) == ["c-2", "c-3", "c-4"]
+        # The retired blocked_by triage sub-score must not be re-emitted.
+        assert "unmet_by_triage" not in sub_scores

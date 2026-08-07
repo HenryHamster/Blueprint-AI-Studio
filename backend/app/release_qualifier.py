@@ -818,8 +818,6 @@ def _never_graded_category_verdicts(active_keys: set[str]) -> list[dict[str, Any
             "category_key": key,
             "status": "not_met",
             "tier": "judged",
-            # Never graded → the capability was never built: unbuilt triage.
-            "blocked_by": "unbuilt",
             "gap": _NEVER_GRADED_GAP,
             "citations": [],
         }
@@ -842,11 +840,6 @@ def _coerce_ledger_category_verdict(v: Any) -> dict[str, Any]:
         "status": getattr(v, "status", None),
         "tier": getattr(v, "tier", "judged"),
         "gap": getattr(v, "gap", None),
-        # blocked_by is not a column on CategoryVerdict (it lives in the
-        # objective_gap debt detail), so ledger read-back paths fall back to the
-        # `unbuilt` default — an unclassified residual must never silently
-        # leave the rung budget.
-        "blocked_by": "unbuilt",
         "grader_run_id": (
             str(getattr(v, "grader_run_id", ""))
             if getattr(v, "grader_run_id", None)
@@ -873,8 +866,6 @@ def _fail_closed_category_verdicts(
             "category_key": k,
             "status": "unverified",
             "tier": "unverified",
-            # Unverified defaults to buildable work: unbuilt triage.
-            "blocked_by": "unbuilt",
         }
         for k in sorted(k for k in active_keys if k)
     ]
@@ -7827,10 +7818,6 @@ async def _finalize_qualification(
                         tier=_v.get("tier", "judged"),
                         gap=_v.get("gap"),
                         citations=_v.get("citations") or [],
-                        # blocked_by triage (design edcc1e6a §3.4): carried into
-                        # the objective_gap debt detail so only `unbuilt`
-                        # residuals consume campaign rung budget.
-                        blocked_by=_v.get("blocked_by"),
                         grader_run_id=merge_grade_task_id,
                         qualification_attempt_id=attempt_id,
                         project_id=version.project_id,
