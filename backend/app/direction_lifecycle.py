@@ -9,7 +9,9 @@ import logging
 import uuid
 from datetime import datetime, timedelta
 
+from sqlalchemy import and_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
@@ -657,6 +659,90 @@ def _record_auto_retired_memory(
     after releasing the directions/project lock.
     """
     pending_retired_memory.append((dict(d), reason))
+
+
+async def _direction_lineage_spend(
+    project_id: uuid.UUID, direction_id: str, session: AsyncSession
+) -> float:
+    """Sum real, provider-priced LLM spend for tasks attributed to this direction.
+
+    The cost envelope check historically only summed ``estimated_cost_usd`` from
+    ``research_history`` — the research cycle's own estimate. That ignores the
+    implementation/review/fix lineage tasks a research cycle's findings spawn,
+    which is where the bulk of a coordinated unit's real spend lands. This walks
+    the direction's task lineage (matched via the same payload keys the admin
+    task-list direction filter uses) and prices actual token usage instead.
+    """
+    from app.llm_cost_attribution import _task_llm_cost
+
+    target = str(direction_id)
+    payload_type = Task.payloads[0]["type"].as_string()
+    # Both the direction match and the research exclusion are pushed into SQL.
+    # This runs once per budgeted direction inside the project row lock, so
+    # loading every task row for the project (with its large payloads/context
+    # JSON) into the identity map would hold the lock long enough to make
+    # concurrent `skip_locked` direction writers silently skip their turn.
+    # Only the columns `_task_llm_cost` prices are selected; `raiseload=True`
+    # turns any accidental extra attribute access into a loud error rather than
+    # a lazy per-row query (`_task_provider_reported_usage` already tolerates a
+    # deferred column, and it is loaded here anyway).
+    rows = (
+        await session.execute(
+            select(Task)
+            .options(
+                load_only(
+                    Task.id,
+                    Task.provider,
+                    Task.model,
+                    Task.attempt_history_db,
+                    Task.api_call_summary,
+                    Task.provider_reported_usage,
+                    Task.llm_input_tokens_banked_db,
+                    Task.llm_output_tokens_banked_db,
+                    Task.llm_call_count_banked_db,
+                    # The banked/attempt-history accessors fall back to legacy
+                    # context keys for rows written before those columns
+                    # existed; without `context` those pre-migration rows would
+                    # silently price as zero. `payloads` — the other large blob,
+                    # and the one this loop used to scan in Python — is now
+                    # matched entirely in SQL and is no longer loaded.
+                    Task.context,
+                    raiseload=True,
+                )
+            )
+            .where(
+                Task.project_id == project_id,
+                or_(
+                    Task.payloads[0]["current_direction_id"].as_string() == target,
+                    and_(
+                        # Mirrors the previous Python `current or direction_id`
+                        # fallback: an absent OR empty current key falls through
+                        # to the plain `direction_id` key.
+                        or_(
+                            Task.payloads[0]["current_direction_id"]
+                            .as_string()
+                            .is_(None),
+                            Task.payloads[0]["current_direction_id"].as_string() == "",
+                        ),
+                        Task.payloads[0]["direction_id"].as_string() == target,
+                    ),
+                ),
+                # Research-cycle spend is already tracked via research_history's
+                # estimated_cost_usd; skip it here to avoid double-counting. A
+                # payload with no ``type`` extracts as NULL, and NULL != 'x' is
+                # NULL (not TRUE), so the IS NULL arm is required to keep those
+                # rows in the sum.
+                or_(payload_type.is_(None), payload_type != "research"),
+            )
+        )
+    ).scalars()
+    spend = 0.0
+    for task in rows:
+        try:
+            spend += max(0.0, _task_llm_cost(task)[0])
+        except (TypeError, ValueError, IndexError):
+            continue
+    return spend
 
 
 async def _process_direction_lifecycle(
@@ -1449,12 +1535,19 @@ async def _process_direction_lifecycle_locked(
             budget_f = float(budget) if budget is not None else None
         except (TypeError, ValueError):
             budget_f = None
+        lineage_spend = 0.0
+        if budget_f and did:
+            # Only pay for the lineage query when a budget is actually declared —
+            # this is the envelope check, not a general-purpose cost readout.
+            lineage_spend = await _direction_lineage_spend(project.id, did, session)
+            cumulative_cost += lineage_spend
         if budget_f and cumulative_cost > budget_f:
             pause_reason = (
                 f"Budget exceeded: cumulative estimated cost ${cumulative_cost:.2f} "
                 f"> cost budget ${budget_f:.2f}"
             )
             d["cost_pause_evidence"] = {
+                "attributed_lineage_spend_usd": round(lineage_spend, 4),
                 "cumulative_estimated_cost_usd": round(cumulative_cost, 4),
                 "cost_budget_usd": round(budget_f, 4),
             }

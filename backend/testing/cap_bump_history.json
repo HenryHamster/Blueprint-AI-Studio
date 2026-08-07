@@ -4530,6 +4530,14 @@
           "old_cap": 7300,
           "new_cap": 8450
         }
+      ],
+      "test_completion_debt.py": [
+        {
+          "commit_sha": "",
+          "commit_date": "2026-08-07T11:28:28.807791+00:00",
+          "old_cap": 2050,
+          "new_cap": 2450
+        }
       ]
     }
   }

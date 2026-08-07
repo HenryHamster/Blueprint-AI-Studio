@@ -357,7 +357,7 @@
     "test_audit_finding_class_guards.py": 2100,
     "test_payload_schemas.py": 2500,
     "test_warm_backlog_reuse.py": 2100,
-    "test_completion_debt.py": 2050,
+    "test_completion_debt.py": 2450,
     "test_build_config_commands.py": 2000,
     "test_staged_directions.py": 1950,
     "test_cost_telemetry_reconciliation.py": 1900,
