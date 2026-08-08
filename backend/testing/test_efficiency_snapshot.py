@@ -11642,6 +11642,55 @@ async def test_agent_efficiency_snapshot_exposes_cohort_provenance(
 
 
 @pytest.mark.asyncio
+async def test_agent_efficiency_snapshot_exposes_cohort_effective_window(
+    client: AsyncClient, db_session
+):
+    """GET /api/agent/projects/{id}/efficiency-snapshot must surface the
+    cohort_effective_window_start / cohort_effective_window_end span actually
+    covered by the loaded cohort, so a cost-baseline reading records the window
+    that gives it provenance (finding d07986d7)."""
+    from app.auth import create_agent_token
+    from app.efficiency_snapshot import _cohort_effective_window
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # A QUEUED (non-terminal) task provides a valid agent token without joining
+    # the terminal cohort itself.
+    token_task = make_task(project_id=project.id)
+    db_session.add(token_task)
+    now = _utcnow()
+    old_task = _make_efficient_task(project.id, updated_at=now - timedelta(days=5))
+    new_task = _make_efficient_task(project.id, updated_at=now)
+    db_session.add(old_task)
+    db_session.add(new_task)
+    await db_session.commit()
+    await db_session.refresh(token_task)
+
+    token = create_agent_token(str(token_task.id), "agent-vm-window-read")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/efficiency-snapshot",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+
+    assert "cohort_effective_window_start" in data, (
+        "agent efficiency-snapshot must include cohort_effective_window_start"
+    )
+    assert "cohort_effective_window_end" in data, (
+        "agent efficiency-snapshot must include cohort_effective_window_end"
+    )
+    # The reported window must be the actual oldest/newest updated_at span of
+    # the loaded cohort — the same value _cohort_effective_window computes.
+    expected = _cohort_effective_window([old_task, new_task])
+    assert data["cohort_effective_window_start"] == expected["start"]
+    assert data["cohort_effective_window_end"] == expected["end"]
+
+
+@pytest.mark.asyncio
 async def test_agent_efficiency_snapshot_cohort_capped_flag(
     client: AsyncClient, db_session, monkeypatch
 ):

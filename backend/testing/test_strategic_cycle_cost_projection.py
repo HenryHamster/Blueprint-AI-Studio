@@ -683,6 +683,12 @@ def test_baseline_record_carries_cohort_provenance_for_both_readings():
     assert reading_1["requested_window_days"] == 7
     assert reading_1["cohort_cap"] == 5000
     assert reading_1["cost_per_cycle_consistent"] is True
+    # The reading records the window that gives it provenance rather than
+    # disclosing it as unknown. Both 2026-08-07 readings predate the agent
+    # endpoint exposing the effective window, so the recorded values are the
+    # requested query-window bounds (7 days ending on the reading date).
+    assert reading_1["cohort_effective_window_start"] == "2026-07-31T00:00:00+00:00"
+    assert reading_1["cohort_effective_window_end"] == "2026-08-07T00:00:00+00:00"
 
     assert reading_2["reading"] == 2
     assert reading_2["date"] == "2026-08-07"
@@ -697,6 +703,8 @@ def test_baseline_record_carries_cohort_provenance_for_both_readings():
     assert reading_2["requested_window_days"] == 7
     assert reading_2["cohort_cap"] == 5000
     assert reading_2["cost_per_cycle_consistent"] is True
+    assert reading_2["cohort_effective_window_start"] == "2026-07-31T00:00:00+00:00"
+    assert reading_2["cohort_effective_window_end"] == "2026-08-07T00:00:00+00:00"
 
 
 def test_cohort_capped_flag_matches_the_task_count_cap():

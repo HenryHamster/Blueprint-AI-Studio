@@ -36,9 +36,10 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import ColumnElement, func, or_, select
 
 from app import strategic_cycle as strategic_cycle_mod
+from app.database import resolve_dialect_name
 from app.message_convergence import OPEN_STATUS
 from app.models import (
     Project,
@@ -191,6 +192,31 @@ async def latest_cycle_watermark(
     return row.phase1_started_at, row.outcome
 
 
+def _not_strategic_type_predicate(
+    session, dialect_name: str | None = None
+) -> ColumnElement[bool]:
+    """Portable SQL predicate for task payload types outside the strategist's own.
+
+    The strategist's own task types (design_doc_update / strategic_review) are
+    excluded from the terminal-transition delta because a completed one IS the
+    cycle itself. The payload type lives in ``Task.payloads[0]["type"]``, which
+    has no portable JSON extraction on SQLite: ``.as_string()`` renders the
+    JSONB accessor through ``JSON_QUOTE(JSON_EXTRACT(...))`` (Postgres-oriented)
+    while the portable path uses ``json_extract`` directly. Resolve the dialect
+    once with ``resolve_dialect_name`` — the same single dialect-handling path
+    the efficiency snapshot uses — rather than duplicating dialect logic here.
+    ``dialect_name`` is an optional override so the SQLite branch is directly
+    testable independent of the engine a test session happens to be bound to.
+    """
+    if dialect_name is None:
+        dialect_name = resolve_dialect_name(session)
+    if dialect_name == "sqlite":
+        payload_type = func.json_extract(Task.payloads, "$[0].type")
+    else:
+        payload_type = Task.payloads[0]["type"].as_string()
+    return ~payload_type.in_(sorted(STRATEGIC_TASK_TYPES))
+
+
 async def compute_cycle_delta_signals(
     session, project_id: uuid.UUID, watermark: datetime | None
 ) -> CycleDeltaSignals:
@@ -211,9 +237,7 @@ async def compute_cycle_delta_signals(
     # own task types are excluded: a completed design_doc_update /
     # strategic_review IS the cycle itself, and counting it would make every
     # completed cycle guarantee the next check sees a "delta".
-    _not_strategic_type = ~Task.payloads[0]["type"].as_string().in_(
-        sorted(STRATEGIC_TASK_TYPES)
-    )
+    _not_strategic_type = _not_strategic_type_predicate(session)
     signals.new_completions = int(
         (
             await session.execute(

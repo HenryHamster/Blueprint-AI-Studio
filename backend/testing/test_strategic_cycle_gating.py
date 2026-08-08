@@ -458,6 +458,33 @@ async def test_non_strategic_completion_is_a_delta(db_session):
     assert signals.has_delta
 
 
+def test_not_strategic_predicate_uses_portable_sqlite_json_path(db_session):
+    """The gate's task-type predicate must take SQLite's portable json_extract
+    path rather than the Postgres-only .as_string() rendering, which wraps the
+    JSONB accessor in JSON_QUOTE(JSON_EXTRACT(...)). Both render to working SQL
+    on SQLite in SQLAlchemy 2.0.51, so this is a structural assertion: the
+    compiled predicate must NOT contain JSON_QUOTE (the .as_string() signature)
+    and must reach the payload column through json_extract.
+    """
+    from sqlalchemy.dialects import sqlite as sqlite_dialect
+
+    from app.strategic_cycle_gating import _not_strategic_type_predicate
+
+    # Force the SQLite branch explicitly so this exercises the portable path
+    # independent of whether the test session is bound to SQLite or Postgres
+    # (the postgres default in CI). The runtime default still resolves the
+    # dialect from the session via resolve_dialect_name.
+    predicate = _not_strategic_type_predicate(db_session, dialect_name="sqlite")
+    compiled = str(predicate.compile(dialect=sqlite_dialect.dialect()))
+    assert "JSON_QUOTE" not in compiled, (
+        "SQLite dialect must not render the Postgres-oriented "
+        f"JSON_QUOTE(JSON_EXTRACT(...)) form; got: {compiled}"
+    )
+    assert "json_extract" in compiled, (
+        f"SQLite dialect must reach the payload type via json_extract; got: {compiled}"
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Pure-logic checks on the fail-closed must-run matrix.
 # ─────────────────────────────────────────────────────────────────────────────

@@ -2264,8 +2264,9 @@ async def agent_fetch_efficiency_snapshot(
     """Return the current efficiency snapshot for the project: cost_per_merged_pr,
     vm_reuse_rate, llm_cost_per_merged_pr, format_compliance, merged-work
     origination split, window metadata, and cohort coverage (cohort_task_count /
-    cohort_capped flag so a truncated sample is distinguishable from a complete
-    window).
+    cohort_capped flag plus the cohort_effective_window_start/end span actually
+    covered by the loaded cohort, so a truncated sample is distinguishable from
+    a complete window and the window a reading covers is recorded).
     Reuses the same compute path as the operator dashboard so numbers are consistent.
     Read-only; cross-project access returns 404."""
     from app.efficiency_snapshot import (  # noqa: PLC0415
@@ -2278,6 +2279,7 @@ async def agent_fetch_efficiency_snapshot(
         FORMAT_COMPLIANCE_KEY,
         _AXIS_WINDOW_DAYS,
         _COHORT_CAP,
+        _cohort_effective_window,
         _compute_cost_per_merged_pr,
         _compute_cost_per_verified_task,
         _compute_llm_cache_hit_rate,
@@ -2298,6 +2300,7 @@ async def agent_fetch_efficiency_snapshot(
 
     await _resolve_agent_project(project_id, token, session)
     tasks = await _load_recent_tasks(session, project_id)
+    cohort_window = _cohort_effective_window(tasks)
     format_compliance = compute_format_compliance_metrics(tasks)
     llm_cost_attribution = _compact_llm_cost_attribution(tasks)
     # Research-vs-strategist attribution of work that LANDED in the window
@@ -2327,6 +2330,8 @@ async def agent_fetch_efficiency_snapshot(
             "window_days": _AXIS_WINDOW_DAYS,
             "cohort_task_count": len(tasks),
             "cohort_capped": len(tasks) >= _COHORT_CAP,
+            "cohort_effective_window_start": cohort_window["start"],
+            "cohort_effective_window_end": cohort_window["end"],
         },
     }
 

@@ -227,10 +227,17 @@ AXIS_WINDOW_DAYS = 7
 #   total_llm_usd            = llm_cost_attribution.total_llm_usd
 #   unpriced_coverage        = llm_cost_attribution.unpriced_coverage
 #   cohort_task_count        = data.cohort_task_count
-#   cohort_effective_window_* = persisted snapshot (not on the agent surface)
+#   cohort_effective_window_* = data.cohort_effective_window_* (agent surface)
 # cohort_capped is DERIVED by :func:`baseline_record` from cohort_task_count vs
 # COHORT_CAP, so a reading that records the count can never silently mislabel
 # the sample.
+#
+# The two historical readings predate the agent endpoint exposing the effective
+# window (see docs/strategic-cycle-cost-baseline.md). Their recorded window is
+# the requested query-window bounds the reading's endpoint actually queried
+# (7 days ending on the reading date); the exact effective span of the capped
+# 5000-row cohort was not captured at the time. Readings taken after the
+# endpoint change record the true effective span from the same read surface.
 BASELINE_READINGS: list[dict[str, Any]] = [
     {
         "reading": 1,
@@ -242,8 +249,8 @@ BASELINE_READINGS: list[dict[str, Any]] = [
         "total_llm_usd": 3439.92,
         "unpriced_coverage": 0.9752,
         "cohort_task_count": 5000,
-        "cohort_effective_window_start": None,  # not captured at reading time
-        "cohort_effective_window_end": None,    # read from the persisted snapshot next reading
+        "cohort_effective_window_start": "2026-07-31T00:00:00+00:00",
+        "cohort_effective_window_end": "2026-08-07T00:00:00+00:00",
     },
     {
         "reading": 2,
@@ -255,8 +262,8 @@ BASELINE_READINGS: list[dict[str, Any]] = [
         "total_llm_usd": 3446.586451,
         "unpriced_coverage": 0.9752,
         "cohort_task_count": 5000,
-        "cohort_effective_window_start": None,
-        "cohort_effective_window_end": None,
+        "cohort_effective_window_start": "2026-07-31T00:00:00+00:00",
+        "cohort_effective_window_end": "2026-08-07T00:00:00+00:00",
     },
 ]
 
