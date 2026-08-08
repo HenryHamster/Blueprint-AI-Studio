@@ -377,7 +377,8 @@
         "sends only the backend-marked canonical user subset to Fast",
         "stops both lanes when the displaced Workday claim cannot be renewed",
         "uses the retained M1 input while its stable claim is leased",
-        "does not start an autonomous turn while a private Fast consultation owns Workday"
+        "does not start an autonomous turn while a private Fast consultation owns Workday",
+        "answers server fast-marked rows through the legacy Workday path when typed Fast is not activated"
       ]
     },
     {
