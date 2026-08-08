@@ -148,6 +148,20 @@ async def resolve_deployed_sha() -> str | None:
 
     revision = os.getenv("K_REVISION")
     if not revision:
+        # Not on Cloud Run (local/dev/non-cloud run). In local-production the
+        # role launchers fail closed unless they can resolve a deploy identity,
+        # so reaching this point means the environment is misconfigured — the
+        # singleton's serving SHA would read "unknown" and post-promotion
+        # serving confirmation would time out against a stale row. Log it
+        # loudly; still return None so startup is never blocked.
+        if os.getenv("BLUEPRINT_DEPLOYMENT_MODE") == "local-production":
+            logger.error(
+                "[DEPLOY] Serving in local-production mode with no resolvable "
+                "deploy identity: DEPLOY_SHA is absent or invalid and the role "
+                "launcher did not derive one from the image. The deployment "
+                "singleton will report serving SHA 'unknown', so post-promotion "
+                "serving confirmation will not confirm this revision."
+            )
         return None  # not on Cloud Run (local/dev/non-cloud run)
 
     project_id = os.getenv("GCP_PROJECT_ID")

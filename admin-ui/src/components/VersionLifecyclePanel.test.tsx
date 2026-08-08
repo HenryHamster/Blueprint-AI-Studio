@@ -3515,6 +3515,63 @@ describe('VersionLifecyclePanel', () => {
     });
   });
 
+  describe('promoted awaiting activation callout', () => {
+    beforeEach(() => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+    });
+
+    it('renders awaiting-activation callout for a promoted-unconfirmed version in recent_versions', () => {
+      const awaitingVersion: api.RecentVersion = {
+        version_number: 3,
+        status: 'promoted',
+        opened_at: '2026-01-01T00:00:00Z',
+        promoted_at: '2026-06-01T12:00:00Z',
+        qualification_attempts: 1,
+        last_qualification: null,
+        serving: { status: 'unconfirmed' },
+      };
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({ version_number: 4 }),
+            recent_versions: [awaitingVersion],
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      const callout = screen.getByTestId('promoted-awaiting-activation');
+      expect(callout).toBeInTheDocument();
+      expect(callout).toHaveTextContent('awaiting activation');
+      expect(callout).toHaveTextContent('v3');
+    });
+
+    it('does not render awaiting-activation callout when serving is resolved', () => {
+      const servingVersion: api.RecentVersion = {
+        version_number: 3,
+        status: 'promoted',
+        opened_at: '2026-01-01T00:00:00Z',
+        promoted_at: '2026-06-01T12:00:00Z',
+        qualification_attempts: 1,
+        last_qualification: null,
+        serving: { status: 'serving_confirmed', sha: 'abc1234', confirmed_at: '2026-06-01T13:00:00Z', failure_reason: null, artifacts: undefined },
+      };
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({ version_number: 4 }),
+            recent_versions: [servingVersion],
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.queryByTestId('promoted-awaiting-activation')).not.toBeInTheDocument();
+    });
+  });
+
   describe('historical audit context (stale audit)', () => {
     it('renders historical-audit-context with active vs audited SHA when audit_evidence_state is stale', () => {
       const staleAudit: api.LatestAudit = {

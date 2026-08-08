@@ -120,6 +120,24 @@ class TestResolveDeployedSha:
         rev.assert_not_called()
         svc.assert_not_called()
 
+    async def test_local_production_without_deploy_sha_logs_error_and_returns_none(
+        self, monkeypatch, mocker
+    ):
+        # A local-production role that boots without a resolvable deploy
+        # identity must be loud about it (the launcher normally fails closed,
+        # so this is the misconfiguration backstop). Still never raises or
+        # blocks startup.
+        monkeypatch.delenv("DEPLOY_SHA", raising=False)
+        monkeypatch.delenv("K_REVISION", raising=False)
+        monkeypatch.setenv("BLUEPRINT_DEPLOYMENT_MODE", "local-production")
+        error_log = mocker.patch.object(deployed_sha.logger, "error")
+        rev = mocker.patch.object(deployed_sha, "_fetch_revision_image")
+        result = await deployed_sha.resolve_deployed_sha()
+        assert result is None
+        rev.assert_not_called()
+        error_log.assert_called_once()
+        assert "local-production" in error_log.call_args.args[0]
+
     async def test_returns_none_when_project_missing(self, monkeypatch, mocker):
         monkeypatch.delenv("DEPLOY_SHA", raising=False)
         monkeypatch.setenv("K_REVISION", "blueprint-orchestrator-00042-abc")

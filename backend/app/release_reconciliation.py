@@ -3551,6 +3551,106 @@ async def _recover_serving_confirmed(
         )
 
 
+async def _record_activation_receipt(
+    session,
+    version: release_version.ReleaseVersion,
+    *,
+    revision: str | None,
+    host: str | None,
+    operator_id: str,
+    now: datetime,
+) -> dict[str, Any]:
+    """Record an operator activation of a promoted version and close the serving loop.
+
+    ``blueprint deploy`` now binds activation to the backend's latest promoted
+    version and POSTs a receipt after the control-plane SSH activation succeeds.
+    This helper makes that receipt durable and authoritative:
+
+      * stamps activation provenance on ``version.last_qualification``
+        (reassigning the dict so SQLAlchemy detects the JSON change, mirroring
+        ``_record_deploy_failed_clear_attestation``);
+      * confirms the ``backend_revision`` artifact with the served identifier —
+        the reported ``revision``, falling back to the version's ``promoted_sha`` —
+        and projects it onto the legacy scalar;
+      * refreshes the full required-artifact registry (rechecking failed rows);
+      * when the required-artifact aggregate resolves to ``serving_confirmed``,
+        delegates to ``_recover_serving_confirmed`` so the whole version flips
+        (served_sha/served_at, verdict outcome, alert resolve, strategic refresh);
+      * when a required non-backend artifact is still pending, leaves the whole
+        version unconfirmed — the receipt-confirmed backend artifact stands and
+        the ``_confirm_serving_or_fail`` sweep finishes the remaining gate.
+
+    Runs on the caller's already-locked session; does NOT commit (the caller
+    commits under the same per-version row lock).
+    """
+    served_sha = (revision or version.promoted_sha or "").strip()
+    backend_artifact, _created = await get_or_create_release_deploy_artifact(
+        session,
+        version,
+        BACKEND_REVISION_ARTIFACT_KIND,
+        confirmation_deadline=version.deploy_confirm_deadline,
+    )
+    if served_sha:
+        apply_serving_decision(
+            backend_artifact,
+            ("serving_confirmed", served_sha, now, None),
+            now=now,
+        )
+        session.add(backend_artifact)
+
+    qual = dict(version.last_qualification or {})
+    qual["activation_receipt"] = {
+        "mode": "cli_activation",
+        "operator": operator_id,
+        "revision": served_sha or None,
+        "host": host,
+        "activated_at": now.isoformat(),
+    }
+    version.last_qualification = qual
+    session.add(version)
+
+    # Make the receipt-confirmed backend artifact durable in this transaction
+    # BEFORE the provider sweep, so ``_refresh_release_artifact_rows``'s
+    # get_or_create finds the confirmed row instead of manufacturing a second,
+    # unconfirmed ``backend_revision`` row (invisible to its SELECT under a
+    # no-autoflush session) and racing the UNIQUE(version_id, artifact_kind)
+    # constraint on commit.
+    await session.flush()
+
+    provider_rows, _had, _mutated, _backend = await _refresh_release_artifact_rows(
+        session,
+        version,
+        now,
+        recheck_failed_required=True,
+    )
+    aggregate_status, aggregate_reason = aggregate_required_artifact_status(
+        provider_rows
+    )
+    if aggregate_status == "serving_confirmed":
+        await _recover_serving_confirmed(
+            session,
+            version,
+            served_sha,
+            now,
+            now,
+            confirmed_reason_code=backend_artifact.reason_code,
+        )
+        return {
+            "mode": "cli_activation",
+            "serving_status": "serving_confirmed",
+            "served_sha": served_sha,
+        }
+    if backend_artifact is not None:
+        if project_backend_revision_artifact(version, backend_artifact):
+            session.add(version)
+    return {
+        "mode": "cli_activation",
+        "serving_status": aggregate_status,
+        "served_sha": served_sha,
+        "reason_code": aggregate_reason,
+    }
+
+
 async def _reconcile_if_deploy_failed_recovered(
     version_id: uuid.UUID,
     *,

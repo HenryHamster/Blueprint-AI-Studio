@@ -1604,6 +1604,264 @@ class TestClearDeployFailed:
         )
 
 
+class TestRecordActivationReceipt:
+    """POST /api/admin/projects/{id}/activation-receipt operator lever.
+
+    The one-command ``blueprint deploy`` path binds the built revision to the
+    project's latest promoted version, activates it on the control-plane host,
+    then POSTs this receipt to close the serving-confirmation loop.
+    """
+
+    @staticmethod
+    async def _make_promoted_unconfirmed_version(
+        session,
+        project_id,
+        *,
+        promoted_sha="promotedsha999",
+        version_number=1,
+    ):
+        from datetime import datetime, timezone
+
+        from app.models import QualificationVerdict
+
+        version = ReleaseVersion(
+            project_id=project_id,
+            version_number=version_number,
+            phase="stabilize",
+            status="promoted",
+            promoted_at=datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc),
+            promoted_sha=promoted_sha,
+            serving_status="unconfirmed",
+            deploy_confirm_deadline=datetime(2026, 1, 1, 1, 0, 0, tzinfo=timezone.utc),
+        )
+        session.add(version)
+        await session.commit()
+        await session.refresh(version)
+
+        verdict = QualificationVerdict(
+            project_id=project_id,
+            release_version_id=version.id,
+            candidate_sha=promoted_sha,
+            confidence=0.95,
+            would_promote=True,
+            promotion_enabled=True,
+            terminal_status="promoted",
+            threshold=0.90,
+        )
+        session.add(verdict)
+        await session.commit()
+        return version
+
+    @staticmethod
+    def _scope_backend_only(mocker):
+        """Limit the artifact registry to the backend provider so the receipt's
+        serving confirmation resolves without the merge/agent providers' GitHub
+        lookups (matching the established TestClearDeployFailed pattern)."""
+        from app import release_artifacts as artifact_registry
+        from app.release_artifacts import BACKEND_REVISION_ARTIFACT_KIND
+
+        mocker.patch.dict("os.environ", {"DEPLOY_REPO_IDENTITY": "acme/widget"})
+        mocker.patch.dict(
+            artifact_registry._ARTIFACT_PROVIDERS,
+            {
+                BACKEND_REVISION_ARTIFACT_KIND: artifact_registry._ARTIFACT_PROVIDERS[
+                    BACKEND_REVISION_ARTIFACT_KIND
+                ]
+            },
+            clear=True,
+        )
+
+    @staticmethod
+    async def _deploy_identity_project(db_session):
+        project = await _make_project(db_session)
+        project.github_owner = "acme"
+        project.github_repo = "widget"
+        db_session.add(project)
+        await db_session.commit()
+        return project
+
+    @pytest.mark.asyncio
+    async def test_receipt_confirms_promoted_version_to_serving(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """A receipt for a promoted unconfirmed version confirms the backend
+        artifact, flips the version to serving_confirmed, and stamps provenance."""
+        self._scope_backend_only(mocker)
+        project = await self._deploy_identity_project(db_session)
+        version = await self._make_promoted_unconfirmed_version(
+            db_session, project.id, promoted_sha="promotedsha999"
+        )
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/activation-receipt",
+            json={
+                "version_number": version.version_number,
+                "revision": "a" * 40,
+                "host": "hamsterwheel",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["serving_status"] == "serving_confirmed"
+        assert data["served_sha"] == "a" * 40
+        assert data["served_at"] is not None
+        assert data["deploy_failure_reason"] is None
+        assert data["receipt"]["mode"] == "cli_activation"
+        assert data["receipt"]["serving_status"] == "serving_confirmed"
+        assert data["receipt"]["served_sha"] == "a" * 40
+
+        await db_session.refresh(version)
+        assert version.serving_status == "serving_confirmed"
+        assert version.served_sha == "a" * 40
+        qual = version.last_qualification or {}
+        receipt = qual["activation_receipt"]
+        assert receipt["mode"] == "cli_activation"
+        assert receipt["host"] == "hamsterwheel"
+        assert receipt["revision"] == "a" * 40
+
+        from sqlmodel import select
+
+        from app.models import QualificationVerdict
+
+        verdict = (
+            await db_session.execute(
+                select(QualificationVerdict).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        ).scalar_one()
+        assert verdict.post_promotion_outcome == "serving_confirmed"
+
+    @pytest.mark.asyncio
+    async def test_idempotent_repost_returns_current_state(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """Re-POSTing an identical receipt for an already-serving version is
+        idempotent (200, no error, same state)."""
+        self._scope_backend_only(mocker)
+        project = await self._deploy_identity_project(db_session)
+        version = await self._make_promoted_unconfirmed_version(
+            db_session, project.id, promoted_sha="promotedsha999"
+        )
+        body = {
+            "version_number": version.version_number,
+            "revision": "b" * 40,
+            "host": "hamsterwheel",
+        }
+        first = await client.post(
+            f"/api/admin/projects/{project.id}/activation-receipt", json=body
+        )
+        assert first.status_code == 200, first.text
+        assert first.json()["serving_status"] == "serving_confirmed"
+
+        second = await client.post(
+            f"/api/admin/projects/{project.id}/activation-receipt", json=body
+        )
+        assert second.status_code == 200, second.text
+        data = second.json()
+        assert data["serving_status"] == "serving_confirmed"
+        assert data["served_sha"] == "b" * 40
+        assert data["receipt"]["serving_status"] == "serving_confirmed"
+
+    @pytest.mark.asyncio
+    async def test_404_when_version_number_unknown(
+        self, client: AsyncClient, db_session
+    ):
+        """Unknown version_number for the project → 404."""
+        project = await _make_project(db_session)
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/activation-receipt",
+            json={"version_number": 99},
+        )
+        assert resp.status_code == 404, resp.text
+
+    @pytest.mark.asyncio
+    async def test_409_when_version_not_promoted(
+        self, client: AsyncClient, db_session
+    ):
+        """A non-promoted version cannot be confirmed serving by a receipt → 409."""
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id)
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/activation-receipt",
+            json={"version_number": 1},
+        )
+        assert resp.status_code == 409, resp.text
+
+    @pytest.mark.asyncio
+    async def test_400_when_revision_not_40_hex(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """A malformed revision is rejected at 400 before any state change."""
+        self._scope_backend_only(mocker)
+        project = await self._deploy_identity_project(db_session)
+        version = await self._make_promoted_unconfirmed_version(
+            db_session, project.id, promoted_sha="promotedsha999"
+        )
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/activation-receipt",
+            json={
+                "version_number": version.version_number,
+                "revision": "not-a-sha",
+            },
+        )
+        assert resp.status_code == 400, resp.text
+
+    @pytest.mark.asyncio
+    async def test_non_admin_rejected(self, override_get_session, db_session):
+        """Non-admin is rejected with 403 by require_admin."""
+        from fastapi import HTTPException
+
+        project = await _make_project(db_session)
+        await self._make_promoted_unconfirmed_version(db_session, project.id)
+
+        async def non_admin():
+            return {"user_id": "other", "email": "other@example.com", "role": "user"}
+
+        async def reject_admin():
+            raise HTTPException(status_code=403, detail="Admin privileges required")
+
+        app.dependency_overrides[get_current_user] = non_admin
+        app.dependency_overrides[require_admin] = reject_admin
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app),
+                base_url="http://test",
+                headers={"Authorization": "Bearer test-token"},
+            ) as ac:
+                resp = await ac.post(
+                    f"/api/admin/projects/{project.id}/activation-receipt",
+                    json={"version_number": 1},
+                )
+            assert resp.status_code == 403
+        finally:
+            app.dependency_overrides.pop(get_current_user, None)
+            app.dependency_overrides.pop(require_admin, None)
+
+    @pytest.mark.asyncio
+    async def test_promoted_version_list_exposes_promoted_sha(
+        self, client: AsyncClient, db_session
+    ):
+        """The promoted-version list the CLI queries for binding includes the
+        promoted SHA, so ``blueprint deploy`` can verify the built revision
+        contains the promoted commit."""
+        project = await _make_project(db_session)
+        version = await self._make_promoted_unconfirmed_version(
+            db_session, project.id, promoted_sha="c" * 40
+        )
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/release-versions",
+            params={"status": "promoted", "limit": 1},
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["total"] == 1
+        entry = data["versions"][0]
+        assert entry["version_number"] == version.version_number
+        assert entry["promoted_sha"] == "c" * 40
+
+
 class TestAgentServingShas:
     """GET /agent-serving-shas exposes read-only agent image provenance."""
 

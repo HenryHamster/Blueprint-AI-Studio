@@ -990,6 +990,37 @@ export function PinnedServingVersionCallout({ version }: { version: RecentVersio
   );
 }
 
+export function PromotedAwaitingActivationCallout({ version }: { version: RecentVersion }) {
+  const servingStatus = version.serving?.status ?? version.serving_status;
+  // Only the "promoted, still unconfirmed" state is awaiting the operator's
+  // single activation approval — serving_confirmed and deploy_failed have their
+  // own surfaces, and an un-armed promotion reads as NULL/NA, not pending.
+  if (version.status !== 'promoted' || servingStatus !== 'unconfirmed') return null;
+  const promotedAt = version.promoted_at ?? version.serving?.confirmed_at ?? version.served_at;
+  const deadline = version.deploy_confirm_deadline;
+  const deadlineText = deadline
+    ? ` · confirm by ${new Date(deadline).toLocaleString()}`
+    : '';
+  return (
+    <div
+      data-testid="promoted-awaiting-activation"
+      className="flex flex-col gap-0.5 px-2 py-1.5 rounded border bg-amber-500/10 border-amber-500/30"
+    >
+      <div className="flex flex-wrap items-center gap-1.5">
+        <span className="text-ui-sm font-semibold text-amber-400">promoted, awaiting activation</span>
+        <span className="text-ui-sm font-mono text-amber-300">v{version.version_number}</span>
+        {promotedAt && (
+          <span className="text-ui-sm text-amber-600">promoted {timeAgo(promotedAt)}</span>
+        )}
+      </div>
+      <p className="text-ui-sm text-amber-300/80">
+        Run <span className="font-mono">blueprint deploy</span> (or approve the deploy) to activate it
+        {deadlineText}.
+      </p>
+    </div>
+  );
+}
+
 export function StagedDirectionsSummary({ staged }: { staged: StagedDirection[] }) {
   if (!staged.length) return null;
   return (

@@ -16,6 +16,7 @@ from app.models import (
     Project,
     ProjectMember,
     ProjectMessage,
+    ReleaseVersion,
     Task,
     TaskStatus,
 )
@@ -24,6 +25,7 @@ from app.operator_attention import (
     build_operator_attention,
     get_operator_message_counts,
 )
+from app.time_utils import _utcnow
 
 TEST_USER_ID = "test-user-attn-alert"
 
@@ -312,4 +314,145 @@ async def test_decay_sweep_decrements_needs_operator_count(db_session):
     assert post["needs_operator"] == 0, (
         f"needs_operator must be 0 after stale QUESTION is decayed, "
         f"got {post['needs_operator']}"
+    )
+
+
+def _add_promoted_version(
+    db_session, project_id, *, version_number=1, serving_status="unconfirmed"
+) -> ReleaseVersion:
+    version = ReleaseVersion(
+        project_id=project_id,
+        version_number=version_number,
+        status="promoted",
+        serving_status=serving_status,
+        promoted_at=_utcnow(),
+    )
+    db_session.add(version)
+    return version
+
+
+@pytest.mark.asyncio
+async def test_promoted_awaiting_activation_item(db_session):
+    """A promoted version still ``unconfirmed`` surfaces as a needs_operator
+    attention item (reason=promotion_awaiting_activation) and increments the
+    promoted_awaiting_activation count and total_needs_operator.
+
+    The aggregate serving status comes from version_serving_summary, so the
+    armed-but-pending promotion is exactly the state where the operator's
+    single activation approval is what the promotion-to-serving path is waiting
+    on.
+    """
+    project = await _seed_alert_project(db_session)
+    _add_promoted_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+
+    attention = await build_operator_attention(db_session, project, TEST_USER_ID)
+
+    assert attention["counts"]["promoted_awaiting_activation"] == 1, (
+        f"promoted-unconfirmed must count 1, got "
+        f"{attention['counts']['promoted_awaiting_activation']}"
+    )
+    item = next(
+        (
+            i
+            for i in attention["items"]
+            if i.get("reason") == "promotion_awaiting_activation"
+        ),
+        None,
+    )
+    assert item is not None, (
+        f"promotion_awaiting_activation item missing from attention, "
+        f"items={[i.get('reason') for i in attention['items']]}"
+    )
+    assert item["severity"] == "needs_operator"
+    assert item["kind"] == "version"
+    assert "awaiting activation" in item["label"]
+    assert item["ref"]["kind"] == "version"
+    assert item["ref"]["project_id"] == str(project.id)
+    assert attention["counts"]["needs_operator"] >= 1
+
+    # Click-through must survive normalize_target: the item declares
+    # operator_action=activate_promoted_version, so a target that normalizes
+    # away to {} would leave the operator with nowhere to go.  The panel that
+    # activates a promoted version renders at runtime/version-lifecycle.
+    target = item.get("target")
+    assert target, (
+        "promotion_awaiting_activation must carry a navigable target; an "
+        "unrecognized surface/section normalizes away to {}"
+    )
+    assert target["surface"] == "runtime"
+    assert target["section"] == "version-lifecycle"
+    assert target["project_id"] == str(project.id)
+
+
+@pytest.mark.asyncio
+async def test_promoted_awaiting_activation_suppressed_when_serving_confirmed(db_session):
+    """A promoted version already ``serving_confirmed`` must NOT surface the
+    awaiting-activation item — the deploy resolved, so there is nothing for the
+    operator to activate."""
+    project = await _seed_alert_project(db_session)
+    _add_promoted_version(
+        db_session, project.id, version_number=1, serving_status="serving_confirmed"
+    )
+    await db_session.commit()
+
+    attention = await build_operator_attention(db_session, project, TEST_USER_ID)
+
+    assert attention["counts"]["promoted_awaiting_activation"] == 0
+    assert all(
+        i.get("reason") != "promotion_awaiting_activation"
+        for i in attention["items"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_promoted_awaiting_activation_absent_when_only_open_version(db_session):
+    """With no promoted row (only the current open version), the count stays 0 —
+    there is no prior promotion awaiting activation."""
+    project = await _seed_alert_project(db_session)
+    db_session.add(
+        ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            status="open",
+            phase="build",
+        )
+    )
+    await db_session.commit()
+
+    attention = await build_operator_attention(db_session, project, TEST_USER_ID)
+
+    assert attention["counts"]["promoted_awaiting_activation"] == 0
+    assert all(
+        i.get("reason") != "promotion_awaiting_activation"
+        for i in attention["items"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_promoted_awaiting_activation_only_latest_promoted_counts(db_session):
+    """Only the HIGHEST-numbered promoted version is examined: an older promoted
+    version still stuck unconfirmed must not surface once a newer promotion has
+    already resolved serving."""
+    project = await _seed_alert_project(db_session)
+    _add_promoted_version(
+        db_session,
+        project.id,
+        version_number=1,
+        serving_status="unconfirmed",
+    )
+    _add_promoted_version(
+        db_session,
+        project.id,
+        version_number=2,
+        serving_status="serving_confirmed",
+    )
+    await db_session.commit()
+
+    attention = await build_operator_attention(db_session, project, TEST_USER_ID)
+
+    assert attention["counts"]["promoted_awaiting_activation"] == 0
+    assert all(
+        i.get("reason") != "promotion_awaiting_activation"
+        for i in attention["items"]
     )

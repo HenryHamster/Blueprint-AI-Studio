@@ -942,7 +942,7 @@ async def github_webhook(
         for task in matching:
             try:
                 gh_token, gh_owner, gh_repo = await get_github_token_for_task(
-                    task.id, session
+                    task.id, session, task=task
                 )
                 ci_result = await get_check_runs_cached(
                     gh_token,

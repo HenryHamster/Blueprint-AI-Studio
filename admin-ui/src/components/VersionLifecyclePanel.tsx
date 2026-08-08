@@ -45,6 +45,7 @@ import {
   DurableQualificationEvidenceRow,
   PromotionReadinessSummary,
   PinnedServingVersionCallout,
+  PromotedAwaitingActivationCallout,
   StagedDirectionsSummary,
   CutConsequences,
   ChallengedVsUnchallengedSummary,
@@ -629,6 +630,15 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
             v => (v.serving?.status ?? v.serving_status) === 'serving_confirmed',
           );
           return serving ? <PinnedServingVersionCallout version={serving} /> : null;
+        })()}
+        {(() => {
+          // The most recent promoted version still awaiting serving activation.
+          // `recent` is ordered most-recent-first, so the first matching entry
+          // is the latest promotion the operator's approval would activate.
+          const awaiting = recent.find(
+            v => v.status === 'promoted' && (v.serving?.status ?? v.serving_status) === 'unconfirmed',
+          );
+          return awaiting ? <PromotedAwaitingActivationCallout version={awaiting} /> : null;
         })()}
         {cv && (
           <div className="space-y-1">

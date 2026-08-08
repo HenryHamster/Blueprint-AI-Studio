@@ -7713,6 +7713,168 @@ async def test_harvest_flake_budget_tristate(db_session, mocker):
 
 
 # ===========================================================================
+# Activation receipt: blueprint deploy → _record_activation_receipt
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_record_activation_receipt_resolves_unconfirmed_to_serving_confirmed(
+    db_session,
+):
+    """An activation receipt for an unconfirmed promoted version confirms the
+    backend artifact with the reported revision and resolves the whole version
+    to serving_confirmed through the shared recovery machinery: scalar flip,
+    served_sha/served_at, verdict outcome, receipt provenance."""
+    from app.release_reconciliation import _record_activation_receipt
+
+    now = _utcnow()
+    promoted_at = now - timedelta(hours=1)
+    deadline = promoted_at + timedelta(hours=1)
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+
+    receipt = await _record_activation_receipt(
+        db_session,
+        version,
+        revision=_SHA_B,
+        host="hamsterwheel",
+        operator_id="op@example.com",
+        now=now,
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert receipt["serving_status"] == "serving_confirmed"
+    assert version.serving_status == "serving_confirmed"
+    assert version.served_sha == _SHA_B
+    assert version.served_at is not None
+    assert version.deploy_failure_reason is None
+
+    # The receipt provenance is stamped on the version audit trail.
+    receipt_block = (version.last_qualification or {}).get("activation_receipt") or {}
+    assert receipt_block.get("revision") == _SHA_B
+    assert receipt_block.get("host") == "hamsterwheel"
+    assert receipt_block.get("operator") == "op@example.com"
+
+    # The backend artifact is confirmed with the served identifier.
+    backend = (
+        (
+            await db_session.execute(
+                _select(ReleaseDeployArtifact).where(
+                    ReleaseDeployArtifact.version_id == version.id,
+                    ReleaseDeployArtifact.artifact_kind
+                    == BACKEND_REVISION_ARTIFACT_KIND,
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert backend is not None
+    assert backend.serving_status == "serving_confirmed"
+    assert backend.served_identifier == _SHA_B
+
+    # The verdict outcome flipped to serving_confirmed.
+    verdict = (
+        (
+            await db_session.execute(
+                _select(QualificationVerdict).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert verdict.post_promotion_outcome == "serving_confirmed"
+
+
+@pytest.mark.asyncio
+async def test_record_activation_receipt_leaves_aggregate_unconfirmed_when_required_pending(
+    db_session, mocker
+):
+    """A required non-backend artifact that stays pending keeps the whole
+    version unconfirmed — only the backend artifact is confirmed by the
+    receipt, and the confirm-sweep finishes the remaining gate."""
+    from app.release_reconciliation import _record_activation_receipt
+
+    async def _never_resolve(_session, _version, _artifact, _now):
+        return None
+
+    backend_provider = artifact_registry._ARTIFACT_PROVIDERS[
+        BACKEND_REVISION_ARTIFACT_KIND
+    ]
+    mocker.patch.dict(
+        artifact_registry._ARTIFACT_PROVIDERS,
+        {
+            BACKEND_REVISION_ARTIFACT_KIND: backend_provider,
+            "synthetic_pending": ReleaseArtifactProvider(
+                artifact_kind="synthetic_pending",
+                check=_never_resolve,
+                required=True,
+            ),
+        },
+        clear=True,
+    )
+    now = _utcnow()
+    promoted_at = now - timedelta(hours=1)
+    deadline = promoted_at + timedelta(hours=1)
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+
+    receipt = await _record_activation_receipt(
+        db_session,
+        version,
+        revision=_SHA_B,
+        host="hamsterwheel",
+        operator_id="op@example.com",
+        now=now,
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # The whole-release aggregate stays unconfirmed.
+    assert receipt["serving_status"] == "unconfirmed"
+
+    # The backend artifact is confirmed with the served identifier.
+    backend = (
+        (
+            await db_session.execute(
+                _select(ReleaseDeployArtifact).where(
+                    ReleaseDeployArtifact.version_id == version.id,
+                    ReleaseDeployArtifact.artifact_kind
+                    == BACKEND_REVISION_ARTIFACT_KIND,
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert backend is not None
+    assert backend.serving_status == "serving_confirmed"
+    assert backend.served_identifier == _SHA_B
+
+    # The synthetic required artifact is still pending, keeping the aggregate
+    # unconfirmed until the sweep resolves it.
+    pending = (
+        (
+            await db_session.execute(
+                _select(ReleaseDeployArtifact).where(
+                    ReleaseDeployArtifact.version_id == version.id,
+                    ReleaseDeployArtifact.artifact_kind == "synthetic_pending",
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert pending is not None
+    assert (pending.serving_status or "unconfirmed") == "unconfirmed"
+
+
+# ===========================================================================
 # Promotion-CI self-heal gate: decoupled from design_doc._auto_remediation,
 # governed by durable operator-owned build_config (default ON, project-agnostic)
 # ===========================================================================

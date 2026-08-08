@@ -5,6 +5,7 @@ module imports cleanly, and that --json emits valid JSON for a read command —
 all with blueprint_api.api mocked so no network/credentials are needed.
 """
 import argparse
+import hashlib
 import io
 import json
 import os
@@ -5497,3 +5498,205 @@ def test_messages_confirm_read_only_refused(mock_api, monkeypatch):
     with pytest.raises(SystemExit) as exc:
         blueprint.main(["messages", "confirm", "accept", "pend-abc123", "--yes"])
     assert exc.value.code == 1
+
+
+# ── blueprint deploy ─────────────────────────────────────────────────────────
+
+_DEPLOY_REV = "c" * 40
+_DEPLOY_PROMOTED_SHA = "a" * 40
+
+
+def _deploy_gh_fake(revision: str = _DEPLOY_REV, compare_status: str = "ahead"):
+    """Fake blueprint._gh serving a successful run list, a manifest download,
+    and a GitHub compare result."""
+
+    def fake_gh(*args):
+        if args[:2] == ("run", "list"):
+            return json.dumps([{
+                "databaseId": 4242,
+                "headSha": "e" * 40,
+                "status": "completed",
+                "conclusion": "success",
+                "createdAt": "2026-06-15T00:00:00Z",
+            }])
+        if args[:2] == ("run", "download"):
+            # args: run download <id> --repo <repo> -n <name> -D <dir>
+            tmp = args[args.index("-D") + 1]
+            manifest = {
+                "image_ref": f"gcr.io/blueprint/app@sha256:{'0' * 64}",
+                "revision": revision,
+            }
+            body = json.dumps(manifest)
+            manifest_path = os.path.join(tmp, "local-app-release.json")
+            with open(manifest_path, "w", encoding="utf-8") as fh:
+                fh.write(body)
+            with open(manifest_path + ".sha256", "w", encoding="utf-8") as fh:
+                fh.write(hashlib.sha256(body.encode()).hexdigest())
+            return ""
+        if args[0] == "api":
+            return json.dumps({"status": compare_status})
+        raise AssertionError(f"unexpected gh call: {args}")
+
+    return fake_gh
+
+
+def _deploy_api_fake(calls, *, promoted=None, post_failure=None):
+    """Fake blueprint.api for deploy: promoted-version lookup + receipt POST."""
+    if promoted is None:
+        promoted = {
+            "id": "uuid-promo",
+            "version_number": 7,
+            "status": "promoted",
+            "promoted_sha": _DEPLOY_PROMOTED_SHA,
+            "serving_status": "unconfirmed",
+        }
+
+    def fake_api(method, path, body=None, timeout=30):
+        calls.append((method, path, body))
+        if method == "GET" and "release-versions" in path and "status=promoted" in path:
+            return {"versions": [promoted], "total": 1, "limit": 1, "offset": 0}
+        if method == "POST" and path.endswith("/activation-receipt"):
+            if post_failure is not None:
+                raise post_failure
+            return {
+                "version_number": promoted["version_number"],
+                "serving_status": "serving_confirmed",
+                "served_sha": _DEPLOY_PROMOTED_SHA,
+                "served_at": "2026-06-15T00:00:00Z",
+                "deploy_failure_reason": None,
+                "receipt": {
+                    "mode": "cli_activation",
+                    "serving_status": "serving_confirmed",
+                    "served_sha": _DEPLOY_PROMOTED_SHA,
+                },
+            }
+        return {}
+
+    return fake_api
+
+
+def _deploy_env(monkeypatch, api_fake, *, revision=_DEPLOY_REV, compare_status="ahead"):
+    """Common deploy test scaffolding: config, project id, gh, api, ssh, input."""
+    calls = []
+    monkeypatch.setattr(blueprint, "_gh", _deploy_gh_fake(revision, compare_status))
+    monkeypatch.setattr(blueprint, "api", api_fake)
+    monkeypatch.setattr(blueprint_api, "api", api_fake)
+    monkeypatch.setattr(blueprint, "get_project_id", lambda x=None: "proj-1")
+    monkeypatch.setattr(
+        blueprint, "load_config",
+        lambda: {"api_url": "http://orchestrator", "api_key": "k", "read_only": False},
+    )
+    monkeypatch.setattr(
+        blueprint_api, "load_config",
+        lambda: {"api_url": "http://orchestrator", "api_key": "k", "read_only": False},
+    )
+    monkeypatch.setattr(blueprint, "_require_write_config", lambda action: None)
+
+    def fake_run(cmd, **kwargs):
+        class R:
+            returncode = 0
+        return R()
+
+    monkeypatch.setattr(blueprint.subprocess, "run", fake_run)
+    return calls
+
+
+def test_deploy_defaults_to_promoted_version(monkeypatch, capsys):
+    """blueprint deploy with no --sha binds to the latest promoted release version:
+    it queries the promoted version, verifies the build contains the promoted SHA,
+    activates over SSH, then POSTs an activation receipt carrying that version."""
+    calls = []
+    api_fake = _deploy_api_fake(calls)
+    _deploy_env(monkeypatch, api_fake)
+
+    rc = blueprint.main(["deploy", "--host", "hamsterwheel", "--yes"])
+    assert rc == 0
+
+    # The deploy defaults to the promoted version, not a bare release build.
+    promoted_reads = [
+        p for m, p, _ in calls
+        if m == "GET" and "release-versions" in p and "status=promoted" in p
+    ]
+    assert promoted_reads, "deploy must query the latest promoted release version"
+    assert "limit=1" in promoted_reads[0]
+
+    # The build revision is bound to the promoted SHA via the GitHub compare API.
+    out = capsys.readouterr().out
+    assert "Binding:" in out
+    assert "v7" in out
+    assert "promoted aaaaaaaaaaaa" in out
+
+    # The receipt is POSTed with the promoted version_number and the revision.
+    receipt_posts = [
+        b for m, p, b in calls if m == "POST" and p.endswith("/activation-receipt")
+    ]
+    assert receipt_posts, "deploy must POST an activation receipt"
+    body = receipt_posts[0]
+    assert body["version_number"] == 7
+    assert body["revision"] == _DEPLOY_REV
+    assert body["host"] == "hamsterwheel"
+
+
+def test_deploy_refuses_without_promoted_version(monkeypatch, capsys):
+    """deploy refuses to activate when the project has no promoted release version
+    unless --force is given."""
+    calls = []
+
+    def fake_api(method, path, body=None, timeout=30):
+        calls.append((method, path, body))
+        if method == "GET" and "release-versions" in path and "status=promoted" in path:
+            return {"versions": [], "total": 0, "limit": 1, "offset": 0}
+        return {}
+
+    _deploy_env(monkeypatch, fake_api)
+    rc = blueprint.main(["deploy", "--host", "hamsterwheel", "--yes"])
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "no promoted release version" in out
+    # No SSH activation, no receipt.
+    assert not any(m == "POST" and p.endswith("/activation-receipt") for m, p, _ in calls)
+
+
+def test_deploy_refuses_non_descendant_without_force(monkeypatch, capsys):
+    """deploy refuses a build that is behind/diverged from the promoted SHA."""
+    calls = []
+    api_fake = _deploy_api_fake(calls)
+    _deploy_env(monkeypatch, api_fake, compare_status="behind")
+    rc = blueprint.main(["deploy", "--host", "hamsterwheel", "--yes"])
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "is behind the promoted SHA" in out
+    assert not any(m == "POST" and p.endswith("/activation-receipt") for m, p, _ in calls)
+
+
+def test_deploy_dry_run_does_not_ssh_or_post_receipt(monkeypatch, capsys):
+    """--dry-run prints the binding analysis but neither SSH-activates nor POSTs."""
+    calls = []
+    api_fake = _deploy_api_fake(calls)
+    _deploy_env(monkeypatch, api_fake)
+
+    ran_ssh = []
+    monkeypatch.setattr(
+        blueprint.subprocess, "run",
+        lambda cmd, **kwargs: ran_ssh.append(cmd) or type("R", (), {"returncode": 0})(),
+    )
+    rc = blueprint.main(["deploy", "--host", "hamsterwheel", "--dry-run"])
+    assert rc == 0
+    assert not ran_ssh, "--dry-run must not SSH-activate"
+    assert not any(m == "POST" and p.endswith("/activation-receipt") for m, p, _ in calls)
+
+
+def test_deploy_receipt_post_failure_warns_and_exits_nonzero(monkeypatch, capsys):
+    """The release activated but the receipt POST failed — the CLI must say so
+    loudly and exit non-zero so the operator knows the loop is still open."""
+    from blueprint_api import APIError
+
+    calls = []
+    api_fake = _deploy_api_fake(calls, post_failure=APIError("HTTP 500: boom"))
+    _deploy_env(monkeypatch, api_fake)
+
+    rc = blueprint.main(["deploy", "--host", "hamsterwheel", "--yes"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "activation receipt could not be recorded" in err
+

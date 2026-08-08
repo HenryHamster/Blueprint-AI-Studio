@@ -250,6 +250,7 @@ async def get_github_token_for_task(
     force_refresh: bool = False,
     *,
     release_dedicated_session_before_io: bool = False,
+    task: Task | None = None,
 ) -> tuple[str, str, str]:
     """Resolve a GitHub token for the task's project.
 
@@ -264,6 +265,14 @@ async def get_github_token_for_task(
 
     Now that the cache is expiry-correct, ``force_refresh`` is redundant for
     freshness purposes and can be dropped from periodic callers.
+
+    ``task`` lets a caller that already holds the loaded ``Task`` ORM object
+    skip the identity-map-bypassing ``select(Task).where(Task.id == ...)``
+    re-fetch (``AsyncSession`` does NOT short-circuit through the identity map,
+    so it would be a real DB round-trip).  The webhook CI-completion fan-out
+    uses this to avoid up to N redundant SELECTs across up to 200 matching
+    EVALUATING tasks.  When omitted, the task is re-fetched as before and the
+    404 behavior is unchanged.
     """
     # Guard before the first SELECT: an autoflush must never make a shared,
     # write-bearing session look clean before the release-mode rollback.
@@ -275,8 +284,9 @@ async def get_github_token_for_task(
     # The opt-in release mode snapshots fallback fields and ends its dedicated
     # read transaction before GitHub or Secret Manager I/O so a slow mint
     # cannot pin a pool connection.
-    stmt = select(Task).where(Task.id == task_id)
-    task = (await session.execute(stmt)).scalars().first()
+    if task is None:
+        stmt = select(Task).where(Task.id == task_id)
+        task = (await session.execute(stmt)).scalars().first()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 

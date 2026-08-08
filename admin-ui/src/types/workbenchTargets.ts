@@ -49,6 +49,10 @@ export const WORKBENCH_RUNTIME_SECTIONS = [
   'provider-settings',
   'notifications',
   'advanced',
+  // RuntimeWorkspace renders VersionLifecyclePanel here; attention items that
+  // deep-link to promotion/activation target it (mirrors RUNTIME_SECTIONS in
+  // backend/app/workbench_contracts.py).
+  'version-lifecycle',
 ] as const;
 
 const WORKBENCH_SURFACE_ALIASES = {

@@ -1335,7 +1335,7 @@ def test_backfill_0707_chains_from_0702_and_declares_kv_keys():
         )
 
 
-def test_schema_head_chains_through_0736_direction_scoped_verdicts():
+def test_schema_head_chains_through_0737_cross_project_scan_indexes():
     """Service-credential migrations follow admission removal as one linear chain.
 
     Historical contracts preserved:
@@ -1346,7 +1346,8 @@ def test_schema_head_chains_through_0736_direction_scoped_verdicts():
     - 0727 (inline LLM spend log) revises 0725
     - 0728 (inline LLM spend pricing status) revises 0727
     - 0735 (task origination) revises 0728
-    - 0736 (direction-scoped category verdicts) revises 0735 — current schema head
+    - 0736 (direction-scoped category verdicts) revises 0735
+    - 0737 (cross-project perf indexes) revises 0736 — current schema head
     """
     versions_dir = Path(__file__).resolve().parents[1] / "alembic" / "versions"
     operability = (
@@ -1413,6 +1414,9 @@ def test_schema_head_chains_through_0736_direction_scoped_verdicts():
     direction_scoped_verdicts = (
         versions_dir / "0736_scope_category_verdict_to_direction.py"
     ).read_text()
+    perf_indexes = (
+        versions_dir / "0737_cross_project_scan_indexes.py"
+    ).read_text()
     assert parse_revision_identifiers(operability) == ("0708", "0707")
     assert parse_revision_identifiers(claims) == ("0709", "0708")
     assert parse_revision_identifiers(incarnation) == ("0710", "0709")
@@ -1449,10 +1453,12 @@ def test_schema_head_chains_through_0736_direction_scoped_verdicts():
     assert parse_revision_identifiers(task_origination) == ("0735", "0728")
     # 0736 chains from 0735: exactly-one-of direction/version verdict scope.
     assert parse_revision_identifiers(direction_scoped_verdicts) == ("0736", "0735")
+    # 0737 chains from 0736: additive cross-project perf indexes.
+    assert parse_revision_identifiers(perf_indexes) == ("0737", "0736")
 
     from app.main import EXPECTED_SCHEMA_REVISION
 
-    assert EXPECTED_SCHEMA_REVISION == "0736", (
-        f"Expected EXPECTED_SCHEMA_REVISION == '0736', got {EXPECTED_SCHEMA_REVISION!r}. "
+    assert EXPECTED_SCHEMA_REVISION == "0737", (
+        f"Expected EXPECTED_SCHEMA_REVISION == '0737', got {EXPECTED_SCHEMA_REVISION!r}. "
         "Bump EXPECTED_SCHEMA_REVISION in backend/app/main.py."
     )

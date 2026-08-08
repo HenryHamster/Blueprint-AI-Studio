@@ -13,7 +13,7 @@ from typing import Any
 
 from sqlalchemy import and_, case, func, not_, or_, union_all
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import aliased, load_only
+from sqlalchemy.orm import aliased, load_only, selectinload
 from sqlmodel import select
 
 from app.message_convergence import (
@@ -54,6 +54,7 @@ from app.message_audience import (
     operator_visible_nonactionable_message_filter,
 )
 from app.reaper_orphan_classify import _classify_orphan
+from app.release_artifacts import version_serving_summary
 from app.release_version import current_open_version
 from app.routers.admin_runners import _runner_health
 from app.runner_project_binding import runner_allowed_for_project
@@ -177,6 +178,7 @@ _ATTENTION_VISIBLE_PRIORITY: dict[tuple[str, str], int] = {
     ("needs_operator", "hand_merge_required"): 15,
     ("needs_operator", "alert"): 20,
     ("needs_operator", "local_runner_hold"): 30,
+    ("needs_operator", "promotion_awaiting_activation"): 35,
     ("needs_operator", "stale_runner_pin"): 40,
     ("needs_operator", "dead_runner"): 45,
     ("needs_operator", "stale_provisioning_task"): 50,
@@ -291,6 +293,13 @@ _ATTENTION_LIFECYCLE_BY_REASON: dict[str, dict[str, Any]] = {
         "mode": "version_lifecycle",
         "clears_when": "criterion_mapped_to_active_direction_or_operator_attested",
         "operator_action": "remap_or_attest_criterion",
+        "acknowledgeable": False,
+        "acknowledge_effect": "none",
+    },
+    "promotion_awaiting_activation": {
+        "mode": "version_lifecycle",
+        "clears_when": "serving_confirmed_or_deploy_resolved",
+        "operator_action": "activate_promoted_version",
         "acknowledgeable": False,
         "acknowledge_effect": "none",
     },
@@ -1577,6 +1586,75 @@ def _experiment_outcome_attention_item(task: Task) -> dict[str, Any]:
     }
 
 
+async def _load_latest_promoted_version(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> ReleaseVersion | None:
+    """Return the highest-numbered ``promoted`` ReleaseVersion for a project.
+
+    Only ``status="promoted"`` rows are candidates — an open version is the
+    current one (not awaiting activation) and an abandoned one is retired.
+    ``deploy_artifacts`` is eager-loaded because the serving summary reads it
+    (async lazy-load would otherwise raise).
+    """
+    return (
+        await session.execute(
+            select(ReleaseVersion)
+            .options(selectinload(ReleaseVersion.deploy_artifacts))
+            .where(
+                ReleaseVersion.project_id == project_id,
+                ReleaseVersion.status == "promoted",
+            )
+            .order_by(ReleaseVersion.version_number.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+
+def _promoted_awaiting_activation_attention_item(
+    project_id: uuid.UUID,
+    version: ReleaseVersion,
+) -> dict[str, Any]:
+    """Attention item for the latest promoted version awaiting serving activation.
+
+    Fires while the promoted version's serving confirmation is still
+    ``unconfirmed``: the promotion has merged but the deploy has not yet been
+    confirmed serving, so the operator's single activation approval is exactly
+    what the promotion-to-serving path is waiting on.
+    """
+    version_number = version.version_number
+    deadline = version.deploy_confirm_deadline
+    deadline_text = (
+        f" Confirmation window ends {deadline.isoformat()}." if deadline else ""
+    )
+    return {
+        "id": f"version:{version.id}:promotion_awaiting_activation",
+        "kind": "version",
+        "severity": "needs_operator",
+        "reason": "promotion_awaiting_activation",
+        "label": f"v{version_number} promoted, awaiting activation",
+        "detail": (
+            f"v{version_number} merged to the promotion target but is not yet "
+            "confirmed serving — run `blueprint deploy` (or approve the deploy) "
+            f"to activate it.{deadline_text}"
+        ),
+        "updated_at": (
+            version.promoted_at.isoformat() if version.promoted_at else None
+        ),
+        "ref": {
+            "kind": "version",
+            "id": str(version.id),
+            "project_id": str(project_id),
+        },
+        "target": _attention_target({
+            "surface": "runtime",
+            "project_id": str(project_id),
+            "section": "version-lifecycle",
+            "id": str(version.id),
+        }),
+    }
+
+
 def _stuck_criteria_attention_item(
     project_id: uuid.UUID,
     stuck_count: int,
@@ -2639,6 +2717,28 @@ async def build_operator_attention(
     except Exception:
         pass
 
+    # Latest promoted version awaiting serving activation: while the most recent
+    # promotion is still ``unconfirmed``, the operator's single activation
+    # approval is what the promotion-to-serving path is waiting on. Defensive
+    # (mirrors the open-version coverage block above) so a release-reading
+    # failure can never 500 this poll-frequent endpoint.
+    promoted_awaiting_activation_item: dict[str, Any] | None = None
+    try:
+        promoted_version = await _load_latest_promoted_version(session, project.id)
+        if promoted_version is not None:
+            aggregate, _evidence = version_serving_summary(promoted_version, project)
+            if aggregate.get("serving_status") == "unconfirmed":
+                promoted_awaiting_activation_item = (
+                    _promoted_awaiting_activation_attention_item(
+                        project.id, promoted_version
+                    )
+                )
+    except Exception:
+        logger.exception(
+            "operator_attention: failed to resolve promoted-awaiting-activation for project %s",
+            project.id,
+        )
+
     directions = project.directions if isinstance(project.directions, list) else []
     manual_directions = [
         direction
@@ -2720,6 +2820,8 @@ async def build_operator_attention(
                 stuck_direction_inactive_count,
             )
         )
+    if promoted_awaiting_activation_item is not None:
+        add_candidate(promoted_awaiting_activation_item)
     if coverage_blocked_count > 0:
         add_candidate(_coverage_blocked_attention_item(project.id, coverage_blocked_count))
     if phantom_bookkeeping_report.get("has_drift"):
@@ -2799,6 +2901,7 @@ async def build_operator_attention(
         + attestation_expiring_count
         + corroboration_failed_count
         + (1 if stale_debt_count > 0 else 0)
+        + (1 if promoted_awaiting_activation_item is not None else 0)
     )
     total_watch = (
         generic_failed_count
@@ -2865,6 +2968,9 @@ async def build_operator_attention(
             "churn_retirement_recommended": len(churn_recommended_directions),
             "pending_confirmations": pending_confirmation_count,
             "stuck_criteria": stuck_criteria_count,
+            "promoted_awaiting_activation": (
+                1 if promoted_awaiting_activation_item is not None else 0
+            ),
             "coverage_blocked": coverage_blocked_count,
             "phantom_criterion_bookkeeping": (
                 1 if phantom_bookkeeping_report.get("has_drift") else 0

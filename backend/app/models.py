@@ -3291,6 +3291,12 @@ class Alert(SQLModel, table=True):
         Index("ix_alert_project_severity", "project_id", "severity"),
         Index("ix_alert_project_domain", "project_id", "domain"),
         Index("ix_alert_project_event_type", "project_id", "event_type"),
+        # Cross-project runner-health monitors scan event_type + dismissed_at
+        # WITHOUT a project_id predicate (runner_health_monitors.py,
+        # runner_health_alerts.py), so the project-prefixed indexes above cannot
+        # serve them.  Leading column event_type turns each recurring scan into an
+        # index range walk instead of a severity-only filter + heap scan.
+        Index("ix_alert_event_type_dismissed", "event_type", "dismissed_at"),
         Index("ix_alert_project_source", "project_id", "source"),
         Index("ix_alert_project_created_at", "project_id", "created_at"),
         # title is filtered in dedupe/existence WHERE clauses across many alert
@@ -4110,6 +4116,17 @@ class ProjectMessage(SQLModel, table=True):
         ),
         Index("ix_projectmessage_from_task_id", "from_task_id"),
         Index("ix_projectmessage_status_from_type", "status", "from_type"),
+        # Cross-project reaper sweeps filter status + message_type and ORDER BY
+        # created_at with no project_id predicate (reaper_bug_message_sweeps.py,
+        # reaper_sweeps.py), so the project-prefixed indexes cannot serve them.
+        # This composite turns each sweep into a bounded index range walk in the
+        # desired order instead of a full status population scan + sort.
+        Index(
+            "ix_projectmessage_status_message_type_created",
+            "status",
+            "message_type",
+            "created_at",
+        ),
         # PostgreSQL migrations create expression indexes for the exact JSONB
         # scalar predicates.  The metadata entries use the backing column so
         # the model/migration coverage invariant can track their names.

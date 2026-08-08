@@ -73,13 +73,15 @@ class LocalApiServiceTests(unittest.TestCase):
             "BLUEPRINT_CONTROL_PLANE_NETWORK": "blueprint-control-plane",
             "BLUEPRINT_API_PORT": "8080",
             "BLUEPRINT_DATABASE_MODE": database_mode,
+            "BLUEPRINT_API_DEPLOY_SHA": "b" * 40,
         }
 
+    @patch.object(api.worker, "_oci_revision_label")
     @patch.object(api, "_assert_container_slot")
     @patch.object(api.worker, "_network_gateway", return_value="172.20.0.1")
     @patch.object(api.worker, "_assert_no_host_ci_runner")
     def test_api_deploy_sha_is_validated_and_forwarded(
-        self, _ci_guard, _gateway, _container_slot
+        self, _ci_guard, _gateway, _container_slot, _oci_label
     ):
         environment = self._environment(database_mode="local-postgres")
         environment["BLUEPRINT_API_DEPLOY_SHA"] = "b" * 40
@@ -90,6 +92,20 @@ class LocalApiServiceTests(unittest.TestCase):
             argv[index + 1] for index, item in enumerate(argv[:-1]) if item == "--env"
         }
         self.assertIn("DEPLOY_SHA", forwarded)
+        _oci_label.assert_not_called()
+
+        # Absent env var: the pinned image's OCI revision label is the
+        # fallback identity source for first-boot/rollback role environments.
+        del environment["BLUEPRINT_API_DEPLOY_SHA"]
+        _oci_label.return_value = "c" * 40
+        with patch.dict(os.environ, environment, clear=True):
+            argv, child_env = api.command()
+        self.assertEqual(child_env["DEPLOY_SHA"], "c" * 40)
+        forwarded = {
+            argv[index + 1] for index, item in enumerate(argv[:-1]) if item == "--env"
+        }
+        self.assertIn("DEPLOY_SHA", forwarded)
+        _oci_label.assert_called_once_with(f"sha256:{'a' * 64}")
 
         environment["BLUEPRINT_API_DEPLOY_SHA"] = "short"
         with (
