@@ -1383,6 +1383,13 @@ def _describe_sha(version_str: str) -> str | None:
     return None
 
 
+def _clean_source_sha(version_str: str | None) -> str | None:
+    """Return a commit identity only for a clean, parseable checkout."""
+    if not version_str or "-dirty" in version_str:
+        return None
+    return _describe_sha(version_str)
+
+
 def _actionable_version_hint(value: object) -> str | None:
     """Return a deploy identity only when the server supplied a real hint.
 
@@ -4071,6 +4078,7 @@ def _heartbeat_loop(
                 "supported_agent_task_types": supported_agent_task_types,
                 "hostname": hostname,
                 "version": version,
+                "git_sha": _clean_source_sha(version),
                 "isolation_backends": isolation_backends,
                 "container_gpu_passthrough": (
                     caps.container_gpu_passthrough if caps is not None else None
@@ -7594,6 +7602,7 @@ def _preflight(
         compute_reason = "no bwrap sandbox and no usable container runtime"
 
     gpu_caps = _detect_gpu()
+    preflight_version = _runner_version()
 
     # Orchestrator / token ping (the token validation).
     heartbeat_body = {
@@ -7609,7 +7618,8 @@ def _preflight(
         "agent_available": claimable[iso.CLASS_AGENT],
         "supported_agent_task_types": supported_agent_task_types,
         "hostname": hostname,
-        "version": _runner_version(),
+        "version": preflight_version,
+        "git_sha": _clean_source_sha(preflight_version),
         # Isolation-backend inventory + selected backends so `--check`
         # populates the fleet view the same way the running heartbeat does.
         "isolation_backends": iso.capabilities_inventory(caps),

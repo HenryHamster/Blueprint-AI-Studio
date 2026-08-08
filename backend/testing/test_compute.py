@@ -443,6 +443,64 @@ async def test_fleet_serving_source_sha_preserves_exact_match_without_ancestry(
 
 
 @pytest.mark.asyncio
+async def test_fleet_serving_source_sha_accepts_live_local_runner(db_session):
+    """A live checkout runner can independently prove the promoted source SHA."""
+    promoted_sha = "a" * 40
+    project = Project(name="Local serving identity", user_id="test-user")
+    db_session.add(project)
+    await db_session.flush()
+    db_session.add(
+        LocalRunner(
+            project_id=project.id,
+            token_hash="0" * 64,
+            status="active",
+            last_seen_at=_utcnow(),
+            source_sha=promoted_sha,
+        )
+    )
+    await db_session.commit()
+
+    assert (
+        await compute.fleet_serving_source_sha(
+            db_session,
+            promoted_sha,
+            project_id=project.id,
+        )
+        is True
+    )
+
+
+@pytest.mark.asyncio
+async def test_fleet_serving_source_sha_rejects_local_runner_on_different_sha(
+    db_session,
+):
+    """A checkout runner reporting another commit must not satisfy the gate."""
+    promoted_sha = "a" * 40
+    project = Project(name="Wrong local serving identity", user_id="test-user")
+    db_session.add(project)
+    await db_session.flush()
+    db_session.add(
+        LocalRunner(
+            project_id=project.id,
+            token_hash="1" * 64,
+            status="active",
+            last_seen_at=_utcnow(),
+            source_sha="b" * 40,
+        )
+    )
+    await db_session.commit()
+
+    assert (
+        await compute.fleet_serving_source_sha(
+            db_session,
+            promoted_sha,
+            project_id=project.id,
+        )
+        is False
+    )
+
+
+@pytest.mark.asyncio
 async def test_fleet_serving_source_sha_accepts_descendant_when_enabled(
     monkeypatch, mocker
 ):
@@ -8138,5 +8196,4 @@ async def test_build_launch_spec_declared_metric_none_when_absent(db_session, mo
 
     spec = compute_jobs._build_launch_spec(job)
     assert spec.declared_metric is None
-
 

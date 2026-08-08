@@ -725,6 +725,28 @@ async def test_heartbeat_no_version_stamp_when_unchanged(db_session):
 
 
 @pytest.mark.asyncio
+async def test_heartbeat_persists_and_clears_checkout_source_identity(db_session):
+    """A clean SHA is durable, while an explicit unknown/dirty report clears it."""
+    _project, runner = await _make_runner(db_session)
+
+    await heartbeat(
+        payload=HeartbeatRequest(git_sha="a" * 40),
+        runner=runner,
+        session=db_session,
+    )
+    await db_session.refresh(runner)
+    assert runner.source_sha == "a" * 40
+
+    await heartbeat(
+        payload=HeartbeatRequest(git_sha=None),
+        runner=runner,
+        session=db_session,
+    )
+    await db_session.refresh(runner)
+    assert runner.source_sha is None
+
+
+@pytest.mark.asyncio
 async def test_cleanup_trims_old_keeps_recent(db_session):
     """Retention cleanup deletes snapshots older than the window, keeps recent."""
     _project, runner = await _make_runner(db_session)

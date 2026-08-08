@@ -714,6 +714,10 @@ class HeartbeatRequest(BaseModel):
     supported_agent_task_types: list[StrictStr] | None = None
     hostname: str | None = None
     version: str | None = None
+    # Clean git commit identity for the checkout serving fleet work. New
+    # runners send this on every heartbeat; null means the checkout is not
+    # verifiable (for example, it is dirty). Older runners may omit it.
+    git_sha: str | None = Field(None, pattern="^[0-9a-f]{7,40}$")
     # Runner-reported isolation-backend inventory + selected backends (optional;
     # old runners omit these). isolation_backends is a flat {backend: bool} map
     # (bwrap_ok/userns_ok/docker_usable/podman_usable/apptainer_ok/enroot_ok/
@@ -1978,6 +1982,8 @@ async def heartbeat(
             caps["version_changed_at"] = now.isoformat()
             caps["previous_version"] = previous_version
         runner.version = new_version
+    if "git_sha" in payload.model_fields_set:
+        runner.source_sha = payload.git_sha
     runner.capabilities = caps
     session.add(runner)
     await session.flush()

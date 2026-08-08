@@ -1115,14 +1115,11 @@ async def fleet_serving_source_sha(
 ) -> bool:
     """True iff the running agent fleet is observed serving ``promoted_sha``.
 
-    Default fleet-serving definition for the agent VM image release artifact: at
-    least one currently-active (LIVE: PROVISIONING / IDLE / LEASED) warm-pool VM
-    reports ``agent_source_sha == promoted_sha`` — i.e. the freshly baked image
-    is live and running on the fleet.  DB-backed so the read survives an
-    orchestrator restart (the durable ``PoolVm.agent_source_sha`` is populated by
-    heartbeats via :func:`persist_pool_vm_image_state`); the in-memory heartbeat
-    map is consulted as a warm fallback before a row is persisted (and for
-    task-bound VMs that have no PoolVm registry row).
+    A fleet-serving observation may come from either currently-live fleet class:
+    a warm-pool VM's ``agent_source_sha`` or a self-hosted runner's
+    ``source_sha``. Both are DB-backed so the read survives an orchestrator
+    restart; the in-memory heartbeat map remains a warm fallback for task-bound
+    VMs that have no PoolVm registry row.
 
     A read-only observation: returns ``False`` (not-yet-serving) rather than
     raising on any error so it can never abort the serving-confirmation sweep.
@@ -1133,7 +1130,9 @@ async def fleet_serving_source_sha(
     try:
         from sqlalchemy import select
 
-        from app.models import PoolVm, Task, TaskStatus
+        from app.models import LocalRunner, PoolVm, Task, TaskStatus
+        from app.runner_health_monitors import _get_liveness_seconds
+        from app.time_utils import _utcnow
         from app.warm_pool import LIVE_POOL_STATES
 
         stmt = select(PoolVm.agent_source_sha).where(
@@ -1144,6 +1143,20 @@ async def fleet_serving_source_sha(
             stmt = stmt.where(PoolVm.project_id == project_id)
         rows = (await session.execute(stmt)).all()
         observed_shas.update(str(row[0]) for row in rows if row[0])
+        if promoted_sha in observed_shas:
+            return True
+
+        runner_cutoff = _utcnow() - timedelta(seconds=_get_liveness_seconds())
+        runner_stmt = select(LocalRunner.source_sha).where(
+            LocalRunner.source_sha.is_not(None),
+            LocalRunner.status == "active",
+            LocalRunner.last_seen_at.is_not(None),
+            LocalRunner.last_seen_at >= runner_cutoff,
+        )
+        if project_id is not None:
+            runner_stmt = runner_stmt.where(LocalRunner.project_id == project_id)
+        runner_rows = (await session.execute(runner_stmt)).all()
+        observed_shas.update(str(row[0]) for row in runner_rows if row[0])
         if promoted_sha in observed_shas:
             return True
     except Exception as e:

@@ -7821,6 +7821,12 @@ class LocalRunner(SQLModel, table=True):
     version: str | None = Field(
         default=None, sa_column=Column(String(64), nullable=True)
     )
+    # Clean git commit identity reported by the runner's checkout. This is
+    # separate from ``version`` because the latter is a human-readable
+    # ``git describe`` value that may include a tag or dirty marker.
+    source_sha: str | None = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
     # "active" | "inactive" | "deleted"
     status: str = Field(
         default="active",
