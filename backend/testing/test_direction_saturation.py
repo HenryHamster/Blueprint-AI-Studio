@@ -200,12 +200,11 @@ def test_flag_saturation_disposition_skips_terminal_directions():
         assert SATURATION_DISPOSITION_KEY not in direction
 
 
-def test_resolve_and_clear_saturation_disposition():
+def test_clear_and_reflag_saturation_disposition():
     from app.direction_saturation import (
         SATURATION_DISPOSITION_KEY,
         clear_saturation_disposition,
         flag_saturation_disposition,
-        resolve_saturation_disposition,
     )
 
     direction = {**_active_direction("d-sat-resolve"), "research_history": _saturated_history()}
@@ -213,15 +212,11 @@ def test_resolve_and_clear_saturation_disposition():
         direction, now_iso="2026-08-01T00:00:00Z", findings_produced=2, tasks_created=0
     ) is True
 
-    # resolve removes the item and reports it.
-    assert resolve_saturation_disposition(
-        direction, disposition="narrow_scope", resolved_at="2026-08-02T00:00:00Z"
-    ) is True
+    # Clearing a pending item removes it and reports the removal.
+    assert clear_saturation_disposition(direction) is True
     assert SATURATION_DISPOSITION_KEY not in direction
-    # Resolving when no item is pending is a no-op.
-    assert resolve_saturation_disposition(
-        direction, disposition="retire", resolved_at="2026-08-03T00:00:00Z"
-    ) is False
+    # Clearing when no item is pending is a no-op.
+    assert clear_saturation_disposition(direction) is False
 
     # A resolved item lets a genuine NEW saturation episode re-flag cleanly.
     assert flag_saturation_disposition(

@@ -24,12 +24,6 @@ SATURATION_DISPOSITION_KEY = "saturation_disposition"
 # Item status values.
 DISPOSITION_REQUIRED = "required"
 
-# Bounded disposition vocabulary the strategist must choose from when resolving
-# a saturated direction.  ``commission_work`` = spawn concrete tasks in the
-# direction, ``narrow_scope`` = tighten the direction's scope/contract so it can
-# produce work again, ``retire`` = retire the direction as exhausted.
-VALID_DISPOSITIONS = frozenset({"commission_work", "narrow_scope", "retire"})
-
 _RETIRED_DIRECTION_STATUSES = frozenset(
     {"expired", "retired", "superseded", "completed"}
 )
@@ -59,9 +53,9 @@ def flag_saturation_disposition(
     already carries a pending item (dedup — never re-emitted across cycles), is
     user-paused (excluded), or is already terminal (nothing left to dispose of).
 
-    The item persists on the direction until the strategist resolves it via
-    ``resolve_saturation_disposition`` or one of the disposition ops
-    (retire_direction / update_direction / spawn_task) removes it.
+    The item persists on the direction until the strategist resolves it via one
+    of the disposition ops (retire_direction / update_direction / spawn_task),
+    which removes it.
     """
     if direction_user_paused(direction):
         return False
@@ -83,25 +77,6 @@ def flag_saturation_disposition(
             "narrow the scope, or retire)"
         ),
     }
-    return True
-
-
-def resolve_saturation_disposition(
-    direction: dict,
-    *,
-    disposition: str,
-    resolved_at: str,
-) -> bool:
-    """Mark a pending saturation-disposition item resolved.
-
-    The item is removed entirely rather than retained: a resolved disposition is
-    the strategist's concrete answer (commission/narrow/retire), and removing it
-    lets a genuinely NEW saturation episode re-flag on a future cycle.  Returns
-    ``True`` when a pending item was present and removed.
-    """
-    if not direction.get(SATURATION_DISPOSITION_KEY):
-        return False
-    direction.pop(SATURATION_DISPOSITION_KEY, None)
     return True
 
 
