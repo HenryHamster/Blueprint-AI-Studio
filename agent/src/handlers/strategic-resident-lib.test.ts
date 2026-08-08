@@ -6,6 +6,7 @@ import {
   materializeContentBlocks, isAllowedAttachmentDownloadUrl,
   rollbackMessageBatchAdmission, RetryableArtifactAttachmentError,
   buildBootstrapPrompt, buildAutonomousPrompt,
+  resolveResidentPurposeText,
   resolveTerminalStatus, nextAuthorityHeld, autonomousActive, FrameCoalescer,
   buildPriorDecisionsText,
   buildRetiredContextText,
@@ -1132,7 +1133,7 @@ describe('buildBootstrapPrompt', () => {
     stagedDirectionsText: '',
     retiredDirectionsText: '',
     previousDecisionOutcomesText: '',
-    visionJson: '{"v":1}',
+    purposeText: 'Ship a coherent strategic v2 pipeline.',
     openMessagesText: 'msg1',
     sessionId: 'ss-1',
     fetchGuidanceText: '',
@@ -1204,14 +1205,25 @@ describe('buildBootstrapPrompt', () => {
 
   it('omits optional sections that are blank', () => {
     const p = buildBootstrapPrompt({
-      ...base, runningUpdate: '', directionsText: '', visionJson: '', openMessagesText: '',
+      ...base, runningUpdate: '', directionsText: '', purposeText: '', openMessagesText: '',
     });
     expect(p).not.toContain('Active directions');
     expect(p).not.toContain('Open operator messages');
-    expect(p).not.toContain('## Vision');
     expect(p).not.toContain('Recently retired / completed directions');
     expect(p).not.toContain('Prior-cycle decision outcomes');
     expect(p).not.toContain('Already-staged (next-version) directions');
+  });
+
+  it('renders an explicit no-purpose marker instead of a silently-empty Vision section', () => {
+    // Absence of project purpose must be OBSERVABLE — a blank effective_purpose
+    // renders the "no project purpose on record" marker rather than dropping the
+    // section (which would be indistinguishable from the payload never carrying it).
+    const p = buildBootstrapPrompt({ ...base, purposeText: '' });
+    expect(p).toContain('## Vision (project purpose)');
+    expect(p).toContain('no project purpose on record');
+    expect(p).not.toContain('Ship a coherent strategic v2 pipeline.');
+    // A whitespace-only purpose renders the same observable marker.
+    expect(buildBootstrapPrompt({ ...base, purposeText: '   ' })).toContain('no project purpose on record');
   });
 
   it('renders the recently-answered operator conversation as a read-only section', () => {
@@ -1324,6 +1336,59 @@ describe('buildBootstrapPrompt', () => {
   });
 });
 
+describe('resolveResidentPurposeText (payload grounding key binding)', () => {
+  // Regression: the vision-key cut (#16973) removed the legacy `vision` dict
+  // from every resident payload; the backend now ships `effective_purpose`.
+  // These tests fail if the resident surface ever re-binds its grounding section
+  // to a payload key the backend does NOT emit, because a vision-bound read would
+  // render a silently-empty section on current backends.
+  it('does NOT bind to the removed payload.vision key', () => {
+    // The legacy vision body is no longer emitted; a payload carrying only
+    // `vision` must resolve to NO purpose text, never to the stale JSON blob.
+    expect(resolveResidentPurposeText({ vision: { future: 'testable code' } })).toBe('');
+    expect(resolveResidentPurposeText({ vision: { future: 'x' }, effective_purpose: '' })).toBe('');
+    // An absent key behaves the same as an empty string (observable absence).
+    expect(resolveResidentPurposeText({})).toBe('');
+  });
+
+  it('reads the live effective_purpose key the backend emits', () => {
+    expect(resolveResidentPurposeText({ effective_purpose: 'Ship the v2 pipeline' })).toBe('Ship the v2 pipeline');
+    expect(resolveResidentPurposeText({ effective_purpose: '  padded purpose  ' })).toBe('padded purpose');
+    // Non-string values degrade to '' (no throw).
+    expect(resolveResidentPurposeText({ effective_purpose: { future: 'x' } })).toBe('');
+    expect(resolveResidentPurposeText({ effective_purpose: 42 })).toBe('');
+  });
+
+  it('renders the grounding section only from effective_purpose, with an observable empty marker', () => {
+    const baseCtx = {
+      contextPrefix: '', projectName: 'Acme', problemModelJson: '{"gaps":[]}',
+      runningUpdate: '', directionsText: '', stagedDirectionsText: '',
+      retiredDirectionsText: '', previousDecisionOutcomesText: '',
+      strategicMemoryNotesText: '', openMessagesText: '', sessionId: 's-1',
+      fetchGuidanceText: '',
+    };
+    // A payload that only carries the removed `vision` key → the section renders
+    // the "no project purpose on record" marker and NEVER the vision JSON blob.
+    const visionOnly = buildBootstrapPrompt({
+      ...baseCtx,
+      purposeText: resolveResidentPurposeText({ vision: { future: 'testable code' } }),
+    });
+    expect(visionOnly).toContain('## Vision (project purpose)');
+    expect(visionOnly).toContain('no project purpose on record');
+    expect(visionOnly).not.toContain('testable code');
+    expect(visionOnly).not.toContain('"future"');
+
+    // The live key drives the section content end-to-end.
+    const withPurpose = buildBootstrapPrompt({
+      ...baseCtx,
+      purposeText: resolveResidentPurposeText({ effective_purpose: 'Ground on the product mission' }),
+    });
+    expect(withPurpose).toContain('## Vision (project purpose)');
+    expect(withPurpose).toContain('Ground on the product mission');
+    expect(withPurpose).not.toContain('no project purpose on record');
+  });
+});
+
 describe('retired/prior-context renderers', () => {
   it('renders compact staged-direction lines and omits empty input', () => {
     expect(buildStagedDirectionsText([])).toBe('');
@@ -1424,7 +1489,7 @@ describe('retired/prior-context renderers', () => {
       ]),
       retiredDirectionsText: retiredText,
       previousDecisionOutcomesText: priorText,
-      visionJson: '',
+      purposeText: '',
       openMessagesText: '',
       fetchGuidanceText: '',
       sessionId: 'ss-x',
@@ -2037,7 +2102,7 @@ describe('buildBootstrapPrompt operator-decision instruction', () => {
     contextPrefix: '', projectName: 'Blueprint', problemModelJson: '{}',
     runningUpdate: '', directionsText: '', stagedDirectionsText: '',
     retiredDirectionsText: '', previousDecisionOutcomesText: '',
-    strategicMemoryNotesText: '', visionJson: '', openMessagesText: '',
+    strategicMemoryNotesText: '', purposeText: '', openMessagesText: '',
     sessionId: 's-1', fetchGuidanceText: '', priorSessionContextText: '',
     skillsText: '', decisionsRegisterText: '',
   };
@@ -3067,7 +3132,7 @@ describe('buildCompactionCheckpoint', () => {
       recentInteractions: '',
       autonomousState: 'Examination tick: 0',
       problemModelJson: JSON.stringify({ goals: ['improve testing'] }),
-      visionJson: JSON.stringify({ future: 'testable code' }),
+      purposeText: 'testable code',
       strategicMemoryNotesText: '- Prefer concrete action over abstract discussion\n- Verify findings before escalating',
       openMessagesText: 'msg: improve test coverage',
       priorSessionContextText: 'Prior session explored auth flows.',
@@ -3082,7 +3147,7 @@ describe('buildCompactionCheckpoint', () => {
     // Every grounding field that was present renders as a sub-section.
     expect(result).toContain('### Problem model');
     expect(result).toContain('improve testing');
-    expect(result).toContain('### Vision');
+    expect(result).toContain('### Vision (project purpose)');
     expect(result).toContain('testable code');
     expect(result).toContain('### Standing behavioral lessons');
     expect(result).toContain('Prefer concrete action');
@@ -3137,7 +3202,7 @@ describe('buildCompactionCheckpoint', () => {
       autonomousState: 'Examination tick: 0',
       problemModelJson: JSON.stringify({ goals: ['improve testing'] }),
       directionsText: '- d-1 active',
-      visionJson: JSON.stringify({ future: 'testable code' }),
+      purposeText: 'testable code',
       openMessagesText: 'msg: improve test coverage',
     };
     const result = buildCompactionCheckpoint(ctx);
@@ -3222,20 +3287,20 @@ describe('buildCompactionCheckpoint', () => {
     expect(withoutStatic).not.toContain('## Prior-cycle decision outcomes');
 
     // PROBLEM 2 — field-level grounding fallback. A successful refetch that
-    // returns an empty STRUCTURAL field (problemModelJson / visionJson) is a
+    // returns an empty STRUCTURAL field (problemModelJson / purposeText) is a
     // transient degraded read: fall back to the snapshot rather than dropping
     // the section. An empty refreshed openMessagesText still WINS (messages the
     // operator's turn just handled must disappear).
     const snapshot: CheckpointGrounding = {
       problemModelJson: JSON.stringify({ goals: ['SNAPSHOT goal'] }, null, 2),
-      visionJson: JSON.stringify({ future: 'SNAPSHOT vision' }, null, 2),
+      purposeText: 'SNAPSHOT purpose',
       strategicMemoryNotesText: '- SNAPSHOT lesson',
       runningUpdate: 'SNAPSHOT running update',
       openMessagesText: 'SNAPSHOT open message',
     };
     const refreshedDegraded: CheckpointGrounding = {
       problemModelJson: '',
-      visionJson: '',
+      purposeText: '',
       strategicMemoryNotesText: '',
       runningUpdate: '',
       openMessagesText: '',
@@ -3243,7 +3308,7 @@ describe('buildCompactionCheckpoint', () => {
     const resolved = resolveCheckpointGrounding(snapshot, refreshedDegraded);
     // Structural fields fall back to the snapshot on an empty refetch.
     expect(resolved.problemModelJson).toContain('SNAPSHOT goal');
-    expect(resolved.visionJson).toContain('SNAPSHOT vision');
+    expect(resolved.purposeText).toContain('SNAPSHOT purpose');
     expect(resolved.strategicMemoryNotesText).toBe('- SNAPSHOT lesson');
     expect(resolved.runningUpdate).toBe('SNAPSHOT running update');
     // openMessagesText is the deliberate exception — empty refreshed wins.
@@ -3391,13 +3456,13 @@ describe('formatCheckpointState', () => {
   it('maps a populated response into pretty-printed JSON + formatted notes + string', () => {
     const resp: CheckpointStateResponse = {
       problem_model: { goals: ['ship refresh'] },
-      vision: { future: 'coherent strategist' },
+      effective_purpose: 'coherent strategist purpose',
       strategic_memory_notes: [{ note: 'do not re-derive', set_at: '2026-07-01T00:00:00Z' }],
       running_update: 'refresh landed',
     };
     const g = formatCheckpointState(resp);
     expect(g.problemModelJson).toBe(JSON.stringify({ goals: ['ship refresh'] }, null, 2));
-    expect(g.visionJson).toBe(JSON.stringify({ future: 'coherent strategist' }, null, 2));
+    expect(g.purposeText).toBe('coherent strategist purpose');
     expect(g.strategicMemoryNotesText).toBe('- [2026-07-01T00:00:00Z] do not re-derive');
     expect(g.runningUpdate).toBe('refresh landed');
   });
@@ -3405,12 +3470,12 @@ describe('formatCheckpointState', () => {
   it('coerces empty {} / missing / mistyped fields to empty strings (no throw)', () => {
     const g = formatCheckpointState({
       problem_model: {},
-      vision: undefined,
+      effective_purpose: undefined,
       strategic_memory_notes: 'not-an-array',
       running_update: 42,
     });
     expect(g.problemModelJson).toBe('');
-    expect(g.visionJson).toBe('');
+    expect(g.purposeText).toBe('');
     expect(g.strategicMemoryNotesText).toBe('');
     expect(g.runningUpdate).toBe('');
     // A fully empty response object must not throw.
@@ -3421,7 +3486,7 @@ describe('formatCheckpointState', () => {
 describe('resolveCheckpointGrounding', () => {
   const snapshot: CheckpointGrounding = {
     problemModelJson: JSON.stringify({ goals: ['STALE goal'] }, null, 2),
-    visionJson: JSON.stringify({ future: 'STALE vision' }, null, 2),
+    purposeText: 'STALE purpose',
     strategicMemoryNotesText: '- STALE lesson',
     runningUpdate: 'STALE running update',
   };
@@ -3431,15 +3496,15 @@ describe('resolveCheckpointGrounding', () => {
     // operator updated mid-session; every field must win over the snapshot.
     const refreshed = formatCheckpointState({
       problem_model: { goals: ['FRESH goal'] },
-      vision: { future: 'FRESH vision' },
+      effective_purpose: 'FRESH purpose',
       strategic_memory_notes: [{ note: 'FRESH lesson', set_at: '2026-07-11T00:00:00Z' }],
       running_update: 'FRESH running update',
     });
     const resolved = resolveCheckpointGrounding(snapshot, refreshed);
     expect(resolved.problemModelJson).toContain('FRESH goal');
     expect(resolved.problemModelJson).not.toContain('STALE');
-    expect(resolved.visionJson).toContain('FRESH vision');
-    expect(resolved.visionJson).not.toContain('STALE');
+    expect(resolved.purposeText).toContain('FRESH purpose');
+    expect(resolved.purposeText).not.toContain('STALE');
     expect(resolved.strategicMemoryNotesText).toBe('- [2026-07-11T00:00:00Z] FRESH lesson');
     expect(resolved.runningUpdate).toBe('FRESH running update');
 
@@ -3462,7 +3527,7 @@ describe('resolveCheckpointGrounding', () => {
   it('falls back to the snapshot when no refresh occurred (refreshed null/undefined)', () => {
     expect(resolveCheckpointGrounding(snapshot, null)).toEqual({
       problemModelJson: snapshot.problemModelJson,
-      visionJson: snapshot.visionJson,
+      purposeText: snapshot.purposeText,
       strategicMemoryNotesText: snapshot.strategicMemoryNotesText,
       runningUpdate: snapshot.runningUpdate,
     });
@@ -3471,7 +3536,7 @@ describe('resolveCheckpointGrounding', () => {
   });
 
   it('an empty refreshed STRUCTURAL field falls back to the snapshot (transient degraded read)', () => {
-    // A successful refetch that returns empty problem-model/vision/memory/running
+    // A successful refetch that returns empty problem-model/purpose/memory/running
     // fields is treated as a transient degraded server read — NOT a mid-session
     // clear — so the checkpoint must fall back to the session-start snapshot
     // field-by-field rather than dropping structural grounding entirely. Only a
@@ -3479,7 +3544,7 @@ describe('resolveCheckpointGrounding', () => {
     // covered in the 'resolveCheckpointGrounding open_messages' suite.)
     const refreshed: CheckpointGrounding = {
       problemModelJson: JSON.stringify({ goals: ['FRESH goal'] }, null, 2),
-      visionJson: '',
+      purposeText: '',
       strategicMemoryNotesText: '',
       runningUpdate: '',
     };
@@ -3488,8 +3553,8 @@ describe('resolveCheckpointGrounding', () => {
     expect(resolved.problemModelJson).toContain('FRESH goal');
     expect(resolved.problemModelJson).not.toContain('STALE');
     // Empty refreshed structural fields fall back to the snapshot, not undefined.
-    expect(resolved.visionJson).toBe(snapshot.visionJson);
-    expect(resolved.visionJson).toContain('STALE vision');
+    expect(resolved.purposeText).toBe(snapshot.purposeText);
+    expect(resolved.purposeText).toContain('STALE purpose');
     expect(resolved.strategicMemoryNotesText).toBe(snapshot.strategicMemoryNotesText);
     expect(resolved.runningUpdate).toBe(snapshot.runningUpdate);
   });
@@ -3519,7 +3584,7 @@ describe('formatCheckpointState open_messages field', () => {
 describe('resolveCheckpointGrounding open_messages', () => {
   const snapshot: CheckpointGrounding = {
     problemModelJson: '{}',
-    visionJson: '{}',
+    purposeText: '',
     strategicMemoryNotesText: '',
     runningUpdate: '',
     openMessagesText: 'STALE open message',
@@ -3528,7 +3593,7 @@ describe('resolveCheckpointGrounding open_messages', () => {
   it('refreshed openMessagesText wins over the snapshot', () => {
     const refreshed: CheckpointGrounding = {
       problemModelJson: '{}',
-      visionJson: '{}',
+      purposeText: '',
       strategicMemoryNotesText: '',
       runningUpdate: '',
       openMessagesText: 'FRESH open message',
@@ -3542,7 +3607,7 @@ describe('resolveCheckpointGrounding open_messages', () => {
     // must WIN so the checkpoint omits the section rather than re-showing stale text.
     const refreshed: CheckpointGrounding = {
       problemModelJson: '{}',
-      visionJson: '{}',
+      purposeText: '',
       strategicMemoryNotesText: '',
       runningUpdate: '',
       openMessagesText: '',
@@ -3559,7 +3624,7 @@ describe('resolveCheckpointGrounding open_messages', () => {
   it('snapshot with no openMessagesText falls back to undefined when refresh is null', () => {
     const snapshotNoMsgs: CheckpointGrounding = {
       problemModelJson: '{}',
-      visionJson: '{}',
+      purposeText: '',
       strategicMemoryNotesText: '',
       runningUpdate: '',
     };
@@ -3585,7 +3650,7 @@ describe('formatCheckpointState recent_handled_conversation field', () => {
 describe('resolveCheckpointGrounding recent_handled_conversation', () => {
   const snapshot: CheckpointGrounding = {
     problemModelJson: '{}',
-    visionJson: '{}',
+    purposeText: '',
     strategicMemoryNotesText: '',
     runningUpdate: '',
     recentHandledConversationText: 'STALE handled tail',
@@ -3594,7 +3659,7 @@ describe('resolveCheckpointGrounding recent_handled_conversation', () => {
   it('refreshed recentHandledConversationText wins over the snapshot', () => {
     const refreshed: CheckpointGrounding = {
       problemModelJson: '{}',
-      visionJson: '{}',
+      purposeText: '',
       strategicMemoryNotesText: '',
       runningUpdate: '',
       recentHandledConversationText: 'FRESH handled tail',
@@ -3606,7 +3671,7 @@ describe('resolveCheckpointGrounding recent_handled_conversation', () => {
   it('empty refreshed recentHandledConversationText collapses to undefined (fresh wins over stale)', () => {
     const refreshed: CheckpointGrounding = {
       problemModelJson: '{}',
-      visionJson: '{}',
+      purposeText: '',
       strategicMemoryNotesText: '',
       runningUpdate: '',
       recentHandledConversationText: '',

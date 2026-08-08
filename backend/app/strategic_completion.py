@@ -5179,15 +5179,27 @@ async def _handle_strategic_completion(
         from app.vision_merge import append_rejected_edits, merge_vision
 
         current_vision = dict(project.vision or {})
-        payload_vision_rev = (task.first_payload.get("vision") or {}).get("revision", 0)
+        # The legacy vision body is no longer shipped in the strategic payload
+        # (see the spawned_vision_rev resolution above), so the payload fallback
+        # is empty for every modern task. Bind the merge baseline to the
+        # cycle's durable baseline_vision snapshot; legacy tasks that still
+        # carry the payload key keep the old read; tasks with no cycle row fall
+        # back to the CURRENT agent-visible vision so the 3-way merge never runs
+        # against an empty baseline (which makes every agent-supplied field read
+        # as a fresh edit and logs spurious rejections for legit updates).
+        payload_vision_rev = spawned_vision_rev
         db_vision_rev = current_vision.get("revision", 0)
         # Baseline: prefer the snapshot the cycle row captured at spawn time
         # (StrategicCycle.cycle_metadata.baseline_vision). Falls back to the
-        # payload vision if the cycle row is unavailable (legacy task).
+        # payload vision (legacy task) and then the current agent-visible vision.
         cycle_id = task.strategic_cycle_id or (task.context or {}).get(
             "strategic_cycle_id"
         )
         baseline_vision = task.first_payload.get("vision") or {}
+        if not baseline_vision:
+            from app.strategic_local_runner import _agent_visible_vision
+
+            baseline_vision = _agent_visible_vision(project.vision)
         if cycle_id:
             cycle_row = await strategic_cycle.get(session, cycle_id)
             if cycle_row is not None:

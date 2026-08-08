@@ -81,7 +81,7 @@ export interface StrategicWatchReceipt {
   target_kind?: 'task';
   target_task_id?: string;
   purpose?: string;
-  state?: 'fired' | 'expired' | string;
+  state?: string;
   terminal_status?: string | null;
   receipt?: {
     title?: string;
@@ -525,7 +525,7 @@ export interface CheckpointStateResponse {
   problem_model?: unknown;
   strategic_memory_notes?: unknown;
   running_update?: unknown;
-  vision?: unknown;
+  effective_purpose?: unknown;
   /** Current open operator messages (same shape as the bootstrap payload's
    *  open_messages). Present on backends that have shipped this field; absent
    *  on older responses — caller degrades gracefully. */
@@ -536,10 +536,25 @@ export interface CheckpointStateResponse {
   recent_handled_conversation?: unknown;
 }
 
+/**
+ * Resolve the resident's project-purpose grounding from the bootstrap payload.
+ *
+ * Binds to `effective_purpose` — the single intent field the backend actually
+ * emits (the legacy `vision` body was removed in #16973). Never read
+ * `payload.vision` here: the backend no longer ships it, so a vision-bound read
+ * would render a silently-empty grounding section that only activates when a
+ * stale backend still carries the old key. Returns a trimmed string, or '' when
+ * the payload carries no purpose (callers log + render an explicit marker).
+ */
+export function resolveResidentPurposeText(payload: Record<string, unknown>): string {
+  return typeof payload.effective_purpose === 'string' ? payload.effective_purpose.trim() : '';
+}
+
 /** The self-model grounding fields the compaction checkpoint carries. */
 export interface CheckpointGrounding {
   problemModelJson: string;
-  visionJson: string;
+  /** Current project purpose text (payload.effective_purpose). */
+  purposeText: string;
   strategicMemoryNotesText: string;
   runningUpdate: string;
   /** Formatted open operator messages text (from open_messages). Absent when
@@ -553,9 +568,10 @@ export interface CheckpointGrounding {
 
 /**
  * Map a checkpoint-state endpoint response into the refreshed grounding fields,
- * formatted identically to the session-start bootstrap (problem_model / vision
- * → pretty JSON, notes → shared formatter, running_update → string). Tolerant
- * of missing / mistyped keys so a partial response never throws.
+ * formatted identically to the session-start bootstrap (problem_model → pretty
+ * JSON, effective_purpose → trimmed text, notes → shared formatter,
+ * running_update → string). Tolerant of missing / mistyped keys so a partial
+ * response never throws.
  *
  * Note: `openMessagesText` is left empty here because the formatting function
  * (`buildOpenMessagesText`) lives in strategic-sections.ts which imports the
@@ -565,7 +581,7 @@ export interface CheckpointGrounding {
 export function formatCheckpointState(resp: CheckpointStateResponse): CheckpointGrounding {
   return {
     problemModelJson: formatRecordJson(resp.problem_model),
-    visionJson: formatRecordJson(resp.vision),
+    purposeText: typeof resp.effective_purpose === 'string' ? resp.effective_purpose.trim() : '',
     strategicMemoryNotesText: formatStrategicMemoryNotes(resp.strategic_memory_notes),
     runningUpdate: typeof resp.running_update === 'string' ? resp.running_update : '',
     openMessagesText: '',
@@ -582,14 +598,13 @@ export function formatCheckpointState(resp: CheckpointStateResponse): Checkpoint
  * DELIBERATE ASYMMETRY — do NOT "simplify" this back into a whole-object
  * `refreshed ?? snapshot` switch:
  *
- *  - STRUCTURAL fields (problemModelJson, visionJson, strategicMemoryNotesText,
+ *  - STRUCTURAL fields (problemModelJson, purposeText, strategicMemoryNotesText,
  *    runningUpdate) fall back FIELD-BY-FIELD: a refreshed value that is
  *    empty/blank is treated as a transient degraded server read (e.g.
- *    _agent_view_problem_model / _agent_visible_vision formatting to empty) and
- *    the session-start snapshot value is used instead. Losing the problem model
- *    or vision to a momentary empty refetch is a coherence loss we refuse to
- *    take; a genuine mid-session edit still refreshes because it returns a
- *    non-empty value.
+ *    _agent_view_problem_model formatting to empty) and the session-start
+ *    snapshot value is used instead. Losing the problem model or purpose to a
+ *    momentary empty refetch is a coherence loss we refuse to take; a genuine
+ *    mid-session edit still refreshes because it returns a non-empty value.
  *  - openMessagesText and recentHandledConversationText are the EXCEPTION: a
  *    refreshed EMPTY value must WIN over the stale bootstrap snapshot. Messages
  *    the operator's turn just handled should DISAPPEAR from the open feed (and
@@ -604,7 +619,7 @@ export function resolveCheckpointGrounding(
   refreshed: CheckpointGrounding | null | undefined,
 ): {
   problemModelJson?: string;
-  visionJson?: string;
+  purposeText?: string;
   strategicMemoryNotesText?: string;
   runningUpdate?: string;
   openMessagesText?: string;
@@ -614,7 +629,7 @@ export function resolveCheckpointGrounding(
   if (refreshed == null) {
     return {
       problemModelJson: snapshot.problemModelJson || undefined,
-      visionJson: snapshot.visionJson || undefined,
+      purposeText: snapshot.purposeText || undefined,
       strategicMemoryNotesText: snapshot.strategicMemoryNotesText || undefined,
       runningUpdate: snapshot.runningUpdate || undefined,
       openMessagesText: snapshot.openMessagesText || undefined,
@@ -628,7 +643,7 @@ export function resolveCheckpointGrounding(
     (refreshedVal && refreshedVal.trim() ? refreshedVal : snapshotVal) || undefined;
   return {
     problemModelJson: structural(refreshed.problemModelJson, snapshot.problemModelJson),
-    visionJson: structural(refreshed.visionJson, snapshot.visionJson),
+    purposeText: structural(refreshed.purposeText, snapshot.purposeText),
     strategicMemoryNotesText: structural(refreshed.strategicMemoryNotesText, snapshot.strategicMemoryNotesText),
     runningUpdate: structural(refreshed.runningUpdate, snapshot.runningUpdate),
     openMessagesText: refreshed.openMessagesText || undefined,
@@ -654,8 +669,8 @@ export interface CompactionCheckpointContext {
   // settled directions, or re-propose corrections the operator already made.
   /** Current problem model JSON (payload.problem_model). */
   problemModelJson?: string;
-  /** Current vision JSON (payload.vision). */
-  visionJson?: string;
+  /** Current project purpose text (payload.effective_purpose). */
+  purposeText?: string;
   /** Formatted standing behavioral lessons (payload.strategic_memory_notes). */
   strategicMemoryNotesText?: string;
   /** Formatted open operator messages text (payload.open_messages). */
@@ -756,8 +771,10 @@ ${ctx.autonomousState.trim()}`);
   if (ctx.directionsText?.trim()) {
     grounding.push(`### Active directions\n${ctx.directionsText.trim()}`);
   }
-  if (ctx.visionJson?.trim()) {
-    grounding.push(`### Vision\n\`\`\`json\n${ctx.visionJson.trim()}\n\`\`\``);
+  if (ctx.purposeText?.trim()) {
+    grounding.push(`### Vision (project purpose)\n${ctx.purposeText.trim()}`);
+  } else if (ctx.purposeText !== undefined) {
+    grounding.push(`### Vision (project purpose)\n_(no project purpose on record — the operator has not seeded intent.purpose / user_purpose. Ground decisions on the problem model and directions above instead.)_`);
   }
   if (ctx.openMessagesText?.trim()) {
     grounding.push(`### Open operator messages\n${ctx.openMessagesText.trim()}`);
@@ -1512,7 +1529,11 @@ export interface BootstrapContext {
   /** Formatted strategic memory notes text (one line per entry, e.g. "- [ts] note").
    *  Empty string or whitespace → section omitted. Absent or omitted defaults to ''. */
   strategicMemoryNotesText?: string;
-  visionJson: string;
+  /** Current project purpose text (payload.effective_purpose). Rendered as the
+   *  `## Vision (project purpose)` grounding section. Empty string renders an
+   *  explicit "no project purpose on record" marker so an absent purpose is
+   *  observable, never silently indistinguishable from a dropped section. */
+  purposeText: string;
   openMessagesText: string;
   /** Formatted recently-answered operator conversation tail
    *  (payload.recent_handled_conversation). Rendered as a read-only,
@@ -1603,8 +1624,10 @@ ${ctx.strategicMemoryNotesText.trim()}`);
 
 ${ctx.toolContentText.trim()}`);
   }
-  if (ctx.visionJson.trim()) {
-    sections.push(`## Vision\n\`\`\`json\n${ctx.visionJson.trim()}\n\`\`\``);
+  if (ctx.purposeText.trim()) {
+    sections.push(`## Vision (project purpose)\n${ctx.purposeText.trim()}`);
+  } else {
+    sections.push(`## Vision (project purpose)\n_(no project purpose on record — the operator has not seeded intent.purpose / user_purpose. Ground decisions on the problem model, directions, and open operator messages below.)_`);
   }
   if (ctx.priorSessionContextText?.trim()) {
     sections.push(`## Prior session context\n${ctx.priorSessionContextText.trim()}`);

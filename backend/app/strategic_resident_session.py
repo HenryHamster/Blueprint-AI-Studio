@@ -5724,12 +5724,17 @@ async def agent_fetch_checkpoint_state(
     # archived_gaps, rejected_agent_edits, unwindowed per-gap memory, and the
     # internal vision continuation blob — the opposite of the coherence the
     # refresh preserves.
+    from app.problem_model import resolve_project_purpose
     from app.strategic_problem_view import _agent_view_problem_model
 
     return {
         "problem_model": _agent_view_problem_model(project.problem_model),
         "strategic_memory_notes": await build_strategic_memory_index(session, project.id),
         "running_update": project.running_update or "",
+        # The bootstrap ships effective_purpose; carry it onto the refreshed
+        # compaction grounding so a post-compaction session keeps the same
+        # project-purpose grounding it started with instead of dropping it.
+        "effective_purpose": resolve_project_purpose(project),
         "open_messages": open_messages,
         "recent_handled_conversation": recent_handled_conversation,
     }

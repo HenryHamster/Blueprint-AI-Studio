@@ -2214,9 +2214,9 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     "open_message_count": {"priority": "critical"},
     "prompt_suffix": {"priority": "high", "exempt": True},
     # Effective purpose — the single live intent field shipped to the agent
-    # (the legacy vision body is no longer shipped: at critical priority it
-    # measured ~37 KB and evicted lower-tier sections; problem_model carries
-    # the durable intent).
+    # (the legacy vision body is no longer shipped). A compact resolved-purpose
+    # string (tens to hundreds of bytes), so it ships at critical priority with
+    # negligible byte cost; problem_model carries the durable intent.
     "effective_purpose": {"priority": "critical"},
     # User-facing state the agent must respond to. Core section: the open-message
     # inbox has BOTH a summarize fallback AND a floor callback, so at least its

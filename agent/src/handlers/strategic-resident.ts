@@ -54,6 +54,7 @@ import {
   decisionsRegisterText, DECISIONS_REGISTER_CAP, isSettledDecisionVerdict, admitDecisionEntry,
   serializeDecisionsReg, restoreDecisionsReg, parseOperatorDecision, OPERATOR_DECISION_VERDICT,
   formatStrategicMemoryNotes, formatCheckpointState, resolveCheckpointGrounding,
+  resolveResidentPurposeText,
   type ConversationClaimResponse, type MessagesPollResponse,
   type SessionHeartbeatResponse, type ResidentInboundMessage,
   type StreamFrameKind, type StreamFrameStatus, type ExamRecord, type ContentBlock,
@@ -879,8 +880,15 @@ export async function handleStrategicResident(
   provisionAmbientHelpers(taskId, WORKSPACE);
 
   // ── Bootstrap context (delivered on the FIRST turn, retained in-session) ────
-  const vision = payload.vision as Record<string, unknown> | undefined;
-  const visionJson = vision && Object.keys(vision).length > 0 ? JSON.stringify(vision, null, 2) : '';
+  // The legacy `vision` body is no longer emitted by the backend (cut in #16973);
+  // the single live intent field is `effective_purpose`. Bind the Vision
+  // grounding section to that key — never to payload.vision, which would render
+  // silently empty. A missing/blank purpose is logged (observable to operators)
+  // and the prompt renders an explicit "no project purpose on record" marker.
+  const purposeText = resolveResidentPurposeText(payload);
+  if (!purposeText) {
+    sendLog(ws, '[resident] WARNING: payload.effective_purpose is empty — grounding the session without a project purpose\n');
+  }
   const problemModel = payload.problem_model as Record<string, unknown> | undefined;
   const problemModelJson = problemModel && Object.keys(problemModel).length > 0
     ? JSON.stringify(problemModel, null, 2) : '';
@@ -991,7 +999,7 @@ export async function handleStrategicResident(
     retiredDirectionsText,
     previousDecisionOutcomesText,
     strategicMemoryNotesText,
-    visionJson,
+    purposeText,
     openMessagesText: buildOpenMessagesText(openMessages),
     recentHandledConversationText: formatRecentHandledConversation(recentHandledConversation),
     sessionId,
@@ -1275,7 +1283,7 @@ export async function handleStrategicResident(
     const grounding = resolveCheckpointGrounding(
       {
         problemModelJson,
-        visionJson,
+        purposeText,
         strategicMemoryNotesText,
         runningUpdate: strVal(payload.running_update),
         openMessagesText: buildOpenMessagesText(openMessages),
@@ -1286,7 +1294,7 @@ export async function handleStrategicResident(
     return {
       examLedgerJson, recentInteractions, autonomousState,
       problemModelJson: grounding.problemModelJson,
-      visionJson: grounding.visionJson,
+      purposeText: grounding.purposeText,
       strategicMemoryNotesText: grounding.strategicMemoryNotesText,
       openMessagesText: grounding.openMessagesText,
       recentHandledConversationText: grounding.recentHandledConversationText,
@@ -2270,6 +2278,7 @@ export async function handleStrategicResident(
       currentWorkStateRev = resp.work_state_rev;
     }
     if (
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- the backend contract emits a dict or omits the key; a defensive wire-level null guard is kept deliberately.
       resp.work_state_summary !== null
       && typeof resp.work_state_summary === 'object'
       && !Array.isArray(resp.work_state_summary)
@@ -2510,7 +2519,7 @@ export async function handleStrategicResident(
       foregroundTyped = warmingController;
       await warmingController.ensureReady();
       const warmingStillCurrent = foregroundTyped === warmingController
-        && typedFastLease?.leaseId === acquiredLease.leaseId
+        && typedFastLease.leaseId === acquiredLease.leaseId
         && typedFastLease.generation === acquiredLease.generation;
       if (!warmingStillCurrent) {
         warmingController.close();
@@ -4065,7 +4074,7 @@ export async function handleStrategicResident(
         content: turn.completion.content,
         idempotency_key: receipt.idempotency_key,
         envelope: claimed.envelope,
-        ...(workdayRequest ? {
+        ...(turn.workdayRequests.length > 0 ? {
           workday_request: {
             delivery_key: workdayRequest.delivery_key,
             question: workdayRequest.prompt,
@@ -4664,6 +4673,7 @@ export async function handleStrategicResident(
       // operator reply is streamed and its lease-renewing heartbeat lands BEFORE
       // any context compaction (handleOperatorTurn enforces that ordering), so a
       // compaction never sits on the critical path ahead of the reply.
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- preemptedTypedContinuationMessages is set by the watchContinuation closure while this loop is suspended; TS narrows it to null here.
       const msgs = preemptedTypedContinuationMessages ?? await pollMessages();
       preemptedTypedContinuationMessages = null;
       if (msgs.length > 0) {
@@ -5152,7 +5162,9 @@ export async function handleStrategicResident(
     // controller after the first snapshot above.  Its provider probe is
     // bounded; join it during teardown, then close/release the final state so a
     // quick stop cannot leak a pooled slot or restricted child.
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- typedFastProvisionAttempt is set to a real Promise by the kickTypedFastProvisioning closure; TS narrows it to null in this scope.
     if (typedFastProvisionAttempt !== null) {
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- same closure assignment makes this a genuine Promise at teardown time.
       await typedFastProvisionAttempt;
     }
     typedForegroundToClose = foregroundTyped;
