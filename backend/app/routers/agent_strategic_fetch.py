@@ -2496,10 +2496,6 @@ SECTION_FETCH_INVENTORY: dict[str, str | None] = {
     "saturation_dispositions": None,
     # Direction/criterion-rejection tails — bounded at build time to ≤20/≤5
     # records and carried verbatim in the strategic payload; no recovery path.
-    # Forced saturation dispositions — derived from the project at payload build
-    # time by build_saturation_dispositions and already bounded there; carried
-    # verbatim with no independent fetch verb.
-    "saturation_dispositions": None,
     "criterion_link_conflicts": None, "rejected_direction_ops": None,
     "payload_staleness": None, "deployment_state": None,
     "operator_overrides": None, "missing_capability_demand": None,
