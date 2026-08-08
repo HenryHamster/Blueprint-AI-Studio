@@ -3058,7 +3058,16 @@ async def agent_poll_messages(
     # canonical predicate instead of asking it to infer visibility from mutable
     # message context or failing an entire mixed page at its claim boundary.
     fast_message_ids: list[str] = []
-    if resident_poll and remaining_rows:
+    from app.strategic_resident_session import (
+        resident_typed_fast_activation_enabled,
+    )
+
+    # Stamping rows fast-eligible hands them to the typed Fast lane
+    # exclusively; the agent never lets legacy Workday answer them. Without a
+    # server-qualified Fast activation that lane can never run, so the stamp
+    # would silently park operator messages forever — leave the rows on the
+    # legacy Workday reply path instead.
+    if resident_poll and remaining_rows and resident_typed_fast_activation_enabled():
         from app.strategic_conversation_query import strategic_conversation_predicate
 
         canonical_ids = set(
