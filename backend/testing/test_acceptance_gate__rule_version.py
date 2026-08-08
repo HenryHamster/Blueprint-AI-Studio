@@ -344,6 +344,14 @@ def _acceptance_rule_behavior_digest(corpus: list[tuple[str, Task]]) -> str:
 # version bump re-derivation depends on.
 _ACCEPTANCE_RULE_BEHAVIOR_DIGESTS: dict[int, str] = {
     1: "42d52a7f2d622758e02b936ad38f96836d4918c79729d5957886b4396e8006e8",
+    # v2 == v1 digest over this corpus: the corpus + digest were introduced on
+    # this branch already matching the current evaluator, so the bump does not
+    # change any CORPUS verdict.  The bump exists to retire v1 STAMPS produced by
+    # the deployed v29 evaluator — which lacked the `truncated and
+    # corroborated is False` absence-proven branch (added on this branch) — so
+    # `effective_acceptance_verdict` re-derives those already-merged rows instead
+    # of trusting a verdict the retired rule produced.
+    2: "42d52a7f2d622758e02b936ad38f96836d4918c79729d5957886b4396e8006e8",
 }
 
 
