@@ -2272,13 +2272,14 @@ def test_cap_bump_resolves_task_lifecycle_breach():
 
     This guards the cap that was raised 7750 -> 8950 WITHOUT operator approval
     on Blueprint's worst chronic offender (PR #16787) — the failure mode the
-    chronic-offender governance guard exists to refuse. That bump is reversed
-    here: the approved cap is 7750. The old assertion of >= 8950 was written
-    alongside the unapproved bump, so it encoded the defect rather than the
-    intent. task_lifecycle.py is well under 7750 lines, so this merge-test gate
-    still proves the JSON is consistent with the actual file size on disk and
-    fails if the cap ever rises above the approved figure without an explicit
-    decision, or the file grows past it before the CI invariant suite runs.
+    chronic-offender governance guard exists to refuse. That bump was reversed
+    to the approved 7750, and the 2026-08 task-lifecycle decomposition ratchet
+    lowered the approved cap further to 6200 — the canonical policy value
+    ``bump_size_limit(5374)``. task_lifecycle.py is at 5374 lines, so this
+    merge-test gate still proves the JSON is consistent with the actual file
+    size on disk and fails if the cap ever rises above the approved figure
+    without an explicit decision, or the file grows past it before the CI
+    invariant suite runs.
     """
     json_path = os.path.join(os.path.dirname(__file__), "module_size_limits.json")
     data = csl.load_limits(json_path)
@@ -2288,9 +2289,9 @@ def test_cap_bump_resolves_task_lifecycle_breach():
     assert target_rel in backend_caps, (
         f"{target_rel} must have a cap entry in module_size_limits.json"
     )
-    assert backend_caps[target_rel] == 7750, (
-        f"{target_rel} cap must be the approved figure 7750 (unapproved bump to "
-        f"8950 reverted); got {backend_caps[target_rel]}"
+    assert backend_caps[target_rel] == 6200, (
+        f"{target_rel} cap must be the approved figure 6200 (ratcheted from "
+        f"7750 after the task-lifecycle decomposition); got {backend_caps[target_rel]}"
     )
 
     # Resolve app/ as testing/'s sibling, matching the Docker harness layout

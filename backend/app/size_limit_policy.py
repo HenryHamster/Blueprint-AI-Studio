@@ -76,12 +76,15 @@ class BumpRecord(TypedDict):
 class BumpHistoryUnavailableError(Exception):
     """Raised when cap-bump history could not be read.
 
-    Distinct from an empty history: ``[]`` means the git read SUCCEEDED and
+    Distinct from an empty history: ``[]`` means the read SUCCEEDED and
     found no cap bumps for the key, while this exception means the read itself
-    failed (subprocess timeout, git not available, non-repo environment, or a
-    non-zero ``git log`` exit — e.g. a truncated/shallow task-VM clone). Callers
-    that gate a cap bump on the chronic-offender verdict must treat this state
-    as fail-closed (refuse the bump) rather than as "no bump history".
+    failed (subprocess timeout, git not available, a non-zero ``git log`` exit
+    in a complete checkout, or an unreadable/malformed ledger mirror). A
+    truncated/shallow clone does NOT raise here: :func:`parse_bump_history`
+    consults the committed ledger mirror (complete even when the clone is
+    shallow) before failing closed. Callers that gate a cap bump on the
+    chronic-offender verdict must treat this state as fail-closed (refuse the
+    bump) rather than as "no bump history".
     """
 
 
@@ -178,8 +181,11 @@ def _git_history_is_truncated(repo_root: str | None = None) -> bool:
     ``.git/shallow`` boundary file and ``git log`` silently returns a partial
     history — treating that as complete would let the guard pass without
     evaluating it and let the chronic-offender classifier read a truncated bump
-    history, both fail-open.  Callers fail closed instead: the production read
-    raises, the guard test skips.
+    history, both fail-open.  Callers never treat the partial history as
+    complete: the production read consults the committed ledger mirror instead
+    of git, and the ledger guard still evaluates the git ⊆ ledger direction
+    (which partial history CAN prove) while skipping only the exact-equality
+    reverse check.
 
     The presence of ``.git/shallow`` ALONE does not mean the mainline ancestry
     is truncated: the backend test harness runs ``git fetch --depth=1 origin
@@ -237,11 +243,13 @@ def parse_bump_history(module_key: str, section: str = "backend") -> list[BumpRe
     cycle do not re-shell.  Returns ``[]`` ONLY when the history read succeeded
     and contains no cap bumps for the key — a genuinely empty history.  Raises
     :class:`BumpHistoryUnavailableError` when the history could not be read at
-    all (subprocess timeout, a non-zero ``git log`` exit in a real checkout —
-    e.g. a truncated/shallow task-VM clone — or an unreadable/malformed ledger
-    in the deployed layout).  Callers that gate the chronic-offender verdict on
-    this history must distinguish "no bumps on record" from "history could not
-    be read" instead of treating both as empty.
+    all (a real ``git log`` failure in a complete checkout, or an
+    unreadable/malformed ledger in the deployed layout).  A truncated/shallow
+    clone is NOT one of those cases: its ``git log`` would be silently partial,
+    but the committed ledger mirror is complete, so it is consulted BEFORE
+    failing closed.  Callers that gate the chronic-offender verdict on this
+    history must distinguish "no bumps on record" from "history could not be
+    read" instead of treating both as empty.
     """
     cache_key = (module_key, section)
     now = time.monotonic()
@@ -252,16 +260,25 @@ def parse_bump_history(module_key: str, section: str = "backend") -> list[BumpRe
             raise outcome
         return outcome
 
-    try:
-        records = _read_git_bump_history(module_key)
-    except BumpHistoryUnavailableError as err:
-        # Cache the failure too: a broken history read stays broken within the
-        # TTL, so a reconcile cycle does not re-shell git per capped file.
-        _bump_history_cache[cache_key] = (err, now)
-        raise err
+    records = None
+    if _git_reads_history_here() and not _git_history_is_truncated():
+        # Complete checkout: read the bump history from the mainline git
+        # ancestry.  A real git failure here is genuine evidence loss and stays
+        # fail-closed (raised, not degraded to "no bump history").
+        try:
+            records = _read_git_bump_history(module_key)
+        except BumpHistoryUnavailableError as err:
+            # Cache the failure too: a broken history read stays broken within
+            # the TTL, so a reconcile cycle does not re-shell git per file.
+            _bump_history_cache[cache_key] = (err, now)
+            raise err
     if records is None:
-        # git structurally unreachable (deployed layout) — read the committed
-        # ledger mirror of the same history.
+        # git structurally unreachable (deployed layout) OR the mainline history
+        # is truncated (a shallow clone's ``git log`` would be silently partial)
+        # — read the committed ledger mirror of the same history.  The mirror is
+        # complete in both cases, so a shallow checkout classifies from the same
+        # history the deployed layout reads instead of failing closed on
+        # evidence it could have obtained.
         try:
             records = _read_cap_bump_history_ledger(section, module_key)
         except BumpHistoryUnavailableError as err:
@@ -283,12 +300,13 @@ def _read_git_bump_history(module_key: str) -> list[BumpRecord] | None:
     task/research branches never merged and must not enter the chronic-offender
     classification.
 
-    Any other failure to read git history — a subprocess error, a shallow/
-    truncated clone (a depth-limited ``.git/shallow``, so ``git log`` would
-    silently return a partial history), or a non-zero ``git log`` exit —
-    raises :class:`BumpHistoryUnavailableError`.  In a real checkout that is
-    genuine evidence loss and must stay fail-closed rather than silently degrade
-    to "no bump history".
+    Any other failure to read git history — a subprocess error or a non-zero
+    ``git log`` exit in a complete checkout — raises
+    :class:`BumpHistoryUnavailableError`.  In a real checkout that is genuine
+    evidence loss and must stay fail-closed rather than silently degrade to
+    "no bump history".  (A shallow/truncated clone also raises here for a direct
+    caller, but :func:`parse_bump_history` never reaches this function on a
+    truncated checkout — it consults the committed ledger mirror first.)
     """
     if not _git_reads_history_here():
         return None
@@ -732,13 +750,18 @@ def classify_breach(
     ``override_chronic=True``, the explicit operator-approval path, which
     grants the bump but records attribution).
 
-    When bump history could not be read (truncated task-VM clone, git
-    unavailable), the verdict FAILS CLOSED: ``is_chronic=True`` with
-    ``suggested_new_limit=None`` and ``history_unavailable=True``, routing the
-    breach to decomposition rather than silently granting a routine cap bump.
-    A genuinely readable but empty history keeps the routine-bump behaviour —
-    the guard distinguishes "no bumps on record" from "history could not be
-    read" instead of treating both as empty.
+    When bump history could not be read, the verdict FAILS CLOSED:
+    ``is_chronic=True`` with ``suggested_new_limit=None`` and
+    ``history_unavailable=True``, routing the breach to decomposition rather
+    than silently granting a routine cap bump.  This happens only when BOTH
+    sources are unusable: a genuine ``git log`` failure in a complete checkout
+    OR an unreadable/malformed committed ledger mirror.  A truncated/shallow
+    clone is NOT one of those cases — :func:`parse_bump_history` reads the
+    committed ledger mirror (complete even on a shallow checkout), so the
+    verdict classifies from the same history the deployed layout reads.  A
+    genuinely readable but empty history keeps the routine-bump behaviour — the
+    guard distinguishes "no bumps on record" from "history could not be read"
+    instead of treating both as empty.
     """
     try:
         history = parse_bump_history(module_key, section)
