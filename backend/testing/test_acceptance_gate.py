@@ -688,6 +688,14 @@ def test_targeted_green_existing_test_absent_from_diff_earns_proven():
         unverified_reason="no_detectable_test_command",
         targeted_green=True,
     )
+    # Without the backend's own tree corroboration the same shape is credited
+    # SOFT — the targeted-green stamp alone is agent-reported evidence.
+    interim = evaluate_code_acceptance(task)
+    assert interim.satisfied is True
+    assert interim.proven is False
+    # The merged-landing site stamped the backend's positive tree check.
+    from app.acceptance_gate import ACCEPTANCE_TEST_CORROBORATED_KEY
+    task.context = {**(task.context or {}), ACCEPTANCE_TEST_CORROBORATED_KEY: True}
     verdict = evaluate_code_acceptance(task)
     assert verdict.declared is True
     assert verdict.satisfied is True
@@ -752,6 +760,13 @@ def test_existing_test_present_and_green_in_merge_verdict_earns_proven():
             "in_diff": False,
         },
     )
+    # The block alone (agent-reported) earns only soft credit; the backend's
+    # positive tree corroboration upgrades it to the proven mint.
+    interim = evaluate_code_acceptance(task)
+    assert interim.satisfied is True
+    assert interim.proven is False
+    from app.acceptance_gate import ACCEPTANCE_TEST_CORROBORATED_KEY
+    task.context = {**(task.context or {}), ACCEPTANCE_TEST_CORROBORATED_KEY: True}
     verdict = evaluate_code_acceptance(task)
     assert verdict.declared is True
     assert verdict.satisfied is True
@@ -4795,7 +4810,8 @@ def test_not_in_diff_green_run_flows_writer_to_gate_as_proven():
     assert _acceptance_test_exists_at_merge(task.context, declared) is True
     assert _acceptance_test_ran_green_at_merge(task.context, declared) is True
 
-    # 4. The gate credits it as PROVEN.
+    # 4. With the backend's OWN tree check confirming existence, the gate
+    # credits it as PROVEN.
     verdict_out = _evaluate_named_test(
         AcceptanceEvidence(
             kind="named_test", test_path="testing/test_seam.py", test_id="test_x"
@@ -4805,11 +4821,28 @@ def test_not_in_diff_green_run_flows_writer_to_gate_as_proven():
         targeted_green=True,
         test_exists=True,
         ran_green=True,
+        corroborated=True,
     )
     assert verdict_out.satisfied is True
     assert verdict_out.proven is True, (
         f"not-in-diff green test still not credited: {verdict_out.reason}"
     )
+
+    # 5. Without positive backend corroboration every remaining input is
+    # agent-reported, so the same shape is credited SOFT — satisfied, never
+    # machine-proven (see test_not_in_diff_proven_requires_positive_corroboration).
+    verdict_soft = _evaluate_named_test(
+        AcceptanceEvidence(
+            kind="named_test", test_path="testing/test_seam.py", test_id="test_x"
+        ),
+        ["app/seam.py"],
+        verified=False,
+        targeted_green=True,
+        test_exists=True,
+        ran_green=True,
+    )
+    assert verdict_soft.satisfied is True
+    assert verdict_soft.proven is False
 
 
 def test_merge_acceptance_block_must_name_the_declared_test():
@@ -5017,6 +5050,9 @@ def test_block_selector_with_node_id_matches_declared_path():
             "passed": True,
         },
     )
+    from app.acceptance_gate import ACCEPTANCE_TEST_CORROBORATED_KEY
+
+    task.context = {**(task.context or {}), ACCEPTANCE_TEST_CORROBORATED_KEY: True}
     verdict = evaluate_code_acceptance(task)
     assert verdict.satisfied is True
     assert verdict.proven is True
@@ -5406,3 +5442,152 @@ def test_declared_test_id_present_uses_word_boundaries():
     assert _declared_test_id_present("test_x", "def test_xy():\n    pass") is False
     assert _declared_test_id_present("test_x", "# a comment about test_xz") is False
     assert _declared_test_id_present("", "def test_x():\n    pass") is False
+
+
+def test_candidate_paths_cover_all_monorepo_roots_and_dedupe():
+    """A declaration that drops its monorepo prefix yields a candidate under
+    EVERY root (backend, admin-ui, agent) — a prefix-dropped admin-ui/agent test
+    must never corroborate as a definite absence because only the backend
+    variant was probed. Already-prefixed declarations are used as-is, and the
+    result is deduplicated with order preserved."""
+    from app.acceptance_gate import _candidate_test_paths
+
+    assert _candidate_test_paths("src/components/X.viewport.test.tsx") == [
+        "src/components/X.viewport.test.tsx",
+        "backend/src/components/X.viewport.test.tsx",
+        "admin-ui/src/components/X.viewport.test.tsx",
+        "agent/src/components/X.viewport.test.tsx",
+    ]
+    # Already-prefixed declarations probe exactly one path.
+    assert _candidate_test_paths("backend/testing/test_seam.py") == [
+        "backend/testing/test_seam.py"
+    ]
+    assert _candidate_test_paths("admin-ui/src/X.test.tsx") == [
+        "admin-ui/src/X.test.tsx"
+    ]
+    assert _candidate_test_paths("agent/src/handlers/x.test.ts") == [
+        "agent/src/handlers/x.test.ts"
+    ]
+    # Leading ./ is stripped and never duplicates.
+    assert _candidate_test_paths("./backend/testing/test_seam.py") == [
+        "backend/testing/test_seam.py"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_corroboration_finds_prefix_dropped_agent_test():
+    """A prefix-dropped agent-side declaration corroborates True via the
+    ``agent/`` candidate instead of reading as a definite absence."""
+    from unittest.mock import AsyncMock, patch
+
+    from app.acceptance_gate import corroborate_acceptance_test_at_merge
+
+    task = _corroboration_task("src/handlers/seam.test.ts", test_id="handles seam")
+    ctx = {
+        "token": "tok",
+        "owner": "owner",
+        "repo": "repo",
+        "branch": "integration",
+        "project_id": "proj-1",
+    }
+    with (
+        patch(
+            "app.source_ref_validation.resolve_branch_verification_context",
+            new=AsyncMock(return_value=dict(ctx)),
+        ),
+        patch(
+            "app.github_repo_snapshot.file_text_on_branch",
+            new=AsyncMock(
+                side_effect=[
+                    (False, None),  # src/handlers/seam.test.ts
+                    (False, None),  # backend/src/handlers/seam.test.ts
+                    (False, None),  # admin-ui/src/handlers/seam.test.ts
+                    (True, "it('handles seam', () => {})"),  # agent/…
+                ]
+            ),
+        ),
+    ):
+        assert await corroborate_acceptance_test_at_merge(task, None) is True
+
+
+@pytest.mark.asyncio
+async def test_corroboration_pins_to_merge_commit_when_sha_provided():
+    """When the caller knows the merge commit, the tree read is pinned to that
+    exact immutable SHA — never routed through the branch-tip cache, whose TTL
+    can still serve the PRE-merge tip moments after a merge and stamp a durable
+    false "test absent" for a test the PR itself just added."""
+    from unittest.mock import AsyncMock, patch
+
+    from app.acceptance_gate import corroborate_acceptance_test_at_merge
+
+    task = _corroboration_task("backend/testing/test_seam.py", test_id="test_x")
+    ctx = {
+        "token": "tok",
+        "owner": "owner",
+        "repo": "repo",
+        "branch": "integration",
+        "project_id": "proj-1",
+    }
+    commit_reader = AsyncMock(return_value=(True, "def test_x():\n    assert 1"))
+    branch_reader = AsyncMock(return_value=(False, None))
+    with (
+        patch(
+            "app.source_ref_validation.resolve_branch_verification_context",
+            new=AsyncMock(return_value=dict(ctx)),
+        ),
+        patch("app.github_repo_snapshot.file_text_at_commit", new=commit_reader),
+        patch("app.github_repo_snapshot.file_text_on_branch", new=branch_reader),
+    ):
+        assert (
+            await corroborate_acceptance_test_at_merge(
+                task, None, commit_sha="a" * 40
+            )
+            is True
+        )
+    branch_reader.assert_not_awaited()
+    assert commit_reader.await_args.kwargs["commit_sha"] == "a" * 40
+
+
+def test_not_in_diff_proven_requires_positive_corroboration():
+    """For a declared test ABSENT from the PR's diff, every input behind the
+    existence/green-run credit is agent-reported — so machine ``proven``
+    additionally requires the backend's OWN tree check to have confirmed
+    existence. Indeterminate corroboration credits soft (satisfied, unproven);
+    positive corroboration keeps the proven mint; an in-diff test is unaffected
+    because presence in the GitHub-sourced diff is already backend-grounded."""
+    from app.acceptance_gate import _evaluate_named_test
+
+    evidence = AcceptanceEvidence(
+        kind="named_test", test_path="testing/test_seam.py", test_id="test_x"
+    )
+    # Indeterminate (None / never computed): soft credit, never proven.
+    soft = _evaluate_named_test(
+        evidence,
+        ["app/seam.py"],
+        verified=True,
+        test_exists=True,
+        ran_green=True,
+    )
+    assert soft.satisfied is True
+    assert soft.proven is False
+    assert "corroboration" in (soft.reason or "")
+    # Positive backend corroboration: the proven mint is preserved.
+    proven = _evaluate_named_test(
+        evidence,
+        ["app/seam.py"],
+        verified=True,
+        test_exists=True,
+        ran_green=True,
+        corroborated=True,
+    )
+    assert proven.satisfied is True
+    assert proven.proven is True
+    # In-diff: the declared test is among the PR's own changed files — proven
+    # without any corroboration marker, exactly as before.
+    in_diff = _evaluate_named_test(
+        evidence,
+        ["app/seam.py", "testing/test_seam.py"],
+        verified=True,
+    )
+    assert in_diff.satisfied is True
+    assert in_diff.proven is True

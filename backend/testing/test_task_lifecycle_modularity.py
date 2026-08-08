@@ -34,11 +34,17 @@ TASK_LIFECYCLE_PATH = os.path.normpath(
 )
 
 # Maps leaf module name -> tuple of symbol names extracted there.
-# S1 moved the post-commit exception types to app.post_commit_errors; S5
-# extracted the review request-changes stage to app.review_request_changes;
-# S2-S12 will append further entries as they move code out of task_lifecycle.py.
+# S1 moved the post-commit exception types to app.post_commit_errors;
+# S2 extracted the post-commit terminal tail to app.task_lifecycle_post_commit_terminal;
+# S3 extracted the completion-handler dispatch to app.task_lifecycle_completion_dispatch;
+# S4 extracted fix-completion handling to app.task_lifecycle_fix_completion;
+# S5 extracted the review request-changes stage to app.review_request_changes;
+# S6-S12 will append further entries as they move code out of task_lifecycle.py.
 EXTRACTED_SYMBOLS: dict[str, tuple[str, ...]] = {
     "app.post_commit_errors": ("PostCommitLocked", "PostCommitFinalCommitFailed"),
+    "app.task_lifecycle_post_commit_terminal": ("run_post_commit_terminal",),
+    "app.task_lifecycle_completion_dispatch": ("run_completion_dispatch",),
+    "app.task_lifecycle_fix_completion": ("run_fix_completion",),
     "app.review_request_changes": ("run_request_changes",),
 }
 

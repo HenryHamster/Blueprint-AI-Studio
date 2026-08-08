@@ -884,11 +884,23 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                             corroborate_acceptance_test_at_merge,
                         )
 
+                        # Pin the tree read to the PR's own merge commit: the
+                        # branch-tip cache's short TTL can still serve the
+                        # PRE-merge tip moments after the merge, which would
+                        # stamp a durable false "test absent" for a test the PR
+                        # itself just added. The merge commit is immutable, so
+                        # this read has no staleness window at all.
+                        _ci_merge_sha = pr_data.get("merge_commit_sha")
                         _corroborated = await corroborate_acceptance_test_at_merge(
                             ci_task,
                             session,
                             project=_orch_ci_project_orm,
                             branch=_ci_base,
+                            commit_sha=(
+                                _ci_merge_sha
+                                if isinstance(_ci_merge_sha, str) and _ci_merge_sha
+                                else None
+                            ),
                         )
                         if _corroborated is not None:
                             # Top-level backend-stamped marker (same shape as

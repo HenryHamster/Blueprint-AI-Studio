@@ -153,6 +153,24 @@
           "commit_date": "2026-08-06T07:22:45Z",
           "old_cap": 7750,
           "new_cap": 8950
+        },
+        {
+          "commit_sha": "cafe34b8e311272cc3cb27912a2975a908da24fa",
+          "commit_date": "2026-08-06T10:45:23Z",
+          "old_cap": 8950,
+          "new_cap": 7750
+        },
+        {
+          "commit_sha": "2c03bf16a8058ab37694dd7e1212f916683b606b",
+          "commit_date": "2026-08-08T00:26:33Z",
+          "old_cap": 7750,
+          "new_cap": 6200
+        },
+        {
+          "commit_sha": "06bf05bab44000855d0f78de2665a67f807f81f1",
+          "commit_date": "2026-08-08T02:32:09Z",
+          "old_cap": 6200,
+          "new_cap": 7750
         }
       ],
       "task_lifecycle_requeue.py": [
@@ -2919,6 +2937,12 @@
           "commit_date": "2026-08-07T17:02:35Z",
           "old_cap": 2250,
           "new_cap": 2650
+        },
+        {
+          "commit_sha": "",
+          "commit_date": "2026-08-08T02:56:43.899076+00:00",
+          "old_cap": 2650,
+          "new_cap": 3150
         }
       ],
       "routers/admin_project_tools.py": [
@@ -4079,6 +4103,12 @@
           "commit_date": "2026-08-07T10:12:00Z",
           "old_cap": 4000,
           "new_cap": 4800
+        },
+        {
+          "commit_sha": "06bf05bab44000855d0f78de2665a67f807f81f1",
+          "commit_date": "2026-08-08T02:32:09Z",
+          "old_cap": 4800,
+          "new_cap": 5700
         }
       ],
       "test_pack_under_budget.py": [
@@ -4229,6 +4259,14 @@
           "commit_date": "2026-08-06T21:01:19Z",
           "old_cap": 2350,
           "new_cap": 2750
+        }
+      ],
+      "test_strategic_session_messages.py": [
+        {
+          "commit_sha": "",
+          "commit_date": "2026-08-08T03:58:05.053929+00:00",
+          "old_cap": 1950,
+          "new_cap": 2250
         }
       ]
     }
