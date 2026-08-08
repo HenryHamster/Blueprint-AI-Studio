@@ -619,6 +619,83 @@ describe('handleStrategicResident — typed Fast lease lifecycle', () => {
     expect(workday.sendTurn).not.toHaveBeenCalled();
   });
 
+  it('answers server fast-marked rows through the legacy Workday path when typed Fast is not activated', async () => {
+    // The backend stamps conversation rows fast-eligible from its canonical
+    // predicate even when this session has no activatable Fast adapter
+    // (typed_fast_enabled: false). Deferring those rows would park every
+    // operator message forever behind a child that can never exist — the
+    // live no-reply deadlock this test pins down.
+    vi.useFakeTimers();
+    const operatorMessage = {
+      id: 'fast-marked-without-activation', content: 'hi',
+      created_at: new Date().toISOString(), from_type: 'user',
+    };
+    let messagePolls = 0;
+    let heartbeatCount = 0;
+    const claimBodies: Array<Record<string, unknown> | undefined> = [];
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/messages?')) {
+        messagePolls += 1;
+        if (messagePolls === 1) {
+          return Promise.resolve({
+            messages: [operatorMessage],
+            fast_message_ids: [operatorMessage.id],
+            claim_required: true,
+          });
+        }
+        return Promise.resolve({ messages: [], fast_message_ids: [], claim_required: true });
+      }
+      return Promise.resolve({ messages: [] });
+    });
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (url.includes('/strategic-session/heartbeat')) {
+        heartbeatCount += 1;
+        return Promise.resolve({
+          authority_held: true,
+          conversation_claim_held: true,
+          stop_requested: heartbeatCount > 1,
+        });
+      }
+      if (url.endsWith('/messages/claim')) {
+        claimBodies.push(body);
+        return Promise.resolve({
+          claim_id: 'claim-legacy-fallback',
+          incarnation_id: 'incarnation-legacy-fallback',
+          incarnation_supported: true,
+          message_ids: [operatorMessage.id],
+        });
+      }
+      if (url.endsWith('/conversation/turns/claim')) {
+        return Promise.reject(new Error('typed Fast claim must not run without activation'));
+      }
+      return Promise.resolve({});
+    });
+    const workday = makeSession(
+      () => Promise.resolve(
+        turnResult({ sentOperatorMessage: true, resultText: 'Workday legacy reply.' }),
+      ),
+      () => true,
+    );
+    mockStartSession.mockReturnValue(workday);
+
+    const done = run('fast-marked-legacy-fallback', {
+      project_name: 'P',
+      open_messages: [],
+      strategic_session_autonomous: false,
+      typed_fast_enabled: false,
+      strategic_session_idle_tick_seconds: 1,
+      strategic_session_message_poll_seconds: 0.001,
+    });
+    await vi.advanceTimersByTimeAsync(5_000);
+    await done;
+
+    expect(workday.sendTurn).toHaveBeenCalledTimes(1);
+    expect(claimBodies.length).toBeGreaterThanOrEqual(1);
+    expect(claimBodies[0]?.message_ids).toEqual([operatorMessage.id]);
+    expect(typedFastMocks.construct).not.toHaveBeenCalled();
+    expect(typedFastMocks.ensureReady).not.toHaveBeenCalled();
+  });
+
   it('continues polling and heartbeating while the Fast readiness probe is pending', async () => {
     vi.useFakeTimers();
     const operatorMessage = {

@@ -1112,6 +1112,19 @@ export async function handleStrategicResident(
   // merely because the project clock moved while nobody asked it to do
   // anything. Workday-only sessions retain their autonomous behavior.
   const workdayOnDemand = typedFastConfig.activated;
+  // The backend stamps conversation rows fast-eligible from its one canonical
+  // predicate, independent of whether THIS session can ever run the typed Fast
+  // lane. When Fast is administratively inactive (not requested, unqualified,
+  // or provider-incompatible) those rows must take the legacy Workday reply
+  // path — deferring them would park every operator message forever behind a
+  // child that can never exist.
+  const partitionInboundMessages = (
+    msgs: ResidentInboundMessage[],
+  ): { fast: ResidentInboundMessage[]; workday: ResidentInboundMessage[] } => (
+    typedFastConfig.activated
+      ? partitionTypedFastMessages(msgs)
+      : { fast: [], workday: [...msgs] }
+  );
   let typedFastReady = typedFastConfig.activated;
   let typedFastProvisioning = false;
   let typedFastProvisionAttempt: Promise<boolean> | null = null;
@@ -3616,7 +3629,7 @@ export async function handleStrategicResident(
       }
       const newMsgs = await pollMessages();
       if (newMsgs.length > 0) {
-        const partition = partitionTypedFastMessages(newMsgs);
+        const partition = partitionInboundMessages(newMsgs);
         const pureFastPage = partition.fast.length > 0
           && partition.workday.length === 0;
         if (
@@ -4115,7 +4128,7 @@ export async function handleStrategicResident(
   const handleOperatorTurn = async (
     msgs: ResidentInboundMessage[],
   ): Promise<'stop' | 'continue'> => {
-    const partition = partitionTypedFastMessages(msgs);
+    const partition = partitionInboundMessages(msgs);
     const fastMessages = partition.fast;
     const workdayMessages = partition.workday;
     // Fast is the typed public-reply owner.  Do not silently fall through to
@@ -4485,7 +4498,7 @@ export async function handleStrategicResident(
   const handlePureFastMessagesDuringWorkday = async (
     messages: ResidentInboundMessage[],
   ): Promise<boolean> => {
-    const partition = partitionTypedFastMessages(messages);
+    const partition = partitionInboundMessages(messages);
     if (
       partition.fast.length === 0
       || partition.workday.length > 0

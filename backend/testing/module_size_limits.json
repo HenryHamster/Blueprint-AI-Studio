@@ -151,7 +151,7 @@
     "strategic_context_package.py": 2500,
     "routers/runner.py": 4400,
     "capability_trial_verdict.py": 1750,
-    "acceptance_gate.py": 3250,
+    "acceptance_gate.py": 3150,
     "review_loop_convergence.py": 1950,
     "routers/admin_project_tools.py": 2650,
     "routers/admin_runners.py": 1950,

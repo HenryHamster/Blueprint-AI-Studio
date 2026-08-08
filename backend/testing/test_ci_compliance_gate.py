@@ -2449,6 +2449,54 @@ def test_cap_bump_resolves_orchestrator_health_breach():
     )
 
 
+def test_cap_bump_resolves_acceptance_gate_breach():
+    """After bumping caps via check_size_limits --fix, acceptance_gate.py must be
+    within its new cap on the real file tree.
+
+    This is the breach the 2026-08-08 ci-compliance remediation targets: automain
+    HEAD 6363f530 reported backend/acceptance_gate.py at 2738 lines over its old
+    cap of 2650. The fix bumps that cap to 3150 in module_size_limits.json — the
+    canonical bump_size_limit(2738) policy value; this merge-test gate proves the
+    bumped JSON is consistent with the actual file size on disk, so the test fails
+    if the cap is reverted (or the file grows past the new cap) before the CI
+    invariant suite runs.
+    """
+    json_path = os.path.join(os.path.dirname(__file__), "module_size_limits.json")
+    data = csl.load_limits(json_path)
+    backend_caps = data.get("backend", {})
+
+    target_rel = "acceptance_gate.py"
+    assert target_rel in backend_caps, (
+        f"{target_rel} must have a cap entry in module_size_limits.json"
+    )
+    assert backend_caps[target_rel] >= 3150, (
+        f"{target_rel} cap must be at least 3150 (bumped from old 2650 cap); "
+        f"got {backend_caps[target_rel]}"
+    )
+
+    # Resolve app/ as testing/'s sibling, matching the Docker harness layout
+    # (see test_cap_bump_resolves_orchestrator_runner_dispatch_breach above).
+    backend_root = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "app")
+    )
+    assert os.path.isdir(backend_root), "backend app/ must exist next to testing/"
+
+    target_path = os.path.join(backend_root, target_rel)
+    assert os.path.isfile(target_path), f"{target_path} must exist on disk"
+
+    actual_count = csl.count_lines(target_path)
+    cap = backend_caps[target_rel]
+    result = csl.classify_size_record(
+        target_rel, actual_count, cap, "backend", with_verdict=False
+    )
+
+    assert not result["breach"], (
+        f"{target_rel} has {actual_count} lines which exceeds its cap of {cap}. "
+        "Run `python3 backend/testing/check_size_limits.py --fix` and commit "
+        "the updated module_size_limits.json."
+    )
+
+
 def test_git_refs_has_no_ci_compliance_branch_literal_fallback():
     """agent/src/gitRefs.ts must stay clean under the CI-compliance agent scan.
 

@@ -1182,8 +1182,11 @@ async def test_resident_poll_uses_authenticated_session_scope(
 
 @pytest.mark.asyncio
 async def test_resident_poll_returns_stale_fast_claim_group_atomically_across_page_cap(
-    client: AsyncClient, db_session
+    client: AsyncClient, db_session, monkeypatch
 ):
+    monkeypatch.setenv(
+        "CALL_FOREGROUND_QUALIFICATION", "claude-warm-stream-json:phase0-v1"
+    )
     project, task = await _make_resident_poll_worker(db_session)
     older = await _add_message(
         db_session,
@@ -1337,6 +1340,9 @@ async def test_resident_poll_leaves_expired_ordinary_claim_group_to_workday(
 async def test_stale_fast_claim_group_degrades_artifacts_without_losing_membership(
     client: AsyncClient, db_session, monkeypatch
 ):
+    monkeypatch.setenv(
+        "CALL_FOREGROUND_QUALIFICATION", "claude-warm-stream-json:phase0-v1"
+    )
     project, task = await _make_resident_poll_worker(db_session)
     claim_id = uuid.uuid4()
     stale_rows = []
@@ -1390,6 +1396,73 @@ async def test_stale_fast_claim_group_degrades_artifacts_without_losing_membersh
         assert "System recovery notice" in row["content"]
         assert row["context"]["_artifact_delivery_deferred"] is True
         assert "attachments" not in row["context"]
+
+
+@pytest.mark.asyncio
+async def test_resident_poll_never_fast_marks_rows_without_server_qualification(
+    client: AsyncClient, db_session, monkeypatch
+):
+    """Without a server-qualified Fast activation, conversation rows must stay
+    on the legacy Workday reply path. The agent treats fast-marked rows as
+    exclusively Fast-owned, so stamping them when no Resident can ever activate
+    the Fast lane parks every operator message forever — the live no-reply
+    deadlock (operator "hi" retried silently until the session was stopped)."""
+    monkeypatch.delenv("CALL_FOREGROUND_QUALIFICATION", raising=False)
+    project, task = await _make_resident_poll_worker(db_session)
+    row = await _add_message(
+        db_session,
+        project,
+        from_type="user",
+        status="open",
+        message_type=MessageType.FEEDBACK,
+        surface=MessageSurface.CONVERSATION,
+        content="hi",
+        sequence=1,
+        resident_session_id="resident-session",
+        created_at=_BASE,
+    )
+
+    response = await client.get(
+        f"/api/agent/projects/{project.id}/messages?limit=20",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert [item["id"] for item in body["messages"]] == [str(row.id)]
+    assert body["fast_message_ids"] == []
+    # The legacy Workday claim path stays available for the un-marked row.
+    assert body["claim_required"] is True
+
+
+@pytest.mark.asyncio
+async def test_resident_poll_fast_marks_conversation_rows_with_server_qualification(
+    client: AsyncClient, db_session, monkeypatch
+):
+    monkeypatch.setenv(
+        "CALL_FOREGROUND_QUALIFICATION", "claude-warm-stream-json:phase0-v1"
+    )
+    project, task = await _make_resident_poll_worker(db_session)
+    row = await _add_message(
+        db_session,
+        project,
+        from_type="user",
+        status="open",
+        message_type=MessageType.FEEDBACK,
+        surface=MessageSurface.CONVERSATION,
+        content="hi",
+        sequence=1,
+        resident_session_id="resident-session",
+        created_at=_BASE,
+    )
+
+    response = await client.get(
+        f"/api/agent/projects/{project.id}/messages?limit=20",
+        headers=_headers(task, vm="agent-vm-resident-poll"),
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert [item["id"] for item in body["messages"]] == [str(row.id)]
+    assert body["fast_message_ids"] == [str(row.id)]
 
 
 @pytest.mark.asyncio
