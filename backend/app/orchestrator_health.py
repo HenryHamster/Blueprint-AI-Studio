@@ -28,6 +28,7 @@ from app.landed_signal import (
     has_merge_unblock_signal,
 )
 from app.rollup_management import _FORCE_DROP_REASONS
+import app.sequenced_spawn as _seqdep
 from app.models import Project, Task, TaskStatus
 from app.orchestrator_filters import _prod_files
 from app.time_utils import _utcnow
@@ -786,6 +787,7 @@ async def ensure_dependent_base_recut(
     if project is None:
         # Cannot resolve the integration branch — hold to be safe.
         return False
+    await _seqdep.apply_declared_release_base(dependent, session)
     recut_sources = await _cross_base_recut_sources(
         dependent, dep_tasks, project, session
     )
@@ -1081,6 +1083,7 @@ async def _check_candidate_task_deps(
         for _t in _rows.scalars().all():
             _replacement_cache[_t.id] = _t
 
+    _gate_branch, _gate_proj = await _seqdep.landing_gate(task, session)
     for dt in dep_tasks:
         effective_dt = dt
         if dt.status == TaskStatus.CANCELLED:
@@ -1116,6 +1119,10 @@ async def _check_candidate_task_deps(
                 continue
             any_failed = True
             break
+        if _gate_branch:
+            if not _seqdep.landing_gate_ok(effective_dt, _gate_branch, _gate_proj):
+                all_met = False
+            continue
         # A cross-base dependency only reaches the dependent's base when it lands
         # on the SHARED integration trunk. Distinguish a GENUINE code-dependency
         # (whose landed code the dependent must build on — HOLD until it lands,

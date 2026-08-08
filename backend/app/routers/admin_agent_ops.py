@@ -4135,6 +4135,27 @@ async def strategic_operation(
         # spawn's returned task_id into a durable depends_on edge, so a
         # multi-task decision can sequence its work instead of only emitting
         # independent parallel siblings.
+        # Optional sequenced-spawn declaration (campaign chains): when the
+        # strategist declares require_deps_landed_on, every depends_on edge is
+        # gated deterministically by sequenced_spawn.landing_gate instead of the
+        # base-branch heuristics, and release_base_branch repoints the task's
+        # base at dependency-release time. Mirrored verbatim into payloads[0];
+        # branch-name shape is enforced by the payload schema below.
+        declared_landing_gate: str | None = None
+        declared_release_base: str | None = None
+        for _seq_key in ("require_deps_landed_on", "release_base_branch"):
+            _seq_raw = data.get(_seq_key)
+            if _seq_raw is None:
+                continue
+            if not isinstance(_seq_raw, str) or not _seq_raw.strip():
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{_seq_key} must be a non-empty branch name",
+                )
+            if _seq_key == "require_deps_landed_on":
+                declared_landing_gate = _seq_raw.strip()
+            else:
+                declared_release_base = _seq_raw.strip()
         raw_depends_on = data.get("depends_on")
         depends_on_ids: list[str] = []
         if raw_depends_on is not None:
@@ -4177,7 +4198,15 @@ async def strategic_operation(
                         ),
                     )
                 _dep_base = (_dep_task.first_payload or {}).get("base_branch")
-                if not _same_base_value(_new_task_base, _dep_base):
+                # A declared landing gate replaces the base-branch heuristic for
+                # this task's edges: dispatch holds until the dep has LANDED on
+                # the named branch (sequenced_spawn.landing_gate), and a declared
+                # release_base_branch re-cuts the base at release — so a
+                # cross-base edge is neither silently skipped nor dispatched
+                # against a base missing the dep's code.
+                if declared_landing_gate is None and not _same_base_value(
+                    _new_task_base, _dep_base
+                ):
                     raise HTTPException(
                         status_code=400,
                         detail=(
@@ -4266,6 +4295,10 @@ async def strategic_operation(
         }
         if direction_id:
             spawn_payload["direction_id"] = direction_id
+        if declared_landing_gate:
+            spawn_payload["require_deps_landed_on"] = declared_landing_gate
+        if declared_release_base:
+            spawn_payload["release_base_branch"] = declared_release_base
 
         # Forward an acceptance_evidence declaration from the strategist into the
         # task payload so direction-free proving spawns can declare a named_test

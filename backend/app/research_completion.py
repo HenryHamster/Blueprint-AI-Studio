@@ -6349,6 +6349,12 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         cross-base landed-signal wait path entirely."""
         if not dependent.payloads:
             return
+        if (dependent.first_payload or {}).get("release_base_branch"):
+            # A declared release-time base pin outranks creation-time
+            # inheritance — the dispatch chokepoint repoints base_branch to the
+            # declared branch when the dependency gate opens, so inheriting the
+            # foundation's base here would only be silently undone.
+            return
         from app.orchestrator_health import (
             _same_base_branch,
             is_genuine_code_dependency,

@@ -148,3 +148,182 @@ class TestStrategistSpawnDependsOnBaseBranch:
         assert body.get("depends_on") == [str(dep.id)], (
             f"spawn must echo the accepted edge; got {body!r}"
         )
+
+
+class TestStrategistSpawnSequencedDeclaration:
+    """spawn_task sequenced-spawn declaration (require_deps_landed_on /
+    release_base_branch): a declared landing gate admits cross-base depends_on
+    edges (the deterministic gate governs them instead of the _same_base_branch
+    heuristic) and both keys are mirrored verbatim into payloads[0]."""
+
+    async def _make_strategic_task(self, db_session, project, vm="agent-vm-seq-spawn"):
+        task = Task(
+            project_id=project.id,
+            title="Strategic review for sequenced spawn",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "strategic_review", "prompt": "review"}],
+            vm_instance_id=vm,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+        token = create_agent_token(
+            str(task.id), vm, task_type="strategic_review"
+        )
+        return task, token
+
+    @pytest.mark.asyncio
+    async def test_spawn_task_landing_gate_admits_cross_base_depends_on(
+        self, client: AsyncClient, db_session
+    ):
+        """A cross-base depends_on edge is ACCEPTED when the spawn declares
+        require_deps_landed_on — the landing gate holds dispatch until the dep
+        has landed on the named branch and release_base_branch re-cuts the base,
+        so the edge is neither silently skipped nor dispatched against a stale
+        base. Both declared keys must land verbatim in payloads[0]."""
+        from app.shared_state import get_project_integration_branch
+
+        project = await _make_project(db_session)
+        strategic, token = await self._make_strategic_task(db_session, project)
+
+        dep = Task(
+            project_id=project.id,
+            title="Cross-base prerequisite (rung A)",
+            status=TaskStatus.QUEUED,
+            payloads=[
+                {"type": "create", "prompt": "x", "base_branch": "plan/rung-a"}
+            ],
+        )
+        db_session.add(dep)
+        await db_session.commit()
+        await db_session.refresh(dep)
+
+        integration = get_project_integration_branch(project)
+        resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(strategic.id),
+                "op": "spawn_task",
+                "data": {
+                    "type": "create",
+                    "title": "Rung B builds on rung A",
+                    "prompt": "Sequenced cross-base spawn must be accepted.",
+                    "depends_on": [str(dep.id)],
+                    "require_deps_landed_on": integration,
+                    "release_base_branch": integration,
+                },
+            },
+        )
+        assert resp.status_code == 200, (
+            f"declared landing gate must admit the cross-base edge; got "
+            f"{resp.status_code}: {resp.text}"
+        )
+        body = resp.json()
+        assert body.get("depends_on") == [str(dep.id)], (
+            f"spawn must echo the accepted edge; got {body!r}"
+        )
+        import uuid as _uuid
+
+        spawned = await db_session.get(Task, _uuid.UUID(body["task_id"]))
+        assert spawned is not None
+        payload = spawned.first_payload or {}
+        assert payload.get("require_deps_landed_on") == integration, (
+            f"landing gate must be mirrored into payloads[0]; got {payload!r}"
+        )
+        assert payload.get("release_base_branch") == integration, (
+            f"release base must be mirrored into payloads[0]; got {payload!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_spawn_task_rejects_cross_base_depends_on_without_gate(
+        self, client: AsyncClient, db_session
+    ):
+        """Declaring only release_base_branch (no landing gate) does NOT admit a
+        cross-base edge: without require_deps_landed_on the dispatch loop still
+        applies the heuristic path, so the ungated edge stays rejected."""
+        project = await _make_project(db_session)
+        strategic, token = await self._make_strategic_task(db_session, project)
+
+        dep = Task(
+            project_id=project.id,
+            title="Cross-base prerequisite",
+            status=TaskStatus.QUEUED,
+            payloads=[
+                {"type": "create", "prompt": "x", "base_branch": "plan/other"}
+            ],
+        )
+        db_session.add(dep)
+        await db_session.commit()
+        await db_session.refresh(dep)
+
+        resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(strategic.id),
+                "op": "spawn_task",
+                "data": {
+                    "type": "create",
+                    "title": "Must not spawn",
+                    "prompt": "Ungated cross-base edge stays rejected.",
+                    "depends_on": [str(dep.id)],
+                    "release_base_branch": "release/v29",
+                },
+            },
+        )
+        assert resp.status_code == 400, (
+            f"ungated cross-base depends_on must stay rejected; got "
+            f"{resp.status_code}: {resp.text}"
+        )
+        body = resp.json()
+        msg = body.get("detail") or body.get("error", {}).get("message", "")
+        assert "Cross-base dependency" in msg
+
+    @pytest.mark.asyncio
+    async def test_spawn_task_sequenced_keys_must_be_branch_names(
+        self, client: AsyncClient, db_session
+    ):
+        """Blank or non-string sequenced keys are rejected up front, and a
+        reserved branch shape is rejected by the payload schema."""
+        project = await _make_project(db_session)
+        strategic, token = await self._make_strategic_task(db_session, project)
+
+        for bad in ("", "   ", 123):
+            resp = await client.post(
+                "/api/agent/strategic",
+                headers={"x-agent-token": token},
+                json={
+                    "task_id": str(strategic.id),
+                    "op": "spawn_task",
+                    "data": {
+                        "type": "create",
+                        "title": "Must not spawn",
+                        "prompt": "Invalid sequenced key.",
+                        "require_deps_landed_on": bad,
+                    },
+                },
+            )
+            assert resp.status_code == 400, (
+                f"require_deps_landed_on={bad!r} must be rejected; got "
+                f"{resp.status_code}: {resp.text}"
+            )
+
+        resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(strategic.id),
+                "op": "spawn_task",
+                "data": {
+                    "type": "create",
+                    "title": "Must not spawn",
+                    "prompt": "Reserved branch component.",
+                    "require_deps_landed_on": "feat/..sneaky",
+                },
+            },
+        )
+        assert resp.status_code == 400, (
+            f"reserved branch shape must be rejected by the payload schema; "
+            f"got {resp.status_code}: {resp.text}"
+        )
