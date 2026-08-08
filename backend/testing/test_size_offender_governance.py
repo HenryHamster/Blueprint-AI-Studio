@@ -653,18 +653,17 @@ def test_cap_bump_history_ledger_matches_git():
     the mirror. This is the guard that keeps ``check_size_limits.py --fix`` and
     the rollup preflight honest about updating the mirror.
 
-    A shallow/truncated checkout (CI's depth-1 clone) cannot evaluate the
-    full-history invariant, so the guard SKIPS there rather than silently
-    passing a check it cannot actually evaluate — the same fail-closed stance
-    the chronic-offender classifier takes on unreadable history.
+    A shallow/truncated checkout (CI's depth-1 clone, an agent task VM) does NOT
+    skip this guard: the git ⊆ ledger direction is still evaluable — every bump
+    the partial mainline history DOES show must be present in the ledger — so
+    it runs there too. Only the exact-equality reverse check needs complete
+    history (a shallow ledger legitimately holds records the partial ``git log``
+    does not show), so that direction alone is skipped on a truncated checkout.
     """
     repo_root = _real_repo_checkout()
     if repo_root is None:
         pytest.skip("no git checkout of this repo available for the ledger guard")
-    if slp._git_history_is_truncated(repo_root):
-        pytest.skip(
-            "shallow/truncated checkout cannot evaluate the full-history ledger guard"
-        )
+    truncated = slp._git_history_is_truncated(repo_root)
     # The CI backend shards bind the checkout read-only at /repo into a root
     # container while the runner user owns the files, so git inside the
     # container refuses every command with "detected dubious ownership" (exit
@@ -717,8 +716,16 @@ def test_cap_bump_history_ledger_matches_git():
         "(regenerate with check_size_limits.py --fix): " + repr(mismatches)
     )
 
-    # In a full-history checkout (the shallow skip above guarantees we only get
-    # here with complete history) the mirror must also not contain phantom
+    if truncated:
+        # Shallow/truncated checkout: the git ⊆ ledger direction above has
+        # already executed (partial history proved the ledger is not missing a
+        # bump it shows). The exact-equality reverse check needs complete
+        # history — a shallow ledger legitimately holds records the partial
+        # ``git log`` does not show — so only that direction is skipped, never
+        # the whole guard.
+        return
+
+    # In a full-history checkout the mirror must also not contain phantom
     # records — the ledger and git must agree exactly.
     for section, keys in caps.items():
         if not isinstance(keys, dict):
@@ -741,7 +748,8 @@ def test_cap_bump_history_ledger_matches_git():
 # Ref-scope regression tests — the cap-bump ledger must mirror the MAINLINE
 # branch's ancestry, never ``--all`` (abandoned task/research branches' bumps
 # never merged and must not enter chronic-offender classification), and a
-# shallow/truncated checkout must fail closed rather than read partial history.
+# shallow/truncated checkout must read the committed ledger mirror (complete)
+# rather than the silently-partial ``git log``.
 # ---------------------------------------------------------------------------
 
 
@@ -935,19 +943,86 @@ def test_rebuild_ledger_preserves_existing_on_truncated_git(tmp_path, mocker):
     assert [(r["old_cap"], r["new_cap"]) for r in records] == [(100, 200)]
 
 
-def test_parse_bump_history_raises_on_shallow_checkout(tmp_path, mocker):
-    """A shallow/truncated checkout is unreadable history.
+def test_parse_bump_history_reads_ledger_on_shallow_checkout(tmp_path, mocker):
+    """A shallow/truncated checkout reads the committed ledger mirror.
 
-    ``parse_bump_history`` must raise BumpHistoryUnavailableError — never
-    return a partial history that could misclassify a chronic offender as
-    routine.  This is the same fail-closed stance the governance guard takes on
-    unreadable history (direction d-edea3732, gap g-governance-guard-fails-open).
+    Regression for the shallow-clone fail-closed bug (introduced by pinning the
+    ledger ref scope to mainline ancestry): a depth-limited clone — every agent
+    task VM, CI's depth-1 checkout — used to raise BumpHistoryUnavailableError
+    in ``parse_bump_history`` because its ``git log`` is silently partial, even
+    though the committed cap-bump-history ledger is complete and sitting right
+    there.  The ledger mirror must be consulted BEFORE failing closed, so a
+    shallow checkout classifies from the same complete history the deployed
+    layout reads instead of refusing every cap bump.
     """
     checkout = _init_shallow_repo(tmp_path)
+    ledger_path = tmp_path / "cap_bump_history.json"
+    ledger_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "history": {
+                    "backend": {
+                        "shallow_git.py": [
+                            {
+                                "commit_sha": "s1",
+                                "commit_date": "2026-01-01T00:00:00+00:00",
+                                "old_cap": 100,
+                                "new_cap": 200,
+                            }
+                        ]
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
     mocker.patch("app.size_limit_policy._REPO_ROOT", checkout)
+    mocker.patch(
+        "app.size_limit_policy._CAP_BUMP_HISTORY_LEDGER_PATH", str(ledger_path)
+    )
     slp._bump_history_cache.clear()
-    with pytest.raises(BumpHistoryUnavailableError):
-        parse_bump_history("shallow_git.py", "backend")
+    history = parse_bump_history("shallow_git.py", "backend")
+    assert [(r["old_cap"], r["new_cap"]) for r in history] == [(100, 200)]
+
+
+def test_classify_breach_reads_ledger_on_shallow_checkout(tmp_path, mocker):
+    """classify_breach reaches its history-readable branch on a shallow clone.
+
+    The chronic-offender verdict must classify from the committed ledger mirror
+    on a depth-limited clone (``history_unavailable=False``) rather than failing
+    closed on every module — the cap-bump remediation path is dead for EVERY
+    module on a shallow clone if the ledger fallback is not reached.
+    """
+    checkout = _init_shallow_repo(tmp_path)
+    ledger_path = tmp_path / "cap_bump_history.json"
+    ledger_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "history": {
+                    "backend": {
+                        "m.py": [
+                            _record(100, 200, days_ago=30),
+                            _record(200, 300, days_ago=20),
+                            _record(300, 400, days_ago=10),
+                        ]
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    mocker.patch("app.size_limit_policy._REPO_ROOT", checkout)
+    mocker.patch(
+        "app.size_limit_policy._CAP_BUMP_HISTORY_LEDGER_PATH", str(ledger_path)
+    )
+    slp._bump_history_cache.clear()
+    verdict = classify_breach("m.py", 450)
+    assert verdict["history_unavailable"] is False
+    assert verdict["bump_count"] == 3
+    assert verdict["is_chronic"] is True
+    assert verdict["suggested_new_limit"] is None
 
 
 def test_mainline_git_ref_falls_back_to_head(tmp_path, mocker):
@@ -956,3 +1031,44 @@ def test_mainline_git_ref_falls_back_to_head(tmp_path, mocker):
     repo = _init_hermetic_repo(tmp_path, branch="dev")
     mocker.patch("app.size_limit_policy._REPO_ROOT", repo)
     assert slp._mainline_git_ref() == "HEAD"
+
+
+def test_truncation_probe_failure_fails_closed(tmp_path, mocker):
+    """A shallow checkout whose ancestry probe CANNOT run (git exits 128 —
+    the containerized dubious-ownership shape) must read as TRUNCATED.
+
+    Regression: the probe used to treat any non-zero ``merge-base
+    --is-ancestor`` exit as "boundary not in ancestry" and fall through to
+    NOT-truncated, so a depth-1 CI checkout bind-mounted into a root container
+    evaluated the full-history ledger guard against partial history and
+    reported phantom ledger drift (git showed [] for bumps that mainline
+    history genuinely contains)."""
+    checkout = _init_shallow_repo(tmp_path)
+
+    real_run = subprocess.run
+
+    def _dubious(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and "merge-base" in cmd:
+            return subprocess.CompletedProcess(cmd, 128, stdout="", stderr="fatal: detected dubious ownership")
+        return real_run(cmd, *args, **kwargs)
+
+    mocker.patch("app.size_limit_policy.subprocess.run", side_effect=_dubious)
+    assert slp._git_history_is_truncated(checkout) is True, (
+        "an unprovable shallow boundary must fail closed (truncated), never open"
+    )
+
+
+def test_truncation_probe_exception_fails_closed(tmp_path, mocker):
+    """If the ancestry probe cannot even spawn (git missing mid-flight), a
+    present shallow boundary must still read as truncated."""
+    checkout = _init_shallow_repo(tmp_path)
+
+    real_run = subprocess.run
+
+    def _boom(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and "merge-base" in cmd:
+            raise OSError("git unavailable")
+        return real_run(cmd, *args, **kwargs)
+
+    mocker.patch("app.size_limit_policy.subprocess.run", side_effect=_boom)
+    assert slp._git_history_is_truncated(checkout) is True
