@@ -4260,6 +4260,14 @@
           "old_cap": 2350,
           "new_cap": 2750
         }
+      ],
+      "test_strategic_session_messages.py": [
+        {
+          "commit_sha": "",
+          "commit_date": "2026-08-08T03:58:05.053929+00:00",
+          "old_cap": 1950,
+          "new_cap": 2250
+        }
       ]
     }
   }
