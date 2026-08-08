@@ -48,6 +48,10 @@ _OPTIONAL_API_CONFIG = frozenset(
         "ADMIN_JWT_SECRET",
         "ADMIN_JWT_EXPIRE_MINUTES",
         "ADMIN_API_KEY_ALLOWED_IPS",
+        # Typed-Fast attestation for the Resident conversation lane. The backend
+        # fail-closes unless this exactly matches its pinned qualification
+        # string, so forwarding an arbitrary value cannot activate anything.
+        "CALL_FOREGROUND_QUALIFICATION",
     }
 )
 _ALLOWED_API_ENV = _REQUIRED_API_SECRETS | _REQUIRED_API_CONFIG | _OPTIONAL_API_CONFIG
