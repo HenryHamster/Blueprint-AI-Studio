@@ -125,6 +125,14 @@ def criterion_met(value: Any, op: str, threshold: Any) -> bool:
 # scoring exactly.
 CODE_ACCEPTANCE_VERDICT_KEY = "code_acceptance_verdict"
 
+# Durable rule-version stamped onto every recorded acceptance verdict (rungs
+# 1-2 of design doc c50453ef). A later qualification reads this field to tell
+# which recorded rows were judged by a now-retired rule and re-derive them via
+# the pure :func:`evaluate_acceptance` core instead of trusting a stale verdict.
+# Bumped whenever the acceptance evaluation rules change. Nothing consumes the
+# field yet — this rung only stamps it, behaviour-preservingly.
+ACCEPTANCE_RULE_VERSION = 1
+
 # Durable top-level context key where a PRE-MERGE structural acceptance finding
 # is stamped while a PR is still open. Lives at the TOP level (not inside
 # ``review_loop``) so it can never flip the merge-verification semantics that an
@@ -204,12 +212,21 @@ class AcceptanceGateVerdict:
 _CHANGED_FILES_STAMP_CAP = 50
 
 
-def _changed_files(task: Task) -> list[str]:
-    """The PR's changed-file paths recorded on the task, as a list of strings."""
-    raw = (task.context or {}).get("_pr_changed_files")
+def _context_changed_files(context: Mapping[str, Any] | None) -> list[str]:
+    """The PR's changed-file paths recorded on a task's context, as strings.
+
+    Context-shaped variant of :func:`_changed_files` so the pure evaluation
+    core (:func:`evaluate_acceptance`) never needs a ``Task`` object.
+    """
+    raw = (context or {}).get("_pr_changed_files")
     if not isinstance(raw, list):
         return []
     return [p for p in raw if isinstance(p, str) and p.strip()]
+
+
+def _changed_files(task: Task) -> list[str]:
+    """The PR's changed-file paths recorded on the task, as a list of strings."""
+    return _context_changed_files(task.context)
 
 
 def stamp_changed_files_signal(
@@ -441,7 +458,7 @@ def _test_semantically_grounded(
     return False
 
 
-def _merge_was_test_verified(task: Task) -> bool:
+def _merge_was_test_verified(context: Mapping[str, Any] | None) -> bool:
     """Whether the merge was gated by a REAL test verdict.
 
     Mirrors the canonical ``landed_signal.is_verified_merge`` predicate (and
@@ -452,8 +469,12 @@ def _merge_was_test_verified(task: Task) -> bool:
     malformed review_loop carries no fall-open reason, so the merge is treated
     as VERIFIED — exactly the fail-safe default every other consumer uses. Only
     an explicit, non-empty ``unverified_merge_reason`` returns False.
+
+    Context-shaped (a bare ``context`` dict, not a ``Task``) so the pure
+    evaluation core (:func:`evaluate_acceptance`) can re-derive verdicts from
+    persisted merge records.
     """
-    review_loop = (task.context or {}).get(REVIEW_LOOP_KEY)
+    review_loop = (context or {}).get(REVIEW_LOOP_KEY)
     if not isinstance(review_loop, dict):
         return True
     reason = review_loop.get(UNVERIFIED_MERGE_REASON_KEY)
@@ -467,21 +488,97 @@ def _merge_was_test_verified(task: Task) -> bool:
 # it (every legacy / older-agent merge) behaves exactly as today.
 ACCEPTANCE_TEST_TARGETED_GREEN_KEY = "acceptance_test_targeted_green"
 
+# Durable distilled descriptor the no-CI merge monitor stamps alongside
+# ``acceptance_test_targeted_green`` (the block's ``selector`` or ``descriptor``)
+# so the gate can corroborate that the targeted-green signal actually names the
+# DECLARED test rather than some other test the agent happened to run green.
+ACCEPTANCE_TEST_TARGETED_DESCRIPTOR_KEY = "acceptance_test_targeted_descriptor"
 
-def _acceptance_test_targeted_green(task: Task) -> bool:
+
+def acceptance_test_block_matches_declared(block: Any, declared_path: str) -> bool:
+    """Whether a merge-test acceptance block describes the DECLARED test path.
+
+    The gate credits ``test_exists`` / ``ran_green`` from an agent-reported
+    merge-test block; that credit is only honest when the block names the test
+    the task actually declared. ``selector`` (the precise ``test_path`` the agent
+    ran, possibly with a ``::node`` suffix) and ``descriptor`` (path-shaped, or a
+    bare node id when the declaration pinned one) are each partitioned at ``::``
+    and matched against ``declared_path`` via the tolerant :func:`_paths_match` —
+    so ``backend/testing/test_foo.py::test_x`` names ``backend/testing/test_foo.py``.
+    Returns False for an absent / malformed block or when neither field names the
+    declared path, so a green run of an UNRELATED test can never be credited as
+    proof of this declaration.
+    """
+    if not isinstance(block, dict):
+        return False
+    declared_path = (declared_path or "").strip()
+    if not declared_path:
+        return False
+    for key in ("selector", "descriptor"):
+        value = str(block.get(key) or "").strip()
+        if not value:
+            continue
+        path_part, _, _ = value.partition("::")
+        path_part = path_part.strip()
+        if path_part and _paths_match(path_part, declared_path):
+            return True
+    return False
+
+
+def _declared_named_test_path(payload: dict | None) -> str | None:
+    """The declared named_test's FILE path from the acceptance evidence payload.
+
+    ``None`` when the payload declared no named_test evidence (or it is
+    unreadable) — the merge-test readers fail closed on a task whose declaration
+    cannot be corroborated. Payload-shaped (reads the same ``first_payload`` the
+    task-based readers used) so the pure evaluation core
+    (:func:`evaluate_acceptance`) can re-derive verdicts from persisted merge
+    records without a ``Task`` object.
+    """
+    evidence = read_acceptance_evidence(payload)
+    if evidence is None or evidence.kind != "named_test":
+        return None
+    return (evidence.test_path or "").partition("::")[0].strip() or None
+
+
+def _acceptance_test_targeted_green(
+    context: Mapping[str, Any] | None, declared_path: str | None = None
+) -> bool:
     """Whether the merge gate independently ran the declared acceptance test as a
     TARGETED run and it exited GREEN (fail-safe / defensive).
 
     Reads ``review_loop['acceptance_test_targeted_green']`` — the durable signal
     the no-CI monitor stamps when :func:`ci_resolution.acceptance_test_is_green`
-    held. Returns True ONLY on a literal ``True`` value; a missing / malformed /
-    non-dict review_loop, or an older agent that never emitted the signal, yields
-    False so today's behavior is preserved.
+    held — and CORROBORATES it: the signal is only honest proof when the block
+    (or the descriptor the monitor distilled from it) names the DECLARED test.
+    A green run of a DIFFERENT test must never prove a name-dropped declaration,
+    so a signal whose identity evidence is absent or mismatched yields False.
+    Returns True ONLY on a literal ``True`` value that names the declared test;
+    a missing / malformed / non-dict review_loop, an older agent that never
+    emitted the signal, or an identity mismatch all yield False so today's
+    behavior is preserved.
+
+    Context-shaped (a bare ``context`` dict plus the declared test path, not a
+    ``Task``) so the pure evaluation core (:func:`evaluate_acceptance`) can
+    re-derive verdicts from persisted merge records.
     """
-    review_loop = (task.context or {}).get(REVIEW_LOOP_KEY)
+    if not declared_path:
+        return False
+    review_loop = (context or {}).get(REVIEW_LOOP_KEY)
     if not isinstance(review_loop, dict):
         return False
-    return review_loop.get(ACCEPTANCE_TEST_TARGETED_GREEN_KEY) is True
+    if review_loop.get(ACCEPTANCE_TEST_TARGETED_GREEN_KEY) is not True:
+        return False
+    block = review_loop.get(MERGE_ACCEPTANCE_BLOCK_KEY)
+    if isinstance(block, dict):
+        return acceptance_test_block_matches_declared(block, declared_path)
+    descriptor = review_loop.get(ACCEPTANCE_TEST_TARGETED_DESCRIPTOR_KEY)
+    if isinstance(descriptor, str) and descriptor.strip():
+        return acceptance_test_block_matches_declared(
+            {"selector": descriptor}, declared_path
+        )
+    # A targeted-green signal with no identity evidence is not corroborable.
+    return False
 
 
 # Durable NORMALIZED acceptance-test block the no-CI merge monitor persists onto
@@ -491,7 +588,7 @@ def _acceptance_test_targeted_green(task: Task) -> bool:
 MERGE_ACCEPTANCE_BLOCK_KEY = "verify_tests_acceptance_block"
 
 
-def _merge_acceptance_test_block(task: Task) -> dict | None:
+def _merge_acceptance_test_block(context: Mapping[str, Any] | None) -> dict | None:
     """Read the declared acceptance test's normalized merge-test block, defensively.
 
     Returns the block the no-CI monitor persisted under
@@ -501,8 +598,12 @@ def _merge_acceptance_test_block(task: Task) -> dict | None:
     malformed / non-dict review_loop, or a legacy task merged before the monitor
     persisted the block, yields ``None`` — so every caller MUST still fall back to
     :func:`_acceptance_test_targeted_green`, which those tasks do carry.
+
+    Context-shaped (a bare ``context`` dict, not a ``Task``) so the pure
+    evaluation core (:func:`evaluate_acceptance`) can re-derive verdicts from
+    persisted merge records.
     """
-    review_loop = (task.context or {}).get(REVIEW_LOOP_KEY)
+    review_loop = (context or {}).get(REVIEW_LOOP_KEY)
     if not isinstance(review_loop, dict):
         return None
     block = review_loop.get(MERGE_ACCEPTANCE_BLOCK_KEY)
@@ -651,15 +752,19 @@ async def corroborate_acceptance_test_at_merge(
     return False
 
 
-def _acceptance_test_exists_at_merge(task: Task) -> bool:
+def _acceptance_test_exists_at_merge(
+    context: Mapping[str, Any] | None, declared_path: str | None = None
+) -> bool:
     """Whether the declared acceptance test is confirmed to EXIST in the repo at
     the merge commit — independent of whether the PR's diff touches it.
 
     True when the merge gate physically executed the declared test as a targeted
     run (``acceptance_test_targeted_green`` — a test that ran must exist), or a
-    merge-test verdict block records the test as ``present``. Defensive: absent /
-    malformed evidence yields False, so a name-dropped test that can be shown to
-    exist nowhere is never credited.
+    merge-test verdict block records the test as ``present``. Both paths are
+    CORROBORATED against the DECLARED test path, so a green run of some OTHER
+    test is never read as existence of the declaration. Defensive: absent /
+    malformed evidence, or a block that names a different test, yields False, so
+    a name-dropped test that can be shown to exist nowhere is never credited.
 
     The agent-reported evidence is NECESSARY but no longer sufficient. When the
     backend has independently corroborated the declared test path against the
@@ -669,36 +774,55 @@ def _acceptance_test_exists_at_merge(task: Task) -> bool:
     test exists that the backend can prove does not is never credited. An
     indeterminate / not-yet-computed corroboration leaves today's behavior
     intact, so a genuinely-existing test is never suppressed on missing data.
+
+    Context-shaped (a bare ``context`` dict plus the declared test path, not a
+    ``Task``) so the pure evaluation core (:func:`evaluate_acceptance`) can
+    re-derive verdicts from persisted merge records.
     """
     # A test can only be confirmed to exist if something actually claimed to run
-    # it (targeted green) or a merge-test verdict records it present.
-    if not _acceptance_test_targeted_green(task):
-        block = _merge_acceptance_test_block(task)
+    # it (targeted green) or a merge-test verdict NAMING THE DECLARED TEST
+    # records it present.
+    if not _acceptance_test_targeted_green(context, declared_path):
+        block = _merge_acceptance_test_block(context)
+        if not declared_path or not acceptance_test_block_matches_declared(
+            block, declared_path
+        ):
+            return False
         if not (block and block.get("present") is True):
             return False
     # Backend-side corroboration against the merged tree: a corroborated absence
     # is a non-existence verdict even when the agent reported the test present.
-    return (
-        (task.context or {}).get(ACCEPTANCE_TEST_CORROBORATED_KEY) is not False
-    )
+    return (context or {}).get(ACCEPTANCE_TEST_CORROBORATED_KEY) is not False
 
 
-def _acceptance_test_ran_green_at_merge(task: Task) -> bool:
+def _acceptance_test_ran_green_at_merge(
+    context: Mapping[str, Any] | None, declared_path: str | None = None
+) -> bool:
     """Whether the declared acceptance test is confirmed to have RAN GREEN under a
     real merge-test verdict — independent of the PR's diff.
 
     True when the targeted-green signal was stamped (the merge gate independently
     executed ONLY the declared test and it exited green), or a merge-test verdict
     block records the declared test as present, ran, with status ``"ran"`` and
-    ``passed``. A test that exists but did not run green (skipped / absent /
-    failed) yields False. Same backend-corrobation override as
-    :func:`_acceptance_test_exists_at_merge`: a corroborated absence means the
-    declared test was never really there, so no green run can be credited for it.
+    ``passed``. Both paths are CORROBORATED against the DECLARED test path, so a
+    green run of some OTHER test is never credited. A test that exists but did
+    not run green (skipped / absent / failed) yields False. Same
+    backend-corroboration override as :func:`_acceptance_test_exists_at_merge`: a
+    corroborated absence means the declared test was never really there, so no
+    green run can be credited for it.
+
+    Context-shaped (a bare ``context`` dict plus the declared test path, not a
+    ``Task``) so the pure evaluation core (:func:`evaluate_acceptance`) can
+    re-derive verdicts from persisted merge records.
     """
-    if _acceptance_test_targeted_green(task):
+    if _acceptance_test_targeted_green(context, declared_path):
         ran_green = True
     else:
-        block = _merge_acceptance_test_block(task)
+        block = _merge_acceptance_test_block(context)
+        if not declared_path or not acceptance_test_block_matches_declared(
+            block, declared_path
+        ):
+            return False
         ran_green = bool(
             block
             and block.get("present") is True
@@ -708,7 +832,7 @@ def _acceptance_test_ran_green_at_merge(task: Task) -> bool:
         )
     if not ran_green:
         return False
-    return (task.context or {}).get(ACCEPTANCE_TEST_CORROBORATED_KEY) is not False
+    return (context or {}).get(ACCEPTANCE_TEST_CORROBORATED_KEY) is not False
 
 
 def _evaluate_named_test(
@@ -720,6 +844,7 @@ def _evaluate_named_test(
     targeted_green: bool = False,
     test_exists: bool = False,
     ran_green: bool = False,
+    block_describes_other_test: bool = False,
 ) -> AcceptanceGateVerdict:
     """Fail-closed gate for a ``named_test`` acceptance declaration.
 
@@ -790,9 +915,45 @@ def _evaluate_named_test(
     sibling's slice of that union, a parent-derived match is real enough to clear
     ``declared_unsatisfied`` (satisfied) but must NOT mint machine ``proven``
     credit — the final proof branch is capped at ``satisfied=True, proven=False``.
+
+    ``block_describes_other_test`` marks that a merge-test acceptance block was
+    recorded but it names a DIFFERENT test than the declared ``test_path`` — a
+    green run of some other test is never proof of this declaration. When the
+    credit would rest on that block (the declared test is absent from the diff,
+    or the merge fell open and the targeted-green signal is the only green
+    evidence), the gate fails closed with a distinct, actionable reason. An
+    in-diff credit under a CI-VERIFIED merge does not rest on the block, so a
+    stray mismatch never penalizes an independently-proven task. Neither does the
+    TRUNCATION credit: there the credit rests on the absence being inconclusive
+    (the declared test may ship beyond the stored 50-path prefix), not on the
+    block, so ``truncated`` with the test absent keeps its soft
+    ``satisfied=True, proven=False`` outcome regardless of a mismatched block —
+    consistent with the truncation invariant above that nothing overrides it.
     """
     declared_path = (evidence.test_path or "").partition("::")[0].strip()
     test_present = any(_paths_match(cf, declared_path) for cf in changed)
+    # Corroboration gate: a merge-test block that names a DIFFERENT test is never
+    # proof of this declaration. Only the block-dependent credits are blocked —
+    # an in-diff test under a CI-verified merge is proven independently of the
+    # block, so a stray mismatch there does not fail a genuinely proven task. The
+    # truncation credit below is likewise block-independent: it rests on the
+    # absence being INCONCLUSIVE, not on the block, so a stray mismatch must not
+    # convert a soft truncation credit into a hard fail (see the truncation
+    # invariant documented above: nothing overrides it).
+    if (
+        block_describes_other_test
+        and not (test_present and verified)
+        and not (truncated and not test_present)
+    ):
+        return AcceptanceGateVerdict(
+            True,
+            False,
+            evidence.kind,
+            f"declared named_test {declared_path!r} cannot be credited from the "
+            "merge-test verdict: the recorded acceptance-test block describes a "
+            "DIFFERENT test than the declared test_path — a green run of another "
+            "test does not prove this declaration",
+        )
     if not test_present:
         if truncated:
             return AcceptanceGateVerdict(
@@ -1066,7 +1227,11 @@ def _evaluate_downstream_artifact(
     )
 
 
-def _evaluate_visual(task: Task, evidence: AcceptanceEvidence) -> AcceptanceGateVerdict:
+def _evaluate_visual(
+    project_id: object,
+    context: Mapping[str, Any] | None,
+    evidence: AcceptanceEvidence,
+) -> AcceptanceGateVerdict:
     """Fail-closed gate for a ``visual`` acceptance declaration.
 
     A visual declaration is satisfied only when the task context already
@@ -1074,6 +1239,10 @@ def _evaluate_visual(task: Task, evidence: AcceptanceEvidence) -> AcceptanceGate
     ``(component, viewport_width)`` pair.  The shared resolver keeps the object
     name derivation consistent with the upload/download path and fails closed
     on absent or mismatched evidence.
+
+    Context-shaped (a bare ``project_id`` + ``context``, not a ``Task``) so the
+    pure evaluation core (:func:`evaluate_acceptance`) can re-derive verdicts
+    from persisted merge records.
     """
     if evidence.component is None or evidence.viewport_width is None:
         return AcceptanceGateVerdict(
@@ -1084,10 +1253,10 @@ def _evaluate_visual(task: Task, evidence: AcceptanceEvidence) -> AcceptanceGate
         )
 
     resolved = resolve_visual_evidence(
-        task.project_id,
+        project_id,
         evidence.component,
         evidence.viewport_width,
-        task.context,
+        dict(context or {}) if context is not None else None,
     )
     if not resolved["resolved"]:
         return AcceptanceGateVerdict(
@@ -1195,30 +1364,76 @@ def _evaluate_coverage_delta(
     )
 
 
-def evaluate_code_acceptance(task: Task) -> AcceptanceGateVerdict:
-    """Evaluate ``task``'s declared acceptance evidence, fail-closed.
+def evaluate_acceptance(
+    payload: dict | None,
+    context: Mapping[str, Any] | None,
+    project_id: object,
+) -> AcceptanceGateVerdict:
+    """Evaluate a task's declared acceptance evidence as a PURE function of its
+    durable inputs — ``payload`` (the first_payload), ``context``, and
+    ``project_id`` — with no ``Task`` ORM dependency.
 
-    Self-contained from the task: reads the declaration from the payload, the
-    PR's changed files from ``context['_pr_changed_files']``, and whether the
-    merge was test-verified from the no-CI gate's recorded reason. A task with no
-    declaration returns a non-recorded passing verdict (``declared=False``),
-    preserving today's behavior exactly.
+    This is the re-derivable core (rung 1 of design doc c50453ef): a later
+    qualification re-runs it over persisted merge records to re-score verdicts
+    that were stamped under a retired rule (see :data:`ACCEPTANCE_RULE_VERSION`),
+    without touching the task rows' live ORM state. Reads the declaration from
+    the payload, the PR's changed files from ``context['_pr_changed_files']``,
+    and whether the merge was test-verified from the no-CI gate's recorded
+    reason. A task with no declaration returns a non-recorded passing verdict
+    (``declared=False``), preserving today's behavior exactly.
+
+    ``evaluate_code_acceptance(task)`` is the thin ``Task`` adapter over this
+    function; both must always return the same verdict for the same
+    (payload, context, project_id) triple.
     """
-    evidence = read_acceptance_evidence(task.first_payload)
+    evidence = read_acceptance_evidence(payload)
     if evidence is None:
         return AcceptanceGateVerdict(
             False, True, None, "no acceptance evidence declared"
         )
 
-    changed = _changed_files(task)
-    verified = _merge_was_test_verified(task)
-    truncated = bool((task.context or {}).get("_pr_changed_files_truncated"))
+    changed = _context_changed_files(context)
+    verified = _merge_was_test_verified(context)
+    truncated = bool((context or {}).get("_pr_changed_files_truncated"))
     parent_derived_files = bool(
-        (task.context or {}).get(PARENT_DERIVED_CHANGED_FILES_KEY)
+        (context or {}).get(PARENT_DERIVED_CHANGED_FILES_KEY)
     )
-    targeted_green = _acceptance_test_targeted_green(task)
-    test_exists = _acceptance_test_exists_at_merge(task)
-    ran_green = _acceptance_test_ran_green_at_merge(task)
+    # Corroborate the merge-test evidence's identity against the DECLARED test.
+    # A block (or a targeted-green signal riding without one) that names a
+    # DIFFERENT test is a distinct fail-closed cause — a green run of another
+    # test must never prove a name-dropped declaration. The hardened readers
+    # below already refuse mismatched evidence; this flag gives the verdict a
+    # specific, actionable reason instead of a misleading generic one.
+    block_describes_other_test = False
+    declared_path = _declared_named_test_path(payload)
+    if evidence.kind == "named_test":
+        if declared_path:
+            block = _merge_acceptance_test_block(context)
+            block_describes_other_test = (
+                block is not None
+                and not acceptance_test_block_matches_declared(block, declared_path)
+            )
+            if not block_describes_other_test:
+                # A targeted-green signal without a persisted block (older
+                # monitor) must still name the declared test — corroborate the
+                # distilled descriptor the monitor stamped alongside it.
+                review_loop = (context or {}).get(REVIEW_LOOP_KEY)
+                if (
+                    isinstance(review_loop, dict)
+                    and review_loop.get(ACCEPTANCE_TEST_TARGETED_GREEN_KEY) is True
+                    and not isinstance(review_loop.get(MERGE_ACCEPTANCE_BLOCK_KEY), dict)
+                ):
+                    descriptor = review_loop.get(ACCEPTANCE_TEST_TARGETED_DESCRIPTOR_KEY)
+                    block_describes_other_test = (
+                        isinstance(descriptor, str)
+                        and bool(descriptor.strip())
+                        and not acceptance_test_block_matches_declared(
+                            {"selector": descriptor}, declared_path
+                        )
+                    )
+    targeted_green = _acceptance_test_targeted_green(context, declared_path)
+    test_exists = _acceptance_test_exists_at_merge(context, declared_path)
+    ran_green = _acceptance_test_ran_green_at_merge(context, declared_path)
 
     if evidence.kind == "named_test":
         return _evaluate_named_test(
@@ -1230,16 +1445,17 @@ def evaluate_code_acceptance(task: Task) -> AcceptanceGateVerdict:
             targeted_green=targeted_green,
             test_exists=test_exists,
             ran_green=ran_green,
+            block_describes_other_test=block_describes_other_test,
         )
 
     if evidence.kind == "downstream_artifact":
         return _evaluate_downstream_artifact(evidence, changed)
 
     if evidence.kind == "visual":
-        return _evaluate_visual(task, evidence)
+        return _evaluate_visual(project_id, context, evidence)
 
     if evidence.kind == "coverage_delta":
-        return _evaluate_coverage_delta(evidence, task.context)
+        return _evaluate_coverage_delta(evidence, context)
 
     # observable_behavior carries no machine-checkable assertion the backend can
     # independently re-run at completion. To the extent checkable, require that
@@ -1268,6 +1484,19 @@ def evaluate_code_acceptance(task: Task) -> AcceptanceGateVerdict:
     return AcceptanceGateVerdict(
         True, False, evidence.kind, f"unrecognized acceptance kind {evidence.kind!r}"
     )
+
+
+def evaluate_code_acceptance(task: Task) -> AcceptanceGateVerdict:
+    """Evaluate ``task``'s declared acceptance evidence, fail-closed.
+
+    Thin ``Task`` adapter over the pure :func:`evaluate_acceptance` core: reads
+    the declaration from the payload, the PR's changed files from
+    ``context['_pr_changed_files']``, and whether the merge was test-verified
+    from the no-CI gate's recorded reason. A task with no declaration returns a
+    non-recorded passing verdict (``declared=False``), preserving today's
+    behavior exactly.
+    """
+    return evaluate_acceptance(task.first_payload, task.context, task.project_id)
 
 
 def evaluate_premerge_acceptance(task: Task) -> AcceptanceGateVerdict | None:
@@ -1367,6 +1596,10 @@ def record_code_acceptance_verdict(task: Task) -> AcceptanceGateVerdict | None:
         "kind": verdict.kind,
         "reason": verdict.reason,
         "proof_ref": verdict.proof_ref,
+        # Stamps the rule version that produced this verdict so a later
+        # qualification can tell which recorded rows were judged by a retired
+        # rule and re-derive them (design doc c50453ef). Nothing consumes it yet.
+        "rule_version": ACCEPTANCE_RULE_VERSION,
     }
     # A re-recorded verdict means new provenance arrived (parent-derived changed
     # files, a GitHub-verified diff, etc.) AFTER the one-shot backfill sweep had
@@ -1378,6 +1611,66 @@ def record_code_acceptance_verdict(task: Task) -> AcceptanceGateVerdict | None:
     ctx.pop(BACKFILL_MISSING_DIFF_TERMINAL_KEY, None)
     task.context = ctx
     return verdict
+
+
+def effective_acceptance_verdict(task: Task) -> dict | None:
+    """The verdict a landed task's acceptance evidence carries under the CURRENT rule.
+
+    Rung 3 of design doc c50453ef: the qualifier's acceptance-window tally must
+    not trust a verdict frozen under a RETIRED rule — an evidence-rule improvement
+    landing mid-version should re-score work that was already merged under the old
+    rule. Returns the recorded :data:`CODE_ACCEPTANCE_VERDICT_KEY` dict verbatim
+    when it was stamped by the current :data:`ACCEPTANCE_RULE_VERSION`; otherwise
+    re-derives it from the task's persisted merge record via the pure
+    :func:`evaluate_acceptance` core (same payload/context/project_id the live
+    gate used — no agent re-run, no network) and re-stamps the current rule.
+
+    Fail-safes (both keep a stale recorded row stable instead of silently
+    re-measuring it):
+
+      * No recorded verdict (undeclared / legacy) returns ``None``, so the
+        caller keeps today's undeclared / inferred-test-cochange classification.
+      * A re-derivation that comes back ``declared=False`` (the payload no longer
+        declares evidence — declaration removed after stamping) returns the frozen
+        dict verbatim rather than erasing a recorded verdict.
+      * A consumed ``downstream_artifact`` verdict is never downgraded: the
+        consumed upgrade (``consumed`` / ``consumed_by_task_id`` /
+        ``consumed_artifact_id``, ``proven=True``) applied by
+        :func:`record_artifact_consumptions_for_task` lives outside the pure core
+        (it needs the consumption rows), so re-derivation would otherwise flip a
+        consumed verdict back to satisfied-but-unproven. The re-derived dict keeps
+        ``proven=True`` whenever the frozen dict was ``consumed``.
+
+    Pure and side-effect-free (does not mutate ``task.context``); the caller
+    decides whether a corrected verdict is written anywhere.
+    """
+    frozen = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+    if not isinstance(frozen, dict):
+        return None
+    if frozen.get("rule_version") == ACCEPTANCE_RULE_VERSION:
+        # Stamped by the current rule — nothing to re-derive.
+        return frozen
+    rederived = evaluate_acceptance(task.first_payload, task.context, task.project_id)
+    if not rederived.declared:
+        # The payload no longer declares acceptance evidence; keep the recorded
+        # row stable rather than erasing it into the undeclared bucket.
+        return frozen
+    effective = dict(frozen)
+    effective.update(
+        {
+            "satisfied": rederived.satisfied,
+            "proven": rederived.proven,
+            "kind": rederived.kind,
+            "reason": rederived.reason,
+            "proof_ref": rederived.proof_ref,
+            "rule_version": ACCEPTANCE_RULE_VERSION,
+        }
+    )
+    if frozen.get("consumed") is True:
+        # Preserve the consumption upgrade: consumed ⊂ proven, so a consumed
+        # verdict stays proven even though the pure core cannot see consumption.
+        effective["proven"] = True
+    return effective
 
 
 def premerge_acceptance_finding(task: Task) -> dict | None:
@@ -1603,6 +1896,7 @@ _UNSATISFIED_REASON_KEYS: tuple[str, ...] = (
     "named_test_not_run_green",
     "named_test_test_only_diff",
     "named_test_ungrounded_seam",
+    "named_test_block_describes_other_test",
     "artifact_empty_diff",
     "artifact_not_in_diff",
     "visual_malformed",
@@ -1627,8 +1921,9 @@ def classify_unsatisfied_reason(recorded: Any) -> str:
     distinctive ``reason`` substring (every fail-closed reason string originates
     in this module). The returned keys are the causes an operator can act on:
     a named test that was never added to the diff, that fell open without a real
-    green run, that shipped no production seam, or that is not semantically
-    grounded; an artifact the diff never delivered; a malformed or missing
+    green run, that shipped no production seam, that is not semantically
+    grounded, or whose merge-test verdict describes a DIFFERENT test than the
+    declared path; an artifact the diff never delivered; a malformed or missing
     visual screenshot; a coverage declaration with a missing threshold, a
     missing/invalid measurement, or a genuine below-threshold measurement; an
     observable-behavior declaration with an empty diff; an unrecognized
@@ -1651,6 +1946,8 @@ def classify_unsatisfied_reason(recorded: Any) -> str:
         return "unrecognized_kind"
 
     if kind == "named_test":
+        if "describes a DIFFERENT test" in reason_str:
+            return "named_test_block_describes_other_test"
         if "is not among the PR's changed files" in reason_str:
             return "named_test_missing_from_diff"
         if "did not run green under a real merge-test verdict" in reason_str:
@@ -2221,6 +2518,7 @@ async def backfill_acceptance_verdicts(session) -> int:
                     "reason": re_eval.reason,
                     "proof_ref": re_eval.proof_ref,
                     "backfilled": True,
+                    "rule_version": ACCEPTANCE_RULE_VERSION,
                 }
                 task.context = ctx
                 session.add(task)
@@ -2266,6 +2564,7 @@ async def backfill_acceptance_verdicts(session) -> int:
                         "reason": re_eval.reason,
                         "proof_ref": re_eval.proof_ref,
                         "backfilled": True,
+                        "rule_version": ACCEPTANCE_RULE_VERSION,
                     }
                     task.context = ctx
                     session.add(task)

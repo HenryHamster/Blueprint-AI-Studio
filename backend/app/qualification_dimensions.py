@@ -93,9 +93,14 @@ QUALIFICATION_DIMENSIONS: tuple[QualificationDimension, ...] = (
         "challenge", "Challenge",
         ledger_backed=True,
     ),
+    # acceptance_window is MUTABLE: the tally re-derives verdicts stamped under a
+    # retired acceptance rule (design doc c50453ef) on every drive, so the live
+    # result can change between same-candidate re-drives after an evidence-rule
+    # improvement lands. A reused ledger row must never overwrite — or be
+    # overlaid over — the freshly measured blob-derived state.
     QualificationDimension(
         "acceptance_window", "Acceptance Window",
-        ledger_backed=True,
+        ledger_backed=True, mutable=True,
     ),
     QualificationDimension(
         "criterion_coverage", "Criterion Coverage",

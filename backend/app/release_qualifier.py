@@ -52,6 +52,7 @@ from app.acceptance_gate import (
     classify_merged_acceptance_context,
     classify_undeclared_reason,
     classify_unsatisfied_reason,
+    effective_acceptance_verdict,
 )
 from app.acceptance_criteria import (
     WALKTHROUGH_E2E_FLOW_MARKERS,
@@ -4437,8 +4438,22 @@ async def _compute_acceptance_window_aggregate(
     buckets: dict[str, int] = dict.fromkeys(ACCEPTANCE_AGGREGATE_BUCKETS, 0)
     undeclared_reasons: dict[str, int] = dict.fromkeys(_UNDECLARED_REASON_KEYS, 0)
     unsatisfied_reasons: dict[str, int] = dict.fromkeys(_UNSATISFIED_REASON_KEYS, 0)
+    # Re-derivation pass (rung 3 of design doc c50453ef): a verdict frozen under
+    # a RETIRED acceptance rule is re-derived from the task's persisted merge
+    # record before classification, so an evidence-rule improvement landing
+    # mid-version re-scores already-merged work. Current-rule stamps and the
+    # declared-fail-safe rows pass through verbatim (see
+    # ``acceptance_gate.effective_acceptance_verdict``); undeclared rows keep no
+    # verdict key so the inferred-test-cochange path still applies.
+    def _effective_context(task: Task) -> dict:
+        ctx = dict(task.context or {})
+        effective = effective_acceptance_verdict(task)
+        if effective is not None:
+            ctx[CODE_ACCEPTANCE_VERDICT_KEY] = effective
+        return ctx
+
     for task in rows_write:
-        ctx = task.context or {}
+        ctx = _effective_context(task)
         bucket = classify_merged_acceptance_context(ctx)
         buckets[bucket] += 1
         if bucket == "undeclared":
@@ -4459,7 +4474,7 @@ async def _compute_acceptance_window_aggregate(
     inferred_task_ids: list[str] = [
         str(task.id)
         for task in rows_write
-        if classify_merged_acceptance_context(task.context or {}) == "inferred_test_cochange"
+        if classify_merged_acceptance_context(_effective_context(task)) == "inferred_test_cochange"
     ][:_INFERRED_TASK_ID_CAP]
     fraction = (verified / total) if total > 0 else None
     return {

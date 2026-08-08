@@ -4724,6 +4724,129 @@ async def test_acceptance_window_aggregate_fraction_none_when_empty(db_session):
 
 
 @pytest.mark.asyncio
+async def test_acceptance_window_rederives_stale_rule_version_verdicts(db_session):
+    """A verdict frozen under a RETIRED acceptance rule is re-derived in the
+    qualifier tally, so an evidence-rule improvement landing mid-version re-scores
+    already-merged work (design doc c50453ef, rung 3).
+
+    Two write-task merges in the same window:
+
+      * A task whose payload DECLARES named_test evidence and whose recorded
+        verdict is stamped under ``rule_version=0`` (retired) with
+        ``satisfied=False``.  The current rule judges the SAME persisted merge
+        record proven — the declared test is in the diff, the merge carried a
+        real merge-test verdict naming it, and the diff exercises a semantically
+        grounded production seam — so the aggregate must count it in the proven
+        bucket, flipping the recorded unsatisfied verdict.
+      * A control task whose verdict is stamped under the CURRENT rule with
+        ``satisfied=False`` and whose declaration genuinely cannot be proven
+        (the declared test is absent from the diff).  A current-rule stamp is
+        trusted verbatim, so it stays excluded.
+    """
+    from app.acceptance_gate import (
+        ACCEPTANCE_RULE_VERSION,
+        CODE_ACCEPTANCE_VERDICT_KEY,
+        effective_acceptance_verdict,
+    )
+
+    project, version = await _make_project_and_version(db_session)
+
+    stale_task = Task(
+        project_id=project.id,
+        title="stale-rule-merge",
+        payloads=[
+            {
+                "type": "create",
+                "acceptance_evidence": {
+                    "kind": "named_test",
+                    "test_path": "backend/testing/test_widget.py",
+                },
+            }
+        ],
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": True,
+            "_pr_changed_files": [
+                "backend/app/widget.py",
+                "backend/testing/test_widget.py",
+            ],
+            "review_loop": {
+                "verify_tests_acceptance_block": {
+                    "present": True,
+                    "ran": True,
+                    "status": "pass",
+                    "passed": True,
+                    "selector": "backend/testing/test_widget.py",
+                },
+            },
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": False,
+                "proven": False,
+                "kind": "named_test",
+                "reason": (
+                    "declared test not among the PR's changed files "
+                    "(retired rule)"
+                ),
+                "rule_version": ACCEPTANCE_RULE_VERSION - 1,
+            },
+        },
+    )
+    # The frozen stamp is stale; the CURRENT rule re-derives the SAME persisted
+    # record as proven (test present + verified merge + grounded seam).
+    effective_stale = effective_acceptance_verdict(stale_task)
+    assert effective_stale is not stale_task.context[CODE_ACCEPTANCE_VERDICT_KEY]
+    assert effective_stale["satisfied"] is True
+    assert effective_stale["proven"] is True
+    assert effective_stale["rule_version"] == ACCEPTANCE_RULE_VERSION
+
+    control_task = Task(
+        project_id=project.id,
+        title="current-rule-unsatisfied",
+        payloads=[
+            {
+                "type": "create",
+                "acceptance_evidence": {
+                    "kind": "named_test",
+                    "test_path": "backend/testing/test_other.py",
+                },
+            }
+        ],
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": True,
+            "_pr_changed_files": ["backend/app/widget.py"],
+            "review_loop": {},
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": False,
+                "proven": False,
+                "kind": "named_test",
+                "reason": "declared named_test ... is not among the PR's changed files",
+                "rule_version": ACCEPTANCE_RULE_VERSION,
+            },
+        },
+    )
+    # A current-rule stamp is trusted verbatim — never re-derived.
+    assert (
+        effective_acceptance_verdict(control_task)
+        is control_task.context[CODE_ACCEPTANCE_VERDICT_KEY]
+    )
+
+    db_session.add(stale_task)
+    db_session.add(control_task)
+    await db_session.commit()
+
+    agg = await rq._compute_acceptance_window_aggregate(db_session, version)
+    assert agg["acceptance_window_total"] == 2
+    assert agg["acceptance_window_verified"] == 1
+    assert agg["acceptance_window_fraction"] == pytest.approx(0.5)
+    # The stale-rule merge re-derived into proven; the control stayed excluded.
+    assert agg["acceptance_window_buckets"]["proven"] == 1
+    assert agg["acceptance_window_buckets"]["declared_unsatisfied"] == 1
+
+
+@pytest.mark.asyncio
 async def test_acceptance_window_aggregate_ignores_post_terminal_updates(
     db_session,
 ):
