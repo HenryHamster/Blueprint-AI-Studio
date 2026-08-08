@@ -426,6 +426,49 @@ def _compact_promotion_readiness(value: Any, *, floor: bool = False) -> dict | N
     return out or None
 
 
+def _compact_finding_resolution(value: Any, *, text_cap: int) -> dict | None:
+    """Compact the version_phase finding-resolution block.
+
+    Keeps the per-finding keys/severity/state — load-bearing for dispatching
+    remediation and recording ledger resolutions — while bounding summaries and
+    dropping verbose provenance, so the block survives budget pressure. The raw
+    carried ``audit_findings`` list is stripped to a count by the compact
+    qualification serializer, so this block is the durable carrier of the keys.
+    """
+    if not isinstance(value, dict):
+        return None
+    out: dict[str, Any] = {}
+    for key in (
+        "requalification_ready",
+        "gating_total",
+        "gating_resolved",
+        "audit_findings_truncated",
+    ):
+        if value.get(key) is not None:
+            out[key] = value.get(key)
+    reason = _bounded_text(value.get("reason"), text_cap)
+    if reason:
+        out["reason"] = reason
+    findings = value.get("findings")
+    if isinstance(findings, list):
+        compact: list[dict[str, Any]] = []
+        for f in findings:
+            if not isinstance(f, dict):
+                continue
+            entry: dict[str, Any] = {}
+            for fkey in ("key", "severity", "state"):
+                if f.get(fkey) is not None:
+                    entry[fkey] = f.get(fkey)
+            summary = _bounded_text(f.get("summary"), text_cap)
+            if summary:
+                entry["summary"] = summary
+            if entry:
+                compact.append(entry)
+        if compact:
+            out["findings"] = compact
+    return out or None
+
+
 def _compact_recent_version_entry(value: Any, *, floor: bool = False) -> dict | None:
     if not isinstance(value, dict):
         return None
@@ -599,6 +642,9 @@ def _compact_version_phase(block: dict, *, floor: bool = False) -> dict:
         compact = _compact_scalar_mapping(block.get(key), text_cap=text_cap)
         if compact:
             out[key] = compact
+    fr = _compact_finding_resolution(block.get("finding_resolution"), text_cap=text_cap)
+    if fr:
+        out["finding_resolution"] = fr
     rv = block.get("recent_versions")
     if isinstance(rv, list):
         cap = (

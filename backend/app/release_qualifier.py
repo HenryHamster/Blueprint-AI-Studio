@@ -52,6 +52,7 @@ from app.acceptance_gate import (
     classify_merged_acceptance_context,
     classify_undeclared_reason,
     classify_unsatisfied_reason,
+    effective_acceptance_verdict,
 )
 from app.acceptance_criteria import (
     WALKTHROUGH_E2E_FLOW_MARKERS,
@@ -862,7 +863,11 @@ def _fail_closed_category_verdicts(
     ``None`` only when there are genuinely no active criterion keys to gate on.
     """
     verdicts = [
-        {"category_key": k, "status": "unverified", "tier": "unverified"}
+        {
+            "category_key": k,
+            "status": "unverified",
+            "tier": "unverified",
+        }
         for k in sorted(k for k in active_keys if k)
     ]
     return verdicts or None
@@ -4433,8 +4438,22 @@ async def _compute_acceptance_window_aggregate(
     buckets: dict[str, int] = dict.fromkeys(ACCEPTANCE_AGGREGATE_BUCKETS, 0)
     undeclared_reasons: dict[str, int] = dict.fromkeys(_UNDECLARED_REASON_KEYS, 0)
     unsatisfied_reasons: dict[str, int] = dict.fromkeys(_UNSATISFIED_REASON_KEYS, 0)
+    # Re-derivation pass (rung 3 of design doc c50453ef): a verdict frozen under
+    # a RETIRED acceptance rule is re-derived from the task's persisted merge
+    # record before classification, so an evidence-rule improvement landing
+    # mid-version re-scores already-merged work. Current-rule stamps and the
+    # declared-fail-safe rows pass through verbatim (see
+    # ``acceptance_gate.effective_acceptance_verdict``); undeclared rows keep no
+    # verdict key so the inferred-test-cochange path still applies.
+    def _effective_context(task: Task) -> dict:
+        ctx = dict(task.context or {})
+        effective = effective_acceptance_verdict(task)
+        if effective is not None:
+            ctx[CODE_ACCEPTANCE_VERDICT_KEY] = effective
+        return ctx
+
     for task in rows_write:
-        ctx = task.context or {}
+        ctx = _effective_context(task)
         bucket = classify_merged_acceptance_context(ctx)
         buckets[bucket] += 1
         if bucket == "undeclared":
@@ -4455,7 +4474,7 @@ async def _compute_acceptance_window_aggregate(
     inferred_task_ids: list[str] = [
         str(task.id)
         for task in rows_write
-        if classify_merged_acceptance_context(task.context or {}) == "inferred_test_cochange"
+        if classify_merged_acceptance_context(_effective_context(task)) == "inferred_test_cochange"
     ][:_INFERRED_TASK_ID_CAP]
     fraction = (verified / total) if total > 0 else None
     return {
@@ -7816,6 +7835,7 @@ async def _finalize_qualification(
                         citations=_v.get("citations") or [],
                         grader_run_id=merge_grade_task_id,
                         qualification_attempt_id=attempt_id,
+                        project_id=version.project_id,
                     )
                 await _category_ledger.upsert_residual(
                     session,
@@ -7823,6 +7843,7 @@ async def _finalize_qualification(
                     candidate_sha,
                     merge_grade_cert.get("residual_uncaptured_gap"),
                     qualification_attempt_id=attempt_id,
+                    project_id=version.project_id,
                 )
             except Exception:  # noqa: BLE001 — ledger write failure must not crash finalize
                 logger.warning(

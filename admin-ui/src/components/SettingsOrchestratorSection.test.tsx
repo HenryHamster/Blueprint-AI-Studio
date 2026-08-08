@@ -149,7 +149,13 @@ describe('SettingsOrchestratorSection', () => {
     const user = userEvent.setup();
     render(<SettingsOrchestratorSection {...baseProps} />);
 
-    await user.click(await screen.findByRole('button', { name: 'Disable managed compute' }));
+    // The disable button is present during the initial settings fetch but is
+    // disabled until the fetch settles. findByRole resolves against the
+    // disabled placeholder, and a click on a disabled button is a no-op, so
+    // wait for the button to become enabled before interacting with it.
+    const disableButton = await screen.findByRole('button', { name: 'Disable managed compute' });
+    await waitFor(() => expect(disableButton).toBeEnabled());
+    await user.click(disableButton);
     expect(screen.getByText('Disable managed compute?')).toBeInTheDocument();
     expect(patchManagedComputeSettings).not.toHaveBeenCalled();
 
@@ -159,7 +165,11 @@ describe('SettingsOrchestratorSection', () => {
     await waitFor(() => {
       expect(patchManagedComputeSettings).toHaveBeenCalledWith({ managed_compute_enabled: false });
     });
-    expect(screen.getByTestId('managed-compute-state')).toHaveTextContent('Managed compute disabled');
+    // The patch having been sent does not guarantee the confirmed state has
+    // flushed to the DOM; wait for the disabled badge text itself.
+    await waitFor(() => {
+      expect(screen.getByTestId('managed-compute-state')).toHaveTextContent('Managed compute disabled');
+    });
   });
 
   it('keeps the last confirmed state visible when changing the managed compute boundary fails', async () => {
@@ -167,12 +177,20 @@ describe('SettingsOrchestratorSection', () => {
     const user = userEvent.setup();
     render(<SettingsOrchestratorSection {...baseProps} />);
 
-    await user.click(await screen.findByRole('button', { name: 'Disable managed compute' }));
+    // Same as above: the disable button starts disabled while the settings
+    // fetch is in flight, so wait for it to be enabled before clicking.
+    const disableButton = await screen.findByRole('button', { name: 'Disable managed compute' });
+    await waitFor(() => expect(disableButton).toBeEnabled());
+    await user.click(disableButton);
     await user.type(screen.getByTestId('confirm-dialog-attestation-input'), 'cost stop');
     await user.click(screen.getByTestId('confirm-dialog-confirm'));
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Could not update the managed-compute boundary');
-    expect(screen.getByTestId('managed-compute-state')).toHaveTextContent('Managed compute enabled');
+    // The failed patch leaves the last confirmed (enabled) state visible; wait
+    // for that content rather than reading it synchronously.
+    await waitFor(() => {
+      expect(screen.getByTestId('managed-compute-state')).toHaveTextContent('Managed compute enabled');
+    });
   });
 
   it('renders structural health observability panel with mode toggle', async () => {
@@ -317,6 +335,12 @@ describe('SettingsOrchestratorSection', () => {
     render(<SettingsOrchestratorSection {...baseProps} />);
 
     const meter = await screen.findByTestId('proof-gate-fleet-coverage-meter');
+    // The meter testid renders during the initial fetch too (showing "n/a"
+    // before any coverage has loaded), so wait for the settings fetch to settle
+    // before asserting on the meter's loaded state.
+    await waitFor(() => {
+      expect(screen.getByTestId('managed-compute-state')).toHaveTextContent('Managed compute enabled');
+    });
     expect(meter).toHaveTextContent('n/a');
     expect(screen.queryByTestId('proof-gate-fleet-coverage-value')).not.toBeInTheDocument();
   });

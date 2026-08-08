@@ -56,6 +56,12 @@ KIND_RETIREMENT_RESIDUAL = "retirement_residual"
 # The obligation surfaces this to the operator/strategist so a test can be
 # added, unblocking the trial path and enabling graduation to ``proven``.
 KIND_CAPABILITY_EARN_OBLIGATION = "capability_earn_obligation"
+# An acceptance category (VersionAcceptanceCriterion / CategoryVerdict) the
+# blind merge-grade judge graded NOT met (status != "met") for a candidate.
+# Gives an UNMET category a durable consequence instead of letting the verdict
+# evaporate: the entry stays open until a later grade run reports the SAME
+# category as ``met``, at which point it auto-resolves.
+KIND_OBJECTIVE_GAP = "objective_gap"
 
 # --- Statuses ---
 STATUS_OPEN = "open"
@@ -88,6 +94,23 @@ def capability_earn_obligation_dedupe_key(project_id: Any, cap_name: str) -> str
     repeated sweep ticks upsert the same obligation row rather than duplicating.
     """
     return f"capability_earn_obligation:{project_id}:{cap_name}"
+
+
+def objective_gap_dedupe_key(version_id: Any, category_key: Any) -> str:
+    """Stable identity for the objective_gap debt owed by one acceptance category.
+
+    Keyed on ``(version_id, category_key)`` only — NOT ``candidate_sha`` — so a
+    re-grade of the same category on a newer candidate tree upserts the SAME
+    debt row (resolving it on ``met``, reopening it on regression) instead of
+    accumulating a new row per candidate.
+    """
+    return f"objective_gap:{version_id}:{category_key}"
+
+
+# Sentinel "category" identifying the holistic merge-grade residual ("gap no
+# criterion captures") in the objective_gap debt ledger — never a real
+# criterion_key (those are ``c-<8hex>``), so it can't collide with one.
+OBJECTIVE_GAP_RESIDUAL_KEY = "__residual__"
 
 
 def _is_async_session(session: Any) -> bool:

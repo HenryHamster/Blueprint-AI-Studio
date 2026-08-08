@@ -21,10 +21,12 @@ from sqlalchemy import func, update
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
+from app.depends_on_provenance import remember_structural_depends_on
 from app.models import (
     DiscoveryCycle,
     Project,
     StrategicSpawnRequest,
+    TASK_ORIGINATION_STRATEGIST,
     Task,
     TaskStatus,
     _utcnow,
@@ -129,7 +131,22 @@ def _task_from_specification(
     if work_specification_hash:
         context["_strategic_work_specification_hash"] = work_specification_hash
     raw_priority = task_spec.get("priority")
-    return Task(
+    # Declared intra-batch ordering travels with the normalized specification,
+    # so EVERY creation path applies it — the immediate (200) dispatch and the
+    # deferred drain alike. Setting it here (rather than patching the row after
+    # creation) also means the edge and the QUEUED row become visible to the
+    # orchestrator in a single transaction, so the successor can never be
+    # claimed in the window before its prerequisites are attached.
+    depends_on_ids = [
+        str(dep).strip()
+        for dep in (task_spec.get("depends_on") or [])
+        if str(dep).strip()
+    ]
+    deduped_depends_on: list[str] = []
+    for dep in depends_on_ids:
+        if dep not in deduped_depends_on:
+            deduped_depends_on.append(dep)
+    task = Task(
         project_id=project_id,
         discovery_cycle_id=discovery_cycle_id,
         title=str(task_spec.get("title") or "Strategic task")[:200],
@@ -140,14 +157,21 @@ def _task_from_specification(
         priority=int(raw_priority if raw_priority is not None else 50),
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         created_by="STRATEGIC_AGENT",
+        origination=TASK_ORIGINATION_STRATEGIST,
         idempotency_key=active_task_idempotency_key,
         criterion_ids=list(task_spec.get("criterion_ids") or []),
+        depends_on=deduped_depends_on,
         **(
             {"requires_approval": bool(task_spec["requires_approval"])}
             if task_spec.get("requires_approval") is not None
             else {}
         ),
     )
+    if deduped_depends_on:
+        # Structural provenance keeps the edge from being mistaken for a legacy
+        # wave-serialization dep and swept by dependency-cleanup paths.
+        remember_structural_depends_on(task, deduped_depends_on)
+    return task
 
 
 async def _dispatch_request(

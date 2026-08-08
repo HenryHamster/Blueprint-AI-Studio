@@ -1077,6 +1077,24 @@ async def apply_post_spawn_state(
                                 did,
                                 _pending_archived_diagnoses,
                             )
+                    # A direction that is STILL active after the terminal-resolution
+                    # paths (success-evidence completion / exhaustion retirement)
+                    # has no automatic way out — it is exactly the "silent longer
+                    # wait" back-off this module removes. Escalate it into a durable
+                    # strategist-disposition item so the strategist is forced to
+                    # answer (commission work / narrow scope / retire) instead of
+                    # quietly extending the refractory and going idle.
+                    if d.get("possibly_saturated") and d.get("status") == "active":
+                        from app.direction_saturation import (
+                            flag_saturation_disposition,
+                        )
+
+                        flag_saturation_disposition(
+                            d,
+                            now_iso=now_iso,
+                            findings_produced=findings_produced_by_dir.get(did, 0),
+                            tasks_created=entry.get("tasks_created", 0),
+                        )
 
             # Also apply sub-research annotation directly on the in-memory
             # `directions` list before the locked write so both updates land

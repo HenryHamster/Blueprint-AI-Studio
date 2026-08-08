@@ -1772,6 +1772,7 @@
       "buildPayloadStalenessSection",
       "buildPruneCandidatesSection",
       "buildQuestionSection",
+      "buildSaturationDispositionsSection",
       "buildSweepComparisonSection",
       "buildSystemMaturitySection",
       "fmtScalar"

@@ -3643,7 +3643,9 @@ async def test_design_doc_update_uses_live_local_continuation_runner_affinity(
         == "workbench_continuous"
     )
     assert task.context.get("preferred_runner_target_id") == str(runner.id)
-    assert STRATEGIC_LOCAL_CONTINUATION_KEY not in task.payloads[0]["vision"]
+    # The legacy vision body is no longer shipped, so the internal
+    # local-continuation marker cannot leak into the agent-visible payload.
+    assert "vision" not in task.payloads[0]
     assert "runner_target_id" not in task.context
     assert not (task.vm_instance_id or "").startswith("runner:")
 
@@ -3700,7 +3702,9 @@ async def test_strategic_review_uses_live_local_continuation_runner_affinity(
         == "workbench_continuous"
     )
     assert task.context.get("preferred_runner_target_id") == str(live_runner.id)
-    assert STRATEGIC_LOCAL_CONTINUATION_KEY not in task.payloads[0]["vision"]
+    # The legacy vision body is no longer shipped, so the internal
+    # local-continuation marker cannot leak into the agent-visible payload.
+    assert "vision" not in task.payloads[0]
     assert "runner_target_id" not in task.context
     assert not (task.vm_instance_id or "").startswith("runner:")
 
@@ -3940,7 +3944,9 @@ async def test_local_continuation_affinity_reads_current_db_marker(
     task = result.scalars().one()
     assert STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY not in task.context
     assert "preferred_runner_target_id" not in task.context
-    assert STRATEGIC_LOCAL_CONTINUATION_KEY not in task.payloads[0]["vision"]
+    # The legacy vision body is no longer shipped, so the internal
+    # local-continuation marker cannot leak into the agent-visible payload.
+    assert "vision" not in task.payloads[0]
 
 
 def test_phase_runner_affinity_falls_back_to_preferred_runner_target_id():
@@ -8216,11 +8222,14 @@ async def test_stabilize_hint_points_at_carried_audit_findings(
 ):
     """A stabilize version whose last_qualification carries audit findings gets
     a prompt_suffix that names the findings and tells the agent to target them
-    with an audit-mode direction — and the findings ride through in
-    version_phase.last_qualification.audit_findings."""
+    with an audit-mode direction — and the steer points at
+    version_phase.finding_resolution (the block that actually carries the
+    finding keys + ledger states), not the stripped
+    last_qualification.audit_findings list."""
     from app.models import ReleaseVersion
 
     await _ensure_releaseversion_table(db_session)
+    await _ensure_audit_finding_resolution_table(db_session)
 
     project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
     db_session.add(project)
@@ -8263,7 +8272,8 @@ async def test_stabilize_hint_points_at_carried_audit_findings(
     payload = tasks[0].payloads[0]
 
     suffix = payload.get("prompt_suffix", "")
-    assert "audit_findings" in suffix, f"Expected findings pointer; got: {suffix}"
+    assert "finding_resolution" in suffix, f"Expected findings pointer; got: {suffix}"
+    assert "last_qualification.audit_findings" not in suffix
     assert "Token baked into VM image" in suffix
     assert "recommended_mode='audit'" in suffix
     # The project has no active audit/fundamentals-mode direction, so the hint
@@ -8281,9 +8291,94 @@ async def test_stabilize_hint_points_at_carried_audit_findings(
         {"severity": "high", "summary": "Token baked into VM image."},
         {"severity": "low", "summary": "Private cross-module import."},
     ]
+    # The finding-resolution block carries the carried finding's key + ledger
+    # state even though the raw audit_findings list is stripped to a count by the
+    # compact qualification serializer.
+    fr = vp.get("finding_resolution")
+    assert fr is not None, "finding_resolution block should carry the finding keys"
+    assert fr["gating_total"] == 1
+    gating = fr["findings"][0]
+    assert gating["severity"] == "high"
+    assert gating["state"] == "unresolved"
+    assert gating["key"]
     # Audit (0.74) is the lowest active sub-score here, so it IS the binding
     # constraint and the hint should frame it that way.
     assert "the audit sub-score is the binding constraint on promotion" in suffix
+
+
+@pytest.mark.asyncio
+async def test_stabilize_hint_points_at_finding_resolution_block(
+    db_session, mocker, _lts_split_active
+):
+    """When carried audit findings block re-qualification, the stabilize steer
+    points the agent at version_phase.finding_resolution — the block that
+    ACTUALLY carries the per-finding keys + ledger states — instead of
+    version_phase.last_qualification.audit_findings, which the compact
+    qualification serializer strips down to a count. The finding_resolution
+    block also survives budget-trim compaction, so the pointer stays valid even
+    when last_qualification.audit_findings has been removed from the payload."""
+    from app.release_scoring import _audit_finding_key
+    from app.strategic_spawning import _summarize_version_phase
+
+    await _ensure_releaseversion_table(db_session)
+    await _ensure_audit_finding_resolution_table(db_session)
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    candidate = "a" * 40
+    version = _make_stabilize_version_with_candidate(candidate)
+    version.project_id = project.id
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # The gating (high) finding is left UNRESOLVED — no ledger row — so the
+    # carried findings genuinely block re-qualification on the behind-head path.
+    _patch_spawning_deps(mocker)
+    _patch_candidate_currency(
+        mocker, resolved=("tok", "owner", "repo"), head_sha="b" * 40
+    )
+    suffix = await _spawn_and_get_stabilize_suffix(project, db_session)
+
+    # The steer points at the block that carries the finding keys, not the
+    # stripped audit_findings list.
+    assert "version_phase.finding_resolution" in suffix, (
+        f"Expected finding_resolution pointer; got: {suffix}"
+    )
+    assert "version_phase.last_qualification.audit_findings" not in suffix
+    assert "UNRESOLVED" in suffix
+    assert "fix-first work" in suffix
+
+    result = await db_session.execute(_select_agent_tasks(project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    vp = tasks[0].payloads[0].get("version_phase")
+    assert vp is not None
+
+    # The payload block carries each gating finding's key + resolution state.
+    fr = vp.get("finding_resolution")
+    assert fr is not None, "finding_resolution block must be present"
+    assert fr["gating_total"] == 1
+    assert fr["gating_resolved"] == 0
+    by_key = {f["key"]: f for f in fr["findings"]}
+    high_key = _audit_finding_key("Token baked into VM image.", None)
+    assert high_key in by_key, f"finding keys missing from block: {list(by_key)}"
+    assert by_key[high_key]["state"] == "unresolved"
+    assert by_key[high_key]["severity"] == "high"
+
+    # The compact version_phase serializer strips last_qualification.audit_findings
+    # to a count but keeps the finding_resolution block — proving it is the durable
+    # carrier of the keys the steer points at.
+    compacted = _summarize_version_phase(vp)
+    assert "audit_findings" not in (compacted.get("last_qualification") or {})
+    assert compacted["finding_resolution"]["findings"]
+    assert compacted["finding_resolution"]["findings"][0]["key"] == high_key
 
 
 async def _spawn_and_get_stabilize_suffix(project, db_session):
@@ -8583,6 +8678,13 @@ async def test_stabilize_hint_requalify_only_when_readiness_signaled(
     assert "Ensure one durable direction owns the outcome" in notready_suffix
     assert "otherwise create one" in notready_suffix
     assert "MUST create a new direction" not in notready_suffix
+    # The ledger only advances on an explicit, evidence-bearing declaration —
+    # a merged PR does NOT credit carried findings (see
+    # test_ci_completion.test_merge_auto_resolve_no_keys_writes_no_rows). Name
+    # the op and where the finding_key comes from so the steer is actionable.
+    assert "record_finding_resolution" in notready_suffix
+    assert "version_phase.finding_resolution.findings[].key" in notready_suffix
+    assert "merging a PR does not credit" in notready_suffix
 
 
 @pytest.mark.asyncio
@@ -17081,7 +17183,6 @@ def test_pathological_problem_model_degrades_loudly_when_it_cannot_fit():
         "base_branch": "main",
         "model": "claude-opus-4-8",
         "effort": "medium",
-        "vision": {"purpose": "small"},
         "problem_model": pm,
         "model_health": {"model_size_status": "oversized", "gap_count": 400},
     }
@@ -17241,39 +17342,43 @@ def test_strategic_review_ships_whole_problem_model_under_contention():
 
 def test_strategic_review_degrades_loudly_in_near_budget_band():
     """The NEAR-BUDGET band: a problem_model that fits the budget on its OWN, but
-    whose bytes plus the always-critical identity/vision keys exceed it. The
+    whose bytes plus the always-critical identity scalars exceed it. The
     full-model floor reservation is ``<= budget`` (so the old drop condition kept
-    the guarantee), yet the critical ``vision`` key sorts first and would be
-    starved into a hard PayloadTooLargeError. The reworked packer accounts for
-    non-floored critical keys' bytes and drops the floor guarantee, so the model
-    degrades LOUDLY via summarize (marker + _packer_meta record) and the cycle
-    still runs — it must NOT raise or silently drop the model."""
+    the guarantee), yet the critical identity keys' bytes starve it. The reworked
+    packer accounts for non-floored critical keys' bytes and drops the floor
+    guarantee, so the model degrades LOUDLY via summarize (marker + _packer_meta
+    record) and the cycle still runs — it must NOT raise or silently drop the
+    model."""
     pm = _mature_agent_view_problem_model()
     model_bytes = len(json.dumps(pm, default=str).encode())
-    # A large but load-bearing critical vision. model alone fits the budget;
-    # model + vision does not.
-    vision = {"purpose": "p" * 12000}
-    vision_bytes = len(json.dumps(vision, default=str).encode())
-    # Budget fits the model alone (reservation <= budget) but NOT model + vision.
-    budget = model_bytes + vision_bytes - 2000
-    assert model_bytes <= budget < model_bytes + vision_bytes
-
-    payload = {
+    # Always-critical identity scalars (the legacy vision body was removed from
+    # the payload, so it no longer competes for budget at critical priority).
+    # The model alone fits the budget; model + critical identity keys does not.
+    identity = {
         "type": "strategic_review",
         "research_mode": "strategic",
         "project_name": "p",
         "base_branch": "main",
         "model": "claude-opus-4-8",
         "effort": "medium",
-        "vision": vision,
+    }
+    # The packer measures each key's size individually, so the critical-full
+    # byte count is the SUM of the per-key sizes, not the serialized dict.
+    critical_bytes = sum(
+        len(json.dumps(v, default=str).encode()) for v in identity.values()
+    )
+    # Budget fits the model alone (reservation <= budget) but NOT model + critical.
+    budget = model_bytes + critical_bytes - 1
+    assert model_bytes <= budget < model_bytes + critical_bytes
+
+    payload = {
+        **identity,
         "problem_model": pm,
         "model_health": {"model_size_status": "healthy", "gap_count": 12},
     }
     # Must NOT raise PayloadTooLargeError — the cycle still runs.
     packed = pack_under_budget(payload, _STRATEGIC_REVIEW_SCHEMA, budget=budget)
 
-    # The critical vision shipped intact.
-    assert packed["vision"] == vision
     meta = packed["_packer_meta"]
     dropped_keys = {d["key"] for d in meta["dropped"]}
 
@@ -19476,7 +19581,6 @@ _CRITICAL_IDENTITY_PAYLOAD = {
     "enable_self_improvement": True,
     "model": "m",
     "effort": "medium",
-    "vision": "V",
     "direction_counts": {"active": 1},
     "max_active_directions": 5,
     "open_message_count": 0,

@@ -30,6 +30,19 @@ _GAP_HISTORY_KEEP = 5
 _GAP_PAST_MOVES_KEEP = 5
 _GAP_EVIDENCE_KEEP = 8
 
+# Low-value provenance/detail fields stripped from every entry of each agent-
+# owned section when building the agent view. The strategic prompt's largest
+# section is problem_model (~41 KB, ~30% of a ~137 KB prompt re-sent every
+# turn); these fields are provenance and verification metadata the strategist
+# reasons AROUND, not off — name/status/description/priority/notes/evidence
+# stay inline. Every stripped field is recoverable via ``./fetch problem-model``
+# and the write-back merge restores it unconditionally
+# (``problem_model._COMPACT_*_FIELDS``, which a test keeps in sync), so the trim
+# is explicit and non-destructive rather than a silent drop.
+_COMPACT_CAPABILITY_FIELDS = ("source", "evidence_refs")
+_COMPACT_GAP_FIELDS = ("source", "evidence_refs")
+_COMPACT_FRICTION_FIELDS = ("source", "mitigations_tried")
+
 
 def _compute_model_health(pm: dict | None) -> dict | None:
     """Fail-open wrapper around :func:`compute_model_size_signal`.
@@ -147,6 +160,65 @@ def _agent_view_problem_model(pm: dict | None) -> dict:
                 "in agent-view problem model"
             )
 
+    intent = trimmed.get("intent")
+    if isinstance(intent, dict):
+        purpose = (intent.get("purpose") or "").strip()
+        user_purpose = (intent.get("user_purpose") or "").strip()
+        if (not purpose or purpose == "..." or bool(re.match(r"^<[^>]+>$", purpose))) and user_purpose:
+            intent["purpose"] = user_purpose
+            logger.info(
+                "[STRATEGIC] Auto-healed blank intent.purpose from user_purpose "
+                "in agent-view problem model"
+            )
+
+    return _compact_low_value_detail(trimmed)
+
+
+def _compact_low_value_detail(trimmed: dict) -> dict:
+    """Strip the low-value provenance/detail fields from each agent-owned entry
+    and stamp an explicit ``_agent_view_compacted`` marker listing exactly what
+    was removed.
+
+    Runs on a shallow copy (the caller already copied the top level), so each
+    capability/friction/gap entry is copied before mutation — the durable
+    ``project.problem_model`` is never touched. The marker makes the trim LOUD:
+    the strategist can see which fields were stripped and pull them on demand
+    via ``./fetch problem-model`` (the full untrimmed model) rather than
+    mistaking the compacted view for the complete record. The write-back merge
+    restores these fields unconditionally (see
+    ``problem_model._COMPACT_CAPABILITY_FIELDS`` etc.), so an agent acting on
+    the compacted view can never wipe the durable detail by omission.
+
+    Sections whose entries carry none of the stripped fields are left untouched
+    and absent from the marker — the agent treats them as complete.
+    """
+    stripped: dict[str, list[str]] = {}
+    for section, fields in (
+        ("capabilities", _COMPACT_CAPABILITY_FIELDS),
+        ("gaps", _COMPACT_GAP_FIELDS),
+        ("friction", _COMPACT_FRICTION_FIELDS),
+    ):
+        items = trimmed.get(section)
+        if not isinstance(items, list) or not items:
+            continue
+        rewritten: list[dict] = []
+        removed: list[str] = []
+        for item in items:
+            if not isinstance(item, dict):
+                rewritten.append(item)
+                continue
+            item2 = dict(item)
+            for field in fields:
+                if field in item2:
+                    if field not in removed:
+                        removed.append(field)
+                    item2.pop(field, None)
+            rewritten.append(item2)
+        if removed:
+            trimmed[section] = rewritten
+            stripped[section] = removed
+    if stripped:
+        trimmed["_agent_view_compacted"] = stripped
     return trimmed
 
 

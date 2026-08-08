@@ -43,6 +43,7 @@ from app.landed_signal import (
     has_merge_unblock_signal,
     is_merged_completion,
 )
+from app.llm_cost_attribution import task_llm_cost_by_provider_model
 from app.models import (
     Artifact,
     ArtifactType,
@@ -1487,8 +1488,13 @@ async def _update_direction_research_outcomes(
     # both this path and the digest path stay consistent and cannot produce
     # chimera keys (e.g. openai|claude-opus-4-8 from independently-resolved
     # columns). Banked attempt_history costs are included; the live span is
-    # included when it exists. Both cost axes (breakdown + total) are derived
-    # from the same helper output so estimated_cost_usd == sum(breakdown).
+    # included when it exists. LLM token spend is folded into the SAME
+    # provider|model buckets (it is naturally per-(provider, model)) so the
+    # breakdown keeps summing exactly to estimated_cost_usd — previously this
+    # per-cycle counter counted VM dollars only, which silently deflated the
+    # envelope the cost-budget auto-pause gate reads. Both cost axes (breakdown
+    # + total) are derived from the same helper output so
+    # estimated_cost_usd == sum(breakdown).
     cost_by_provider_model: dict[str, float] = {}
     cycle_cost_total = 0.0
     for ct in child_tasks_rows:
@@ -1498,6 +1504,12 @@ async def _update_direction_research_outcomes(
                 cost_by_provider_model.get(bucket_key, 0.0) + t_cost
             )
             cycle_cost_total += t_cost
+        llm_costs, _llm_unpriced = task_llm_cost_by_provider_model(ct)
+        for bucket_key, t_llm in llm_costs.items():
+            cost_by_provider_model[bucket_key] = (
+                cost_by_provider_model.get(bucket_key, 0.0) + t_llm
+            )
+            cycle_cost_total += t_llm
 
     # Include ComputeJob.final_cost_usd for compute_experiment tasks. These tasks
     # run on compute substrate rather than a VM, so their real spend lives on the

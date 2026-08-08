@@ -577,7 +577,11 @@ runtime_config: Dict = {
     # active dispatch concurrency. This cap throttles pending-rollup
     # accumulation: each EVALUATING parent has children waiting to merge
     # into a research branch and then to main; piling up rollup PRs makes
-    # each subsequent merge incrementally more conflict-prone.
+    # each subsequent merge incrementally more conflict-prone. EVALUATING
+    # parents that still have active children are productive in-flight work
+    # (the research already shipped its spawn and is waiting on children), so
+    # they are EXCLUDED from the admission count at spawn time — otherwise the
+    # system throttles itself harder the more work it ships.
     "max_total_research_per_project": int(
         os.getenv("MAX_TOTAL_RESEARCH_PER_PROJECT", "5")
     ),

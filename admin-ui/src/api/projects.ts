@@ -556,6 +556,32 @@ export interface DimensionState {
   reason: string | null;
 }
 
+/** Per-finding resolution state for a carried high/medium audit finding, joined
+ *  against the operator resolution ledger by finding key. `state` is
+ *  `resolved` when an operator (or the sweep) wrote a resolution ledger row,
+ *  `stale` when code-verified stale, `unresolved` when no ledger row exists. */
+export interface RequalificationFinding {
+  key: string;
+  severity: string;
+  summary: string | null;
+  state: 'resolved' | 'stale' | 'unresolved';
+}
+
+/** Ledger-backed re-qualification readiness for the open release version.
+ *  `requalification_ready` is TRUE exactly when every carried gating finding has
+ *  a resolution-ledger row in state `resolved` or `stale`. `findings` carries
+ *  the per-finding resolution view so an operator can see which finding still
+ *  blocks re-qualification and dispose it in-product. */
+export interface RequalificationReadiness {
+  requalification_ready: boolean;
+  open_version_id: string | null;
+  audit_findings_truncated: boolean;
+  gating_total: number;
+  gating_resolved: number;
+  reason: string;
+  findings: RequalificationFinding[];
+}
+
 export interface CurrentVersion {
   version_number: number;
   phase: string;
@@ -641,6 +667,13 @@ export interface CurrentVersion {
    *  run; empty array when no qualification data is available. Additive field —
    *  older backends omit it. */
   dimension_states?: DimensionState[];
+  /** Ledger-backed re-qualification readiness signal (additive; nullable when
+   *  the signal could not be computed). `requalification_ready` is the top-level
+   *  boolean trigger; `requalification_readiness` carries the full per-finding
+   *  resolution view (each gating finding's key, severity, summary, and
+   *  resolved|stale|unresolved state) plus the gating counts and reason. */
+  requalification_ready?: boolean | null;
+  requalification_readiness?: RequalificationReadiness | null;
 }
 
 /** Auto-trigger mode for the qualification trigger resolver. */
@@ -1130,6 +1163,53 @@ export async function linkCriteriaToDirection(
   if (!res.ok) {
     const detail = data?.detail || `Failed to link criteria to direction: ${res.status}`;
     throw new Error(typeof detail === 'string' ? detail : `Failed to link criteria to direction: ${res.status}`);
+  }
+  return data;
+}
+
+/** Body for POST /projects/{id}/finding-resolution — write an operator
+ *  resolution-ledger entry for one carried audit finding. `finding_key` is the
+ *  stable content-derived 16-hex key surfaced in the readiness findings list;
+ *  `release_version_id` is the open version's id (`readiness.open_version_id`).
+ *  `state` is `resolved` when the finding is demonstrably fixed (e.g. a merged
+ *  fix landed) or `stale` when it no longer applies to the current code. */
+export interface RecordFindingResolutionBody {
+  finding_key: string;
+  release_version_id: string;
+  state: 'resolved' | 'stale';
+  severity?: string | null;
+  note?: string | null;
+  resolving_ref?: string | null;
+  verified_against_sha?: string | null;
+}
+
+/** Upserted AuditFindingResolution row, echoed by the endpoint. */
+export interface RecordFindingResolutionResponse {
+  id: string;
+  project_id: string;
+  release_version_id: string;
+  finding_key: string;
+  state: string;
+  severity: string | null;
+  note: string | null;
+  resolving_ref: string | null;
+  verified_against_sha: string | null;
+}
+
+/** Record an operator finding-resolution entry (resolved | stale) for the open
+ *  release version. Members and above; the endpoint upserts latest-write-wins. */
+export async function recordFindingResolution(
+  projectId: string,
+  body: RecordFindingResolutionBody,
+): Promise<RecordFindingResolutionResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/finding-resolution`,
+    { method: 'POST', body: JSON.stringify(body) },
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const detail = data?.detail || `Failed to record finding resolution: ${res.status}`;
+    throw new Error(typeof detail === 'string' ? detail : `Failed to record finding resolution: ${res.status}`);
   }
   return data;
 }

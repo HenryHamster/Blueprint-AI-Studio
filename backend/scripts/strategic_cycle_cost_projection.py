@@ -97,6 +97,13 @@ No ``target_concurrency`` configuration key exists for the strategic decision
 loop, and no per-task cost/volume is fabricated either: when any input is
 unavailable the projection refuses to guess and says so explicitly rather than
 silently dropping a term to zero.
+
+The module ALSO records the strategic-cycle cost BASELINE as a durable, dated
+measurement record (docs/strategic-cycle-cost-baseline.md). The baseline is the
+stated thing future reduction claims are measured against -- section [8] and
+:func:`baseline_record` carry it verbatim with cohort provenance (requested
+window, cohort task count, whether the cohort hit the 5000-row cap), derived the
+same way the efficiency-snapshot read surface computes it.
 """
 
 from __future__ import annotations
@@ -105,7 +112,7 @@ import json
 import math
 import textwrap
 from pathlib import Path
-from typing import Any, Mapping, cast
+from typing import Any, Mapping, Sequence, cast
 
 # ---------------------------------------------------------------------------
 # Measured / stated inputs
@@ -195,6 +202,70 @@ MONTHLY_ENVELOPE_USD = 3_000.0
 MEASURED_FLEET_LLM_USD_PER_7_DAYS = 15.46
 MEASURED_FLEET_VM_USD_PER_7_DAYS = 8.00
 MEASURED_TASKS_PER_7_DAYS = 75
+
+# ---------------------------------------------------------------------------
+# Baseline measurement record (docs/strategic-cycle-cost-baseline.md)
+# ---------------------------------------------------------------------------
+
+# Row cap applied to the efficiency-snapshot terminal-task cohort
+# (efficiency_snapshot.py:_COHORT_CAP). A baseline reading is comparable across
+# time ONLY when its provenance says whether the cohort hit this cap: a capped
+# cohort is a recency SAMPLE (most-recently-updated first), so every aggregate
+# it feeds -- including the strategic-cycle cost per event -- describes that
+# narrower span, not the full requested window.
+COHORT_CAP = 5000
+
+# Requested window for the efficiency-snapshot "current" axes
+# (efficiency_snapshot.py:_AXIS_WINDOW_DAYS).
+AXIS_WINDOW_DAYS = 7
+
+# The two strategic-cycle cost readings recorded 2026-08-07, verbatim. Each
+# field maps to the agent efficiency-snapshot read surface:
+#   cycle_count              = llm_cost_attribution.strategic_cycle_cost_per_event.cycle_count
+#   strategic_cycle_cost_usd = llm_cost_attribution.strategic_cycle_cost_per_event.total_usd
+#   cost_per_cycle           = llm_cost_attribution.strategic_cycle_cost_per_event.per_event_usd
+#   total_llm_usd            = llm_cost_attribution.total_llm_usd
+#   unpriced_coverage        = llm_cost_attribution.unpriced_coverage
+#   cohort_task_count        = data.cohort_task_count
+#   cohort_effective_window_* = data.cohort_effective_window_* (agent surface)
+# cohort_capped is DERIVED by :func:`baseline_record` from cohort_task_count vs
+# COHORT_CAP, so a reading that records the count can never silently mislabel
+# the sample.
+#
+# The two historical readings predate the agent endpoint exposing the effective
+# window (see docs/strategic-cycle-cost-baseline.md). Their recorded window is
+# the requested query-window bounds the reading's endpoint actually queried
+# (7 days ending on the reading date); the exact effective span of the capped
+# 5000-row cohort was not captured at the time. Readings taken after the
+# endpoint change record the true effective span from the same read surface.
+BASELINE_READINGS: list[dict[str, Any]] = [
+    {
+        "reading": 1,
+        "date": "2026-08-07",
+        "integration_head": "9e25341c",
+        "cycle_count": 212,
+        "strategic_cycle_cost_usd": 1610.081459,
+        "cost_per_cycle": 7.594724,
+        "total_llm_usd": 3439.92,
+        "unpriced_coverage": 0.9752,
+        "cohort_task_count": 5000,
+        "cohort_effective_window_start": "2026-07-31T00:00:00+00:00",
+        "cohort_effective_window_end": "2026-08-07T00:00:00+00:00",
+    },
+    {
+        "reading": 2,
+        "date": "2026-08-07",
+        "integration_head": "83813e87",
+        "cycle_count": 212,
+        "strategic_cycle_cost_usd": 1618.175162,
+        "cost_per_cycle": 7.632902,
+        "total_llm_usd": 3446.586451,
+        "unpriced_coverage": 0.9752,
+        "cohort_task_count": 5000,
+        "cohort_effective_window_start": "2026-07-31T00:00:00+00:00",
+        "cohort_effective_window_end": "2026-08-07T00:00:00+00:00",
+    },
+]
 
 
 def effective_input_price_multiplier(read_share: float) -> float:
@@ -568,6 +639,82 @@ def target_concurrency_status() -> dict:
     }
 
 
+def cohort_capped(cohort_task_count: Any) -> bool | None:
+    """True exactly when a cohort reached the 5000-row cap; None when unknown.
+
+    Mirrors efficiency_snapshot's ``cohort_capped = cohort_task_count >=
+    _COHORT_CAP`` so a baseline reading's provenance flag is derived the same
+    way the read surface computes it. ``None`` (not False) when the count is
+    missing or not a number, so a caller never mistakes "unknown" for
+    "uncapped" -- the fail-closed rule this measurement record lives by.
+    """
+    if isinstance(cohort_task_count, bool) or not isinstance(
+        cohort_task_count, (int, float)
+    ):
+        return None
+    return float(cohort_task_count) >= COHORT_CAP
+
+
+def baseline_record(
+    readings: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Normalize and validate baseline readings with cohort provenance.
+
+    Produces the machine-readable form of the durable baseline doc
+    (docs/strategic-cycle-cost-baseline.md). For every reading it:
+
+      * derives ``cohort_capped`` from ``cohort_task_count`` vs ``COHORT_CAP``
+        (never trusts a hand-stamped flag);
+      * stamps the requested window (``_AXIS_WINDOW_DAYS``) and the cap;
+      * validates the cost arithmetic: ``cost_per_cycle`` must equal
+        ``strategic_cycle_cost_usd / cycle_count`` (deriving it when a reading
+        omits it, and flagging ``cost_per_cycle_consistent`` False when a
+        recorded value disagrees).
+
+    A reading that lacks a numeric ``cohort_task_count`` keeps ``cohort_capped
+    = None`` -- provenance unknown is reported as unknown, never as uncapped.
+    """
+    source = list(readings) if readings is not None else BASELINE_READINGS
+    normalized: list[dict[str, Any]] = []
+    all_cost_consistent = True
+    for reading in source:
+        record = dict(reading)
+        record["requested_window_days"] = AXIS_WINDOW_DAYS
+        record["cohort_cap"] = COHORT_CAP
+        record["cohort_capped"] = cohort_capped(record.get("cohort_task_count"))
+        cycle_count = record.get("cycle_count")
+        total = record.get("strategic_cycle_cost_usd")
+        cost_consistent = False
+        if (
+            isinstance(cycle_count, (int, float))
+            and not isinstance(cycle_count, bool)
+            and cycle_count > 0
+            and isinstance(total, (int, float))
+            and not isinstance(total, bool)
+        ):
+            expected = total / cycle_count
+            recorded = record.get("cost_per_cycle")
+            if recorded is None:
+                record["cost_per_cycle"] = round(expected, 6)
+                cost_consistent = True
+            elif (
+                isinstance(recorded, (int, float))
+                and not isinstance(recorded, bool)
+                and abs(recorded - expected) <= 0.0005
+            ):
+                cost_consistent = True
+        record["cost_per_cycle_consistent"] = cost_consistent
+        all_cost_consistent = all_cost_consistent and cost_consistent
+        normalized.append(record)
+    return {
+        "available": True,
+        "cohort_cap": COHORT_CAP,
+        "requested_window_days": AXIS_WINDOW_DAYS,
+        "cost_arithmetic_consistent": all_cost_consistent,
+        "readings": normalized,
+    }
+
+
 def project_monthly_spend(
     per_cycle_cost_usd: float,
     cycles_per_month: float | None,
@@ -932,6 +1079,31 @@ def main() -> None:
     print("  guess rather than fabricate a number:")
     print(f"    no cycle volume : {project_monthly_spend(base_cost, None)}")
     print(f"    no per-task data: {project_monthly_spend_with_tasks(base_cost, measured_cycles_per_month(), None, None)}")
+
+    print("\n[8] Baseline measurement record (docs/strategic-cycle-cost-baseline.md)\n")
+    record = baseline_record()
+    for reading in record["readings"]:
+        capped = reading["cohort_capped"]
+        capped_label = (
+            "True (cohort at the 5000-row cap)"
+            if capped is True
+            else ("None (cohort_task_count not captured)" if capped is None else "False")
+        )
+        print(f"  Reading {reading['reading']} -- {reading['date']}, integration HEAD "
+              f"{reading['integration_head']}:")
+        print(f"    cycle_count              : {reading['cycle_count']}")
+        print(f"    strategic_cycle_cost_usd : ${reading['strategic_cycle_cost_usd']}")
+        print(f"    cost_per_cycle           : ${reading['cost_per_cycle']}")
+        print(f"    total_llm_usd            : ${reading['total_llm_usd']}")
+        print(f"    unpriced_coverage        : {reading['unpriced_coverage']}")
+        print(f"    requested window (days)  : {reading['requested_window_days']}")
+        print(f"    cohort_task_count        : {reading['cohort_task_count']}")
+        print(f"    cohort_capped            : {capped_label}")
+    print("\n  Cohort provenance: both readings share cycle_count 212, i.e. the same "
+          "cohort. Every cost lever landed so far modifies prompt assembly in "
+          "backend/app/strategic_spawning.py, which executes only in the deployed "
+          "backend; the deployed backend is at origin/main and contains none of "
+          "them, so a flat reading here is not evidence about the levers.")
 
 
 if __name__ == "__main__":

@@ -25,6 +25,7 @@ import {
   buildPayloadStalenessSection,
   buildCompletionDebtSection,
   buildPendingFollowupsSection,
+  buildSaturationDispositionsSection,
 } from './strategic-sections.js';
 import { buildThinkerPrompt } from '../prompts/thinker.js';
 
@@ -244,6 +245,52 @@ describe('buildHeldDirectionsSection', () => {
     expect(result).toContain('dir beta (id: d-b)');
     expect(result).toContain('fp-a');
     expect(result).toContain('fp-b');
+  });
+});
+
+describe('buildSaturationDispositionsSection', () => {
+  it('returns empty string for undefined or empty input', () => {
+    expect(buildSaturationDispositionsSection(undefined)).toBe('');
+    expect(buildSaturationDispositionsSection([])).toBe('');
+  });
+
+  it('renders the REQUIRED header and the bounded disposition options', () => {
+    const result = buildSaturationDispositionsSection([{
+      id: 'd-sat',
+      text: 'vector index scaling',
+      priority: 'high',
+      flagged_at: '2026-08-01T00:00:00Z',
+      cycles_researched: 8,
+      findings_produced: 12,
+      recent_tasks_created: 0,
+    }]);
+    expect(result).toContain('REQUIRED — saturated direction dispositions');
+    expect(result).toContain('spawn-task');
+    expect(result).toContain('update-direction');
+    expect(result).toContain('retire-direction');
+    expect(result).toContain('commission work | narrow scope | retire');
+    expect(result).toContain('vector index scaling (id: d-sat)');
+    expect(result).toContain('Priority: high');
+    expect(result).toContain('Accumulated findings: 12');
+    expect(result).toContain('Recent tasks spawned: 0');
+  });
+
+  it('warns the direction stays flagged until disposed', () => {
+    const result = buildSaturationDispositionsSection([{
+      id: 'd-sat',
+      text: 'x',
+      priority: 'low',
+    }]);
+    expect(result).toContain('will keep surfacing here every cycle until you dispose of it');
+  });
+
+  it('renders multiple saturated directions', () => {
+    const result = buildSaturationDispositionsSection([
+      { id: 'd-a', text: 'dir alpha', priority: 'high' },
+      { id: 'd-b', text: 'dir beta', priority: 'low' },
+    ]);
+    expect(result).toContain('dir alpha (id: d-a)');
+    expect(result).toContain('dir beta (id: d-b)');
   });
 });
 

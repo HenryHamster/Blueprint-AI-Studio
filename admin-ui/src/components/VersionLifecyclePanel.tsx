@@ -1,6 +1,7 @@
 /* eslint-disable react-hooks/set-state-in-effect */
 import { useState, useEffect, useRef } from 'react';
 import { ConfirmDialog } from './ConfirmDialog';
+import { ReleaseQualificationFindings } from './ReleaseQualificationFindings';
 import { VersionSummaryPanel } from './VersionSummaryPanel';
 import {
   attestAcceptanceCriterion,
@@ -1039,6 +1040,14 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
               <div className="pl-2 border-l border-neutral-700/50">
                 <HistoricalAuditContext audit={cv.stale_audit} activeCandidateSha={cv.active_candidate_sha} />
               </div>
+            )}
+            {cv.requalification_readiness && (
+              <ReleaseQualificationFindings
+                readiness={cv.requalification_readiness}
+                projectId={projectId}
+                readOnly={readOnly}
+                onRefresh={onRefresh}
+              />
             )}
             {cv.tasks_merged !== undefined && (
               <div>

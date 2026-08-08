@@ -2615,21 +2615,33 @@ async def claim_task(
             if k.startswith("playbook/")
         )
         response["first_task_on_repo"] = total_playbook_count == 0
-        # Deterministic empty/near-empty repo signal persisted at onboarding
-        # (build_config.repo_is_empty). Distinct from first_task_on_repo (a
-        # playbook-count proxy): this reflects actual source presence, so the
-        # research prompt can gate bootstrap-from-goal guidance on real code.
-        response["repo_is_empty"] = (project_for_playbook.build_config or {}).get(
-            "repo_is_empty"
-        )
-        # The authoritative real-source count persisted at onboarding (same
-        # bounded walk that set repo_is_empty). Echoed so the agent's clone-time
-        # detector (verifyCloneDelivered) compares its live tree against this
-        # backend-computed number instead of recomputing under its own exclusion
-        # rules. Only forwarded when a real count was persisted (int, not None).
-        _source_file_count = (project_for_playbook.build_config or {}).get(
-            "source_file_count"
-        )
+        # Deterministic empty/near-empty repo signal. The durable project-level
+        # signal is persisted at onboarding (build_config.repo_is_empty), but a
+        # research child spawned while the repo was empty carries its own copy on
+        # the task row (research_completion stamps repo_is_empty/source_file_count
+        # into the child context at spawn). Prefer the task's own snapshot: the
+        # project-level field is mutable and can be re-detected as non-empty after
+        # the first commit lands, while the task's greenfield origin is fixed at
+        # spawn. Distinct from first_task_on_repo (a playbook-count proxy): this
+        # reflects actual source presence, so the research prompt can gate
+        # bootstrap-from-goal guidance on real code.
+        _claim_repo_is_empty = _claimed_context.get("repo_is_empty")
+        if _claim_repo_is_empty is None:
+            _claim_repo_is_empty = (project_for_playbook.build_config or {}).get(
+                "repo_is_empty"
+            )
+        response["repo_is_empty"] = _claim_repo_is_empty
+        # The authoritative real-source count. Same precedence as repo_is_empty:
+        # the task's spawn-time snapshot wins when present (research children on
+        # empty repos), else the onboarding-persisted project count. Echoed so the
+        # agent's clone-time detector (verifyCloneDelivered) compares its live tree
+        # against this backend-computed number instead of recomputing under its own
+        # exclusion rules. Only forwarded when a real count was persisted (int).
+        _source_file_count = _claimed_context.get("source_file_count")
+        if not isinstance(_source_file_count, int):
+            _source_file_count = (project_for_playbook.build_config or {}).get(
+                "source_file_count"
+            )
         if isinstance(_source_file_count, int):
             response["source_file_count"] = _source_file_count
         if playbook_entries:

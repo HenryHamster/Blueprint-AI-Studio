@@ -206,23 +206,20 @@ interface VerifyTestsResult {
     // status, yields false. Additive: a backend that does not read it is
     // unaffected; the sibling backend change consumes it to mint ``proven``.
     passed: boolean;
-    // Whether the declared test FILE is among the PR's own changed files — the
-    // SAME changed-files requirement the backend acceptance gate
-    // (acceptance_gate._evaluate_named_test) checks FIRST, before any green/
-    // verification logic. Matched with the SAME tolerance the backend
-    // ``_paths_match`` uses (exact / suffix / basename). A declared test that runs
-    // green but is NOT in the PR's diff can never earn machine-proven coverage:
-    // the gate hard-fails ``proven=False`` for "declared named_test … is not among
-    // the PR's changed files". Surfacing it HERE makes that verdict visible
-    // PRE-merge (the agent already has the diff for the documented-command /
-    // disabled-tests probes) instead of only after the badge-only merge. true =
-    // the test file is in the diff; false = it is NOT (green run will not be
-    // credited proven); omitted when the diff could not be computed (base ref
-    // unavailable) so the check is indeterminate. ADDITIVE: an older backend that
-    // ignores it is unaffected; the sibling ci_resolution change withholds the
-    // targeted-green mint when it is explicitly false AND surfaces it as a clear
-    // pre-merge failure (acceptance_test_not_in_diff_is_clear_failure), so no
-    // spurious green is advertised for a test the gate will reject.
+    // Whether the declared test FILE is among the PR's own changed files.
+    // Matched with the SAME tolerance the backend ``_paths_match`` uses (exact /
+    // suffix / basename). true = the test file is in the diff; false = it is NOT;
+    // omitted when the diff could not be computed (base ref unavailable) so the
+    // check is indeterminate.
+    //
+    // INFORMATIONAL ONLY — it does not gate anything on either side. A declared
+    // test that runs green but is NOT in the PR's diff is the
+    // behaviour-preserving-refactor shape, whose strongest possible evidence IS a
+    // pre-existing test still passing; the backend gate
+    // (acceptance_gate._evaluate_named_test) credits it via existence-at-merge,
+    // so neither ci_resolution.acceptance_test_is_green nor
+    // classify_merge_test_verdict consults this field. It is reported so the
+    // merge record shows whether the declared test was co-modified or re-verified.
     in_diff?: boolean;
   };
 }

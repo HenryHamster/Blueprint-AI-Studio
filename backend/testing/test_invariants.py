@@ -1448,6 +1448,13 @@ class TestSchemaRevisionSync:
         rollup auto-merge guard consumes, so the invariant test and the
         runtime guard assert against identical revision/down_revision
         resolution.
+
+        Enumerates every ``.py`` file in the versions directory (the same
+        predicate the post-merge guard uses) — NOT just files whose ``NNNN``
+        filename prefix is all-digits. A migration like
+        ``0612b_fix_checkpoint_clear_fk_cascade.py`` has a non-numeric prefix
+        but is a real chain member; a guard that silently drops it on filename
+        grounds orphans ``0612`` into a phantom head.
         """
         import glob as globmod
 
@@ -1456,7 +1463,7 @@ class TestSchemaRevisionSync:
         migrations_dir = os.path.join(
             os.path.dirname(__file__), "..", "alembic", "versions"
         )
-        files = globmod.glob(os.path.join(migrations_dir, "[0-9]*.py"))
+        files = globmod.glob(os.path.join(migrations_dir, "*.py"))
 
         sources: dict[str, str] = {}
         for path in files:
@@ -1498,6 +1505,125 @@ class TestSchemaRevisionSync:
         assert len(heads) == 1, (
             f"Expected exactly 1 head migration, found {len(heads)}: {heads}"
         )
+
+    def test_post_merge_guard_keeps_non_numeric_prefix_migration_in_chain(self):
+        """The post-merge Alembic head guard must include non-numeric-prefix
+        migrations when building the chain.
+
+        ``0612b_fix_checkpoint_clear_fk_cascade.py`` declares
+        ``revision = "0612b"`` with ``down_revision = "0612"`` — a valid chain
+        member whose filename prefix the ``NNNN``-only filter cannot parse. The
+        pre-fix guard silently dropped it, orphaning ``0612`` into a phantom
+        head and reporting a false block ("2 Alembic heads (0612, 0725)") on a
+        healthy single-head chain. This drives the guard's real post-merge code
+        path over the on-disk migration set and asserts the healthy verdict.
+        """
+        import asyncio
+        import glob as globmod
+        from unittest.mock import AsyncMock, patch
+
+        from app import rollup_migration_validation as rmv
+        from app.migration_chain import build_migration_chain, find_heads
+
+        migrations_dir = os.path.join(
+            os.path.dirname(__file__), "..", "alembic", "versions"
+        )
+        basenames = [
+            os.path.basename(p)
+            for p in globmod.glob(os.path.join(migrations_dir, "*.py"))
+        ]
+        sources = {
+            os.path.basename(p): open(p).read()
+            for p in globmod.glob(os.path.join(migrations_dir, "*.py"))
+        }
+        assert "0612b_fix_checkpoint_clear_fk_cascade.py" in basenames
+
+        # Pin 0612b into the computed chain and assert the single-head set.
+        chain, duplicates, unparseable = build_migration_chain(sources)
+        assert not duplicates and not unparseable
+        assert "0612b" in chain
+        from app.main import EXPECTED_SCHEMA_REVISION
+
+        heads = find_heads(chain)
+        assert heads == [EXPECTED_SCHEMA_REVISION], (
+            f"expected single head [{EXPECTED_SCHEMA_REVISION!r}] with 0612b in "
+            f"the chain, got {sorted(heads)}"
+        )
+
+        async def _file_text(path, *, token, owner, repo, ref, **kwargs):
+            return sources.get(os.path.basename(path))
+
+        with patch(
+            "app.github.get_pr_files",
+            new=AsyncMock(
+                return_value=[
+                    {
+                        "filename": (
+                            "backend/alembic/versions/"
+                            "0612b_fix_checkpoint_clear_fk_cascade.py"
+                        ),
+                        "status": "added",
+                    }
+                ]
+            ),
+        ), patch(
+            "app.github.list_versions_at_ref",
+            new=AsyncMock(return_value=basenames),
+        ), patch(
+            "app.github.get_file_text_at_ref",
+            new=AsyncMock(side_effect=_file_text),
+        ):
+            verdict, reason = asyncio.run(
+                rmv._validate_migration_chain_post_merge(
+                    "tok", "acme", "widget", 424242, "deadbeef"
+                )
+            )
+        assert verdict == "ok", (
+            "post-merge Alembic guard blocked a healthy single-head chain: "
+            f"{reason!r}"
+        )
+
+    def test_post_merge_guard_and_invariant_enumerate_identical_migration_set(self):
+        """The post-merge Alembic guard and the chain invariant must enumerate the
+        IDENTICAL migration file set.
+
+        The 0612b defect was not a bad head-count assertion — it was the two
+        enumerations of the migration set disagreeing on exactly one silently-
+        dropped file. Assert set equality (not counts) so any future divergence
+        between the guard's enumeration and the invariant's is caught directly.
+        """
+        import glob as globmod
+
+        from app.migration_chain import migration_chain_versions
+
+        migrations_dir = os.path.join(
+            os.path.dirname(__file__), "..", "alembic", "versions"
+        )
+        # The guard's enumeration over the versions-directory listing (what the
+        # post-merge guard feeds into build_migration_chain). Mirrors the GitHub
+        # contents listing that list_versions_at_ref returns: files only.
+        disk_entries = [
+            entry
+            for entry in os.listdir(migrations_dir)
+            if os.path.isfile(os.path.join(migrations_dir, entry))
+        ]
+        guard_set = set(migration_chain_versions(disk_entries))
+        # The invariant test's enumeration (test_migration_chain_is_linear globs
+        # `*.py` — every migration file, numeric-prefix or not).
+        invariant_set = {
+            os.path.basename(p)
+            for p in globmod.glob(os.path.join(migrations_dir, "*.py"))
+        }
+        assert guard_set == invariant_set, (
+            "the post-merge Alembic guard and the chain invariant enumerate "
+            "different migration sets — the two enumerations diverging is the "
+            "bug class that silently dropped 0612b. "
+            f"guard-only={sorted(guard_set - invariant_set)} "
+            f"invariant-only={sorted(invariant_set - guard_set)}"
+        )
+        # The non-numeric-prefix migration that used to be dropped must be in
+        # both enumerations.
+        assert "0612b_fix_checkpoint_clear_fk_cascade.py" in guard_set
 
     def test_migration_chain_is_monotonic(self):
         """The on-disk migration chain must be monotonic: the migration with the
@@ -3985,60 +4111,118 @@ class TestPreMergeDualHeadGuardCoverage:
 
     def test_process_post_commit_exempt_sites_carry_marker(self):
         """The two intentionally-exempt merge sites in the real
-        ``task_lifecycle.py:_process_post_commit`` must each carry the inline
-        marker.
+        ``task_lifecycle.py:_process_post_commit`` (and any registered stage
+        modules) must each carry the inline marker.
+
+        Registry-driven: as S2-S12 extract stages into sibling modules and
+        register them in ``_POST_COMMIT_STAGE_REGISTRY``, those modules are
+        automatically included in the scan. The total expected count stays 2
+        until a new exempt site is intentionally added.
 
         If a marker is removed (or a third, unmarked merge is added) this test
         — together with ``test_all_pr_merge_sites_guarded`` — fails, so the
         exemption cannot be silently dropped or silently widened.
         """
         import ast
+        import inspect as _inspect
 
+        from testing._post_commit_test_helpers import _POST_COMMIT_STAGE_REGISTRY
+
+        def _count_merges_in_function(source, source_lines, tree, func_name):
+            """Count (total, marked) merge sites in a named function in tree."""
+            total = 0
+            marked = 0
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if node.name != func_name:
+                    continue
+                for call in ast.walk(node):
+                    if not isinstance(call, ast.Call):
+                        continue
+                    func = call.func
+                    name = (
+                        func.id
+                        if isinstance(func, ast.Name)
+                        else func.attr
+                        if isinstance(func, ast.Attribute)
+                        else None
+                    )
+                    if name not in self._MERGE_NAMES:
+                        continue
+                    total += 1
+                    end = getattr(call, "end_lineno", None) or call.lineno
+                    span = source_lines[call.lineno - 1 : end]
+                    has_marker = any(
+                        (idx := line.find(self._EXEMPT_MARKER)) != -1
+                        and line[idx + len(self._EXEMPT_MARKER) :].strip()
+                        for line in span
+                    )
+                    if has_marker:
+                        marked += 1
+            return total, marked
+
+        def _count_merges_in_module(source, source_lines, tree):
+            """Count (total, marked) merge sites across ALL functions in tree."""
+            total = 0
+            marked = 0
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                for call in ast.walk(node):
+                    if not isinstance(call, ast.Call):
+                        continue
+                    func = call.func
+                    name = (
+                        func.id
+                        if isinstance(func, ast.Name)
+                        else func.attr
+                        if isinstance(func, ast.Attribute)
+                        else None
+                    )
+                    if name not in self._MERGE_NAMES:
+                        continue
+                    total += 1
+                    end = getattr(call, "end_lineno", None) or call.lineno
+                    span = source_lines[call.lineno - 1 : end]
+                    has_marker = any(
+                        (idx := line.find(self._EXEMPT_MARKER)) != -1
+                        and line[idx + len(self._EXEMPT_MARKER) :].strip()
+                        for line in span
+                    )
+                    if has_marker:
+                        marked += 1
+            return total, marked
+
+        # Scan _process_post_commit in task_lifecycle.py
         app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
         fpath = os.path.join(app_dir, "task_lifecycle.py")
         with open(fpath, encoding="utf-8") as f:
             source = f.read()
         source_lines = source.splitlines()
         tree = ast.parse(source, filename=fpath)
+        total_merges, marked = _count_merges_in_function(
+            source, source_lines, tree, "_process_post_commit"
+        )
 
-        marked = 0
-        total_merges = 0
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            if node.name != "_process_post_commit":
-                continue
-            for call in ast.walk(node):
-                if not isinstance(call, ast.Call):
-                    continue
-                func = call.func
-                name = (
-                    func.id
-                    if isinstance(func, ast.Name)
-                    else func.attr
-                    if isinstance(func, ast.Attribute)
-                    else None
-                )
-                if name not in self._MERGE_NAMES:
-                    continue
-                total_merges += 1
-                end = getattr(call, "end_lineno", None) or call.lineno
-                span = source_lines[call.lineno - 1 : end]
-                has_marker = any(
-                    (idx := line.find(self._EXEMPT_MARKER)) != -1
-                    and line[idx + len(self._EXEMPT_MARKER) :].strip()
-                    for line in span
-                )
-                if has_marker:
-                    marked += 1
+        # Scan every registered stage module (added by S2-S12 extractions)
+        for stage_module in _POST_COMMIT_STAGE_REGISTRY:
+            mod_file = getattr(stage_module, "__file__", None) or _inspect.getfile(stage_module)
+            with open(mod_file, encoding="utf-8") as f:
+                mod_source = f.read()
+            mod_lines = mod_source.splitlines()
+            mod_tree = ast.parse(mod_source, filename=mod_file)
+            t, m = _count_merges_in_module(mod_source, mod_lines, mod_tree)
+            total_merges += t
+            marked += m
 
         assert total_merges == 2, (
-            f"Expected exactly 2 merge sites in _process_post_commit, found "
-            f"{total_merges}. If the function's merge sites changed, update this "
-            "test and the inline markers accordingly."
+            f"Expected exactly 2 merge sites across _process_post_commit and all "
+            f"registered stage modules, found {total_merges}. If the merge sites "
+            "changed, update this test and the inline markers accordingly."
         )
         assert marked == 2, (
-            f"Expected both _process_post_commit merge sites to carry the "
+            f"Expected all _process_post_commit merge sites to carry the "
             f"'{self._EXEMPT_MARKER} <reason>' inline marker; only {marked} do. "
             "Each staging-only / non-migration auto-merge must declare its "
             "exemption inline so the coverage invariant stays green."
@@ -12712,15 +12896,15 @@ class TestProblemModelWritePathInvariants:
         # lifecycle.py: sanitize_problem_model_raw -> startup healing write-back
         ("lifecycle.py", 505): "sanitize_problem_model_raw(...) strips packer markers before startup healing write-back",
         # direction_lifecycle.py: sanitize_problem_model_raw -> reconcile_gaps_for_retired_directions
-        ("direction_lifecycle.py", 816): "sanitize_problem_model_raw input -> reconcile_gaps_for_retired_directions mutates raw dict in place",
+        ("direction_lifecycle.py", 844): "sanitize_problem_model_raw input -> reconcile_gaps_for_retired_directions mutates raw dict in place",
         # direction_lifecycle.py: reconcile_gap_staffing_raw_result (parses through ProblemModel)
-        ("direction_lifecycle.py", 844): "reconcile_gap_staffing_raw_result calls parse_problem_model internally",
+        ("direction_lifecycle.py", 872): "reconcile_gap_staffing_raw_result calls parse_problem_model internally",
         # strategic_completion.py: apply_agent_update (write-back)
-        ("strategic_completion.py", 5068): "apply_agent_update inline-sanitizes both current and proposed",
+        ("strategic_completion.py", 5084): "apply_agent_update inline-sanitizes both current and proposed",
         # strategic_completion.py: apply_agent_update (re-normalized)
-        ("strategic_completion.py", 5105): "apply_agent_update result, then _normalize_active_moves_writeback",
+        ("strategic_completion.py", 5121): "apply_agent_update result, then _normalize_active_moves_writeback",
         # strategic_completion.py: parse_problem_model -> model_dump (fallback gap reconciliation)
-        ("strategic_completion.py", 6788): "parse_problem_model(…) validated pydantic model_dump",
+        ("strategic_completion.py", 6804): "parse_problem_model(…) validated pydantic model_dump",
         # reaper_sweeps.py: parse_problem_model -> model_dump (moot-confirmation sweep)
         ("reaper_sweeps.py", 1253): "parse_problem_model(…) validated pydantic model_dump",
         # reaper_sweeps.py: parse_problem_model -> model_dump (stale-decay sweep)
@@ -12735,18 +12919,18 @@ class TestProblemModelWritePathInvariants:
         ("routers/admin_onboard.py", 915): "pm parsed from ProblemModel, model_dump",
         # admin_agent_ops.py: reconcile_gap_staffing_raw_result -> problem_model key (5 sites)
         ("routers/admin_agent_ops.py", 1832): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 2250): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 2690): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 2803): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 3058): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 2258): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 2705): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 2818): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 3073): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
         # admin_agent_ops.py: apply_agent_update (op endpoint write-back)
-        ("routers/admin_agent_ops.py", 4589): "apply_agent_update result",
+        ("routers/admin_agent_ops.py", 4732): "apply_agent_update result",
         # admin_agent_ops.py: apply_agent_update (re-normalized after write-back)
-        ("routers/admin_agent_ops.py", 4617): "apply_agent_update result, then _normalize_active_moves_writeback",
+        ("routers/admin_agent_ops.py", 4760): "apply_agent_update result, then _normalize_active_moves_writeback",
         # admin_agent_ops.py: current_model.model_dump() (pending_confirm op)
-        ("routers/admin_agent_ops.py", 5148): "validated current_model pydantic model_dump",
+        ("routers/admin_agent_ops.py", 5291): "validated current_model pydantic model_dump",
         # admin_agent_ops.py: current_model.model_dump() (resolve_pending_confirm op)
-        ("routers/admin_agent_ops.py", 5230): "validated current_model pydantic model_dump",
+        ("routers/admin_agent_ops.py", 5373): "validated current_model pydantic model_dump",
     }
 
     def test_all_problem_model_write_paths_are_sanitized(self):

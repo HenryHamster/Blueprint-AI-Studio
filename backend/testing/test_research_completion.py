@@ -19546,3 +19546,112 @@ async def test_salvage_bundle_combined_decay_and_dedup_path(db_session, mocker):
     assert dedup_entry["claims"][1]["claim"] == "Index selectivity > 80%"
     assert len(dedup_entry["sources"]) == 1
     assert dedup_entry["sources"][0]["ref"] == "db_query_plan_20260710.txt"
+
+
+# ── Objective completion, increment 1 (residual half): a non-null merge-grade
+# residual ("gap no criterion captures") opens a durable objective_gap
+# completion-debt entry, mirroring the per-category sync that
+# upsert_category_verdict already performs; a later cleared residual resolves
+# it. Exercises the REAL production path (category_verdict_ledger.upsert_residual
+# -> app.completion_debt), not a stub, against a real merge-grade-shaped verdict.
+class TestObjectiveGapResidualCompletionDebt:
+    async def _project_and_version(self, db_session):
+        from app import release_version as _rv
+
+        project = _Project(
+            name="Objective Gap Residual Test Project",
+            user_id="objective-gap-residual-user",
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        version = await _rv.open_version(db_session, project.id, version_number=1)
+        await db_session.commit()
+        await db_session.refresh(version)
+        return project, version
+
+    @_pytest.mark.asyncio
+    async def test_real_merge_grade_residual_opens_and_later_clears_objective_gap_debt(
+        self, db_session
+    ):
+        """A real ``upsert_residual`` call carrying the blind merge-grade
+        judge's ``residual_uncaptured_gap`` opens a durable objective_gap
+        entry; a later candidate with no residual resolves it."""
+        from app import category_verdict_ledger as _cvl
+        from app import completion_debt as _cd
+        from app.models import CompletionDebtEntry
+
+        project, version = await self._project_and_version(db_session)
+        dedupe_key = _cd.objective_gap_dedupe_key(
+            version.id, _cd.OBJECTIVE_GAP_RESIDUAL_KEY
+        )
+
+        # Real merge-grade artifact shape: category_verdicts all `met`, but a
+        # non-empty residual ("gap no criterion captures") remains.
+        await _cvl.upsert_category_verdict(
+            db_session,
+            version_id=version.id,
+            candidate_sha="a" * 40,
+            category_key="c-1a2b3c4d",
+            status="met",
+            tier="judged",
+            gap=None,
+            citations=[{"file": "backend/app/export.py", "line": 42}],
+            grader_run_id="run-1",
+            project_id=project.id,
+        )
+        await _cvl.upsert_residual(
+            db_session,
+            version.id,
+            "a" * 40,
+            "The candidate handles export but never addressed migration rollback safety",
+            qualification_attempt_id=None,
+            project_id=project.id,
+        )
+        await db_session.commit()
+
+        row = (
+            await db_session.execute(
+                _select(CompletionDebtEntry).where(
+                    CompletionDebtEntry.dedupe_key == dedupe_key
+                )
+            )
+        ).scalar_one()
+        assert row.kind == _cd.KIND_OBJECTIVE_GAP
+        assert row.status == _cd.STATUS_OPEN
+        assert row.project_id == project.id
+        assert (row.detail or {}).get("gap") == (
+            "The candidate handles export but never addressed migration rollback safety"
+        )
+
+        # A later candidate whose grade run reports NO residual gap resolves it.
+        await _cvl.upsert_residual(
+            db_session,
+            version.id,
+            "b" * 40,
+            None,
+            qualification_attempt_id=None,
+            project_id=project.id,
+        )
+        await db_session.commit()
+        await db_session.refresh(row)
+
+        assert row.status == _cd.STATUS_RESOLVED
+        assert row.resolved_at is not None
+
+    @_pytest.mark.asyncio
+    async def test_residual_debt_independent_of_category_debt_dedupe_key(
+        self, db_session
+    ):
+        """The residual sentinel key must never collide with a real
+        criterion_key's dedupe key, even for adversarial category_key input."""
+        from app import completion_debt as _cd
+
+        _project, version = await self._project_and_version(db_session)
+        residual_key = _cd.objective_gap_dedupe_key(
+            version.id, _cd.OBJECTIVE_GAP_RESIDUAL_KEY
+        )
+        category_key = _cd.objective_gap_dedupe_key(version.id, "c-1a2b3c4d")
+        assert residual_key != category_key
+        assert _cd.OBJECTIVE_GAP_RESIDUAL_KEY not in ("c-1a2b3c4d",)

@@ -724,7 +724,11 @@ esac
 
 // Static content checks (no bash execution — these run on every platform,
 // including Windows where the POSIX integration suite above is skipped).
-  it('publishes after a bounded local-gate timeout with an explicit CI receipt', async () => {
+  // Regression test: a timed-out ./check must BLOCK ./pr open — not publish with
+  // a deferred "authoritative CI must decide" receipt. A missing verdict (check
+  // was killed before completion) is not an implicit pass. This is the primary
+  // gate-bypass route traced in the incident report for PR #16801 / task b9a990ed.
+  it('blocks ./pr open when ./check times out (exit 124) — no-verdict must not be treated as a pass', async () => {
     const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
     const receiptPath = '/tmp/pr_gate_receipt_task-gate-timeout.json';
     const argsPath = '/tmp/pr_gate_timeout_args_task-gate-timeout.txt';
@@ -759,43 +763,39 @@ case "$*" in
   *"ls-files --others --exclude-standard"*) exit 0 ;;
   *"status --porcelain"*) exit 0 ;;
   *"rev-list --count origin/main..HEAD"*) printf '1\\n'; exit 0 ;;
-  *"push --force-with-lease origin blueprint/task-gate-timeout"*) exit 0 ;;
+  *"push --force-with-lease origin blueprint/task-gate-timeout"*) printf 'push must not run\\n' >&2; exit 1 ;;
   *) exit 0 ;;
 esac
 `, { mode: 0o755 });
       rfs.writeFileSync(`${bin}/curl`, `#!/bin/sh
 ARGS="$*"
-OUT=""
-while [ $# -gt 0 ]; do
-  case "$1" in
-    -o) OUT="$2"; shift 2 ;;
-    *) shift ;;
-  esac
-done
 case "$ARGS" in
-  *"/api/agent/github/token?task_id=task-gate-timeout"*) printf '{"data":{"token":"token-abc"}}'; exit 0 ;;
-  *"/api/agent/github/pull-requests"*) [ -n "$OUT" ] && printf '{"data":{"html_url":"https://github.com/acme/repo/pull/9"}}' > "$OUT"; printf '201'; exit 0 ;;
-  *"/pulls/9"*) printf '{"mergeable":true,"mergeable_state":"clean"}'; exit 0 ;;
+  *"/api/agent/github/pull-requests"*) printf 'PR create must not run\\n' >&2; exit 1 ;;
   *) exit 0 ;;
 esac
 `, { mode: 0o755 });
-      rfs.writeFileSync(`${bin}/jq`, '#!/bin/sh\ncase "$*" in\n  *".data.token"*) printf \'token-abc\\n\' ;;\n  *".data.html_url"*) printf \'https://github.com/acme/repo/pull/9\\n\' ;;\n  *".mergeable_state"*) printf \'clean\\n\' ;;\n  *".mergeable // \\"null\\""*) printf \'true\\n\' ;;\n  *) printf \'{}\\n\' ;;\nesac\n', { mode: 0o755 });
+      rfs.writeFileSync(`${bin}/jq`, '#!/bin/sh\nprintf \'{}\\n\'\n', { mode: 0o755 });
     });
 
-    expect(result.status).toBe(0);
+    // The gate must BLOCK: a timed-out check produced no verdict, which is not a pass.
+    expect(result.status).toBe(1);
     expect(result.stdout).not.toContain('check must not run');
+    expect(result.stderr).not.toContain('push must not run');
+    expect(result.stderr).not.toContain('PR create must not run');
     expect(realFs.readFileSync(argsPath, 'utf8')).toContain('--kill-after=10s 600s ./check');
+    // Receipt written with timed_out status and authoritative_ci_required: false
+    // (we are blocking, not deferring).
     expect(JSON.parse(realFs.readFileSync(receiptPath, 'utf8'))).toMatchObject({
       status: 'timed_out',
       command: './check',
       timeout_seconds: 600,
       exit_code: 124,
-      authoritative_ci_required: true,
+      authoritative_ci_required: false,
     });
-    expect(realFs.readFileSync(prPath, 'utf8').trim()).toBe('https://github.com/acme/repo/pull/9');
+    // No PR URL marker written — the gate blocked before push/create.
+    expect(realFs.existsSync(prPath)).toBe(false);
     realFs.rmSync(receiptPath, { force: true });
     realFs.rmSync(argsPath, { force: true });
-    realFs.rmSync(prPath, { force: true });
   });
 
   it('keeps a deterministic local-gate failure fail-closed', async () => {
@@ -840,7 +840,12 @@ exec "$@"
     expect(realFs.existsSync(prPath)).toBe(false);
     realFs.rmSync(receiptPath, { force: true });
   });
-  it('publishes with authoritative CI required when the local gate is unavailable', async () => {
+  // Regression test: when the timeout tool itself fails (exits 127 — command not
+  // found inside timeout, or timeout's own internal error), the gate must BLOCK.
+  // Previously this fell through the `125|126|127` unavailable case and published
+  // with authoritative_ci_required:true, allowing ./done --warn-out-of-scope to
+  // complete a submission without ./check ever producing a verdict.
+  it('blocks ./pr open when timeout tool exits with a non-zero code without running check', async () => {
     const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
     const receiptPath = '/tmp/pr_gate_receipt_task-gate-unavailable.json';
     const prPath = '/tmp/pr_url_task-gate-unavailable';
@@ -859,6 +864,7 @@ exec "$@"
       const bin = `${dir}/bin`;
       rfs.mkdirSync(bin, { recursive: true });
       rfs.writeFileSync(`${dir}/check`, '#!/bin/sh\nprintf "check must not run\\n" >&2\nexit 99\n', { mode: 0o755 });
+      // timeout stub exits 127 — simulates the tool failing before running ./check
       rfs.writeFileSync(`${bin}/timeout`, '#!/bin/sh\nexit 127\n', { mode: 0o755 });
       rfs.writeFileSync(`${bin}/git`, `#!/bin/sh
 case "$*" in
@@ -869,40 +875,108 @@ case "$*" in
   *"ls-files --others --exclude-standard"*) exit 0 ;;
   *"status --porcelain"*) exit 0 ;;
   *"rev-list --count origin/main..HEAD"*) printf '1\n'; exit 0 ;;
-  *"push --force-with-lease origin blueprint/task-gate-unavailable"*) exit 0 ;;
+  *"push --force-with-lease origin blueprint/task-gate-unavailable"*) printf 'push must not run\n' >&2; exit 1 ;;
   *) exit 0 ;;
 esac
 `, { mode: 0o755 });
       rfs.writeFileSync(`${bin}/curl`, `#!/bin/sh
-ARGS="$*"
-OUT=""
-while [ $# -gt 0 ]; do
-  case "$1" in
-    -o) OUT="$2"; shift 2 ;;
-    *) shift ;;
-  esac
-done
-case "$ARGS" in
-  *"/api/agent/github/token?task_id=task-gate-unavailable"*) printf '{"data":{"token":"token-abc"}}'; exit 0 ;;
-  *"/api/agent/github/pull-requests"*) [ -n "$OUT" ] && printf '{"data":{"html_url":"https://github.com/acme/repo/pull/10"}}' > "$OUT"; printf '201'; exit 0 ;;
-  *"/pulls/10"*) printf '{"mergeable":true,"mergeable_state":"clean"}'; exit 0 ;;
+case "$*" in
+  *"/api/agent/github/pull-requests"*) printf 'PR create must not run\n' >&2; exit 1 ;;
   *) exit 0 ;;
 esac
 `, { mode: 0o755 });
-      rfs.writeFileSync(`${bin}/jq`, '#!/bin/sh\ncase "$*" in\n  *".data.token"*) printf \'token-abc\\n\' ;;\n  *".data.html_url"*) printf \'https://github.com/acme/repo/pull/10\\n\' ;;\n  *".mergeable_state"*) printf \'clean\\n\' ;;\n  *".mergeable // \\"null\\""*) printf \'true\\n\' ;;\n  *) printf \'{}\\n\' ;;\nesac\n', { mode: 0o755 });
+      rfs.writeFileSync(`${bin}/jq`, '#!/bin/sh\nprintf \'{}\\n\'\n', { mode: 0o755 });
     });
 
-    expect(result.status).toBe(0);
+    // The gate must BLOCK — ./check never ran and produced no verdict.
+    expect(result.status).toBe(1);
     expect(result.stdout).not.toContain('check must not run');
+    expect(result.stderr).not.toContain('push must not run');
+    expect(result.stderr).not.toContain('PR create must not run');
+    // Receipt was written (the gate ran and recorded failure).
     expect(JSON.parse(realFs.readFileSync(receiptPath, 'utf8'))).toMatchObject({
-      status: 'unavailable',
+      status: 'failed',
       command: './check',
       exit_code: 127,
-      authoritative_ci_required: true,
+      authoritative_ci_required: false,
     });
-    expect(realFs.readFileSync(prPath, 'utf8').trim()).toBe('https://github.com/acme/repo/pull/10');
+    // No PR URL marker written — gate blocked before push/create.
+    expect(realFs.existsSync(prPath)).toBe(false);
     realFs.rmSync(receiptPath, { force: true });
-    realFs.rmSync(prPath, { force: true });
+  });
+
+});
+
+// ── Static content: run_pr_gate fallback when timeout is absent ───────────────
+// Integration-testing "no timeout in PATH" is unreliable across systems because
+// timeout lives at different paths (/usr/bin, /bin via symlink) and PATH
+// manipulation can't portably exclude it without breaking other tools. The
+// fallback logic is verified here via static content inspection of the generated
+// script: the conditional must run ./check DIRECTLY (not set GATE_STATUS=127)
+// when timeout is absent, ensuring ./check's exit code determines the gate.
+describe('writePrHelper — run_pr_gate timeout-absent fallback (static)', () => {
+  let capturedScripts: Record<string, string> = {};
+
+  beforeEach(() => {
+    capturedScripts = {};
+    vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
+      const [path, content] = args as [string, string];
+      capturedScripts[path] = content;
+    });
+  });
+
+  it('runs ./check directly (no GATE_STATUS=127 skip) when timeout is not in PATH', () => {
+    writePrHelper({
+      taskId: 'task-notimeout-static',
+      workBranch: 'blueprint/task-notimeout-static',
+      baseBranch: 'main',
+      owner: 'acme',
+      repo: 'repo',
+      testsOnMainBranch: false,
+    });
+    const script = capturedScripts['/tmp/workspace/pr'];
+    expect(script).toBeDefined();
+
+    // The conditional must check for timeout absence and, when absent, run
+    // ./check directly — not set GATE_STATUS=127 and skip running the check.
+    expect(script).toContain('if ! command -v timeout >/dev/null 2>&1; then');
+    // The fallback branch runs ./check and captures its exit code.
+    expect(script).toContain('./check "$@"');
+    expect(script).toContain('GATE_STATUS=$?');
+    // The WARNING message must be present so the log shows timeout was absent.
+    expect(script).toContain('WARNING: timeout not available — running');
+    // Old defective pattern (set GATE_STATUS without running check) must be absent.
+    expect(script).not.toContain('GATE_STATUS=127');
+    // Old pass-through patterns (125|126|127 → return 0) must be absent.
+    expect(script).not.toContain('125|126|127');
+    expect(script).not.toContain('Publishing with an unavailable receipt');
+  });
+
+  it('write_gate_receipt timed_out uses authoritative_ci_required:false — timeout blocks, not defers', () => {
+    writePrHelper({
+      taskId: 'task-timeout-static',
+      workBranch: 'blueprint/task-timeout-static',
+      baseBranch: 'main',
+      owner: 'acme',
+      repo: 'repo',
+      testsOnMainBranch: false,
+    });
+    const script = capturedScripts['/tmp/workspace/pr'];
+    expect(script).toBeDefined();
+
+    // The timed_out receipt must set authoritative_ci_required: false because we
+    // are blocking (not deferring). Old code wrote "true" and returned 0 (pass).
+    expect(script).toContain('write_gate_receipt timed_out "$GATE_STATUS" false');
+    // The old pass-through return (return 0 after timed_out) must be absent.
+    // The only return in the 124|137 case must be a non-zero status.
+    const timeoutCaseStart = script.indexOf('124|137)');
+    const timeoutCaseEnd = script.indexOf(';;', timeoutCaseStart);
+    const timeoutBlock = script.slice(timeoutCaseStart, timeoutCaseEnd);
+    expect(timeoutBlock).not.toContain('return 0');
+    expect(timeoutBlock).toContain('return "$GATE_STATUS"');
+    // Error message must explain what happened and how to fix it.
+    expect(timeoutBlock).toContain('did not complete within the time limit');
+    expect(timeoutBlock).toContain('no verdict was produced');
   });
 });
 
@@ -928,8 +1002,8 @@ describe('writePrHelper — generated script content', () => {
     });
     const script = capturedScripts['/tmp/workspace/pr'];
     expect(script).toBeDefined();
-    // A deterministic red gate still blocks, while timeout/tool unavailability
-    // returns through run_pr_gate with a durable authoritative-CI receipt.
+    // All gate failures block — a deterministic red, a timeout, or an unavailable
+    // tool all prevent ./pr open from writing the PR URL. Only exit 0 passes.
     expect(script).toContain('if ! run_pr_gate test; then');
     expect(script).toContain('timeout --signal=TERM --kill-after=10s "${GATE_TIMEOUT_SECONDS}s" ./check "$@"');
     expect(script).toContain('PR_GATE_TIMEOUT_SECONDS:-600');

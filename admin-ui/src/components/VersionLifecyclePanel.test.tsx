@@ -1751,6 +1751,59 @@ describe('VersionLifecyclePanel', () => {
     });
   });
 
+  describe('re-qualification readiness surface', () => {
+    it('renders the ledger-backed readiness panel when requalification_readiness is present', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              requalification_ready: false,
+              requalification_readiness: {
+                requalification_ready: false,
+                open_version_id: 'ver-uuid-open',
+                audit_findings_truncated: false,
+                gating_total: 2,
+                gating_resolved: 1,
+                reason: '1 of 2 carried high/medium audit finding(s) still unresolved',
+                findings: [
+                  { key: 'adb632b709685086', severity: 'high', summary: 'blocking finding', state: 'unresolved' },
+                  { key: 'deadbeef12345678', severity: 'medium', summary: 'already fixed', state: 'resolved' },
+                ],
+              },
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.getByTestId('requalification-readiness')).toBeInTheDocument();
+      expect(screen.getByTestId('requalification-ready-badge')).toHaveTextContent(
+        'blocked by carried findings',
+      );
+      expect(screen.getByTestId('requalification-reason')).toHaveTextContent('1 of 2');
+      // The unresolved finding offers a dispose control; the resolved one does not.
+      expect(screen.getAllByTestId('resolve-finding')).toHaveLength(1);
+    });
+
+    it('omits the readiness panel when requalification_readiness is absent (older backend)', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              requalification_ready: null,
+              requalification_readiness: null,
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.queryByTestId('requalification-readiness')).not.toBeInTheDocument();
+    });
+  });
+
   describe('qualification verdict staleness', () => {
     it('flags the verdict as stale and shows the verdict candidate SHA when tasks merged after it', () => {
       render(

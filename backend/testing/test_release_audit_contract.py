@@ -750,3 +750,111 @@ def test_default_quality_tier_is_opus():
         "— release gates rely on opus-tier fallback; "
         "explicit quality_tier='opus' payloads will be overridden if default changes"
     )
+
+
+class TestMergeGradeRealVerdict:
+    """Drive a REAL merge-test verdict through ``evaluate_merge_grade`` and the
+    per-category gate in ``compute_composite``.
+
+    This is the acceptance-evidence path: the test produces an actual merge-grade
+    verdict (pure, no DB) from a real artifact, then asserts the normalized
+    per-category verdicts (status / tier / gap / citations) and the composite
+    sub-scores operators rely on to see WHY the gate fired.
+    """
+
+    @staticmethod
+    def _verdict_artifact() -> dict:
+        return {
+            "graded_candidate_sha": "c0ffee" * 5,
+            "covers_goal": False,
+            "coverage_score": 0.3,
+            "biggest_gap": "The goal requires X, but the merged diff only adds Y.",
+            "category_verdicts": [
+                {
+                    "category_key": "c-1",
+                    "status": "met",
+                    "gap": None,
+                    "citations": [{"kind": "diff", "ref": "backend/app/foo.py:12"}],
+                },
+                {
+                    "category_key": "c-2",
+                    "status": "not_met",
+                    "gap": "Capability Z is not wired up.",
+                    "citations": [{"kind": "diff", "ref": "backend/app/bar.py"}],
+                },
+                {
+                    "category_key": "c-3",
+                    "status": "partial",
+                    "gap": "Gated on an upstream deploy.",
+                    "citations": [{"kind": "diff", "ref": "backend/app/qux.py"}],
+                },
+            ],
+            "residual_uncaptured_gap": None,
+        }
+
+    @staticmethod
+    def _active_categories() -> list[dict]:
+        return [
+            {"category_key": "c-1", "text": "First"},
+            {"category_key": "c-2", "text": "Second"},
+            {"category_key": "c-3", "text": "Third"},
+            {"category_key": "c-4", "text": "Never graded"},
+        ]
+
+    def test_evaluate_merge_grade_returns_a_fail_verdict_with_normalized_categories(self):
+        from app.release_scoring import evaluate_merge_grade
+
+        result = evaluate_merge_grade(
+            "Deliver X, Y, and Z.",
+            self._verdict_artifact(),
+            active_categories=self._active_categories(),
+        )
+        assert result["status"] == "fail"
+        assert result["blocked"] is True
+        verdicts = {
+            v["category_key"]: v
+            for v in result["category_verdicts"]
+            if isinstance(v, dict)
+        }
+        # c-1 is met and cited (judged tier — no machine evidence supplied).
+        assert verdicts["c-1"]["status"] == "met"
+        assert verdicts["c-1"]["tier"] == "judged"
+        assert verdicts["c-1"]["gap"] is None
+        assert verdicts["c-1"]["citations"] == [
+            {"kind": "diff", "ref": "backend/app/foo.py:12"}
+        ]
+        # c-2 is not_met and carries its gap.
+        assert verdicts["c-2"]["status"] == "not_met"
+        assert verdicts["c-2"]["gap"] == "Capability Z is not wired up."
+        # c-3 partial is preserved (gates identically to not_met downstream).
+        assert verdicts["c-3"]["status"] == "partial"
+        # A category the artifact never graded is fail-closed to not_met.
+        assert verdicts["c-4"]["status"] == "not_met"
+        assert "Not graded" in (verdicts["c-4"]["gap"] or "")
+
+    def test_compute_composite_surfaces_the_category_gate_sub_scores(self):
+        from app.release_scoring import compute_composite
+        from app.release_scoring import evaluate_merge_grade
+
+        grade = evaluate_merge_grade(
+            "Deliver X, Y, and Z.",
+            self._verdict_artifact(),
+            active_categories=self._active_categories(),
+        )
+        composite = compute_composite(
+            ci_green=True,
+            audit_score=0.9,
+            test_erosion=0.0,
+            smoketest_score=0.9,
+            policy={},
+            category_verdicts=grade["category_verdicts"],
+            residual_uncaptured_gap=grade["residual_uncaptured_gap"],
+            merge_grade_misses=True,
+            merge_grade_exempt=False,
+        )
+        sub_scores = composite["sub_scores"]
+        assert sub_scores.get("category_count") == 4
+        assert sub_scores.get("met_category_count") == 1
+        assert sorted(sub_scores.get("unmet_categories", [])) == ["c-2", "c-3", "c-4"]
+        # The retired blocked_by triage sub-score must not be re-emitted.
+        assert "unmet_by_triage" not in sub_scores

@@ -14474,6 +14474,130 @@ class TestStrategistDisposeCompletionDebt:
             f"spawned task must be linked; got detail={entry.detail!r}"
         )
 
+    @pytest.mark.asyncio
+    async def test_spawn_task_batch_authors_dependency_edges(
+        self, client: AsyncClient, db_session
+    ):
+        """spawn_task depends_on chains each successor onto a previously
+        spawned sibling, authoring the intra-batch ordering a multi-task
+        strategist decision needs (A -> B -> C) instead of independent
+        parallel siblings.
+
+        The edge is durable on the Task row and stamped with structural
+        provenance so cleanup paths never sweep it as a legacy wave dep.
+        """
+        from app.auth import create_agent_token
+        from app.depends_on_provenance import get_structural_depends_on_ids
+
+        project = await _make_project(db_session)
+        strategic = Task(
+            project_id=project.id,
+            title="Strategic review for batch ordering",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "strategic_review", "prompt": "review"}],
+            vm_instance_id="vm-spawn-batch-ordering",
+        )
+        db_session.add(strategic)
+        await db_session.commit()
+        await db_session.refresh(strategic)
+        token = create_agent_token(
+            str(strategic.id), "vm-spawn-batch-ordering", task_type="strategic_review"
+        )
+
+        async def _spawn(data: dict) -> dict:
+            resp = await client.post(
+                "/api/agent/strategic",
+                headers={"x-agent-token": token},
+                json={"task_id": str(strategic.id), "op": "spawn_task", "data": data},
+            )
+            assert resp.status_code == 200, (
+                f"expected spawn ok, got {resp.status_code}: {resp.text}"
+            )
+            return resp.json()
+
+        # Foundation (batch index 0).
+        body_a = await _spawn(
+            {
+                "type": "create",
+                "title": "Foundation module",
+                "prompt": "Build the shared foundation module.",
+            }
+        )
+        a_id = body_a["task_id"]
+
+        # Successor B authors an edge onto A; the response echoes it.
+        body_b = await _spawn(
+            {
+                "type": "refactor",
+                "title": "Build on foundation",
+                "prompt": "Refactor the caller onto the foundation module.",
+                "depends_on": [a_id],
+            }
+        )
+        b_id = body_b["task_id"]
+        assert body_b.get("depends_on") == [a_id]
+
+        # Successor C chains onto B (A -> B -> C).
+        body_c = await _spawn(
+            {
+                "type": "qa",
+                "title": "Verify the chain",
+                "prompt": "Add regression coverage for the refactor.",
+                "depends_on": [b_id],
+            }
+        )
+        c_id = body_c["task_id"]
+
+        a = await db_session.get(Task, uuid.UUID(a_id))
+        b = await db_session.get(Task, uuid.UUID(b_id))
+        c = await db_session.get(Task, uuid.UUID(c_id))
+
+        assert a is not None and b is not None and c is not None
+        assert b.depends_on == [a_id], f"B must depend on A; got {b.depends_on}"
+        assert c.depends_on == [b_id], f"C must depend on B; got {c.depends_on}"
+        assert a.depends_on == []
+        # Structural provenance keeps the edge from being swept as a wave dep.
+        assert get_structural_depends_on_ids(b) == [a_id]
+        assert get_structural_depends_on_ids(c) == [b_id]
+        # Every batch member is a strategist sibling under the same review.
+        for child in (a, b, c):
+            ctx = child.context or {}
+            assert ctx.get("spawned_by") == "strategic_direct"
+            assert ctx.get("parent_strategic_task_id") == str(strategic.id)
+
+        # A dependency on a task outside the project is rejected up front.
+        other_project = await _make_project(db_session)
+        foreign = Task(
+            project_id=other_project.id,
+            title="Foreign task",
+            status=TaskStatus.QUEUED,
+            payloads=[{"type": "create", "prompt": "x"}],
+        )
+        db_session.add(foreign)
+        await db_session.commit()
+        await db_session.refresh(foreign)
+
+        bad_resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(strategic.id),
+                "op": "spawn_task",
+                "data": {
+                    "type": "create",
+                    "title": "Must not spawn",
+                    "prompt": "Dependency validation must reject this.",
+                    "depends_on": [str(foreign.id)],
+                },
+            },
+        )
+        assert bad_resp.status_code == 400, (
+            f"cross-project depends_on must be rejected; got {bad_resp.status_code}"
+        )
+        bad_body = bad_resp.json()
+        msg = bad_body.get("detail") or bad_body.get("error", {}).get("message", "")
+        assert "depends_on" in msg, f"error must mention depends_on; got {msg!r}"
+
 
 @pytest.mark.asyncio
 async def test_direction_created_during_gated_op_survives_commit(

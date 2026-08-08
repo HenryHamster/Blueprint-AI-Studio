@@ -1372,7 +1372,7 @@ class TestApiKeyCompletionHeadersPopulateUsageMeter:
         async def fake_call_direct_llm(api_key, *, messages, max_tokens, timeout, **kw):
             assert api_key == "sk-ant-api-test-key"
             assert max_tokens == 1
-            return ("1", rate_limit_data)
+            return ("1", rate_limit_data, None)
 
         monkeypatch.setattr(
             "app.direct_llm_client.call_direct_llm",
@@ -1421,7 +1421,7 @@ class TestApiKeyCompletionHeadersPopulateUsageMeter:
         from app.models import LLMAuthMode
 
         async def fake_call_direct_llm(api_key, *, messages, max_tokens, timeout, **kw):
-            return ("1", {"source": "messages_api_header", "updated_at": "2026-07-22T10:00:00Z"})
+            return ("1", {"source": "messages_api_header", "updated_at": "2026-07-22T10:00:00Z"}, None)
 
         monkeypatch.setattr(
             "app.direct_llm_client.call_direct_llm",
@@ -1517,7 +1517,7 @@ class TestApiKeyMeterExecutesAutoArmLoop:
         async def fake_call_direct_llm(api_key, *, messages, max_tokens, timeout, **kw):
             assert api_key == "sk-ant-key-1"
             assert max_tokens == 1
-            return ("1", rate_limit_data)
+            return ("1", rate_limit_data, None)
 
         monkeypatch.setattr(
             "app.direct_llm_client.call_direct_llm", fake_call_direct_llm

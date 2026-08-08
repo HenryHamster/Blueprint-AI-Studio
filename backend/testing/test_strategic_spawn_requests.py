@@ -8,6 +8,7 @@ from datetime import timedelta
 import pytest
 from sqlmodel import select
 
+from app.depends_on_provenance import get_structural_depends_on_ids
 from app.models import (
     CompletionDebtEntry,
     Project,
@@ -739,3 +740,114 @@ async def test_orchestrator_sweep_drains_without_heartbeat_and_links_debt_once(
     await db_session.refresh(debt)
     linked = (debt.detail or {}).get("linked_tasks") or []
     assert [row["task_id"] for row in linked] == [str(deferred.request.task_id)]
+
+
+@pytest.mark.asyncio
+async def test_immediate_spawn_carries_depends_on_at_task_creation(db_session):
+    """The ordering edge is set when the Task row is built, not patched after.
+
+    A create-then-patch would publish a QUEUED successor with no dependencies
+    for the window between the two commits, letting the dispatch loop claim it
+    ahead of its prerequisite.
+    """
+    project, owner = await _owner(db_session)
+    prereq = Task(
+        project_id=project.id,
+        title="Prerequisite",
+        created_by="STRATEGIC_AGENT",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "first"}],
+    )
+    db_session.add(prereq)
+    await db_session.flush()
+
+    spec = _spec("Successor", watch=False)
+    spec["task"]["depends_on"] = [str(prereq.id)]
+    submission = await submit_strategic_spawn(
+        db_session,
+        project_id=project.id,
+        parent_task_id=owner.id,
+        task_type="create",
+        specification=spec,
+        idempotency_key="immediate-ordered",
+        direction_id=None,
+        burst_cap=10,
+        burst_window_minutes=60,
+    )
+    await db_session.commit()
+
+    assert submission.task is not None
+    assert submission.task.status == TaskStatus.QUEUED
+    assert [str(d) for d in (submission.task.depends_on or [])] == [str(prereq.id)]
+    assert get_structural_depends_on_ids(submission.task) == [str(prereq.id)]
+
+
+@pytest.mark.asyncio
+async def test_deferred_spawn_keeps_depends_on_when_later_drained(db_session):
+    """Deferral is a normal outcome; it must not drop the ordering edge.
+
+    The router only ever saw the immediate (200) path, so a burst-capped spawn
+    used to be created by the drain with ``depends_on == []`` and dispatched
+    unordered — the exact failure this feature exists to prevent.
+    """
+    project, owner = await _owner(db_session)
+    prereq = Task(
+        project_id=project.id,
+        title="Prerequisite",
+        created_by="STRATEGIC_AGENT",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "first"}],
+    )
+    db_session.add(prereq)
+    await db_session.flush()
+
+    first = await submit_strategic_spawn(
+        db_session,
+        project_id=project.id,
+        parent_task_id=owner.id,
+        task_type="create",
+        specification=_spec("Occupy the window", watch=False),
+        idempotency_key="burst-occupier",
+        direction_id=None,
+        burst_cap=1,
+        burst_window_minutes=60,
+    )
+    assert first.task is not None
+
+    spec = _spec("Deferred successor", watch=False)
+    spec["task"]["depends_on"] = [str(prereq.id), str(prereq.id)]
+    deferred = await submit_strategic_spawn(
+        db_session,
+        project_id=project.id,
+        parent_task_id=owner.id,
+        task_type="create",
+        specification=spec,
+        idempotency_key="deferred-ordered",
+        direction_id=None,
+        burst_cap=1,
+        burst_window_minutes=60,
+    )
+    assert deferred.task is None
+    assert deferred.request.state == "deferred"
+
+    first.request.dispatched_at = _utcnow() - timedelta(minutes=61)
+    deferred.request.not_before = _utcnow() - timedelta(seconds=1)
+    db_session.add(first.request)
+    db_session.add(deferred.request)
+    await db_session.commit()
+
+    drained = await drain_deferred_spawn_requests(
+        db_session,
+        project_id=project.id,
+        burst_cap=1,
+        burst_window_minutes=60,
+    )
+    await db_session.commit()
+    assert [row.id for row in drained] == [deferred.request.id]
+
+    await db_session.refresh(deferred.request)
+    spawned = await db_session.get(Task, deferred.request.task_id)
+    assert spawned is not None
+    # Deduplicated, and marked structural so cleanup paths keep the edge.
+    assert [str(d) for d in (spawned.depends_on or [])] == [str(prereq.id)]
+    assert get_structural_depends_on_ids(spawned) == [str(prereq.id)]

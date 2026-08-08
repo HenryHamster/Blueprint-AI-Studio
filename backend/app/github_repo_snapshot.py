@@ -232,6 +232,26 @@ async def _get_snapshot(
     sha = await _resolve_branch_sha(token, owner, repo, branch, project_id)
     if not sha:
         return None
+    return await _get_snapshot_at_sha(token, owner, repo, sha, project_id)
+
+
+async def _get_snapshot_at_sha(
+    token: str,
+    owner: str,
+    repo: str,
+    sha: str,
+    project_id: str | None = None,
+) -> Tuple[Dict[str, str], bool] | None:
+    """The cached (paths, truncated) snapshot for an EXPLICIT commit *sha*.
+
+    A commit's tree is immutable, so this read has no freshness window at all —
+    unlike branch reads, which resolve the tip through a
+    :data:`_BRANCH_SHA_TTL_S` cache and can lag the branch by up to that TTL.
+    Callers that know the exact commit they mean (e.g. corroborating a merged
+    PR against its merge commit) MUST use this instead of a branch read.
+    """
+    if _quota_reserve_active():
+        return None
     key = (owner, repo, sha)
     snapshot = _tree_cache.get(key)
     if snapshot is not None:
@@ -452,6 +472,39 @@ async def file_text_on_branch(
     so callers can distinguish "absent" from "unreadable".
     """
     snapshot = await _get_snapshot(token, owner, repo, branch, project_id)
+    return await _file_text_from_snapshot(snapshot, path, token, owner, repo, project_id)
+
+
+async def file_text_at_commit(
+    path: str,
+    *,
+    token: str,
+    owner: str,
+    repo: str,
+    commit_sha: str,
+    project_id: str | None = None,
+) -> Tuple[bool | None, str | None]:
+    """Decoded text of *path* in the tree of an EXPLICIT commit. Tri-state.
+
+    Same return contract as :func:`file_text_on_branch`, but reads the immutable
+    tree of *commit_sha* directly — no branch-tip resolution, so no
+    :data:`_BRANCH_SHA_TTL_S` staleness window. Use this whenever the caller
+    knows the exact commit the answer must be true at (e.g. a merged PR's merge
+    commit): a branch read taken moments after a merge can still serve the
+    PRE-merge tip from cache and report a just-added file absent.
+    """
+    snapshot = await _get_snapshot_at_sha(token, owner, repo, commit_sha, project_id)
+    return await _file_text_from_snapshot(snapshot, path, token, owner, repo, project_id)
+
+
+async def _file_text_from_snapshot(
+    snapshot: Tuple[Dict[str, str], bool] | None,
+    path: str,
+    token: str,
+    owner: str,
+    repo: str,
+    project_id: str | None = None,
+) -> Tuple[bool | None, str | None]:
     if snapshot is None:
         return None, None
     paths, truncated = snapshot

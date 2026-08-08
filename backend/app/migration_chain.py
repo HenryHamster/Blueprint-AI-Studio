@@ -67,6 +67,22 @@ def find_heads(chain: dict[str, str | None]) -> list[str]:
     return [r for r in chain if r not in pointed_to]
 
 
+def migration_chain_versions(entries: Iterable[str]) -> list[str]:
+    """Select migration files from a versions-directory listing.
+
+    Both the runtime post-merge guard and the chain invariant tests enumerate the
+    migration set through this predicate so the two can never diverge again.
+    Membership is any ``.py`` file in the versions directory: Alembic loads every
+    ``.py`` module there, and the in-file ``revision`` parse (not a filename-prefix
+    heuristic) decides chain membership. A migration whose filename prefix is not
+    all-digits (e.g. ``0612b_fix_checkpoint_clear_fk_cascade.py``) is therefore
+    INCLUDED — a guard that silently drops it on filename grounds orphans its
+    ``down_revision`` into a phantom head, the exact bug class this predicate
+    exists to prevent.
+    """
+    return [fn for fn in entries if os.path.basename(fn).endswith(".py")]
+
+
 def find_roots(chain: dict[str, str | None]) -> list[str]:
     """Revisions whose ``down_revision`` is ``None`` or points outside the chain.
 

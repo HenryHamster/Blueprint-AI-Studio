@@ -282,19 +282,32 @@ function DirectionCardImpl({
   const handleRetireDirection = useCallback(() => { setRetireConfirmOpen(false); decideChurnRetirement?.(d.id, 'RETIRE'); }, [decideChurnRetirement, d.id]);
 
   // Memoize the budget utilization badge (was IIFE at ~1051) so it does
-  // not recompute cost rankings and color classes on every render.
+  // not recompute cost rankings and color classes on every render. The badge
+  // reads the LIFETIME lineage figure when present — the same meter the
+  // backend's budget pause gate uses — and always surfaces the rolling-window
+  // figure as a distinct secondary reading rather than silently substituting
+  // it for lifetime spend. Legacy snapshots without the lineage fields degrade
+  // to an explicitly window-labelled badge.
   const budgetUtilizationBadge = useMemo<React.ReactNode>(() => {
-    const spend = d.estimated_cost_usd;
     const budget = d.cost_budget_usd;
+    const hasLifetime = d.lineage_spend_usd != null;
+    const spend = hasLifetime ? d.lineage_spend_usd : d.estimated_cost_usd;
+    const windowSpend = hasLifetime ? d.estimated_cost_usd : null;
     if (spend == null && (budget == null || budget === 0)) return null;
     const utilPct = d.budget_utilization_pct != null
       ? d.budget_utilization_pct
       : (budget != null && budget > 0 && spend != null ? (spend / budget) * 100 : null);
     const exceeded = d.budget_exceeded ?? (utilPct != null && utilPct > 100);
+    const basisLabel = d.budget_basis
+      ?? (hasLifetime ? 'lifetime lineage' : 'rolling window');
+    const prefix = hasLifetime ? 'Lifetime' : 'Window';
     if (budget == null || budget === 0) {
       return (
-        <span className="text-ui-sm px-1.5 py-0.5 rounded border font-medium bg-neutral-800/60 border-neutral-700/60 text-neutral-500">
-          ${(spend ?? 0).toFixed(2)} spent
+        <span
+          title={`${prefix} $${(spend ?? 0).toFixed(2)} spent — basis: ${basisLabel}`}
+          className="text-ui-sm px-1.5 py-0.5 rounded border font-medium bg-neutral-800/60 border-neutral-700/60 text-neutral-500"
+        >
+          {prefix} ${(spend ?? 0).toFixed(2)} spent
         </span>
       );
     }
@@ -307,19 +320,56 @@ function DirectionCardImpl({
     }
     const color = exceeded ? 'red' : utilPct != null && utilPct > 80 ? 'amber' : 'emerald';
     const label = exceeded
-      ? `$${spend.toFixed(2)} · over budget`
+      ? `${prefix} $${spend.toFixed(2)} · over budget`
       : utilPct != null
-        ? `$${spend.toFixed(2)} / $${budget.toFixed(2)} · ${Math.round(utilPct)}%`
-        : `$${spend.toFixed(2)} / $${budget.toFixed(2)}`;
+        ? `${prefix} $${spend.toFixed(2)} / $${budget.toFixed(2)} · ${Math.round(utilPct)}%`
+        : `${prefix} $${spend.toFixed(2)} / $${budget.toFixed(2)}`;
+    const tooltipLines = [
+      `${prefix} $${spend.toFixed(2)} spent of $${budget.toFixed(2)} budget`,
+    ];
+    if (hasLifetime) {
+      tooltipLines.push(
+        `VM $${(d.lineage_vm_cost_usd ?? 0).toFixed(2)} · LLM $${(d.lineage_llm_cost_usd ?? 0).toFixed(2)} · Compute $${(d.lineage_compute_cost_usd ?? 0).toFixed(2)}`
+      );
+      if (d.lineage_task_count != null) {
+        tooltipLines.push(`${d.lineage_task_count} lineage task${d.lineage_task_count === 1 ? '' : 's'}`);
+      }
+      if (d.lineage_llm_unpriced) tooltipLines.push('some LLM spend unpriced');
+      if (windowSpend != null) tooltipLines.push(`Rolling window: $${windowSpend.toFixed(2)}`);
+    }
+    tooltipLines.push(`Basis: ${basisLabel}`);
+    const tooltip = tooltipLines.join('\n');
     return (
-      <span
-        title={`$${spend.toFixed(2)} spent of $${budget.toFixed(2)} budget`}
-        className={`text-ui-sm px-1.5 py-0.5 rounded border font-medium bg-${color}-950/40 border-${color}-900/50 text-${color}-400`}
-      >
-        {label}
-      </span>
+      <>
+        <span
+          title={tooltip}
+          className={`text-ui-sm px-1.5 py-0.5 rounded border font-medium bg-${color}-950/40 border-${color}-900/50 text-${color}-400`}
+        >
+          {label}
+        </span>
+        {windowSpend != null && (
+          <span
+            title={`Rolling-window spend (digest window): $${windowSpend.toFixed(2)}`}
+            className="text-ui-sm px-1.5 py-0.5 rounded border font-medium bg-neutral-900/60 border-neutral-800/60 text-neutral-500"
+          >
+            window ${windowSpend.toFixed(2)}
+          </span>
+        )}
+      </>
     );
-  }, [d.estimated_cost_usd, d.cost_budget_usd, d.budget_utilization_pct, d.budget_exceeded]);
+  }, [
+    d.estimated_cost_usd,
+    d.cost_budget_usd,
+    d.budget_utilization_pct,
+    d.budget_exceeded,
+    d.lineage_spend_usd,
+    d.lineage_vm_cost_usd,
+    d.lineage_llm_cost_usd,
+    d.lineage_compute_cost_usd,
+    d.lineage_task_count,
+    d.lineage_llm_unpriced,
+    d.budget_basis,
+  ]);
 
   // Memoize the cost-per-merge warning badges (was IIFE at ~1089) so it
   // does not recompute provider/model cost rankings each render.

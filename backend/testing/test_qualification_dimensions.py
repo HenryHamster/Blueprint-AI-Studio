@@ -58,12 +58,16 @@ _EXPECTED_LEDGER_KEYS = frozenset({
 # gates.  env_preflight was subsequently promoted to mutable (it is
 # environment-dependent: an operator repairing the deploy environment must take
 # effect on a same-candidate re-drive), so the canonical registry now carries a
-# fourth mutable dimension.  This is an intentional contract change, not drift.
+# fourth mutable dimension.  acceptance_window joined as the fifth: its tally
+# re-derives verdicts stamped under a retired acceptance rule (design doc
+# c50453ef) on every drive, so a corrected measurement must land on a
+# same-candidate re-drive rather than being frozen by a reused ledger row.
+# This is an intentional contract change, not drift.
 _LEGACY_MUTABLE_KEYS = frozenset({
     "ci", "migration_identity", "migration_apply",
 })
 
-_EXPECTED_MUTABLE_KEYS = _LEGACY_MUTABLE_KEYS | {"env_preflight"}
+_EXPECTED_MUTABLE_KEYS = _LEGACY_MUTABLE_KEYS | {"env_preflight", "acceptance_window"}
 
 _LEGACY_PROMOTION_REQUIRED = (
     "ci", "audit", "test_erosion",
@@ -92,8 +96,11 @@ def test_ledger_dimension_keys_match_active_contract():
 def test_mutable_dimension_keys_match_legacy():
     # env_preflight joins the three legacy mutable gates — re-measured live each
     # drive so a repaired environment is honoured on a same-candidate re-drive.
+    # acceptance_window is mutable too — re-derived under the current acceptance
+    # rule so an evidence-rule improvement re-scores already-merged work.
     assert qd.MUTABLE_DIMENSION_KEYS == _EXPECTED_MUTABLE_KEYS
     assert "env_preflight" in qd.MUTABLE_DIMENSION_KEYS
+    assert "acceptance_window" in qd.MUTABLE_DIMENSION_KEYS
 
 
 def test_promotion_required_order_and_set_match_legacy():

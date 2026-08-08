@@ -870,6 +870,55 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                         if ci_task.project_id is not None
                         else None
                     )
+                    # Backend-side corroboration of the declared acceptance
+                    # test's path against the tree the PR just merged into.
+                    # The acceptance gate previously took the agent's
+                    # ``present`` word for existence; this stamps the backend's
+                    # own check so ``_acceptance_test_exists_at_merge`` fails
+                    # closed on a corroborated absence (see
+                    # ``acceptance_gate.corroborate_acceptance_test_at_merge``).
+                    # Best-effort: a failure here must never abort the landing.
+                    try:
+                        from app.acceptance_gate import (
+                            ACCEPTANCE_TEST_CORROBORATED_KEY,
+                            corroborate_acceptance_test_at_merge,
+                        )
+
+                        # Pin the tree read to the PR's own merge commit: the
+                        # branch-tip cache's short TTL can still serve the
+                        # PRE-merge tip moments after the merge, which would
+                        # stamp a durable false "test absent" for a test the PR
+                        # itself just added. The merge commit is immutable, so
+                        # this read has no staleness window at all.
+                        _ci_merge_sha = pr_data.get("merge_commit_sha")
+                        _corroborated = await corroborate_acceptance_test_at_merge(
+                            ci_task,
+                            session,
+                            project=_orch_ci_project_orm,
+                            branch=_ci_base,
+                            commit_sha=(
+                                _ci_merge_sha
+                                if isinstance(_ci_merge_sha, str) and _ci_merge_sha
+                                else None
+                            ),
+                        )
+                        if _corroborated is not None:
+                            # Top-level backend-stamped marker (same shape as
+                            # ``_pr_changed_files``), read by the synchronous
+                            # ``_acceptance_test_exists_at_merge`` predicate.
+                            ci_task.context = {
+                                **(ci_task.context or {}),
+                                ACCEPTANCE_TEST_CORROBORATED_KEY: (
+                                    _corroborated
+                                ),
+                            }
+                    except Exception:
+                        logger.exception(
+                            "[CI] PR #%s acceptance-test corroboration failed "
+                            "for task %s — landing proceeds without it",
+                            ci_pr_number,
+                            ci_task.id,
+                        )
                     _landed_on_integration = (
                         await _apply_ci_merged_landed_signal(
                             ci_task,
@@ -2249,23 +2298,69 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                     # green signal (acceptance_test_is_green returns False) and
                     # today's behavior is preserved. Never blocks; only records.
                     _accept_block = ci_resolution.acceptance_test_block(_verdict)
+                    # Persist the NORMALIZED block itself alongside the distilled
+                    # boolean. ``verify_tests_verdict`` above holds the classifier's
+                    # outcome STRING ("pass"/"fail"/"undetected"), so it can never
+                    # carry the block; without this key
+                    # ``acceptance_gate._merge_acceptance_test_block`` has no writer
+                    # and its present/ran/status/passed evidence path is dead code.
+                    if _accept_block is not None:
+                        ci_loop["verify_tests_acceptance_block"] = _accept_block
+                    # Corroborate that the block names the task's DECLARED test
+                    # before minting the targeted-green signal. A green run of a
+                    # DIFFERENT test must never be stored as proof of the declared
+                    # named_test — the acceptance gate fails closed on a mismatched
+                    # block, so the monitor must not persist a signal the gate would
+                    # reject. The raw block is still stored above for auditability.
+                    _block_matches_declared = False
+                    if _accept_block is not None:
+                        from app.acceptance_gate import (
+                            acceptance_test_block_matches_declared,
+                            read_acceptance_evidence,
+                        )
+
+                        _decl_evidence = read_acceptance_evidence(
+                            ci_task.first_payload
+                        )
+                        _decl_path = (
+                            (_decl_evidence.test_path or "").partition("::")[0].strip()
+                            if _decl_evidence is not None
+                            and _decl_evidence.kind == "named_test"
+                            else ""
+                        )
+                        _block_matches_declared = bool(
+                            _decl_path
+                            and acceptance_test_block_matches_declared(
+                                _accept_block, _decl_path
+                            )
+                        )
                     if ci_resolution.acceptance_test_is_green(_accept_block):
-                        ci_loop["acceptance_test_targeted_green"] = True
                         _accept_desc = str(
                             _accept_block.get("selector")
                             or _accept_block.get("descriptor")
                             or ""
                         ).strip()
-                        if _accept_desc:
-                            ci_loop["acceptance_test_targeted_descriptor"] = (
-                                _accept_desc
+                        if _block_matches_declared:
+                            ci_loop["acceptance_test_targeted_green"] = True
+                            if _accept_desc:
+                                ci_loop["acceptance_test_targeted_descriptor"] = (
+                                    _accept_desc
+                                )
+                            logger.info(
+                                f"[CI] PR #{ci_pr_number} no-CI merge gate: declared "
+                                f"acceptance test ran GREEN via targeted execution "
+                                f"({_accept_desc or 'unnamed'}) — stamping proven "
+                                f"signal for the named_test acceptance gate"
                             )
-                        logger.info(
-                            f"[CI] PR #{ci_pr_number} no-CI merge gate: declared "
-                            f"acceptance test ran GREEN via targeted execution "
-                            f"({_accept_desc or 'unnamed'}) — stamping proven "
-                            f"signal for the named_test acceptance gate"
-                        )
+                        else:
+                            logger.warning(
+                                f"[CI] PR #{ci_pr_number} no-CI merge gate: "
+                                f"acceptance test ran GREEN via targeted execution "
+                                f"({_accept_desc or 'unnamed'}) but it does NOT "
+                                f"match the task's declared named_test — NOT "
+                                f"stamping the proven signal (a green run of "
+                                f"another test cannot prove the declaration)"
+                            )
                     # Extract coverage data from the verify-tests verdict for the
                     # coverage_delta acceptance gate. The MERGE_TEST_RESULT artifact
                     # carries a ``coverage`` block with test-count fields

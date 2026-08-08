@@ -265,6 +265,44 @@ describe('repairStructuredOutput', () => {
     expect(res.retry?.exitCode).toBe(0);
   });
 
+  it('surfaces the validateParsedValue detail (not the static requiredKeys list) in the reopen preamble', async () => {
+    // requiredKeys only hard-gates extraction on 'summary' — 'verdict' is
+    // conditionally required (only when not_a_regression), so it deliberately
+    // is NOT in requiredKeys and is instead enforced by validateParsedValue.
+    // The preamble must tell the model about the ACTUAL missing field
+    // (verdict) rather than falling back to naming only the static
+    // requiredKeys ('summary'), which would mislead the retry.
+    const missingVerdict = JSON.stringify({ summary: 'present, but no verdict field' });
+    const repaired = JSON.stringify({ summary: 'present', verdict: 'real_regression' });
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 0, allOutput: repaired, lastResultText: repaired,
+      codexTurnCompleted: true, stderrTail: '',
+    });
+
+    const res = await repairStructuredOutput({
+      mode: 'object',
+      requiredKeys: ['summary'],
+      first: makeFirst({ exitCode: 0, lastResultText: missingVerdict }),
+      reopenPrompt: REOPEN_PROMPT,
+      ws: WS,
+      statusRef: STATUS_REF(),
+      validateParsedValue: (value) => {
+        const obj = value as Record<string, unknown>;
+        if (typeof obj.verdict === 'string') return { ok: true };
+        return {
+          ok: false,
+          reason: 'parsed_object_missing_key',
+          detail: 'missing required fields: verdict',
+        };
+      },
+    });
+
+    const sentPrompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(sentPrompt).toContain('missing required fields: verdict');
+    expect(sentPrompt).not.toContain('missing required keys: "summary"');
+    expect(res.value).toEqual({ summary: 'present', verdict: 'real_regression' });
+  });
+
   it('sets retryStatus on statusRef before the reopen run', async () => {
     vi.mocked(runClaudeCode).mockResolvedValueOnce({
       exitCode: 0, allOutput: VALID_OBJECT, lastResultText: VALID_OBJECT,
@@ -383,7 +421,7 @@ describe('repairStructuredOutput', () => {
     expect(res.retry).not.toBeNull();
   });
 
-  it('parsed_array_invalid_value: preamble says shape did not match (not missing required keys)', async () => {
+  it('parsed_array_invalid_value: preamble surfaces the validateParsedValue detail (not missing required keys)', async () => {
     vi.mocked(runClaudeCode).mockResolvedValueOnce({
       exitCode: 0, allOutput: VALID_OBJECT, lastResultText: VALID_OBJECT,
       codexTurnCompleted: true, stderrTail: '',
@@ -402,7 +440,9 @@ describe('repairStructuredOutput', () => {
     });
 
     const sentPrompt = vi.mocked(runClaudeCode).mock.calls[0][0];
-    expect(sentPrompt).toContain('shape did not match');
+    // The validator's specific detail is surfaced verbatim (more actionable
+    // than the generic fallback) since a detail was supplied.
+    expect(sentPrompt).toContain('unrecognized verdict strings: uncertain');
     expect(sentPrompt).not.toContain('missing required keys');
     expect(sentPrompt).toContain(REOPEN_PROMPT);
     expect(vi.mocked(recordFormatMiss).mock.calls[0][0]).toBe('parsed_array_invalid_value');

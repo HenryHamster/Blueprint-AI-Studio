@@ -11184,6 +11184,46 @@ class TestCrossBaseDependencyGate:
         assert eligible == "eligible"
 
     @pytest.mark.asyncio
+    async def test_same_base_refactor_dependency_waits_for_pr_merge(self, db_session):
+        """A plan-authored refactor/migrate/qa prerequisite must not release its
+        same-base dependent until its PR is merged, matching create-type
+        behavior — a COMPLETED-but-unmerged prerequisite must still hold."""
+        from app.orchestrator import _check_candidate_task_deps
+
+        project = make_project(name="SameBaseRefactor", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "refactor", "base_branch": "plan/refactor1"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.COMPLETED,
+        )
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "plan/refactor1"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add_all([dep, dependent])
+        await db_session.commit()
+
+        # Same-base refactor dep COMPLETED but PR not merged → still waits.
+        waiting, _ = await _check_candidate_task_deps(
+            dependent, [dep], [dep.id], db_session, self._verify_false
+        )
+        assert waiting == "waiting", (
+            "dependent must wait for a COMPLETED same-base refactor prerequisite's "
+            "PR to merge before dispatching"
+        )
+        # PR merged → eligible.
+        eligible, _ = await _check_candidate_task_deps(
+            dependent, [dep], [dep.id], db_session, self._verify_true
+        )
+        assert eligible == "eligible"
+
+    @pytest.mark.asyncio
     async def test_compute_experiment_same_base_eligible_after_pr_merged(
         self, db_session
     ):

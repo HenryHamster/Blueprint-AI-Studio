@@ -100,6 +100,7 @@ function buildStrategicFingerprintPrompt(
     systemMaturitySection: p.systemMaturitySection ? '<system-maturity>' : '',
     driftSection: p.driftSection ? '<drift>' : '',
     heldDirectionsSection: p.heldDirectionsSection ? '<held-directions>' : '',
+    saturationDispositionsSection: p.saturationDispositionsSection ? '<saturation-dispositions>' : '',
     recentWorkSection: '<recent-work>',
     feedbackSection: '<feedback>',
     questionSection: '<question>',
@@ -209,6 +210,16 @@ export interface ThinkerPromptParams {
    * constructions/tests that omit it still compile; '' renders nothing.
    */
   heldDirectionsSection?: string;
+  /**
+   * Forced-strategist-disposition block for saturated directions (backend-built
+   * `saturation_dispositions`). Each entry is a direction that keeps producing
+   * research findings but spawns no work. Rendered as REQUIRED — the strategist
+   * MUST answer each listed direction this cycle with a bounded disposition
+   * (commission work / narrow scope / retire) via the matching strategic op.
+   * The item persists on the backend until resolved. Optional so existing
+   * constructions/tests that omit it still compile; '' renders nothing.
+   */
+  saturationDispositionsSection?: string;
   recentWorkSection: string;
   feedbackSection: string;
   questionSection: string;
@@ -499,7 +510,7 @@ Only if something this cycle was hard in a way worth remembering. Fields: what_w
 ## 6. Problem model (update — non-destructive merge)
 Write your problem_model update as JSON to \`${PROBLEM_MODEL_PATH_TOKEN}\` ${READ_ONLY_BASH_WRITE_NOTE} (use a code block in your analysis for auditability AND write the file — the file is the authoritative handoff to the Executor). The backend MERGES the agent-owned collections (\`capabilities\`, \`gaps\`, \`friction\`, \`pending_user_confirmation\`) rather than replacing them: entries upsert by stable key (\`capabilities\` by name; the rest by id), **entries you omit are preserved**, and per-gap \`history\`/\`past_moves\` union. So you do NOT need to reconstruct every gap/capability from memory — emit the ones you're changing plus enough to stay coherent. If a section was trimmed or dropped from your payload (see "Context not shipped" above), write just the parts you're changing and trust the rest is retained, or \`./fetch problem-model\` first to read the full current state.
 
-Normally your **whole** problem_model is shipped inline this cycle — full gaps, capabilities, and friction — so you edit it directly. Only in the exceptional case where the full model cannot fit the byte budget does it arrive floored/skeletonized (recoverable siblings yield first, so this is rare). **If** that happened — look for the \`_agent_view_floor_applied\` marker, which means gap \`description\`/\`evidence\` were stripped and capabilities/friction were reduced to \`name\`+\`status\` — **echo that marker back verbatim** in your update file. The backend uses it to know which fields you never actually saw, so editing and resubmitting a skeleton entry (e.g. bumping a gap's \`priority\` or a capability's \`status\`) won't blank the durable \`description\`, \`notes\`, \`source\`, etc. you couldn't see. Without the marker echoed, a blank field is treated as a deliberate clear. When the marker is absent (the normal case), the model you see is complete — edit freely.
+Normally your **whole** problem_model is shipped inline this cycle — every gap, capability, and friction entry — so you edit it directly. To keep the section small, low-value provenance fields are compacted out of each entry (look for the \`_agent_view_compacted\` marker): capability and gap \`source\`/\`evidence_refs\`, and friction \`source\`/\`mitigations_tried\`. **Do NOT reconstruct these from memory** — the backend restores them from the durable model on write-back automatically, so editing an entry that arrived without them and resubmitting it cannot blank the durable values. Only fetch them when you actually need them: \`./fetch problem-model\` returns the full model, \`./fetch gap <gap_id>\` one gap. The marker is informational — do NOT echo it back. Only in the exceptional case where the full model cannot fit the byte budget does it arrive floored/skeletonized (recoverable siblings yield first, so this is rare). **If** that happened — look for the \`_agent_view_floor_applied\` marker, which means gap \`description\`/\`evidence\` were stripped and capabilities/friction were reduced to \`name\`+\`status\` — **echo that marker back verbatim** in your update file. The backend uses it to know which fields you never actually saw, so editing and resubmitting a skeleton entry (e.g. bumping a gap's \`priority\` or a capability's \`status\`) won't blank the durable \`description\`, \`notes\`, \`source\`, etc. you couldn't see. Without that marker echoed, a blank field is treated as a deliberate clear.
 
 To intentionally REMOVE an agent-owned entry (not just change its status), add a top-level \`_deletions\` field: \`{"capabilities": ["name"], "gaps": ["id"], "friction": ["id"]}\`. Removal is ONLY via \`_deletions\` — omitting an entry never deletes it. Closing a gap is a status change, not a deletion (set \`status: closed\` → it auto-archives). Operator-owned fields (\`intent.purpose\`, \`context\`, \`constraints\`) are protected separately — to change those, route through \`pending_user_confirmation\` (\`type: intent_change\`), don't overwrite them. The Executor reads this file verbatim; if it's missing the cycle fails loudly rather than fabricating.
 
@@ -663,7 +674,7 @@ ${p.visionJson ? `## Vision (legacy artifact — use problem_model instead; reta
 ${p.outcomeSection}${p.previousDecisionOutcomes}${p.pastRetirementCritiquesSection}${p.retiredDirectionsSummarySection}
 ${p.directionPortfolioSection}
 ${p.stagedDirectionsSection ? `\n${p.stagedDirectionsSection}\n` : ''}${p.userPausedSection}${p.rejectedProposalsSection}${p.operatorOverridesSection}
-${p.availableCapabilitiesSection ? `\n${p.availableCapabilitiesSection}` : ''}${p.modelHealthSection}${p.pruneCandidatesSection ? `\n${p.pruneCandidatesSection}\n` : ''}${p.systemMaturitySection}${p.driftSection}${p.heldDirectionsSection ? `\n${p.heldDirectionsSection}` : ''}${p.efficiencySnapshotSection}${p.ciComplianceSection ? `\n${p.ciComplianceSection}` : ''}${p.completionDebtSection ? `\n${p.completionDebtSection}` : ''}${p.pendingFollowupsSection ? `\n${p.pendingFollowupsSection}` : ''}${p.sweepComparisonSection ? `\n${p.sweepComparisonSection}` : ''}${p.localRunnerSection ? `\n${p.localRunnerSection}\n` : ''}${p.compactionHintsSection ? `\n${p.compactionHintsSection}\n` : ''}
+${p.availableCapabilitiesSection ? `\n${p.availableCapabilitiesSection}` : ''}${p.modelHealthSection}${p.pruneCandidatesSection ? `\n${p.pruneCandidatesSection}\n` : ''}${p.systemMaturitySection}${p.driftSection}${p.heldDirectionsSection ? `\n${p.heldDirectionsSection}` : ''}${p.saturationDispositionsSection ? `\n${p.saturationDispositionsSection}\n` : ''}${p.efficiencySnapshotSection}${p.ciComplianceSection ? `\n${p.ciComplianceSection}` : ''}${p.completionDebtSection ? `\n${p.completionDebtSection}` : ''}${p.pendingFollowupsSection ? `\n${p.pendingFollowupsSection}` : ''}${p.sweepComparisonSection ? `\n${p.sweepComparisonSection}` : ''}${p.localRunnerSection ? `\n${p.localRunnerSection}\n` : ''}${p.compactionHintsSection ? `\n${p.compactionHintsSection}\n` : ''}
 ${p.recentWorkSection}${p.versionPhaseSection}${p.memoCitationsSection}
 
 ${bootstrapOrRecoverSection}

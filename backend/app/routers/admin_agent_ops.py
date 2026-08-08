@@ -2220,6 +2220,14 @@ async def strategic_operation(
                     != _pre_constraints
                 ):
                     _reset_outcome_detection_state(d)
+                # Any successful strategist update to the direction answers a
+                # pending saturation-disposition item (the strategist acted:
+                # narrowed scope, changed priority/status, rewrote the contract).
+                # Drop the durable item so a future NEW saturation episode can
+                # re-flag cleanly instead of re-surfacing a stale decision.
+                from app.direction_saturation import clear_saturation_disposition
+
+                clear_saturation_disposition(d)
                 updated = True
                 break
         if not updated:
@@ -2373,6 +2381,13 @@ async def strategic_operation(
             return _blk
 
         matched_direction["status"] = "expired"
+        # A retire disposition answers any pending saturation-disposition item:
+        # the direction is being taken off the board, so there is nothing left to
+        # commission or narrow. Drop the durable item so it is not re-flagged on
+        # a stale read and a future NEW saturation episode can re-flag cleanly.
+        from app.direction_saturation import clear_saturation_disposition
+
+        clear_saturation_disposition(matched_direction)
         if terminal_reason:
             matched_direction["terminal_reason"] = str(terminal_reason).strip().lower()
         notes = matched_direction.get("notes", [])
@@ -4113,6 +4128,100 @@ async def strategic_operation(
         # Cap to prevent runaway prompts consuming token budget
         prompt = _cap_str(raw_prompt, 10_000, "prompt", warnings)
         title = _cap_str(raw_title, 200, "title", warnings)
+        # Optional intra-batch ordering: a list of same-project task UUIDs
+        # (siblings previously spawned by this strategic review) this task
+        # must run after. Expresses the build-on ordering the plan spawner
+        # authors between subtasks — each spawn_task call resolves the prior
+        # spawn's returned task_id into a durable depends_on edge, so a
+        # multi-task decision can sequence its work instead of only emitting
+        # independent parallel siblings.
+        # Optional sequenced-spawn declaration (campaign chains): when the
+        # strategist declares require_deps_landed_on, every depends_on edge is
+        # gated deterministically by sequenced_spawn.landing_gate instead of the
+        # base-branch heuristics, and release_base_branch repoints the task's
+        # base at dependency-release time. Mirrored verbatim into payloads[0];
+        # branch-name shape is enforced by the payload schema below.
+        declared_landing_gate: str | None = None
+        declared_release_base: str | None = None
+        for _seq_key in ("require_deps_landed_on", "release_base_branch"):
+            _seq_raw = data.get(_seq_key)
+            if _seq_raw is None:
+                continue
+            if not isinstance(_seq_raw, str) or not _seq_raw.strip():
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{_seq_key} must be a non-empty branch name",
+                )
+            if _seq_key == "require_deps_landed_on":
+                declared_landing_gate = _seq_raw.strip()
+            else:
+                declared_release_base = _seq_raw.strip()
+        raw_depends_on = data.get("depends_on")
+        depends_on_ids: list[str] = []
+        if raw_depends_on is not None:
+            if not isinstance(raw_depends_on, list) or not raw_depends_on:
+                raise HTTPException(
+                    status_code=400,
+                    detail="depends_on must be a non-empty list of task UUIDs",
+                )
+            # This spawn always cuts from the project integration branch (see
+            # spawn_payload below). Reject a dependency whose own base branch
+            # differs: the dispatch loop only waits on a dependency matching
+            # _same_base_branch (orchestrator_health.py), so a cross-base edge
+            # would be silently skipped and the dependent would dispatch against
+            # a base missing the dependency's landed code. Mirrors the
+            # operator-facing depends_on gate in admin_task_mutations.py.
+            from app.orchestrator_health import (
+                _same_base_branch_value as _same_base_value,
+            )
+
+            _new_task_base = _get_project_integration_branch(project)
+            for _dep in raw_depends_on:
+                _dep_text = str(_dep).strip()
+                try:
+                    _dep_uuid = uuid.UUID(_dep_text)
+                except (ValueError, AttributeError):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "depends_on entries must be task UUIDs; got "
+                            f"{_dep!r}"
+                        ),
+                    ) from None
+                _dep_task = await session.get(Task, _dep_uuid)
+                if _dep_task is None or _dep_task.project_id != project.id:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "depends_on references a task outside this "
+                            f"project: {_dep_text}"
+                        ),
+                    )
+                _dep_base = (_dep_task.first_payload or {}).get("base_branch")
+                # A declared landing gate replaces the base-branch heuristic for
+                # this task's edges: dispatch holds until the dep has LANDED on
+                # the named branch (sequenced_spawn.landing_gate), and a declared
+                # release_base_branch re-cuts the base at release — so a
+                # cross-base edge is neither silently skipped nor dispatched
+                # against a base missing the dep's code.
+                if declared_landing_gate is None and not _same_base_value(
+                    _new_task_base, _dep_base
+                ):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "Cross-base dependency rejected: this spawn's base "
+                            f"branch '{_new_task_base or '(default)'}' differs "
+                            f"from dependency {_dep_text}'s base "
+                            f"'{_dep_base or '(default)'}'. A dependency only "
+                            f"propagates its landed code when both share a base "
+                            f"branch; otherwise the dependent would dispatch "
+                            f"without the prerequisite's changes. Align the base "
+                            f"branches or re-point the dependency."
+                        ),
+                    )
+                if _dep_text not in depends_on_ids:
+                    depends_on_ids.append(_dep_text)
         direction_id = data.get("direction_id")
         direction_entry = next(
             (
@@ -4186,6 +4295,10 @@ async def strategic_operation(
         }
         if direction_id:
             spawn_payload["direction_id"] = direction_id
+        if declared_landing_gate:
+            spawn_payload["require_deps_landed_on"] = declared_landing_gate
+        if declared_release_base:
+            spawn_payload["release_base_branch"] = declared_release_base
 
         # Forward an acceptance_evidence declaration from the strategist into the
         # task payload so direction-free proving spawns can declare a named_test
@@ -4379,6 +4492,9 @@ async def strategic_operation(
                 "requires_approval": spawn_requires_approval,
                 "watch": data.get("watch", default_watch),
                 "watch_purpose": str(data.get("watch_purpose") or "")[:1000],
+                # Carried in the spec so idempotency hashing covers the
+                # declared edges; applied to the task below on creation.
+                "depends_on": depends_on_ids,
             }
         }
         try:
@@ -4419,6 +4535,32 @@ async def strategic_operation(
                 ),
                 status_code=202,
             )
+        # NOTE: the declared intra-batch ordering is applied inside
+        # ``_task_from_specification`` (app/strategic_spawn_requests.py) at Task
+        # construction, so the edge lands in the SAME transaction as the QUEUED
+        # row and every creation path — immediate dispatch here and the deferred
+        # drain — carries it. Do not re-patch it here: a create-then-patch would
+        # expose a window in which the orchestrator sees a dependency-free
+        # QUEUED successor and dispatches it ahead of its prerequisite.
+        # An accepted spawn targeting the direction is the strategist's
+        # ``commission_work`` disposition: concrete work now exists in the
+        # direction, so the pending saturation item is answered. Clear it under
+        # the directions lock (mirrors every other direction mutation in this
+        # handler) so the drop persists and cannot be lost to a concurrent
+        # directions write; a future NEW saturation episode can re-flag cleanly.
+        if direction_id:
+            from app.direction_saturation import clear_saturation_disposition
+
+            def _apply_spawn_clear(fresh: list) -> list | None:
+                _target = next(
+                    (d for d in fresh if d.get("id") == direction_id), None
+                )
+                if _target is not None:
+                    clear_saturation_disposition(_target)
+                return None
+
+            await _with_directions_locked(session, project.id, _apply_spawn_clear)
+            await session.commit()
         logger.info(
             f"[STRATEGIC API] Accepted {spawn_type} task {new_task.id} "
             f"(priority={spawn_priority}) from strategic review {task.id} "
@@ -4438,6 +4580,7 @@ async def strategic_operation(
                     if submission.linked_debt_id
                     else {}
                 ),
+                **({"depends_on": depends_on_ids} if depends_on_ids else {}),
             }
         )
 

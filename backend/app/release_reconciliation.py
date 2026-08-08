@@ -17,6 +17,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app import github, pause_clock, release_version
 from app.database import AsyncSessionLocal
+from app.github_checks import _details_have_genuine_failure
 from app.models import (
     DeploymentState,
     DeploymentStatus,
@@ -307,21 +308,71 @@ def _check_result_has_genuine_failure(check_result: dict | None) -> bool:
     Transient interruption conclusions: ``cancelled``, ``timed_out``.
 
     When per-check ``details`` are present and non-empty the verdict is derived
-    from individual check conclusions, so a transient-only outcome is correctly
-    excluded.  When details are absent or empty the aggregate ``conclusion``
+    from individual check conclusions via
+    :func:`app.github_checks._details_have_genuine_failure`, so a transient-only
+    outcome is correctly excluded — INCLUDING an aggregate ``needs`` gate whose
+    ``failure`` only launders a cancelled/timed_out matrix shard (the v28
+    attempt-6 promotion failure on PR #16885, where ``CI / Backend`` reported
+    ``failure`` with zero failing tests).
+
+    The ``genuine_failure`` signal computed at the ``get_check_runs`` boundary is
+    trusted when present and explicitly ``False`` (an aggregate-parent-aware
+    computation the details-only fallback mirrors); when the signal is absent
+    (hand-built fixtures / legacy callers) the details fallback applies the same
+    discount.  When details are absent or empty the aggregate ``conclusion``
     field is used as a fallback — preserving existing behaviour for callers that
     supply no per-check detail list.
     """
     if not isinstance(check_result, dict):
         return False
+    # The get_check_runs boundary computes the aggregate-parent-aware signal from
+    # the SAME details list below, so a False here is authoritative even when the
+    # aggregate conclusion is failure.
+    if check_result.get("genuine_failure") is False:
+        return False
     genuine = {"failure", "action_required"}
     details = check_result.get("details")
     if isinstance(details, list) and details:
-        return any(
-            isinstance(d, dict) and d.get("conclusion") in genuine for d in details
-        )
+        return _details_have_genuine_failure(details)
     # No per-check details — fall back to the aggregate conclusion.
     return check_result.get("conclusion") in genuine
+
+
+def _ci_result_has_failed_test(check_result: dict | None) -> bool:
+    """Return True when *check_result* contains a genuinely FAILED test that a
+    code-fix task could remediate — a leaf (non-aggregate-parent) check whose
+    conclusion is ``failure``.
+
+    This is the promotion-CI harvest's "is there anything to fix" signal.  It is
+    deliberately stricter than :func:`_check_result_has_genuine_failure`: an
+    ``action_required`` check is a human-action gate (review / approval) and a
+    ``cancelled`` / ``timed_out`` is infrastructure — neither is a failing test a
+    code change can fix (the auto-remediation handler likewise only treats
+    ``failure`` as a failed check).  When the promotion PR's red CI is made up
+    entirely of those (the infrastructure-cancelled-shard case), the harvest must
+    record the failure as infrastructure and NOT spawn a doomed code-fix task.
+
+    Mirror of :func:`_check_result_has_genuine_failure`: an aggregate ``needs``
+    gate whose ``failure`` merely launders a cancelled/timed_out matrix shard is
+    discounted (a parent name with ``X (``-prefixed children never counts), so a
+    laundered aggregate cannot fool the harvest into spawning a fix.
+    """
+    if not isinstance(check_result, dict):
+        return False
+    details = check_result.get("details")
+    if isinstance(details, list) and details:
+        names = [str(d.get("name") or "") for d in details if isinstance(d, dict)]
+        for d in details:
+            if not isinstance(d, dict) or d.get("conclusion") != "failure":
+                continue
+            name = str(d.get("name") or "")
+            if any(other != name and other.startswith(f"{name} (") for other in names):
+                # Aggregate parent — its `failure` launders its matrix children.
+                continue
+            return True
+        return False
+    # No per-check details — fall back to the aggregate conclusion.
+    return check_result.get("conclusion") == "failure"
 
 
 def _pr_number_from_url(pr_url: str | None) -> int | None:
@@ -848,7 +899,17 @@ async def _harvest_promotion_ci_failures(
                 _setup_flake = _ci_result.get("setup_phase_failure", False)
                 _failed_logs = _ci_result.get("failed_logs", "")
                 _content_flake = _is_ci_infra_flake_log(_failed_logs)
-                if (_setup_flake or _content_flake) and _flake_budget_exhausted:
+                # Zero genuinely failing tests — the promotion PR went red only on
+                # infrastructure-cancelled/timed_out shards (or a laundered
+                # aggregate gate).  A code change cannot remediate this, so the
+                # harvest must never spawn a fix task that has nothing to fix;
+                # record it as infrastructure and hand the decision to Strategic.
+                _no_failed_tests = not _ci_result_has_failed_test(_ci_result)
+                if (
+                    (_setup_flake or _content_flake)
+                    and _flake_budget_exhausted
+                    and not _no_failed_tests
+                ):
                     # Rerun budget for THIS head_sha is spent and the gate is
                     # still red, so the flake verdict is not actionable — either
                     # the infra problem is persistent or (more likely, given the
@@ -866,19 +927,33 @@ async def _harvest_promotion_ci_failures(
                         "setup_phase_failure" if _setup_flake else "infra_log_patterns",
                         ci_source_sha[:8],
                     )
-                elif _setup_flake or _content_flake:
-                    _flake_reason = (
-                        "setup_phase_failure" if _setup_flake else "infra_log_patterns"
-                    )
-                    logger.info(
-                        "[RELEASE_QUALIFIER] promotion-CI harvest: v%d CI failure "
-                        "is an infrastructure flake (%s) — requesting a Strategic "
-                        "delivery decision and skipping fix "
-                        "spawn (source %s)",
-                        version_number,
-                        _flake_reason,
-                        ci_source_sha[:8],
-                    )
+                elif _setup_flake or _content_flake or _no_failed_tests:
+                    if _no_failed_tests:
+                        _flake_reason = "zero_failing_tests"
+                        logger.info(
+                            "[RELEASE_QUALIFIER] promotion-CI harvest: v%d "
+                            "promotion CI red reports ZERO genuinely failing "
+                            "tests (infrastructure-cancelled/timed_out shards "
+                            "only) — recording as infrastructure and skipping "
+                            "fix spawn (source %s)",
+                            version_number,
+                            ci_source_sha[:8],
+                        )
+                    else:
+                        _flake_reason = (
+                            "setup_phase_failure"
+                            if _setup_flake
+                            else "infra_log_patterns"
+                        )
+                        logger.info(
+                            "[RELEASE_QUALIFIER] promotion-CI harvest: v%d CI "
+                            "failure is an infrastructure flake (%s) — "
+                            "requesting a Strategic delivery decision and "
+                            "skipping fix spawn (source %s)",
+                            version_number,
+                            _flake_reason,
+                            ci_source_sha[:8],
+                        )
                     # Drift-sentinel path only: the CI run being harvested lives
                     # on the LIVE integration branch (not a torn-down release
                     # branch), so re-running the failed jobs can clear a

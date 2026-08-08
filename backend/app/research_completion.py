@@ -13,9 +13,10 @@ import os
 import random
 import uuid
 from collections.abc import Mapping
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any, Dict, List
 
+from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
@@ -32,12 +33,18 @@ from app.findings_index import (  # noqa: F401 — re-exported for callers/tests
 )
 from app.findings_shelving import _shelve_findings_for_next_cycle  # noqa: F401
 from app.models import (
+    TASK_ORIGINATION_PLAN,
+    TASK_ORIGINATION_RESEARCH,
+    TASK_ORIGINATION_STRATEGIST,
+    TASK_ORIGINATION_SYSTEM,
+    TASK_ORIGINATION_USER,
     Artifact,
     ArtifactType,
     Project,
     Task,
     TaskStatus,
 )
+from app.landed_signal import landed_signal_predicate
 from app.cochange_decomposition import (
     auto_decompose_findings_by_cochange,
     cluster_files_by_cochange as _cluster_files_by_cochange,  # noqa: F401 — re-exported for tests
@@ -312,6 +319,121 @@ _ADVERSARIAL_TARGETED_RETRY_LIMIT = 1
 _ADVERSARIAL_INFRA_FAILURE_MODE_KEY = "adversarial_spawn_gate_infra_failure_mode"
 _ADVERSARIAL_INFRA_FAILURE_MODE_ENFORCE = "enforce"
 _ADVERSARIAL_INFRA_UNVERIFIED_VERDICT = "unverified"
+
+
+# Origination classes that name a real commissioning decision — someone (a
+# person, the strategist, or the autonomous research loop) chose to create this
+# work. SYSTEM and REVIEW/HOTFIX are downstream consequences of a decision that
+# was already made, so they are excluded from the "commissioned" denominator.
+# SYSTEM in particular is a RESIDUAL bucket, not a described class (see the
+# TASK_ORIGINATION_* block in app.models), and putting a residual in a
+# denominator understates every real share in it by an unknown amount.
+_COMMISSIONED_ORIGINATIONS = (
+    TASK_ORIGINATION_RESEARCH,
+    TASK_ORIGINATION_STRATEGIST,
+    TASK_ORIGINATION_PLAN,
+    TASK_ORIGINATION_USER,
+)
+
+
+async def merged_work_origination_split(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    since: datetime | None = None,
+) -> dict[str, int]:
+    """Count a project's merged completions grouped by durable ``Task.origination``.
+
+    Answers 'what share of merged work did research originate' without walking
+    parent lineage — the durable record does that walking at spawn time. A merged
+    completion is ``status == COMPLETED`` plus the landed signal; the landed test
+    is :func:`app.landed_signal.landed_signal_predicate`, the SQL mirror of
+    ``has_landed_signal``, so the filter runs server-side and no Task row (with
+    its large ``payloads``/``context`` JSON) is loaded into Python. The count is
+    a ``GROUP BY origination`` aggregate, so its cost does not grow with the
+    number of merged tasks.
+
+    ``since`` bounds the LANDING time, not the creation time:
+    ``COALESCE(completed_at, updated_at) >= since``. This is the axis the
+    question is asked on ('of tasks that MERGED over a recent window') and it is
+    the only unbiased one — research work is created as a research parent, then
+    a plan, then children, and lands days later, whereas a strategist commission
+    is created and lands close together, so a ``created_at`` window would
+    systematically understate the research share. ``completed_at`` is stamped on
+    every terminal transition by the ``Task.status`` ORM event and backfilled at
+    insert for already-terminal rows; ``updated_at`` covers any row that predates
+    that stamping.
+
+    Rows whose ``origination`` was never stamped read the column default SYSTEM.
+    SYSTEM is a RESIDUAL — 'everything not classified as USER, STRATEGIST,
+    RESEARCH, PLAN, REVIEW or HOTFIX' — so prefer the commissioned-work
+    denominator computed by :func:`merged_work_origination_reading` over
+    ``sum(split.values())``.
+
+    Returns a mapping ``{origination class: merged-task count}`` keyed by the
+    ``TASK_ORIGINATION_*`` constants from ``app.models``. Classes with no merged
+    work in the window are absent from the mapping.
+    """
+    landed_at = func.coalesce(Task.completed_at, Task.updated_at)
+    stmt = (
+        select(Task.origination, func.count())
+        .where(
+            Task.project_id == project_id,
+            Task.status == TaskStatus.COMPLETED,
+            landed_signal_predicate(session),
+        )
+        .group_by(Task.origination)
+    )
+    if since is not None:
+        stmt = stmt.where(landed_at >= since)
+    split: dict[str, int] = {}
+    for origination, count in (await session.execute(stmt)).all():
+        origin = origination or TASK_ORIGINATION_SYSTEM
+        split[origin] = split.get(origin, 0) + int(count)
+    return split
+
+
+def merged_work_origination_reading(split: dict[str, int]) -> dict[str, Any]:
+    """Turn a raw origination split into the reading operators actually read.
+
+    The headline the work-supply direction asks for is 'of merged work, what
+    share did the autonomous research loop originate versus what the strategist
+    commissioned directly'. That is a share of COMMISSIONED work — the classes
+    in :data:`_COMMISSIONED_ORIGINATIONS` — because the SYSTEM residual and the
+    REVIEW/HOTFIX consequence buckets name no commissioning decision and would
+    silently inflate the denominator.
+
+    ``*_share_of_merged`` is also returned so the residual stays visible: if the
+    two denominators disagree sharply, most merged work is unattributed and the
+    commissioned share is the number to quote, with ``merged_total`` alongside it.
+    Shares are ``None`` (never 0.0) when the denominator is empty, so 'no data'
+    is distinguishable from 'a real zero'.
+    """
+    merged_total = sum(split.values())
+    commissioned_total = sum(split.get(k, 0) for k in _COMMISSIONED_ORIGINATIONS)
+    research = split.get(TASK_ORIGINATION_RESEARCH, 0)
+    strategist = split.get(TASK_ORIGINATION_STRATEGIST, 0)
+
+    def _share(numerator: int, denominator: int) -> float | None:
+        return round(numerator / denominator, 4) if denominator > 0 else None
+
+    return {
+        "by_origination": dict(split),
+        "merged_total": merged_total,
+        "commissioned_total": commissioned_total,
+        "commissioned_originations": list(_COMMISSIONED_ORIGINATIONS),
+        "research_merged": research,
+        "strategist_merged": strategist,
+        # Headline: research vs strategist among work someone chose to commission.
+        "research_share_of_commissioned": _share(research, commissioned_total),
+        "strategist_share_of_commissioned": _share(strategist, commissioned_total),
+        # Same numerators over ALL merged work, including the SYSTEM residual —
+        # kept so the size of the unattributed bucket is never hidden.
+        "research_share_of_merged": _share(research, merged_total),
+        "strategist_share_of_merged": _share(strategist, merged_total),
+        "unattributed_merged": merged_total - commissioned_total,
+    }
+
 
 def _trim_finding_for_memo(finding: Dict[str, Any]) -> Dict[str, Any]:
     """Trim a dropped finding to a bounded dict for embedding in a MemoPayload.
@@ -1022,6 +1144,20 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
                         "total_cycles": total_cycles,
                     }
                 )
+        # A zero-findings direction that is STILL active after the terminal
+        # resolution paths has no automatic way out — the same silent-back-off
+        # case as the findings path. Escalate it into a durable strategist
+        # disposition item so the strategist is forced to answer instead of the
+        # direction quietly idling on its longer saturation refractory.
+        if target.get("possibly_saturated") and target.get("status") == "active":
+            from app.direction_saturation import flag_saturation_disposition
+
+            flag_saturation_disposition(
+                target,
+                now_iso=now_iso,
+                findings_produced=0,
+                tasks_created=0,
+            )
 
     await with_directions_locked(
         session, task.project_id, _apply_no_findings_refractory
@@ -3986,6 +4122,22 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         except Exception:
             logger.debug("[RESEARCH] directions_repo import failed; criterion cache empty")
 
+    # Empty/near-empty repo provenance captured at spawn time. A research child
+    # spawned while the project's durable build_config reported the repo empty
+    # must carry that greenfield origin on its own row: the project-level signal
+    # is mutable (re-detection flips repo_is_empty once the first scaffolding
+    # lands), so the child cannot rely on reading it later at claim time. Stamped
+    # onto every spawned child's context below so the agent's greenfield guidance
+    # survives the parent->child handoff.
+    _empty_repo_provenance: Dict[str, Any] = {}
+    if project_obj is not None:
+        _proj_build_cfg = project_obj.build_config or {}
+        if _proj_build_cfg.get("repo_is_empty") is True:
+            _empty_repo_provenance = {
+                "repo_is_empty": True,
+                "source_file_count": _proj_build_cfg.get("source_file_count", 0) or 0,
+            }
+
     for orig_i, finding, fhash in deduplicated:
         scope = finding.get("scope", DEFAULT_TASK_SCOPE)
         risk = finding.get("risk", "low")
@@ -5256,6 +5408,12 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 "claims": (finding.get("claims") or [])[:8],
                 "finding_hash": fhash,
                 "finding_lineage": sorted(_finding_lineage),
+                # Durable greenfield provenance (stamped above from the project's
+                # build_config when the repo was empty at spawn time). Consumed by
+                # the agent-claim path so a child spawned on an empty repo keeps
+                # its greenfield guidance even if the project build_config is
+                # later re-detected as non-empty.
+                **_empty_repo_provenance,
                 **(
                     {"acceptance_evidence": _acceptance_evidence}
                     if _acceptance_evidence
@@ -5436,6 +5594,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
             status=TaskStatus.QUEUED,
             created_by="ORCHESTRATOR",
+            origination=TASK_ORIGINATION_RESEARCH,
             requires_approval=needs_approval,
             depends_on=[],
             priority=finding_priority,
@@ -5659,6 +5818,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             },
             status=TaskStatus.QUEUED,
             created_by="ORCHESTRATOR",
+            origination=TASK_ORIGINATION_RESEARCH,
             depends_on=[],
             priority=TASK_PRIORITY_MAP.get("low", 0),
         )
@@ -5754,6 +5914,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             },
             status=TaskStatus.QUEUED,
             created_by="ORCHESTRATOR",
+            origination=TASK_ORIGINATION_RESEARCH,
             depends_on=[],
             priority=TASK_PRIORITY_MAP.get("medium", 50),
         )
@@ -6187,6 +6348,12 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         base_branch to match so the pair is same-base from birth and avoids the
         cross-base landed-signal wait path entirely."""
         if not dependent.payloads:
+            return
+        if (dependent.first_payload or {}).get("release_base_branch"):
+            # A declared release-time base pin outranks creation-time
+            # inheritance — the dispatch chokepoint repoints base_branch to the
+            # declared branch when the dependency gate opens, so inheriting the
+            # foundation's base here would only be silently undone.
             return
         from app.orchestrator_health import (
             _same_base_branch,

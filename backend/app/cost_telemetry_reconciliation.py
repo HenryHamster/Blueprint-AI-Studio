@@ -35,6 +35,7 @@ from typing import Any, Dict, List
 
 from app.llm_cost_attribution import (
     LLM_TOKEN_PRICING,
+    _is_provider_probe,
     _price_llm_attempt,
     _task_llm_attempts,
     compute_llm_cost_breakdown,
@@ -405,9 +406,17 @@ def reconcile_task_llm_cost(task: Task) -> ReconciliationResult:
     return reconcile_llm_cost([task])
 
 
+def _coerce_reconcile_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def reconcile_provider_reported_usage(tasks: List[Task]) -> ReconciliationResult:
     """Cross-check the agent's ``api_call_summary`` token counters against the
-    provider-reported usage values from the Anthropic Messages API.
+    provider-reported usage values from the provider API (Anthropic Messages API,
+    OpenAI/Codex, DeepSeek).
 
     This is a **genuinely independent** comparison: the agent accumulates
     ``provider_reported_usage`` through a separate code path from
@@ -415,25 +424,31 @@ def reconcile_provider_reported_usage(tasks: List[Task]) -> ReconciliationResult
     captured before normalization. Divergence indicates an accumulation bug,
     double-counting, or dropped-call accounting in the agent.
 
-    Tolerance: relative delta <= 0.1% on both the inclusive input token total
-    (``provider_reported_input_tokens + cache_creation + cache_read`` vs
-    ``api_call_summary.total_input_tokens``) and output token total
-    (``provider_reported_output_tokens`` vs
-    ``api_call_summary.total_output_tokens``).
+    Accumulation across attempts: retried tasks bank each closed attempt's
+    provider-reported usage into ``attempt_history`` (key ``provider_reported_usage``)
+    alongside the agent-side ``llm_*`` totals, and the live column holds the
+    current attempt. Both sides are summed over every attempt that carried a
+    probe, so a task's totals accumulate across retries instead of overwriting.
+    Attempts WITHOUT a probe (legacy banked rows, or the explicit
+    ``{"reported": false}`` not-reported marker) are excluded from BOTH the
+    provider and agent sides, so they cannot manufacture a false divergence.
 
-    What this proves: that the agent counts Anthropic provider tokens
-    correctly for its own calls. What it does NOT prove: pricing table
-    accuracy, non-Anthropic provider accuracy, or fleet-level billing
-    correctness.
+    Tolerance: relative delta <= 0.1% on both the inclusive input token total
+    (``provider_reported_input_tokens + cache_creation + cache_read`` vs the
+    agent's inclusive input total) and output token total.
+
+    What this proves: that the agent counts provider tokens correctly for its
+    own calls. What it does NOT prove: pricing table accuracy, provider billing
+    accuracy, or fleet-level billing correctness.
 
     Args:
-        tasks: List of Task records to cross-check. Tasks without
-            ``provider_reported_usage`` or with ``provider_reported_usage``
-            all-zero are skipped (not a failure).
+        tasks: List of Task records to cross-check. Tasks without any
+            provider-reported probe (NULL, all-empty, or the not-reported marker)
+            are skipped (not a failure).
 
     Returns:
         A ``ReconciliationResult`` with ``source="provider_reported"``,
-        aggregated across all tasks that had both provider-reported and
+        aggregated across all tasks/attempts that had both provider-reported and
         agent-accumulated token data. When NO task carried a usable probe
         (``provider_reported_task_count == 0``), the tolerance verdict is
         unproven and therefore reports ``provider_reported_within_tolerance
@@ -453,34 +468,65 @@ def reconcile_provider_reported_usage(tasks: List[Task]) -> ReconciliationResult
     per_task: List[Dict[str, Any]] = []
 
     for task in tasks:
-        provider_usage = (
-            task.provider_reported_usage
-            if hasattr(task, "provider_reported_usage")
-            else None
-        ) or {}
-        api_summary = (task.api_call_summary or {})
+        p_input = 0
+        p_output = 0
+        p_cache_creation = 0
+        p_cache_read = 0
+        a_input = 0
+        a_output = 0
+        a_cache_creation = 0
+        a_cache_read = 0
+        task_checked = False
 
-        p_input = int(provider_usage.get("input_tokens", 0) or 0)
-        p_output = int(provider_usage.get("output_tokens", 0) or 0)
-        p_cache_creation = int(provider_usage.get("cache_creation_input_tokens", 0) or 0)
-        p_cache_read = int(provider_usage.get("cache_read_input_tokens", 0) or 0)
+        # Banked attempts (attempt_history snapshots) that carried a probe.
+        for attempt in getattr(task, "attempt_history", None) or []:
+            if not isinstance(attempt, dict):
+                continue
+            attempt_usage = attempt.get("provider_reported_usage")
+            if not _is_provider_probe(attempt_usage):
+                continue
+            p_input += _coerce_reconcile_int(attempt_usage.get("input_tokens"))
+            p_output += _coerce_reconcile_int(attempt_usage.get("output_tokens"))
+            p_cache_creation += _coerce_reconcile_int(
+                attempt_usage.get("cache_creation_input_tokens")
+            )
+            p_cache_read += _coerce_reconcile_int(
+                attempt_usage.get("cache_read_input_tokens")
+            )
+            a_input += _coerce_reconcile_int(attempt.get("llm_input_tokens"))
+            a_output += _coerce_reconcile_int(attempt.get("llm_output_tokens"))
+            a_cache_creation += _coerce_reconcile_int(
+                attempt.get("llm_cache_creation_input_tokens")
+            )
+            a_cache_read += _coerce_reconcile_int(
+                attempt.get("llm_cache_read_input_tokens")
+            )
+            task_checked = True
 
-        a_input = int(api_summary.get("total_input_tokens", 0) or 0)
-        a_output = int(api_summary.get("total_output_tokens", 0) or 0)
-        a_cache_creation = int(
-            api_summary.get("total_cache_creation_input_tokens", 0) or 0
-        )
-        a_cache_read = int(
-            api_summary.get("total_cache_read_input_tokens", 0) or 0
-        )
+        # Current attempt (live column + api_call_summary).
+        current_usage = getattr(task, "provider_reported_usage", None)
+        if _is_provider_probe(current_usage):
+            api_summary = task.api_call_summary or {}
+            p_input += _coerce_reconcile_int(current_usage.get("input_tokens"))
+            p_output += _coerce_reconcile_int(current_usage.get("output_tokens"))
+            p_cache_creation += _coerce_reconcile_int(
+                current_usage.get("cache_creation_input_tokens")
+            )
+            p_cache_read += _coerce_reconcile_int(
+                current_usage.get("cache_read_input_tokens")
+            )
+            a_input += _coerce_reconcile_int(api_summary.get("total_input_tokens"))
+            a_output += _coerce_reconcile_int(api_summary.get("total_output_tokens"))
+            a_cache_creation += _coerce_reconcile_int(
+                api_summary.get("total_cache_creation_input_tokens")
+            )
+            a_cache_read += _coerce_reconcile_int(
+                api_summary.get("total_cache_read_input_tokens")
+            )
+            task_checked = True
 
-        # Skip tasks with no provider-reported data (NULL or all-zero).
-        if (
-            p_input <= 0
-            and p_output <= 0
-            and p_cache_creation <= 0
-            and p_cache_read <= 0
-        ):
+        # Skip tasks with no provider-reported probe at all.
+        if not task_checked:
             continue
 
         total_provider_input += p_input

@@ -1984,6 +1984,10 @@ async def update_agent_status(
                         # never silently misclassified by the acceptance classifier
                         # (see acceptance_gate.stamp_changed_files_signal).
                         ctx.update(stamp_changed_files_signal(payload.changed_files))
+                        # Fresh provenance re-admits the task to the acceptance
+                        # backfill sweep (no verdict re-record on this path).
+                        ctx.pop("_backfill_checked_at", None)
+                        ctx.pop("_backfill_missing_diff_terminal_at", None)
                         related = (
                             ctx.get("related_files")
                             or task.first_payload.get("related_files")
@@ -2050,6 +2054,10 @@ async def update_agent_status(
                     # the non-lossy full-list summary so a >50-file PR is never
                     # misclassified (see acceptance_gate.stamp_changed_files_signal).
                     ctx.update(stamp_changed_files_signal(payload.changed_files))
+                    # Fresh provenance re-admits the task to the acceptance
+                    # backfill sweep (no verdict re-record on this path).
+                    ctx.pop("_backfill_checked_at", None)
+                    ctx.pop("_backfill_missing_diff_terminal_at", None)
                     related = (
                         ctx.get("related_files")
                         or task.first_payload.get("related_files")

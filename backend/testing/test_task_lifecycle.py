@@ -45,6 +45,7 @@ from app.models import (
     TaskWakeRegistration,
     WakeAction,
     WakeDeliveryState,
+    MigrationReservationStatus,
 )
 from app.schemas import AgentStatusPayload
 from app.task_lifecycle import (
@@ -63,6 +64,7 @@ from app.task_lifecycle import (
 )
 from app.reaper_sweeps import sweep_deliver_task_wakes
 from app.time_utils import _utcnow
+from testing._post_commit_test_helpers import _post_commit_sources
 from app.retry_prompt import (
     _extract_failing_tests,
     _extract_error_files,
@@ -3713,7 +3715,7 @@ async def test_childless_recovery_current_handler_failure_propagates(tl_db, mock
 
 
 def test_strategic_completion_reserves_message_block_before_authority_locks():
-    source = inspect.getsource(_process_post_commit)
+    source = _post_commit_sources()
     reserve_at = source.index("await reserve_project_message_sequences(")
     reservation_commit_at = source.index("await session.commit()", reserve_at)
     authority_lock_at = source.index("async with lock_project_then_task(")
@@ -4343,6 +4345,7 @@ async def _run_request_changes_branch(
     ci_check_runs,
     original_context=None,
     review_history=None,
+    pr_files=None,
 ):
     """Drive _process_post_commit through the review-verdict handling.
 
@@ -4401,12 +4404,15 @@ async def _run_request_changes_branch(
         "app.github.submit_pr_review", new_callable=AsyncMock, return_value={"id": 1}
     )
     mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
-    # Empty-PR check returns a non-empty file list so the empty-PR short-circuit
-    # is NOT taken in the still-blocks scenarios.
+    # Empty-PR check. Default: a non-empty file list so the empty-PR
+    # short-circuit is NOT taken in the still-blocks scenarios. Callers
+    # exercising the empty-PR cleanup path pass pr_files=[].
     mocker.patch(
         "app.github.get_pr_files",
         new_callable=AsyncMock,
-        return_value=[{"filename": "app/x.py"}],
+        return_value=(
+            [{"filename": "app/x.py"}] if pr_files is None else pr_files
+        ),
     )
     # get_check_runs_cached is called twice in the branch with different args:
     #   1) the downgrade gate (treat_missing_as_success=False)
@@ -4858,6 +4864,125 @@ async def test_request_changes_no_blocking_issue_ci_pending_still_blocks(tl_db, 
         "No-blocking-issue + non-green CI must keep REQUEST_CHANGES blocking"
     )
     merge_mock.assert_not_awaited()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# REQUEST_CHANGES empty-PR short-circuit (X2 of the fdd07b88 plan) — extracted
+# into app/review_request_changes.run_request_changes
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_request_changes_empty_pr_closes_and_marks_parent_non_terminal(
+    tl_db, mocker
+):
+    """Empty-PR short-circuit: REQUEST_CHANGES on a PR with no file changes
+    closes the PR instead of spawning a futile fix, and classifies the rollup
+    parent's landing so intermediate staged targets keep waiting downstream.
+
+    With ``classify_rollup_merge_outcome`` reporting a NON-terminal landing
+    (branch equivalent to ``main`` but not an integration landing), the
+    original task stays EVALUATING with ``pr_closed_empty`` set and the
+    broadcast carries that status. No fix is spawned.
+    """
+    close_mock = mocker.patch(
+        "app.github.close_pull_request", new_callable=AsyncMock
+    )
+    classify_mock = mocker.patch(
+        "app.review_request_changes.classify_rollup_merge_outcome",
+        new_callable=AsyncMock,
+        return_value=(False, False, "main"),
+    )
+    captured, merge_mock, review_task = await _run_request_changes_branch(
+        tl_db,
+        mocker,
+        verdict_json=_CONCRETE_DEFECT_VERDICT,
+        ci_check_runs={
+            "status": "completed",
+            "conclusion": "success",
+            "failed_logs": "",
+            "details": [],
+        },
+        pr_files=[],
+    )
+    assert captured == [], "Empty PR must NOT spawn a futile fix"
+    merge_mock.assert_not_awaited()
+    close_mock.assert_awaited_once()
+    classify_mock.assert_awaited_once()
+    assert review_task.status == TaskStatus.COMPLETED
+    assert "closed as empty" in review_task.latest_status_message
+
+    session, _factory = tl_db
+    original_id = uuid.UUID(review_task.first_payload["original_task_id"])
+    original = await session.get(Task, original_id)
+    await session.refresh(original)
+    assert (original.context or {}).get("pr_closed_empty") is True
+    assert original.status == TaskStatus.EVALUATING
+
+    import app.task_lifecycle as _tl_mod
+
+    broadcast_mock = _tl_mod.broadcast_to_project
+    broadcast_mock.assert_awaited()
+    _call = broadcast_mock.await_args
+    assert _call.args[1] == "task_updated"
+    assert _call.args[2]["task_id"] == str(original.id)
+    assert _call.args[2]["status"] == TaskStatus.EVALUATING
+
+
+@pytest.mark.asyncio
+async def test_request_changes_empty_pr_terminal_merge_unblocks_dependents(
+    tl_db, mocker
+):
+    """Terminal variant of the empty-PR cleanup: when the closed PR's branch is
+    an integration landing, the original task completes, its direction merge
+    counts heal, and its dependents are unblocked
+    (``event_driven_unblock_dependents``).
+    """
+    close_mock = mocker.patch(
+        "app.github.close_pull_request", new_callable=AsyncMock
+    )
+    classify_mock = mocker.patch(
+        "app.review_request_changes.classify_rollup_merge_outcome",
+        new_callable=AsyncMock,
+        return_value=(True, True, "main"),
+    )
+    landed_mock = mocker.patch(
+        "app.review_request_changes.apply_merged_landed_signal"
+    )
+    refresh_mock = mocker.patch(
+        "app.direction_outcomes.refresh_direction_outcomes_after_merge",
+        new_callable=AsyncMock,
+    )
+    unblock_mock = mocker.patch(
+        "app.reaper_sweeps.event_driven_unblock_dependents",
+        new_callable=AsyncMock,
+    )
+    captured, merge_mock, review_task = await _run_request_changes_branch(
+        tl_db,
+        mocker,
+        verdict_json=_CONCRETE_DEFECT_VERDICT,
+        ci_check_runs={
+            "status": "completed",
+            "conclusion": "success",
+            "failed_logs": "",
+            "details": [],
+        },
+        pr_files=[],
+    )
+    assert captured == [], "Empty PR must NOT spawn a futile fix"
+    merge_mock.assert_not_awaited()
+    close_mock.assert_awaited_once()
+    classify_mock.assert_awaited_once()
+    landed_mock.assert_called_once()
+    refresh_mock.assert_awaited_once()
+    unblock_mock.assert_awaited_once()
+
+    session, _factory = tl_db
+    original_id = uuid.UUID(review_task.first_payload["original_task_id"])
+    original = await session.get(Task, original_id)
+    await session.refresh(original)
+    assert (original.context or {}).get("pr_closed_empty") is True
+    assert original.status == TaskStatus.COMPLETED
 
 
 @pytest.mark.asyncio
@@ -5562,7 +5687,7 @@ async def test_process_post_commit_review_approve_merge_proceeds_when_guard_ok(
 
 def test_rollup_handoff_log_uses_precommit_parent_id_snapshot():
     """The post-commit log must not dereference an expired rollup parent."""
-    source = inspect.getsource(_process_post_commit)
+    source = _post_commit_sources()
     assert "(parent {_orig_id_str})" in source
     assert "(parent {_orig.id})" not in source
 
@@ -7141,6 +7266,187 @@ async def test_fix_completion_spawn_failure_creates_alert(tl_db, mocker):
     )
 
 
+# ── Fix-task base_branch fallback chain + original_task_id recovery ──────────
+
+
+async def _make_fix_task_with_payload(
+    session,
+    project,
+    *,
+    base_branch: str | None = None,
+    original_task_id: str | None = None,
+    review_loop: dict | None = None,
+) -> Task:
+    """Create a COMPLETED fix task with a custom first_payload (optionally
+    carrying ``base_branch`` / ``original_task_id``) and review_loop context."""
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="fix",
+        status=TaskStatus.COMPLETED,
+        context={"review_loop": review_loop or {}},
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+    payload: dict = {"type": "fix", "prompt": "do fix"}
+    if base_branch is not None:
+        payload["base_branch"] = base_branch
+    if original_task_id is not None:
+        payload["original_task_id"] = original_task_id
+    task.payloads = [payload]
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    return task
+
+
+def _patch_fix_completion_github(mocker, spawned_review):
+    """Patch the GitHub/security/spawn surface used by the fix-completion branch."""
+    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "merged": False,
+            "state": "open",
+            "base": {"sha": "live-base"},
+            "head": {"sha": "live-head"},
+        },
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={
+            "blocked": False,
+            "findings": [],
+            "summary": "clean",
+            "report": "",
+        },
+    )
+    spawn_mock = mocker.patch(
+        "app.task_lifecycle._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(spawned_review, True),
+    )
+    return spawn_mock
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "rl_base_branch,payload_base_branch,project_integration,expected_base_branch",
+    [
+        # Branch 1: review_loop.base_branch wins over everything.
+        ("rl-main", "payload-main", None, "rl-main"),
+        # Branch 2: task_payload.base_branch fallback when review_loop lacks it.
+        (None, "payload-main", None, "payload-main"),
+        # Branch 3 (terminal/default arm): falls through to
+        # _shared_state.get_project_integration_branch(_fix_project).
+        (None, None, "project-integration", "project-integration"),
+    ],
+    ids=["review_loop", "task_payload", "project_integration_default"],
+)
+async def test_fix_completion_base_branch_fallback_chain(
+    tl_db,
+    mocker,
+    rl_base_branch,
+    payload_base_branch,
+    project_integration,
+    expected_base_branch,
+):
+    """Every arm of the base_branch fallback chain is exercised, including the
+    terminal/default arm that resolves from the project's integration branch."""
+    spawned_review = mocker.Mock(id=uuid.uuid4())
+    spawn_mock = _patch_fix_completion_github(mocker, spawned_review)
+
+    session, factory = tl_db
+    project = await _make_project(session)
+    if project_integration is not None:
+        project.integration_branch = project_integration
+        session.add(project)
+        await session.commit()
+
+    review_loop = {"pr_number": 50, "branch": "blueprint/test-branch"}
+    if rl_base_branch is not None:
+        review_loop["base_branch"] = rl_base_branch
+    task = await _make_fix_task_with_payload(
+        session,
+        project,
+        base_branch=payload_base_branch,
+        review_loop=review_loop,
+    )
+
+    payload = AgentStatusPayload(task_id=task.id, status=TaskStatus.COMPLETED)
+    await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    spawn_mock.assert_awaited_once()
+    # _spawn_pipeline_task(task, "review", session, pr_number, branch, base_branch, ...)
+    spawn_args = spawn_mock.await_args.args
+    assert spawn_args[1] == "review"
+    assert spawn_args[5] == expected_base_branch, (
+        f"expected base_branch {expected_base_branch!r}, got {spawn_args[5]!r}"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "rl_original_task_id,payload_original_task_id,expected_original_task_id",
+    [
+        # Found: review_loop.original_task_id is passed through to the spawn.
+        ("ci-task-rl", None, "ci-task-rl"),
+        # Found: task_payload.original_task_id fallback when review_loop lacks it.
+        (None, "ci-task-payload", "ci-task-payload"),
+        # Not found: neither review_loop nor task_payload carries it — the
+        # spawn receives an empty string (no stale value leaking through).
+        (None, None, ""),
+    ],
+    ids=["review_loop", "task_payload", "not_found"],
+)
+async def test_fix_completion_original_task_id_recovery(
+    tl_db,
+    mocker,
+    rl_original_task_id,
+    payload_original_task_id,
+    expected_original_task_id,
+):
+    """The original CI task id is recovered from review_loop / first_payload and
+    forwarded to the re-review spawn; when absent it resolves to an empty string."""
+    spawned_review = mocker.Mock(id=uuid.uuid4())
+    spawn_mock = _patch_fix_completion_github(mocker, spawned_review)
+
+    session, factory = tl_db
+    project = await _make_project(session)
+
+    review_loop = {
+        "pr_number": 51,
+        "branch": "blueprint/test-branch",
+        "base_branch": "main",
+    }
+    if rl_original_task_id is not None:
+        review_loop["original_task_id"] = rl_original_task_id
+    task = await _make_fix_task_with_payload(
+        session,
+        project,
+        original_task_id=payload_original_task_id,
+        review_loop=review_loop,
+    )
+
+    payload = AgentStatusPayload(task_id=task.id, status=TaskStatus.COMPLETED)
+    await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    spawn_mock.assert_awaited_once()
+    spawn_kwargs = spawn_mock.await_args.kwargs
+    assert spawn_kwargs["original_task_id"] == expected_original_task_id, (
+        f"expected original_task_id {expected_original_task_id!r}, "
+        f"got {spawn_kwargs['original_task_id']!r}"
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Exact-target merge authority
 # ══════════════════════════════════════════════════════════════════════════════
@@ -7958,6 +8264,114 @@ async def test_post_commit_strategic_backstop_raise_does_not_500(tl_db, mocker):
     result = await _process_post_commit(task.id, payload, _session_factory=factory)
     assert result["status"] == "received"
     assert captured["session"] is not session
+
+
+@pytest.mark.asyncio
+async def test_post_commit_terminal_expires_migration_reservation_on_failure(
+    tl_db, mocker
+):
+    """T4 (fdd07b88 §6.2 gap): a FAILED task holding an ACTIVE migration
+    reservation must have it expired by the terminal-tail stage
+    (run_post_commit_terminal -> _expire_migration_reservation_if_terminal),
+    freeing the provisional revision id for re-allocation. Exercises the
+    extracted app.task_lifecycle_post_commit_terminal module end-to-end via
+    _process_post_commit rather than mocking the helper out."""
+    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
+    session, factory = tl_db
+    project = await _make_project(session)
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="create",
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+    task.payloads = [{"type": "create", "prompt": "x", "base_branch": "main"}]
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    reservation = await allocate_migration_reservation(session, task)
+    assert reservation.status == MigrationReservationStatus.ACTIVE
+
+    task.status = TaskStatus.FAILED
+    session.add(task)
+    await session.commit()
+
+    payload = AgentStatusPayload(task_id=task.id, status=TaskStatus.FAILED)
+    result = await _process_post_commit(task.id, payload, _session_factory=factory)
+    assert result["status"] == "received"
+
+    await session.refresh(reservation)
+    assert reservation.status == MigrationReservationStatus.EXPIRED
+
+
+@pytest.mark.asyncio
+async def test_completion_dispatch_requeues_on_transient_handler_error(
+    tl_db, mocker
+):
+    """S3 (fdd07b88): a completion handler raising a transient error (matches
+    the keyword allowlist) must requeue the task rather than fail it.
+    Exercises the extracted app.task_lifecycle_completion_dispatch module
+    end-to-end via _process_post_commit rather than mocking the stage out."""
+    session, factory = tl_db
+    project = await _make_project(session)
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="memo",
+        status=TaskStatus.COMPLETED,
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+    mocker.patch(
+        "app.task_completion._handle_memo_completion",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("connection refused while posting result"),
+    )
+    payload = AgentStatusPayload(
+        task_id=task.id, status=TaskStatus.COMPLETED, logs="done"
+    )
+
+    result = await _process_post_commit(task.id, payload, _session_factory=factory)
+    assert result["status"] == "received"
+
+    await session.refresh(task)
+    assert task.status == TaskStatus.QUEUED
+    assert task.attempt_count == 1
+
+
+@pytest.mark.asyncio
+async def test_completion_dispatch_fails_task_on_non_transient_handler_error(
+    tl_db, mocker
+):
+    """S3 (fdd07b88): a completion handler raising a non-transient error must
+    mark the task FAILED with a classified failure category rather than
+    requeue. Exercises the extracted app.task_lifecycle_completion_dispatch
+    module end-to-end via _process_post_commit rather than mocking the stage
+    out."""
+    session, factory = tl_db
+    project = await _make_project(session)
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="memo",
+        status=TaskStatus.COMPLETED,
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+    mocker.patch(
+        "app.task_completion._handle_memo_completion",
+        new_callable=AsyncMock,
+        side_effect=ValueError("malformed memo payload"),
+    )
+    payload = AgentStatusPayload(
+        task_id=task.id, status=TaskStatus.COMPLETED, logs="done"
+    )
+
+    result = await _process_post_commit(task.id, payload, _session_factory=factory)
+    assert result["status"] == "received"
+
+    await session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    assert "Completed but handler failed" in (task.latest_status_message or "")
 
 
 @pytest.mark.asyncio

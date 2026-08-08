@@ -10,13 +10,14 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
+import sqlalchemy
+
 from app.landed_signal import is_merged_completion, is_verified_merge
 from app.models import (
     Task,
     TaskStatus,
     get_task_current_attempt_cache_input_tokens,
     get_task_current_attempt_llm_totals,
-    get_task_total_llm_totals,
     get_task_total_vm_cost_usd,
 )
 
@@ -126,6 +127,30 @@ NON_ANTHROPIC_LLM_CONSERVATISM_MULTIPLIER: float = 1.25
 MIN_TRUSTWORTHY_PROBE_COVERAGE: float = 0.5
 
 
+def _median_or_zero(values: list[float]) -> float:
+    """Return the median of ``values``, ``0.0`` when the list is empty."""
+    ordered = sorted(values)
+    n = len(ordered)
+    if n == 0:
+        return 0.0
+    if n % 2:
+        return ordered[n // 2]
+    return (ordered[n // 2 - 1] + ordered[n // 2]) / 2.0
+
+
+# Fallback rates used to ESTIMATE the spend of unpriced (provider, model) combos
+# so ``unpriced_coverage_fraction`` can be spend-weighted — the size of the
+# pricing blind spot is otherwise unquantifiable. An unpriced model is estimated
+# as a TYPICAL listed model (the median input/output rate across the pricing
+# table), erring toward neither the cheapest nor the most expensive row.
+UNPRICED_FALLBACK_INPUT_RATE: float = _median_or_zero(
+    [in_rate for in_rate, _ in LLM_TOKEN_PRICING.values()]
+)
+UNPRICED_FALLBACK_OUTPUT_RATE: float = _median_or_zero(
+    [out_rate for _, out_rate in LLM_TOKEN_PRICING.values()]
+)
+
+
 def _bounded_cache_input_counts(
     input_tokens: int,
     cache_creation_input_tokens: int,
@@ -175,6 +200,14 @@ def _price_llm_attempt(
     elif (provider_key, model_key) in LLM_CACHE_READ_INPUT_PRICING:
         cache_creation_rate = input_rate
         cache_read_rate = LLM_CACHE_READ_INPUT_PRICING[(provider_key, model_key)]
+    elif provider_key == "openai":
+        # Every OpenAI model in LLM_CACHE_READ_INPUT_PRICING is exactly 0.1x its
+        # base input rate. Default unlisted/new OpenAI models to the same 0.1x
+        # relationship so a model added to LLM_TOKEN_PRICING without a cache row
+        # is never silently full-billed for cache reads — the zero-cache-read
+        # defect this capture fix eliminates.
+        cache_creation_rate = input_rate
+        cache_read_rate = input_rate * CACHE_READ_INPUT_RATE_MULTIPLIER
     else:
         cache_creation_rate = input_rate
         cache_read_rate = input_rate
@@ -285,6 +318,84 @@ def _llm_attempt_nonnegative_int(value: Any) -> int:
     return int(value) if isinstance(value, (int, float)) and value >= 0 else 0
 
 
+def _coerce_probe_int(value: Any) -> int:
+    """Coerce a provider-usage token field to int, ``None``/non-numeric -> 0.
+
+    Matches the tolerant coercion ``cost_telemetry_reconciliation`` applied to
+    these fields historically (``int(value or 0)``), so the shared probe helper
+    below is behavior-identical to the module-local one it replaces.
+    """
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _is_provider_probe(usage: Any) -> bool:
+    """True when a ``provider_reported_usage`` dict carries a genuine probe.
+
+    A probe is a non-empty dict that is NOT the explicit not-reported marker
+    (``{"reported": false}``). Dicts carrying ``reported: true`` are probes even
+    when every token count is zero (a real usage block reported zero tokens —
+    distinct from not-reported). Legacy dicts from pre-marker agents have no
+    ``reported`` key and are probes only when at least one token field is
+    non-zero, preserving the historical all-zero skip. ``None`` / ``{}`` is
+    never a probe.
+    """
+    if not isinstance(usage, dict) or not usage:
+        return False
+    if usage.get("reported") is False:
+        return False
+    if usage.get("reported") is True:
+        return True
+    # Legacy dict without a ``reported`` key: preserve the historical rule that
+    # an all-zero dict is treated as "no data" and skipped.
+    return any(
+        _coerce_probe_int(usage.get(key)) > 0
+        for key in (
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        )
+    )
+
+
+def _provider_probe_token_counts(usage: Any) -> tuple[int, int, int, int] | None:
+    """Return ``(inclusive_input, output, cache_creation, cache_read)`` for a
+    genuine provider-reported usage probe, or ``None`` when ``usage`` carries no
+    probe.
+
+    The probe's ``input_tokens`` is the UNCACHED input; the inclusive input
+    total equals ``input_tokens + cache_creation + cache_read`` (matching
+    :func:`reconcile_provider_reported_usage`, which sums all three classes).
+    """
+    if not _is_provider_probe(usage):
+        return None
+    uncached = max(0, _coerce_probe_int(usage.get("input_tokens")))
+    output = max(0, _coerce_probe_int(usage.get("output_tokens")))
+    cc = max(0, _coerce_probe_int(usage.get("cache_creation_input_tokens")))
+    cr = max(0, _coerce_probe_int(usage.get("cache_read_input_tokens")))
+    inclusive = uncached + cc + cr
+    cc, cr = _bounded_cache_input_counts(inclusive, cc, cr)
+    return inclusive, output, cc, cr
+
+
+def _task_provider_reported_usage(task: Task) -> Any:
+    """Safely read ``task.provider_reported_usage`` when the column may be deferred.
+
+    Callers that load Task rows with ``load_only(..., raiseload=True)`` (e.g.
+    efficiency_snapshot) never load this column; a direct attribute access then
+    raises ``InvalidRequestError``. Treat the unloaded column as absent so the
+    pricing path falls back to agent counters, which is the correct behavior for
+    a Task row that was not selected for probe-based pricing.
+    """
+    try:
+        return task.provider_reported_usage
+    except sqlalchemy.exc.InvalidRequestError:
+        return None
+
+
 def _task_llm_attempts(
     task: Task,
 ) -> list[tuple[str | None, str | None, int, int, int, int, int]]:
@@ -294,29 +405,61 @@ def _task_llm_attempts(
     ``input`` is the INCLUSIVE input total; ``cache_creation`` / ``cache_read``
     are provider-reported cache sub-counts (``0`` for attempts that predate cache
     tracking, which makes the pricing helper fall back to the base input rate).
+
+    Pricing source: an attempt's PROVIDER-REPORTED usage probe (the raw provider
+    ``response.usage`` captured at the LLM-call boundary) is the canonical token
+    source whenever a genuine probe exists; the agent-accumulated ``llm_*`` /
+    ``api_call_summary`` counters are the fallback for attempts that carry no
+    probe. ``call_count`` always comes from the agent counters (probes carry no
+    call count).
     """
     history = task.attempt_history or []
     if not history:
-        input_tokens, output_tokens, call_count = get_task_total_llm_totals(task)
-        cache_creation, cache_read = get_task_current_attempt_cache_input_tokens(task)
-        cache_creation, cache_read = _bounded_cache_input_counts(
-            input_tokens, cache_creation, cache_read
-        )
-        return (
-            [
+        # No banked history: the live attempt is priced from its probe when one
+        # exists. Legacy pre-banking retry spend in the banked columns carries no
+        # probe, so it stays a separate row priced from agent counters rather than
+        # being silently merged into (or dropped by) the probe row.
+        banked_input = int(task.llm_input_tokens_banked or 0)
+        banked_output = int(task.llm_output_tokens_banked or 0)
+        banked_calls = int(task.llm_call_count_banked or 0)
+        probe = _provider_probe_token_counts(_task_provider_reported_usage(task))
+        if probe is not None:
+            current_input, current_output, current_cc, current_cr = probe
+            current_calls = get_task_current_attempt_llm_totals(task)[2]
+        else:
+            current_input, current_output, current_calls = (
+                get_task_current_attempt_llm_totals(task)
+            )
+            current_cc, current_cr = get_task_current_attempt_cache_input_tokens(task)
+            current_cc, current_cr = _bounded_cache_input_counts(
+                current_input, current_cc, current_cr
+            )
+        rows = []
+        if banked_input > 0 or banked_output > 0:
+            rows.append(
                 (
                     task.provider,
                     task.model,
-                    input_tokens,
-                    output_tokens,
-                    call_count,
-                    cache_creation,
-                    cache_read,
+                    banked_input,
+                    banked_output,
+                    banked_calls,
+                    0,
+                    0,
                 )
-            ]
-            if input_tokens > 0 or output_tokens > 0
-            else []
-        )
+            )
+        if current_input > 0 or current_output > 0:
+            rows.append(
+                (
+                    task.provider,
+                    task.model,
+                    current_input,
+                    current_output,
+                    current_calls,
+                    current_cc,
+                    current_cr,
+                )
+            )
+        return rows
 
     def _resolve_pair(attempt: dict) -> tuple[str | None, str | None]:
         ap = attempt.get("provider")
@@ -331,32 +474,44 @@ def _task_llm_attempts(
 
     attempts = []
     for attempt in history:
-        input_tokens = _llm_attempt_nonnegative_int(attempt.get("llm_input_tokens"))
-        cache_creation, cache_read = _bounded_cache_input_counts(
-            input_tokens,
-            _llm_attempt_nonnegative_int(
-                attempt.get("llm_cache_creation_input_tokens")
-            ),
-            _llm_attempt_nonnegative_int(attempt.get("llm_cache_read_input_tokens")),
-        )
+        probe = _provider_probe_token_counts(attempt.get("provider_reported_usage"))
+        if probe is not None:
+            input_tokens, output_tokens, cache_creation, cache_read = probe
+            call_count = _llm_attempt_nonnegative_int(attempt.get("llm_call_count"))
+        else:
+            input_tokens = _llm_attempt_nonnegative_int(attempt.get("llm_input_tokens"))
+            output_tokens = _llm_attempt_nonnegative_int(attempt.get("llm_output_tokens"))
+            call_count = _llm_attempt_nonnegative_int(attempt.get("llm_call_count"))
+            cache_creation, cache_read = _bounded_cache_input_counts(
+                input_tokens,
+                _llm_attempt_nonnegative_int(
+                    attempt.get("llm_cache_creation_input_tokens")
+                ),
+                _llm_attempt_nonnegative_int(attempt.get("llm_cache_read_input_tokens")),
+            )
         attempts.append(
             (
                 *_resolve_pair(attempt),
                 input_tokens,
-                _llm_attempt_nonnegative_int(attempt.get("llm_output_tokens")),
-                _llm_attempt_nonnegative_int(attempt.get("llm_call_count")),
+                output_tokens,
+                call_count,
                 cache_creation,
                 cache_read,
             )
         )
-    current_input, current_output, current_calls = get_task_current_attempt_llm_totals(
-        task
-    )
-    if current_input > 0 or current_output > 0:
+    current_probe = _provider_probe_token_counts(_task_provider_reported_usage(task))
+    if current_probe is not None:
+        current_input, current_output, current_cc, current_cr = current_probe
+        current_calls = get_task_current_attempt_llm_totals(task)[2]
+    else:
+        current_input, current_output, current_calls = (
+            get_task_current_attempt_llm_totals(task)
+        )
         current_cc, current_cr = get_task_current_attempt_cache_input_tokens(task)
         current_cc, current_cr = _bounded_cache_input_counts(
             current_input, current_cc, current_cr
         )
+    if current_input > 0 or current_output > 0:
         attempts.append(
             (
                 task.provider,
@@ -371,13 +526,33 @@ def _task_llm_attempts(
     return attempts
 
 
+def _provider_priced_attempt_count(task: Task) -> int:
+    """Count attempts priced from a genuine provider-reported usage probe.
+
+    Mirrors :func:`_task_llm_attempts` source selection: each banked attempt
+    carrying a probe and the live attempt carrying a probe count once. Used by
+    the billing reconciliation so the canonical-vs-fallback split is observable
+    in its report (``internal.provider_priced_attempt_count``).
+    """
+    count = 0
+    for attempt in task.attempt_history or []:
+        if _is_provider_probe(attempt.get("provider_reported_usage")):
+            count += 1
+    if _is_provider_probe(_task_provider_reported_usage(task)):
+        count += 1
+    return count
+
+
 def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
     """Per-provider and per-model LLM cost/token rollup over the given tasks.
 
     Returns a structured dict with:
       - ``by_provider``: list of provider-level rollups.
       - ``by_model``: list of (provider, model) rollups with a ``priced`` flag.
-      - ``totals``: aggregate totals plus priced/unpriced task counts.
+      - ``totals``: aggregate totals plus priced/unpriced task counts, the
+        spend-weighted ``unpriced_coverage_fraction``, the estimated dollar
+        value of unpriced spend (``estimated_unpriced_cost_usd``), and the
+        unpriced rows' retained token volume.
       - ``unpriced_combos``: capped list of ``provider:model`` strings that
         have non-zero tokens but no entry in :data:`LLM_TOKEN_PRICING`.
       - ``approximate_priced_combos``: capped list of ``provider:model`` strings
@@ -387,10 +562,15 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
     A task contributes one or more attempt rows to a bucket when it has a
     non-null provider, non-null model, and non-zero aggregate tokens across
     its banked retry history plus the live ``api_call_summary`` snapshot.
-    Unpriced (provider, model) combos are still counted in ``task_count`` and feed
-    ``unpriced_coverage_fraction`` but contribute ``0.0`` cost. Cost values
-    are rounded to 6 decimals and shares to 4 decimals, matching the rest of
-    this module.
+    Unpriced (provider, model) combos are still counted in ``task_count`` and
+    ``unpriced_task_count`` but contribute ``0.0`` cost; their token volume is
+    retained (``unpriced_input_tokens`` / ``unpriced_output_tokens``) and their
+    spend is ESTIMATED at :data:`UNPRICED_FALLBACK_INPUT_RATE` /
+    :data:`UNPRICED_FALLBACK_OUTPUT_RATE` so ``unpriced_coverage_fraction`` can
+    be spend-weighted — ``priced_cost / (priced_cost + estimated_unpriced_cost)``
+    — instead of a raw task count that weighs a 1M-token unpriced row the same
+    as a 1K-token priced one. Cost values are rounded to 6 decimals and shares
+    to 4 decimals, matching the rest of this module.
 
     Each provider/model row also carries the merge outcome of its tasks:
     ``merged_count`` (tasks landed on the integration branch per
@@ -448,6 +628,14 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
     total_merged_count = 0
     total_verified_merged_count = 0
     total_tool_result_bytes: int | None = None
+    # Unpriced-rows honesty block: their token volume is retained (the blind
+    # spot stays measurable) and their spend is estimated at the fallback rate
+    # so ``unpriced_coverage_fraction`` can be spend-weighted.
+    estimated_unpriced_cost_usd = 0.0
+    unpriced_input_tokens = 0
+    unpriced_output_tokens = 0
+    unpriced_cache_creation_tokens = 0
+    unpriced_cache_read_tokens = 0
 
     for t in tasks:
         merged = is_merged_completion(t)
@@ -514,6 +702,23 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
                     and len(unpriced_combos) < _UNPRICED_COMBOS_CAP
                 ):
                     unpriced_combos.append(combo)
+                # Retain the unpriced token volume and estimate the row's spend
+                # at the fallback rate so coverage is spend-weighted, not a raw
+                # task count.
+                estimated_unpriced_cost_usd += _price_llm_attempt(
+                    input_tokens,
+                    output_tokens,
+                    cache_creation,
+                    cache_read,
+                    UNPRICED_FALLBACK_INPUT_RATE,
+                    UNPRICED_FALLBACK_OUTPUT_RATE,
+                    provider=provider,
+                    model=model,
+                )
+                unpriced_input_tokens += int(input_tokens)
+                unpriced_output_tokens += int(output_tokens)
+                unpriced_cache_creation_tokens += int(cache_creation)
+                unpriced_cache_read_tokens += int(cache_read)
 
             # fallback_cost_usd is per-attempt (each fallback attempt's spend
             # counts); fallback_task_count is per-task, credited once below.
@@ -676,9 +881,15 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
             model_buckets.items(), key=lambda kv: kv[1]["cost_usd"], reverse=True
         )
     ]
-    priceable = priced_task_count + unpriced_task_count
+    # Spend-weighted coverage: priced spend / (priced spend + estimated unpriced
+    # spend). Unpriced rows' spend is estimated at the fallback rate; the count
+    # of priceable tasks is retained in priced/unpriced_task_count for callers
+    # that want the raw task split. None only when there is no spend at all.
+    estimated_total_spend = total_cost + estimated_unpriced_cost_usd
     unpriced_coverage_fraction: float | None = (
-        round(priced_task_count / priceable, 4) if priceable else None
+        round(total_cost / estimated_total_spend, 4)
+        if estimated_total_spend > 0
+        else None
     )
     return {
         "by_provider": by_provider,
@@ -703,6 +914,11 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
             "priced_task_count": priced_task_count,
             "unpriced_task_count": unpriced_task_count,
             "unpriced_coverage_fraction": unpriced_coverage_fraction,
+            "estimated_unpriced_cost_usd": round(estimated_unpriced_cost_usd, 6),
+            "unpriced_input_tokens": unpriced_input_tokens,
+            "unpriced_output_tokens": unpriced_output_tokens,
+            "unpriced_cache_creation_input_tokens": unpriced_cache_creation_tokens,
+            "unpriced_cache_read_input_tokens": unpriced_cache_read_tokens,
             "fallback_task_count": fallback_task_count,
             "fallback_cost_usd": round(fallback_cost_usd, 6),
             "total_tool_result_bytes": total_tool_result_bytes,
@@ -747,6 +963,57 @@ def _task_llm_cost(task: Task) -> tuple[float, bool]:
         else:
             any_unpriced = True
     return cost, any_unpriced
+
+
+def task_llm_cost_by_provider_model(task: Task) -> tuple[dict[str, float], bool]:
+    """Return ``({"<provider>|<model>": usd, ...}, any_unpriced)`` for one task.
+
+    Same attempt enumeration and pricing path as :func:`_task_llm_cost` — the
+    only difference is that cost is bucketed per resolved ``(provider, model)``
+    pair instead of collapsed into a single float, so callers that already carry
+    a per-``provider|model`` VM breakdown can fold LLM spend into the same
+    buckets. ``sum(result.values())`` equals ``_task_llm_cost(task)[0]`` by
+    construction.
+
+    Attempts whose pair cannot be resolved atomically (or whose pair has no
+    pricing row) contribute nothing and set ``any_unpriced`` — identical to
+    :func:`_task_llm_cost`, so no bucket is ever half-resolved.
+    """
+    buckets: dict[str, float] = {}
+    any_unpriced = False
+    for (
+        provider,
+        model,
+        input_tokens,
+        output_tokens,
+        _call_count,
+        cache_creation,
+        cache_read,
+    ) in _task_llm_attempts(task):
+        if input_tokens <= 0 and output_tokens <= 0:
+            continue
+        if not provider or not model:
+            any_unpriced = True
+            continue
+        key = (provider.lower(), model.lower())
+        pricing = LLM_TOKEN_PRICING.get(key)
+        if not pricing:
+            any_unpriced = True
+            continue
+        input_rate, output_rate = pricing
+        cost = _price_llm_attempt(
+            input_tokens,
+            output_tokens,
+            cache_creation,
+            cache_read,
+            input_rate,
+            output_rate,
+            provider=key[0],
+            model=key[1],
+        )
+        bucket = f"{provider}|{model}"
+        buckets[bucket] = buckets.get(bucket, 0.0) + cost
+    return buckets, any_unpriced
 
 
 def _task_llm_cost_split(task: Task) -> tuple[float, float, bool]:
@@ -1342,9 +1609,11 @@ def _compact_llm_cost_attribution(
 
     Calls the three existing pure helpers (compute_llm_cost_breakdown,
     compute_llm_cost_by_task_type, compute_pr_rework_chain_breakdown) and keeps
-    only the dollar-total fields needed for retroactive drift decomposition:
-    per-(provider,model) cost, per-task-type cost, and the first-pass/rework
-    split.  Priced rows only in by_model so zero-cost unpriced combos don't
+    the dollar-total fields needed for retroactive drift decomposition plus the
+    per-task-type turn counts and cache-creation/cache-read token splits that
+    name the real cost driver (per-(provider,model) cost, per-task-type cost,
+    first-pass/rework split, turns per call, cache-read share). Priced rows
+    only in by_model so zero-cost unpriced combos don't
     inflate the block; unpriced_coverage carries the honesty signal.
 
     self_repair_burn_share is computed as a token-cost ratio when repair token
@@ -1377,6 +1646,20 @@ def _compact_llm_cost_attribution(
             "task_type": r["task_type"],
             "cost_usd": r["total_cost_usd"],
             "mean_input_tokens_per_call": r.get("mean_input_tokens_per_call"),
+            # Turn counts — None when no task in the bucket reported num_turns.
+            # These are the per-task-type cost-driver signal that prompt bytes
+            # alone cannot express.
+            "mean_turns_per_call": r.get("mean_turns_per_call"),
+            "mean_input_tokens_per_turn": r.get("mean_input_tokens_per_turn"),
+            # Cache split per task type: creation vs read sub-counts and the
+            # cache-read share of total input, so the visible proxy for the
+            # cost driver is token composition, not just prompt bytes.
+            "total_cache_creation_input_tokens": r["total_cache_creation_input_tokens"],
+            "total_cache_read_input_tokens": r["total_cache_read_input_tokens"],
+            "cache_read_share": r.get("cache_read_share"),
+            "mean_uncached_input_tokens_per_call": r.get(
+                "mean_uncached_input_tokens_per_call"
+            ),
             "total_tool_result_bytes": r.get("total_tool_result_bytes"),
             "total_prompt_size_bytes": r.get("total_prompt_size_bytes"),
             "mean_prompt_size_bytes": r.get("mean_prompt_size_bytes"),
@@ -1452,6 +1735,11 @@ def _compact_llm_cost_attribution(
         "rework_share": rework.get("rework_share_of_total_llm_cost"),
         "total_llm_usd": total_usd,
         "unpriced_coverage": breakdown["totals"].get("unpriced_coverage_fraction"),
+        "estimated_unpriced_cost_usd": breakdown["totals"].get(
+            "estimated_unpriced_cost_usd"
+        ),
+        "unpriced_input_tokens": breakdown["totals"].get("unpriced_input_tokens"),
+        "unpriced_output_tokens": breakdown["totals"].get("unpriced_output_tokens"),
         "unpriced_combos": breakdown.get("unpriced_combos", []),
         SELF_REPAIR_BURN_SHARE_KEY: self_repair_burn_share,
         "strategic_cycle_cost_per_event": strategic_cycle_cost_per_event,

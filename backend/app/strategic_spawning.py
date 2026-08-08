@@ -38,6 +38,7 @@ from app.direction_outcomes import (
     verified_merged_count,
 )
 from app.direction_mode import mode_prompt_hint, normalized_recommended_mode
+from app.direction_saturation import build_saturation_dispositions
 from app.knowledge_query import build_knowledge_index, build_compute_sweep_groups, fetch_direction_knowledge_index, build_pending_followups, build_strategic_memory_index
 from app.models import (
     Task,
@@ -174,7 +175,6 @@ from app.strategic_local_runner import (  # noqa: F401 — re-exported for calle
     _RUNNER_LIVENESS_SECONDS,
     _load_baked_image_ref,
     _load_local_runner_status,
-    _agent_visible_vision,
     _local_runner_handles_task_type,
     _local_runner_is_live,
     _local_runner_agent_available,
@@ -2202,13 +2202,21 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # heavier ``directions_summary`` detail list is trimmed or dropped for budget.
     "direction_counts": {"priority": "critical"},
     "max_active_directions": {"priority": "critical"},
+    # Forced strategist dispositions for saturated directions. High priority and
+    # exempt: a pending saturation item is a bounded small list and the strategist
+    # MUST answer it (commission work / narrow scope / retire), so it must never be
+    # trimmed or dropped under byte budget. Built from the durable per-direction
+    # ``saturation_disposition`` item, never re-emitted across cycles.
+    "saturation_dispositions": {"priority": "high", "exempt": True},
     # Trim-proof authoritative count of unresolved open operator messages computed
     # BEFORE packing. Critical tier (tiny scalar) so the agent sees the true inbox
     # depth even when ``open_messages`` itself is trimmed/dropped under byte budget.
     "open_message_count": {"priority": "critical"},
     "prompt_suffix": {"priority": "high", "exempt": True},
-    # Vision + intent — small but load-bearing for every decision
-    "vision": {"priority": "critical"},
+    # Effective purpose — the single live intent field shipped to the agent
+    # (the legacy vision body is no longer shipped: at critical priority it
+    # measured ~37 KB and evicted lower-tier sections; problem_model carries
+    # the durable intent).
     "effective_purpose": {"priority": "critical"},
     # User-facing state the agent must respond to. Core section: the open-message
     # inbox has BOTH a summarize fallback AND a floor callback, so at least its
@@ -2507,7 +2515,6 @@ _DESIGN_DOC_UPDATE_SCHEMA: dict[str, dict] = {
     "base_branch": {"priority": "critical"},
     "model": {"priority": "critical"},
     "effort": {"priority": "critical"},
-    "vision": {"priority": "critical"},
     "effective_purpose": {"priority": "critical"},
     # Trim-proof authoritative count of unresolved open operator messages — see
     # _STRATEGIC_REVIEW_SCHEMA["open_message_count"]. Critical tier so the agent
@@ -4307,7 +4314,6 @@ async def _spawn_design_doc_update(
                 session, project.id, "proposed_changes"
             ) or (project.design_doc or {}).get("proposed_changes", []),
             "project_name": project.name,
-            "vision": _agent_visible_vision(project.vision),
             "effective_purpose": resolve_project_purpose(project),
             **(
                 {"missing_capability_demand": _missing_demand}
@@ -5879,6 +5885,7 @@ async def _spawn_strategic_review(
             session.add(project)
         _res_retired_summary = _build_retired_directions_summary(project)
         _res_prev_outcomes = _build_previous_decision_outcomes(project, cycle_history)
+        _res_saturation_dispositions = build_saturation_dispositions(project)
         _res_criterion_conflicts: list[dict] | None = None
         if get_project_integration_branch(project) != get_project_promotion_target(project):
             # Criterion-link conflicts are version-lifecycle context (they key off
@@ -5991,7 +5998,7 @@ async def _spawn_strategic_review(
                     "project_name": _project_name,
                     "base_branch": get_project_integration_branch(project),
                     # Cheap in-memory ORM scalars (no I/O).
-                    "vision": _agent_visible_vision(project.vision),
+                    "effective_purpose": resolve_project_purpose(project),
                     "problem_model": _agent_view_problem_model(project.problem_model),
                     "running_update": project.running_update or "",
                     # Pure-computation direction grounding (no I/O).
@@ -6008,6 +6015,11 @@ async def _spawn_strategic_review(
                     ),
                     "direction_counts": _res_direction_counts,
                     "max_active_directions": _res_direction_counts["max_active"],
+                    **(
+                        {"saturation_dispositions": _res_saturation_dispositions}
+                        if _res_saturation_dispositions
+                        else {}
+                    ),
                     **(
                         {"retired_directions_summary": _res_retired_summary}
                         if _res_retired_summary
@@ -7411,27 +7423,47 @@ async def _spawn_strategic_review(
             # prior blanket re-qualify steer so the strategic spawn never breaks.
             _readiness: dict | None = None
             _requal_ready = True
-            if _candidate_behind:
-                try:
-                    from app.release_readiness import (
-                        compute_requalification_readiness,
-                    )
+            try:
+                from app.release_readiness import (
+                    compute_requalification_readiness,
+                )
 
-                    _readiness = await compute_requalification_readiness(
-                        session, project.id
-                    )
-                    _requal_ready = bool(_readiness.get("requalification_ready"))
-                except Exception:
-                    logger.exception(
-                        "[STRATEGIC] requalification readiness compute failed; "
-                        "defaulting to blanket re-qualify steer"
-                    )
-                    _readiness = None
-                    _requal_ready = True
+                _readiness = await compute_requalification_readiness(
+                    session, project.id
+                )
+                _requal_ready = bool(_readiness.get("requalification_ready"))
+            except Exception:
+                logger.exception(
+                    "[STRATEGIC] requalification readiness compute failed; "
+                    "defaulting to blanket re-qualify steer"
+                )
+                _readiness = None
+                _requal_ready = True
             # Re-qualification is the highest-leverage steer ONLY on the behind-head
             # path with the readiness trigger met; everywhere else there is fix work
             # to dispatch (so the create-a-direction escalation below should fire).
             _prefer_requalify = _candidate_behind and _requal_ready
+            # Surface the finding-resolution block — per-finding keys + ledger
+            # states — so the steer can point the agent at a payload block that
+            # ACTUALLY carries the finding keys. The compact qualification
+            # serializer strips ``last_qualification.audit_findings`` down to a
+            # count, so that path is empty in the delivered payload.
+            if _version_phase_block is not None and _readiness is not None:
+                _version_phase_block["finding_resolution"] = {
+                    key: _readiness[key]
+                    for key in (
+                        "requalification_ready",
+                        "gating_total",
+                        "gating_resolved",
+                        "audit_findings_truncated",
+                        "reason",
+                    )
+                    if _readiness.get(key) is not None
+                }
+                if isinstance(_readiness.get("findings"), list):
+                    _version_phase_block["finding_resolution"]["findings"] = (
+                        _readiness["findings"]
+                    )
             if _candidate_behind:
                 _cand_short = _currency["candidate_sha"][:8]
                 _head_short = _currency["head_sha"][:8]
@@ -7454,7 +7486,7 @@ async def _spawn_strategic_review(
                         f"current HEAD; a new audit against the current snapshot will "
                         f"report which finding(s), if any, genuinely remain. Prior "
                         f"list (against {_cand_short}) in "
-                        f"version_phase.last_qualification.audit_findings. Top prior "
+                        f"version_phase.finding_resolution. Top prior "
                         f"findings: {_top}."
                     )
                 elif _requal_ready:
@@ -7467,7 +7499,7 @@ async def _spawn_strategic_review(
                         f"qualify_request to re-qualify the current HEAD; a new audit "
                         f"against the current snapshot will confirm the findings are "
                         f"cleared. Prior list (against {_cand_short}) in "
-                        f"version_phase.last_qualification.audit_findings. Top prior "
+                        f"version_phase.finding_resolution. Top prior "
                         f"findings: {_top}."
                     )
                 else:
@@ -7482,18 +7514,23 @@ async def _spawn_strategic_review(
                         f"re-flag the unresolved finding(s). Instead, prioritize the "
                         f"outstanding fix-first work: scope audit/fundamentals-mode "
                         f"remediation at the unresolved finding(s) and record each as "
-                        f"resolved or code-verified stale in the resolution ledger. "
+                        f"resolved or code-verified stale in the resolution ledger "
+                        f"via the record_finding_resolution op (finding_key from "
+                        f"version_phase.finding_resolution.findings[].key) — that "
+                        f"explicit, evidence-bearing call is the ONLY thing that "
+                        f"advances gating_resolved; merging a PR does not credit "
+                        f"findings on its own. "
                         f"Once every gating finding is resolved-or-stale the readiness "
                         f"signal flips and a fresh qualify_request becomes the right "
                         f"move. Prior list (against {_cand_short}) in "
-                        f"version_phase.last_qualification.audit_findings. Top prior "
+                        f"version_phase.finding_resolution. Top prior "
                         f"findings: {_top}."
                     )
             else:
                 _stabilize_hint += (
                     f" The last qualification's audit flagged "
-                    f"{len(_carried_findings)} finding(s) — full list in "
-                    f"version_phase.last_qualification.audit_findings — and "
+                    f"{len(_carried_findings)} finding(s) — finding keys and "
+                    f"resolution states in version_phase.finding_resolution — and "
                     f"{_binding_desc}. Top findings: {_top}."
                 )
                 if not _currency_resolved:
@@ -7723,6 +7760,10 @@ async def _spawn_strategic_review(
     _direction_counts = _build_direction_counts(project)
     _active_directions_count = _direction_counts["active"]
     _max_active_directions = _direction_counts["max_active"]
+    # Durable forced-disposition items for saturated directions. Pure over
+    # project.directions; computed once and conditionally shipped so an empty
+    # list never becomes a payload key.
+    _saturation_dispositions = build_saturation_dispositions(project)
     # Keep runtime capacity subordinate to portfolio coherence. Directions are
     # durable outcomes; bounded parallel work belongs in tasks beneath them.
     _portfolio_coherence_hint = _build_portfolio_coherence_hint(
@@ -8007,7 +8048,6 @@ async def _spawn_strategic_review(
                     _agent_view_design_doc(project.design_doc), **verification_kwargs
                 )
             ),
-            "vision": _agent_visible_vision(project.vision),
             "effective_purpose": resolve_project_purpose(project),
             "problem_model": _verified_problem_model,
             **(
@@ -8091,6 +8131,11 @@ async def _spawn_strategic_review(
             # true active set even when ``directions_summary`` is trimmed/dropped.
             "direction_counts": _direction_counts,
             "max_active_directions": _max_active_directions,
+            **(
+                {"saturation_dispositions": _saturation_dispositions}
+                if _saturation_dispositions
+                else {}
+            ),
             "directions_summary": direction_stats,
             **(
                 {"criterion_link_conflicts": _criterion_link_conflicts}

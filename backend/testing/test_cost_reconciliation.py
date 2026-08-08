@@ -26,6 +26,7 @@ Run with:
 """
 from __future__ import annotations
 
+import ast
 import contextlib
 import importlib.util
 import io
@@ -526,6 +527,296 @@ def test_sample_export_fixture_loads_and_reconciles():
     # The cache-read breakout is populated from the export side.
     assert report["cache_read_breakout"]["export_tokens"] == 518_000_000
     assert report["cache_read_breakout"]["export_cost_usd"] > 0
+
+
+def _inline_row(
+    *,
+    provider: str = "deepseek",
+    created_at: str = "2026-08-05T12:00:00Z",
+    cost_usd: float = 0.25,
+    pricing_status: str | None = None,
+) -> dict:
+    """One ``inline_llm_spend_log`` row as ``_load_inline_llm_spend_rows`` emits it.
+
+    ``pricing_status`` is omitted by default to keep legacy fixtures (which
+    predate the column) exercising the absent-key tolerance in the consumer.
+    """
+    row = {
+        "provider": provider,
+        "created_at": created_at,
+        "cost_usd": cost_usd,
+    }
+    if pricing_status is not None:
+        row["pricing_status"] = pricing_status
+    return row
+
+
+def test_inline_llm_spend_is_a_separate_bucket_folded_into_the_internal_total():
+    """Backend-initiated inline LLM calls (``app.inline_llm``) are recorded as
+    their own observable bucket AND folded into ``internal.total_cost_usd``, so
+    the residual against the export shrinks by exactly the inline spend.
+
+    Task side: one attempt priced at $0.04452 (see the first test's arithmetic).
+    Inline side: two calls, $0.25 + $0.75 = $1.00.
+    Export: $10.00 -> residual = 10 - (0.04452 + 1.00) = $8.95548.
+    """
+    mod = _load_module()
+    rows = [_task_row("t1", attempts=[_usage_attempt()])]
+    export = _export(
+        [
+            {
+                "timestamp": "2026-08-05T12:00:00Z",
+                "model": "deepseek-v4-flash",
+                "input_tokens": 1,
+                "cache_read_input_tokens": 1,
+                "output_tokens": 1,
+                "cost_usd": 10.0,
+            }
+        ],
+        start="2026-08-05",
+        end="2026-08-05",
+    )
+    common = dict(
+        start="2026-08-05",
+        end="2026-08-05",
+        pricing=_PRICING,
+        cache_read_pricing=_CACHE_READ_PRICING,
+    )
+
+    baseline = mod.reconcile_provider_cost(rows, export, "deepseek", **common)
+    assert baseline["internal"]["inline_cost_usd"] == pytest.approx(0.0, abs=1e-12)
+    assert baseline["internal"]["inline_call_count"] == 0
+    assert baseline["residual"]["absolute_usd"] == pytest.approx(9.95548, abs=1e-5)
+
+    report = mod.reconcile_provider_cost(
+        rows,
+        export,
+        "deepseek",
+        inline_llm_rows=[
+            _inline_row(cost_usd=0.25),
+            _inline_row(cost_usd=0.75),
+        ],
+        **common,
+    )
+    internal = report["internal"]
+    assert internal["inline_cost_usd"] == pytest.approx(1.0, abs=1e-9)
+    assert internal["inline_call_count"] == 2
+    # Folded into the headline internal total on top of the per-attempt cost.
+    assert internal["total_cost_usd"] == pytest.approx(1.04452, abs=1e-9)
+    # ...and therefore visible in the residual, the headline of this report.
+    assert report["residual"]["absolute_usd"] == pytest.approx(8.95548, abs=1e-5)
+    # The inline bucket is spend-only: it must not inflate token counts or the
+    # per-attempt cost breakouts.
+    assert internal["uncached_input_tokens"] == 100_000
+    assert internal["output_cost_usd"] == pytest.approx(0.028, abs=1e-9)
+    assert report["tasks"]["total"] == 1
+
+
+def test_inline_llm_spend_filters_by_provider_and_window():
+    """Inline rows for another provider, or outside the reconciliation window,
+    are excluded -- the same filtering the task and export sides apply. Rows
+    with an unparseable/absent timestamp are skipped rather than counted, since
+    they cannot be placed in the window."""
+    mod = _load_module()
+    export = _export([], start="2026-08-05", end="2026-08-05")
+    report = mod.reconcile_provider_cost(
+        [],
+        export,
+        "deepseek",
+        start="2026-08-05",
+        end="2026-08-05",
+        pricing=_PRICING,
+        cache_read_pricing=_CACHE_READ_PRICING,
+        inline_llm_rows=[
+            _inline_row(cost_usd=1.5),  # in window, right provider
+            _inline_row(provider="openai", cost_usd=100.0),  # wrong provider
+            _inline_row(created_at="2026-08-04T23:59:59Z", cost_usd=200.0),  # before
+            _inline_row(created_at="2026-08-06T00:00:00Z", cost_usd=300.0),  # after
+            _inline_row(created_at=None, cost_usd=400.0),  # unplaceable
+            _inline_row(cost_usd=None),  # recorded call, no cost yet
+        ],
+    )
+    internal = report["internal"]
+    assert internal["inline_cost_usd"] == pytest.approx(1.5, abs=1e-9)
+    # The in-window rows are both counted; only the priced one adds cost.
+    assert internal["inline_call_count"] == 2
+    assert internal["total_cost_usd"] == pytest.approx(1.5, abs=1e-9)
+
+
+def test_inline_llm_spend_unpriced_rows_label_the_total_as_a_floor():
+    """Unpriced inline calls (no pricing row, cost_usd NULL) are counted
+    separately and excluded from inline_cost_usd — a NULL/unknown cost must
+    never silently coerce to zero, which would be the dropped-spend bug wearing
+    a different hat. When any exist, the report flags the total as a FLOOR so a
+    reader never mistakes it for an exact figure."""
+    mod = _load_module()
+    report = mod.reconcile_provider_cost(
+        [],
+        _export([], start="2026-08-05", end="2026-08-05"),
+        "deepseek",
+        start="2026-08-05",
+        end="2026-08-05",
+        pricing=_PRICING,
+        cache_read_pricing=_CACHE_READ_PRICING,
+        inline_llm_rows=[
+            _inline_row(cost_usd=0.5, pricing_status="priced"),
+            _inline_row(cost_usd=None, pricing_status="unpriced"),
+            _inline_row(cost_usd=0.25),  # legacy row: no status key -> priced
+        ],
+    )
+    internal = report["internal"]
+    assert internal["inline_call_count"] == 3
+    assert internal["inline_cost_usd"] == pytest.approx(0.75, abs=1e-9)
+    assert internal["inline_unpriced_call_count"] == 1
+    assert internal["inline_cost_is_floor"] is True
+    assert internal["total_cost_usd"] == pytest.approx(0.75, abs=1e-9)
+
+
+def test_inline_llm_spend_fully_priced_total_is_not_a_floor():
+    """With every inline call priced, the report's floor flag stays False."""
+    mod = _load_module()
+    report = mod.reconcile_provider_cost(
+        [],
+        _export([], start="2026-08-05", end="2026-08-05"),
+        "deepseek",
+        start="2026-08-05",
+        end="2026-08-05",
+        pricing=_PRICING,
+        cache_read_pricing=_CACHE_READ_PRICING,
+        inline_llm_rows=[
+            _inline_row(cost_usd=0.5),
+            _inline_row(cost_usd=0.25, pricing_status="priced"),
+        ],
+    )
+    internal = report["internal"]
+    assert internal["inline_call_count"] == 2
+    assert internal["inline_cost_usd"] == pytest.approx(0.75, abs=1e-9)
+    assert internal["inline_unpriced_call_count"] == 0
+    assert internal["inline_cost_is_floor"] is False
+
+
+def test_inline_llm_spend_provider_match_is_case_insensitive():
+    """The provider filter normalizes case on both sides, matching the task-row
+    filter -- a ``DeepSeek``-cased log row is not silently dropped."""
+    mod = _load_module()
+    report = mod.reconcile_provider_cost(
+        [],
+        _export([], start="2026-08-05", end="2026-08-05"),
+        "DeepSeek",
+        pricing=_PRICING,
+        cache_read_pricing=_CACHE_READ_PRICING,
+        inline_llm_rows=[_inline_row(provider="DEEPSEEK", cost_usd=2.0)],
+    )
+    assert report["internal"]["inline_call_count"] == 1
+    assert report["internal"]["inline_cost_usd"] == pytest.approx(2.0, abs=1e-9)
+
+
+def test_inline_llm_spend_is_reported_without_a_window_bound():
+    """With no ``start``/``end`` the window filter must not drop every inline
+    row (a naive date comparison against ``None`` would)."""
+    mod = _load_module()
+    unbounded_export = {
+        "provider": "deepseek",
+        "currency": "USD",
+        "exported_at": "2026-08-06T00:00:00Z",
+        "records": [],
+    }
+    report = mod.reconcile_provider_cost(
+        [],
+        unbounded_export,
+        "deepseek",
+        pricing=_PRICING,
+        cache_read_pricing=_CACHE_READ_PRICING,
+        inline_llm_rows=[
+            _inline_row(created_at="2020-01-01T00:00:00Z", cost_usd=1.0),
+            _inline_row(created_at="2030-01-01T00:00:00Z", cost_usd=2.0),
+        ],
+    )
+    assert report["window"] == {"start": None, "end": None}
+    assert report["internal"]["inline_call_count"] == 2
+    assert report["internal"]["inline_cost_usd"] == pytest.approx(3.0, abs=1e-9)
+
+
+def test_report_printer_surfaces_the_inline_llm_bucket():
+    """The operator-facing printer names the inline bucket and its call count,
+    so folded-in inline spend is never invisible in the artifact they read."""
+    mod = _load_module()
+    rows = [_task_row("t1", attempts=[_usage_attempt()])]
+    export = _export([], start="2026-08-05", end="2026-08-05")
+    report = mod.reconcile_provider_cost(
+        rows,
+        export,
+        "deepseek",
+        pricing=_PRICING,
+        cache_read_pricing=_CACHE_READ_PRICING,
+        inline_llm_rows=[_inline_row(cost_usd=1.25)],
+    )
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        mod._print_report(report, rows, export)
+    text = buf.getvalue()
+    assert "inline LLM spend" in text
+    assert "1 calls" in text
+
+
+def test_provider_priced_attempt_count_is_summed_across_task_rows():
+    """The canonical-vs-fallback split carried on each task row is aggregated
+    into the internal block, so the report can show how much of the internal
+    total came from provider-reported usage probes."""
+    mod = _load_module()
+    rows = [
+        {**_task_row("t1", attempts=[_usage_attempt()]), "provider_priced_attempt_count": 2},
+        {**_task_row("t2", attempts=[_usage_attempt()]), "provider_priced_attempt_count": 1},
+        _task_row("t3", attempts=[_usage_attempt()]),  # key absent -> 0
+    ]
+    report = mod.reconcile_provider_cost(
+        rows,
+        _export([], start="2026-08-05", end="2026-08-05"),
+        "deepseek",
+        pricing=_PRICING,
+        cache_read_pricing=_CACHE_READ_PRICING,
+    )
+    assert report["internal"]["provider_priced_attempt_count"] == 3
+
+
+def test_main_loads_both_db_inputs_under_a_single_event_loop():
+    """Regression: ``main()`` must not issue a second ``asyncio.run()`` against
+    the pooled ``app.database`` engine -- the second loop would check out
+    asyncpg connections bound to the first, already-closed loop. Both loaders
+    are awaited inside one coroutine instead."""
+    mod = _load_module()
+    tree = ast.parse(_SCRIPT_PATH.read_text(encoding="utf-8"))
+    runs = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "run"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "asyncio"
+    ]
+    assert len(runs) == 1, (
+        "the script must make exactly one asyncio.run() call; a second event "
+        f"loop would reuse pooled connections bound to a closed one (found {len(runs)})"
+    )
+    # Both DB reads are awaited inside that single coroutine.
+    assert callable(getattr(mod, "_load_reconciliation_inputs", None))
+    combined = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.AsyncFunctionDef)
+        and n.name == "_load_reconciliation_inputs"
+    )
+    awaited = {
+        n.value.func.id
+        for n in ast.walk(combined)
+        if isinstance(n, ast.Await)
+        and isinstance(n.value, ast.Call)
+        and isinstance(n.value.func, ast.Name)
+    }
+    assert {"_load_task_rows", "_load_inline_llm_spend_rows"} <= awaited
+    # ...and the pooled engine is disposed before the loop closes.
+    assert "dispose_engine" in awaited
 
 
 def test_report_printer_shows_the_residual_without_a_db():

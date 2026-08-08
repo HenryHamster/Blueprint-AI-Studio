@@ -637,7 +637,12 @@ def capability_evidence_status(cap: Capability) -> EvidenceStatus:
 
 
 PACKER_MARKER_KEYS: frozenset[str] = frozenset(
-    {"truncated", "_agent_view_floor_applied", "_gap_memory_trimmed"}
+    {
+        "truncated",
+        "_agent_view_floor_applied",
+        "_gap_memory_trimmed",
+        "_agent_view_compacted",
+    }
 )
 
 
@@ -2470,6 +2475,18 @@ _FRICTION_FLOOR_FIELDS = (
     "promoted_to_gap_id",
 )
 
+# Fields ALWAYS compacted out of the agent-view problem_model (see
+# ``strategic_problem_view._COMPACT_*_FIELDS`` — a test keeps the two modules'
+# lists in sync). The strategist never sees them, so a blank in a write-back
+# means "never received", NOT "clear" — restore them unconditionally on merge.
+# This is distinct from the floor path above: the floor only fires under byte
+# pressure and is marker-gated; the compaction runs every cycle and the agent
+# cannot express a deliberate clear for a field it never saw, so preserving is
+# the only safe direction (over-preserving is the project's accepted trade-off).
+_COMPACT_CAPABILITY_FIELDS = ("source", "evidence_refs")
+_COMPACT_GAP_FIELDS = ("source", "evidence_refs")
+_COMPACT_FRICTION_FIELDS = ("source", "mitigations_tried")
+
 
 def _is_blank_floor_field(value: Any) -> bool:
     """A floor-strippable field value the agent may never have received: ``None``
@@ -2602,11 +2619,15 @@ def _merge_agent_owned_collections(
         merged = _merge_gap(c, p, p.id in _pm_compacted)
         if gap_floor_fields:
             _restore_floored_fields(c, merged, gap_floor_fields)
+        # Always-compacted provenance fields are restored unconditionally — the
+        # agent never saw them, so omission is not a clear.
+        _restore_floored_fields(c, merged, _COMPACT_GAP_FIELDS)
         return merged
 
     def _merge_cap_preserving(c: Capability, p: Capability) -> Capability:
         if caps_floored:
             _restore_floored_fields(c, p, _CAP_FLOOR_FIELDS)
+        _restore_floored_fields(c, p, _COMPACT_CAPABILITY_FIELDS)
         return p
 
     def _merge_friction_preserving(c: Friction, p: Friction) -> Friction:
@@ -2618,6 +2639,7 @@ def _merge_agent_owned_collections(
             merged.status = c.status
         if friction_floored:
             _restore_floored_fields(c, merged, _FRICTION_FLOOR_FIELDS)
+        _restore_floored_fields(c, merged, _COMPACT_FRICTION_FIELDS)
         return merged
 
     archived_gap_ids = {g.id for g in proposed.archived_gaps}
@@ -2894,6 +2916,10 @@ def apply_agent_update(
     # that echoes back a truncated view does not produce a permanent 400.
     floor_applied = proposed_raw.pop("_agent_view_floor_applied", None)
     proposed_raw.pop("_gap_memory_trimmed", None)
+    # The compaction marker is informational at write time — restore of the
+    # compacted fields is unconditional (see _COMPACT_*_FIELDS), so the echoed
+    # marker is only lifted to satisfy ProblemModel's extra="forbid".
+    proposed_raw.pop("_agent_view_compacted", None)
     proposed_raw.pop("truncated", None)
 
     proposed = ProblemModel.model_validate(proposed_raw)

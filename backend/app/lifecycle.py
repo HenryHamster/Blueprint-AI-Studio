@@ -1524,6 +1524,7 @@ async def lifespan(app):
         """
         from app.efficiency_snapshot import (
             SNAPSHOT_INTERVAL_SECONDS,
+            maybe_alert_overdue_snapshot_cadence,
             maybe_alert_pool_payoff_transition,
             maybe_alert_provider_routing_transition,
             maybe_alert_self_repair_burn_share,
@@ -1555,6 +1556,30 @@ async def lifespan(app):
                                 "[EFFICIENCY_SNAPSHOT] project=%s error=%s",
                                 project_id,
                                 proj_exc,
+                            )
+                        # Daily-snapshot cadence overdue alert: same hourly tick,
+                        # edge-triggered, so a silently failing or absent daily
+                        # snapshot pages the operator instead of letting
+                        # last_run_at age invisibly. Best-effort — isolated
+                        # try/except + commit.
+                        try:
+                            overdue_fired = await maybe_alert_overdue_snapshot_cadence(
+                                scan_session, project_id
+                            )
+                            await scan_session.commit()
+                            if overdue_fired:
+                                logger.info(
+                                    "[EFFICIENCY_SNAPSHOT] project=%s "
+                                    "snapshot-cadence-overdue alert fired",
+                                    project_id,
+                                )
+                        except Exception as overdue_exc:
+                            await scan_session.rollback()
+                            logger.warning(
+                                "[EFFICIENCY_SNAPSHOT] project=%s "
+                                "snapshot-cadence-overdue alert error=%s",
+                                project_id,
+                                overdue_exc,
                             )
                         # Warm-pool payoff transition alert: runs every hourly
                         # tick (independent of the daily snapshot-write cadence)

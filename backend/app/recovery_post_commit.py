@@ -49,6 +49,7 @@ from app.recovery_post_commit_orphans import (  # noqa: F401
     _spawn_review_for_recovered_task,
     _recover_orphaned_tasks,
 )
+from app.post_commit_errors import PostCommitLocked
 
 logger = logging.getLogger(__name__)
 
@@ -96,8 +97,6 @@ def _post_commit_retry_is_transient(exc: BaseException) -> bool:
     PERSISTENT and DOES count — a post-commit pass that wedges past its own 240s
     budget every time is the non-transient case the cap is meant to bound.
     """
-    from app.task_lifecycle import PostCommitLocked
-
     if isinstance(exc, PostCommitLocked):
         return True
     msg = f"{type(exc).__name__}: {exc}".lower()

@@ -25,7 +25,7 @@ import {
   retryPostShellFn,
 } from '../prompt.js';
 import { AGENT_TOKEN_FILE_ENV, GITHUB_TOKEN_FILE_ENV, agentTokenShellFn, jsonStrShellFn } from '../token-file.js';
-import { normalizeProviderTokenUsage } from './usage.js';
+import { normalizeProviderTokenUsage, extractProviderReportedUsage } from './usage.js';
 import { applyDeepSeekModelEnv, pinDeepSeekModel } from './deepseek-env.js';
 import { maybeConsumeCodexWeeklyReset } from './codex-rate-limit-reset.js';
 
@@ -1267,7 +1267,7 @@ export function syncAgentHelpersToPath(
     try {
       const stat = fs.lstatSync(source);
       if (!stat.isFile()) continue;
-      const quotedSource = `'${source.replace(/'/g, `'\"'\"'`)}'`;
+      const quotedSource = `'${source.replace(/'/g, `'"'"'`)}'`;
       // A wrapper preserves script-relative workspace behavior. Copying helper
       // bytes would break helpers such as `artifacts`, which intentionally
       // locate .blueprint-inputs relative to their own workspace path.
@@ -1329,7 +1329,7 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
   stderrTail?: string;
 }> {
   const runner = getProviderRunner();
-  let runCommand = isolatedTextOnly
+  const runCommand = isolatedTextOnly
     ? buildIsolatedTextOnlyMemoryCommand(runner, prompt, model, effort, isolatedTextOnly)
     : runner.buildRunCommand(prompt, model, effort, disallowedTools);
   let allOutput = '';
@@ -1906,11 +1906,16 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
                 // Provider-reported path (Component B): capture raw provider usage
                 // BEFORE normalization — separate accumulator independent from
                 // recordLlmTokens so the backend can cross-check the two paths.
-                const rawInputTokens = Number(usage.input_tokens ?? 0);
-                const rawOutputTokens = Number(usage.output_tokens ?? 0);
-                const rawCacheCreation = Number(usage.cache_creation_input_tokens ?? 0);
-                const rawCacheRead = Number(usage.cache_read_input_tokens ?? 0);
-                recordProviderReportedUsage(rawInputTokens, rawOutputTokens, rawCacheCreation, rawCacheRead);
+                // extractProviderReportedUsage handles both Anthropic-shaped and
+                // OpenAI/DeepSeek-shaped usage blocks, so every provider that
+                // emits a usage object lands in provider_reported_usage.
+                const providerUsage = extractProviderReportedUsage(usage);
+                recordProviderReportedUsage(
+                  providerUsage?.inputTokens ?? 0,
+                  providerUsage?.outputTokens ?? 0,
+                  providerUsage?.cacheCreationTokens ?? 0,
+                  providerUsage?.cacheReadTokens ?? 0,
+                );
 
                 const normalizedUsage = normalizeProviderTokenUsage(usage);
                 if (normalizedUsage) {
@@ -2101,6 +2106,17 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
               resultEventSeen = true;  // run report: codex terminal turn event
               const usage = obj.usage as Record<string, unknown> | undefined;
               if (usage && typeof usage === 'object') {
+                // Provider-reported path (Component B): OpenAI/Codex reports
+                // usage as prompt_tokens/completion_tokens (+ cached sub-counts).
+                // extractProviderReportedUsage maps it into the persisted four-field
+                // shape so openai tasks populate provider_reported_usage too.
+                const providerUsage = extractProviderReportedUsage(usage);
+                recordProviderReportedUsage(
+                  providerUsage?.inputTokens ?? 0,
+                  providerUsage?.outputTokens ?? 0,
+                  providerUsage?.cacheCreationTokens ?? 0,
+                  providerUsage?.cacheReadTokens ?? 0,
+                );
                 const normalizedUsage = normalizeProviderTokenUsage(usage);
                 if (normalizedUsage) {
                   recordLlmTokens(

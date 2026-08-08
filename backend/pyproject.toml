@@ -127,6 +127,30 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 # log-and-continue policy: each branch handles a distinct PR / pipeline stage and
 # must not crash the dispatcher on transient lookup / GitHub failures.
 "app/task_lifecycle.py" = ["BLE001"]
+# task_lifecycle_post_commit_terminal.py was extracted from task_lifecycle.py
+# (S2 of the fdd07b88 decomposition plan); it carries the same log-and-continue
+# terminal-tail pattern — each guarded section must roll back and continue so
+# one failed helper (rollup, direction outcomes, remediation, qualifier
+# finalize, strategic backstop) never poisons the shared session for the rest.
+"app/task_lifecycle_post_commit_terminal.py" = ["BLE001"]
+# task_lifecycle_completion_dispatch.py was extracted from task_lifecycle.py
+# (S3 of the fdd07b88 decomposition plan); it carries the same log-and-continue
+# / catch-classify-recover pattern around the completion-handler dispatch, so a
+# handler failure is classified and requeued/failed rather than crashing the
+# post-commit pipeline.
+"app/task_lifecycle_completion_dispatch.py" = ["BLE001"]
+# task_lifecycle_fix_completion.py was extracted from task_lifecycle.py
+# (S4 of the fdd07b88 decomposition plan); it carries the same log-and-continue
+# fix-completion pattern — each guarded section (PR state check, security scan,
+# deferred review spawn) must log and continue so a transient GitHub failure
+# never crashes the post-commit pipeline or strands the fix handoff.
+"app/task_lifecycle_fix_completion.py" = ["BLE001"]
+# review_request_changes.py was extracted from task_lifecycle.py
+# (S5 of the fdd07b88 decomposition plan); it carries the same log-and-continue
+# request-changes pattern — each guarded section (empty-PR probe, stale-target
+# guard, authority revoke, cap-alert creation) must log and continue so a
+# transient GitHub / lock failure never crashes the post-commit pipeline.
+"app/review_request_changes.py" = ["BLE001"]
 # agent_status.py is the /api/agent/status endpoint — same log-and-continue
 # policy: each transient lookup (PR state, account info, alerts, post-commit)
 # must not 500 the status POST or the agent's failure surface gets lost.

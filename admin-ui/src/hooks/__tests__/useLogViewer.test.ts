@@ -26,6 +26,7 @@ vi.mock('../../api', () => ({
   apiErrorMessage: vi.fn((_payload: unknown, fallback: string) => fallback),
   API_BASE_URL: '',
   fetchTask: vi.fn(async (id: string) => ({ id, project_id: 'projA', status: 'IN_PROGRESS', title: 'T' })),
+  recordFindingResolution: vi.fn(),
 }));
 
 class MockWebSocket {

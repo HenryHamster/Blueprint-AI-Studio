@@ -6042,7 +6042,11 @@ def test_arm_ci_wait_asserts_pr_number_present():
 async def test_merge_auto_resolves_finding_keys_on_orig_task(db_session, mocker):
     """When the original (fix) task carries resolving_finding_keys and a PR
     merges, apply_finding_resolution must write resolved ledger rows for the
-    open ReleaseVersion.  Exercises the primary path inside _orig_session."""
+    open ReleaseVersion.  Exercises the primary path inside _orig_session.
+
+    Credit is tied to the DECLARED keys: only findings the merged work said it
+    addressed are credited.  Merges that declare nothing credit nothing (see
+    ``test_merge_auto_resolve_no_keys_writes_no_rows``)."""
     from sqlmodel import select as _select
 
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
@@ -6196,8 +6200,16 @@ async def test_merge_auto_resolve_skips_when_no_open_version(db_session, mocker)
 
 @pytest.mark.asyncio
 async def test_merge_auto_resolve_no_keys_writes_no_rows(db_session, mocker):
-    """When the orig task has no resolving_finding_keys, no AuditFindingResolution
-    rows are written — existing behavior is unchanged for ordinary fix tasks."""
+    """A merge that declares no finding keys credits NOTHING.
+
+    Regression guard for the blanket-credit defect: the open version here carries
+    genuine UNRESOLVED gating findings (critical/high/medium).  A merge whose task
+    carries no ``resolving_finding_keys`` is not evidence that those findings were
+    addressed, so no AuditFindingResolution row may be written — otherwise an
+    unrelated refactor/rollup merge would drive ``gating_resolved`` to
+    ``gating_total`` and promote the version with the findings unaddressed.
+    Crediting requires an explicit declaration: task-context keys, or the
+    ``record_finding_resolution`` strategic op / operator trigger."""
     from sqlmodel import select as _select
 
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
@@ -6216,7 +6228,28 @@ async def test_merge_auto_resolve_no_keys_writes_no_rows(db_session, mocker):
     await db_session.refresh(project)
 
     version = ReleaseVersion(
-        project_id=project.id, version_number=1, status="open"
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={
+            "audit_findings": [
+                {
+                    "key": "aaaabbbbccccdddd",
+                    "severity": "critical",
+                    "summary": "genuine unresolved critical finding",
+                },
+                {
+                    "key": "eeeeffff00001111",
+                    "severity": "high",
+                    "summary": "genuine unresolved high finding",
+                },
+                {
+                    "key": "2222333344445555",
+                    "severity": "medium",
+                    "summary": "genuine unresolved medium finding",
+                },
+            ]
+        },
     )
     db_session.add(version)
     await db_session.commit()
@@ -6258,7 +6291,85 @@ async def test_merge_auto_resolve_no_keys_writes_no_rows(db_session, mocker):
         .scalars()
         .all()
     )
-    assert len(rows) == 0, "No AuditFindingResolution rows expected for task without keys"
+    assert len(rows) == 0, (
+        "No AuditFindingResolution rows expected for a task that declares no "
+        f"finding keys; carried gating findings must stay unresolved. Got: "
+        f"{[(r.finding_key, r.state) for r in rows]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_merge_auto_resolve_no_orig_no_keys_writes_no_rows(db_session, mocker):
+    """No-orig fallback: a parking task without declared keys credits NOTHING.
+
+    Same invariant as ``test_merge_auto_resolve_no_keys_writes_no_rows`` for the
+    second call site (``ci_orig_id`` absent).  A merge that names no finding is
+    not evidence any carried finding was addressed."""
+    from sqlmodel import select as _select
+
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+    from app.models import AuditFindingResolution, ReleaseVersion
+
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": True},
+    )
+
+    project = Project(name="No orig, no keys — no rows", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        last_qualification={
+            "audit_findings": [
+                {
+                    "key": "6666777788889999",
+                    "severity": "critical",
+                    "summary": "genuine unresolved critical finding",
+                },
+                {
+                    "key": "aaaa0000bbbb1111",
+                    "severity": "high",
+                    "summary": "genuine unresolved high finding",
+                },
+            ]
+        },
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # No ``original_task_id`` in the review loop → the no-orig fallback runs.
+    task = _make_task(db_session, project, pr_number=44)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True
+    rows = (
+        (
+            await db_session.execute(
+                _select(AuditFindingResolution).where(
+                    AuditFindingResolution.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 0, (
+        "No-orig merge without declared finding keys must not credit carried "
+        f"gating findings. Got: {[(r.finding_key, r.state) for r in rows]}"
+    )
 
 
 # ─── General CI rerun gate (flake-tolerant) tests ──────────────────────────

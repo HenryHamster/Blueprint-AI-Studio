@@ -1609,3 +1609,220 @@ class TestAgentStatusCloneFailedSelfHealSeam:
             "A repo with real content (repo_has_commits=True) must NOT have its "
             f"repo_is_empty flipped; got build_config={project.build_config!r}"
         )
+
+
+class TestEmptyRepoOnboardToResearchCompletionEndToEnd:
+    """End-to-end: onboard a genuinely empty repo through the real endpoint,
+    drive a research task to completion, and prove the spawned research child
+    carries durable greenfield provenance that survives project build_config
+    re-detection (the first commit landing flips repo_is_empty, so the child
+    must not depend on reading the mutable project field later)."""
+
+    @pytest.mark.asyncio
+    async def test_onboard_empty_repo_research_completion_keeps_greenfield_provenance(
+        self, client, db_session
+    ):
+        """Onboard an empty repo, complete a research task end-to-end, and verify
+        both halves of the durable greenfield handoff:
+
+          1. research_completion stamps repo_is_empty/source_file_count onto each
+             spawned child's context at spawn time (the project build_config is
+             mutable and flips once the first scaffolding lands);
+          2. the agent-claim path prefers that spawn-time snapshot over the
+             project's re-detected build_config when building the claim response,
+             so the agent's greenfield guidance survives the parent->child
+             handoff.
+        """
+        from app.auth import create_agent_token
+        from app.findings_index import query_findings_index
+        from app.models import ProjectStatus
+        from app.research_completion import _handle_research_completion
+        from sqlalchemy import select
+        from sqlalchemy.orm.attributes import flag_modified
+
+        # ── 1. Onboard the empty repo through the REAL endpoint ──────────────
+        with (
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+            patch(
+                "app.github.get_repo_default_branch",
+                new_callable=AsyncMock,
+                return_value="main",
+            ),
+            patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=True,  # the commitless repo was seeded
+            ),
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value=_empty_repo_build_config(),
+            ),
+        ):
+            resp = await client.post(
+                "/api/admin/projects/onboard",
+                json={"github_owner": "acme", "github_repo": "empty-repo"},
+            )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        project_id = data["project_id"]
+        assert data["default_branch"] == "main"
+
+        # ── 2. The six missing-state pins ────────────────────────────────────
+        # (a) project record exists, with the resolved default branch persisted.
+        project = await db_session.get(Project, project_id)
+        assert project is not None
+        assert project.integration_branch == "main"
+        assert project.status == ProjectStatus.DEPLOYING
+        assert project.autonomous_enabled is False
+
+        # (b) absent .blueprint/tools.json — the persisted build_config honestly
+        # records an empty repo (no language, no CI, zero real source files).
+        build_config = project.build_config or {}
+        assert build_config.get("repo_is_empty") is True
+        assert build_config.get("source_file_count") == 0
+        assert build_config.get("has_ci") is False
+        assert "tools" not in build_config
+        assert "commands" not in build_config
+
+        # (c) empty knowledge index — nothing finalized yet.
+        rows = await query_findings_index(db_session, project_id)
+        assert rows == []
+
+        # (d) no acceptance criteria / no directions on the fresh project.
+        assert not (project.directions or [])
+
+        # (e) no prior qualification — the empty-repo bootstrap guard fired and
+        # no task of any kind was created by onboarding.
+        tasks = (
+            await db_session.execute(
+                select(Task).where(Task.project_id == project_id)
+            )
+        ).scalars().all()
+        assert tasks == []
+
+        # ── 3. Drive a research task through the real completion handler ─────
+        research_task = Task(
+            project_id=project.id,
+            title="Research: empty repo",
+            payloads=[{"type": "research", "base_branch": "main"}],
+            context={"research_depth": 0},
+            status=TaskStatus.IN_PROGRESS,
+            created_by="ORCHESTRATOR",
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        )
+        db_session.add(research_task)
+        await db_session.commit()
+        await db_session.refresh(research_task)
+
+        finding = {
+            "title": "Seed repository scaffolding",
+            "description": "The empty repo needs a README and scaffold.",
+            "prompt": "Create README.md and basic project scaffolding.",
+            "priority": "medium",
+            "scope": "small",
+            "risk": "low",
+            "type": "improvement",
+        }
+        logs = json.dumps([finding])
+
+        async def _passthrough_ensure_branch(task, *_a, **_kw):
+            return task
+
+        # Same external-call mock surface as test_autonomous_research.py's
+        # _patch_research_externals — the completion logic itself runs real.
+        with (
+            patch(
+                "app.task_completion._ensure_branch",
+                new=_passthrough_ensure_branch,
+            ),
+            patch(
+                "app.broadcast.broadcast_to_project",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "app.research_completion._validate_plan_dependencies",
+                return_value=True,
+            ),
+            patch(
+                "app.research_completion._log_file_overlaps",
+                return_value=[],
+            ),
+            patch("app.max_plan_pool._all_accounts", return_value=[]),
+            patch(
+                "app.research_completion._apply_structural_actionability_downgrade",
+                return_value=0,
+            ),
+            patch(
+                "app.research_completion._is_high_stakes_finding",
+                return_value=False,
+            ),
+        ):
+            await _handle_research_completion(research_task, logs, db_session)
+
+        # Parent flipped EVALUATING with live children — the wedge to prevent
+        # (COMPLETED-with-children, or stranded IN_PROGRESS) is absent.
+        await db_session.refresh(research_task)
+        assert research_task.status == TaskStatus.EVALUATING
+
+        # Findings were finalized: the index marker is set and the surviving
+        # finding landed in plan_output.
+        assert (research_task.context or {}).get("research_findings_finalized") is True
+        assert research_task.plan_output is not None
+        assert any(
+            f.get("title") == finding["title"] for f in research_task.plan_output
+        )
+
+        # The child spawned carrying the durable greenfield provenance — the
+        # research_completion production change.
+        children = (
+            await db_session.execute(
+                select(Task).where(Task.parent_task_id == research_task.id)
+            )
+        ).scalars().all()
+        assert len(children) == 1
+        child = children[0]
+        assert child.context.get("repo_is_empty") is True
+        assert child.context.get("source_file_count") == 0
+
+        # ── 4. Simulate re-detection after the first scaffolding commit ──────
+        # The project's durable build_config flips to non-empty (repo_bootstrap /
+        # maybe_redetect_on_emptiness_disagreement re-detects the now-seeded
+        # repo). The spawned child must NOT depend on this mutable field.
+        project.build_config = {
+            **build_config,
+            "repo_is_empty": False,
+            "source_file_count": 3,
+            "has_ci": False,
+        }
+        flag_modified(project, "build_config")
+        db_session.add(project)
+        await db_session.commit()
+
+        # ── 5. Claim the child — the agent-claim production change ───────────
+        token = create_agent_token(str(child.id), child.vm_instance_id)
+        claim_resp = await client.post(
+            "/api/agent/claim", headers={"x-agent-token": token}
+        )
+        assert claim_resp.status_code == 200, claim_resp.text
+        claim_data = claim_resp.json()
+        # The child's spawn-time snapshot (repo_is_empty True / 0 files) must
+        # win over the re-detected project build_config (now False / 3 files).
+        assert claim_data["repo_is_empty"] is True
+        assert claim_data["source_file_count"] == 0
+
+        # ── 6. Simulate the rollup terminal flip, then query the index ───────
+        child.status = TaskStatus.COMPLETED
+        db_session.add(child)
+        await db_session.commit()
+        research_task.status = TaskStatus.COMPLETED
+        db_session.add(research_task)
+        await db_session.commit()
+
+        rows = await query_findings_index(db_session, project_id)
+        assert len(rows) == 1
+        assert rows[0]["finding_title"] == finding["title"]

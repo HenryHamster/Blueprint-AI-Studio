@@ -1086,6 +1086,52 @@ describe('handleReview — verdict file parsing', () => {
     expect(String(status.logs)).toContain('"verdict":"APPROVE"');
   });
 
+  it('accepts a markdown-wrapped well-formed verdict from the /tmp file without a repair pass', async () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync).mockReturnValue(
+      '```json\n{"verdict":"APPROVE","feedback":"wrapped but well-formed"}\n```',
+    );
+    // The model wrote the verdict ONLY to the file (wrapped in a fence) and its
+    // final output text carries no standalone verdict JSON. Before the contract
+    // fix, strict JSON.parse rejected the fence and a repair reopen burned a
+    // miss + attempt; the string-aware reader must accept it on the first pass.
+    vi.mocked(indexMod.runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: 'review output without a standalone verdict JSON',
+      lastResultText: 'review text without a standalone verdict JSON',
+    });
+
+    await handleReview(
+      'task-wrapped', basePayload, { context: { scope: 'medium' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    expect(vi.mocked(indexMod.runClaudeCode)).toHaveBeenCalledTimes(1);
+    const status = vi.mocked(indexMod.persistAndPostStatus).mock.calls[0][1];
+    expect(status.status).toBe('COMPLETED');
+    const verdictJson = JSON.parse(String(status.verdict_json)) as { verdict: string; feedback: string };
+    expect(verdictJson.verdict).toBe('APPROVE');
+    expect(verdictJson.feedback).toBe('wrapped but well-formed');
+    expect(getFormatComplianceTelemetry()).toEqual({
+      format_miss_by_reason: {},
+      format_repair_miss_by_reason: {},
+      format_error_total: 0,
+      format_repair_attempts: 0,
+      format_repair_successes: 0,
+      format_repair_infra_failures: 0,
+      format_repair_input_tokens: 0,
+      format_repair_output_tokens: 0,
+      format_miss_by_schema: {},
+      format_repair_attempts_by_schema: {},
+      format_repair_successes_by_schema: {},
+      format_repair_infra_failures_by_schema: {},
+      format_repair_input_tokens_by_schema: {},
+      format_repair_output_tokens_by_schema: {},
+      format_repair_miss_by_schema: {},
+      format_miss_by_schema_and_reason: {},
+    });
+  });
+
   it("augments verdict_json with investigated_files derived from the review's tool trace", async () => {
     vi.mocked(fs.existsSync).mockReturnValue(true);
     vi.mocked(fs.readFileSync).mockReturnValue(

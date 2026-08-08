@@ -4,17 +4,23 @@ The v28 stabilisation work measured the strategic decision-loop payload and
 found its largest section is ``problem_model`` at 27.6% of the mean prompt
 bytes (37,196 bytes of a 134,842-byte prompt). This test builds the
 agent-view ``problem_model`` section from a deterministic, realistic fixture
-and asserts the STRUCTURAL byte reductions that keep the section bounded —
-chiefly that ``revision_log`` (the durable model-write history, which the
-schema marks "Not auto-injected into prompts — accessible via tool call") is
-no longer shipped inside the problem_model section.
+and asserts the STRUCTURAL byte reductions that keep the section bounded:
+
+- ``revision_log`` (the durable model-write history, which the schema marks
+  "Not auto-injected into prompts — accessible via tool call") is no longer
+  shipped inside the problem_model section;
+- low-value provenance/detail fields (``source``, ``evidence_refs``, friction
+  ``mitigations_tried``) are compacted out of every agent-owned entry by
+  ``_agent_view_problem_model`` — recoverable via ``./fetch problem-model`` and
+  restored on write-back, never a silent drop (see ``test_strategic_payload.py``
+  for the recoverability/non-destructive assertions).
 
 It asserts measured byte sizes, not just structure: total section bytes, the
 per-section bytes of the sections the builder ships, and the exact bytes
 saved by dropping the revision log. The byte ceilings are sized to the
 fixture with headroom; a regression that re-ships the revision log (the
-single largest structurally-redundant slice, ~18% of the section) trips the
-total-bytes ceiling.
+single largest structurally-redundant slice) OR re-ships the compacted
+provenance fields trips the total-bytes ceiling.
 """
 
 import json
@@ -23,13 +29,14 @@ from app.payload_schemas import _serialized_size, pack_under_budget
 from app.strategic_problem_view import _agent_view_problem_model
 
 # Byte ceilings for the fixture below, measured from the fixture's serialized
-# agent-view output with headroom. Total is deliberately tight: re-shipping
-# the ~4.9 KB revision_log pushes the total over it.
-_PROBLEM_MODEL_VIEW_MAX_BYTES = 39_000
+# compacted agent-view output (23,496 B) with headroom. Total is deliberately
+# tight: re-shipping the ~4.9 KB revision_log (→ 28,451 B) or re-shipping the
+# compacted provenance fields (→ 35,097 B) both push the total over it.
+_PROBLEM_MODEL_VIEW_MAX_BYTES = 28_000
 _PER_SECTION_MAX_BYTES = {
-    "gaps": 18_000,
-    "capabilities": 15_000,
-    "friction": 5_000,
+    "gaps": 15_000,
+    "capabilities": 8_000,
+    "friction": 3_000,
     "intent": 2_000,
 }
 
@@ -356,7 +363,6 @@ def test_strategic_payload_total_bytes_under_budget():
                 {"key": "systems/release-pipeline", "summary": "Architecture section summary"},
             ]
         },
-        "vision": {"_strategic_cycle_history": []},
         "effective_purpose": "Blueprint keeps itself ahead of relevant advances with minimal attention",
         "direction_counts": {"active": 4, "max_active": 6},
         "max_active_directions": 6,
@@ -375,3 +381,59 @@ def test_strategic_payload_total_bytes_under_budget():
     assert "problem_model" in packed
     assert packed["problem_model"] == problem_model
     assert "revision_log" not in packed["problem_model"]
+
+
+def test_strategic_payload_drops_legacy_vision_keeps_effective_purpose():
+    """The legacy vision body is no longer shipped in the strategic payload:
+    the section-priority tables carry no vision entry at ANY tier (the critical
+    pin — and its ~37KB eviction of lower-tier sections — is gone from both
+    strategic surfaces), the payload exposes ``effective_purpose`` (the single
+    live intent field) instead, and a caller that still passes a vision body is
+    NOT treated as a critical-tier section — an oversized body drops under
+    budget rather than raising PayloadTooLargeError."""
+    from app.strategic_spawning import (
+        _DESIGN_DOC_UPDATE_SCHEMA,
+        _STRATEGIC_REVIEW_SCHEMA,
+    )
+
+    # No critical-tier vision entry — no vision entry at all — in either
+    # strategic section-priority table.
+    assert "vision" not in _STRATEGIC_REVIEW_SCHEMA
+    assert "vision" not in _DESIGN_DOC_UPDATE_SCHEMA
+
+    pm = _build_problem_model_fixture()
+    problem_model = _agent_view_problem_model(pm)
+    effective_purpose = (
+        "Blueprint keeps itself ahead of relevant advances with minimal attention"
+    )
+    payload = {
+        "type": "strategic_review",
+        "research_mode": "strategic",
+        "problem_model": problem_model,
+        "effective_purpose": effective_purpose,
+        "direction_counts": {"active": 4, "max_active": 6},
+        "max_active_directions": 6,
+        "project_name": "Blueprint",
+        "open_message_count": 0,
+        "open_messages": [],
+        "conversation_thread": [],
+    }
+
+    # The packed strategic payload carries no legacy vision body…
+    packed = pack_under_budget(payload, _STRATEGIC_REVIEW_SCHEMA)
+    assert "vision" not in packed
+    # …while effective_purpose — the single live intent field — still ships.
+    assert packed["effective_purpose"] == effective_purpose
+
+    # A caller that still passes a legacy vision body gets it treated as an
+    # ordinary unregistered low-priority key, never a critical-tier section:
+    # an oversized body drops under budget instead of hard-failing the pack.
+    packed_with_vision = pack_under_budget(
+        {**payload, "vision": {"purpose": "x" * 200_000}},
+        _STRATEGIC_REVIEW_SCHEMA,
+    )
+    assert "vision" not in packed_with_vision, (
+        "the oversized legacy vision body must be dropped as unregistered "
+        "low-priority, never shipped or hard-failed as critical"
+    )
+    assert packed_with_vision["effective_purpose"] == effective_purpose

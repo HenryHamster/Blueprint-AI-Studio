@@ -29,7 +29,14 @@ from app.compute_experiment_contract import (
 from app.resource_envelope import resolve_project_require_local_runner
 from app.depends_on_provenance import remember_structural_depends_on
 from app.finding_deduplication import normalize_prerequisite, resolve_prerequisite_task
-from app.models import Project, Task, TaskHistory, TaskStatus
+from app.models import (
+    TASK_ORIGINATION_PLAN,
+    Project,
+    Task,
+    TaskHistory,
+    TaskStatus,
+    _INHERITABLE_ORIGINATIONS,
+)
 from app.payload_schemas import (
     parse_acceptance_evidence,
     read_acceptance_evidence,
@@ -866,6 +873,16 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         getattr(project, "problem_model", None)
     )
 
+    # Children inherit the plan task's durable origination when the plan parent
+    # is itself a recognized origin class (research cycle, strategist commission,
+    # operator) so merged-work analytics credit the full lineage; otherwise they
+    # are plain PLAN-originated subtasks.
+    _child_origination = (
+        task.origination
+        if task.origination in _INHERITABLE_ORIGINATIONS
+        else TASK_ORIGINATION_PLAN
+    )
+
     child_tasks = []
     for i, subtask_def in enumerate(subtasks):
         # Gate the child type on the registry-derived plan-subtask allowlist
@@ -1202,6 +1219,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
             status=TaskStatus.QUEUED,
             created_by="ORCHESTRATOR",
+            origination=_child_origination,
             depends_on=[],
             priority=subtask_priority,
         )
@@ -1255,6 +1273,12 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         """Inherit *foundation*'s base_branch when it is a genuine cross-tree
         code-dep of *dependent*, preventing the cross-base landed-signal wedge."""
         if not dependent.payloads:
+            return
+        if (dependent.first_payload or {}).get("release_base_branch"):
+            # A declared release-time base pin outranks creation-time
+            # inheritance — the dispatch chokepoint repoints base_branch to the
+            # declared branch when the dependency gate opens, so inheriting the
+            # foundation's base here would only be silently undone.
             return
         from app.orchestrator_health import (
             _same_base_branch,

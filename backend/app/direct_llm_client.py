@@ -198,6 +198,35 @@ def normalize_rate_limit_data(
     return normalized
 
 
+def extract_usage_data(response: Any) -> dict[str, Any] | None:
+    """Extract ``response.usage`` into the ``provider_reported_usage`` shape.
+
+    Returns a dict with ``input_tokens``, ``output_tokens``,
+    ``cache_creation_input_tokens``, ``cache_read_input_tokens`` (all ints) and
+    ``reported: True`` — the same shape ``Task.provider_reported_usage`` uses,
+    so callers can price it with the shared pricing helpers. Returns ``None``
+    when the response carries no usable usage block (e.g. no ``usage``
+    attribute, or a test stub whose fields aren't real integers).
+    """
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return None
+    try:
+        input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+        output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+        cache_creation = int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
+        cache_read = int(getattr(usage, "cache_read_input_tokens", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_creation_input_tokens": cache_creation,
+        "cache_read_input_tokens": cache_read,
+        "reported": True,
+    }
+
+
 async def call_direct_llm(
     api_key: str,
     *,
@@ -207,14 +236,16 @@ async def call_direct_llm(
     model: str = DIRECT_LLM_MODEL,
     system: str | None = None,
     base_url: str | None = None,
-) -> tuple[str, dict[str, Any]]:
+) -> tuple[str, dict[str, Any], dict[str, Any] | None]:
     """Construct an AsyncAnthropic client and make one messages.create call.
 
-    Returns ``(text, rate_limit_data)`` where *text* is the trimmed concatenated
-    text from all content blocks and *rate_limit_data* is a structured dict from
-    :func:`normalize_rate_limit_data` containing the response-header rate-limit
-    information (unified-5h, request-level, token-level). Callers without an
-    account context can discard the second element with ``_``.
+    Returns ``(text, rate_limit_data, usage_data)`` where *text* is the trimmed
+    concatenated text from all content blocks, *rate_limit_data* is a
+    structured dict from :func:`normalize_rate_limit_data` containing the
+    response-header rate-limit information (unified-5h, request-level,
+    token-level), and *usage_data* is :func:`extract_usage_data`'s reading of
+    ``resp.usage`` (or ``None`` when unavailable). Callers without an account
+    context can discard the second element with ``_``.
 
     Raises on any error — callers wrap this in their own retry loop so
     parse-error retries work exactly as before.
@@ -242,6 +273,7 @@ async def call_direct_llm(
     text = "\n".join(text_parts).strip()
     raw_headers = extract_rate_limit_headers(resp)
     rate_limit_data = normalize_rate_limit_data(raw_headers)
-    return text, rate_limit_data
+    usage_data = extract_usage_data(resp)
+    return text, rate_limit_data, usage_data
 
 

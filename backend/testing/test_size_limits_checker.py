@@ -8,6 +8,7 @@ clean; section scoping works; absent-tree sections are skipped not errored.
 
 import json
 import os
+import subprocess
 import sys
 
 import app.size_limit_policy as slp
@@ -312,6 +313,133 @@ def test_uncapped_scan_skips_already_capped_files(tmp_path):
         str(root), {"capped.py": 1700}, (".py",), csl._no_exclusion
     )
     assert [rec["rel"] for rec in offenders] == ["uncapped.py"]
+
+
+# ── Merge-duplicated bump-pair dedup (cap_bump_history generator) ─────────────
+
+
+def test_parse_git_diff_dedups_merge_duplicated_bump_pairs():
+    """Merge-duplicated bump pairs collapse to the earliest-dated commit.
+
+    The same cap change (old_cap -> new_cap) appears twice in ``git log --all``
+    output — once on the commit that first introduced the new limit value and
+    again on a sibling/promotion commit that re-applied the identical value.
+    git log emits commits newest-first, so the later duplicate appears FIRST in
+    the output. The dedup must keep the earliest-dated record of each pair by
+    timestamp (not position), and must not collapse distinct later bumps.
+    """
+    log = """\
+COMMIT bbb222 2026-05-22T22:49:42+00:00
+
+diff --git a/backend/testing/module_size_limits.json b/backend/testing/module_size_limits.json
+--- a/backend/testing/module_size_limits.json
++++ b/backend/testing/module_size_limits.json
+@@ -1,5 +1,5 @@
+   "backend": {
+-    "main.py": 3700,
++    "main.py": 3800,
+   }
+
+COMMIT aaa111 2026-05-22T03:27:04+00:00
+
+diff --git a/backend/testing/module_size_limits.json b/backend/testing/module_size_limits.json
+--- a/backend/testing/module_size_limits.json
++++ b/backend/testing/module_size_limits.json
+@@ -1,5 +1,5 @@
+   "backend": {
+-    "main.py": 3700,
++    "main.py": 3800,
+   }
+
+COMMIT ccc333 2026-06-01T10:00:00+00:00
+
+diff --git a/backend/testing/module_size_limits.json b/backend/testing/module_size_limits.json
+--- a/backend/testing/module_size_limits.json
++++ b/backend/testing/module_size_limits.json
+@@ -1,5 +1,5 @@
+   "backend": {
+-    "main.py": 3800,
++    "main.py": 3900,
+   }
+"""
+    records = slp._parse_git_diff_output(log, "main.py")
+    # (3700, 3800) appeared twice — collapsed to the earlier commit (aaa111),
+    # even though the later duplicate (bbb222) appears first in the output.
+    # (3800, 3900) is a distinct later bump and survives.
+    assert [(r["commit_sha"], r["old_cap"], r["new_cap"]) for r in records] == [
+        ("aaa111", 3700, 3800),
+        ("ccc333", 3800, 3900),
+    ]
+
+
+def test_parse_git_diff_does_not_dedup_distinct_pairs():
+    """A module's distinct bumps all survive; only identical pairs collapse."""
+    log = """\
+COMMIT bbb222 2026-06-01T10:00:00+00:00
+
+diff --git a/backend/testing/module_size_limits.json b/backend/testing/module_size_limits.json
+--- a/backend/testing/module_size_limits.json
++++ b/backend/testing/module_size_limits.json
+@@ -1,5 +1,5 @@
+   "backend": {
+-    "m.py": 1000,
++    "m.py": 1200,
+   }
+
+COMMIT aaa111 2026-05-01T10:00:00+00:00
+
+diff --git a/backend/testing/module_size_limits.json b/backend/testing/module_size_limits.json
+--- a/backend/testing/module_size_limits.json
++++ b/backend/testing/module_size_limits.json
+@@ -1,5 +1,5 @@
+   "backend": {
+-    "m.py": 800,
++    "m.py": 1000,
+   }
+"""
+    records = slp._parse_git_diff_output(log, "m.py")
+    assert [(r["commit_sha"], r["old_cap"], r["new_cap"]) for r in records] == [
+        ("aaa111", 800, 1000),
+        ("bbb222", 1000, 1200),
+    ]
+
+
+def test_parse_git_diff_dedup_keeps_earliest_across_offsets():
+    """The earliest survivor is chosen by actual timestamp, not ISO-string order.
+
+    ``-07:00`` is later in the day than ``+00:00`` for the same clock time; a
+    raw string sort would mis-order ``22:00-07:00`` (== 05:00 UTC next day)
+    before ``00:30+00:00``. Dedup must treat them by their true UTC instant.
+    """
+    log = """\
+COMMIT aaa111 2026-05-22T00:30:00+00:00
+
+diff --git a/backend/testing/module_size_limits.json b/backend/testing/module_size_limits.json
+--- a/backend/testing/module_size_limits.json
++++ b/backend/testing/module_size_limits.json
+@@ -1,5 +1,5 @@
+   "backend": {
+-    "main.py": 3700,
++    "main.py": 3800,
+   }
+
+COMMIT bbb222 2026-05-21T22:00:00-07:00
+
+diff --git a/backend/testing/module_size_limits.json b/backend/testing/module_size_limits.json
+--- a/backend/testing/module_size_limits.json
++++ b/backend/testing/module_size_limits.json
+@@ -1,5 +1,5 @@
+   "backend": {
+-    "main.py": 3700,
++    "main.py": 3800,
+   }
+"""
+    records = slp._parse_git_diff_output(log, "main.py")
+    # bbb222 (-07:00) is 2026-05-22T05:00:00+00:00 — LATER than aaa111's
+    # 00:30+00:00, so aaa111 wins even though "22:00-07:00" < "00:30+00:00"
+    # as a raw string.
+    assert len(records) == 1
+    assert records[0]["commit_sha"] == "aaa111"
 
 
 # ── Chronic-offender gate in --fix mode ─────────────────────────────────────
@@ -659,3 +787,263 @@ def test_base_root_uncapped_not_excused_by_base_breach(tmp_path, capsys):
     assert rc == 1
     assert "[uncapped] backend/big.py" in out
     assert "[pre-existing]" not in out
+
+
+# ── Cap-raise guardrail (silent cap raises must fail CHECK mode) ─────────────
+
+
+def test_detect_unjustified_cap_raises_pure():
+    """Pure detection: raises above the MAINLINE baseline are flagged; lowerings,
+    unchanged caps, and brand-new caps (no baseline value) never are."""
+    mainline = {
+        "backend": {"big.py": 100, "same.py": 50, "gone.py": 40},
+        "agent": {"a.ts": 10},
+    }
+    data = {
+        # big.py raised 100 -> 200; same.py unchanged; gone.py lowered 40 -> 30
+        # (was on mainline but not raised); new.py added with no mainline cap.
+        "backend": {"big.py": 200, "same.py": 50, "gone.py": 30, "new.py": 25},
+        "agent": {"a.ts": 10},
+    }
+    raises = csl.detect_unjustified_cap_raises(
+        data, mainline, ["backend", "agent"], history_for=lambda s, r: []
+    )
+    assert raises == [("backend", "big.py", 100, 200)]
+
+
+def test_detect_unjustified_cap_raises_ledger_justified():
+    """A raise with a matching cap-bump-history entry is deliberate and not flagged."""
+    raises = csl.detect_unjustified_cap_raises(
+        {"backend": {"m.py": 200}},
+        {"backend": {"m.py": 100}},
+        ["backend"],
+        history_for=lambda s, r: [{"old_cap": 100, "new_cap": 200}],
+    )
+    assert raises == []
+
+
+def test_detect_unjustified_cap_raises_bumprecord_contract():
+    """parse_bump_history returns BumpRecord dataclasses (not dicts); the
+    justification check must accept that shape too."""
+    from datetime import datetime, timezone
+
+    from app.size_limit_policy import BumpRecord
+
+    record = BumpRecord(
+        commit_sha="sha1",
+        commit_date=datetime.now(timezone.utc).isoformat(),
+        old_cap=100,
+        new_cap=200,
+    )
+    raises = csl.detect_unjustified_cap_raises(
+        {"backend": {"m.py": 200}},
+        {"backend": {"m.py": 100}},
+        ["backend"],
+        history_for=lambda s, r: [record],
+    )
+    assert raises == []
+    # And the same record does NOT justify a different (old, new) pair.
+    raises = csl.detect_unjustified_cap_raises(
+        {"backend": {"m.py": 300}},
+        {"backend": {"m.py": 100}},
+        ["backend"],
+        history_for=lambda s, r: [record],
+    )
+    assert raises == [("backend", "m.py", 100, 300)]
+
+
+def test_check_flags_unjustified_cap_raise(tmp_path, capsys, mocker):
+    """CHECK must FAIL when a diff raises a cap with no cap_bump_history entry —
+    naming the file, the old and new values, and how to record the bump."""
+    repo, jp = _build_repo(tmp_path, backend={"m.py": (50, 200)})
+    # The mainline ancestry baseline caps m.py at 100; this change raised it to
+    # 200. No ledger entry justifies the raise.
+    mocker.patch(
+        "testing.check_size_limits._mainline_limits_via_git",
+        return_value=({"backend": {"m.py": 100}}, None),
+    )
+    mocker.patch("app.size_limit_policy.parse_bump_history", return_value=[])
+    rc = _run(jp, repo, "--sections", "backend")
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "[cap-raise] backend/m.py: cap raised 100 -> 200" in out
+    assert "cap_bump_history.json" in out
+    assert "--fix" in out
+
+
+def test_check_ledger_justified_cap_raise_passes(tmp_path, capsys, mocker):
+    """A raise WITH a matching cap_bump_history entry stays legal."""
+    from datetime import datetime, timezone
+
+    from app.size_limit_policy import BumpRecord
+
+    repo, jp = _build_repo(tmp_path, backend={"m.py": (50, 200)})
+    mocker.patch(
+        "testing.check_size_limits._mainline_limits_via_git",
+        return_value=({"backend": {"m.py": 100}}, None),
+    )
+    mocker.patch(
+        "app.size_limit_policy.parse_bump_history",
+        return_value=[
+            BumpRecord(
+                commit_sha="sha1",
+                commit_date=datetime.now(timezone.utc).isoformat(),
+                old_cap=100,
+                new_cap=200,
+            )
+        ],
+    )
+    assert _run(jp, repo, "--sections", "backend") == 0
+
+
+def test_check_cap_lowering_always_legal(tmp_path, capsys, mocker):
+    """Lowering a cap must never require a ledger entry — even with empty history."""
+    repo, jp = _build_repo(tmp_path, backend={"m.py": (50, 100)})
+    mocker.patch(
+        "testing.check_size_limits._mainline_limits_via_git",
+        return_value=({"backend": {"m.py": 200}}, None),
+    )
+    # No ledger entry at all — irrelevant for a lowering.
+    mocker.patch("app.size_limit_policy.parse_bump_history", return_value=[])
+    assert _run(jp, repo, "--sections", "backend") == 0
+
+
+def test_check_cap_raise_guard_fails_closed_on_unreadable_history(
+    tmp_path, capsys, mocker
+):
+    """A raise whose justification cannot be read fails CLOSED (flagged), never
+    degraded to 'no bump on record' — the chronic-offender classifier's contract."""
+    from app.size_limit_policy import BumpHistoryUnavailableError
+
+    repo, jp = _build_repo(tmp_path, backend={"m.py": (50, 200)})
+    mocker.patch(
+        "testing.check_size_limits._mainline_limits_via_git",
+        return_value=({"backend": {"m.py": 100}}, None),
+    )
+    mocker.patch(
+        "app.size_limit_policy.parse_bump_history",
+        side_effect=BumpHistoryUnavailableError("ledger gone"),
+    )
+    rc = _run(jp, repo, "--sections", "backend")
+    assert rc == 1
+    assert "[cap-raise] backend/m.py: cap raised 100 -> 200" in capsys.readouterr().out
+
+
+def test_check_cap_raise_guard_skips_when_mainline_unavailable(
+    tmp_path, capsys, mocker
+):
+    """A shallow clone / checkout without the mainline ancestry must SKIP the
+    raise guard with a clear message — not crash and not spuriously fail."""
+    repo, jp = _build_repo(tmp_path, backend={"m.py": (50, 200)})
+    mocker.patch(
+        "testing.check_size_limits._mainline_limits_via_git",
+        return_value=(None, "no mainline branch present (ref helper fell back to HEAD)"),
+    )
+    rc = _run(jp, repo, "--sections", "backend")
+    assert rc == 0
+    assert "[cap-raise-guard] skipped" in capsys.readouterr().out
+
+
+def test_check_cap_raise_guard_skips_non_git_checkout(tmp_path, capsys):
+    """A non-git repo root (hermetic fixture) cannot establish a mainline
+    baseline — the guard degrades to a clear skip, not a failure."""
+    repo, jp = _build_repo(tmp_path, backend={"m.py": (50, 200)})
+    assert _run(jp, repo, "--sections", "backend") == 0
+    assert "[cap-raise-guard] skipped" in capsys.readouterr().out
+
+
+def _git(repo_root, *args):
+    subprocess.run(
+        ["git", "-C", str(repo_root), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _write_git_repo(repo_root, caps):
+    """Scaffold ``backend/testing/module_size_limits.json`` at ``repo_root`` with
+    ``caps`` and commit it as the initial commit on the given branch."""
+    (repo_root / "backend" / "testing").mkdir(parents=True)
+    (repo_root / "backend" / "app").mkdir(parents=True)
+    limits = dict(caps)
+    limits["_doc"] = "test doc"
+    with open(repo_root / "backend" / "testing" / "module_size_limits.json", "w") as f:
+        json.dump(limits, f)
+    _git(repo_root, "init", "-q", "-b", "main")
+    _git(repo_root, "config", "user.email", "test@example.com")
+    _git(repo_root, "config", "user.name", "Test")
+    _git(repo_root, "add", ".")
+    _git(repo_root, "commit", "-q", "-m", "initial")
+
+
+def test_mainline_limits_via_git_reads_mainline_caps(tmp_path):
+    """_mainline_limits_via_git reads module_size_limits.json AT the mainline ref,
+    not the working tree — so a local raise is still judged against the committed
+    ancestry baseline."""
+    repo = tmp_path / "repo"
+    _write_git_repo(repo, {"backend": {"m.py": 100}})
+    # The working tree now raises the cap; the committed mainline ref still has 100.
+    limits = json.loads(
+        (repo / "backend" / "testing" / "module_size_limits.json").read_text()
+    )
+    limits["backend"]["m.py"] = 200
+    (repo / "backend" / "testing" / "module_size_limits.json").write_text(
+        json.dumps(limits)
+    )
+    baseline, reason = csl._mainline_limits_via_git(str(repo))
+    assert reason is None
+    assert baseline["backend"]["m.py"] == 100
+
+
+def test_mainline_limits_via_git_skips_when_mainline_ref_absent(tmp_path):
+    """A checkout with no mainline branch (only a feature branch — the shape of a
+    shallow CI clone that never fetched the integration branch) degrades to a
+    clear skip, not a crash or a spurious failure."""
+    repo = tmp_path / "repo"
+    (repo / "backend" / "testing").mkdir(parents=True)
+    (repo / "backend" / "testing" / "module_size_limits.json").write_text(
+        json.dumps({"backend": {"m.py": 100}})
+    )
+    _git(repo, "init", "-q", "-b", "feature/size-work")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "feature work")
+    baseline, reason = csl._mainline_limits_via_git(str(repo))
+    assert baseline is None
+    assert "no mainline branch present" in reason
+
+
+def test_fix_records_bump_then_check_accepts_raise(tmp_path, capsys, mocker):
+    """End-to-end: --fix bumps a cap AND records the (old -> new) pair in the
+    fixture cap_bump_history.json; a follow-up CHECK accepts the raise because
+    the ledger now justifies it."""
+    repo, jp = _build_repo(tmp_path, backend={"big.py": (1720, 1600)})
+    mocker.patch("app.size_limit_policy.parse_bump_history", return_value=[])
+    assert _run(jp, repo, "--fix", "--sections", "backend") == 0
+
+    new_cap = bump_size_limit(1720)
+    ledger_path = os.path.join(os.path.dirname(jp), "cap_bump_history.json")
+    ledger = json.loads(_read(ledger_path))
+    assert (1600, new_cap) in [
+        (r["old_cap"], r["new_cap"]) for r in ledger["history"]["backend"]["big.py"]
+    ]
+
+    # Undo the empty-history mock (used only so --fix treats big.py as a
+    # first-time breach) before the follow-up check reads the real ledger.
+    mocker.stopall()
+    # Follow-up CHECK: the mainline baseline holds the pre-fix cap, so the bump
+    # is a raise vs the ancestry — but the freshly-recorded ledger entry makes it
+    # deliberate and legal. Pin the ledger branch (deployed-layout read) so the
+    # test is deterministic regardless of whether _REPO_ROOT is a complete
+    # checkout (where parse_bump_history would otherwise read git, not the
+    # fixture mirror).
+    slp._bump_history_cache.clear()
+    mocker.patch("app.size_limit_policy._git_reads_history_here", return_value=False)
+    mocker.patch(
+        "testing.check_size_limits._mainline_limits_via_git",
+        return_value=({"backend": {"big.py": 1600}}, None),
+    )
+    mocker.patch("app.size_limit_policy._CAP_BUMP_HISTORY_LEDGER_PATH", ledger_path)
+    assert _run(jp, repo, "--sections", "backend") == 0

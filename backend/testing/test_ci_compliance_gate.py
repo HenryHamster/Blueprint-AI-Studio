@@ -2219,18 +2219,67 @@ def test_cap_bump_resolves_discovery_review_breach():
     )
 
 
+def test_cap_bump_resolves_release_qualifier_audit_breach():
+    """After bumping caps via check_size_limits --fix, release_qualifier_audit.py
+    must be within its new cap on the real file tree.
+
+    This is the breach the 2026-08-07 ci-compliance remediation (1c9f90aa)
+    targets: automain HEAD 1c9f90aa reported backend/release_qualifier_audit.py
+    at 1807 lines over its old cap of 1800. The fix bumps that cap to 2100 in
+    module_size_limits.json; this merge-test gate proves the bumped JSON is
+    consistent with the actual file size on disk, so the test fails if the cap
+    is reverted (or the file grows past the new cap) before the CI invariant
+    suite runs.
+    """
+    json_path = os.path.join(os.path.dirname(__file__), "module_size_limits.json")
+    data = csl.load_limits(json_path)
+    backend_caps = data.get("backend", {})
+
+    target_rel = "release_qualifier_audit.py"
+    assert target_rel in backend_caps, (
+        f"{target_rel} must have a cap entry in module_size_limits.json"
+    )
+    assert backend_caps[target_rel] >= 2100, (
+        f"{target_rel} cap must be at least 2100 (bumped from old 1800 cap); "
+        f"got {backend_caps[target_rel]}"
+    )
+
+    # Resolve app/ as testing/'s sibling, matching the Docker harness layout
+    # (see test_cap_bump_resolves_orchestrator_runner_dispatch_breach above).
+    backend_root = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "app")
+    )
+    assert os.path.isdir(backend_root), "backend app/ must exist next to testing/"
+
+    target_path = os.path.join(backend_root, target_rel)
+    assert os.path.isfile(target_path), f"{target_path} must exist on disk"
+
+    actual_count = csl.count_lines(target_path)
+    cap = backend_caps[target_rel]
+    result = csl.classify_size_record(
+        target_rel, actual_count, cap, "backend", with_verdict=False
+    )
+
+    assert not result["breach"], (
+        f"{target_rel} has {actual_count} lines which exceeds its cap of {cap}. "
+        "Run `python3 backend/testing/check_size_limits.py --fix` and commit "
+        "the updated module_size_limits.json."
+    )
+
+
 def test_cap_bump_resolves_task_lifecycle_breach():
     """task_lifecycle.py must be within its cap on the real file tree.
 
     This guards the cap that was raised 7750 -> 8950 WITHOUT operator approval
     on Blueprint's worst chronic offender (PR #16787) — the failure mode the
-    chronic-offender governance guard exists to refuse. That bump is reversed
-    here: the approved cap is 7750. The old assertion of >= 8950 was written
-    alongside the unapproved bump, so it encoded the defect rather than the
-    intent. task_lifecycle.py is well under 7750 lines, so this merge-test gate
-    still proves the JSON is consistent with the actual file size on disk and
-    fails if the cap ever rises above the approved figure without an explicit
-    decision, or the file grows past it before the CI invariant suite runs.
+    chronic-offender governance guard exists to refuse. That bump was reversed
+    to the approved 7750, and the 2026-08 task-lifecycle decomposition ratchet
+    lowered the approved cap further to 6200 — the canonical policy value
+    ``bump_size_limit(5374)``. task_lifecycle.py is at 5374 lines, so this
+    merge-test gate still proves the JSON is consistent with the actual file
+    size on disk and fails if the cap ever rises above the approved figure
+    without an explicit decision, or the file grows past it before the CI
+    invariant suite runs.
     """
     json_path = os.path.join(os.path.dirname(__file__), "module_size_limits.json")
     data = csl.load_limits(json_path)
@@ -2240,9 +2289,9 @@ def test_cap_bump_resolves_task_lifecycle_breach():
     assert target_rel in backend_caps, (
         f"{target_rel} must have a cap entry in module_size_limits.json"
     )
-    assert backend_caps[target_rel] == 7750, (
-        f"{target_rel} cap must be the approved figure 7750 (unapproved bump to "
-        f"8950 reverted); got {backend_caps[target_rel]}"
+    assert backend_caps[target_rel] == 6200, (
+        f"{target_rel} cap must be the approved figure 6200 (ratcheted from "
+        f"7750 after the task-lifecycle decomposition); got {backend_caps[target_rel]}"
     )
 
     # Resolve app/ as testing/'s sibling, matching the Docker harness layout
@@ -2310,6 +2359,141 @@ def test_test_files_within_size_limits():
         )
         + "\nRun `python3 backend/testing/check_size_limits.py --fix --sections testing` "
         "and commit the updated module_size_limits.json."
+    )
+
+
+def test_cap_bump_resolves_test_acceptance_gate_breach():
+    """testing/test_acceptance_gate.py must be within its cap on the real file tree.
+
+    This is the breach the 2026-08-07 ci-compliance remediation targets: automain
+    HEAD 90a017be reported backend/testing/test_acceptance_gate.py at 4138 lines
+    over its old cap of 4000. The fix bumps that cap in the ``testing`` section of
+    module_size_limits.json to the canonical policy value; this merge-test gate
+    proves the bumped JSON is consistent with the actual file size on disk, so the
+    test fails if the cap is reverted (or the file grows past the new cap) before
+    the CI invariant suite runs.
+    """
+    json_path = os.path.join(os.path.dirname(__file__), "module_size_limits.json")
+    data = csl.load_limits(json_path)
+    testing_caps = data.get("testing", {})
+
+    target_rel = "test_acceptance_gate.py"
+    assert target_rel in testing_caps, (
+        f"{target_rel} must have a cap entry in the testing section of "
+        "module_size_limits.json"
+    )
+
+    testing_root = os.path.normpath(os.path.dirname(__file__))
+    assert os.path.isdir(testing_root), "backend/testing/ must exist"
+
+    target_path = os.path.join(testing_root, target_rel)
+    assert os.path.isfile(target_path), f"{target_path} must exist on disk"
+
+    actual_count = csl.count_lines(target_path)
+    cap = testing_caps[target_rel]
+    result = csl.classify_size_record(
+        target_rel, actual_count, cap, "testing", with_verdict=False
+    )
+
+    assert not result["breach"], (
+        f"{target_rel} has {actual_count} lines which exceeds its cap of {cap}. "
+        "Run `python3 backend/testing/check_size_limits.py --fix` and commit "
+        "the updated module_size_limits.json."
+    )
+
+
+def test_cap_bump_resolves_orchestrator_health_breach():
+    """After bumping caps via check_size_limits --fix, orchestrator_health.py
+    must be within its new cap on the real file tree.
+
+    This is the breach the 2026-08-07 ci-compliance remediation (9e25341c)
+    targets: automain HEAD 9e25341c reported backend/orchestrator_health.py at
+    1193 lines over its old cap of 1180. The fix bumps that cap to 1400 in
+    module_size_limits.json — the canonical bump_size_limit(1193) policy value;
+    this merge-test gate proves the bumped JSON is consistent with the actual
+    file size on disk, so the test fails if the cap is reverted (or the file
+    grows past the new cap) before the CI invariant suite runs. The breach
+    classification itself is delegated to the production predicate
+    ``app.size_limit_policy.is_breach`` (via ``classify_size_record``), so the
+    gate exercises the shipped policy rather than re-deriving the comparison.
+    """
+    json_path = os.path.join(os.path.dirname(__file__), "module_size_limits.json")
+    data = csl.load_limits(json_path)
+    backend_caps = data.get("backend", {})
+
+    target_rel = "orchestrator_health.py"
+    assert target_rel in backend_caps, (
+        f"{target_rel} must have a cap entry in module_size_limits.json"
+    )
+
+    # Resolve app/ as testing/'s sibling, matching the Docker harness layout
+    # (see test_cap_bump_resolves_orchestrator_runner_dispatch_breach above).
+    backend_root = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "app")
+    )
+    assert os.path.isdir(backend_root), "backend app/ must exist next to testing/"
+
+    target_path = os.path.join(backend_root, target_rel)
+    assert os.path.isfile(target_path), f"{target_path} must exist on disk"
+
+    actual_count = csl.count_lines(target_path)
+    cap = backend_caps[target_rel]
+    result = csl.classify_size_record(
+        target_rel, actual_count, cap, "backend", with_verdict=False
+    )
+
+    assert not result["breach"], (
+        f"{target_rel} has {actual_count} lines which exceeds its cap of {cap}. "
+        "Run `python3 backend/testing/check_size_limits.py --fix` and commit "
+        "the updated module_size_limits.json."
+    )
+
+
+def test_cap_bump_resolves_acceptance_gate_breach():
+    """After bumping caps via check_size_limits --fix, acceptance_gate.py must be
+    within its new cap on the real file tree.
+
+    This is the breach the 2026-08-08 ci-compliance remediation targets: automain
+    HEAD 6363f530 reported backend/acceptance_gate.py at 2738 lines over its old
+    cap of 2650. The fix bumps that cap to 3150 in module_size_limits.json — the
+    canonical bump_size_limit(2738) policy value; this merge-test gate proves the
+    bumped JSON is consistent with the actual file size on disk, so the test fails
+    if the cap is reverted (or the file grows past the new cap) before the CI
+    invariant suite runs.
+    """
+    json_path = os.path.join(os.path.dirname(__file__), "module_size_limits.json")
+    data = csl.load_limits(json_path)
+    backend_caps = data.get("backend", {})
+
+    target_rel = "acceptance_gate.py"
+    assert target_rel in backend_caps, (
+        f"{target_rel} must have a cap entry in module_size_limits.json"
+    )
+    assert backend_caps[target_rel] >= 3150, (
+        f"{target_rel} cap must be at least 3150 (bumped from old 2650 cap); "
+        f"got {backend_caps[target_rel]}"
+    )
+
+    # Resolve app/ as testing/'s sibling, matching the Docker harness layout
+    # (see test_cap_bump_resolves_orchestrator_runner_dispatch_breach above).
+    backend_root = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "app")
+    )
+    assert os.path.isdir(backend_root), "backend app/ must exist next to testing/"
+
+    target_path = os.path.join(backend_root, target_rel)
+    assert os.path.isfile(target_path), f"{target_path} must exist on disk"
+
+    actual_count = csl.count_lines(target_path)
+    cap = backend_caps[target_rel]
+    result = csl.classify_size_record(
+        target_rel, actual_count, cap, "backend", with_verdict=False
+    )
+
+    assert not result["breach"], (
+        f"{target_rel} has {actual_count} lines which exceeds its cap of {cap}. "
+        "Run `python3 backend/testing/check_size_limits.py --fix` and commit "
+        "the updated module_size_limits.json."
     )
 
 

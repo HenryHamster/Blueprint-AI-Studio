@@ -294,6 +294,12 @@ def _aggregate_task_row(
         "cache_read_cost_usd": 0.0,
         "cache_creation_cost_usd": 0.0,
         "output_cost_usd": 0.0,
+        # Number of this task's attempts priced from a provider-reported usage
+        # probe (canonical) rather than the agent-counter fallback. Carried so
+        # the report can make the canonical-vs-fallback split observable.
+        "provider_priced_attempt_count": int(
+            row.get("provider_priced_attempt_count", 0)
+        ),
     }
     has_usage = any(
         (
@@ -414,6 +420,7 @@ def reconcile_provider_cost(
     cache_read_pricing: Mapping[tuple[str, str], float] | None = None,
     cache_read_multiplier: float | None = None,
     cache_creation_multiplier: float | None = None,
+    inline_llm_rows: Iterable[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Reconcile internally attributed cost against a provider billing export.
 
@@ -466,7 +473,7 @@ def reconcile_provider_cost(
     end_date = _parse_date(end if end is not None else window.get("end"))
 
     # ── Internal side: price recorded per-attempt usage ───────────────────
-    internal: dict[str, float | int] = {
+    internal: dict[str, Any] = {
         "total_cost_usd": 0.0,
         "uncached_input_tokens": 0,
         "cache_read_input_tokens": 0,
@@ -481,6 +488,10 @@ def reconcile_provider_cost(
         # per-attempt pair was genuinely absent. Surfaced so silent task-level
         # pricing (the defect this module fixed) cannot hide in the report.
         "task_model_fallback_attempt_count": 0,
+        # Number of attempts priced from a provider-reported usage probe
+        # (canonical input) rather than the agent-counter fallback. Surfaced so
+        # the provider-truth-vs-agent-counter split is observable.
+        "provider_priced_attempt_count": 0,
     }
     task_counts = {"total": 0, "with_usage": 0, "missing_usage": 0}
     provider_key = (provider or "").lower()
@@ -506,6 +517,10 @@ def reconcile_provider_cost(
         internal["task_model_fallback_attempt_count"] = (
             int(internal["task_model_fallback_attempt_count"]) + fallback_count
         )
+        internal["provider_priced_attempt_count"] = (
+            int(internal["provider_priced_attempt_count"])
+            + int(totals["provider_priced_attempt_count"])
+        )
         if has_usage:
             task_counts["with_usage"] += 1
             for key in _INTERNAL_TOKEN_KEYS:
@@ -522,6 +537,43 @@ def reconcile_provider_cost(
     internal["cache_read_cost_usd"] = round(float(internal["cache_read_cost_usd"]), COST_ROUND)
     internal["cache_creation_cost_usd"] = round(float(internal["cache_creation_cost_usd"]), COST_ROUND)
     internal["output_cost_usd"] = round(float(internal["output_cost_usd"]), COST_ROUND)
+
+    # ── Inline LLM spend: backend-initiated calls outside the Task/attempt
+    # path (app.inline_llm.call_inline_llm_json), previously dark to this
+    # reconciliation entirely. Kept as a SEPARATE observable bucket rather
+    # than blended into the per-attempt totals above, then folded into
+    # total_cost_usd so the internal side reflects all recorded spend for
+    # the provider/window.
+    inline_cost_usd = 0.0
+    inline_call_count = 0
+    inline_unpriced_call_count = 0
+    for row in inline_llm_rows or []:
+        if (row.get("provider") or "").lower() != provider_key:
+            continue
+        created = _parse_ts(row.get("created_at"))
+        if created is None:
+            continue
+        if start_date is not None and created.date() < start_date:
+            continue
+        if end_date is not None and created.date() > end_date:
+            continue
+        inline_call_count += 1
+        status = (row.get("pricing_status") or "").strip().lower()
+        cost_usd = row.get("cost_usd")
+        if status == "unpriced" or cost_usd is None:
+            # Unknown-cost call: counted, but its cost is NOT summed — a
+            # NULL/absent cost must never silently coerce to zero, which would
+            # understate the internal total exactly like the drop it replaces.
+            inline_unpriced_call_count += 1
+        else:
+            inline_cost_usd += float(cost_usd)
+    internal["inline_cost_usd"] = round(inline_cost_usd, COST_ROUND)
+    internal["inline_call_count"] = inline_call_count
+    internal["inline_unpriced_call_count"] = inline_unpriced_call_count
+    internal["inline_cost_is_floor"] = inline_unpriced_call_count > 0
+    internal["total_cost_usd"] = round(
+        float(internal["total_cost_usd"]) + inline_cost_usd, COST_ROUND
+    )
 
     # ── Export side: the provider's own numbers for the window ────────────
     kept_records = []
@@ -610,6 +662,11 @@ def reconcile_provider_cost(
 
 def _task_to_row(task: Any, attempts: list[tuple]) -> dict[str, Any]:
     """Reduce an ORM ``Task`` + its ``_task_llm_attempts`` rows to a row dict."""
+    # Lazy ``app.*`` import keeps the module stdlib-only at import time; the
+    # probe count is the number of this task's attempts priced from a
+    # provider-reported usage probe (canonical) vs agent-counter fallback.
+    from app.llm_cost_attribution import _provider_priced_attempt_count
+
     return {
         "id": str(task.id) if getattr(task, "id", None) else None,
         "provider": task.provider,
@@ -618,6 +675,7 @@ def _task_to_row(task: Any, attempts: list[tuple]) -> dict[str, Any]:
             task.created_at.isoformat() if getattr(task, "created_at", None) else None
         ),
         "estimated_cost_usd": getattr(task, "estimated_cost_usd", None),
+        "provider_priced_attempt_count": _provider_priced_attempt_count(task),
         "attempts": [
             {
                 "provider": p,
@@ -664,6 +722,76 @@ async def _load_task_rows(provider: str, start: str | None, end: str | None) -> 
     async with AsyncSessionLocal() as session:
         tasks = (await session.execute(stmt)).scalars().all()
     return [_task_to_row(t, _task_llm_attempts(t)) for t in tasks]
+
+
+async def _load_inline_llm_spend_rows(
+    provider: str, start: str | None, end: str | None
+) -> list[dict[str, Any]]:
+    """Read ``inline_llm_spend_log`` rows for the provider in the window.
+
+    Lazy ``app.*`` import so the module stays stdlib-only at import time (same
+    convention as ``_load_task_rows``).
+    """
+    backend_root = Path(__file__).resolve().parents[1]
+    if str(backend_root) not in sys.path:
+        sys.path.insert(0, str(backend_root))
+
+    from app.database import AsyncSessionLocal
+    from app.models import InlineLlmSpendLog
+    from sqlalchemy import select
+
+    start_dt = _day_start_naive_utc(start)
+    end_dt_exclusive = _day_start_naive_utc(end, offset_days=1)
+
+    stmt = select(InlineLlmSpendLog).where(InlineLlmSpendLog.provider == provider)
+    if start_dt is not None:
+        stmt = stmt.where(InlineLlmSpendLog.created_at >= start_dt)
+    if end_dt_exclusive is not None:
+        stmt = stmt.where(InlineLlmSpendLog.created_at < end_dt_exclusive)
+
+    async with AsyncSessionLocal() as session:
+        rows = (await session.execute(stmt)).scalars().all()
+    return [
+        {
+            "provider": r.provider,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "cost_usd": r.cost_usd,
+            # "unpriced" rows carry cost_usd NULL; consumers must count them
+            # separately and label any summed total a FLOOR.
+            "pricing_status": r.pricing_status,
+        }
+        for r in rows
+    ]
+
+
+async def _load_reconciliation_inputs(
+    provider: str, start: str | None, end: str | None
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Load both DB-backed inputs inside a SINGLE event loop.
+
+    ``app.database`` builds a *pooled* async engine (QueuePool with
+    ``pool_pre_ping``), so its asyncpg connections are bound to whichever
+    event loop first checked them out. Running each loader under its own
+    ``asyncio.run()`` would return connections to the pool, close that loop,
+    and then hand the same dead-loop connections to the next run — the
+    pre-ping itself would execute on the closed loop. Both reads therefore
+    share one loop here, and the engine is disposed before it returns so the
+    process leaves no pooled connections behind.
+    """
+    backend_root = Path(__file__).resolve().parents[1]
+    if str(backend_root) not in sys.path:
+        sys.path.insert(0, str(backend_root))
+
+    from app.database import dispose_engine
+
+    try:
+        task_rows = await _load_task_rows(provider, start, end)
+        inline_llm_rows = await _load_inline_llm_spend_rows(provider, start, end)
+    finally:
+        # Canonical best-effort dispose: no-op when the lazy engine was never
+        # instantiated, and never raises.
+        await dispose_engine()
+    return task_rows, inline_llm_rows
 
 
 def load_export(path: str | Path) -> dict[str, Any]:
@@ -716,6 +844,21 @@ def _print_report(
     fallback_count = internal.get("task_model_fallback_attempt_count", 0)
     if fallback_count:
         print(f"  task-model pricing fallback: {fallback_count} attempts priced at the task-level model")
+    probe_priced = internal.get("provider_priced_attempt_count", 0)
+    if probe_priced:
+        print(f"  attempts priced from provider probe: {probe_priced}")
+    inline_calls = internal.get("inline_call_count", 0)
+    if inline_calls:
+        print(
+            f"  inline LLM spend (backend calls): {_fmt_usd(internal.get('inline_cost_usd'))}"
+            f" across {inline_calls} calls"
+        )
+        unpriced_inline = internal.get("inline_unpriced_call_count", 0)
+        if unpriced_inline:
+            print(
+                f"    of which {unpriced_inline} call(s) carry UNPRICED usage; "
+                f"the inline total above is a FLOOR"
+            )
 
     print("\n[2] Provider export (operator-supplied, ground truth for the window)\n")
     print(f"  total_cost_usd             : {_fmt_usd(export_totals['total_cost_usd'])}")
@@ -804,7 +947,12 @@ def main() -> None:
             file=sys.stderr,
         )
 
-    task_rows = asyncio.run(_load_task_rows(provider, start, end))
+    # ONE asyncio.run() for both DB reads: app.database's engine is pooled, so
+    # a second event loop would check out connections bound to the first
+    # (now-closed) loop. See _load_reconciliation_inputs.
+    task_rows, inline_llm_rows = asyncio.run(
+        _load_reconciliation_inputs(provider, start, end)
+    )
     # Pass the ledger's LIVE pricing tables in explicitly (matching the
     # module docstring): the CLI is priced exactly as the ledger prices it.
     from app.llm_cost_attribution import (
@@ -824,6 +972,7 @@ def main() -> None:
         cache_read_pricing=LLM_CACHE_READ_INPUT_PRICING,
         cache_read_multiplier=CACHE_READ_INPUT_RATE_MULTIPLIER,
         cache_creation_multiplier=CACHE_CREATION_INPUT_RATE_MULTIPLIER,
+        inline_llm_rows=inline_llm_rows,
     )
     _print_report(report, task_rows, export)
 
