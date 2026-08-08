@@ -1451,6 +1451,9 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 # release_base_branch — branch this task's base_branch is repointed to at
 #   dependency-release time; it starts from that branch's tip including the
 #   dependencies' merged code.
+# BOTH fields MUST be the project integration branch (the base this spawn builds
+#   from): a direct spawn never creates a shared/campaign branch, so any other
+#   name is rejected with a 400 that names the allowed integration branch.
 
 # Implementation-ready bounded work uses the same command and needs no direction.
 ./strategic spawn-task '{"type": "create|refactor|qa", "title": "...", "prompt": "Full implementation prompt...", "idempotency_key": "stable-logical-request"}'

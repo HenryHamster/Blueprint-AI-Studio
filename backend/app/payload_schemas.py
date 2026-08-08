@@ -142,7 +142,11 @@ class BasePayload(BaseModel):
             "Branch every ``depends_on`` dependency must have LANDED on before "
             "this task dispatches: hold until each dep is COMPLETED with its "
             "merged work on the named branch, bypassing the file-overlap "
-            "heuristic. Undeclared (None) keeps existing gating unchanged."
+            "heuristic. Undeclared (None) keeps existing gating unchanged. "
+            "NOTE: on the strategist ``spawn_task`` API this field only accepts "
+            "the project integration branch — a direct spawn always builds "
+            "from that branch and no shared/campaign branch is ever created "
+            "for a strategist, so any other ref is rejected at admission."
         ),
     )
     release_base_branch: str | None = Field(
@@ -151,7 +155,11 @@ class BasePayload(BaseModel):
             "Branch this task's ``base_branch`` is repointed to at dependency "
             "release time. The agent clones the branch TIP at claim, so the "
             "task starts from this branch's state including its dependencies' "
-            "merged work; a task with no ``depends_on`` sets ``base_branch``."
+            "merged work; a task with no ``depends_on`` sets ``base_branch``. "
+            "NOTE: on the strategist ``spawn_task`` API this field only accepts "
+            "the project integration branch — a direct spawn always builds "
+            "from that branch and no shared/campaign branch is ever created "
+            "for a strategist, so any other ref is rejected at admission."
         ),
     )
 

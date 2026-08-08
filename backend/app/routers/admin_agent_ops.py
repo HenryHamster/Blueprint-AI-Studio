@@ -4301,9 +4301,17 @@ async def strategic_operation(
         # gated deterministically by sequenced_spawn.landing_gate instead of the
         # base-branch heuristics, and release_base_branch repoints the task's
         # base at dependency-release time. Mirrored verbatim into payloads[0];
-        # branch-name shape is enforced by the payload schema below.
+        # branch-name shape is enforced by the payload schema below. This API
+        # always cuts the spawned task from the project integration branch and
+        # nothing anywhere creates a shared/campaign branch for a strategist, so
+        # a sequencing field is only usable when it names that integration
+        # branch — any other ref would later be consumed as a literal branch
+        # that does not exist. Reject such a declaration here, before dependency
+        # resolution or payload persistence, so a bad campaign declaration never
+        # reaches admission.
         declared_landing_gate: str | None = None
         declared_release_base: str | None = None
+        integration_branch = _get_project_integration_branch(project)
         for _seq_key in ("require_deps_landed_on", "release_base_branch"):
             _seq_raw = data.get(_seq_key)
             if _seq_raw is None:
@@ -4313,10 +4321,23 @@ async def strategic_operation(
                     status_code=400,
                     detail=f"{_seq_key} must be a non-empty branch name",
                 )
+            _seq_value = _seq_raw.strip()
+            if _seq_value != integration_branch:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"{_seq_key} names branch {_seq_value!r}, but direct "
+                        f"strategist spawns build only from the project "
+                        f"integration branch {integration_branch!r} — no "
+                        f"shared/campaign branch is ever created for a "
+                        f"strategist, so the declared ref would not exist. "
+                        f"Declare {integration_branch!r} (or omit the field)."
+                    ),
+                )
             if _seq_key == "require_deps_landed_on":
-                declared_landing_gate = _seq_raw.strip()
+                declared_landing_gate = _seq_value
             else:
-                declared_release_base = _seq_raw.strip()
+                declared_release_base = _seq_value
         raw_depends_on = data.get("depends_on")
         depends_on_ids: list[str] = []
         if raw_depends_on is not None:

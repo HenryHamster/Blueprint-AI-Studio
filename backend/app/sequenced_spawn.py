@@ -20,6 +20,15 @@ The helpers here are called from ``orchestrator_health`` (the dispatch gate in
 ``ensure_dependent_base_recut``); they live in this module because
 ``orchestrator_health`` is a chronic size offender and this logic is a
 self-contained policy unit.
+
+DIRECT-SPAWN LIMITATION: the strategist ``spawn_task`` API (routers
+``admin_agent_ops``) always cuts the spawned task from the project integration
+branch, and nothing anywhere creates a shared/campaign branch for a strategist.
+Those fields are therefore only admissible on that API when they name the
+project integration branch; any other ref is rejected at admission with a 400
+(the agent manifest and ``BasePayload`` documentation state the same). The
+fields remain free-form on persisted payloads authored by the plan/research
+spawners, which may repoint onto a branch the orchestrator actually maintains.
 """
 
 import logging

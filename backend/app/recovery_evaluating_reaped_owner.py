@@ -17,7 +17,7 @@ from sqlmodel import select
 
 from app import services
 from app.branch_resolution import classify_rollup_merge_outcome
-from app.landed_signal import apply_merged_landed_signal
+from app.landed_signal import corroborate_and_apply_merged_landed_signal
 from app.models import Artifact, ArtifactType, Task, TaskStatus
 from app.recovery_evaluating_helpers import _heal_direction_outcomes_best_effort
 
@@ -133,13 +133,18 @@ async def _handle_reaped_owner_fallback(
         )
         if _fb_record:
             task.context = dict(ctx)
-            apply_merged_landed_signal(
+            await corroborate_and_apply_merged_landed_signal(
                 task,
                 _fb_proj,
+                session,
                 base_branch=_fb_landed,
                 hotfix_lane=bool(
                     (task.first_payload or {}).get("hotfix") or ctx.get("hotfix")
                 ),
+                # The PR payload this branch already fetched carries the merge
+                # commit — pin acceptance corroboration to that immutable tree
+                # rather than the 60s-TTL branch-tip cache.
+                merge_commit_sha=_fb_pr_data.get("merge_commit_sha"),
             )
             flag_modified(task, "context")
         session.add(task)
@@ -297,13 +302,17 @@ async def _handle_reaped_owner_reconcile(
         )
         if _ro_record:
             task.context = dict(ctx)
-            apply_merged_landed_signal(
+            await corroborate_and_apply_merged_landed_signal(
                 task,
                 _ro_proj,
+                session,
                 base_branch=_ro_landed,
                 hotfix_lane=bool(
                     (task.first_payload or {}).get("hotfix") or ctx.get("hotfix")
                 ),
+                # Same as the fallback branch above: the already-fetched PR
+                # payload pins corroboration to the immutable merge commit.
+                merge_commit_sha=_ro_pr_data.get("merge_commit_sha"),
             )
             flag_modified(task, "context")
         session.add(task)

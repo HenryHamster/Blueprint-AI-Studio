@@ -83,7 +83,7 @@ from app.branch_resolution import (
 )
 from app.landed_signal import (
     LANDED_MERGE_SHA_KEY,
-    apply_merged_landed_signal,
+    corroborate_and_apply_merged_landed_signal,
     mark_unblocked_non_merge,
 )
 from app.shared_state import (
@@ -426,7 +426,7 @@ _FORCE_DROP_REASONS = frozenset(
 )
 
 
-def _propagate_landed_to_rollup_children(
+async def _propagate_landed_to_rollup_children(
     completed_children: list[Task],
     session: AsyncSession,
     *,
@@ -450,21 +450,34 @@ def _propagate_landed_to_rollup_children(
     newly-landed child so rollup children (which land via the parent's single
     PR with no PR fetch of their own) carry exact commit identity for the
     discovery-review receipt.
+
+    Unlike the sync predecessor, this landing path corroborates each child's
+    declared acceptance test at the merge commit BEFORE recording the verdict,
+    so a child with its OWN (GitHub-verified) changed files whose declared test
+    is absent from the diff mints machine-proven credit instead of soft.
     """
     from app.landed_signal import (
         NON_MERGE_UNBLOCK_REASON_KEY,
+        corroborate_and_mark_landed_on_integration,
         has_landed_signal,
         has_merge_unblock_signal,
-        mark_landed_on_integration,
     )
 
+    _project = (
+        await session.get(Project, completed_children[0].project_id)
+        if completed_children and completed_children[0].project_id is not None
+        else None
+    )
     for child in completed_children:
         ctx = child.context or {}
         if ctx.get(NON_MERGE_UNBLOCK_REASON_KEY) in _FORCE_DROP_REASONS:
             continue
         if has_merge_unblock_signal(child) and not has_landed_signal(child):
-            mark_landed_on_integration(
-                child, merge_commit_sha=merge_commit_sha
+            await corroborate_and_mark_landed_on_integration(
+                child,
+                session,
+                _project,
+                merge_commit_sha=merge_commit_sha,
             )
             session.add(child)
 
@@ -500,9 +513,9 @@ async def _propagate_landed_to_staging_merged_descendants(
     from app import acceptance_gate as _acceptance_gate
     from app.landed_signal import (
         NON_MERGE_UNBLOCK_REASON_KEY,
+        corroborate_and_mark_landed_on_integration,
         has_landed_signal,
         has_merge_unblock_signal,
-        mark_landed_on_integration,
     )
 
     visited: set = {parent_task_id}
@@ -515,6 +528,13 @@ async def _propagate_landed_to_staging_merged_descendants(
     _parent = await session.get(Task, parent_task_id)
     _parent_ctx: dict = (_parent.context or {}) if _parent is not None else {}
     _parent_coverage: dict | None = _parent_ctx.get("test_coverage_result")
+    # The rollup's own project, loaded once so the corroboration twin can
+    # resolve GitHub credentials when it stamps a descendant's landed signal.
+    _desc_project = (
+        await session.get(Project, _parent.project_id)
+        if _parent is not None and _parent.project_id is not None
+        else None
+    )
     # The landed parent's exact merge commit, forwarded to every descendant
     # stamped in this walk (rollup descendants land via the parent's single PR).
     _parent_merge_sha: str | None = _parent_ctx.get(LANDED_MERGE_SHA_KEY)
@@ -599,8 +619,11 @@ async def _propagate_landed_to_staging_merged_descendants(
                     _propagated = True
 
                 if not has_landed_signal(row):
-                    mark_landed_on_integration(
-                        row, merge_commit_sha=_parent_merge_sha
+                    await corroborate_and_mark_landed_on_integration(
+                        row,
+                        session,
+                        _desc_project,
+                        merge_commit_sha=_parent_merge_sha,
                     )
                     session.add(row)
                     stamped.append(row)
@@ -3029,16 +3052,23 @@ async def _check_and_trigger_rollup(
                                 **_clear_rollup_transient_state(parent.context),
                             }
                             if _landed:
-                                apply_merged_landed_signal(
+                                await corroborate_and_apply_merged_landed_signal(
                                     parent,
                                     project,
+                                    session,
                                     base_branch=target_branch,
                                     hotfix_lane=_promotion_target_rollup_allowed(
                                         parent, target_branch
                                     ),
                                     non_merge_reason="merged_pr_non_integration_branch",
+                                    # The already-merged PR payload carries its
+                                    # merge commit — pin corroboration to that
+                                    # immutable tree, not the 60s-TTL tip cache.
+                                    merge_commit_sha=pr_state.get(
+                                        "merge_commit_sha"
+                                    ),
                                 )
-                                _propagate_landed_to_rollup_children(
+                                await _propagate_landed_to_rollup_children(
                                     completed_children,
                                     session,
                                     merge_commit_sha=(
@@ -3457,16 +3487,22 @@ async def _check_and_trigger_rollup(
                         },
                     }
                     if _landed:
-                        apply_merged_landed_signal(
+                        # No merge commit exists on this path: the zero-diff PR
+                        # was CLOSED (its branch was already equivalent to the
+                        # target) and credited as a merge-equivalent landing.
+                        # Corroboration runs unpinned and, per its own contract,
+                        # will not stamp a durable absence from a cached tip.
+                        await corroborate_and_apply_merged_landed_signal(
                             parent,
                             project,
+                            session,
                             base_branch=target_branch,
                             hotfix_lane=_promotion_target_rollup_allowed(
                                 parent, target_branch
                             ),
                             non_merge_reason="merged_pr_non_integration_branch",
                         )
-                        _propagate_landed_to_rollup_children(
+                        await _propagate_landed_to_rollup_children(
                             completed_children,
                             session,
                             merge_commit_sha=(
@@ -4309,9 +4345,10 @@ async def _check_and_trigger_rollup(
                             "rollup_pr_url": rollup_pr_url,
                         }
                         if _landed:
-                            apply_merged_landed_signal(
+                            await corroborate_and_apply_merged_landed_signal(
                                 parent,
                                 project,
+                                session,
                                 base_branch=target_branch,
                                 hotfix_lane=_promotion_target_rollup_allowed(
                                     parent, target_branch
@@ -4322,7 +4359,7 @@ async def _check_and_trigger_rollup(
                                 # degraded and could not fetch the PR.
                                 merge_commit_sha=merge_result.get("sha"),
                             )
-                            _propagate_landed_to_rollup_children(
+                            await _propagate_landed_to_rollup_children(
                                 completed_children,
                                 session,
                                 merge_commit_sha=(
@@ -4708,6 +4745,7 @@ async def _check_and_trigger_rollup(
                                     )
                                 )
                                 _repoll_merged = False
+                                _repoll_merge_sha: str | None = None
                                 _repoll_success_ri: int | None = None
                                 _repoll_merge_fail_msg: str | None = None
                                 _repoll_authority_held = False
@@ -4811,6 +4849,7 @@ async def _check_and_trigger_rollup(
                                             )
                                         elif _rp_merge.get("merged"):
                                             _repoll_merged = True
+                                            _repoll_merge_sha = _rp_merge.get("sha")
                                             _repoll_success_ri = _ri
                                         else:
                                             _repoll_merge_fail_msg = _rp_merge.get(
@@ -4875,15 +4914,20 @@ async def _check_and_trigger_rollup(
                                         "rollup_pr_url": rollup_pr_url,
                                     }
                                     if _rp_landed:
-                                        apply_merged_landed_signal(
+                                        await corroborate_and_apply_merged_landed_signal(
                                             parent,
                                             project,
+                                            session,
                                             base_branch=target_branch,
                                             hotfix_lane=_promotion_target_rollup_allowed(
                                                 parent, target_branch
                                             ),
+                                            # Merge sha from the repoll merge —
+                                            # pins corroboration to the merge
+                                            # tree, not the cached branch tip.
+                                            merge_commit_sha=_repoll_merge_sha,
                                         )
-                                        _propagate_landed_to_rollup_children(
+                                        await _propagate_landed_to_rollup_children(
                                             completed_children,
                                             session,
                                             merge_commit_sha=(
@@ -5172,15 +5216,22 @@ async def _check_and_trigger_rollup(
                                             "rollup_pr_url": rollup_pr_url,
                                         }
                                         if _esc_landed:
-                                            apply_merged_landed_signal(
+                                            await corroborate_and_apply_merged_landed_signal(
                                                 parent,
                                                 project,
+                                                session,
                                                 base_branch=target_branch,
                                                 hotfix_lane=_promotion_target_rollup_allowed(
                                                     parent, target_branch
                                                 ),
+                                                # Merge sha from the escalation
+                                                # merge — pins corroboration to
+                                                # the immutable merge tree.
+                                                merge_commit_sha=_esc_result.get(
+                                                    "sha"
+                                                ),
                                             )
-                                            _propagate_landed_to_rollup_children(
+                                            await _propagate_landed_to_rollup_children(
                                                 completed_children,
                                                 session,
                                                 merge_commit_sha=(

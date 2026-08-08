@@ -45,7 +45,9 @@ from app.failure_classification import (
 )
 from app.acceptance_gate import (
     ACCEPTANCE_AGGREGATE_BUCKETS,
+    ACCEPTANCE_TEST_CORROBORATED_KEY,
     CODE_ACCEPTANCE_VERDICT_KEY,
+    WINDOW_CORROBORATION_ATTEMPTED_SHA_KEY,
     _UNDECLARED_REASON_KEYS,
     _UNSATISFIED_REASON_KEYS,
     _is_test_path,
@@ -53,6 +55,7 @@ from app.acceptance_gate import (
     classify_undeclared_reason,
     classify_unsatisfied_reason,
     effective_acceptance_verdict,
+    record_code_acceptance_verdict,
 )
 from app.acceptance_criteria import (
     WALKTHROUGH_E2E_FLOW_MARKERS,
@@ -72,6 +75,7 @@ try:  # pragma: no cover - exercised once the sibling ledger module lands
 except Exception:  # noqa: BLE001 - sibling module not yet landed in this checkout
     _category_ledger = None  # type: ignore[assignment]
 
+from app.landed_signal import LANDED_MERGE_SHA_KEY
 from app.landed_signal import is_verified_merge, landed_signal_predicate
 from app.models import (
     ArtifactType,
@@ -4509,6 +4513,92 @@ async def _compute_acceptance_window_aggregate(
                 task.context = ctx
                 session.add(task)
         return ctx
+
+    # Corroboration pass (the fix for "the acceptance window mints ~0 proven
+    # coverage"): soft named_test verdicts (satisfied, unproven) recorded on a
+    # non-CI-monitor landing path carry no corroboration marker, so a declared
+    # test ABSENT from the PR's diff but PRESENT in the merged tree is capped at
+    # soft credit forever. Corroborate each such verdict against the stored
+    # merge commit and re-record — a test the backend confirms exists at the
+    # merge commit then mints machine-proven coverage. CONSERVATIVE: only a
+    # confirmed presence (True) stamps the marker and re-records; a corroborated
+    # absence or indeterminate result leaves the recorded soft verdict untouched,
+    # so this additive observability pass never downgrades a previous
+    # qualification. Best-effort and bounded per drive — corroboration is GitHub
+    # I/O, so the pass never blocks the aggregation on a slow/absent tree.
+    #
+    # The cap bounds ATTEMPTS, not successes: a window where every candidate
+    # corroborates indeterminate (no GitHub creds, unavailable tree) must still
+    # issue at most ``_WINDOW_CORROBORATION_CAP`` round-trips per drive. And
+    # because a non-True result stamps no corroboration marker, the attempt is
+    # additionally recorded DURABLY under
+    # :data:`WINDOW_CORROBORATION_ATTEMPTED_SHA_KEY` keyed by the merge sha that
+    # was read — otherwise the same tasks would be re-read in full on every
+    # subsequent qualifier drive, forever. Keying by sha (not a bare boolean)
+    # keeps a later landing on a NEW merge commit eligible for a fresh attempt.
+    _window_project = await session.get(Project, version.project_id)
+    _WINDOW_CORROBORATION_CAP = 50
+    _corroboration_attempts = 0
+    for task in rows_write:
+        if _corroboration_attempts >= _WINDOW_CORROBORATION_CAP:
+            break
+        _ctx = _effective_context(task)
+        _verdict = _ctx.get(CODE_ACCEPTANCE_VERDICT_KEY)
+        if not (
+            isinstance(_verdict, dict)
+            and _verdict.get("kind") == "named_test"
+            and _verdict.get("satisfied") is True
+            and _verdict.get("proven") is not True
+            and ACCEPTANCE_TEST_CORROBORATED_KEY not in _ctx
+        ):
+            continue
+        _sha = (task.context or {}).get(LANDED_MERGE_SHA_KEY)
+        if not isinstance(_sha, str) or not _sha:
+            continue
+        _sha = _sha[:64]
+        if (task.context or {}).get(WINDOW_CORROBORATION_ATTEMPTED_SHA_KEY) == _sha:
+            # Already attempted against this exact merge commit on an earlier
+            # drive and it did not produce a definitive result. The read is
+            # deterministic for an immutable commit, so retrying spends I/O for
+            # no new information.
+            continue
+        from app.acceptance_gate import corroborate_acceptance_test_at_merge
+
+        _corroboration_attempts += 1
+        try:
+            _result = await corroborate_acceptance_test_at_merge(
+                task,
+                session,
+                project=_window_project,
+                commit_sha=_sha,
+            )
+        except Exception:  # noqa: BLE001 — window corroboration must never abort
+            logger.warning(
+                "[RELEASE_QUALIFIER] acceptance-window corroboration failed for "
+                "task %s",
+                getattr(task, "id", None),
+                exc_info=True,
+            )
+            # An UNEXPECTED raise (the helper swallows its own I/O failures) is
+            # not durably marked: leave the task eligible so a transient fault
+            # cannot permanently deny it proven credit. The per-drive cap above
+            # already bounds the cost.
+            continue
+        _new_ctx = {
+            **(task.context or {}),
+            WINDOW_CORROBORATION_ATTEMPTED_SHA_KEY: _sha,
+        }
+        if _result is True:
+            # CONSERVATIVE: only a confirmed presence stamps the corroboration
+            # marker and re-records. A corroborated absence (False) or an
+            # indeterminate result (None) leaves the recorded soft verdict
+            # untouched — it is only marked as attempted.
+            _new_ctx[ACCEPTANCE_TEST_CORROBORATED_KEY] = True
+            task.context = _new_ctx
+            record_code_acceptance_verdict(task)
+        else:
+            task.context = _new_ctx
+        session.add(task)
 
     for task in rows_write:
         ctx = _effective_context(task)

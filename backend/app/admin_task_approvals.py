@@ -218,13 +218,15 @@ async def _handle_rollup_pr_approval(
             # the hotfix path stamps pr_merged=True / landed_on_integration=False
             # while the non-hotfix promotion-target landing stays unqualified
             # (pr_merged unset).
-            task.context = _mutation_facade()._merge_context_with_hotfix_non_landing(
+            task.context = await _mutation_facade()._merge_context_with_hotfix_non_landing(
                 task,
                 _project,
+                session,
                 base_context=ctx,
                 landed_branch=landed_branch,
                 record_pr_merged=record_pr_merged,
                 preserve_hotfix_non_landing=True,
+                merge_commit_sha=merge_result.get("sha"),
             )
             if terminal_rollup_merge:
                 task.latest_status_message = (
@@ -524,12 +526,14 @@ async def _merge_critical_pr(
                 source="admin_task_mutations.critical_pr_approval",
             )
             task.status = TaskStatus.COMPLETED
-            task.context = _mutation_facade()._merge_context_with_hotfix_non_landing(
+            task.context = await _mutation_facade()._merge_context_with_hotfix_non_landing(
                 task,
                 _project,
+                session,
                 base_context=ctx,
                 landed_branch=base_branch,
                 record_pr_merged=record_pr_merged,
+                merge_commit_sha=merge_result.get("sha"),
             )
             task.latest_status_message = f"Human-approved merge of PR #{pr_number}"
             await create_pr_comment(

@@ -1312,6 +1312,7 @@ async def reaper_service():
                         io_gh_pr_state = _io.gh_pr_state
                         io_gh_pr_merged = _io.gh_pr_merged
                         io_gh_pr_base_branch = _io.gh_pr_base_branch
+                        io_gh_pr_merge_sha = _io.gh_pr_merge_commit_sha
 
                         # ── RE-ACQUIRE FOR UPDATE FOR MUTATIONS ──────────────────
                         # All external I/O above is done. Re-acquire the FOR UPDATE
@@ -1777,6 +1778,7 @@ async def reaper_service():
                         _gh_pr_state = io_gh_pr_state
                         _gh_pr_merged = io_gh_pr_merged
                         _gh_pr_base_branch = io_gh_pr_base_branch
+                        _gh_pr_merge_sha = io_gh_pr_merge_sha
                         _pr_actually_open = (
                             _has_pr_artifact and _pr_num and _gh_pr_state == "open"
                         )
@@ -1820,6 +1822,7 @@ async def reaper_service():
                                     or (task.context or {}).get("hotfix")
                                 ),
                                 non_merge_reason="merged_pr_non_integration_branch",
+                                merge_commit_sha=_gh_pr_merge_sha,
                             )
                             try:
                                 from app.task_completion import (

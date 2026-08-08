@@ -33,7 +33,7 @@ from app.models import (
 from app.branch_resolution import merged_pr_counts_as_integration_landing
 from app.landed_signal import (
     LANDED_MERGE_SHA_KEY,
-    mark_landed_on_integration,
+    corroborate_and_mark_landed_on_integration,
     mark_stranded_non_landing,
     mark_unblocked_non_merge,
 )
@@ -459,12 +459,18 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
                 )
                 if record_pr_merged:
                     # Update in-memory first so caller sees the change even if DB write
-                    # fails. Pass ``project`` so the PR-verification landing path also
-                    # mints the capability proof (not just the acceptance verdict), and
-                    # the merge SHA so exact commit identity is recorded.
-                    mark_landed_on_integration(
+                    # fails. The async twin corroborates the declared acceptance test
+                    # against the PR's own merge commit BEFORE the verdict is recorded,
+                    # so a not-in-diff declared test that exists at the merge commit
+                    # mints machine-proven credit (previously this PR-verification
+                    # landing path left the corroboration marker absent). Pass
+                    # ``project`` so the path also mints the capability proof, and the
+                    # merge SHA so exact commit identity is recorded.
+                    await corroborate_and_mark_landed_on_integration(
                         task,
+                        session,
                         project,
+                        branch=merged_base_branch,
                         merge_commit_sha=pr_data.get("merge_commit_sha"),
                     )
                     # Persist to DB in separate session (best-effort — may fail if
@@ -538,9 +544,11 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
                     )
                     task.context = dict(_ctx)
                     if record_pr_merged:
-                        mark_landed_on_integration(
+                        await corroborate_and_mark_landed_on_integration(
                             task,
+                            session,
                             project,
+                            branch=merged_base_branch,
                             merge_commit_sha=pr_data.get("merge_commit_sha"),
                         )
                     if task.status != TaskStatus.COMPLETED:

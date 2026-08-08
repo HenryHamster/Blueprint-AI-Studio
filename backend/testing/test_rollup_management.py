@@ -2512,7 +2512,7 @@ async def test_propagate_skips_force_dropped_children(cleanup_db, mocker):
         )
         children.append(child)
 
-    _propagate_landed_to_rollup_children(children, cleanup_db)
+    await _propagate_landed_to_rollup_children(children, cleanup_db)
 
     for child, reason in zip(children, force_drop_reasons):
         assert not has_landed_signal(child), (
@@ -2549,7 +2549,7 @@ async def test_propagate_rollup_children_carries_merge_sha(cleanup_db):
             "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
         },
     )
-    _propagate_landed_to_rollup_children(
+    await _propagate_landed_to_rollup_children(
         [child], cleanup_db, merge_commit_sha="a" * 40
     )
 
@@ -2568,7 +2568,7 @@ async def test_propagate_rollup_children_carries_merge_sha(cleanup_db):
             "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
         },
     )
-    _propagate_landed_to_rollup_children([no_sha_child], cleanup_db)
+    await _propagate_landed_to_rollup_children([no_sha_child], cleanup_db)
 
     assert has_landed_signal(no_sha_child)
     assert LANDED_MERGE_SHA_KEY not in (no_sha_child.context or {})

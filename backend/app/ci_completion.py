@@ -199,7 +199,7 @@ async def _attempt_merge_with_retry_and_escalation(
         is_custom_staged_rollup_root,
         merged_pr_counts_as_integration_landing,
     )
-    from app.landed_signal import apply_merged_landed_signal
+    from app.landed_signal import corroborate_and_apply_merged_landed_signal
     from app.models import Project
     from app.shared_state import (
         get_project_integration_branch,
@@ -862,9 +862,10 @@ async def _attempt_merge_with_retry_and_escalation(
                                 _orig_ctx = dict(orig.context or {})
                                 _orig_ctx["test_coverage_result"] = _tcov
                                 orig.context = _orig_ctx
-                            _orig_landed_on_integration = apply_merged_landed_signal(
+                            _orig_landed_on_integration = await corroborate_and_apply_merged_landed_signal(
                                 orig,
                                 orig_project,
+                                session,
                                 base_branch=ci_base,
                                 hotfix_lane=bool(
                                     (orig.first_payload or {}).get("hotfix")

@@ -656,3 +656,362 @@ def test_not_in_diff_proven_requires_positive_corroboration():
     )
     assert in_diff.satisfied is True
     assert in_diff.proven is True
+
+
+# ---------------------------------------------------------------------------
+# Landing-path corroboration (the "every landing path" fix)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_corroborate_acceptance_for_landing_stamps_marker():
+    """The shared corroborate+stamp wrapper used by every landing path stamps
+    the marker only on a definitive tri-state and never raises."""
+    from unittest.mock import AsyncMock, patch
+
+    from app.acceptance_gate import (
+        ACCEPTANCE_TEST_CORROBORATED_KEY,
+        corroborate_acceptance_for_landing,
+    )
+
+    ctx = {
+        "token": "tok",
+        "owner": "owner",
+        "repo": "repo",
+        "branch": "integration",
+        "project_id": "proj-1",
+    }
+    # Definitive presence: marker stamped True.
+    task_present = _corroboration_task(
+        "backend/testing/test_seam.py", test_id="test_x"
+    )
+    with (
+        patch(
+            "app.source_ref_validation.resolve_branch_verification_context",
+            new=AsyncMock(return_value=dict(ctx)),
+        ),
+        patch(
+            "app.github_repo_snapshot.file_text_at_commit",
+            new=AsyncMock(return_value=(True, "def test_x():\n    assert 1")),
+        ),
+    ):
+        result = await corroborate_acceptance_for_landing(
+            task_present, None, commit_sha="a" * 40
+        )
+    assert result is True
+    assert task_present.context.get(ACCEPTANCE_TEST_CORROBORATED_KEY) is True
+
+    # Definitive absence: marker stamped False — fail-closed, never fail-open.
+    task_absent = _corroboration_task(
+        "backend/testing/test_nowhere.py", test_id="test_x"
+    )
+    with (
+        patch(
+            "app.source_ref_validation.resolve_branch_verification_context",
+            new=AsyncMock(return_value=dict(ctx)),
+        ),
+        patch(
+            "app.github_repo_snapshot.file_text_at_commit",
+            new=AsyncMock(return_value=(False, None)),
+        ),
+    ):
+        result_absent = await corroborate_acceptance_for_landing(
+            task_absent, None, commit_sha="a" * 40
+        )
+    assert result_absent is False
+    assert task_absent.context.get(ACCEPTANCE_TEST_CORROBORATED_KEY) is False
+
+    # No declared named_test: indeterminate, marker stays absent.
+    no_named = _make_code_task(
+        acceptance_evidence={"kind": "coverage_delta", "threshold": 5},
+        changed_files=["app/seam.py"],
+    )
+    result_none = await corroborate_acceptance_for_landing(
+        no_named, None, commit_sha="a" * 40
+    )
+    assert result_none is None
+    assert ACCEPTANCE_TEST_CORROBORATED_KEY not in (no_named.context or {})
+
+
+@pytest.mark.asyncio
+async def test_corroborate_acceptance_for_landing_never_raises():
+    """A resolver/tree-snapshot failure must degrade to None, never abort a
+    landing, and never stamp a marker the gate could misread as a confirmation."""
+    from unittest.mock import AsyncMock, patch
+
+    from app.acceptance_gate import (
+        ACCEPTANCE_TEST_CORROBORATED_KEY,
+        corroborate_acceptance_for_landing,
+    )
+
+    task = _corroboration_task("backend/testing/test_seam.py", test_id="test_x")
+    with patch(
+        "app.source_ref_validation.resolve_branch_verification_context",
+        new=AsyncMock(side_effect=RuntimeError("boom")),
+    ):
+        result = await corroborate_acceptance_for_landing(
+            task, None, commit_sha="a" * 40
+        )
+    assert result is None
+    assert ACCEPTANCE_TEST_CORROBORATED_KEY not in (task.context or {})
+
+
+@pytest.mark.asyncio
+async def test_corroboration_backfills_on_non_ci_monitor_landing_path():
+    """A non-CI-monitor landing path (here: a rollup/PR-verification landing via
+    the async ``mark_landed_on_integration`` twin) corroborates the declared
+    acceptance test at the merge commit BEFORE recording the verdict, so a
+    not-in-diff declared test that genuinely exists in the merged tree mints
+    machine-proven credit instead of soft/unproven.
+
+    Previously only the orchestrator CI monitor's already-merged recheck branch
+    stamped the corroboration marker; every other landing path left it absent
+    and the gate fell back to agent self-report — the mechanical reason the
+    acceptance window minted ~0 proven coverage.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from app.acceptance_gate import (
+        ACCEPTANCE_TEST_CORROBORATED_KEY,
+        CODE_ACCEPTANCE_VERDICT_KEY,
+        classify_merged_acceptance_context,
+    )
+    from app.landed_signal import (
+        LANDED_ON_INTEGRATION_KEY,
+        LANDED_SIGNAL_KEY,
+        corroborate_and_mark_landed_on_integration,
+    )
+
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_seam.py",
+            "test_id": "test_x",
+        },
+        changed_files=["app/seam.py"],  # declared test is NOT in the PR diff
+        targeted_green=True,  # the merge gate physically ran the declared test
+    )
+    ctx = {
+        "token": "tok",
+        "owner": "owner",
+        "repo": "repo",
+        "branch": "integration",
+        "project_id": "proj-1",
+    }
+    with (
+        patch(
+            "app.source_ref_validation.resolve_branch_verification_context",
+            new=AsyncMock(return_value=dict(ctx)),
+        ),
+        patch(
+            "app.github_repo_snapshot.file_text_at_commit",
+            new=AsyncMock(return_value=(True, "def test_x():\n    assert 1")),
+        ),
+    ):
+        # The non-CI-monitor landing write: corroborate at the merge commit,
+        # THEN stamp the landed signal and record the verdict.
+        await corroborate_and_mark_landed_on_integration(
+            task, None, merge_commit_sha="a" * 40
+        )
+
+    assert task.context.get(ACCEPTANCE_TEST_CORROBORATED_KEY) is True
+    assert task.context.get(LANDED_SIGNAL_KEY) is True
+    assert task.context.get(LANDED_ON_INTEGRATION_KEY) is True
+    verdict = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+    assert isinstance(verdict, dict)
+    assert verdict.get("satisfied") is True
+    assert verdict.get("proven") is True, f"not proven: {verdict.get('reason')}"
+    # The acceptance window reads this exact context — proven must bucket.
+    assert classify_merged_acceptance_context(task.context) == "proven"
+
+
+@pytest.mark.asyncio
+async def test_backfill_corroborates_marker_absent_soft_named_test(db_session):
+    """A pre-fix soft named_test verdict (marker absent, recorded on a
+    non-CI-monitor landing path) is corroborated by the backfill sweep against
+    its stored merge commit and upgraded to machine-proven when the backend
+    confirms the declared test exists in the merged tree."""
+    from datetime import datetime, timezone
+    from unittest.mock import AsyncMock, patch
+
+    from testing.factories import make_project
+
+    from app.acceptance_gate import (
+        ACCEPTANCE_TEST_CORROBORATED_KEY,
+        CODE_ACCEPTANCE_VERDICT_KEY,
+        backfill_acceptance_verdicts,
+    )
+    from app.landed_signal import LANDED_MERGE_SHA_KEY
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.flush()
+
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_seam.py",
+            "test_id": "test_x",
+        },
+        changed_files=["app/seam.py"],  # declared test NOT in the recorded diff
+        targeted_green=True,
+    )
+    task.project_id = project.id
+    task.completed_at = datetime(2026, 7, 9, 8, 0, 0, tzinfo=timezone.utc)
+    # A pre-fix soft verdict: satisfied, unproven, and NO corroboration marker —
+    # exactly what every non-CI-monitor landing path recorded before this fix.
+    ctx = dict(task.context or {})
+    ctx[CODE_ACCEPTANCE_VERDICT_KEY] = {
+        "satisfied": True,
+        "proven": False,
+        "kind": "named_test",
+        "reason": (
+            "declared named_test 'backend/testing/test_seam.py' is not among "
+            "the PR's changed files and its existence at the merge commit rests "
+            "on agent-reported evidence alone — credited soft without machine proof"
+        ),
+    }
+    ctx[LANDED_MERGE_SHA_KEY] = "a" * 40
+    task.context = ctx
+    db_session.add(task)
+    await db_session.flush()
+
+    with patch(
+        "app.acceptance_gate.corroborate_acceptance_test_at_merge",
+        new=AsyncMock(return_value=True),
+    ):
+        upgraded = await backfill_acceptance_verdicts(db_session)
+
+    assert upgraded >= 1, "backfill should upgrade the marker-absent soft verdict"
+    await db_session.refresh(task)
+    verdict = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+    assert isinstance(verdict, dict)
+    assert verdict.get("satisfied") is True
+    assert verdict.get("proven") is True, f"not proven: {verdict.get('reason')}"
+    assert verdict.get("backfilled") is True
+    assert task.context.get(ACCEPTANCE_TEST_CORROBORATED_KEY) is True
+
+
+@pytest.mark.asyncio
+async def test_unpinned_absence_is_not_stamped_durably():
+    """A corroborated ABSENCE read WITHOUT a merge sha must not be stamped.
+
+    Without a pinned commit the read goes through ``file_text_on_branch``, whose
+    branch-sha cache has a 60s TTL and right after a merge can still serve the
+    PRE-merge tip — reporting a test the PR itself just added as absent. That
+    ``False`` is durable and overrides the agent's targeted-green evidence in
+    ``_acceptance_test_exists_at_merge`` forever, so the wrapper leaves the
+    marker unstamped instead. A PINNED absence is still stamped (asserted by
+    ``test_corroborate_acceptance_for_landing_stamps_marker``).
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from app.acceptance_gate import (
+        ACCEPTANCE_TEST_CORROBORATED_KEY,
+        corroborate_acceptance_for_landing,
+    )
+
+    ctx = {
+        "token": "tok",
+        "owner": "owner",
+        "repo": "repo",
+        "branch": "integration",
+        "project_id": "proj-1",
+    }
+    task = _corroboration_task("backend/testing/test_nowhere.py", test_id="test_x")
+    with (
+        patch(
+            "app.source_ref_validation.resolve_branch_verification_context",
+            new=AsyncMock(return_value=dict(ctx)),
+        ),
+        patch(
+            "app.github_repo_snapshot.file_text_on_branch",
+            new=AsyncMock(return_value=(False, None)),
+        ),
+    ):
+        result = await corroborate_acceptance_for_landing(task, None)
+    # The tri-state is still reported to the caller...
+    assert result is False
+    # ...but nothing durable is written from an unpinned, cacheable read.
+    assert ACCEPTANCE_TEST_CORROBORATED_KEY not in (task.context or {})
+
+    # An unpinned PRESENCE is safe (a stale tip proves the test predates the
+    # merge) and is still stamped.
+    task_present = _corroboration_task(
+        "backend/testing/test_seam.py", test_id="test_x"
+    )
+    with (
+        patch(
+            "app.source_ref_validation.resolve_branch_verification_context",
+            new=AsyncMock(return_value=dict(ctx)),
+        ),
+        patch(
+            "app.github_repo_snapshot.file_text_on_branch",
+            new=AsyncMock(return_value=(True, "def test_x():\n    assert 1")),
+        ),
+    ):
+        result_present = await corroborate_acceptance_for_landing(task_present, None)
+    assert result_present is True
+    assert task_present.context.get(ACCEPTANCE_TEST_CORROBORATED_KEY) is True
+
+
+@pytest.mark.asyncio
+async def test_landing_twins_pin_corroboration_to_the_merge_commit():
+    """Both async landed-signal twins forward the caller's merge sha as the
+    PINNED ``commit_sha`` so the tree read hits the immutable merge commit
+    instead of the 60s-TTL branch-tip cache — and normalize a junk sha
+    (``None``/empty/non-string) to ``None`` rather than passing it through.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from app.landed_signal import (
+        corroborate_and_apply_merged_landed_signal,
+        corroborate_and_mark_landed_on_integration,
+    )
+
+    sha = "b" * 40
+    task = _corroboration_task("backend/testing/test_seam.py", test_id="test_x")
+    spy = AsyncMock(return_value=None)
+    with (
+        patch("app.acceptance_gate.corroborate_acceptance_for_landing", new=spy),
+        patch("app.landed_signal.mark_landed_on_integration"),
+    ):
+        await corroborate_and_mark_landed_on_integration(
+            task, None, None, branch="integration", merge_commit_sha=sha
+        )
+    assert spy.await_args.kwargs["commit_sha"] == sha
+
+    spy_apply = AsyncMock(return_value=None)
+    with (
+        patch("app.acceptance_gate.corroborate_acceptance_for_landing", new=spy_apply),
+        patch("app.landed_signal.apply_merged_landed_signal", return_value=True),
+    ):
+        await corroborate_and_apply_merged_landed_signal(
+            task,
+            None,
+            None,
+            base_branch="integration",
+            hotfix_lane=False,
+            merge_commit_sha=sha,
+        )
+    assert spy_apply.await_args.kwargs["commit_sha"] == sha
+
+    # Junk shas normalize to None (never handed to file_text_at_commit as a ref).
+    for junk in (None, "", 12345):
+        spy_junk = AsyncMock(return_value=None)
+        with (
+            patch(
+                "app.acceptance_gate.corroborate_acceptance_for_landing",
+                new=spy_junk,
+            ),
+            patch("app.landed_signal.apply_merged_landed_signal", return_value=True),
+        ):
+            await corroborate_and_apply_merged_landed_signal(
+                task,
+                None,
+                None,
+                base_branch="integration",
+                hotfix_lane=False,
+                merge_commit_sha=junk,
+            )
+        assert spy_junk.await_args.kwargs["commit_sha"] is None

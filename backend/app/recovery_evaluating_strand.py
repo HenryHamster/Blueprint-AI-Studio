@@ -31,8 +31,8 @@ from datetime import datetime
 from app.time_utils import _utcnow
 
 from app import services
-from app.landed_signal import mark_landed_on_integration
-from app.models import TaskStatus
+from app.landed_signal import corroborate_and_mark_landed_on_integration
+from app.models import Project, TaskStatus
 from app.recovery_evaluating_helpers import _apply_rollup_merge_classification
 
 logger = logging.getLogger(__name__)
@@ -73,6 +73,7 @@ async def _handle_evaluating_strand_backstop(
                 _s_state = "open"
                 _s_merged = False
                 _s_lookup_ok = False
+                _s_merge_sha: str | None = None
                 try:
                     from app.routers.agent import (
                         get_github_token_for_task,
@@ -92,6 +93,7 @@ async def _handle_evaluating_strand_backstop(
                     )
                     _s_state = _pr.get("state") or "open"
                     _s_merged = bool(_pr.get("merged"))
+                    _s_merge_sha = _pr.get("merge_commit_sha")
                     _s_lookup_ok = True
                 except Exception as _strand_exc:
                     logger.warning(
@@ -115,7 +117,32 @@ async def _handle_evaluating_strand_backstop(
                     # prior bare ``pr_merged=True`` analytics
                     # meaning while routing through the helper).
                     task.context = dict(ctx)
-                    mark_landed_on_integration(task)
+                    # The async twin corroborates the declared acceptance test at
+                    # the merge tree before stamping the landed signal, so this
+                    # out-of-band strand-recovery landing also mints machine-proven
+                    # credit for a not-in-diff declared test (previously the marker
+                    # was left absent on every non-CI-monitor landing path).
+                    # The project is REQUIRED for corroboration — the tree read
+                    # resolves the repo's GitHub credentials from it, so passing
+                    # None would degrade every corroboration to indeterminate and
+                    # leave the marker absent exactly as before. It also mints the
+                    # capability proof on this landing path (same guarantee as
+                    # ``rollup_pr_verification``).
+                    _strand_project = (
+                        await session.get(Project, task.project_id)
+                        if task.project_id
+                        else None
+                    )
+                    await corroborate_and_mark_landed_on_integration(
+                        task,
+                        session,
+                        _strand_project,
+                        # The child PR's own merge commit, from the lookup
+                        # above: corroboration must read the immutable merge
+                        # tree, not the 60s-TTL branch-tip cache that can still
+                        # serve the pre-merge tip.
+                        merge_commit_sha=_s_merge_sha,
+                    )
                     flag_modified(task, "context")
                     session.add(task)
                     await session.commit()
@@ -347,6 +374,7 @@ async def _handle_rollup_lost_marker(task, ctx, session):
                     f"merged into {{landed}}; awaiting downstream landing"
                 ),
                 hotfix_lane=None,
+                merge_commit_sha=_lm_pr_data.get("merge_commit_sha"),
             )
             flag_modified(task, "context")
             session.add(task)

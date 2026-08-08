@@ -878,52 +878,36 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                     # Backend-side corroboration of the declared acceptance
                     # test's path against the tree the PR just merged into.
                     # The acceptance gate previously took the agent's
-                    # ``present`` word for existence; this stamps the backend's
-                    # own check so ``_acceptance_test_exists_at_merge`` fails
-                    # closed on a corroborated absence (see
-                    # ``acceptance_gate.corroborate_acceptance_test_at_merge``).
-                    # Best-effort: a failure here must never abort the landing.
-                    try:
-                        from app.acceptance_gate import (
-                            ACCEPTANCE_TEST_CORROBORATED_KEY,
-                            corroborate_acceptance_test_at_merge,
-                        )
+                    # ``present`` word for existence; the shared
+                    # ``corroborate_acceptance_for_landing`` helper stamps the
+                    # backend's own check so ``_acceptance_test_exists_at_merge``
+                    # fails closed on a corroborated absence — and, since the
+                    # marker now rides EVERY landing path, the verdict recorded
+                    # by the merge can mint machine-proven credit for a
+                    # not-in-diff test. Best-effort: a failure here must never
+                    # abort the landing.
+                    # Pin the tree read to the PR's own merge commit: the
+                    # branch-tip cache's short TTL can still serve the
+                    # PRE-merge tip moments after the merge, which would
+                    # stamp a durable false "test absent" for a test the PR
+                    # itself just added. The merge commit is immutable, so
+                    # this read has no staleness window at all.
+                    from app.acceptance_gate import (
+                        corroborate_acceptance_for_landing,
+                    )
 
-                        # Pin the tree read to the PR's own merge commit: the
-                        # branch-tip cache's short TTL can still serve the
-                        # PRE-merge tip moments after the merge, which would
-                        # stamp a durable false "test absent" for a test the PR
-                        # itself just added. The merge commit is immutable, so
-                        # this read has no staleness window at all.
-                        _ci_merge_sha = pr_data.get("merge_commit_sha")
-                        _corroborated = await corroborate_acceptance_test_at_merge(
-                            ci_task,
-                            session,
-                            project=_orch_ci_project_orm,
-                            branch=_ci_base,
-                            commit_sha=(
-                                _ci_merge_sha
-                                if isinstance(_ci_merge_sha, str) and _ci_merge_sha
-                                else None
-                            ),
-                        )
-                        if _corroborated is not None:
-                            # Top-level backend-stamped marker (same shape as
-                            # ``_pr_changed_files``), read by the synchronous
-                            # ``_acceptance_test_exists_at_merge`` predicate.
-                            ci_task.context = {
-                                **(ci_task.context or {}),
-                                ACCEPTANCE_TEST_CORROBORATED_KEY: (
-                                    _corroborated
-                                ),
-                            }
-                    except Exception:
-                        logger.exception(
-                            "[CI] PR #%s acceptance-test corroboration failed "
-                            "for task %s — landing proceeds without it",
-                            ci_pr_number,
-                            ci_task.id,
-                        )
+                    _ci_merge_sha = pr_data.get("merge_commit_sha")
+                    await corroborate_acceptance_for_landing(
+                        ci_task,
+                        session,
+                        project=_orch_ci_project_orm,
+                        branch=_ci_base,
+                        commit_sha=(
+                            _ci_merge_sha
+                            if isinstance(_ci_merge_sha, str) and _ci_merge_sha
+                            else None
+                        ),
+                    )
                     _landed_on_integration = (
                         await _apply_ci_merged_landed_signal(
                             ci_task,

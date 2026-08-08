@@ -38,7 +38,7 @@ from sqlmodel import select
 
 from app.branch_resolution import classify_rollup_merge_outcome
 from app.context_bounds import bound_review_history
-from app.landed_signal import apply_merged_landed_signal
+from app.landed_signal import corroborate_and_apply_merged_landed_signal
 from app.models import Alert, AlertSeverity, Project, Task, TaskStatus
 from app.post_commit_errors import PostCommitFinalCommitFailed
 from app.retry_prompt import _detect_ci_review_disagreement
@@ -213,9 +213,15 @@ async def run_request_changes(
                         "pr_closed_empty": True,
                     }
                     if _record_pr_merged:
-                        apply_merged_landed_signal(
+                        # No merge_commit_sha exists on this path: the empty PR
+                        # was CLOSED, not merged, and credited as a
+                        # merge-equivalent landing. Corroboration therefore runs
+                        # unpinned and, per its own contract, declines to stamp
+                        # a durable absence read through the branch-tip cache.
+                        await corroborate_and_apply_merged_landed_signal(
                             _orig,
                             _orig_project,
+                            session,
                             base_branch=_landed_branch,
                             hotfix_lane=bool(
                                 (_orig.first_payload or {}).get(

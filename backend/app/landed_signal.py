@@ -509,3 +509,122 @@ def apply_merged_landed_signal(
     elif non_merge_reason:
         mark_unblocked_non_merge(task, reason=non_merge_reason)
     return landed_on_integration
+
+
+def _pinned_corroboration_sha(merge_commit_sha: Any) -> str | None:
+    """Normalize a caller-supplied merge sha for a PINNED corroboration read.
+
+    Landing sites forward the sha straight off a GitHub payload, where it can be
+    absent or ``None`` (and, for a squash/rebase merge not yet finalized, an
+    empty string). Only a non-empty string can pin
+    :func:`app.github_repo_snapshot.file_text_at_commit` to an immutable tree;
+    anything else must degrade to ``None`` so corroboration is not silently
+    handed a junk ref.
+    """
+    if isinstance(merge_commit_sha, str) and merge_commit_sha:
+        return merge_commit_sha[:64]
+    return None
+
+
+async def corroborate_and_mark_landed_on_integration(
+    task: Task,
+    session: AsyncSession,
+    project: Any = None,
+    *,
+    branch: str | None = None,
+    merge_commit_sha: str | None = None,
+) -> None:
+    """Async twin of :func:`mark_landed_on_integration` with backend corroboration.
+
+    Runs the backend's own check that the task's declared acceptance test exists
+    in the merged tree (:func:`app.acceptance_gate.corroborate_acceptance_for_landing`,
+    pinning the read to *merge_commit_sha* when known) BEFORE stamping the landed
+    signal and recording the code-acceptance verdict, so a not-in-diff declared
+    test that genuinely exists at the merge commit mints machine-proven credit
+    instead of soft/unproven. This is the fix for the non-CI-monitor landing
+    paths (rollup PR verification, recovery strands, propagation) that recorded
+    verdicts without ever stamping the corroboration marker.
+
+    Corroboration is best-effort — never raises, never aborts the landing. The
+    caller is responsible for committing. Sync callers keep using the sync
+    :func:`mark_landed_on_integration` unchanged.
+
+    PASS *merge_commit_sha* WHENEVER THE CALLER KNOWS IT. It pins the tree read
+    to the immutable merge commit; without it the read falls back to the
+    branch-tip cache, whose 60s TTL can serve the PRE-merge tip and would
+    otherwise stamp a durable "test absent". Corroboration refuses to stamp an
+    unpinned absence for exactly that reason, so an omitted sha silently costs
+    the landing its machine-proven credit.
+    """
+    from app.acceptance_gate import corroborate_acceptance_for_landing
+
+    await corroborate_acceptance_for_landing(
+        task,
+        session,
+        project=project,
+        branch=branch,
+        commit_sha=_pinned_corroboration_sha(merge_commit_sha),
+    )
+    mark_landed_on_integration(task, project, merge_commit_sha=merge_commit_sha)
+
+
+async def corroborate_and_apply_merged_landed_signal(
+    task: Task,
+    project,
+    session: AsyncSession,
+    *,
+    base_branch: str,
+    hotfix_lane: bool,
+    non_merge_reason: str | None = None,
+    merge_commit_sha: str | None = None,
+) -> bool:
+    """Async twin of :func:`apply_merged_landed_signal` with backend corroboration.
+
+    Same guarded write contract as the sync function — returns True iff the
+    merged PR landed on the project's integration branch — but corroborates the
+    declared acceptance test at the merge commit BEFORE routing through the sync
+    write, so the landing mints machine-proven credit for a not-in-diff declared
+    test exactly like the CI monitor's recheck branch. Corroboration is
+    best-effort and never aborts the landing.
+
+    This is the write EVERY async merged-landing flow calls: CI completion
+    (``ci_completion``), task lifecycle auto-merge and review-merge, rollup
+    merge/repoll/escalation (``rollup_management``), recovery
+    (``recovery_evaluating_helpers`` / ``_reaped_owner``), request-changes
+    cleanup, and the GitHub-webhook / agent-status / operator-trigger /
+    admin-approval routers. The one remaining sync
+    :func:`apply_merged_landed_signal` caller is
+    ``orchestrator_ci_monitor._apply_ci_merged_landed_signal``, whose own call
+    site already awaits
+    :func:`app.acceptance_gate.corroborate_acceptance_for_landing` immediately
+    before the write — routing it through here too would only duplicate that
+    GitHub read.
+
+    ``project`` is REQUIRED for corroboration to do anything: the tree read
+    resolves the repo's GitHub credentials from it, so a ``None`` project
+    degrades corroboration to indeterminate (marker left absent) while the
+    landed-signal write itself behaves exactly as the sync function does.
+
+    PASS *merge_commit_sha* WHENEVER THE CALLER KNOWS IT — it pins the tree read
+    to the immutable merge commit instead of the 60s-TTL branch-tip cache, which
+    right after a merge can still serve the PRE-merge tip. Corroboration refuses
+    to stamp an unpinned absence, so an omitted sha costs the landing its
+    machine-proven credit rather than recording a false one.
+    """
+    from app.acceptance_gate import corroborate_acceptance_for_landing
+
+    await corroborate_acceptance_for_landing(
+        task,
+        session,
+        project=project,
+        branch=base_branch,
+        commit_sha=_pinned_corroboration_sha(merge_commit_sha),
+    )
+    return apply_merged_landed_signal(
+        task,
+        project,
+        base_branch=base_branch,
+        hotfix_lane=hotfix_lane,
+        non_merge_reason=non_merge_reason,
+        merge_commit_sha=merge_commit_sha,
+    )

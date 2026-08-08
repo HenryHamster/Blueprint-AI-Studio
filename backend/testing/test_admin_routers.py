@@ -4663,9 +4663,10 @@ class TestModifyTaskApplySeam:
             context={},
         )
 
-        merged_context = _merge_context_with_hotfix_non_landing(
+        merged_context = await _merge_context_with_hotfix_non_landing(
             task,
             project,
+            db_session,
             base_context={"rollup_pr_number": 123},
             landed_branch="main",
             record_pr_merged=True,

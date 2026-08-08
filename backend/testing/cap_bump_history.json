@@ -4284,6 +4284,14 @@
           "old_cap": 1807,
           "new_cap": 2100
         }
+      ],
+      "test_dependency_contracts.py": [
+        {
+          "commit_sha": "",
+          "commit_date": "2026-08-08T18:13:51.043279+00:00",
+          "old_cap": 1616,
+          "new_cap": 2000
+        }
       ]
     }
   }

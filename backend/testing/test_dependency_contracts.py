@@ -1564,3 +1564,173 @@ class TestStrategistSpawnedDependencyRepresentation:
             f"dependent must become eligible once the prerequisite lands; "
             f"got {eligible!r}"
         )
+
+    @pytest.mark.asyncio
+    async def test_spawn_task_rejects_unusable_sequencing_branch(
+        self, client, db_session
+    ):
+        """A direct strategist spawn always builds from the project integration
+        branch and nothing ever creates a shared/campaign branch for a
+        strategist, so ``require_deps_landed_on`` / ``release_base_branch`` are
+        only usable when they name that integration branch. A syntactically
+        valid but unusable campaign branch must be rejected at the API boundary
+        with an actionable 400 (naming the supplied value AND the allowed
+        integration branch) and no task may be admitted; the same field set to
+        the integration branch must still spawn."""
+        from sqlmodel import select
+
+        project = await self._make_project(db_session)
+        strategic, token = await self._make_strategic_task(db_session, project)
+        integration = self._integration_base(project)
+
+        for seq_key in ("require_deps_landed_on", "release_base_branch"):
+            resp = await client.post(
+                "/api/agent/strategic",
+                headers={"x-agent-token": token},
+                json={
+                    "task_id": str(strategic.id),
+                    "op": "spawn_task",
+                    "data": {
+                        "type": "create",
+                        "title": f"Must not spawn ({seq_key})",
+                        "prompt": "A campaign branch a strategist never creates.",
+                        seq_key: "campaign/checkout-flow",
+                    },
+                },
+            )
+            assert resp.status_code == 400, (
+                f"spawn_task with unusable {seq_key}='campaign/checkout-flow' "
+                f"must be rejected; got {resp.status_code}: {resp.text}"
+            )
+            msg = self._error_message(resp.json())
+            assert "campaign/checkout-flow" in msg, (
+                f"error must identify the supplied value; got {msg!r}"
+            )
+            assert integration in msg, (
+                f"error must name the allowed integration branch {integration!r}; "
+                f"got {msg!r}"
+            )
+            # Rejection happens before task admission / payload persistence — no
+            # task may exist for the rejected spawn.
+            spawned_rows = (
+                await db_session.execute(
+                    select(Task).where(
+                        Task.title == f"Must not spawn ({seq_key})"
+                    )
+                )
+            ).scalars().all()
+            assert not spawned_rows, (
+                f"no task may be created for a rejected sequencing branch; "
+                f"got {len(spawned_rows)} rows"
+            )
+
+        # Control case: the same field set to the project integration branch
+        # still spawns, so valid integration-branch chains are preserved.
+        resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(strategic.id),
+                "op": "spawn_task",
+                "data": {
+                    "type": "create",
+                    "title": "Valid integration-branch chain",
+                    "prompt": "Integration-branch sequencing must keep working.",
+                    "require_deps_landed_on": integration,
+                    "release_base_branch": integration,
+                },
+            },
+        )
+        assert resp.status_code == 200, (
+            f"spawn_task with the integration branch as sequencing ref must "
+            f"succeed; got {resp.status_code}: {resp.text}"
+        )
+        spawned_id = resp.json().get("task_id")
+        assert spawned_id, f"spawn response must return a task_id; got {resp.json()!r}"
+        spawned = await db_session.get(Task, uuid.UUID(spawned_id))
+        assert spawned is not None
+        assert (spawned.first_payload or {}).get("require_deps_landed_on") == integration, (
+            f"landing gate must be mirrored into payloads[0]; got {spawned.first_payload!r}"
+        )
+        assert (spawned.first_payload or {}).get("release_base_branch") == integration, (
+            f"release base must be mirrored into payloads[0]; got {spawned.first_payload!r}"
+        )
+
+
+class TestMergedLandingCorroborationWiring:
+    """Every ASYNC merged-landing flow must route through the corroborating twin.
+
+    ``landed_signal.apply_merged_landed_signal`` is the sync guarded write; it
+    records the code-acceptance verdict WITHOUT the backend's own
+    acceptance-test corroboration marker, so a declared test that exists in the
+    merged tree but not in the PR's diff is capped at soft/unproven credit. The
+    async twin ``corroborate_and_apply_merged_landed_signal`` stamps the marker
+    first. A new async landing site that calls the sync helper directly silently
+    re-opens that hole, so the wiring is pinned here rather than left to review.
+    """
+
+    # The single sanctioned sync caller: its own call site already awaits
+    # ``acceptance_gate.corroborate_acceptance_for_landing`` immediately before
+    # the write, so routing it through the twin would only duplicate the read.
+    SYNC_CALLER_ALLOWLIST = {"app/orchestrator_ci_monitor.py"}
+
+    def _call_sites(self, func_name: str) -> dict[str, list[int]]:
+        import ast
+        import pathlib
+
+        app_dir = pathlib.Path(__file__).resolve().parent.parent / "app"
+        sites: dict[str, list[int]] = {}
+        for path in sorted(app_dir.rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                target = node.func
+                name = (
+                    target.id
+                    if isinstance(target, ast.Name)
+                    else target.attr
+                    if isinstance(target, ast.Attribute)
+                    else None
+                )
+                if name == func_name:
+                    rel = str(path.relative_to(app_dir.parent))
+                    sites.setdefault(rel, []).append(node.lineno)
+        return sites
+
+    def test_sync_apply_merged_landed_signal_has_only_allowlisted_callers(self):
+        callers = self._call_sites("apply_merged_landed_signal")
+        # The twin's own delegation lives in landed_signal.py itself.
+        callers.pop("app/landed_signal.py", None)
+        unexpected = {
+            path: lines
+            for path, lines in callers.items()
+            if path not in self.SYNC_CALLER_ALLOWLIST
+        }
+        assert not unexpected, (
+            "async merged-landing flows must call "
+            "landed_signal.corroborate_and_apply_merged_landed_signal (which "
+            "stamps the backend acceptance-test corroboration before the "
+            "verdict is recorded); found direct sync calls at "
+            f"{unexpected}"
+        )
+
+    def test_corroborating_twin_is_actually_wired_into_landing_flows(self):
+        """The twin must not be dead code — the defect the previous review found."""
+        callers = self._call_sites("corroborate_and_apply_merged_landed_signal")
+        callers.pop("app/landed_signal.py", None)
+        assert len(callers) >= 10, (
+            "the corroborating twin must be the live write for the async "
+            f"landing flows; found only {sorted(callers)}"
+        )
+        for expected in (
+            "app/ci_completion.py",
+            "app/task_lifecycle.py",
+            "app/rollup_management.py",
+            "app/recovery_evaluating_helpers.py",
+            "app/routers/github.py",
+        ):
+            assert expected in callers, (
+                f"{expected} must land through the corroborating twin; "
+                f"wired modules: {sorted(callers)}"
+            )

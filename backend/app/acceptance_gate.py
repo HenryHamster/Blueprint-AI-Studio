@@ -43,6 +43,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Mapping
 
 from app.ci_resolution import is_degraded_unverified_reason
+from app.landed_signal import LANDED_MERGE_SHA_KEY
 from app.landed_signal import REVIEW_LOOP_KEY, UNVERIFIED_MERGE_REASON_KEY
 from app.landed_signal import merge_verification_status
 from sqlalchemy import String, and_, cast, exists, not_, or_
@@ -623,6 +624,15 @@ def _merge_acceptance_test_block(context: Mapping[str, Any] | None) -> dict | No
 # missing data).
 ACCEPTANCE_TEST_CORROBORATED_KEY = "_acceptance_test_corroborated"
 
+# Durable "corroboration was already attempted at this merge commit" marker,
+# written by the release qualifier's acceptance-window backfill pass. A
+# corroboration that returns False/None stamps NO
+# :data:`ACCEPTANCE_TEST_CORROBORATED_KEY`, so without this marker the same
+# tasks would be re-read from GitHub on every subsequent qualifier drive
+# forever. The value is the merge sha that was read (not a bare boolean), so a
+# task that later lands on a NEW merge commit is eligible for a fresh attempt.
+WINDOW_CORROBORATION_ATTEMPTED_SHA_KEY = "_acceptance_corroboration_attempted_sha"
+
 
 def _declared_test_reference(
     evidence: AcceptanceEvidence,
@@ -782,6 +792,73 @@ async def corroborate_acceptance_test_at_merge(
     if saw_indeterminate:
         return None
     return False
+
+
+async def corroborate_acceptance_for_landing(
+    task: Task,
+    session: Any,
+    project: Any = None,
+    *,
+    branch: str | None = None,
+    commit_sha: str | None = None,
+) -> bool | None:
+    """Run :func:`corroborate_acceptance_test_at_merge` and stamp its marker.
+
+    This is the reusable "corroborate + stamp" wrapper every integration-landing
+    path calls BEFORE it records the code-acceptance verdict, so a declared test
+    that is ABSENT from the PR's diff but PRESENT in the merged tree can mint
+    machine-proven coverage (see :func:`_evaluate_named_test` — the proven mint
+    for a not-in-diff test requires the backend's own
+    :data:`ACCEPTANCE_TEST_CORROBORATED_KEY` to be ``True``). Previously only the
+    orchestrator CI monitor stamped the marker; every other landing path
+    (:func:`app.landed_signal.mark_landed_on_integration` callers) left it
+    absent and the gate fell back to agent self-report, capping a genuinely
+    existing not-in-diff test at soft/unproven credit forever.
+
+    Stamps the marker onto ``task.context`` ONLY when corroboration produced a
+    definitive tri-state (``True``/``False``); an indeterminate ``None`` leaves
+    the marker absent so the evaluation core falls back to agent-reported
+    evidence. Best-effort — never raises, so a corroboration failure can never
+    abort a real merge landing. The caller is responsible for committing.
+
+    ONE EXTRA GUARD on the durable ``False``: a corroborated ABSENCE is only
+    stamped when the read was PINNED to an immutable *commit_sha*. Without it
+    the read goes through the branch-tip cache
+    (:data:`app.github_repo_snapshot._BRANCH_SHA_TTL_S`, 60s), which moments
+    after a merge can still serve the PRE-merge tip and report a test the PR
+    itself just added as absent — and that ``False`` is durable and overrides
+    the agent's targeted-green evidence in
+    :func:`_acceptance_test_exists_at_merge` forever. An unpinned absence
+    therefore leaves the marker unstamped (today's fallback behaviour) rather
+    than recording a verdict the cache cannot support. A ``True`` needs no such
+    guard: a stale tip proves the test existed even BEFORE the merge.
+
+    Returns the corroboration result (``True``/``False``/``None``) so a caller
+    that needs a CONSERVATIVE backfill (only upgrade, never downgrade — see
+    ``_compute_acceptance_window_aggregate``) can decide not to re-record on a
+    corroborated absence.
+    """
+    try:
+        result = await corroborate_acceptance_test_at_merge(
+            task,
+            session,
+            project=project,
+            branch=branch,
+            commit_sha=commit_sha,
+        )
+        if result is True or (result is False and commit_sha):
+            task.context = {
+                **(task.context or {}),
+                ACCEPTANCE_TEST_CORROBORATED_KEY: result,
+            }
+        return result
+    except Exception:  # noqa: BLE001 — corroboration must never abort a landing
+        logger.warning(
+            "corroborate_acceptance_for_landing failed for task %s",
+            getattr(task, "id", None),
+            exc_info=True,
+        )
+        return None
 
 
 def _acceptance_test_exists_at_merge(
@@ -2390,6 +2467,54 @@ def summarize_version_acceptance_aggregate(
 # ---------------------------------------------------------------------------
 
 
+async def _corroborate_soft_named_test(task: Task, session: Any) -> bool:
+    """Corroborate a soft named_test verdict that lacks a corroboration marker.
+
+    Soft (``satisfied=True, proven=False``) named_test verdicts recorded on a
+    non-CI-monitor landing path (rollup propagation, PR verification, recovery
+    strands) never had :data:`ACCEPTANCE_TEST_CORROBORATED_KEY` stamped, so a
+    not-in-diff declared test is capped at soft/unproven credit forever — the
+    mechanical reason the acceptance window mints ~0 proven coverage. This runs
+    the backend's own tree check against the task's stored merge commit and
+    stamps a confirmed-PRESENCE marker so the caller's re-evaluation can mint
+    machine-proven credit.
+
+    Conservative: only a corroborated ``True`` stamps the marker; a corroborated
+    ABSENCE or an indeterminate result leaves the marker absent so the recorded
+    soft verdict is never downgraded (matching the backfill's upgrade-only
+    contract). Best-effort — never raises.
+
+    Returns True iff a confirmed-presence marker was newly stamped.
+    """
+    ctx = task.context or {}
+    sha = ctx.get(LANDED_MERGE_SHA_KEY)
+    if not isinstance(sha, str) or not sha:
+        return False
+    project = (
+        await session.get(Project, task.project_id)
+        if task.project_id is not None
+        else None
+    )
+    try:
+        result = await corroborate_acceptance_test_at_merge(
+            task, session, project=project, commit_sha=sha[:64]
+        )
+    except Exception:  # noqa: BLE001 — backfill corroboration must never raise
+        logger.warning(
+            "backfill corroboration failed for task %s",
+            getattr(task, "id", None),
+            exc_info=True,
+        )
+        return False
+    if result is True:
+        task.context = {
+            **(task.context or {}),
+            ACCEPTANCE_TEST_CORROBORATED_KEY: True,
+        }
+        return True
+    return False
+
+
 async def backfill_acceptance_verdicts(session) -> int:
     """Re-evaluate pre-fix named_test acceptance verdicts that may have been
     false-negatives. Three historical failure classes are healed:
@@ -2594,7 +2719,17 @@ async def backfill_acceptance_verdicts(session) -> int:
             satisfied = verdict_data.get("satisfied")
             missing_from_diff = False
             if satisfied is True:
-                pass
+                # Soft named_test verdicts (satisfied, unproven) recorded on a
+                # non-CI-monitor landing path carry no corroboration marker, so a
+                # not-in-diff declared test is credited soft forever. Corroborate
+                # it against the stored merge commit before re-evaluating — a
+                # test the backend confirms EXISTS at the merge commit then mints
+                # machine-proven credit. Conservative: only a confirmed presence
+                # stamps the marker; a corroborated absence / indeterminate
+                # result leaves the soft credit untouched (backfill never
+                # downgrades a recorded verdict).
+                if ACCEPTANCE_TEST_CORROBORATED_KEY not in (task.context or {}):
+                    await _corroborate_soft_named_test(task, session)
             elif satisfied is False:
                 # Two re-evaluable unsatisfied classes:
                 #   (a) Pre-fix verified-merge mis-scoring: the old

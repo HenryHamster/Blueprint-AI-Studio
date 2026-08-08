@@ -17852,8 +17852,11 @@ def test_blocked_unblock_helpers_reexport_identity():
 async def test_apply_rollup_merge_classification_hotfix_lane_bool(
     terminal_rollup_merge, mocker
 ):
-    """hotfix_lane=False → apply_merged_landed_signal called when record_merged;
-    task.status, vm_instance_id, last_heartbeat, and message set correctly."""
+    """hotfix_lane=False → the CORROBORATING twin
+    corroborate_and_apply_merged_landed_signal is awaited when record_merged
+    (the sync helper would record the acceptance verdict without the backend's
+    own corroboration marker); task.status, vm_instance_id, last_heartbeat, and
+    message set correctly."""
     import app.services  # noqa: F401 — prime circular-import chain before importing helpers
     from app.recovery_evaluating_helpers import _apply_rollup_merge_classification
     from app.models import Task, TaskStatus
@@ -17872,11 +17875,17 @@ async def test_apply_rollup_merge_classification_hotfix_lane_bool(
         return_value=(True, terminal_rollup_merge, "main"),
     )
     mock_apply = mocker.patch(
+        "app.landed_signal.corroborate_and_apply_merged_landed_signal",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+    mock_sync_apply = mocker.patch(
         "app.landed_signal.apply_merged_landed_signal",
         return_value=True,
     )
     mocker.patch(
-        "app.landed_signal.mark_landed_on_integration",
+        "app.landed_signal.corroborate_and_mark_landed_on_integration",
+        new_callable=AsyncMock,
     )
 
     mock_proj = object()
@@ -17895,6 +17904,7 @@ async def test_apply_rollup_merge_classification_hotfix_lane_bool(
         hotfix_lane=False,
         ctx_override=ctx_override,
         non_merge_reason="merged_pr_non_integration_branch",
+        merge_commit_sha="c" * 40,
     )
 
     assert record_merged is True
@@ -17922,13 +17932,21 @@ async def test_apply_rollup_merge_classification_hotfix_lane_bool(
         merged_base_branch="main",
         source="test",
     )
-    mock_apply.assert_called_once_with(
+    mock_apply.assert_awaited_once_with(
         task,
         mock_proj,
+        mock_session,
         base_branch="main",
         hotfix_lane=False,
         non_merge_reason="merged_pr_non_integration_branch",
+        # The caller's merge sha must be forwarded so the acceptance-test
+        # corroboration reads the immutable merge tree instead of the
+        # 60s-TTL branch-tip cache (which can still serve the pre-merge tip).
+        merge_commit_sha="c" * 40,
     )
+    # The recovery path must NOT reach the sync helper directly — that is the
+    # variant that lands without stamping the acceptance-test corroboration.
+    mock_sync_apply.assert_not_called()
     assert task.context is ctx_override
 
 
@@ -17936,8 +17954,8 @@ async def test_apply_rollup_merge_classification_hotfix_lane_bool(
 async def test_apply_rollup_merge_classification_no_signal_when_not_record_merged(
     mocker,
 ):
-    """When record_merged=False, neither apply_merged_landed_signal nor
-    mark_landed_on_integration is called."""
+    """When record_merged=False, neither landing write (guarded twin nor
+    mark-landed twin) is called."""
     import app.services  # noqa: F401 — prime circular-import chain before importing helpers
     from app.recovery_evaluating_helpers import _apply_rollup_merge_classification
     from app.models import Task, TaskStatus
@@ -17950,8 +17968,14 @@ async def test_apply_rollup_merge_classification_no_signal_when_not_record_merge
         new_callable=AsyncMock,
         return_value=(False, True, "main"),
     )
-    mock_apply = mocker.patch("app.landed_signal.apply_merged_landed_signal")
-    mock_mark = mocker.patch("app.landed_signal.mark_landed_on_integration")
+    mock_apply = mocker.patch(
+        "app.landed_signal.corroborate_and_apply_merged_landed_signal",
+        new_callable=AsyncMock,
+    )
+    mock_mark = mocker.patch(
+        "app.landed_signal.corroborate_and_mark_landed_on_integration",
+        new_callable=AsyncMock,
+    )
 
     record_merged, terminal, landed = await _apply_rollup_merge_classification(
         task,
@@ -17975,7 +17999,8 @@ async def test_apply_rollup_merge_classification_no_signal_when_not_record_merge
 async def test_apply_rollup_merge_classification_hotfix_lane_none_routes_mark_landed(
     mocker,
 ):
-    """hotfix_lane=None → mark_landed_on_integration called; apply_merged_landed_signal skipped."""
+    """hotfix_lane=None → corroborate_and_mark_landed_on_integration awaited (with
+    the session and project it needs to corroborate); the guarded twin skipped."""
     import app.services  # noqa: F401 — prime circular-import chain before importing helpers
     from app.recovery_evaluating_helpers import _apply_rollup_merge_classification
     from app.models import Task, TaskStatus
@@ -17988,19 +18013,29 @@ async def test_apply_rollup_merge_classification_hotfix_lane_none_routes_mark_la
         new_callable=AsyncMock,
         return_value=(True, True, "automain"),
     )
-    mock_apply = mocker.patch("app.landed_signal.apply_merged_landed_signal")
-    mock_mark = mocker.patch("app.landed_signal.mark_landed_on_integration")
+    mock_apply = mocker.patch(
+        "app.landed_signal.corroborate_and_apply_merged_landed_signal",
+        new_callable=AsyncMock,
+    )
+    mock_mark = mocker.patch(
+        "app.landed_signal.corroborate_and_mark_landed_on_integration",
+        new_callable=AsyncMock,
+    )
+    mock_sync_mark = mocker.patch("app.landed_signal.mark_landed_on_integration")
+    _proj = object()
+    _session = AsyncMock()
 
     record_merged, terminal, landed = await _apply_rollup_merge_classification(
         task,
-        object(),
-        AsyncMock(),
+        _proj,
+        _session,
         pr_number=5,
         merged_base_branch="automain",
         source="recovery_sweeps.lost_marker",
         msg_terminal="✓ rollup PR #5 already merged to {landed}; converged",
         msg_non_terminal="Lost-marker: merged into {landed}; awaiting",
         hotfix_lane=None,
+        merge_commit_sha="d" * 40,
     )
 
     assert record_merged is True
@@ -18014,7 +18049,18 @@ async def test_apply_rollup_merge_classification_hotfix_lane_none_routes_mark_la
         == "✓ rollup PR #5 already merged to automain; converged"
     )
     mock_apply.assert_not_called()
-    mock_mark.assert_called_once_with(task)
+    mock_mark.assert_awaited_once_with(
+        task,
+        _session,
+        _proj,
+        branch="automain",
+        # Pinned to the immutable merge commit, not the cached branch tip.
+        merge_commit_sha="d" * 40,
+    )
+    # The project is required for corroboration (it resolves the repo's GitHub
+    # credentials), so the twin must receive it rather than the old bare
+    # ``mark_landed_on_integration(task)``.
+    mock_sync_mark.assert_not_called()
 
 
 def test_apply_rollup_merge_classification_reexported_from_recovery_evaluating():

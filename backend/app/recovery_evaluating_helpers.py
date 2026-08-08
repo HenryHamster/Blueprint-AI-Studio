@@ -884,6 +884,7 @@ async def _apply_rollup_merge_classification(
     hotfix_lane: bool | None,
     ctx_override: dict | None = None,
     non_merge_reason: str | None = None,
+    merge_commit_sha: str | None = None,
 ) -> tuple[bool, bool, str]:
     """Shared classify→status→signal sequence for rollup-merge recovery sites.
 
@@ -892,18 +893,28 @@ async def _apply_rollup_merge_classification(
 
     ``msg_terminal`` / ``msg_non_terminal`` may contain a ``{landed}`` placeholder
     expanded with the resolved landing branch. ``hotfix_lane=None`` routes through
-    ``mark_landed_on_integration``; a bool value routes through
-    ``apply_merged_landed_signal``. ``ctx_override`` is staged onto ``task.context``
+    ``corroborate_and_mark_landed_on_integration``; a bool value routes through
+    ``corroborate_and_apply_merged_landed_signal``. Both are the corroborating
+    async twins, so this shared recovery path stamps the backend's own
+    acceptance-test corroboration before the code-acceptance verdict is recorded
+    (a not-in-diff declared test that exists in the merged tree mints
+    machine-proven credit instead of soft/unproven). ``ctx_override`` is staged onto ``task.context``
     before the signal write when supplied (used at site 1 where _ctx2 must be
     committed after the signal).
+
+    ``merge_commit_sha`` is the merged PR's own merge commit. EVERY caller here
+    already holds the GitHub PR payload it classified from, so pass
+    ``pr_data["merge_commit_sha"]``: it pins the acceptance corroboration read to
+    an immutable tree instead of the branch-tip cache, whose 60s TTL can still
+    serve the PRE-merge tip and make a just-added test look absent.
 
     Returns (record_merged, terminal, landed_branch).
     """
     from app.branch_resolution import classify_rollup_merge_outcome
     from app.landed_signal import (
-        apply_merged_landed_signal,
+        corroborate_and_apply_merged_landed_signal,
+        corroborate_and_mark_landed_on_integration,
         has_landed_signal,
-        mark_landed_on_integration,
     )
 
     record_merged, terminal, landed = await classify_rollup_merge_outcome(
@@ -926,14 +937,22 @@ async def _apply_rollup_merge_classification(
         if ctx_override is not None:
             task.context = ctx_override
         if hotfix_lane is None:
-            mark_landed_on_integration(task)
+            await corroborate_and_mark_landed_on_integration(
+                task,
+                session,
+                proj,
+                branch=landed,
+                merge_commit_sha=merge_commit_sha,
+            )
         else:
-            apply_merged_landed_signal(
+            await corroborate_and_apply_merged_landed_signal(
                 task,
                 proj,
+                session,
                 base_branch=landed,
                 hotfix_lane=hotfix_lane,
                 non_merge_reason=non_merge_reason,
+                merge_commit_sha=merge_commit_sha,
             )
         # Membership-based merge-credit propagation. The signal writes above only
         # stamp the rollup ITSELF; when it landed on the integration branch, every

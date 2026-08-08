@@ -69,7 +69,7 @@ from app.branch_resolution import (
     is_custom_staged_rollup_root,
     merged_pr_counts_as_integration_landing,
 )
-from app.landed_signal import apply_merged_landed_signal
+from app.landed_signal import corroborate_and_apply_merged_landed_signal
 from app.rollup_management import _check_and_trigger_rollup, _cleanup_branches
 from app.task_lifecycle_completion_dispatch import run_completion_dispatch
 from app.task_lifecycle_fix_completion import run_fix_completion
@@ -2329,15 +2329,21 @@ async def _process_post_commit(
                                     )
                                 )
                             if _record_pr_merged:
-                                apply_merged_landed_signal(
+                                await corroborate_and_apply_merged_landed_signal(
                                     task,
                                     _project,
+                                    session,
                                     base_branch=base_branch,
                                     hotfix_lane=bool(
                                         (task.first_payload or {}).get("hotfix")
                                         or (task.context or {}).get("hotfix")
                                     ),
                                     non_merge_reason="merged_pr_non_integration_branch",
+                                    # Pin acceptance corroboration to the merge
+                                    # commit the API just returned; the
+                                    # branch-tip cache can still serve the
+                                    # pre-merge tip for another 60s.
+                                    merge_commit_sha=merge_result.get("sha"),
                                 )
                             try:
                                 from app.task_completion import (
@@ -4571,9 +4577,10 @@ async def _process_post_commit(
                                                 source="task_lifecycle.review_merge_success",
                                             )
                                         if _record_pr_merged:
-                                            apply_merged_landed_signal(
+                                            await corroborate_and_apply_merged_landed_signal(
                                                 orig,
                                                 _orig_project,
+                                                session,
                                                 base_branch=base_branch,
                                                 hotfix_lane=bool(
                                                     (orig.first_payload or {}).get(
@@ -4585,6 +4592,13 @@ async def _process_post_commit(
                                                 ),
                                                 non_merge_reason=(
                                                     "merged_pr_non_integration_branch"
+                                                ),
+                                                # Immutable merge commit from the
+                                                # merge API — pins acceptance
+                                                # corroboration off the 60s-TTL
+                                                # branch-tip cache.
+                                                merge_commit_sha=merge_result.get(
+                                                    "sha"
                                                 ),
                                             )
                                         try:

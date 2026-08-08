@@ -242,6 +242,8 @@ class TestStrategistSpawnSequencedDeclaration:
         """Declaring only release_base_branch (no landing gate) does NOT admit a
         cross-base edge: without require_deps_landed_on the dispatch loop still
         applies the heuristic path, so the ungated edge stays rejected."""
+        from app.shared_state import get_project_integration_branch
+
         project = await _make_project(db_session)
         strategic, token = await self._make_strategic_task(db_session, project)
 
@@ -268,7 +270,10 @@ class TestStrategistSpawnSequencedDeclaration:
                     "title": "Must not spawn",
                     "prompt": "Ungated cross-base edge stays rejected.",
                     "depends_on": [str(dep.id)],
-                    "release_base_branch": "release/v29",
+                    # Only the integration branch is an admissible sequencing
+                    # ref for a direct strategist spawn; the resolver must
+                    # still reject the ungated cross-base edge on its own.
+                    "release_base_branch": get_project_integration_branch(project),
                 },
             },
         )
