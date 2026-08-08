@@ -160,8 +160,20 @@ def _mainline_git_ref(repo_root: str | None = None) -> str:
     root = repo_root or _REPO_ROOT
     for candidate in _MAINLINE_BRANCH_CANDIDATES:
         try:
+            # safe.directory: keep the probe working when the checkout is bound
+            # into a container as another user (CI's /repo mount) — without it
+            # every candidate dies with exit 128 and the scope silently falls
+            # back to HEAD.
             result = subprocess.run(
-                ["git", "rev-parse", "--verify", "--quiet", candidate],
+                [
+                    "git",
+                    "-c",
+                    f"safe.directory={root}",
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    candidate,
+                ],
                 capture_output=True,
                 text=True,
                 timeout=5,
@@ -209,18 +221,36 @@ def _git_history_is_truncated(repo_root: str | None = None) -> bool:
     ref = _mainline_git_ref(root)
     for boundary in boundaries:
         try:
+            # ``-c safe.directory``: CI binds the checkout into a root container
+            # while the runner user owns the files, so without it git dies with
+            # "dubious ownership" (exit 128) and a shallow checkout would read
+            # as NOT truncated — the exact fail-open this helper must not have.
             result = subprocess.run(
-                ["git", "merge-base", "--is-ancestor", boundary, ref],
+                [
+                    "git",
+                    "-c",
+                    f"safe.directory={root}",
+                    "merge-base",
+                    "--is-ancestor",
+                    boundary,
+                    ref,
+                ],
                 capture_output=True,
                 text=True,
                 timeout=5,
                 cwd=root,
             )
-        except Exception:  # noqa: BLE001 — probe; unresolvable boundary falls through
-            continue
+        except Exception:  # noqa: BLE001 — probe unrunnable: fail closed below
+            return True
         if result.returncode == 0:
             # A shallow boundary commit is in the mainline ancestry, so the
             # mainline history is truncated.
+            return True
+        if result.returncode != 1:
+            # ``--is-ancestor`` answers only 0 (yes) or 1 (no); anything else
+            # (128 dubious-ownership, unresolvable ref) means the probe could
+            # not evaluate the boundary at all. A shallow file IS present, so
+            # treat unprovable as truncated — fail closed, never open.
             return True
     return False
 

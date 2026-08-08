@@ -1031,3 +1031,44 @@ def test_mainline_git_ref_falls_back_to_head(tmp_path, mocker):
     repo = _init_hermetic_repo(tmp_path, branch="dev")
     mocker.patch("app.size_limit_policy._REPO_ROOT", repo)
     assert slp._mainline_git_ref() == "HEAD"
+
+
+def test_truncation_probe_failure_fails_closed(tmp_path, mocker):
+    """A shallow checkout whose ancestry probe CANNOT run (git exits 128 —
+    the containerized dubious-ownership shape) must read as TRUNCATED.
+
+    Regression: the probe used to treat any non-zero ``merge-base
+    --is-ancestor`` exit as "boundary not in ancestry" and fall through to
+    NOT-truncated, so a depth-1 CI checkout bind-mounted into a root container
+    evaluated the full-history ledger guard against partial history and
+    reported phantom ledger drift (git showed [] for bumps that mainline
+    history genuinely contains)."""
+    checkout = _init_shallow_repo(tmp_path)
+
+    real_run = subprocess.run
+
+    def _dubious(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and "merge-base" in cmd:
+            return subprocess.CompletedProcess(cmd, 128, stdout="", stderr="fatal: detected dubious ownership")
+        return real_run(cmd, *args, **kwargs)
+
+    mocker.patch("app.size_limit_policy.subprocess.run", side_effect=_dubious)
+    assert slp._git_history_is_truncated(checkout) is True, (
+        "an unprovable shallow boundary must fail closed (truncated), never open"
+    )
+
+
+def test_truncation_probe_exception_fails_closed(tmp_path, mocker):
+    """If the ancestry probe cannot even spawn (git missing mid-flight), a
+    present shallow boundary must still read as truncated."""
+    checkout = _init_shallow_repo(tmp_path)
+
+    real_run = subprocess.run
+
+    def _boom(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and "merge-base" in cmd:
+            raise OSError("git unavailable")
+        return real_run(cmd, *args, **kwargs)
+
+    mocker.patch("app.size_limit_policy.subprocess.run", side_effect=_boom)
+    assert slp._git_history_is_truncated(checkout) is True
