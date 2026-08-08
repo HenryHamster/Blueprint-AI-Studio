@@ -155,6 +155,31 @@ class LocalApiServiceTests(unittest.TestCase):
         )
         self.assertIn("ADMIN_UI_URL", forwarded)
 
+    @patch.object(api, "_assert_container_slot")
+    @patch.object(api.worker, "_network_gateway", return_value="172.20.0.1")
+    @patch.object(api.worker, "_assert_no_host_ci_runner")
+    def test_typed_fast_attestation_is_accepted_and_forwarded(
+        self, _ci_guard, _gateway, _container_slot
+    ):
+        self.payload["CALL_FOREGROUND_QUALIFICATION"] = (
+            "claude-warm-stream-json:phase0-v1"
+        )
+        self.secrets.write_text(json.dumps(self.payload), encoding="utf-8")
+        with patch.dict(
+            os.environ,
+            self._environment(database_mode="local-postgres"),
+            clear=True,
+        ):
+            argv, child_env = api.command()
+        self.assertEqual(
+            child_env["CALL_FOREGROUND_QUALIFICATION"],
+            "claude-warm-stream-json:phase0-v1",
+        )
+        forwarded = {
+            argv[index + 1] for index, item in enumerate(argv[:-1]) if item == "--env"
+        }
+        self.assertIn("CALL_FOREGROUND_QUALIFICATION", forwarded)
+
     def test_api_secret_bundle_accepts_only_https_admin_ui_url(self):
         self.payload["ADMIN_UI_URL"] = "http://insecure.example"
         self.secrets.write_text(json.dumps(self.payload), encoding="utf-8")

@@ -79,8 +79,10 @@ ORCHESTRATOR_URL
 ALLOWED_ORIGINS
 ```
 
-`INITIAL_ADMIN_EMAIL`, `ADMIN_JWT_SECRET`, `ADMIN_JWT_EXPIRE_MINUTES`, and
-`ADMIN_API_KEY_ALLOWED_IPS` are optional API-only values. The API launcher
+`INITIAL_ADMIN_EMAIL`, `ADMIN_JWT_SECRET`, `ADMIN_JWT_EXPIRE_MINUTES`,
+`ADMIN_API_KEY_ALLOWED_IPS`, and `CALL_FOREGROUND_QUALIFICATION` (the typed-Fast
+Resident attestation; the backend fail-closes unless it exactly matches the
+pinned qualification string) are optional API-only values. The API launcher
 rejects worker-only keys such as `MAX_CONCURRENT_VMS`, `VPC_NETWORK`,
 `AGENT_SERVICE_ACCOUNT_EMAIL`, and `CLOUD_RUN_JOB_NAME`.
 
