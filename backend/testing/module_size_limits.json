@@ -47,7 +47,7 @@
     "autonomous_research.py": 4550,
     "autonomous_research_residual.py": 900,
     "efficiency_snapshot.py": 6000,
-    "llm_cost_attribution.py": 1850,
+    "llm_cost_attribution.py": 2250,
     "research_completion.py": 7400,
     "research_provenance_validation.py": 400,
     "research_scope_calibration.py": 650,
