@@ -1103,6 +1103,34 @@ describe('handleStrategic problem_model recovery framing', () => {
     expect(section).not.toContain('this is the first cycle');
     expect(section).not.toContain('EXISTS but was not shipped in full');
   });
+
+  it('present as compact digest: `_agent_view_lean` marker → present framing with digest note and echo-back steering', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      problem_model: {
+        intent: { purpose: 'real' },
+        capabilities: [{ name: 'ci', status: 'working' }],
+        gaps: [{ id: 'g-1', name: 'a gap', status: 'open' }],
+        _agent_view_lean: {
+          stripped_gap_fields: ['description', 'evidence', 'active_moves'],
+          summarized_capabilities: 1,
+        },
+      },
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-dg', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    const params = capturedThinkerParams;
+    expect(params?.problemModelRecovery).toBe('present');
+    const section = String(params?.problemModelSection);
+    expect(section).toContain('compact digest');
+    expect(section).toContain('_agent_view_lean');
+    expect(section).toContain('echo the `_agent_view_lean` marker back');
+    expect(section).toContain('./fetch problem-model');
+    // Digest is the full live model shipped — NOT the packer-drop recovery path.
+    expect(section).not.toContain('EXISTS but was not shipped in full');
+    expect(section).not.toContain('this is the first cycle');
+  });
 });
 
 describe('handleStrategic self-repo prompt framing', () => {

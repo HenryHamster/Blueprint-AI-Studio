@@ -232,6 +232,117 @@ def test_write_back_restores_compacted_fields():
     assert "_gap_memory_trimmed" not in new_raw
 
 
+def test_write_back_echoing_lean_digest_preserves_stripped_durable_detail():
+    """An agent editing the DEFAULT lean digest and echoing the
+    ``_agent_view_lean`` marker back cannot wipe durable detail the digest never
+    showed: the marker drives the same floor-aware preservation as
+    ``_agent_view_floor_applied``, restoring gap description/evidence/active_moves,
+    capability notes/backing_paths/source/absorbs, and friction
+    description/seen_in/mitigations_tried/source/promoted_to_gap_id on
+    write-back."""
+    from app.strategic_problem_view import _agent_view_problem_model_lean
+
+    durable = {
+        "revision": 6,
+        "intent": {"purpose": "Blueprint keeps itself ahead of relevant advances"},
+        "capabilities": [
+            {
+                "name": "CapA",
+                "status": "working",
+                "notes": "works well",
+                "source": {"type": "shipped_change", "pr_number": 42},
+                "evidence_refs": [
+                    {"kind": "named_test", "ref": "testing/test_cap_a.py", "proven": True}
+                ],
+                "backing_paths": ["backend/app/cap_a.py"],
+                "absorbs": ["CapA-old"],
+                "proof_exempt": True,
+            }
+        ],
+        "gaps": [
+            {
+                "id": "g-1",
+                "name": "gap one",
+                "description": "the gap",
+                "evidence": "PR #42 establishes the gap.",
+                "status": "active",
+                "priority": "medium",
+                "size": "medium",
+                "opened": "2026-05-01T00:00:00Z",
+                "source": {
+                    "type": "user_message",
+                    "message_id": "msg-1",
+                    "excerpt": "from user",
+                },
+                "evidence_refs": [
+                    {"kind": "named_test", "ref": "testing/test_gap_one.py", "proven": True}
+                ],
+                "active_moves": ["d-1"],
+                "past_moves": ["d-0"],
+                "history": [],
+            }
+        ],
+        "friction": [
+            {
+                "id": "f-1",
+                "name": "flaky ci",
+                "description": "flaky ci",
+                "seen_in": ["d-1"],
+                "status": "active",
+                "source": {"type": "self_reflection", "message_id": "msg-2"},
+                "mitigations_tried": ["added retry", "increased timeout"],
+                "promoted_to_gap_id": "g-2",
+            }
+        ],
+    }
+    digest = _agent_view_problem_model_lean(durable)
+    # The digest ships WITHOUT the low-value detail, stamped `_agent_view_lean`.
+    assert digest["_agent_view_lean"]["stripped_gap_fields"] == [
+        "description",
+        "evidence",
+        "active_moves",
+    ]
+    assert "description" not in digest["gaps"][0]
+    assert "notes" not in digest["capabilities"][0]
+    assert "seen_in" not in digest["friction"][0]
+    assert "promoted_to_gap_id" not in digest["friction"][0]
+
+    # The agent edits the digest it saw (bumps gap priority + capability status)
+    # and echoes it back, marker included — exactly the Section 6 contract.
+    proposed = copy.deepcopy(digest)
+    proposed["gaps"][0]["priority"] = "high"
+    proposed["capabilities"][0]["status"] = "planned"
+
+    new_raw, _diff = apply_agent_update(durable, proposed, "2026-08-07T00:00:00")
+
+    merged_gap = new_raw["gaps"][0]
+    assert merged_gap["priority"] == "high"  # the real edit lands
+    assert merged_gap["description"] == "the gap"
+    assert merged_gap["evidence"] == "PR #42 establishes the gap."
+    assert merged_gap["active_moves"] == ["d-1"]
+    _assert_source_preserved(merged_gap["source"], durable["gaps"][0]["source"])
+    assert merged_gap["evidence_refs"] == durable["gaps"][0]["evidence_refs"]
+
+    merged_cap = new_raw["capabilities"][0]
+    assert merged_cap["status"] == "planned"  # the real edit lands
+    assert merged_cap["notes"] == "works well"
+    assert merged_cap["backing_paths"] == ["backend/app/cap_a.py"]
+    assert merged_cap["absorbs"] == ["CapA-old"]
+    assert merged_cap["proof_exempt"] is True
+    _assert_source_preserved(merged_cap["source"], durable["capabilities"][0]["source"])
+
+    merged_fr = new_raw["friction"][0]
+    assert merged_fr["description"] == "flaky ci"
+    assert merged_fr["seen_in"] == ["d-1"]
+    assert merged_fr["mitigations_tried"] == ["added retry", "increased timeout"]
+    assert merged_fr["promoted_to_gap_id"] == "g-2"
+    _assert_source_preserved(merged_fr["source"], durable["friction"][0]["source"])
+
+    # Packer markers never persist into the durable model.
+    assert "_agent_view_lean" not in new_raw
+    assert "_agent_view_floor_applied" not in new_raw
+
+
 def test_compacted_field_lists_are_in_sync():
     """The view builder and the write-back merge must agree on the compacted
     field set. If one module strips a field the other does not restore (or

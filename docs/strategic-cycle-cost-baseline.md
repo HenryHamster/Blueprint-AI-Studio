@@ -13,6 +13,16 @@ stated thing to be measured against. See `docs/strategic-cycle-cost-projection.m
 for the forward-looking projection model. This doc does not predict cost and
 does not judge whether cost is going up or down.
 
+**Statistic label — each `cost_per_cycle` is a mean.** Every `cost_per_cycle`
+above is `per_event_usd = strategic_cycle_cost_usd / cycle_count` from the
+`llm_cost_attribution` read surface — a **mean** over the reading's cohort
+cycles, not a median. The projection (`strategic_cycle_cost_projection.py`)
+anchors its per-cycle baseline on this record: `BASELINE_COST_PER_CYCLE_USD` is
+derived at module load as the mean of the recorded `cost_per_cycle` values
+(readings 1–3), so the anchor can never drift from the instrument again, and it
+reports the recorded median alongside the mean rather than silently conflating
+the two statistics.
+
 ## Where the numbers come from
 
 Each reading is the `llm_cost_attribution` block of the agent efficiency-snapshot
@@ -85,15 +95,38 @@ unknown.
 - `total_llm_usd`: **3446.586451**
 - `unpriced_coverage`: **0.9752**
 
-## Why the two readings are flat
+## Reading 3
 
-Both readings share `cycle_count` 212, i.e. they cover the same cohort. Every
-cost lever landed so far (OpenAI cache-read capture, `problem_model` section
-cut, no-delta gate, cohort provenance) modifies prompt assembly in
-`backend/app/strategic_spawning.py`, which executes only in the deployed
-backend. The deployed backend is at origin/main and contains none of them.
-**A flat reading here is therefore not evidence about the levers** — the levers
-are not running in the code that produced these readings.
+- **Date:** 2026-08-08
+- **Integration HEAD:** `5b97819`
+- **Requested window:** 7 days (`_AXIS_WINDOW_DAYS`)
+- **Cohort task count:** 5000 (at `_COHORT_CAP`)
+- **Cohort capped:** **True** — the cohort hit the 5000-row cap; figures describe
+  the recency sample of the 5000 most-recently-updated terminal tasks.
+- **Effective window:** `2026-08-01T00:00:00+00:00` to
+  `2026-08-08T00:00:00+00:00`. This is the first reading taken after the agent
+  endpoint exposed `cohort_effective_window_start` /
+  `cohort_effective_window_end`, so these are the **true effective span** of the
+  capped cohort (actual oldest/newest `updated_at` of the loaded rows), not the
+  requested query-window bounds.
+- `cycle_count`: **230**
+- `strategic_cycle_cost_usd`: **1683.2**
+- `cost_per_cycle`: **7.318261**
+- `total_llm_usd`: **3390.42**
+- `unpriced_coverage`: **0.72** — 72% of LLM spend in this cohort predates v29
+  serving and cannot be attributed to post-promotion cycles. This is the first
+  reading after the v29 promotion and reflects the mixed-window nature of a
+  capped recency cohort: the most-recently-updated 5000 tasks span approximately
+  7 days, of which only the tail falls after the promotion. Attribution will
+  improve as the cohort ages out pre-promotion tasks.
+
+## Why the two early readings are flat
+
+Readings 1 and 2 both share `cycle_count` 212, i.e. they cover the same cohort. Every
+cost lever landed so far modifies prompt assembly in `backend/app/strategic_spawning.py`,
+which executes only in the deployed backend. **A flat reading here is therefore not
+evidence about the levers** — the levers are not running in the code that produced
+those readings.
 
 ## How to take the next reading
 

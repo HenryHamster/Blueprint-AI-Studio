@@ -26,7 +26,10 @@ provenance fields trips the total-bytes ceiling.
 import json
 
 from app.payload_schemas import _serialized_size, pack_under_budget
-from app.strategic_problem_view import _agent_view_problem_model
+from app.strategic_problem_view import (
+    _agent_view_problem_model,
+    _agent_view_problem_model_lean,
+)
 
 # Byte ceilings for the fixture below, measured from the fixture's serialized
 # compacted agent-view output (23,496 B) with headroom. Total is deliberately
@@ -437,3 +440,108 @@ def test_strategic_payload_drops_legacy_vision_keeps_effective_purpose():
         "low-priority, never shipped or hard-failed as critical"
     )
     assert packed_with_vision["effective_purpose"] == effective_purpose
+
+
+def test_problem_model_section_bounded_without_dropping_live_regions():
+    """The DEFAULT problem_model shipping shape is a compact per-entry digest
+    (``_agent_view_problem_model_lean``): byte-bounded, yet keeping EVERY live
+    region the strategist reasons over — every capability/gap/friction entry,
+    intent/context/constraints/pending confirmations inline, and each entry's
+    decision-relevant scalars. Descriptions/evidence/notes/history/provenance
+    are CUT (non-destructive, recoverable via ./fetch problem-model), never
+    whole entries dropped. This is the v29 perf cut: problem_model was ~48 KB
+    of a ~173 KB mean strategic render — ~28% of the prompt driving ~48% of
+    fleet LLM spend — shipped whole every cycle."""
+    pm = _build_problem_model_fixture()
+    view = _agent_view_problem_model(pm)
+    digest = _agent_view_problem_model_lean(pm)
+
+    # 1) Byte-bounded: the digest is a small fraction of the full agent view.
+    digest_bytes = _serialized_bytes(digest)
+    view_bytes = _serialized_bytes(view)
+    assert digest_bytes < view_bytes // 2, (
+        f"lean digest must be materially smaller than the agent-view model: "
+        f"digest {digest_bytes} vs view {view_bytes}"
+    )
+    assert digest_bytes < 12_000, (
+        f"lean digest shipped {digest_bytes} bytes — over the 12 KB ceiling"
+    )
+
+    # 2) No live region dropped: every capability/gap/friction entry ships, and
+    #    the non-live reference regions (archived_gaps, revision_log) do not.
+    assert {c["name"] for c in digest["capabilities"]} == {
+        c["name"] for c in pm["capabilities"]
+    }
+    assert {g["id"] for g in digest["gaps"]} == {g["id"] for g in pm["gaps"]}
+    assert {f["id"] for f in digest["friction"]} == {f["id"] for f in pm["friction"]}
+    assert "archived_gaps" not in digest
+    assert "revision_log" not in digest
+    # intent/context/constraints/pending confirmations stay inline.
+    assert digest["intent"]["purpose"] == pm["intent"]["purpose"]
+    assert digest["context"] == pm["context"]
+    assert digest["constraints"] == pm["constraints"]
+    assert digest["pending_user_confirmation"] == pm["pending_user_confirmation"]
+
+    # 3) Each live entry keeps its decision-relevant scalars and nothing else —
+    #    a regression that re-ships the bulk detail trips the subset check.
+    _GAP_DIGEST_KEYS = {
+        "id", "name", "status", "priority", "size", "opened", "tag",
+        "deferral", "closed",
+    }
+    for gap in digest["gaps"]:
+        assert gap["id"] and gap["name"] and gap["status"]
+        assert gap["priority"] and gap["size"] and gap["opened"]
+        assert set(gap.keys()) <= _GAP_DIGEST_KEYS, (
+            f"digest gap {gap['id']} must reduce to decision-relevant scalars, "
+            f"got {sorted(gap.keys())}"
+        )
+    for cap in digest["capabilities"]:
+        assert cap["name"] and cap["status"]
+        assert set(cap.keys()) <= {"name", "status", "proof_exempt"}, (
+            f"digest capability {cap['name']} must reduce to decision-relevant "
+            f"scalars, got {sorted(cap.keys())}"
+        )
+    for fr in digest["friction"]:
+        assert fr["id"] and fr["name"] and fr["status"]
+        assert set(fr.keys()) <= {"id", "name", "status"}, (
+            f"digest friction {fr['id']} must reduce to decision-relevant "
+            f"scalars, got {sorted(fr.keys())}"
+        )
+
+    # 4) The cut is loud + non-destructive: the marker names what was reduced,
+    #    and the durable model is never mutated.
+    marker = digest["_agent_view_lean"]
+    assert marker["stripped_gap_fields"] == ["description", "evidence", "active_moves"]
+    assert marker["summarized_capabilities"] == len(pm["capabilities"])
+    assert marker["summarized_friction"] == len(pm["friction"])
+    assert "description" in pm["gaps"][0]
+    assert "notes" in pm["capabilities"][0]
+    assert "seen_in" in pm["friction"][0]
+
+    # 5) The whole strategic payload packs under budget with the digest shipped
+    #    intact (exercising the schema wiring that registers the digest builder
+    #    as problem_model's summarize/floor callbacks).
+    from app.strategic_spawning import _STRATEGIC_REVIEW_SCHEMA
+
+    payload = {
+        "type": "strategic_review",
+        "research_mode": "strategic",
+        "problem_model": digest,
+        "design_doc": {
+            "sections": [
+                {"key": "notes/strategic-context", "summary": "Prior-cycle context index entry"},
+                {"key": "systems/release-pipeline", "summary": "Architecture section summary"},
+            ]
+        },
+        "effective_purpose": "Blueprint keeps itself ahead of relevant advances with minimal attention",
+        "direction_counts": {"active": 4, "max_active": 6},
+        "max_active_directions": 6,
+        "project_name": "Blueprint",
+        "open_message_count": 0,
+        "open_messages": [],
+        "conversation_thread": [],
+    }
+    packed = pack_under_budget(payload, _STRATEGIC_REVIEW_SCHEMA)
+    assert _serialized_size(packed) < 120 * 1024
+    assert packed["problem_model"] == digest
+    assert "_agent_view_lean" in packed["problem_model"]

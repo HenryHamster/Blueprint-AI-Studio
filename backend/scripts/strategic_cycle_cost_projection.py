@@ -2,7 +2,8 @@
 """Project v28's median per-cycle strategist (strategic_review) LLM cost.
 
 v28's headline goal promises a median strategist cycle under $1.50 (down from a
-measured $4.41). Nothing in the repo computes that number; this module derives
+measured $7.52 baseline). Nothing in the repo computes that number; this module
+derives
 the projected median from stated inputs, every one cited below, and prices the
 two caching regimes SEPARATELY:
 
@@ -10,7 +11,7 @@ two caching regimes SEPARATELY:
     fixed prompt + accumulated conversation. Anthropic's automatic prefix cache
     matches the whole fixed payload (TTL 5 min, extended to 1 h when a cached
     prefix keeps being re-sent). This is the DOMINANT caching regime and it is
-    ALREADY priced into the measured $4.41 baseline. The v28 prompt reorder
+    ALREADY priced into the measured $7.52 baseline. The v28 prompt reorder
     does not change it: the prompt is rendered once per cycle and byte-identical
     across turns whether or not the stable prefix leads.
 
@@ -28,9 +29,12 @@ assumption, shows sensitivity, and reports the number honestly even though it
 exceeds $1.50.
 
 Inputs and sources (each cited):
-  * Baseline per-cycle cost       $4.41/cycle — task-provided measurement.
-    (Design doc d6c4d7fb-… cites $4.43/cycle; strategic_review_effort.py
-    docstring cites "~$4.43 per cycle".)
+  * Baseline per-cycle cost       $7.52/cycle — the MEAN of the recorded
+    baseline readings' cost_per_cycle (docs/strategic-cycle-cost-baseline.md,
+    BASELINE_READINGS below), derived at module load so the anchor can never
+    drift from the instrument again. The earlier task-provided $4.41/cycle
+    constant (design doc d6c4d7fb-… cites $4.43; strategic_review_effort.py
+    docstring cites "~$4.43 per cycle") is superseded by the recorded baseline.
   * Mean input tokens per call    741,992 — task-provided measurement.
     (Design doc cites 737,568.) Per call this is the INCLUSIVE input total:
     fresh input + cache read + cache creation (see _cache_read_share and
@@ -74,8 +78,16 @@ Inputs and sources (each cited):
 
 Tokens are estimated from measured bytes at 4 bytes/token (standard English-text
 approximation; the byte counts themselves are exact, and the cost model is
-anchored on the measured $4.41, so the token estimate only affects the tiny
-cross-cycle term).
+anchored on the measured $7.52 baseline, so the token estimate only affects the
+tiny cross-cycle term).
+
+Statistic label: each recorded ``cost_per_cycle`` is a MEAN over its cohort's
+cycles (``per_event_usd = total_usd / cycle_count`` in
+llm_cost_attribution.py), while the projection's headline claim is about a
+MEDIAN per-cycle cost. The projection anchors on the mean of the recorded
+per-reading means and REPORTS the recorded median alongside it
+(:func:`baseline_per_cycle_stats`), so the mean-vs-median gap is stated rather
+than silently conflated.
 
 The module also projects MONTHLY spend (criterion c-3fd62b9d). The criterion's
 envelope covers BOTH halves of the cost envelope, so the monthly figure is two
@@ -110,6 +122,7 @@ from __future__ import annotations
 
 import json
 import math
+import statistics
 import textwrap
 from pathlib import Path
 from typing import Any, Mapping, Sequence, cast
@@ -118,9 +131,10 @@ from typing import Any, Mapping, Sequence, cast
 # Measured / stated inputs
 # ---------------------------------------------------------------------------
 
-# Measured per-cycle cost and per-call inclusive input (task-provided; design
-# doc corroborates at $4.43 / 737,568).
-BASELINE_COST_PER_CYCLE_USD = 4.41
+# Measured per-cycle cost and per-call inclusive input. The per-cycle baseline
+# anchor is DERIVED from the recorded baseline readings (defined below) so it
+# can never drift from the instrument; MEAN_INPUT_TOKENS_PER_CALL is
+# task-provided (design doc corroborates at 737,568).
 MEAN_INPUT_TOKENS_PER_CALL = 741_992
 
 # Rendered prompt sizes, measured statically from thinker.ts / prompt.ts.
@@ -141,7 +155,7 @@ CACHE_CREATE_MULTIPLIER = 1.25        # cache create = 1.25 x input rate
 BASELINE_CACHE_READ_SHARE = 0.55
 
 # Assumptions (stated explicitly).
-INPUT_COST_SHARE_BASE = 0.90          # input(+create+read) share of the $4.41
+INPUT_COST_SHARE_BASE = 0.90          # input(+create+read) share of the baseline
 CROSS_CYCLE_SURVIVAL_BASE = 0.0       # P(cache survives the inter-cycle gap)
 
 # Sensitivity points for the routine share -- scenario inputs, NOT the headline.
@@ -265,6 +279,21 @@ BASELINE_READINGS: list[dict[str, Any]] = [
         "cohort_effective_window_start": "2026-07-31T00:00:00+00:00",
         "cohort_effective_window_end": "2026-08-07T00:00:00+00:00",
     },
+    {
+        "reading": 3,
+        "date": "2026-08-08",
+        "integration_head": "5b97819",
+        "cycle_count": 230,
+        "strategic_cycle_cost_usd": 1683.2,
+        "cost_per_cycle": 7.318261,
+        "total_llm_usd": 3390.42,
+        "unpriced_coverage": 0.72,
+        "cohort_task_count": 5000,
+        # First reading to record the true effective window from the agent endpoint
+        # (postdates the cohort_effective_window_* exposure in the read surface).
+        "cohort_effective_window_start": "2026-08-01T00:00:00+00:00",
+        "cohort_effective_window_end": "2026-08-08T00:00:00+00:00",
+    },
 ]
 
 
@@ -315,6 +344,11 @@ def project_cycle_cost(
     cost = baseline x tier_multiplier x [input_share x m(after)/m(before)
            + (1 - input_share)]
            - cross_cycle_saving
+
+    ``baseline`` is BASELINE_COST_PER_CYCLE_USD — the mean of the recorded
+    baseline readings' ``cost_per_cycle`` (section [8]), never a task-provided
+    constant. The claim is a MEDIAN while the anchor is a MEAN; the gap is
+    labelled by :func:`baseline_per_cycle_stats`.
     """
     before = effective_input_price_multiplier(BASELINE_CACHE_READ_SHARE)
     after = effective_input_price_multiplier(cache_read_share_after)
@@ -498,6 +532,7 @@ def headline_claim() -> dict[str, object]:
     r = source["routine_share"]
     status = source["status"]
     bound_kind = source["bound_kind"]
+    stats = baseline_per_cycle_stats()
     if r is None:
         return {
             "available": False,
@@ -509,6 +544,9 @@ def headline_claim() -> dict[str, object]:
             "routine_share_status": "unmeasured",
             "bound_kind": None,
             "denominator_cycles": None,
+            "baseline_mean_usd": stats["mean_usd"],
+            "baseline_median_usd": stats["median_usd"],
+            "mean_median_note": stats["statistic_note"],
             "reason": (
                 "routine share R is unmeasured: no measured share and no valid "
                 "fail-closed replayed lower bound are recorded in the split "
@@ -546,6 +584,9 @@ def headline_claim() -> dict[str, object]:
         "routine_share_status": status,
         "bound_kind": bound_kind,
         "denominator_cycles": source["denominator_cycles"],
+        "baseline_mean_usd": stats["mean_usd"],
+        "baseline_median_usd": stats["median_usd"],
+        "mean_median_note": stats["statistic_note"],
         "reason": reason,
     }
 
@@ -715,6 +756,63 @@ def baseline_record(
     }
 
 
+def baseline_per_cycle_stats(
+    readings: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Mean/median reconciliation of the recorded baseline per-cycle costs.
+
+    The projection claims a MEDIAN per-cycle cost but anchors on a MEAN: each
+    recorded ``cost_per_cycle`` is ``per_event_usd = total_usd / cycle_count``
+    (a mean over its cohort's cycles), and the projection uses the mean of the
+    recorded per-reading means as its baseline anchor. This returns both
+    statistics plus the reading count and an explicit note labelling the gap,
+    so a reader never conflates the two.
+
+    ``readings`` is normalized through :func:`baseline_record` (cohort
+    provenance, cost-arithmetic validation), so the stats describe exactly the
+    validated record section [8] prints.
+    """
+    source = baseline_record(readings)["readings"]
+    values = [float(r["cost_per_cycle"]) for r in source]
+    if not values:
+        return {
+            "available": False,
+            "mean_usd": None,
+            "median_usd": None,
+            "reading_count": 0,
+            "statistic_note": "no baseline readings recorded",
+        }
+    mean_usd = sum(values) / len(values)
+    median_usd = statistics.median(values)
+    gap_pct = abs(median_usd - mean_usd) / mean_usd
+    conservative = "conservative" if mean_usd >= median_usd else "NOT conservative"
+    return {
+        "available": True,
+        "mean_usd": mean_usd,
+        "median_usd": median_usd,
+        "reading_count": len(values),
+        "statistic_note": (
+            f"Each recorded cost_per_cycle is a MEAN over its cohort's cycles "
+            f"(per_event_usd = total_usd / cycle_count), while the projection "
+            f"claims a MEDIAN per-cycle cost. The projection anchors on the "
+            f"mean of the {len(values)} recorded per-reading means "
+            f"(${mean_usd:.4f}); the recorded median across those readings is "
+            f"${median_usd:.4f} ({gap_pct:.1%} "
+            f"{'higher' if median_usd > mean_usd else 'lower'}), so the mean "
+            f"anchor is {conservative} relative to the recorded median."
+        ),
+    }
+
+
+# The projection's per-cycle baseline anchor is DERIVED from the recorded
+# baseline readings (the mean of the recorded per-reading means) — never a
+# task-provided constant. Adding a reading to BASELINE_READINGS moves the
+# anchor automatically, so it cannot drift from the instrument again.
+BASELINE_COST_PER_CYCLE_USD = cast(
+    float, baseline_per_cycle_stats()["mean_usd"]
+)
+
+
 def project_monthly_spend(
     per_cycle_cost_usd: float,
     cycles_per_month: float | None,
@@ -835,8 +933,11 @@ def main() -> None:
     # view's denominator (a replayed payload's measured view is a stamped
     # SUBSET of the replay denominator).
     basis = source["denominator_cycles"] or 0
+    stats = baseline_per_cycle_stats()
 
-    print("\n[0] HEADLINE claim (>=30% below the $4.41 baseline)\n")
+    print(f"\n[0] HEADLINE claim (>=30% below the ${BASELINE_COST_PER_CYCLE_USD:.2f} baseline)\n")
+    for line in textwrap.wrap(str(stats["statistic_note"]), width=96):
+        print(f"  {line}")
     claim = headline_claim()
     if claim["available"]:
         if claim["routine_share_status"] == "replayed":
@@ -849,7 +950,8 @@ def main() -> None:
             print(f"  Measured routine share R = {claim['routine_share']:.4f} "
                   f"({basis} completed tiered cycles)")
         print(f"  Projected cost at the driving R : ${claim['cost_per_cycle_usd']:.2f}/cycle")
-        print(f"  Below $4.41 baseline         : {claim['below_baseline_pct']:.1%} "
+        print(f"  Below ${BASELINE_COST_PER_CYCLE_USD:.2f} baseline         : "
+              f"{claim['below_baseline_pct']:.1%} "
               f"(threshold {claim['threshold_pct']:.0%})")
         if claim["claim_verified"]:
             if claim["routine_share_status"] == "replayed":
@@ -877,7 +979,9 @@ def main() -> None:
 
     print("\n[1] Measured / stated inputs (each cited to its source)\n")
     rows = [
-        ("Baseline cost/cycle", f"${BASELINE_COST_PER_CYCLE_USD} (task measurement; design doc $4.43)"),
+        ("Baseline cost/cycle",
+         f"${BASELINE_COST_PER_CYCLE_USD:.4f} (mean of {stats['reading_count']} "
+         "recorded baseline readings — section [8])"),
         ("Mean input tokens/call (inclusive)", f"{MEAN_INPUT_TOKENS_PER_CALL:,} (task measurement; design doc 737,568)"),
         ("Baseline cache read share", f"{BASELINE_CACHE_READ_SHARE:.2f} (design doc)"),
         ("Stable prefix rendered", f"{STABLE_PREFIX_BYTES:,} B ~ {STABLE_PREFIX_TOKENS:,.0f} tokens (measured, thinker.ts)"),
@@ -908,11 +1012,13 @@ def main() -> None:
     print(f"  total prompt bytes (rep.)     {share['total_prompt_bytes']:>10,}")
     print(f"  stable share of INSTRUCTION   {share['stable_share_of_instruction']:.1%}   <-- the claim that holds")
     print(f"  stable share of TOTAL PROMPT  {share['stable_share_of_total']:.1%}   <-- NOT the claim; payload dominates")
-    print("  (the cost model below is anchored on the measured $4.41/cycle, so")
+    print(f"  (the cost model below is anchored on the measured "
+          f"${BASELINE_COST_PER_CYCLE_USD:.2f}/cycle baseline, so")
     print("   the token split only feeds the tiny cross-cycle term)")
 
     print("\n[3] The two caching regimes priced separately\n")
-    print("  INTRA-CYCLE (turn repetition): already priced into the $4.41 baseline.")
+    print(f"  INTRA-CYCLE (turn repetition): already priced into the "
+          f"${BASELINE_COST_PER_CYCLE_USD:.2f} baseline.")
     print("    The prompt is rendered once per cycle and byte-identical across turns,")
     print("    so turn 2+ re-sends the whole conversation and can cache the fixed")
     print("    payload. The v28 stable-prefix reorder does NOT change this regime.")
@@ -969,7 +1075,8 @@ def main() -> None:
         if claim["routine_share_status"] == "replayed":
             print(f"  Replayed R (fail-closed LOWER BOUND) = {claim['routine_share']:.4f}: "
                   f"${claim['cost_per_cycle_usd']:.2f}/cycle = "
-                  f"{claim['below_baseline_pct']:.1%} below the $4.41 baseline.")
+                  f"{claim['below_baseline_pct']:.1%} below the "
+                  f"${BASELINE_COST_PER_CYCLE_USD:.2f} baseline.")
             print("  The headline is AT the fail-closed replayed lower bound (replayed")
             print("  split, NOT a measured realized split).")
             if claim["claim_verified"]:
@@ -982,7 +1089,8 @@ def main() -> None:
         else:
             print(f"  Measured R = {claim['routine_share']:.4f}: "
                   f"${claim['cost_per_cycle_usd']:.2f}/cycle = "
-                  f"{claim['below_baseline_pct']:.1%} below the $4.41 baseline.")
+                  f"{claim['below_baseline_pct']:.1%} below the "
+                  f"${BASELINE_COST_PER_CYCLE_USD:.2f} baseline.")
             if claim["claim_verified"]:
                 print("  The >=30%-below-baseline headline HOLDS at the measured R.")
             else:
@@ -1099,11 +1207,15 @@ def main() -> None:
         print(f"    requested window (days)  : {reading['requested_window_days']}")
         print(f"    cohort_task_count        : {reading['cohort_task_count']}")
         print(f"    cohort_capped            : {capped_label}")
-    print("\n  Cohort provenance: both readings share cycle_count 212, i.e. the same "
-          "cohort. Every cost lever landed so far modifies prompt assembly in "
+    print("\n  Cohort provenance: readings 1 and 2 share cycle_count 212, i.e. the same "
+          "cohort. Reading 3 (2026-08-08, integration HEAD 5b97819) is the first "
+          "post-promotion reading: cycle_count 230 and unpriced_coverage 0.72 "
+          "(down from 0.9752), meaning 72% of spend still predates v29 serving "
+          "and cannot be attributed to post-promotion cycles. Every cost lever "
+          "landed so far modifies prompt assembly in "
           "backend/app/strategic_spawning.py, which executes only in the deployed "
-          "backend; the deployed backend is at origin/main and contains none of "
-          "them, so a flat reading here is not evidence about the levers.")
+          "backend; a flat reading on readings 1 and 2 is therefore not evidence "
+          "about the levers.")
 
 
 if __name__ == "__main__":

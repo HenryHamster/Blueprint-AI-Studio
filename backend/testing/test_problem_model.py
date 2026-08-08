@@ -1795,6 +1795,116 @@ def test_apply_agent_update_floored_friction_skeleton_preserves_detail():
     assert fr["promoted_to_gap_id"] == "g-flaky-ci"
 
 
+def test_apply_agent_update_lean_digest_echo_preserves_stripped_detail():
+    """Echoing the ``_agent_view_lean`` marker (the DEFAULT digest shipping
+    shape — see strategic_problem_view._agent_view_problem_model_lean) drives
+    the same floor-aware preservation as ``_agent_view_floor_applied``: gap
+    description/evidence/active_moves, capability notes/backing_paths/source/
+    absorbs, and friction description/seen_in/mitigations_tried/source/
+    promoted_to_gap_id are restored on write-back so an agent editing the
+    digest cannot wipe durable detail it never saw."""
+    current = {
+        "revision": 3,
+        "capabilities": [
+            {
+                "name": "Billing",
+                "status": "partial",
+                "notes": "durable notes",
+                "backing_paths": ["a.py"],
+                "absorbs": ["billing-old"],
+                "source": {"type": "shipped_change", "pr_number": 42},
+            }
+        ],
+        "gaps": [
+            {
+                "id": "g-1",
+                "name": "invoicing",
+                "status": "active",
+                "priority": "medium",
+                "description": "durable desc",
+                "evidence": "PR #42 establishes the gap.",
+                "active_moves": ["t-staffed-99"],
+            }
+        ],
+        "friction": [
+            {
+                "id": "f-1",
+                "name": "flaky CI",
+                "status": "active",
+                "description": "durable desc",
+                "seen_in": ["d-1"],
+                "mitigations_tried": ["retry"],
+                "source": {"type": "agent_observation"},
+                "promoted_to_gap_id": "g-flaky-ci",
+            }
+        ],
+    }
+    proposed = {
+        "capabilities": [{"name": "Billing", "status": "working"}],
+        "gaps": [
+            {
+                "id": "g-1",
+                "name": "invoicing",
+                "status": "active",
+                "priority": "high",
+                "description": "",
+                "evidence": "",
+                "active_moves": [],
+            }
+        ],
+        "friction": [{"id": "f-1", "name": "flaky CI", "status": "mitigated"}],
+        "_agent_view_lean": {
+            "stripped_gap_fields": ["description", "evidence", "active_moves"],
+            "summarized_capabilities": 1,
+            "summarized_friction": 1,
+        },
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+
+    cap = new_raw["capabilities"][0]
+    assert cap["status"] == "working"  # edit applied
+    assert cap["notes"] == "durable notes"
+    assert cap["backing_paths"] == ["a.py"]
+    assert cap["absorbs"] == ["billing-old"]
+    assert cap["source"]["pr_number"] == 42
+
+    gap = new_raw["gaps"][0]
+    assert gap["priority"] == "high"  # edit applied
+    assert gap["description"] == "durable desc"
+    assert gap["evidence"] == "PR #42 establishes the gap."
+    assert gap["active_moves"] == ["t-staffed-99"]
+
+    fr = new_raw["friction"][0]
+    assert fr["status"] == "mitigated"  # edit applied
+    assert fr["description"] == "durable desc"
+    assert fr["seen_in"] == ["d-1"]
+    assert fr["mitigations_tried"] == ["retry"]
+    assert fr["source"]["type"] == "agent_observation"
+    assert fr["promoted_to_gap_id"] == "g-flaky-ci"
+
+    # Packer markers never persist into the durable model.
+    assert "_agent_view_lean" not in new_raw
+    assert "_agent_view_floor_applied" not in new_raw
+
+
+def test_apply_agent_update_lean_digest_echo_is_not_unconditional_restoration():
+    """The ``_agent_view_lean`` echo is the agent's signal of what it saw — NOT
+    unconditional restoration. A model resubmitted without the marker (e.g. a
+    full model fetched via ``./fetch problem-model`` and edited) keeps blank
+    fields as genuine clears, so preservation never blinds the agent."""
+    current = {
+        "revision": 3,
+        "gaps": [
+            {"id": "g-1", "name": "x", "status": "active", "description": "old"}
+        ],
+    }
+    proposed = {
+        "gaps": [{"id": "g-1", "name": "x", "status": "active", "description": ""}]
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    assert new_raw["gaps"][0]["description"] == ""
+
+
 def test_apply_agent_update_caps_friction_cleared_without_floor_marker():
     """Without a floor marker (or with the section not skeletonized) a blank
     capability/friction detail field is a genuine clear and applies."""
