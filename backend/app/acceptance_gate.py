@@ -509,6 +509,148 @@ def _merge_acceptance_test_block(task: Task) -> dict | None:
     return block if isinstance(block, dict) else None
 
 
+# Internal, BACKEND-computed marker recording whether the declared acceptance
+# test's path (and node id, when declared) was independently corroborated against
+# the repo's tree at the merge commit. Underscore-prefixed like
+# ``_pr_changed_files``: computed by the backend (see
+# :func:`corroborate_acceptance_test_at_merge`), NEVER by the agent, so the
+# existence predicate can fail closed without trusting the agent's ``present``
+# word. Value is ``True`` (path + node confirmed present), ``False`` (path or
+# node confirmed ABSENT), or absent (not yet computed → callers fall back to the
+# agent-reported evidence rather than suppress a genuinely-existing test on
+# missing data).
+ACCEPTANCE_TEST_CORROBORATED_KEY = "_acceptance_test_corroborated"
+
+
+def _declared_test_reference(
+    evidence: AcceptanceEvidence,
+) -> tuple[str, str | None]:
+    """Split a ``named_test`` declaration into ``(test_path, node_id)``.
+
+    The node id may be carried inline (``path::node_id`` in ``test_path``) or in
+    the separate ``test_id`` field; the inline form wins. Returns an empty path
+    for a declaration that names no test file.
+    """
+    raw = (evidence.test_path or "").strip()
+    path_part, sep, inline_node = raw.partition("::")
+    path_part = path_part.strip()
+    node_id = (inline_node.strip() if sep else "") or (
+        evidence.test_id or ""
+    ).strip()
+    return path_part, (node_id or None)
+
+
+def _declared_test_id_present(node_id: str, file_text: str) -> bool:
+    """Whether *node_id* names a real test node inside *file_text*.
+
+    Matches the id's leaf node (the segment after the last ``::``, so a full
+    pytest node like ``TestSeam::test_x`` reduces to ``test_x``) as a standalone
+    identifier. A fabricated id that appears nowhere in the file fails closed; a
+    present id sharing only a word-boundary prefix with something else
+    (``test_x`` vs ``test_xy``) does not false-positive.
+    """
+    leaf = node_id.rsplit("::", 1)[-1].strip()
+    if not leaf:
+        return False
+    return re.search(rf"\b{re.escape(leaf)}\b", file_text) is not None
+
+
+def _candidate_test_paths(declared_path: str) -> list[str]:
+    """Repo-relative candidate paths for a declared test path.
+
+    Returns the declared path plus a ``backend/``-prefixed variant (when the
+    declared path does not already carry the prefix) so a declaration that drops
+    the monorepo prefix still corroborates against the real tree. Deduplicated,
+    order preserved.
+    """
+    declared = declared_path.strip().lstrip("./")
+    candidates = [declared]
+    if not declared.startswith("backend/"):
+        candidates.append("backend/" + declared)
+    return candidates
+
+
+async def corroborate_acceptance_test_at_merge(
+    task: Task,
+    session: Any,
+    project: Any = None,
+    *,
+    branch: str | None = None,
+) -> bool | None:
+    """Backend-side corroboration that the declared named_test exists in the repo
+    tree at the merge commit — NOT taken on the agent's word.
+
+    Tri-state:
+
+      * ``True`` — the declared test path (and, when declared, its node id) is
+        confirmed present in the repo tree on *branch* (defaulting to the
+        project's integration branch).
+      * ``False`` — the declared path is confirmed ABSENT, or the declared node
+        id is absent from a present file. This is a backend-refuted
+        non-existence verdict and is never fail-open.
+      * ``None`` — indeterminate: the task declares no ``named_test``, the
+        project has no GitHub credentials, the tree snapshot is unavailable, or
+        a present file's text could not be read. Indeterminate is NOT absence —
+        callers fall back to the agent-reported evidence so a genuinely-existing
+        test is never suppressed on missing data.
+
+    The caller stamps the result onto the task's context under
+    :data:`ACCEPTANCE_TEST_CORROBORATED_KEY` so the synchronous
+    :func:`_acceptance_test_exists_at_merge` predicate can fail closed without a
+    network call. Never raises.
+    """
+    evidence = read_acceptance_evidence(task.first_payload)
+    if evidence is None or evidence.kind != "named_test":
+        return None
+    declared_path, declared_id = _declared_test_reference(evidence)
+    if not declared_path:
+        return None
+
+    from app.source_ref_validation import resolve_branch_verification_context
+
+    try:
+        ctx = await resolve_branch_verification_context(session, project)
+    except Exception:  # noqa: BLE001 — corroboration must degrade, never raise
+        return None
+    if branch:
+        ctx["branch"] = branch
+    token = ctx.get("token")
+    owner = ctx.get("owner")
+    repo = ctx.get("repo")
+    if not (token and owner and repo):
+        return None
+    if not ctx.get("branch"):
+        return None
+
+    from app.github_repo_snapshot import file_text_on_branch
+
+    saw_indeterminate = False
+    for path in _candidate_test_paths(declared_path):
+        try:
+            exists, text = await file_text_on_branch(
+                path,
+                token=token,
+                owner=owner,
+                repo=repo,
+                branch=ctx["branch"],
+                project_id=ctx.get("project_id"),
+            )
+        except Exception:  # noqa: BLE001 — corroboration must degrade, never raise
+            saw_indeterminate = True
+            continue
+        if exists is True:
+            if declared_id:
+                if text is None:
+                    return None
+                return _declared_test_id_present(declared_id, text)
+            return True
+        if exists is None:
+            saw_indeterminate = True
+    if saw_indeterminate:
+        return None
+    return False
+
+
 def _acceptance_test_exists_at_merge(task: Task) -> bool:
     """Whether the declared acceptance test is confirmed to EXIST in the repo at
     the merge commit — independent of whether the PR's diff touches it.
@@ -518,11 +660,27 @@ def _acceptance_test_exists_at_merge(task: Task) -> bool:
     merge-test verdict block records the test as ``present``. Defensive: absent /
     malformed evidence yields False, so a name-dropped test that can be shown to
     exist nowhere is never credited.
+
+    The agent-reported evidence is NECESSARY but no longer sufficient. When the
+    backend has independently corroborated the declared test path against the
+    repo tree (:data:`ACCEPTANCE_TEST_CORROBORATED_KEY`, computed by
+    :func:`corroborate_acceptance_test_at_merge`), a corroborated ABSENCE
+    overrides the agent's ``present`` word fail-closed — an agent asserting a
+    test exists that the backend can prove does not is never credited. An
+    indeterminate / not-yet-computed corroboration leaves today's behavior
+    intact, so a genuinely-existing test is never suppressed on missing data.
     """
-    if _acceptance_test_targeted_green(task):
-        return True
-    block = _merge_acceptance_test_block(task)
-    return bool(block and block.get("present") is True)
+    # A test can only be confirmed to exist if something actually claimed to run
+    # it (targeted green) or a merge-test verdict records it present.
+    if not _acceptance_test_targeted_green(task):
+        block = _merge_acceptance_test_block(task)
+        if not (block and block.get("present") is True):
+            return False
+    # Backend-side corroboration against the merged tree: a corroborated absence
+    # is a non-existence verdict even when the agent reported the test present.
+    return (
+        (task.context or {}).get(ACCEPTANCE_TEST_CORROBORATED_KEY) is not False
+    )
 
 
 def _acceptance_test_ran_green_at_merge(task: Task) -> bool:
@@ -533,18 +691,24 @@ def _acceptance_test_ran_green_at_merge(task: Task) -> bool:
     executed ONLY the declared test and it exited green), or a merge-test verdict
     block records the declared test as present, ran, with status ``"ran"`` and
     ``passed``. A test that exists but did not run green (skipped / absent /
-    failed) yields False.
+    failed) yields False. Same backend-corrobation override as
+    :func:`_acceptance_test_exists_at_merge`: a corroborated absence means the
+    declared test was never really there, so no green run can be credited for it.
     """
     if _acceptance_test_targeted_green(task):
-        return True
-    block = _merge_acceptance_test_block(task)
-    return bool(
-        block
-        and block.get("present") is True
-        and block.get("ran") is True
-        and block.get("status") == "ran"
-        and block.get("passed") is True
-    )
+        ran_green = True
+    else:
+        block = _merge_acceptance_test_block(task)
+        ran_green = bool(
+            block
+            and block.get("present") is True
+            and block.get("ran") is True
+            and block.get("status") == "ran"
+            and block.get("passed") is True
+        )
+    if not ran_green:
+        return False
+    return (task.context or {}).get(ACCEPTANCE_TEST_CORROBORATED_KEY) is not False
 
 
 def _evaluate_named_test(

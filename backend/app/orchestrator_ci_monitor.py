@@ -870,6 +870,43 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                         if ci_task.project_id is not None
                         else None
                     )
+                    # Backend-side corroboration of the declared acceptance
+                    # test's path against the tree the PR just merged into.
+                    # The acceptance gate previously took the agent's
+                    # ``present`` word for existence; this stamps the backend's
+                    # own check so ``_acceptance_test_exists_at_merge`` fails
+                    # closed on a corroborated absence (see
+                    # ``acceptance_gate.corroborate_acceptance_test_at_merge``).
+                    # Best-effort: a failure here must never abort the landing.
+                    try:
+                        from app.acceptance_gate import (
+                            ACCEPTANCE_TEST_CORROBORATED_KEY,
+                            corroborate_acceptance_test_at_merge,
+                        )
+
+                        _corroborated = await corroborate_acceptance_test_at_merge(
+                            ci_task,
+                            session,
+                            project=_orch_ci_project_orm,
+                            branch=_ci_base,
+                        )
+                        if _corroborated is not None:
+                            # Top-level backend-stamped marker (same shape as
+                            # ``_pr_changed_files``), read by the synchronous
+                            # ``_acceptance_test_exists_at_merge`` predicate.
+                            ci_task.context = {
+                                **(ci_task.context or {}),
+                                ACCEPTANCE_TEST_CORROBORATED_KEY: (
+                                    _corroborated
+                                ),
+                            }
+                    except Exception:
+                        logger.exception(
+                            "[CI] PR #%s acceptance-test corroboration failed "
+                            "for task %s — landing proceeds without it",
+                            ci_pr_number,
+                            ci_task.id,
+                        )
                     _landed_on_integration = (
                         await _apply_ci_merged_landed_signal(
                             ci_task,
