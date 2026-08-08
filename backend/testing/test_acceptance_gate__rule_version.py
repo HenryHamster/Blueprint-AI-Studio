@@ -35,8 +35,10 @@ from app.acceptance_gate import (
     ACCEPTANCE_TEST_CORROBORATED_KEY,
     CODE_ACCEPTANCE_VERDICT_KEY,
     PARENT_DERIVED_CHANGED_FILES_KEY,
+    acceptance_input_fingerprint,
     effective_acceptance_verdict,
     evaluate_acceptance,
+    record_code_acceptance_verdict,
 )
 from app.models import Task, TaskStatus
 from testing._release_qualifier_testhelpers import _make_project_and_version, rq
@@ -379,6 +381,65 @@ def test_acceptance_rule_version_must_move_with_rule_changes():
     )
 
 
+def test_current_rule_verdict_rederives_when_evaluator_inputs_change():
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+        },
+        changed_files=["backend/app/widget.py"],
+    )
+    record_code_acceptance_verdict(task)
+    frozen = task.context[CODE_ACCEPTANCE_VERDICT_KEY]
+
+    task.context["_backfill_checked_at"] = "later"
+    assert effective_acceptance_verdict(task) is frozen
+
+    task.context["_pr_changed_files"].append("backend/testing/test_widget.py")
+    task.context["review_loop"] = {
+        "verify_tests_acceptance_block": {
+            "present": True,
+            "ran": True,
+            "status": "ran",
+            "passed": True,
+            "selector": "backend/testing/test_widget.py",
+        }
+    }
+    effective = effective_acceptance_verdict(task)
+    assert effective is not frozen
+    assert effective["satisfied"] is True
+    assert effective["proven"] is True
+
+
+def test_current_rule_legacy_verdict_without_fingerprint_rederives():
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+        },
+        changed_files=["backend/app/widget.py", "backend/testing/test_widget.py"],
+        merge_test_block={"present": True, "ran": True, "status": "ran",
+                          "passed": True, "selector": "backend/testing/test_widget.py"},
+    )
+    legacy = {
+        "satisfied": False,
+        "proven": False,
+        "kind": "named_test",
+        "reason": "legacy current-rule verdict",
+        "rule_version": ACCEPTANCE_RULE_VERSION,
+    }
+    task.context[CODE_ACCEPTANCE_VERDICT_KEY] = legacy
+
+    effective = effective_acceptance_verdict(task)
+    assert effective is not legacy
+    assert effective["satisfied"] is True
+    assert effective["proven"] is True
+    assert effective["input_fingerprint"] == acceptance_input_fingerprint(
+        task.first_payload, task.context, task.project_id
+    )
+    assert effective["land_time_verdict"] == legacy
+
+
 async def test_rule_version_bump_rederives_merged_work_during_qualification(
     db_session,
 ):
@@ -513,6 +574,13 @@ async def test_rule_version_bump_rederives_merged_work_during_qualification(
                 "rule_version": ACCEPTANCE_RULE_VERSION,
             },
         },
+    )
+    control_task.context[CODE_ACCEPTANCE_VERDICT_KEY][
+        "input_fingerprint"
+    ] = acceptance_input_fingerprint(
+        control_task.first_payload,
+        control_task.context,
+        control_task.project_id,
     )
 
     # Sanity: the CURRENT rule disagrees with BOTH stale stamps (that is what a

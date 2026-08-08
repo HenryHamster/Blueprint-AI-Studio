@@ -26,6 +26,7 @@ from app.acceptance_gate import (
     REDERIVED_BY_QUALIFIER,
     TEST_COVERAGE_RESULT_KEY,
     acceptance_blocks_success,
+    acceptance_input_fingerprint,
     acceptance_is_proven,
     acceptance_counts_as_verified_context,
     acceptance_was_declared,
@@ -452,6 +453,9 @@ def test_effective_acceptance_verdict_current_rule_returns_frozen_verbatim():
         "reason": "stamped under the current rule",
         "rule_version": ACCEPTANCE_RULE_VERSION,
     }
+    frozen["input_fingerprint"] = acceptance_input_fingerprint(
+        task.first_payload, task.context, task.project_id
+    )
     task.context[CODE_ACCEPTANCE_VERDICT_KEY] = frozen
     # A current-rule stamp is trusted verbatim — no re-derivation, no rewrite.
     assert effective_acceptance_verdict(task) is frozen
@@ -1905,6 +1909,9 @@ async def test_consumed_downstream_artifact_upgrades_to_proven(db_session):
         # the rule version that produced it so a later qualification can tell
         # which rows were judged by a retired rule and re-derive them.
         "rule_version": ACCEPTANCE_RULE_VERSION,
+        "input_fingerprint": acceptance_input_fingerprint(
+            producer.first_payload, producer.context, producer.project_id
+        ),
         # Audit honesty (design doc c50453ef §5): a direct recording is an
         # ORIGINAL land-time stamp, never a re-derivation.
         "stamped_at_land_time": True,

@@ -4746,6 +4746,7 @@ async def test_acceptance_window_rederives_stale_rule_version_verdicts(db_sessio
     from app.acceptance_gate import (
         ACCEPTANCE_RULE_VERSION,
         CODE_ACCEPTANCE_VERDICT_KEY,
+        acceptance_input_fingerprint,
         effective_acceptance_verdict,
     )
 
@@ -4826,6 +4827,13 @@ async def test_acceptance_window_rederives_stale_rule_version_verdicts(db_sessio
                 "rule_version": ACCEPTANCE_RULE_VERSION,
             },
         },
+    )
+    control_task.context[CODE_ACCEPTANCE_VERDICT_KEY][
+        "input_fingerprint"
+    ] = acceptance_input_fingerprint(
+        control_task.first_payload,
+        control_task.context,
+        control_task.project_id,
     )
     # A current-rule stamp is trusted verbatim — never re-derived.
     assert (

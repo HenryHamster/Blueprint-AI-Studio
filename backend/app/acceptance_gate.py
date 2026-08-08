@@ -35,10 +35,12 @@ same way the reproduce-on-HEAD verdict does.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
-import uuid
 import operator
 import re
+import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Mapping
 
@@ -1733,6 +1735,96 @@ def evaluate_acceptance(
     )
 
 
+# These are the durable evaluator inputs; verdict and audit metadata are excluded.
+_ACCEPTANCE_INPUT_CONTEXT_KEYS = (
+    "_pr_changed_files",
+    "_pr_changed_files_truncated",
+    PARENT_DERIVED_CHANGED_FILES_KEY,
+    ACCEPTANCE_TEST_CORROBORATED_KEY,
+    TEST_COVERAGE_RESULT_KEY,
+    "viewport_failure_screenshot_uri",
+    INHERITED_ACCEPTANCE_BLOCK_KEY,
+)
+_ACCEPTANCE_INPUT_REVIEW_LOOP_KEYS = (
+    UNVERIFIED_MERGE_REASON_KEY,
+    MERGE_ACCEPTANCE_BLOCK_KEY,
+    ACCEPTANCE_TEST_TARGETED_GREEN_KEY,
+    ACCEPTANCE_TEST_TARGETED_DESCRIPTOR_KEY,
+)
+_ACCEPTANCE_TEST_BLOCK_INPUT_KEYS = (
+    "present", "ran", "status", "passed", "selector", "descriptor"
+)
+
+
+def _fingerprint_mapping(value: Any, keys: tuple[str, ...]) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    return {
+        key: value[key]
+        for key in keys
+        if key in value
+    }
+
+
+def acceptance_input_fingerprint(
+    payload: dict | None,
+    context: Mapping[str, Any] | None,
+    project_id: object,
+) -> str:
+    """Hash evaluator inputs so late evidence can invalidate a current stamp."""
+    source = context or {}
+    relevant_context: dict[str, Any] = {}
+    for key in _ACCEPTANCE_INPUT_CONTEXT_KEYS:
+        if key not in source:
+            continue
+        value = source[key]
+        if key in (INHERITED_ACCEPTANCE_BLOCK_KEY, TEST_COVERAGE_RESULT_KEY):
+            keys = (
+                ("coverage_pct", "source")
+                if key == TEST_COVERAGE_RESULT_KEY
+                else _ACCEPTANCE_TEST_BLOCK_INPUT_KEYS
+            )
+            value = _fingerprint_mapping(value, keys)
+            if value is None:
+                continue
+        elif key == ACCEPTANCE_TEST_CORROBORATED_KEY:
+            if not isinstance(value, bool):
+                continue
+        elif key in (
+            "_pr_changed_files_truncated",
+            PARENT_DERIVED_CHANGED_FILES_KEY,
+        ):
+            value = bool(value)
+        relevant_context[key] = value
+    review_loop = source.get(REVIEW_LOOP_KEY)
+    if isinstance(review_loop, Mapping):
+        projected_review_loop: dict[str, Any] = {}
+        for key in _ACCEPTANCE_INPUT_REVIEW_LOOP_KEYS:
+            if key not in review_loop:
+                continue
+            value = review_loop[key]
+            if key == MERGE_ACCEPTANCE_BLOCK_KEY:
+                value = _fingerprint_mapping(value, _ACCEPTANCE_TEST_BLOCK_INPUT_KEYS)
+                if value is None:
+                    continue
+            projected_review_loop[key] = value
+        if projected_review_loop:
+            relevant_context[REVIEW_LOOP_KEY] = projected_review_loop
+    material = {
+        "payload": payload,
+        "project_id": str(project_id),
+        "context": relevant_context,
+    }
+    canonical = json.dumps(
+        material,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def evaluate_code_acceptance(task: Task) -> AcceptanceGateVerdict:
     """Evaluate ``task``'s declared acceptance evidence, fail-closed.
 
@@ -1851,6 +1943,9 @@ def record_code_acceptance_verdict(task: Task) -> AcceptanceGateVerdict | None:
         # rule and re-derive them (design doc c50453ef). Consumed by
         # :func:`effective_acceptance_verdict`.
         "rule_version": ACCEPTANCE_RULE_VERSION,
+        "input_fingerprint": acceptance_input_fingerprint(
+            task.first_payload, task.context, task.project_id
+        ),
         # Audit honesty (design doc c50453ef §5): this is the ORIGINAL recording
         # of the verdict at land time, not a re-derivation. A re-derivation
         # (rule-version bump) sets this to False and nests the original verdict
@@ -1905,8 +2000,15 @@ def effective_acceptance_verdict(task: Task) -> dict | None:
     frozen = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
     if not isinstance(frozen, dict):
         return None
-    if frozen.get("rule_version") == ACCEPTANCE_RULE_VERSION:
-        # Stamped by the current rule — nothing to re-derive.
+    current_fingerprint = acceptance_input_fingerprint(
+        task.first_payload, task.context, task.project_id
+    )
+    if (
+        frozen.get("rule_version") == ACCEPTANCE_RULE_VERSION
+        and frozen.get("input_fingerprint") == current_fingerprint
+    ):
+        # Stamped by the current rule against these exact inputs — nothing to
+        # re-derive. Missing fingerprints are legacy rows and are healed below.
         return frozen
     rederived = evaluate_acceptance(task.first_payload, task.context, task.project_id)
     if not rederived.declared:
@@ -1933,6 +2035,7 @@ def effective_acceptance_verdict(task: Task) -> dict | None:
             "reason": rederived.reason,
             "proof_ref": rederived.proof_ref,
             "rule_version": ACCEPTANCE_RULE_VERSION,
+            "input_fingerprint": current_fingerprint,
             "stamped_at_land_time": False,
             "rederived_at": _utcnow().isoformat(),
             "rederived_by": REDERIVED_BY_QUALIFIER,
@@ -2878,6 +2981,9 @@ async def backfill_acceptance_verdicts(session) -> int:
                     "proof_ref": re_eval.proof_ref,
                     "backfilled": True,
                     "rule_version": ACCEPTANCE_RULE_VERSION,
+                    "input_fingerprint": acceptance_input_fingerprint(
+                        task.first_payload, ctx, task.project_id
+                    ),
                 }
                 task.context = ctx
                 session.add(task)
@@ -2924,6 +3030,9 @@ async def backfill_acceptance_verdicts(session) -> int:
                         "proof_ref": re_eval.proof_ref,
                         "backfilled": True,
                         "rule_version": ACCEPTANCE_RULE_VERSION,
+                        "input_fingerprint": acceptance_input_fingerprint(
+                            task.first_payload, ctx, task.project_id
+                        ),
                     }
                     task.context = ctx
                     session.add(task)
