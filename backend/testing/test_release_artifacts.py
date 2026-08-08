@@ -542,8 +542,10 @@ def test_effective_confirm_deadline_backstops_null_from_promoted_at():
         # unavailable) → the soft ancestry timeout, never an infinite defer.
         (None, timedelta(minutes=5), timedelta(hours=2), ("confirmation_timed_out", "backend_revision_ancestry_indeterminate", None)),
         # Past the derived window + determinately NOT a descendant, and the live
-        # revision predates the promotion → the honest no_new_revision timeout.
-        (False, timedelta(minutes=-5), timedelta(hours=2), ("confirmation_timed_out", "no_new_revision", None)),
+        # revision predates the promotion → the honest no_new_revision timeout,
+        # substantiated via the deploy-workflow run listing (no deploy.yml run
+        # for the promoted SHA → never dispatched).
+        (False, timedelta(minutes=-5), timedelta(hours=2), ("confirmation_timed_out", "deploy_workflow_never_dispatched", None)),
         # Within the derived window → still defers; the backstop bounds the
         # wait, it does not make the reclassifier eager.
         (None, timedelta(minutes=5), timedelta(minutes=30), None),
@@ -580,6 +582,11 @@ async def test_supersession_null_deadline_times_out_not_defers(
         new=AsyncMock(return_value=("tok", "acme", "widget")),
     )
     mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=ancestry))
+    # No deploy.yml run for the promoted SHA — the predates-promotion timeout
+    # is substantiated as never-dispatched rather than the bare no_new_revision.
+    mocker.patch(
+        "app.github.get_workflow_run_for_sha", new=AsyncMock(return_value=None)
+    )
 
     out = await _check_backend_revision_serving(
         session,
@@ -588,6 +595,176 @@ async def test_supersession_null_deadline_times_out_not_defers(
         _now(),
     )
     assert out == expected
+
+
+# ---------------------------------------------------------------------------
+# no_new_revision substantiation via the deploy workflow run listing
+# ---------------------------------------------------------------------------
+
+
+def _predates_promotion_stale_mismatch(mocker):
+    """Shared setup for the no_new_revision substantiation tests: a STABLE
+    revision predating the promotion, determinately NOT a descendant, past the
+    derived confirmation deadline, with GitHub creds resolved."""
+    from unittest.mock import AsyncMock
+
+    from app.models import DeploymentStatus
+
+    promoted_at = _now() - timedelta(hours=2)
+    version = _Version(
+        promoted_sha=_SHA,
+        promoted_at=promoted_at,
+        deploy_confirm_deadline=None,
+    )
+    ds = _DeployState(
+        status=DeploymentStatus.STABLE,
+        current_sha="b" * 40,
+        deployed_at=promoted_at - timedelta(minutes=5),  # predates promotion
+    )
+    project = _Proj(github_owner="acme", github_repo="widget")
+    session = _DispatchSession(project=project, ds=ds)
+    mocker.patch(
+        "app.release_promotion._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "acme", "widget")),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    return session, version
+
+
+@pytest.mark.asyncio
+async def test_no_new_revision_substantiated_when_deploy_workflow_never_dispatched(
+    mocker,
+):
+    """A promotion whose deploy never happened no longer resolves to a bare
+    no_new_revision: the deploy-workflow run listing for the promoted SHA shows
+    NO deploy.yml run, so the timeout is substantiated as
+    deploy_workflow_never_dispatched — distinct from 'ran and failed' and from
+    'ran and the revision is stale'."""
+    from unittest.mock import AsyncMock
+
+    from app.release_artifacts import _check_backend_revision_serving
+
+    session, version = _predates_promotion_stale_mismatch(mocker)
+    # No deploy.yml run exists for the promoted SHA — the deploy workflow was
+    # never dispatched.
+    mocker.patch(
+        "app.github.get_workflow_run_for_sha", new=AsyncMock(return_value=None)
+    )
+
+    out = await _check_backend_revision_serving(
+        session,
+        version,
+        _Artifact(BACKEND_REVISION_ARTIFACT_KIND, None),
+        _now(),
+    )
+    assert out == (
+        "confirmation_timed_out",
+        "deploy_workflow_never_dispatched",
+        None,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("run", "expected_reason"),
+    [
+        # Completed non-success → the deploy workflow ran and failed.
+        (
+            {"run_id": 11, "status": "completed", "conclusion": "failure", "html_url": "u"},
+            "deploy_workflow_failed",
+        ),
+        (
+            {"run_id": 12, "status": "completed", "conclusion": "cancelled", "html_url": "u"},
+            "deploy_workflow_failed",
+        ),
+        # Completed success → the pipeline shipped but the promoted revision
+        # never served (stale revision).
+        (
+            {"run_id": 13, "status": "completed", "conclusion": "success", "html_url": "u"},
+            "deploy_workflow_succeeded_stale_revision",
+        ),
+        # Still in flight past the deadline → the deploy is stuck in the pipeline.
+        (
+            {"run_id": 14, "status": "in_progress", "conclusion": None, "html_url": "u"},
+            "deploy_workflow_in_progress",
+        ),
+    ],
+)
+async def test_no_new_revision_substantiated_by_deploy_workflow_conclusion(
+    mocker, run, expected_reason
+):
+    """The deploy-workflow run conclusion names the specific gate behind the
+    no_new_revision timeout: failed, succeeded-but-stale, or still-in-progress."""
+    from unittest.mock import AsyncMock
+
+    from app.release_artifacts import _check_backend_revision_serving
+
+    session, version = _predates_promotion_stale_mismatch(mocker)
+    mocker.patch(
+        "app.github.get_workflow_run_for_sha", new=AsyncMock(return_value=run)
+    )
+
+    out = await _check_backend_revision_serving(
+        session,
+        version,
+        _Artifact(BACKEND_REVISION_ARTIFACT_KIND, None),
+        _now(),
+    )
+    assert out == ("confirmation_timed_out", expected_reason, None)
+
+
+@pytest.mark.asyncio
+async def test_no_new_revision_keeps_backstop_when_deploy_workflow_unavailable(mocker):
+    """A credential/API failure on the deploy-workflow lookup keeps the honest
+    no_new_revision backstop — never fabricate a specific gate from a failed
+    lookup (conservative: report, never silently confirm)."""
+    from unittest.mock import AsyncMock
+
+    from app.release_artifacts import _check_backend_revision_serving
+
+    session, version = _predates_promotion_stale_mismatch(mocker)
+    # The reclassifier resolves credentials once to run the ancestry check;
+    # the substantiation's own credential resolution then fails (e.g. a
+    # transient gap), so the deploy-workflow lookup cannot run — keep the
+    # honest no_new_revision backstop rather than fabricating a specific gate.
+    mocker.patch(
+        "app.release_promotion._resolve_github_with_session",
+        new=AsyncMock(side_effect=[("tok", "acme", "widget"), None]),
+    )
+    mocker.patch(
+        "app.github.get_workflow_run_for_sha",
+        new=AsyncMock(side_effect=AssertionError("must not be called without creds")),
+    )
+
+    out = await _check_backend_revision_serving(
+        session,
+        version,
+        _Artifact(BACKEND_REVISION_ARTIFACT_KIND, None),
+        _now(),
+    )
+    assert out == ("confirmation_timed_out", "no_new_revision", None)
+
+
+@pytest.mark.asyncio
+async def test_no_new_revision_keeps_backstop_when_workflow_lookup_raises(mocker):
+    """An exception from the deploy-workflow lookup keeps no_new_revision."""
+    from unittest.mock import AsyncMock
+
+    from app.release_artifacts import _check_backend_revision_serving
+
+    session, version = _predates_promotion_stale_mismatch(mocker)
+    mocker.patch(
+        "app.github.get_workflow_run_for_sha",
+        new=AsyncMock(side_effect=RuntimeError("github exploded")),
+    )
+
+    out = await _check_backend_revision_serving(
+        session,
+        version,
+        _Artifact(BACKEND_REVISION_ARTIFACT_KIND, None),
+        _now(),
+    )
+    assert out == ("confirmation_timed_out", "no_new_revision", None)
 
 
 @pytest.mark.asyncio
@@ -684,6 +861,11 @@ async def test_redetection_tick_cannot_latch_deploy_failed(mocker):
             new=AsyncMock(return_value=("tok", "acme", "widget")),
         )
         mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+        # No deploy.yml run for the promoted SHA — the timeout is substantiated
+        # as never-dispatched rather than the bare no_new_revision backstop.
+        mocker.patch(
+            "app.github.get_workflow_run_for_sha", new=AsyncMock(return_value=None)
+        )
 
         out = await _check_backend_revision_serving(
             session_dispatch,
@@ -693,7 +875,11 @@ async def test_redetection_tick_cannot_latch_deploy_failed(mocker):
         )
         assert out is not None
         assert out[0] != "deploy_failed"
-        assert out == ("confirmation_timed_out", "no_new_revision", None)
+        assert out == (
+            "confirmation_timed_out",
+            "deploy_workflow_never_dispatched",
+            None,
+        )
     finally:
         async with engine.begin() as conn:
             await conn.run_sync(SQLModel.metadata.drop_all)

@@ -19,6 +19,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from app import release_version
+from app.branch_resolution import get_project_promotion_target
+from app.database import resolve_dialect_name
+from app.landed_signal import landed_signal_predicate
 from app.models import (
     Alert,
     AlertSeverity,
@@ -49,6 +52,14 @@ from app.time_utils import _utcnow
 from app.json_extract import async_json_loads
 from app.deployed_sha import get_serving_sha
 
+# ── merge-grade contract helpers ─────────────────────────────────────────────
+# Canonically defined in app.release_scoring (where the RELEASE_MERGE_GRADE
+# artifact is parsed); the direction-scoped objective grade reuses the same
+# scope-agnostic evaluator and placeholder-goal predicate as the version path.
+from app.release_scoring import (
+    evaluate_merge_grade,
+    is_contentless_goal,
+)
 # Preserve the historical logger name so existing caplog filters and log
 # processing continue to see these events under release_qualifier.
 logger = logging.getLogger("backend.app.release_qualifier")
@@ -848,6 +859,364 @@ async def _spawn_release_merge_grade_task(
         )
     )
     return task
+
+
+# ---------------------------------------------------------------------------
+# Direction-scoped blind objective grade (dir d-4f944896)
+# ---------------------------------------------------------------------------
+# The version-scoped merge grade above is hard-wired to the one open
+# ReleaseVersion.  A DIRECTION (campaign) has no version; its objective is the
+# strategist-authored steer (``completion_criteria`` / ``context.success_evidence``)
+# and its "integrated merged diff" is the union of the PRs its tasks landed.  The
+# spawner below creates the same blind ``release_merge_grade`` task scoped to a
+# direction, and :func:`record_direction_merge_grade` consumes the completed
+# artifact into the DIRECTION-scoped category-verdict ledger (the version-scoped
+# inline recording in ``release_qualifier.finalize_qualification`` is the exact
+# analogue).  The BLINDNESS contract is preserved verbatim: the grader sees the
+# direction objective and the merged diffs ONLY — never the strategist narrative.
+
+
+def _resolve_direction_objective(direction: dict[str, Any]) -> str | None:
+    """Resolve a direction's DECLARED OBJECTIVE text, or None.
+
+    ``completion_criteria`` lives directly on the direction dict (see
+    ``claim_task_helpers._build_direction_contract``); when it is unset the
+    fallback is ``context["success_evidence"]`` — the success contract the
+    campaign's objective is judged against.  First non-empty string wins.
+    """
+    if not isinstance(direction, dict):
+        return None
+    completion = direction.get("completion_criteria")
+    if isinstance(completion, str) and completion.strip():
+        return completion.strip()
+    ctx = direction.get("context")
+    if isinstance(ctx, dict):
+        success = ctx.get("success_evidence")
+        if isinstance(success, str) and success.strip():
+            return success.strip()
+    return None
+
+
+def _task_pr_number(task: Task) -> int | None:
+    """Extract the merged PR number a task shipped, or None.
+
+    Reads the PR-reference keys the codebase uses across task contexts —
+    ``context["pr_number"]``, ``context["rollup_pr_number"]``,
+    ``context["review_loop"]["pr_number"]`` — with the legacy
+    ``first_payload["pr_number"]`` fallback (mirrors branch_cleanup /
+    llm_cost_attribution's read surface).
+    """
+    ctx = task.context or {}
+    review_loop = ctx.get("review_loop")
+    for raw in (
+        ctx.get("pr_number"),
+        ctx.get("rollup_pr_number"),
+        review_loop.get("pr_number") if isinstance(review_loop, dict) else None,
+        (task.first_payload or {}).get("pr_number"),
+    ):
+        if raw is None:
+            continue
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+async def _collect_direction_merged_pr_numbers(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    direction_id: str,
+) -> list[int]:
+    """Collect the merged-PR window of a direction's INTEGRATED MERGED DIFF.
+
+    Every COMPLETED task tagged ``context["direction_id"] == direction_id`` that
+    truly landed on the integration branch (``landed_signal_predicate`` — the
+    same landed-signal predicate the version acceptance-window uses) contributes
+    its merged PR number, deduplicated and sorted ascending.  This is the window
+    the blind grader fetches each PR's diff from to grade goal coverage.
+    """
+    from sqlalchemy import cast as _cast
+    from sqlalchemy import func as _func
+    from sqlalchemy.dialects.postgresql import JSONB as _JSONB
+
+    dialect_name = resolve_dialect_name(session)
+    if dialect_name == "sqlite":
+        direction_filter = (
+            _func.json_extract(Task.context, "$.direction_id") == direction_id
+        )
+    else:
+        direction_filter = Task.context.op("@>")(
+            _cast({"direction_id": direction_id}, _JSONB)
+        )
+    result = await session.execute(
+        select(Task)
+        .where(
+            Task.project_id == project_id,
+            Task.status == TaskStatus.COMPLETED,
+            direction_filter,
+            landed_signal_predicate(session),
+        )
+        .order_by(Task.id)
+    )
+    seen: set[int] = set()
+    merged_prs: list[int] = []
+    for _task in result.scalars().all():
+        pr = _task_pr_number(_task)
+        if pr is not None and pr not in seen:
+            seen.add(pr)
+            merged_prs.append(pr)
+    # Deterministic payload: the merged-PR window is a SET of PR numbers, so sort
+    # numerically regardless of task-id ordering (Task.id is a UUID, not a
+    # creation counter).
+    return sorted(merged_prs)
+
+
+async def _spawn_direction_merge_grade_task(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    direction: dict[str, Any],
+    candidate_sha: str,
+    qualification_attempt_id: uuid.UUID | str,
+    categories: list[dict[str, Any]] | None = None,
+    rubric_fingerprint: str | None = None,
+    base_branch: str | None = None,
+    merged_pr_numbers: list[int] | None = None,
+) -> Task | None:
+    """Create + queue a blind ``release_merge_grade`` task for a DIRECTION.
+
+    The direction analog of :func:`_spawn_release_merge_grade_task`.  The agent
+    grades the direction's INTEGRATED MERGED DIFF (the ``merged_prs`` window
+    derived from tasks tagged with this direction) against the direction's
+    DECLARED OBJECTIVE and emits the same goal-coverage verdict shape.
+
+      * OBJECTIVE RESOLUTION — ``completion_criteria`` then
+        ``context.success_evidence`` (see :func:`_resolve_direction_objective`).
+        FAILS CLOSED when no real objective exists: a missing or contentless
+        objective returns ``None`` and no task row is minted (reuses
+        ``release_scoring.is_contentless_goal`` — the same placeholder predicate
+        the version path uses to skip spawning).
+      * INTEGRATED MERGED DIFF — ``base_branch`` defaults to the project's
+        PROMOTION TARGET (the stable ancestor the version path also pins its
+        diff to); ``candidate_sha`` is the caller-supplied integrated-diff tip;
+        ``merged_prs`` is derived from landed direction tasks (or supplied
+        directly by the caller).  The promotion target is the base so a
+        terminal rollup (candidate == integration-branch tip) still grades a
+        NON-EMPTY three-dot range — pinning the integration branch there would
+        yield ``automain...automain-tip`` = empty and the objective could never
+        be graded.
+      * SCOPE CARRIER — ``direction_id`` rides in BOTH the task payload and the
+        task context so the agent can echo it and the backend can key results.
+
+    BLINDNESS CONTRACT (dir d-c0fe439f) — preserved verbatim from the version
+    spawner: the grader sees the frozen objective and the merged diffs ONLY; the
+    ``assert`` tripwire fails loudly if a future edit ever leaks a running-update
+    key into the payload.
+    """
+    direction_id = str(direction.get("id") or direction.get("direction_id") or "").strip()
+    if not direction_id:
+        logger.warning(
+            "[RELEASE_QUALIFIER] _spawn_direction_merge_grade_task: direction "
+            "carries no id/direction_id — refusing to spawn a grade",
+        )
+        return None
+    objective = _resolve_direction_objective(direction)
+    if not objective or is_contentless_goal(objective):
+        logger.warning(
+            "[RELEASE_QUALIFIER] _spawn_direction_merge_grade_task: direction %s "
+            "has no gradeable objective (completion_criteria/context.success_evidence "
+            "missing or contentless) — spawning nothing",
+            direction_id,
+        )
+        return None
+    if base_branch is None:
+        _project = await session.get(Project, project_id)
+        if _project is None:
+            # Fail closed: without the project row there is no project-aware
+            # promotion target to pin the diff range to — never fabricate a
+            # hardcoded "main" fallback (branch-literal compliance invariant).
+            logger.warning(
+                "[RELEASE_QUALIFIER] _spawn_direction_merge_grade_task: project %s "
+                "not found — refusing to spawn a grade without a promotion target",
+                project_id,
+            )
+            return None
+        # Pin the diff base to the STABLE promotion target (never the live
+        # integration branch): for a terminal rollup the candidate_sha IS the
+        # integration-branch tip, so an integration-branch base would produce an
+        # EMPTY three-dot range and the objective could never be graded.  The
+        # promotion target is always a stable ancestor of the candidate and
+        # matches the version path's `promotion_target...<candidate_sha>`.
+        base_branch = get_project_promotion_target(_project)
+    if merged_pr_numbers is None:
+        merged_pr_numbers = await _collect_direction_merged_pr_numbers(
+            session, project_id, direction_id
+        )
+    payload: dict[str, Any] = {
+        "type": "release_merge_grade",
+        "base_branch": base_branch,
+        "diff_range": f"{base_branch}...{candidate_sha}",
+        # Pin the grade to the integrated-diff tip the caller resolved.
+        "candidate_sha": candidate_sha,
+        "qualification_attempt_id": str(qualification_attempt_id),
+        # The ONLY narrative the grader is allowed to see: the frozen objective.
+        "version_goal": objective,
+        # The direction's merged-PR window (same contract the version grade uses);
+        # the agent fetches each PR's diff to grade goal coverage.
+        "merged_prs": list(merged_pr_numbers),
+        # Goal-verification redesign: the ACTIVE acceptance-criterion CATEGORIES
+        # (the direction's declared acceptance criteria), same contract as the
+        # version spawner.
+        "categories": list(categories or []),
+        "rubric_fingerprint": rubric_fingerprint,
+        # Direction scope discriminator — the agent echoes it and the backend
+        # keys results into the direction-scoped ledger.
+        "direction_id": direction_id,
+        # Explicitly pin to Opus — regression guard against silent downgrade
+        # (mirrors the version spawner).
+        "quality_tier": "opus",
+    }
+    # Blindness guard — see the version spawner's contract note. No payload key
+    # may carry the strategist running-update narrative into a grade that must be
+    # blind to it under BOTH scopes.
+    assert not any("running_update" in str(key).lower() for key in payload), (
+        "release_merge_grade payload must stay BLIND to the strategist "
+        "running_update — no running-update text may be threaded in"
+    )
+    type_model = (_runtime_config.get("task_type_models", {}) or {}).get(
+        "release_merge_grade"
+    )
+    if type_model:
+        payload["model"] = type_model
+    type_effort = (_runtime_config.get("task_type_efforts", {}) or {}).get(
+        "release_merge_grade"
+    )
+    if type_effort:
+        payload["effort"] = type_effort
+    try:
+        payload = validate_internal_payload(
+            payload, "release_qualifier:release_merge_grade"
+        )
+    except PayloadTooLargeError:
+        # A too-large merge-grade payload (an enormous objective or PR list) is a
+        # real bug worth surfacing — let it raise to the spawn caller's handler.
+        raise
+
+    task = Task(
+        project_id=project_id,
+        title=f"Direction merge grade: {direction_id} ({base_branch}...{candidate_sha[:8]}) vs objective",
+        description=(
+            f"Blind goal-coverage grade of the direction's integrated merged "
+            f"diffs ({len(merged_pr_numbers)} merged PRs) against its declared objective"
+        ),
+        payloads=[payload],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        context={
+            "direction_id": direction_id,
+            "candidate_sha": candidate_sha,
+            "qualification_attempt_id": str(qualification_attempt_id),
+            "rubric_fingerprint": rubric_fingerprint,
+            "scope": "medium",
+        },
+    )
+    session.add(task)
+    await session.flush()
+    session.add(
+        TaskHistory(
+            task_id=task.id,
+            action="SPAWNED",
+            details={
+                "spawned_by": "RELEASE_QUALIFIER",
+                "task_type": "release_merge_grade",
+                "direction_id": direction_id,
+                "candidate_sha": candidate_sha,
+                "qualification_attempt_id": str(qualification_attempt_id),
+                "merged_pr_count": len(merged_pr_numbers),
+                "rubric_fingerprint": rubric_fingerprint,
+            },
+        )
+    )
+    return task
+
+
+async def record_direction_merge_grade(
+    session: AsyncSession,
+    *,
+    direction_id: str,
+    project_id: uuid.UUID,
+    goal: str,
+    artifact: dict[str, Any],
+    active_categories: list[dict[str, Any]] | None = None,
+    qualification_attempt_id: uuid.UUID | None = None,
+    grader_run_id: Any = None,
+) -> dict[str, Any]:
+    """Consume a completed direction-scoped ``RELEASE_MERGE_GRADE`` artifact.
+
+    The RESULT side of the direction grade: evaluates the artifact with
+    ``release_scoring.evaluate_merge_grade`` (already scope-agnostic — goal +
+    artifact + active_categories) and records the per-category verdicts + residual
+    into the DIRECTION-scoped category-verdict ledger keyed on ``direction_id``
+    (the exact counterpart of the version-scoped inline recording in
+    ``release_qualifier.finalize_qualification``).  The ``objective_gap``
+    completion-debt consequence rides along inside each ledger upsert, keyed on
+    ``objective_gap:direction:<direction_id>:<category_key>``.  Ledger writes are
+    best-effort and never raise — a ledger hiccup must not break grading.
+
+    Returns the evaluated verdict dict (status/covers_goal/coverage/biggest_gap/
+    category_verdicts/residual_uncaptured_gap) PLUS a ``ledger_writes`` boolean —
+    True only when at least one category-verdict/residual row was actually
+    persisted for this grade.  A consumer that only wants to re-stamp its
+    direction when a grade was NEWLY RECORDED checks ``ledger_writes`` so an
+    artifact with no gradable content (missing ``graded_candidate_sha``, no
+    per-category verdicts) does not trigger a write.
+    """
+    cert = evaluate_merge_grade(goal, artifact, active_categories or None)
+    candidate_sha = (
+        str(artifact.get("graded_candidate_sha") or "").strip()
+        if isinstance(artifact, dict)
+        else ""
+    ) or None
+    fresh_verdicts = cert.get("category_verdicts")
+    ledger_writes = False
+    if fresh_verdicts and candidate_sha:
+        try:
+            from app import category_verdict_ledger as _ledger
+
+            for _v in fresh_verdicts:
+                await _ledger.upsert_category_verdict(
+                    session,
+                    direction_id=direction_id,
+                    candidate_sha=candidate_sha,
+                    category_key=_v.get("category_key"),
+                    status=_v.get("status"),
+                    tier=_v.get("tier", "judged"),
+                    gap=_v.get("gap"),
+                    citations=_v.get("citations") or [],
+                    grader_run_id=grader_run_id,
+                    qualification_attempt_id=qualification_attempt_id,
+                    project_id=project_id,
+                )
+            await _ledger.upsert_residual(
+                session,
+                direction_id=direction_id,
+                candidate_sha=candidate_sha,
+                uncaptured_gap=cert.get("residual_uncaptured_gap"),
+                qualification_attempt_id=qualification_attempt_id,
+                project_id=project_id,
+            )
+            ledger_writes = True
+        except Exception:  # noqa: BLE001 — ledger write failure must not break grading
+            logger.warning(
+                "[RELEASE_QUALIFIER] failed to persist direction-scoped "
+                "merge-grade verdicts for direction %s — grading continues with "
+                "the in-memory verdict",
+                direction_id,
+                exc_info=True,
+            )
+    return {**cert, "ledger_writes": ledger_writes}
 
 
 async def _latest_artifact_logs(

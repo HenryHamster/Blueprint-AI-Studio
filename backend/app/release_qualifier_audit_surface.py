@@ -213,6 +213,20 @@ def _audit_report_confirms_incremental_base(report: Any, expected_base_sha: str)
         and str(scope.get("effective_base_sha") or "").strip() == expected_base_sha
     )
 
+def _audit_report_confirms_goal_category_range(report: Any, expected_full_range: str) -> bool:
+    # Fail-open: absent report/scope/echo all mean the grader ran the full
+    # fallback (older agents) or the report is unrelated to goal grading.  Hold
+    # ONLY when a present echo disagrees with the full version delta.
+    if not isinstance(report, dict):
+        return True
+    scope = report.get("audit_scope")
+    if not isinstance(scope, dict):
+        return True
+    echoed = scope.get("goal_category_diff_range")
+    if not isinstance(echoed, str) or not echoed.strip():
+        return True
+    return echoed.strip() == expected_full_range
+
 def _carried_finding_as_report_item(
     finding: dict[str, Any],
     *,

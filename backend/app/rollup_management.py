@@ -1182,6 +1182,21 @@ async def _do_rollup_post_merge_housekeeping(
         for _rep in _dir_representatives.values():
             await refresh_direction_outcomes_after_merge(_rep, session)
         await _record_completed_children_merge_evidence(completed_children, session)
+        if project is not None:
+            try:
+                await _maybe_spawn_direction_merge_grade(
+                    parent,
+                    project,
+                    session,
+                    gh_token,
+                    owner,
+                    repo,
+                    target_branch,
+                )
+            except Exception as _mg_exc:  # noqa: BLE001 — best-effort post-merge grade
+                logger.warning(
+                    f"[ROLLUP] Failed to spawn direction merge grade: {_mg_exc}"
+                )
     try:
         await delete_branch(gh_token, owner, repo, staging_branch)
     except Exception as del_err:
@@ -1250,6 +1265,127 @@ async def _do_rollup_post_merge_housekeeping(
             f"[MERGE-QUEUE] Sibling nudge after rollup PR "
             f"#{rollup_pr_number} failed: {_queue_exc}"
         )
+
+
+async def _maybe_spawn_direction_merge_grade(
+    parent: Task,
+    project: "Project",
+    session: "AsyncSession",
+    gh_token: str,
+    owner: str,
+    repo: str,
+    target_branch: str,
+) -> None:
+    """Spawn a direction-scoped blind objective grade after a landed rollup.
+
+    The parent rollup's context carries the campaign's ``direction_id`` when the
+    rollup is a multi-task campaign.  When that direction declares a gradeable
+    objective, its integrated merged diff (the integration-branch tip the rollup
+    just landed on) is graded against it via the direction-scoped spawner
+    (``release_qualifier_audit._spawn_direction_merge_grade_task``).  The
+    completed grade's verdicts are later consumed by the direction lifecycle
+    (``strategic_completion.consume_direction_merge_grade_if_ready``) into the
+    direction-scoped category-verdict ledger, and the direction's completion
+    gate then reflects the objective verdict instead of child-merge counts.
+
+    Duplicate-spawn guard: the spawned task id + candidate sha are stamped on
+    the parent context; a re-poll of the same landed merge reuses the existing
+    spawn instead of minting another grade.
+    """
+    ctx = dict(parent.context or {})
+    direction_id = str(ctx.get("direction_id") or "").strip()
+    if not direction_id:
+        return
+    direction = next(
+        (
+            d
+            for d in (project.directions or [])
+            if str(d.get("id") or "") == direction_id
+        ),
+        None,
+    )
+    if direction is None:
+        return
+    from app.release_qualifier_audit import (  # noqa: PLC0415
+        _collect_direction_merged_pr_numbers,
+        _resolve_direction_objective,
+        _spawn_direction_merge_grade_task,
+    )
+    from app.release_scoring import is_contentless_goal  # noqa: PLC0415
+
+    objective = _resolve_direction_objective(direction)
+    if not objective or is_contentless_goal(objective):
+        return
+    try:
+        from app.github_refs import get_branch_sha  # noqa: PLC0415
+
+        candidate_sha = await get_branch_sha(gh_token, owner, repo, target_branch)
+    except Exception as _sha_exc:  # noqa: BLE001 — best-effort post-merge grade
+        logger.warning(
+            f"[ROLLUP] Failed to resolve {target_branch} tip for direction "
+            f"merge grade: {_sha_exc}"
+        )
+        return
+    if not candidate_sha:
+        return
+    if ctx.get("_direction_merge_grade_candidate_sha") == candidate_sha:
+        return  # already spawned for this merged diff
+    import uuid  # noqa: PLC0415
+
+    merged_prs = await _collect_direction_merged_pr_numbers(
+        session, project.id, direction_id
+    )
+    from app.strategic_completion import (  # noqa: PLC0415
+        _direction_active_categories,
+        _direction_active_category_keys,
+    )
+
+    active_keys = await _direction_active_category_keys(
+        session, project, direction, direction_id
+    )
+    if not active_keys:
+        # No rubric to grade against — an empty active set is un-consumable:
+        # direction_objective_completion_verdict returns None for it and
+        # record_direction_merge_grade writes no ledger rows (no category
+        # verdicts), so consume_direction_merge_grade_if_ready never records the
+        # grade and the completion gate would never consult it. Skip spawning
+        # (mirrors the is_contentless_goal early-return above).
+        return
+    active_categories = await _direction_active_categories(
+        session, project, direction, active_keys
+    )
+    # The diff base is the STABLE promotion target, NOT the target_branch the
+    # candidate was resolved from: on a terminal rollup target_branch IS the
+    # integration branch, so an integration-branch base would yield an EMPTY
+    # three-dot range and the objective could never be graded.
+    from app.branch_resolution import get_project_promotion_target  # noqa: PLC0415
+
+    grade_base = get_project_promotion_target(project)
+    grade_task = await _spawn_direction_merge_grade_task(
+        session,
+        project.id,
+        direction=direction,
+        candidate_sha=candidate_sha,
+        qualification_attempt_id=uuid.uuid4(),
+        base_branch=grade_base,
+        merged_pr_numbers=merged_prs,
+        categories=active_categories or None,
+    )
+    if grade_task is None:
+        return
+    parent.context = {
+        **ctx,
+        "_direction_merge_grade_task_id": str(grade_task.id),
+        "_direction_merge_grade_candidate_sha": candidate_sha,
+    }
+    from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+
+    flag_modified(parent, "context")
+    session.add(parent)
+    logger.info(
+        f"[ROLLUP] Spawned direction merge grade {grade_task.id} for "
+        f"{direction_id} ({grade_base}...{candidate_sha[:8]}) vs objective"
+    )
 
 
 async def _record_completed_children_merge_evidence(

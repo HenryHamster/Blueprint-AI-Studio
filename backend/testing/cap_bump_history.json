@@ -2649,6 +2649,12 @@
           "commit_date": "2026-07-05T12:49:45Z",
           "old_cap": 1750,
           "new_cap": 2200
+        },
+        {
+          "commit_sha": "",
+          "commit_date": "2026-08-08T09:54:02.855012+00:00",
+          "old_cap": 2200,
+          "new_cap": 2300
         }
       ],
       "routers/admin_notifications.py": [
@@ -2731,6 +2737,12 @@
           "commit_date": "2026-07-09T14:18:10Z",
           "old_cap": 1750,
           "new_cap": 2050
+        },
+        {
+          "commit_sha": "",
+          "commit_date": "2026-08-08T06:52:49.741498+00:00",
+          "old_cap": 2050,
+          "new_cap": 2400
         }
       ],
       "lifecycle.py": [
@@ -3031,6 +3043,12 @@
           "commit_date": "2026-08-07T13:34:21Z",
           "old_cap": 1800,
           "new_cap": 2100
+        },
+        {
+          "commit_sha": "",
+          "commit_date": "2026-08-08T09:54:02.855012+00:00",
+          "old_cap": 2100,
+          "new_cap": 2500
         }
       ]
     },
@@ -4187,6 +4205,12 @@
           "commit_date": "2026-08-06T01:59:39Z",
           "old_cap": 1900,
           "new_cap": 2350
+        },
+        {
+          "commit_sha": "",
+          "commit_date": "2026-08-08T09:54:02.855012+00:00",
+          "old_cap": 2350,
+          "new_cap": 2850
         }
       ],
       "test_operator_inbox_liveness.py": [

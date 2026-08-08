@@ -2333,3 +2333,109 @@ async def test_goal_category_grading_uses_full_version_delta_while_audit_stays_i
     full_range = f"main...{candidate}"
     assert payload.get("diff_range") == full_range
     assert payload.get("goal_category_diff_range") == full_range
+
+
+@pytest.mark.asyncio
+async def test_finalize_holds_when_audit_graded_a_narrowed_goal_category_range(
+    db_session,
+):
+    """Finalize HOLDS when the audit report's echoed goal_category_diff_range
+    disagrees with the full version delta the promotion would carry.
+
+    ``goal_category_diff_range`` is pinned at spawn to ``base_branch...candidate``
+    so goal/acceptance-category grading spans the full version delta (goal
+    verdicts have no scoped carry-forward).  The agent echoes the range it
+    actually graded into ``audit_scope.goal_category_diff_range``, but the
+    backend previously never read that echo — a grader could report the full
+    range while grading a narrowed incremental window and every gate would
+    pass.  The finalize-time read site closes that gap by holding the
+    qualification via _handle_infra_failure."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    candidate = "abcd" * 10
+    await _seed_audit_only_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        audit_logs={
+            "audit_score": 1.0,
+            "findings": [],
+            "test_erosion": {"deleted_test_files": []},
+            "audit_scope": {
+                "mode": "full",
+                # A narrowed echo — the grader claims a SMALLER window than the
+                # full version delta the promotion PR would carry.
+                "goal_category_diff_range": "main...0000111122223333",
+            },
+        },
+    )
+    _pre_gates = {
+        "ci_green": True,
+        "ci_resolution": {"state": "success", "resolved_sha": candidate},
+        "migration_verdict": "ok",
+        "migration_detail": None,
+        "apply_verdict": "ok",
+        "apply_detail": None,
+    }
+
+    result = await rq._finalize_qualification(
+        db_session, version, _pre_gates=_pre_gates
+    )
+    await db_session.commit()
+
+    assert result["status"] == "infra_failure"
+    assert result["error"] == "audit_goal_category_range_narrowed"
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "infra_failure"
+    assert version.last_qualification["error"] == "audit_goal_category_range_narrowed"
+
+
+@pytest.mark.asyncio
+async def test_finalize_accepts_audit_that_graded_the_full_goal_category_range(
+    db_session,
+):
+    """A report whose echoed goal_category_diff_range IS the full version delta
+    finalizes normally — proving the read-site check is not an always-true
+    hold."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    candidate = "abcd" * 10
+    await _seed_audit_only_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        audit_logs={
+            "audit_score": 1.0,
+            "findings": [],
+            "test_erosion": {"deleted_test_files": []},
+            "audit_scope": {
+                "mode": "full",
+                "goal_category_diff_range": f"main...{candidate}",
+            },
+        },
+    )
+    _pre_gates = {
+        "ci_green": True,
+        "ci_resolution": {"state": "success", "resolved_sha": candidate},
+        "migration_verdict": "ok",
+        "migration_detail": None,
+        "apply_verdict": "ok",
+        "apply_detail": None,
+    }
+
+    result = await rq._finalize_qualification(
+        db_session, version, _pre_gates=_pre_gates
+    )
+    await db_session.commit()
+
+    assert result["status"] == "dry_run"
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "dry_run"

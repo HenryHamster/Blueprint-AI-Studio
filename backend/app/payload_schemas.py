@@ -27,7 +27,11 @@ from pydantic import (
     model_validator,
 )
 
-from app.task_capabilities import ALL_TASK_TYPES, TaskType
+from app.task_capabilities import (
+    ALL_TASK_TYPES,
+    CODE_PRODUCING_TASK_TYPES,
+    TaskType,
+)
 from app.viewport_evidence import VIEWPORT_WIDTH_MAX, VIEWPORT_WIDTH_MIN
 
 logger = logging.getLogger(__name__)
@@ -56,13 +60,13 @@ _MAX_PAYLOAD_BYTES = 190 * 1024
 
 # Task payload types that ship a code-producing PR, which the acceptance gate
 # scores (:mod:`app.acceptance_gate` documents the same set — create / fix /
-# refactor / qa / migrate / deps / docs). These must declare acceptance_evidence
-# at authoring time so a merged task has a proof the merge gate can check and
-# mint CriterionEvidence credit from; a code payload authored through the
-# strict validation surface without a declaration is rejected.
-_CODE_PRODUCING_TASK_TYPES: frozenset[str] = frozenset(
-    {"create", "fix", "refactor", "qa", "migrate", "deps", "docs"}
-)
+# refactor / qa / migrate / deps / docs). The canonical membership lives in
+# :data:`app.task_capabilities.CODE_PRODUCING_TASK_TYPES` — imported above — so
+# payload validation and orchestrator dependency classification can never drift
+# apart. These must declare acceptance_evidence at authoring time so a merged
+# task has a proof the merge gate can check and mint CriterionEvidence credit
+# from; a code payload authored through the strict validation surface without a
+# declaration is rejected.
 
 
 class PayloadTooLargeError(ValueError):
@@ -911,6 +915,13 @@ class ReleaseMergeGradePayload(_SystemPopulated):
     deliberately absent from this schema, and the spawner guards against it
     being threaded in.  Fields stay optional (BasePayload is extra-tolerant) and
     the handler fails loud at runtime when the candidate SHA / goal is missing.
+
+    ``direction_id`` (optional, additive) scopes the grade to a DIRECTION's
+    campaign objective instead of a release version: ``version_goal`` then holds
+    the direction's declared objective and ``merged_prs`` its INTEGRATED MERGED
+    DIFF window.  The version path is unchanged (``direction_id`` absent), and
+    the blindness contract holds under BOTH scopes — ``running_update`` stays
+    out of every payload key.
     """
 
     diff_range: str | None = None
@@ -918,6 +929,7 @@ class ReleaseMergeGradePayload(_SystemPopulated):
     version_goal: str | None = None
     merged_prs: list[int] | None = None
     prompt: str | None = None
+    direction_id: str | None = None
 
 
 class WalkthroughE2EPayload(_SystemPopulated):
@@ -1964,7 +1976,7 @@ def validate_task_payload(
     _enforce_payload_size(result)
     if (
         require_acceptance_evidence
-        and type_value in _CODE_PRODUCING_TASK_TYPES
+        and type_value in CODE_PRODUCING_TASK_TYPES
         and result.get("acceptance_evidence") is None
     ):
         raise ValueError(

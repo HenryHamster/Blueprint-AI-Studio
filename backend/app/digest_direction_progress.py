@@ -369,6 +369,9 @@ async def compute_direction_progress(
     from app.direction_outcomes import synthesize_prompt_quality_patterns
     from app.notification_dispatch import dispatch_external_notification
     from app.routers.admin_analytics import _derive_completed_at  # noqa: PLC0415
+    from app.strategic_completion import (  # noqa: PLC0415
+        direction_objective_completion_verdict,
+    )
 
     direction_progress_list: List[Dict[str, Any]] = []
     direction_portfolio_composition: List[Dict[str, Any]] = []
@@ -1196,6 +1199,12 @@ async def compute_direction_progress(
                 )
 
         if not quiet_this_window:
+            try:
+                _objective_verdict = await direction_objective_completion_verdict(
+                    session, project, d
+                )
+            except Exception:  # noqa: BLE001 — additive surface must not break digest
+                _objective_verdict = None
             direction_progress_list.append(
                 {
                     "direction_id": did,
@@ -1234,6 +1243,11 @@ async def compute_direction_progress(
                     "avg_time_to_merge_hours": avg_time_to_merge_hours,
                     "possibly_saturated": bool(d.get("possibly_saturated", False)),
                     "possibly_complete": bool(d.get("possibly_complete", False)),
+                    # Campaign objective verdict: True/False when the direction's
+                    # integrated merged diff has been graded against its declared
+                    # objective; None when ungraded (no rubric / no grade yet).
+                    # Additive — existing consumers ignore it.
+                    "objective_fully_met": _objective_verdict,
                     "auto_paused": bool(d.get("auto_paused", False)),
                     "auto_pause_count": int(d.get("auto_pause_count") or 0),
                     "churn_family_pause_count": int(d.get("churn_family_pause_count") or 0),

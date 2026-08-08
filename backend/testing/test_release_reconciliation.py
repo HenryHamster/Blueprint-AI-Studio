@@ -2011,8 +2011,13 @@ async def test_confirm_no_new_revision_times_out_scenario(db_session, mocker):
         db_session, promoted_at=promoted_at, deadline=deadline
     )
     # Stale revision predating the promotion; STABLE but never advanced, and
-    # determinately NOT a descendant of the promoted commit.
+    # determinately NOT a descendant of the promoted commit.  No deploy.yml run
+    # exists for the promoted SHA, so the timeout is substantiated as
+    # never-dispatched rather than the bare no_new_revision backstop.
     mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    mocker.patch(
+        "app.github.get_workflow_run_for_sha", new=AsyncMock(return_value=None)
+    )
     await _set_deploy_state(
         db_session,
         status=DeploymentStatus.STABLE,
@@ -2026,7 +2031,7 @@ async def test_confirm_no_new_revision_times_out_scenario(db_session, mocker):
     assert resolved is True
     await db_session.refresh(version)
     assert version.serving_status == "confirmation_timed_out"
-    assert version.deploy_failure_reason == "no_new_revision"
+    assert version.deploy_failure_reason == "deploy_workflow_never_dispatched"
     # No loud deploy-failed alert → no dedup stamp.
     assert version.deploy_confirm_alerted_at is None
 
@@ -3212,6 +3217,11 @@ async def test_confirm_pre_promotion_diverged_sha_waits_then_times_out(
         deployed_at=promoted_at - timedelta(hours=2),  # predates promotion
     )
     mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    # No deploy.yml run for the promoted SHA — the past-deadline timeout is
+    # substantiated as never-dispatched, never deploy_failed / never confirmed.
+    mocker.patch(
+        "app.github.get_workflow_run_for_sha", new=AsyncMock(return_value=None)
+    )
 
     # Within the confirmation window: no decision, version stays unconfirmed.
     resolved = await _confirm_serving_or_fail(
@@ -3234,7 +3244,7 @@ async def test_confirm_pre_promotion_diverged_sha_waits_then_times_out(
     assert resolved is True
     await db_session.refresh(version)
     assert version.serving_status == "confirmation_timed_out"
-    assert version.deploy_failure_reason == "no_new_revision"
+    assert version.deploy_failure_reason == "deploy_workflow_never_dispatched"
     assert version.served_sha is None
 
 

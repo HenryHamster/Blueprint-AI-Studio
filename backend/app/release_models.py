@@ -22,6 +22,7 @@ from datetime import datetime
 from pydantic import BaseModel
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     Column,
     Float,
     ForeignKey,
@@ -1159,14 +1160,25 @@ class CategoryVerdict(SQLModel, table=True):
     a re-grade OVERWRITES — so a category that regressed on a newer candidate
     tree flips back to ``not_met`` instead of staying satisfied forever.
 
-    One row PER ``(version_id, candidate_sha, category_key)``.  Re-grading a
-    single category is an UPSERT on that key: it rewrites ONLY its own row and
-    never touches another category's verdict (within-candidate isolation).  The
-    active category set is authored as ``VersionAcceptanceCriterion`` rows
+    One row PER ``(version_id, candidate_sha, category_key)`` — or, for a
+    DIRECTION-scoped grade, PER ``(direction_id, candidate_sha, category_key)``.
+    Re-grading a single category is an UPSERT on that key: it rewrites ONLY its
+    own row and never touches another category's verdict (within-candidate
+    isolation).  Exactly one of ``version_id`` / ``direction_id`` is set (the
+    other is NULL) — enforced by ``chk_categoryverdict_exactly_one_scope`` and
+    by the ledger accessor.  The version-scoped guarantee that at most one row
+    exists per ``(version_id, candidate_sha, category_key,
+    qualification_attempt_id)`` is preserved by a partial unique index
+    ``WHERE direction_id IS NULL``; the direction analogue lives under a
+    ``WHERE version_id IS NULL`` partial unique index.
+
+    The active category set is authored as ``VersionAcceptanceCriterion`` rows
     (``category_key`` here corresponds to ``VersionAcceptanceCriterion``'s
     ``criterion_key``); an active criterion with no ``met`` verdict for a
     candidate is NOT met (fail-closed) — see
-    :func:`app.category_verdict_ledger.is_candidate_fully_met`.
+    :func:`app.category_verdict_ledger.is_candidate_fully_met`.  A direction
+    scope has no ``VersionAcceptanceCriterion`` rows; its active rubric is the
+    caller-supplied ``active_category_keys`` parameter.
 
     ``category_key`` is nullable and the ``candidate_sha`` is nullable per the
     migration-linter rules and to mirror ``QualificationDimensionResult``; in
@@ -1177,13 +1189,23 @@ class CategoryVerdict(SQLModel, table=True):
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
 
-    version_id: uuid.UUID = Field(
+    # Exactly one of version_id / direction_id is set; the other stays NULL.
+    # Nullable because a direction-scoped verdict has no release version.
+    version_id: uuid.UUID | None = Field(
         sa_column=Column(
             GUID(),
             ForeignKey("releaseversion.id", ondelete="CASCADE"),
-            nullable=False,
+            nullable=True,
             index=True,
         ),
+    )
+
+    # The DIRECTION scope for this verdict (the ``d-<hex>`` direction key) when
+    # the grade targets a direction objective rather than a release version.
+    # NULL for version-scoped verdicts.
+    direction_id: str | None = Field(
+        default=None,
+        sa_column=Column(String(128), nullable=True, index=True),
     )
 
     # The candidate tree (automain HEAD SHA) this verdict is FOR.  Nullable per
@@ -1246,12 +1268,34 @@ class CategoryVerdict(SQLModel, table=True):
     )
 
     __table_args__ = (
-        UniqueConstraint(
+        # Exactly-one-of scope: a verdict is either version-scoped or
+        # direction-scoped, never both and never neither.
+        CheckConstraint(
+            "(version_id IS NULL AND direction_id IS NOT NULL) OR "
+            "(version_id IS NOT NULL AND direction_id IS NULL)",
+            name="chk_categoryverdict_exactly_one_scope",
+        ),
+        # Version-scoped uniqueness (Postgres NULL semantics treat NULLs as
+        # distinct, so the partial predicates keep the two scopes isolated).
+        Index(
+            "uq_categoryverdict_version_sha_category_attempt",
             "version_id",
             "candidate_sha",
             "category_key",
             "qualification_attempt_id",
-            name="uq_categoryverdict_version_sha_category_attempt",
+            unique=True,
+            postgresql_where=text("direction_id IS NULL"),
+            sqlite_where=text("direction_id IS NULL"),
+        ),
+        Index(
+            "uq_categoryverdict_direction_sha_category_attempt",
+            "direction_id",
+            "candidate_sha",
+            "category_key",
+            "qualification_attempt_id",
+            unique=True,
+            postgresql_where=text("version_id IS NULL"),
+            sqlite_where=text("version_id IS NULL"),
         ),
     )
 
@@ -1266,22 +1310,35 @@ class ResidualVerdict(SQLModel, table=True):
     met even if every category is ``met``
     (:func:`app.category_verdict_ledger.is_candidate_fully_met`).
 
-    One row PER ``(version_id, candidate_sha, qualification_attempt_id)``;
-    a re-grade UPSERTs it within an attempt, and different attempts on the
-    same candidate each retain their own residual row.
+    One row PER ``(version_id, candidate_sha, qualification_attempt_id)`` — or,
+    for a DIRECTION-scoped grade, PER ``(direction_id, candidate_sha,
+    qualification_attempt_id)``; a re-grade UPSERTs it within an attempt, and
+    different attempts on the same candidate each retain their own residual row.
+    Exactly one of ``version_id`` / ``direction_id`` is set (the other is NULL)
+    — enforced by ``chk_residualverdict_exactly_one_scope``.
     """
 
     __tablename__ = "residualverdict"
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
 
-    version_id: uuid.UUID = Field(
+    # Exactly one of version_id / direction_id is set; the other stays NULL.
+    # Nullable because a direction-scoped verdict has no release version.
+    version_id: uuid.UUID | None = Field(
         sa_column=Column(
             GUID(),
             ForeignKey("releaseversion.id", ondelete="CASCADE"),
-            nullable=False,
+            nullable=True,
             index=True,
         ),
+    )
+
+    # The DIRECTION scope for this residual (the ``d-<hex>`` direction key) when
+    # the grade targets a direction objective rather than a release version.
+    # NULL for version-scoped residuals.
+    direction_id: str | None = Field(
+        default=None,
+        sa_column=Column(String(128), nullable=True, index=True),
     )
 
     # The candidate tree (automain HEAD SHA) this residual is FOR.  Nullable per
@@ -1313,11 +1370,32 @@ class ResidualVerdict(SQLModel, table=True):
     )
 
     __table_args__ = (
-        UniqueConstraint(
+        # Exactly-one-of scope: a residual is either version-scoped or
+        # direction-scoped, never both and never neither.
+        CheckConstraint(
+            "(version_id IS NULL AND direction_id IS NOT NULL) OR "
+            "(version_id IS NOT NULL AND direction_id IS NULL)",
+            name="chk_residualverdict_exactly_one_scope",
+        ),
+        # Version-scoped uniqueness (Postgres NULL semantics treat NULLs as
+        # distinct, so the partial predicates keep the two scopes isolated).
+        Index(
+            "uq_residualverdict_version_sha_attempt",
             "version_id",
             "candidate_sha",
             "qualification_attempt_id",
-            name="uq_residualverdict_version_sha_attempt",
+            unique=True,
+            postgresql_where=text("direction_id IS NULL"),
+            sqlite_where=text("direction_id IS NULL"),
+        ),
+        Index(
+            "uq_residualverdict_direction_sha_attempt",
+            "direction_id",
+            "candidate_sha",
+            "qualification_attempt_id",
+            unique=True,
+            postgresql_where=text("version_id IS NULL"),
+            sqlite_where=text("version_id IS NULL"),
         ),
     )
 

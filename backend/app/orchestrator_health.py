@@ -31,6 +31,7 @@ from app.rollup_management import _FORCE_DROP_REASONS
 import app.sequenced_spawn as _seqdep
 from app.models import Project, Task, TaskStatus
 from app.orchestrator_filters import _prod_files
+from app.task_capabilities import CODE_PRODUCING_TASK_TYPES
 from app.time_utils import _utcnow
 
 logger = logging.getLogger("blueprint")
@@ -67,12 +68,13 @@ _RECUT_MISSING_BASE_BLOCKER_KIND = "cross-base re-cut base missing"
 # ---------------------------------------------------------------------------
 
 # Task types that PRODUCE a code change, and therefore can carry a real code
-# relationship to a dependent. Pure-sequencing types (research / plan / review /
-# investigate / strategic) only order work — a dependency of that kind never
-# propagates code into the dependent's base, so it is ordering-only.
-_CODE_PRODUCING_TASK_TYPES = frozenset(
-    {"create", "fix", "refactor", "migrate", "docs", "deps", "qa", ""}
-)
+# relationship to a dependent. The canonical membership lives in
+# :data:`app.task_capabilities.CODE_PRODUCING_TASK_TYPES` (create / fix /
+# refactor / qa / migrate / deps / docs) — imported above — so dependency
+# classification and payload acceptance-evidence validation can never drift
+# apart. Pure-sequencing types (research / plan / review / investigate /
+# strategic) only order work — a dependency of that kind never propagates code
+# into the dependent's base, so it is ordering-only.
 
 # Dependent task types that exist specifically to TRANSFORM another task's
 # output: a fix / refactor that ``depends_on`` a code-producing task is,
@@ -81,13 +83,13 @@ _OUTPUT_TRANSFORMING_TASK_TYPES = frozenset({"fix", "refactor"})
 
 
 def _task_type(task: Task) -> str:
-    """The task's payload type, normalized ("" == default create)."""
-    return (task.first_payload or {}).get("type", "create") or ""
+    """The task's payload type, normalized (missing/empty == default create)."""
+    return (task.first_payload or {}).get("type", "create") or "create"
 
 
 def _is_code_producing_task(task: Task) -> bool:
     """True when *task* emits a code change (vs. a pure-sequencing task type)."""
-    return _task_type(task) in _CODE_PRODUCING_TASK_TYPES
+    return _task_type(task) in CODE_PRODUCING_TASK_TYPES
 
 
 def is_genuine_code_dependency(dependent: Task, dependency: Task) -> bool:
@@ -1174,11 +1176,12 @@ async def _check_candidate_task_deps(
             continue
 
         # Same-base (or ordering-only cross-base) COMPLETED dependency. For
-        # code-producing tasks (create/fix/refactor/migrate/qa/deps/docs — the
-        # same set is_genuine_code_dependency already treats as capable of a
-        # real code relationship), also require PR to be merged — but only
-        # when the dep shares this task's base (else the merge lands where the
-        # dependent can't see it, so the merge requirement is meaningless).
+        # code-producing tasks (the canonical CODE_PRODUCING_TASK_TYPES set —
+        # the same membership is_genuine_code_dependency already treats as
+        # capable of a real code relationship), also require PR to be merged —
+        # but only when the dep shares this task's base (else the merge lands
+        # where the dependent can't see it, so the merge requirement is
+        # meaningless).
         # Pure-sequencing types (research/plan/review/...) never ship a PR, so
         # they release the dependent on COMPLETED as before. A code-producing
         # dep that completed with no PR at all (e.g. no diff was needed) is

@@ -622,6 +622,13 @@ AGENT_BAKE_WORKFLOW_FILE = "packer-agent.yml"
 # signal for the integration HEAD before re-entering qualification.
 CI_WORKFLOW_FILE = "ci.yml"
 
+# The deploy pipeline workflow file (.github/workflows/deploy.yml).  deploy.yml
+# runs on push and deploys the pushed merge commit, so its Actions runs keyed on
+# the promoted SHA are the evidence that distinguishes "deploy workflow never
+# dispatched" from "it ran and failed" from "it ran and the revision is stale"
+# when a promotion's serving confirmation times out with no new revision.
+DEPLOY_WORKFLOW_FILE = "deploy.yml"
+
 
 async def dispatch_workflow_run(
     token: str,

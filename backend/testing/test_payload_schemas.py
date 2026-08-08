@@ -6,7 +6,6 @@ from app.payload_schemas import (
     ALL_TASK_TYPES,
     PayloadTooLargeError,
     TaskType,
-    _CODE_PRODUCING_TASK_TYPES,
     _MAX_PAYLOAD_BYTES,
     format_payload_validation_error,
     normalize_acceptance_evidence,
@@ -15,6 +14,7 @@ from app.payload_schemas import (
     validate_internal_payload,
     validate_task_payload,
 )
+from app.task_capabilities import CODE_PRODUCING_TASK_TYPES
 
 
 # A minimal, schema-valid observable_behavior declaration for code-producing
@@ -437,7 +437,7 @@ def test_model_for_type_count_matches_enum():
 )
 def test_prompt_required_types_pass(task_type):
     payload: dict = {"type": task_type, "prompt": "Do the thing"}
-    if task_type in _CODE_PRODUCING_TASK_TYPES:
+    if task_type in CODE_PRODUCING_TASK_TYPES:
         payload["acceptance_evidence"] = dict(_CODE_EVIDENCE)
     result = _valid(payload)
     assert result["type"] == task_type
@@ -585,10 +585,31 @@ def test_discovery_review_payload_rejects_removed_confirmation_fields(legacy_fie
 )
 def test_system_populated_types_pass_with_no_extra_fields(task_type):
     payload: dict = {"type": task_type}
-    if task_type in _CODE_PRODUCING_TASK_TYPES:
+    if task_type in CODE_PRODUCING_TASK_TYPES:
         payload["acceptance_evidence"] = dict(_CODE_EVIDENCE)
     result = _valid(payload)
     assert result["type"] == task_type
+
+
+def test_release_merge_grade_payload_round_trips_direction_id():
+    """The direction scope discriminator survives validate_task_payload, and an
+    absent key stays absent (exclude_none keeps legacy payloads byte-identical)."""
+    scoped = {
+        "type": "release_merge_grade",
+        "base_branch": "automain",
+        "candidate_sha": "beef" * 10,
+        "version_goal": "Ship the scoped objective gate",
+        "merged_prs": [301, 302],
+        "direction_id": "d-1a2b3c4d5e6f",
+    }
+    result = _valid(scoped)
+    assert result["direction_id"] == "d-1a2b3c4d5e6f"
+    assert result["version_goal"] == "Ship the scoped objective gate"
+    assert result["merged_prs"] == [301, 302]
+
+    legacy = {"type": "release_merge_grade", "candidate_sha": "cafe" * 10}
+    result_legacy = _valid(legacy)
+    assert "direction_id" not in result_legacy
 
 
 def test_compute_experiment_payload_carries_launch_and_benchmark_fields():
@@ -1678,7 +1699,7 @@ def test_acceptance_evidence_valid_kinds_round_trip(task_type, evidence_key):
 
 @pytest.mark.parametrize(
     "task_type",
-    [t for t in sorted(_ACCEPTANCE_TYPES) if t not in _CODE_PRODUCING_TASK_TYPES],
+    [t for t in sorted(_ACCEPTANCE_TYPES) if t not in CODE_PRODUCING_TASK_TYPES],
 )
 def test_acceptance_evidence_absent_is_legacy_compatible(task_type):
     """A non-code payload with no acceptance_evidence still validates and omits the field (legacy).

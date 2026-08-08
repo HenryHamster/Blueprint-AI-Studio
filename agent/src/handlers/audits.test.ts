@@ -1652,6 +1652,26 @@ describe('fetchCandidateCommitWithRetry — bounded candidate-fetch retry', () =
     expect(res.diffRangeResolves).toBe(false);  // genuine unresolvable → fail loud
     expect(res.diffRangeFailDetail).toContain('bad revision');
   });
+
+  it('FAILS LOUD when the diff range resolves to ZERO commits (empty range)', async () => {
+    // `git rev-list --count <base>...<candidate>` prints "0" and exits 0 when the
+    // symmetric difference is EMPTY (base == candidate). Without this guard the
+    // range would be treated as 'resolves' and the handler would audit/grade a
+    // blank surface. The default verifyDiffRange must fail loud instead.
+    vi.mocked(git).mockImplementation((args: string[]) => {
+      if (args[0] === 'rev-parse') return CANDIDATE_SHA;
+      if (args[0] === 'rev-list') return '0'; // EMPTY — no commits in range
+      return '';
+    });
+    const sleep = vi.fn().mockResolvedValue(undefined);
+
+    const res = await fetchCandidateCommitWithRetry(CANDIDATE_SHA, DIFF_RANGE, null, { sleep });
+
+    expect(res.fetchOk).toBe(true);
+    expect(res.diffRangeResolves).toBe(false);
+    expect(res.diffRangeFailDetail).toContain('EMPTY');
+    expect(res.diffRangeFailDetail).toContain(DIFF_RANGE);
+  });
 });
 
 // ── Prompt size telemetry — audit handlers record prompt size before runClaudeCode ─

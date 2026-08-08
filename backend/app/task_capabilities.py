@@ -905,6 +905,19 @@ WRITE_TASK_TYPES: frozenset[str] = frozenset(
     for capability in TASK_CAPABILITIES
     if capability.agent_mode == "write"
 )
+# SINGLE source of truth for "does this task type ship a code-producing PR whose
+# landed code a dependent must build on?". This is the canonical definition that
+# payload_schemas (which requires an acceptance_evidence declaration on exactly
+# these types) and orchestrator_health (which classifies a dependency as a
+# GENUINE code dependency only when its type is here) both import — it MUST be
+# the only edit point for that question, not a literal duplicated per module.
+# Deliberately NARROWER than WRITE_TASK_TYPES: ``salvage_bundle`` also opens a
+# PR but is a consolidated backfill batch, not a type whose landed code a fresh
+# sibling is expected to build on, so it is NOT code-producing for dependency /
+# acceptance purposes. Unknown / unregistered types are not members (fail-closed).
+CODE_PRODUCING_TASK_TYPES: frozenset[str] = frozenset(
+    {"create", "fix", "refactor", "qa", "migrate", "deps", "docs"}
+)
 # Canonical registry of task types that directly ship user-facing PRODUCT value
 # (as opposed to structural / overhead work). This is the SINGLE source of truth
 # for the product/structural split used by direction-outcome analytics

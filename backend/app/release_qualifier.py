@@ -129,7 +129,9 @@ from app.release_qualifier_audit import (
     _spawn_release_audit_challenge_task,
     _spawn_release_audit_task,
     _spawn_release_merge_grade_task,
+    _spawn_direction_merge_grade_task,  # noqa: F401 — re-exported for callers/tests
     _spawn_qualifier_walkthrough_task,
+    record_direction_merge_grade,  # noqa: F401 — re-exported for callers/tests
     get_infra_failure_stats,  # noqa: F401 — re-exported for callers/tests
     get_latest_qualification_audit_findings,  # noqa: F401 — re-exported for callers/tests
     get_latest_release_audit_challenge,  # noqa: F401 — re-exported for callers/tests
@@ -274,6 +276,7 @@ from app.release_qualifier_audit_surface import (
     _audit_dimension_detail,  # noqa: F401 — re-exported for callers/tests
     _audit_finding_identity,  # noqa: F401 — re-exported for callers/tests
     _audit_finding_path,  # noqa: F401 — re-exported for callers/tests
+    _audit_report_confirms_goal_category_range,  # noqa: F401 — re-exported for callers/tests
     _audit_report_confirms_incremental_base,  # noqa: F401 — re-exported for callers/tests
     _audit_report_raw_findings,  # noqa: F401 — re-exported for callers/tests
     _audited_surface_hash_from_map,  # noqa: F401 — re-exported for callers/tests
@@ -6566,6 +6569,35 @@ async def _finalize_qualification(
                 return await _handle_infra_failure(
                     session, version, qual, "audit_report_findings_wrong_type"
                 )
+
+    # Goal and acceptance-category grading has no scoped carry-forward, so the
+    # release_audit report MUST have graded the full version delta the
+    # promotion would carry.  The agent echoes the range it actually graded
+    # into audit_scope.goal_category_diff_range (pinned at spawn to
+    # base_branch...candidate_sha); a present echo that disagrees means a
+    # narrowed goal/category window — hold rather than score a narrowed grade.
+    if isinstance(audit_report, dict) and candidate_sha:
+        _expected_goal_category_range = (
+            f"{_lts_branch_names(_policy_project)[1]}...{candidate_sha}"
+        )
+        if not _audit_report_confirms_goal_category_range(
+            audit_report, _expected_goal_category_range
+        ):
+            _echoed_goal_category_range = (audit_report.get("audit_scope") or {}).get(
+                "goal_category_diff_range"
+            )
+            logger.warning(
+                "[RELEASE_QUALIFIER] v%d candidate %s: release_audit report "
+                "echoed goal_category_diff_range %r but expected the full "
+                "version delta %r — holding",
+                version.version_number,
+                str(candidate_sha)[:8],
+                _echoed_goal_category_range,
+                _expected_goal_category_range,
+            )
+            return await _handle_infra_failure(
+                session, version, qual, "audit_goal_category_range_narrowed"
+            )
 
     # Persist audit and test_erosion to the per-dimension ledger immediately
     # since both have now been resolved (from the ledger or live).  An infra

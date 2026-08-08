@@ -1510,6 +1510,46 @@ def _research_findings_would_spawn(findings: List[Dict[str, Any]]) -> bool:
     return False
 
 
+def _wire_research_sibling_edges(
+    child_tasks: List[Task],
+    finding_to_child: Dict[int, int],
+    overlaps: List[tuple],
+    candidates: List[Task],
+) -> List[tuple]:
+    """Wire REAL ``depends_on`` edges between research siblings that share a
+    related_file, mirroring plan_completion._inject_file_overlap_deps: research
+    previously only surfaced file-overlap warnings, so same-file siblings
+    dispatched in parallel and raced at merge. The later sibling (by findings
+    index) depends on the earlier. Edges are additive and skipped when they
+    would close a cycle or involve a CANCELLED/FAILED sibling — a live dependent
+    must never be cascade-cancelled behind a dead one. Returns wired
+    ``(predecessor_id, successor_id, shared_files)`` edges.
+    """
+    from app.blocked_need_resolution import _would_create_cycle
+
+    wired: List[tuple] = []
+    for i, j, shared_files in overlaps:
+        ci = finding_to_child.get(i)
+        cj = finding_to_child.get(j)
+        if ci is None or cj is None or ci >= len(child_tasks) or cj >= len(child_tasks):
+            continue
+        predecessor, successor = child_tasks[ci], child_tasks[cj]
+        if (
+            predecessor.status in (TaskStatus.CANCELLED, TaskStatus.FAILED)
+            or successor.status in (TaskStatus.CANCELLED, TaskStatus.FAILED)
+        ):
+            continue
+        pred_id = str(predecessor.id)
+        existing = list(successor.depends_on or [])
+        if pred_id in existing or _would_create_cycle(successor, predecessor, candidates):
+            continue
+        existing.append(pred_id)
+        successor.depends_on = existing
+        remember_structural_depends_on(successor, pred_id)
+        wired.append((pred_id, str(successor.id), sorted(shared_files)))
+    return wired
+
+
 def converge_spawn_batch_foundations(
     child_tasks: List[Task],
     active_tasks: List[Task],
@@ -6879,8 +6919,25 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             remember_structural_depends_on(child_tasks[ci], prev_id)
             session.add(child_tasks[ci])
 
-    # Log file overlap warnings for observability and surface them to agents
+    # Author REAL sibling dependency edges for findings that share a related_file
+    # (plan parity with _inject_file_overlap_deps): two same-file siblings would
+    # otherwise dispatch in parallel and race at merge. Later child depends on
+    # earlier, cycle-guarded.
     overlaps = _log_file_overlaps(findings, "RESEARCH")
+    _wired_sibling_edges = _wire_research_sibling_edges(
+        child_tasks,
+        finding_to_child,
+        overlaps,
+        list(existing_tasks) + list(child_tasks),
+    )
+    if _wired_sibling_edges:
+        logger.info(
+            "[RESEARCH] Wired %d sibling file-overlap serialization edge(s) "
+            "across %d spawned child task(s)",
+            len(_wired_sibling_edges),
+            len(child_tasks),
+        )
+    # Log file overlap warnings for observability and surface them to agents
     for i, j, shared_files in overlaps:
         for fi in (i, j):
             ci = finding_to_child.get(fi)

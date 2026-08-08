@@ -107,6 +107,22 @@ def objective_gap_dedupe_key(version_id: Any, category_key: Any) -> str:
     return f"objective_gap:{version_id}:{category_key}"
 
 
+def objective_gap_direction_dedupe_key(direction_id: Any, category_key: Any) -> str:
+    """Stable identity for a DIRECTION-scoped objective_gap debt entry.
+
+    Mirrors :func:`objective_gap_dedupe_key` but for a direction objective
+    instead of a release version.  The ``direction:`` infix namespace guarantees
+    the key can never collide with the version key format
+    (``objective_gap:<version_id>:<category_key>`` — a direction id like
+    ``d-1a2b3c4d`` can never parse as a version UUID, but the explicit marker
+    keeps the two namespaces disjoint by construction).  Keyed on
+    ``(direction_id, category_key)`` only, NOT ``candidate_sha``, so a re-grade
+    of the same category on a newer candidate tree upserts the SAME debt row
+    instead of accumulating a new row per candidate.
+    """
+    return f"objective_gap:direction:{direction_id}:{category_key}"
+
+
 # Sentinel "category" identifying the holistic merge-grade residual ("gap no
 # criterion captures") in the objective_gap debt ledger — never a real
 # criterion_key (those are ``c-<8hex>``), so it can't collide with one.

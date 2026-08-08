@@ -868,3 +868,236 @@ class TestDependentWorkspaceContainsPrerequisiteMergedCode:
             "succeeds; its absence would force cold provisioning for every "
             "follow-on task even when a warm VM is available"
         )
+
+
+# ---------------------------------------------------------------------------
+# 5. Research authors REAL sibling file-overlap serialization edges
+# ---------------------------------------------------------------------------
+
+
+class TestResearchSiblingFileOverlapSerialization:
+    """``_wire_research_sibling_edges`` (research_completion.py) must author real
+    ``depends_on`` edges between research-spawned siblings that share a
+    related_file — not just the ``file_overlap_warnings`` observability surface —
+    so two siblings touching the same file serialize instead of dispatching in
+    parallel and racing at merge. This is research-side parity with
+    ``plan_completion._inject_file_overlap_deps``, which already chains same-file
+    plan subtasks."""
+
+    async def _scenario(self, db_session, *, first_cancelled=False, reverse_dep=False):
+        """A project plus two findings sharing a related_file and their children.
+
+        ``reverse_dep`` pre-wires the earlier child to depend on the later one so
+        the wiring's later→earlier edge would close a cycle; ``first_cancelled``
+        marks the earlier child CANCELLED (escalated/co-deferred this cycle).
+        """
+        from app.models import TaskStatus
+        from testing.factories import make_project, make_task
+
+        project = make_project(name="ResearchSiblingEdges", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+
+        shared_file = "backend/app/models.py"
+        findings = [
+            {"title": "a", "related_files": [shared_file]},
+            {"title": "b", "related_files": [shared_file]},
+        ]
+        children = [
+            make_task(
+                project_id=project.id,
+                title="a",
+                payloads=[{"type": "create", "base_branch": "research/aaa"}],
+                context={"related_files": [shared_file]},
+            ),
+            make_task(
+                project_id=project.id,
+                title="b",
+                payloads=[{"type": "create", "base_branch": "research/aaa"}],
+                context={"related_files": [shared_file]},
+            ),
+        ]
+        if first_cancelled:
+            children[0].status = TaskStatus.CANCELLED
+        if reverse_dep:
+            children[0].depends_on = [str(children[1].id)]
+        db_session.add_all(children)
+        await db_session.commit()
+        return findings, children
+
+    @pytest.mark.asyncio
+    async def test_research_siblings_sharing_a_file_receive_real_serialization_edges(
+        self, db_session
+    ):
+        """Two findings sharing a related_file map to two child tasks; the later
+        child must end up with a REAL, structural ``depends_on`` edge pointing at
+        the earlier one (the dispatch merge-wait then holds it until the earlier
+        sibling's PR lands), while the earlier sibling stays dependency-free."""
+        from app.depends_on_provenance import has_structural_depends_on
+        from app.research_completion import (
+            _log_file_overlaps,
+            _wire_research_sibling_edges,
+        )
+
+        findings, children = await self._scenario(db_session)
+        overlaps = _log_file_overlaps(findings, "RESEARCH")
+        wired = _wire_research_sibling_edges(
+            children,
+            {0: 0, 1: 1},
+            overlaps,
+            list(children),
+        )
+
+        assert len(wired) == 1, (
+            f"expected exactly one file-overlap serialization edge, got {wired!r}"
+        )
+        pred_id, succ_id, shared_files = wired[0]
+        assert pred_id == str(children[0].id)
+        assert succ_id == str(children[1].id)
+        assert shared_files == ["backend/app/models.py"]
+
+        # The later sibling carries a REAL depends_on edge, not just a warning.
+        assert children[1].depends_on == [str(children[0].id)], (
+            f"later research sibling must depend on the earlier one, "
+            f"got {children[1].depends_on!r}"
+        )
+        # The edge is structural, so the dispatch merge-wait honors it as a real
+        # prerequisite rather than advisory ordering.
+        assert has_structural_depends_on(children[1], str(children[0].id)), (
+            "file-overlap serialization edge must be recorded as a structural "
+            "dependency (context), not just depends_on"
+        )
+        # The earlier sibling is the producer — it must not depend on the later one.
+        assert (children[0].depends_on or []) == [], (
+            f"earlier sibling should not depend on the later one, "
+            f"got {children[0].depends_on!r}"
+        )
+        # The warning surface is preserved for observability.
+        assert len(overlaps) == 1
+
+    @pytest.mark.asyncio
+    async def test_research_file_overlap_edge_refuses_cycle(self, db_session):
+        """A file-overlap serialization edge that would close an existing
+        depends_on cycle must be skipped rather than deadlock the batch."""
+        from app.research_completion import (
+            _log_file_overlaps,
+            _wire_research_sibling_edges,
+        )
+
+        findings, children = await self._scenario(db_session, reverse_dep=True)
+        overlaps = _log_file_overlaps(findings, "RESEARCH")
+        wired = _wire_research_sibling_edges(
+            children,
+            {0: 0, 1: 1},
+            overlaps,
+            list(children),
+        )
+        assert wired == [], f"cycle-closing edge must be refused, got {wired!r}"
+        assert (children[1].depends_on or []) == [], (
+            "no edge may be added when it would close a depends_on cycle, "
+            f"got {children[1].depends_on!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_research_file_overlap_skips_cancelled_sibling(self, db_session):
+        """A sibling CANCELLED this cycle (escalated or co-deferred) must not
+        become a dependency — wiring a live sibling behind it would cascade-cancel
+        the live sibling at dispatch."""
+        from app.research_completion import (
+            _log_file_overlaps,
+            _wire_research_sibling_edges,
+        )
+
+        findings, children = await self._scenario(db_session, first_cancelled=True)
+        overlaps = _log_file_overlaps(findings, "RESEARCH")
+        wired = _wire_research_sibling_edges(
+            children,
+            {0: 0, 1: 1},
+            overlaps,
+            list(children),
+        )
+        assert wired == [], f"dead sibling must not be wired, got {wired!r}"
+        assert (children[1].depends_on or []) == [], (
+            "live sibling must not depend on a CANCELLED sibling, "
+            f"got {children[1].depends_on!r}"
+        )
+
+
+# 3. Code-producing task types resolve to ONE canonical definition
+# ---------------------------------------------------------------------------
+
+
+def test_code_producing_task_type_set_has_a_single_canonical_definition():
+    """The code-producing task-type set must live in a single canonical constant.
+
+    payload_schemas (which gates acceptance_evidence declarations) and
+    orchestrator_health (which classifies a dependency as a genuine CODE
+    dependency) each used to maintain their own literal frozenset that agreed
+    only by coincidence of editing — drift between them silently released a
+    dependent before its prerequisite's code merged. Both consumers now import
+    ``task_capabilities.CODE_PRODUCING_TASK_TYPES``, so this test pins that
+    they observe the SAME membership and that orchestrator_health's runtime
+    predicate classifies every registered type against the canonical set.
+    """
+    import app.orchestrator_health as _oh
+    import app.payload_schemas as _ps
+    from app.payload_schemas import validate_task_payload
+    from app.task_capabilities import (
+        ALL_TASK_TYPES,
+        CODE_PRODUCING_TASK_TYPES,
+        WRITE_TASK_TYPES,
+    )
+    from testing.factories import make_task
+
+    # Single definition: both consumers import the same canonical object.
+    assert _ps.CODE_PRODUCING_TASK_TYPES is CODE_PRODUCING_TASK_TYPES, (
+        "payload_schemas must import the canonical CODE_PRODUCING_TASK_TYPES, "
+        "not re-define a private literal"
+    )
+
+    # Canonical membership is exactly the agreed seven write/PR types, all
+    # registry-known and all write-mode.
+    assert CODE_PRODUCING_TASK_TYPES == frozenset(
+        {"create", "fix", "refactor", "qa", "migrate", "deps", "docs"}
+    )
+    assert CODE_PRODUCING_TASK_TYPES <= ALL_TASK_TYPES
+    assert CODE_PRODUCING_TASK_TYPES <= WRITE_TASK_TYPES
+
+    # orchestrator_health classifies every registered type against the
+    # canonical set — including the default-create normalization (a missing or
+    # empty payload type resolves to "create", the sentinel the retired ""
+    # member used to carry).
+    for ttype in sorted(ALL_TASK_TYPES):
+        task = make_task(payloads=[{"type": ttype}])
+        assert _oh._is_code_producing_task(task) == (
+            ttype in CODE_PRODUCING_TASK_TYPES
+        ), f"orchestrator_health._is_code_producing_task disagrees for {ttype!r}"
+    assert _oh._is_code_producing_task(make_task(payloads=[{}])) is True
+    assert _oh._is_code_producing_task(make_task(payloads=[{"type": ""}])) is True
+
+    # payload_schemas enforces the acceptance_evidence requirement on exactly
+    # the canonical set: a valid code payload with no declaration is rejected,
+    # and the same payload with one validates.
+    _MINIMAL = {
+        "create": {"prompt": "do the thing"},
+        "fix": {"prompt": "fix it", "pr_number": 7, "branch": "fix/x"},
+        "refactor": {"prompt": "refactor it"},
+        "qa": {},
+        "migrate": {"prompt": "add a column"},
+        "deps": {},
+        "docs": {},
+    }
+    _EVIDENCE = {
+        "kind": "observable_behavior",
+        "description": "ships a real, testable change",
+    }
+    for ttype in sorted(CODE_PRODUCING_TASK_TYPES):
+        raw = {"type": ttype, **_MINIMAL[ttype]}
+        with pytest.raises(ValueError) as exc:
+            validate_task_payload(raw)
+        assert "acceptance_evidence" in str(exc.value), (
+            f"code-producing payload type {ttype!r} without a declaration must "
+            "be rejected for missing acceptance_evidence"
+        )
+        ok = validate_task_payload({**raw, "acceptance_evidence": dict(_EVIDENCE)})
+        assert ok["type"] == ttype

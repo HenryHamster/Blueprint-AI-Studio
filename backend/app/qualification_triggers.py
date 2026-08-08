@@ -146,9 +146,11 @@ def resolve_qualification_trigger(
     is_candidate_fully_met:
         The sha-keyed acceptance-ledger verdict for the last-evaluated candidate
         (from :func:`app.category_verdict_ledger.is_candidate_fully_met`): True
-        iff every active acceptance category is ``met`` and no residual gap.
-        Used ONLY to gate the ``not_promoted``/``criterion_coverage_incomplete``
-        redrive leg — the initial/error T1 fire does not depend on it.
+        iff there is at least one ACTIVE acceptance category, every one is
+        ``met``, and no residual gap — an empty (never-authored or fully
+        retracted) rubric is NOT fully met.  Used ONLY to gate the
+        ``not_promoted``/``criterion_coverage_incomplete`` redrive leg — the
+        initial/error T1 fire does not depend on it.
     requalification_ready:
         True when all gating not_promoted findings are ledger-resolved/stale;
         False or None when not.

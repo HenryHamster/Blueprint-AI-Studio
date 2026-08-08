@@ -195,9 +195,22 @@ export async function fetchCandidateCommitWithRetry(
   // either endpoint or the merge-base is unreachable. Run both so a genuinely
   // unresolvable range fails loud, while a clean exit proves the symmetric-
   // difference range is fully resolvable.
+  //
+  // A count of 0 is ALSO unresolvable: an EMPTY symmetric difference (base and
+  // candidate resolve to the same commit — e.g. the candidate IS the base branch
+  // tip) means there is literally no diff to audit/grade. `git rev-list --count`
+  // prints "0" and exits 0, so without this guard an empty range would be
+  // treated as "resolves" and the handler would grade a blank surface. Fail
+  // loud instead: never audit/grade an empty range.
   const verifyDiffRange = opts.verifyDiffRange ?? ((sha: string, range: string): void => {
     git(['rev-parse', '--verify', `${sha}^{commit}`]);
-    git(['rev-list', '--count', range]);
+    const count = git(['rev-list', '--count', range]);
+    if (parseInt(count, 10) === 0) {
+      throw new Error(
+        `diff range ${range} is EMPTY (0 commits) — base and candidate resolve ` +
+        `to the same commit; refusing to audit/grade a blank surface`,
+      );
+    }
   });
 
   let fetchOk = false;

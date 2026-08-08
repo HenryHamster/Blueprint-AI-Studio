@@ -390,3 +390,486 @@ async def test_run_qualification_skips_merge_grade_when_goal_empty(db_session, m
     )
     types = [(t.first_payload or {}).get("type") for t in tasks]
     assert "release_merge_grade" not in types
+
+
+# ===========================================================================
+# _spawn_direction_merge_grade_task + record_direction_merge_grade — the
+# DIRECTION-scoped blind objective grade (campaign path, dir d-4f944896)
+# ===========================================================================
+
+
+async def _make_direction_project(db_session):
+    project = Project(
+        name="DirGradeTest",
+        user_id="u1",
+        github_owner="acme",
+        github_repo="repo",
+        integration_branch="automain",
+        promotion_target="main",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    return project
+
+
+async def _seed_direction_landed_tasks(db_session, project_id, direction_id):
+    """Seed landed + unlanded tasks tagged with the direction."""
+    for pr, title in ((301, "landed child A"), (302, "landed child B")):
+        db_session.add(
+            Task(
+                project_id=project_id,
+                title=title,
+                payloads=[{"type": "create", "pr_number": pr}],
+                vm_instance_id=f"vm-{pr}",
+                status=TaskStatus.COMPLETED,
+                context={
+                    "direction_id": direction_id,
+                    "pr_number": pr,
+                    "landed_on_integration": True,
+                },
+            )
+        )
+    # A direction task that did NOT land must be excluded from the window.
+    db_session.add(
+        Task(
+            project_id=project_id,
+            title="unlanded child",
+            payloads=[{"type": "create", "pr_number": 303}],
+            vm_instance_id="vm-303",
+            status=TaskStatus.COMPLETED,
+            context={"direction_id": direction_id, "pr_number": 303},
+        )
+    )
+    # A landed task NOT tagged with the direction must be excluded too.
+    db_session.add(
+        Task(
+            project_id=project_id,
+            title="other direction",
+            payloads=[{"type": "create", "pr_number": 304}],
+            vm_instance_id="vm-304",
+            status=TaskStatus.COMPLETED,
+            context={
+                "direction_id": "d-other",
+                "pr_number": 304,
+                "landed_on_integration": True,
+            },
+        )
+    )
+    await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_direction_scoped_merge_grade_spawn_and_record(db_session):
+    """A direction-scoped spawn carries direction_id in payload + task.context,
+    derives the integrated merged-PR window, and its completed artifact records
+    scoped verdicts/residual + objective_gap debt keyed on the direction."""
+    from app import category_verdict_ledger as cvl
+    from app import completion_debt
+    from app.models import CompletionDebtEntry
+    from app.release_qualifier_audit import (
+        _spawn_direction_merge_grade_task,
+        record_direction_merge_grade,
+    )
+
+    project = await _make_direction_project(db_session)
+    direction_id = "d-1a2b3c4d5e6f"
+    direction = {
+        "id": direction_id,
+        "text": "Scope the blind objective judge to directions",
+        "status": "active",
+        "completion_criteria": _GOOD_GOAL,
+        "context": {"success_evidence": _GOOD_GOAL},
+    }
+    candidate_sha = "beef" * 10
+    attempt_id = uuid.uuid4()
+
+    await _seed_direction_landed_tasks(db_session, project.id, direction_id)
+
+    # --- spawn: direction_id in payload + context, window derived from tasks --
+    task = await _spawn_direction_merge_grade_task(
+        db_session,
+        project.id,
+        direction=direction,
+        candidate_sha=candidate_sha,
+        qualification_attempt_id=attempt_id,
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    assert task is not None
+    assert task.status == TaskStatus.QUEUED
+    payload = task.first_payload
+    assert payload["type"] == "release_merge_grade"
+    assert payload["direction_id"] == direction_id
+    assert payload["version_goal"] == _GOOD_GOAL
+    # The diff base defaults to the project's PROMOTION TARGET ("main"), NOT the
+    # live integration branch ("automain"): the candidate_sha is the automain tip
+    # on the terminal-rollup path, so an automain base would produce an EMPTY
+    # three-dot range and the objective could never be graded.
+    assert payload["base_branch"] == "main"
+    assert payload["diff_range"] == f"main...{candidate_sha}"
+    assert payload["candidate_sha"] == candidate_sha
+    assert payload["merged_prs"] == [301, 302]
+    assert payload["quality_tier"] == "opus"
+    assert task.context["direction_id"] == direction_id
+    # Blindness contract: running_update must NOT appear in any payload key.
+    assert not any("running_update" in str(k).lower() for k in payload)
+
+    # --- record: the completed artifact's verdicts/debt key on the direction --
+    artifact = {
+        "graded_candidate_sha": candidate_sha,
+        "covers_goal": False,
+        "coverage_score": 0.4,
+        "biggest_gap": "Objective still missing the ledger wiring.",
+        "rationale": "Read the merged diff.",
+        "category_verdicts": [
+            {
+                "category_key": "c-dir-1",
+                "status": "not_met",
+                "gap": "Direction-scoped verdict not yet recorded.",
+                "citations": [{"kind": "diff", "ref": "backend/app/a.py"}],
+            }
+        ],
+        "residual_uncaptured_gap": (
+            "The objective's acceptance criteria are not fully captured."
+        ),
+    }
+    cert = await record_direction_merge_grade(
+        db_session,
+        direction_id=direction_id,
+        project_id=project.id,
+        goal=_GOOD_GOAL,
+        artifact=artifact,
+        active_categories=[{"category_key": "c-dir-1", "text": "objective met"}],
+        qualification_attempt_id=attempt_id,
+        grader_run_id=str(task.id),
+    )
+    await db_session.commit()
+
+    assert cert["status"] == "fail"
+    assert cert["blocked"] is True
+    verdicts = await cvl.get_category_verdicts(
+        db_session, None, candidate_sha, direction_id=direction_id
+    )
+    assert len(verdicts) == 1
+    assert verdicts[0].direction_id == direction_id
+    assert verdicts[0].category_key == "c-dir-1"
+    assert verdicts[0].status == "not_met"
+    assert verdicts[0].gap == "Direction-scoped verdict not yet recorded."
+    residual = await cvl.get_residual(
+        db_session, None, candidate_sha, direction_id=direction_id
+    )
+    assert residual == artifact["residual_uncaptured_gap"]
+
+    # The not_met verdict opens the DIRECTION-keyed objective_gap debt.
+    key = completion_debt.objective_gap_direction_dedupe_key(direction_id, "c-dir-1")
+    entry = (
+        await db_session.execute(
+            select(CompletionDebtEntry).where(CompletionDebtEntry.dedupe_key == key)
+        )
+    ).scalar_one()
+    assert entry.kind == completion_debt.KIND_OBJECTIVE_GAP
+    assert entry.status == completion_debt.STATUS_OPEN
+    assert entry.detail["direction_id"] == direction_id
+    assert entry.detail["version_id"] is None
+    assert entry.detail["category_key"] == "c-dir-1"
+    assert entry.detail["status"] == "not_met"
+    assert entry.detail["gap"] == "Direction-scoped verdict not yet recorded."
+    assert entry.detail["candidate_sha"] == candidate_sha
+
+
+@pytest.mark.asyncio
+async def test_direction_spawn_resolves_objective_from_completion_criteria(db_session):
+    """The direction objective is read from completion_criteria, then falls back
+    to context.success_evidence."""
+    from app.release_qualifier_audit import _spawn_direction_merge_grade_task
+
+    project = await _make_direction_project(db_session)
+    direction_id = "d-deadbeef1234"
+    candidate_sha = "cafe" * 10
+    attempt_id = uuid.uuid4()
+
+    task = await _spawn_direction_merge_grade_task(
+        db_session,
+        project.id,
+        direction={
+            "id": direction_id,
+            "completion_criteria": "Ship the scoped objective gate",
+            "context": {"success_evidence": "ignored — completion_criteria wins"},
+        },
+        candidate_sha=candidate_sha,
+        qualification_attempt_id=attempt_id,
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+    assert task.first_payload["version_goal"] == "Ship the scoped objective gate"
+
+    task2 = await _spawn_direction_merge_grade_task(
+        db_session,
+        project.id,
+        direction={
+            "id": "d-2nd",
+            "context": {"success_evidence": "Fallback success evidence text"},
+        },
+        candidate_sha=candidate_sha,
+        qualification_attempt_id=attempt_id,
+    )
+    await db_session.commit()
+    await db_session.refresh(task2)
+    assert task2.first_payload["version_goal"] == "Fallback success evidence text"
+
+
+@pytest.mark.asyncio
+async def test_direction_spawn_terminal_rollup_diff_range_is_non_empty(db_session):
+    """A terminal-rollup direction grade must NOT grade an EMPTY three-dot range.
+
+    On the primary path the candidate_sha IS the integration-branch (automain)
+    tip right after the rollup lands.  Pinning the diff base to the integration
+    branch would yield ``automain...automain-tip`` — an empty symmetric
+    difference that the agent pre-flight would accept as 'resolves' (rev-list
+    prints 0, exits 0) and then grade a blank surface, so the objective could
+    never be graded as met.  The spawner pins the base to the project's
+    PROMOTION TARGET (a stable ancestor that always lags the candidate) — the
+    same convention the version path uses — guaranteeing a non-empty range.
+    """
+    from app.release_qualifier_audit import _spawn_direction_merge_grade_task
+
+    project = await _make_direction_project(db_session)  # integration=automain, promotion_target=main
+    direction_id = "d-terminal-rollup"
+    candidate_sha = "f00d" * 10  # the automain tip after the rollup merged
+    attempt_id = uuid.uuid4()
+
+    task = await _spawn_direction_merge_grade_task(
+        db_session,
+        project.id,
+        direction={
+            "id": direction_id,
+            "completion_criteria": "A real objective to grade",
+        },
+        candidate_sha=candidate_sha,
+        qualification_attempt_id=attempt_id,
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+    payload = task.first_payload
+
+    # The base is the PROMOTION TARGET, never the integration branch the
+    # candidate was resolved from — that branch equality is the empty-range
+    # condition, and it must be structurally impossible on the terminal path.
+    assert payload["base_branch"] == "main"
+    assert payload["base_branch"] == project.promotion_target
+    assert payload["base_branch"] != project.integration_branch
+    # The graded range is the stable promotion-target...candidate window.
+    assert payload["diff_range"] == f"main...{candidate_sha}"
+
+
+async def _seed_direction_merge_grade_task(
+    db_session, project, direction_id, candidate_sha, attempt_id, artifact_logs
+):
+    """Seed a COMPLETED direction-scoped release_merge_grade task + artifact."""
+    mg_task = Task(
+        project_id=project.id,
+        title="dir grade",
+        payloads=[{"type": "release_merge_grade", "base_branch": "main"}],
+        vm_instance_id="vm-mg",
+        status=TaskStatus.COMPLETED,
+        context={
+            "direction_id": direction_id,
+            "candidate_sha": candidate_sha,
+            "qualification_attempt_id": str(attempt_id),
+        },
+    )
+    db_session.add(mg_task)
+    await db_session.flush()
+    db_session.add(
+        Artifact(
+            task_id=mg_task.id,
+            artifact_type=ArtifactType.RELEASE_MERGE_GRADE,
+            logs=json.dumps(artifact_logs),
+        )
+    )
+    await db_session.commit()
+    return mg_task
+
+
+@pytest.mark.asyncio
+async def test_consume_direction_merge_grade_false_when_no_ledger_write(db_session):
+    """consume_direction_merge_grade_if_ready returns False when the artifact
+    produced NO ledger writes (missing graded_candidate_sha / no per-category
+    verdicts), so the lifecycle does not re-stamp the direction row every
+    cycle just because a grade task is COMPLETED."""
+    from app import category_verdict_ledger as cvl
+    from app.strategic_completion import consume_direction_merge_grade_if_ready
+
+    project = await _make_direction_project(db_session)
+    direction_id = "d-consume-nograde"
+    candidate_sha = "bead" * 10
+    attempt_id = uuid.uuid4()
+
+    # A usable HOLISTIC verdict but NO graded_candidate_sha and NO
+    # category_verdicts → record_direction_merge_grade writes nothing.
+    await _seed_direction_merge_grade_task(
+        db_session,
+        project,
+        direction_id,
+        candidate_sha,
+        attempt_id,
+        {
+            "covers_goal": False,
+            "coverage_score": 0.4,
+            "biggest_gap": "Objective unmet.",
+            "rationale": "Read the diff.",
+        },
+    )
+
+    direction = {
+        "id": direction_id,
+        "completion_criteria": "Ship the objective.",
+        "criterion_keys": ["c-consume-1"],
+    }
+    recorded = await consume_direction_merge_grade_if_ready(
+        db_session, project, direction
+    )
+    assert recorded is False
+
+    # Nothing was persisted in the direction-scoped ledger.
+    verdicts = await cvl.get_category_verdicts(
+        db_session, None, candidate_sha, direction_id=direction_id
+    )
+    assert verdicts == []
+
+
+@pytest.mark.asyncio
+async def test_consume_direction_merge_grade_true_when_ledger_written(db_session):
+    """consume_direction_merge_grade_if_ready returns True ONLY when a real
+    verdict/debt record was written, and the next call is a no-op (no re-stamp)."""
+    from app import category_verdict_ledger as cvl
+    from app.strategic_completion import consume_direction_merge_grade_if_ready
+
+    project = await _make_direction_project(db_session)
+    direction_id = "d-consume-yes"
+    candidate_sha = "beef" * 10
+    attempt_id = uuid.uuid4()
+
+    await _seed_direction_merge_grade_task(
+        db_session,
+        project,
+        direction_id,
+        candidate_sha,
+        attempt_id,
+        {
+            "graded_candidate_sha": candidate_sha,
+            "covers_goal": False,
+            "coverage_score": 0.4,
+            "biggest_gap": "Objective unmet.",
+            "rationale": "Read the diff.",
+            "category_verdicts": [
+                {
+                    "category_key": "c-consume-1",
+                    "status": "not_met",
+                    "gap": "Not yet shipped.",
+                    "citations": [{"kind": "diff", "ref": "backend/app/a.py"}],
+                }
+            ],
+            "residual_uncaptured_gap": None,
+        },
+    )
+
+    direction = {
+        "id": direction_id,
+        "completion_criteria": "Ship the objective.",
+        "criterion_keys": ["c-consume-1"],
+    }
+    recorded = await consume_direction_merge_grade_if_ready(
+        db_session, project, direction
+    )
+    assert recorded is True
+
+    # The verdict actually landed in the direction-scoped ledger.
+    verdicts = await cvl.get_category_verdicts(
+        db_session, None, candidate_sha, direction_id=direction_id
+    )
+    assert len(verdicts) == 1
+    assert verdicts[0].category_key == "c-consume-1"
+
+    # Already recorded → the next consume is a no-op (returns False).
+    recorded2 = await consume_direction_merge_grade_if_ready(
+        db_session, project, direction
+    )
+    assert recorded2 is False
+
+
+@pytest.mark.asyncio
+async def test_direction_spawn_fails_closed_on_missing_or_contentless_objective(db_session):
+    """No gradeable objective (missing or contentless) spawns NO task row."""
+    from app.release_qualifier_audit import _spawn_direction_merge_grade_task
+
+    project = await _make_direction_project(db_session)
+    attempt_id = uuid.uuid4()
+    candidate_sha = "dead" * 10
+
+    for direction in (
+        {"id": "d-missing"},  # no objective fields at all
+        {"id": "d-contentless", "completion_criteria": "test"},  # placeholder word
+        {"id": "d-blank", "completion_criteria": "   "},
+    ):
+        spawned = await _spawn_direction_merge_grade_task(
+            db_session,
+            project.id,
+            direction=direction,
+            candidate_sha=candidate_sha,
+            qualification_attempt_id=attempt_id,
+        )
+        await db_session.commit()
+        assert spawned is None, f"direction {direction['id']} should fail closed"
+
+
+@pytest.mark.asyncio
+async def test_direction_spawn_fails_closed_when_project_missing(db_session):
+    """No project row → no integration branch to pin the diff range to — the
+    spawner fails closed (never fabricates a hardcoded 'main' fallback)."""
+    from app.release_qualifier_audit import _spawn_direction_merge_grade_task
+
+    attempt_id = uuid.uuid4()
+    candidate_sha = "face" * 10
+    spawned = await _spawn_direction_merge_grade_task(
+        db_session,
+        uuid.uuid4(),  # a project id that has no Project row
+        direction={"id": "d-orphan", "completion_criteria": "A real objective"},
+        candidate_sha=candidate_sha,
+        qualification_attempt_id=attempt_id,
+    )
+    await db_session.commit()
+    assert spawned is None
+
+
+@pytest.mark.asyncio
+async def test_direction_spawn_keeps_payload_blind_to_running_update(db_session):
+    """The direction-scoped payload never leaks running-update text."""
+    from app.release_qualifier_audit import _spawn_direction_merge_grade_task
+
+    project = await _make_direction_project(db_session)
+    candidate_sha = "aced" * 10
+    attempt_id = uuid.uuid4()
+    # Even a direction whose context carries a strategist narrative must not
+    # thread it through the grade payload.
+    task = await _spawn_direction_merge_grade_task(
+        db_session,
+        project.id,
+        direction={
+            "id": "d-blind",
+            "completion_criteria": "A real objective",
+            "context": {
+                "success_evidence": "ignored",
+                "running_update": "the strategist says everything is fine",
+            },
+        },
+        candidate_sha=candidate_sha,
+        qualification_attempt_id=attempt_id,
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+    payload = task.first_payload
+    assert not any("running_update" in str(k).lower() for k in payload)
+    assert "running_update" not in json.dumps(payload)
