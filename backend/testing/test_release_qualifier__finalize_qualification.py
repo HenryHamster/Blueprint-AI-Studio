@@ -6370,6 +6370,18 @@ async def test_finalize_walkthrough_report_against_open_rubric_is_quality_not_in
                 "assertion_delta": 5,
                 "test_count_delta": 2,
             },
+            # The fixed audits.ts emits the acceptance-category contract whenever
+            # an active rubric exists — independent of a version goal string — so
+            # a goal-less version's report still carries per-category verdicts.
+            "category_verdicts": [
+                {
+                    "category_key": key,
+                    "status": "met",
+                    "citations": [{"kind": "diff", "ref": "ui.tsx:10"}],
+                }
+                for key in live_walkthrough_keys
+            ],
+            "residual_uncaptured_gap": None,
         },
         smoke_logs={
             "passed": True,
@@ -6456,10 +6468,10 @@ async def test_finalize_walkthrough_report_open_rubric_all_passed_records_passed
     """A fully-passing walkthrough report against the OPEN version's rubric —
     with covered-tier evidence ingested for every resolved key — records the
     walkthrough_e2e dimension as passed (sub_score 1.0) instead of infra-failing
-    on the retired frozen-trio schema check.  The overall verdict stays
-    not_promoted only because the fresh criteria have no merge-grade verdict (an
-    unrelated, pre-existing coverage gate); the point is that the walkthrough
-    probe itself is no longer refused as malformed."""
+    on the retired frozen-trio schema check.  The goal-less version's active
+    rubric is graded per-category by the fixed audits.ts contract (all ``met``,
+    so the coverage gate stays inert); the point is that the walkthrough probe
+    itself is no longer refused as malformed."""
     from app import shared_state
 
     shared_state.runtime_config["promotion_enabled"] = False
@@ -6490,6 +6502,18 @@ async def test_finalize_walkthrough_report_open_rubric_all_passed_records_passed
                 "assertion_delta": 5,
                 "test_count_delta": 2,
             },
+            # The fixed audits.ts emits the acceptance-category contract whenever
+            # an active rubric exists — independent of a version goal string — so
+            # a goal-less version's report still carries per-category verdicts.
+            "category_verdicts": [
+                {
+                    "category_key": key,
+                    "status": "met",
+                    "citations": [{"kind": "diff", "ref": "ui.tsx:10"}],
+                }
+                for key in live_walkthrough_keys
+            ],
+            "residual_uncaptured_gap": None,
         },
         smoke_logs={
             "passed": True,

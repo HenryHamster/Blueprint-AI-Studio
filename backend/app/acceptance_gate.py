@@ -129,8 +129,9 @@ CODE_ACCEPTANCE_VERDICT_KEY = "code_acceptance_verdict"
 # 1-2 of design doc c50453ef). A later qualification reads this field to tell
 # which recorded rows were judged by a now-retired rule and re-derive them via
 # the pure :func:`evaluate_acceptance` core instead of trusting a stale verdict.
-# Bumped whenever the acceptance evaluation rules change. Nothing consumes the
-# field yet — this rung only stamps it, behaviour-preservingly.
+# Bumped whenever the acceptance evaluation rules change. Consumed by
+# :func:`effective_acceptance_verdict` (rung 3), which re-derives any recorded
+# row whose stamp predates the current rule.
 ACCEPTANCE_RULE_VERSION = 1
 
 # Durable top-level context key where a PRE-MERGE structural acceptance finding
@@ -937,9 +938,14 @@ def _evaluate_named_test(
     files still drops every path beyond index 50. A legitimately declared test
     lying beyond that stored prefix would read as absent and unsoundly hard-fail a
     truthful declaration. So truncation always yields the soft (inconclusive)
-    credit above; nothing overrides it. Where the list is complete
-    (``truncated=False``), the plain hard-fail below already applies and is
-    genuinely authoritative because every changed path is stored.
+    credit above; nothing overrides it — EXCEPT a backend-refuted
+    :data:`ACCEPTANCE_TEST_CORROBORATED_KEY` (``corroborated is False``). That is
+    not a data artifact: the backend checked the EXACT merge-commit tree and
+    confirmed the declared test exists nowhere, so the truncation premise ("may
+    ship beyond the stored prefix") is provably defeated and the hard fail below
+    applies. Where the list is complete (``truncated=False``), the plain
+    hard-fail below already applies and is genuinely authoritative because every
+    changed path is stored.
 
     ``parent_derived`` marks that the changed-file list was INHERITED from a
     rollup parent's combined diff (the union of all siblings' changes) rather than
@@ -972,6 +978,9 @@ def _evaluate_named_test(
     (``None``: never computed / credentials missing / snapshot unavailable) caps
     the credit at ``satisfied=True, proven=False``: honest missing data never
     penalizes the merge, but the agent's word alone never mints machine proof.
+    A corroborated ABSENCE (``False``) is stronger still: it overrides even the
+    truncation soft credit — a >50-file PR whose declared test the backend proves
+    exists nowhere cannot claim the "may ship beyond the stored prefix" excuse.
     An in-diff test is unaffected — presence in the GitHub-sourced diff is
     already backend-grounded evidence.
     """
@@ -1000,6 +1009,25 @@ def _evaluate_named_test(
             "test does not prove this declaration",
         )
     if not test_present:
+        if truncated and corroborated is False:
+            # The truncation soft credit rests on the premise that the declared
+            # test "may ship beyond the stored 50-path prefix". A backend-REFUTED
+            # corroboration defeats that premise: the backend checked the exact
+            # merge-commit tree and confirmed the declared test exists NOWHERE, so
+            # its absence is proven rather than inconclusive. This closes the
+            # large-rollup name-drop shape — a >50-file PR whose declared test
+            # never shipped must not earn the truncation credit.
+            return AcceptanceGateVerdict(
+                True,
+                False,
+                evidence.kind,
+                f"declared named_test {declared_path!r} is not among the PR's "
+                "changed files — the changed-file list was truncated (>50 files, "
+                "only the first 50 paths are stored), but the backend "
+                "corroborated at the merge commit that the declared test does "
+                "not exist in the repo tree, so absence is proven rather than "
+                "inconclusive",
+            )
         if truncated:
             return AcceptanceGateVerdict(
                 True,
@@ -1155,31 +1183,29 @@ def _evaluate_named_test_premerge(
     """Pre-merge structural gate for a ``named_test`` acceptance declaration.
 
     Mirrors :func:`_evaluate_named_test`'s structurally-checkable requirements
-    (test present, non-test seam, semantic grounding) while skipping the
-    merge-time green-run requirement. Same fail-closed reason strings, so
+    (non-test seam, semantic grounding) while skipping the merge-time
+    green-run requirement. A declared test ABSENT from the PR's diff is NOT a
+    structural defect: the merge-time gate credits a test that exists at the
+    merge commit and ran green (backend-corroborated), and pre-merge we cannot
+    know whether that holds — so absence from the diff alone is
+    satisfied/unproven, with the anti-fraud existence check deferred to merge.
+    The test-only-diff and ungrounded-seam hard-fails survive because the merge
+    gate enforces them identically. Same fail-closed reason strings, so
     :func:`classify_unsatisfied_reason` maps them identically. Truncated /
     parent-derived input stays inconclusive (satisfied/unproven), as at merge.
     """
     declared_path = (evidence.test_path or "").partition("::")[0].strip()
     test_present = any(_paths_match(cf, declared_path) for cf in changed)
-    if not test_present:
-        if truncated:
-            return AcceptanceGateVerdict(
-                True,
-                True,
-                evidence.kind,
-                f"declared named_test {declared_path!r} could not be confirmed "
-                "among the PR's changed files because the changed-file list was "
-                "truncated (>50 files, only the first 50 paths are stored) — the "
-                "test may ship beyond the stored prefix, so absence is "
-                "inconclusive before merge",
-            )
+    if not test_present and truncated:
         return AcceptanceGateVerdict(
             True,
-            False,
+            True,
             evidence.kind,
-            f"declared named_test {declared_path!r} is not among the PR's "
-            "changed files — the claimed test was not added or modified here",
+            f"declared named_test {declared_path!r} could not be confirmed "
+            "among the PR's changed files because the changed-file list was "
+            "truncated (>50 files, only the first 50 paths are stored) — the "
+            "test may ship beyond the stored prefix, so absence is "
+            "inconclusive before merge",
         )
     seam_files = [cf for cf in changed if not _is_test_path(cf)]
     if not seam_files:
@@ -1207,6 +1233,22 @@ def _evaluate_named_test_premerge(
             f"declared named_test {declared_path!r} matches the rollup parent's "
             "combined changed-file diff (inherited, not the child's own PR) — "
             "credited soft without machine proof before merge",
+        )
+    if not test_present:
+        # Absent from the diff but structurally sound: the merge gate credits an
+        # unmodified test that exists at the merge commit and ran green (see
+        # _evaluate_named_test), so absence alone must not hard-fail the open PR.
+        # Existence-at-merge and the green run are merge-time checks; pre-merge
+        # we can only credit soft and let the merge gate mint proof or fail.
+        return AcceptanceGateVerdict(
+            True,
+            True,
+            evidence.kind,
+            f"declared named_test {declared_path!r} is not among the PR's changed "
+            "files, but the merge gate credits an unmodified test that exists at "
+            "the merge commit and ran green — absence from the diff is not a "
+            "structural defect, so this is credited soft without machine proof "
+            "before merge",
         )
     return AcceptanceGateVerdict(
         True,
@@ -1577,14 +1619,17 @@ def evaluate_premerge_acceptance(task: Task) -> AcceptanceGateVerdict | None:
 
     Mirrors :func:`evaluate_code_acceptance` but only judges what is decidable
     from the declaration + the PR's changed files before merge: named_test is
-    present with a non-test, semantically-grounded seam (the green run is
-    verified at merge); downstream_artifact is delivered by the diff; visual /
-    coverage_delta declarations are guaranteed well-formed by the schema (the
-    screenshot / measurement is verified at merge); observable_behavior ships a
-    real diff. A structural defect returns ``satisfied=False`` with the same
-    actionable reason string the merge-time gate uses
-    (:func:`classify_unsatisfied_reason` maps it identically); a task with no
-    declaration returns ``None``.
+    satisfied when the diff ships a non-test, semantically-grounded seam for it
+    to exercise — a declared test absent from the diff is NOT a defect, because
+    the merge gate credits an unmodified test that exists at the merge commit
+    and ran green (existence-at-merge and the green run are verified at merge);
+    downstream_artifact is delivered by the diff; visual / coverage_delta
+    declarations are guaranteed well-formed by the schema (the screenshot /
+    measurement is verified at merge); observable_behavior ships a real diff. A
+    structural defect (test-only diff, ungrounded seam, undelivered artifact)
+    returns ``satisfied=False`` with the same actionable reason string the
+    merge-time gate uses (:func:`classify_unsatisfied_reason` maps it
+    identically); a task with no declaration returns ``None``.
     """
     evidence = read_acceptance_evidence(task.first_payload)
     if evidence is None:
@@ -1670,7 +1715,8 @@ def record_code_acceptance_verdict(task: Task) -> AcceptanceGateVerdict | None:
         "proof_ref": verdict.proof_ref,
         # Stamps the rule version that produced this verdict so a later
         # qualification can tell which recorded rows were judged by a retired
-        # rule and re-derive them (design doc c50453ef). Nothing consumes it yet.
+        # rule and re-derive them (design doc c50453ef). Consumed by
+        # :func:`effective_acceptance_verdict`.
         "rule_version": ACCEPTANCE_RULE_VERSION,
     }
     # A re-recorded verdict means new provenance arrived (parent-derived changed

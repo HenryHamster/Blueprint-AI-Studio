@@ -39,6 +39,12 @@ LANDED_SIGNAL_KEY = "pr_merged"
 LANDED_ON_INTEGRATION_KEY = "landed_on_integration"
 NON_MERGE_UNBLOCK_REASON_KEY = "_non_merge_unblock_reason"
 
+# Where the exact merge commit SHA of an integration landing is recorded. The
+# discovery-review receipt (``discovery_review_packet._merge_sha``) reads this
+# key first; without it a landed write task reports "lacks exact commit
+# identity" and pins the direction's discovery cycle in EVIDENCE_PENDING.
+LANDED_MERGE_SHA_KEY = "merge_commit_sha"
+
 # Durable negative marker: a rollup whose merge commit was confirmed NOT to be an
 # ancestor of the project's integration branch (``is_ancestor_of`` -> False). The
 # rollup->integration merge never landed, so the task must NOT carry the shipped
@@ -272,12 +278,20 @@ def landed_signal_predicate(session: AsyncSession) -> ColumnElement[bool]:
     )
 
 
-def mark_landed_on_integration(task: Task, project: Any = None) -> None:
+def mark_landed_on_integration(
+    task: Task, project: Any = None, *, merge_commit_sha: str | None = None
+) -> None:
     """Stamp the landed signal for a PR that merged onto the integration branch.
 
     This is the canonical write for a *real* integration-branch merge. Callers
     that need the integration-vs-promotion-target guard should use
     :func:`apply_merged_landed_signal` instead, which routes through here.
+
+    When *merge_commit_sha* is provided, the exact merge commit is recorded under
+    ``LANDED_MERGE_SHA_KEY`` (truncated to 64 chars, matching the discovery
+    receipt reader's bound). This gives the discovery-review packet the commit
+    identity it needs to close the "lacks exact commit identity" evidence gap
+    without an extra GitHub round-trip.
 
     Also records the code-task acceptance verdict when the task declared
     acceptance evidence, so every integration-landing path (rollup propagation,
@@ -306,6 +320,8 @@ def mark_landed_on_integration(task: Task, project: Any = None) -> None:
         LANDED_ON_INTEGRATION_KEY: True,
     }
     ctx.pop(NON_MERGE_UNBLOCK_REASON_KEY, None)
+    if merge_commit_sha:
+        ctx[LANDED_MERGE_SHA_KEY] = str(merge_commit_sha)[:64]
     # When a staging-merged child is promoted to integration-landed, clear the
     # stale unverified_merge_reason the staging CI monitor stamped.  Staging
     # branches genuinely lack CI, but the task now reaches integration through
@@ -400,6 +416,7 @@ def apply_merged_landed_signal(
     base_branch: str,
     hotfix_lane: bool,
     non_merge_reason: str | None = None,
+    merge_commit_sha: str | None = None,
 ) -> bool:
     """Guarded write path for a merged PR.
 
@@ -413,6 +430,10 @@ def apply_merged_landed_signal(
     When *non_merge_reason* is provided, merged PRs that landed somewhere other
     than the integration branch are still marked as merge-equivalent rollup
     unblocks via :func:`mark_unblocked_non_merge`.
+
+    *merge_commit_sha* is forwarded to :func:`mark_landed_on_integration` on a
+    genuine integration landing so the exact commit identity is recorded
+    alongside the landed flags.
     """
     from app.branch_resolution import _signal_blocking_project_branch_configuration
     from app.shared_state import (
@@ -445,7 +466,7 @@ def apply_merged_landed_signal(
         # record_code_acceptance_verdict AND record_capability_proof are both
         # called inside mark_landed_on_integration (project supplied here), so
         # every landing path records the verdict and mints the capability proof.
-        mark_landed_on_integration(task, project)
+        mark_landed_on_integration(task, project, merge_commit_sha=merge_commit_sha)
         try:
             from app.capability_proof import record_gap_evidence
 

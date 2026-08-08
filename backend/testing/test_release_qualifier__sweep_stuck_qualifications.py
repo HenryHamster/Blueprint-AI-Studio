@@ -5819,3 +5819,161 @@ async def test_rubric_unknown_is_redriven_like_rubric_changed(db_session, mocker
     )
     assert result is True
     mock_run_qual.assert_called_once()
+
+
+# ===========================================================================
+# Walkthrough evidence-contract re-drive
+# (_redrive_walkthrough_contract_qualification + sweep wiring)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_walkthrough_contract_redrive_guards_noop(db_session, mocker):
+    """The walkthrough-contract re-driver is scoped tightly: it re-drives ONLY
+    an open, stabilize-phase version whose last_qualification is a durable
+    ``not_promoted``/``walkthrough_e2e_contract_failed`` verdict.  Every other
+    status/blocker/phase combination is a no-op (returns False, no spawn).  A
+    different blocker must not be hijacked by the walkthrough re-drive path."""
+    from app.release_qualifier_redrive import _redrive_walkthrough_contract_qualification
+
+    mock_run_qual = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    # Wrong status (a pending qualification, not a durable blocker).
+    _project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "in_progress",
+        "blocker": None,
+        "candidate_sha": "beefcafe" * 5,
+        "requested_probes": [],
+        "retry_episode": 0,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    assert (
+        await _redrive_walkthrough_contract_qualification(
+            version.id, session_factory=_shared_session_factory(db_session)
+        )
+        is False
+    )
+    assert not mock_run_qual.called
+
+    # Wrong blocker (a different not_promoted blocker must stay untouched).
+    version.last_qualification = {
+        "status": "not_promoted",
+        "blocker": "criterion_coverage_incomplete",
+        "candidate_sha": "beefcafe" * 5,
+        "requested_probes": [],
+        "retry_episode": 0,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    assert (
+        await _redrive_walkthrough_contract_qualification(
+            version.id, session_factory=_shared_session_factory(db_session)
+        )
+        is False
+    )
+    assert not mock_run_qual.called
+
+    # Wrong phase (a build-phase version is not a stabilization candidate).
+    version.phase = "build"
+    version.last_qualification = {
+        "status": "not_promoted",
+        "blocker": "walkthrough_e2e_contract_failed",
+        "candidate_sha": "beefcafe" * 5,
+        "requested_probes": ["walkthrough_e2e"],
+        "retry_episode": 0,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    assert (
+        await _redrive_walkthrough_contract_qualification(
+            version.id, session_factory=_shared_session_factory(db_session)
+        )
+        is False
+    )
+    assert not mock_run_qual.called
+
+
+@pytest.mark.asyncio
+async def test_walkthrough_contract_redrive_spawn_failure_not_counted(db_session, mocker):
+    """A walkthrough-contract re-entry that does NOT actually spawn (transient
+    GitHub outage, sha_error, ...) is not counted as a performed re-drive: the
+    per-episode counter only advances on a genuine fresh spawn, so the bounded
+    cap is not burned on failed attempts."""
+    from app.release_qualifier_redrive import _redrive_walkthrough_contract_qualification
+
+    _project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "not_promoted",
+        "blocker": "walkthrough_e2e_contract_failed",
+        "candidate_sha": "beefcafe" * 5,
+        "qualification_attempt_id": str(uuid.uuid4()),
+        "requested_probes": ["walkthrough_e2e"],
+        "retry_episode": 0,
+        "walkthrough_contract_redrive_count": 0,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mock_run_qual = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "sha_error"}),
+    )
+
+    result = await _redrive_walkthrough_contract_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert result is False
+    mock_run_qual.assert_called_once()
+    await db_session.refresh(version)
+    assert version.last_qualification["walkthrough_contract_redrive_count"] == 0, (
+        "a failed re-entry must NOT advance the walkthrough-contract counter"
+    )
+
+
+@pytest.mark.asyncio
+async def test_sweep_wires_walkthrough_contract_redriver(db_session, mocker):
+    """The sweep invokes the walkthrough-contract re-driver for open versions
+    as its scheduled re-drive leg — the version blocked on
+    ``walkthrough_e2e_contract_failed`` gets an autonomous re-entry attempt on
+    the next sweep instead of stranding until a human re-requests
+    qualification."""
+    # Isolate the sweep's post-finalize strategic re-trigger (covered by its
+    # own tests) so this wiring assertion stays focused.
+    mocker.patch(
+        "app.release_qualifier._maybe_trigger_strategic_after_qualification",
+        new=AsyncMock(return_value=None),
+    )
+    mock_redrive = mocker.patch(
+        "app.release_qualifier_sweep._redrive_walkthrough_contract_qualification",
+        new=AsyncMock(return_value=True),
+    )
+
+    _project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "not_promoted",
+        "blocker": "walkthrough_e2e_contract_failed",
+        "candidate_sha": "beefcafe" * 5,
+        "requested_probes": ["walkthrough_e2e"],
+        "retry_episode": 0,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    mock_redrive.assert_called_once()
+    assert mock_redrive.call_args.args[0] == version.id
+    assert mock_redrive.call_args.kwargs.get("session_factory") is not None

@@ -6668,6 +6668,12 @@ async def test_ungraded_acceptance_contract_fails_closed(
                 "assertion_delta": 5,
                 "test_count_delta": 2,
             },
+            # A current-contract grader emits the acceptance-category section
+            # whenever an active rubric exists (independent of a version goal
+            # string).  ``category_verdicts: []`` is a grader that DID answer but
+            # graded nothing — every active criterion normalizes to ``not_met``.
+            "category_verdicts": [],
+            "residual_uncaptured_gap": None,
         },
         smoke_logs={
             "passed": True,
@@ -6700,11 +6706,12 @@ async def test_ungraded_acceptance_contract_fails_closed(
     # gate and let the candidate pass.  That mechanism is retired: evidence rows no
     # longer certify a criterion — the per-category merge-grade does, at qualify time.
     #
-    # These two criteria are ACTIVE and were never graded (this fixture's version has
-    # no usable goal, so no merge-grade child is spawned and no CategoryVerdict rows
-    # exist for the candidate).  An ungraded acceptance contract must FAIL CLOSED, not
-    # sail through on a `None` gate input — otherwise the version promotes over a
-    # contract nothing ever checked.
+    # These two criteria are ACTIVE and the grader graded nothing for them (this
+    # fixture's version has no usable goal, so no merge-grade child is spawned, and
+    # the goal-less rubric contract normalizes the empty per-category section to a
+    # ``not_met`` verdict per active criterion).  An ungraded acceptance contract must
+    # FAIL CLOSED, not sail through on a `None` gate input — otherwise the version
+    # promotes over a contract nothing ever checked.
     assert result["status"] == "not_promoted", result
     await db_session.refresh(version)
     assert version.last_qualification["blocker"] == "criterion_coverage_incomplete"
@@ -6712,7 +6719,7 @@ async def test_ungraded_acceptance_contract_fails_closed(
     _verdicts = version.last_qualification["category_verdicts"]
     assert {v["category_key"] for v in _verdicts} == {"c-covered1", "c-covered2"}
     assert all(v["status"] == "not_met" for v in _verdicts)
-    assert all("never graded" in v["gap"] for v in _verdicts)
+    assert all("Not graded" in v["gap"] for v in _verdicts)
     promote_spy.assert_not_called()
 
 

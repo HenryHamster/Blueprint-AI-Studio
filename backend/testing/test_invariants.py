@@ -11304,7 +11304,9 @@ def _referenced_symbol_names(
             collect_table_references(child)
 
     for root in roots:
-        for py_file in sorted(root.rglob("*.py")):
+        # A root may be a single module (an in-process-driven production script that
+        # lives outside the production package trees) or a directory to walk.
+        for py_file in [root] if root.is_file() else sorted(root.rglob("*.py")):
             try:
                 source = py_file.read_text(encoding="utf-8")
             except (UnicodeDecodeError, OSError):
@@ -11410,6 +11412,12 @@ def _production_reference_roots(backend_dir: Path) -> "tuple[Path, ...]":
     ``0472_encrypt_oauth_token.upgrade()`` calls ``app.field_encryption.encrypt_field``),
     so a patch on a symbol they call IS live and must not be reported as vacuous.
 
+    ``testing/check_size_limits.py`` is named FILE-BY-FILE (not by adding ``testing/``
+    as a tree — that would let any test's own reference suppress a finding and gut this
+    guard). It is the CI size-cap gate: production code that happens to live beside the
+    suite, and ``test_size_limits_checker.py`` drives it in-process via ``csl.main(...)``,
+    so a patch on a symbol it calls IS live.
+
     NOT here, deliberately: ``agent/`` and the repo-root runner scripts. Those execute in
     a SEPARATE process, so an in-process pytest patch on a symbol only they call is still
     inert — exactly the finding this guard should surface.
@@ -11420,8 +11428,9 @@ def _production_reference_roots(backend_dir: Path) -> "tuple[Path, ...]":
             backend_dir / "app",
             backend_dir / "alembic",
             backend_dir / "scripts",
+            backend_dir / "testing" / "check_size_limits.py",
         )
-        if d.is_dir()
+        if d.exists()
     )
 
 # app.* FUNCTIONS that are patched in backend/testing/ but have NO call site in any
@@ -12903,11 +12912,11 @@ class TestProblemModelWritePathInvariants:
         # direction_lifecycle.py: reconcile_gap_staffing_raw_result (parses through ProblemModel)
         ("direction_lifecycle.py", 874): "reconcile_gap_staffing_raw_result calls parse_problem_model internally",
         # strategic_completion.py: apply_agent_update (write-back)
-        ("strategic_completion.py", 5348): "apply_agent_update inline-sanitizes both current and proposed",
+        ("strategic_completion.py", 5360): "apply_agent_update inline-sanitizes both current and proposed",
         # strategic_completion.py: apply_agent_update (re-normalized)
-        ("strategic_completion.py", 5385): "apply_agent_update result, then _normalize_active_moves_writeback",
+        ("strategic_completion.py", 5397): "apply_agent_update result, then _normalize_active_moves_writeback",
         # strategic_completion.py: parse_problem_model -> model_dump (fallback gap reconciliation)
-        ("strategic_completion.py", 7068): "parse_problem_model(…) validated pydantic model_dump",
+        ("strategic_completion.py", 7080): "parse_problem_model(…) validated pydantic model_dump",
         # reaper_sweeps.py: parse_problem_model -> model_dump (moot-confirmation sweep)
         ("reaper_sweeps.py", 1253): "parse_problem_model(…) validated pydantic model_dump",
         # reaper_sweeps.py: parse_problem_model -> model_dump (stale-decay sweep)

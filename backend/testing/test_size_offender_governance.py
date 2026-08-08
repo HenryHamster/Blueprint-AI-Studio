@@ -645,25 +645,37 @@ def test_cap_bump_history_ledger_matches_git():
 
     The deployed backend reads the ledger (not git), so a ledger that drifts
     from git history would change chronic-offender classification between dev
-    and production. Every bump the readable MAINLINE git history shows must be
-    present in the ledger (git ⊆ ledger); in a full checkout the reverse is
-    checked too — the two must agree exactly. The scope is the mainline
-    integration branch's ancestry (``slp._mainline_git_ref``), never ``--all``:
-    bumps on abandoned task/research branches never merged and must not enter
-    the mirror. This is the guard that keeps ``check_size_limits.py --fix`` and
-    the rollup preflight honest about updating the mirror.
+    and production. Every bump the readable MAINLINE git history shows at-or-
+    after the ledger's coverage window must be present in the ledger (git ⊆
+    ledger); AND no ledger record may be a phantom the mainline history cannot
+    justify (ledger ⊆ git) — checked via ``slp.phantom_ledger_records``. The
+    scope is the mainline integration branch's ancestry
+    (``slp._mainline_git_ref``), never ``--all``: bumps on abandoned
+    task/research branches never merged and must not enter the mirror.  This is
+    the guard that keeps ``check_size_limits.py --fix`` and the rollup preflight
+    honest about updating the mirror.
+
+    The ledger deliberately does NOT mirror pre-ratchet bump history: the
+    2026-05-05 guardrail ratchet reset the baselines, and bumps below the
+    ratchet caps would wrongly extend the chronic-offender window.  The
+    forward direction therefore scopes to the ledger's own coverage window (its
+    earliest record, per-key with a global fallback), so pre-window git bumps
+    are legitimately absent.
 
     A shallow/truncated checkout (CI's depth-1 clone, an agent task VM) does NOT
     skip this guard: the git ⊆ ledger direction is still evaluable — every bump
-    the partial mainline history DOES show must be present in the ledger — so
-    it runs there too. Only the exact-equality reverse check needs complete
-    history (a shallow ledger legitimately holds records the partial ``git log``
-    does not show), so that direction alone is skipped on a truncated checkout.
+    the partial mainline history DOES show must be present in the ledger — and
+    ``phantom_ledger_records`` is deliberately NOT skipped on a truncated
+    checkout either. It verifies every record the partial history CAN
+    adjudicate (a resolvable SHA whose diff shows no bump, or a commit proven
+    outside the mainline ancestry) and skips only records the partial history
+    cannot resolve. The reverse direction is therefore exercised on every CI
+    shard and agent VM — exactly where the ledger most often drifts — instead
+    of being skipped there.
     """
     repo_root = _real_repo_checkout()
     if repo_root is None:
         pytest.skip("no git checkout of this repo available for the ledger guard")
-    truncated = slp._git_history_is_truncated(repo_root)
     # The CI backend shards bind the checkout read-only at /repo into a root
     # container while the runner user owns the files, so git inside the
     # container refuses every command with "detected dubious ownership" (exit
@@ -695,53 +707,308 @@ def test_cap_bump_history_ledger_matches_git():
     with open(slp._MODULE_SIZE_LIMITS_PATH, encoding="utf-8") as f:
         caps = json.load(f)
 
+    # The ledger deliberately does NOT mirror pre-ratchet bump history: the
+    # 2026-05-05 guardrail ratchet reset the baselines, and bumps below the
+    # ratchet caps would wrongly extend the chronic-offender window.  The
+    # ledger's coverage therefore starts at its earliest record; a git bump
+    # that predates the ledger's window for its key is legitimately absent.
+    # For a key that holds ledger records the window is that key's earliest
+    # record; for a key with none (a cap established before the window that has
+    # not moved since) the window falls back to the ledger's global earliest
+    # record.  Only bumps at-or-after the window must be present (git ⊆
+    # ledger); the phantom check below is the reverse direction.
+    global_start = min(
+        (
+            slp._parse_iso(r["commit_date"])
+            for _section, _keys in ledger_history.items()
+            for _key, _recs in _keys.items()
+            for r in _recs
+            if r.get("commit_date")
+        ),
+        default=None,
+    )
     mismatches = []
     for section, keys in caps.items():
         if not isinstance(keys, dict):
             continue
         for key in keys:
-            git_pairs = sorted(
-                (r["old_cap"], r["new_cap"])
-                for r in _parse_git_diff_output(git_out, key)
+            git_records = _parse_git_diff_output(git_out, key)
+            ledger_recs = ledger_history.get(section, {}).get(key, [])
+            ledger_pairs = {
+                (r["old_cap"], r["new_cap"]) for r in ledger_recs
+            }
+            window_start = min(
+                (
+                    slp._parse_iso(r["commit_date"])
+                    for r in ledger_recs
+                    if r.get("commit_date")
+                ),
+                default=global_start,
             )
-            ledger_pairs = sorted(
-                (r["old_cap"], r["new_cap"])
-                for r in ledger_history.get(section, {}).get(key, [])
-            )
-            if not all(p in ledger_pairs for p in git_pairs):
-                mismatches.append((section, key, git_pairs, ledger_pairs))
+            for rec in git_records:
+                pair = (rec["old_cap"], rec["new_cap"])
+                if pair in ledger_pairs:
+                    continue
+                if window_start is not None and slp._parse_iso(
+                    rec["commit_date"]
+                ) < window_start:
+                    # Pre-ledger (pre-ratchet) bump — legitimately absent.
+                    continue
+                mismatches.append(
+                    (
+                        section,
+                        key,
+                        (rec["old_cap"], rec["new_cap"]),
+                        rec["commit_sha"][:12],
+                        rec["commit_date"],
+                        sorted(ledger_pairs),
+                    )
+                )
 
     assert not mismatches, (
         "cap-bump-history ledger is missing git-recorded bumps "
         "(regenerate with check_size_limits.py --fix): " + repr(mismatches)
     )
 
-    if truncated:
-        # Shallow/truncated checkout: the git ⊆ ledger direction above has
-        # already executed (partial history proved the ledger is not missing a
-        # bump it shows). The exact-equality reverse check needs complete
-        # history — a shallow ledger legitimately holds records the partial
-        # ``git log`` does not show — so only that direction is skipped, never
-        # the whole guard.
-        return
+    # Reverse direction (ledger ⊆ git): no ledger record may be a phantom the
+    # mainline history cannot justify — a wrong old_cap, a decrease mis-filed as
+    # a bump, a commit outside the mainline ancestry, or a non-resolving SHA.
+    # Unlike the git ⊆ ledger direction this is not limited to current-caps keys
+    # (a phantom on a removed key still proves the ledger was fabricated), and
+    # unlike the old exact-equality reverse check it is NOT skipped on a
+    # truncated checkout: phantom_ledger_records verifies every record the
+    # partial history CAN adjudicate and skips only records it cannot resolve.
+    # This is the half of the ledger guard that used to be silently skipped on
+    # every shallow CI shard and agent VM — exactly where drift accumulates.
+    phantoms = slp.phantom_ledger_records(repo_root=repo_root)
+    assert phantoms == [], (
+        "cap-bump-history ledger holds phantom records the mainline git history "
+        "cannot justify (regenerate with check_size_limits.py --fix): "
+        + repr(phantoms)
+    )
 
-    # In a full-history checkout the mirror must also not contain phantom
-    # records — the ledger and git must agree exactly.
-    for section, keys in caps.items():
-        if not isinstance(keys, dict):
-            continue
-        for key in keys:
-            git_pairs = sorted(
-                (r["old_cap"], r["new_cap"])
-                for r in _parse_git_diff_output(git_out, key)
-            )
-            ledger_pairs = sorted(
-                (r["old_cap"], r["new_cap"])
-                for r in ledger_history.get(section, {}).get(key, [])
-            )
-            assert git_pairs == ledger_pairs, (
-                f"ledger drifted from git for {section}/{key}"
-            )
+
+# ---------------------------------------------------------------------------
+# Phantom-record unit tests — the reverse ledger guard (ledger ⊆ git).  A
+# ledger record whose commit_sha does not resolve to a mainline bump of the
+# exact (old_cap -> new_cap) pair is a phantom: a wrong old_cap, a decrease
+# mis-filed as a bump, a non-ancestor commit, or a fabricated SHA.  These run
+# against hermetic repos so the verdict is deterministic in every environment.
+# ---------------------------------------------------------------------------
+
+
+def _hermetic_head_sha(repo: str) -> str:
+    return subprocess.run(
+        ["git", "-C", repo, "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+
+def _phantom_ledger(repo: str, key: str, record: dict) -> list:
+    """Run phantom_ledger_records against a hermetic repo + single-record ledger."""
+    ledger = {
+        "schema_version": 1,
+        "history": {"backend": {key: [record]}},
+    }
+    with patch("app.size_limit_policy._REPO_ROOT", repo), patch(
+        "app.size_limit_policy._MODULE_SIZE_LIMITS_RELPATH", "module_size_limits.json"
+    ):
+        return slp.phantom_ledger_records(repo_root=repo, history=ledger)
+
+
+def test_phantom_ledger_records_accepts_matching_bump(tmp_path, mocker):
+    """A ledger record whose commit actually made the exact bump is NOT a
+    phantom — the commit's diff shows the pair, so the mirror is truthful."""
+    repo = _init_hermetic_repo(tmp_path)
+    _hermetic_write_cap(repo, 100)
+    _hermetic_commit(repo, "init", date="2026-01-01T00:00:00+00:00")
+    _hermetic_write_cap(repo, 200)
+    _hermetic_commit(repo, "bump to 200", date="2026-01-02T00:00:00+00:00")
+    bump_sha = _hermetic_head_sha(repo)
+
+    phantoms = _phantom_ledger(
+        repo,
+        "m.py",
+        {
+            "commit_sha": bump_sha,
+            "commit_date": "2026-01-02T00:00:00+00:00",
+            "old_cap": 100,
+            "new_cap": 200,
+        },
+    )
+    assert phantoms == []
+
+
+def test_phantom_ledger_records_flags_wrong_old_cap(tmp_path, mocker):
+    """A ledger record citing a real bump commit but with a WRONG old_cap is a
+    phantom — the commit's diff proves the raise started from 100, not 50."""
+    repo = _init_hermetic_repo(tmp_path)
+    _hermetic_write_cap(repo, 100)
+    _hermetic_commit(repo, "init", date="2026-01-01T00:00:00+00:00")
+    _hermetic_write_cap(repo, 200)
+    _hermetic_commit(repo, "bump to 200", date="2026-01-02T00:00:00+00:00")
+    bump_sha = _hermetic_head_sha(repo)
+
+    phantoms = _phantom_ledger(
+        repo,
+        "m.py",
+        {
+            "commit_sha": bump_sha,
+            "commit_date": "2026-01-02T00:00:00+00:00",
+            "old_cap": 50,
+            "new_cap": 200,
+        },
+    )
+    assert len(phantoms) == 1
+    section, key, old_cap, new_cap, sha, reason = phantoms[0]
+    assert (section, key, old_cap, new_cap) == ("backend", "m.py", 50, 200)
+    assert "no recorded bump" in reason
+
+
+def test_phantom_ledger_records_skips_empty_sha_pending(tmp_path, mocker):
+    """An empty commit_sha is a rollup-pending bump written before the commit
+    exists — there is nothing to verify, so it is never a phantom."""
+    repo = _init_hermetic_repo(tmp_path)
+    _hermetic_write_cap(repo, 100)
+    _hermetic_commit(repo, "init", date="2026-01-01T00:00:00+00:00")
+
+    phantoms = _phantom_ledger(
+        repo,
+        "m.py",
+        {
+            "commit_sha": "",
+            "commit_date": "2026-01-02T00:00:00+00:00",
+            "old_cap": 100,
+            "new_cap": 200,
+        },
+    )
+    assert phantoms == []
+
+
+def test_phantom_ledger_records_flags_unresolvable_sha_on_full(tmp_path, mocker):
+    """On a complete checkout a ledger SHA that does not resolve is a phantom —
+    a fabricated SHA is indistinguishable from a missing commit ONLY when the
+    objects might be unfetched (a shallow clone); a full checkout has no excuse."""
+    repo = _init_hermetic_repo(tmp_path)
+    _hermetic_write_cap(repo, 100)
+    _hermetic_commit(repo, "init", date="2026-01-01T00:00:00+00:00")
+
+    phantoms = _phantom_ledger(
+        repo,
+        "m.py",
+        {
+            "commit_sha": "deadbeef" * 5,
+            "commit_date": "2026-01-02T00:00:00+00:00",
+            "old_cap": 100,
+            "new_cap": 200,
+        },
+    )
+    assert len(phantoms) == 1
+    assert phantoms[0][5] == "commit SHA does not resolve"
+
+
+def test_phantom_ledger_records_skips_beyond_boundary_on_shallow(tmp_path, mocker):
+    """On a shallow clone a ledger SHA that does not resolve is SKIPPED, not
+    flagged — the object may simply be beyond the fetch boundary, and a genuine
+    bump is indistinguishable from a fabricated SHA when the object is gone."""
+    checkout = _init_shallow_repo(tmp_path)
+
+    phantoms = _phantom_ledger(
+        checkout,
+        "m.py",
+        {
+            "commit_sha": "deadbeef" * 5,
+            "commit_date": "2026-01-02T00:00:00+00:00",
+            "old_cap": 100,
+            "new_cap": 200,
+        },
+    )
+    assert phantoms == []
+
+
+def test_phantom_ledger_records_flags_non_ancestor_commit(tmp_path, mocker):
+    """A commit outside the mainline ancestry is a phantom even when its object
+    resolves — the bump it made was never merged, so it must not be in the
+    ledger the deployed backend reads."""
+    repo = _init_hermetic_repo(tmp_path)
+    _hermetic_write_cap(repo, 100)
+    _hermetic_commit(repo, "init", date="2026-01-01T00:00:00+00:00")
+    _hermetic_write_cap(repo, 200)
+    _hermetic_commit(repo, "mainline bump", date="2026-01-02T00:00:00+00:00")
+    # Abandoned branch bump (200 -> 300) is never merged back to mainline.
+    subprocess.run(["git", "checkout", "-q", "-b", "abandoned"], cwd=repo, check=True)
+    _hermetic_write_cap(repo, 300)
+    _hermetic_commit(repo, "abandoned bump", date="2026-01-03T00:00:00+00:00")
+    abandoned_sha = _hermetic_head_sha(repo)
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=repo, check=True)
+
+    phantoms = _phantom_ledger(
+        repo,
+        "m.py",
+        {
+            "commit_sha": abandoned_sha,
+            "commit_date": "2026-01-03T00:00:00+00:00",
+            "old_cap": 200,
+            "new_cap": 300,
+        },
+    )
+    assert len(phantoms) == 1
+    assert phantoms[0][5] == "commit is not in the mainline ancestry"
+
+
+def test_rebuild_prunes_proven_phantom_records(tmp_path, mocker):
+    """rebuild_cap_bump_history_ledger prunes a ledger record the mainline git
+    history cannot justify (a wrong old_cap), so ``--fix`` self-heals the mirror
+    instead of the merge safety net preserving the phantom forever."""
+    repo = _init_hermetic_repo(tmp_path)
+    _hermetic_write_cap(repo, 100)
+    _hermetic_commit(repo, "init", date="2026-01-01T00:00:00+00:00")
+    _hermetic_write_cap(repo, 200)
+    _hermetic_commit(repo, "bump to 200", date="2026-01-02T00:00:00+00:00")
+    bump_sha = _hermetic_head_sha(repo)
+
+    ledger_path = tmp_path / "cap_bump_history.json"
+    # Existing ledger holds the REAL bump AND a phantom (wrong old_cap) that the
+    # merge safety net would otherwise keep forever.
+    ledger_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "history": {
+                    "backend": {
+                        "m.py": [
+                            {
+                                "commit_sha": bump_sha,
+                                "commit_date": "2026-01-02T00:00:00+00:00",
+                                "old_cap": 100,
+                                "new_cap": 200,
+                            },
+                            {
+                                "commit_sha": bump_sha,
+                                "commit_date": "2026-01-02T00:00:00+00:00",
+                                "old_cap": 50,
+                                "new_cap": 200,
+                            },
+                        ]
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with patch("app.size_limit_policy._REPO_ROOT", repo), patch(
+        "app.size_limit_policy._MODULE_SIZE_LIMITS_RELPATH", "module_size_limits.json"
+    ):
+        slp.rebuild_cap_bump_history_ledger(
+            caps_json_path=str(Path(repo) / "module_size_limits.json"),
+            ledger_path=str(ledger_path),
+        )
+
+    records = json.loads(ledger_path.read_text())["history"]["backend"]["m.py"]
+    assert [(r["old_cap"], r["new_cap"]) for r in records] == [(100, 200)]
 
 
 # ---------------------------------------------------------------------------

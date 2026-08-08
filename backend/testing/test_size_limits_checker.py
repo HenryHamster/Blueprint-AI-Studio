@@ -952,6 +952,62 @@ def test_check_cap_raise_guard_skips_non_git_checkout(tmp_path, capsys):
     assert "[cap-raise-guard] skipped" in capsys.readouterr().out
 
 
+def test_check_flags_phantom_ledger_records(tmp_path, capsys, mocker):
+    """CHECK must FAIL when the cap-bump-history ledger holds a record the
+    mainline git history cannot justify (a phantom) — naming the file, the old
+    and new values, the commit, and the remedy. This is the reverse direction
+    of the ledger↔git contract (ledger ⊆ git) and it must NOT be skipped on a
+    truncated checkout."""
+    repo, jp = _build_repo(tmp_path, backend={"m.py": (50, 100)})
+    # Simulate a phantom: ledger claims 50 -> 100 at a commit whose diff shows
+    # no such bump.
+    mocker.patch(
+        "app.size_limit_policy.phantom_ledger_records",
+        return_value=[
+            ("backend", "m.py", 50, 100, "deadbeefcafe00000000000000000000000000",
+             "commit's diff shows no recorded bump for this key/pair")
+        ],
+    )
+    rc = _run(jp, repo, "--sections", "backend")
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "[ledger-phantom] backend/m.py: ledger records 50 -> 100" in out
+    assert "cap_bump_history.json" in out
+    assert "--fix" in out
+
+
+def test_check_passes_with_clean_ledger(tmp_path, capsys, mocker):
+    """CHECK passes when the ledger holds no phantom records — a clean mirror is
+    not a failure even when every other guard is green."""
+    repo, jp = _build_repo(tmp_path, backend={"m.py": (50, 100)})
+    mocker.patch("app.size_limit_policy.phantom_ledger_records", return_value=[])
+    assert _run(jp, repo, "--sections", "backend") == 0
+    out = capsys.readouterr().out
+    assert "[ledger-phantom]" not in out
+
+
+def test_fix_prunes_phantom_ledger_records(tmp_path, capsys, mocker):
+    """--fix self-heals a phantom ledger even when no cap breach exists to bump:
+    the checker must rebuild the ledger (pruning phantoms) rather than report
+    'no breaches to fix' and leave the phantom in place."""
+    repo, jp = _build_repo(tmp_path, backend={"m.py": (50, 100)})
+    mocker.patch(
+        "app.size_limit_policy.phantom_ledger_records",
+        return_value=[
+            ("backend", "m.py", 50, 100, "deadbeefcafe00000000000000000000000000",
+             "commit's diff shows no recorded bump for this key/pair")
+        ],
+    )
+    rebuilt = mocker.patch("app.size_limit_policy.rebuild_cap_bump_history_ledger")
+    assert _run(jp, repo, "--fix", "--sections", "backend") == 0
+    out = capsys.readouterr().out
+    assert "Pruned 1 phantom record(s)" in out
+    rebuilt.assert_called_once()
+    # The rebuild is invoked with the bumps applied by this fix (none here) so
+    # pruning is the only operation.
+    assert rebuilt.call_args.kwargs["pending"] == []
+
+
 def _git(repo_root, *args):
     subprocess.run(
         ["git", "-C", str(repo_root), *args],

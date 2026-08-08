@@ -586,6 +586,100 @@ describe('handleReleaseAudit — pinned candidate + diff-range pre-flight', () =
     expect(report.audit_scope.diff_range).toBe(deltaRange);
   });
 
+  it('emits the acceptance-category contract when no version goal is set', async () => {
+    // A version with an ACTIVE acceptance-criteria rubric but NO version goal
+    // string must still be graded per-category: the backend always ships
+    // payload.categories, and the qualifier's goal-verification gate IS the
+    // acceptance contract.  The category section must not be dropped just
+    // because versionGoalSection is empty.
+    const categories = [
+      { category_key: 'goal_alignment', text: 'The candidate advances the version goal' },
+      { category_key: 'ship_safety', text: 'Promotion stays safe' },
+    ];
+    vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
+      const a = args as string[];
+      if (a[0] === 'diff' && a[1] === '--name-status') return 'M\tbackend/app/main.py\n';
+      if (a[0] === 'diff') return '';
+      return '';
+    });
+
+    await handleReleaseAudit(
+      TASK_ID, {
+        ...RELEASE_PAYLOAD,
+        categories,
+        // no version_goal supplied
+      }, BASE_TASK,
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    // The category contract is emitted even without a goal string...
+    expect(prompt).toContain('Acceptance categories:');
+    expect(prompt).toContain('- goal_alignment: The candidate advances the version goal');
+    expect(prompt).toContain('- ship_safety: Promotion stays safe');
+    // ...grading the FULL version delta (the whole range the promotion PR would
+    // carry), with the per-category verdict requirements the backend gates on.
+    expect(prompt).toContain(`FULL version delta (\`git diff ${DIFF_RANGE}\`)`);
+    expect(prompt).toContain('Emit one `category_verdicts` entry for every supplied key');
+    expect(prompt).toContain('`status` (`met` | `partial` | `not_met`)');
+    expect(prompt).toContain('residual_uncaptured_gap');
+    // The version-goal section is absent — there is no goal string to grade.
+    expect(prompt).not.toContain('## Version Goal');
+    expect(prompt).not.toContain('Emit `covers_goal`');
+    // The report still emits the audit artifact normally.
+    const call = vi.mocked(persistAndPostStatus).mock.calls.at(-1)?.[1];
+    expect(call?.status).toBe('COMPLETED');
+    expect(call?.artifact_type).toBe('RELEASE_AUDIT_REPORT');
+  });
+
+  it('repair re-ask requests category_verdicts when categories exist without a version goal', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    const categories = [{ category_key: 'goal_alignment', text: 'Advances the goal' }];
+    vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
+      const a = args as string[];
+      if (a[0] === 'diff' && a[1] === '--name-status') return 'M\tbackend/app/main.py\n';
+      if (a[0] === 'diff') return '';
+      return '';
+    });
+    const repaired = {
+      audit_score: 0.91,
+      test_erosion: { deleted_test_files: [], assertion_delta: 0, test_count_delta: 0 },
+      category_verdicts: [
+        { category_key: 'goal_alignment', status: 'met', citations: [{ kind: 'diff', ref: 'main.py:1' }] },
+      ],
+      residual_uncaptured_gap: null,
+      findings: [],
+    };
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: 'release audit complete but prose only',
+        lastResultText: 'raw tail fallback text',
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify(repaired),
+      });
+
+    await handleReleaseAudit(
+      TASK_ID, {
+        ...RELEASE_PAYLOAD,
+        categories,
+      }, BASE_TASK,
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const reopenPrompt = vi.mocked(runClaudeCode).mock.calls[1][0];
+    // The repair re-ask must still demand the per-category section even though
+    // there is no version goal (no covers_goal/coverage_score clause).
+    expect(reopenPrompt).toContain('Output ONLY the JSON object now');
+    expect(reopenPrompt).toContain('"category_verdicts" and "residual_uncaptured_gap" from the acceptance-category review');
+    expect(reopenPrompt).not.toContain('covers_goal');
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+  });
+
   it('falls back to the full range when the requested baseline is not an ancestor', async () => {
     const auditBaseSha = '0123456789abcdef0123456789abcdef01234567';
     vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {

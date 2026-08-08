@@ -4845,6 +4845,22 @@ async def test_acceptance_window_rederives_stale_rule_version_verdicts(db_sessio
     assert agg["acceptance_window_buckets"]["proven"] == 1
     assert agg["acceptance_window_buckets"]["declared_unsatisfied"] == 1
 
+    # Durability: the re-derived verdict must not stay a per-drive throwaway —
+    # the aggregate writes it back onto the session-bound task so every OTHER
+    # reader (task_outcomes, direction_outcomes, acceptance_criteria,
+    # metrics_integrity_sweep) sees the corrected row instead of the stale one.
+    stale_ctx = stale_task.context or {}
+    assert stale_ctx[CODE_ACCEPTANCE_VERDICT_KEY]["rule_version"] == (
+        ACCEPTANCE_RULE_VERSION
+    )
+    assert stale_ctx[CODE_ACCEPTANCE_VERDICT_KEY]["satisfied"] is True
+    assert stale_ctx[CODE_ACCEPTANCE_VERDICT_KEY]["proven"] is True
+    # A current-rule stamp is untouched — the frozen dict stays verbatim.
+    assert (
+        effective_acceptance_verdict(control_task)
+        is control_task.context[CODE_ACCEPTANCE_VERDICT_KEY]
+    )
+
 
 @pytest.mark.asyncio
 async def test_acceptance_window_aggregate_ignores_post_terminal_updates(

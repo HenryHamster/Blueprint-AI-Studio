@@ -23,6 +23,8 @@ from app.branch_resolution import get_project_integration_branch
 from app.landed_signal import (
     apply_merged_landed_signal,
     mark_landed_on_integration,
+    LANDED_MERGE_SHA_KEY,
+    LANDED_SIGNAL_KEY,
     NON_MERGE_UNBLOCK_REASON_KEY,
 )
 from app.models import Project, Task, TaskStatus
@@ -137,6 +139,111 @@ def test_acceptance_verdict_failure_does_not_block_landing(monkeypatch):
     # The landing bit must be written regardless.
     from app.landed_signal import LANDED_ON_INTEGRATION_KEY
     assert task.context.get(LANDED_ON_INTEGRATION_KEY) is True
+
+
+# ---------------------------------------------------------------------------
+# Merge commit identity recording
+# ---------------------------------------------------------------------------
+
+
+def test_mark_landed_on_integration_records_merge_sha():
+    """The canonical landing write records the exact merge commit SHA.
+
+    This is the named acceptance-evidence test required by the task plan: a
+    landed write task stamped through ``mark_landed_on_integration`` with a
+    merge commit carries ``merge_commit_sha`` in context so the
+    discovery-review receipt's ``_merge_sha`` reader can resolve exact commit
+    identity instead of reporting "lacks exact commit identity".
+    """
+    task = _make_code_task_with_evidence(
+        acceptance_evidence=None,
+        changed_files=["backend/app/widget.py"],
+    )
+
+    mark_landed_on_integration(task, merge_commit_sha="a" * 40)
+
+    assert task.context.get(LANDED_SIGNAL_KEY) is True
+    assert task.context.get(LANDED_ON_INTEGRATION_KEY) is True
+    assert task.context.get(LANDED_MERGE_SHA_KEY) == "a" * 40
+
+
+def test_mark_landed_on_integration_truncates_long_merge_sha():
+    """A merge SHA longer than 64 chars is truncated to the reader's bound."""
+    task = _make_code_task_with_evidence(
+        acceptance_evidence=None,
+        changed_files=["backend/app/widget.py"],
+    )
+
+    mark_landed_on_integration(task, merge_commit_sha="b" * 80)
+
+    recorded = task.context.get(LANDED_MERGE_SHA_KEY)
+    assert recorded == "b" * 64
+    assert len(recorded) == 64
+
+
+def test_mark_landed_on_integration_preserves_existing_merge_sha_when_none():
+    """Re-stamping a landing without a SHA must not erase a recorded SHA."""
+    task = _make_code_task_with_evidence(
+        acceptance_evidence=None,
+        changed_files=["backend/app/widget.py"],
+    )
+    task.context = {
+        **(task.context or {}),
+        LANDED_MERGE_SHA_KEY: "c" * 40,
+    }
+
+    mark_landed_on_integration(task)
+
+    assert task.context.get(LANDED_MERGE_SHA_KEY) == "c" * 40
+
+
+def test_apply_merged_landed_signal_stamps_merge_sha_only_on_integration():
+    """apply_merged_landed_signal forwards the SHA on an integration landing."""
+    task = _make_code_task_with_evidence(
+        acceptance_evidence=None,
+        changed_files=["backend/app/widget.py"],
+    )
+    project = Project(
+        name="sha integration", user_id="test-user", integration_branch="automain"
+    )
+    integration = get_project_integration_branch(project)
+
+    landed = apply_merged_landed_signal(
+        task,
+        project,
+        base_branch=integration,
+        hotfix_lane=False,
+        merge_commit_sha="d" * 40,
+    )
+
+    assert landed is True
+    assert task.context.get(LANDED_MERGE_SHA_KEY) == "d" * 40
+
+
+def test_apply_merged_landed_signal_omits_sha_on_non_integration_landing():
+    """A merge onto a staging branch records the unblock marker but no SHA."""
+    task = _make_code_task_with_evidence(
+        acceptance_evidence=None,
+        changed_files=["backend/app/widget.py"],
+    )
+    project = Project(
+        name="sha staging", user_id="test-user", integration_branch="automain"
+    )
+
+    landed = apply_merged_landed_signal(
+        task,
+        project,
+        base_branch="research/def01234",
+        hotfix_lane=False,
+        non_merge_reason="merged_pr_non_integration_branch",
+        merge_commit_sha="e" * 40,
+    )
+
+    assert landed is False
+    assert task.context.get(LANDED_MERGE_SHA_KEY) is None
+    assert task.context.get(NON_MERGE_UNBLOCK_REASON_KEY) == (
+        "merged_pr_non_integration_branch"
+    )
 
 
 @pytest.mark.asyncio

@@ -224,6 +224,7 @@ async def _apply_ci_merged_landed_signal(
     base_branch: str,
     review_loop: dict,
     project: Project | None = None,
+    merge_commit_sha: str | None = None,
 ) -> bool:
     """Stage the pr_merged landed signal only when the merged PR landed on
     the project's integration branch.
@@ -235,6 +236,9 @@ async def _apply_ci_merged_landed_signal(
     ``project`` may be pre-loaded from the caller's batch cache to avoid an
     N+1 session.get(Project, ...) on the hot CI-polling path.  When omitted
     (default), the function falls back to the legacy per-call session.get.
+
+    ``merge_commit_sha`` is forwarded to the canonical write so the exact merge
+    commit identity is recorded alongside the landed flags.
     """
     from app.landed_signal import apply_merged_landed_signal
 
@@ -252,6 +256,7 @@ async def _apply_ci_merged_landed_signal(
         project,
         base_branch=base_branch,
         hotfix_lane=hotfix_lane,
+        merge_commit_sha=merge_commit_sha,
     )
 
 
@@ -926,6 +931,9 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                             base_branch=_ci_base,
                             review_loop=ci_loop,
                             project=_orch_ci_project_orm,
+                            merge_commit_sha=(pr_data or {}).get(
+                                "merge_commit_sha"
+                            ),
                         )
                     )
                     ci_task.status = TaskStatus.COMPLETED

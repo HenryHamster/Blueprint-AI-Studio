@@ -288,6 +288,41 @@ class TestEvaluateMergeGradeCategories:
         assert out["covers_goal"] is True
         assert out["coverage"] == 0.9
 
+    def test_empty_goal_with_active_rubric_grades_categories(self):
+        """A version with NO goal string but an ACTIVE rubric is still graded
+        per-category: the acceptance contract is the gradeable object.
+
+        The holistic covers_goal signal stays None (no goal string to cover),
+        status stays not_applicable so the holistic merge_grade_misses gate stays
+        inert, but the per-category verdicts ARE normalized and returned — an
+        uncited ``met`` is downgraded to ``not_met`` and an ungraded active
+        category is ``not_met``, exactly as in the goal-ful path.
+        """
+        art = {
+            "covers_goal": True,
+            "coverage_score": 1.0,
+            "category_verdicts": [
+                {"category_key": "c-1", "status": "met", "citations": []},  # uncited
+                {
+                    "category_key": "c-2",
+                    "status": "met",
+                    "citations": [{"kind": "diff", "ref": "ui.tsx:10"}],
+                },
+                # c-3 omitted entirely — active but ungraded
+            ],
+        }
+        out = rs.evaluate_merge_grade("", art, self._CATS + [
+            {"category_key": "c-3", "text": "wires the widget into the API"}
+        ])
+        assert out["status"] == "not_applicable"
+        assert out["blocked"] is False
+        assert out["covers_goal"] is None
+        by_key = {v["category_key"]: v for v in out["category_verdicts"]}
+        assert by_key["c-1"]["status"] == "not_met"  # uncited met downgraded
+        assert by_key["c-2"]["status"] == "met"  # cited
+        assert by_key["c-3"]["status"] == "not_met"  # ungraded active
+        assert by_key["c-3"]["gap"]
+
     def test_grader_emitting_empty_list_still_grades_every_category_not_met(self):
         """A CAPABLE grader that emits ``category_verdicts: []`` did answer — it
         just graded nothing.  That is a real not_met, NOT the unsupported hold:
@@ -652,26 +687,68 @@ class TestCategoryGateNonEngagingPaths:
 
     # Path 1 -------------------------------------------------------------------
 
-    def test_contentless_goal_evaluate_returns_none_category_verdicts(self):
-        """evaluate_merge_grade with a contentless placeholder goal returns
-        category_verdicts=None and status=not_applicable (blocked=False).
+    def test_contentless_goal_with_active_rubric_grades_categories(self):
+        """evaluate_merge_grade with a contentless placeholder goal grades the
+        ACTIVE acceptance-criteria contract even though there is no goal string.
 
-        This is the root cause: no merge-grade child is spawned for a
-        contentless goal, so evaluate_merge_grade never receives a graded
-        artifact and returns None for the per-category verdicts.  The caller
-        (_finalize_qualification) must synthesize _never_graded_category_verdicts
-        for active criteria rather than passing None to compute_composite.
+        The release audit ships ``payload.categories`` whenever a rubric is
+        active — independently of ``version_goal`` — and the goal-verification
+        gate IS the acceptance contract.  So a contentless goal is only
+        ``not_applicable`` when there is NO rubric.  With an active rubric:
+
+          * an artifact that DOES carry ``category_verdicts`` is graded and
+            returned as ``not_applicable`` (no holistic goal signal) with the
+            verdicts populated — the gate reads them instead of fail-closing the
+            whole contract as never-graded;
+          * an artifact that omits the ``category_verdicts`` key entirely (a
+            stale grader predating the per-category protocol) is
+            ``category_grade_unsupported`` (HOLD) — never a fabricated
+            ``not_met`` verdict.
         """
         active_cats = [{"category_key": "c-1"}, {"category_key": "c-2"}]
+        graded_artifact = {
+            "covers_goal": True,
+            "coverage_score": 1.0,
+            "category_verdicts": [
+                {
+                    "category_key": "c-1",
+                    "status": "met",
+                    "citations": [{"kind": "diff", "ref": "a.py:1"}],
+                },
+                {
+                    "category_key": "c-2",
+                    "status": "met",
+                    "citations": [{"kind": "diff", "ref": "b.py:2"}],
+                },
+            ],
+        }
         for goal in ("", "test", "n/a", "tbd", "placeholder", "none"):
-            result = rs.evaluate_merge_grade(
+            graded = rs.evaluate_merge_grade(goal, graded_artifact, active_cats)
+            assert graded["status"] == "not_applicable", f"goal={goal!r}"
+            assert graded["blocked"] is False
+            assert graded["covers_goal"] is None
+            assert {v["category_key"]: v["status"] for v in graded["category_verdicts"]} == {
+                "c-1": "met",
+                "c-2": "met",
+            }
+        # Stale grader (no category_verdicts key) → HOLD, not fabricated not_met.
+        for goal in ("", "test", "n/a", "tbd", "placeholder", "none"):
+            unsupported = rs.evaluate_merge_grade(
                 goal,
                 {"covers_goal": True, "coverage_score": 1.0},
                 active_cats,
             )
-            assert result["category_verdicts"] is None, f"goal={goal!r}"
-            assert result["status"] == "not_applicable"
-            assert result["blocked"] is False
+            assert unsupported["status"] == "category_grade_unsupported", f"goal={goal!r}"
+            assert unsupported["blocked"] is True
+            assert unsupported["category_verdicts"] is None
+        # No rubric → unchanged byte-identical not_applicable (regression guard).
+        for goal in ("", "test", "n/a", "tbd", "placeholder", "none"):
+            bare = rs.evaluate_merge_grade(
+                goal, {"covers_goal": True, "coverage_score": 1.0}
+            )
+            assert bare["status"] == "not_applicable"
+            assert bare["blocked"] is False
+            assert bare["category_verdicts"] is None
 
     def test_contentless_goal_none_category_verdicts_skips_gate_in_compute_composite(self):
         """compute_composite with category_verdicts=None skips the per-category
@@ -902,33 +979,66 @@ class TestCategoryGateNonEngagingPaths:
         assert out["confidence"] > 0.0
         assert out.get("confidence_recovered_from_ci_unresolved") is True
 
-    def test_contentless_goal_full_chain_shows_gate_skip_then_fallback_blocks(self):
-        """Full chain for path 1: evaluate_merge_grade(contentless goal) → None
-        category_verdicts → compute_composite would skip gate → but
-        _never_graded_category_verdicts blocks when fed to compute_composite.
-
-        This documents the two-step safety: the evaluator deliberately returns
-        None (skip), and the qualifier MUST call _never_graded_category_verdicts
-        to synthesize fail-closed verdicts for any active criteria.
+    def test_contentless_goal_full_chain_grades_categories_when_artifact_has_them(self):
+        """Full chain for path 1 (REDESIGNED): a contentless goal + ACTIVE rubric
+        is still graded when the artifact carries per-category verdicts — the gate
+        reads them instead of skipping.  When the grader cannot emit the section
+        at all, evaluate_merge_grade HOLDS (category_grade_unsupported), and the
+        qualifier's _never_graded_category_verdicts remains the belt-and-suspenders
+        fail-closed fallback for a no-grade-at-all state.
         """
         from app.release_qualifier import _never_graded_category_verdicts
 
         active_cats = [{"category_key": "c-auth"}, {"category_key": "c-dashboard"}]
         active_keys = {c["category_key"] for c in active_cats}
 
-        # Step 1: evaluate_merge_grade returns category_verdicts=None for a
-        # contentless goal — the per-category gate is not engaged at this level.
-        eval_out = rs.evaluate_merge_grade("test", None, active_cats)
-        assert eval_out["category_verdicts"] is None
+        # Step 1: a contentless goal WITH a graded rubric returns the per-category
+        # verdicts (status not_applicable — no holistic goal signal — but the
+        # acceptance contract IS graded).
+        eval_out = rs.evaluate_merge_grade(
+            "test",
+            {
+                "covers_goal": True,
+                "coverage_score": 1.0,
+                "category_verdicts": [
+                    {
+                        "category_key": "c-auth",
+                        "status": "met",
+                        "citations": [{"kind": "diff", "ref": "auth.py:1"}],
+                    },
+                    {
+                        "category_key": "c-dashboard",
+                        "status": "met",
+                        "citations": [{"kind": "diff", "ref": "dash.py:2"}],
+                    },
+                ],
+            },
+            active_cats,
+        )
         assert eval_out["status"] == "not_applicable"
+        assert eval_out["blocked"] is False
+        assert eval_out["category_verdicts"] is not None
 
-        # Step 2: passing None directly to compute_composite SKIPS the gate.
-        skipped = rs.compute_composite(**_perfect_kwargs(category_verdicts=None))
-        assert skipped["blocker"] is None
-        assert skipped["promote"] is True
+        # Step 2: feeding those verdicts to compute_composite does NOT skip the
+        # gate; an all-met contract promotes (no criterion_coverage_incomplete).
+        promoted = rs.compute_composite(
+            **_perfect_kwargs(
+                category_verdicts=eval_out["category_verdicts"],
+                residual_uncaptured_gap=eval_out["residual_uncaptured_gap"],
+            )
+        )
+        assert promoted["blocker"] is None
+        assert promoted["promote"] is True
 
-        # Step 3: the qualifier's _never_graded_category_verdicts synthesizes
-        # not_met for every active key, and compute_composite then BLOCKS.
+        # Step 3: when the grader cannot emit the section at all, evaluate_merge_grade
+        # HOLDS (category_grade_unsupported) instead of fabricating not_met...
+        unsupported = rs.evaluate_merge_grade("test", None, active_cats)
+        assert unsupported["status"] == "category_grade_unsupported"
+        assert unsupported["blocked"] is True
+        assert unsupported["category_verdicts"] is None
+
+        # Step 4: ...and the qualifier's _never_graded_category_verdicts remains
+        # the fail-closed fallback for a no-grade-at-all state.
         fallback = _never_graded_category_verdicts(active_keys)
         blocked = rs.compute_composite(**_perfect_kwargs(category_verdicts=fallback))
         assert blocked["blocker"] == "criterion_coverage_incomplete"

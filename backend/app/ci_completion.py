@@ -17,7 +17,7 @@ CI" — it is NOT permission to merge. A legacy scalar
 durable review history (or an explicit no-review policy marker) is required.
 """
 
-import asyncio
+import asyncio  # noqa: F401  # test mock target (app.ci_completion.asyncio.sleep)
 import contextlib
 import logging
 import uuid
@@ -871,6 +871,7 @@ async def _attempt_merge_with_retry_and_escalation(
                                     or (orig.context or {}).get("hotfix")
                                 ),
                                 non_merge_reason="merged_pr_non_integration_branch",
+                                merge_commit_sha=merge_result.get("sha"),
                             )
                             # Membership-based merge-credit propagation across the
                             # nested-rollup + squash boundary. apply_merged_landed_signal

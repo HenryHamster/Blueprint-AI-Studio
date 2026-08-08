@@ -334,7 +334,7 @@ vi.mock('../index.js', () => ({
   persistAndPostStatus: vi.fn().mockResolvedValue(undefined),
   runClaudeCode: vi.fn().mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' }),
   apiPost: vi.fn().mockResolvedValue({}),
-  resolveBaseBranch: () => 'main',
+  resolveBaseBranch: vi.fn(() => 'main'),
   setCurrentPromptFingerprint: vi.fn(),
   sendHeartbeatSync: vi.fn(),
 }));
@@ -1340,6 +1340,48 @@ describe('handleStrategic executor prompt: criterion_keys direction guidance', (
     // Guidance explains why: directions without criterion_keys write no CriterionEvidence
     expect(executorPrompt).toContain('CriterionEvidence');
     expect(executorPrompt).toContain('never invent keys');
+  });
+});
+
+describe('handleStrategic executor prompt: sequenced landing gates', () => {
+  beforeEach(() => {
+    vi.mocked(runClaudeCode).mockClear();
+    vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
+      ok: true,
+      analysisText: 'analysis',
+    });
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: '',
+    });
+  });
+
+  it('teaches the foundation-first ordered spawn workflow with the landing-gate fields', async () => {
+    vi.mocked(mockedIndexModule.resolveBaseBranch).mockReturnValueOnce('project-integration');
+    const statusRef = { value: '' };
+    await handleStrategic(
+      'task-sequenced-landing-gates',
+      { project_name: 'Blueprint' },
+      {},
+      'tok',
+      'owner',
+      'repo',
+      null,
+      statusRef,
+    );
+
+    const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0]?.[0];
+    expect(executorPrompt).toBeDefined();
+    // Foundation-first ordering: spawn the foundation, then reference its task_id.
+    expect(executorPrompt).toContain('spawn the FOUNDATION first');
+    expect(executorPrompt).toContain('"depends_on": ["<foundation task_id>"]');
+    // Both fields use the resolved project integration branch, so the re-cut
+    // base is the exact branch whose landing status releases the successor.
+    expect(executorPrompt).toContain('"require_deps_landed_on": "project-integration", "release_base_branch": "project-integration"');
+    expect(executorPrompt).toContain('every depends_on dependency must have LANDED on');
+    // Independent work stays parallel (no depends_on) so it is not held by the chain.
+    expect(executorPrompt).toContain('work parallel (no depends_on)');
   });
 });
 

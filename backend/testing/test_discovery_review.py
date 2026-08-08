@@ -456,6 +456,51 @@ async def test_candidate_sha_is_not_accepted_as_exact_landed_identity(db_session
 
 
 @pytest.mark.asyncio
+async def test_canonical_landing_write_resolves_commit_identity_gap(db_session):
+    """A landed write task stamped through mark_landed_on_integration with a
+    merge SHA no longer reports 'lacks exact commit identity'.
+
+    This exercises the end-to-end fix: the canonical write records the exact
+    merge commit, so the discovery-review receipt can resolve commit identity
+    and the cycle is not pinned in EVIDENCE_PENDING.
+    """
+    from app.landed_signal import mark_landed_on_integration
+
+    _, cycle, source = await _cycle_with_source(db_session)
+    landed_task = Task(
+        project_id=source.project_id,
+        discovery_cycle_id=cycle.id,
+        parent_task_id=source.id,
+        title="Write with recorded merge identity",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={},
+    )
+    db_session.add(landed_task)
+    await db_session.flush()
+
+    mark_landed_on_integration(landed_task, merge_commit_sha="c" * 40)
+    db_session.add(landed_task)
+    await db_session.flush()
+
+    spawned = await maybe_close_and_spawn_discovery_review(db_session, cycle.id)
+    assert spawned.spawned is True
+    review = await db_session.get(Task, spawned.task_id)
+    outcome = next(
+        item
+        for item in review.first_payload["evidence_packet"]
+        if item["semantic_role"] == "parent_outcome"
+    )
+    snapshot = outcome["evidence_metadata"]["snapshot"]
+    assert snapshot["missing_required_evidence"] == []
+    assert any(
+        item.get("merge_commit_sha") == "c" * 40
+        for item in snapshot["landed_outcomes"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_abundant_semantic_evidence_is_bounded_without_stranding(db_session):
     project, cycle, source = await _cycle_with_source(db_session)
     source.plan_output = [

@@ -919,8 +919,16 @@ export async function handleReleaseAudit(
   const categoryContractSection = categories.length > 0
     ? `\nAssess each acceptance category below against the FULL version delta (\`git diff ${goalCategoryDiffRange}\`), NOT the narrowed code-quality range — every supplied criterion grades the whole version the promotion PR would carry. Emit one \`category_verdicts\` entry for every supplied key, with \`status\` (\`met\` | \`partial\` | \`not_met\`), a concrete \`gap\` (null when met), and diff-grounded \`citations\` (file paths or commit/PR references). Also emit \`residual_uncaptured_gap\` for any important goal gap not represented by a category, else null.\n\nAcceptance categories:\n${categories.map((row) => `- ${row.category_key}: ${row.text}`).join('\n')}\n`
     : '';
+  // The acceptance-category contract grades the FULL version delta and is
+  // emitted whenever an active rubric is supplied — independent of whether a
+  // version goal string exists.  The backend always ships ``payload.categories``
+  // even when ``version_goal`` is absent/contentless, and a version with an
+  // active rubric but no goal must still be graded per-category (previously the
+  // section was nested inside ``versionGoalSection``, so an empty goal dropped
+  // every category instruction and the qualifier fail-closed the whole
+  // acceptance contract as never-graded).
   const versionGoalSection = versionGoal
-    ? `\n## Version Goal\n\n${versionGoal}\n\nIn addition to the standard quality checks below (which review the code-quality range \`${diffRange}\`), assess whether the FULL version delta (\`git diff ${goalCategoryDiffRange}\` / \`git log ${goalCategoryDiffRange} --oneline\`) plausibly delivers the version's strategic goal stated above — do NOT limit the goal verdict to the narrowed code-quality range. Emit \`covers_goal\` (boolean), \`coverage_score\` (float 0.0–1.0), \`biggest_gap\` (string or null), and \`goal_alignment\` with \`state\` (\`aligned\` | \`shortfall\` | \`not_applicable\`), \`assessed_grade\`, \`biggest_gap\`, and a diff-grounded \`reasoning_summary\`. These fields are additional to \`audit_score\`, \`test_erosion\`, and \`findings\`.\n${categoryContractSection}\n`
+    ? `\n## Version Goal\n\n${versionGoal}\n\nIn addition to the standard quality checks below (which review the code-quality range \`${diffRange}\`), assess whether the FULL version delta (\`git diff ${goalCategoryDiffRange}\` / \`git log ${goalCategoryDiffRange} --oneline\`) plausibly delivers the version's strategic goal stated above — do NOT limit the goal verdict to the narrowed code-quality range. Emit \`covers_goal\` (boolean), \`coverage_score\` (float 0.0–1.0), \`biggest_gap\` (string or null), and \`goal_alignment\` with \`state\` (\`aligned\` | \`shortfall\` | \`not_applicable\`), \`assessed_grade\`, \`biggest_gap\`, and a diff-grounded \`reasoning_summary\`. These fields are additional to \`audit_score\`, \`test_erosion\`, and \`findings\`.\n`
     : '';
 
   const buildConfig = resolveBuildConfig(task);
@@ -950,7 +958,7 @@ IMPORTANT: You are running on \`${baseBranch}\` intentionally. You must judge th
    - Architecture drift (patterns inconsistent with the existing codebase conventions)
    - Test coverage gaps for new behavior
    - Documentation / comment accuracy
-${versionGoalSection}
+${versionGoalSection}${categoryContractSection}
 4. **Score and emit results.** Write your findings as a JSON object to \`/tmp/release_audit_report_${taskId}.json\` with EXACTLY this structure:
 
 \`\`\`json
@@ -1115,7 +1123,7 @@ Rules:
       schemaLabel: 'release_audit',
       first: { exitCode, allOutput, lastResultText },
       reopenPrompt: `${priorAnalysisSection}Your prior release review response did not end with a parseable JSON report object.
-Output ONLY the JSON object now — with top-level "audit_score", "test_erosion", and "findings".${versionGoal ? ' Also include "covers_goal", "coverage_score", "biggest_gap", "category_verdicts", and "residual_uncaptured_gap" from the requested holistic goal review.' : ''} Each finding must include "severity", "summary", "file", and "verification_note". No markdown, no code fences, no prose.`,
+Output ONLY the JSON object now — with top-level "audit_score", "test_erosion", and "findings".${versionGoal ? ' Also include "covers_goal", "coverage_score", and "biggest_gap" from the requested holistic goal review.' : ''}${categories.length > 0 ? ' Also include "category_verdicts" and "residual_uncaptured_gap" from the acceptance-category review.' : ''} Each finding must include "severity", "summary", "file", and "verification_note". No markdown, no code fences, no prose.`,
       ws,
       statusRef,
       model,

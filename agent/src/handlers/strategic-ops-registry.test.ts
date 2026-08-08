@@ -106,9 +106,21 @@ describe('generated ./strategic CLI derives from the registry', () => {
     expect(create?.notes?.join('\n')).toContain('multiple spawn-task calls under one direction');
     const spawn = cliOpInput('spawn-task');
     expect(spawn?.example).toMatchObject({ direction_id: 'd-pipeline-reliability' });
+    expect(spawn?.fields).toContain('depends_on');
+    expect(spawn?.fields).toContain('require_deps_landed_on');
+    expect(spawn?.fields).toContain('release_base_branch');
     expect(spawn?.notes?.join('\n')).toContain(
       'bounded implementation, research, plan, design, and compute work under an existing strategic outcome',
     );
+    // The ordered-workflow note teaches foundation-first sequencing plus the
+    // named landing branch and the base re-cut.
+    expect(spawn?.notes?.join('\n')).toContain('spawn the foundation first');
+    expect(spawn?.notes?.join('\n')).toContain('require_deps_landed_on');
+    expect(spawn?.notes?.join('\n')).toContain('release_base_branch');
+    expect(spawn?.notes?.join('\n')).toContain('Keep genuinely independent work parallel');
+    // The generated ./strategic schema spawn-task exposes the landing-gate fields.
+    expect(script).toContain('"require_deps_landed_on"');
+    expect(script).toContain('"release_base_branch"');
     expect(script).toContain('"required":["text","success_evidence","retirement_condition"]');
   });
 

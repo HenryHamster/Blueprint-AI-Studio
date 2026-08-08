@@ -3233,8 +3233,8 @@ async def _spawn_pipeline_task(
         # task context, which the fix agent formats with severity tags and file/line
         # locations. Avoid duplicating it here as unstructured text.
         # Surface a pre-merge acceptance finding (a structural defect in the
-        # declared acceptance evidence, e.g. the named test was never added to
-        # the diff) AHEAD of the review feedback so the fix agent corrects the
+        # declared acceptance evidence, e.g. a test-only diff or an ungrounded
+        # seam) AHEAD of the review feedback so the fix agent corrects the
         # code or the declaration in the same pass — otherwise the defect is
         # only discovered at merge-landing, when nothing can be done about it.
         from app.acceptance_gate import (

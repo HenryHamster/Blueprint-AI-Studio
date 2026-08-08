@@ -73,6 +73,10 @@ describePosix('writePrHelper', () => {
           cwd: dir,
           env: {
             ...process.env,
+            // The generated pr script resolves GATE_TIMEOUT_SECONDS from this
+            // env; tests assert the DEFAULT (600s) timeout-blocking contract, so
+            // scrub any operator-level override the ambient shell carries.
+            PR_GATE_TIMEOUT_SECONDS: '',
             WORKSPACE: dir,
             PATH: `${realPath.join(dir, 'bin')}:${process.env.PATH ?? ''}`,
             ORCHESTRATOR_URL: 'https://orchestrator.example',

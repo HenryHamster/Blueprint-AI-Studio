@@ -194,3 +194,53 @@ def test_challenge_vocabulary_covers_activate_direction():
     assert "activate_direction" in manifest_ops, (
         "activate_direction not found in strategic_ops_manifest.json — coherence gap"
     )
+
+
+def test_spawn_task_exposes_sequenced_landing_gate_fields():
+    """The spawn_task discoverability contract must expose both sequenced
+    landing-gate fields, and ``strategic_operation`` must still accept and mirror
+    them into the spawned payload.
+
+    ``require_deps_landed_on`` / ``release_base_branch`` are implemented in the
+    backend (sequenced_spawn.landing_gate + the router mirroring) but previously
+    appeared nowhere in the agent runtime, so the strategist could not author
+    build-on-top sequences. This guard fails on EITHER side drifting alone: a
+    registry/manifest edit that drops a field without a router change, or a
+    router edit that drops the mirror without the manifest, both fail here.
+    """
+    manifest = _load_manifest()
+    spawn = next(entry for entry in manifest if entry["op"] == "spawn_task")
+    contract = spawn["input"]
+    assert contract["kind"] == "json"
+    fields = set(contract["fields"])
+    assert "require_deps_landed_on" in fields, (
+        "spawn_task manifest input is missing require_deps_landed_on — add it to "
+        "INPUTS.spawn_task in agent/src/handlers/strategic-ops-registry.ts and "
+        "regenerate backend/app/strategic_ops_manifest.json"
+    )
+    assert "release_base_branch" in fields, (
+        "spawn_task manifest input is missing release_base_branch — add it to "
+        "INPUTS.spawn_task in agent/src/handlers/strategic-ops-registry.ts and "
+        "regenerate backend/app/strategic_ops_manifest.json"
+    )
+    notes = "\n".join(contract["notes"])
+    assert "require_deps_landed_on" in notes and "release_base_branch" in notes, (
+        "spawn_task manifest notes do not teach the ordered landing-gate workflow — "
+        "add a note explaining require_deps_landed_on + release_base_branch to "
+        "INPUTS.spawn_task and regenerate the manifest"
+    )
+    body = _extract_strategic_operation_body(
+        _ROUTER_PATH.read_text(encoding="utf-8")
+    )
+    # The router reads both keys (via the seq-key loop) and mirrors both into
+    # spawn_payload; a router-only drift that drops either surface fails here.
+    assert '"require_deps_landed_on"' in body and '"release_base_branch"' in body, (
+        "strategic_operation no longer reads one of require_deps_landed_on / "
+        "release_base_branch from spawn data"
+    )
+    assert 'spawn_payload["require_deps_landed_on"]' in body, (
+        "strategic_operation no longer mirrors require_deps_landed_on into spawn_payload"
+    )
+    assert 'spawn_payload["release_base_branch"]' in body, (
+        "strategic_operation no longer mirrors release_base_branch into spawn_payload"
+    )

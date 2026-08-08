@@ -32,6 +32,7 @@ from app.models import (
 )
 from app.branch_resolution import merged_pr_counts_as_integration_landing
 from app.landed_signal import (
+    LANDED_MERGE_SHA_KEY,
     mark_landed_on_integration,
     mark_stranded_non_landing,
     mark_unblocked_non_merge,
@@ -127,6 +128,16 @@ async def verify_rollup_merge_landed(
             return "indeterminate"
     if not merge_commit_sha:
         return "indeterminate"
+
+    # Record the resolved merge commit identity on the task so every
+    # rollup-ancestry-verified landing carries exact commit identity for the
+    # discovery-review receipt — even callers (``_classify_merged_rollup_landing``)
+    # that never thread a SHA through explicitly. Mirrors the in-memory mutation
+    # pattern of ``mark_stranded_non_landing``: the caller's commit persists it.
+    task.context = {
+        **(task.context or {}),
+        LANDED_MERGE_SHA_KEY: str(merge_commit_sha)[:64],
+    }
 
     if integration_branch is None:
         integration_branch = get_project_integration_branch(project)
@@ -449,8 +460,13 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
                 if record_pr_merged:
                     # Update in-memory first so caller sees the change even if DB write
                     # fails. Pass ``project`` so the PR-verification landing path also
-                    # mints the capability proof (not just the acceptance verdict).
-                    mark_landed_on_integration(task, project)
+                    # mints the capability proof (not just the acceptance verdict), and
+                    # the merge SHA so exact commit identity is recorded.
+                    mark_landed_on_integration(
+                        task,
+                        project,
+                        merge_commit_sha=pr_data.get("merge_commit_sha"),
+                    )
                     # Persist to DB in separate session (best-effort — may fail if
                     # caller holds FOR UPDATE lock on this row, but in-memory update is
                     # sufficient for the current rollup cycle).
@@ -522,7 +538,11 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
                     )
                     task.context = dict(_ctx)
                     if record_pr_merged:
-                        mark_landed_on_integration(task, project)
+                        mark_landed_on_integration(
+                            task,
+                            project,
+                            merge_commit_sha=pr_data.get("merge_commit_sha"),
+                        )
                     if task.status != TaskStatus.COMPLETED:
                         task.status = TaskStatus.COMPLETED
                     try:

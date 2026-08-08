@@ -2526,6 +2526,116 @@ async def test_propagate_skips_force_dropped_children(cleanup_db, mocker):
         )
 
 
+@pytest.mark.asyncio
+async def test_propagate_rollup_children_carries_merge_sha(cleanup_db):
+    """_propagate_landed_to_rollup_children must forward the landed parent's
+    merge commit SHA onto every child it newly lands, so rollup children (which
+    land via the parent's single PR with no PR fetch of their own) carry exact
+    commit identity for the discovery-review receipt.  When no SHA is supplied,
+    the child is still landed but carries no merge_commit_sha key.
+    """
+    from app.rollup_management import _propagate_landed_to_rollup_children
+    from app.landed_signal import LANDED_MERGE_SHA_KEY, has_landed_signal
+
+    project = await _make_project(cleanup_db)
+
+    child = await _make_task(
+        cleanup_db,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+        },
+    )
+    _propagate_landed_to_rollup_children(
+        [child], cleanup_db, merge_commit_sha="a" * 40
+    )
+
+    assert has_landed_signal(child)
+    assert (child.context or {}).get(LANDED_MERGE_SHA_KEY) == "a" * 40
+    assert "_non_merge_unblock_reason" not in (child.context or {})
+
+    # No SHA supplied → landed but without commit identity key.
+    no_sha_child = await _make_task(
+        cleanup_db,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+        },
+    )
+    _propagate_landed_to_rollup_children([no_sha_child], cleanup_db)
+
+    assert has_landed_signal(no_sha_child)
+    assert LANDED_MERGE_SHA_KEY not in (no_sha_child.context or {})
+
+
+@pytest.mark.asyncio
+async def test_propagate_bfs_descendants_carry_parent_merge_sha(cleanup_db):
+    """The BFS staging-merged descendant sweep must forward the landed parent's
+    merge commit SHA onto every descendant it newly stamps, so deep rollup
+    descendants resolve exact commit identity for the discovery-review receipt.
+    """
+    from app.rollup_management import _propagate_landed_to_staging_merged_descendants
+    from app.landed_signal import LANDED_MERGE_SHA_KEY, has_landed_signal
+
+    project = await _make_project(cleanup_db, integration_branch="main")
+
+    outer_parent = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="research",
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": True,
+            LANDED_MERGE_SHA_KEY: "f" * 40,
+        },
+    )
+    sub_rollup = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="plan",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=outer_parent.id,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+        },
+    )
+    grandchild = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="create",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=sub_rollup.id,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+        },
+    )
+
+    stamped = await _propagate_landed_to_staging_merged_descendants(
+        outer_parent.id, cleanup_db
+    )
+    await cleanup_db.commit()
+
+    await cleanup_db.refresh(sub_rollup)
+    await cleanup_db.refresh(grandchild)
+
+    assert {t.id for t in stamped} == {sub_rollup.id, grandchild.id}
+    assert has_landed_signal(sub_rollup)
+    assert has_landed_signal(grandchild)
+    assert (sub_rollup.context or {}).get(LANDED_MERGE_SHA_KEY) == "f" * 40
+    assert (grandchild.context or {}).get(LANDED_MERGE_SHA_KEY) == "f" * 40
+
+
 def _mock_repoll_resolves_to_dirty(mocker, *, initial_state):
     """Mock setup for the re-poll-resolves-to-dirty path.
 

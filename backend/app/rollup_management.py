@@ -81,7 +81,11 @@ from app.branch_resolution import (
     is_custom_staged_rollup_root,
     merged_pr_counts_as_integration_landing,
 )
-from app.landed_signal import apply_merged_landed_signal, mark_unblocked_non_merge
+from app.landed_signal import (
+    LANDED_MERGE_SHA_KEY,
+    apply_merged_landed_signal,
+    mark_unblocked_non_merge,
+)
 from app.shared_state import (
     runtime_config as _runtime_config,
     get_project_integration_branch as _get_project_integration_branch,
@@ -423,7 +427,10 @@ _FORCE_DROP_REASONS = frozenset(
 
 
 def _propagate_landed_to_rollup_children(
-    completed_children: list[Task], session: AsyncSession
+    completed_children: list[Task],
+    session: AsyncSession,
+    *,
+    merge_commit_sha: str | None = None,
 ) -> None:
     """Stamp landed_on_integration on children carried by a landed rollup.
 
@@ -438,6 +445,11 @@ def _propagate_landed_to_rollup_children(
     review_respawn_cap) carry pr_merged=True but were never genuinely merged;
     they must retain landed_on_integration=False so they are not falsely
     credited as landed.
+
+    *merge_commit_sha* is the landed parent's merge commit, forwarded to each
+    newly-landed child so rollup children (which land via the parent's single
+    PR with no PR fetch of their own) carry exact commit identity for the
+    discovery-review receipt.
     """
     from app.landed_signal import (
         NON_MERGE_UNBLOCK_REASON_KEY,
@@ -451,7 +463,9 @@ def _propagate_landed_to_rollup_children(
         if ctx.get(NON_MERGE_UNBLOCK_REASON_KEY) in _FORCE_DROP_REASONS:
             continue
         if has_merge_unblock_signal(child) and not has_landed_signal(child):
-            mark_landed_on_integration(child)
+            mark_landed_on_integration(
+                child, merge_commit_sha=merge_commit_sha
+            )
             session.add(child)
 
 
@@ -501,6 +515,9 @@ async def _propagate_landed_to_staging_merged_descendants(
     _parent = await session.get(Task, parent_task_id)
     _parent_ctx: dict = (_parent.context or {}) if _parent is not None else {}
     _parent_coverage: dict | None = _parent_ctx.get("test_coverage_result")
+    # The landed parent's exact merge commit, forwarded to every descendant
+    # stamped in this walk (rollup descendants land via the parent's single PR).
+    _parent_merge_sha: str | None = _parent_ctx.get(LANDED_MERGE_SHA_KEY)
 
     # Read the landed PR-owning parent's GitHub-verified changed-file list so it
     # can be propagated DOWN to every landed descendant that lacks its own
@@ -582,7 +599,9 @@ async def _propagate_landed_to_staging_merged_descendants(
                     _propagated = True
 
                 if not has_landed_signal(row):
-                    mark_landed_on_integration(row)
+                    mark_landed_on_integration(
+                        row, merge_commit_sha=_parent_merge_sha
+                    )
                     session.add(row)
                     stamped.append(row)
                 elif _propagated:
@@ -3020,7 +3039,11 @@ async def _check_and_trigger_rollup(
                                     non_merge_reason="merged_pr_non_integration_branch",
                                 )
                                 _propagate_landed_to_rollup_children(
-                                    completed_children, session
+                                    completed_children,
+                                    session,
+                                    merge_commit_sha=(
+                                        parent.context or {}
+                                    ).get(LANDED_MERGE_SHA_KEY),
                                 )
                                 await _propagate_landed_to_staging_merged_descendants(
                                     parent.id, session
@@ -3444,7 +3467,11 @@ async def _check_and_trigger_rollup(
                             non_merge_reason="merged_pr_non_integration_branch",
                         )
                         _propagate_landed_to_rollup_children(
-                            completed_children, session
+                            completed_children,
+                            session,
+                            merge_commit_sha=(
+                                parent.context or {}
+                            ).get(LANDED_MERGE_SHA_KEY),
                         )
                         await _propagate_landed_to_staging_merged_descendants(
                             parent.id, session
@@ -4290,9 +4317,17 @@ async def _check_and_trigger_rollup(
                                     parent, target_branch
                                 ),
                                 non_merge_reason="merged_pr_non_integration_branch",
+                                # merge_pull_request returns the exact merge
+                                # commit; record it even if the ancestry gate
+                                # degraded and could not fetch the PR.
+                                merge_commit_sha=merge_result.get("sha"),
                             )
                             _propagate_landed_to_rollup_children(
-                                completed_children, session
+                                completed_children,
+                                session,
+                                merge_commit_sha=(
+                                    parent.context or {}
+                                ).get(LANDED_MERGE_SHA_KEY),
                             )
                             await _propagate_landed_to_staging_merged_descendants(
                                 parent.id, session
@@ -4849,7 +4884,11 @@ async def _check_and_trigger_rollup(
                                             ),
                                         )
                                         _propagate_landed_to_rollup_children(
-                                            completed_children, session
+                                            completed_children,
+                                            session,
+                                            merge_commit_sha=(
+                                                parent.context or {}
+                                            ).get(LANDED_MERGE_SHA_KEY),
                                         )
                                         await _propagate_landed_to_staging_merged_descendants(
                                             parent.id, session
@@ -5142,7 +5181,11 @@ async def _check_and_trigger_rollup(
                                                 ),
                                             )
                                             _propagate_landed_to_rollup_children(
-                                                completed_children, session
+                                                completed_children,
+                                                session,
+                                                merge_commit_sha=(
+                                                    parent.context or {}
+                                                ).get(LANDED_MERGE_SHA_KEY),
                                             )
                                             await _propagate_landed_to_staging_merged_descendants(
                                                 parent.id, session

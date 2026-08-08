@@ -512,12 +512,28 @@ def _qualification_probe_contract_is_reusable(
         return True
     result = prior_qual.get("walkthrough_e2e_result")
     candidate_sha = str(prior_qual.get("candidate_sha") or "").strip()
-    return bool(
+    if (
         isinstance(result, dict)
         and result.get("status") in {"passed", "failed"}
         and candidate_sha
         and result.get("candidate_sha") == candidate_sha
         and result.get("exercised_engine_sha") == candidate_sha
+    ):
+        return True
+    # A walkthrough evidence-CONTRACT failure
+    # (blocker="walkthrough_e2e_contract_failed") records a DETERMINISTIC
+    # deployed-side verdict: the serving validator rejected the report's
+    # structure or key resolution, and re-running the SAME candidate would
+    # reproduce the same rejection (the validator is deployed, not re-rolled).
+    # Treating the record as reusable lets run_qualification's cached-verdict
+    # guard make a same-candidate re-drive a cheap no-op (no VM spawn, no
+    # cap advance) while a candidate advance — a conforming fix landing on
+    # automain — or a goal/rubric change (contract_fingerprint drift) still
+    # spawns a fresh qualification.  The walkthrough-contract sweep re-driver
+    # depends on this no-op for its unchanged-candidate sweep passes.
+    return bool(
+        prior_qual.get("status") == "not_promoted"
+        and prior_qual.get("blocker") == "walkthrough_e2e_contract_failed"
     )
 
 # Explicit enumeration of every dimension written by _dual_write_dimension_results.
@@ -3484,6 +3500,17 @@ async def run_qualification(
         # pending record carrying the accumulated count even if that post-commit
         # write is lost to a crash.
         "rubric_redrive_count": int(prior_qual.get("rubric_redrive_count") or 0),
+        # Per-contract-episode re-drive counter, carried forward from the prior
+        # walkthrough contract-failure verdict (0 when the prior outcome was not
+        # a contract failure).  The walkthrough-contract re-driver
+        # (_redrive_walkthrough_contract_qualification) increments this
+        # POST-commit after each successful re-entry so the cap advances across
+        # the spawn→finalize→re-drive cycle; stamping it here keeps the pending
+        # record carrying the accumulated count even if that post-commit write
+        # is lost to a crash.
+        "walkthrough_contract_redrive_count": int(
+            prior_qual.get("walkthrough_contract_redrive_count") or 0
+        ),
         "keyless_requalification_consumed_at": prior_qual.get(
             "keyless_requalification_consumed_at"
         ),
@@ -3785,6 +3812,13 @@ async def _handle_walkthrough_contract_failure(
     finalized_at = _utcnow().isoformat()
     candidate_sha = qual.get("candidate_sha")
     sub_scores: dict[str, Any] = {"walkthrough_e2e": 0.0}
+    # Stamp the serving engine sha on the record so observability (and any
+    # future site-change detection) can see WHICH deployed validator produced
+    # this contract failure — a new serving sha means the validator may have
+    # changed.  Lazy import mirrors the spawn_failed record's idiom
+    # (app.deployed_sha is a lightweight env-reader; no load-order coupling).
+    from app.deployed_sha import get_serving_sha  # noqa: PLC0415
+
     record: dict[str, Any] = {
         "qualification_attempt_id": qual.get("qualification_attempt_id"),
         "retry_episode": qual.get("retry_episode", 0),
@@ -3794,6 +3828,7 @@ async def _handle_walkthrough_contract_failure(
         "ci_green": qual.get("ci_green"),
         "ci_resolution": qual.get("ci_resolution"),
         "smoketest_enabled": bool(qual.get("smoketest_enabled", False)),
+        "engine_sha": get_serving_sha(),
         "status": "not_promoted",
         "blocker": "walkthrough_e2e_contract_failed",
         # Persist the execution site directly so every downstream surface
@@ -3818,6 +3853,13 @@ async def _handle_walkthrough_contract_failure(
         # sweep's exactly-once bound survives the overwrite of last_qualification.
         "keyless_requalification_consumed_at": qual.get(
             "keyless_requalification_consumed_at"
+        ),
+        # Carry the per-contract-episode re-drive counter forward so the
+        # sweep's walkthrough-contract re-driver cap
+        # (_redrive_walkthrough_contract_qualification) survives the
+        # spawn→finalize→re-drive overwrite of last_qualification.
+        "walkthrough_contract_redrive_count": qual.get(
+            "walkthrough_contract_redrive_count"
         ),
     }
     version.last_qualification = record
@@ -4447,12 +4489,25 @@ async def _compute_acceptance_window_aggregate(
     # mid-version re-scores already-merged work. Current-rule stamps and the
     # declared-fail-safe rows pass through verbatim (see
     # ``acceptance_gate.effective_acceptance_verdict``); undeclared rows keep no
-    # verdict key so the inferred-test-cochange path still applies.
+    # verdict key so the inferred-test-cochange path still applies. The re-derived
+    # verdict is written back onto the session-bound task so the correction is
+    # DURABLE for every reader, not a per-drive throwaway.
     def _effective_context(task: Task) -> dict:
         ctx = dict(task.context or {})
         effective = effective_acceptance_verdict(task)
         if effective is not None:
             ctx[CODE_ACCEPTANCE_VERDICT_KEY] = effective
+            # Durability: re-derivation recomputes the corrected verdict on every
+            # drive and every other reader (task_outcomes, direction_outcomes,
+            # acceptance_criteria, metrics_integrity_sweep, capability_proof)
+            # reads the RECORDED row — so a non-frozen re-derivation is stamped
+            # back onto ``task.context`` and made durable by the enclosing flow's
+            # next commit. Idempotent: once re-stamped under the CURRENT rule,
+            # later drives return the frozen dict verbatim and skip this write.
+            frozen = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+            if effective is not frozen:
+                task.context = ctx
+                session.add(task)
         return ctx
 
     for task in rows_write:
@@ -7659,10 +7714,15 @@ async def _finalize_qualification(
             "blocked": False,
             "detail": None,
         }
-    if _merge_grade_goal_usable and "merge_grade" not in resolved_dims:
+    if (_merge_grade_goal_usable or bool(active_categories)) and "merge_grade" not in resolved_dims:
         # The primary release review is holistic.  It supplies both defect/test
         # evidence and the formerly separate blind merge-grade contract, so one
         # candidate decision consumes one LLM task rather than a fixed fan-out.
+        # ``evaluate_merge_grade`` is also reached when the goal is empty/
+        # contentless but an ACTIVE acceptance-criteria rubric exists: the rubric
+        # is a gradeable contract on its own (the audit ships ``categories`` even
+        # without a goal string), and its per-category verdicts must be graded and
+        # gated instead of fail-closing the whole contract as never-graded.
         merge_grade_artifact: dict[str, Any] | None = (
             audit_report
             if isinstance(audit_report, dict)
@@ -7716,12 +7776,13 @@ async def _finalize_qualification(
         # that supports the protocol reaches the fleet.
         if merge_grade_cert["status"] == "category_grade_unsupported":
             logger.warning(
-                "[RELEASE_QUALIFIER] v%d candidate %s: the merge-grade agent "
-                "returned no `category_verdicts` section while %d acceptance "
+                "[RELEASE_QUALIFIER] v%d candidate %s: the release-audit/merge-grade "
+                "agent returned no `category_verdicts` section while %d acceptance "
                 "criteria are ACTIVE — the grader predates the per-category "
-                "protocol. HOLDING (not fabricating not_met verdicts). Rebake the "
-                "agent image from a ref carrying agent/src/handlers/merge-grade.ts "
-                "per-category output.",
+                "protocol (or the goal-less rubric contract). HOLDING (not "
+                "fabricating not_met verdicts). Rebake the agent image from a ref "
+                "carrying agent/src/handlers/audits.ts / merge-grade.ts per-category "
+                "output.",
                 version.version_number,
                 (candidate_sha or "")[:8],
                 len(active_categories or []),

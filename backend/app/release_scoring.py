@@ -376,6 +376,17 @@ def evaluate_merge_grade(
     :func:`_cited_test_is_machine_verified`); ``None`` leaves every met category at
     the judged tier (v1 behaviour).
 
+    Empty/contentless goal + an ACTIVE rubric: the acceptance-criteria contract is
+    itself gradeable independent of the goal string (the release audit ships
+    ``payload.categories`` even when ``version_goal`` is absent/contentless), so
+    the per-category verdicts are still graded and gated.  The holistic
+    ``covers_goal``/``coverage``/``biggest_gap`` signal stays ``None`` (there is
+    no goal string to cover) and ``status`` stays ``"not_applicable"`` so the
+    holistic ``merge_grade_misses`` gate stays inert.  A grader that omits the
+    ``category_verdicts`` key (or returns a non-dict artifact) in this state is
+    reported ``category_grade_unsupported`` — same HOLD semantics as the goal-ful
+    path, never a fabricated ``not_met``.
+
     When ``active_categories`` is supplied but the artifact omits the
     ``category_verdicts`` key ENTIRELY, the grader cannot produce per-category
     output (a stale agent image predating the protocol) — that is NOT the same as
@@ -389,6 +400,50 @@ def evaluate_merge_grade(
     """
     goal_text = (goal or "").strip()
     if not goal_text or is_contentless_goal(goal_text):
+        # A contentless/unset goal normally means there is nothing to grade
+        # against (``not_applicable``).  But an ACTIVE acceptance-criteria rubric
+        # is a gradeable contract in its own right: the release audit ships
+        # ``categories`` even when ``version_goal`` is absent/contentless, and the
+        # per-category verdicts must still be graded and gated.  Without this, a
+        # version with a rubric but no goal string produces zero verdicts, every
+        # active criterion is never-graded, and the caller's fail-closed fallback
+        # blocks it on ``criterion_coverage_incomplete`` forever — even after the
+        # grader emits a per-category grade.  So when ``active_categories`` is
+        # supplied, grade the per-category contract; the holistic ``covers_goal``
+        # signal stays ``None`` (there is no goal string to cover) and ``status``
+        # stays ``not_applicable`` so the holistic ``merge_grade_misses`` gate
+        # stays inert.
+        if active_categories:
+            if not isinstance(artifact, dict) or "category_verdicts" not in artifact:
+                # The grader cannot produce per-category output (a non-dict
+                # artifact, or a dict with no ``category_verdicts`` key at all —
+                # a stale agent image predating the per-category protocol).  Same
+                # HOLD semantics as the goal-ful path below: report
+                # ``category_grade_unsupported`` rather than fabricating a
+                # ``not_met`` verdict for every active criterion.
+                return {
+                    "status": "category_grade_unsupported",
+                    "covers_goal": None,
+                    "coverage": None,
+                    "biggest_gap": None,
+                    "blocked": True,
+                    "detail": artifact if isinstance(artifact, dict) else None,
+                    "category_verdicts": None,
+                    "residual_uncaptured_gap": None,
+                }
+            category_verdicts, residual_uncaptured_gap = _normalize_category_verdicts(
+                artifact, active_categories, verified_merge_evidence
+            )
+            return {
+                "status": "not_applicable",
+                "covers_goal": None,
+                "coverage": None,
+                "biggest_gap": None,
+                "blocked": False,
+                "detail": artifact,
+                "category_verdicts": category_verdicts,
+                "residual_uncaptured_gap": residual_uncaptured_gap,
+            }
         return {
             "status": "not_applicable",
             "covers_goal": None,

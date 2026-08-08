@@ -58,10 +58,12 @@ from app.release_qualifier_redrive import (
     _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS,  # noqa: F401 — re-exported for tests
     _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS,  # noqa: F401 — re-exported for release_qualifier
     _MAX_RUBRIC_REDRIVE_ATTEMPTS,  # noqa: F401 — re-exported for tests
+    _MAX_WALKTHROUGH_CONTRACT_REDRIVE_ATTEMPTS,  # noqa: F401 — re-exported for tests
     _TRANSIENT_ERROR_CODES,  # noqa: F401 — re-exported for tests
     _redrive_error_qualification,
     _redrive_infra_failure_qualification,
     _redrive_rubric_changed_qualification,
+    _redrive_walkthrough_contract_qualification,
 )
 
 logger = logging.getLogger(__name__)
@@ -1639,6 +1641,42 @@ async def sweep_stuck_qualifications(
             logger.info(
                 "[RELEASE_QUALIFIER] sweep re-drove rubric_changed version %s "
                 "(fresh grade spawned against the current rubric)",
+                version_id,
+            )
+
+    # Re-drive qualifications stranded at ``status=not_promoted`` /
+    # ``blocker=walkthrough_e2e_contract_failed``.  The walkthrough
+    # evidence-contract blocker is a DURABLE deployed-side verdict (the serving
+    # validator rejected the report) with NO scheduled re-entry: the existing
+    # not_promoted re-drive covers only criterion_coverage_incomplete,
+    # reconciliation covers only ci_unresolved, and the auto-trigger executor
+    # explicitly excludes not_promoted blockers other than the acceptance
+    # grade.  This loop is the missing scheduled path — re-enter
+    # run_qualification (with auto_trigger=True) so a conforming fix on
+    # automain or a rubric/goal change releases the blocked candidate for a
+    # fresh qualification, bounded by
+    # _MAX_WALKTHROUGH_CONTRACT_REDRIVE_ATTEMPTS so a deployed site that keeps
+    # rejecting reports cannot spin attempts forever (the cap raises an
+    # operator Alert and halts).  Runs AFTER the error/infra/rubric re-drivers
+    # (same version_ids snapshot) and BEFORE the auto-trigger leg, which
+    # excludes this blocker — the bespoke re-driver owns it now.
+    for version_id in version_ids:
+        try:
+            redriven = await _redrive_walkthrough_contract_qualification(
+                version_id,
+                session_factory=session_factory,
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: walkthrough contract re-drive "
+                "failed for version %s",
+                version_id,
+            )
+            continue
+        if redriven:
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep re-drove walkthrough "
+                "contract-failed version %s (fresh qualification spawned)",
                 version_id,
             )
 
