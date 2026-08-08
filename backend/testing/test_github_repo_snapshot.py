@@ -514,3 +514,62 @@ async def test_pr_is_not_behind_for_reuses_cached_base_tip(mocker):
 
     ref_calls = [c for c in calls if "/git/ref/heads/automain" in c[1]]
     assert len(ref_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_file_text_at_commit_skips_branch_tip_cache(mocker):
+    """A commit-pinned read never consults the branch-tip cache: even with a
+    freshly-cached PRE-merge tip, the tree is fetched at the exact commit SHA —
+    so a file the merge itself just added is found, not reported absent."""
+    from app.github_repo_snapshot import file_text_at_commit
+
+    # Poison the tip cache with a pre-merge commit whose tree lacks the file.
+    snapshot._branch_sha_cache[("acme", "widget", "automain")] = (
+        "e" * 40,
+        time.monotonic(),
+    )
+    merge_sha = "f" * 40
+    calls = _patch_requests(
+        mocker,
+        [
+            _tree_response(
+                paths=("backend/app/x.py", "backend/testing/test_new.py")
+            ),
+            _blob_response("def test_new():\n    pass\n"),
+        ],
+    )
+    exists, text = await file_text_at_commit(
+        "backend/testing/test_new.py",
+        token="ghs_test",
+        owner="acme",
+        repo="widget",
+        commit_sha=merge_sha,
+    )
+    assert exists is True
+    assert "test_new" in (text or "")
+    # No /git/ref call at all — the first request is the tree at the exact
+    # merge commit, immune to any cached (stale) branch tip.
+    assert f"/git/trees/{merge_sha}?recursive=1" in calls[0][1]
+    assert all("/git/ref/" not in url for _, url in calls)
+
+
+@pytest.mark.asyncio
+async def test_file_text_at_commit_quota_reserve_indeterminate(mocker):
+    """The commit-pinned read honors the quota reserve floor exactly like the
+    branch read: below the reserve it degrades to indeterminate, never absent."""
+    from app.github_repo_snapshot import file_text_at_commit
+
+    shared_state.github_quota.update(
+        {"remaining": 10, "limit": 5000, "reset_at": int(time.time()) + 1800}
+    )
+    calls = _patch_requests(mocker, [_tree_response()])
+    exists, text = await file_text_at_commit(
+        "backend/app/x.py",
+        token="ghs_test",
+        owner="acme",
+        repo="widget",
+        commit_sha="f" * 40,
+    )
+    assert exists is None
+    assert text is None
+    assert calls == []

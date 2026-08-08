@@ -656,19 +656,32 @@ def _declared_test_id_present(node_id: str, file_text: str) -> bool:
     return re.search(rf"\b{re.escape(leaf)}\b", file_text) is not None
 
 
+# Top-level monorepo roots a declared test path may have dropped. A declaration
+# already carrying one of these prefixes is used as-is; otherwise every root is
+# tried, so a prefix-dropped admin-ui/agent declaration can never corroborate as
+# a definite absence merely because only the backend/ variant was probed.
+_MONOREPO_TEST_ROOTS = ("backend/", "admin-ui/", "agent/")
+
+
 def _candidate_test_paths(declared_path: str) -> list[str]:
     """Repo-relative candidate paths for a declared test path.
 
-    Returns the declared path plus a ``backend/``-prefixed variant (when the
-    declared path does not already carry the prefix) so a declaration that drops
-    the monorepo prefix still corroborates against the real tree. Deduplicated,
-    order preserved.
+    Returns the declared path plus, when it does not already carry one of the
+    :data:`_MONOREPO_TEST_ROOTS` prefixes, a variant under EACH root — so a
+    declaration that drops its monorepo prefix (backend, admin-ui, or agent)
+    still corroborates against the real tree. Deduplicated, order preserved.
     """
     declared = declared_path.strip().lstrip("./")
     candidates = [declared]
-    if not declared.startswith("backend/"):
-        candidates.append("backend/" + declared)
-    return candidates
+    if not declared.startswith(_MONOREPO_TEST_ROOTS):
+        candidates.extend(root + declared for root in _MONOREPO_TEST_ROOTS)
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for candidate in candidates:
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            deduped.append(candidate)
+    return deduped
 
 
 async def corroborate_acceptance_test_at_merge(
@@ -677,9 +690,17 @@ async def corroborate_acceptance_test_at_merge(
     project: Any = None,
     *,
     branch: str | None = None,
+    commit_sha: str | None = None,
 ) -> bool | None:
     """Backend-side corroboration that the declared named_test exists in the repo
     tree at the merge commit — NOT taken on the agent's word.
+
+    When *commit_sha* is provided (the merged PR's merge commit), the tree is
+    read at that EXACT immutable commit — never through the branch-tip cache,
+    whose short TTL can still serve the PRE-merge tip moments after a merge and
+    would report a just-added test absent. Callers at a merged-landing site
+    MUST pass it whenever they know the merge commit. Without it, the read
+    falls back to *branch* (defaulting to the project's integration branch).
 
     Tri-state:
 
@@ -720,22 +741,32 @@ async def corroborate_acceptance_test_at_merge(
     repo = ctx.get("repo")
     if not (token and owner and repo):
         return None
-    if not ctx.get("branch"):
+    if not commit_sha and not ctx.get("branch"):
         return None
 
-    from app.github_repo_snapshot import file_text_on_branch
+    from app.github_repo_snapshot import file_text_at_commit, file_text_on_branch
 
     saw_indeterminate = False
     for path in _candidate_test_paths(declared_path):
         try:
-            exists, text = await file_text_on_branch(
-                path,
-                token=token,
-                owner=owner,
-                repo=repo,
-                branch=ctx["branch"],
-                project_id=ctx.get("project_id"),
-            )
+            if commit_sha:
+                exists, text = await file_text_at_commit(
+                    path,
+                    token=token,
+                    owner=owner,
+                    repo=repo,
+                    commit_sha=commit_sha,
+                    project_id=ctx.get("project_id"),
+                )
+            else:
+                exists, text = await file_text_on_branch(
+                    path,
+                    token=token,
+                    owner=owner,
+                    repo=repo,
+                    branch=ctx["branch"],
+                    project_id=ctx.get("project_id"),
+                )
         except Exception:  # noqa: BLE001 — corroboration must degrade, never raise
             saw_indeterminate = True
             continue
@@ -845,6 +876,7 @@ def _evaluate_named_test(
     test_exists: bool = False,
     ran_green: bool = False,
     block_describes_other_test: bool = False,
+    corroborated: bool | None = None,
 ) -> AcceptanceGateVerdict:
     """Fail-closed gate for a ``named_test`` acceptance declaration.
 
@@ -929,6 +961,19 @@ def _evaluate_named_test(
     block, so ``truncated`` with the test absent keeps its soft
     ``satisfied=True, proven=False`` outcome regardless of a mismatched block —
     consistent with the truncation invariant above that nothing overrides it.
+
+    ``corroborated`` is the backend's OWN tri-state tree check of the declared
+    test's existence at the merge commit (the stamped
+    :data:`ACCEPTANCE_TEST_CORROBORATED_KEY` value). For a test ABSENT from the
+    PR's diff, existence-at-merge is the anti-fraud guard, and the agent-reported
+    inputs behind ``test_exists``/``ran_green``/``targeted_green`` are exactly
+    what a fraudulent declaration would fabricate — so the proven mint for that
+    shape additionally requires ``corroborated is True``. Anything else
+    (``None``: never computed / credentials missing / snapshot unavailable) caps
+    the credit at ``satisfied=True, proven=False``: honest missing data never
+    penalizes the merge, but the agent's word alone never mints machine proof.
+    An in-diff test is unaffected — presence in the GitHub-sourced diff is
+    already backend-grounded evidence.
     """
     declared_path = (evidence.test_path or "").partition("::")[0].strip()
     test_present = any(_paths_match(cf, declared_path) for cf in changed)
@@ -1039,6 +1084,27 @@ def _evaluate_named_test(
             "combined changed-file diff (inherited, not the child's own PR) — "
             "credited soft without machine proof, as the match may live in a "
             "sibling's slice of the union diff",
+        )
+    if not test_present and corroborated is not True:
+        # The declared test is NOT in the PR's diff, so its existence at the
+        # merge commit is the anti-fraud guard — and every input that guard rests
+        # on here (the merge-test block, the targeted-green stamp) is
+        # agent-reported. Machine ``proven`` for this shape requires the
+        # backend's OWN tree check to have positively confirmed existence
+        # (:data:`ACCEPTANCE_TEST_CORROBORATED_KEY` is True). Indeterminate /
+        # never-computed corroboration credits soft instead: the merge stays
+        # satisfied (no window monopolization, no penalty for missing data) but
+        # purely agent-reported evidence can never mint ``proven``. A
+        # corroborated ABSENCE never reaches here — it already forced
+        # ``test_exists`` False and hard-failed above.
+        return AcceptanceGateVerdict(
+            True,
+            True,
+            evidence.kind,
+            f"declared named_test {declared_path!r} is not among the PR's "
+            "changed files and its existence at the merge commit rests on "
+            "agent-reported evidence alone (backend corroboration "
+            "indeterminate) — credited soft without machine proof",
         )
     if via_targeted:
         if test_present:
@@ -1434,6 +1500,11 @@ def evaluate_acceptance(
     targeted_green = _acceptance_test_targeted_green(context, declared_path)
     test_exists = _acceptance_test_exists_at_merge(context, declared_path)
     ran_green = _acceptance_test_ran_green_at_merge(context, declared_path)
+    # The backend's own tri-state tree check (True/False/None); anything but a
+    # bool means "never determinately corroborated" and is passed through as
+    # None so the proven mint for a not-in-diff test stays capped soft.
+    _corroborated_raw = (context or {}).get(ACCEPTANCE_TEST_CORROBORATED_KEY)
+    corroborated = _corroborated_raw if isinstance(_corroborated_raw, bool) else None
 
     if evidence.kind == "named_test":
         return _evaluate_named_test(
@@ -1446,6 +1517,7 @@ def evaluate_acceptance(
             test_exists=test_exists,
             ran_green=ran_green,
             block_describes_other_test=block_describes_other_test,
+            corroborated=corroborated,
         )
 
     if evidence.kind == "downstream_artifact":

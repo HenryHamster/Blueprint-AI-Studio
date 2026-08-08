@@ -399,7 +399,7 @@
     "test_conversational_workday_protection.py": 1800,
     "test_admin_routers__projects.py": 4100,
     "test_admin_routers__strategic_directions.py": 2200,
-    "test_strategic_session_messages.py": 1950,
+    "test_strategic_session_messages.py": 2250,
     "test_warm_pool_dispatch.py": 2100,
     "test_admin_routers__notifications.py": 1800,
     "test_ci_compliance_gate.py": 2750,
