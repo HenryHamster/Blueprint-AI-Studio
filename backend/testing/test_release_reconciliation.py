@@ -17,7 +17,7 @@ from __future__ import annotations
 import contextlib
 from datetime import timedelta
 from uuid import uuid4
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, call
 
 import pytest
 
@@ -7989,6 +7989,72 @@ async def test_record_activation_receipt_approved_mode_stamps_provenance(db_sess
     assert receipt_block["revision"] == _SHA_A
     assert receipt_block["activation_requested_by"] == "op@example.com"
     assert receipt_block["activation_requested_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_cli_activation_with_outstanding_approval_allows_promoted_descendant(
+    db_session, mocker
+):
+    """The working CLI deploy path may receipt a descendant of promoted_sha.
+
+    ``blueprint deploy`` performs the same ancestry check before activation.
+    An outstanding approval for the current promotion must not turn that valid
+    CLI receipt into a 409, and the receipt must still close serving
+    confirmation with the observed descendant SHA.
+    """
+    from app.release_activation import reject_stale_or_mismatched_approved_receipt
+    from app.release_reconciliation import _record_activation_receipt
+
+    ancestry = mocker.patch(
+        "app.github.is_ancestor_of", new=AsyncMock(return_value=True)
+    )
+    now = _utcnow()
+    promoted_at = now - timedelta(hours=1)
+    deadline = promoted_at + timedelta(hours=1)
+    project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline, promoted_sha=_SHA_A
+    )
+    version.activation_requested_at = promoted_at + timedelta(minutes=30)
+    version.activation_requested_by = "op@example.com"
+    db_session.add(version)
+    await db_session.commit()
+
+    rejection_detail = await reject_stale_or_mismatched_approved_receipt(
+        db_session, version, _SHA_B
+    )
+    assert rejection_detail is None
+
+    ancestry.return_value = False
+    rejection_detail = await reject_stale_or_mismatched_approved_receipt(
+        db_session, version, _SHA_B
+    )
+    assert rejection_detail is not None
+    assert "does not match" in rejection_detail
+    ancestry.return_value = True
+
+    receipt = await _record_activation_receipt(
+        db_session,
+        version,
+        revision=_SHA_B,
+        host="hamsterwheel",
+        operator_id="op@example.com",
+        now=now,
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert receipt["serving_status"] == "serving_confirmed"
+    assert version.serving_status == "serving_confirmed"
+    assert version.served_sha == _SHA_B
+    expected_ancestry_call = call(
+        "tok",
+        "acme",
+        "widget",
+        _SHA_A,
+        _SHA_B,
+        project_id=str(project.id),
+    )
+    assert ancestry.await_args_list == [expected_ancestry_call, expected_ancestry_call]
 
 
 # ===========================================================================

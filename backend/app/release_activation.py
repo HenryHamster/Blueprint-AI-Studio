@@ -16,9 +16,14 @@ approval stamp; the privileged activation is PULLED and executed host-side.
 
 from __future__ import annotations
 
+import logging
+
 from sqlalchemy import select
 
 from app import release_version
+from app.models import Project
+
+logger = logging.getLogger(__name__)
 
 
 def _approved_activation_mismatch(
@@ -83,6 +88,53 @@ async def _approved_activation_superseded(
     return latest is not None and latest.id != version.id
 
 
+async def _approved_activation_descendant(
+    session,
+    version: release_version.ReleaseVersion,
+    effective_sha: str,
+) -> bool:
+    """Return whether *effective_sha* contains the approved promoted commit.
+
+    The CLI validates this same relationship before it activates: its checked
+    out revision may be a merge commit or other descendant of ``promoted_sha``
+    rather than the exact promotion commit.  The approval guard must recognize
+    that valid artifact without trusting an unverified mismatch.  Any missing
+    credentials, unavailable project, API error, or indeterminate comparison
+    fails closed so the receipt remains rejected.
+    """
+    if not version.promoted_sha or not effective_sha:
+        return False
+
+    project = await session.get(Project, version.project_id)
+    if project is None:
+        return False
+
+    try:
+        from app import github
+        from app.release_promotion import _resolve_github_with_session
+
+        resolved = await _resolve_github_with_session(session, project)
+        if resolved is None:
+            return False
+        token, owner, repo = resolved
+        ancestry = await github.is_ancestor_of(
+            token,
+            owner,
+            repo,
+            version.promoted_sha,
+            effective_sha,
+            project_id=str(version.project_id),
+        )
+    except Exception as exc:  # noqa: BLE001 — fail closed on verification errors
+        logger.warning(
+            "[RELEASE_ACTIVATION] descendant verification failed for v%s (%s)",
+            version.version_number,
+            exc,
+        )
+        return False
+    return ancestry is True
+
+
 async def reject_stale_or_mismatched_approved_receipt(
     session,
     version: release_version.ReleaseVersion,
@@ -90,14 +142,16 @@ async def reject_stale_or_mismatched_approved_receipt(
 ) -> str | None:
     """Return a 409 rejection detail for a receipt under a live approval, else None.
 
-    An in-product approval authorizes EXACTLY the approved version's promoted
-    SHA, and only while that version is still the CURRENT promoted version.  A
-    receipt reporting a different revision — or a receipt once a newer promotion
-    has superseded the approved version — is rejected.  Returns ``None`` when the
-    receipt is acceptable: no approval (the legacy ``blueprint deploy`` CLI path
-    is unchanged), the version is already ``serving_confirmed`` (idempotency /
-    recovery governs re-POSTs), or the reported revision equals the approved
-    ``promoted_sha`` and no newer promotion has superseded the version.
+    An in-product approval authorizes the approved version's promoted SHA, and
+    a CLI receipt may report a verified descendant of that SHA.  Only while
+    that version is still the CURRENT promoted version is the approval live. A
+    receipt reporting a diverged, behind, unrelated, or unverifiable revision
+    — or a receipt once a newer promotion has superseded the approved version
+    — is rejected.  Returns ``None`` when the receipt is acceptable: no approval
+    (the legacy ``blueprint deploy`` CLI path is unchanged), the version is
+    already ``serving_confirmed`` (idempotency / recovery governs re-POSTs), or
+    the reported revision is the approved SHA or a verified descendant and no
+    newer promotion has superseded the version.
 
     Applied whenever ``activation_requested_at`` is set and the version is not
     yet resolved — including a never-armed promotion whose ``serving_status`` is
@@ -114,4 +168,9 @@ async def reject_stale_or_mismatched_approved_receipt(
             f"— a newer promotion has superseded it. Approve the current "
             "promoted version instead."
         )
-    return _approved_activation_mismatch(version, effective_sha)
+    mismatch = _approved_activation_mismatch(version, effective_sha)
+    if mismatch is None:
+        return None
+    if await _approved_activation_descendant(session, version, effective_sha):
+        return None
+    return mismatch
