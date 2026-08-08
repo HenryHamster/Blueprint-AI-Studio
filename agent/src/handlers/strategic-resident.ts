@@ -2314,6 +2314,7 @@ export async function handleStrategicResident(
   const heartbeat = async (
     progress: boolean,
     handledIds?: string[],
+    autonomousTurnWorked?: boolean,
   ): Promise<SessionHeartbeatResponse | null> => {
     // A heartbeat is proof the loop is alive — reset the warm session's idle
     // ceiling so a chat-only / monitor session (which issues no turns to reset
@@ -2331,6 +2332,13 @@ export async function handleStrategicResident(
     );
     const body: Record<string, unknown> = {
       session_id: sessionId, task_id: taskId, progress, note,
+      // Autonomous examination progress: a completed autonomous WORKING turn
+      // (tool calls / TICK-VERDICT) that applied no strategic op still renews
+      // the continuation lease for an unattended review (examination IS the
+      // work). Only ever set true from the autonomous turn-loop below; operator
+      // and liveness heartbeats leave it false, so the operator-chat mutation
+      // gate is unchanged.
+      autonomous_turn: autonomousTurnWorked === true,
       worker_generation: workerGeneration,
       resident_incarnation_id: residentProcessIncarnation,
       repo_head: lastDeliveredRepoHead,
@@ -5084,9 +5092,24 @@ export async function handleStrategicResident(
       const consumedBarrierIds = turnInterrupted
         ? undefined
         : firedResidentBarriers.map((barrier) => barrier.id);
+      // Autonomous-freshness signal: for an unattended review, examination IS
+      // the work, so a completed working turn renews the continuation lease even
+      // when it applied no strategic op. "Worked" = the turn actually EXECUTED
+      // (ran tool calls or emitted a TICK-VERDICT) and was not an interrupt /
+      // timeout / dead-subprocess — a hung child never reaches here (the stall
+      // detector breaks the loop first). Distinct from appliedStrategicOp so
+      // mutation accounting / last_progress_at stay exact; the backend advances
+      // freshness on this only when no strategic op was applied. Requires
+      // authorityHeld so a lease that lapsed mid-turn is not re-armed.
+      const autonomousTurnWorked = authorityHeld
+        && !turnInterrupted
+        && (r.sawToolUse
+          || parseTickVerdict(r.resultText) !== null
+          || parseTickVerdict(r.accumulatedTurnText) !== null);
       const hb = await heartbeat(
         r.appliedStrategicOp && authorityHeld,
         consumedBarrierIds,
+        autonomousTurnWorked,
       );
       // Record the pacing baseline AFTER the post-turn heartbeat so the loop's own
       // writes are already folded into the rev we compare against next iteration.

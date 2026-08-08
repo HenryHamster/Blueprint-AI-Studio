@@ -2282,6 +2282,14 @@ async def test_unattended_cap_handoff_is_atomic_with_cap_end(
 async def test_stale_continuation_lease_atomically_terminalizes_resident_task(
     db_session, monkeypatch
 ):
+    """A POST-CLAIM idle session past the TTL still lapses (born-stale backstop).
+
+    The session has already taken its first agent heartbeat (arm-at-claim
+    exemption consumed), then goes idle past the continuation TTL with no
+    progress. This SUBSEQUENT stale beat must terminalize the resident task and
+    hand authority back to the cadence — the arm-at-claim first-beat exemption
+    covers ONLY provisioning latency and must not weaken this idle-reclaim.
+    """
     project = await _make_project(db_session)
     task = await _make_task(db_session, project)
     await _make_runner(db_session, project)
@@ -2299,6 +2307,14 @@ async def test_stale_continuation_lease_atomically_terminalizes_resident_task(
     marker["last_seen_at"] = (_utcnow() - timedelta(minutes=5)).isoformat()
     marker["updated_at"] = marker["last_seen_at"]
     vision[STRATEGIC_LOCAL_CONTINUATION_KEY] = marker
+    # Model a POST-CLAIM session: stamp first_agent_heartbeat_at so the
+    # arm-at-claim exemption (which re-anchors freshness on the agent's FIRST
+    # heartbeat, covering provisioning latency exactly once) has already been
+    # consumed. This heartbeat is therefore a SUBSEQUENT beat subject to the
+    # normal TTL freshness gate — not the exempt claim beat.
+    blob = dict(vision[RESIDENT_SESSION_KEY])
+    blob["first_agent_heartbeat_at"] = (_utcnow() - timedelta(minutes=6)).isoformat()
+    vision[RESIDENT_SESSION_KEY] = blob
     project.vision = vision
     flag_modified(project, "vision")
     db_session.add(project)
@@ -2325,6 +2341,338 @@ async def test_stale_continuation_lease_atomically_terminalizes_resident_task(
     pending = task.context["_post_commit_pending_meta"]
     assert pending["reason"] == "resident_session_ended"
     assert pending["payload"]["status"] == TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_autonomous_working_turn_renews_freshness_without_mutation(
+    db_session, monkeypatch
+):
+    """An UNATTENDED autonomous review renews freshness on examination work.
+
+    A completed autonomous working turn (``autonomous_turn=True``) that applied
+    NO strategic op must renew the continuation lease — for an autonomous review
+    examination IS the work, and "no mutation in the whole TTL window" is its
+    healthy steady state, not a stall. Without this the session would be
+    guillotined at the 25-min TTL with zero directions and scored a strategic
+    failure. The 2h unattended cap and the agent-side consecutive-stall detector
+    remain the backstops for a genuinely-stuck session (covered separately).
+    """
+    project = await _make_project(db_session)
+    task = await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    started = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    # Well within the unattended cap so ONLY the TTL freshness gate is under test.
+    monkeypatch.setitem(
+        runtime_config, STRATEGIC_SESSION_MAX_UNATTENDED_SETTING, 86_400
+    )
+    monkeypatch.setitem(runtime_config, "strategic_continuation_ttl_seconds", 60)
+
+    # Drive the marker's freshness past the TTL so a bare/liveness heartbeat would
+    # lapse — the autonomous-turn renewal must rescue it.
+    project = await db_session.get(Project, project.id)
+    vision = dict(project.vision or {})
+    marker = dict(vision[STRATEGIC_LOCAL_CONTINUATION_KEY])
+    marker["last_seen_at"] = (_utcnow() - timedelta(minutes=5)).isoformat()
+    marker["updated_at"] = marker["last_seen_at"]
+    vision[STRATEGIC_LOCAL_CONTINUATION_KEY] = marker
+    # Model a POST-CLAIM session: stamp first_agent_heartbeat_at so the
+    # arm-at-claim exemption (which re-anchors freshness on the agent's FIRST
+    # heartbeat, covering provisioning latency exactly once) has already been
+    # consumed. This heartbeat is therefore a SUBSEQUENT beat subject to the
+    # normal TTL freshness gate — not the exempt claim beat.
+    blob = dict(vision[RESIDENT_SESSION_KEY])
+    blob["first_agent_heartbeat_at"] = (_utcnow() - timedelta(minutes=6)).isoformat()
+    vision[RESIDENT_SESSION_KEY] = blob
+    project.vision = vision
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    project = await db_session.get(Project, project.id)
+    renewed = await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=started["session_id"],
+        task_id=started["task_id"],
+        progress=False,
+        autonomous_turn=True,
+    )
+
+    assert renewed["authority_held"] is True
+    assert not renewed["stop_requested"]
+    assert renewed["status"] != "ended"
+    # The session was NOT ended: the backing resident task is not terminalized
+    # and no terminalization is queued.
+    await db_session.refresh(task)
+    assert task.status not in {
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+    }
+    assert task.post_commit_pending is not True
+
+    # Freshness advanced to now with the autonomous renewal reason, and it is NOT
+    # accounted as strategic progress (last_progress_at stays None).
+    refreshed = await db_session.get(Project, project.id)
+    fresh_marker = dict(refreshed.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY]
+    assert fresh_marker["last_renewal_reason"] == "autonomous_turn"
+    seen_at = datetime.fromisoformat(fresh_marker["last_seen_at"])
+    assert (_utcnow() - seen_at) < timedelta(minutes=1)
+    blob = read_resident_session(dict(refreshed.vision or {}))
+    assert blob["last_progress_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_autonomous_turn_flag_does_not_rescue_operator_chat_idle_lapse(
+    db_session, monkeypatch
+):
+    """The operator-chat path is unchanged: no autonomous turn ⇒ TTL still lapses.
+
+    A chat/monitor session never runs autonomous turns, so it never sets
+    ``autonomous_turn``. A bare liveness heartbeat (``progress=False`` AND
+    ``autonomous_turn=False``) must still lapse an idle session at the TTL,
+    handing authority back to the cadence — the abandoned-operator reclaim the
+    new autonomous-freshness path must NOT weaken.
+    """
+    project = await _make_project(db_session)
+    task = await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    started = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    monkeypatch.setitem(
+        runtime_config, STRATEGIC_SESSION_MAX_UNATTENDED_SETTING, 86_400
+    )
+    monkeypatch.setitem(runtime_config, "strategic_continuation_ttl_seconds", 60)
+
+    project = await db_session.get(Project, project.id)
+    vision = dict(project.vision or {})
+    marker = dict(vision[STRATEGIC_LOCAL_CONTINUATION_KEY])
+    marker["last_seen_at"] = (_utcnow() - timedelta(minutes=5)).isoformat()
+    marker["updated_at"] = marker["last_seen_at"]
+    vision[STRATEGIC_LOCAL_CONTINUATION_KEY] = marker
+    # Model a POST-CLAIM session: stamp first_agent_heartbeat_at so the
+    # arm-at-claim exemption (which re-anchors freshness on the agent's FIRST
+    # heartbeat, covering provisioning latency exactly once) has already been
+    # consumed. This heartbeat is therefore a SUBSEQUENT beat subject to the
+    # normal TTL freshness gate — not the exempt claim beat.
+    blob = dict(vision[RESIDENT_SESSION_KEY])
+    blob["first_agent_heartbeat_at"] = (_utcnow() - timedelta(minutes=6)).isoformat()
+    vision[RESIDENT_SESSION_KEY] = blob
+    project.vision = vision
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    project = await db_session.get(Project, project.id)
+    lapsed = await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=started["session_id"],
+        task_id=started["task_id"],
+        progress=False,
+        autonomous_turn=False,
+    )
+
+    assert lapsed["authority_held"] is False
+    assert lapsed["stop_requested"] is True
+    assert lapsed["status"] == "ended"
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    assert task.latest_status_message == (
+        "Resident strategic session ended after its continuation lease lapsed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_first_agent_heartbeat_reanchors_born_stale_session(
+    db_session, monkeypatch
+):
+    """Arm-at-claim: the FIRST agent heartbeat re-anchors a born-stale marker.
+
+    The continuation marker is armed at session START; long queue/provision
+    latency alone can drive it past the TTL before the agent runs a single turn.
+    The agent's FIRST heartbeat must re-anchor freshness to NOW and NOT lapse the
+    session — provisioning time is not charged against the work window. This is
+    the bc2ebf44 repro (a session that carried a real ledger yet ran ~3s before
+    the born-stale marker terminalized it), now fixed.
+    """
+    project = await _make_project(db_session)
+    task = await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    started = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    # Well within the unattended cap so ONLY the TTL freshness gate is under test.
+    monkeypatch.setitem(
+        runtime_config, STRATEGIC_SESSION_MAX_UNATTENDED_SETTING, 86_400
+    )
+    monkeypatch.setitem(runtime_config, "strategic_continuation_ttl_seconds", 60)
+
+    # Drive the marker past the TTL to emulate long provisioning BEFORE the agent
+    # sent any heartbeat. Crucially the blob has NO first_agent_heartbeat_at, so
+    # the heartbeat below is the session's FIRST agent contact (the claim beat).
+    project = await db_session.get(Project, project.id)
+    vision = dict(project.vision or {})
+    marker = dict(vision[STRATEGIC_LOCAL_CONTINUATION_KEY])
+    marker["last_seen_at"] = (_utcnow() - timedelta(minutes=5)).isoformat()
+    marker["updated_at"] = marker["last_seen_at"]
+    vision[STRATEGIC_LOCAL_CONTINUATION_KEY] = marker
+    project.vision = vision
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    assert read_resident_session(dict(vision)).get("first_agent_heartbeat_at") is None
+
+    project = await db_session.get(Project, project.id)
+    renewed = await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=started["session_id"],
+        task_id=started["task_id"],
+        progress=False,
+    )
+
+    assert renewed["authority_held"] is True
+    assert not renewed["stop_requested"]
+    assert renewed["status"] != "ended"
+    await db_session.refresh(task)
+    assert task.status not in {
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+    }
+    assert task.post_commit_pending is not True
+
+    # Freshness re-anchored to now with the first-heartbeat reason, and the blob
+    # now records the claim beat so the NEXT beat is no longer exempt.
+    refreshed = await db_session.get(Project, project.id)
+    fresh_marker = dict(refreshed.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY]
+    assert fresh_marker["last_renewal_reason"] == "first_agent_heartbeat"
+    seen_at = datetime.fromisoformat(fresh_marker["last_seen_at"])
+    assert (_utcnow() - seen_at) < timedelta(minutes=1)
+    blob = read_resident_session(dict(refreshed.vision or {}))
+    assert blob["first_agent_heartbeat_at"] is not None
+    # The claim beat re-anchors freshness but reports NO strategic progress.
+    assert blob["last_progress_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_post_claim_idle_still_lapses(db_session, monkeypatch):
+    """After the claim beat, a later idle beat past the TTL still lapses.
+
+    Once the first agent heartbeat has re-anchored freshness (arm-at-claim
+    exemption consumed), a SUBSEQUENT heartbeat that finds the marker stale with
+    no progress must terminalize the session — the exemption covers provisioning
+    latency exactly once and never the ongoing idle-reclaim backstop.
+    """
+    project = await _make_project(db_session)
+    task = await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    started = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    monkeypatch.setitem(
+        runtime_config, STRATEGIC_SESSION_MAX_UNATTENDED_SETTING, 86_400
+    )
+    monkeypatch.setitem(runtime_config, "strategic_continuation_ttl_seconds", 60)
+
+    # Claim beat already happened (first_agent_heartbeat_at set), then the marker
+    # went stale — this is a post-claim idle beat, NOT the exempt claim beat.
+    project = await db_session.get(Project, project.id)
+    vision = dict(project.vision or {})
+    marker = dict(vision[STRATEGIC_LOCAL_CONTINUATION_KEY])
+    marker["last_seen_at"] = (_utcnow() - timedelta(minutes=5)).isoformat()
+    marker["updated_at"] = marker["last_seen_at"]
+    vision[STRATEGIC_LOCAL_CONTINUATION_KEY] = marker
+    blob = dict(vision[RESIDENT_SESSION_KEY])
+    blob["first_agent_heartbeat_at"] = (_utcnow() - timedelta(minutes=6)).isoformat()
+    vision[RESIDENT_SESSION_KEY] = blob
+    project.vision = vision
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    project = await db_session.get(Project, project.id)
+    lapsed = await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=started["session_id"],
+        task_id=started["task_id"],
+        progress=False,
+    )
+
+    assert lapsed["authority_held"] is False
+    assert lapsed["stop_requested"] is True
+    assert lapsed["status"] == "ended"
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    assert task.latest_status_message == (
+        "Resident strategic session ended after its continuation lease lapsed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_autonomous_turn_does_not_bypass_unattended_cap(
+    db_session, monkeypatch
+):
+    """The 2h unattended cap still reclaims a stuck autonomous session.
+
+    An autonomous session whose turn loop is alive (``autonomous_turn=True``) but
+    that has had NO operator interaction past the unattended cap must still be
+    ENDED. Autonomous-freshness tracks "the turn loop is alive"; the unattended
+    cap is the separate "alive but should not pin authority forever" backstop and
+    the new renewal path must not let a heartbeat slip past it.
+    """
+    project = await _make_project(db_session)
+    task = await _make_task(db_session, project)
+    await _make_runner(db_session, project)
+    started = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    monkeypatch.setattr(
+        "app.strategic_trigger.maybe_arm_operator_refresh",
+        AsyncMock(return_value="steering"),
+    )
+    # Cap short, TTL long: isolate the unattended-cap backstop from the TTL gate.
+    monkeypatch.setitem(runtime_config, STRATEGIC_SESSION_MAX_UNATTENDED_SETTING, 60)
+    monkeypatch.setitem(
+        runtime_config, "strategic_continuation_ttl_seconds", 86_400
+    )
+
+    project = await db_session.get(Project, project.id)
+    vision = dict(project.vision or {})
+    blob = dict(vision[RESIDENT_SESSION_KEY])
+    blob["last_operator_interaction_at"] = (
+        _utcnow() - timedelta(hours=2)
+    ).isoformat()
+    vision[RESIDENT_SESSION_KEY] = blob
+    project.vision = vision
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    project = await db_session.get(Project, project.id)
+    capped = await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=started["session_id"],
+        task_id=started["task_id"],
+        progress=False,
+        autonomous_turn=True,
+    )
+
+    assert capped["authority_held"] is False
+    assert capped["stop_requested"] is True
+    assert capped["status"] == "ended"
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    assert task.latest_status_message == (
+        "Resident strategic session ended after reaching the idle limit"
+    )
 
 
 @pytest.mark.asyncio

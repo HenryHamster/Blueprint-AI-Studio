@@ -3071,6 +3071,18 @@ def _arm_and_finalize_vision(
     leftover (possibly stale) marker, else the brand-new session would be born
     non-authoritative (fresh==False) and the cloud cadence would keep spawning
     competing cycles until the first progress op.
+
+    Arm-at-claim (implemented in ``renew_resident_session_lease._renew``): freshness
+    is anchored HERE, at session START (before the agent has claimed/provisioned),
+    so long queue/provision latency alone could otherwise elapse the TTL before the
+    agent runs a single turn — lapsing the session on its very first heartbeat with
+    zero work (observed: tasks b22a6224, bc2ebf44). To close that pre-claim gap the
+    lease's FIRST agent heartbeat re-anchors freshness to NOW and is exempt from the
+    lapse check, tracked by the ``first_agent_heartbeat_at`` blob flag so EXACTLY
+    ONE beat is exempted. The born-stale lapse still fires for a SUBSEQUENT idle
+    beat past the TTL (queue latency vs a genuine post-work lapse are thereby
+    distinguished), so provisioning time is not charged against the work window
+    while the idle-reclaim backstop is preserved.
     """
     current = read_resident_session(vision)
     if (
@@ -4742,6 +4754,7 @@ async def renew_resident_session_lease(
     incarnation_id: uuid.UUID | None = None,
     worker_generation: int = 1,
     progress: bool = False,
+    autonomous_turn: bool = False,
     note: str | None = None,
     message_cursor: str | None = None,
     handled_message_ids: list[str] | None = None,
@@ -4758,13 +4771,22 @@ async def renew_resident_session_lease(
     Validates the heartbeat against the recorded session, then applies four
     coordinated lease rules:
 
-    * **Progress-gated freshness.** Continuation *freshness* renews only on
-      ``progress=True`` (an applied strategic op) OR fresh operator interaction —
-      passing ``renewal_reason='strategic_progress'`` to
-      ``apply_strategic_local_continuation_marker``. A bare liveness heartbeat
-      (``progress=False``) is liveness-only: it PRESERVES the marker's existing
-      freshness (re-passing its own ``last_seen_at``, no ``renewal_reason``) and
-      never bumps it, so mere runner liveness can't extend the dead-man's switch.
+    * **Progress-gated freshness.** Continuation *freshness* renews on
+      ``progress=True`` (an applied strategic op → ``renewal_reason=
+      'strategic_progress'``) OR fresh operator interaction OR — for an
+      UNATTENDED autonomous review — a completed autonomous working turn
+      (``autonomous_turn=True`` → ``renewal_reason='autonomous_turn'``). The last
+      path exists because examination IS the work for an autonomous review: "no
+      mutation in 25 min" is its healthy steady state, not a stall, so the pure
+      mutation gate would guillotine a healthy CLEAR-verdict session at the TTL.
+      ``autonomous_turn`` is set ONLY by the agent's autonomous turn-loop, which
+      a chat/monitor session never runs — so the operator-chat mutation/operator
+      freshness gate is unchanged, and a genuinely-stuck autonomous session is
+      still reclaimed by the unattended cap + consecutive-stall backstops. A bare
+      liveness heartbeat (``progress=False`` and no ``autonomous_turn``) is
+      liveness-only: it PRESERVES the marker's existing freshness (re-passing its
+      own ``last_seen_at``, no ``renewal_reason``) and never bumps it, so mere
+      runner liveness can't extend the dead-man's switch.
 
     * **Unattended cap → END the session.** If the operator has not interacted
       for longer than ``strategic_session_max_unattended_seconds`` (an elapsed,
@@ -5079,13 +5101,45 @@ async def renew_resident_session_lease(
         prior_last_seen = (
             marker.get("last_seen_at") if isinstance(marker, dict) else None
         )
-        # Finding 4: this heartbeat renews freshness ONLY when the request body
-        # reports progress==True (an applied strategic op). Operator interaction
-        # also renews freshness per the lease contract, but via the operator's
-        # OWN message/workbench path (sync_local_continuation_marker=True) — not
-        # this heartbeat, which uses a fresh operator message only to re-arm the
-        # unattended cap (below). Bare liveness (progress=False) NEVER bumps it.
+        # Arm-at-claim: the continuation marker is armed at session START (before
+        # the agent claims/provisions the task — see _arm_and_finalize_vision), so
+        # long queue/provision latency ALONE can elapse the TTL before the agent
+        # runs a single turn, lapsing the session on its very first heartbeat with
+        # zero work (observed: bc2ebf44 carried a real exam/decisions ledger yet
+        # ran ~3s before the born-stale marker terminalized it). The FIRST
+        # heartbeat from the executing agent re-anchors freshness to NOW and is
+        # EXEMPT from the lapse check below, so provisioning time is never charged
+        # against the work window. Tracked by an explicit blob flag (NOT
+        # worker_state, which flips at arm; NOT last_operator_interaction_at) so
+        # EXACTLY ONE beat is exempted — a later idle beat past the TTL is a
+        # SUBSEQUENT beat and still lapses. This opens no never-claimed hole: a
+        # session whose agent NEVER heartbeats is reaped by reaper_orphan_classify
+        # (PROVISIONING + last_heartbeat IS NULL), and the unattended cap (above,
+        # keyed off started_at) still bounds a session that provisions past it.
+        first_agent_heartbeat = not fresh.get("first_agent_heartbeat_at")
+        # Finding 4: this heartbeat renews freshness when the request body reports
+        # progress==True (an applied strategic op) OR — for an unattended
+        # autonomous review — autonomous_turn==True (a completed autonomous
+        # working turn: tool calls / TICK-VERDICT). The autonomous path exists
+        # because examination IS the work for an autonomous review, so "no
+        # mutation in the whole TTL window" is its HEALTHY steady state, not a
+        # stall; the pure mutation gate would guillotine a healthy CLEAR-verdict
+        # session at the TTL with zero directions. ``autonomous_turn`` is set ONLY
+        # by the agent's autonomous turn-loop, which a chat/monitor session never
+        # runs — so the operator-chat mutation gate is unchanged, and a
+        # genuinely-stuck autonomous session is still reclaimed by the unattended
+        # cap (above) + the agent-side consecutive-stall detector. Operator
+        # interaction also renews freshness per the lease contract, but via the
+        # operator's OWN message/workbench path (sync_local_continuation_marker=
+        # True) — not this heartbeat, which uses a fresh operator message only to
+        # re-arm the unattended cap (above). Bare liveness (progress=False and no
+        # autonomous_turn) NEVER bumps it.
         renew_freshness = bool(progress)
+        # An autonomous working turn advances freshness only when it did NOT also
+        # apply a strategic op (progress already covers that, and keeps
+        # last_progress_at / mutation accounting exact — see the ``if progress:``
+        # branch below, which autonomous_turn deliberately does not trip).
+        autonomous_renewal = bool(autonomous_turn) and not progress
         synthetic_workbench: dict[str, Any] = {
             "interaction_mode": "continuous",
             "session_started_at": owner_started or fresh.get("started_at"),
@@ -5093,13 +5147,19 @@ async def renew_resident_session_lease(
         if runner_id:
             synthetic_workbench["preferred_runner_id"] = runner_id
 
-        if renew_freshness:
+        if renew_freshness or autonomous_renewal or first_agent_heartbeat:
             apply_strategic_local_continuation_marker(
                 vision,
                 synthetic_workbench,
                 operator_user_id=str(op_id or ""),
                 preferred_runner_id=str(runner_id) if runner_id else None,
-                renewal_reason="strategic_progress",
+                renewal_reason=(
+                    "strategic_progress"
+                    if renew_freshness
+                    else "autonomous_turn"
+                    if autonomous_renewal
+                    else "first_agent_heartbeat"
+                ),
             )
             holder["authority_held"] = True
         elif isinstance(marker, dict) and prior_last_seen:
@@ -5131,7 +5191,12 @@ async def renew_resident_session_lease(
         post = strategic_local_continuation_status_from_vision(
             vision, operator_user_id=op_id
         )
-        if post.get("reason") == "stale":
+        # The first agent heartbeat re-anchored freshness above (its renewal makes
+        # ``post`` read fresh, not stale), so this ``and not first_agent_heartbeat``
+        # guard is belt-and-suspenders: NEVER lapse on the claim beat even if the
+        # marker read is transiently non-fresh — provisioning latency must not be
+        # charged as an idle lapse. A SUBSEQUENT idle beat past the TTL still lapses.
+        if post.get("reason") == "stale" and not first_agent_heartbeat:
             holder["lapsed"] = True
             # Report no authority (the marker is stale) and end the session.
             holder["authority_held"] = False
@@ -5144,6 +5209,11 @@ async def renew_resident_session_lease(
         updated.pop("worker_retry_until", None)
         updated.pop("worker_retry_reason", None)
         updated["worker_heartbeat_at"] = lease_now_iso
+        if first_agent_heartbeat:
+            # Stamp the claim beat so subsequent heartbeats are NOT exempted from
+            # the lapse check — the arm-at-claim exemption covers provisioning
+            # latency exactly once, then the ordinary progress/TTL gate resumes.
+            updated["first_agent_heartbeat_at"] = lease_now_iso
         if progress:
             updated["last_progress_at"] = lease_now_iso
         if op_reengaged and latest_msg_dt is not None:
@@ -5744,6 +5814,14 @@ class ResidentSessionHeartbeatRequest(BaseModel):
     session_id: str
     task_id: str
     progress: bool | None = None
+    # Autonomous examination progress. Set by the agent's autonomous turn-loop
+    # when a completed working turn (tool calls / TICK-VERDICT — not an
+    # interrupt/timeout/dead subprocess) finished WITHOUT applying a strategic
+    # mutation. It renews continuation freshness for an unattended autonomous
+    # review, whose healthy steady state is "examined, found CLEAR, no mutation".
+    # A chat/monitor session never runs these turns, so it never sets this flag
+    # and the operator-chat mutation/operator freshness gate is unchanged.
+    autonomous_turn: bool | None = None
     worker_generation: int = 1
     resident_incarnation_id: uuid.UUID | None = None
     note: str | None = None
@@ -5965,6 +6043,7 @@ async def resident_session_heartbeat(
         task_id=payload.task_id,
         incarnation_id=payload.resident_incarnation_id,
         progress=bool(payload.progress),
+        autonomous_turn=bool(payload.autonomous_turn),
         worker_generation=payload.worker_generation,
         note=payload.note,
         message_cursor=payload.message_cursor,
