@@ -1117,6 +1117,12 @@
           "commit_date": "2026-07-12T18:13:52Z",
           "old_cap": 3350,
           "new_cap": 3900
+        },
+        {
+          "commit_sha": "b339eed08d4a0d14078cebe5dc5898a4822e8d21",
+          "commit_date": "2026-08-07T08:50:56+00:00",
+          "old_cap": 3900,
+          "new_cap": 4550
         }
       ],
       "autonomous_research_residual.py": [
@@ -1215,8 +1221,8 @@
           "new_cap": 1850
         },
         {
-          "commit_sha": "",
-          "commit_date": "2026-08-08T22:47:07.265215+00:00",
+          "commit_sha": "d06bac3d55a465c812f68b5329583891990bdcac",
+          "commit_date": "2026-08-08T22:56:48+00:00",
           "old_cap": 1850,
           "new_cap": 2250
         }
@@ -2243,6 +2249,12 @@
           "commit_date": "2026-06-14T22:47:48Z",
           "old_cap": 1850,
           "new_cap": 2250
+        },
+        {
+          "commit_sha": "b339eed08d4a0d14078cebe5dc5898a4822e8d21",
+          "commit_date": "2026-08-07T08:50:56+00:00",
+          "old_cap": 2250,
+          "new_cap": 2650
         }
       ],
       "problem_model.py": [
@@ -3001,6 +3013,12 @@
           "new_cap": 2800
         },
         {
+          "commit_sha": "b644fbb02",
+          "commit_date": "2026-07-28T15:00:00Z",
+          "old_cap": 4200,
+          "new_cap": 4900
+        },
+        {
           "commit_sha": "2a3a595b5c6ff9870e2e068a23bd3f91b802d0db",
           "commit_date": "2026-07-28T18:06:40-07:00",
           "old_cap": 4900,
@@ -3041,12 +3059,6 @@
           "commit_date": "2026-06-06T21:56:23Z",
           "old_cap": 1650,
           "new_cap": 2000
-        },
-        {
-          "commit_sha": "f446d6e9c6cc2c995a0620cc92d7ee46dfc0546e",
-          "commit_date": "2026-07-26T13:20:32-07:00",
-          "old_cap": 2000,
-          "new_cap": 2350
         }
       ],
       "prompts/task-type-focus.ts": [
@@ -3268,12 +3280,6 @@
         }
       ],
       "handlers/strategic-resident.ts": [
-        {
-          "commit_sha": "f446d6e9c6cc2c995a0620cc92d7ee46dfc0546e",
-          "commit_date": "2026-07-26T13:20:32-07:00",
-          "old_cap": 2350,
-          "new_cap": 2750
-        },
         {
           "commit_sha": "0a82aa632296286149890bdbb5a6499e8dd895ab",
           "commit_date": "2026-07-28T01:23:45-07:00",
@@ -4213,6 +4219,12 @@
       ],
       "test_strategic_resident_session.py": [
         {
+          "commit_sha": "b644fbb02",
+          "commit_date": "2026-07-28T15:00:00Z",
+          "old_cap": 2050,
+          "new_cap": 2500
+        },
+        {
           "commit_sha": "c6569b49c96cdb11cef1102366dc546a4b7c8a7e",
           "commit_date": "2026-07-28T16:00:39-07:00",
           "old_cap": 2500,
@@ -4225,10 +4237,18 @@
           "new_cap": 3550
         },
         {
-          "commit_sha": "",
-          "commit_date": "2026-08-08T22:01:38.570533+00:00",
+          "commit_sha": "13a5013bf57795d3b7bfd3755027019f7e90c044",
+          "commit_date": "2026-08-08T22:21:52+00:00",
           "old_cap": 3550,
           "new_cap": 4500
+        }
+      ],
+      "test_shard_balance.py": [
+        {
+          "commit_sha": "b644fbb02",
+          "commit_date": "2026-07-28T15:00:00Z",
+          "old_cap": 100,
+          "new_cap": 350
         }
       ],
       "test_admin_routers__strategic_directions.py": [

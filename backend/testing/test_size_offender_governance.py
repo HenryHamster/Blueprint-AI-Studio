@@ -24,9 +24,11 @@ from app import hotfix_backmerge as hb
 from app import size_limit_policy as slp
 from app.models import Alert, Project
 from app.size_limit_policy import (
+    CHRONIC_BUMP_THRESHOLD,
     CHRONIC_WINDOW_DAYS,
     BumpHistoryUnavailableError,
     BumpRecord,
+    UNATTRIBUTED_COMMIT_SHA,
     _is_chronic_offender,
     _parse_git_diff_output,
     classify_breach,
@@ -627,6 +629,39 @@ def test_ledger_with_pending_bumps_appends_and_dedups():
     assert len(updated["history"]["backend"]["m.py"]) == 2
     assert updated["history"]["backend"]["m.py"][-1]["old_cap"] == 200
     assert updated["history"]["backend"]["m.py"][-1]["new_cap"] == 300
+    assert updated["history"]["backend"]["m.py"][-1]["commit_sha"] == (
+        UNATTRIBUTED_COMMIT_SHA
+    )
+    assert all(record["commit_sha"] for record in updated["history"]["backend"]["m.py"])
+
+
+def test_restored_cap_bumps_keep_strategic_resident_session_chronic():
+    """The three restored b644fbb02 records keep governance above threshold.
+
+    Deleting the earliest record lowers ``_is_chronic_offender``'s growth
+    baseline and can drop a file below the three-record chronic threshold. This
+    assertion pins the repair's bias direction: restoration cannot loosen the
+    governance verdict.
+    """
+    with open(slp._CAP_BUMP_HISTORY_LEDGER_PATH, encoding="utf-8") as f:
+        ledger = json.load(f)
+
+    resident = ledger["history"]["backend"]["strategic_resident_session.py"]
+    resident_test = ledger["history"]["testing"]["test_strategic_resident_session.py"]
+    shard_test = ledger["history"]["testing"]["test_shard_balance.py"]
+
+    assert {
+        (record["commit_sha"], record["old_cap"], record["new_cap"])
+        for record in resident + resident_test + shard_test
+    } >= {
+        ("b644fbb02", 4200, 4900),
+        ("b644fbb02", 2050, 2500),
+        ("b644fbb02", 100, 350),
+    }
+    assert len(resident) >= CHRONIC_BUMP_THRESHOLD
+    assert len(resident_test) >= CHRONIC_BUMP_THRESHOLD
+    assert _is_chronic_offender(resident)
+    assert _is_chronic_offender(resident_test)
 
 
 def _real_repo_checkout() -> str | None:
@@ -887,10 +922,12 @@ def test_phantom_ledger_records_skips_empty_sha_pending(tmp_path, mocker):
     assert phantoms == []
 
 
-def test_phantom_ledger_records_flags_unresolvable_sha_on_full(tmp_path, mocker):
-    """On a complete checkout a ledger SHA that does not resolve is a phantom —
-    a fabricated SHA is indistinguishable from a missing commit ONLY when the
-    objects might be unfetched (a shallow clone); a full checkout has no excuse."""
+def test_phantom_ledger_records_preserves_unresolvable_sha_on_full(tmp_path, mocker):
+    """An unresolvable SHA is preserved even on a complete checkout.
+
+    A missing object is absent corroboration, not positive proof that the
+    ledger record was fabricated. The self-heal must not delete on that basis.
+    """
     repo = _init_hermetic_repo(tmp_path)
     _hermetic_write_cap(repo, 100)
     _hermetic_commit(repo, "init", date="2026-01-01T00:00:00+00:00")
@@ -905,8 +942,7 @@ def test_phantom_ledger_records_flags_unresolvable_sha_on_full(tmp_path, mocker)
             "new_cap": 200,
         },
     )
-    assert len(phantoms) == 1
-    assert phantoms[0][5] == "commit SHA does not resolve"
+    assert phantoms == []
 
 
 def test_phantom_ledger_records_skips_beyond_boundary_on_shallow(tmp_path, mocker):
@@ -1009,6 +1045,38 @@ def test_rebuild_prunes_proven_phantom_records(tmp_path, mocker):
 
     records = json.loads(ledger_path.read_text())["history"]["backend"]["m.py"]
     assert [(r["old_cap"], r["new_cap"]) for r in records] == [(100, 200)]
+
+
+def test_rebuild_preserves_unverifiable_record(tmp_path, mocker):
+    """Failure to corroborate a commit is non-destructive during self-heal."""
+    repo = _init_hermetic_repo(tmp_path)
+    _hermetic_write_cap(repo, 100)
+    _hermetic_commit(repo, "init", date="2026-01-01T00:00:00+00:00")
+
+    ledger_path = tmp_path / "cap_bump_history.json"
+    unverifiable = {
+        "commit_sha": "deadbeef" * 5,
+        "commit_date": "2026-01-02T00:00:00+00:00",
+        "old_cap": 100,
+        "new_cap": 200,
+    }
+    ledger_path.write_text(
+        json.dumps(
+            {"schema_version": 1, "history": {"backend": {"m.py": [unverifiable]}}}
+        ),
+        encoding="utf-8",
+    )
+
+    with patch("app.size_limit_policy._REPO_ROOT", repo), patch(
+        "app.size_limit_policy._MODULE_SIZE_LIMITS_RELPATH", "module_size_limits.json"
+    ):
+        slp.rebuild_cap_bump_history_ledger(
+            caps_json_path=str(Path(repo) / "module_size_limits.json"),
+            ledger_path=str(ledger_path),
+        )
+
+    records = json.loads(ledger_path.read_text())["history"]["backend"]["m.py"]
+    assert records == [unverifiable]
 
 
 # ---------------------------------------------------------------------------

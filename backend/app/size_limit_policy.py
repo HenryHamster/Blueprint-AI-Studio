@@ -67,6 +67,8 @@ CHRONIC_GROWTH_PCT: float = 0.30
 
 
 class BumpRecord(TypedDict):
+    # A real commit SHA, or ``UNATTRIBUTED_COMMIT_SHA`` for a cap bump staged
+    # before the commit that will contain it exists.
     commit_sha: str
     commit_date: str  # ISO-8601
     old_cap: int
@@ -86,6 +88,12 @@ class BumpHistoryUnavailableError(Exception):
     chronic-offender verdict must treat this state as fail-closed (refuse the
     bump) rather than as "no bump history".
     """
+
+
+# A cap file and its ledger are sometimes committed together, so the commit SHA
+# cannot be known while the tree is being assembled.  This explicit marker
+# replaces the old empty-string record and is never eligible for pruning.
+UNATTRIBUTED_COMMIT_SHA = "unattributed"
 
 
 # Module-level TTL cache: (module_key, section) -> (outcome, monotonic_time)
@@ -437,9 +445,12 @@ def ledger_with_pending_bumps(
 
     ``pending`` entries are ``(section, key, old_cap, new_cap)`` — cap bumps
     not yet in the committed history (an uncommitted ``--fix`` bump, or a rollup
-    auto-bump about to be committed).  Records already present for the same
-    (key, old_cap, new_cap) are not duplicated, so a retried rollup cycle (or a
-    regenerated ``--fix``) is idempotent.
+    auto-bump about to be committed).  They are recorded with the explicit
+    ``UNATTRIBUTED_COMMIT_SHA`` marker; an empty ``commit_sha`` is never
+    appended.  Records already present for the same (key, old_cap, new_cap) are
+    not duplicated, so a retried rollup cycle (or a regenerated ``--fix``) is
+    idempotent. A later complete-history regeneration can replace the marker
+    with the actual commit SHA.
     """
     result = dict(ledger_data) if isinstance(ledger_data, dict) else {}
     history: dict = {}
@@ -453,7 +464,7 @@ def ledger_with_pending_bumps(
         if (old_cap, new_cap) not in known:
             records.append(
                 {
-                    "commit_sha": "",
+                    "commit_sha": UNATTRIBUTED_COMMIT_SHA,
                     "commit_date": now_iso,
                     "old_cap": old_cap,
                     "new_cap": new_cap,
@@ -491,11 +502,11 @@ def rebuild_cap_bump_history_ledger(
     record the existing ledger already holds for a current key is the mirror
     replaced outright (the merge path keeps both).  ``git log`` itself never
     runs on a truncated checkout.  On ANY checkout where git is available —
-    including truncated ones — the mirror is then self-healed by pruning
-    ledger records the mainline history cannot justify (:func:`phantom_ledger_records`),
-    so phantom records (a wrong ``old_cap``, a decrease mis-filed as a bump, a
-    non-ancestor commit, a non-resolving SHA) do not survive ``--fix`` even on
-    the shallow clones CI and agents run.  ``caps_json_path`` / ``ledger_path``
+    including truncated ones — the mirror is then self-healed by pruning only
+    records that positive git evidence proves fabricated
+    (:func:`phantom_ledger_records`). Missing or otherwise unverifiable evidence
+    is preserved, never treated as proof of fabrication. ``caps_json_path`` /
+    ``ledger_path``
     default to the shipped files (under ``backend/testing/``); callers with a
     hermetic fixture repo pass the fixture paths.
     """
@@ -568,19 +579,17 @@ def rebuild_cap_bump_history_ledger(
         base_history = existing_history
 
     if git_available:
-        # Self-heal: prune ledger records the mainline git history cannot
-        # justify (a phantom: wrong old_cap, a decrease mis-filed as a bump, a
-        # non-ancestor commit, or a SHA that does not exist).  Without this the
+        # Self-heal: prune ledger records positive mainline evidence proves
+        # fabricated (a wrong old_cap, a decrease mis-filed as a bump, or a
+        # non-ancestor commit). Without this the
         # _git_would_drop_ledger_records merge safety net would preserve them
         # FOREVER — a phantom pair is by definition absent from git's bump set,
         # so regeneration would "drop" it and the merge path would merge it
         # straight back in.  Unlike the full-history regeneration above, this
         # runs on truncated checkouts too (every CI shard and agent VM is
-        # shallow): phantom_ledger_records verifies every record it can
-        # adjudicate — a resolvable SHA whose diff shows no bump, or a commit
-        # proven outside the mainline ancestry — and skips only records the
-        # partial history cannot resolve.  Pruned records are provably phantom,
-        # never a can't-tell skip.
+        # shallow). phantom_ledger_records skips every record whose provenance
+        # cannot be corroborated; only positive contradictory evidence is
+        # returned for pruning.
         phantoms = phantom_ledger_records(
             repo_root=_REPO_ROOT,
             ledger_path=out_path,
@@ -966,14 +975,13 @@ def phantom_ledger_records(
     """Return ledger records the mainline git history cannot justify.
 
     Each returned entry is ``(section, key, old_cap, new_cap, commit_sha,
-    reason)`` — a record in the cap-bump-history ledger whose ``commit_sha``
-    does not resolve to a mainline bump of that exact (old_cap -> new_cap)
-    pair.  This is the REVERSE direction of the ``git ⊆ ledger`` guard: while
-    that guard proves the mirror is not missing a git-recorded bump, this
-    proves no record the mirror holds was fabricated — a wrong ``old_cap``, a
-    decrease mis-filed as a bump, a non-ancestor commit, or a SHA that does not
-    exist.  Empty-``commit_sha`` records (rollup-pending bumps, written before
-    the bump's commit is known) are always skipped.
+    reason)`` — a record in the cap-bump-history ledger that positive git
+    evidence proves contradictory to the named commit. This is the REVERSE
+    direction of the ``git ⊆ ledger`` guard: while that guard proves the mirror
+    is not missing a git-recorded bump, this proves no record the mirror holds
+    is fabricated — a wrong ``old_cap``, a decrease mis-filed as a bump, or a
+    non-ancestor commit. Empty and explicitly unattributed records are always
+    preserved because absent or unverifiable evidence cannot justify deletion.
 
     Runs on a truncated/shallow checkout too — every CI shard and agent VM — so
     the phantom check is not skipped exactly where the ledger most often
@@ -986,9 +994,9 @@ def phantom_ledger_records(
       gone; and
     * a beyond-boundary ancestor whose ancestry probe cannot answer.
 
-    On a complete checkout NOTHING is skipped: every genuine bump's SHA
-    resolves and appears in the mainline log, so a non-resolving SHA, a
-    non-ancestor commit, or a commit whose diff shows no such bump is a phantom.
+    Even on a complete checkout, an unresolved or unreadable provenance check is
+    preserved. A record is prunable only when the available diff or ancestry
+    result positively contradicts it.
 
     ``history`` (the full ledger dict) defaults to the shipped ledger at
     ``ledger_path``; ``repo_root`` defaults to ``_REPO_ROOT``.
@@ -1009,7 +1017,6 @@ def phantom_ledger_records(
         ledger = history
         out_path = ledger_path or _CAP_BUMP_HISTORY_LEDGER_PATH
 
-    truncated = _git_history_is_truncated(root)
     ref = _mainline_git_ref(root)
     if ref == "HEAD":
         # No mainline branch present (a feature-branch-only clone): the ref
@@ -1061,16 +1068,16 @@ def phantom_ledger_records(
                     new_cap = int(rec["new_cap"])
                 except (KeyError, TypeError, ValueError):
                     continue
-                if sha:
+                if sha and sha != UNATTRIBUTED_COMMIT_SHA:
                     shas.add(sha)
                 records.append((section, key, old_cap, new_cap, sha))
     resolved = _resolve_shas(shas, root) if shas else {}
 
     phantoms: list[tuple[str, str, int, int, str, str]] = []
     for section, key, old_cap, new_cap, sha in records:
-        if not sha:
-            # Rollup-pending bump: written before the commit that bumps the cap
-            # exists; nothing to verify against yet.
+        if not sha or sha == UNATTRIBUTED_COMMIT_SHA:
+            # Rollup-pending or legacy unattributed bump: written before the
+            # commit that bumps the cap exists; nothing to verify against yet.
             continue
         pair = (old_cap, new_cap)
         commit_pairs = bump_map.get(sha, {}).get(key, set())
@@ -1090,10 +1097,7 @@ def phantom_ledger_records(
             continue
         # SHA not in the mainline log: resolve it and pin down why.
         if not resolved.get(sha, False):
-            if not truncated:
-                phantoms.append(
-                    (section, key, old_cap, new_cap, sha, "commit SHA does not resolve")
-                )
+            # Evidence is absent, not positive proof of fabrication.
             continue
         ancestry = _commit_in_mainline_ancestry(sha, root)
         if ancestry is False:
@@ -1109,19 +1113,14 @@ def phantom_ledger_records(
             )
             continue
         if ancestry is None:
-            if not truncated:
-                phantoms.append(
-                    (section, key, old_cap, new_cap, sha, "mainline ancestry unverifiable")
-                )
+            # An ancestry probe failure is evidence loss, not proof of a fake
+            # record. Never delete on this polarity.
             continue
         # A beyond-boundary ancestor whose objects are present in this (possibly
         # shallow) checkout: render its diff directly and verify the pair.
         diff_text = _git_show_file_diff(sha, root)
         if diff_text is None:
-            if not truncated:
-                phantoms.append(
-                    (section, key, old_cap, new_cap, sha, "commit diff unreadable")
-                )
+            # An unreadable diff cannot establish fabrication.
             continue
         shown_pairs = _diff_bump_pairs(diff_text).get(key, set())
         if pair not in shown_pairs:
