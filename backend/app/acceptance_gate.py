@@ -135,6 +135,13 @@ CODE_ACCEPTANCE_VERDICT_KEY = "code_acceptance_verdict"
 # row whose stamp predates the current rule.
 ACCEPTANCE_RULE_VERSION = 1
 
+# ``rederived_by`` stamped on a re-derived verdict (design doc c50453ef §5).
+# Identifies the actor that re-scored already-merged work so an auditor can tell
+# a land-time stamp from a qualification-time correction. Every re-derivation
+# goes through :func:`effective_acceptance_verdict`, which runs at qualification
+# time inside the qualifier's acceptance-window tally — hence the qualifier label.
+REDERIVED_BY_QUALIFIER = f"qualifier:v{ACCEPTANCE_RULE_VERSION}"
+
 # Durable top-level context key where a PRE-MERGE structural acceptance finding
 # is stamped while a PR is still open. Lives at the TOP level (not inside
 # ``review_loop``) so it can never flip the merge-verification semantics that an
@@ -589,6 +596,19 @@ def _acceptance_test_targeted_green(
 # STRING ("pass"/"fail"/"undetected") and therefore can never carry the block.
 MERGE_ACCEPTANCE_BLOCK_KEY = "verify_tests_acceptance_block"
 
+# Durable top-level context key where a ROLLUP CHILD receives its parent's
+# normalized acceptance-test block when the parent's block names the CHILD's
+# declared test path (rung 6 of design doc c50453ef, closing U1). Rollup
+# children merge via the parent's single PR and never own a ``review_loop``, so
+# without this a child's declared test that the parent's CI genuinely ran green
+# reads as "did not run green" and fails closed forever. Lives at the TOP level
+# (like ``_pr_changed_files``) because the child's ``review_loop`` is
+# deliberately absent — an inherited block must never be mistaken for the
+# child's own merge evidence. The propagation site (``rollup_management``)
+# copies the parent's block ONLY when its ``selector``/``descriptor`` matches
+# the child's declared test path; an unmatched selector propagates nothing.
+INHERITED_ACCEPTANCE_BLOCK_KEY = "_inherited_acceptance_block"
+
 
 def _merge_acceptance_test_block(context: Mapping[str, Any] | None) -> dict | None:
     """Read the declared acceptance test's normalized merge-test block, defensively.
@@ -601,15 +621,26 @@ def _merge_acceptance_test_block(context: Mapping[str, Any] | None) -> dict | No
     persisted the block, yields ``None`` — so every caller MUST still fall back to
     :func:`_acceptance_test_targeted_green`, which those tasks do carry.
 
+    For a ROLLUP CHILD (which never owns a ``review_loop``), the reader falls
+    back to the top-level :data:`INHERITED_ACCEPTANCE_BLOCK_KEY` block the rollup
+    propagation stamped from its parent — the block describes the child's
+    declared test (the propagation site matches the selector), so ``test_exists``
+    / ``ran_green`` for an unmodified declared test on a rollup child are
+    readable from the same normalized shape. ``_acceptance_test_targeted_green``
+    deliberately does NOT read the inherited block: the targeted-green signal is
+    per-PR evidence and is never propagated to a child.
+
     Context-shaped (a bare ``context`` dict, not a ``Task``) so the pure
     evaluation core (:func:`evaluate_acceptance`) can re-derive verdicts from
     persisted merge records.
     """
     review_loop = (context or {}).get(REVIEW_LOOP_KEY)
-    if not isinstance(review_loop, dict):
-        return None
-    block = review_loop.get(MERGE_ACCEPTANCE_BLOCK_KEY)
-    return block if isinstance(block, dict) else None
+    if isinstance(review_loop, dict):
+        block = review_loop.get(MERGE_ACCEPTANCE_BLOCK_KEY)
+        if isinstance(block, dict):
+            return block
+    inherited = (context or {}).get(INHERITED_ACCEPTANCE_BLOCK_KEY)
+    return inherited if isinstance(inherited, dict) else None
 
 
 # Internal, BACKEND-computed marker recording whether the declared acceptance
@@ -1795,6 +1826,13 @@ def record_code_acceptance_verdict(task: Task) -> AcceptanceGateVerdict | None:
         # rule and re-derive them (design doc c50453ef). Consumed by
         # :func:`effective_acceptance_verdict`.
         "rule_version": ACCEPTANCE_RULE_VERSION,
+        # Audit honesty (design doc c50453ef §5): this is the ORIGINAL recording
+        # of the verdict at land time, not a re-derivation. A re-derivation
+        # (rule-version bump) sets this to False and nests the original verdict
+        # under ``land_time_verdict`` so the land-time judgment is never
+        # destroyed. Rollup propagation records a child's verdict here too — the
+        # child's own first recording, stamped against its merge record.
+        "stamped_at_land_time": True,
     }
     # A re-recorded verdict means new provenance arrived (parent-derived changed
     # files, a GitHub-verified diff, etc.) AFTER the one-shot backfill sweep had
@@ -1851,6 +1889,17 @@ def effective_acceptance_verdict(task: Task) -> dict | None:
         # row stable rather than erasing it into the undeclared bucket.
         return frozen
     effective = dict(frozen)
+    # Audit honesty (design doc c50453ef §5): the land-time verdict is NEVER
+    # destroyed by re-derivation. Nest the ORIGINAL land-time recording — the
+    # frozen dict itself when it is the original stamp, else the already-nested
+    # original from a prior re-derivation (never a re-derived chain). A reviewer
+    # can always read what the retiring rule judged, side by side with what the
+    # current rule re-derives.
+    original_land_time = (
+        frozen
+        if frozen.get("stamped_at_land_time") is not False
+        else frozen.get("land_time_verdict") or frozen
+    )
     effective.update(
         {
             "satisfied": rederived.satisfied,
@@ -1859,6 +1908,10 @@ def effective_acceptance_verdict(task: Task) -> dict | None:
             "reason": rederived.reason,
             "proof_ref": rederived.proof_ref,
             "rule_version": ACCEPTANCE_RULE_VERSION,
+            "stamped_at_land_time": False,
+            "rederived_at": _utcnow().isoformat(),
+            "rederived_by": REDERIVED_BY_QUALIFIER,
+            "land_time_verdict": original_land_time,
         }
     )
     if frozen.get("consumed") is True:
@@ -1866,6 +1919,20 @@ def effective_acceptance_verdict(task: Task) -> dict | None:
         # verdict stays proven even though the pure core cannot see consumption.
         effective["proven"] = True
     return effective
+
+
+def verdict_rule_version(recorded: Mapping[str, Any] | None) -> int:
+    """The rule version a recorded verdict was stamped under, ``0`` when absent.
+
+    Used by the qualifier's window audit (:data:`ACCEPTANCE_AGGREGATE_BUCKETS`)
+    to count how many recorded rows were judged by each RETIRED version before
+    re-derivation. ``0`` means the row predates the version stamp — a legacy
+    verdict recorded before design doc c50453ef landed.
+    """
+    if not isinstance(recorded, dict):
+        return 0
+    version = recorded.get("rule_version")
+    return version if isinstance(version, int) else 0
 
 
 def premerge_acceptance_finding(task: Task) -> dict | None:

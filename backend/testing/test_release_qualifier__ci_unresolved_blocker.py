@@ -4861,6 +4861,34 @@ async def test_acceptance_window_rederives_stale_rule_version_verdicts(db_sessio
         is control_task.context[CODE_ACCEPTANCE_VERDICT_KEY]
     )
 
+    # Re-derivation audit (design doc c50453ef §5): the drive reports how much
+    # already-merged work was re-scored, in which direction, and under which
+    # retired rule version the stale population was stamped — so score movement
+    # is inspectable instead of a silently-shifting aggregate. The stale task was
+    # re-derived (upgrade: unsatisfied → proven); the control was stamped under
+    # the current rule and never counted.
+    assert agg["acceptance_window_rederived_count"] == 1
+    assert agg["acceptance_window_rederived_upgrades"] == 1
+    assert agg["acceptance_window_rederived_downgrades"] == 0
+    assert agg["acceptance_window_rule_version"] == ACCEPTANCE_RULE_VERSION
+    assert agg["acceptance_window_stale_version_counts"] == {
+        ACCEPTANCE_RULE_VERSION - 1: 1
+    }
+    assert agg["acceptance_window_rederived_task_ids"] == [str(stale_task.id)]
+
+    # The durable re-derived stamp is auditable too: it is marked as a
+    # re-derivation and nests the ORIGINAL land-time (unsatisfied) verdict — the
+    # retired rule's judgment is never destroyed by the correction.
+    stale_verdict = stale_ctx[CODE_ACCEPTANCE_VERDICT_KEY]
+    assert stale_verdict["stamped_at_land_time"] is False
+    assert isinstance(stale_verdict["rederived_at"], str)
+    assert stale_verdict["rederived_by"] == f"qualifier:v{ACCEPTANCE_RULE_VERSION}"
+    assert stale_verdict["land_time_verdict"]["satisfied"] is False
+    assert (
+        stale_verdict["land_time_verdict"]["rule_version"]
+        == ACCEPTANCE_RULE_VERSION - 1
+    )
+
 
 @pytest.mark.asyncio
 async def test_acceptance_window_aggregate_ignores_post_terminal_updates(

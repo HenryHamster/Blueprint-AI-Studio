@@ -45,6 +45,7 @@ from app.failure_classification import (
 )
 from app.acceptance_gate import (
     ACCEPTANCE_AGGREGATE_BUCKETS,
+    ACCEPTANCE_RULE_VERSION,
     ACCEPTANCE_TEST_CORROBORATED_KEY,
     CODE_ACCEPTANCE_VERDICT_KEY,
     WINDOW_CORROBORATION_ATTEMPTED_SHA_KEY,
@@ -56,6 +57,7 @@ from app.acceptance_gate import (
     classify_unsatisfied_reason,
     effective_acceptance_verdict,
     record_code_acceptance_verdict,
+    verdict_rule_version,
 )
 from app.acceptance_criteria import (
     WALKTHROUGH_E2E_FLOW_MARKERS,
@@ -4445,6 +4447,12 @@ async def _compute_acceptance_window_aggregate(
         "acceptance_window_undeclared_reasons": dict, # split of the undeclared bucket by reason (sums to buckets["undeclared"])
         "acceptance_window_declared_unsatisfied_reasons": dict, # split of the declared_unsatisfied bucket by reason (sums to buckets["declared_unsatisfied"])
         "acceptance_window_inferred_test_cochange": int,  # verified merges credited via inferred_test_cochange
+        "acceptance_window_rederived_count": int,  # write-task verdicts re-derived under the current rule this drive (each task counted once)
+        "acceptance_window_rederived_upgrades": int,  # re-derived verdicts that strictly improved (satisfied/proven minted)
+        "acceptance_window_rederived_downgrades": int,  # re-derived verdicts that strictly worsened
+        "acceptance_window_rule_version": int,  # the acceptance rule version this drive judged under
+        "acceptance_window_stale_version_counts": dict,  # retired rule version -> recorded rows stamped under it (legacy pre-stamp rows counted under 0)
+        "acceptance_window_rederived_task_ids": list,  # task ids actually re-derived this drive (capped)
       }
 
     The nested breakdowns are purely additive: ``acceptance_window_buckets``
@@ -4496,8 +4504,50 @@ async def _compute_acceptance_window_aggregate(
     # verdict key so the inferred-test-cochange path still applies. The re-derived
     # verdict is written back onto the session-bound task so the correction is
     # DURABLE for every reader, not a per-drive throwaway.
+    # Re-derivation audit (design doc c50453ef §5): the window reports how much
+    # already-merged work was re-scored by the current rule THIS drive, in which
+    # direction, and which retired rule versions produced the stale population —
+    # so score movement is inspectable instead of a silently-shifting aggregate.
+    # A task is counted exactly ONCE per drive even though the corroboration pass
+    # and the classification pass both walk every write-task row.
+    _REDERIVED_TASK_ID_CAP = 100
+    _rederived_seen: set[str] = set()
+    _stale_seen: set[str] = set()
+    _rederived_task_ids: list[str] = []
+    _stale_version_counts: dict[int, int] = {}
+    _rederived_upgrades = 0
+    _rederived_downgrades = 0
+
+    def _verdict_rank(verdict: dict) -> int:
+        """Ordinal rank of a verdict for upgrade/downgrade direction: 0
+        unsatisfied, 1 satisfied-unproven, 2 proven."""
+        if verdict.get("proven") is True:
+            return 2
+        if verdict.get("satisfied") is True:
+            return 1
+        return 0
+
     def _effective_context(task: Task) -> dict:
+        nonlocal _rederived_upgrades, _rederived_downgrades
         ctx = dict(task.context or {})
+        frozen = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+        if frozen is not None and not isinstance(frozen, dict):
+            frozen = None
+        # Audit the RETIRED-version population BEFORE re-derivation: every
+        # recorded row stamped under a rule other than the current one is counted
+        # once under its own version, so the stale population's size and vintage
+        # are visible even when a row cannot be re-derived (its payload no longer
+        # declares evidence, so ``effective_acceptance_verdict`` returns the
+        # frozen row verbatim).
+        if isinstance(frozen, dict):
+            _version = verdict_rule_version(frozen)
+            if _version != ACCEPTANCE_RULE_VERSION:
+                _task_id = str(task.id)
+                if _task_id not in _stale_seen:
+                    _stale_seen.add(_task_id)
+                    _stale_version_counts[_version] = (
+                        _stale_version_counts.get(_version, 0) + 1
+                    )
         effective = effective_acceptance_verdict(task)
         if effective is not None:
             ctx[CODE_ACCEPTANCE_VERDICT_KEY] = effective
@@ -4508,10 +4558,25 @@ async def _compute_acceptance_window_aggregate(
             # back onto ``task.context`` and made durable by the enclosing flow's
             # next commit. Idempotent: once re-stamped under the CURRENT rule,
             # later drives return the frozen dict verbatim and skip this write.
-            frozen = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
             if effective is not frozen:
                 task.context = ctx
                 session.add(task)
+                # Count the re-derivation exactly once per task per drive. The
+                # direction is the strict rank movement between the retired-rule
+                # verdict and the current-rule verdict, so upgrades AND downgrades
+                # are both visible — re-derivation is honest, not monotonic.
+                _task_id = str(task.id)
+                if _task_id not in _rederived_seen:
+                    _rederived_seen.add(_task_id)
+                    _rederived_task_ids.append(_task_id)
+                    _frozen_rank = (
+                        _verdict_rank(frozen) if isinstance(frozen, dict) else 0
+                    )
+                    _effective_rank = _verdict_rank(effective)
+                    if _effective_rank > _frozen_rank:
+                        _rederived_upgrades += 1
+                    elif _effective_rank < _frozen_rank:
+                        _rederived_downgrades += 1
         return ctx
 
     # Corroboration pass (the fix for "the acceptance window mints ~0 proven
@@ -4648,6 +4713,24 @@ async def _compute_acceptance_window_aggregate(
         # Per-merge audit trail: task IDs of the inferred_test_cochange merges so
         # operators can trace which specific merges were counted without SQL.
         "acceptance_window_inferred_test_cochange_task_ids": inferred_task_ids,
+        # Re-derivation audit (design doc c50453ef §5): how much already-merged
+        # work was re-scored by the CURRENT rule this drive, in which direction,
+        # and which retired rule versions produced the stale population. All keys
+        # are additive observability — the scalar ``verified`` and the bucket
+        # counts above are unchanged. ``rederived_count`` == len(rederived_task_ids)
+        # before the cap; upgrades + downgrades can be less than the count because
+        # a re-derivation that preserves the rank (e.g. a satisfied->satisfied
+        # reason change) is still a re-derivation.
+        "acceptance_window_rederived_count": len(_rederived_seen),
+        "acceptance_window_rederived_upgrades": _rederived_upgrades,
+        "acceptance_window_rederived_downgrades": _rederived_downgrades,
+        "acceptance_window_rule_version": ACCEPTANCE_RULE_VERSION,
+        "acceptance_window_stale_version_counts": dict(
+            sorted(_stale_version_counts.items())
+        ),
+        "acceptance_window_rederived_task_ids": _rederived_task_ids[
+            :_REDERIVED_TASK_ID_CAP
+        ],
     }
 
 async def _collect_verified_merge_test_evidence(

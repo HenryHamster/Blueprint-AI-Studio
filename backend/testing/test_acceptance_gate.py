@@ -23,6 +23,7 @@ from app.acceptance_gate import (
     CODE_ACCEPTANCE_VERDICT_KEY,
     CRITERION_OPS,
     PREMERGE_ACCEPTANCE_FINDING_KEY,
+    REDERIVED_BY_QUALIFIER,
     TEST_COVERAGE_RESULT_KEY,
     acceptance_blocks_success,
     acceptance_is_proven,
@@ -416,6 +417,10 @@ def test_record_code_acceptance_verdict_stamps_rule_version():
     stamped = task.context[CODE_ACCEPTANCE_VERDICT_KEY]
     assert stamped["rule_version"] == ACCEPTANCE_RULE_VERSION
     assert isinstance(ACCEPTANCE_RULE_VERSION, int) and ACCEPTANCE_RULE_VERSION >= 1
+    # A direct recording is an ORIGINAL land-time stamp, never a re-derivation —
+    # so a later rule-version bump can tell the two apart (design doc c50453ef §5).
+    assert stamped["stamped_at_land_time"] is True
+    assert "land_time_verdict" not in stamped
     # Legacy verdicts (no rule_version) are still readable by every consumer —
     # the field is additive.
     assert acceptance_is_proven({"proven": True, "satisfied": True}) is True
@@ -467,13 +472,14 @@ def test_effective_acceptance_verdict_retired_rule_rederives():
     # Simulate a stale stamp: the retired rule judged the same evidence
     # unsatisfied (e.g. it never granted the existence-at-merge credit the
     # current rule does), so re-derivation must flip it to proven.
-    task.context[CODE_ACCEPTANCE_VERDICT_KEY] = {
+    frozen = {
         "satisfied": False,
         "proven": False,
         "kind": "named_test",
         "reason": "declared test not among the PR's changed files (retired rule)",
         "rule_version": ACCEPTANCE_RULE_VERSION - 1,
     }
+    task.context[CODE_ACCEPTANCE_VERDICT_KEY] = frozen
     effective = effective_acceptance_verdict(task)
     assert effective["satisfied"] is True
     assert effective["proven"] is True
@@ -481,6 +487,17 @@ def test_effective_acceptance_verdict_retired_rule_rederives():
     assert effective["rule_version"] == ACCEPTANCE_RULE_VERSION
     assert acceptance_blocks_success(effective) is False
     assert acceptance_is_proven(effective) is True
+    # Audit honesty (design doc c50453ef §5): the re-derived dict is marked as a
+    # re-derivation, timed, and nests the ORIGINAL land-time verdict — the
+    # retired rule's judgment is never destroyed by re-scoring.
+    assert effective["stamped_at_land_time"] is False
+    assert isinstance(effective["rederived_at"], str) and effective["rederived_at"]
+    assert effective["rederived_by"] == REDERIVED_BY_QUALIFIER
+    assert effective["land_time_verdict"] == frozen
+    # The nested land-time verdict is the ORIGINAL, not another re-derived chain
+    # (a legacy stamp with no marker counts as original — absent is not False).
+    assert effective["land_time_verdict"].get("stamped_at_land_time") is not False
+    assert effective["land_time_verdict"]["rule_version"] == ACCEPTANCE_RULE_VERSION - 1
 
 
 def test_effective_acceptance_verdict_rederivation_declared_false_keeps_frozen():
@@ -514,7 +531,7 @@ def test_effective_acceptance_verdict_preserves_consumed_upgrade():
     )
     consumed_by = str(uuid.uuid4())
     consumed_artifact = str(uuid.uuid4())
-    task.context[CODE_ACCEPTANCE_VERDICT_KEY] = {
+    frozen = {
         "satisfied": True,
         "proven": True,
         "consumed": True,
@@ -524,6 +541,7 @@ def test_effective_acceptance_verdict_preserves_consumed_upgrade():
         "reason": "delivered",
         "rule_version": ACCEPTANCE_RULE_VERSION - 1,
     }
+    task.context[CODE_ACCEPTANCE_VERDICT_KEY] = frozen
     effective = effective_acceptance_verdict(task)
     assert effective["satisfied"] is True
     assert effective["proven"] is True
@@ -532,6 +550,48 @@ def test_effective_acceptance_verdict_preserves_consumed_upgrade():
     assert effective["consumed_artifact_id"] == consumed_artifact
     assert effective["rule_version"] == ACCEPTANCE_RULE_VERSION
     assert acceptance_is_proven(effective) is True
+    # The consumption upgrade is preserved WITHOUT erasing audit honesty: the
+    # original consumed verdict is nested as the land-time verdict.
+    assert effective["stamped_at_land_time"] is False
+    assert effective["rederived_by"] == REDERIVED_BY_QUALIFIER
+    assert effective["land_time_verdict"] == frozen
+    assert effective["land_time_verdict"]["consumed"] is True
+
+
+def test_effective_acceptance_verdict_rederivation_chain_nests_original():
+    """Re-deriving an ALREADY-re-derived verdict must nest the ORIGINAL land-time
+    verdict — never the previous re-derived dict — so the land-time judgment is
+    not replaced by a chain of re-scorings."""
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+        },
+        changed_files=["backend/app/widget.py", "backend/testing/test_widget.py"],
+    )
+    original = {
+        "satisfied": False,
+        "proven": False,
+        "kind": "named_test",
+        "reason": "declared test not among the PR's changed files (retired rule)",
+        "rule_version": ACCEPTANCE_RULE_VERSION - 2,
+        "stamped_at_land_time": True,
+    }
+    # First re-derivation (v-2 -> v-1): nests the original.
+    task.context[CODE_ACCEPTANCE_VERDICT_KEY] = dict(original)
+    once = effective_acceptance_verdict(task)
+    assert once["land_time_verdict"] == original
+    assert once["stamped_at_land_time"] is False
+    assert once["rederived_by"] == REDERIVED_BY_QUALIFIER
+    # Second re-derivation (v-1 -> v): the recorded row is the previous
+    # re-derived dict; the nested land-time verdict must still be the ORIGINAL.
+    task.context[CODE_ACCEPTANCE_VERDICT_KEY] = once
+    twice = effective_acceptance_verdict(task)
+    assert twice["stamped_at_land_time"] is False
+    assert twice["rederived_by"] == REDERIVED_BY_QUALIFIER
+    assert twice["land_time_verdict"] == original
+    assert twice["land_time_verdict"]["satisfied"] is False
+    assert twice["land_time_verdict"]["rule_version"] == ACCEPTANCE_RULE_VERSION - 2
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1823,6 +1883,9 @@ async def test_consumed_downstream_artifact_upgrades_to_proven(db_session):
         # the rule version that produced it so a later qualification can tell
         # which rows were judged by a retired rule and re-derive them.
         "rule_version": ACCEPTANCE_RULE_VERSION,
+        # Audit honesty (design doc c50453ef §5): a direct recording is an
+        # ORIGINAL land-time stamp, never a re-derivation.
+        "stamped_at_land_time": True,
     }
     consumer = _make_code_task(changed_files=["backend/app/consumer.py"])
     consumer.project_id = project_id
@@ -4826,6 +4889,77 @@ def test_merge_acceptance_block_reads_the_key_the_monitor_writes():
     assert _merge_acceptance_test_block(task.context) is None
     task.context[REVIEW_LOOP_KEY][MERGE_ACCEPTANCE_BLOCK_KEY] = "not a dict"
     assert _merge_acceptance_test_block(task.context) is None
+
+
+def test_merge_acceptance_block_reads_inherited_block_for_rollup_child():
+    """A rollup child (which merges via the parent's single PR and never owns a
+    review_loop) reads its PARENT-INHERITED acceptance-test block — rung 6 of
+    design doc c50453ef, closing U1. The inherited block lives at the TOP level
+    under ``_inherited_acceptance_block`` (never inside review_loop, which a
+    child legitimately lacks), and the reader falls back to it only when the
+    child carries no own block. A mismatched inherited block fails closed — a
+    green run of some OTHER test is never credited for this declaration."""
+    from app.acceptance_gate import (
+        INHERITED_ACCEPTANCE_BLOCK_KEY,
+        MERGE_ACCEPTANCE_BLOCK_KEY,
+        _acceptance_test_exists_at_merge,
+        _acceptance_test_ran_green_at_merge,
+        _declared_named_test_path,
+        _merge_acceptance_test_block,
+    )
+
+    block = {
+        "declared": True,
+        "descriptor": "the seam test",
+        "selector": "testing/test_seam.py::test_x",
+        "present": True,
+        "ran": True,
+        "status": "ran",
+        "passed": True,
+    }
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "testing/test_seam.py",
+            "test_id": "test_x",
+        },
+        changed_files=["app/seam.py"],
+    )
+    # Rollup child shape: NO review_loop at all, only the parent's inherited
+    # block stamped by _propagate_landed_to_staging_merged_descendants.
+    task.context.pop(REVIEW_LOOP_KEY, None)
+    task.context[INHERITED_ACCEPTANCE_BLOCK_KEY] = block
+    assert _merge_acceptance_test_block(task.context) == block
+    declared = _declared_named_test_path(task.first_payload)
+    assert _acceptance_test_exists_at_merge(task.context, declared) is True
+    assert _acceptance_test_ran_green_at_merge(task.context, declared) is True
+
+    # A child that somehow DOES carry its own review_loop block: the own block
+    # wins, and a non-green own block is not rescued by the inherited one.
+    own = dict(block)
+    own["passed"] = False
+    task.context[REVIEW_LOOP_KEY] = {MERGE_ACCEPTANCE_BLOCK_KEY: own}
+    assert _merge_acceptance_test_block(task.context) == own
+    assert _acceptance_test_ran_green_at_merge(task.context, declared) is False
+
+    # A mismatched inherited block (names a DIFFERENT test — descriptor AND
+    # selector both point elsewhere) fails closed.
+    mismatched = dict(block)
+    mismatched["descriptor"] = "some_other_test.py"
+    mismatched["selector"] = "backend/testing/test_other.py::test_other"
+    task2 = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "testing/test_seam.py",
+            "test_id": "test_x",
+        },
+        changed_files=["app/seam.py"],
+    )
+    task2.context.pop(REVIEW_LOOP_KEY, None)
+    task2.context[INHERITED_ACCEPTANCE_BLOCK_KEY] = mismatched
+    declared2 = _declared_named_test_path(task2.first_payload)
+    assert _acceptance_test_exists_at_merge(task2.context, declared2) is False
+    assert _acceptance_test_ran_green_at_merge(task2.context, declared2) is False
 
 
 def test_not_in_diff_green_run_flows_writer_to_gate_as_proven():

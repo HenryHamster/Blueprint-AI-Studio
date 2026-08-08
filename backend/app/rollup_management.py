@@ -553,6 +553,28 @@ async def _propagate_landed_to_staging_merged_descendants(
         if isinstance(p, str) and p.strip()
     ]
 
+    # Rung 6 of design doc c50453ef (closes U1): the parent's normalized
+    # acceptance-test block — the no-CI merge monitor's record of which declared
+    # test the parent's single PR genuinely ran, and how it exited — is inherited
+    # by a descendant ONLY when the block's selector/descriptor names THAT
+    # descendant's declared test path. Rollup children merge via the parent's
+    # single PR and never own a ``review_loop``, so without this a child whose
+    # declared test the parent's CI genuinely ran green would read as "did not
+    # run green" and fail closed forever. The inherited block is stored under
+    # :data:`acceptance_gate.INHERITED_ACCEPTANCE_BLOCK_KEY` at the TOP level of
+    # the child's context — never inside review_loop, which a child legitimately
+    # lacks — so the reader side (``acceptance_gate._merge_acceptance_test_block``)
+    # can find it without mistaking it for the child's own merge evidence. The
+    # per-descendant selector match is checked in the walk below; an unmatched
+    # selector propagates nothing, because a green run of some OTHER test is
+    # never credible proof of this declaration.
+    _parent_block: dict | None = (
+        _parent_ctx.get(_acceptance_gate.REVIEW_LOOP_KEY) or {}
+    ).get(_acceptance_gate.MERGE_ACCEPTANCE_BLOCK_KEY)
+    if not isinstance(_parent_block, dict):
+        _parent_block = _parent_ctx.get(_acceptance_gate.MERGE_ACCEPTANCE_BLOCK_KEY)
+    _parent_block = _parent_block if isinstance(_parent_block, dict) else None
+
     while queue:
         rows = (
             (
@@ -617,6 +639,32 @@ async def _propagate_landed_to_staging_merged_descendants(
                     row.context = _cf_ctx
                     _acceptance_gate.record_code_acceptance_verdict(row)
                     _propagated = True
+
+                # Rung 6 (design doc c50453ef, closes U1): inherit the parent's
+                # acceptance-test block onto a descendant whose DECLARED named_test
+                # the block actually describes. The child's declared test ran as
+                # part of the parent's single PR; the block is the durable record
+                # that it ran (green or not — the reader fails closed on a block
+                # that did not run green). Stamped once, under the top-level
+                # inherited key, and only for a matching declaration. After
+                # stamping, re-evaluate the verdict so a stale
+                # declared_unsatisfied flips to proven.
+                if _parent_block is not None and not (row.context or {}).get(
+                    _acceptance_gate.INHERITED_ACCEPTANCE_BLOCK_KEY
+                ):
+                    _declared_path = _acceptance_gate._declared_named_test_path(
+                        row.first_payload
+                    )
+                    if _declared_path and _acceptance_gate.acceptance_test_block_matches_declared(
+                        _parent_block, _declared_path
+                    ):
+                        _inh_ctx = dict(row.context or {})
+                        _inh_ctx[
+                            _acceptance_gate.INHERITED_ACCEPTANCE_BLOCK_KEY
+                        ] = _parent_block
+                        row.context = _inh_ctx
+                        _acceptance_gate.record_code_acceptance_verdict(row)
+                        _propagated = True
 
                 if not has_landed_signal(row):
                     await corroborate_and_mark_landed_on_integration(

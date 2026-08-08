@@ -3456,6 +3456,144 @@ async def test_propagate_landed_descendants_inherits_changed_files(cleanup_db):
 
 
 @pytest.mark.asyncio
+async def test_propagate_landed_descendants_inherits_acceptance_block(cleanup_db):
+    """Rung 6 of design doc c50453ef (closes U1): a rollup child whose DECLARED
+    named_test the parent's single-PR acceptance-test block describes inherits that
+    block under ``_inherited_acceptance_block``, so the child's existence-at-merge
+    / ran-green readers see the parent's genuinely-run test instead of failing
+    closed on an absent ``review_loop``. A child whose declaration the block does
+    NOT describe inherits nothing (a green run of some OTHER test is never credited
+    for this declaration), and an already-inherited block is never clobbered.
+    """
+    from app.rollup_management import _propagate_landed_to_staging_merged_descendants
+    from app.acceptance_gate import (
+        INHERITED_ACCEPTANCE_BLOCK_KEY,
+        MERGE_ACCEPTANCE_BLOCK_KEY,
+        REVIEW_LOOP_KEY,
+        _acceptance_test_ran_green_at_merge,
+        _declared_named_test_path,
+    )
+
+    project = await _make_project(cleanup_db, integration_branch="main")
+
+    block = {
+        "declared": True,
+        "descriptor": "test_widget.py",
+        "selector": "backend/testing/test_widget.py::test_x",
+        "present": True,
+        "ran": True,
+        "status": "ran",
+        "passed": True,
+    }
+    parent = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="research",
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": True,
+            REVIEW_LOOP_KEY: {MERGE_ACCEPTANCE_BLOCK_KEY: block},
+        },
+    )
+
+    # CASE 1: child declares the SAME test the parent's block describes.
+    matching_child = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="create",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=parent.id,
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "make widget",
+                "acceptance_evidence": {
+                    "kind": "named_test",
+                    "test_path": "backend/testing/test_widget.py",
+                },
+            }
+        ],
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+        },
+    )
+    # CASE 2: child declares a DIFFERENT test — no inheritance.
+    other_child = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="create",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=parent.id,
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "make other",
+                "acceptance_evidence": {
+                    "kind": "named_test",
+                    "test_path": "backend/testing/test_other.py",
+                },
+            }
+        ],
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+        },
+    )
+    # CASE 3: child already carries an inherited block — never clobbered.
+    existing_block = dict(block)
+    existing_block["descriptor"] = "older inherited block"
+    already = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="create",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=parent.id,
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "make widget too",
+                "acceptance_evidence": {
+                    "kind": "named_test",
+                    "test_path": "backend/testing/test_widget.py",
+                },
+            }
+        ],
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+            INHERITED_ACCEPTANCE_BLOCK_KEY: existing_block,
+        },
+    )
+
+    await _propagate_landed_to_staging_merged_descendants(parent.id, cleanup_db)
+    await cleanup_db.commit()
+    await cleanup_db.refresh(matching_child)
+    await cleanup_db.refresh(other_child)
+    await cleanup_db.refresh(already)
+
+    match_ctx = matching_child.context or {}
+    assert match_ctx.get(INHERITED_ACCEPTANCE_BLOCK_KEY) == block
+    declared = _declared_named_test_path(matching_child.first_payload)
+    assert declared == "backend/testing/test_widget.py"
+    # The reader side now sees the parent's genuinely-run test via the inherited
+    # block — the child's ran-green evidence is no longer invisible.
+    assert _acceptance_test_ran_green_at_merge(match_ctx, declared) is True
+
+    other_ctx = other_child.context or {}
+    assert INHERITED_ACCEPTANCE_BLOCK_KEY not in other_ctx
+    other_declared = _declared_named_test_path(other_child.first_payload)
+    assert _acceptance_test_ran_green_at_merge(other_ctx, other_declared) is False
+
+    # An already-inherited block is untouched (setdefault-style, never clobbered).
+    assert (already.context or {}).get(INHERITED_ACCEPTANCE_BLOCK_KEY) == existing_block
+
+
+@pytest.mark.asyncio
 async def test_propagate_landed_descendants_no_parent_changed_files_noop(cleanup_db):
     """When the rollup parent has no ``_pr_changed_files`` (e.g. a research/plan
     parent with no code diff), descendants inherit nothing — the changed-files
