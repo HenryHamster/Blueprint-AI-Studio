@@ -225,6 +225,17 @@ def _resident_typed_fast_payload() -> dict[str, Any]:
         "typed_fast_qualification": qualification,
     }
 
+
+def resident_typed_fast_activation_enabled() -> bool:
+    """True only when this control plane qualifies a typed Fast child.
+
+    The Workday poll must not stamp conversation rows fast-eligible when no
+    Resident can ever activate the Fast lane: the agent treats fast-marked
+    rows as exclusively Fast-owned, so stamping them without an activatable
+    adapter parks every operator message behind a child that will never exist.
+    """
+    return _resident_typed_fast_payload().get("typed_fast_enabled") is True
+
 # A task row can remain IN_PROGRESS long after its resident subprocess or runner
 # disappeared. Workday's synchronous ensure path must not trust that row
 # forever: a worker is healthy only while its task heartbeat is recent.
