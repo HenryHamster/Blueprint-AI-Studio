@@ -9,13 +9,23 @@ Two modes:
 
 * check mode (default): line-count every file listed in the scoped section(s) and
   print each breach (path, current lines, cap). Exits non-zero if any file exceeds
-  its cap, zero when clean.
+  its cap, zero when clean. Check mode ALSO guards the ratchet itself: a cap
+  raised above the MAINLINE ancestry tip (``_mainline_git_ref``) with no
+  cap_bump_history.json entry justifying the exact (old -> new) raise is a SILENT
+  cap bump and fails the check, naming the file, the old and new values, and how
+  to record the bump. Lowering a cap is always legal and never needs a ledger
+  entry. When the mainline baseline cannot be established (not a git checkout, no
+  mainline branch, unreadable file at the ref — e.g. a shallow CI clone that never
+  fetched the integration branch) the guard degrades to a clear skip, never a
+  crash or a spurious failure.
 * ``--fix`` mode: for every breached file, rewrite *only* that file's cap in the
   tracked JSON to the canonical ``bump_size_limit`` policy value; AND for every
   uncapped source file over ``_COVERAGE_THRESHOLD`` lines (the complementary
   coverage guardrail the ``test_*_no_uncapped_large_file`` meta-tests enforce),
-  ADD a new cap entry sized at the same policy headroom. Both paths preserve key
-  order and the leading ``_doc`` field so the diff stays minimal. After ``--fix``
+  ADD a new cap entry sized at the same policy headroom. Each applied bump is
+  appended to the cap_bump_history.json ledger, so the very raise ``--fix`` makes
+  is the justification a follow-up check accepts. Both paths preserve key order
+  and the leading ``_doc`` field so the diff stays minimal. After ``--fix``
   re-running check mode passes. The bump stays policy-consistent so the guardrail
   still catches genuine runaway growth.
 
@@ -37,6 +47,7 @@ current environment is reported as skipped rather than treated as an error.
 import argparse
 import json
 import os
+import subprocess
 import sys
 
 # Make ``app.size_limit_policy`` importable when run as
@@ -389,6 +400,139 @@ def _split_preexisting(
     return blocking, preexisting
 
 
+def _mainline_limits_via_git(repo_root: str) -> "tuple[dict | None, str | None]":
+    """Read ``module_size_limits.json`` at the MAINLINE ancestry tip.
+
+    Returns ``(limits, None)`` when the baseline is established, else
+    ``(None, reason)`` — a clear skip, never a crash.  Reuses the
+    mainline-ancestry scoping from ``app.size_limit_policy``
+    (``_mainline_git_ref``): the ref whose ancestry is the cap-bump-history
+    source of truth is also the baseline for "did this change RAISE a cap".
+    ``git show <ref>:backend/testing/module_size_limits.json`` reads the caps at
+    that ref directly — no checkout of the integration branch needed.
+
+    Shallow-clone behavior: when the mainline ref is absent from the checkout
+    (a depth-1 CI clone that never fetched the integration branch, or a
+    task-VM shallow clone), or the file cannot be read at the ref, the caller
+    must SKIP the cap-raise guard rather than fail — a missing ancestry
+    baseline proves nothing either way. ``None`` with a reason is that skip.
+    """
+    from app.size_limit_policy import _mainline_git_ref
+
+    if not os.path.isdir(os.path.join(repo_root, ".git")):
+        return None, f"{repo_root} is not a git checkout"
+    try:
+        ref = _mainline_git_ref(repo_root)
+    except Exception as exc:  # noqa: BLE001 — a probe; degrade to a clear skip
+        return None, f"could not resolve the mainline ref: {exc}"
+    if ref == "HEAD":
+        return None, "no mainline branch present (ref helper fell back to HEAD)"
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-c",
+                f"safe.directory={repo_root}",
+                "show",
+                f"{ref}:backend/testing/module_size_limits.json",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            cwd=repo_root,
+        )
+    except Exception as exc:  # noqa: BLE001 — a probe; degrade to a clear skip
+        return None, f"git show {ref}:.../module_size_limits.json raised: {exc}"
+    if result.returncode != 0:
+        return None, (
+            f"module_size_limits.json not readable at {ref} "
+            f"(git show exit {result.returncode})"
+        )
+    try:
+        limits = json.loads(result.stdout)
+    except ValueError as exc:
+        return None, f"module_size_limits.json at {ref} is not valid JSON: {exc}"
+    if not isinstance(limits, dict):
+        return None, (
+            f"module_size_limits.json at {ref} is a JSON {type(limits).__name__}, "
+            "not an object"
+        )
+    return limits, None
+
+
+def _record_justifies(record, old_cap: int, new_cap: int) -> bool:
+    """True when ``record`` is a cap-bump history entry for the exact raise.
+
+    Accepts both the ledger's raw dict records and the ``BumpRecord`` dataclass
+    ``parse_bump_history`` returns — the raise is justified only when a recorded
+    bump matches the exact (old_cap -> new_cap) pair being guarded.
+    """
+    if isinstance(record, dict):
+        return record.get("old_cap") == old_cap and record.get("new_cap") == new_cap
+    return record.old_cap == old_cap and record.new_cap == new_cap
+
+
+def detect_unjustified_cap_raises(
+    data: dict,
+    mainline_data: dict,
+    sections: "list[str]",
+    *,
+    history_for,
+) -> "list[tuple[str, str, int, int]]":
+    """Return ``(section, rel, old_cap, new_cap)`` for every cap in ``data``
+    raised ABOVE the same module's cap on ``mainline_data`` with no ledger entry
+    justifying the raise.
+
+    Pure / filesystem-free: the caller supplies the mainline baseline and the
+    ledger lookup (``history_for(section, rel)`` returns that module's cap-bump
+    records). A raise with a matching (old_cap -> new_cap) record is deliberate
+    and recorded; a raise without one is a SILENT cap bump and must fail the
+    check. Lowerings and unchanged caps never need a ledger entry — the ratchet
+    only guards the raising direction. A module absent from the baseline (a NEW
+    cap for a previously-uncapped file) is not a raise either.
+    """
+    raises: "list[tuple[str, str, int, int]]" = []
+    for section in sections:
+        current_caps = data.get(section) or {}
+        baseline_caps = mainline_data.get(section) or {}
+        for rel, new_cap in current_caps.items():
+            if not isinstance(new_cap, int):
+                continue
+            old_cap = baseline_caps.get(rel)
+            if not isinstance(old_cap, int):
+                # No cap on the mainline baseline — adding a cap for a new file
+                # (previously uncapped) is not a raise and needs no ledger.
+                continue
+            if new_cap <= old_cap:
+                # Unchanged or lowered — always legal, never needs a ledger entry.
+                continue
+            justified = any(
+                _record_justifies(record, old_cap, new_cap)
+                for record in history_for(section, rel)
+            )
+            if not justified:
+                raises.append((section, rel, old_cap, new_cap))
+    return raises
+
+
+def _cap_bump_history_for(section: str, rel: str) -> list:
+    """Return the cap-bump history ledger records for ``(section, rel)``.
+
+    Delegates to ``app.size_limit_policy.parse_bump_history`` — the same source
+    the chronic-offender verdict and the --fix regenerator use — so a raise is
+    justified by exactly the history that classifies bumps.  An UNREADABLE
+    history returns [] — a raise then has no justification and is flagged.  That
+    fails CLOSED, matching the chronic-offender classifier's contract: unreadable
+    evidence is never "no bump on record" a raise could lean on.
+    """
+    from app.size_limit_policy import BumpHistoryUnavailableError, parse_bump_history
+
+    try:
+        return parse_bump_history(rel, section)
+    except BumpHistoryUnavailableError:
+        return []
+
+
 def _parse_sections(raw: str) -> list[str]:
     if raw.strip().lower() == "all":
         return list(SECTIONS)
@@ -662,6 +806,42 @@ def main(argv: list[str] | None = None) -> int:
             f"needed: a dedicated chore PR running check_size_limits.py --fix "
             f"(chronic offenders require operator approval via --force-chronic)."
         )
+
+    # Cap-raise guardrail: the ratchet must only ever be WEAKENED deliberately.
+    # A check that merely asks "is each file under its cap" passes MORE easily
+    # when a cap is raised, so compare this change's caps against the MAINLINE
+    # ancestry (not an arbitrary base) and fail when a raise has no
+    # cap_bump_history.json entry justifying it. A matching ledger entry proves
+    # the raise was recorded (via --fix or an explicit ledger edit); lowering a
+    # cap is always legal; a raise without a ledger entry is a silent cap bump
+    # and blocks the check. When the mainline baseline cannot be established
+    # (not a git checkout, no mainline branch, unreadable file at the ref) the
+    # guard degrades to a clear skip — a missing ancestry baseline proves
+    # nothing either way.
+    mainline_data, mainline_reason = _mainline_limits_via_git(args.repo_root)
+    if mainline_data is None:
+        print(f"[cap-raise-guard] skipped: {mainline_reason}")
+    else:
+        unjustified_raises = detect_unjustified_cap_raises(
+            data,
+            mainline_data,
+            args.sections,
+            history_for=_cap_bump_history_for,
+        )
+        if unjustified_raises:
+            for section, rel, old_cap, new_cap in unjustified_raises:
+                print(
+                    f"[cap-raise] {section}/{rel}: cap raised {old_cap} -> {new_cap} "
+                    "with no cap-bump-history entry justifying the raise"
+                )
+            print(
+                f"\n{len(unjustified_raises)} unjustified cap raise(s). Raising a "
+                "cap must be deliberate AND recorded: run this checker with --fix "
+                "(which bumps the cap and appends the bump to cap_bump_history.json), "
+                "or add a cap_bump_history.json entry for the "
+                f"({old_cap} -> {new_cap}) raise."
+            )
+            exit_code = 1
 
     if exit_code == 0 and not preexisting:
         print("All scoped files within their size caps.")
