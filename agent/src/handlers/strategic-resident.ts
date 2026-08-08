@@ -44,6 +44,7 @@ import {
   MESSAGE_POLL_LIMIT, MAX_POLL_PAGES, OPERATOR_MESSAGE_BATCH_CAP, MAX_IMAGES_PER_TURN,
   buildPriorDecisionsText, buildRetiredContextText, buildStagedDirectionsText,
   buildSurfaceCatalog, nextFocus, classifyTickOutcome, openFoundLeads, parseTickVerdict,
+  buildDirectionChangeSignals, hasDueSurface, REEXAM_COOLDOWN_MS,
   classifyOperatorDecisionReview, mergePendingOperatorDecisionReview,
   retainPendingOperatorDecisionReview, advancePendingOperatorDecisionReview, MAX_REVIEW_ATTEMPTS,
   shouldRunAutonomousTurn, actionableFiredWatchRevision, wakeBarrierRevision,
@@ -1202,6 +1203,13 @@ export async function handleStrategicResident(
   // TICK-VERDICT records what was examined so an idle claim can never be a global
   // "nothing to do" and can never rest on unexamined surfaces. No quotas exist.
   let surfaceCatalog = buildSurfaceCatalog(payload, listWorkspaceTopDirs(WORKSPACE));
+  // Per-direction change-fingerprints for the re-exam change-gate, keyed
+  // direction:<id>. Derived from the session-start payload's directions_summary
+  // (the source of the outcome/cycle/PR/churn counters); the heartbeat does not
+  // refresh those counters mid-session, so within a session this map is stable
+  // and the cooldown drives re-exam, while counter deltas surface across a
+  // restart/bootstrap versus the exam ledger's persisted baseline signal.
+  const directionChangeSignals = buildDirectionChangeSignals(payload);
   // Restore the exam ledger from the persisted context (written by the heartbeat
   // note round-trip). A clean restart continues rotation rather than wiping it.
   const restoredLedger = restoreLedger(
@@ -4787,6 +4795,17 @@ export async function handleStrategicResident(
         wakeBarrierRevision(firedResidentBarriers),
       ].join('#');
       const ownedWorkPending = hasPendingOwnedWork(currentWorkStateSummary);
+      // Re-exam change-gate: is ANY surface due for a real look this tick? Only
+      // consulted on the unchanged-state exploration path (operator/agenda/
+      // followup/watch/world-change wakes short-circuit ahead of it). When the
+      // exploration interval elapses but every surface is settled-clear-and-
+      // unchanged within its cooldown, the exploration turn is suppressed and the
+      // loop idles cheaply below instead of deep-re-reading a settled surface.
+      const anyDue = hasDueSurface(surfaceCatalog, examRecords, {
+        currentSignals: directionChangeSignals,
+        nowMs: Date.now(),
+        cooldownMs: REEXAM_COOLDOWN_MS,
+      });
       if (!shouldRunAutonomousTurn({
         currentWorkStateRev,
         lastTurnWorkStateRev: lastAutonomousWorkStateRev,
@@ -4799,6 +4818,12 @@ export async function handleStrategicResident(
         msSinceLastAutonomousTurn: lastAutonomousTurnAt === 0
           ? Number.POSITIVE_INFINITY : Date.now() - lastAutonomousTurnAt,
         explorationIntervalMs: cfg.explorationIntervalMs,
+        anyDue,
+        // Empty-session guard: this session has run an autonomous turn iff
+        // lastAutonomousTurnAt has been stamped (set to Date.now() only after a
+        // turn completes; 0 at session start). Ensures the all-quiet suppression
+        // never fires before the session makes any strategic API activity.
+        hasRunAutonomousTurnThisSession: lastAutonomousTurnAt !== 0,
       })) {
         const wakeProjection = explorationWakeProjection(
           lastAutonomousTurnAt,
@@ -4836,7 +4861,15 @@ export async function handleStrategicResident(
       // somewhere new/deeper, open FOUND leads to restate, and a corrective flag
       // set after an unevidenced idle claim.
       operatorTurnJustCompleted = false;
-      const focus = nextFocus(surfaceCatalog, examRecords, FOCUS_LIST_SIZE);
+      // Change-gated rotation: never-examined first, then DUE surfaces (changed
+      // since their clear, unsettled, or cooldown-elapsed) ahead of settled-
+      // clear-and-unchanged ones — so a due surface is examined before an
+      // already-cleared, unchanged one is re-read.
+      const focus = nextFocus(surfaceCatalog, examRecords, FOCUS_LIST_SIZE, {
+        currentSignals: directionChangeSignals,
+        nowMs: Date.now(),
+        cooldownMs: REEXAM_COOLDOWN_MS,
+      });
       const recentRecords = examRecords.slice(-6);
       const openFound = openFoundLeads(examRecords);
       const corrective = correctiveNextTick;
@@ -4964,6 +4997,12 @@ export async function handleStrategicResident(
         at: new Date().toISOString(),
         interrupted: turnInterrupted,
       });
+      // Stamp the surface's live change-fingerprint onto the record so a future
+      // tick can tell whether the surface moved since THIS exam. Only direction
+      // surfaces expose a signal (undefined otherwise) — this is the baseline the
+      // re-exam change-gate diffs the next live fingerprint against.
+      const examinedSignal = directionChangeSignals.get(upd.record.surfaceKey);
+      if (examinedSignal !== undefined) upd.record.signal = examinedSignal;
       examRecords.push(upd.record);
       if (examRecords.length > EXAM_RECORDS_CAP) {
         examRecords.splice(0, examRecords.length - EXAM_RECORDS_CAP);
