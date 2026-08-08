@@ -296,6 +296,32 @@ class ReleaseVersion(SQLModel, table=True):
         sa_column=Column(String(128), nullable=True),
     )
 
+    # ----- Approved activation (in-product promotion activation control) -----
+    # Stamped when an operator approves activation of THIS promoted version for
+    # the trusted control-plane host to execute.  The approval binds EXACTLY the
+    # version's immutable ``promoted_sha``: the activation-receipt path rejects
+    # any reported revision that differs (or a receipt once a newer promotion has
+    # superseded this one), so an approval can never authorize a different or
+    # historical artifact.  Both nullable and purely additive — pre-existing
+    # promoted rows backfill NULL and keep the legacy CLI path unchanged.
+    #
+    #   activation_requested_at is NULL          -> awaiting approval
+    #   activation_requested_at set, unconfirmed -> approved-but-not-yet-executed
+    #
+    # The approved execution is additionally recorded as immutable audit
+    # provenance in ``last_qualification["activation_approval"]``.
+    activation_requested_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+
+    # Operator identity that approved activation, mirroring goal_editor_info
+    # provenance conventions ("[operator:email]" / uid).
+    activation_requested_by: str | None = Field(
+        default=None,
+        sa_column=Column(String(255), nullable=True),
+    )
+
     deploy_artifacts: List["ReleaseDeployArtifact"] = Relationship(
         back_populates="version"
     )

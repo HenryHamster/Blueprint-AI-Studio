@@ -367,6 +367,9 @@ async def test_promoted_awaiting_activation_item(db_session):
     assert item["severity"] == "needs_operator"
     assert item["kind"] == "version"
     assert "awaiting activation" in item["label"]
+    # Read-model distinction: no approval yet → awaiting_approval.
+    assert item["activation_state"] == "awaiting_approval"
+    assert item["activation_requested_at"] is None
     assert item["ref"]["kind"] == "version"
     assert item["ref"]["project_id"] == str(project.id)
     assert attention["counts"]["needs_operator"] >= 1
@@ -383,6 +386,38 @@ async def test_promoted_awaiting_activation_item(db_session):
     assert target["surface"] == "runtime"
     assert target["section"] == "version-lifecycle"
     assert target["project_id"] == str(project.id)
+
+
+@pytest.mark.asyncio
+async def test_promoted_approved_activation_item_distinguishes_state(db_session):
+    """A promoted version with an in-product approval (activation_requested_at
+    set) still counts as promotion_awaiting_activation, but the item's
+    activation_state distinguishes approved-but-not-yet-executed from awaiting
+    approval and the label reflects the approved state."""
+    project = await _seed_alert_project(db_session)
+    version = _add_promoted_version(db_session, project.id, version_number=1)
+    version.activation_requested_at = _utcnow()
+    version.activation_requested_by = "test@example.com"
+    await db_session.commit()
+
+    attention = await build_operator_attention(db_session, project, TEST_USER_ID)
+
+    assert attention["counts"]["promoted_awaiting_activation"] == 1
+    item = next(
+        (
+            i
+            for i in attention["items"]
+            if i.get("reason") == "promotion_awaiting_activation"
+        ),
+        None,
+    )
+    assert item is not None
+    assert item["activation_state"] == "approved_pending_execution"
+    assert item["activation_requested_by"] == "test@example.com"
+    assert item["activation_requested_at"] is not None
+    assert "approved" in item["label"]
+    assert item["target"]["surface"] == "runtime"
+    assert item["target"]["section"] == "version-lifecycle"
 
 
 @pytest.mark.asyncio

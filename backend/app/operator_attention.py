@@ -1621,23 +1621,47 @@ def _promoted_awaiting_activation_attention_item(
     ``unconfirmed``: the promotion has merged but the deploy has not yet been
     confirmed serving, so the operator's single activation approval is exactly
     what the promotion-to-serving path is waiting on.
+
+    The item distinguishes the two live sub-states through ``activation_state``
+    and the label/detail copy: ``awaiting_approval`` (no approval yet — the
+    operator must approve or run ``blueprint deploy``) vs
+    ``approved_pending_execution`` (an operator approved it and the trusted
+    control-plane host is executing it).
     """
     version_number = version.version_number
     deadline = version.deploy_confirm_deadline
     deadline_text = (
         f" Confirmation window ends {deadline.isoformat()}." if deadline else ""
     )
+    approval = getattr(version, "activation_requested_at", None)
+    approved = approval is not None
+    if approved:
+        requested_by = version.activation_requested_by or "an operator"
+        label = f"v{version_number} approved — activating…"
+        detail = (
+            f"v{version_number} activation approved by {requested_by} — the "
+            f"control-plane host is executing the approved promoted SHA.{deadline_text}"
+        )
+    else:
+        label = f"v{version_number} promoted, awaiting activation"
+        detail = (
+            f"v{version_number} merged to the promotion target but is not yet "
+            "confirmed serving — run `blueprint deploy` (or approve the deploy) "
+            f"to activate it.{deadline_text}"
+        )
     return {
         "id": f"version:{version.id}:promotion_awaiting_activation",
         "kind": "version",
         "severity": "needs_operator",
         "reason": "promotion_awaiting_activation",
-        "label": f"v{version_number} promoted, awaiting activation",
-        "detail": (
-            f"v{version_number} merged to the promotion target but is not yet "
-            "confirmed serving — run `blueprint deploy` (or approve the deploy) "
-            f"to activate it.{deadline_text}"
+        "label": label,
+        "detail": detail,
+        # Read-model distinction: awaiting approval vs approved-but-not-yet-executed.
+        "activation_state": (
+            "approved_pending_execution" if approved else "awaiting_approval"
         ),
+        "activation_requested_at": approval.isoformat() if approval else None,
+        "activation_requested_by": version.activation_requested_by,
         "updated_at": (
             version.promoted_at.isoformat() if version.promoted_at else None
         ),

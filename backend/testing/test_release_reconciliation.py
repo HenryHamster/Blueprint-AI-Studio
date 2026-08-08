@@ -7875,6 +7875,123 @@ async def test_record_activation_receipt_leaves_aggregate_unconfirmed_when_requi
 
 
 # ===========================================================================
+# Approved activation control: _approved_activation_mismatch /
+# _approved_activation_superseded / approved-mode receipt provenance
+# ===========================================================================
+
+
+def test_approved_activation_mismatch_only_guards_live_approved_receipts():
+    """``_approved_activation_mismatch`` rejects ONLY the case an in-product
+    approval intends to close: an active approval (still unconfirmed) reporting
+    a revision other than the approved promoted SHA.  No approval (the legacy
+    CLI path), a matching SHA, or an already-resolved version all pass through
+    unchanged."""
+    from app.release_activation import _approved_activation_mismatch
+
+    version = rv.ReleaseVersion(
+        project_id=uuid4(),
+        version_number=1,
+        status="promoted",
+        serving_status="unconfirmed",
+        promoted_sha=_SHA_A,
+    )
+
+    # No approval → the legacy CLI path is unchanged even for a differing
+    # revision (the built revision may legitimately be a descendant).
+    assert _approved_activation_mismatch(version, _SHA_B) is None
+
+    # Active approval + the EXACT approved SHA → no rejection.
+    version.activation_requested_at = _utcnow()
+    version.activation_requested_by = "op@example.com"
+    assert _approved_activation_mismatch(version, _SHA_A) is None
+
+    # Active approval + a DIFFERENT revision → mismatch rejection naming the
+    # approved SHA prefix so the operator can see which artifact is authorized.
+    detail = _approved_activation_mismatch(version, "9" * 40)
+    assert detail is not None
+    assert "does not match" in detail
+    assert _SHA_A[:12] in detail
+
+    # Already-resolved → the existing idempotency / recovery machinery governs.
+    version.serving_status = "serving_confirmed"
+    assert _approved_activation_mismatch(version, _SHA_B) is None
+
+
+@pytest.mark.asyncio
+async def test_approved_activation_superseded_detects_newer_promotion(db_session):
+    """An approved version is superseded once a NEWER promotion exists; the
+    current promoted version is never superseded by itself."""
+    from app.release_activation import _approved_activation_superseded
+
+    now = _utcnow()
+    promoted_at = now - timedelta(hours=2)
+    deadline = promoted_at + timedelta(hours=1)
+    project, v1 = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline, promoted_sha=_SHA_A
+    )
+    v1.activation_requested_at = now
+    v1.activation_requested_by = "op@example.com"
+    db_session.add(v1)
+    await db_session.commit()
+
+    assert await _approved_activation_superseded(db_session, v1) is False
+
+    # A newer promotion supersedes the approved v1.
+    v2 = await rv.open_version(db_session, project.id, version_number=2)
+    v2.status = "promoted"
+    v2.promoted_at = now
+    v2.promoted_sha = _SHA_B
+    v2.serving_status = "unconfirmed"
+    v2.deploy_confirm_deadline = now + timedelta(hours=1)
+    db_session.add(v2)
+    await db_session.commit()
+
+    assert await _approved_activation_superseded(db_session, v1) is True
+    assert await _approved_activation_superseded(db_session, v2) is False
+
+
+@pytest.mark.asyncio
+async def test_record_activation_receipt_approved_mode_stamps_provenance(db_session):
+    """A receipt under an in-product approval records mode=approved_activation
+    and the approval binding it fulfilled, alongside the standard provenance."""
+    from app.release_reconciliation import _record_activation_receipt
+
+    now = _utcnow()
+    promoted_at = now - timedelta(hours=1)
+    deadline = promoted_at + timedelta(hours=1)
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session,
+        promoted_at=promoted_at,
+        deadline=deadline,
+        promoted_sha=_SHA_A,
+    )
+    version.activation_requested_at = promoted_at + timedelta(minutes=30)
+    version.activation_requested_by = "op@example.com"
+    db_session.add(version)
+    await db_session.commit()
+
+    receipt = await _record_activation_receipt(
+        db_session,
+        version,
+        revision=_SHA_A,
+        host="hamsterwheel",
+        operator_id="op@example.com",
+        now=now,
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert receipt["mode"] == "approved_activation"
+    assert version.serving_status == "serving_confirmed"
+
+    receipt_block = (version.last_qualification or {}).get("activation_receipt") or {}
+    assert receipt_block["mode"] == "approved_activation"
+    assert receipt_block["revision"] == _SHA_A
+    assert receipt_block["activation_requested_by"] == "op@example.com"
+    assert receipt_block["activation_requested_at"] is not None
+
+
+# ===========================================================================
 # Promotion-CI self-heal gate: decoupled from design_doc._auto_remediation,
 # governed by durable operator-owned build_config (default ON, project-agnostic)
 # ===========================================================================

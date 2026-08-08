@@ -389,7 +389,7 @@
     "test_max_plan_pool_usage.py": 2750,
     "test_shard_balance.py": 350,
     "test_admin_routers__messages.py": 5250,
-    "test_admin_routers__version_lifecycle.py": 4800,
+    "test_admin_routers__version_lifecycle.py": 5600,
     "test_admin_routers__runners.py": 1600,
     "test_admin_routers__users.py": 1000,
     "test_compute__experiments.py": 1600,

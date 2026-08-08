@@ -818,11 +818,14 @@ async def _record_activation_receipt(
 
     qual = dict(version.last_qualification or {})
     qual["activation_receipt"] = {
-        "mode": "cli_activation",
+        "mode": "approved_activation" if version.activation_requested_at else "cli_activation",
         "operator": operator_id,
         "revision": served_sha or None,
         "host": host,
         "activated_at": now.isoformat(),
+        # Provenance for an approved execution: the approval this receipt fulfilled.
+        "activation_requested_at": version.activation_requested_at.isoformat() if version.activation_requested_at else None,
+        "activation_requested_by": version.activation_requested_by,
     }
     version.last_qualification = qual
     session.add(version)
@@ -854,7 +857,7 @@ async def _record_activation_receipt(
             confirmed_reason_code=backend_artifact.reason_code,
         )
         return {
-            "mode": "cli_activation",
+            "mode": "approved_activation" if version.activation_requested_at else "cli_activation",
             "serving_status": "serving_confirmed",
             "served_sha": served_sha,
         }
@@ -863,7 +866,7 @@ async def _record_activation_receipt(
     ):
         session.add(version)
     return {
-        "mode": "cli_activation",
+        "mode": "approved_activation" if version.activation_requested_at else "cli_activation",
         "serving_status": aggregate_status,
         "served_sha": served_sha,
         "reason_code": aggregate_reason,

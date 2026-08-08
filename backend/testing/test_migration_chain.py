@@ -1335,7 +1335,7 @@ def test_backfill_0707_chains_from_0702_and_declares_kv_keys():
         )
 
 
-def test_schema_head_chains_through_0737_cross_project_scan_indexes():
+def test_schema_head_chains_through_0738_activation_request_approval():
     """Service-credential migrations follow admission removal as one linear chain.
 
     Historical contracts preserved:
@@ -1347,7 +1347,8 @@ def test_schema_head_chains_through_0737_cross_project_scan_indexes():
     - 0728 (inline LLM spend pricing status) revises 0727
     - 0735 (task origination) revises 0728
     - 0736 (direction-scoped category verdicts) revises 0735
-    - 0737 (cross-project perf indexes) revises 0736 — current schema head
+    - 0737 (cross-project perf indexes) revises 0736
+    - 0738 (approved-activation control columns) revises 0737 — current schema head
     """
     versions_dir = Path(__file__).resolve().parents[1] / "alembic" / "versions"
     operability = (
@@ -1417,6 +1418,9 @@ def test_schema_head_chains_through_0737_cross_project_scan_indexes():
     perf_indexes = (
         versions_dir / "0737_cross_project_scan_indexes.py"
     ).read_text()
+    activation_approval = (
+        versions_dir / "0738_activation_request_approval.py"
+    ).read_text()
     assert parse_revision_identifiers(operability) == ("0708", "0707")
     assert parse_revision_identifiers(claims) == ("0709", "0708")
     assert parse_revision_identifiers(incarnation) == ("0710", "0709")
@@ -1455,10 +1459,14 @@ def test_schema_head_chains_through_0737_cross_project_scan_indexes():
     assert parse_revision_identifiers(direction_scoped_verdicts) == ("0736", "0735")
     # 0737 chains from 0736: additive cross-project perf indexes.
     assert parse_revision_identifiers(perf_indexes) == ("0737", "0736")
+    # 0738 chains from 0737: approved-activation control columns.
+    assert parse_revision_identifiers(activation_approval) == ("0738", "0737")
+    assert "activation_requested_at" in activation_approval
+    assert "activation_requested_by" in activation_approval
 
     from app.main import EXPECTED_SCHEMA_REVISION
 
-    assert EXPECTED_SCHEMA_REVISION == "0737", (
-        f"Expected EXPECTED_SCHEMA_REVISION == '0737', got {EXPECTED_SCHEMA_REVISION!r}. "
+    assert EXPECTED_SCHEMA_REVISION == "0738", (
+        f"Expected EXPECTED_SCHEMA_REVISION == '0738', got {EXPECTED_SCHEMA_REVISION!r}. "
         "Bump EXPECTED_SCHEMA_REVISION in backend/app/main.py."
     )

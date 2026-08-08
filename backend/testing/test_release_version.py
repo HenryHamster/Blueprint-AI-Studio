@@ -20,7 +20,7 @@ import json
 import uuid
 from datetime import timedelta
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from sqlalchemy.exc import IntegrityError
@@ -3594,3 +3594,185 @@ async def test_list_release_versions_requires_membership(db_session):
             current_user={"user_id": "stranger"},
         )
     assert exc.value.status_code == 404
+
+
+# ===========================================================================
+# Approved activation: an approval stamp + a host-side pull → recorded receipt
+#
+# The in-product one-click activation path splits "approve" (an in-product
+# admin decision, cheap and safe to expose) from "execute" (the privileged
+# host-side activation, which stays on the control-plane host outside the
+# API/worker containers).  The backend may only RECORD an approval stamp; the
+# actual deployment is PULLED and executed host-side, and only then is the
+# activation receipt POSTed back into the backend.  These tests pin that
+# contract: an approval stamp plus a host-side pull yields a recorded
+# ``approved_activation`` receipt, and the backend itself has no outbound-deploy
+# capability (no ssh / paramiko) anywhere in app code.
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_approved_activation_receipt_recorded_on_host_pull(
+    db_session, monkeypatch
+):
+    """An in-product approval stamp plus a host-side pull records an
+    ``approved_activation`` receipt and resolves the version to
+    ``serving_confirmed``.
+
+    The backend only stamps ``activation_requested_at`` / ``activation_requested_by``
+    on the approved version; the trusted control-plane host pulls that approval,
+    executes the privileged activation, and POSTs the receipt back.  The receipt
+    path records ``mode=approved_activation`` with the approval provenance it
+    fulfilled and flips the version to ``serving_confirmed`` through the shared
+    recovery machinery."""
+    import dataclasses
+
+    from app import release_artifacts as artifact_registry
+    from app.release_artifacts import (
+        BACKEND_REVISION_ARTIFACT_KIND,
+        PROMOTION_MERGE_ARTIFACT_KIND,
+    )
+    from app.release_models import ReleaseDeployArtifact
+    from app.release_reconciliation import _record_activation_receipt
+
+    # The backend_revision / agent_image providers are observable only for the
+    # repo this deployment serves; stamp the deploy identity to match.
+    monkeypatch.setenv("DEPLOY_REPO_IDENTITY", "acme/widget")
+
+    # promotion_merge is observable for every GitHub project and would hit a
+    # live GitHub ancestry/check-runs lookup; stub its provider to confirm
+    # immediately so the aggregate resolves on the receipt-confirmed backend
+    # artifact without network I/O.
+    async def _confirm_merge_immediately(_session, _version, _artifact, _now):
+        return ("serving_confirmed", _version.promoted_sha, _now)
+
+    _merge_provider = artifact_registry._ARTIFACT_PROVIDERS.get(
+        PROMOTION_MERGE_ARTIFACT_KIND
+    )
+    if _merge_provider is not None:
+        monkeypatch.setitem(
+            artifact_registry._ARTIFACT_PROVIDERS,
+            PROMOTION_MERGE_ARTIFACT_KIND,
+            dataclasses.replace(_merge_provider, check=_confirm_merge_immediately),
+        )
+
+    # The agent_image serving check resolves via live GitHub seams; stub them to
+    # a non-bake promotion that confirms immediately (no network I/O).
+    _resolve_patch = patch(
+        "app.release_promotion._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "acme", "widget")),
+    )
+    _rebake_patch = patch(
+        "app.github_refs.agent_image_rebake_expected",
+        new=AsyncMock(return_value=False),
+    )
+    _base_patch = patch(
+        "app.release_artifacts._previously_deployed_sha",
+        return_value="p" * 40,
+    )
+    _resolve_patch.start()
+    _rebake_patch.start()
+    _base_patch.start()
+    try:
+        now = _utcnow()
+        promoted_at = now - timedelta(hours=1)
+        deadline = promoted_at + timedelta(hours=1)
+        sha = "a" * 40
+
+        project = Project(
+            name="RV-ApprovedActivation",
+            user_id="rv-user",
+            github_owner="acme",
+            github_repo="widget",
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        version = await rv.open_version(db_session, project.id, version_number=1)
+        version.status = "promoted"
+        version.promoted_at = promoted_at
+        version.promoted_sha = sha
+        version.serving_status = "unconfirmed"
+        version.deploy_confirm_deadline = deadline
+        version.last_qualification = {"status": "promoted", "promoted_sha": sha}
+        # The in-product approval stamp: recorded by the backend, executed
+        # host-side.  The backend has no deploy capability of its own.
+        version.activation_requested_at = promoted_at + timedelta(minutes=30)
+        version.activation_requested_by = "op@example.com"
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        # The backend_revision artifact armed at promotion, awaiting the
+        # host-side pull's receipt.
+        db_session.add(
+            ReleaseDeployArtifact(
+                version_id=version.id,
+                artifact_kind=BACKEND_REVISION_ARTIFACT_KIND,
+                serving_status="unconfirmed",
+                confirmation_deadline=deadline,
+            )
+        )
+        await db_session.commit()
+
+        # Host-side pull: the control-plane host activates the approved version
+        # and POSTs the receipt back into the backend.
+        receipt = await _record_activation_receipt(
+            db_session,
+            version,
+            revision=sha,
+            host="control-plane-host",
+            operator_id="op@example.com",
+            now=now,
+        )
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        assert receipt["mode"] == "approved_activation"
+        assert version.serving_status == "serving_confirmed"
+        assert version.served_sha == sha
+        assert version.served_at is not None
+        assert version.deploy_failure_reason is None
+
+        # The receipt provenance is stamped on the version audit trail.
+        receipt_block = (version.last_qualification or {}).get(
+            "activation_receipt"
+        ) or {}
+        assert receipt_block["mode"] == "approved_activation"
+        assert receipt_block["revision"] == sha
+        assert receipt_block["host"] == "control-plane-host"
+        assert receipt_block["operator"] == "op@example.com"
+        assert receipt_block["activation_requested_by"] == "op@example.com"
+        assert receipt_block["activation_requested_at"] is not None
+    finally:
+        _resolve_patch.stop()
+        _rebake_patch.stop()
+        _base_patch.stop()
+
+
+def test_backend_has_no_outbound_deploy_capability():
+    """The backend must never be able to grant itself the right to deploy
+    itself: no ssh / paramiko and no outbound-deploy primitive anywhere in
+    ``backend/app``.  The in-product approval path only records a stamp; the
+    privileged activation is PULLED and executed host-side by the control
+    plane."""
+    app_dir = Path(__file__).resolve().parents[1] / "app"
+    offenders: list[tuple[str, str]] = []
+    needles = (
+        ("import paramiko", "paramiko import"),
+        ("from paramiko", "paramiko import"),
+        ("import ssh", "ssh import"),
+        ("from ssh import", "ssh import"),
+    )
+    for py in sorted(app_dir.rglob("*.py")):
+        text = py.read_text(encoding="utf-8")
+        for needle, label in needles:
+            if needle in text:
+                offenders.append((str(py.relative_to(app_dir.parents[1])), label))
+    assert not offenders, (
+        "Backend app code must not import an outbound-deploy primitive "
+        "(ssh/paramiko): the software being deployed must never be able to "
+        "grant itself the right to deploy itself. Found: "
+        + ", ".join(f"{path} ({label})" for path, label in offenders)
+    )
