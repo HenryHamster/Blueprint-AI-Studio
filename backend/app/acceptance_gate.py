@@ -133,7 +133,13 @@ CODE_ACCEPTANCE_VERDICT_KEY = "code_acceptance_verdict"
 # Bumped whenever the acceptance evaluation rules change. Consumed by
 # :func:`effective_acceptance_verdict` (rung 3), which re-derives any recorded
 # row whose stamp predates the current rule.
-ACCEPTANCE_RULE_VERSION = 1
+#
+# v2: the evaluation rules changed this version — :func:`_merge_acceptance_test_block`
+# now also reads the inherited rollup-child block (:data:`INHERITED_ACCEPTANCE_BLOCK_KEY`)
+# and the window-corroboration marker semantics changed, so a row stamped under v1
+# can score differently under the current core. Bumping retires those v1 stamps so
+# rung 3 re-derives them instead of trusting a verdict the retired rule produced.
+ACCEPTANCE_RULE_VERSION = 2
 
 # ``rederived_by`` stamped on a re-derived verdict (design doc c50453ef §5).
 # Identifies the actor that re-scored already-merged work so an auditor can tell

@@ -1625,8 +1625,9 @@ def _promoted_awaiting_activation_attention_item(
     The item distinguishes the two live sub-states through ``activation_state``
     and the label/detail copy: ``awaiting_approval`` (no approval yet — the
     operator must approve or run ``blueprint deploy``) vs
-    ``approved_pending_execution`` (an operator approved it and the trusted
-    control-plane host is executing it).
+    ``approved_pending_execution`` (an operator recorded an approval; the
+    promoted version is still awaiting host-side activation via
+    ``blueprint deploy`` — the approval stamp does not itself execute).
     """
     version_number = version.version_number
     deadline = version.deploy_confirm_deadline
@@ -1637,10 +1638,12 @@ def _promoted_awaiting_activation_attention_item(
     approved = approval is not None
     if approved:
         requested_by = version.activation_requested_by or "an operator"
-        label = f"v{version_number} approved — activating…"
+        label = f"v{version_number} approved — awaiting activation"
         detail = (
-            f"v{version_number} activation approved by {requested_by} — the "
-            f"control-plane host is executing the approved promoted SHA.{deadline_text}"
+            f"v{version_number} activation approved by {requested_by}; the "
+            "approval is recorded and the promoted version is awaiting host-side "
+            "activation — run `blueprint deploy` to activate it and confirm it "
+            f"serving.{deadline_text}"
         )
     else:
         label = f"v{version_number} promoted, awaiting activation"
