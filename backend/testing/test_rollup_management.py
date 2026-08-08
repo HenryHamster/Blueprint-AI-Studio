@@ -3688,7 +3688,7 @@ async def test_propagate_landed_re_evaluates_already_landed_child_when_parent_ch
     )
 
     # First propagation: parent has no changed files → child lands but its
-    # verdict is frozen at declared_unsatisfied (missing-from-diff).
+    # verdict is frozen at declared_unsatisfied with unavailable provenance.
     stamped = await _propagate_landed_to_staging_merged_descendants(
         parent.id, cleanup_db
     )
@@ -3699,7 +3699,7 @@ async def test_propagate_landed_re_evaluates_already_landed_child_when_parent_ch
     recorded = (child.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
     assert recorded is not None
     assert recorded.get("satisfied") is False
-    assert "is not among the PR's changed files" in (recorded.get("reason") or "")
+    assert "changed-file provenance was unavailable" in (recorded.get("reason") or "")
 
     # Parent's GitHub-verified changed files arrive late.
     parent_ctx = dict(parent.context or {})

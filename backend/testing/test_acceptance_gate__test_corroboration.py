@@ -65,6 +65,27 @@ def test_corroborated_absence_overrides_agent_present_word():
     assert _acceptance_test_ran_green_at_merge(task.context, declared) is False
 
 
+def test_missing_diff_provenance_is_not_proven_test_absence():
+    """A task with no recorded diff gets a provenance diagnosis, not a claim
+    that its declared test was absent from the PR."""
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+        },
+        changed_files=None,
+    )
+
+    verdict = evaluate_code_acceptance(task)
+
+    assert verdict.satisfied is False
+    assert "changed-file provenance was unavailable" in verdict.reason
+    record_code_acceptance_verdict(task)
+    assert classify_unsatisfied_reason(
+        task.context["code_acceptance_verdict"]
+    ) == "named_test_diff_provenance_unavailable"
+
+
 def test_corroborated_absence_is_a_non_existence_verdict_end_to_end():
     """End-to-end through the real writer: a backend-refuted declared test must
     not be credited — ``evaluate_code_acceptance`` must mint a non-existence

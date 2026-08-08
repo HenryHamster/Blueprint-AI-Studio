@@ -655,6 +655,28 @@ def test_named_test_missing_from_changed_files_fails_closed():
     assert acceptance_blocks_success(task.context[CODE_ACCEPTANCE_VERDICT_KEY]) is True
 
 
+def test_named_test_without_changed_file_provenance_has_distinct_reason():
+    """A missing diff signal is not proof that the declared test was omitted."""
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+        },
+        changed_files=None,
+        unverified_reason=None,
+    )
+
+    verdict = evaluate_code_acceptance(task)
+
+    assert verdict.satisfied is False
+    assert "changed-file provenance was unavailable" in verdict.reason
+    recorded = record_code_acceptance_verdict(task)
+    assert recorded is not None
+    assert classify_unsatisfied_reason(
+        task.context[CODE_ACCEPTANCE_VERDICT_KEY]
+    ) == "named_test_diff_provenance_unavailable"
+
+
 def test_named_test_test_only_diff_fails_closed():
     # Test present + verified, but the diff is test-only: no changed production
     # seam for the test to exercise (covers the "does not touch changed code" and
@@ -2413,6 +2435,12 @@ def test_classify_undeclared_reason_partitions_undeclared_bucket():
 # gate formats) so the classifier is tested against what actually lands in
 # task.context[CODE_ACCEPTANCE_VERDICT_KEY], not a hand-rolled reimplementation.
 _REASONED_UNSATISFIED_SAMPLES = {
+    "named_test_diff_provenance_unavailable": (
+        "named_test",
+        "declared named_test 'backend/testing/test_widget.py' could not be "
+        "evaluated because PR changed-file provenance was unavailable — "
+        "_pr_changed_files was never recorded",
+    ),
     "named_test_missing_from_diff": (
         "named_test",
         "declared named_test 'backend/testing/test_widget.py' is not among the "
@@ -4288,9 +4316,9 @@ async def test_backfill_verdicts_advances_past_unprovable(db_session):
 
 
 @pytest.mark.asyncio
-async def test_backfill_missing_from_diff_failure_stays_re_examinable(db_session):
-    """A missing-from-diff named_test verdict that STILL cannot be proven (no
-    changed-file provenance has arrived) is stamped with the ordinary one-shot
+async def test_backfill_missing_diff_provenance_stays_re_examinable(db_session):
+    """An unavailable-provenance named_test verdict that STILL cannot be proven
+    (no changed-file provenance has arrived) is stamped with the ordinary one-shot
     ``_backfill_checked_at`` marker — freeing the LIMIT-200 window — but NOT
     the terminal marker: the candidate query re-admits the class as soon as
     provenance arrives, so marking never freezes the verdict. (Pre-fix the
@@ -4319,8 +4347,9 @@ async def test_backfill_missing_from_diff_failure_stays_re_examinable(db_session
         "proven": False,
         "kind": "named_test",
         "reason": (
-            "declared named_test 'backend/testing/test_widget.py' is not among the "
-            "PR's changed files — the claimed test was not added or modified here"
+            "declared named_test 'backend/testing/test_widget.py' could not be "
+            "evaluated because PR changed-file provenance was unavailable — "
+            "_pr_changed_files was never recorded"
         ),
     }
     task.context = ctx
@@ -4784,7 +4813,7 @@ async def test_landed_rollup_child_regrades_after_parent_changed_files_arrive(db
     await db_session.flush()
 
     # First propagation: parent has NO changed files → child lands but its verdict
-    # is frozen at declared_unsatisfied (missing-from-diff).
+    # is frozen at declared_unsatisfied with unavailable provenance.
     stamped = await _propagate_landed_to_staging_merged_descendants(
         parent.id, db_session
     )
@@ -4796,7 +4825,7 @@ async def test_landed_rollup_child_regrades_after_parent_changed_files_arrive(db
     recorded = (child.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
     assert recorded is not None
     assert recorded.get("satisfied") is False
-    assert "is not among the PR's changed files" in (recorded.get("reason") or "")
+    assert "changed-file provenance was unavailable" in (recorded.get("reason") or "")
 
     # ── Late arrival: the parent's GitHub-verified changed files land. ─────
     parent_ctx = dict(parent.context or {})

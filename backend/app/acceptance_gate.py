@@ -233,6 +233,19 @@ def _context_changed_files(context: Mapping[str, Any] | None) -> list[str]:
     return [p for p in raw if isinstance(p, str) and p.strip()]
 
 
+def _changed_file_provenance_available(context: Mapping[str, Any] | None) -> bool:
+    """Whether the context contains a recorded (possibly empty) PR diff list.
+
+    An empty list is authoritative evidence of an empty diff. A missing or
+    malformed value means the backend never learned the diff and must not
+    classify that absence as proof that a declared test was omitted.
+    """
+    raw = (context or {}).get("_pr_changed_files")
+    return isinstance(raw, list) and all(
+        isinstance(path, str) and bool(path.strip()) for path in raw
+    )
+
+
 def _changed_files(task: Task) -> list[str]:
     """The PR's changed-file paths recorded on the task, as a list of strings."""
     return _context_changed_files(task.context)
@@ -979,6 +992,7 @@ def _evaluate_named_test(
     evidence: AcceptanceEvidence,
     changed: list[str],
     verified: bool,
+    changed_file_provenance_available: bool = True,
     truncated: bool = False,
     parent_derived: bool = False,
     targeted_green: bool = False,
@@ -1117,6 +1131,15 @@ def _evaluate_named_test(
             "test does not prove this declaration",
         )
     if not test_present:
+        if not changed_file_provenance_available:
+            return AcceptanceGateVerdict(
+                True,
+                False,
+                evidence.kind,
+                f"declared named_test {declared_path!r} could not be evaluated "
+                "because PR changed-file provenance was unavailable — "
+                "_pr_changed_files was never recorded",
+            )
         if truncated and corroborated is False:
             # The truncation soft credit rests on the premise that the declared
             # test "may ship beyond the stored 50-path prefix". A backend-REFUTED
@@ -1609,6 +1632,7 @@ def evaluate_acceptance(
         )
 
     changed = _context_changed_files(context)
+    changed_file_provenance_available = _changed_file_provenance_available(context)
     verified = _merge_was_test_verified(context)
     truncated = bool((context or {}).get("_pr_changed_files_truncated"))
     parent_derived_files = bool(
@@ -1661,6 +1685,7 @@ def evaluate_acceptance(
             evidence,
             changed,
             verified,
+            changed_file_provenance_available,
             truncated,
             parent_derived=parent_derived_files,
             targeted_green=targeted_green,
@@ -2154,6 +2179,7 @@ def classify_undeclared_reason(context: Mapping[str, Any] | None) -> str:
 # even on verdicts stamped without a ``reason`` (legacy / manually-written rows)
 # or carrying a future reason string this module has not seen yet.
 _UNSATISFIED_REASON_KEYS: tuple[str, ...] = (
+    "named_test_diff_provenance_unavailable",
     "named_test_missing_from_diff",
     "named_test_not_run_green",
     "named_test_test_only_diff",
@@ -2210,6 +2236,8 @@ def classify_unsatisfied_reason(recorded: Any) -> str:
     if kind == "named_test":
         if "describes a DIFFERENT test" in reason_str:
             return "named_test_block_describes_other_test"
+        if "changed-file provenance was unavailable" in reason_str:
+            return "named_test_diff_provenance_unavailable"
         if "is not among the PR's changed files" in reason_str:
             return "named_test_missing_from_diff"
         if "did not run green under a real merge-test verdict" in reason_str:
@@ -2594,20 +2622,20 @@ async def backfill_acceptance_verdicts(session) -> int:
        treated an ABSENT/malformed ``review_loop`` as unverified, so a landed
        task whose context simply lacked a ``review_loop`` dict was scored
        unsatisfied even though the merge was genuinely verified;
-    3. ``satisfied=False`` with the "is not among the PR's changed files"
+    3. ``satisfied=False`` with either a missing-diff or unavailable-provenance
        reason — recorded when changed-file provenance was absent or late
        (rollup children merge via the PARENT's single PR, so a verdict stamped
-       before the parent's ``_pr_changed_files`` arrived reads as missing-from-
-       diff). Late-arriving provenance flips these to satisfied (proven when
-       the task's own PR files are GitHub-verified, else capped at
-       satisfied_unproven for the parent-derived union diff). Candidates of
-       this class are re-admitted to the sweep once changed-file provenance
-       has arrived — even when an OLD run already stamped the one-shot
-       ``_backfill_checked_at`` marker on them — and leave the window
-       terminally (``_backfill_missing_diff_terminal_at``) when provenance
-       was in hand yet re-evaluation still failed. Fresh provenance clears
-       both markers, so late re-stamps always re-admit the task without the
-       class ever monopolizing the LIMIT-200 window.
+       before the parent's ``_pr_changed_files`` arrived cannot distinguish
+       omission from missing data). Late-arriving provenance flips these to
+       satisfied (proven when the task's own PR files are GitHub-verified, else
+       capped at satisfied_unproven for the parent-derived union diff).
+       Candidates of this class are re-admitted to the sweep once changed-file
+       provenance has arrived — even when an OLD run already stamped the
+       one-shot ``_backfill_checked_at`` marker on them — and leave the window
+       terminally (``_backfill_missing_diff_terminal_at``) when provenance was
+       in hand yet re-evaluation still failed. Fresh provenance clears both
+       markers, so late re-stamps always re-admit the task without the class
+       ever monopolizing the LIMIT-200 window.
 
     Each class is re-evaluated with the current (fixed) logic, and
     :class:`~app.models.CriterionEvidence` is recorded via
@@ -2650,11 +2678,17 @@ async def backfill_acceptance_verdicts(session) -> int:
         # ``context -> 'code_acceptance_verdict' -> 'reason'`` on Postgres,
         # ``$.code_acceptance_verdict.reason`` on SQLite. NULL when the verdict
         # or reason is absent, so a LIKE on the result selects only the
-        # missing-from-diff class.
-        _missing_from_diff_verdict = func.json_extract(
-            Task.context, "$.code_acceptance_verdict.reason"
-        ).like("%is not among the PR's changed files%")
-        # Re-admission gate for the missing-from-diff class: changed-file
+        # missing-diff and unavailable-provenance classes.
+        _missing_from_diff_verdict = or_(
+            func.json_extract(
+                Task.context, "$.code_acceptance_verdict.reason"
+            ).like("%is not among the PR's changed files%"),
+            func.json_extract(
+                Task.context, "$.code_acceptance_verdict.reason"
+            ).like("%changed-file provenance was unavailable%"),
+        )
+        # Re-admission gate for the missing-diff/unavailable-provenance classes:
+        # changed-file
         # provenance has arrived (``_pr_changed_files`` is always a list when
         # stamped, so NULL means absent) and no sweep has yet found the task
         # unprovable WITH that provenance in hand (terminal marker absent).
@@ -2669,10 +2703,13 @@ async def backfill_acceptance_verdicts(session) -> int:
         )
     else:
         _backfill_checked = not_(Task.context.has_key("_backfill_checked_at"))
-        _missing_from_diff_verdict = (
+        _missing_from_diff_verdict = or_(
             Task.context["code_acceptance_verdict"]["reason"].astext.like(
                 "%is not among the PR's changed files%"
-            )
+            ),
+            Task.context["code_acceptance_verdict"]["reason"].astext.like(
+                "%changed-file provenance was unavailable%"
+            ),
         )
         _missing_diff_readmit = and_(
             _missing_from_diff_verdict,
@@ -2705,7 +2742,7 @@ async def backfill_acceptance_verdicts(session) -> int:
             .correlate(Task)
         )
     # Candidates are tasks the sweep has not examined yet, OR tasks whose
-    # persisted verdict is the missing-from-diff class AND whose changed-file
+    # persisted verdict is a missing-diff/unavailable-provenance class AND whose changed-file
     # provenance has since arrived — even if an OLD sweep run already stamped
     # the one-shot ``_backfill_checked_at`` marker on them (those markers were
     # stamped before the missing-from-diff class was re-evaluable, so honoring
@@ -2805,11 +2842,12 @@ async def backfill_acceptance_verdicts(session) -> int:
                 #       simply lacked a review_loop dict was recorded unsatisfied
                 #       with the "did not run green" reason even though the merge
                 #       was genuinely verified.
-                #   (b) Missing-from-diff: the declared named_test was not in the
-                #       recorded changed-file list — often because rollup children
-                #       never owned a PR and the parent's changed files arrived
-                #       LATE. Late-arriving provenance can flip this class, so it
-                #       is admitted to re-evaluation; when still unprovable it is
+                #   (b) Missing diff provenance/omission: the declared named_test
+                #       was not found in the recorded changed-file list, or no
+                #       list was recorded — often because rollup children never
+                #       owned a PR and the parent's changed files arrived LATE.
+                #       Late-arriving provenance can flip this class, so it is
+                #       admitted to re-evaluation; when still unprovable it is
                 #       marked (terminally so when provenance was already in hand)
                 #       and re-admitted only when fresh provenance clears the
                 #       markers (see the ``missing_from_diff`` handling below).
@@ -2817,6 +2855,7 @@ async def backfill_acceptance_verdicts(session) -> int:
                 reason_str = reason if isinstance(reason, str) else ""
                 missing_from_diff = (
                     "is not among the PR's changed files" in reason_str
+                    or "changed-file provenance was unavailable" in reason_str
                 )
                 if not isinstance(reason, str) or (
                     "did not run green under a real merge-test verdict" not in reason
