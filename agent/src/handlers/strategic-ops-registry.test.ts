@@ -124,6 +124,20 @@ describe('generated ./strategic CLI derives from the registry', () => {
     expect(script).toContain('"required":["text","success_evidence","retirement_condition"]');
   });
 
+  it('spawn-task advertises depends_on and documents its authoring-time rejection cases', () => {
+    const spawn = cliOpInput('spawn-task');
+    // The dependency field must be part of the advertised spawn schema so the
+    // strategist can author layered work.
+    expect(spawn?.fields).toContain('depends_on');
+    // And the notes must teach the authoring-time rejection set (a bad edge is
+    // a clear 400, never a silently dropped or wedged dependency).
+    const notes = spawn?.notes?.join('\n') ?? '';
+    expect(notes).toContain('depends_on entries are validated at authoring time');
+    for (const word of ['cross-base', 'terminal-failed', 'cyclic', 'rejected']) {
+      expect(notes, `spawn-task notes must mention the ${word} rejection case`).toContain(word);
+    }
+  });
+
   it('every CLI-flagged op has a case arm routing its alias to _call "<op>"', () => {
     for (const e of cliOps()) {
       expect(script, `missing case arm for ${e.alias}`).toContain(`${e.alias})`);

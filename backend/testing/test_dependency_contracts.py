@@ -22,12 +22,16 @@ from __future__ import annotations
 
 import json
 import time
+import uuid
 from unittest.mock import AsyncMock, patch
 
 import jwt as pyjwt
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
+
+from app.auth import create_agent_token
+from app.models import Project, ProjectMember, Task, TaskStatus
 
 
 # ---------------------------------------------------------------------------
@@ -1101,3 +1105,462 @@ def test_code_producing_task_type_set_has_a_single_canonical_definition():
         )
         ok = validate_task_payload({**raw, "acceptance_evidence": dict(_EVIDENCE)})
         assert ok["type"] == ttype
+
+
+# 5. Strategist-spawned dependency representation
+# ---------------------------------------------------------------------------
+
+
+class TestStrategistSpawnedDependencyRepresentation:
+    """spawn_task ``depends_on`` must reuse the SAME persisted representation the
+    PLAN spawner writes to ``Task.depends_on`` (a flat list of prerequisite task
+    id strings plus the ``_structural_depends_on_ids`` provenance marker) rather
+    than inventing a parallel one, and must reject invalid declarations at
+    authoring time so a bad edge never silently drops or wedges the dependent in
+    the dispatch gate."""
+
+    @staticmethod
+    async def _make_project(db_session, name="StrategistSpawnDep"):
+        project = Project(name=name, user_id="u-dep-contract")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        member = ProjectMember(
+            project_id=project.id, user_id="u-dep-contract", role="owner"
+        )
+        db_session.add(member)
+        await db_session.commit()
+        return project
+
+    async def _make_strategic_task(
+        self, db_session, project, vm="agent-vm-strategist-dep"
+    ):
+        task = Task(
+            project_id=project.id,
+            title="Strategic review for spawned dependency contract",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "strategic_review", "prompt": "review"}],
+            vm_instance_id=vm,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+        token = create_agent_token(
+            str(task.id), vm, task_type="strategic_review"
+        )
+        return task, token
+
+    @staticmethod
+    def _integration_base(project):
+        from app.shared_state import get_project_integration_branch
+
+        return get_project_integration_branch(project)
+
+    @staticmethod
+    def _error_message(body: dict) -> str:
+        """Extract the human-readable message from either error envelope the
+        API uses (HTTPException handler wraps it as ``error.message``; direct
+        JSON responses use ``detail``)."""
+        if not isinstance(body, dict):
+            return ""
+        return (
+            body.get("detail")
+            or (body.get("error") or {}).get("message", "")
+            or ""
+        )
+
+    async def _spawn_dependent(
+        self, client, db_session, project, strategic, token, depends_on
+    ):
+        resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(strategic.id),
+                "op": "spawn_task",
+                "data": {
+                    "type": "create",
+                    "title": "Spawned dependent with a declared dependency",
+                    "prompt": "A bounded follow-on that builds on the foundation.",
+                    "depends_on": depends_on,
+                },
+            },
+        )
+        return resp
+
+    @pytest.mark.asyncio
+    async def test_strategist_spawned_dependency_matches_plan_authored_representation(
+        self, client, db_session
+    ):
+        """A spawn_task carrying ``depends_on`` must persist the exact same
+        dependency state a plan-authored edge persists — a flat list of
+        prerequisite task id strings on ``Task.depends_on`` plus the structural
+        provenance marker — so the dispatch gate treats it identically to a
+        plan-authored dependency."""
+        from app.depends_on_provenance import get_structural_depends_on_ids
+
+        project = await self._make_project(db_session)
+        strategic, token = await self._make_strategic_task(db_session, project)
+
+        integration = self._integration_base(project)
+        foundation = Task(
+            project_id=project.id,
+            title="Foundation prerequisite",
+            status=TaskStatus.QUEUED,
+            payloads=[
+                {"type": "create", "prompt": "x", "base_branch": integration}
+            ],
+        )
+        db_session.add(foundation)
+        await db_session.commit()
+        await db_session.refresh(foundation)
+
+        resp = await self._spawn_dependent(
+            client, db_session, project, strategic, token, [str(foundation.id)]
+        )
+        assert resp.status_code == 200, (
+            f"spawn_task with a same-base depends_on must succeed; got "
+            f"{resp.status_code}: {resp.text}"
+        )
+        spawned_id = resp.json().get("task_id")
+        assert spawned_id, f"spawn response must return a task_id; got {resp.json()!r}"
+        spawned = await db_session.get(Task, uuid.UUID(spawned_id))
+        assert spawned is not None
+        # Same persisted representation plan_completion writes:
+        # Task.depends_on is a flat list[str] of prerequisite task ids...
+        assert spawned.depends_on == [str(foundation.id)], (
+            f"spawned dependent must carry depends_on=[{foundation.id}] like a "
+            f"plan-authored edge; got {spawned.depends_on!r}"
+        )
+        assert all(isinstance(d, str) for d in (spawned.depends_on or [])), (
+            f"depends_on entries must be plain str task ids; got {spawned.depends_on!r}"
+        )
+        # ...and the structural provenance marker so cleanup paths preserve it.
+        assert get_structural_depends_on_ids(spawned) == [str(foundation.id)], (
+            "spawned dependency must be recorded as a structural edge "
+            f"(got {get_structural_depends_on_ids(spawned)!r}) exactly as "
+            "plan_completion.remember_structural_depends_on records it"
+        )
+        # The spawn response echoes the accepted edge back to the strategist.
+        assert resp.json().get("depends_on") == [str(foundation.id)], (
+            f"spawn response must echo the accepted edge; got {resp.json()!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_spawn_task_dependent_inherits_prerequisite_base_branch(
+        self, client, db_session
+    ):
+        """A spawned dependent starts from its prerequisite's base branch — the
+        base-inheritance outcome a plan-authored dependency gets from
+        plan_completion._maybe_inherit_base. The strategist spawn path always
+        cuts from the project integration branch and rejects cross-base
+        prerequisites at authoring time, so the dependent's payload base_branch
+        must equal the prerequisite's; the dispatch gate's _same_base_branch
+        check then waits on the prerequisite landing on that shared branch."""
+        project = await self._make_project(db_session)
+        strategic, token = await self._make_strategic_task(db_session, project)
+
+        integration = self._integration_base(project)
+        foundation = Task(
+            project_id=project.id,
+            title="Foundation prerequisite",
+            status=TaskStatus.QUEUED,
+            payloads=[
+                {"type": "create", "prompt": "x", "base_branch": integration}
+            ],
+        )
+        db_session.add(foundation)
+        await db_session.commit()
+        await db_session.refresh(foundation)
+
+        resp = await self._spawn_dependent(
+            client, db_session, project, strategic, token, [str(foundation.id)]
+        )
+        assert resp.status_code == 200, (
+            f"spawn_task with a same-base depends_on must succeed; got "
+            f"{resp.status_code}: {resp.text}"
+        )
+        spawned_id = resp.json().get("task_id")
+        assert spawned_id, f"spawn response must return a task_id; got {resp.json()!r}"
+        spawned = await db_session.get(Task, uuid.UUID(spawned_id))
+        assert spawned is not None
+        # Base inheritance: the dependent starts from the same branch as its
+        # prerequisite, so it dispatches only after the prerequisite's code
+        # lands on that shared branch.
+        prerequisite_base = (foundation.first_payload or {}).get("base_branch")
+        dependent_base = (spawned.first_payload or {}).get("base_branch")
+        assert prerequisite_base is not None, "foundation must declare a base_branch"
+        assert dependent_base == prerequisite_base, (
+            "spawned dependent must inherit its prerequisite's base_branch; "
+            f"expected {prerequisite_base!r}, got {dependent_base!r} "
+            f"(payload: {spawned.first_payload!r})"
+        )
+
+    @pytest.mark.asyncio
+    async def test_spawn_task_rejects_unknown_depends_on(self, client, db_session):
+        """A depends_on entry naming a task that does not exist must be rejected
+        at authoring time with a clear error, not silently dropped."""
+        project = await self._make_project(db_session)
+        strategic, token = await self._make_strategic_task(db_session, project)
+
+        missing = uuid.uuid4()
+        resp = await self._spawn_dependent(
+            client, db_session, project, strategic, token, [str(missing)]
+        )
+        assert resp.status_code == 400, (
+            f"unknown depends_on must be rejected; got {resp.status_code}: {resp.text}"
+        )
+        msg = self._error_message(resp.json())
+        assert "outside this project" in msg, (
+            f"error must explain the unknown prerequisite; got {msg!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_spawn_task_rejects_cross_project_depends_on(
+        self, client, db_session
+    ):
+        """A depends_on entry referencing a task in another project must be
+        rejected at authoring time — the strategist may only sequence work it
+        can actually see land."""
+        project = await self._make_project(db_session)
+        strategic, token = await self._make_strategic_task(db_session, project)
+
+        other = await self._make_project(db_session, name="Other Project")
+        other_task = Task(
+            project_id=other.id,
+            title="Other project task",
+            status=TaskStatus.QUEUED,
+            payloads=[{"type": "create", "prompt": "x"}],
+        )
+        db_session.add(other_task)
+        await db_session.commit()
+        await db_session.refresh(other_task)
+
+        resp = await self._spawn_dependent(
+            client, db_session, project, strategic, token, [str(other_task.id)]
+        )
+        assert resp.status_code == 400, (
+            f"cross-project depends_on must be rejected; got "
+            f"{resp.status_code}: {resp.text}"
+        )
+        msg = self._error_message(resp.json())
+        assert "outside this project" in msg, (
+            f"error must explain the cross-project prerequisite; got {msg!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_spawn_task_rejects_terminal_failed_depends_on(
+        self, client, db_session
+    ):
+        """A depends_on entry referencing a terminal-failed task must be
+        rejected at authoring time — the dispatch gate cascade-cancels on a
+        FAILED prerequisite, so authoring the edge would be pointless."""
+        project = await self._make_project(db_session)
+        strategic, token = await self._make_strategic_task(db_session, project)
+
+        integration = self._integration_base(project)
+        failed = Task(
+            project_id=project.id,
+            title="Failed prerequisite",
+            status=TaskStatus.FAILED,
+            payloads=[
+                {"type": "create", "prompt": "x", "base_branch": integration}
+            ],
+        )
+        db_session.add(failed)
+        await db_session.commit()
+        await db_session.refresh(failed)
+
+        resp = await self._spawn_dependent(
+            client, db_session, project, strategic, token, [str(failed.id)]
+        )
+        assert resp.status_code == 400, (
+            f"terminal-failed depends_on must be rejected; got "
+            f"{resp.status_code}: {resp.text}"
+        )
+        msg = self._error_message(resp.json())
+        assert "terminal-failed" in msg, (
+            f"error must name the terminal-failed guard; got {msg!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_spawn_task_rejects_self_referential_depends_on(
+        self, client, db_session
+    ):
+        """A depends_on entry referencing the calling strategic task itself must
+        be rejected at authoring time."""
+        project = await self._make_project(db_session)
+        strategic, token = await self._make_strategic_task(db_session, project)
+
+        resp = await self._spawn_dependent(
+            client, db_session, project, strategic, token, [str(strategic.id)]
+        )
+        assert resp.status_code == 400, (
+            f"self-referential depends_on must be rejected; got "
+            f"{resp.status_code}: {resp.text}"
+        )
+        msg = self._error_message(resp.json())
+        assert "itself" in msg, (
+            f"error must reject the self-reference; got {msg!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_spawn_task_rejects_duplicate_depends_on(self, client, db_session):
+        """Listing the same prerequisite twice must be rejected rather than
+        silently deduplicated — the strategist should author exact edges."""
+        project = await self._make_project(db_session)
+        strategic, token = await self._make_strategic_task(db_session, project)
+
+        integration = self._integration_base(project)
+        foundation = Task(
+            project_id=project.id,
+            title="Foundation prerequisite",
+            status=TaskStatus.QUEUED,
+            payloads=[
+                {"type": "create", "prompt": "x", "base_branch": integration}
+            ],
+        )
+        db_session.add(foundation)
+        await db_session.commit()
+        await db_session.refresh(foundation)
+
+        resp = await self._spawn_dependent(
+            client,
+            db_session,
+            project,
+            strategic,
+            token,
+            [str(foundation.id), str(foundation.id)],
+        )
+        assert resp.status_code == 400, (
+            f"duplicate depends_on must be rejected; got {resp.status_code}: {resp.text}"
+        )
+        msg = self._error_message(resp.json())
+        assert "more than once" in msg, (
+            f"error must name the duplicate; got {msg!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_spawn_task_rejects_cyclic_depends_on(self, client, db_session):
+        """Authoring onto a prerequisite set whose own edges already form a
+        cycle must be rejected at authoring time — the dispatch gate would
+        otherwise deadlock the new dependent forever."""
+        project = await self._make_project(db_session)
+        strategic, token = await self._make_strategic_task(db_session, project)
+
+        integration = self._integration_base(project)
+        first = Task(
+            project_id=project.id,
+            title="Cycle node A",
+            status=TaskStatus.QUEUED,
+            payloads=[
+                {"type": "create", "prompt": "x", "base_branch": integration}
+            ],
+        )
+        db_session.add(first)
+        await db_session.commit()
+        await db_session.refresh(first)
+        second = Task(
+            project_id=project.id,
+            title="Cycle node B",
+            status=TaskStatus.QUEUED,
+            payloads=[
+                {"type": "create", "prompt": "x", "base_branch": integration}
+            ],
+            depends_on=[str(first.id)],
+        )
+        db_session.add(second)
+        await db_session.commit()
+        await db_session.refresh(second)
+        # Close the loop: first now depends on second. Both remain queued, so
+        # the model permits the edges — only the dispatch gate would deadlock.
+        first.depends_on = [str(second.id)]
+        db_session.add(first)
+        await db_session.commit()
+        await db_session.refresh(first)
+
+        resp = await self._spawn_dependent(
+            client, db_session, project, strategic, token, [str(second.id)]
+        )
+        assert resp.status_code == 400, (
+            f"cyclic depends_on must be rejected; got {resp.status_code}: {resp.text}"
+        )
+        msg = self._error_message(resp.json())
+        assert "cyclic" in msg, (
+            f"error must name the cycle guard; got {msg!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_spawn_task_dependent_is_held_until_prerequisite_lands(
+        self, client, db_session
+    ):
+        """The spawned dependent must be held by the same dispatch gate
+        (orchestrator_health._check_candidate_task_deps) until the prerequisite
+        completes AND its PR merges — exactly the sequencing a plan-authored
+        edge gets, so the strategist's layered work actually orders."""
+        from app.orchestrator import _check_candidate_task_deps
+
+        project = await self._make_project(db_session)
+        strategic, token = await self._make_strategic_task(db_session, project)
+
+        integration = self._integration_base(project)
+        foundation = Task(
+            project_id=project.id,
+            title="Foundation prerequisite",
+            status=TaskStatus.QUEUED,
+            payloads=[
+                {"type": "create", "prompt": "x", "base_branch": integration}
+            ],
+        )
+        db_session.add(foundation)
+        await db_session.commit()
+        await db_session.refresh(foundation)
+
+        resp = await self._spawn_dependent(
+            client, db_session, project, strategic, token, [str(foundation.id)]
+        )
+        assert resp.status_code == 200, (
+            f"spawn_task with a same-base depends_on must succeed; got "
+            f"{resp.status_code}: {resp.text}"
+        )
+        spawned_id = resp.json().get("task_id")
+        spawned = await db_session.get(Task, uuid.UUID(spawned_id))
+        assert spawned is not None
+        assert spawned.depends_on == [str(foundation.id)]
+
+        async def _verify_true(_t, _s):
+            return True
+
+        async def _verify_false(_t, _s):
+            return False
+
+        # QUEUED foundation: the dependent must wait.
+        waiting, _ = await _check_candidate_task_deps(
+            spawned, [foundation], [foundation.id], db_session, _verify_false
+        )
+        assert waiting == "waiting", (
+            f"dependent must wait while the prerequisite is still queued; "
+            f"got {waiting!r}"
+        )
+
+        # Foundation completes but its PR has not merged: still waiting.
+        foundation.status = TaskStatus.COMPLETED
+        db_session.add(foundation)
+        await db_session.commit()
+        await db_session.refresh(foundation)
+        waiting, _ = await _check_candidate_task_deps(
+            spawned, [foundation], [foundation.id], db_session, _verify_false
+        )
+        assert waiting == "waiting", (
+            f"dependent must wait for the prerequisite's PR to merge; "
+            f"got {waiting!r}"
+        )
+
+        # Once the PR merges, the dependent becomes eligible.
+        eligible, _ = await _check_candidate_task_deps(
+            spawned, [foundation], [foundation.id], db_session, _verify_true
+        )
+        assert eligible == "eligible", (
+            f"dependent must become eligible once the prerequisite lands; "
+            f"got {eligible!r}"
+        )
