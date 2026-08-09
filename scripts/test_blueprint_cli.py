@@ -14,11 +14,13 @@ import subprocess
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import blueprint
 import blueprint_api
 import blueprint_deploy_agent
+import local_app_release as local_release
 import pytest
 
 
@@ -5956,6 +5958,99 @@ def test_migration_image_requires_approved_immutable_artifact_registry_reference
     ):
         with pytest.raises(ValueError, match="approved immutable"):
             blueprint._migration_image(argparse.Namespace(image=invalid))
+def test_migration_deploy_stops_units_before_migrate_and_starts_after(monkeypatch):
+    """A schema-changing release has one ordered, bounded downtime window."""
+    image_ref = local_release._IMAGE_PREFIX + "@sha256:" + "d" * 64
+    api_path = Path("/etc/blueprint/nodes/henry_hamster/roles/api/role.env")
+    old_image = "sha256:" + "b" * 64
+    api_payload = (
+        f"BLUEPRINT_API_IMAGE_ID={old_image}\n"
+        "BLUEPRINT_API_SECRETS_FILE=/safe/api.json\n"
+    ).encode()
+    worker_payload = (
+        f"BLUEPRINT_WORKER_IMAGE_ID={old_image}\n"
+        "BLUEPRINT_WORKER_GOOGLE_CREDENTIALS_FILE=/safe/worker.json\n"
+    ).encode()
+    events: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(local_release, "_is_root", lambda: True)
+    monkeypatch.setenv("SUDO_USER", "henry_hamster")
+    monkeypatch.setattr(local_release, "_trusted_root_directory", lambda _path: None)
+    monkeypatch.setattr(local_release, "_validate_manifest", lambda *_args: None)
+    monkeypatch.setattr(local_release, "_uid_for_user", lambda _user: 1000)
+    monkeypatch.setattr(
+        local_release,
+        "_secure_role_file",
+        lambda path: api_payload if path == api_path else worker_payload,
+    )
+    monkeypatch.setattr(
+        local_release, "_public_origin", lambda *_args: "https://release.test"
+    )
+    monkeypatch.setattr(
+        local_release, "_service_marker", lambda unit: ("active", unit)
+    )
+    monkeypatch.setattr(
+        local_release, "_hash_protected_tree", lambda _root: {"safe": "hash"}
+    )
+    monkeypatch.setattr(local_release, "_assert_edge_is_decoupled", lambda: None)
+    monkeypatch.setattr(local_release, "_local_version_payload", lambda: b'{"sha":"old"}')
+    monkeypatch.setattr(
+        local_release, "_public_snapshot", lambda _url: (b'{"sha":"old"}', "hash")
+    )
+    monkeypatch.setattr(local_release, "_prepare_evidence_root", lambda _root: None)
+    monkeypatch.setattr(
+        local_release, "_secure_registry_credential", lambda *_args: "credential"
+    )
+    monkeypatch.setattr(
+        local_release,
+        "_registry_auth",
+        lambda _credential: contextlib.nullcontext(Path("/tmp/registry")),
+    )
+    monkeypatch.setattr(local_release, "_run", lambda *_args, **_kwargs: SimpleNamespace())
+    monkeypatch.setattr(local_release, "_verify_frontend", lambda *_args: "e" * 64)
+    monkeypatch.setattr(local_release, "_inspect_candidate", lambda *_args: "sha256:" + "c" * 64)
+    monkeypatch.setattr(local_release, "_retain_prior_image", lambda _image: "retained:old")
+    monkeypatch.setattr(local_release, "_image_schema_revision", lambda _image: "0743")
+    database_revisions = iter(("0742", "0743"))
+    monkeypatch.setattr(
+        local_release, "_database_schema_revision", lambda: next(database_revisions)
+    )
+    monkeypatch.setattr(
+        local_release,
+        "_stop_unit_container",
+        lambda unit, _container, _allowed: events.append(("stop", unit)),
+    )
+
+    def migrate(args: argparse.Namespace) -> int:
+        assert args.local is True
+        assert args.image == image_ref
+        events.append(("migrate", args.image))
+        return 0
+
+    monkeypatch.setattr(blueprint, "cmd_migrate", migrate)
+    monkeypatch.setattr(local_release, "_atomic_write", lambda *_args: None)
+    monkeypatch.setattr(
+        local_release,
+        "_start_service",
+        lambda unit, _image, *, allowed_images: events.append(("start", unit)),
+    )
+    monkeypatch.setattr(local_release, "_wait_verified", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(local_release, "_verify_health", lambda *_args: None)
+    monkeypatch.setattr(
+        local_release,
+        "_write_evidence",
+        lambda *_args: Path("/var/lib/blueprint/local-app-releases/evidence.json"),
+    )
+
+    local_release.release(image_ref, "a" * 40)
+
+    assert events == [
+        ("stop", "blueprint-worker.service"),
+        ("stop", "blueprint-api.service"),
+        ("migrate", image_ref),
+        ("start", "blueprint-worker.service"),
+        ("start", "blueprint-api.service"),
+    ]
 
 
 def test_deploy_refuses_without_promoted_version(monkeypatch, capsys):

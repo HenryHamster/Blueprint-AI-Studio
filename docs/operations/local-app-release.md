@@ -89,13 +89,18 @@ gcloud artifacts repositories get-iam-policy blueprint-repo \
 The output must contain the worker account under
 `roles/artifactregistry.reader` and must not add the API runtime account.
 
-The tool retains the prior image, stops only a container whose immutable ID and
-runtime contract match the managed API or worker, waits for the unit and that
-exact container to stop, and starts the worker before the API. Worker startup
-and sole-leadership readiness must pass before the API is touched. Local API
-revision and health must pass before public health. Only services touched by a
-failed activation are rolled back, using the same identity and readiness
-checks. Root-only receipts are written below
+The tool retains the prior image and compares the candidate's baked schema
+revision with the live database head. Matching revisions retain the existing
+hot-swap behavior. A mismatch uses bounded downtime: it stops both managed app
+units, waits for their exact containers to stop, runs the canonical local
+migration transaction with the candidate image, confirms the resulting schema
+head, then starts the worker before the API. Worker startup and sole-leadership
+readiness must pass before the API is touched. Local API revision and health
+must pass before public health. Once a migration downtime window begins, a
+failure leaves the app units stopped and requires a fix-forward release; it
+never rolls prior code back across a possibly advanced schema. Other failed
+activations roll back only their touched services using the same identity and
+readiness checks. Root-only receipts are written below
 `/var/lib/blueprint/local-app-releases/`.
 
 Cloud Run remains a manually activated recovery target. Firebase Hosting

@@ -3,8 +3,11 @@
 
 The command is intentionally root-only and hamsterwheel-specific. It pulls an
 Artifact Registry image by digest, verifies its OCI revision and bundled UI,
-then atomically updates only the API and worker role environment files. Any
-activation or health-check failure restores both prior files and services.
+then atomically updates only the API and worker role environment files. A
+schema-changing candidate uses a bounded stop -> migrate -> start transaction;
+once that downtime begins, failure is held for fix-forward rather than rolling
+an older image onto a potentially advanced schema. Other activation or
+health-check failures restore both prior files and services.
 """
 
 from __future__ import annotations
@@ -834,6 +837,17 @@ def _restart_service(
 ) -> None:
     container = _CONTAINERS[unit]
     _stop_unit_container(unit, container, allowed_images)
+    _start_service(unit, image_id, allowed_images=allowed_images)
+
+
+def _start_service(
+    unit: str,
+    image_id: str,
+    *,
+    allowed_images: frozenset[str],
+) -> None:
+    """Start a previously stopped managed unit on the selected image."""
+    container = _CONTAINERS[unit]
     _run(["/usr/bin/systemctl", "reset-failed", unit], check=False)
     _run(["/usr/bin/systemctl", "start", unit], timeout=120)
     _wait_service_container(unit, container, image_id)
@@ -1138,6 +1152,28 @@ def _database_schema_revision() -> str:
     return revisions[0]
 
 
+def _run_local_migration(image_ref: str) -> None:
+    """Run the canonical local migration primitive for this immutable image."""
+    # The root-installed release bundle includes blueprint.py and blueprint_api.py.
+    # Calling cmd_migrate keeps this path on the same hardened container contract
+    # as `blueprint migrate --local`, rather than creating a second migration path.
+    import blueprint
+
+    result = blueprint.cmd_migrate(
+        argparse.Namespace(
+            local=True,
+            image=image_ref,
+            sha=None,
+            worker_env_file=None,
+            worker_secrets_file=None,
+            registry_credential_file=None,
+            network=None,
+        )
+    )
+    if result != 0:
+        raise RuntimeError(f"local migration exited {result}")
+
+
 def _code_rollback_refusal(prior_image_id: str) -> str | None:
     try:
         prior_revision = _image_schema_revision(prior_image_id)
@@ -1276,6 +1312,9 @@ def release(image_ref: str, revision: str) -> Path:
     image_id = _inspect_candidate(image_ref, revision, bundle_sha256)
     retained_tag = _retain_prior_image(prior_api)
     allowed_images = frozenset({prior_api, image_id})
+    target_schema_revision = _image_schema_revision(image_id)
+    database_schema_before = _database_schema_revision()
+    migration_required = target_schema_revision != database_schema_before
 
     def receipt(outcome: str, error: str, markers_match: bool) -> dict[str, object]:
         return {
@@ -1286,6 +1325,9 @@ def release(image_ref: str, revision: str) -> Path:
             "image_id": image_id,
             "prior_image_id": prior_api,
             "retained_prior_tag": retained_tag,
+            "target_schema_revision": target_schema_revision,
+            "database_schema_before": database_schema_before,
+            "migration_required": migration_required,
             "outcome": outcome,
             "error_sha256": (
                 hashlib.sha256(error.encode()).hexdigest() if error else None
@@ -1295,7 +1337,24 @@ def release(image_ref: str, revision: str) -> Path:
         }
 
     touched_units: list[str] = []
+    migration_choreography_started = False
     try:
+        if migration_required:
+            # A schema-changing deploy cannot hot-swap: the old image rejects
+            # the advanced DB and the candidate rejects the old DB.  Stop both
+            # Restart=always units first, wait for each managed container to be
+            # gone, then use the existing hardened migration transaction.
+            migration_choreography_started = True
+            for unit in _ACTIVATION_ORDER:
+                _stop_unit_container(unit, _CONTAINERS[unit], allowed_images)
+            _run_local_migration(image_ref)
+            database_schema_after = _database_schema_revision()
+            if database_schema_after != target_schema_revision:
+                raise RuntimeError(
+                    "local migration completed at schema "
+                    f"{database_schema_after}, but target image expects "
+                    f"{target_schema_revision}"
+                )
         _atomic_write(
             api_path,
             _replace_role_values(
@@ -1318,7 +1377,10 @@ def release(image_ref: str, revision: str) -> Path:
         )
         for unit in _ACTIVATION_ORDER:
             touched_units.append(unit)
-            _restart_service(unit, image_id, allowed_images=allowed_images)
+            if migration_required:
+                _start_service(unit, image_id, allowed_images=allowed_images)
+            else:
+                _restart_service(unit, image_id, allowed_images=allowed_images)
             if unit == "blueprint-worker.service":
                 _wait_verified(
                     _verify_worker_ready,
@@ -1338,6 +1400,22 @@ def release(image_ref: str, revision: str) -> Path:
         )
     except Exception as exc:
         error = str(exc)
+        if migration_choreography_started:
+            hold_message = (
+                "migration deploy failed after bounded downtime began "
+                f"({error}); app units are intentionally left stopped; "
+                "do not roll back code across the migration — fix forward"
+            )
+            try:
+                evidence = _write_evidence(
+                    _EVIDENCE_ROOT,
+                    receipt("migration_failed", hold_message, False),
+                )
+            except (OSError, PermissionError, RuntimeError, ValueError) as evidence_exc:
+                raise RuntimeError(
+                    f"{hold_message}; EVIDENCE_WRITE_FAILED: {evidence_exc}"
+                ) from exc
+            raise RuntimeError(f"{hold_message}; evidence={evidence}") from exc
         rollback_refusal = _code_rollback_refusal(prior_api)
         if rollback_refusal is not None:
             try:

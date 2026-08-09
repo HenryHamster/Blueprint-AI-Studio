@@ -968,6 +968,42 @@ class LocalAppReleaseTests(unittest.TestCase):
                 ],
             )
 
+    def test_nonmigration_deploy_does_not_stop_units(self):
+        """The established hot-swap path remains untouched when schemas match."""
+        with (
+            self._release_patches() as mocks,
+            patch.object(release, "_stop_unit_container") as stop,
+            patch.object(release, "_run_local_migration") as migrate,
+        ):
+            release.release(IMAGE_REF, REVISION)
+        stop.assert_not_called()
+        migrate.assert_not_called()
+        self.assertEqual(mocks["restart"].call_count, 2)
+
+    def test_migration_deploy_holds_and_does_not_rollback_on_failure(self):
+        """Once migration downtime starts, failures require a fix-forward release."""
+        with self._release_patches() as mocks:
+            mocks["image_schema"].return_value = "0743"
+            mocks["database_schema"].return_value = "0742"
+            with (
+                patch.object(release, "_stop_unit_container") as stop,
+                patch.object(
+                    release,
+                    "_run_local_migration",
+                    side_effect=RuntimeError("upgrade failed"),
+                ) as migrate,
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "app units are intentionally left stopped.*do not roll back code.*fix forward",
+                ),
+            ):
+                release.release(IMAGE_REF, REVISION)
+        migrate.assert_called_once_with(IMAGE_REF)
+        self.assertEqual(stop.call_count, 2)
+        mocks["atomic"].assert_not_called()
+        mocks["restart"].assert_not_called()
+        self.assertEqual(mocks["evidence"].call_args.args[1]["outcome"], "migration_failed")
+
     def test_worker_activation_failure_rolls_back_only_touched_worker(self):
         def restart(unit: str, image: str, **_kwargs) -> None:
             if unit == "blueprint-worker.service" and image == NEW_IMAGE:
@@ -1032,7 +1068,7 @@ class LocalAppReleaseTests(unittest.TestCase):
         with self._release_patches(
             health_error=RuntimeError("candidate health failed")
         ) as mocks:
-            mocks["image_schema"].return_value = "0742"
+            mocks["image_schema"].side_effect = ["0743", "0742"]
             mocks["database_schema"].return_value = "0743"
             with self.assertRaisesRegex(
                 RuntimeError,
