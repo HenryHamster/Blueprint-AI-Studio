@@ -908,6 +908,7 @@ async def _requeue_parent_task(
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
             status=TaskStatus.QUEUED,
             created_by="ORCHESTRATOR",
+            origination=child.origination,
             requires_approval=child.requires_approval,
             spend_approval_cleared_at=child.spend_approval_cleared_at,
         )

@@ -25,7 +25,13 @@ from app.context_bounds import bound_review_history, warn_if_context_oversized
 from app.ci_merge_helpers import revoke_review_authority_for_active_fix
 from app.database import resolve_dialect_name
 from app.github import post_pipeline_merge_summary_comment as post_merge_summary_comment  # noqa: F401
-from app.models import TASK_ORIGINATION_REVIEW, Task, TaskHistory, TaskStatus
+from app.models import (
+    TASK_ORIGINATION_REVIEW,
+    TASK_ORIGINATION_ROLLUP,
+    Task,
+    TaskHistory,
+    TaskStatus,
+)
 from app.payload_schemas import validate_internal_payload
 from app.review_fix_lane_pilot import PILOT_PROPAGATE_KEYS
 from app.shared_state import (
@@ -1209,7 +1215,11 @@ async def _spawn_verify_tests_task(
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
-        origination=TASK_ORIGINATION_REVIEW,
+        origination=(
+            TASK_ORIGINATION_ROLLUP
+            if _is_rollup_chain_source(source_task)
+            else TASK_ORIGINATION_REVIEW
+        ),
     )
     session.add(new_task)
     try:
@@ -1630,7 +1640,11 @@ async def _handle_lane_checkpoint_recovery(
         vm_instance_id=None,
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
-        origination=TASK_ORIGINATION_REVIEW,
+        origination=(
+            TASK_ORIGINATION_ROLLUP
+            if _is_rollup_chain_source(source_task)
+            else TASK_ORIGINATION_REVIEW
+        ),
     )
     session.add(recovery_task)
     await session.flush()  # assign recovery_task.id for the lane rebind
@@ -4310,7 +4324,11 @@ async def _spawn_pipeline_task(
         vm_instance_id=spawn_vm_instance_id,
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
-        origination=TASK_ORIGINATION_REVIEW,
+        origination=(
+            TASK_ORIGINATION_ROLLUP
+            if is_rollup_source
+            else TASK_ORIGINATION_REVIEW
+        ),
     )
     if task_type == "fix":
         # Commit the active child and authority revocation atomically.  Every

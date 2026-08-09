@@ -13,7 +13,7 @@ import os
 import random
 import uuid
 from collections.abc import Mapping
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
 from sqlalchemy import func
@@ -323,8 +323,10 @@ _ADVERSARIAL_INFRA_UNVERIFIED_VERDICT = "unverified"
 
 # Origination classes that name a real commissioning decision — someone (a
 # person, the strategist, or the autonomous research loop) chose to create this
-# work. SYSTEM and REVIEW/HOTFIX are downstream consequences of a decision that
-# was already made, so they are excluded from the "commissioned" denominator.
+# work. SYSTEM and every automatic consequence/probe class are downstream of a
+# decision that was already made (or are residual attribution), so they are
+# excluded from the "commissioned" denominator. Keep this tuple limited to
+# classes that represent an explicit commissioning decision.
 # SYSTEM in particular is a RESIDUAL bucket, not a described class (see the
 # TASK_ORIGINATION_* block in app.models), and putting a residual in a
 # denominator understates every real share in it by an unknown amount.
@@ -335,12 +337,25 @@ _COMMISSIONED_ORIGINATIONS = (
     TASK_ORIGINATION_USER,
 )
 
+# Migration 0735 backfilled every pre-existing task's origination as SYSTEM.
+# The v29 rollout that made the stamped value meaningful reached production at
+# this UTC instant; rows created before it cannot provide truthful origination
+# evidence and must stay out of the reading.
+TASK_ORIGINATION_COHORT_START = datetime(2026, 8, 8, 6, 59, 0)
+# Derived, never hand-written: the ISO form consumers read must be the SAME
+# instant the created_at floor applies, rendered UTC-aware. The stored constant
+# is naive because it is compared against a naive-UTC DB column.
+TASK_ORIGINATION_COHORT_START_ISO = TASK_ORIGINATION_COHORT_START.replace(
+    tzinfo=timezone.utc
+).isoformat()
+
 
 async def merged_work_origination_split(
     session: AsyncSession,
     project_id: uuid.UUID,
     *,
     since: datetime | None = None,
+    created_since: datetime = TASK_ORIGINATION_COHORT_START,
 ) -> dict[str, int]:
     """Count a project's merged completions grouped by durable ``Task.origination``.
 
@@ -354,21 +369,20 @@ async def merged_work_origination_split(
     number of merged tasks.
 
     ``since`` bounds the LANDING time, not the creation time:
-    ``COALESCE(completed_at, updated_at) >= since``. This is the axis the
-    question is asked on ('of tasks that MERGED over a recent window') and it is
-    the only unbiased one — research work is created as a research parent, then
-    a plan, then children, and lands days later, whereas a strategist commission
-    is created and lands close together, so a ``created_at`` window would
-    systematically understate the research share. ``completed_at`` is stamped on
-    every terminal transition by the ``Task.status`` ORM event and backfilled at
-    insert for already-terminal rows; ``updated_at`` covers any row that predates
-    that stamping.
+    ``COALESCE(completed_at, updated_at) >= since``. This remains the axis the
+    question is asked on ('of tasks that MERGED over a recent window'), but it is
+    intersected with ``created_since`` so migration-0735 backfilled rows cannot
+    masquerade as observed origination. Research work created after the rollout
+    can still land later, so this floor does not impose a seven-day creation
+    window. ``completed_at`` is stamped on every terminal transition by the
+    ``Task.status`` ORM event and backfilled at insert for already-terminal rows;
+    ``updated_at`` covers any row that predates that stamping.
 
     Rows whose ``origination`` was never stamped read the column default SYSTEM.
-    SYSTEM is a RESIDUAL — 'everything not classified as USER, STRATEGIST,
-    RESEARCH, PLAN, REVIEW or HOTFIX' — so prefer the commissioned-work
-    denominator computed by :func:`merged_work_origination_reading` over
-    ``sum(split.values())``.
+    SYSTEM is a RESIDUAL — everything not classified as USER, STRATEGIST,
+    RESEARCH, PLAN, REVIEW, HOTFIX, ROLLUP, QUALIFIER, EVERGREEN, REMEDIATION
+    or SMOKETEST — so prefer the commissioned-work denominator computed by
+    :func:`merged_work_origination_reading` over ``sum(split.values())``.
 
     Returns a mapping ``{origination class: merged-task count}`` keyed by the
     ``TASK_ORIGINATION_*`` constants from ``app.models``. Classes with no merged
@@ -381,6 +395,7 @@ async def merged_work_origination_split(
             Task.project_id == project_id,
             Task.status == TaskStatus.COMPLETED,
             landed_signal_predicate(session),
+            Task.created_at >= created_since,
         )
         .group_by(Task.origination)
     )
@@ -393,7 +408,11 @@ async def merged_work_origination_split(
     return split
 
 
-def merged_work_origination_reading(split: dict[str, int]) -> dict[str, Any]:
+def merged_work_origination_reading(
+    split: dict[str, int],
+    *,
+    cohort_created_at_floor: str = TASK_ORIGINATION_COHORT_START_ISO,
+) -> dict[str, Any]:
     """Turn a raw origination split into the reading operators actually read.
 
     The headline the work-supply direction asks for is 'of merged work, what
@@ -419,6 +438,7 @@ def merged_work_origination_reading(split: dict[str, int]) -> dict[str, Any]:
 
     return {
         "by_origination": dict(split),
+        "cohort_created_at_floor": cohort_created_at_floor,
         "merged_total": merged_total,
         "commissioned_total": commissioned_total,
         "commissioned_originations": list(_COMMISSIONED_ORIGINATIONS),

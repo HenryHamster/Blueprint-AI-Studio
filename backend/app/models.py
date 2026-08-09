@@ -235,13 +235,16 @@ def task_status_releases_agent_resources(status: TaskStatus | str | None) -> boo
 #   REVIEW     — review-pipeline child: fix, lane recovery, verify_tests
 #                (review_pipeline)
 #   HOTFIX     — hotfix backmerge child (hotfix_backmerge)
-#   SYSTEM     — the default, and the honest name for "everything not classified
-#                above": ordinary orchestrator automation such as rollups,
-#                audit-finding follow-ups, requeues, evergreen backlog and
-#                release-qualifier side-cars, plus every row that predates this
-#                column. NEVER research- or strategist-attributed. Because SYSTEM
-#                is a residual rather than a described class, treat it as such
-#                when computing shares — see
+#   ROLLUP     — review/fix children of a rollup PR chain
+#   QUALIFIER  — release-qualifier audit, challenge, walkthrough and grade sidecars
+#   EVERGREEN  — utilization-triggered evergreen research probes
+#   REMEDIATION— automated debug fixes, smoketest fixes and security rescans
+#   SMOKETEST  — post-rollup smoketest tasks and their failure-fix plans
+#   SYSTEM     — the default, and the honest residual for automation that has no
+#                more specific class, plus every row that predates this column.
+#                NEVER research- or strategist-attributed. Because SYSTEM is a
+#                residual rather than a described class, treat it as such when
+#                computing shares — see
 #                ``research_completion.merged_work_origination_split``.
 TASK_ORIGINATION_USER = "USER"
 TASK_ORIGINATION_STRATEGIST = "STRATEGIST"
@@ -249,6 +252,11 @@ TASK_ORIGINATION_RESEARCH = "RESEARCH"
 TASK_ORIGINATION_PLAN = "PLAN"
 TASK_ORIGINATION_REVIEW = "REVIEW"
 TASK_ORIGINATION_HOTFIX = "HOTFIX"
+TASK_ORIGINATION_ROLLUP = "ROLLUP"
+TASK_ORIGINATION_QUALIFIER = "QUALIFIER"
+TASK_ORIGINATION_EVERGREEN = "EVERGREEN"
+TASK_ORIGINATION_REMEDIATION = "REMEDIATION"
+TASK_ORIGINATION_SMOKETEST = "SMOKETEST"
 TASK_ORIGINATION_SYSTEM = "SYSTEM"
 # Origination classes a child task inherits from its parent when the parent is
 # that class (used by plan_completion subtask spawning). Everything else on a

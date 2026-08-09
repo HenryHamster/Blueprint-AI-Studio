@@ -37,6 +37,8 @@ from app.models import (
     StrategicCycle,
     Task,
     TaskStatus,
+    TASK_ORIGINATION_RESEARCH,
+    TASK_ORIGINATION_STRATEGIST,
     PoolVm,
     PoolVmState,
     ArtifactType,
@@ -168,6 +170,7 @@ async def _make_task(
     depends_on: list | None = None,
     latest_status_message: str | None = None,
     vm_instance_id: str | None = None,
+    origination: str | None = None,
 ) -> Task:
     # Audit W1: extract promoted columns from context for legacy fixtures.
     ctx = dict(context or {})
@@ -186,6 +189,7 @@ async def _make_task(
         depends_on=depends_on or [],
         latest_status_message=latest_status_message,
         vm_instance_id=vm_instance_id,
+        origination=origination or "SYSTEM",
         **extra,
     )
     session.add(task)
@@ -1888,6 +1892,43 @@ async def test_requeue_cancels_failed_children_and_creates_clones(tl_db, mocker)
     assert clone.context["_max_attempts"] == 4
     assert clone.context["_previous_error"] == "Build failed: tests failing"
     assert clone.context.get("_previous_failure_class") is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "origination",
+    [TASK_ORIGINATION_RESEARCH, TASK_ORIGINATION_STRATEGIST],
+)
+async def test_requeue_clone_inherits_origination(tl_db, mocker, origination):
+    """Requeue clones retain the source task's durable origination class."""
+    mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
+    await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        origination=origination,
+        latest_status_message="Build failed: tests failing",
+    )
+
+    assert await _requeue_parent_task(parent, session) == 1
+
+    clone = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id,
+                    Task.status == TaskStatus.QUEUED,
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert clone.origination == origination
 
 
 @pytest.mark.asyncio

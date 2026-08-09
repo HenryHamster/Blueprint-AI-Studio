@@ -30,6 +30,7 @@ from app.models import (
     Project,
     QualificationVerdict,
     ReleaseVersion,
+    TASK_ORIGINATION_QUALIFIER,
     Task,
     TaskHistory,
     TaskStatus,
@@ -407,6 +408,7 @@ async def _spawn_release_audit_task(
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
+        origination=TASK_ORIGINATION_QUALIFIER,
         context={
             "release_version_id": str(version_id),
             "candidate_sha": candidate_sha,
@@ -500,6 +502,7 @@ async def _spawn_release_audit_challenge_task(
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
+        origination=TASK_ORIGINATION_QUALIFIER,
         context={
             "release_version_id": str(version_id),
             "candidate_sha": candidate_sha,
@@ -710,6 +713,7 @@ async def _spawn_qualifier_walkthrough_task(
         status=TaskStatus.PROVISIONING,
         vm_provisioned_at=_utcnow(),
         created_by="ORCHESTRATOR",
+        origination=TASK_ORIGINATION_QUALIFIER,
         context={
             "release_version_id": str(version_id),
             "qualifier_walkthrough_e2e": True,
@@ -833,6 +837,7 @@ async def _spawn_release_merge_grade_task(
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
+        origination=TASK_ORIGINATION_QUALIFIER,
         context={
             "release_version_id": str(version_id),
             "candidate_sha": candidate_sha,
@@ -1114,6 +1119,7 @@ async def _spawn_direction_merge_grade_task(
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
+        origination=TASK_ORIGINATION_QUALIFIER,
         context={
             "direction_id": direction_id,
             "candidate_sha": candidate_sha,

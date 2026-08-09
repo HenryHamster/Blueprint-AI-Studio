@@ -20,7 +20,16 @@ from app.branch_resolution import (
     classify_rollup_merge_outcome,
     merged_pr_counts_as_integration_landing,
 )
-from app.models import Artifact, ArtifactType, Project, Task, TaskHistory, TaskStatus, _utcnow
+from app.models import (
+    TASK_ORIGINATION_SMOKETEST,
+    Artifact,
+    ArtifactType,
+    Project,
+    Task,
+    TaskHistory,
+    TaskStatus,
+    _utcnow,
+)
 from app.payload_schemas import validate_internal_payload
 from app.shared_state import (
     get_project_integration_branch,
@@ -322,6 +331,7 @@ async def _maybe_spawn_rollup_smoketest(
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
             status=TaskStatus.QUEUED,
             created_by="ORCHESTRATOR",
+            origination=TASK_ORIGINATION_SMOKETEST,
         )
         session.add(smoketest_task)
         await session.commit()

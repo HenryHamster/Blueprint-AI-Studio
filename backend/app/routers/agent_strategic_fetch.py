@@ -2303,6 +2303,7 @@ async def agent_fetch_efficiency_snapshot(
     )
     from app.digest_metrics import compute_format_compliance_metrics  # noqa: PLC0415
     from app.research_completion import (  # noqa: PLC0415
+        TASK_ORIGINATION_COHORT_START,
         merged_work_origination_split,
     )
     from app.project_telemetry import (  # noqa: PLC0415
@@ -2356,9 +2357,11 @@ async def agent_fetch_efficiency_snapshot(
             session,
             project_id,
             since=origination_window_start,
+            created_since=TASK_ORIGINATION_COHORT_START,
         ),
         window_start=origination_window_start,
         window_end=origination_window_end,
+        cohort_created_at_floor=TASK_ORIGINATION_COHORT_START,
     )
 
     # The persisted append-only efficiency snapshot time series

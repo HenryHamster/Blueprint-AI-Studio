@@ -33,6 +33,11 @@ from app.models import (
     TASK_ORIGINATION_RESEARCH,
     TASK_ORIGINATION_STRATEGIST,
     TASK_ORIGINATION_SYSTEM,
+    TASK_ORIGINATION_EVERGREEN,
+    TASK_ORIGINATION_QUALIFIER,
+    TASK_ORIGINATION_REMEDIATION,
+    TASK_ORIGINATION_ROLLUP,
+    TASK_ORIGINATION_SMOKETEST,
     Task,
     TaskStatus,
 )
@@ -18452,7 +18457,9 @@ async def test_merged_work_origination_split_windows_on_landing_time(db_session)
     await db_session.commit()
     await db_session.refresh(project)
 
-    def _merged(title: str, *, created_days_ago: int, landed_days_ago: int) -> Task:
+    from app.research_completion import TASK_ORIGINATION_COHORT_START
+
+    def _merged(title: str, *, created_at: datetime, landed_days_ago: int) -> Task:
         t = Task(
             project_id=project.id,
             title=title,
@@ -18463,27 +18470,102 @@ async def test_merged_work_origination_split_windows_on_landing_time(db_session)
             origination=TASK_ORIGINATION_RESEARCH,
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
         )
-        t.created_at = _utcnow() - timedelta(days=created_days_ago)
+        t.created_at = created_at
         t.completed_at = _utcnow() - timedelta(days=landed_days_ago)
         t.updated_at = t.completed_at
         db_session.add(t)
         return t
 
-    # Long-lineage research work: created well before the window, landed inside
-    # it. A created_at window would silently drop exactly this row.
-    _merged("Long lineage research merge", created_days_ago=30, landed_days_ago=2)
+    # Research work created at the rollout boundary is still counted when it
+    # lands inside the seven-day landing window.
+    _merged(
+        "Long lineage research merge",
+        created_at=TASK_ORIGINATION_COHORT_START + timedelta(hours=1),
+        landed_days_ago=2,
+    )
     # Created and landed inside the window.
-    _merged("Fresh research merge", created_days_ago=1, landed_days_ago=1)
+    _merged(
+        "Fresh research merge",
+        created_at=_utcnow() - timedelta(days=1),
+        landed_days_ago=1,
+    )
     # Landed before the window — genuinely out of scope.
-    _merged("Old research merge", created_days_ago=40, landed_days_ago=30)
+    _merged(
+        "Old research merge",
+        created_at=TASK_ORIGINATION_COHORT_START + timedelta(hours=2),
+        landed_days_ago=30,
+    )
     await db_session.commit()
 
     from app.research_completion import merged_work_origination_split
 
     since = _utcnow() - timedelta(days=7)
-    split = await merged_work_origination_split(db_session, project.id, since=since)
+    split = await merged_work_origination_split(
+        db_session,
+        project.id,
+        since=since,
+        # This test isolates the landing-time axis; the default post-0735 floor
+        # is covered by test_merged_work_origination_split_excludes_pre_boundary_rows.
+        created_since=TASK_ORIGINATION_COHORT_START - timedelta(days=40),
+    )
 
     assert split == {TASK_ORIGINATION_RESEARCH: 2}
+
+
+@pytest.mark.asyncio
+async def test_merged_work_origination_split_excludes_pre_boundary_rows(db_session):
+    """Migration-0735 backfills cannot become evidence about work supply."""
+    project = Project(
+        name="Origination Boundary",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-origin-boundary", "Boundary direction")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    from app.research_completion import (
+        TASK_ORIGINATION_COHORT_START,
+        merged_work_origination_split,
+    )
+
+    def _merged(title: str, *, created_at: datetime, origination: str) -> None:
+        db_session.add(
+            Task(
+                project_id=project.id,
+                title=title,
+                payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
+                context={"pr_merged": True},
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                origination=origination,
+                created_at=created_at,
+                completed_at=_utcnow() - timedelta(days=1),
+                updated_at=_utcnow() - timedelta(days=1),
+                vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+            )
+        )
+
+    _merged(
+        "Backfilled SYSTEM merge",
+        created_at=TASK_ORIGINATION_COHORT_START - timedelta(seconds=1),
+        origination=TASK_ORIGINATION_SYSTEM,
+    )
+    _merged(
+        "Stamped research merge",
+        created_at=TASK_ORIGINATION_COHORT_START + timedelta(seconds=1),
+        origination=TASK_ORIGINATION_RESEARCH,
+    )
+    await db_session.commit()
+
+    split = await merged_work_origination_split(
+        db_session,
+        project.id,
+        since=_utcnow() - timedelta(days=7),
+    )
+
+    assert split == {TASK_ORIGINATION_RESEARCH: 1}
 
 
 @pytest.mark.asyncio
@@ -18562,6 +18644,13 @@ def test_every_origination_class_has_a_live_stamping_site():
         if name.startswith("TASK_ORIGINATION_")
     ]
     assert declared, "expected TASK_ORIGINATION_* constants on app.models"
+    assert {
+        "TASK_ORIGINATION_ROLLUP",
+        "TASK_ORIGINATION_QUALIFIER",
+        "TASK_ORIGINATION_EVERGREEN",
+        "TASK_ORIGINATION_REMEDIATION",
+        "TASK_ORIGINATION_SMOKETEST",
+    }.issubset(declared), "automatic spawn classes must remain in the taxonomy"
 
     unstamped = []
     for name in declared:
@@ -18585,6 +18674,25 @@ def test_every_origination_class_has_a_live_stamping_site():
         f"the SYSTEM residual and inflates the denominator of "
         f"merged_work_origination_split. Stamp it or delete the constant."
     )
+
+
+def test_automatic_origination_classes_stay_out_of_commissioned_denominator():
+    """Automatic consequences and probes do not masquerade as commissioned work."""
+    from app.research_completion import merged_work_origination_reading
+
+    automatic = {
+        TASK_ORIGINATION_ROLLUP: 1,
+        TASK_ORIGINATION_QUALIFIER: 1,
+        TASK_ORIGINATION_EVERGREEN: 1,
+        TASK_ORIGINATION_REMEDIATION: 1,
+        TASK_ORIGINATION_SMOKETEST: 1,
+        TASK_ORIGINATION_SYSTEM: 1,
+    }
+    reading = merged_work_origination_reading(automatic)
+
+    assert reading["merged_total"] == 6
+    assert reading["commissioned_total"] == 0
+    assert reading["research_share_of_commissioned"] is None
 
 
 @pytest.mark.asyncio

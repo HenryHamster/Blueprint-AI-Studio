@@ -26,6 +26,8 @@ from sqlmodel import select
 from app.database import AsyncSessionLocal
 from app.context_bounds import bound_review_history
 from app.models import (
+    TASK_ORIGINATION_REMEDIATION,
+    TASK_ORIGINATION_SMOKETEST,
     Task,
     TaskHistory,
     Project,
@@ -4865,6 +4867,7 @@ async def _process_post_commit(
                                                     vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
                                                     status=TaskStatus.QUEUED,
                                                     created_by="ORCHESTRATOR",
+                                                    origination=TASK_ORIGINATION_SMOKETEST,
                                                 )
                                                 session.add(smoketest_task)
                                                 await session.commit()
@@ -5049,6 +5052,7 @@ async def _process_post_commit(
                                                             status=TaskStatus.QUEUED,
                                                             requires_approval=False,
                                                             created_by="ORCHESTRATOR",
+                                                            origination=TASK_ORIGINATION_REMEDIATION,
                                                         )
                                                         session.add(rescan_task)
                                                         await session.commit()
