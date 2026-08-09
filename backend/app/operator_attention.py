@@ -55,6 +55,7 @@ from app.message_audience import (
 )
 from app.reaper_orphan_classify import _classify_orphan
 from app.release_artifacts import version_serving_summary
+from app.release_qualifier_audit import snapshot_stranded_approved_prs
 from app.release_version import current_open_version
 from app.routers.admin_runners import _runner_health
 from app.runner_project_binding import runner_allowed_for_project
@@ -110,6 +111,7 @@ _DEAD_RUNNER_PREVIEW_LIMIT = 4
 _STUCK_ACCEPTANCE_CRITERIA_PREVIEW_LIMIT = 4
 _STALE_COMPLETION_DEBT_AFTER = timedelta(hours=24)
 _STALE_COMPLETION_DEBT_PREVIEW_LIMIT = 4
+_STRANDED_APPROVED_PR_PREVIEW_LIMIT = 4
 
 # How long before an operator attestation expires the system starts warning
 # the operator.  Attestations carry ATTESTATION_WINDOW_DAYS (7 days) from
@@ -2116,6 +2118,9 @@ async def get_operator_message_counts(
         ).scalar()
         or 0
     )
+    # Deliberately NOT including the stranded-approved-PR snapshot here: this
+    # is the high-frequency badge poll and must stay integer-only.  The snapshot
+    # is a JSONB scan and is served by build_operator_attention instead.
     return {
         "blocker": counts.get(MessageType.BLOCKER, 0),
         "question": counts.get(MessageType.QUESTION, 0),
@@ -2150,6 +2155,7 @@ async def build_operator_attention(
             )
         )
     ).scalar_one_or_none()
+    stranded_snapshot = await snapshot_stranded_approved_prs(session, project.id)
 
     _base_filters = [
         ProjectMessage.project_id == project.id,
@@ -3074,6 +3080,11 @@ async def build_operator_attention(
             "handmerge_preserved_tasks": handmerge_preserved_count,
             "experiment_outcomes": unmet_experiment_count,
             "stale_completion_debts": stale_debt_count,
+            "stranded_approved_prs": stranded_snapshot.get("count"),
+            "stranded_approved_prs_status": stranded_snapshot.get("status"),
+            "stranded_approved_prs_preview": list(
+                stranded_snapshot.get("pr_numbers") or []
+            )[:_STRANDED_APPROVED_PR_PREVIEW_LIMIT],
         },
         "items": items,
     }

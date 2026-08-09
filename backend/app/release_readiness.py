@@ -422,6 +422,10 @@ def format_qualification_for_api(qual: dict[str, Any]) -> dict[str, Any]:
         "confidence": qual.get("confidence"),
         "threshold": qual.get("threshold"),
         "sub_scores": qual.get("sub_scores"),
+        # Qualification-launch merge-state evidence.  ``None`` is preserved on
+        # legacy records; an object with status=unavailable is not rewritten as
+        # a misleading zero.
+        "stranded_approved_prs": qual.get("stranded_approved_prs"),
         "blocker": qual.get("blocker"),
         "started_at": qual.get("started_at"),
         "finalized_at": qual.get("finalized_at"),
@@ -544,6 +548,7 @@ def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
         "candidate_sha": verdict.candidate_sha,
         "confidence": verdict.confidence,
         "sub_scores": sub_scores,
+        "stranded_approved_prs": _sub(verdict, "stranded_approved_prs"),
         "blocker": verdict.blocker,
         "requested_probes": requested_probes,
         "walkthrough_e2e_result": walkthrough_e2e_result,

@@ -1,5 +1,6 @@
 """Audited-surface, grading-range, and walkthrough redrive tests."""
 from _release_qualifier_testhelpers import *  # noqa: F403
+from app import release_qualifier_audit as rqa
 
 def test_audited_surface_seam_is_reachable_via_rq_and_reuses_verdicts():
     """The audited-surface cluster extracted into release_qualifier_audit_surface
@@ -609,3 +610,162 @@ async def test_walkthrough_contract_failed_is_redriven_within_cap(
         .all()
     )
     assert len(alerts_again) == 1
+
+
+def _approved_task(project_id, title, pr_number, *, merged=False, target=True):
+    """An approved review loop, optionally already landed / without a target."""
+    base = {"base_sha": "base" * 10, "head_sha": "head" * 10}
+    review_loop = {"review_approved": True}
+    if target is True:
+        review_loop["review_target"] = {**base, "pr_number": pr_number}
+    elif target is not None:
+        review_loop["review_target"] = target
+    return Task(
+        project_id=project_id,
+        title=title,
+        status=TaskStatus.COMPLETED,
+        context={
+            "review_loop": review_loop,
+            **({"pr_merged": True} if merged else {}),
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_qualification_reports_stranded_approved_prs(db_session, mocker):
+    """Qualification records the bounded approved-but-unlanded PR snapshot."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+    shared_state.runtime_config["smoketest_enabled"] = False
+    shared_state.runtime_config["env_preflight_enabled"] = False
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    db_session.add_all([
+        _approved_task(project.id, "approved review", 701),
+        _approved_task(project.id, "duplicate review", 701),
+        _approved_task(project.id, "already landed review", 702, merged=True),
+    ])
+    await db_session.commit()
+
+    snapshot = await rq.snapshot_stranded_approved_prs(db_session, project.id)
+    assert snapshot["status"] == "available"
+    assert snapshot["count"] == 1
+    assert snapshot["pr_numbers"] == [701]
+
+    candidate = "qualify0" * 5
+    mocker.patch("app.github.get_repo_installation_token", new=AsyncMock(return_value="gh-token"))
+    mocker.patch("app.github.get_branch_sha", new=AsyncMock(return_value=candidate))
+    mocker.patch("app.github.get_check_runs_cached", new=AsyncMock(return_value={"conclusion": "success"}))
+    result = await rq.run_qualification(
+        db_session, project.id, version, explicit_request=True
+    )
+    assert result["status"] == "spawned"
+    await db_session.commit()
+    await db_session.refresh(version)
+    assert version.last_qualification["stranded_approved_prs"]["count"] == 1
+
+    audit_task = await db_session.get(
+        Task, uuid.UUID(version.last_qualification["audit_task_id"])
+    )
+    audit_task.status = TaskStatus.COMPLETED
+    db_session.add(audit_task)
+    db_session.add(
+        Artifact(
+            task_id=audit_task.id,
+            artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
+            logs=json.dumps({"findings": []}),
+        )
+    )
+    shared_state.runtime_config["promotion_enabled"] = False
+    await db_session.commit()
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+    assert result["status"] in {"dry_run", "promoted"}
+
+    await db_session.refresh(version)
+    assert version.last_qualification["stranded_approved_prs"]["count"] == 1
+    from app.release_readiness import format_qualification_for_api
+
+    assert format_qualification_for_api(version.last_qualification)[
+        "stranded_approved_prs"
+    ]["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_stranded_snapshot_filters_landed_rows_before_the_scan_cap(db_session):
+    """A mature project's merged approvals must not exhaust the bounded scan.
+
+    ``review_approved`` persists after a merge and archival is manual, so if the
+    landed filter ran in Python AFTER the cap the readout would be permanently
+    ``unavailable`` on any real project — the feature would ship dark.
+    """
+    project, _version = await _make_project_and_version(db_session)
+    db_session.add_all(
+        [
+            _approved_task(project.id, f"landed {n}", 1000 + n, merged=True)
+            for n in range(rqa._STRANDED_APPROVED_PR_SCAN_LIMIT + 50)
+        ]
+        + [_approved_task(project.id, "stranded", 999)]
+    )
+    await db_session.commit()
+
+    snapshot = await rq.snapshot_stranded_approved_prs(db_session, project.id)
+    assert snapshot["status"] == "available"
+    assert snapshot["pr_numbers"] == [999]
+
+
+@pytest.mark.asyncio
+async def test_stranded_snapshot_degrades_per_row_not_project_wide(db_session):
+    """One approval without a usable review_target must not void the readout."""
+    project, _version = await _make_project_and_version(db_session)
+    db_session.add_all(
+        [
+            _approved_task(project.id, "legacy no target", 0, target=None),
+            _approved_task(project.id, "malformed target", 0, target="not-a-dict"),
+            _approved_task(project.id, "no pr number", 0, target={"head_sha": "abc"}),
+            _approved_task(project.id, "real stranding", 4242),
+        ]
+    )
+    await db_session.commit()
+
+    snapshot = await rq.snapshot_stranded_approved_prs(db_session, project.id)
+    assert snapshot["status"] == "available"
+    assert snapshot["pr_numbers"] == [4242]
+    assert snapshot["unparseable_approvals"] == 3
+
+
+@pytest.mark.asyncio
+async def test_stranded_snapshot_failure_does_not_poison_caller_transaction(
+    db_session, mocker
+):
+    """A failed scan is absorbed by a SAVEPOINT, leaving the caller usable.
+
+    ``run_qualification`` calls this while holding the version row's FOR UPDATE
+    lock inside an open transaction; swallowing the exception without a nested
+    rollback would leave that transaction aborted on PostgreSQL.
+    """
+    project, _version = await _make_project_and_version(db_session)
+    db_session.add(_approved_task(project.id, "stranded", 777))
+    await db_session.commit()
+
+    # Force the SELECT itself to fail so the SAVEPOINT path is exercised, not
+    # just a pre-query raise.
+    from sqlalchemy import func as _sa_func
+
+    mocker.patch.object(
+        rqa,
+        "_stranded_approved_pr_columns",
+        return_value=(
+            _sa_func.blueprint_no_such_function(rqa.Task.context),
+            rqa.Task.context,
+        ),
+    )
+    snapshot = await rq.snapshot_stranded_approved_prs(db_session, project.id)
+    assert snapshot["status"] == "unavailable"
+    assert snapshot["count"] is None
+
+    # The caller's session is still usable for subsequent statements.
+    mocker.stopall()
+    still_works = await rq.snapshot_stranded_approved_prs(db_session, project.id)
+    assert still_works["status"] == "available"

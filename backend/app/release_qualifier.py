@@ -143,6 +143,7 @@ from app.release_qualifier_audit import (
     get_latest_release_audit_challenge,  # noqa: F401 — re-exported for callers/tests
     get_latest_release_audit_report,  # noqa: F401 — re-exported for callers/tests
     resolve_lifecycle_audit_evidence,  # noqa: F401 — re-exported for callers/tests
+    snapshot_stranded_approved_prs,
     required_children_terminal as _required_children_terminal,
 )
 from app.ci_resolution import (
@@ -2712,6 +2713,12 @@ async def run_qualification(
         )
         return _promo
 
+    # Snapshot the merge-state signal under the version lock that owns the
+    # qualification launch; promotion scoring stays unchanged.
+    stranded_approved_prs = await snapshot_stranded_approved_prs(
+        session, version.project_id
+    )
+
     # Snapshot the live decision contract while the version row is locked.
     # Candidate code facts may remain reusable across goal edits, but a cached
     # holistic verdict is valid only for this exact goal + rubric pair.
@@ -3453,6 +3460,7 @@ async def run_qualification(
         "retry_episode_cap": retry_episode_cap,
         "candidate_sha": candidate_sha,
         "candidate_diff_hash": candidate_diff_hash,
+        "stranded_approved_prs": stranded_approved_prs,
         "audited_surface_paths": candidate_audited_surface or None,
         "audit_base_sha": incremental_audit_base_sha,
         "prior_audit_candidate_sha": (
@@ -3566,6 +3574,7 @@ async def run_qualification(
         "qualification_attempt_id": str(attempt_id),
         "retry_episode": retry_episode,
         "candidate_sha": candidate_sha,
+        "stranded_approved_prs": stranded_approved_prs,
         "ci_green": ci_green,
         "ci_state": ci_state,
         "smoketest_enabled": smoketest_enabled,
@@ -8556,6 +8565,9 @@ async def _finalize_qualification(
     acceptance_window = await _compute_acceptance_window_aggregate(session, version)
     extended_sub_scores = dict(composite["sub_scores"])
     extended_sub_scores.update(acceptance_window)
+    extended_sub_scores["stranded_approved_prs"] = qual.get(
+        "stranded_approved_prs"
+    )
     if walkthrough_e2e_result is not None:
         composite = _apply_walkthrough_decision(
             composite, walkthrough_e2e_result
@@ -8581,6 +8593,7 @@ async def _finalize_qualification(
         "smoketest_enabled": smoketest_enabled,
         "confidence": composite["confidence"],
         "sub_scores": extended_sub_scores,
+        "stranded_approved_prs": qual.get("stranded_approved_prs"),
         "blocker": composite["blocker"],
         # Execution-site of the responsible check (dir: tag promotion blockers
         # inert-until-promote). "deployed" = a fix on automain is inert until this
