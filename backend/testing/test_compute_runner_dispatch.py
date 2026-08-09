@@ -23,6 +23,7 @@ import asyncio
 import json
 import uuid
 from datetime import datetime, timezone, timedelta
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -1784,6 +1785,116 @@ async def test_try_runner_dispatch_gpu_experiment_requires_has_gpu_runner(db_ses
 
 
 @pytest.mark.asyncio
+async def test_admin_ui_task_dispatch_requires_viewport_capable_runner(db_session):
+    """Admin-UI source changes use the same viewport prerequisite as ``check``.
+
+    The task's declared ``related_files`` is the pre-PR dispatch scope; a later
+    ``_pr_changed_files`` context is covered by the same production predicate.
+    An unknown/partial runner inventory must not claim the task.
+    """
+    from app import auth as auth_mod
+    from app import orchestrator as orch
+    from app.models import LocalRunner
+
+    project = Project(name="Viewport Route", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    def _make_runner(inventory):
+        token = auth_mod.create_runner_token(uuid.uuid4())
+        return LocalRunner(
+            project_id=project.id,
+            token_hash=auth_mod.hash_runner_token(token),
+            capabilities={
+                "task_types": "all",
+                "agent_available": True,
+                "isolation_backends": inventory,
+            },
+        )
+
+    incapable = _make_runner({"docker_usable": True})
+    capable = _make_runner(
+        {
+            "docker_usable": True,
+            "playwright_chromium_usable": True,
+        }
+    )
+    db_session.add_all([incapable, capable])
+    await db_session.commit()
+    await db_session.refresh(incapable)
+    await db_session.refresh(capable)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "refactor"}],
+        context={"related_files": ["admin-ui/src/components/Widget.tsx"]},
+        status=TaskStatus.QUEUED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    assert (
+        await orch._try_runner_dispatch(
+            db_session, task, {project.id: [incapable]}
+        )
+        is False
+    )
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.QUEUED
+
+    assert (
+        await orch._try_runner_dispatch(
+            db_session, task, {project.id: [incapable, capable]}
+        )
+        is True
+    )
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.PROVISIONING
+    assert task.vm_instance_id == f"runner:{capable.id}"
+
+
+@pytest.mark.asyncio
+async def test_viewport_block_retries_when_capable_runner_appears(monkeypatch):
+    """A formerly permanent viewport block re-arms when the fleet can satisfy it."""
+    from app import orchestrator_runner_dispatch as dispatch
+    from app.blocked_task_unblock_sweeps import _blocked_precondition_state
+    from app.runner_eligibility import RunnerDispatchSnapshot
+
+    project_id = uuid.uuid4()
+    capable = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "isolation_backends": {
+                "docker_usable": True,
+                "playwright_chromium_usable": True,
+            }
+        },
+    )
+
+    async def _active_runners(_session):
+        return {project_id: [capable]}
+
+    monkeypatch.setattr(dispatch, "_load_active_runners_cache", _active_runners)
+    task = SimpleNamespace(
+        project_id=project_id,
+        depends_on=[],
+        blocker_kind=None,
+        blocked_reason="BLOCKER: VIEWPORT_GATE_INFRA_UNAVAILABLE: no Docker",
+        latest_status_message="viewport bootstrap unavailable",
+        first_payload={"type": "refactor"},
+        context={
+            "blocker": {"source": "agent"},
+            "related_files": ["admin-ui/src/components/Widget.tsx"],
+        },
+    )
+
+    assert await _blocked_precondition_state(task, object(), lambda: None) == "retry"
+
+
+@pytest.mark.asyncio
 async def test_try_runner_dispatch_cpu_experiment_routes_to_any_runner(db_session):
     """A CPU compute_experiment (no accelerator) can be pinned to any eligible runner."""
     from app import auth as auth_mod
@@ -2889,5 +3000,3 @@ async def test_compute_experiment_defaults_container_image_to_project_image(
     assert payload.get("container_image") != _PROJECT_IMAGE, (
         "container_image must be pinned to the build digest, not the mutable tag"
     )
-
-
