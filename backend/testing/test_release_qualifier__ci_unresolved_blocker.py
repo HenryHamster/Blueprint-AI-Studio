@@ -4592,6 +4592,12 @@ async def test_acceptance_window_fraction_nonzero_with_inferred_cochange(db_sess
     assert reasons["no_changed_files_context"] == 1
     assert reasons["no_test_prod_cochange"] == 1
     assert sum(reasons.values()) == buckets["undeclared"]
+    undeclared_ids = agg["acceptance_window_undeclared_task_ids"]
+    assert undeclared_ids == sorted(undeclared_ids)
+    assert len(undeclared_ids) == buckets["undeclared"]
+    assert agg["acceptance_window_undeclared_task_ids_total"] == buckets["undeclared"]
+    assert agg["acceptance_window_undeclared_task_ids_truncated"] is False
+    assert agg["acceptance_window_bucket_task_id_cap"] == 100
 
     # (c) The additive nested keys do not break the sub-scores invariant guard.
     assert acceptance_window_sub_scores_violations(agg) == []
@@ -4709,8 +4715,56 @@ async def test_acceptance_window_aggregate_declared_unsatisfied_reasons(db_sessi
     for key, count in reasons.items():
         assert count == expected_counts.get(key, 0), key
 
+    unsatisfied_ids = agg["acceptance_window_declared_unsatisfied_task_ids"]
+    assert unsatisfied_ids == sorted(unsatisfied_ids)
+    assert len(unsatisfied_ids) == buckets["declared_unsatisfied"]
+    assert (
+        agg["acceptance_window_declared_unsatisfied_task_ids_total"]
+        == buckets["declared_unsatisfied"]
+    )
+    assert agg["acceptance_window_declared_unsatisfied_task_ids_truncated"] is False
+
     # The additive breakdown does not break the sub-scores invariant guard.
     assert acceptance_window_sub_scores_violations(agg) == []
+
+
+@pytest.mark.asyncio
+async def test_acceptance_window_bucket_task_ids_are_capped_with_truthful_tail_metadata(
+    db_session,
+):
+    """Identity evidence is deterministic and cannot grow with an old version window."""
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+
+    project, version = await _make_project_and_version(db_session)
+    for index in range(101):
+        db_session.add(
+            Task(
+                project_id=project.id,
+                title=f"capped-unsatisfied-{index}",
+                payloads=[{"type": "create"}],
+                status=TaskStatus.COMPLETED,
+                context={
+                    "pr_merged": True,
+                    "landed_on_integration": True,
+                    CODE_ACCEPTANCE_VERDICT_KEY: {
+                        "kind": "named_test",
+                        "satisfied": False,
+                        "proven": False,
+                        "reason": "named_test_missing_from_diff",
+                    },
+                },
+            )
+        )
+    await db_session.commit()
+
+    aggregate = await rq._compute_acceptance_window_aggregate(db_session, version)
+
+    ids = aggregate["acceptance_window_declared_unsatisfied_task_ids"]
+    assert aggregate["acceptance_window_declared_unsatisfied_task_ids_total"] == 101
+    assert aggregate["acceptance_window_declared_unsatisfied_task_ids_truncated"] is True
+    assert aggregate["acceptance_window_bucket_task_id_cap"] == 100
+    assert len(ids) == 100
+    assert ids == sorted(ids)
 
 
 @pytest.mark.asyncio

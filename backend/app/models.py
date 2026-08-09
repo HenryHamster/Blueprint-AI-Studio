@@ -55,6 +55,7 @@ from app.models_base import NaiveUTCDateTime
 # ``app.release_models`` depends only on ``app.models_base`` / ``app.time_utils``
 # (never on ``app.models``), so this import forms no cycle.
 from app.release_models import (  # noqa: F401
+    AcceptanceHealingSweepRun,
     AuditFindingResolution,
     CategoryVerdict,
     CompletionDebtEntry,

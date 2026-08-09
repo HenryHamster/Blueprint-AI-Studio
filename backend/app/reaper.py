@@ -323,6 +323,7 @@ from app.reaper_sweeps import (
     sweep_retire_consumed_message_attachments,
     sweep_backfill_merged_named_test_coverage,
     sweep_acceptance_verdict_healing_backfills,
+    sweep_acceptance_healing_sweep_run_retention,
     _sweep_strategic_cycle_starvation,
 )
 from app.approved_pr_stranding import sweep_approved_pr_stranding
@@ -3343,10 +3344,37 @@ async def reaper_service():
                 # cadence-gated; independent timer.
                 _mark_reaper_progress()
                 try:
-                    await sweep_acceptance_verdict_healing_backfills(session, now)
+                    healing_result = await sweep_acceptance_verdict_healing_backfills(
+                        session, now
+                    )
+                    # Only the cycles that actually ran the passes are worth a
+                    # line; the cadence-skipped majority would otherwise log once
+                    # a minute with a null run_id.
+                    if healing_result.get("outcome") != "cadence_skipped":
+                        logger.info(
+                            "[REAPER] Step 21b: acceptance-verdict healing outcome=%s "
+                            "evidence_rows_recorded=%s run_id=%s",
+                            healing_result.get("outcome"),
+                            healing_result.get("evidence_rows_recorded"),
+                            healing_result.get("run_id"),
+                        )
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Acceptance-verdict healing backfills sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 21c: Retention purge for the append-only Step 21b sweep-run
+                # ledger (90-day TTL, daily cadence-gated on its own timer) so the
+                # observational table cannot grow without bound.
+                _mark_reaper_progress()
+                try:
+                    await sweep_acceptance_healing_sweep_run_retention(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Acceptance-healing sweep-run purge: {e}",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):

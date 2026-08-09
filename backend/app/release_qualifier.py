@@ -4457,6 +4457,9 @@ async def _compute_acceptance_window_aggregate(
         "acceptance_window_buckets": dict,         # per-bucket counts over the write-task window (sums to write_total)
         "acceptance_window_undeclared_reasons": dict, # split of the undeclared bucket by reason (sums to buckets["undeclared"])
         "acceptance_window_declared_unsatisfied_reasons": dict, # split of the declared_unsatisfied bucket by reason (sums to buckets["declared_unsatisfied"])
+        "acceptance_window_undeclared_task_ids": list,  # deterministic capped IDs in the undeclared bucket
+        "acceptance_window_declared_unsatisfied_task_ids": list,  # deterministic capped IDs in the declared-unsatisfied bucket
+        "acceptance_window_bucket_task_id_cap": int,  # shared cap for the two identity-evidence lists
         "acceptance_window_inferred_test_cochange": int,  # verified merges credited via inferred_test_cochange
         "acceptance_window_rederived_count": int,  # write-task verdicts re-derived under the current rule this drive (each task counted once)
         "acceptance_window_rederived_upgrades": int,  # re-derived verdicts that strictly improved (satisfied/proven minted)
@@ -4506,6 +4509,12 @@ async def _compute_acceptance_window_aggregate(
     buckets: dict[str, int] = dict.fromkeys(ACCEPTANCE_AGGREGATE_BUCKETS, 0)
     undeclared_reasons: dict[str, int] = dict.fromkeys(_UNDECLARED_REASON_KEYS, 0)
     unsatisfied_reasons: dict[str, int] = dict.fromkeys(_UNSATISFIED_REASON_KEYS, 0)
+    # Retain enough task identity to audit an unhealed bucket without making the
+    # qualification payload unbounded.  IDs are sorted after classification so
+    # database row order cannot change the observable result.
+    _BUCKET_TASK_ID_CAP = 100
+    undeclared_task_ids: list[str] = []
+    declared_unsatisfied_task_ids: list[str] = []
     # Re-derivation pass (rung 3 of design doc c50453ef): a verdict frozen under
     # a RETIRED acceptance rule is re-derived from the task's persisted merge
     # record before classification, so an evidence-rule improvement landing
@@ -4682,10 +4691,12 @@ async def _compute_acceptance_window_aggregate(
         buckets[bucket] += 1
         if bucket == "undeclared":
             undeclared_reasons[classify_undeclared_reason(ctx)] += 1
+            undeclared_task_ids.append(str(task.id))
         elif bucket == "declared_unsatisfied":
             unsatisfied_reasons[
                 classify_unsatisfied_reason(ctx.get(CODE_ACCEPTANCE_VERDICT_KEY))
             ] += 1
+            declared_unsatisfied_task_ids.append(str(task.id))
     verified = (
         buckets["proven"]
         + buckets["satisfied_unproven"]
@@ -4715,6 +4726,27 @@ async def _compute_acceptance_window_aggregate(
         "acceptance_window_buckets": buckets,
         "acceptance_window_undeclared_reasons": undeclared_reasons,
         "acceptance_window_declared_unsatisfied_reasons": unsatisfied_reasons,
+        # Deterministic, bounded identity evidence for the two buckets that
+        # cannot be diagnosed from counts alone.  ``*_total`` and
+        # ``*_truncated`` make an omitted tail unambiguous rather than looking
+        # like an empty bucket.
+        "acceptance_window_undeclared_task_ids": sorted(undeclared_task_ids)[
+            :_BUCKET_TASK_ID_CAP
+        ],
+        "acceptance_window_undeclared_task_ids_total": len(undeclared_task_ids),
+        "acceptance_window_undeclared_task_ids_truncated": len(undeclared_task_ids)
+        > _BUCKET_TASK_ID_CAP,
+        "acceptance_window_declared_unsatisfied_task_ids": sorted(
+            declared_unsatisfied_task_ids
+        )[:_BUCKET_TASK_ID_CAP],
+        "acceptance_window_declared_unsatisfied_task_ids_total": len(
+            declared_unsatisfied_task_ids
+        ),
+        "acceptance_window_declared_unsatisfied_task_ids_truncated": len(
+            declared_unsatisfied_task_ids
+        )
+        > _BUCKET_TASK_ID_CAP,
+        "acceptance_window_bucket_task_id_cap": _BUCKET_TASK_ID_CAP,
         # Additive audit breakdown: how many verified merges were credited via the
         # inferred test-cochange path (undeclared merge, CI-verified, test+prod
         # co-change) rather than an explicit proven/satisfied declaration. Consumed

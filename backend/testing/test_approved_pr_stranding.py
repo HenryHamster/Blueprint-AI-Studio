@@ -39,8 +39,11 @@ def _git_fixture(
     _run("git", "checkout", "-b", "approved-work", cwd=repo)
     (repo / "shared.txt").write_text("work\n" if conflict else "base\nwork\n", encoding="utf-8")
     if conflict_marker_content:
+        marker = "<" * 7
+        separator = "=" * 7
         (repo / "conflict-notes.txt").write_text(
-            "<<<<<<< HEAD\nThis documents a conflict marker.\n=======\n>>>>>>> branch\n",
+            f"{marker} HEAD\nThis documents a conflict marker.\n"
+            f"{separator}\n{marker} branch\n",
             encoding="utf-8",
         )
     _run("git", "add", ".", cwd=repo)

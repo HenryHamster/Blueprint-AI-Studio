@@ -2096,6 +2096,8 @@ async def backfill_unverified_merge_evidence(
     session: AsyncSession,
     project_id: uuid.UUID,
     direction_key: str | None = None,
+    *,
+    diagnostic: dict[str, str] | None = None,
 ) -> int:
     """Backfill criterion evidence for tasks whose unverified merge prevented it.
 
@@ -2110,7 +2112,9 @@ async def backfill_unverified_merge_evidence(
     context carries that direction_id.
 
     Best-effort: errors are logged and swallowed so a backfill failure never blocks
-    the caller (the reconcile-backfill endpoint).
+    the caller (the reconcile-backfill endpoint).  Callers that need to preserve a
+    failed pass in an execution ledger may provide ``diagnostic``; it receives a
+    stable error code and exception class while this API remains count-compatible.
 
     Returns the count of new ``CriterionEvidence`` rows recorded.
     """
@@ -2331,11 +2335,16 @@ async def backfill_unverified_merge_evidence(
                 total,
             )
         return total
-    except Exception:
+    except Exception as exc:
         logger.exception(
             "backfill_unverified_merge_evidence: failed for project %s",
             project_id,
         )
+        if diagnostic is not None:
+            diagnostic.update(
+                error="backfill_unverified_merge_evidence_failed",
+                error_type=type(exc).__name__,
+            )
         return 0
 
 
@@ -2351,6 +2360,8 @@ async def backfill_rollup_child_changed_files(
     session: AsyncSession,
     project_id: uuid.UUID,
     direction_key: str | None = None,
+    *,
+    diagnostic: dict[str, str] | None = None,
 ) -> int:
     """Retroactively stamp a rollup parent's changed files onto landed children.
 
@@ -2382,7 +2393,9 @@ async def backfill_rollup_child_changed_files(
     carries that ``direction_id`` (matching the sibling backfills).
 
     Idempotent (``setdefault`` — a re-run stamps nothing new) and best-effort
-    (errors are logged and swallowed so a failure never blocks the caller).
+    (errors are logged and swallowed so a failure never blocks the caller).  A
+    caller may provide ``diagnostic`` to retain a stable error code and exception
+    class when the swallowed failure must remain auditable.
 
     Returns the count of children newly stamped by this call.
     """
@@ -2521,11 +2534,16 @@ async def backfill_rollup_child_changed_files(
                 stamped_total,
             )
         return stamped_total
-    except Exception:
+    except Exception as exc:
         logger.exception(
             "backfill_rollup_child_changed_files: failed for project %s",
             project_id,
         )
+        if diagnostic is not None:
+            diagnostic.update(
+                error="backfill_rollup_child_changed_files_failed",
+                error_type=type(exc).__name__,
+            )
         return 0
 
 
@@ -3391,6 +3409,7 @@ async def record_operator_walkthrough_evidence(
 async def record_acceptance_window_coverage_evidence(
     session: AsyncSession,
     version: Any,
+    diagnostic: dict[str, Any] | None = None,
 ) -> int:
     """Record covering ``acceptance_window_recompute`` evidence when the version's
     acceptance-window metric re-scores genuinely non-zero.
@@ -3412,7 +3431,10 @@ async def record_acceptance_window_coverage_evidence(
     every failure is logged and swallowed so it never raises into the sweep or
     qualification path.
 
-    Returns the number of evidence rows newly recorded.
+    Returns the number of evidence rows newly recorded.  When ``diagnostic`` is
+    supplied, writes one observational ``branch`` value describing why the
+    minter recorded evidence or legitimately skipped it.  This is deliberately
+    not persisted as criterion evidence and changes no coverage decision.
 
     **DEPLOYED-SIDE CONSTRAINT**: this function executes inside the deployed
     orchestrator process at the deployed (main) SHA, called from
@@ -3431,6 +3453,8 @@ async def record_acceptance_window_coverage_evidence(
         # evidence row does not create recurring work on every reaper cycle.
         targets = await _resolve_acceptance_window_criteria(session, version)
         if not targets:
+            if diagnostic is not None:
+                diagnostic["branch"] = "no_target_criterion"
             logger.info(
                 "record_acceptance_window_coverage_evidence: no active criterion "
                 "names the acceptance-window metric on version %s — recording nothing",
@@ -3449,6 +3473,8 @@ async def record_acceptance_window_coverage_evidence(
         )
         already_present = {ev.criterion_id for ev in ev_result.scalars().all()}
         if len(already_present) == len(target_ids):
+            if diagnostic is not None:
+                diagnostic["branch"] = "evidence_already_present"
             return 0
 
         latest_landed_updated_at = (
@@ -3467,6 +3493,8 @@ async def record_acceptance_window_coverage_evidence(
         )
         version_id = version.id
         if _acceptance_window_recompute_state.get(version_id) == state_fingerprint:
+            if diagnostic is not None:
+                diagnostic["branch"] = "unchanged_window_state"
             return 0
 
         aggregate = await release_qualifier._compute_acceptance_window_aggregate(
@@ -3475,6 +3503,8 @@ async def record_acceptance_window_coverage_evidence(
         write_total = int(aggregate.get("acceptance_window_write_total") or 0)
         verified = int(aggregate.get("acceptance_window_verified") or 0)
         if write_total <= 0 or verified <= 0:
+            if diagnostic is not None:
+                diagnostic["branch"] = "false_zero_window"
             # Cache only the intentional no-write outcome. A coverable window
             # relies on durable evidence idempotency instead: caching before its
             # transaction commits could let a transient insert/commit failure
@@ -3524,8 +3554,14 @@ async def record_acceptance_window_coverage_evidence(
             write_total,
             verified,
         )
+        if diagnostic is not None:
+            diagnostic["branch"] = (
+                "evidence_recorded" if recorded else "evidence_already_present"
+            )
         return recorded
     except Exception:
+        if diagnostic is not None:
+            diagnostic["branch"] = "error"
         logger.exception(
             "record_acceptance_window_coverage_evidence: failed for version %s",
             getattr(version, "id", None),

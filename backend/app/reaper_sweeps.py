@@ -4260,7 +4260,37 @@ _ACCEPTANCE_HEALING_BACKFILL_INTERVAL_SECONDS = 3600
 _last_acceptance_healing_backfill_sweep: datetime | None = None
 
 
-async def sweep_acceptance_verdict_healing_backfills(session, now=None) -> int:
+async def _persist_acceptance_healing_sweep_run(
+    session, *, now: datetime, result: dict[str, Any]
+) -> None:
+    """Append the Step 21b outcome without coupling it to qualification state."""
+    from app.models import AcceptanceHealingSweepRun
+
+    run = AcceptanceHealingSweepRun(
+        executed_at=now,
+        outcome=result["outcome"],
+        projects_examined=result["projects_examined"],
+        open_versions_examined=result["open_versions_examined"],
+        project_pass_counts=result["project_pass_counts"],
+        project_results=result["project_results"],
+        evidence_rows_recorded=result["evidence_rows_recorded"],
+    )
+    try:
+        session.add(run)
+        await session.commit()
+    except Exception:
+        logger.exception("[REAPER] Step 21b: failed to append sweep-run record")
+        with contextlib.suppress(Exception):
+            await session.rollback()
+        result["record_persisted"] = False
+        return
+    result["record_persisted"] = True
+    result["run_id"] = str(run.id)
+
+
+async def sweep_acceptance_verdict_healing_backfills(
+    session, now=None
+) -> dict[str, Any]:
     """Step 21b: Heal stale declared_unsatisfied acceptance verdicts on the sweep.
 
     Runs the two reconcile-only backfills that heal stale acceptance verdicts for
@@ -4285,10 +4315,13 @@ async def sweep_acceptance_verdict_healing_backfills(session, now=None) -> int:
     runs LAST so a healed merge window re-scores non-zero and records its probe
     evidence.
 
-    Hourly cadence-gated on an independent timer.  Returns the total number of new
-    ``CriterionEvidence`` rows recorded across all projects (the unverified-merge
-    backfill + window-minter passes; rollup stamping is a context fix, not
-    evidence).
+    Hourly cadence-gated on an independent timer.  Returns an observational run
+    record and appends the same payload to ``AcceptanceHealingSweepRun`` — but
+    ONLY for invocations that actually ran the passes; a cadence-skipped call
+    returns its result without writing a row.  The record is deliberately
+    separate from criterion evidence: it explains the sweep's behaviour but never
+    satisfies an acceptance criterion, and
+    :func:`sweep_acceptance_healing_sweep_run_retention` bounds its growth.
     """
     global _last_acceptance_healing_backfill_sweep
     from app.models import Project
@@ -4300,18 +4333,37 @@ async def sweep_acceptance_verdict_healing_backfills(session, now=None) -> int:
     )
 
     _now = now or _utcnow()
+    result: dict[str, Any] = {
+        "executed_at": _now.isoformat(),
+        "outcome": "no_op",
+        "projects_examined": [],
+        "open_versions_examined": [],
+        "project_pass_counts": {},
+        "project_results": [],
+        "evidence_rows_recorded": 0,
+    }
     if not _is_cadence_due(
         _last_acceptance_healing_backfill_sweep,
         _ACCEPTANCE_HEALING_BACKFILL_INTERVAL_SECONDS,
         _now,
     ):
-        return 0
+        # Deliberately NOT persisted.  The reaper cycles on a ~60s backoff while
+        # this sweep is hourly, so ~59 of every 60 invocations land here; a row
+        # per skip would append ~1.4k rows/day carrying nothing the cadence timer
+        # does not already imply.  Only runs that actually examined something are
+        # appended — the same skipped-cadence-without-a-write shape _sweep_gc_guard
+        # uses.
+        result["outcome"] = "cadence_skipped"
+        result["record_persisted"] = False
+        return result
     _last_acceptance_healing_backfill_sweep = _now
 
     # Find projects that have an open release version — only they have active
     # criteria whose acceptance window can be healed.
     _BATCH = 50
-    total = 0
+    healing_changes = 0
+    evidence_rows_recorded = 0
+    project_errors = 0
     last_id: uuid.UUID | None = None
     while True:
         query = select(Project.id).order_by(Project.id).limit(_BATCH)
@@ -4324,13 +4376,70 @@ async def sweep_acceptance_verdict_healing_backfills(session, now=None) -> int:
         last_id = rows[-1]
 
         for pid in rows:
+            project_id = str(pid)
+            result["projects_examined"].append(project_id)
             try:
                 open_ver = await _cur_open_ver(session, pid)
                 if open_ver is None:
+                    pass_counts = {
+                        "rollup_children_stamped": 0,
+                        "unverified_evidence": 0,
+                        "acceptance_window_evidence": 0,
+                    }
+                    result["project_pass_counts"][project_id] = pass_counts
+                    result["project_results"].append(
+                        {
+                            "project_id": project_id,
+                            "open_version_id": None,
+                            "skip_reason": "no_open_version",
+                            "pass_counts": pass_counts,
+                            "acceptance_window_branch": "no_open_version",
+                        }
+                    )
                     continue
-                stamped = await _backfill_rollup(session, pid)
-                unverified = await _backfill_unverified(session, pid)
-                window_evidence = await _record_window_evidence(session, open_ver)
+                version_id = str(open_ver.id)
+                result["open_versions_examined"].append(
+                    {"project_id": project_id, "release_version_id": version_id}
+                )
+                pass_errors: dict[str, dict[str, str]] = {}
+                rollup_diagnostic: dict[str, str] = {}
+                stamped = await _backfill_rollup(
+                    session, pid, diagnostic=rollup_diagnostic
+                )
+                if rollup_diagnostic:
+                    pass_errors["rollup_child_changed_files"] = rollup_diagnostic
+                    # The helper preserves endpoint best-effort behavior by
+                    # swallowing its own failure.  Clear any failed transaction
+                    # before independently attempting the remaining passes.
+                    await session.rollback()
+                    # rollback() expires every ORM instance, including the
+                    # version passed to the final window minter.  Re-query it
+                    # before the next independent pass so async attribute reads
+                    # cannot trigger a synchronous MissingGreenlet refresh.
+                    open_ver = await _cur_open_ver(session, pid)
+                    if open_ver is None:
+                        raise RuntimeError(
+                            "open release version closed during acceptance healing"
+                        )
+
+                unverified_diagnostic: dict[str, str] = {}
+                unverified = await _backfill_unverified(
+                    session, pid, diagnostic=unverified_diagnostic
+                )
+                if unverified_diagnostic:
+                    pass_errors["unverified_merge_evidence"] = unverified_diagnostic
+                    await session.rollback()
+                    # See the corresponding rollup-pass reload above: this
+                    # rollback also expires open_ver before the window minter.
+                    open_ver = await _cur_open_ver(session, pid)
+                    if open_ver is None:
+                        raise RuntimeError(
+                            "open release version closed during acceptance healing"
+                        )
+                window_diagnostic: dict[str, Any] = {}
+                window_evidence = await _record_window_evidence(
+                    session, open_ver, diagnostic=window_diagnostic
+                )
                 # Each pass commits internally per batch; this commit flushes the
                 # window-minter rows (already persisted by record_evidence) and
                 # keeps the per-project transaction clean for the next project.
@@ -4344,8 +4453,29 @@ async def sweep_acceptance_verdict_healing_backfills(session, now=None) -> int:
                         unverified,
                         window_evidence,
                     )
-                total += unverified + window_evidence
+                healing_changes += stamped + unverified + window_evidence
+                evidence_rows_recorded += unverified + window_evidence
+                if pass_errors:
+                    project_errors += 1
+                pass_counts = {
+                    "rollup_children_stamped": stamped,
+                    "unverified_evidence": unverified,
+                    "acceptance_window_evidence": window_evidence,
+                }
+                result["project_pass_counts"][project_id] = pass_counts
+                project_result = {
+                    "project_id": project_id,
+                    "open_version_id": version_id,
+                    "pass_counts": pass_counts,
+                    "acceptance_window_branch": window_diagnostic.get(
+                        "branch", "unknown"
+                    ),
+                }
+                if pass_errors:
+                    project_result["pass_errors"] = pass_errors
+                result["project_results"].append(project_result)
             except Exception:
+                project_errors += 1
                 logger.warning(
                     "[REAPER] Step 21b: acceptance-verdict healing backfills failed "
                     "for project %s:",
@@ -4354,16 +4484,93 @@ async def sweep_acceptance_verdict_healing_backfills(session, now=None) -> int:
                 )
                 with contextlib.suppress(Exception):
                     await session.rollback()
+                result["project_pass_counts"][project_id] = {}
+                result["project_results"].append(
+                    {
+                        "project_id": project_id,
+                        "open_version_id": None,
+                        "pass_counts": {},
+                        "acceptance_window_branch": "error",
+                        "error": "project_healing_failed",
+                    }
+                )
 
         if len(rows) < _BATCH:
             break
 
-    if total:
+    result["evidence_rows_recorded"] = evidence_rows_recorded
+    if project_errors:
+        result["outcome"] = "error"
+    elif healing_changes:
+        result["outcome"] = "changed"
         logger.info(
-            "[REAPER] Step 21b: acceptance-verdict healing total=%d",
-            total,
+            "[REAPER] Step 21b: acceptance-verdict healing changes=%d evidence=%d",
+            healing_changes,
+            evidence_rows_recorded,
         )
-    return total
+    elif not result["open_versions_examined"]:
+        result["outcome"] = "no_open_version"
+
+    await _persist_acceptance_healing_sweep_run(session, now=_now, result=result)
+    return result
+
+
+# Retention window for the append-only Step 21b sweep-run ledger.  90 days is
+# deliberately longer than the 30-day EvergreenFillDecisionLog window: a run row
+# explains why a release version's acceptance window did (or did not) heal, and a
+# release cycle plus its post-promotion review routinely spans more than a month,
+# so a 30-day purge would drop the evidence while the version it explains is
+# still open.  Purged on a daily cadence — the rows are hourly at most, so
+# nothing is gained by re-running the DELETE every ~60s reaper cycle.
+ACCEPTANCE_HEALING_SWEEP_RUN_RETENTION_DAYS = 90
+_ACCEPTANCE_HEALING_RETENTION_INTERVAL_SECONDS = 86400
+_last_acceptance_healing_retention_sweep: datetime | None = None
+
+
+async def sweep_acceptance_healing_sweep_run_retention(
+    session,
+    now=None,
+    *,
+    retention_days: int = ACCEPTANCE_HEALING_SWEEP_RUN_RETENTION_DAYS,
+) -> int:
+    """Purge AcceptanceHealingSweepRun rows older than retention_days (default 90).
+
+    ``AcceptanceHealingSweepRun`` is append-only, so without this it grows without
+    bound.  Mirrors :func:`sweep_evergreen_fill_decision_retention` (the module's
+    established shape for append-only operational logs) with a daily cadence gate
+    on its own timer, so the DELETE does not re-run on every ~60s reaper cycle.
+
+    Returns the number of rows deleted (0 when the cadence is not yet due).
+    """
+    from app.models import AcceptanceHealingSweepRun
+    from sqlalchemy import delete
+
+    global _last_acceptance_healing_retention_sweep
+
+    _now = now or _utcnow()
+    if not _is_cadence_due(
+        _last_acceptance_healing_retention_sweep,
+        _ACCEPTANCE_HEALING_RETENTION_INTERVAL_SECONDS,
+        _now,
+    ):
+        return 0
+    _last_acceptance_healing_retention_sweep = _now
+
+    cutoff = _now - timedelta(days=retention_days)
+    res = await session.execute(
+        delete(AcceptanceHealingSweepRun).where(
+            AcceptanceHealingSweepRun.executed_at < cutoff
+        )
+    )
+    count = res.rowcount or 0
+    if count:
+        await session.commit()
+        logger.info(
+            "[REAPER] Purged %d stale acceptance-healing sweep-run row(s)", count
+        )
+    else:
+        await session.rollback()
+    return count
 
 
 __all__ = [
@@ -4431,4 +4638,6 @@ __all__ = [
     "sweep_backfill_merged_named_test_coverage",
     "sweep_acceptance_verdict_healing_backfills",
     "_ACCEPTANCE_HEALING_BACKFILL_INTERVAL_SECONDS",
+    "sweep_acceptance_healing_sweep_run_retention",
+    "ACCEPTANCE_HEALING_SWEEP_RUN_RETENTION_DAYS",
 ]

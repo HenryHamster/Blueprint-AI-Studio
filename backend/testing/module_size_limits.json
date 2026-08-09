@@ -166,7 +166,8 @@
     "conversation_coordinator.py": 1900,
     "routers/agent_warm_continuity.py": 1700,
     "post_commit_errors.py": 58,
-    "task_lifecycle_completion_dispatch.py": 500
+    "task_lifecycle_completion_dispatch.py": 500,
+    "release_models.py": 1750
   },
   "agent": {
     "index.ts": 4600,

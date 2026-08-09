@@ -949,6 +949,79 @@ class QualificationVerdict(SQLModel, table=True):
     )
 
 
+class AcceptanceHealingSweepRun(SQLModel, table=True):
+    """Append-only Step 21b acceptance-healing execution record.
+
+    ``ReleaseVersion.last_qualification`` is a mutable projection, and the
+    reconciliation passes called by the reaper are intentionally best-effort.
+    This ledger preserves what a particular Step 21b invocation actually
+    examined and why it did (or did not) mint acceptance-window evidence.  It
+    is observational only: no reader may use it as criterion evidence.
+
+    Growth is bounded at both ends: only invocations that actually ran the passes
+    append a row (cadence-skipped reaper cycles write nothing), and
+    ``reaper_sweeps.sweep_acceptance_healing_sweep_run_retention`` purges rows
+    older than ``ACCEPTANCE_HEALING_SWEEP_RUN_RETENTION_DAYS`` (90) on a daily
+    cadence.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+
+    # When the reaper ran the Step 21b passes.  Cadence-skipped invocations do
+    # not produce a row, so every executed_at is a real examination.
+    executed_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            NaiveUTCDateTime, nullable=False, server_default=func.now()
+        ),
+    )
+
+    # Exactly one of no_open_version | error | no_op | changed.  ``cadence_skipped``
+    # never reaches this table — that run examined nothing.
+    outcome: str = Field(
+        sa_column=Column(String(32), nullable=False),
+    )
+
+    # Deterministic UUID-string lists, retained independently of mutable
+    # qualification projections.  ``project_results`` contains the per-project
+    # rollup/unverified/window pass counts plus the window skip/evidence branch.
+    projects_examined: Any = Field(
+        default_factory=list,
+        sa_column=Column(
+            JSONB, nullable=False, server_default=text("'[]'")
+        ),
+    )
+    open_versions_examined: Any = Field(
+        default_factory=list,
+        sa_column=Column(
+            JSONB, nullable=False, server_default=text("'[]'")
+        ),
+    )
+    project_pass_counts: Any = Field(
+        default_factory=dict,
+        sa_column=Column(
+            JSONB, nullable=False, server_default=text("'{}'")
+        ),
+    )
+    project_results: Any = Field(
+        default_factory=list,
+        sa_column=Column(
+            JSONB, nullable=False, server_default=text("'[]'")
+        ),
+    )
+
+    # New evidence rows written by the unverified-merge and acceptance-window
+    # passes.  Rollup changed-file stamps remain context repairs, never evidence.
+    evidence_rows_recorded: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
+
+    __table_args__ = (
+        Index("ix_acceptancehealingsweeprun_executed_at", "executed_at"),
+    )
+
+
 class AuditFindingResolution(SQLModel, table=True):
     """Durable per-finding resolution ledger for carried qualification audit findings.
 
