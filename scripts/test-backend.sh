@@ -19,6 +19,7 @@
 #   scripts/test-backend.sh --sandbox-postgres           # private local Postgres; no Docker socket required
 set -euo pipefail
 cd "$(dirname "$0")/../backend"
+source ../scripts/backend-test-route.sh
 
 # The real upgrade chain contains fail-closed encrypted-data migrations. Keep a
 # deterministic non-production Fernet key in the repo-owned harness so Alembic
@@ -147,6 +148,11 @@ if [ "$SANDBOX_POSTGRES" = "1" ]; then
     echo "ERROR: --sandbox-postgres requires $PYTHON" >&2
     exit 2
   }
+elif [ "$USE_POSTGRES" = "1" ] && _AUTO_POSTGRES_FLAG="$(select_backend_test_route 2>/dev/null)" && [ "$_AUTO_POSTGRES_FLAG" = "--sandbox-postgres" ]; then
+  SANDBOX_POSTGRES=1
+  USE_DOCKER=0
+  PYTHON="${BLUEPRINT_SANDBOX_PYTHON:-/opt/blueprint-backend-venv/bin/python}"
+  echo "=== Using off-image pgserver PostgreSQL sandbox ==="
 elif command -v docker &>/dev/null; then
   USE_DOCKER=1
 else
@@ -341,36 +347,6 @@ resolve_deps_image() {
   fi
   echo "WARN: deps image $img unavailable (pull failed, missing tag, or timeout)" >&2
   echo "WARN: falling back to local docker build — slower but identical result" >&2
-  return 1
-}
-
-# --- PostgreSQL bindir resolution for --sandbox-postgres ---
-# Resolve a usable PostgreSQL server bindir. Prefers `pg_config --bindir` when
-# it is on PATH and points at a real server (images with libpq-dev /
-# postgresql-client install pg_config on PATH). When pg_config is absent from
-# PATH, falls back to the highest-versioned /usr/lib/postgresql/*/bin that
-# actually holds initdb (an image with only the server packages still has the
-# server binaries there). Prints the bindir and returns 0; returns 1 when
-# neither exists — a pg_config that exists but points at a non-server dir stays
-# fail-closed rather than scanning. Keep this helper byte-identical across
-# check, scripts/test-backend.sh and the generated check_backend_verification.sh
-# fragment — mirrored paths must not diverge again.
-resolve_pg_bindir() {
-  local bindir cand
-  if command -v pg_config >/dev/null 2>&1; then
-    bindir="$(pg_config --bindir 2>/dev/null || true)"
-    if [ -n "$bindir" ] && [ -x "$bindir/initdb" ]; then
-      printf '%s\n' "$bindir"
-      return 0
-    fi
-    return 1
-  fi
-  for cand in $(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -V | tail -n 1); do
-    if [ -x "$cand/initdb" ]; then
-      printf '%s\n' "$cand"
-      return 0
-    fi
-  done
   return 1
 }
 

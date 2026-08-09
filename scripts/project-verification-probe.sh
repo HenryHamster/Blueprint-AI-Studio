@@ -40,21 +40,19 @@ if [ "$PROBE_MODE" = "all" ] || [ "$PROBE_MODE" = "ruff" ]; then
   timeout "$COMMAND_TIMEOUT_SECONDS" python3 -m ruff check --isolated --no-cache "$RUFF_INPUT"
 fi
 
-# Resolve a usable PostgreSQL server bindir. Prefers `pg_config --bindir` when
-# it is on PATH and points at a real server (images with libpq-dev /
-# postgresql-client install pg_config on PATH). When pg_config is absent from
-# PATH, falls back to the highest-versioned /usr/lib/postgresql/*/bin that
-# actually holds initdb (an image with only the server packages still has the
-# server binaries there). Prints the bindir and returns 0; returns 1 when
-# neither exists — a pg_config that exists but points at a non-server dir stays
-# fail-closed rather than scanning. A pg_config that EXISTS but exits non-zero
-# (a broken wrapper) must not falsely deny the capability: the guarded
-# substitution above captures whatever it prints and the bindir check keeps the
-# decision fail-closed. Keep this helper byte-identical across check,
-# scripts/test-backend.sh, the generated check_backend_verification.sh fragment
-# and this probe — mirrored paths must not diverge again.
+# Resolve the same PostgreSQL binaries as the backend route selector.  This
+# copy is intentional: the probe is copied by itself into Packer and bwrap
+# workspaces, where sibling repo scripts are not present.
 resolve_pg_bindir() {
-  local bindir cand
+  local bindir cand sandbox_python
+  sandbox_python="${BLUEPRINT_SANDBOX_PYTHON:-/opt/blueprint-backend-venv/bin/python}"
+  if [ -x "$sandbox_python" ]; then
+    bindir="$("$sandbox_python" -c 'from pgserver._commands import POSTGRES_BIN_PATH; print(POSTGRES_BIN_PATH)' 2>/dev/null || true)"
+    if [ -n "$bindir" ] && [ -x "$bindir/initdb" ]; then
+      printf '%s\n' "$bindir"
+      return 0
+    fi
+  fi
   if command -v pg_config >/dev/null 2>&1; then
     bindir="$(pg_config --bindir 2>/dev/null || true)"
     if [ -n "$bindir" ] && [ -x "$bindir/initdb" ]; then
@@ -76,23 +74,20 @@ resolve_pg_bindir() {
 # isolation namespace. This is the same socketless boundary used by generated
 # authoring checks: no host Docker socket or host data directory is exposed.
 if [ "$PROBE_MODE" = "all" ] || [ "$PROBE_MODE" = "docker-postgres" ]; then
-  # Resolution is the SHARED helper above, byte-identical to the mirrored
-  # resolve_pg_bindir in check, scripts/test-backend.sh and
-  # check_backend_verification.sh: this probe's result IS the input to the
-  # dispatch gate (runner_eligibility.py keys authoring dispatch off the
-  # docker_postgres probe), so proof and gate admit exactly the same hosts.
+  # This probe's result is the input to the dispatch gate
+  # (runner_eligibility.py keys authoring dispatch off the docker_postgres
+  # probe), so keep this resolver's precedence aligned with the shared route
+  # selector.
   POSTGRES_BIN="$(resolve_pg_bindir)" || {
     echo "Sandbox PostgreSQL verification failed: no usable PostgreSQL server bindir" >&2
     exit 1
   }
   test -x "$POSTGRES_BIN/pg_ctl"
-  # The `check` gate selects --sandbox-postgres only when the baked backend
-  # interpreter is present AND usable, so the capability we advertise here must
-  # include it: a host with PostgreSQL but no baked venv would otherwise be
-  # dispatched a backend authoring task that fails closed at the gate. Prove it
-  # functionally (imports pytest), not by testing for a file.
+  # The `check` gate selects --sandbox-postgres only when the selected
+  # interpreter can import both declared runtime packages. This also covers
+  # off-image hosts using BLUEPRINT_SANDBOX_PYTHON.
   SANDBOX_PYTHON="${BLUEPRINT_SANDBOX_PYTHON:-/opt/blueprint-backend-venv/bin/python}"
-  if ! timeout "$COMMAND_TIMEOUT_SECONDS" "$SANDBOX_PYTHON" -c 'import pytest' \
+  if ! timeout "$COMMAND_TIMEOUT_SECONDS" "$SANDBOX_PYTHON" -c 'import pgserver, pytest' \
     >/dev/null 2>&1; then
     echo "Sandbox PostgreSQL verification failed: baked sandbox interpreter $SANDBOX_PYTHON cannot import pytest" >&2
     exit 1

@@ -125,35 +125,7 @@ run() {
   fi
 }
 
-# Resolve a usable PostgreSQL server bindir for --sandbox-postgres. Prefers
-# `pg_config --bindir` when it is on PATH and points at a real server (images
-# with libpq-dev / postgresql-client install pg_config on PATH). When pg_config
-# is absent from PATH, falls back to the highest-versioned
-# /usr/lib/postgresql/*/bin that actually holds initdb (an image with only the
-# server packages still has the server binaries there). Prints the bindir and
-# returns 0; returns 1 when neither exists — a pg_config that exists but points
-# at a non-server dir stays fail-closed rather than scanning. Keep this helper
-# byte-identical across check, scripts/test-backend.sh and the generated
-# check_backend_verification.sh fragment — mirrored paths must not diverge
-# again.
-resolve_pg_bindir() {
-  local bindir cand
-  if command -v pg_config >/dev/null 2>&1; then
-    bindir="$(pg_config --bindir 2>/dev/null || true)"
-    if [ -n "$bindir" ] && [ -x "$bindir/initdb" ]; then
-      printf '%s\n' "$bindir"
-      return 0
-    fi
-    return 1
-  fi
-  for cand in $(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -V | tail -n 1); do
-    if [ -x "$cand/initdb" ]; then
-      printf '%s\n' "$cand"
-      return 0
-    fi
-  done
-  return 1
-}
+source scripts/backend-test-route.sh
 
 # Idempotent npm install guarded by package-lock IDENTITY, not the mere
 # existence of node_modules. A warm/reused VM carries a populated
@@ -362,17 +334,8 @@ if touches "backend/"; then
         FAILED+=("backend verification no impacted pytest")
       else
         _VERIFY_POSTGRES_FLAG=""
-        if PG_BIN="$(resolve_pg_bindir)" && [ -x "${BLUEPRINT_SANDBOX_PYTHON:-/opt/blueprint-backend-venv/bin/python}" ]; then
-          # --sandbox-postgres runs the harness against the Packer-baked venv
-          # (scripts/test-backend.sh hard-exits without it). A host with the
-          # bindir but no baked venv must fall through to the Docker branch
-          # below, not hard-exit. The interpreter path is the same
-          # BLUEPRINT_SANDBOX_PYTHON-overridable default the harness
-          # (scripts/test-backend.sh) and the capability probe use, so the
-          # gate, the harness and the proof cannot drift apart.
-          _VERIFY_POSTGRES_FLAG=--sandbox-postgres
-        elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-          _VERIFY_POSTGRES_FLAG=--postgres
+        if _VERIFY_POSTGRES_FLAG="$(select_backend_test_route)"; then
+          :
         else
           echo "[check] required backend verification FAILED — PostgreSQL runtime unavailable"
           FAILED+=("backend verification PostgreSQL unavailable")

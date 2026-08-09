@@ -38,3 +38,7 @@ mypy==1.20.2
 # Suite sharding for parallel CI (matrix shards run `--splits N --group K`).
 # Deterministic split by collection order (no pytest-randomly installed).
 pytest-split==0.11.0
+pgserver==0.1.4
+# The companion wheel adds pg_trgm (required by the migration chain) to the
+# same embedded pgserver installation; keep both versions pinned together.
+pgserver-search==0.1.6

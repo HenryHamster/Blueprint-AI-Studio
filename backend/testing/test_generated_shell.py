@@ -1978,7 +1978,7 @@ class TestProjectVerificationRuntimeContract:
             "-/opt/blueprint-backend-venv/bin/python}\"" in probe
         ), "probe must resolve the same interpreter path the gate requires"
         # Functional proof (it must actually import pytest), not a file test.
-        assert '"$SANDBOX_PYTHON" -c \'import pytest\'' in probe
+        assert '"$SANDBOX_PYTHON" -c \'import pgserver, pytest\'' in probe
         # Bounded by the same timeout as every other probe command.
         assert 'timeout "$COMMAND_TIMEOUT_SECONDS" "$SANDBOX_PYTHON"' in probe, (
             "interpreter proof must run under the probe command timeout"
@@ -1986,16 +1986,13 @@ class TestProjectVerificationRuntimeContract:
         # It must gate the docker-postgres capability (run before the sidecar
         # comes up), not sit after the final success echo.
         assert probe.index("$SANDBOX_PYTHON") < probe.index('"$POSTGRES_BIN/initdb"')
-        # The gate's own interpreter guard uses the identical default.
-        guard = '[ -x "${BLUEPRINT_SANDBOX_PYTHON:-/opt/blueprint-backend-venv/bin/python}" ]'
         for label, path in (
             ("tracked check", _TRACKED_CHECK),
             ("generated fragment", _BACKEND_VERIFICATION_FRAGMENT),
         ):
-            assert guard in path.read_text(encoding="utf-8"), (
-                f"{label} must guard --sandbox-postgres on the same interpreter "
-                "default the probe proves"
-            )
+            assert "source scripts/backend-test-route.sh" in path.read_text(
+                encoding="utf-8"
+            ), f"{label} must use the shared backend route selector"
         assert (
             'PYTHON="${BLUEPRINT_SANDBOX_PYTHON:-/opt/blueprint-backend-venv/bin/python}"'
             in _BACKEND_TEST_HARNESS.read_text(encoding="utf-8")
@@ -2004,44 +2001,18 @@ class TestProjectVerificationRuntimeContract:
     def test_probe_and_gate_resolve_pg_bindir_identically(self):
         """Capability proof and dispatch gate must admit the same hosts.
 
-        The probe result IS the dispatch gate's input, so if the mirrored
-        resolve_pg_bindir helpers diverged from the probe's resolution the
-        fleet would advertise hosts the gate cannot serve (or deny hosts it
-        can). Assert the helper body is byte-identical (modulo indentation)
-        across all four copies rather than trusting the comment that says so.
+        The tracked gate and harness source the canonical selector. The probe
+        is deployed by itself, so it carries the same resolver logic locally.
         """
-        mirrors = {
-            "probe": _PROJECT_VERIFICATION_PROBE,
-            "tracked check": _TRACKED_CHECK,
-            "backend harness": _BACKEND_TEST_HARNESS,
-            "generated fragment": _BACKEND_VERIFICATION_FRAGMENT,
-        }
-        bodies = {}
-        for label, path in mirrors.items():
-            text = path.read_text(encoding="utf-8")
-            start = text.index("resolve_pg_bindir() {")
-            lines = []
-            # The fragment is indented inside the generated ./check, so close on
-            # the first line that is exactly `}` after stripping.
-            for line in text[start:].splitlines():
-                stripped = line.strip()
-                if stripped:
-                    lines.append(stripped)
-                if stripped == "}":
-                    break
-            else:  # pragma: no cover - malformed helper
-                raise AssertionError(f"{label}: resolve_pg_bindir is unterminated")
-            bodies[label] = "\n".join(lines)
-            assert "ls -d /usr/lib/postgresql/*/bin" in bodies[label], (
-                f"{label}: resolve_pg_bindir must keep the server-bindir scan"
-            )
-        assert len(set(bodies.values())) == 1, (
-            "resolve_pg_bindir diverged across mirrors: "
-            + repr({k: v for k, v in bodies.items()})
+        helper = (_BLUEPRINT_ROOT / "scripts" / "backend-test-route.sh").read_text(
+            encoding="utf-8"
         )
-        # The probe must USE the shared helper, not open-code its own order.
-        probe = _PROJECT_VERIFICATION_PROBE.read_text(encoding="utf-8")
-        assert 'POSTGRES_BIN="$(resolve_pg_bindir)"' in probe
+        assert "resolve_pg_bindir()" in helper
+        assert "POSTGRES_BIN=\"$(resolve_pg_bindir)\"" in _PROJECT_VERIFICATION_PROBE.read_text(
+            encoding="utf-8"
+        )
+        for path in (_TRACKED_CHECK, _BACKEND_TEST_HARNESS, _BACKEND_VERIFICATION_FRAGMENT):
+            assert "backend-test-route.sh" in path.read_text(encoding="utf-8")
 
     def test_packer_runs_probe_as_agent_before_success_sentinel(self):
         hcl = _read_packer_hcl()
@@ -2104,11 +2075,16 @@ class TestProjectVerificationRuntimeContract:
     def test_generated_fragment_and_tracked_check_share_fail_closed_contract(self):
         fragment = _BACKEND_VERIFICATION_FRAGMENT.read_text(encoding="utf-8")
         tracked = _TRACKED_CHECK.read_text(encoding="utf-8")
+        helper = (_BLUEPRINT_ROOT / "scripts" / "backend-test-route.sh").read_text(
+            encoding="utf-8"
+        )
+        contract_sources = (fragment, tracked, helper)
         for required in (
             "python3 -m ruff check --select E,F,W --ignore E501",
             "USE_TEST_POSTGRES=true bash",
             "--sandbox-postgres",
             "pg_config --bindir",
+            "backend-test-route.sh",
             # The sandbox branch additionally requires the Packer-baked venv the
             # harness hard-exits without; a host missing it must take the Docker
             # branch rather than hard-exit (gap-2 reachability fix).
@@ -2119,34 +2095,20 @@ class TestProjectVerificationRuntimeContract:
             "BLUEPRINT_SANDBOX_PYTHON",
             "/opt/blueprint-backend-venv/bin/python",
         ):
-            assert required in fragment, f"generated fragment missing {required}"
-            assert required in tracked, f"tracked check missing {required}"
+            assert any(required in source for source in contract_sources), (
+                f"shared backend route contract missing {required}"
+            )
         for forbidden in ("--standalone --no-postgres", "GATE-ENVIRONMENT"):
             required_start = fragment.index("required backend-authoring verification")
             assert forbidden not in fragment[required_start:]
-        # The sandbox branch must require BOTH a usable PostgreSQL server bindir
-        # and the baked sandbox interpreter before selecting --sandbox-postgres;
-        # a host with only PostgreSQL binaries falls through to the --postgres
-        # (Docker sidecar) branch, and only the both-unavailable path stays
-        # fail-closed ("PostgreSQL runtime unavailable").
-        sandbox_guard = (
-            'PG_BIN="$(resolve_pg_bindir)" && '
-            '[ -x "${BLUEPRINT_SANDBOX_PYTHON:-/opt/blueprint-backend-venv/bin/python}" ]'
-        )
         for script, label in ((fragment, "generated fragment"), (tracked, "tracked check")):
-            assert sandbox_guard in script, (
-                f"{label} must require the baked sandbox interpreter alongside "
-                "resolve_pg_bindir before selecting --sandbox-postgres"
-            )
-            assert "=--sandbox-postgres" in script, (
-                f"{label} must still assign --sandbox-postgres when the sandbox is usable"
-            )
-            assert "=--postgres" in script, (
-                f"{label} must still carry the --postgres Docker-sidecar fallback"
+            assert "select_backend_test_route" in script, (
+                f"{label} must use the shared route selector"
             )
             assert "PostgreSQL runtime unavailable" in script, (
                 f"{label} must stay fail-closed when neither path is available"
             )
+        assert "backend_test_sandbox_available" in helper
 
 
 class TestVmSelfDestructTtl:
