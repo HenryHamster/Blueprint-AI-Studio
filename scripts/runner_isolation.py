@@ -2044,13 +2044,14 @@ def plan_agent_execution(
         PROJECT_VERIFICATION_VENV,
         *npm_tool_roots(tools),
     ]
-    tool_dirs = [os.path.join(PROJECT_VERIFICATION_VENV, "bin"), *tool_dirs_for(tools)]
+    tool_dirs = [os.path.join(PROJECT_VERIFICATION_VENV, "bin")]
     verification_injected: dict[str, str] = {}
     if verification_toolchain is not None:
         ro_binds.append(verification_toolchain.root)
         tool_dirs += [os.path.dirname(verification_toolchain.python_path), verification_toolchain.postgres_bindir]
         verification_injected = {"BLUEPRINT_SANDBOX_PYTHON": verification_toolchain.python_path,
                                  "BLUEPRINT_SANDBOX_PG_BINDIR": verification_toolchain.postgres_bindir}
+    tool_dirs += tool_dirs_for(tools)
 
     env = build_agent_env(
         source_env,

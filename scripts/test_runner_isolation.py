@@ -987,6 +987,30 @@ class TestResourceCaps(unittest.TestCase):
 # ── Plan orchestrators ────────────────────────────────────────────────────────
 
 class TestAgentPlan(unittest.TestCase):
+    def test_verification_toolchain_dirs_precede_host_dirs_in_sandbox_path(self):
+        verification_toolchain = iso.VerificationToolchain(
+            python_path="/opt/provisioned-venv/bin/python",
+            postgres_bindir="/opt/provisioned-postgres/bin",
+        )
+        with mock.patch.object(
+            iso, "resolve_tools", return_value=["/host/tools/python3", "/host/tools/git"]
+        ):
+            plan = iso.plan_agent_execution(
+                caps=_caps(bwrap_path="/usr/bin/bwrap", userns_ok=True),
+                agent_binary=["node", "/opt/agent/dist/index.js"],
+                workspace_host="/tmp/ws/t1",
+                injected_env={"TASK_ID": "t1"},
+                source_env={"PATH": "/host/tools"},
+                verification_toolchain=verification_toolchain,
+            )
+
+        path_dirs = plan.env["PATH"].split(":")
+        venv_bin = os.path.dirname(verification_toolchain.python_path)
+        pg_bin = verification_toolchain.postgres_bindir
+        host_bin = "/host/tools"
+        self.assertLess(path_dirs.index(venv_bin), path_dirs.index(host_bin))
+        self.assertLess(path_dirs.index(pg_bin), path_dirs.index(host_bin))
+
     def test_decline_without_bwrap(self):
         plan = iso.plan_agent_execution(
             caps=_caps(docker_usable=True),
