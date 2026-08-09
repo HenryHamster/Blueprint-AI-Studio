@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import subprocess
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import select
 
+import app.approved_pr_stranding as stranding
 from app.approved_pr_stranding import inspect_approved_pr, sweep_approved_pr_stranding
 from app.models import Alert, Project, ReleaseVersion, Task, TaskStatus
 
@@ -178,7 +181,96 @@ async def test_sweep_alerts_after_two_qualification_cycles(db_session, tmp_path:
         )
     ).scalar_one()
     assert "PR #17048" in alert.message
-    assert "merge-tree classification: clean" in alert.message
+    assert "Mergeability classification: clean" in alert.message
+
+
+@pytest.mark.asyncio
+async def test_stranded_verdict_without_local_checkout(db_session, monkeypatch):
+    """The deployed image uses GitHub ancestry without a repo or git binary."""
+    monkeypatch.delenv("BLUEPRINT_REPO_ROOT", raising=False)
+
+    def no_git_available(*args, **kwargs):
+        raise AssertionError("deployed detector must not invoke local git")
+
+    monkeypatch.setattr(stranding.subprocess, "run", no_git_available)
+    monkeypatch.setattr(
+        "app.release_promotion._resolve_github_with_session",
+        AsyncMock(return_value=("token", "acme", "widget")),
+    )
+    monkeypatch.setattr(
+        "app.github.get_pull_request",
+        AsyncMock(return_value={"mergeable": True}),
+    )
+    monkeypatch.setattr(
+        "app.github.get_branch_sha",
+        AsyncMock(return_value="integration-head"),
+    )
+    monkeypatch.setattr(
+        "app.github.is_ancestor_of",
+        AsyncMock(return_value=False),
+    )
+
+    project = Project(
+        name="Deployed detector project",
+        user_id="test-user",
+        github_owner="acme",
+        github_repo="widget",
+        integration_branch="main",
+    )
+    db_session.add(project)
+    await db_session.flush()
+    task = Task(
+        project_id=project.id,
+        title="approved work without checkout",
+        status=TaskStatus.COMPLETED,
+        created_by="TEST",
+        context={
+            "review_loop": {
+                "review_approved": True,
+                "review_target": {
+                    "project_id": str(project.id),
+                    "pr_number": 17160,
+                    "base_sha": "base-sha",
+                    "head_sha": "reviewed-head",
+                },
+            }
+        },
+    )
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        active_qualification_attempt_id=uuid.uuid4(),
+    )
+    db_session.add_all([task, version])
+    await db_session.commit()
+
+    first = await sweep_approved_pr_stranding(
+        db_session, now=datetime(2026, 8, 9, tzinfo=timezone.utc)
+    )
+    assert first["stranded"] == 1
+    assert first["alerts_created"] == 0
+    assert task.context["approved_pr_stranding"]["state"] == "stranded"
+
+    version.active_qualification_attempt_id = uuid.uuid4()
+    db_session.add(version)
+    await db_session.commit()
+    second = await sweep_approved_pr_stranding(
+        db_session, now=datetime(2026, 8, 9, 0, 15, tzinfo=timezone.utc)
+    )
+    assert second["stranded"] == 1
+    assert second["alerts_created"] == 1
+    alert = (
+        await db_session.execute(
+            select(Alert).where(
+                Alert.event_type == "release.approved_pr_stranded",
+                Alert.project_id == project.id,
+            )
+        )
+    ).scalar_one()
+    assert alert.task_id == task.id
+    assert "PR #17160" in alert.message
+    assert "integration-head" in alert.message
 
 
 @pytest.mark.asyncio

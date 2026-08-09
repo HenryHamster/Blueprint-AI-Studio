@@ -1,10 +1,11 @@
 """Recurring detection of approved pull requests that never reached main.
 
 Review approval is a workflow fact, not proof that a commit landed.  This
-module keeps the detector on the reaper's existing recurring surface and uses
-the local git checkout when one is available.  Every git result is tri-state:
-an unavailable checkout or incomplete review target is ``unknown`` rather than
-``clean``.
+module keeps the detector on the reaper's existing recurring surface.  The
+deployed path uses the authenticated GitHub API because the backend image has
+no checkout; an explicit ``repo_root`` remains available for deterministic
+local fixtures.  Every evidence path is tri-state: unavailable or incomplete
+evidence is ``unknown`` rather than ``clean``.
 """
 
 from __future__ import annotations
@@ -29,14 +30,15 @@ from app.landed_signal import (
     STRANDED_LANDING_REASON_KEY,
 )
 from app.models import Alert, AlertSeverity, Project, ReleaseVersion, Task
-from app.time_utils import _utcnow
+from app.time_utils import _is_cadence_due, _utcnow
 
 logger = logging.getLogger(__name__)
 
-_REPO_ROOT = os.environ.get("BLUEPRINT_REPO_ROOT", "/tmp/workspace")
 _GIT_TIMEOUT_SECONDS = 5
 _APPROVED_PR_BATCH_SIZE = 100
 _MAX_CYCLE_IDS = 8
+_STRANDING_SCAN_INTERVAL_SECONDS = 15 * 60
+_last_stranding_scan: datetime | None = None
 _OBSERVATION_KEY = "approved_pr_stranding"
 _EVENT_TYPE = "release.approved_pr_stranded"
 _ALERT_TITLE = "Approved pull request has not reached the integration branch"
@@ -104,7 +106,7 @@ def inspect_approved_pr(
     base_sha: str | None,
     head_sha: str | None,
     integration_branch: str,
-    repo_root: str = _REPO_ROOT,
+    repo_root: str,
 ) -> ApprovedPrEvidence:
     """Classify a review target using git ancestry and merge-tree evidence.
 
@@ -222,6 +224,101 @@ def inspect_approved_pr(
         )
     return ApprovedPrEvidence(
         "stranded", "clean", integration_head_sha, merge_base_sha
+    )
+
+
+async def _inspect_approved_pr_with_github(
+    *,
+    session,
+    project: Project,
+    candidate: _ApprovedPrCandidate,
+) -> ApprovedPrEvidence:
+    """Classify a target through the deployed backend's GitHub API path.
+
+    The compare endpoint is the source of merge truth: a PR approval or PR
+    state is never treated as proof that the reviewed commit reached the
+    integration branch.  The branch tip is fetched separately so the evidence
+    and operator alert identify the exact head that was checked.
+    """
+    from app import github
+    from app.release_promotion import _resolve_github_with_session
+
+    try:
+        resolved = await _resolve_github_with_session(session, project)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[APPROVED_PR] GitHub credentials unavailable for project %s: %s",
+            project.id,
+            exc,
+        )
+        return ApprovedPrEvidence(
+            "unknown", "unknown", reason="GitHub credentials unavailable"
+        )
+    if resolved is None:
+        return ApprovedPrEvidence(
+            "unknown", "unknown", reason="GitHub repository credentials unavailable"
+        )
+    token, owner, repo = resolved
+    project_id = str(project.id)
+    branch = get_project_integration_branch(project)
+
+    # Mergeability is descriptive only. It is deliberately fetched separately
+    # from ancestry so a temporarily unavailable PR detail cannot turn a
+    # definitive compare result into an unknown verdict.
+    mergeability: Mergeability = "unknown"
+    try:
+        pull = await github.get_pull_request(
+            token, owner, repo, candidate.pr_number, project_id=project_id
+        )
+        if pull.get("mergeable") is True:
+            mergeability = "clean"
+        elif pull.get("mergeable") is False:
+            mergeability = "conflicted"
+    except Exception as exc:  # noqa: BLE001
+        logger.info(
+            "[APPROVED_PR] PR detail unavailable for #%s: %s",
+            candidate.pr_number,
+            exc,
+        )
+
+    try:
+        integration_head_sha = await github.get_branch_sha(
+            token, owner, repo, branch, project_id=project_id, live=True
+        )
+        reachable = await github.is_ancestor_of(
+            token,
+            owner,
+            repo,
+            candidate.commit_sha,
+            branch,
+            project_id=project_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[APPROVED_PR] GitHub ancestry unavailable for PR #%s: %s",
+            candidate.pr_number,
+            exc,
+        )
+        return ApprovedPrEvidence(
+            "unknown", "unknown", reason="GitHub ancestry check unavailable"
+        )
+
+    if reachable is True:
+        return ApprovedPrEvidence(
+            "landed", "not_applicable", integration_head_sha=integration_head_sha
+        )
+    if reachable is False:
+        return ApprovedPrEvidence(
+            "stranded",
+            mergeability,
+            integration_head_sha=integration_head_sha,
+            reason="GitHub compare confirms the reviewed commit is not on the integration branch",
+        )
+    return ApprovedPrEvidence(
+        "unknown",
+        "unknown",
+        integration_head_sha=integration_head_sha,
+        reason="GitHub compare returned no definitive ancestry result",
     )
 
 
@@ -358,13 +455,24 @@ def _observation_for(
     return updated, changed
 
 
-async def sweep_approved_pr_stranding(session, *, repo_root: str = _REPO_ROOT) -> dict[str, int]:
+async def sweep_approved_pr_stranding(
+    session, *, repo_root: str | None = None, now: datetime | None = None
+) -> dict[str, int]:
     """Scan approved targets and durable merged records for non-landed work.
 
     Task observations are committed before alerts.  That ordering makes the
     detector's evidence durable even if alert creation or notification later
     fails, and prevents an alert from claiming a check that was never recorded.
     """
+    global _last_stranding_scan
+    if repo_root is None:
+        scan_now = now or _utcnow()
+        if not _is_cadence_due(
+            _last_stranding_scan, _STRANDING_SCAN_INTERVAL_SECONDS, scan_now
+        ):
+            return {"scanned": 0, "stranded": 0, "unknown": 0, "alerts_created": 0}
+        _last_stranding_scan = scan_now
+
     rows = (
         await session.execute(
             select(Task, Project)
@@ -436,23 +544,28 @@ async def sweep_approved_pr_stranding(session, *, repo_root: str = _REPO_ROOT) -
         )
         candidates.setdefault(candidate_key, candidate)
 
-    now = _utcnow()
+    now = now or _utcnow()
     observations: list[tuple[_ApprovedPrCandidate, dict[str, Any]]] = []
     changed_tasks = False
     counts = {"scanned": len(candidates), "stranded": 0, "unknown": 0, "alerts_created": 0}
     for candidate in candidates.values():
         branch = get_project_integration_branch(candidate.project)
-        evidence = (
-            ApprovedPrEvidence("unknown", "unknown", reason=candidate.target_reason)
-            if not candidate.target_valid
-            else await asyncio.to_thread(
+        if not candidate.target_valid:
+            evidence = ApprovedPrEvidence(
+                "unknown", "unknown", reason=candidate.target_reason
+            )
+        elif repo_root is None:
+            evidence = await _inspect_approved_pr_with_github(
+                session=session, project=candidate.project, candidate=candidate
+            )
+        else:
+            evidence = await asyncio.to_thread(
                 inspect_approved_pr,
                 base_sha=candidate.base_sha,
                 head_sha=candidate.commit_sha,
                 integration_branch=branch,
                 repo_root=repo_root,
             )
-        )
         if evidence.state == "stranded":
             counts["stranded"] += 1
         elif evidence.state == "unknown":
@@ -514,7 +627,7 @@ async def sweep_approved_pr_stranding(session, *, repo_root: str = _REPO_ROOT) -
             f"{candidate.commit_sha} is not an ancestor of "
             f"{observation.get('integration_branch')} HEAD "
             f"{observation.get('integration_head_sha') or 'unknown'}. "
-            f"Local merge-tree classification: {observation.get('mergeability')}. "
+            f"Mergeability classification: {observation.get('mergeability')}. "
             "Review approval is not treated as proof of landing."
         )
         if alert is None:
@@ -541,4 +654,8 @@ async def sweep_approved_pr_stranding(session, *, repo_root: str = _REPO_ROOT) -
     return counts
 
 
-__all__ = ["ApprovedPrEvidence", "inspect_approved_pr", "sweep_approved_pr_stranding"]
+__all__ = [
+    "ApprovedPrEvidence",
+    "inspect_approved_pr",
+    "sweep_approved_pr_stranding",
+]
