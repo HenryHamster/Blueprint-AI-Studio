@@ -18,20 +18,18 @@ The client finds the newest successful "Deploy Blueprint" run on `main`,
 downloads its `local-app-release.json` + `.sha256` artifact, verifies the
 checksum, and invokes the host-side shim over SSH.
 
-## Host-side shim and sudoers rule (one-time install)
+## Host-side shim and root release service (one-time install)
 
-The shim source is `scripts/blueprint_release.py`. Install it root-owned and
-allow it without a password:
+The local-app bootstrap installs the shim root-owned together with an
+ACL-limited socket unit and root service. The deploy agent submits its
+approval-bound digest and revision over that socket; no sudoers grant is used
+by the hardened agent:
 
 ```bash
 # from a checkout at the reviewed commit
-sudo install -o root -g root -m 0755 \
-  scripts/blueprint_release.py /usr/local/sbin/blueprint-release
-
-echo 'henry_hamster ALL=(root) NOPASSWD: /usr/local/sbin/blueprint-release' \
-  | sudo tee /etc/sudoers.d/blueprint-release
-sudo chmod 0440 /etc/sudoers.d/blueprint-release
-sudo visudo -c
+sudo env -i SUDO_USER=henry_hamster PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+  /var/lib/blueprint/bootstrap/local-app-release/bootstrap_local_app_release.py \
+  --revision FULL_GIT_SHA
 ```
 
 ## Why the passwordless rule is safe
@@ -49,11 +47,10 @@ The trust chain never depends on the caller:
    root-installed immutable `local_app_release.py`, which checks the image
    digest and revision label, static-tree manifest, service ownership, and
    post-start health — and rolls back a failed activation.
-4. **Residual exposure is bounded.** A compromised operator SSH key can
-   activate any image CI has previously built (including an older one — a
-   rollback, which the revision receipts record), but can never deploy non-CI
-   code. Revoking `/etc/sudoers.d/blueprint-release` restores interactive-sudo
-   ceremony without breaking the tooling.
+4. **Residual exposure is bounded.** A compromised service account can request
+   any image CI has previously built (including an older one — a rollback,
+   which the revision receipts record), but cannot replace the root-owned shim
+   or deploy non-CI code. The socket ACL is the execution boundary.
 
 Migrations remain deliberately outside this path: a release whose code expects
 a newer schema fails closed at worker startup and rolls back. Run migrations

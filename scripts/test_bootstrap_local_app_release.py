@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -279,18 +280,167 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
         self.assertIn("User=henry_hamster", payload)
         self.assertIn("RuntimeDirectory=blueprint-deploy-agent", payload)
         self.assertIn("RuntimeDirectoryMode=0750", payload)
+        self.assertIn("StateDirectory=blueprint-deploy-agent", payload)
+        self.assertIn(
+            "--state-path /var/lib/blueprint-deploy-agent/deploy-agent.state", payload
+        )
         self.assertIn(
             "--lock-path /run/blueprint-deploy-agent/deploy-agent.lock", payload
         )
         self.assertIn("--poll-interval 30", payload)
-        self.assertNotIn("NoNewPrivileges=true", payload)
+
+    def test_release_execution_is_root_owned_and_socket_activated(self):
+        service = bootstrap._release_service_unit().decode()
+        socket = bootstrap._release_socket_unit("henry_hamster").decode()
+        self.assertIn("User=root", service)
+        self.assertIn("ExecStart=/usr/local/sbin/blueprint-release --serve", service)
+        self.assertIn("ListenStream=/run/blueprint-release.sock", socket)
+        self.assertIn("SocketGroup=henry_hamster", socket)
+        self.assertIn("SocketMode=0660", socket)
+        self.assertNotIn("sudo", service + socket)
+
+    def test_systemd_verify_parses_the_rendered_execution_units(self):
+        if not Path("/usr/bin/systemd-analyze").is_file():
+            self.skipTest("systemd-analyze is unavailable; runtime unit verification is deferred")
+        with tempfile.TemporaryDirectory() as raw_directory:
+            root = Path(raw_directory)
+            (root / "blueprint-deploy-agent.service").write_bytes(
+                bootstrap._deploy_agent_unit(PurePosixPath("/usr/local/lib/bundle"), "henry_hamster")
+                .replace(b"/usr/bin/python3.12", b"/usr/bin/true")
+            )
+            (root / "blueprint-release.service").write_bytes(
+                bootstrap._release_service_unit().replace(
+                    b"/usr/local/sbin/blueprint-release", b"/usr/bin/true"
+                )
+            )
+            (root / "blueprint-release.socket").write_bytes(
+                bootstrap._release_socket_unit("henry_hamster")
+            )
+            result = subprocess.run(
+                [
+                    "/usr/bin/systemd-analyze",
+                    "verify",
+                    str(root / "blueprint-deploy-agent.service"),
+                    str(root / "blueprint-release.service"),
+                    str(root / "blueprint-release.socket"),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+
+    def test_effective_properties_keep_agent_hardened_and_release_root(self):
+        outputs = iter(
+            (
+                "NoNewPrivileges=yes\nUser=henry_hamster\n",
+                "NoNewPrivileges=no\nUser=root\n",
+            )
+        )
+        with unittest.mock.patch.object(
+            bootstrap,
+            "_run",
+            side_effect=lambda _argv: bootstrap.subprocess.CompletedProcess(
+                [], 0, next(outputs), ""
+            ),
+        ):
+            bootstrap._verify_release_execution_boundary("henry_hamster")
+
+    def test_approved_activation_rehearses_root_handoff_and_receipt(self):
+        import blueprint as deploy_blueprint
+
+        revision = "a" * 40
+        promoted = {
+            "version_number": 7,
+            "status": "promoted",
+            "promoted_sha": revision,
+            "serving_status": "unconfirmed",
+            "activation_requested_at": "2026-08-09T00:00:00Z",
+        }
+        calls = []
+
+        class FakeReleaseSocket:
+            def __init__(self):
+                self.sent = b""
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def settimeout(self, timeout):
+                self.timeout = timeout
+
+            def connect(self, path):
+                self.path = path
+
+            def sendall(self, payload):
+                self.sent += payload
+
+            def shutdown(self, _how):
+                pass
+
+            def recv(self, _limit):
+                return b"OK\n"
+
+        release_socket = FakeReleaseSocket()
+
+        def fake_api(method, path, body=None, timeout=30):
+            calls.append((method, path, body))
+            return {
+                "version_number": 7,
+                "serving_status": "serving_confirmed",
+                "served_sha": revision,
+            }
+
+        with (
+            unittest.mock.patch.object(
+                deploy_blueprint, "_read_live_approved_activation", return_value=promoted
+            ),
+            unittest.mock.patch.object(
+                deploy_blueprint,
+                "_fetch_deploy_manifest",
+                return_value={
+                    "run": {"databaseId": 1},
+                    "digest": "sha256:" + "0" * 64,
+                    "revision": revision,
+                },
+            ),
+            unittest.mock.patch.object(
+                deploy_blueprint.socket,
+                "socket",
+                return_value=release_socket,
+            ),
+            unittest.mock.patch.object(
+                deploy_blueprint, "get_project_id", return_value="project-1"
+            ),
+            unittest.mock.patch.object(deploy_blueprint, "api", side_effect=fake_api),
+        ):
+            self.assertTrue(
+                deploy_blueprint._deploy_agent_once(
+                    type("Args", (), {"project_id": None})()
+                )
+            )
+
+        self.assertEqual(
+            release_socket.sent,
+            ("sha256:" + "0" * 64 + " " + revision + "\n").encode("ascii"),
+        )
+        self.assertEqual(
+            next(body for method, path, body in calls if method == "POST"),
+            {"version_number": 7, "revision": revision, "host": "control-plane"},
+        )
 
     def test_deploy_agent_install_restarts_existing_service_after_update(self):
         with tempfile.TemporaryDirectory() as raw_directory:
             directory = Path(raw_directory)
             unit = directory / "blueprint-deploy-agent.service"
             shim = directory / "blueprint-release"
-            sudoers = directory / "blueprint-release sudoers"
+            release_service = directory / "blueprint-release.service"
+            release_socket = directory / "blueprint-release.socket"
+            legacy_sudoers = directory / "blueprint-release sudoers"
+            legacy_sudoers.write_bytes(b"henry_hamster ALL=(root) NOPASSWD: old\n")
             commands = []
 
             def run(argv):
@@ -299,16 +449,27 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
 
             with (
                 unittest.mock.patch.object(bootstrap, "_DEPLOY_AGENT_UNIT", unit),
+                unittest.mock.patch.object(bootstrap, "_RELEASE_SERVICE", release_service),
+                unittest.mock.patch.object(bootstrap, "_RELEASE_SOCKET_UNIT", release_socket),
                 unittest.mock.patch.object(bootstrap, "_RELEASE_SHIM", shim),
-                unittest.mock.patch.object(bootstrap, "_RELEASE_SUDOERS", sudoers),
+                unittest.mock.patch.object(bootstrap, "_LEGACY_RELEASE_SUDOERS", legacy_sudoers),
                 unittest.mock.patch.object(
                     bootstrap, "_atomic_write", self._test_atomic_write
                 ),
                 unittest.mock.patch.object(
-                    bootstrap, "_snapshot_optional",
-                    return_value=None,
+                    bootstrap,
+                    "_snapshot_optional",
+                    side_effect=lambda path: (
+                        (legacy_sudoers.read_bytes(), 0o440)
+                        if path == legacy_sudoers
+                        else None
+                    ),
                 ),
                 unittest.mock.patch.object(bootstrap, "_run", side_effect=run),
+                unittest.mock.patch.object(
+                    bootstrap,
+                    "_verify_release_execution_boundary",
+                ),
             ):
                 bootstrap._install_deploy_agent(
                     bundle=PurePosixPath("/trusted/new-bundle"),
@@ -318,12 +479,17 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
 
             self.assertEqual(commands[:2], [
                 ["/usr/bin/systemctl", "daemon-reload"],
-                ["/usr/bin/systemctl", "enable", "--now", "blueprint-deploy-agent.service"],
+                ["/usr/bin/systemd-analyze", "verify", str(unit), str(release_service), str(release_socket)],
             ])
             self.assertEqual(
                 commands[-1],
                 ["/usr/bin/systemctl", "restart", "blueprint-deploy-agent.service"],
             )
+            self.assertIn(
+                ["/usr/bin/systemctl", "enable", "--now", "blueprint-release.socket"],
+                commands,
+            )
+            self.assertFalse(legacy_sudoers.exists())
 
 
 if __name__ == "__main__":

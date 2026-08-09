@@ -48,6 +48,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -70,7 +71,8 @@ GCP_PROJECT = os.environ.get("GCP_PROJECT", "blueprint-orchestrator")
 
 _DEPLOY_AGENT_UNIT_PATH = "/etc/systemd/system/blueprint-deploy-agent.service"
 _DEPLOY_AGENT_POLL_PATH = "/run/blueprint-deploy-agent/deploy-agent.poll"
-_DEPLOY_AGENT_STATE_PATH = "/run/blueprint-deploy-agent/deploy-agent.state"
+_DEPLOY_AGENT_STATE_PATH = "/var/lib/blueprint-deploy-agent/deploy-agent.state"
+_RELEASE_SOCKET_PATH = "/run/blueprint-release.sock"
 _RELEASE_SHIM_PATH = "/usr/local/sbin/blueprint-release"
 _DEPLOY_AGENT_POLL_MAX_AGE_SECONDS = 120
 
@@ -5951,15 +5953,36 @@ def _fetch_deploy_manifest(wanted_sha: str | None = None) -> dict:
 
 
 def _invoke_release_shim(digest: str, revision: str, *, host: str | None) -> None:
-    """Use the single root-owned release shim, locally or through legacy SSH."""
-    command = ["sudo", "/usr/local/sbin/blueprint-release", digest, revision]
-    if host is not None:
-        command = ["ssh", "-t", host, *command]
+    """Use the root-owned release socket, or the legacy remote SSH path."""
+    if host is None:
+        _request_release_socket(digest, revision)
+        return
+    command = ["ssh", "-t", host, "sudo", _RELEASE_SHIM_PATH, digest, revision]
     proc = subprocess.run(command, check=False)
     if proc.returncode != 0:
         print(f"ERROR: release exited {proc.returncode} — the release tool "
               "rolls back failed activations; inspect its receipt on the host.")
         raise APIError(f"release failed with exit code {proc.returncode}")
+
+
+def _request_release_socket(digest: str, revision: str) -> None:
+    """Send the already validated approval to the root socket executor."""
+    if not _DEPLOY_REVISION_RE.fullmatch(revision):
+        raise APIError("release revision failed validation")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+        raise APIError("release digest failed validation")
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(60)
+            connection.connect(_RELEASE_SOCKET_PATH)
+            connection.sendall(f"{digest} {revision}\n".encode("ascii"))
+            connection.shutdown(socket.SHUT_WR)
+            response = connection.recv(256).decode("ascii", errors="replace").strip()
+    except OSError as exc:
+        raise APIError(f"release executor socket unavailable: {exc}") from exc
+    if response != "OK":
+        detail = response.removeprefix("ERROR ") or "empty executor response"
+        raise APIError(f"release executor failed: {detail}")
 
 
 def _read_live_approved_activation(args: argparse.Namespace) -> dict | None:

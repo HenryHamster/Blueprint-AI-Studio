@@ -23,14 +23,27 @@ sudo env -i \
 ```
 
 The bootstrap installs a new content-addressed script bundle and redirects only
-the API unit's future starts to the new wrapper. Because systemd dependencies
+the API unit's future starts to the new wrapper, installs the always-on
+non-root deploy agent, and installs a socket-activated root release executor.
+Because systemd dependencies
 cannot be removed by a drop-in, it snapshots the legacy edge base unit and
 noninteractive drop-in, renders the complete reviewed edge unit with the live
 immutable helper and environment paths, and retires the obsolete drop-in to a
 root-only recovery copy. It preserves original file modes for rollback,
 performs `daemon-reload`, and does not restart the API, worker, database,
 backup timer, or edge. It verifies the effective dependency and hardening
-contracts, all five unit markers, and every unrelated role/base file.
+contracts, including systemd's effective `NoNewPrivileges` values, all five
+unit markers, and every unrelated role/base file. Receipt-retry state is kept
+under `/var/lib/blueprint-deploy-agent/` so a deploy-agent restart cannot cause
+the release to run twice.
+
+The deploy agent does not use `sudo`: its hardened non-root unit connects to
+`/run/blueprint-release.sock`, whose root-owned socket unit starts
+`blueprint-release.service` as root. The socket ACL is limited to the service
+account. The agent's live approval read, exact CI manifest binding, superseding
+promotion re-read, and activation receipt POST remain the authority checks;
+the root executor independently validates the digest and revision before it
+starts the immutable release tool.
 
 ## Release
 

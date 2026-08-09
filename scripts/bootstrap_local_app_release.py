@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Narrow, no-restart bootstrap for hamsterwheel application releases."""
+"""Root-owned bootstrap for hamsterwheel application releases.
+
+The long-lived deploy agent remains a hardened non-root service.  It hands an
+already approval- and manifest-validated request to the socket-activated
+root-owned release service; the privileged release step never runs in the
+agent's sandbox.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +14,7 @@ import os
 import re
 import stat
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -33,8 +40,10 @@ _RETIRED_EDGE_DROP_IN = Path(
     "retired-10-noninteractive-funnel.conf"
 )
 _DEPLOY_AGENT_UNIT = Path("/etc/systemd/system/blueprint-deploy-agent.service")
+_RELEASE_SERVICE = Path("/etc/systemd/system/blueprint-release.service")
+_RELEASE_SOCKET_UNIT = Path("/etc/systemd/system/blueprint-release.socket")
 _RELEASE_SHIM = Path("/usr/local/sbin/blueprint-release")
-_RELEASE_SUDOERS = Path("/etc/sudoers.d/blueprint-release")
+_LEGACY_RELEASE_SUDOERS = Path("/etc/sudoers.d/blueprint-release")
 _NODE_ROOT = Path("/etc/blueprint/nodes")
 _REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
 _EDGE_ENTRYPOINT_RE = re.compile(
@@ -244,10 +253,13 @@ def _deploy_agent_unit(bundle: Path, install_user: str) -> bytes:
         "LockPersonality=true\n"
         "RuntimeDirectory=blueprint-deploy-agent\n"
         "RuntimeDirectoryMode=0750\n"
+        "StateDirectory=blueprint-deploy-agent\n"
+        "StateDirectoryMode=0700\n"
         "Environment=PYTHONUNBUFFERED=1\n"
         f"ExecStart=/usr/bin/python3.12 {executable} deploy-agent "
         "--poll-interval 30 "
         "--lock-path /run/blueprint-deploy-agent/deploy-agent.lock\n"
+        "--state-path /var/lib/blueprint-deploy-agent/deploy-agent.state\n"
         "Restart=always\n"
         "RestartSec=30\n"
         "StandardOutput=journal\n"
@@ -257,10 +269,64 @@ def _deploy_agent_unit(bundle: Path, install_user: str) -> bytes:
     ).encode()
 
 
-def _release_sudoers(install_user: str) -> bytes:
+def _release_service_unit() -> bytes:
+    """Render the unsandboxed root executor started by the release socket."""
     return (
-        f"{install_user} ALL=(root) NOPASSWD: /usr/local/sbin/blueprint-release\n"
+        b"[Unit]\n"
+        b"Description=Blueprint approved-activation root release executor\n"
+        b"After=blueprint-release.socket\n"
+        b"\n"
+        b"[Service]\n"
+        b"Type=oneshot\n"
+        b"User=root\n"
+        b"NoNewPrivileges=no\n"
+        b"ExecStart=/usr/local/sbin/blueprint-release --serve\n"
+    )
+
+
+def _release_socket_unit(install_user: str) -> bytes:
+    """Render the ACL-limited socket that crosses the privilege boundary."""
+    return (
+        "[Unit]\n"
+        "Description=Blueprint approved-activation release socket\n"
+        "\n"
+        "[Socket]\n"
+        "ListenStream=/run/blueprint-release.sock\n"
+        "SocketUser=root\n"
+        f"SocketGroup={install_user}\n"
+        "SocketMode=0660\n"
+        "Service=blueprint-release.service\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=sockets.target\n"
     ).encode()
+
+
+def _verify_release_execution_boundary(install_user: str) -> None:
+    """Read systemd's effective properties, including implicit no-new-privs."""
+    expected = {"User", "NoNewPrivileges"}
+    agent = _parse_systemctl_properties(
+        _run([
+            "/usr/bin/systemctl",
+            "show",
+            _DEPLOY_AGENT_UNIT.name,
+            *(f"--property={name}" for name in sorted(expected)),
+        ]).stdout,
+        expected,
+    )
+    release = _parse_systemctl_properties(
+        _run([
+            "/usr/bin/systemctl",
+            "show",
+            _RELEASE_SERVICE.name,
+            *(f"--property={name}" for name in sorted(expected)),
+        ]).stdout,
+        expected,
+    )
+    if agent != {"User": install_user, "NoNewPrivileges": "yes"}:
+        raise RuntimeError("deploy agent effective hardening is incomplete")
+    if release != {"User": "root", "NoNewPrivileges": "no"}:
+        raise RuntimeError("release executor is still subject to no-new-privileges")
 
 
 def _install_deploy_agent(
@@ -269,15 +335,33 @@ def _install_deploy_agent(
     install_user: str,
     release_shim: bytes,
 ) -> None:
-    """Install the agent and its narrow sudo capability as one recoverable set."""
-    managed = (_DEPLOY_AGENT_UNIT, _RELEASE_SHIM, _RELEASE_SUDOERS)
+    """Install the agent and root socket executor as one recoverable set."""
+    managed = (
+        _DEPLOY_AGENT_UNIT,
+        _RELEASE_SERVICE,
+        _RELEASE_SOCKET_UNIT,
+        _RELEASE_SHIM,
+        _LEGACY_RELEASE_SUDOERS,
+    )
     previous = {path: _snapshot_optional(path) for path in managed}
     try:
         _atomic_write(_DEPLOY_AGENT_UNIT, _deploy_agent_unit(bundle, install_user), 0o644)
+        _atomic_write(_RELEASE_SERVICE, _release_service_unit(), 0o644)
+        _atomic_write(_RELEASE_SOCKET_UNIT, _release_socket_unit(install_user), 0o644)
         _atomic_write(_RELEASE_SHIM, release_shim, 0o755)
-        _atomic_write(_RELEASE_SUDOERS, _release_sudoers(install_user), 0o440)
+        if previous[_LEGACY_RELEASE_SUDOERS] is not None:
+            _LEGACY_RELEASE_SUDOERS.unlink()
         _run(["/usr/bin/systemctl", "daemon-reload"])
+        _run([
+            "/usr/bin/systemd-analyze",
+            "verify",
+            str(_DEPLOY_AGENT_UNIT),
+            str(_RELEASE_SERVICE),
+            str(_RELEASE_SOCKET_UNIT),
+        ])
+        _verify_release_execution_boundary(install_user)
         _run(["/usr/bin/systemctl", "enable", "--now", _DEPLOY_AGENT_UNIT.name])
+        _run(["/usr/bin/systemctl", "enable", "--now", _RELEASE_SOCKET_UNIT.name])
         # enable --now does not reload an already-running process after its
         # immutable bundle or unit has changed. Explicitly roll it over so the
         # installed agent is the one that is actually polling.
@@ -290,7 +374,7 @@ def _install_deploy_agent(
         except Exception as rollback_error:  # noqa: BLE001 - preserve original failure
             print(
                 f"WARNING: could not restart restored deploy agent: {rollback_error}",
-                file=os.sys.stderr,
+                file=sys.stderr,
             )
         raise
 
@@ -549,6 +633,17 @@ def bootstrap(revision: str) -> Path:
             _RETIRED_EDGE_DROP_IN,
         )
     }
+    deploy_agent_previous = {
+        path: _snapshot_optional(path)
+        for path in (
+            _DEPLOY_AGENT_UNIT,
+            _RELEASE_SERVICE,
+            _RELEASE_SOCKET_UNIT,
+            _RELEASE_SHIM,
+            _LEGACY_RELEASE_SUDOERS,
+        )
+    }
+    all_previous = {**previous, **deploy_agent_previous}
     retired = previous[_RETIRED_EDGE_DROP_IN]
     if retired is not None and retired[1] != 0o600:
         raise ValueError("retired edge drop-in evidence must be mode 0600")
@@ -577,20 +672,41 @@ def bootstrap(revision: str) -> Path:
                 raise ValueError("existing immutable bundle payload mismatch")
         else:
             _atomic_write(destination, payload, 0o755)
-    _install_service_configuration(
-        bundle=bundle,
-        edge_payload=edge_payload,
-        install_user=install_user,
-        edge_runtime_before=edge_runtime_before,
-        markers_before=markers_before,
-        protected_before=protected_before,
-        previous=previous,
-    )
-    _install_deploy_agent(
-        bundle=bundle,
-        install_user=install_user,
-        release_shim=release_shim,
-    )
+    try:
+        _install_service_configuration(
+            bundle=bundle,
+            edge_payload=edge_payload,
+            install_user=install_user,
+            edge_runtime_before=edge_runtime_before,
+            markers_before=markers_before,
+            protected_before=protected_before,
+            previous=previous,
+        )
+        _install_deploy_agent(
+            bundle=bundle,
+            install_user=install_user,
+            release_shim=release_shim,
+        )
+    except Exception:
+        _restore_snapshots(all_previous)
+        _run(["/usr/bin/systemctl", "daemon-reload"])
+        if deploy_agent_previous[_DEPLOY_AGENT_UNIT] is not None:
+            try:
+                _run(["/usr/bin/systemctl", "restart", _DEPLOY_AGENT_UNIT.name])
+            except Exception as rollback_error:  # noqa: BLE001
+                print(
+                    f"WARNING: could not restart restored deploy agent: {rollback_error}",
+                    file=sys.stderr,
+                )
+        else:
+            try:
+                _run(["/usr/bin/systemctl", "stop", _DEPLOY_AGENT_UNIT.name])
+            except Exception as rollback_error:  # noqa: BLE001
+                print(
+                    f"WARNING: could not stop newly installed deploy agent: {rollback_error}",
+                    file=sys.stderr,
+                )
+        raise
     return bundle
 
 
@@ -603,7 +719,7 @@ def main() -> int:
     try:
         bundle = bootstrap(args.revision)
     except (OSError, PermissionError, RuntimeError, ValueError) as exc:
-        print(f"ERROR: {exc}", file=os.sys.stderr)
+        print(f"ERROR: {exc}", file=sys.stderr)
         return 1
     print(f"LOCAL_APP_RELEASE_BOOTSTRAP_COMPLETE bundle={bundle}")
     return 0

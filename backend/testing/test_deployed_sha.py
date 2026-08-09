@@ -3,17 +3,44 @@
 All network calls are mocked — these tests never reach the real Cloud Run API.
 """
 
+import importlib.util
 import sys
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
 from app import deployed_sha
 
 _SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "scripts"
-if str(_SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(_SCRIPTS_DIR))
-import blueprint as deploy_blueprint  # noqa: E402
+
+
+def _load_blueprint_script():
+    """Load the script and its sibling dependency without mutating sys.path."""
+    api_spec = importlib.util.spec_from_file_location(
+        "blueprint_api_for_deployed_sha_test", _SCRIPTS_DIR / "blueprint_api.py"
+    )
+    assert api_spec and api_spec.loader
+    api_module = importlib.util.module_from_spec(api_spec)
+    previous_api = sys.modules.get("blueprint_api")
+    sys.modules["blueprint_api"] = api_module
+    try:
+        api_spec.loader.exec_module(api_module)
+        blueprint_spec = importlib.util.spec_from_file_location(
+            "blueprint_for_deployed_sha_test", _SCRIPTS_DIR / "blueprint.py"
+        )
+        assert blueprint_spec and blueprint_spec.loader
+        blueprint_module = importlib.util.module_from_spec(blueprint_spec)
+        blueprint_spec.loader.exec_module(blueprint_module)
+        return blueprint_module
+    finally:
+        if previous_api is None:
+            sys.modules.pop("blueprint_api", None)
+        else:
+            sys.modules["blueprint_api"] = previous_api
+
+
+deploy_blueprint = _load_blueprint_script()
 
 # A real 64-hex container image digest (sha256). It is all-hex, so a naive
 # git-SHA check would WRONGLY accept it — the resolver must reject it.
@@ -215,7 +242,7 @@ class TestResolveDeployedSha:
 class TestApprovedActivationExecutor:
     """The host executor must close approved activations with evidence."""
 
-    _PROMOTED = {
+    _PROMOTED: ClassVar[dict] = {
         "version_number": 30,
         "status": "promoted",
         "promoted_sha": _GIT_SHA,
@@ -279,7 +306,7 @@ class TestApprovedActivationExecutor:
         ]
 
     def test_failed_activation_is_reported_not_timeout(self, monkeypatch):
-        from blueprint_api import APIError
+        APIError = deploy_blueprint.APIError
 
         monkeypatch.setattr(
             deploy_blueprint,
@@ -295,11 +322,13 @@ class TestApprovedActivationExecutor:
                 "revision": _GIT_SHA,
             },
         )
-        monkeypatch.setattr(
-            deploy_blueprint.subprocess,
-            "run",
-            lambda *args, **kwargs: type("Result", (), {"returncode": 17})(),
-        )
+        handoffs = []
+
+        def fail_release(digest, revision):
+            handoffs.append((digest, revision))
+            raise APIError("release failed with exit code 17")
+
+        monkeypatch.setattr(deploy_blueprint, "_request_release_socket", fail_release)
         receipt_calls = []
         monkeypatch.setattr(
             deploy_blueprint,
@@ -313,8 +342,8 @@ class TestApprovedActivationExecutor:
             deploy_blueprint._deploy_agent_once(
                 type("Args", (), {"project_id": None})()
             )
+        assert handoffs == [("sha256:" + "0" * 64, _GIT_SHA)]
         assert not receipt_calls
-        assert "confirmation_timed_out" not in "release failed with exit code 17"
 
 
 @pytest.mark.asyncio

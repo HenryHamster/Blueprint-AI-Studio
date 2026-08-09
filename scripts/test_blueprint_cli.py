@@ -5916,12 +5916,11 @@ def test_deploy_agent_executes_approved_request_and_posts_receipt(monkeypatch, t
     api_fake = _deploy_api_fake(calls)
     agent_revision = _DEPLOY_PROMOTED_SHA
     _deploy_env(monkeypatch, api_fake, revision=agent_revision)
-    shim_calls = []
+    socket_calls = []
     monkeypatch.setattr(
-        blueprint.subprocess,
-        "run",
-        lambda command, **kwargs: shim_calls.append(command)
-        or type("R", (), {"returncode": 0})(),
+        blueprint,
+        "_request_release_socket",
+        lambda digest, revision: socket_calls.append((digest, revision)),
     )
     promoted = {
         "version_number": 7,
@@ -5938,10 +5937,7 @@ def test_deploy_agent_executes_approved_request_and_posts_receipt(monkeypatch, t
     ) is True
     assert json.loads(poll_path.read_text(encoding="utf-8"))["polled_at"]
 
-    assert shim_calls == [[
-        "sudo", "/usr/local/sbin/blueprint-release",
-        f"sha256:{'0' * 64}", agent_revision,
-    ]]
+    assert socket_calls == [(f"sha256:{'0' * 64}", agent_revision)]
     receipt = next(
         body for method, path, body in calls
         if method == "POST" and path.endswith("/activation-receipt")
@@ -6014,22 +6010,21 @@ def test_deploy_agent_receipt_failure_retries_without_reexecuting_shim(
         return {}
 
     _deploy_env(monkeypatch, fake_api, revision=_DEPLOY_PROMOTED_SHA)
-    shim_calls = []
+    socket_calls = []
     monkeypatch.setattr(
-        blueprint.subprocess,
-        "run",
-        lambda command, **kwargs: shim_calls.append(command)
-        or type("R", (), {"returncode": 0})(),
+        blueprint,
+        "_request_release_socket",
+        lambda digest, revision: socket_calls.append((digest, revision)),
     )
     args = argparse.Namespace(project_id=None, state_path=str(tmp_path / "agent.state"))
 
     with pytest.raises(APIError):
         blueprint._deploy_agent_once(args)
-    assert len(shim_calls) == 1
+    assert len(socket_calls) == 1
     assert (tmp_path / "agent.state").exists()
 
     assert blueprint._deploy_agent_once(args) is True
-    assert len(shim_calls) == 1
+    assert len(socket_calls) == 1
     assert post_attempts == 2
     assert not (tmp_path / "agent.state").exists()
 
