@@ -118,7 +118,14 @@ Each poll cycle the agent:
    a newer promotion superseded the approved version since polling.
 5. Sends `<digest> <revision>` to `/run/blueprint-release.sock` locally (no SSH
    and no sudo — the agent runs ON the control-plane host), then posts the
-   activation receipt.
+   activation receipt. A root-release handoff failure (`APIError`) is retried in
+   the activation phase at most three times: 5 seconds before the second
+   attempt and 10 seconds before the third. An accepted or ambiguous socket
+   handoff is never
+   replayed. If all three attempts fail, the agent durably records
+   `phase=failed`, the attempt count, and `root_release.failure_reason`; it
+   reports that reason and does not turn the failure into a confirmation
+   timeout or `no_new_revision`.
 
 Serialization is an `flock` on `/run/blueprint-deploy-agent/deploy-agent.lock`
 and receipt-retry state is stored at
@@ -145,12 +152,14 @@ poll cadence; the agent never crashes a poll cycle into the service.
   `sudo systemctl reset-failed blueprint-deploy-agent.service` (clears the
   StartLimitBurst cap) and
   `sudo systemctl restart blueprint-deploy-agent.service`.
-- **A cycle fails conservatively:** the agent logs the reason and backs off; it
-  never posts a receipt for a failed activation. If the release succeeds but
-  receipt delivery fails, a host-local marker retries only the receipt and
-  never invokes the release executor again for that approval. The approval
-  stays pending in the backend, so the next healthy cycle retries it. An
-  operator can always hand-run `python scripts/blueprint.py deploy` instead.
+- **A cycle fails conservatively:** transient root-release failures receive the
+  bounded 5s/10s retry sequence above. The agent never posts a receipt for a
+  failed activation. If the release succeeds but receipt delivery fails, a
+  host-local marker retries only the receipt and never invokes the release
+  executor again for that approval. If the activation retry budget is
+  exhausted, inspect the durable marker and journal for
+  `root_release.failure_reason`; the approval remains unconfirmed and requires
+  operator reconciliation before another activation approval is attempted.
 - **Manual rollback:** run `python scripts/blueprint.py deploy --sha
   <earlier-main-sha> --force` when an operator must select the earlier image.
   The release tool permits the rollback only when that image has the same

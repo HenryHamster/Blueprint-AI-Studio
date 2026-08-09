@@ -17,13 +17,71 @@ approval stamp; the privileged activation is PULLED and executed host-side.
 from __future__ import annotations
 
 import logging
+import time
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import select
-
-from app import release_version
-from app.models import Project
+if TYPE_CHECKING:
+    from app import release_version
 
 logger = logging.getLogger(__name__)
+
+
+DEFAULT_ACTIVATION_ATTEMPTS = 3
+DEFAULT_ACTIVATION_BACKOFF_SECONDS = (5.0, 10.0)
+
+
+class ActivationPhaseFailure(RuntimeError):
+    """A bounded activation phase exhausted its retry budget."""
+
+    def __init__(self, phase: str, attempts: int, final_exception: Exception):
+        self.phase = phase
+        self.attempts = attempts
+        self.final_exception = final_exception
+        super().__init__(
+            f"{phase} failed after {attempts} attempts: {final_exception}"
+        )
+
+
+def retry_activation_phase(
+    phase: str,
+    action: Callable[[], Any],
+    *,
+    max_attempts: int = DEFAULT_ACTIVATION_ATTEMPTS,
+    backoff_seconds: tuple[float, ...] = DEFAULT_ACTIVATION_BACKOFF_SECONDS,
+    retry_if: Callable[[Exception], bool] | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    before_attempt: Callable[[int], None] | None = None,
+) -> Any:
+    """Run one activation phase with bounded retries and real backoff.
+
+    ``retry_if`` lets the caller keep non-transient failures fail-fast.  A
+    retryable failure is wrapped in :class:`ActivationPhaseFailure` when the
+    finite budget is exhausted so the caller can persist a truthful terminal
+    result instead of turning it into an indefinite poll or timeout.
+    """
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be positive")
+    if any(delay <= 0 for delay in backoff_seconds):
+        raise ValueError("activation retry backoff must be positive")
+
+    attempts = 0
+    while attempts < max_attempts:
+        attempts += 1
+        if before_attempt is not None:
+            before_attempt(attempts)
+        try:
+            return action()
+        except Exception as exc:
+            if retry_if is not None and not retry_if(exc):
+                raise
+            if attempts >= max_attempts:
+                raise ActivationPhaseFailure(phase, attempts, exc) from exc
+            delay_index = min(attempts - 1, len(backoff_seconds) - 1)
+            delay = backoff_seconds[delay_index] if backoff_seconds else 0.0
+            if delay <= 0:
+                raise ValueError("activation retry backoff must not be empty") from exc
+            sleep(delay)
 
 
 def _approved_activation_mismatch(
@@ -74,6 +132,9 @@ async def _approved_activation_superseded(
     scope "latest promoted" the same way (highest-numbered ``status="promoted"``
     row).
     """
+    from app import release_version
+    from sqlalchemy import select
+
     latest = (
         await session.execute(
             select(release_version.ReleaseVersion)
@@ -104,6 +165,8 @@ async def _approved_activation_descendant(
     """
     if not version.promoted_sha or not effective_sha:
         return False
+
+    from app.models import Project
 
     project = await session.get(Project, version.project_id)
     if project is None:

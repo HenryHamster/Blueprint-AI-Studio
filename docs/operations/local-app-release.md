@@ -43,7 +43,12 @@ The deploy agent does not use `sudo`: its hardened non-root unit connects to
 account. The agent's live approval read, exact CI manifest binding, superseding
 promotion re-read, and activation receipt POST remain the authority checks;
 the root executor independently validates the digest and revision before it
-starts the immutable release tool.
+starts the immutable release tool. A failed root-release activation phase is
+retried at most three times, with 5 seconds and then 10 seconds of backoff.
+Accepted or ambiguous socket handoffs are fenced and never replayed. Exhaustion
+is reported and persisted as `phase=failed` with the attempt count and
+`root_release.failure_reason`; it is not converted into a serving-confirmation
+timeout.
 
 ## Release
 

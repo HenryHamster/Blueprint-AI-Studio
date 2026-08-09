@@ -45,6 +45,7 @@ import argparse
 import contextlib
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -69,6 +70,27 @@ from blueprint_api import (
     load_config,
     resolve_project_id_by_name,
 )
+
+# Keep the retry policy shared with the backend's activation contract.  The
+# bootstrap copies this standalone module beside blueprint.py; source-tree CLI
+# runs load the same file from backend/app.
+_ACTIVATION_MODULE = Path(__file__).resolve().with_name("release_activation.py")
+if not _ACTIVATION_MODULE.is_file():
+    _ACTIVATION_MODULE = (
+        Path(__file__).resolve().parents[1] / "backend" / "app" / "release_activation.py"
+    )
+if not _ACTIVATION_MODULE.is_file():
+    raise ImportError(f"activation retry module missing: {_ACTIVATION_MODULE}")
+
+_activation_spec = importlib.util.spec_from_file_location(
+    "_blueprint_release_activation", _ACTIVATION_MODULE
+)
+if _activation_spec is None or _activation_spec.loader is None:
+    raise ImportError(f"cannot load activation retry module: {_ACTIVATION_MODULE}")
+_activation_module = importlib.util.module_from_spec(_activation_spec)
+_activation_spec.loader.exec_module(_activation_module)
+ActivationPhaseFailure = _activation_module.ActivationPhaseFailure
+retry_activation_phase = _activation_module.retry_activation_phase
 
 SERVICE_NAME = os.environ.get("BLUEPRINT_GCP_SERVICE", "blueprint-orchestrator")
 GCP_PROJECT = os.environ.get("GCP_PROJECT", "blueprint-orchestrator")
@@ -6333,6 +6355,13 @@ def _request_release_socket(digest: str, revision: str) -> bool:
             return False
         raise APIError(f"release executor socket unavailable: {exc}") from exc
     except OSError as exc:
+        if request_sent:
+            print(
+                "Release executor handoff was accepted but its response was "
+                "lost; receipt delivery is parked for the next poll.",
+                file=sys.stderr,
+            )
+            return False
         raise APIError(f"release executor socket unavailable: {exc}") from exc
     if response != "OK":
         detail = response.removeprefix("ERROR ") or "empty executor response"
@@ -6425,7 +6454,8 @@ def _deploy_agent_once(args: argparse.Namespace) -> bool:
         if matches_approval and pending_receipt.get("phase") == "failed":
             print(
                 f"Approved activation for v{approved.get('version_number')} failed "
-                "before its promoted SHA was observed serving.",
+                f"before its promoted SHA was observed serving: "
+                f"{pending_receipt.get('failure_reason', 'no failure reason recorded')}.",
                 file=sys.stderr,
             )
             return False
@@ -6506,23 +6536,56 @@ def _deploy_agent_once(args: argparse.Namespace) -> bool:
         "promoted_sha": promoted_sha,
         "revision": release["revision"],
         "phase": "started",
+        "activation_attempts": 0,
     }
     # Persist the intent before crossing the privileged boundary. This is the
     # at-most-once fence when the agent dies or the socket wait expires while
     # the root service continues the release.
     _write_deploy_agent_state(state_path, activation_state)
+
+    def invoke_activation(attempt: int) -> bool:
+        # Persist the attempt counter before crossing the privileged boundary.
+        # A process restart therefore cannot silently reset a failed phase's
+        # retry budget or mistake a terminal failure for a timeout.
+        activation_state["activation_attempts"] = attempt
+        activation_state["root_release"] = {
+            "phase": "activation",
+            "attempt": attempt,
+            "status": "started",
+        }
+        _write_deploy_agent_state(state_path, activation_state)
+        return _invoke_release_shim(release["digest"], release["revision"], host=None)
+
     try:
-        release_completed = _invoke_release_shim(
-            release["digest"], release["revision"], host=None
+        release_completed = retry_activation_phase(
+            "activation",
+            lambda: invoke_activation(activation_state["activation_attempts"] + 1),
+            retry_if=lambda exc: isinstance(exc, APIError),
+            sleep=time.sleep,
         )
-    except APIError:
-        _clear_deploy_agent_state(state_path)
-        raise
+    except ActivationPhaseFailure as failure:
+        activation_state["phase"] = "failed"
+        activation_state["failure_reason"] = str(failure)
+        activation_state["root_release"] = {
+            "phase": failure.phase,
+            "status": "failed",
+            "attempts": failure.attempts,
+            "failure_reason": str(failure.final_exception),
+        }
+        _write_deploy_agent_state(state_path, activation_state)
+        print(
+            f"Approved activation for v{current.get('version_number')} failed: "
+            f"{failure}",
+            file=sys.stderr,
+        )
+        return False
     if release_completed is False:
         activation_state["phase"] = "accepted"
+        activation_state.setdefault("root_release", {})["status"] = "accepted"
         _write_deploy_agent_state(state_path, activation_state)
         return False
     activation_state["phase"] = "completed"
+    activation_state.setdefault("root_release", {})["status"] = "completed"
     _write_deploy_agent_state(state_path, activation_state)
     confirmation = _pending_activation_confirmation(activation_state, promoted_sha)
     _write_deploy_agent_state(state_path, activation_state)

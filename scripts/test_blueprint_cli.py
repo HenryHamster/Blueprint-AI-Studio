@@ -6280,6 +6280,65 @@ def test_deploy_agent_executes_approved_request_and_posts_receipt(monkeypatch, t
     }
 
 
+def test_deploy_agent_retries_failed_activation_phase_then_confirms(
+    monkeypatch, tmp_path
+):
+    """A transient root failure is retried before one receipt is posted."""
+    from blueprint_api import APIError
+
+    calls = []
+    promoted = {
+        "version_number": 7,
+        "status": "promoted",
+        "promoted_sha": _DEPLOY_PROMOTED_SHA,
+        "serving_status": "unconfirmed",
+        "activation_requested_at": "2026-06-15T00:00:00Z",
+    }
+    _deploy_env(
+        monkeypatch,
+        _deploy_api_fake(calls, promoted=promoted),
+        revision=_DEPLOY_PROMOTED_SHA,
+    )
+    release_results = iter(
+        [
+            APIError("release executor failed: transient one"),
+            APIError("release executor failed: transient two"),
+            True,
+        ]
+    )
+    release_calls = []
+    monkeypatch.setattr(
+        blueprint,
+        "_invoke_release_shim",
+        lambda *args, **kwargs: (
+            release_calls.append((args, kwargs)),
+            (lambda result: (_ for _ in ()).throw(result)
+             if isinstance(result, Exception) else result)(next(release_results)),
+        )[1],
+    )
+    sleeps = []
+    monkeypatch.setattr(blueprint.time, "sleep", sleeps.append)
+    monkeypatch.setattr(blueprint, "_local_served_sha", lambda: _DEPLOY_PROMOTED_SHA)
+
+    state_path = tmp_path / "deploy-agent.state"
+    assert blueprint._deploy_agent_once(
+        argparse.Namespace(project_id=None, state_path=str(state_path))
+    ) is True
+
+    assert len(release_calls) == 3
+    assert sleeps == [5.0, 10.0]
+    assert not state_path.exists()
+    receipts = [
+        body for method, path, body in calls
+        if method == "POST" and path.endswith("/activation-receipt")
+    ]
+    assert receipts == [{
+        "version_number": 7,
+        "revision": _DEPLOY_PROMOTED_SHA,
+        "host": "control-plane",
+    }]
+
+
 def _write_accepted_activation_state(state_path):
     state_path.write_text(json.dumps({
         "version_number": 7, "promoted_sha": _DEPLOY_PROMOTED_SHA,
@@ -6348,7 +6407,7 @@ def test_deploy_agent_confirms_when_served_sha_matches(monkeypatch, tmp_path):
 def test_deploy_agent_does_not_post_receipt_when_shim_raises(
     monkeypatch, tmp_path, failure
 ):
-    """A failed release cannot turn its started marker into confirmation."""
+    """A failed release retries three times and records its terminal reason."""
     from blueprint_api import APIError
 
     promoted = {
@@ -6370,6 +6429,7 @@ def test_deploy_agent_does_not_post_receipt_when_shim_raises(
         "_invoke_release_shim",
         lambda *args, **kwargs: (_ for _ in ()).throw(APIError(failure)),
     )
+    monkeypatch.setattr(blueprint.time, "sleep", lambda _seconds: None)
     state_path = tmp_path / "deploy-agent.state"
     args = argparse.Namespace(
         project_id=None,
@@ -6377,35 +6437,21 @@ def test_deploy_agent_does_not_post_receipt_when_shim_raises(
         state_path=str(state_path),
     )
 
-    with pytest.raises(APIError, match="release"):
-        blueprint._deploy_agent_once(args)
-    assert not any(path.endswith("/activation-receipt") for _, path, _ in calls)
-    assert not state_path.exists()
-
-    state_path.write_text(
-        json.dumps(
-            {
-                "version_number": promoted["version_number"],
-                "promoted_sha": _DEPLOY_PROMOTED_SHA,
-                "revision": _DEPLOY_PROMOTED_SHA,
-                "phase": "started",
-            }
-        ),
-        encoding="utf-8",
-    )
-    release_calls = []
-    monkeypatch.setattr(blueprint, "_local_served_sha", lambda: None)
-    monkeypatch.setattr(
-        blueprint,
-        "_invoke_release_shim",
-        lambda *args, **kwargs: release_calls.append((args, kwargs)),
-    )
     assert blueprint._deploy_agent_once(args) is False
-    assert release_calls == []
+    assert not any(path.endswith("/activation-receipt") for _, path, _ in calls)
+    failed = json.loads(state_path.read_text(encoding="utf-8"))
+    assert failed["phase"] == "failed"
+    assert failed["activation_attempts"] == 3
+    assert failed["root_release"]["status"] == "failed"
+    assert failed["root_release"]["attempts"] == 3
+    assert failure in failed["root_release"]["failure_reason"]
+
+    monkeypatch.setattr(blueprint, "_local_served_sha", lambda: None)
+    assert blueprint._deploy_agent_once(args) is False
     assert not any(path.endswith("/activation-receipt") for _, path, _ in calls)
     resumed = json.loads(state_path.read_text(encoding="utf-8"))
-    assert resumed["phase"] == "started"
-    assert resumed["confirmation_deadline_at"]
+    assert resumed["phase"] == "failed"
+    assert resumed["failure_reason"] == failed["failure_reason"]
 
 
 @pytest.mark.parametrize(

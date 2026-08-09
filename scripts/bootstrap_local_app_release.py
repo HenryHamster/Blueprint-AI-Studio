@@ -25,6 +25,7 @@ _SOURCE_NAMES = (
     "local_worker_service.py",
     "blueprint.py",
     "blueprint_api.py",
+    "release_activation.py",
 )
 _EDGE_TEMPLATE_NAME = "blueprint-edge-system.service"
 _BUNDLE_ROOT = Path("/usr/local/lib/blueprint-node")
