@@ -89,6 +89,13 @@ RUNNER_PULL_UNPINS_CONTEXT_KEY = "runner_pull_unpins"
 # Machine-readable skip codes (returned in the 503 body and stamped on the task).
 SKIP_CODE_NO_ACCOUNT = "no_eligible_account"
 SKIP_CODE_CREDENTIAL_ERROR = "credential_resolution_failed"
+# A DETERMINISTIC runner/task capability mismatch — e.g. a browser-required task
+# pinned to a runner with no usable Chromium. Unlike the two codes above, which
+# describe a TRANSIENT pool state that may heal on a later poll, a capability
+# mismatch never becomes routable by re-polling THIS runner, so the pinned task is
+# released to QUEUED immediately (see release_capability_mismatched_task) rather
+# than counted toward the ~20-min escalation clock.
+SKIP_CODE_CAPABILITY_MISMATCH = "runner_capability_mismatch"
 
 # How often ``count`` may advance (the ESCALATION clock — see ``at`` above).
 # Throttled so a live countdown in the reason ("240s left") cannot rewrite the
@@ -405,14 +412,17 @@ async def _maybe_create_skip_alert(
     return True
 
 
-async def _unpin_skipped_task(session: AsyncSession, task: Task) -> bool:
-    """Return a hopelessly-unroutable pinned task to QUEUED for re-dispatch.
+async def _return_pin_to_queue(
+    session: AsyncSession, task: Task, *, status_message: str
+) -> bool:
+    """Re-lock a pinned task under the dispatch claim guard and return it to QUEUED.
 
-    Re-selects the row ``FOR UPDATE SKIP LOCKED`` under the SAME claim guard the
-    dispatch path uses (``PROVISIONING`` + ``started_at IS NULL``): a concurrent
-    poll may have resolved and claimed this task since we read it unlocked, and
-    unpinning a task that is booting an agent would strand it. Losing that race
-    is a no-op, not an error.
+    The shared body behind both the repeated-skip unpin and the deterministic
+    capability-mismatch release. Re-selects the row ``FOR UPDATE SKIP LOCKED``
+    under the SAME claim guard the dispatch path uses (``PROVISIONING`` +
+    ``started_at IS NULL``): a concurrent poll may have resolved and claimed this
+    task since the caller read it unlocked, and unpinning a task that is booting an
+    agent would strand it. Losing that race is a no-op, not an error.
 
     The local-runner REQUIREMENT (``strategic_local_runner_required`` and the
     compute require-local stamps) is deliberately left alone — only the pin to
@@ -452,18 +462,61 @@ async def _unpin_skipped_task(session: AsyncSession, task: Task) -> bool:
     locked.status = TaskStatus.QUEUED
     locked.vm_instance_id = None
     locked.vm_provisioned_at = None
-    locked.latest_status_message = (
-        "Unpinned from local runner after repeated pull skips "
-        "(credentials unresolvable); returned to QUEUED for re-dispatch."
-    )[:500]
+    locked.latest_status_message = status_message[:500]
     session.add(locked)
-    logger.warning(
-        "[RUNNERS] Task %s unpinned back to QUEUED after %d runner-pull skips "
-        "— it was permanently unroutable and blocking the runner's candidate scan",
-        locked.id,
-        SKIP_UNPIN_THRESHOLD,
-    )
     return True
+
+
+async def _unpin_skipped_task(session: AsyncSession, task: Task) -> bool:
+    """Return a hopelessly-unroutable pinned task to QUEUED for re-dispatch."""
+    released = await _return_pin_to_queue(
+        session,
+        task,
+        status_message=(
+            "Unpinned from local runner after repeated pull skips "
+            "(credentials unresolvable); returned to QUEUED for re-dispatch."
+        ),
+    )
+    if released:
+        logger.warning(
+            "[RUNNERS] Task %s unpinned back to QUEUED after %d runner-pull skips "
+            "— it was permanently unroutable and blocking the runner's candidate "
+            "scan",
+            task.id,
+            SKIP_UNPIN_THRESHOLD,
+        )
+    return released
+
+
+async def release_capability_mismatched_task(
+    session: AsyncSession, task: Task, reason: str
+) -> bool:
+    """Release a pinned task the polling runner can NEVER satisfy back to QUEUED.
+
+    A capability mismatch — e.g. a browser-required task pinned to a runner with no
+    usable Chromium — is DETERMINISTIC: re-polling THIS runner will never make the
+    task routable, so unlike the repeated-skip escalation there is no clock to run
+    down. The pin is cleared on the first poll that detects the mismatch and normal
+    dispatch — which already filters browser work to Chromium-capable runners —
+    re-routes it (or holds it QUEUED until a capable runner has a free slot).
+    Losing the winner-lock race (the task was claimed concurrently) is a no-op.
+    """
+    released = await _return_pin_to_queue(
+        session,
+        task,
+        status_message=(
+            f"Released from local runner (capability mismatch): {reason} "
+            "Returned to QUEUED for re-dispatch to a capable runner."
+        ),
+    )
+    if released:
+        logger.warning(
+            "[RUNNERS] Task %s released back to QUEUED — the pinned runner cannot "
+            "satisfy a required capability: %s",
+            task.id,
+            reason,
+        )
+    return released
 
 
 async def maybe_escalate_pull_skip(
