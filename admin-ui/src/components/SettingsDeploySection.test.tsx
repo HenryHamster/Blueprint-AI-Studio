@@ -209,7 +209,7 @@ describe('MergeGradeGateSettings (via DeploySection)', () => {
 });
 
 describe('activation deployment status', () => {
-  it('explains that approval waits for the activation executor before a receipt can arrive', () => {
+  it('explains that the control-plane deploy agent executes approval before a receipt can arrive', () => {
     render(
       <PromotedAwaitingActivationCallout
         version={{
@@ -224,10 +224,10 @@ describe('activation deployment status', () => {
       />,
     );
 
-    expect(screen.getByTestId('promoted-awaiting-activation')).toHaveTextContent('host-side activation executor');
+    expect(screen.getByTestId('promoted-awaiting-activation')).toHaveTextContent('control-plane deploy agent');
     expect(screen.getByTestId('promoted-awaiting-activation')).toHaveTextContent(
-      'must be installed and running before a serving receipt can arrive',
+      'If the agent is not installed and running, use blueprint deploy manually',
     );
-    expect(screen.getByTestId('promoted-awaiting-activation')).not.toHaveTextContent('deploy agent');
+    expect(screen.getByTestId('promoted-awaiting-activation')).not.toHaveTextContent('host-side activation executor');
   });
 });

@@ -3587,7 +3587,7 @@ describe('VersionLifecyclePanel', () => {
       fireEvent.click(screen.getByTestId('approve-activation'));
       expect(screen.getByText('Approve activation of v3?')).toBeInTheDocument();
       expect(screen.getByText(/This records approval/)).toHaveTextContent(
-        'host-side activation executor',
+        'control-plane deploy agent polls for this approval',
       );
       fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
 
@@ -3599,7 +3599,7 @@ describe('VersionLifecyclePanel', () => {
         const callout = screen.getByTestId('promoted-awaiting-activation');
         expect(callout).toHaveTextContent('approved — awaiting activation');
         expect(callout).toHaveTextContent('Approved by admin@example.com');
-        expect(callout).toHaveTextContent('waiting for the host-side activation executor');
+        expect(callout).toHaveTextContent('control-plane deploy agent will validate the bound manifest');
         expect(callout).toHaveTextContent('serving receipt');
         expect(callout).not.toHaveTextContent('serving_confirmed');
         expect(callout).not.toHaveTextContent('activated');
