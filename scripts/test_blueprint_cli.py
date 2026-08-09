@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 import blueprint
 import blueprint_api
+import blueprint_deploy_agent
 import pytest
 
 
@@ -5977,7 +5978,7 @@ def test_deploy_agent_preflight_classifies_control_plane_failures(
     assert "remediation" in control
 
 
-def test_deploy_agent_receipt_failure_retries_without_reexecuting_shim(
+def test_deploy_agent_receipt_failure_does_not_rerun_shim(
     monkeypatch, tmp_path
 ):
     """A successful activation is not repeated while its receipt is retried."""
@@ -6009,24 +6010,78 @@ def test_deploy_agent_receipt_failure_retries_without_reexecuting_shim(
             }
         return {}
 
+    real_write_guard = blueprint._require_write_config
     _deploy_env(monkeypatch, fake_api, revision=_DEPLOY_PROMOTED_SHA)
+    monkeypatch.setattr(blueprint, "_require_write_config", real_write_guard)
+    monkeypatch.setattr(
+        blueprint_deploy_agent, "get_project_id", lambda _project_id=None: "proj-1"
+    )
     socket_calls = []
     monkeypatch.setattr(
         blueprint,
         "_request_release_socket",
         lambda digest, revision: socket_calls.append((digest, revision)),
     )
-    args = argparse.Namespace(project_id=None, state_path=str(tmp_path / "agent.state"))
+    args = argparse.Namespace(
+        project_id=None,
+        host="control-plane",
+        interval=30,
+        dry_run=False,
+        lockfile=str(tmp_path / "agent.lock"),
+        state_path=str(tmp_path / "agent.state"),
+    )
 
-    with pytest.raises(APIError):
-        blueprint._deploy_agent_once(args)
+    assert blueprint_deploy_agent._run_cycle(args) == 1
     assert len(socket_calls) == 1
     assert (tmp_path / "agent.state").exists()
 
-    assert blueprint._deploy_agent_once(args) is True
+    assert blueprint_deploy_agent._run_cycle(args) == 0
     assert len(socket_calls) == 1
     assert post_attempts == 2
     assert not (tmp_path / "agent.state").exists()
+
+
+def test_deploy_agent_read_only_config_refuses_before_shim(monkeypatch, tmp_path):
+    """A read-only agent credential is rejected before any activation lookup or shim call."""
+    shim_calls = []
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"read_only": True})
+    monkeypatch.setattr(
+        blueprint,
+        "_read_live_approved_activation",
+        lambda _args: pytest.fail("read-only config must stop before polling"),
+    )
+    monkeypatch.setattr(
+        blueprint,
+        "_invoke_release_shim",
+        lambda *args, **kwargs: shim_calls.append((args, kwargs)),
+    )
+
+    with pytest.raises(SystemExit):
+        blueprint._deploy_agent_once(
+            argparse.Namespace(
+                project_id=None,
+                state_path=str(tmp_path / "agent.state"),
+            )
+        )
+    assert not shim_calls
+
+
+def test_standalone_deploy_agent_read_only_refuses_before_shim(monkeypatch, tmp_path):
+    """The installed wrapper repeats the write guard inside every cycle."""
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"read_only": True})
+    monkeypatch.setattr(
+        blueprint,
+        "_read_live_approved_activation",
+        lambda _args: pytest.fail("read-only config must stop before polling"),
+    )
+    args = argparse.Namespace(
+        project_id="proj-1",
+        host="control-plane",
+        lockfile=str(tmp_path / "agent.lock"),
+        state_path=str(tmp_path / "agent.state"),
+        poll_state_path=str(tmp_path / "agent.poll"),
+    )
+    assert blueprint_deploy_agent._run_cycle(args) == 1
 
 
 def test_deploy_agent_noops_without_live_approval(monkeypatch):

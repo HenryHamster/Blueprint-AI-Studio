@@ -55,3 +55,113 @@ The trust chain never depends on the caller:
 Migrations remain deliberately outside this path: a release whose code expects
 a newer schema fails closed at worker startup and rolls back. Run migrations
 first (see `docs/local-control-plane.md`), then deploy.
+
+## Host-side deploy agent (one-time install)
+
+An operator can also activate an approved promotion in-product instead of
+hand-running `blueprint deploy`: the backend stamps an approval
+(`POST .../approve-activation`), and a durable host-side poller
+(`scripts/blueprint_deploy_agent.py`) — running on the control-plane host as the
+operator account — detects the pending binding, submits it to the same
+root-owned release socket, and posts the activation receipt. The agent adds
+reachability, not privilege: it is bounded by the ACL-limited socket and
+`/usr/local/sbin/blueprint-release` execution boundary above, and it refuses
+(waits conservatively) on any binding that does not resolve to exactly the
+approved version's immutable `promoted_sha`.
+
+### Install (as the operator, `henry_hamster`)
+
+```bash
+# 1. The root-owned release service + socket from the section above must already be installed.
+# 2. Install the self-contained agent bundle and its systemd unit template.
+#    The agent imports blueprint.py, which imports blueprint_api.py, so install
+#    all three together; do not rely on a checkout or PYTHONPATH at service time.
+sudo install -d -o henry_hamster -g henry_hamster -m 0755 \
+  /usr/local/lib/blueprint-node/deploy-agent
+sudo install -o henry_hamster -g henry_hamster -m 0755 \
+  scripts/blueprint_deploy_agent.py \
+  /usr/local/lib/blueprint-node/deploy-agent/blueprint_deploy_agent.py
+sudo install -o henry_hamster -g henry_hamster -m 0644 \
+  scripts/blueprint.py scripts/blueprint_api.py \
+  /usr/local/lib/blueprint-node/deploy-agent/
+
+# 3. Render and install the unit (substitute real values), then enable it:
+sed -e 's/@USER@/henry_hamster/g' \
+    -e 's|@PYTHON@|/usr/bin/python3|g' \
+    -e 's|@AGENT@|/usr/local/lib/blueprint-node/deploy-agent/blueprint_deploy_agent.py|g' \
+    -e 's|@ENV_FILE@|/etc/blueprint/deploy-agent.env|g' \
+    -e 's|@WANTED_BY@|multi-user.target|g' \
+  scripts/blueprint-deploy-agent.service | sudo tee /etc/systemd/system/blueprint-deploy-agent.service >/dev/null
+sudo systemctl daemon-reload
+sudo systemctl enable --now blueprint-deploy-agent.service
+
+# 4. Preflight the install (exit 0 = config present, project resolvable, shim present):
+/usr/bin/python3 /usr/local/lib/blueprint-node/deploy-agent/blueprint_deploy_agent.py --check
+```
+
+`@ENV_FILE@` is optional: the agent reads the operator's
+`~/.blueprint-config.json` (or `BLUEPRINT_API_URL`/`BLUEPRINT_API_KEY`) exactly
+like `blueprint deploy`. Set `BLUEPRINT_DEPLOY_AGENT_QUIET=1` in the env file to
+silence the agent's own logging (systemd journaling remains).
+
+### How the agent works
+
+Each poll cycle the agent:
+
+1. Reads the project's latest promoted release version
+   (`release-versions?status=promoted&limit=1` — the same endpoint the CLI
+   reads).
+2. Treats it as a **pending approved activation** only when
+   `activation_requested_at` is set and `serving_status` is still
+   `unconfirmed` — the same predicate `POST /approve-activation` requires
+   before it will stamp an approval. Never-approved, never-armed (`NULL`),
+   and already-resolved versions are skipped.
+3. Resolves the approved artifact **exactly**: it locates the CI deploy run for
+   the version's immutable `promoted_sha`, downloads + checksum-verifies the
+   manifest, and **refuses** unless the manifest's built revision equals that
+   `promoted_sha`. A descendant or unrelated revision is never activated — an
+   approval cannot authorize a different or historical artifact.
+4. Re-runs the shared binding check (`_resolve_deploy_binding`) and refuses if
+   a newer promotion superseded the approved version since polling.
+5. Sends `<digest> <revision>` to `/run/blueprint-release.sock` locally (no SSH
+   and no sudo — the agent runs ON the control-plane host), then posts the
+   activation receipt.
+
+Serialization is an `flock` on the agent's default lockfile,
+`~/.blueprint/deploy-agent.lock` — under the operator's home (the same
+`~/.blueprint` state directory `blueprint_runner` uses), so the unprivileged
+`User=henry_hamster` account can create it out of the box, without a
+root-owned `/run` directory or a `RuntimeDirectory=` line. Override with
+`--lockfile`. Overlapping agent restarts never run two deploys at once.
+Transient control-plane failures are logged and retried at the poll cadence
+with a 10× backoff after a failed cycle; the agent never crashes a poll cycle
+into the service.
+
+### Observability
+
+- **Status / receipts:** `journalctl -u blueprint-deploy-agent.service -f`. Each
+  cycle logs `pending approved activation: vN (promoted …)`, `activation
+  complete for vN (…)`, or a `REFUSING`/`skipping` line with the reason.
+- **Serving confirmation:** the in-product version history reflects the receipt
+  (`serving_status=serving_confirmed` + `served_sha`).
+- **One-shot cycle (debug):**
+  `/usr/local/lib/blueprint-node/deploy-agent/blueprint_deploy_agent.py --once --project-id <id>`
+
+### Recovery and manual rollback
+
+- **Agent is dead / won't start:** run `--check` for the preflight verdict
+  (missing config → create `~/.blueprint-config.json`; missing shim → re-run
+  the shim install above). Then `sudo systemctl reset-failed
+  blueprint-deploy-agent.service` (clears the StartLimitBurst cap) and
+  `sudo systemctl restart blueprint-deploy-agent.service`.
+- **A cycle fails conservatively:** the agent logs the reason and backs off; it
+  never posts a receipt for a failed activation. If the release succeeds but
+  receipt delivery fails, a host-local marker retries only the receipt and
+  never invokes the release executor again for that approval. The approval
+  stays pending in the backend, so the next healthy cycle retries it. An
+  operator can always hand-run `python scripts/blueprint.py deploy` instead.
+- **Manual rollback (unchanged):** `blueprint deploy` / the release tool's
+  rollback behavior is untouched. To roll back to an earlier revision, run
+  `python scripts/blueprint.py deploy --sha <earlier-main-sha> --force` (the
+  receipt records it), or revoke `/etc/sudoers.d/blueprint-release` to restore
+  interactive-sudo ceremony while you investigate.

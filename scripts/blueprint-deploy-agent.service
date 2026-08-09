@@ -1,0 +1,64 @@
+# Blueprint host-side deploy agent — systemd SYSTEM unit TEMPLATE
+#
+# This is a TEMPLATE, not a ready-to-use unit. Do NOT hand-edit and copy it.
+# The one-time install ceremony (documented in
+# docs/operations/one-command-deploy.md) renders @USER@, @PYTHON@, @AGENT@,
+# @ENV_FILE@, and @WANTED_BY@, writes the result to
+# /etc/systemd/system/blueprint-deploy-agent.service, and runs daemon-reload +
+# enable --now.
+#
+# The agent polls the orchestrator's approved-activation contract and, when an
+# operator has approved a promoted version, submits it to the root-owned
+# release socket and posts the activation receipt. The privilege boundary is
+# unchanged: the agent is the operator account and the socket ACL is the only
+# elevation it has.
+#
+# ENVIRONMENT FILE (@ENV_FILE@):
+#   Optional 0600 file with agent config (the leading `-` means "ignore if
+#   absent"). The agent otherwise reads the operator's ~/.blueprint-config.json
+#   exactly like `blueprint deploy` does.
+#
+# RESTART — crash recovery:
+#   Restart=always restarts the agent whenever it exits, for any reason; a
+#   burst cap (StartLimitIntervalSec=60 / StartLimitBurst=3) prevents a
+#   persistent failure from restarting forever. The agent itself also backs off
+#   (interval x10) after a failed poll cycle, so control-plane outages do not
+#   spin the loop. A deliberate operator `systemctl stop` is still honored.
+#
+# SERIALIZATION:
+#   The agent takes a non-blocking flock on its lockfile (~/.blueprint/
+#   deploy-agent.lock by default, overridable with --lockfile) before each poll
+#   cycle, so overlapping agent restarts never run two deploys at once.  The
+#   default is under the operator's home (the same ~/.blueprint state dir
+#   blueprint_runner uses), so User=@USER@ can create it without a root-owned
+#   /run directory or a RuntimeDirectory= line.
+#
+# VIEWING LOGS:
+#   journalctl -u blueprint-deploy-agent.service -f
+
+[Unit]
+Description=Blueprint host-side deploy agent
+Documentation=file:///usr/local/lib/blueprint-node/deploy-agent/README.md
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=@USER@
+UMask=0077
+PrivateTmp=true
+ExecStart=@PYTHON@ @AGENT@ --interval 30
+ExecStartPre=@PYTHON@ @AGENT@ --check
+Restart=always
+RestartSec=5
+# Load agent config from an optional 0600 file (`-` = ignore if absent).
+EnvironmentFile=-@ENV_FILE@
+StandardOutput=journal
+StandardError=journal
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=@WANTED_BY@
