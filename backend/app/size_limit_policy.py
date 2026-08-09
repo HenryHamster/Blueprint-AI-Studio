@@ -1137,6 +1137,23 @@ def phantom_ledger_records(
     return phantoms
 
 
+def cap_history_chain_breaks(history: list[BumpRecord]) -> list[tuple[int, int]]:
+    """Return upward breaks in a module's ordered cap-bump history.
+
+    Consecutive records should form a chain: the next record's ``old_cap``
+    equals the previous record's ``new_cap``. A lower next ``old_cap`` is a
+    legitimate cap decrease and is intentionally ignored; only an upward gap
+    can represent a deleted cap-raise record. The returned pairs are
+    ``(previous_new_cap, next_old_cap)``.
+    """
+    ordered = sorted(history, key=lambda r: _parse_iso(r["commit_date"]))
+    return [
+        (previous["new_cap"], current["old_cap"])
+        for previous, current in zip(ordered, ordered[1:])
+        if current["old_cap"] > previous["new_cap"]
+    ]
+
+
 def _is_chronic_offender(history: list[BumpRecord]) -> bool:
     """Return True when ``history`` meets the chronic-offender threshold.
 
@@ -1149,18 +1166,28 @@ def _is_chronic_offender(history: list[BumpRecord]) -> bool:
        AND there are at least ``CHRONIC_BUMP_THRESHOLD`` bumps on record
        (avoids false-positives from a single jump on a fresh file).
     """
+    # A missing record is evidence loss, not permission to grant a routine
+    # bump. An upward chain break is the observable residue of a deleted cap
+    # raise; classify it as chronic so self-heal cannot loosen governance while
+    # the ledger is incomplete. Downward breaks are legal cap decreases and are
+    # deliberately excluded by cap_history_chain_breaks().
+    if cap_history_chain_breaks(history):
+        return True
+
     if len(history) < CHRONIC_BUMP_THRESHOLD:
         return False
 
+    ordered = sorted(history, key=lambda r: _parse_iso(r["commit_date"]))
+
     # Trigger 1 — window check.
     cutoff = datetime.now(timezone.utc) - timedelta(days=CHRONIC_WINDOW_DAYS)
-    recent_count = sum(1 for r in history if _parse_iso(r["commit_date"]) >= cutoff)
+    recent_count = sum(1 for r in ordered if _parse_iso(r["commit_date"]) >= cutoff)
     if recent_count >= CHRONIC_BUMP_THRESHOLD:
         return True
 
     # Trigger 2 — cumulative growth check.
-    first_cap = history[0]["old_cap"]
-    current_cap = history[-1]["new_cap"]
+    first_cap = ordered[0]["old_cap"]
+    current_cap = ordered[-1]["new_cap"]
     return first_cap > 0 and (current_cap - first_cap) / first_cap >= CHRONIC_GROWTH_PCT
 
 

@@ -31,6 +31,7 @@ from app.size_limit_policy import (
     UNATTRIBUTED_COMMIT_SHA,
     _is_chronic_offender,
     _parse_git_diff_output,
+    cap_history_chain_breaks,
     classify_breach,
     parse_bump_history,
 )
@@ -165,6 +166,31 @@ def test_chronic_growth_trigger_needs_3_bumps():
 
 def test_chronic_empty_history_not_chronic():
     assert not _is_chronic_offender([])
+
+
+def test_cap_history_chain_breaks_only_report_upward_gaps():
+    """A missing cap raise is actionable; a cap decrease is not a ledger error."""
+    history = [
+        _record(1000, 1050, 300),
+        _record(1100, 1150, 200),  # missing 1050 -> 1100 raise
+        _record(1150, 1200, 100),
+        _record(1150, 1180, 50),  # legitimate decrease in the next old cap
+    ]
+
+    assert cap_history_chain_breaks(history) == [(1050, 1100)]
+
+
+def test_chronic_history_gap_fails_closed_before_growth_rebaseline():
+    """An upward gap remains chronic even when the damaged suffix grew <30%."""
+    history = [
+        _record(1000, 1050, 300),
+        _record(1100, 1150, 200),
+        _record(1150, 1200, 100),
+    ]
+
+    # Without the missing 1050 -> 1100 record, the old growth calculation sees
+    # only 20% growth and would silently loosen the chronic-offender gate.
+    assert _is_chronic_offender(history)
 
 
 # ---------------------------------------------------------------------------
