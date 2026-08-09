@@ -1404,7 +1404,7 @@ def test_backfill_0707_chains_from_0702_and_declares_kv_keys():
         )
 
 
-def test_schema_head_chains_through_0750_acceptance_healing_sweep_runs():
+def test_schema_head_chains_through_0751_acceptance_healing_cleanup():
     """Service-credential migrations follow admission removal as one linear chain.
 
     Historical contracts preserved:
@@ -1424,7 +1424,8 @@ def test_schema_head_chains_through_0750_acceptance_healing_sweep_runs():
     - 0742 (origination reading cohort checkpoint) revises 0741
     - 0743 (automatic origination taxonomy checkpoint) revises 0742
     - 0744 (acceptance-healing sweep-run ledger) revises 0743
-    - 0750 (reserved acceptance-healing follow-up) revises 0744 — current schema head
+    - 0750 (reserved acceptance-healing follow-up) revises 0744
+    - 0751 removes the unused acceptance-healing sweep-run ledger — current schema head
     """
     versions_dir = Path(__file__).resolve().parents[1] / "alembic" / "versions"
     operability = (
@@ -1518,6 +1519,9 @@ def test_schema_head_chains_through_0750_acceptance_healing_sweep_runs():
     acceptance_healing_sweep_follow_up = (
         versions_dir / "0750_acceptance_healing_sweep_runs.py"
     ).read_text()
+    acceptance_healing_cleanup = (
+        versions_dir / "0751_drop_acceptance_healing_sweep_runs.py"
+    ).read_text()
     assert parse_revision_identifiers(operability) == ("0708", "0707")
     assert parse_revision_identifiers(claims) == ("0709", "0708")
     assert parse_revision_identifiers(incarnation) == ("0710", "0709")
@@ -1576,12 +1580,18 @@ def test_schema_head_chains_through_0750_acceptance_healing_sweep_runs():
         "0750",
         "0744",
     )
+    assert parse_revision_identifiers(acceptance_healing_cleanup) == (
+        "0751",
+        "0750",
+    )
     assert '"acceptancehealingsweeprun"' in acceptance_healing_sweep_runs
     assert '"project_results"' in acceptance_healing_sweep_runs
+    assert 'op.drop_table("acceptancehealingsweeprun")' in acceptance_healing_cleanup
+    assert "op.create_table(" in acceptance_healing_cleanup
 
     from app.main import EXPECTED_SCHEMA_REVISION
 
-    assert EXPECTED_SCHEMA_REVISION == "0750", (
-        f"Expected EXPECTED_SCHEMA_REVISION == '0750', got {EXPECTED_SCHEMA_REVISION!r}. "
+    assert EXPECTED_SCHEMA_REVISION == "0751", (
+        f"Expected EXPECTED_SCHEMA_REVISION == '0751', got {EXPECTED_SCHEMA_REVISION!r}. "
         "Bump EXPECTED_SCHEMA_REVISION in backend/app/main.py."
     )

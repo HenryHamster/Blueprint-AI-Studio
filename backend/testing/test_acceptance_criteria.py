@@ -10428,7 +10428,7 @@ async def test_sweep_heals_rollup_child_acceptance_verdict(db_session):
         )
     finally:
         rsw._last_acceptance_healing_backfill_sweep = _prev_cadence
-    assert sweep_result["evidence_rows_recorded"] >= 1, (
+    assert sweep_result >= 1, (
         "the sweep must record acceptance-window criterion evidence for the "
         "healed window"
     )
@@ -10466,8 +10466,7 @@ async def test_sweep_heals_rollup_child_acceptance_verdict(db_session):
         )
     finally:
         rsw._last_acceptance_healing_backfill_sweep = _prev_cadence
-    assert second_result["outcome"] == "no_op"
-    assert second_result["evidence_rows_recorded"] == 0
+    assert second_result == 0
 
 
 # ---------------------------------------------------------------------------

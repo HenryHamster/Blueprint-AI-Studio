@@ -1,18 +1,15 @@
 """Tests for reaper bug-message sweep helpers (Step 18e: unlinked BLOCKER decay)."""
 
 from unittest.mock import AsyncMock
-from uuid import UUID
-
 import pytest
 import pytest_asyncio
 from datetime import timedelta
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
-from sqlmodel import SQLModel, select
+from sqlmodel import SQLModel
 
 from app.models import (
-    AcceptanceHealingSweepRun,
     MessageType,
     Project,
     ProjectMessage,
@@ -258,10 +255,6 @@ async def test_acceptance_healing_backfill_cadence_gated(sweep_db):
 
     The timer is independent of every other sweep's stamp, so an earlier sweep in
     the same reaper cycle cannot accidentally suppress the healing pass.
-
-    A cadence-skipped invocation must ALSO write no sweep-run row: the reaper
-    cycles roughly once a minute against an hourly sweep, so persisting the skip
-    would append ~1.4k rows/day recording only that the timer was not due.
     """
     import app.reaper_sweeps as rsw
 
@@ -270,132 +263,18 @@ async def test_acceptance_healing_backfill_cadence_gated(sweep_db):
     try:
         now = _utcnow()
         first = await rsw.sweep_acceptance_verdict_healing_backfills(sweep_db, now=now)
-        assert first["outcome"] == "no_open_version"
-        assert first["evidence_rows_recorded"] == 0
+        assert first == 0
         assert rsw._last_acceptance_healing_backfill_sweep == now
-        # The run that actually examined the fleet IS recorded.
-        assert first["record_persisted"] is True
-        rows_after_first = (
-            await sweep_db.execute(select(AcceptanceHealingSweepRun))
-        ).scalars().all()
-        assert len(rows_after_first) == 1
 
-        # Many suppressed calls within the interval: none re-stamp the timer and
-        # none append a row.
+        # Many suppressed calls within the interval do not re-stamp the timer.
         for _ in range(5):
             second = await rsw.sweep_acceptance_verdict_healing_backfills(
                 sweep_db, now=now
             )
-            assert second["outcome"] == "cadence_skipped"
-            assert second["record_persisted"] is False
-            assert "run_id" not in second
+            assert second == 0
         assert rsw._last_acceptance_healing_backfill_sweep == now
-
-        rows_after_skips = (
-            await sweep_db.execute(select(AcceptanceHealingSweepRun))
-        ).scalars().all()
-        assert [r.id for r in rows_after_skips] == [r.id for r in rows_after_first]
-        assert all(r.outcome != "cadence_skipped" for r in rows_after_skips)
     finally:
         rsw._last_acceptance_healing_backfill_sweep = _prev
-
-
-@pytest.mark.asyncio
-async def test_acceptance_healing_sweep_run_retention_purges_old_rows(sweep_db):
-    """Step 21c purges sweep-run rows older than the retention window only."""
-    import app.reaper_sweeps as rsw
-
-    now = _utcnow()
-    stale = AcceptanceHealingSweepRun(
-        executed_at=now
-        - timedelta(days=rsw.ACCEPTANCE_HEALING_SWEEP_RUN_RETENTION_DAYS + 1),
-        outcome="no_op",
-    )
-    boundary = AcceptanceHealingSweepRun(
-        executed_at=now
-        - timedelta(days=rsw.ACCEPTANCE_HEALING_SWEEP_RUN_RETENTION_DAYS - 1),
-        outcome="changed",
-    )
-    fresh = AcceptanceHealingSweepRun(executed_at=now, outcome="changed")
-    sweep_db.add_all([stale, boundary, fresh])
-    await sweep_db.commit()
-
-    _prev = rsw._last_acceptance_healing_retention_sweep
-    rsw._last_acceptance_healing_retention_sweep = None
-    try:
-        deleted = await rsw.sweep_acceptance_healing_sweep_run_retention(
-            sweep_db, now=now
-        )
-    finally:
-        rsw._last_acceptance_healing_retention_sweep = _prev
-
-    assert deleted == 1
-    remaining = (
-        await sweep_db.execute(select(AcceptanceHealingSweepRun))
-    ).scalars().all()
-    assert {r.id for r in remaining} == {boundary.id, fresh.id}
-
-
-@pytest.mark.asyncio
-async def test_acceptance_healing_sweep_run_retention_cadence_gated(sweep_db):
-    """The purge runs at most daily so it is not re-issued every reaper cycle."""
-    import app.reaper_sweeps as rsw
-
-    now = _utcnow()
-    old_ts = now - timedelta(
-        days=rsw.ACCEPTANCE_HEALING_SWEEP_RUN_RETENTION_DAYS + 1
-    )
-    sweep_db.add(AcceptanceHealingSweepRun(executed_at=old_ts, outcome="no_op"))
-    await sweep_db.commit()
-
-    _prev = rsw._last_acceptance_healing_retention_sweep
-    rsw._last_acceptance_healing_retention_sweep = None
-    try:
-        assert (
-            await rsw.sweep_acceptance_healing_sweep_run_retention(sweep_db, now=now)
-            == 1
-        )
-        assert rsw._last_acceptance_healing_retention_sweep == now
-
-        # A second stale row inside the same day is left alone until the cadence
-        # comes due again.
-        sweep_db.add(AcceptanceHealingSweepRun(executed_at=old_ts, outcome="no_op"))
-        await sweep_db.commit()
-        assert (
-            await rsw.sweep_acceptance_healing_sweep_run_retention(sweep_db, now=now)
-            == 0
-        )
-        assert (
-            len(
-                (await sweep_db.execute(select(AcceptanceHealingSweepRun)))
-                .scalars()
-                .all()
-            )
-            == 1
-        )
-
-        # Once a day has elapsed the purge runs again.
-        later = now + timedelta(
-            seconds=rsw._ACCEPTANCE_HEALING_RETENTION_INTERVAL_SECONDS
-        )
-        assert (
-            await rsw.sweep_acceptance_healing_sweep_run_retention(sweep_db, now=later)
-            == 1
-        )
-    finally:
-        rsw._last_acceptance_healing_retention_sweep = _prev
-
-
-@pytest.mark.asyncio
-async def test_acceptance_healing_sweep_run_retention_wired_into_reaper():
-    """The purge is imported and invoked by the reaper cycle, not just defined."""
-    import inspect
-
-    import app.reaper as reaper
-
-    assert hasattr(reaper, "sweep_acceptance_healing_sweep_run_retention")
-    src = inspect.getsource(reaper)
-    assert "await sweep_acceptance_healing_sweep_run_retention(session, now)" in src
 
 
 @pytest.mark.asyncio
@@ -432,7 +311,7 @@ async def test_acceptance_healing_backfill_skips_closed_projects(sweep_db, mocke
     finally:
         rsw._last_acceptance_healing_backfill_sweep = _prev
 
-    assert total["outcome"] == "no_open_version"
+    assert total == 0
     rollup.assert_not_called()
     unverified.assert_not_called()
     window.assert_not_called()
@@ -440,15 +319,15 @@ async def test_acceptance_healing_backfill_skips_closed_projects(sweep_db, mocke
 
 @pytest.mark.asyncio
 async def test_acceptance_healing_backfill_records_stamped_only_change(sweep_db, mocker):
-    """A rollup-context repair is a changed run even when it mints no evidence."""
+    """A rollup-context repair runs even when it mints no evidence."""
     import app.reaper_sweeps as rsw
     from app import release_version as rv
 
     project = await _make_project(sweep_db)
-    version = await rv.open_version(sweep_db, project.id, version_number=1)
+    await rv.open_version(sweep_db, project.id, version_number=1)
     await sweep_db.commit()
 
-    mocker.patch(
+    rollup = mocker.patch(
         "app.acceptance_criteria.backfill_rollup_child_changed_files",
         new=AsyncMock(return_value=1),
     )
@@ -470,15 +349,8 @@ async def test_acceptance_healing_backfill_records_stamped_only_change(sweep_db,
     finally:
         rsw._last_acceptance_healing_backfill_sweep = previous
 
-    assert result["outcome"] == "changed"
-    assert result["evidence_rows_recorded"] == 0
-    run = await sweep_db.get(AcceptanceHealingSweepRun, UUID(result["run_id"]))
-    assert run is not None
-    assert run.outcome == "changed"
-    assert run.project_pass_counts[str(project.id)]["rollup_children_stamped"] == 1
-    assert run.open_versions_examined == [
-        {"project_id": str(project.id), "release_version_id": str(version.id)}
-    ]
+    assert result == 0
+    rollup.assert_awaited_once_with(sweep_db, project.id, diagnostic={})
 
 
 @pytest.mark.asyncio
@@ -497,10 +369,10 @@ async def test_acceptance_healing_backfill_records_stamped_only_change(sweep_db,
         ),
     ],
 )
-async def test_acceptance_healing_backfill_persists_reconcile_pass_error(
+async def test_acceptance_healing_backfill_continues_after_reconcile_pass_error(
     sweep_db, mocker, real_orm_expiry, helper_name, pass_name, error_code
 ):
-    """Reconcile errors remain visible without poisoning the independent window pass."""
+    """Reconcile errors do not poison the independent window pass."""
     import app.reaper_sweeps as rsw
     from app import release_version as rv
     from sqlalchemy import inspect as sa_inspect
@@ -554,31 +426,15 @@ async def test_acceptance_healing_backfill_persists_reconcile_pass_error(
     finally:
         rsw._last_acceptance_healing_backfill_sweep = previous
 
-    assert result["outcome"] == "error"
+    assert result == 0
     other_pass.assert_awaited_once()
     window_pass.assert_awaited_once()
     assert window_attribute_reads
-    run = await sweep_db.get(AcceptanceHealingSweepRun, UUID(result["run_id"]))
-    assert run is not None
-    assert run.outcome == "error"
-    project_result = run.project_results[0]
-    assert project_result["pass_errors"] == {
-        pass_name: {
-            "error": error_code,
-            "error_type": "DatabaseError",
-        }
-    }
 
 
 @pytest.mark.asyncio
-async def test_acceptance_verdict_healing_sweep_records_skip_reasons(sweep_db):
-    """Step 21b records both a false-zero skip and a real evidence-producing run.
-
-    The durable row is intentionally observational: it identifies the open
-    versions examined and the exact acceptance-window branch, but cannot make
-    the false-zero version covered.  The second project demonstrates that the
-    normal healing path still writes only ordinary criterion evidence.
-    """
+async def test_acceptance_verdict_healing_sweep_mints_window_evidence(sweep_db):
+    """Step 21b heals a real evidence-producing project without side effects on a false zero."""
     from app import acceptance_criteria as ac
     from app import release_version as rv
     import app.reaper_sweeps as rsw
@@ -642,26 +498,4 @@ async def test_acceptance_verdict_healing_sweep_records_skip_reasons(sweep_db):
     finally:
         rsw._last_acceptance_healing_backfill_sweep = previous
 
-    assert result["outcome"] == "changed"
-    assert result["record_persisted"] is True
-    assert result["evidence_rows_recorded"] >= 1
-
-    run = await sweep_db.get(AcceptanceHealingSweepRun, UUID(result["run_id"]))
-    assert run is not None
-    assert run.outcome == "changed"
-    assert set(run.projects_examined) == {
-        str(false_zero_project.id),
-        str(healed_project.id),
-    }
-    assert {entry["release_version_id"] for entry in run.open_versions_examined} == {
-        str(false_zero_version.id),
-        str(healed_version.id),
-    }
-    by_project = {entry["project_id"]: entry for entry in run.project_results}
-    assert by_project[str(false_zero_project.id)]["acceptance_window_branch"] == (
-        "false_zero_window"
-    )
-    healed = by_project[str(healed_project.id)]
-    assert healed["acceptance_window_branch"] == "evidence_recorded"
-    assert healed["pass_counts"]["acceptance_window_evidence"] >= 1
-    assert run.project_pass_counts[str(healed_project.id)] == healed["pass_counts"]
+    assert result >= 1
