@@ -164,6 +164,7 @@ from app.release_scoring import (
     _AUDIT_DEDUCTIONS,  # noqa: F401
     _CHALLENGE_FINDING_MAX,  # noqa: F401 — re-exported for callers/tests
     _DEFAULT_POLICY,
+    PROMOTION_CONFIDENCE_THRESHOLD,  # noqa: F401 — canonical default for tests/callers
     _FINDING_SUMMARY_MAX,
     _MAX_CARRIED_FINDINGS,  # noqa: F401
     _MAX_DELETED_TEST_FILES,  # noqa: F401 — re-exported for callers/tests
@@ -197,6 +198,7 @@ from app.release_scoring import (
     compute_composite,
     evaluate_merge_grade,
     is_contentless_goal,
+    promotion_threshold_for_policy,  # noqa: F401 — canonical enforcement helper
 )
 from app.release_stall_alerts import (
     _BUILD_STALL_AGE_DAYS,  # noqa: F401 — re-exported for back-compat

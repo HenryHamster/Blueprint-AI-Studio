@@ -112,6 +112,40 @@ def test_qualification_contract_fingerprint_tracks_goal_and_categories():
     )
 
 
+def test_declared_promotion_threshold_matches_enforced(mocker):
+    """The packaged default and the real composite gate share one threshold.
+
+    Runtime and project-specific overrides remain supported; this guard checks
+    the fleet default that seeds those overrides.  The three verdicts below
+    exercise the inclusive ``confidence >= threshold`` enforcement boundary.
+    """
+    mocker.patch.dict(
+        rq._runtime_config,
+        {"promotion_threshold": None, "promotion_weights": None},
+        clear=False,
+    )
+    policy = rq._load_policy()
+    declared_threshold = policy["threshold"]
+
+    assert declared_threshold == pytest.approx(rq.PROMOTION_CONFIDENCE_THRESHOLD)
+
+    for candidate_confidence, expected_promotion in (
+        (declared_threshold - 0.0001, False),
+        (declared_threshold, True),
+        (declared_threshold + 0.0001, True),
+    ):
+        verdict = rq.compute_composite(
+            ci_green=True,
+            audit_score=candidate_confidence,
+            test_erosion=candidate_confidence,
+            smoketest_score=None,
+            smoketest_enabled=False,
+            policy=policy,
+        )
+        assert verdict["confidence"] == pytest.approx(candidate_confidence, abs=0.0001)
+        assert verdict["promote"] is expected_promotion
+
+
 @pytest.mark.asyncio
 async def test_promotion_disabled_does_not_overwrite_pending_qualification(
     db_session, mocker

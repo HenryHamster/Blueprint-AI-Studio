@@ -26,12 +26,19 @@ from app.migration_reconciliation import effective_authorized_divergences
 logger = logging.getLogger(__name__)
 
 
+# Canonical fleet default for the promotion confidence gate.  The packaged
+# promotion_policy.yaml value and runtime-config seed must agree with this
+# value; the release-qualifier guard tests that contract.  Runtime and
+# per-project policy overrides are intentionally resolved above this default.
+PROMOTION_CONFIDENCE_THRESHOLD = 0.90
+
+
 # Hardcoded fallback used when promotion_policy.yaml is missing, unreadable, or
 # malformed.  MUST match the documented defaults in promotion_policy.yaml so a
 # parse failure degrades to the intended rubric rather than a silent surprise.
 _DEFAULT_POLICY: dict[str, Any] = {
     "weights": {"audit": 4 / 7, "test_erosion": 3 / 7},
-    "threshold": 0.90,
+    "threshold": PROMOTION_CONFIDENCE_THRESHOLD,
 }
 
 # total_open count at which _score_completion_debt_pressure reaches 0.0.
@@ -113,6 +120,16 @@ def _clamp01(value: float) -> float:
     if v > 1.0:
         return 1.0
     return v
+
+
+def promotion_threshold_for_policy(policy: dict[str, Any]) -> float:
+    """Return the threshold the composite promotion gate must enforce.
+
+    A resolved policy may carry an operator-configured threshold.  The shared
+    canonical default is used only when a caller supplies an incomplete policy,
+    keeping fallback behavior and the enforcement path on the same definition.
+    """
+    return float(policy.get("threshold", PROMOTION_CONFIDENCE_THRESHOLD))
 
 
 # Default coverage threshold used ONLY when the merge-grade artifact omits an
@@ -976,7 +993,7 @@ def compute_composite(
     a short human-readable string when a hard blocker fired, else None.
     """
     weights = policy.get("weights") or _DEFAULT_POLICY["weights"]
-    threshold = float(policy.get("threshold", _DEFAULT_POLICY["threshold"]))
+    threshold = promotion_threshold_for_policy(policy)
     # Qualifier VM smoke is retired. Accept legacy three-key policies, ignore
     # their smoke weight, and renormalize the two active deterministic signals.
     w_audit = float(weights.get("audit", _DEFAULT_POLICY["weights"]["audit"]))
