@@ -68,6 +68,21 @@ class TestGpuPassthroughRetry(unittest.TestCase):
         self.assertEqual(retry_at, local_runner._GPU_PASSTHROUGH_RETRY_SECONDS)
         refresh.assert_called_once_with(transient)
 
+        # no_host_gpu is a permanent state — must NOT be retried regardless of elapsed time.
+        no_host_gpu = iso.replace(
+            _docker_caps(),
+            container_gpu_passthrough={
+                "docker": {"verified": False, "mode": "hook", "reason": "no_host_gpu"}
+            },
+        )
+        with patch.object(iso, "refresh_container_gpu_passthrough") as refresh_permanent:
+            result2, retry_at2 = local_runner._retry_transient_gpu_passthrough(
+                no_host_gpu, 0.0, now=999.0
+            )
+        self.assertIs(result2, no_host_gpu)
+        self.assertEqual(retry_at2, 0.0)
+        refresh_permanent.assert_not_called()
+
 
 class TestVerificationToolchain(unittest.TestCase):
     def test_bootstrap_failure_is_not_a_verification_claim(self):
@@ -94,20 +109,6 @@ class TestVerificationToolchain(unittest.TestCase):
                  patch.object(local_runner.subprocess, "run", side_effect=fake_run):
                 toolchain = local_runner._bootstrap_verification_toolchain()
             self.assertEqual(toolchain.python_path, os.path.join(root, "venv", "bin", "python"))
-
-        no_host_gpu = iso.replace(
-            _docker_caps(),
-            container_gpu_passthrough={
-                "docker": {"verified": False, "mode": "hook", "reason": "no_host_gpu"}
-            },
-        )
-        with patch.object(iso, "refresh_container_gpu_passthrough") as refresh:
-            result, retry_at = local_runner._retry_transient_gpu_passthrough(
-                no_host_gpu, 0.0, now=999.0
-            )
-        self.assertIs(result, no_host_gpu)
-        self.assertEqual(retry_at, 0.0)
-        refresh.assert_not_called()
 
 
 def _healthy_llm_clis():

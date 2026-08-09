@@ -223,7 +223,7 @@ def _bootstrap_verification_toolchain() -> "iso.VerificationToolchain | None":
         with open(ruff_input, "w", encoding="utf-8") as fh:
             fh.write("verification_value = 1\n")
         try:
-            ruff = run([python_path, "-m", "ruff", "check", "--isolated", "--no-cache", ruff_input], 30, tool_env)
+            run([python_path, "-m", "ruff", "check", "--isolated", "--no-cache", ruff_input], 30, tool_env)
         finally:
             try:
                 os.remove(ruff_input)
