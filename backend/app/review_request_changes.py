@@ -48,6 +48,7 @@ from app.review_pipeline import (
     detect_fix_all_issue_class,
     fix_all_occurrences_directive,
     review_loop_parked_for_operator,
+    stale_respawn_delta_base_sha,
 )
 from app.rollup_locking import _OriginalTaskLockTimeout, _lock_original_task
 
@@ -447,6 +448,18 @@ async def run_request_changes(
                 branch,
                 base_branch,
                 original_task_id=original_task_id,
+                # The prior review's head is the narrowest safe diff base for
+                # the replacement review — but only when the head actually
+                # moved and the base did not. Base-drift-only and empty
+                # provenance stay a full-review fallback; a head-relative
+                # delta would be empty and would silently drop the reported
+                # defect.
+                delta_base_sha=stale_respawn_delta_base_sha(
+                    reviewed_head_sha=reviewed_head_sha,
+                    reviewed_base_sha=reviewed_base_sha,
+                    live_head_sha=head_sha,
+                    live_base_sha=base_sha,
+                ),
                 review_target={
                     "project_id": str(task.project_id),
                     "pr_number": int(pr_number),

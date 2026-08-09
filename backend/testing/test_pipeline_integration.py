@@ -1190,6 +1190,10 @@ async def test_cached_approve_with_stale_base_always_respawns_exact_target_revie
         "base_sha": "live-base",
         "head_sha": "same-head",
     }
+    # Base-drift-only: the head never moved, so a head-relative delta would be
+    # an EMPTY diff range reviewed with broad context suppressed — a rubber
+    # stamp. The respawn must be a full re-review against the new base.
+    assert not _review_loop(rereviews[0]).get("delta_base_sha")
 
 
 @pytest.mark.asyncio

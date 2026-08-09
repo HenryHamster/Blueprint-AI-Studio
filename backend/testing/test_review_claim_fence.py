@@ -18,7 +18,9 @@ def _target(project: Project, pr_number: int, *, head: str = "head-a") -> dict:
     }
 
 
-def _mock_live_pr(mocker, *, head: str = "head-a") -> AsyncMock:
+def _mock_live_pr(
+    mocker, *, base: str = "base-a", head: str = "head-a"
+) -> AsyncMock:
     mocker.patch(
         "app.review_claim_fence.get_github_token_for_task",
         new=AsyncMock(return_value=("token", "owner", "repo")),
@@ -29,7 +31,7 @@ def _mock_live_pr(mocker, *, head: str = "head-a") -> AsyncMock:
             return_value={
                 "state": "open",
                 "merged": False,
-                "base": {"sha": "base-a"},
+                "base": {"sha": base},
                 "head": {"sha": head},
             }
         ),
@@ -83,11 +85,82 @@ async def test_claim_fence_collapses_duplicate_exact_review(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_claim_fence_revalidates_in_progress_review_replay(
-    db_session, mocker
+@pytest.mark.parametrize("task_type", ["review", "fix"])
+async def test_claim_fence_collapses_duplicate_across_sibling_projects(
+    db_session, mocker, task_type
+):
+    """Duplicates registered under a *second* project for the same repo collapse.
+
+    ``chain_tasks`` spans every project ``repository_project_ids`` returns for
+    one owner/repo, so a sibling candidate legitimately carries a different
+    ``project_id`` than the fenced task's live target. If the target predicate
+    compared ``project_id`` it would drop that sibling from the contender set,
+    each duplicate would elect itself canonical, and two concurrent
+    reviews/fixes would run against the same PR head.
+    """
+    owner_project = Project(
+        name=f"Claim fence cross-project owner {task_type}",
+        user_id="test-user",
+        github_owner="owner",
+        github_repo="repo",
+    )
+    duplicate_project = Project(
+        name=f"Claim fence cross-project duplicate {task_type}",
+        user_id="test-user",
+        github_owner="owner",
+        github_repo="repo",
+    )
+    db_session.add_all([owner_project, duplicate_project])
+    await db_session.commit()
+    await db_session.refresh(owner_project)
+    await db_session.refresh(duplicate_project)
+
+    pr_number = 4201 if task_type == "review" else 4202
+    target_key = "review_target" if task_type == "review" else "fix_target"
+    owner = Task(
+        id=uuid.UUID(int=11 if task_type == "review" else 13),
+        project_id=owner_project.id,
+        title=f"Canonical {task_type} (owner project)",
+        payloads=[{"type": task_type, "pr_number": pr_number}],
+        # Pinned under its OWN project id — the fenced sibling's live target
+        # names the duplicate project.
+        context={"review_loop": {target_key: _target(owner_project, pr_number)}},
+        status=TaskStatus.QUEUED,
+    )
+    duplicate = Task(
+        id=uuid.UUID(int=12 if task_type == "review" else 14),
+        project_id=duplicate_project.id,
+        title=f"Duplicate {task_type} (sibling project)",
+        payloads=[{"type": task_type, "pr_number": pr_number}],
+        context={"review_loop": {target_key: _target(duplicate_project, pr_number)}},
+        status=TaskStatus.QUEUED,
+    )
+    db_session.add_all([owner, duplicate])
+    await db_session.commit()
+    _mock_live_pr(mocker)
+
+    decision = await lock_pr_task_for_execution(
+        db_session,
+        task_id=duplicate.id,
+        claimable_statuses=(TaskStatus.QUEUED,),
+    )
+    await db_session.commit()
+
+    assert decision.allowed is False, (
+        "cross-project duplicate must collapse onto the canonical sibling"
+    )
+    assert "already owns execution" in decision.reason
+    await db_session.refresh(duplicate)
+    assert duplicate.status == TaskStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("task_type", ["review", "fix"])
+async def test_base_drift_retargets_instead_of_cancelling(
+    db_session, mocker, task_type
 ):
     project = Project(
-        name="Claim fence replay",
+        name=f"Claim fence base drift {task_type}",
         user_id="test-user",
         github_owner="owner",
         github_repo="repo",
@@ -95,19 +168,74 @@ async def test_claim_fence_revalidates_in_progress_review_replay(
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
-    pr_number = 4102
+    pr_number = 4102 if task_type == "review" else 4109
+    target_key = "review_target" if task_type == "review" else "fix_target"
     task = Task(
         project_id=project.id,
-        title="Stale replay review",
-        payloads=[{"type": "review", "pr_number": pr_number}],
+        title=f"Base-drift {task_type}",
+        payloads=[{"type": task_type, "pr_number": pr_number}],
         context={
-            "review_loop": {"review_target": _target(project, pr_number, head="old")}
+            "review_loop": {
+                target_key: {
+                    **_target(project, pr_number),
+                    "base_sha": "old-base",
+                }
+            }
         },
         status=TaskStatus.IN_PROGRESS,
     )
     db_session.add(task)
     await db_session.commit()
-    _mock_live_pr(mocker, head="new")
+    _mock_live_pr(mocker, base="new-base")
+
+    decision = await lock_pr_task_for_execution(
+        db_session,
+        task_id=task.id,
+        claimable_statuses=(TaskStatus.IN_PROGRESS,),
+    )
+    await db_session.commit()
+
+    assert decision.allowed is True
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.IN_PROGRESS
+    assert (task.context or {})["review_loop"][target_key] == {
+        "project_id": str(project.id),
+        "pr_number": pr_number,
+        "base_sha": "new-base",
+        "head_sha": "head-a",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("task_type", ["review", "fix"])
+async def test_claim_fence_rejects_head_drift_for_review_and_fix(
+    db_session, mocker, task_type
+):
+    project = Project(
+        name=f"Claim fence head drift {task_type}",
+        user_id="test-user",
+        github_owner="owner",
+        github_repo="repo",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    pr_number = 4110 if task_type == "review" else 4111
+    target_key = "review_target" if task_type == "review" else "fix_target"
+    task = Task(
+        project_id=project.id,
+        title=f"Head-drift {task_type}",
+        payloads=[{"type": task_type, "pr_number": pr_number}],
+        context={
+            "review_loop": {
+                target_key: _target(project, pr_number, head="old-head")
+            }
+        },
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    _mock_live_pr(mocker, head="new-head")
 
     decision = await lock_pr_task_for_execution(
         db_session,
@@ -117,7 +245,11 @@ async def test_claim_fence_revalidates_in_progress_review_replay(
     await db_session.commit()
 
     assert decision.allowed is False
-    assert decision.reason == "assigned review target is stale"
+    assert decision.reason == (
+        "assigned review target is stale"
+        if task_type == "review"
+        else "assigned fix target is stale"
+    )
     await db_session.refresh(task)
     assert task.status == TaskStatus.CANCELLED
 

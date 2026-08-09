@@ -10557,11 +10557,63 @@ async def test_stale_head_verdict_discards_fix_and_respawns_review(tl_db, mocker
     assert spawned_task_type == "review", (
         f"Stale-head discard must respawn a review, got {spawned_task_type!r}"
     )
+    assert calls[0][1]["delta_base_sha"] == "oldsha0000000"
 
     # Context flags.
     ctx = review_task.context or {}
     assert ctx.get("_review_stale_head") is True, "_review_stale_head must be set"
     assert not any(call[0][1] == "fix" for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_base_drift_only_request_changes_respawns_full_review(tl_db, mocker):
+    """Base-only drift must respawn a FULL review, never an empty delta.
+
+    When only ``reviewed_base_sha`` goes stale the head is unchanged, so a
+    ``delta_base_sha`` equal to the prior reviewed head would make the
+    replacement reviewer run ``git diff <live head>..HEAD`` — an empty range,
+    with the broad-review context suppressed. It would inspect nothing, and
+    the REQUEST_CHANGES finding this respawn exists to re-prove would be
+    silently dropped.
+    """
+    calls, review_task = await _run_stale_head_branch(
+        tl_db,
+        mocker,
+        reviewed_head_sha="samehead00000",
+        live_head_sha="samehead00000",
+        reviewed_base_sha="oldbase000000",
+        live_base_sha="newbase111111",
+    )
+
+    review_calls = [c for c in calls if c[0][1] == "review"]
+    assert len(review_calls) == 1
+    assert not any(c[0][1] == "fix" for c in calls)
+    assert review_calls[0][1]["delta_base_sha"] == ""
+    assert (review_task.context or {}).get("_review_stale_head") is True
+
+
+@pytest.mark.asyncio
+async def test_base_and_head_drift_request_changes_respawns_full_review(
+    tl_db, mocker
+):
+    """When the base moved too, no head-relative delta can cover the change.
+
+    The prior review proved ``old base..old head``. A delta from the old head
+    would show the head motion but never the effect of the new base, so the
+    respawn must fall back to a full review.
+    """
+    calls, _ = await _run_stale_head_branch(
+        tl_db,
+        mocker,
+        reviewed_head_sha="oldhead000000",
+        live_head_sha="newhead111111",
+        reviewed_base_sha="oldbase000000",
+        live_base_sha="newbase111111",
+    )
+
+    review_calls = [c for c in calls if c[0][1] == "review"]
+    assert len(review_calls) == 1
+    assert review_calls[0][1]["delta_base_sha"] == ""
 
 
 @pytest.mark.asyncio
@@ -10839,6 +10891,7 @@ async def test_missing_review_provenance_respawns_exact_target_review(tl_db, moc
         "base_sha": "livebasesha",
         "head_sha": "anylivesha",
     }
+    assert review_calls[0][1]["delta_base_sha"] == ""
     assert (review_task.context or {}).get("_review_stale_head") is True
 
 

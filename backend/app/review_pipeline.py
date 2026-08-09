@@ -1741,6 +1741,43 @@ async def _pinned_unclaimed_sibling_exists(
     return (await session.execute(stmt)).first() is not None
 
 
+def stale_respawn_delta_base_sha(
+    *,
+    reviewed_head_sha: object,
+    reviewed_base_sha: object,
+    live_head_sha: object,
+    live_base_sha: object,
+) -> str:
+    """Narrowest *safe* diff base for a respawned exact-target review.
+
+    A delta review runs ``git diff <delta_base_sha>..HEAD`` with the broad
+    review context deliberately suppressed (agent/src/handlers/review-fix.ts).
+    That narrowing is only sound when the head actually moved AND the base did
+    not: the discarded review already covered ``reviewed_base..reviewed_head``,
+    so the head delta is then the sole unreviewed range.
+
+    Returns "" — meaning a FULL re-review — in every other case:
+
+    * **base-drift only** (``reviewed_head == live head``): the delta range is
+      empty, so a delta reviewer inspects nothing and rubber-stamps an
+      approval, or silently drops a real REQUEST_CHANGES finding.
+    * **the base moved at all**: the code was never reviewed against the new
+      base, and no head-relative delta can cover that.
+    * **missing provenance** on either side: never guess a narrower scope.
+    """
+    reviewed_head = str(reviewed_head_sha or "")
+    reviewed_base = str(reviewed_base_sha or "")
+    live_head = str(live_head_sha or "")
+    live_base = str(live_base_sha or "")
+    if not (reviewed_head and reviewed_base and live_head and live_base):
+        return ""
+    # base moved  -> no head-relative delta can cover it.
+    # head held   -> the delta range would be empty.
+    if reviewed_base != live_base or reviewed_head == live_head:
+        return ""
+    return reviewed_head
+
+
 async def _spawn_pipeline_task(
     source_task: Task,
     task_type: str,

@@ -56,6 +56,7 @@ from app.review_pipeline import (
     build_ci_failure_fix_prompt,
     build_merge_conflict_fix_prompt,
     reconciled_approve_markers,
+    stale_respawn_delta_base_sha,
     evaluate_auto_approve_small_main,
     ensure_issue_ids,
     should_skip_initial_review,
@@ -3501,6 +3502,18 @@ async def _process_post_commit(
                             branch,
                             base_branch,
                             original_task_id=original_task_id,
+                            # Re-review only the head delta that made the
+                            # approval stale. Base drift (and missing
+                            # provenance) falls back to a full review: the
+                            # head-relative delta would be empty and the
+                            # respawn would rubber-stamp code never reviewed
+                            # against the new base.
+                            delta_base_sha=stale_respawn_delta_base_sha(
+                                reviewed_head_sha=reviewed_head_sha,
+                                reviewed_base_sha=reviewed_base_sha,
+                                live_head_sha=_live_approve_target["head_sha"],
+                                live_base_sha=_live_approve_target["base_sha"],
+                            ),
                             review_target=_live_approve_target,
                         )
                         await session.commit()
@@ -4007,6 +4020,16 @@ async def _process_post_commit(
                                     branch,
                                     base_branch,
                                     original_task_id=original_task_id,
+                                    # Keep the defensive merge-path respawn
+                                    # consistent with the primary stale guard:
+                                    # delta only when the head really moved and
+                                    # the base held still.
+                                    delta_base_sha=stale_respawn_delta_base_sha(
+                                        reviewed_head_sha=reviewed_head_sha,
+                                        reviewed_base_sha=reviewed_base_sha,
+                                        live_head_sha=head_sha,
+                                        live_base_sha=live_base_sha,
+                                    ),
                                     review_target={
                                         "project_id": str(task.project_id),
                                         "pr_number": int(pr_number),
