@@ -259,7 +259,7 @@ def _execute_pending_activation(agent_args: argparse.Namespace) -> int:
             "promoted_sha": binding_sha,
             "revision": revision,
         }.items()
-    ):
+    ) and pending_receipt.get("phase") in {"accepted", "completed"}:
         try:
             _post_activation_receipt(deploy_args, promoted, revision)
         except APIError as exc:
@@ -286,6 +286,7 @@ def _execute_pending_activation(agent_args: argparse.Namespace) -> int:
             deploy_args, revision, digest, inplace=True
         )
     except APIError as exc:
+        _clear_activation_state(state_path)
         logger.error("activation failed; no receipt posted: %s", exc)
         return 1
     if release_completed is False:

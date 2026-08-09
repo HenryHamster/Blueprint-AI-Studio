@@ -285,6 +285,19 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
         payload = bootstrap._deploy_agent_unit(
             PurePosixPath("/trusted/bundle"), "henry_hamster"
         ).decode()
+        self.assertIn(
+            "ExecStartPre=/usr/bin/python3.12 /trusted/bundle/blueprint.py "
+            "deploy-agent --preflight",
+            payload,
+        )
+        self.assertIn("StartLimitIntervalSec=60", payload)
+        self.assertIn("StartLimitBurst=3", payload)
+        self.assertLess(
+            payload.index("StartLimitIntervalSec=60"), payload.index("[Service]")
+        )
+        self.assertLess(
+            payload.index("StartLimitBurst=3"), payload.index("[Service]")
+        )
         self.assertIn("User=henry_hamster", payload)
         self.assertIn("RuntimeDirectory=blueprint-deploy-agent", payload)
         self.assertIn("RuntimeDirectoryMode=0750", payload)
@@ -603,8 +616,8 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                 os.close(original_fd)
                 release_socket.close()
 
-    def test_crash_after_release_handoff_retries_receipt_without_second_release(self):
-        """The pre-release marker survives agent death and parks the approval."""
+    def test_send_timeout_after_release_handoff_retries_receipt_without_second_release(self):
+        """An in-flight release parks the receipt without replaying the release."""
         revision = "d" * 40
         promoted = {
             "version_number": 9,
@@ -644,14 +657,13 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                     "_invoke_release_shim",
                     side_effect=lambda *args, **kwargs: (
                         release_calls.append(args),
-                        (_ for _ in ()).throw(KeyboardInterrupt()),
+                        False,
                     )[1],
                 ),
             ):
-                with self.assertRaises(KeyboardInterrupt):
-                    blueprint._deploy_agent_once(args)
+                self.assertFalse(blueprint._deploy_agent_once(args))
                 self.assertTrue(state_path.exists())
-                self.assertEqual(json.loads(state_path.read_text())["phase"], "started")
+                self.assertEqual(json.loads(state_path.read_text())["phase"], "accepted")
 
                 self.assertTrue(blueprint._deploy_agent_once(args))
                 self.assertEqual(len(release_calls), 1)

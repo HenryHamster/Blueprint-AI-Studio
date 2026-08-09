@@ -6411,6 +6411,7 @@ def _deploy_agent_once(args: argparse.Namespace) -> bool:
             pending_receipt.get("version_number") == approved.get("version_number")
             and pending_receipt.get("promoted_sha") == promoted_sha
             and pending_receipt.get("revision") == promoted_sha
+            and pending_receipt.get("phase") in {"accepted", "completed"}
         ):
             _post_activation_receipt(
                 argparse.Namespace(
@@ -6453,7 +6454,13 @@ def _deploy_agent_once(args: argparse.Namespace) -> bool:
     # at-most-once fence when the agent dies or the socket wait expires while
     # the root service continues the release.
     _write_deploy_agent_state(state_path, activation_state)
-    release_completed = _invoke_release_shim(release["digest"], release["revision"], host=None)
+    try:
+        release_completed = _invoke_release_shim(
+            release["digest"], release["revision"], host=None
+        )
+    except APIError:
+        _clear_deploy_agent_state(state_path)
+        raise
     if release_completed is False:
         activation_state["phase"] = "accepted"
         _write_deploy_agent_state(state_path, activation_state)

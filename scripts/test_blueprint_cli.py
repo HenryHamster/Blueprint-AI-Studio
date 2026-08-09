@@ -6071,6 +6071,128 @@ def test_deploy_agent_executes_approved_request_and_posts_receipt(monkeypatch, t
 
 
 @pytest.mark.parametrize(
+    "failure",
+    [
+        "release executor socket unavailable: [Errno 111] refused",
+        "release executor failed: rollback completed",
+    ],
+)
+def test_deploy_agent_does_not_post_receipt_when_shim_raises(
+    monkeypatch, tmp_path, failure
+):
+    """A failed release cannot turn its started marker into confirmation."""
+    from blueprint_api import APIError
+
+    promoted = {
+        "id": "uuid-promo",
+        "version_number": 7,
+        "status": "promoted",
+        "promoted_sha": _DEPLOY_PROMOTED_SHA,
+        "serving_status": "unconfirmed",
+        "activation_requested_at": "2026-06-15T00:00:00Z",
+    }
+    calls = []
+    _deploy_env(
+        monkeypatch,
+        _deploy_api_fake(calls, promoted=promoted),
+        revision=_DEPLOY_PROMOTED_SHA,
+    )
+    monkeypatch.setattr(
+        blueprint,
+        "_invoke_release_shim",
+        lambda *args, **kwargs: (_ for _ in ()).throw(APIError(failure)),
+    )
+    state_path = tmp_path / "deploy-agent.state"
+    args = argparse.Namespace(
+        project_id=None,
+        host="control-plane",
+        state_path=str(state_path),
+    )
+
+    with pytest.raises(APIError, match="release"):
+        blueprint._deploy_agent_once(args)
+    assert not any(path.endswith("/activation-receipt") for _, path, _ in calls)
+    assert not state_path.exists()
+
+    state_path.write_text(
+        json.dumps(
+            {
+                "version_number": promoted["version_number"],
+                "promoted_sha": _DEPLOY_PROMOTED_SHA,
+                "revision": _DEPLOY_PROMOTED_SHA,
+                "phase": "started",
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(APIError, match="release"):
+        blueprint._deploy_agent_once(args)
+    assert not any(path.endswith("/activation-receipt") for _, path, _ in calls)
+    assert not state_path.exists()
+
+
+def test_standalone_deploy_agent_does_not_post_receipt_when_shim_raises(
+    monkeypatch, tmp_path
+):
+    """The standalone agent clears a failed handoff before its next cycle."""
+    from blueprint_api import APIError
+
+    promoted = {
+        "id": "uuid-promo",
+        "version_number": 7,
+        "status": "promoted",
+        "promoted_sha": _DEPLOY_PROMOTED_SHA,
+        "serving_status": "unconfirmed",
+        "activation_requested_at": "2026-06-15T00:00:00Z",
+    }
+    calls = []
+    _deploy_env(
+        monkeypatch,
+        _deploy_api_fake(calls, promoted=promoted),
+        revision=_DEPLOY_PROMOTED_SHA,
+    )
+    monkeypatch.setattr(
+        blueprint_deploy_agent,
+        "get_project_id",
+        lambda _project_id=None: "proj-1",
+    )
+    monkeypatch.setattr(
+        blueprint,
+        "_invoke_release_shim",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            APIError("release executor failed: rollback completed")
+        ),
+    )
+    state_path = tmp_path / "deploy-agent.state"
+    args = argparse.Namespace(
+        project_id="proj-1",
+        host="control-plane",
+        dry_run=False,
+        lockfile=str(tmp_path / "deploy-agent.lock"),
+        state_path=str(state_path),
+    )
+
+    assert blueprint_deploy_agent._execute_pending_activation(args) == 1
+    assert not any(path.endswith("/activation-receipt") for _, path, _ in calls)
+    assert not state_path.exists()
+
+    state_path.write_text(
+        json.dumps(
+            {
+                "version_number": promoted["version_number"],
+                "promoted_sha": _DEPLOY_PROMOTED_SHA,
+                "revision": _DEPLOY_PROMOTED_SHA,
+                "phase": "started",
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert blueprint_deploy_agent._execute_pending_activation(args) == 1
+    assert not any(path.endswith("/activation-receipt") for _, path, _ in calls)
+    assert not state_path.exists()
+
+
+@pytest.mark.parametrize(
     ("error", "status"),
     [
         ("HTTP 401: invalid credential", "unauthorized"),
@@ -6207,6 +6329,7 @@ def test_standalone_deploy_agent_read_only_refuses_before_shim(monkeypatch, tmp_
 def test_deploy_agent_noops_without_live_approval(monkeypatch):
     """No approval (or a resolved approval) never reaches GitHub, the shim,
     or the receipt endpoint."""
+    monkeypatch.setattr(blueprint, "_require_write_config", lambda _action: None)
     monkeypatch.setattr(blueprint, "_read_live_approved_activation", lambda args: None)
     monkeypatch.setattr(
         blueprint,
