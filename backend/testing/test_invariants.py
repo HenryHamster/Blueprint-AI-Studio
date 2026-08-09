@@ -10846,6 +10846,13 @@ _LIVE_REF_READ_ALLOWLIST = frozenset(
         # then writes it under an expected-head lease. Cached tips would defeat
         # the compare-and-swap and can recreate the empty-commit loop.
         "rollup_size_preflight.py:preflight_rollup_size_caps",
+        # Approved-PR stranding detection fetches the integration branch's exact
+        # live HEAD to decide whether an approved PR's commit actually landed
+        # (is an ancestor). The checked head is reported verbatim in the evidence
+        # and operator alert, and a <=60s-stale cached tip could flip the
+        # ancestor test either way — producing a false stranding verdict or
+        # missing a real one. This read is SHA-critical.
+        "approved_pr_stranding.py:_inspect_approved_pr_with_github",
     }
 )
 

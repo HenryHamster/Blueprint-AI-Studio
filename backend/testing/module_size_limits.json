@@ -383,7 +383,6 @@
     "test_release_qualifier__sweep_stuck_qualifications.py": 6100,
     "test_release_qualifier__site_b_lock_window_fix.py": 4950,
     "_release_qualifier_testhelpers.py": 2350,
-    "test_release_qualifier.py": 2850,
     "test_operator_inbox_liveness.py": 2800,
     "test_compute_image_build_local.py": 9400,
     "test_compute_runner_dispatch.py": 3350,

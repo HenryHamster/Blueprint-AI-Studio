@@ -12675,8 +12675,14 @@ async def test_capability_proof_trial_flag_off_records_nothing(db_session):
 
 
 def test_local_runner_receipt_requires_bootstrapped_toolchain_and_probe_legs():
-    scripts_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "scripts"))
-    sys.path.insert(0, scripts_root)
+    from pathlib import Path
+
+    script_candidates = (
+        Path(__file__).parents[2] / "scripts",
+        Path("/repo/scripts"),
+    )
+    scripts_dir = next(path for path in script_candidates if path.is_dir())
+    sys.path.insert(0, str(scripts_dir))
     import local_runner as runner
     import runner_isolation as isolation
 
