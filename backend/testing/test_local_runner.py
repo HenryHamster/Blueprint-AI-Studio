@@ -3399,16 +3399,21 @@ class TestRunnerEndpoints:
         assert "runner_target_id" not in (task.context or {})
 
     @pytest.mark.asyncio
-    async def test_next_task_dispatches_browser_task_on_chromium_capable_runner(
+    async def test_pull_time_guard_reads_nested_chromium_capability(
         self, client: AsyncClient, db_session
     ):
-        """The browser guard must not over-block: a browser-required task pinned to
-        a Chromium-capable runner dispatches normally and is NOT released."""
+        """A nested heartbeat capability admits a browser-required pinned task."""
         project = await _make_project(db_session)
         runner, token = await _make_runner(
             db_session,
             project.id,
-            capabilities={"task_types": "all", "playwright_chromium_usable": True},
+            capabilities={
+                "task_types": "all",
+                "isolation_backends": {
+                    "docker_usable": True,
+                    "playwright_chromium_usable": True,
+                },
+            },
         )
         _seed_pool_account(TEST_USER_ID)
         try:
@@ -3441,6 +3446,10 @@ class TestRunnerEndpoints:
             assert task.status == TaskStatus.PROVISIONING
             assert task.started_at is not None
             assert task.vm_instance_id == f"runner:{runner.id}"
+            assert runner.capabilities["isolation_backends"][
+                "playwright_chromium_usable"
+            ] is True
+            assert "playwright_chromium_usable" not in runner.capabilities
             assert body["agent_token"]
         finally:
             _clear_pool()

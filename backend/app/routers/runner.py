@@ -1310,10 +1310,9 @@ async def next_task(
     # guard and _select_eligible_runner agree exactly on which tasks need Chromium.
     # Lazy: orchestrator_runner_dispatch closes an import cycle with this module.
     from app.orchestrator_runner_dispatch import _payload_requires_browser
+    from app.runner_eligibility import _runner_chromium_usable
 
-    runner_chromium_usable = (
-        runner.capabilities or {}
-    ).get("playwright_chromium_usable") is True
+    runner_chromium_usable = _runner_chromium_usable(runner)
 
     def _runner_lacks_required_browser(candidate: Task) -> bool:
         """This runner cannot satisfy a browser-required candidate pinned to it."""
