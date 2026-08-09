@@ -637,10 +637,16 @@ async def test_sweep_triggers_stabilize_stall_check(db_session):
     )
     await db_session.commit()
 
+    # Scoped to the stabilize-stall event type — the same sweep runs independent
+    # lifecycle checks (e.g. the standing full-suite drift sentinel) that may
+    # emit their own alerts for this project.
     alerts = (
         (
             await db_session.execute(
-                select(_Alert).where(_Alert.project_id == project.id)
+                select(_Alert).where(
+                    _Alert.project_id == project.id,
+                    _Alert.event_type == "release.stabilize_stalled",
+                )
             )
         )
         .scalars()
@@ -1054,6 +1060,45 @@ async def test_finalize_records_ci_resolution_on_not_promoted(db_session, mocker
     assert ci_res["state"] == rq._CI_PENDING
     assert ci_res["resolved_sha"] is None
     assert ci_res["detail"] == "no check-runs on candidate and no PR head with CI"
+
+
+@pytest.mark.asyncio
+async def test_finalize_relaxed_no_checks_records_ci_dimension_as_passed(
+    db_session, mocker
+):
+    """A topology-safe no_checks result is passed in the persisted CI ledger."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+    mocker.patch.object(
+        rq, "resolve_project_promotion_enabled", return_value=False
+    )
+    _project, version = await _seed_relaxed_ci_clean_qualification(db_session)
+    mocker.patch.object(rq, "promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(
+        db_session,
+        version,
+        _pre_gates=_clean_finalize_pre_gates(
+            rq._CI_NO_CHECKS,
+            ci_required=False,
+            integration_branch_topology={
+                "integration_branch": "automain",
+                "promotion_target": "main",
+                "candidate_reachable_from_integration": True,
+            },
+        ),
+    )
+    await db_session.commit()
+
+    assert result["status"] == "dry_run"
+    assert result.get("blocker") is None
+    rows = await _dimension_rows_by_dim(db_session, version)
+    assert rows["ci"].status == "passed"
+    assert rows["ci"].detail["state"] == rq._CI_NO_CHECKS
+    assert rows["ci"].detail["integration_branch_topology"][
+        "candidate_reachable_from_integration"
+    ] is True
 
 
 @pytest.mark.asyncio

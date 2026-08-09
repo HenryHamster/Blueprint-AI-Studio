@@ -1847,6 +1847,26 @@ def _ci_required_for_finalize(
         return True
     return not proceed_on_no_checks(project, integration_branch)
 
+
+def _ci_dimension_status(
+    *,
+    ci_green: bool,
+    ci_resolution: dict[str, Any],
+    ci_required: bool,
+) -> str:
+    """Map the effective CI policy to the persisted dimension status.
+
+    A topology-safe ``no_checks`` result is a deliberate non-blocking outcome,
+    not a failed or unresolved CI result.  Keep this mapping beside the
+    finalize policy so the eager and comprehensive ledger writers cannot drift
+    from ``compute_composite``'s blocker semantics.
+    """
+    if ci_green or (
+        not ci_required and ci_resolution.get("state") == _CI_NO_CHECKS
+    ):
+        return "passed"
+    return "blocked"
+
 async def _resolve_ci_at_finalize(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -5589,6 +5609,10 @@ async def _dual_write_dimension_results(
     sub_scores = base_record.get("sub_scores") or {}
     blocker = composite.get("blocker")
     ci_green = bool(base_record.get("ci_green"))
+    ci_resolution = base_record.get("ci_resolution")
+    if not isinstance(ci_resolution, dict):
+        ci_resolution = {}
+    ci_required = bool(base_record.get("ci_required", True))
 
 
     def _score(key: str) -> float | None:
@@ -5663,10 +5687,14 @@ async def _dual_write_dimension_results(
     specs: list[dict[str, Any]] = [
         {
             "dimension": "ci",
-            "status": "passed" if ci_green else "blocked",
+            "status": _ci_dimension_status(
+                ci_green=ci_green,
+                ci_resolution=ci_resolution,
+                ci_required=ci_required,
+            ),
             "sub_score": None,
             "blocker": _own_blocker({"ci_not_green", "ci_unresolved"}),
-            "detail": base_record.get("ci_resolution"),
+            "detail": ci_resolution,
             "producing_task_id": None,
         },
         {
@@ -6165,17 +6193,28 @@ async def _finalize_qualification(
             session, version, candidate_sha
         )
 
+    ci_state = ci_resolution.get("state", _CI_RED)
+    _policy_project = await session.get(Project, version.project_id)
+    ci_required = True
+    if _pre_gates is not None and "ci_required" in _pre_gates:
+        ci_required = bool(_pre_gates["ci_required"])
+    elif ci_state == _CI_NO_CHECKS:
+        ci_required = _ci_required_for_finalize(_policy_project, ci_resolution)
+
     # Eager-write CI dimension so this fact survives a later gate's infra failure
     # that returns before _dual_write_dimension_results (line 5065).
     if candidate_sha:
         await _upsert_dimension_result(
             session, version, candidate_sha, "ci",
-            status="passed" if ci_green else "blocked",
+            status=_ci_dimension_status(
+                ci_green=ci_green,
+                ci_resolution=ci_resolution,
+                ci_required=ci_required,
+            ),
             detail=ci_resolution if isinstance(ci_resolution, dict) else None,
             origin_attempt_id=attempt_id,
         )
 
-    _policy_project = await session.get(Project, version.project_id)
     # Prefer the promotion policy frozen at spawn; fall back to the live policy
     # for legacy records that predate the attempt-contract freeze.
     policy = qual.get("promotion_policy_snapshot") or _load_policy(_policy_project)
@@ -8012,13 +8051,6 @@ async def _finalize_qualification(
         "rubric_provenance": rubric_provenance,
     }
 
-    ci_state = ci_resolution.get("state", _CI_RED)
-    ci_required = True
-    if _pre_gates is not None and "ci_required" in _pre_gates:
-        ci_required = bool(_pre_gates["ci_required"])
-    elif ci_state == _CI_NO_CHECKS:
-        _proj_for_ci_gate = await session.get(Project, version.project_id)
-        ci_required = _ci_required_for_finalize(_proj_for_ci_gate, ci_resolution)
     merge_grade_misses = _merge_grade_misses_armed(
         {
             "merge_grade_status": merge_grade_cert["status"],
@@ -8621,6 +8653,7 @@ async def _finalize_qualification(
         # differs only in CI/fixture/config files (content-hash reuse).
         "candidate_diff_hash": qual.get("candidate_diff_hash"),
         "ci_green": ci_green,
+        "ci_required": ci_required,
         "ci_resolution": ci_resolution,
         "smoketest_enabled": smoketest_enabled,
         "confidence": composite["confidence"],

@@ -5931,10 +5931,16 @@ async def test_step9_calcification_alert_fires_for_repeated_hard_blockers(
     await _run_reaper_once()
     await reaper_db.refresh(version)
 
+    # Scoped to the calcification event type — the same Step 9 sweep runs
+    # independent lifecycle checks (e.g. the standing full-suite drift sentinel)
+    # that may emit their own alerts for this project.
     alerts = (
         (
             await reaper_db.execute(
-                _select(_Alert).where(_Alert.project_id == project.id)
+                _select(_Alert).where(
+                    _Alert.project_id == project.id,
+                    _Alert.event_type == "release.calcifying",
+                )
             )
         )
         .scalars()
@@ -5973,10 +5979,16 @@ async def test_step9_calcification_alert_not_fired_for_dry_run_hold(
 
     await _run_reaper_once()
 
+    # Scoped to the calcification event type: the assertion is that a dry-run
+    # hold raises no CALCIFICATION alert.  Unrelated sweep observations (e.g.
+    # the standing full-suite drift sentinel) are not part of that contract.
     alerts = (
         (
             await reaper_db.execute(
-                _select(_Alert).where(_Alert.project_id == project.id)
+                _select(_Alert).where(
+                    _Alert.project_id == project.id,
+                    _Alert.event_type == "release.calcifying",
+                )
             )
         )
         .scalars()
