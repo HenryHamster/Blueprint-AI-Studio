@@ -146,12 +146,16 @@ CODE_ACCEPTANCE_VERDICT_KEY = "code_acceptance_verdict"
 # :func:`effective_acceptance_verdict` (rung 3), which re-derives any recorded
 # row whose stamp predates the current rule.
 #
+# v3: rollup children now carry an authoritative changed-file signal derived from
+# their own immutable PR commit range.  That provenance is distinct from the
+# parent's union diff, so a matching named test may earn machine proof.
+#
 # v2: the evaluation rules changed this version — :func:`_merge_acceptance_test_block`
 # now also reads the inherited rollup-child block (:data:`INHERITED_ACCEPTANCE_BLOCK_KEY`)
 # and the window-corroboration marker semantics changed, so a row stamped under v1
 # can score differently under the current core. Bumping retires those v1 stamps so
 # rung 3 re-derives them instead of trusting a verdict the retired rule produced.
-ACCEPTANCE_RULE_VERSION = 2
+ACCEPTANCE_RULE_VERSION = 3
 
 # ``rederived_by`` stamped on a re-derived verdict (design doc c50453ef §5).
 # Identifies the actor that re-scored already-merged work so an auditor can tell
@@ -310,6 +314,13 @@ def stamp_changed_files_signal(
 # (inferred) tier and never mint machine ``proven`` credit from it.
 PARENT_DERIVED_CHANGED_FILES_KEY = "_pr_changed_files_from_rollup_parent"
 
+# A rollup child does not own the parent PR, but its persisted review target
+# identifies the exact child PR range.  The compare result for that range is
+# authoritative in the same way as a GitHub PR diff; unlike the parent's union
+# diff it cannot include a sibling's files.  This marker is intentionally a new
+# provenance kind rather than an alias for ``PARENT_DERIVED_CHANGED_FILES_KEY``.
+COMMIT_RANGE_DERIVED_CHANGED_FILES_KEY = "_pr_changed_files_from_rollup_commit_range"
+
 
 def stamp_parent_derived_changed_files_signal(paths: list[str]) -> dict[str, Any]:
     """Changed-file signal for a rollup child inheriting its parent's combined diff.
@@ -324,6 +335,23 @@ def stamp_parent_derived_changed_files_signal(paths: list[str]) -> dict[str, Any
     """
     signal = stamp_changed_files_signal(paths, github_verified=False)
     signal[PARENT_DERIVED_CHANGED_FILES_KEY] = True
+    signal["_pr_changed_files_provenance"] = "parent_derived"
+    return signal
+
+
+def stamp_commit_range_derived_changed_files_signal(paths: list[str]) -> dict[str, Any]:
+    """Stamp a rollup child's exact PR-range changed-file provenance.
+
+    The caller must have obtained *paths* from the child's immutable
+    ``base_sha...head_sha`` compare, never from the rollup parent's combined
+    diff.  The GitHub-verified sentinel makes a named-test match eligible for
+    ``proven=True``; the explicit provenance marker prevents this exact range
+    from being mistaken for the weaker parent-union fallback.
+    """
+    signal = stamp_changed_files_signal(paths, github_verified=True)
+    signal.pop(PARENT_DERIVED_CHANGED_FILES_KEY, None)
+    signal[COMMIT_RANGE_DERIVED_CHANGED_FILES_KEY] = True
+    signal["_pr_changed_files_provenance"] = "commit_range_derived"
     return signal
 
 
@@ -1762,6 +1790,8 @@ _ACCEPTANCE_INPUT_CONTEXT_KEYS = (
     "_pr_changed_files",
     "_pr_changed_files_truncated",
     PARENT_DERIVED_CHANGED_FILES_KEY,
+    COMMIT_RANGE_DERIVED_CHANGED_FILES_KEY,
+    "_pr_changed_files_provenance",
     ACCEPTANCE_TEST_CORROBORATED_KEY,
     TEST_COVERAGE_RESULT_KEY,
     "viewport_failure_screenshot_uri",
@@ -1815,6 +1845,7 @@ def acceptance_input_fingerprint(
         elif key in (
             "_pr_changed_files_truncated",
             PARENT_DERIVED_CHANGED_FILES_KEY,
+            COMMIT_RANGE_DERIVED_CHANGED_FILES_KEY,
         ):
             value = bool(value)
         relevant_context[key] = value

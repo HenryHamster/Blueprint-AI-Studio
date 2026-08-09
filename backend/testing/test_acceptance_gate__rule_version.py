@@ -354,6 +354,7 @@ _ACCEPTANCE_RULE_BEHAVIOR_DIGESTS: dict[int, str] = {
     # `effective_acceptance_verdict` re-derives those already-merged rows instead
     # of trusting a verdict the retired rule produced.
     2: "42d52a7f2d622758e02b936ad38f96836d4918c79729d5957886b4396e8006e8",
+    3: "42d52a7f2d622758e02b936ad38f96836d4918c79729d5957886b4396e8006e8",
 }
 
 

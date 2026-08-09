@@ -2356,6 +2356,111 @@ async def backfill_unverified_merge_evidence(
 _ROLLUP_PARENT_WALK_MAX_DEPTH = 8
 
 
+def _rollup_child_commit_range(task: Task) -> tuple[str, str] | None:
+    """Return the backend-persisted immutable PR range for a rollup child."""
+    context = task.context or {}
+    review_loop = context.get("review_loop")
+    candidates = [
+        review_loop.get("review_target")
+        if isinstance(review_loop, dict)
+        else None,
+        review_loop.get("fix_target")
+        if isinstance(review_loop, dict)
+        else None,
+        context.get("review_target"),
+        context.get("fix_target"),
+    ]
+    for target in candidates:
+        if not isinstance(target, dict):
+            continue
+        base_sha = target.get("base_sha")
+        head_sha = target.get("head_sha")
+        if (
+            isinstance(base_sha, str)
+            and base_sha.strip()
+            and isinstance(head_sha, str)
+            and head_sha.strip()
+            and base_sha.strip() != head_sha.strip()
+        ):
+            return base_sha.strip(), head_sha.strip()
+
+    if isinstance(review_loop, dict):
+        base_sha = review_loop.get("base_sha")
+        head_sha = review_loop.get("head_sha")
+        if (
+            isinstance(base_sha, str)
+            and base_sha.strip()
+            and isinstance(head_sha, str)
+            and head_sha.strip()
+            and base_sha.strip() != head_sha.strip()
+        ):
+            return base_sha.strip(), head_sha.strip()
+
+    base_sha = context.get("base_sha")
+    head_sha = context.get("head_sha")
+    if (
+        isinstance(base_sha, str)
+        and base_sha.strip()
+        and isinstance(head_sha, str)
+        and head_sha.strip()
+        and base_sha.strip() != head_sha.strip()
+    ):
+        return base_sha.strip(), head_sha.strip()
+    return None
+
+
+async def stamp_rollup_child_commit_range(
+    task: Task,
+    *,
+    gh_token: str,
+    owner: str,
+    repo: str,
+) -> bool:
+    """Stamp a child's exact PR-range diff, returning whether it was resolved.
+
+    ``review_target`` is written by the backend from the live PR before review
+    or merge.  Comparing those immutable SHAs is exact child provenance even
+    though the child never owns the rollup parent's PR.  ``None`` from GitHub
+    means indeterminate and leaves the existing context untouched; an empty
+    list is authoritative proof of an empty child range and is therefore still
+    stamped.
+    """
+    commit_range = _rollup_child_commit_range(task)
+    if commit_range is None:
+        return False
+    from app.acceptance_gate import (
+        record_code_acceptance_verdict,
+        stamp_commit_range_derived_changed_files_signal,
+    )
+    from app.github_refs import get_files_changed_between_refs
+
+    base_sha, head_sha = commit_range
+    try:
+        changed = await get_files_changed_between_refs(
+            gh_token,
+            owner,
+            repo,
+            base_sha,
+            head_sha,
+            project_id=str(task.project_id),
+        )
+    except Exception:
+        logger.warning(
+            "rollup child %s commit-range compare failed",
+            getattr(task, "id", None),
+            exc_info=True,
+        )
+        return False
+    if changed is None:
+        return False
+
+    context = dict(task.context or {})
+    context.update(stamp_commit_range_derived_changed_files_signal(changed))
+    task.context = context
+    record_code_acceptance_verdict(task)
+    return True
+
+
 async def backfill_rollup_child_changed_files(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -2363,7 +2468,7 @@ async def backfill_rollup_child_changed_files(
     *,
     diagnostic: dict[str, str] | None = None,
 ) -> int:
-    """Retroactively stamp a rollup parent's changed files onto landed children.
+    """Repair legacy rollup children that landed before source stamping existed.
 
     The forward-path propagation in
     :func:`app.rollup_management._propagate_landed_to_staging_merged_descendants`
@@ -2374,16 +2479,12 @@ async def backfill_rollup_child_changed_files(
     stuck at ``declared_unsatisfied``; the unverified-merge backfill skips them
     because ``_changed_files(task)`` is empty.
 
-    This best-effort reconcile pass finds landed COMPLETED tasks that carry NO
-    ``_pr_changed_files`` but whose nearest landed ancestor (walking
-    ``parent_task_id``) DOES carry a GitHub-verified changed-file list, and
-    stamps that list onto the child using the SAME parent-derived semantics as
-    the forward path: :func:`stamp_parent_derived_changed_files_signal`
-    (``setdefault`` — never clobber a child's own list — and deliberately NO
-    ``_pr_changed_files_github_verified`` sentinel, so credit is capped at the
-    satisfied/unproven tier and never mints machine ``proven`` credit from the
-    parent's union diff).  The acceptance verdict is then re-evaluated so a stale
-    ``declared_unsatisfied`` reason flips.
+    The canonical path now compares each child's backend-persisted immutable
+    ``base_sha...head_sha`` range and stamps
+    :func:`stamp_commit_range_derived_changed_files_signal`, overwriting any
+    self-report or legacy parent-derived list.  The parent-union path remains
+    only as a compatibility fallback for old rows that have no usable child
+    range; it is deliberately never used when the exact compare succeeds.
 
     Wired to run BEFORE :func:`backfill_unverified_merge_evidence` in the
     reconcile endpoint so that, within the SAME run, a newly-stamped child is
@@ -2408,6 +2509,34 @@ async def backfill_rollup_child_changed_files(
         _BATCH_LIMIT = 500
         stamped_total = 0
         offset = 0
+        # Resolve credentials once for exact child-range comparisons.  A missing
+        # credential only disables this best-effort legacy repair; the parent
+        # fallback below remains conservative and GitHub-verified.
+        gh_credentials: tuple[str, str, str] | None = None
+        try:
+            from app.routers.agent import get_github_token_for_task
+
+            first_task = (
+                await session.execute(
+                    select(Task)
+                    .where(
+                        Task.project_id == project_id,
+                        Task.status == TaskStatus.COMPLETED,
+                        landed_signal_predicate(session),
+                    )
+                    .limit(1)
+                )
+            ).scalars().first()
+            if first_task is not None:
+                gh_credentials = await get_github_token_for_task(
+                    first_task.id, session
+                )
+        except Exception:
+            logger.info(
+                "backfill_rollup_child_changed_files: exact-range credentials unavailable",
+                exc_info=True,
+            )
+
         # Cache ancestor lookups across the scan — sibling children share the
         # same rollup parent, so one github-verified resolution per ancestor id
         # avoids re-walking the chain for every child.
@@ -2499,12 +2628,27 @@ async def backfill_rollup_child_changed_files(
             for task in batch:
                 if not is_merged_completion(task):
                     continue
-                # Only children that lack their own changed-file context — a
-                # child that already carries a list is left untouched (setdefault
-                # / idempotency).
-                if _acceptance_gate._changed_files(task):
-                    continue
                 if task.parent_task_id is None:
+                    continue
+
+                # Exact child provenance supersedes both self-reported and
+                # parent-derived lists.  This is intentionally attempted before
+                # the old skip-if-has-list guard: that guard made the dominant
+                # v31 named_test_missing_from_diff bucket unreachable.
+                if gh_credentials is not None and await stamp_rollup_child_commit_range(
+                    task,
+                    gh_token=gh_credentials[0],
+                    owner=gh_credentials[1],
+                    repo=gh_credentials[2],
+                ):
+                    session.add(task)
+                    batch_stamped += 1
+                    continue
+
+                # Legacy fallback: only inherit a parent's union when the child
+                # has no changed-file list at all.  It remains soft/unproven and
+                # is never allowed to shadow an exact range or a self-report.
+                if _acceptance_gate._changed_files(task):
                     continue
 
                 parent_changed = await _github_verified_ancestor_changed(task)

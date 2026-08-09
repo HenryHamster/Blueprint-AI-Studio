@@ -426,6 +426,48 @@ _FORCE_DROP_REASONS = frozenset(
 )
 
 
+async def _stamp_child_commit_range(
+    child: Task,
+    credentials: tuple[str, str, str] | None,
+) -> bool:
+    """Stamp exact child-PR provenance when the rollup is landed."""
+    if credentials is None:
+        return False
+    try:
+        from app.acceptance_criteria import stamp_rollup_child_commit_range
+
+        return await stamp_rollup_child_commit_range(
+            child,
+            gh_token=credentials[0],
+            owner=credentials[1],
+            repo=credentials[2],
+        )
+    except Exception:
+        logger.warning(
+            "[ROLLUP] exact child commit-range provenance failed for %s",
+            getattr(child, "id", None),
+            exc_info=True,
+        )
+        return False
+
+
+async def _resolve_rollup_diff_credentials(
+    task: Task, session: AsyncSession
+) -> tuple[str, str, str] | None:
+    """Resolve one project-scoped GitHub credential tuple for child compares."""
+    try:
+        from app.routers.agent import get_github_token_for_task
+
+        return await get_github_token_for_task(task.id, session)
+    except Exception:
+        logger.info(
+            "[ROLLUP] child commit-range credentials unavailable for %s",
+            getattr(task, "id", None),
+            exc_info=True,
+        )
+        return None
+
+
 async def _propagate_landed_to_rollup_children(
     completed_children: list[Task],
     session: AsyncSession,
@@ -468,10 +510,16 @@ async def _propagate_landed_to_rollup_children(
         if completed_children and completed_children[0].project_id is not None
         else None
     )
+    _credentials = (
+        await _resolve_rollup_diff_credentials(completed_children[0], session)
+        if completed_children
+        else None
+    )
     for child in completed_children:
         ctx = child.context or {}
         if ctx.get(NON_MERGE_UNBLOCK_REASON_KEY) in _FORCE_DROP_REASONS:
             continue
+        await _stamp_child_commit_range(child, _credentials)
         if has_merge_unblock_signal(child) and not has_landed_signal(child):
             await corroborate_and_mark_landed_on_integration(
                 child,
@@ -539,18 +587,17 @@ async def _propagate_landed_to_staging_merged_descendants(
     # stamped in this walk (rollup descendants land via the parent's single PR).
     _parent_merge_sha: str | None = _parent_ctx.get(LANDED_MERGE_SHA_KEY)
 
-    # Read the landed PR-owning parent's GitHub-verified changed-file list so it
-    # can be propagated DOWN to every landed descendant that lacks its own
-    # ``_pr_changed_files`` context.  Rollup children merge via the PARENT's
-    # single PR — they never own a GitHub PR, so ``_stamp_github_verified_
-    # changed_files`` never runs on them and their declared ``named_test``
-    # acceptance evidence cannot be located in the diff (declared_unsatisfied).
-    # The parent's diff is the union of every sibling's changes, so it is stamped
-    # as parent-derived (capped at the satisfied/unproven tier, never proven).
+    # Resolve once for exact child PR ranges.  The parent-union context below is
+    # retained only as a legacy fallback when no exact child range is available.
+    _credentials = (
+        await _resolve_rollup_diff_credentials(_parent, session)
+        if _parent is not None
+        else None
+    )
     _parent_changed: list[str] = [
-        p
-        for p in (_parent_ctx.get("_pr_changed_files") or [])
-        if isinstance(p, str) and p.strip()
+        path
+        for path in (_parent_ctx.get("_pr_changed_files") or [])
+        if isinstance(path, str) and path.strip()
     ]
 
     # Rung 6 of design doc c50453ef (closes U1): the parent's normalized
@@ -621,22 +668,25 @@ async def _propagate_landed_to_staging_merged_descendants(
                     row.context = _desc_ctx
                     _propagated = True
 
-                # Propagate the parent's changed-file context to descendants that
-                # lack their own self-reported ``_pr_changed_files`` so a declared
-                # named_test can be located in the diff and a stale
-                # declared_unsatisfied verdict flips.  setdefault semantics: NEVER
-                # clobber a child that already carries its own list.  After
-                # stamping, re-evaluate the acceptance verdict so it re-stamps.
-                if _parent_changed and not (row.context or {}).get(
+                # Derive the child's own exact PR range before evaluating its
+                # acceptance verdict.  This deliberately overwrites a
+                # self-report: the backend compare is authoritative and fixes
+                # the v31 skip-if-has-list hole.
+                if await _stamp_child_commit_range(row, _credentials):
+                    _propagated = True
+                elif _parent_changed and not (row.context or {}).get(
                     "_pr_changed_files"
                 ):
-                    _cf_ctx = dict(row.context or {})
-                    _cf_ctx.update(
+                    # Compatibility repair for old children whose backend did
+                    # not persist a usable child range.  Parent-union provenance
+                    # remains soft and cannot mint proven credit.
+                    _desc_ctx = dict(row.context or {})
+                    _desc_ctx.update(
                         _acceptance_gate.stamp_parent_derived_changed_files_signal(
                             _parent_changed
                         )
                     )
-                    row.context = _cf_ctx
+                    row.context = _desc_ctx
                     _acceptance_gate.record_code_acceptance_verdict(row)
                     _propagated = True
 

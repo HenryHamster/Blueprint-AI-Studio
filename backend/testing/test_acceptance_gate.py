@@ -14,12 +14,14 @@ tests (consumed artifact upgrade) run under the full test harness.
 
 import os
 import uuid
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlmodel import select
 
 from app.acceptance_gate import (
     ACCEPTANCE_RULE_VERSION,
+    COMMIT_RANGE_DERIVED_CHANGED_FILES_KEY,
     CODE_ACCEPTANCE_VERDICT_KEY,
     CRITERION_OPS,
     PREMERGE_ACCEPTANCE_FINDING_KEY,
@@ -426,6 +428,90 @@ def test_record_code_acceptance_verdict_stamps_rule_version():
     # Legacy verdicts (no rule_version) are still readable by every consumer —
     # the field is additive.
     assert acceptance_is_proven({"proven": True, "satisfied": True}) is True
+
+
+@pytest.mark.asyncio
+async def test_rollup_child_commit_range_stamp_reaches_proven(db_session, mocker):
+    """An exact child PR range earns proven acceptance and criterion evidence."""
+    from app import acceptance_criteria as ac
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.flush()
+    version = ReleaseVersion(project_id=project.id)
+    db_session.add(version)
+    await db_session.flush()
+    criterion = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="The rollup child test proves its production seam",
+        created_by="strategist",
+    )
+
+    declared_test = "backend/testing/test_acceptance_gate.py"
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": declared_test,
+        },
+        changed_files=["backend/app/old_self_report.py"],
+        merge_test_block={
+            "present": True,
+            "ran": True,
+            "status": "ran",
+            "passed": True,
+            "selector": declared_test,
+        },
+    )
+    task.project_id = project.id
+    task.criterion_ids = [criterion.criterion_key]
+    task.context.update(
+        {
+            "pr_merged": True,
+            "landed_on_integration": True,
+            "review_loop": {
+                "review_target": {
+                    "base_sha": "base-sha",
+                    "head_sha": "child-head-sha",
+                },
+                "verify_tests_acceptance_block": {
+                    "present": True,
+                    "ran": True,
+                    "status": "ran",
+                    "passed": True,
+                    "selector": declared_test,
+                },
+            },
+        }
+    )
+    db_session.add(task)
+    await db_session.flush()
+
+    mocker.patch(
+        "app.github_refs.get_files_changed_between_refs",
+        new_callable=AsyncMock,
+        return_value=["backend/app/acceptance_gate.py", declared_test],
+    )
+    from app.acceptance_criteria import stamp_rollup_child_commit_range
+
+    initial = record_code_acceptance_verdict(task)
+    assert initial.proven is False
+    assert await stamp_rollup_child_commit_range(
+        task,
+        gh_token="token",
+        owner="owner",
+        repo="repo",
+    ) is True
+    assert (task.context or {}).get(COMMIT_RANGE_DERIVED_CHANGED_FILES_KEY) is True
+    assert (task.context or {}).get("_pr_changed_files_github_verified") is True
+    assert (task.context or {})[CODE_ACCEPTANCE_VERDICT_KEY]["proven"] is True
+
+    recorded = await ac.record_task_merge_evidence(db_session, task, project.id)
+    assert recorded >= 1
+    evidence = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    task_merge = [e for e in evidence if e.source_kind == "task_merge"]
+    assert task_merge and task_merge[0].detail["proven"] is True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
