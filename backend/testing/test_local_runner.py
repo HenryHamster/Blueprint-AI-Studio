@@ -3352,6 +3352,100 @@ class TestRunnerEndpoints:
             assert task.status == TaskStatus.PROVISIONING
 
     @pytest.mark.asyncio
+    async def test_next_task_releases_browser_task_pinned_to_non_chromium_runner(
+        self, client: AsyncClient, db_session
+    ):
+        """A browser-required task pinned to a runner with no usable Chromium is
+        released to QUEUED immediately.
+
+        The mismatch is deterministic — re-polling this runner can never make the
+        task routable — so it is unpinned on the first poll that sees it rather than
+        left to run down the ~20-min skip-escalation clock. Normal dispatch, which
+        filters browser work to Chromium-capable runners, then re-routes it.
+        """
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session, project.id, capabilities={"task_types": "all"}
+        )
+
+        # acceptance_evidence.kind == "viewport" is the realistic viewport-snapshot
+        # signal (the other detection branch, requires_browser, is covered below).
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "fix", "acceptance_evidence": {"kind": "viewport"}}],
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{runner.id}",
+            context={"runner_target_id": str(runner.id)},
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        resp = await client.post(
+            "/api/runner/next-task",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        # Nothing dispatchable FOR THIS runner — it has no Chromium.
+        assert resp.status_code == 503
+        body = resp.json()
+        assert {s["task_id"] for s in body["skipped"]} == {str(task.id)}
+        assert body["skipped"][0]["code"] == "runner_capability_mismatch"
+
+        # The pin is gone: the task is back in QUEUED, unpinned, ready to re-dispatch.
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.QUEUED
+        assert task.vm_instance_id is None
+        assert task.started_at is None
+        assert "runner_target_id" not in (task.context or {})
+
+    @pytest.mark.asyncio
+    async def test_next_task_dispatches_browser_task_on_chromium_capable_runner(
+        self, client: AsyncClient, db_session
+    ):
+        """The browser guard must not over-block: a browser-required task pinned to
+        a Chromium-capable runner dispatches normally and is NOT released."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={"task_types": "all", "playwright_chromium_usable": True},
+        )
+        _seed_pool_account(TEST_USER_ID)
+        try:
+            task = Task(
+                project_id=project.id,
+                payloads=[{"type": "fix", "requires_browser": True}],
+                status=TaskStatus.PROVISIONING,
+                vm_instance_id=f"runner:{runner.id}",
+                context={"runner_target_id": str(runner.id)},
+            )
+            db_session.add(task)
+            await db_session.commit()
+
+            resp = await client.post(
+                "/api/runner/next-task",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+            assert resp.status_code == 200
+            body = resp.json()
+            assert body["task_id"] == str(task.id)
+
+            await db_session.refresh(task)
+            # Dispatched, not released: PROVISIONING with the dispatch marker set and
+            # still bound to this runner's vm id. A release would instead flip the task
+            # back to QUEUED and clear vm_instance_id. (next-task consumes the
+            # runner_target_id pin and overwrites context with the minted credentials,
+            # so it is no longer present — mirroring
+            # test_next_task_returns_pinned_task_and_stays_provisioning.)
+            assert task.status == TaskStatus.PROVISIONING
+            assert task.started_at is not None
+            assert task.vm_instance_id == f"runner:{runner.id}"
+            assert body["agent_token"]
+        finally:
+            _clear_pool()
+
+    @pytest.mark.asyncio
     async def test_next_task_honors_priority_over_created_at(
         self, client: AsyncClient, db_session
     ):
