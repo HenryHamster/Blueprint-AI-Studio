@@ -124,6 +124,7 @@ import json
 import math
 import statistics
 import textwrap
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence, cast
 
@@ -296,6 +297,14 @@ BASELINE_READINGS: list[dict[str, Any]] = [
     },
 ]
 
+# Separate ledger for complete ``by_serving_sha`` rows. Never append these to
+# BASELINE_READINGS: that list is the frozen comparison anchor.
+SERVING_SHA_READINGS: list[dict[str, Any]] = []
+
+# A directional cost verdict needs more than a mathematically valid mean. Thirty
+# cycles is the explicit minimum evidence rule for this diagnostic surface.
+# Keep this as a named policy so a thin cohort cannot silently become a claim.
+MINIMUM_COST_VERDICT_N = 30
 
 def effective_input_price_multiplier(read_share: float) -> float:
     """Price per token relative to the full input rate.
@@ -804,6 +813,252 @@ def baseline_per_cycle_stats(
     }
 
 
+def _looks_like_git_sha(value: Any) -> bool:
+    """True iff ``value`` is a plausible git commit SHA (7-40 hex chars).
+
+    Mirrors :func:`app.deployed_sha._looks_like_git_sha` (duplicated so this
+    script stays importable without the app package). A non-blank string is NOT
+    a sufficient identity check: ``DeploymentState.current_sha`` initializes to
+    the literal ``"unknown"`` when no deploy identity can be resolved, and
+    treating that as a valid serving revision would qualify a reading whose
+    cohort is attributed to a revision that does not exist.
+    """
+    if not isinstance(value, str):
+        return False
+    value = value.strip()
+    if not (7 <= len(value) <= 40):
+        return False
+    return all(c in "0123456789abcdef" for c in value.lower())
+
+
+def serving_sha_record(
+    readings: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Normalize ``by_serving_sha`` rows without changing the baseline.
+
+    Missing identity or unreconciled arithmetic stays unavailable. The record
+    also reports unweighted dispersion across serving slices and a qualification
+    verdict based on the sum of their cycle counts. A syntactically valid record
+    can therefore still have an unavailable cost verdict when its cohort is
+    below :data:`MINIMUM_COST_VERDICT_N`.
+    """
+    source = list(readings) if readings is not None else SERVING_SHA_READINGS
+    normalized: list[dict[str, Any]] = []
+    all_valid = True
+    for reading in source:
+        record = dict(reading)
+        sha = record.get("serving_sha")
+        sha_valid = _looks_like_git_sha(sha)
+        cycle_count = record.get("cycle_count")
+        total = record.get("total_usd")
+        per_event = record.get("per_event_usd")
+        arithmetic_consistent = False
+        if (
+            isinstance(cycle_count, (int, float))
+            and not isinstance(cycle_count, bool)
+            and cycle_count > 0
+            and math.isfinite(float(cycle_count))
+            and isinstance(total, (int, float))
+            and not isinstance(total, bool)
+            and math.isfinite(float(total))
+            and float(total) >= 0
+        ):
+            expected = float(total) / float(cycle_count)
+            if per_event is None:
+                record["per_event_usd"] = round(expected, 6)
+                arithmetic_consistent = True
+            elif (
+                isinstance(per_event, (int, float))
+                and not isinstance(per_event, bool)
+                and math.isfinite(float(per_event))
+                and float(per_event) >= 0
+                and abs(float(per_event) - expected) <= 0.0005
+            ):
+                arithmetic_consistent = True
+        coverage = record.get("unpriced_coverage")
+        coverage_valid = coverage is None or (
+            isinstance(coverage, (int, float))
+            and not isinstance(coverage, bool)
+            and math.isfinite(float(coverage))
+            and 0.0 <= float(coverage) <= 1.0
+        )
+        record["serving_sha_valid"] = sha_valid
+        record["cost_arithmetic_consistent"] = arithmetic_consistent
+        record["reading_valid"] = sha_valid and arithmetic_consistent and coverage_valid
+        all_valid = all_valid and record["reading_valid"]
+        normalized.append(record)
+    cycle_count = sum(
+        int(record["cycle_count"])
+        for record in normalized
+        if record["reading_valid"]
+    )
+    dispersion = _per_slice_dispersion(normalized)
+    qualification = _cost_verdict(
+        normalized,
+        all_readings_valid=all_valid,
+        cycle_count=cycle_count,
+    )
+    return {
+        "available": bool(normalized) and all_valid,
+        "reading_count": len(normalized),
+        "all_readings_valid": all_valid,
+        "dispersion": dispersion,
+        "qualification": qualification,
+        "readings": normalized,
+    }
+
+
+def _per_slice_dispersion(readings: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Summarize validated per-slice means without inventing a one-slice SD."""
+    values = [
+        float(record["per_event_usd"])
+        for record in readings
+        if record.get("reading_valid")
+    ]
+    result = {
+        "available": len(values) > 1,
+        "slice_count": len(values),
+        "mean_usd": statistics.mean(values) if values else None,
+        "median_usd": statistics.median(values) if values else None,
+        "stddev_usd": statistics.stdev(values) if len(values) > 1 else None,
+    }
+    return result
+
+
+def _parse_cycle_timestamp(value: Any) -> datetime | None:
+    """Parse an optional ISO cycle timestamp into an aware UTC datetime."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _projected_qualification_date(
+    readings: Sequence[Mapping[str, Any]], cycle_count: int
+) -> str | None:
+    """Project the date the minimum n is reached from observed slice cadence."""
+    if cycle_count >= MINIMUM_COST_VERDICT_N:
+        return None
+    bounds: list[tuple[datetime, datetime]] = []
+    for record in readings:
+        if not record.get("reading_valid"):
+            continue
+        first = _parse_cycle_timestamp(record.get("first_cycle_at"))
+        last = _parse_cycle_timestamp(record.get("last_cycle_at"))
+        if first is not None and last is not None:
+            bounds.append((first, last))
+    if not bounds:
+        return None
+    first = min(first for first, _ in bounds)
+    last = max(last for _, last in bounds)
+    elapsed_seconds = (last - first).total_seconds()
+    if elapsed_seconds <= 0 or cycle_count <= 0:
+        return None
+    cycles_per_second = cycle_count / elapsed_seconds
+    remaining = MINIMUM_COST_VERDICT_N - cycle_count
+    projected = last + timedelta(seconds=remaining / cycles_per_second)
+    return projected.date().isoformat()
+
+
+def _cost_verdict(
+    readings: Sequence[Mapping[str, Any]],
+    *,
+    all_readings_valid: bool,
+    cycle_count: int,
+) -> dict[str, Any]:
+    """Return the fail-closed verdict metadata for a serving-SHA cohort."""
+    projected_date = _projected_qualification_date(readings, cycle_count)
+    result = {
+        "available": False,
+        "verdict": "unavailable",
+        "reason": None,
+        "n": cycle_count,
+        "required_n": MINIMUM_COST_VERDICT_N,
+        "projected_date": None,
+    }
+    if not readings or not all_readings_valid:
+        result["reason"] = "one or more serving-SHA slices are invalid"
+    elif cycle_count < MINIMUM_COST_VERDICT_N:
+        result.update(
+            verdict="insufficient_sample",
+            reason=(
+                f"cost verdict requires at least {MINIMUM_COST_VERDICT_N} cycles; "
+                f"only {cycle_count} are observed"
+            ),
+            projected_date=projected_date,
+        )
+    else:
+        result.update(available=True, verdict="available")
+    return result
+
+
+def serving_sha_comparison(
+    reading: Mapping[str, Any],
+    baseline_cost_usd: float | None = None,
+) -> dict[str, Any]:
+    """Compare one attributable row to the frozen baseline.
+
+    Invalid identity or partial attribution is never evidence of a change.
+    """
+    record_bundle = serving_sha_record([reading])
+    record = record_bundle["readings"][0]
+    qualification = record_bundle["qualification"]
+    baseline = (
+        BASELINE_COST_PER_CYCLE_USD
+        if baseline_cost_usd is None
+        else baseline_cost_usd
+    )
+    metadata = {
+        "n": qualification["n"],
+        "required_n": qualification["required_n"],
+        "projected_date": qualification["projected_date"],
+        "dispersion": record_bundle["dispersion"],
+    }
+    baseline_valid = (
+        isinstance(baseline, (int, float))
+        and not isinstance(baseline, bool)
+        and math.isfinite(float(baseline))
+        and baseline > 0
+    )
+    invalid = not record["reading_valid"] or not baseline_valid
+    if invalid or not qualification["available"]:
+        return {
+            "available": False,
+            "verdict": "unavailable" if invalid else qualification["verdict"],
+            "serving_sha": record.get("serving_sha"),
+            "reason": (
+                "serving-SHA reading or baseline is invalid"
+                if invalid
+                else qualification["reason"]
+            ),
+            "baseline_cost_per_cycle_usd": (
+                None if invalid else float(baseline)
+            ),
+            "serving_cost_per_cycle_usd": None,
+            "delta_usd": None,
+            "below_baseline_pct": None,
+            **metadata,
+        }
+    serving_cost = float(record["per_event_usd"])
+    delta = float(baseline) - serving_cost
+    return {
+        "available": True,
+        "verdict": "available",
+        "serving_sha": record["serving_sha"],
+        "cycle_count": record["cycle_count"],
+        "baseline_cost_per_cycle_usd": float(baseline),
+        "serving_cost_per_cycle_usd": serving_cost,
+        "delta_usd": delta,
+        "below_baseline_pct": delta / float(baseline),
+        **metadata,
+    }
+
+
 # The projection's per-cycle baseline anchor is DERIVED from the recorded
 # baseline readings (the mean of the recorded per-reading means) — never a
 # task-provided constant. Adding a reading to BASELINE_READINGS moves the
@@ -1216,6 +1471,27 @@ def main() -> None:
           "backend/app/strategic_spawning.py, which executes only in the deployed "
           "backend; a flat reading on readings 1 and 2 is therefore not evidence "
           "about the levers.")
+
+    print("[9] Serving-SHA readings (separate from the baseline anchor)\n")
+    serving_record = serving_sha_record()
+    if not serving_record["readings"]:
+        print("  No complete serving-SHA readings recorded yet.")
+        print("  Copy a complete by_serving_sha row here only after its SHA and")
+        print("  per-event arithmetic are captured; incomplete attribution is")
+        print("  intentionally not compared with the baseline.")
+    else:
+        for serving_reading in serving_record["readings"]:
+            comparison = serving_sha_comparison(serving_reading)
+            print(f"  serving SHA {serving_reading.get('serving_sha')!r}: "
+                  f"{serving_reading.get('cycle_count')} cycles, "
+                  f"${serving_reading.get('per_event_usd')} / cycle")
+            if comparison["available"]:
+                print(f"    vs frozen baseline ${comparison['baseline_cost_per_cycle_usd']:.4f}: "
+                      f"{comparison['below_baseline_pct']:.1%} below")
+            else:
+                print(f"    comparison unavailable: {comparison['reason']}")
+    print("  These rows are diagnostic like-for-like readings, not part of "
+          "BASELINE_READINGS, and cannot move BASELINE_COST_PER_CYCLE_USD.")
 
 
 if __name__ == "__main__":

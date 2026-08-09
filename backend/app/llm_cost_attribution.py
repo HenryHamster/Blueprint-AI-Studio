@@ -1608,14 +1608,15 @@ def compute_llm_cost_by_failure_class(tasks: list[Task]) -> list[Dict[str, Any]]
 # slices below so they can never disagree about which tasks count.
 _STRATEGIC_CYCLE_TYPES = {"design_doc_update", "strategic_review"}
 
-# Bound on the per-cycle detail list persisted in each daily snapshot. The
-# decision-loop cohort spans 7 days / up to 5000 tasks, so distinct cycle ids
-# can reach the hundreds; keeping only the NEWEST _STRATEGIC_CYCLE_SLICE_CAP
-# cycles keeps the snapshot blob compact while still covering the whole recency
-# window in most readings. by_serving_sha is computed from ALL cycles
-# (uncapped) so the serving-sha rollup reconciles with the aggregate total
-# regardless of how many cycles actually ran.
-_STRATEGIC_CYCLE_SLICE_CAP = 60
+def _task_execution_span(task: Task) -> tuple[datetime | None, datetime | None]:
+    """Return the best persisted execution span for a task.
+
+    ``started_at``/``completed_at`` are authoritative. Older tasks may not
+    have them, so retain historical timestamp fallbacks for those rows.
+    """
+    start = task.started_at or task.created_at or task.updated_at
+    end = task.completed_at or task.updated_at or start
+    return start, end
 
 
 def _strategic_cycle_cost_slices(
@@ -1629,19 +1630,16 @@ def _strategic_cycle_cost_slices(
     two sliceable views:
 
     ``by_cycle`` — one row per cycle ``{cycle_id, total_usd, task_count,
-    first_task_at, last_task_at}`` with timestamps drawn from
-    ``Task.updated_at``, sorted oldest-first and capped at
-    ``_STRATEGIC_CYCLE_SLICE_CAP`` rows (newest kept; ``capped`` True when
-    truncation happened). This makes the decision-loop cost a TIME SERIES: a
-    reading can be partitioned at any timestamp by comparing ``first_task_at``
-    against the boundary.
+    first_task_at, last_task_at}`` with timestamps drawn from task execution
+    spans, sorted oldest-first. This makes the decision-loop cost a complete
+    TIME SERIES: a reading can be partitioned at any timestamp by comparing
+    ``first_task_at`` against the boundary.
 
     ``by_serving_sha`` — per-serving-sha rollup over ALL cycles (uncapped) so
-    it reconciles with the aggregate ``total_usd``. Each cycle is attributed to
-    the serving revision live when its first task was last updated: the latest
-    timeline boundary whose ``since`` <= ``first_task_at`` wins, and cycles
-    before the first boundary land in a ``None``-sha bucket. ``None`` when no
-    timeline is supplied.
+    it reconciles with the aggregate ``total_usd``. A cycle is attributed only
+    when its complete execution span fits within one serving interval. A cycle
+    that crosses a serving boundary, or predates the first known boundary,
+    lands in a ``None``-sha bucket. ``None`` when no timeline is supplied.
 
     ``serving_sha_timeline`` is a sorted oldest-first list of
     ``{"since": iso8601, "sha": str}`` boundaries — see
@@ -1659,10 +1657,12 @@ def _strategic_cycle_cost_slices(
     if not grouped:
         return {"by_cycle": [], "by_serving_sha": None, "capped": False}
 
-    _MIN = datetime.min  # noqa: DTZ901 - naive sentinel; Task.updated_at is naive UTC
+    _MIN = datetime.min  # noqa: DTZ901 - naive sentinel; task timestamps are naive UTC
     cycles: list[Dict[str, Any]] = []
     for cycle_id, cycle_tasks in grouped.items():
-        touched = [t.updated_at for t in cycle_tasks if t.updated_at is not None]
+        spans = [_task_execution_span(t) for t in cycle_tasks]
+        starts = [start for start, _ in spans if start is not None]
+        ends = [end for _, end in spans if end is not None]
         cycles.append(
             {
                 "cycle_id": cycle_id,
@@ -1670,14 +1670,12 @@ def _strategic_cycle_cost_slices(
                     sum(_task_llm_cost(t)[0] for t in cycle_tasks), 6
                 ),
                 "task_count": len(cycle_tasks),
-                "first_task_at": min(touched) if touched else None,
-                "last_task_at": max(touched) if touched else None,
+                "first_task_at": min(starts) if starts else None,
+                "last_task_at": max(ends) if ends else None,
             }
         )
 
     cycles.sort(key=lambda c: c["first_task_at"] or _MIN)
-    capped = len(cycles) > _STRATEGIC_CYCLE_SLICE_CAP
-    detail = cycles[-_STRATEGIC_CYCLE_SLICE_CAP:] if capped else cycles
     by_cycle = [
         {
             "cycle_id": c["cycle_id"],
@@ -1690,7 +1688,7 @@ def _strategic_cycle_cost_slices(
             if c["last_task_at"] is not None
             else None,
         }
-        for c in detail
+        for c in cycles
     ]
 
     by_serving_sha: list[Dict[str, Any]] | None = None
@@ -1705,13 +1703,14 @@ def _strategic_cycle_cost_slices(
             if isinstance(since_s, str) and since_s:
                 try:
                     since = datetime.fromisoformat(since_s)
-                except ValueError:
+                except (TypeError, ValueError):
                     since = None
                 if since is not None and since.tzinfo is not None:
                     # Timeline boundary timestamps are naive UTC; normalize an
                     # aware ISO stamp so it compares against Task.updated_at.
                     since = since.replace(tzinfo=None)
-            boundaries.append((since, sha))
+            if since is not None:
+                boundaries.append((since, sha))
         boundaries.sort(key=lambda pair: (pair[0] is None, pair[0] or _MIN))
 
         def _attributing_sha(ts: datetime | None) -> str | None:
@@ -1723,19 +1722,31 @@ def _strategic_cycle_cost_slices(
                     match = sha
             return match
 
-        buckets: Dict[str, Dict[str, Any]] = {}
+        def _attributing_span(
+            start: datetime | None, end: datetime | None
+        ) -> str | None:
+            """Attribute only spans wholly contained in one serving period."""
+            if start is None:
+                return None
+            start_sha = _attributing_sha(start)
+            end_sha = _attributing_sha(end or start)
+            return start_sha if start_sha == end_sha else None
+
+        buckets: Dict[str | None, Dict[str, Any]] = {}
         for c in cycles:  # ALL cycles, not the capped detail list
-            sha = _attributing_sha(c["first_task_at"])
+            sha = _attributing_span(c["first_task_at"], c["last_task_at"])
             bucket = buckets.setdefault(
                 sha,
                 {
                     "serving_sha": sha,
+                    "tasks": [],
                     "cycle_count": 0,
                     "total_usd": 0.0,
                     "first_cycle_at": None,
                     "last_cycle_at": None,
                 },
             )
+            bucket["tasks"].extend(grouped[c["cycle_id"]])
             bucket["cycle_count"] += 1
             bucket["total_usd"] += c["total_usd"]
             first = c["first_task_at"]
@@ -1745,28 +1756,44 @@ def _strategic_cycle_cost_slices(
                 if bucket["last_cycle_at"] is None or first > bucket["last_cycle_at"]:
                     bucket["last_cycle_at"] = first
 
-        by_serving_sha = [
-            {
-                "serving_sha": b["serving_sha"],
-                "cycle_count": b["cycle_count"],
-                "total_usd": round(b["total_usd"], 6),
-                "per_event_usd": round(b["total_usd"] / b["cycle_count"], 6)
-                if b["cycle_count"] > 0
-                else None,
-                "first_cycle_at": b["first_cycle_at"].isoformat()
-                if b["first_cycle_at"] is not None
-                else None,
-                "last_cycle_at": b["last_cycle_at"].isoformat()
-                if b["last_cycle_at"] is not None
-                else None,
-            }
-            for b in sorted(
-                buckets.values(),
-                key=lambda b: b["first_cycle_at"] or _MIN,
+        by_serving_sha = []
+        for b in sorted(
+            buckets.values(),
+            key=lambda b: b["first_cycle_at"] or _MIN,
+        ):
+            pricing_totals = compute_llm_cost_breakdown(b["tasks"])["totals"]
+            by_serving_sha.append(
+                {
+                    "serving_sha": b["serving_sha"],
+                    "cycle_count": b["cycle_count"],
+                    "total_usd": round(b["total_usd"], 6),
+                    "per_event_usd": round(b["total_usd"] / b["cycle_count"], 6)
+                    if b["cycle_count"] > 0
+                    else None,
+                    "first_cycle_at": b["first_cycle_at"].isoformat()
+                    if b["first_cycle_at"] is not None
+                    else None,
+                    "last_cycle_at": b["last_cycle_at"].isoformat()
+                    if b["last_cycle_at"] is not None
+                    else None,
+                    # Match the aggregate compact attribution's honesty signal,
+                    # but calculate it from this serving-sha bucket's own tasks.
+                    "unpriced_coverage": pricing_totals.get(
+                        "unpriced_coverage_fraction"
+                    ),
+                    "estimated_unpriced_cost_usd": pricing_totals.get(
+                        "estimated_unpriced_cost_usd"
+                    ),
+                    "unpriced_input_tokens": pricing_totals.get(
+                        "unpriced_input_tokens"
+                    ),
+                    "unpriced_output_tokens": pricing_totals.get(
+                        "unpriced_output_tokens"
+                    ),
+                }
             )
-        ]
 
-    return {"by_cycle": by_cycle, "by_serving_sha": by_serving_sha, "capped": capped}
+    return {"by_cycle": by_cycle, "by_serving_sha": by_serving_sha, "capped": False}
 
 
 def _compact_llm_cost_attribution(

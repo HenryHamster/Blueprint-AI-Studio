@@ -42,6 +42,7 @@ from app.landed_signal import (
     is_verified_merge,
 )
 from app.models import (
+    DeploymentState,
     ImprovementLane,
     ImprovementLaneStatus,
     PoolIdleCostLedger,
@@ -418,6 +419,8 @@ _SNAPSHOT_HISTORY_MAX = 7
 #      reconciles with the aggregate total_usd), and by_cycle_capped — so a
 #      decision-loop reading can separate cycles that ran before a lever reached
 #      serving from cycles that ran after.
+# v18: cycle timestamps use task execution spans, and the current serving boundary
+#      uses the durable DeploymentState.deployed_at instead of snapshot capture time.
 METRIC_DEF_VERSION = "v18"
 
 
@@ -548,14 +551,16 @@ def _serving_sha_timeline_from_snapshots(
     snapshots: Sequence[Mapping[str, Any]],
     current_sha: str | None,
     now: datetime,
+    current_deployed_at: datetime | None = None,
 ) -> list[Dict[str, Any]] | None:
     """Build the sorted serving-sha boundary list a cycle-cost slice needs.
 
     Each snapshot that carries a ``serving_sha`` contributes a boundary: from
     its ``captured_at`` onward that revision was serving until a later snapshot
-    superseded it. ``current_sha`` (the live ``DEPLOY_SHA``) is appended at
-    ``now`` so cycles active after the newest snapshot still attribute to the
-    revision serving right now. Consecutive boundaries with the same sha are
+    superseded it. ``current_sha`` is appended at its durable deployment time
+    when available, or at ``now`` for legacy/pre-stamp deployments, so cycles
+    active after the newest snapshot still attribute to the revision serving
+    right now. Consecutive boundaries with the same sha are
     collapsed to the earliest stamp (that is when the sha's serving period
     began), which keeps the timeline minimal and the attribution correct across
     back-to-back snapshots of an unchanged revision.
@@ -580,7 +585,10 @@ def _serving_sha_timeline_from_snapshots(
             since = since.replace(tzinfo=None)
         boundaries.append((since, sha))
     if current_sha:
-        boundaries.append((now, current_sha))
+        since = current_deployed_at or now
+        if since.tzinfo is not None:
+            since = since.replace(tzinfo=None)
+        boundaries.append((since, current_sha))
     if not boundaries:
         return None
     boundaries.sort(key=lambda pair: pair[0])
@@ -599,20 +607,37 @@ async def _load_serving_sha_timeline(
     """Load the serving-sha timeline a project's cycle-cost slices need.
 
     Merges the design_doc container and ``project_efficiency_snapshot`` table
-    history (via :func:`_read_snapshot_history`) and appends the current
-    ``DEPLOY_SHA`` at now, so both the daily snapshot write path and the live
-    agent endpoint can slice strategic-cycle cost by serving revision. Returns
-    None when no snapshot carries a serving_sha and no DEPLOY_SHA is stamped.
+    history (via :func:`_read_snapshot_history`) with the durable
+    ``DeploymentState.current_sha/deployed_at`` boundary, so both the daily
+    snapshot write path and the live agent endpoint can slice strategic-cycle
+    cost by serving revision. Legacy snapshots and ``DEPLOY_SHA`` remain the
+    fallback when the deployment record is unavailable.
     """
     project = await session.get(Project, project_id, populate_existing=True)
     if project is None:
         return None
     container = (project.design_doc or {}).get(DESIGN_DOC_KEY) or {}
     snapshots = await _read_snapshot_history(session, project_id, container)
-    from app.deployed_sha import get_serving_sha
+    deployment = await session.get(DeploymentState, 1)
+    from app.deployed_sha import _looks_like_git_sha, get_serving_sha
+
+    # The singleton initializes current_sha to the literal "unknown" whenever
+    # DEPLOY_SHA is unset / the deployment identity cannot be resolved. That
+    # value is truthy but names no revision, so accepting it would attribute
+    # strategic cycles to a fabricated serving sha that downstream identity
+    # checks (which only test "non-blank str") would happily accept. Only a
+    # real git SHA may open a serving boundary; anything else falls through to
+    # the DEPLOY_SHA reader, which validates the same way and returns None when
+    # there is no identity to report.
+    if deployment is not None and _looks_like_git_sha(deployment.current_sha):
+        current_sha = deployment.current_sha
+        current_deployed_at = deployment.deployed_at
+    else:
+        current_sha = get_serving_sha()
+        current_deployed_at = None
 
     return _serving_sha_timeline_from_snapshots(
-        snapshots, get_serving_sha(), _utcnow()
+        snapshots, current_sha, _utcnow(), current_deployed_at
     )
 
 
