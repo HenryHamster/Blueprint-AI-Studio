@@ -18,6 +18,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -145,7 +146,13 @@ def test_off_image_pgserver_route_wins_without_baked_paths(tmp_path: Path) -> No
     (tmp_path / "pytest.py").write_text("", encoding="utf-8")
 
     env = os.environ.copy()
-    env["BLUEPRINT_SANDBOX_PYTHON"] = "/usr/bin/python3"
+    # Use the running interpreter as the sandbox Python: it is guaranteed to
+    # exist on every host (the CI backend-test-deps image installs it at
+    # /usr/local/bin/python, not /usr/bin/python3), and the fake ``pgserver``
+    # package on PYTHONPATH shadows any real wheel, so the route still resolves
+    # the fabricated bindir. A hardcoded /usr/bin/python3 silently fails closed
+    # on any image without a system python3 there.
+    env["BLUEPRINT_SANDBOX_PYTHON"] = sys.executable
     env["PYTHONPATH"] = str(tmp_path)
     env["PATH"] = f"{tmp_path}:/usr/bin:/bin"
     result = subprocess.run(
