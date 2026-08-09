@@ -46,6 +46,16 @@ _SCRIPTS_DIR = _resolve_scripts_dir()
 _REPO_ROOT = _SCRIPTS_DIR.parent
 
 
+def test_scripts_dir_honors_explicit_override(tmp_path, monkeypatch):
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    (scripts_dir / "blueprint_api.py").touch()
+    (scripts_dir / "blueprint.py").touch()
+    monkeypatch.setenv("BLUEPRINT_REPO_SCRIPTS_DIR", str(scripts_dir))
+
+    assert _resolve_scripts_dir() == scripts_dir
+
+
 def _load_blueprint_script():
     """Load the script and its sibling dependency without mutating sys.path."""
     api_spec = importlib.util.spec_from_file_location(
@@ -129,9 +139,10 @@ def test_operator_docs_do_not_revoke_bootstrap_removed_sudoers_grant():
     deploy_doc = (_REPO_ROOT / "docs/operations/one-command-deploy.md").read_text(
         encoding="utf-8"
     )
+    normalized_doc = " ".join(deploy_doc.split())
     assert (
-        f"bootstrap removes the legacy\n  `{legacy_path}` grant during installation"
-        in deploy_doc
+        f"bootstrap removes the legacy `{legacy_path}` grant during installation"
+        in normalized_doc
     )
 
 # A real 64-hex container image digest (sha256). It is all-hex, so a naive
