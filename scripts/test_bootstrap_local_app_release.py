@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import ast
 import os
 import re
@@ -15,6 +16,7 @@ from pathlib import Path, PurePosixPath
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+import blueprint
 import bootstrap_local_app_release as bootstrap
 import blueprint_release as release
 
@@ -427,8 +429,7 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
             bootstrap._verify_release_execution_boundary("henry_hamster")
 
     def test_approved_activation_rehearses_root_handoff_and_receipt(self):
-        import blueprint as deploy_blueprint
-
+        deploy_blueprint = blueprint
         revision = "a" * 40
         promoted = {
             "version_number": 7,
@@ -512,6 +513,163 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
             next(body for method, path, body in calls if method == "POST"),
             {"version_number": 7, "revision": revision, "host": "control-plane"},
         )
+
+    def test_slow_release_timeout_is_one_shot_and_receipt_retries(self):
+        """A release outliving the socket wait is not replayed on the next poll."""
+        digest = "sha256:" + "0" * 64
+        revision = "c" * 40
+        promoted = {
+            "version_number": 8,
+            "status": "promoted",
+            "promoted_sha": revision,
+            "serving_status": "unconfirmed",
+            "activation_requested_at": "2026-08-09T00:00:00Z",
+        }
+        calls = []
+        with tempfile.TemporaryDirectory() as raw_directory:
+            directory = Path(raw_directory)
+            socket_path = directory / "blueprint-release.sock"
+            release_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            release_socket.bind(str(socket_path))
+            release_socket.listen(1)
+            count_path = directory / "release-count"
+            script = (
+                "from pathlib import Path; import time; "
+                f"p=Path({str(count_path)!r}); "
+                "p.open('a', encoding='utf-8').write('release\\n'); "
+                "time.sleep(0.15)"
+            )
+            original_fd = os.dup(release._SOCKET_FD)
+            os.dup2(release_socket.fileno(), release._SOCKET_FD)
+
+            def fake_api(method, path, body=None, timeout=30):
+                calls.append((method, path, body))
+                return {"serving_status": "serving_confirmed", "served_sha": revision}
+
+            args = type(
+                "Args",
+                (),
+                {
+                    "project_id": None,
+                    "state_path": str(directory / "missing" / "agent.state"),
+                    "poll_state_path": str(directory / "missing" / "agent.poll"),
+                },
+            )()
+            server = threading.Thread(target=release._serve_one_request)
+            try:
+                with (
+                    unittest.mock.patch.object(blueprint, "_RELEASE_SOCKET_PATH", str(socket_path)),
+                    unittest.mock.patch.object(blueprint, "_RELEASE_SOCKET_TIMEOUT_SECONDS", 0.03),
+                    unittest.mock.patch.object(blueprint, "_require_write_config"),
+                    unittest.mock.patch.object(
+                        blueprint, "_read_live_approved_activation", return_value=promoted
+                    ),
+                    unittest.mock.patch.object(
+                        blueprint,
+                        "_fetch_deploy_manifest",
+                        return_value={"run": {}, "digest": digest, "revision": revision},
+                    ) as fetch_manifest,
+                    unittest.mock.patch.object(blueprint, "get_project_id", return_value="project-1"),
+                    unittest.mock.patch.object(blueprint, "api", side_effect=fake_api),
+                    unittest.mock.patch.object(
+                        release,
+                        "_release_command",
+                        return_value=[sys.executable, "-c", script],
+                    ),
+                    unittest.mock.patch.object(
+                        release.os, "geteuid", return_value=0
+                    ),
+                ):
+                    server.start()
+                    self.assertFalse(blueprint._deploy_agent_once(args))
+                    server.join(timeout=2)
+                    self.assertFalse(server.is_alive())
+                    self.assertEqual(count_path.read_text(encoding="utf-8"), "release\n")
+                    self.assertEqual(
+                        [item for item in calls if item[0] == "POST"], [],
+                    )
+
+                    self.assertTrue(blueprint._deploy_agent_once(args))
+                    self.assertEqual(count_path.read_text(encoding="utf-8"), "release\n")
+                    receipts = [item for item in calls if item[0] == "POST"]
+                    self.assertEqual(len(receipts), 1)
+                    self.assertEqual(
+                        receipts[0][2],
+                        {"version_number": 8, "revision": revision, "host": "control-plane"},
+                    )
+                    fetch_manifest.assert_called_once()
+            finally:
+                os.dup2(original_fd, release._SOCKET_FD)
+                os.close(original_fd)
+                release_socket.close()
+
+    def test_crash_after_release_handoff_retries_receipt_without_second_release(self):
+        """The pre-release marker survives agent death and parks the approval."""
+        revision = "d" * 40
+        promoted = {
+            "version_number": 9,
+            "status": "promoted",
+            "promoted_sha": revision,
+            "serving_status": "unconfirmed",
+            "activation_requested_at": "2026-08-09T00:00:00Z",
+        }
+        calls = []
+        release_calls = []
+
+        def fake_api(method, path, body=None, timeout=30):
+            calls.append((method, path, body))
+            return {"serving_status": "serving_confirmed", "served_sha": revision}
+
+        with tempfile.TemporaryDirectory() as raw_directory:
+            state_path = Path(raw_directory) / "nested" / "agent.state"
+            args = type("Args", (), {"project_id": None, "state_path": str(state_path)})()
+            with (
+                unittest.mock.patch.object(blueprint, "_require_write_config"),
+                unittest.mock.patch.object(
+                    blueprint, "_read_live_approved_activation", return_value=promoted
+                ),
+                unittest.mock.patch.object(
+                    blueprint,
+                    "_fetch_deploy_manifest",
+                    return_value={
+                        "run": {},
+                        "digest": "sha256:" + "1" * 64,
+                        "revision": revision,
+                    },
+                ),
+                unittest.mock.patch.object(blueprint, "get_project_id", return_value="project-1"),
+                unittest.mock.patch.object(blueprint, "api", side_effect=fake_api),
+                unittest.mock.patch.object(
+                    blueprint,
+                    "_invoke_release_shim",
+                    side_effect=lambda *args, **kwargs: (
+                        release_calls.append(args),
+                        (_ for _ in ()).throw(KeyboardInterrupt()),
+                    )[1],
+                ),
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    blueprint._deploy_agent_once(args)
+                self.assertTrue(state_path.exists())
+                self.assertEqual(json.loads(state_path.read_text())["phase"], "started")
+
+                self.assertTrue(blueprint._deploy_agent_once(args))
+                self.assertEqual(len(release_calls), 1)
+                self.assertEqual(
+                    len([item for item in calls if item[0] == "POST"]), 1
+                )
+                self.assertFalse(state_path.exists())
+
+    def test_manual_lock_path_creates_missing_parent(self):
+        with tempfile.TemporaryDirectory() as raw_directory:
+            lock_path = Path(raw_directory) / "missing" / "deploy-agent.lock"
+            handle = blueprint._acquire_deploy_agent_lock(str(lock_path))
+            try:
+                self.assertIsNotNone(handle)
+                self.assertTrue(lock_path.parent.is_dir())
+            finally:
+                if handle is not None:
+                    handle.close()
 
     def test_release_serve_accepts_the_exact_agent_wire_payload(self):
         digest = "sha256:" + "0" * 64

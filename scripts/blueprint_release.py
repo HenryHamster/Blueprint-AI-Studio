@@ -137,10 +137,16 @@ def _serve_one_request() -> None:
             payload = connection.recv(_MAX_REQUEST_BYTES)
             digest, revision = _validated_args(_request_args(payload))
             return_code = _run_release(digest, revision)
-            if return_code == 0:
-                connection.sendall(b"OK\n")
-            else:
-                connection.sendall(f"ERROR release exited {return_code}\n".encode("ascii"))
+            try:
+                if return_code == 0:
+                    connection.sendall(b"OK\n")
+                else:
+                    connection.sendall(f"ERROR release exited {return_code}\n".encode("ascii"))
+            except OSError:
+                # The agent may time out while the root release continues. A
+                # disconnected client must not turn a completed release into
+                # a service error or trigger a second release on restart.
+                pass
     finally:
         listener.close()
 

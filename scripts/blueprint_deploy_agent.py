@@ -252,11 +252,14 @@ def _execute_pending_activation(agent_args: argparse.Namespace) -> int:
         getattr(agent_args, "state_path", _DEFAULT_STATE_PATH)
     ).expanduser()
     pending_receipt = _read_activation_state(state_path)
-    if pending_receipt == {
-        "version_number": version_number,
-        "promoted_sha": binding_sha,
-        "revision": revision,
-    }:
+    if pending_receipt is not None and all(
+        pending_receipt.get(key) == value
+        for key, value in {
+            "version_number": version_number,
+            "promoted_sha": binding_sha,
+            "revision": revision,
+        }.items()
+    ):
         try:
             _post_activation_receipt(deploy_args, promoted, revision)
         except APIError as exc:
@@ -269,19 +272,29 @@ def _execute_pending_activation(agent_args: argparse.Namespace) -> int:
         logger.info("activation receipt recorded for v%s", version_number)
         return 0
 
+    activation_state = {
+        "version_number": version_number,
+        "promoted_sha": binding_sha,
+        "revision": revision,
+        "phase": "started",
+    }
+    # Fence the privileged handoff before invoking it. A timeout or process
+    # death must leave the next cycle with a receipt retry, never a replay.
+    _write_activation_state(state_path, activation_state)
     try:
-        _execute_deploy_shim(deploy_args, revision, digest, inplace=True)
+        release_completed = _execute_deploy_shim(
+            deploy_args, revision, digest, inplace=True
+        )
     except APIError as exc:
         logger.error("activation failed; no receipt posted: %s", exc)
         return 1
-    _write_activation_state(
-        state_path,
-        {
-            "version_number": version_number,
-            "promoted_sha": binding_sha,
-            "revision": revision,
-        },
-    )
+    if release_completed is False:
+        activation_state["phase"] = "accepted"
+        _write_activation_state(state_path, activation_state)
+        logger.info("release is still running; receipt will be retried")
+        return 1
+    activation_state["phase"] = "completed"
+    _write_activation_state(state_path, activation_state)
     try:
         _post_activation_receipt(deploy_args, promoted, revision)
     except APIError as exc:

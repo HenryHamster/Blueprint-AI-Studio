@@ -73,6 +73,7 @@ _DEPLOY_AGENT_UNIT_PATH = "/etc/systemd/system/blueprint-deploy-agent.service"
 _DEPLOY_AGENT_POLL_PATH = "/run/blueprint-deploy-agent/deploy-agent.poll"
 _DEPLOY_AGENT_STATE_PATH = "/var/lib/blueprint-deploy-agent/deploy-agent.state"
 _RELEASE_SOCKET_PATH = "/run/blueprint-release.sock"
+_RELEASE_SOCKET_TIMEOUT_SECONDS = 60
 _RELEASE_SHIM_PATH = "/usr/local/sbin/blueprint-release"
 _DEPLOY_AGENT_POLL_MAX_AGE_SECONDS = 120
 
@@ -5952,37 +5953,49 @@ def _fetch_deploy_manifest(wanted_sha: str | None = None) -> dict:
     return {"run": run, "digest": digest, "revision": revision}
 
 
-def _invoke_release_shim(digest: str, revision: str, *, host: str | None) -> None:
+def _invoke_release_shim(digest: str, revision: str, *, host: str | None) -> bool:
     """Use the root-owned release socket, or the legacy remote SSH path."""
     if host is None:
-        _request_release_socket(digest, revision)
-        return
+        return _request_release_socket(digest, revision)
     command = ["ssh", "-t", host, "sudo", _RELEASE_SHIM_PATH, digest, revision]
     proc = subprocess.run(command, check=False)
     if proc.returncode != 0:
         print(f"ERROR: release exited {proc.returncode} — the release tool "
               "rolls back failed activations; inspect its receipt on the host.")
         raise APIError(f"release failed with exit code {proc.returncode}")
+    return True
 
 
-def _request_release_socket(digest: str, revision: str) -> None:
-    """Send the already validated approval to the root socket executor."""
+def _request_release_socket(digest: str, revision: str) -> bool:
+    """Send the approval, reporting when execution outlives the socket wait."""
     if not _DEPLOY_REVISION_RE.fullmatch(revision):
         raise APIError("release revision failed validation")
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
         raise APIError("release digest failed validation")
+    request_sent = False
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-            connection.settimeout(60)
+            connection.settimeout(_RELEASE_SOCKET_TIMEOUT_SECONDS)
             connection.connect(_RELEASE_SOCKET_PATH)
             connection.sendall(f"{digest} {revision}\n".encode("ascii"))
+            request_sent = True
             connection.shutdown(socket.SHUT_WR)
             response = connection.recv(256).decode("ascii", errors="replace").strip()
+    except TimeoutError as exc:
+        if request_sent:
+            print(
+                "Release executor is still running; receipt delivery is parked "
+                "for the next poll.",
+                file=sys.stderr,
+            )
+            return False
+        raise APIError(f"release executor socket unavailable: {exc}") from exc
     except OSError as exc:
         raise APIError(f"release executor socket unavailable: {exc}") from exc
     if response != "OK":
         detail = response.removeprefix("ERROR ") or "empty executor response"
         raise APIError(f"release executor failed: {detail}")
+    return True
 
 
 def _resolve_deploy_manifest(args: argparse.Namespace) -> tuple[str, str, dict]:
@@ -5997,9 +6010,9 @@ def _execute_deploy_shim(
     digest: str,
     *,
     inplace: bool = False,
-) -> None:
+) -> bool:
     """Run the canonical root-owned executor, locally or over legacy SSH."""
-    _invoke_release_shim(
+    return _invoke_release_shim(
         digest,
         revision,
         host=None if inplace else getattr(args, "host", None),
@@ -6015,7 +6028,14 @@ def _execute_deploy(
     inplace: bool = False,
 ) -> None:
     """Execute the shim, then post the receipt as a distinct stage."""
-    _execute_deploy_shim(args, revision, digest, inplace=inplace)
+    release_completed = _execute_deploy_shim(args, revision, digest, inplace=inplace)
+    if release_completed is False:
+        print(
+            "Release is still running; activation receipt will be retried by "
+            "the deploy agent.",
+            file=sys.stderr,
+        )
+        return
     print("Release activated. Runners self-update on their next heartbeat.")
     _post_activation_receipt(args, promoted, revision)
 
@@ -6039,7 +6059,7 @@ def _read_live_approved_activation(args: argparse.Namespace) -> dict | None:
 def _deploy_agent_once(args: argparse.Namespace) -> bool:
     """Execute one current approval and post the existing activation receipt.
 
-    A successful shim invocation is recorded before the receipt POST. If the
+    The activation intent is recorded before the shim invocation. If the
     control plane is temporarily unavailable, later polls retry only that
     receipt for the same approval instead of restarting the release.
     """
@@ -6091,15 +6111,23 @@ def _deploy_agent_once(args: argparse.Namespace) -> bool:
     ):
         print("Approved activation changed before execution; leaving it for the next poll.")
         return False
-    _invoke_release_shim(release["digest"], release["revision"], host=None)
-    _write_deploy_agent_state(
-        state_path,
-        {
-            "version_number": current.get("version_number"),
-            "promoted_sha": promoted_sha,
-            "revision": release["revision"],
-        },
-    )
+    activation_state = {
+        "version_number": current.get("version_number"),
+        "promoted_sha": promoted_sha,
+        "revision": release["revision"],
+        "phase": "started",
+    }
+    # Persist the intent before crossing the privileged boundary. This is the
+    # at-most-once fence when the agent dies or the socket wait expires while
+    # the root service continues the release.
+    _write_deploy_agent_state(state_path, activation_state)
+    release_completed = _invoke_release_shim(release["digest"], release["revision"], host=None)
+    if release_completed is False:
+        activation_state["phase"] = "accepted"
+        _write_deploy_agent_state(state_path, activation_state)
+        return False
+    activation_state["phase"] = "completed"
+    _write_deploy_agent_state(state_path, activation_state)
     _post_activation_receipt(
         argparse.Namespace(
             project_id=getattr(args, "project_id", None),
@@ -6118,7 +6146,7 @@ def _read_deploy_agent_state(path: str | None) -> dict | None:
     if not path:
         return None
     try:
-        with open(path, encoding="utf-8") as handle:
+        with open(os.path.expanduser(path), encoding="utf-8") as handle:
             state = json.load(handle)
     except (OSError, ValueError):
         return None
@@ -6135,10 +6163,12 @@ def _write_deploy_agent_poll(path: str | None) -> None:
 
 
 def _write_deploy_agent_state(path: str | None, state: dict) -> None:
-    """Atomically persist successful execution before receipt delivery."""
+    """Atomically persist an activation intent before receipt delivery."""
     if not path:
         return
-    directory = os.path.dirname(path) or "."
+    path = os.path.expanduser(path)
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(directory, mode=0o700, exist_ok=True)
     temporary = None
     try:
         fd, temporary = tempfile.mkstemp(prefix=".deploy-agent.", dir=directory)
@@ -6163,7 +6193,7 @@ def _clear_deploy_agent_state(path: str | None) -> None:
     if not path:
         return
     try:
-        os.unlink(path)
+        os.unlink(os.path.expanduser(path))
     except FileNotFoundError:
         pass
 
@@ -6454,6 +6484,8 @@ def _render_deploy_agent_preflight(data: dict) -> None:
 
 def _acquire_deploy_agent_lock(path: str):
     """Acquire the systemd-owned runtime lock without blocking another poll."""
+    path = os.path.expanduser(path)
+    os.makedirs(os.path.dirname(os.path.abspath(path)), mode=0o700, exist_ok=True)
     handle = open(path, "a+", encoding="utf-8")  # noqa: SIM115 - returned locked handle
     try:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
