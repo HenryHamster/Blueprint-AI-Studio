@@ -30,7 +30,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -1944,11 +1943,20 @@ class TestProjectVerificationRuntimeContract:
             (fake_pgbindir / stub).chmod(0o755)
         env = os.environ.copy()
         env["PATH"] = f"{fake_bin}{os.pathsep}{env.get('PATH', '')}"
-        # The probe also proves the baked sandbox interpreter the gate requires.
-        # Test hosts (and the backend CI image) have no /opt/blueprint-backend-venv,
-        # so designate this interpreter as the sandbox one — it imports pytest by
-        # construction, keeping this case about pg_config resolution alone.
-        env["BLUEPRINT_SANDBOX_PYTHON"] = sys.executable
+        # This case is about the pg_config bindir resolution alone, so the
+        # sandbox branch of resolve_pg_bindir must NOT win. A real interpreter
+        # (e.g. sys.executable on the backend CI image, which bundles the
+        # pgserver wheel) resolves a real POSTGRES_BIN_PATH whose initdb refuses
+        # to run as the CI root user, masking this test. Use a stub interpreter
+        # that satisfies the probe's `import pgserver, pytest` gate (exit 0) but
+        # resolves no pgserver bindir (prints nothing for POSTGRES_BIN_PATH), so
+        # resolution falls through to the fake pg_config path under test. The
+        # import gate itself is covered separately by
+        # test_probe_proves_the_baked_sandbox_interpreter_the_gate_requires.
+        fake_sandbox_python = tmp_path / "sandbox-python"
+        fake_sandbox_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        fake_sandbox_python.chmod(0o755)
+        env["BLUEPRINT_SANDBOX_PYTHON"] = str(fake_sandbox_python)
         result = subprocess.run(
             [bash_executable, str(_PROJECT_VERIFICATION_PROBE), "docker-postgres"],
             capture_output=True,
