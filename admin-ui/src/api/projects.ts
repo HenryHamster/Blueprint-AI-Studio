@@ -1070,7 +1070,8 @@ export interface ApproveActivationResponse {
 }
 
 /** Record the admin's approval for the latest promoted, unconfirmed version.
- * The host-side deploy agent performs activation and posts the receipt later. */
+ * This only records the request; a host-side activation executor must perform
+ * activation and post the serving receipt later. */
 export async function approveActivation(projectId: string): Promise<ApproveActivationResponse> {
   const res = await apiFetch(
     `/api/admin/projects/${encodeURIComponent(projectId)}/approve-activation`,

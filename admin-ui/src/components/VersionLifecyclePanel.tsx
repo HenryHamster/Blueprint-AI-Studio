@@ -485,7 +485,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, ref
     if (readOnly || !canManagePlatform || !projectId) return;
     setLocalDialog({
       title: `Approve activation of v${version.version_number}?`,
-      message: 'This approves the newest CI-built main release bound to this promotion. The host-side deploy agent will perform activation, and the serving receipt will confirm when it is live.',
+      message: 'This records approval for the newest CI-built main release bound to this promotion; it does not deploy by itself. Activation requires the host-side activation executor to be installed and running. Until it is present and runs, no serving receipt will arrive.',
       confirmLabel: 'Approve activation',
       onConfirm: async () => {
         setLocalDialog(null);

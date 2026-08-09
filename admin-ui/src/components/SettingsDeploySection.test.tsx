@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
 import { DeploySection } from './SettingsDeploySection';
+import { PromotedAwaitingActivationCallout } from './VersionLifecyclePanelPrimitives';
 import { apiFetch } from '../api';
 
 vi.mock('../api', () => ({ apiFetch: vi.fn() }));
@@ -204,5 +205,29 @@ describe('MergeGradeGateSettings (via DeploySection)', () => {
       expect(patchCalls).toHaveLength(1);
     });
     expect(screen.queryByText('Must be a number between 0.0 and 1.0')).toBeNull();
+  });
+});
+
+describe('activation deployment status', () => {
+  it('explains that approval waits for the activation executor before a receipt can arrive', () => {
+    render(
+      <PromotedAwaitingActivationCallout
+        version={{
+          version_number: 4,
+          status: 'promoted',
+          opened_at: '2026-07-01T12:00:00Z',
+          promoted_at: '2026-07-01T12:00:00Z',
+          qualification_attempts: 1,
+          last_qualification: null,
+          serving: { status: 'unconfirmed' },
+        }}
+      />,
+    );
+
+    expect(screen.getByTestId('promoted-awaiting-activation')).toHaveTextContent('host-side activation executor');
+    expect(screen.getByTestId('promoted-awaiting-activation')).toHaveTextContent(
+      'must be installed and running before a serving receipt can arrive',
+    );
+    expect(screen.getByTestId('promoted-awaiting-activation')).not.toHaveTextContent('deploy agent');
   });
 });
