@@ -25,7 +25,7 @@ import statistics
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Mapping, Sequence
+from typing import Any, Dict, Mapping, Sequence, cast
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from sqlalchemy import func, or_
@@ -346,6 +346,14 @@ UNPRICED_ALERT_MIN_TASKS = 3
 # Window over which "current" axes are computed for each daily snapshot.
 _AXIS_WINDOW_DAYS = 7
 
+# Migration 0735 added Task.origination with a SYSTEM server default, which
+# backfilled every pre-existing task. Origination shares are therefore only
+# evidence-bearing after the migration's capture boundary; older rows are a
+# residual, not proof of direct/system work.
+ORIGINATION_CAPTURED_AT = datetime(2026, 8, 7)
+ORIGINATION_MIN_QUOTABLE_COHORT = 20
+ORIGINATION_MAX_UNATTRIBUTED_SHARE = 0.20
+
 # Row cap applied to _load_recent_tasks. Past this many terminal tasks in the
 # requested window, the loaded cohort is a recency SAMPLE (most-recently-
 # updated first) rather than the full window — every aggregate computed from
@@ -410,7 +418,71 @@ _SNAPSHOT_HISTORY_MAX = 7
 #      reconciles with the aggregate total_usd), and by_cycle_capped — so a
 #      decision-loop reading can separate cycles that ran before a lever reached
 #      serving from cycles that ran after.
-METRIC_DEF_VERSION = "v17"
+METRIC_DEF_VERSION = "v18"
+
+
+def build_merged_work_origination_reading(
+    split: Mapping[str, int],
+    *,
+    window_start: datetime,
+    window_end: datetime,
+) -> dict[str, Any]:
+    """Attach evidence provenance to the merged-work origination split.
+
+    Suppress shares unless the window is post-0735, sufficiently sized, and not
+    mostly residual-contaminated; retain counts for diagnosis when unquotable.
+    """
+    from app.research_completion import merged_work_origination_reading
+
+    reading = cast(dict[str, Any], merged_work_origination_reading(dict(split)))
+    merged_total = reading["merged_total"]
+    commissioned_total = reading["commissioned_total"]
+    unattributed = reading["unattributed_merged"]
+    contamination_rate = (
+        round(unattributed / merged_total, 4) if merged_total else None
+    )
+
+    reason: str | None = None
+    if window_start < ORIGINATION_CAPTURED_AT:
+        reason = "window_predates_origination_capture"
+    elif merged_total == 0:
+        reason = "no_origination_data"
+    elif commissioned_total == 0:
+        reason = "no_commissioned_origination_data"
+    elif commissioned_total < ORIGINATION_MIN_QUOTABLE_COHORT:
+        reason = "cohort_too_small"
+    elif (
+        contamination_rate is not None
+        and contamination_rate > ORIGINATION_MAX_UNATTRIBUTED_SHARE
+    ):
+        reason = "cohort_too_contaminated"
+
+    quotable = reason is None
+    if not quotable:
+        for key in (
+            "research_share_of_commissioned",
+            "strategist_share_of_commissioned",
+            "research_share_of_merged",
+            "strategist_share_of_merged",
+        ):
+            reading[key] = None
+
+    reading.update(
+        {
+            "window_start": window_start.isoformat(),
+            "window_end": window_end.isoformat(),
+            "window_days": round(
+                (window_end - window_start).total_seconds() / 86400, 1
+            ),
+            "origination_capture_start": ORIGINATION_CAPTURED_AT.isoformat(),
+            "window_fully_captured": window_start >= ORIGINATION_CAPTURED_AT,
+            "cohort_size": commissioned_total,
+            "contamination_rate": contamination_rate,
+            "status": "QUOTABLE" if quotable else "UNQUOTABLE",
+            "unquotable_reason": reason,
+        }
+    )
+    return reading
 
 
 async def _read_snapshot_history(
@@ -2971,18 +3043,22 @@ async def compute_current_axes(
     # derived from the 5000-row `tasks` cohort above, which is created_at-ordered
     # and capped, so it would answer a different (and biased) question.
     from app.research_completion import (  # noqa: PLC0415 — avoids an import cycle
-        merged_work_origination_reading,
         merged_work_origination_split,
     )
 
-    merged_work_origination = merged_work_origination_reading(
+    origination_window_end = _utcnow()
+    origination_window_start = origination_window_end - timedelta(
+        days=_AXIS_WINDOW_DAYS
+    )
+    merged_work_origination = build_merged_work_origination_reading(
         await merged_work_origination_split(
             session,
             project_id,
-            since=_utcnow() - timedelta(days=_AXIS_WINDOW_DAYS),
-        )
+            since=origination_window_start,
+        ),
+        window_start=origination_window_start,
+        window_end=origination_window_end,
     )
-    merged_work_origination["window_days"] = _AXIS_WINDOW_DAYS
 
     # Provider routing A/B verdict (direction d-cf39cb40): derive from the
     # per-model efficiency breakdown so the verdict carries BOTH cost ratio AND
@@ -4026,6 +4102,9 @@ async def read_baseline_with_drift(
         },
         "baseline_captured_at": baseline.get("captured_at"),
         "last_snapshot_at": container.get("last_run_at") or latest.get("captured_at"),
+        # Merged-work origination is a persisted sibling reading, including its
+        # capture-window and quotability provenance rather than a bare share.
+        "merged_work_origination": latest.get("merged_work_origination"),
         "vm_cold_start_breakdown": latest.get("vm_cold_start_breakdown"),
         "reuse_funnel": get_reuse_funnel_snapshot(),
         # Durable (restart-surviving) warm-reuse drop-out ranking from the latest

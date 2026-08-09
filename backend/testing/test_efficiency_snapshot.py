@@ -40,6 +40,9 @@ from app.efficiency_snapshot import (
     LLM_TOKEN_PRICING,
     METRIC_DEF_VERSION,
     NESTED_METRIC_CONSUMERS,
+    ORIGINATION_CAPTURED_AT,
+    ORIGINATION_MIN_QUOTABLE_COHORT,
+    build_merged_work_origination_reading,
     PROMPT_STATIC_BYTES_THRESHOLD,
     PROVIDER_ROUTING_ADOPT,
     PROVIDER_ROUTING_INSUFFICIENT_DATA,
@@ -86,6 +89,8 @@ from app.models import (
     ImprovementLane,
     ImprovementLaneStatus,
     TaskStatus,
+    TASK_ORIGINATION_RESEARCH,
+    TASK_ORIGINATION_STRATEGIST,
     bank_task_current_attempt,
 )
 from app.llm_cost_attribution import (
@@ -909,6 +914,7 @@ async def test_read_baseline_with_drift_returns_drift_pct(db_session):
     assert cpm_axis["baseline"] == base_cpm
     assert cpm_axis["drift_pct"] == 50.0
     assert result["baseline_captured_at"] is not None
+    assert "merged_work_origination" in result
 
 
 @pytest.mark.asyncio
@@ -11792,6 +11798,93 @@ async def test_capped_cohort_reports_effective_window_as_authoritative(
     assert data["window_days"] == expected_days
     assert data["window_days"] < 7
     assert data["window_days"] == 3.0
+
+
+def test_origination_reading_quotes_a_fully_covered_window():
+    """A complete, sufficiently sized classified window yields real shares."""
+    window_start = ORIGINATION_CAPTURED_AT + timedelta(days=1)
+    window_end = window_start + timedelta(days=7)
+    split = {
+        TASK_ORIGINATION_RESEARCH: ORIGINATION_MIN_QUOTABLE_COHORT // 2,
+        TASK_ORIGINATION_STRATEGIST: ORIGINATION_MIN_QUOTABLE_COHORT // 2,
+    }
+
+    reading = build_merged_work_origination_reading(
+        split, window_start=window_start, window_end=window_end
+    )
+
+    assert reading["status"] == "QUOTABLE"
+    assert reading["research_share_of_commissioned"] == pytest.approx(0.5)
+    assert reading["window_start"] == window_start.isoformat()
+    assert reading["window_end"] == window_end.isoformat()
+    assert reading["unquotable_reason"] is None
+
+
+def test_origination_reading_refuses_a_window_before_capture():
+    """A pre-capture window is explicitly unquotable, never a zero share."""
+    window_start = ORIGINATION_CAPTURED_AT - timedelta(days=1)
+    window_end = ORIGINATION_CAPTURED_AT + timedelta(days=6)
+    split = {
+        TASK_ORIGINATION_RESEARCH: ORIGINATION_MIN_QUOTABLE_COHORT // 2,
+        TASK_ORIGINATION_STRATEGIST: ORIGINATION_MIN_QUOTABLE_COHORT // 2,
+    }
+
+    reading = build_merged_work_origination_reading(
+        split, window_start=window_start, window_end=window_end
+    )
+
+    assert reading["status"] == "UNQUOTABLE"
+    assert reading["unquotable_reason"] == "window_predates_origination_capture"
+    assert reading["research_share_of_commissioned"] is None
+
+
+def test_origination_reading_refuses_an_undersized_cohort():
+    """A small classified cohort cannot support a directional share claim."""
+    window_start = ORIGINATION_CAPTURED_AT + timedelta(days=1)
+    window_end = window_start + timedelta(days=7)
+    reading = build_merged_work_origination_reading(
+        {TASK_ORIGINATION_RESEARCH: 1, TASK_ORIGINATION_STRATEGIST: 1},
+        window_start=window_start,
+        window_end=window_end,
+    )
+
+    assert reading["status"] == "UNQUOTABLE"
+    assert reading["unquotable_reason"] == "cohort_too_small"
+    assert reading["research_share_of_commissioned"] is None
+
+
+def test_origination_reading_distinguishes_no_data_from_a_valid_zero():
+    """No rows are not the same fact as a measured zero research share."""
+    window_start = ORIGINATION_CAPTURED_AT + timedelta(days=1)
+    window_end = window_start + timedelta(days=7)
+
+    no_data = build_merged_work_origination_reading(
+        {}, window_start=window_start, window_end=window_end
+    )
+    zero = build_merged_work_origination_reading(
+        {TASK_ORIGINATION_STRATEGIST: ORIGINATION_MIN_QUOTABLE_COHORT},
+        window_start=window_start,
+        window_end=window_end,
+    )
+
+    assert no_data["status"] == "UNQUOTABLE"
+    assert no_data["unquotable_reason"] == "no_origination_data"
+    assert no_data["research_share_of_commissioned"] is None
+    assert zero["status"] == "QUOTABLE"
+    assert zero["research_share_of_commissioned"] == 0.0
+    contaminated = build_merged_work_origination_reading(
+        {
+            TASK_ORIGINATION_RESEARCH: ORIGINATION_MIN_QUOTABLE_COHORT,
+            TASK_ORIGINATION_STRATEGIST: ORIGINATION_MIN_QUOTABLE_COHORT,
+            "SYSTEM": ORIGINATION_MIN_QUOTABLE_COHORT,
+        },
+        window_start=window_start,
+        window_end=window_end,
+    )
+    assert contaminated["status"] == "UNQUOTABLE"
+    assert contaminated["unquotable_reason"] == "cohort_too_contaminated"
+    assert contaminated["research_share_of_commissioned"] is None
+
 
 @pytest.mark.asyncio
 async def test_efficiency_snapshot_history_surface_returns_captures_with_provenance(

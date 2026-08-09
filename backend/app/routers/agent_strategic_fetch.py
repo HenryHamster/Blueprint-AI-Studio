@@ -2288,6 +2288,7 @@ async def agent_fetch_efficiency_snapshot(
         _AXIS_WINDOW_DAYS,
         _COHORT_CAP,
         _cohort_effective_window,
+        build_merged_work_origination_reading,
         _compute_cost_per_merged_pr,
         _compute_cost_per_verified_task,
         _compute_llm_cache_hit_rate,
@@ -2302,7 +2303,6 @@ async def agent_fetch_efficiency_snapshot(
     )
     from app.digest_metrics import compute_format_compliance_metrics  # noqa: PLC0415
     from app.research_completion import (  # noqa: PLC0415
-        merged_work_origination_reading,
         merged_work_origination_split,
     )
     from app.project_telemetry import (  # noqa: PLC0415
@@ -2347,12 +2347,18 @@ async def agent_fetch_efficiency_snapshot(
     # (direction d-197325ef, criterion c-09d49820). Computed by its own
     # GROUP BY over the landing timestamp rather than from the created_at-ordered,
     # 5000-row-capped `tasks` cohort, which would answer a biased question.
-    merged_work_origination = merged_work_origination_reading(
+    origination_window_end = _utcnow()
+    origination_window_start = origination_window_end - timedelta(
+        days=_AXIS_WINDOW_DAYS
+    )
+    merged_work_origination = build_merged_work_origination_reading(
         await merged_work_origination_split(
             session,
             project_id,
-            since=_utcnow() - timedelta(days=_AXIS_WINDOW_DAYS),
-        )
+            since=origination_window_start,
+        ),
+        window_start=origination_window_start,
+        window_end=origination_window_end,
     )
 
     # The persisted append-only efficiency snapshot time series
