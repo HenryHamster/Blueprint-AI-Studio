@@ -39,6 +39,16 @@ _REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
 _SYSTEM_USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 _SERVICES = ("blueprint-api.service", "blueprint-worker.service")
 _ACTIVATION_ORDER = ("blueprint-worker.service", "blueprint-api.service")
+# App units may legitimately be crash-looping (activating/failed) or absent
+# (inactive) when a release runs — e.g. a migration-carrying deploy left the
+# prior image unable to satisfy the new schema-version gate.  Replacing that
+# broken image is exactly what a release does, so these states must not block
+# it; the image validation in _validate_managed_container stays the hard safety
+# gate against acting on an unexpected image.  Any other ActiveState is
+# unexpected and still refuses the release.
+_RECOVERABLE_APP_STATES = frozenset(
+    {"active", "activating", "deactivating", "inactive", "failed"}
+)
 _UNTOUCHED_UNITS = (
     "blueprint-database.service",
     "blueprint-database-backup.timer",
@@ -741,7 +751,13 @@ def _stop_unit_container(
         container_id = _validate_managed_container(
             container, existing, allowed_images
         )
-    _run(["/usr/bin/systemctl", "stop", "--no-block", unit])
+    # Block until systemd has fully stopped the unit before touching its
+    # container.  A non-blocking stop returns while Restart=always is still
+    # armed, so a crash-looping old image (common after a migration deploy)
+    # gets auto-restarted mid-swap and races the tool's own docker stop/remove
+    # ("removal of container ... already in progress").  A blocking stop
+    # cancels the restart cycle so the container is static when we proceed.
+    _run(["/usr/bin/systemctl", "stop", unit], timeout=120)
     if container_id is not None:
         stop = _run(
             [
@@ -1148,8 +1164,11 @@ def release(image_ref: str, revision: str) -> Path:
     if prior_api != prior_worker or not _IMAGE_ID_RE.fullmatch(prior_api):
         raise RuntimeError("current API and worker image IDs are not a safe pair")
     for unit in _SERVICES:
-        if _service_marker(unit)[0] != "active":
-            raise RuntimeError(f"{unit} must be active before release")
+        state = _service_marker(unit)[0]
+        if state not in _RECOVERABLE_APP_STATES:
+            raise RuntimeError(
+                f"{unit} is in unexpected state {state!r}; refusing to release"
+            )
     untouched_before = {unit: _service_marker(unit) for unit in _UNTOUCHED_UNITS}
     for unit, marker in untouched_before.items():
         if marker[0] != "active":
