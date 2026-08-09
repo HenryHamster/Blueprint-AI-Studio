@@ -5,6 +5,7 @@ All network calls are mocked — these tests never reach the real Cloud Run API.
 
 import ast
 import importlib.util
+import os
 import re
 import sys
 from pathlib import Path
@@ -14,7 +15,34 @@ import pytest
 
 from app import deployed_sha
 
-_SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "scripts"
+
+def _resolve_scripts_dir() -> Path:
+    """Locate the repo ``scripts/`` dir across local + Docker test environments.
+
+    Candidates, in order: an explicit env override, the ``/repo`` bind-mount,
+    then the repo root two levels above ``backend/testing/``. The CI backend
+    shards and ``scripts/test-backend.sh`` build the image from ``backend/``
+    alone (``COPY . .`` → ``/app``) and mount the repo root read-only at
+    ``/repo`` — so inside that image ``parents[2]`` is the filesystem root and
+    ``/scripts`` does not exist; the repo ``scripts/`` is reachable only via
+    ``/repo/scripts``. Local/plain checkouts resolve via ``parents[2]``.
+    Mirrors ``test_local_runner_terminal_log._resolve_local_runner_path``.
+    """
+    candidates = []
+    env_override = os.getenv("BLUEPRINT_REPO_SCRIPTS_DIR")
+    if env_override:
+        candidates.append(Path(env_override))
+    candidates.append(Path("/repo/scripts"))
+    candidates.append(Path(__file__).resolve().parents[2] / "scripts")
+    for path in candidates:
+        if (path / "blueprint_api.py").is_file():
+            return path
+    # Fall back to the plain-checkout path so a genuine miss surfaces a clear
+    # FileNotFoundError naming the expected location rather than a bare None.
+    return candidates[-1]
+
+
+_SCRIPTS_DIR = _resolve_scripts_dir()
 _REPO_ROOT = _SCRIPTS_DIR.parent
 
 
