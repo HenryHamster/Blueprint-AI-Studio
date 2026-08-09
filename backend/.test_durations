@@ -14889,8 +14889,6 @@
   "testing/test_release_scoring.py::TestCategoryGateNonEngagingPaths::test_ci_unresolved_recovery_with_all_met_verdicts_promotes": 12.25,
   "testing/test_release_scoring.py::TestCategoryGateNonEngagingPaths::test_ci_unresolved_recovery_with_none_category_verdicts_skips_gate_by_design": 19.08,
   "testing/test_release_scoring.py::TestCategoryGateNonEngagingPaths::test_ci_unresolved_recovery_with_not_met_category_verdicts_keeps_blocker": 0.4,
-  "testing/test_release_scoring.py::TestCategoryGateNonEngagingPaths::test_contentless_goal_evaluate_returns_none_category_verdicts": 0.194,
-  "testing/test_release_scoring.py::TestCategoryGateNonEngagingPaths::test_contentless_goal_full_chain_shows_gate_skip_then_fallback_blocks": 15.48,
   "testing/test_release_scoring.py::TestCategoryGateNonEngagingPaths::test_contentless_goal_none_category_verdicts_skips_gate_in_compute_composite": 0.12,
   "testing/test_release_scoring.py::TestCategoryGateNonEngagingPaths::test_merge_grade_exempt_all_met_verdicts_promote": 0.4,
   "testing/test_release_scoring.py::TestCategoryGateNonEngagingPaths::test_merge_grade_exempt_no_rubric_none_verdicts_skips_gate": 13.2,
