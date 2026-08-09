@@ -251,6 +251,19 @@ def count_lines(path: str) -> int:
         return len(f.readlines())
 
 
+def iter_capped_paths(root: str, caps: dict) -> "list[tuple[str, str, int | None]]":
+    """Return deterministic ``(relative path, absolute path, cap)`` records.
+
+    The CI compliance gate and the command-line scanner both consume the same
+    cap mapping. Keeping path resolution in this dependency-free module makes
+    a newly registered testing companion (such as an extracted test seam)
+    visible to both checks without duplicating the JSON traversal contract.
+    Missing files are retained so callers that diagnose stale caps preserve the
+    existing ``count=None`` behavior.
+    """
+    return [(rel, os.path.join(root, rel), cap) for rel, cap in caps.items()]
+
+
 def scan_section(caps: dict, root: str, section: str = "backend") -> list[dict]:
     """Line-count every file in ``caps`` under ``root``.
 
@@ -264,9 +277,7 @@ def scan_section(caps: dict, root: str, section: str = "backend") -> list[dict]:
     per-file git lookup the chronic verdict would trigger.
     """
     records = []
-    for rel in caps:
-        cap = caps[rel]
-        path = os.path.join(root, rel)
+    for rel, path, cap in iter_capped_paths(root, caps):
         count = count_lines(path) if os.path.isfile(path) else None
         rec = classify_size_record(rel, count, cap, section, with_verdict=False)
         rec["path"] = path

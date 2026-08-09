@@ -4089,12 +4089,6 @@
           "commit_date": "2026-07-23T01:13:06Z",
           "old_cap": 11750,
           "new_cap": 13650
-        },
-        {
-          "commit_sha": "unattributed",
-          "commit_date": "2026-08-09T22:55:43.227270+00:00",
-          "old_cap": 13650,
-          "new_cap": 15750
         }
       ],
       "test_ci_completion.py": [

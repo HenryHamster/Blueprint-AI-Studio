@@ -2472,17 +2472,24 @@ def test_test_files_within_size_limits():
         "and commit the updated JSON."
     )
     acceptance_criteria_cap = testing_caps.get("test_acceptance_criteria.py")
-    assert acceptance_criteria_cap == 15750, (
-        "test_acceptance_criteria.py must use the canonical 13663-line breach "
-        f"cap bump to 15750; got {acceptance_criteria_cap}"
+    assert acceptance_criteria_cap == 13650, (
+        "test_acceptance_criteria.py must retain its governed 13650-line cap "
+        f"after the walkthrough split; got {acceptance_criteria_cap}"
     )
-
     testing_root = os.path.normpath(os.path.dirname(__file__))
     assert os.path.isdir(testing_root), "backend/testing/ must exist"
 
+    walkthrough_rel = "test_acceptance_criteria__walkthrough.py"
+    assert walkthrough_rel in testing_caps, (
+        f"{walkthrough_rel} must be registered in the testing size-cap section"
+    )
+    walkthrough_path = os.path.join(testing_root, walkthrough_rel)
+    assert os.path.isfile(walkthrough_path), (
+        f"{walkthrough_rel} must exist after the acceptance-criteria split"
+    )
+
     breaches = []
-    for rel, cap in testing_caps.items():
-        path = os.path.join(testing_root, rel)
+    for rel, path, cap in csl.iter_capped_paths(testing_root, testing_caps):
         if not os.path.isfile(path):
             continue
         count = csl.count_lines(path)

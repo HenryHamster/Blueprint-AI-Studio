@@ -5,6 +5,7 @@ All network calls are mocked — these tests never reach the real Cloud Run API.
 
 import ast
 import importlib.util
+import json
 import os
 import re
 import sys
@@ -410,7 +411,7 @@ class TestApprovedActivationExecutor:
             ),
         ]
 
-    def test_failed_activation_is_reported_not_timeout(self, monkeypatch):
+    def test_failed_activation_is_reported_not_timeout(self, monkeypatch, tmp_path):
         APIError = deploy_blueprint.APIError
 
         monkeypatch.setattr(deploy_blueprint, "_require_write_config", lambda _role: None)
@@ -444,12 +445,21 @@ class TestApprovedActivationExecutor:
             ),
         )
 
-        with pytest.raises(APIError, match="release failed with exit code 17"):
-            deploy_blueprint._deploy_agent_once(
-                type("Args", (), {"project_id": None})()
-            )
-        assert handoffs == [("sha256:" + "0" * 64, _GIT_SHA)]
+        assert deploy_blueprint._deploy_agent_once(
+            type(
+                "Args",
+                (),
+                {"project_id": None, "state_path": str(tmp_path / "deploy-agent.state")},
+            )()
+        ) is False
+        assert handoffs == [("sha256:" + "0" * 64, _GIT_SHA)] * 3
         assert not receipt_calls
+        failure_state = json.loads(
+            (tmp_path / "deploy-agent.state").read_text(encoding="utf-8")
+        )
+        assert failure_state["phase"] == "failed"
+        assert failure_state["activation_attempts"] == 3
+        assert "release failed with exit code 17" in failure_state["failure_reason"]
 
 
 @pytest.mark.asyncio
