@@ -149,6 +149,11 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # Migration safety: the upgrade path adds only a nullable direction_id
+    # column and RELAXES version_id to nullable, so it never adds a NOT NULL
+    # column to a populated table and needs no server_default. The
+    # nullable=False calls below are downgrade-only reversions restoring
+    # version_id's original NOT NULL on rollback, not forward-deploy steps.
     # ----- residualverdict -----
     op.drop_index(
         "uq_residualverdict_direction_sha_attempt",
