@@ -42,6 +42,7 @@ See also:
     subcommands.
 """
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -5509,8 +5510,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help="Deploy even when no promoted release version exists or the built "
-             "revision does not contain the promoted SHA (emergency override).",
+        "revision does not contain the promoted SHA (emergency override).",
     )
+    p_deploy_agent = sub.add_parser(
+        "deploy-agent", parents=[common],
+        help="Run the trusted local executor for approved activations.")
+    p_deploy_agent.add_argument(
+        "--once", action="store_true",
+        help="Poll and process at most one approved activation, then exit.")
+    p_deploy_agent.add_argument(
+        "--poll-interval", type=int, default=30,
+        help="Seconds between approval polls (default: 30).")
+    p_deploy_agent.add_argument(
+        "--lock-path", default="/run/blueprint-deploy-agent/deploy-agent.lock",
+        help="Local serialization lock path (managed by the systemd runtime directory).")
+    p_deploy_agent.add_argument(
+        "--state-path", default="/run/blueprint-deploy-agent/deploy-agent.state",
+        help="Local receipt-retry state path (managed by the systemd runtime directory).")
 
     # envelope
     p_envelope = sub.add_parser(
@@ -5796,7 +5812,7 @@ _DEPLOY_REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
 def _gh(*gh_args: str) -> str:
     """Run gh and return stdout, mapping failure to APIError for main()."""
     proc = subprocess.run(
-        ["gh", *gh_args], capture_output=True, text=True
+        ["gh", *gh_args], capture_output=True, text=True, check=False
     )
     if proc.returncode != 0:
         print(f"ERROR: gh {' '.join(gh_args[:3])}... failed: {proc.stderr.strip()[:400]}")
@@ -5804,19 +5820,8 @@ def _gh(*gh_args: str) -> str:
     return proc.stdout
 
 
-def _resolve_deploy_binding(args: argparse.Namespace, revision: str) -> dict | None:
-    """Resolve the promoted release version this deploy binds to (or ``None``).
-
-    Bind the built revision to the project's latest promoted release version:
-    query the backend for the newest ``status=promoted`` version and, when the
-    built revision differs from the promoted SHA, verify via the GitHub compare
-    API that the build CONTAINS the promoted commit (status ``identical`` or
-    ``ahead``).  Refuse ``behind``/``diverged`` revisions — a build that does not
-    include the promoted commit must not be surfaced as the promoted version
-    serving.  ``--force`` bypasses every refusal (emergency override); with no
-    promoted version at all, ``--force`` returns ``None`` and the deploy proceeds
-    unbound (legacy behavior, no receipt).
-    """
+def _read_latest_promoted_version(args: argparse.Namespace) -> dict | None:
+    """Read the current promoted version, without interpreting CLI overrides."""
     pid = get_project_id(getattr(args, "project_id", None))
     versions_data, err = _safe_read(
         f"/api/admin/projects/{pid}/release-versions?status=promoted&limit=1"
@@ -5825,17 +5830,13 @@ def _resolve_deploy_binding(args: argparse.Namespace, revision: str) -> dict | N
         print(f"ERROR: could not read promoted release versions: {err}")
         raise APIError(1, "promoted version lookup failed")
     versions = (versions_data or {}).get("versions") or []
-    promoted = versions[0] if versions else None
-    if promoted is None:
-        if getattr(args, "force", False):
-            print("  WARNING: no promoted release version found — deploying "
-                  "unbound (--force).")
-            return None
-        print("ERROR: no promoted release version found for this project; "
-              "refusing to activate a revision that is not bound to a "
-              "promotion. Use --force to deploy anyway.")
-        raise APIError(1, "no promoted release version")
+    return versions[0] if versions else None
 
+
+def _validate_deploy_binding(
+    revision: str, promoted: dict, *, force: bool = False
+) -> None:
+    """Verify that ``revision`` is the promotion or its GitHub descendant."""
     promoted_sha = (promoted.get("promoted_sha") or "").lower()
     version_number = promoted.get("version_number")
     status = "identical"
@@ -5845,7 +5846,7 @@ def _resolve_deploy_binding(args: argparse.Namespace, revision: str) -> dict | N
         ))
         status = (compare.get("status") or "unknown")
         if status not in ("identical", "ahead"):
-            if getattr(args, "force", False):
+            if force:
                 print(f"  WARNING: built revision {revision[:12]} is {status} "
                       f"the promoted SHA {promoted_sha[:12]} — binding check "
                       "bypassed (--force).")
@@ -5857,7 +5858,263 @@ def _resolve_deploy_binding(args: argparse.Namespace, revision: str) -> dict | N
                 raise APIError(1, "revision not descendant of promoted sha")
     print(f"  Binding:   v{version_number} (promoted {promoted_sha[:12]}, "
           f"build {status})")
+
+
+def _resolve_deploy_binding(args: argparse.Namespace, revision: str) -> dict | None:
+    """Resolve and verify the version this legacy CLI deploy binds to.
+
+    ``--force`` retains its emergency legacy behavior: no promotion can mean
+    an unbound deploy, and a non-descendant can still be activated deliberately.
+    """
+    promoted = _read_latest_promoted_version(args)
+    if promoted is None:
+        if getattr(args, "force", False):
+            print("  WARNING: no promoted release version found — deploying "
+                  "unbound (--force).")
+            return None
+        print("ERROR: no promoted release version found for this project; "
+              "refusing to activate a revision that is not bound to a "
+              "promotion. Use --force to deploy anyway.")
+        raise APIError(1, "no promoted release version")
+    _validate_deploy_binding(revision, promoted, force=getattr(args, "force", False))
     return promoted
+
+
+def _fetch_deploy_manifest(wanted_sha: str | None = None) -> dict:
+    """Fetch a CI manifest and verify its checksum, digest, and revision.
+
+    The interactive CLI and deploy agent share this exact artifact-validation
+    path. Neither caller treats a downloaded manifest as activation authority
+    until promotion binding has separately succeeded.
+    """
+    requested = (wanted_sha or "").lower() or None
+    run_list_args = [
+        "run", "list", "--repo", _DEPLOY_REPO, "--workflow", _DEPLOY_WORKFLOW,
+    ]
+    if requested is None or not _DEPLOY_REVISION_RE.fullmatch(requested):
+        # GitHub's --commit filter requires the full head SHA. Keep the
+        # documented abbreviated --sha form on the prefix-capable branch page.
+        run_list_args.extend(["--branch", "main", "--limit", "15"])
+    else:
+        # The agent is polling an approval for a specific commit. Ask GitHub
+        # for that commit directly; filtering a recent global page can lose a
+        # still-retained artifact after enough newer deployments land.
+        run_list_args.extend(["--commit", requested, "--limit", "15"])
+    run_list_args.extend(["--json", "databaseId,headSha,status,conclusion,createdAt"])
+    runs = json.loads(_gh(*run_list_args))
+    run = next(
+        (
+            item for item in runs
+            if item.get("status") == "completed" and item.get("conclusion") == "success"
+            and (requested is None or item.get("headSha", "").startswith(requested))
+        ),
+        None,
+    )
+    if run is None:
+        print("ERROR: no successful Deploy Blueprint run found"
+              + (f" for sha {requested}" if requested else "."))
+        raise APIError(1, "no successful deploy run")
+    sha = run["headSha"]
+    with tempfile.TemporaryDirectory() as temporary:
+        _gh(
+            "run", "download", str(run["databaseId"]), "--repo", _DEPLOY_REPO,
+            "-n", f"local-app-release-{sha}", "-D", temporary,
+        )
+        manifest_path = os.path.join(temporary, "local-app-release.json")
+        with open(manifest_path, "rb") as handle:
+            manifest_bytes = handle.read()
+        with open(manifest_path + ".sha256", encoding="utf-8") as handle:
+            expected_digest = handle.read().split()[0]
+        if hashlib.sha256(manifest_bytes).hexdigest() != expected_digest:
+            print("ERROR: manifest checksum mismatch — refusing to deploy.")
+            raise APIError(1, "manifest checksum mismatch")
+        manifest = json.loads(manifest_bytes)
+    digest = (manifest.get("image_ref") or "").rsplit("@", 1)[-1]
+    revision = manifest.get("revision") or ""
+    if not _DEPLOY_DIGEST_RE.fullmatch(digest) or not _DEPLOY_REVISION_RE.fullmatch(revision):
+        print("ERROR: manifest digest/revision failed validation — refusing to deploy.")
+        raise APIError(1, "manifest validation failed")
+    return {"run": run, "digest": digest, "revision": revision}
+
+
+def _invoke_release_shim(digest: str, revision: str, *, host: str | None) -> None:
+    """Use the single root-owned release shim, locally or through legacy SSH."""
+    command = ["sudo", "/usr/local/sbin/blueprint-release", digest, revision]
+    if host is not None:
+        command = ["ssh", "-t", host, *command]
+    proc = subprocess.run(command, check=False)
+    if proc.returncode != 0:
+        print(f"ERROR: release exited {proc.returncode} — the release tool "
+              "rolls back failed activations; inspect its receipt on the host.")
+        raise APIError(f"release failed with exit code {proc.returncode}")
+
+
+def _read_live_approved_activation(args: argparse.Namespace) -> dict | None:
+    """Return only a promoted version that is still approved and unconfirmed."""
+    promoted = _read_latest_promoted_version(args)
+    if promoted is None:
+        return None
+    promoted_sha = (promoted.get("promoted_sha") or "").lower()
+    if (
+        promoted.get("status") != "promoted"
+        or promoted.get("serving_status") != "unconfirmed"
+        or not promoted.get("activation_requested_at")
+        or not _DEPLOY_REVISION_RE.fullmatch(promoted_sha)
+    ):
+        return None
+    return promoted
+
+
+def _deploy_agent_once(args: argparse.Namespace) -> bool:
+    """Execute one current approval and post the existing activation receipt.
+
+    A successful shim invocation is recorded before the receipt POST. If the
+    control plane is temporarily unavailable, later polls retry only that
+    receipt for the same approval instead of restarting the release.
+    """
+    approved = _read_live_approved_activation(args)
+    if approved is None:
+        return False
+    promoted_sha = approved["promoted_sha"].lower()
+    state_path = getattr(args, "state_path", None)
+    pending_receipt = _read_deploy_agent_state(state_path)
+    if pending_receipt is not None:
+        if (
+            pending_receipt.get("version_number") == approved.get("version_number")
+            and pending_receipt.get("promoted_sha") == promoted_sha
+            and pending_receipt.get("revision") == promoted_sha
+        ):
+            _post_activation_receipt(
+                argparse.Namespace(
+                    project_id=getattr(args, "project_id", None),
+                    host="control-plane",
+                ),
+                approved,
+                promoted_sha,
+            )
+            _clear_deploy_agent_state(state_path)
+            print(f"Approved activation for v{approved.get('version_number')} completed.")
+            return True
+        _clear_deploy_agent_state(state_path)
+
+    # Approved activations are bound by the receipt endpoint to this exact
+    # promoted SHA. The legacy CLI still uses the descendant binding below.
+    release = _fetch_deploy_manifest(promoted_sha)
+    if release["revision"] != promoted_sha:
+        raise APIError(1, "manifest revision does not match approved promoted sha")
+    _validate_deploy_binding(release["revision"], approved)
+    # Download can take long enough for a superseding promotion. Re-read before
+    # touching the privileged shim; the receipt endpoint also rejects any race
+    # that occurs during the shim invocation.
+    current = _read_live_approved_activation(args)
+    if (
+        current is None
+        or current.get("version_number") != approved.get("version_number")
+        or (current.get("promoted_sha") or "").lower() != promoted_sha
+        or release["revision"] != (current.get("promoted_sha") or "").lower()
+    ):
+        print("Approved activation changed before execution; leaving it for the next poll.")
+        return False
+    _invoke_release_shim(release["digest"], release["revision"], host=None)
+    _write_deploy_agent_state(
+        state_path,
+        {
+            "version_number": current.get("version_number"),
+            "promoted_sha": promoted_sha,
+            "revision": release["revision"],
+        },
+    )
+    _post_activation_receipt(
+        argparse.Namespace(project_id=getattr(args, "project_id", None), host="control-plane"),
+        current,
+        release["revision"],
+    )
+    _clear_deploy_agent_state(state_path)
+    print(f"Approved activation for v{current.get('version_number')} completed.")
+    return True
+
+
+def _read_deploy_agent_state(path: str | None) -> dict | None:
+    """Read the agent's host-local receipt retry marker, if it is valid."""
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            state = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(state, dict):
+        return None
+    return state
+
+
+def _write_deploy_agent_state(path: str | None, state: dict) -> None:
+    """Atomically persist successful execution before receipt delivery."""
+    if not path:
+        return
+    directory = os.path.dirname(path) or "."
+    temporary = None
+    try:
+        fd, temporary = tempfile.mkstemp(prefix=".deploy-agent.", dir=directory)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(state, handle, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+
+def _clear_deploy_agent_state(path: str | None) -> None:
+    """Remove a delivered or superseded receipt retry marker."""
+    if not path:
+        return
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+def _acquire_deploy_agent_lock(path: str):
+    """Acquire the systemd-owned runtime lock without blocking another poll."""
+    handle = open(path, "a+", encoding="utf-8")  # noqa: SIM115 - returned locked handle
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
+def cmd_deploy_agent(args: argparse.Namespace) -> None:
+    """Run the local approved-activation executor at a 30-second default cadence."""
+    if args.poll_interval <= 0:
+        raise APIError(1, "poll interval must be positive")
+    _require_write_config("deploy-agent")
+    lock = _acquire_deploy_agent_lock(args.lock_path)
+    if lock is None:
+        print("deploy-agent: another activation poll is already running; skipping.")
+        return
+    try:
+        while True:
+            try:
+                _deploy_agent_once(args)
+            except APIError as exc:
+                print(f"deploy-agent: {exc}", file=sys.stderr)
+                if args.once:
+                    raise
+            if args.once:
+                return
+            time.sleep(args.poll_interval)
+    finally:
+        lock.close()
 
 
 def _post_activation_receipt(
@@ -5917,47 +6174,10 @@ def cmd_deploy(args: argparse.Namespace) -> None:
     re-verifies digest, revision label, and health with automatic rollback —
     so this client is a convenience, not a trust boundary.
     """
-    runs = json.loads(_gh(
-        "run", "list", "--repo", _DEPLOY_REPO, "--workflow", _DEPLOY_WORKFLOW,
-        "--branch", "main", "--limit", "15",
-        "--json", "databaseId,headSha,status,conclusion,createdAt",
-    ))
-    wanted_sha = (args.sha or "").lower() or None
-    run = next(
-        (
-            r for r in runs
-            if r.get("status") == "completed" and r.get("conclusion") == "success"
-            and (wanted_sha is None or r.get("headSha", "").startswith(wanted_sha))
-        ),
-        None,
-    )
-    if run is None:
-        print("ERROR: no successful Deploy Blueprint run found"
-              + (f" for sha {wanted_sha}" if wanted_sha else "") + ".")
-        raise APIError(1, "no successful deploy run")
-    sha = run["headSha"]
-    with tempfile.TemporaryDirectory() as tmp:
-        _gh(
-            "run", "download", str(run["databaseId"]), "--repo", _DEPLOY_REPO,
-            "-n", f"local-app-release-{sha}", "-D", tmp,
-        )
-        manifest_path = os.path.join(tmp, "local-app-release.json")
-        checksum_path = manifest_path + ".sha256"
-        with open(manifest_path, "rb") as fh:
-            manifest_bytes = fh.read()
-        with open(checksum_path, encoding="utf-8") as fh:
-            expected_digest = fh.read().split()[0]
-        actual_digest = hashlib.sha256(manifest_bytes).hexdigest()
-        if actual_digest != expected_digest:
-            print("ERROR: manifest checksum mismatch — refusing to deploy.")
-            raise APIError(1, "manifest checksum mismatch")
-        manifest = json.loads(manifest_bytes)
-    image_ref = manifest.get("image_ref", "")
-    revision = manifest.get("revision", "")
-    digest = image_ref.rsplit("@", 1)[-1]
-    if not _DEPLOY_DIGEST_RE.fullmatch(digest) or not _DEPLOY_REVISION_RE.fullmatch(revision):
-        print("ERROR: manifest digest/revision failed validation — refusing to deploy.")
-        raise APIError(1, "manifest validation failed")
+    release = _fetch_deploy_manifest(args.sha)
+    run = release["run"]
+    digest = release["digest"]
+    revision = release["revision"]
 
     print("=== LOCAL CONTROL-PLANE DEPLOY ===")
     print(f"  Host:      {args.host}")
@@ -5974,14 +6194,7 @@ def cmd_deploy(args: argparse.Namespace) -> None:
         if answer not in ("y", "yes"):
             print("Aborted.")
             return
-    proc = subprocess.run([
-        "ssh", "-t", args.host,
-        "sudo", "/usr/local/sbin/blueprint-release", digest, revision,
-    ])
-    if proc.returncode != 0:
-        print(f"ERROR: release exited {proc.returncode} — the release tool "
-              "rolls back failed activations; inspect its receipt on the host.")
-        raise APIError(proc.returncode, "release failed")
+    _invoke_release_shim(digest, revision, host=args.host)
     print("Release activated. Runners self-update on their next heartbeat.")
     _post_activation_receipt(args, promoted, revision)
 
@@ -6015,6 +6228,7 @@ _DISPATCH = {
     "knowledge": cmd_knowledge,
     "compute": cmd_compute,
     "deploy": cmd_deploy,
+    "deploy-agent": cmd_deploy_agent,
 }
 
 

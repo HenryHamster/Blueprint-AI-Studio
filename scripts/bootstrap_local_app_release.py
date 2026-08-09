@@ -16,6 +16,8 @@ _SOURCE_NAMES = (
     "local_app_release.py",
     "local_api_service.py",
     "local_worker_service.py",
+    "blueprint.py",
+    "blueprint_api.py",
 )
 _EDGE_TEMPLATE_NAME = "blueprint-edge-system.service"
 _BUNDLE_ROOT = Path("/usr/local/lib/blueprint-node")
@@ -30,6 +32,9 @@ _RETIRED_EDGE_DROP_IN = Path(
     "/var/lib/blueprint/bootstrap/local-app-release/"
     "retired-10-noninteractive-funnel.conf"
 )
+_DEPLOY_AGENT_UNIT = Path("/etc/systemd/system/blueprint-deploy-agent.service")
+_RELEASE_SHIM = Path("/usr/local/sbin/blueprint-release")
+_RELEASE_SUDOERS = Path("/etc/sudoers.d/blueprint-release")
 _NODE_ROOT = Path("/etc/blueprint/nodes")
 _REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
 _EDGE_ENTRYPOINT_RE = re.compile(
@@ -207,6 +212,87 @@ def _api_drop_in(bundle: Path) -> bytes:
         "ExecStart=\n"
         f"ExecStart=/usr/bin/python3.12 {service}\n"
     ).encode()
+
+
+def _deploy_agent_unit(bundle: Path, install_user: str) -> bytes:
+    """Render the non-root service that polls approved activation requests.
+
+    RuntimeDirectory is created and owned by systemd for ``User`` before the
+    process starts. This is necessary because /run itself is not writable by
+    the service account, while the agent's advisory flock must be local and
+    unavailable to unprivileged peers.
+    """
+    executable = bundle / "blueprint.py"
+    return (
+        "[Unit]\n"
+        "Description=Blueprint approved-activation deploy agent\n"
+        "Wants=network-online.target\n"
+        "After=network-online.target\n\n"
+        "[Service]\n"
+        "Type=simple\n"
+        f"User={install_user}\n"
+        "UMask=0077\n"
+        "PrivateTmp=true\n"
+        "ProtectSystem=strict\n"
+        "ProtectHome=read-only\n"
+        "ProtectKernelTunables=true\n"
+        "ProtectKernelModules=true\n"
+        "ProtectKernelLogs=true\n"
+        "ProtectControlGroups=true\n"
+        "PrivateDevices=true\n"
+        "RestrictSUIDSGID=true\n"
+        "LockPersonality=true\n"
+        "RuntimeDirectory=blueprint-deploy-agent\n"
+        "RuntimeDirectoryMode=0750\n"
+        "Environment=PYTHONUNBUFFERED=1\n"
+        f"ExecStart=/usr/bin/python3.12 {executable} deploy-agent "
+        "--poll-interval 30 "
+        "--lock-path /run/blueprint-deploy-agent/deploy-agent.lock\n"
+        "Restart=always\n"
+        "RestartSec=30\n"
+        "StandardOutput=journal\n"
+        "StandardError=journal\n\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n"
+    ).encode()
+
+
+def _release_sudoers(install_user: str) -> bytes:
+    return (
+        f"{install_user} ALL=(root) NOPASSWD: /usr/local/sbin/blueprint-release\n"
+    ).encode()
+
+
+def _install_deploy_agent(
+    *,
+    bundle: Path,
+    install_user: str,
+    release_shim: bytes,
+) -> None:
+    """Install the agent and its narrow sudo capability as one recoverable set."""
+    managed = (_DEPLOY_AGENT_UNIT, _RELEASE_SHIM, _RELEASE_SUDOERS)
+    previous = {path: _snapshot_optional(path) for path in managed}
+    try:
+        _atomic_write(_DEPLOY_AGENT_UNIT, _deploy_agent_unit(bundle, install_user), 0o644)
+        _atomic_write(_RELEASE_SHIM, release_shim, 0o755)
+        _atomic_write(_RELEASE_SUDOERS, _release_sudoers(install_user), 0o440)
+        _run(["/usr/bin/systemctl", "daemon-reload"])
+        _run(["/usr/bin/systemctl", "enable", "--now", _DEPLOY_AGENT_UNIT.name])
+        # enable --now does not reload an already-running process after its
+        # immutable bundle or unit has changed. Explicitly roll it over so the
+        # installed agent is the one that is actually polling.
+        _run(["/usr/bin/systemctl", "restart", _DEPLOY_AGENT_UNIT.name])
+    except Exception:
+        _restore_snapshots(previous)
+        _run(["/usr/bin/systemctl", "daemon-reload"])
+        try:
+            _run(["/usr/bin/systemctl", "restart", _DEPLOY_AGENT_UNIT.name])
+        except Exception as rollback_error:  # noqa: BLE001 - preserve original failure
+            print(
+                f"WARNING: could not restart restored deploy agent: {rollback_error}",
+                file=os.sys.stderr,
+            )
+        raise
 
 
 def _edge_runtime(install_user: str) -> tuple[str, str]:
@@ -443,6 +529,7 @@ def bootstrap(revision: str) -> Path:
     source = Path(__file__).resolve(strict=True).parent
     _trusted_directory(source)
     payloads = {name: _trusted_file(source / name) for name in _SOURCE_NAMES}
+    release_shim = _trusted_file(source / "blueprint_release.py")
     edge_template = _trusted_file(source / _EDGE_TEMPLATE_NAME)
     edge_runtime_before = _edge_runtime(install_user)
     edge_payload = _edge_unit(
@@ -498,6 +585,11 @@ def bootstrap(revision: str) -> Path:
         markers_before=markers_before,
         protected_before=protected_before,
         previous=previous,
+    )
+    _install_deploy_agent(
+        bundle=bundle,
+        install_user=install_user,
+        release_shim=release_shim,
     )
     return bundle
 

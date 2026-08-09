@@ -3,9 +3,17 @@
 All network calls are mocked — these tests never reach the real Cloud Run API.
 """
 
+import sys
+from pathlib import Path
+
 import pytest
 
 from app import deployed_sha
+
+_SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "scripts"
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+import blueprint as deploy_blueprint  # noqa: E402
 
 # A real 64-hex container image digest (sha256). It is all-hex, so a naive
 # git-SHA check would WRONGLY accept it — the resolver must reject it.
@@ -109,6 +117,7 @@ class TestResolveDeployedSha:
         result = await deployed_sha.resolve_deployed_sha()
         assert result == _GIT_SHA
 
+
     async def test_returns_none_when_k_revision_absent(self, monkeypatch, mocker):
         monkeypatch.delenv("DEPLOY_SHA", raising=False)
         monkeypatch.delenv("K_REVISION", raising=False)
@@ -202,6 +211,114 @@ class TestResolveDeployedSha:
         result = await deployed_sha.resolve_deployed_sha()
         assert result == _GIT_SHA
 
+
+class TestApprovedActivationExecutor:
+    """The host executor must close approved activations with evidence."""
+
+    _PROMOTED = {
+        "version_number": 30,
+        "status": "promoted",
+        "promoted_sha": _GIT_SHA,
+        "serving_status": "unconfirmed",
+        "activation_requested_at": "2026-08-09T00:00:00Z",
+    }
+
+    def test_records_receipt_with_deployed_sha(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            deploy_blueprint,
+            "_read_live_approved_activation",
+            lambda _args: self._PROMOTED,
+        )
+        monkeypatch.setattr(
+            deploy_blueprint,
+            "_fetch_deploy_manifest",
+            lambda _sha: {
+                "run": {"databaseId": 1234},
+                "digest": "sha256:" + "0" * 64,
+                "revision": _GIT_SHA,
+            },
+        )
+        monkeypatch.setattr(
+            deploy_blueprint,
+            "_invoke_release_shim",
+            lambda digest, revision, *, host: calls.append(
+                ("shim", digest, revision, host)
+            ),
+        )
+        monkeypatch.setattr(
+            deploy_blueprint,
+            "get_project_id",
+            lambda _project_id=None: "project-1",
+        )
+
+        def fake_api(method, path, body=None, timeout=30):
+            calls.append((method, path, body))
+            return {
+                "version_number": 30,
+                "serving_status": "serving_confirmed",
+                "served_sha": _GIT_SHA,
+            }
+
+        monkeypatch.setattr(deploy_blueprint, "api", fake_api)
+
+        assert deploy_blueprint._deploy_agent_once(
+            type("Args", (), {"project_id": None})()
+        ) is True
+        assert calls == [
+            ("shim", "sha256:" + "0" * 64, _GIT_SHA, None),
+            (
+                "POST",
+                "/api/admin/projects/project-1/activation-receipt",
+                {
+                    "version_number": 30,
+                    "revision": _GIT_SHA,
+                    "host": "control-plane",
+                },
+            ),
+        ]
+
+    def test_failed_activation_is_reported_not_timeout(self, monkeypatch):
+        from blueprint_api import APIError
+
+        monkeypatch.setattr(
+            deploy_blueprint,
+            "_read_live_approved_activation",
+            lambda _args: self._PROMOTED,
+        )
+        monkeypatch.setattr(
+            deploy_blueprint,
+            "_fetch_deploy_manifest",
+            lambda _sha: {
+                "run": {"databaseId": 1234},
+                "digest": "sha256:" + "0" * 64,
+                "revision": _GIT_SHA,
+            },
+        )
+        monkeypatch.setattr(
+            deploy_blueprint.subprocess,
+            "run",
+            lambda *args, **kwargs: type("Result", (), {"returncode": 17})(),
+        )
+        receipt_calls = []
+        monkeypatch.setattr(
+            deploy_blueprint,
+            "api",
+            lambda method, path, body=None, timeout=30: receipt_calls.append(
+                (method, path, body)
+            ),
+        )
+
+        with pytest.raises(APIError, match="release failed with exit code 17"):
+            deploy_blueprint._deploy_agent_once(
+                type("Args", (), {"project_id": None})()
+            )
+        assert not receipt_calls
+        assert "confirmation_timed_out" not in "release failed with exit code 17"
+
+
+@pytest.mark.asyncio
+class TestResolveDeployedShaRemainder:
     async def test_returns_none_when_no_source_yields_sha(self, monkeypatch, mocker):
         monkeypatch.delenv("DEPLOY_SHA", raising=False)
         monkeypatch.setenv("K_REVISION", "blueprint-orchestrator-00042-abc")

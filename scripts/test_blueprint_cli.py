@@ -5514,7 +5514,7 @@ def _deploy_gh_fake(revision: str = _DEPLOY_REV, compare_status: str = "ahead"):
         if args[:2] == ("run", "list"):
             return json.dumps([{
                 "databaseId": 4242,
-                "headSha": "e" * 40,
+                "headSha": revision,
                 "status": "completed",
                 "conclusion": "success",
                 "createdAt": "2026-06-15T00:00:00Z",
@@ -5538,6 +5538,90 @@ def _deploy_gh_fake(revision: str = _DEPLOY_REV, compare_status: str = "ahead"):
         raise AssertionError(f"unexpected gh call: {args}")
 
     return fake_gh
+
+
+def test_fetch_deploy_manifest_queries_github_for_approved_sha(monkeypatch):
+    """An approved SHA is found even when it is outside the recent run page."""
+    approved_sha = "b" * 40
+    calls = []
+
+    def fake_gh(*args):
+        calls.append(args)
+        if args[:2] == ("run", "list"):
+            assert "--commit" in args
+            assert args[args.index("--commit") + 1] == approved_sha
+            return json.dumps([{
+                "databaseId": 9001,
+                "headSha": approved_sha,
+                "status": "completed",
+                "conclusion": "success",
+                "createdAt": "2026-06-15T00:00:00Z",
+            }])
+        if args[:2] == ("run", "download"):
+            temporary = args[args.index("-D") + 1]
+            manifest = {
+                "image_ref": f"gcr.io/blueprint/app@sha256:{'1' * 64}",
+                "revision": approved_sha,
+            }
+            body = json.dumps(manifest).encode()
+            manifest_path = os.path.join(temporary, "local-app-release.json")
+            with open(manifest_path, "wb") as handle:
+                handle.write(body)
+            with open(manifest_path + ".sha256", "w", encoding="utf-8") as handle:
+                handle.write(hashlib.sha256(body).hexdigest())
+            return ""
+        raise AssertionError(f"unexpected gh call: {args}")
+
+    monkeypatch.setattr(blueprint, "_gh", fake_gh)
+
+    release = blueprint._fetch_deploy_manifest(approved_sha)
+
+    assert release["run"]["databaseId"] == 9001
+    assert release["revision"] == approved_sha
+    assert calls[0][:2] == ("run", "list")
+
+
+def test_fetch_deploy_manifest_accepts_abbreviated_sha(monkeypatch):
+    """Short --sha values use the prefix-capable main branch lookup."""
+    approved_sha = "b" * 40
+    prefix = approved_sha[:7]
+    calls = []
+
+    def fake_gh(*args):
+        calls.append(args)
+        if args[:2] == ("run", "list"):
+            assert "--branch" in args
+            assert args[args.index("--branch") + 1] == "main"
+            assert "--commit" not in args
+            return json.dumps([{
+                "databaseId": 9002,
+                "headSha": approved_sha,
+                "status": "completed",
+                "conclusion": "success",
+                "createdAt": "2026-06-15T00:00:00Z",
+            }])
+        if args[:2] == ("run", "download"):
+            temporary = args[args.index("-D") + 1]
+            manifest = {
+                "image_ref": f"gcr.io/blueprint/app@sha256:{'1' * 64}",
+                "revision": approved_sha,
+            }
+            body = json.dumps(manifest).encode()
+            manifest_path = os.path.join(temporary, "local-app-release.json")
+            with open(manifest_path, "wb") as handle:
+                handle.write(body)
+            with open(manifest_path + ".sha256", "w", encoding="utf-8") as handle:
+                handle.write(hashlib.sha256(body).hexdigest())
+            return ""
+        raise AssertionError(f"unexpected gh call: {args}")
+
+    monkeypatch.setattr(blueprint, "_gh", fake_gh)
+
+    release = blueprint._fetch_deploy_manifest(prefix)
+
+    assert release["run"]["databaseId"] == 9002
+    assert release["revision"] == approved_sha
+    assert calls[0][:2] == ("run", "list")
 
 
 def _deploy_api_fake(calls, *, promoted=None, post_failure=None):
@@ -5657,6 +5741,30 @@ def test_deploy_refuses_without_promoted_version(monkeypatch, capsys):
     assert not any(m == "POST" and p.endswith("/activation-receipt") for m, p, _ in calls)
 
 
+def test_deploy_force_remains_unbound_without_promoted_version(monkeypatch):
+    """The shared helpers preserve the legacy emergency --force escape hatch."""
+    calls = []
+
+    def fake_api(method, path, body=None, timeout=30):
+        calls.append((method, path, body))
+        if method == "GET" and "release-versions" in path and "status=promoted" in path:
+            return {"versions": [], "total": 0, "limit": 1, "offset": 0}
+        return {}
+
+    _deploy_env(monkeypatch, fake_api)
+    shim_calls = []
+    monkeypatch.setattr(
+        blueprint.subprocess,
+        "run",
+        lambda command, **kwargs: shim_calls.append(command)
+        or type("R", (), {"returncode": 0})(),
+    )
+
+    assert blueprint.main(["deploy", "--host", "hamsterwheel", "--yes", "--force"]) == 0
+    assert shim_calls[0][:3] == ["ssh", "-t", "hamsterwheel"]
+    assert not any(m == "POST" and p.endswith("/activation-receipt") for m, p, _ in calls)
+
+
 def test_deploy_refuses_non_descendant_without_force(monkeypatch, capsys):
     """deploy refuses a build that is behind/diverged from the promoted SHA."""
     calls = []
@@ -5700,3 +5808,113 @@ def test_deploy_receipt_post_failure_warns_and_exits_nonzero(monkeypatch, capsys
     err = capsys.readouterr().err
     assert "activation receipt could not be recorded" in err
 
+
+def test_deploy_agent_executes_approved_request_and_posts_receipt(monkeypatch):
+    """The host agent consumes one live approval through the local shim, then
+    records the exact promoted revision with the existing receipt endpoint."""
+    calls = []
+    api_fake = _deploy_api_fake(calls)
+    agent_revision = _DEPLOY_PROMOTED_SHA
+    _deploy_env(monkeypatch, api_fake, revision=agent_revision)
+    shim_calls = []
+    monkeypatch.setattr(
+        blueprint.subprocess,
+        "run",
+        lambda command, **kwargs: shim_calls.append(command)
+        or type("R", (), {"returncode": 0})(),
+    )
+    promoted = {
+        "version_number": 7,
+        "status": "promoted",
+        "promoted_sha": _DEPLOY_PROMOTED_SHA,
+        "serving_status": "unconfirmed",
+        "activation_requested_at": "2026-06-15T00:00:00Z",
+    }
+    monkeypatch.setattr(blueprint, "_read_live_approved_activation", lambda args: promoted)
+
+    assert blueprint._deploy_agent_once(argparse.Namespace(project_id=None)) is True
+
+    assert shim_calls == [[
+        "sudo", "/usr/local/sbin/blueprint-release",
+        f"sha256:{'0' * 64}", agent_revision,
+    ]]
+    receipt = next(
+        body for method, path, body in calls
+        if method == "POST" and path.endswith("/activation-receipt")
+    )
+    assert receipt == {
+        "version_number": 7,
+        "revision": agent_revision,
+        "host": "control-plane",
+    }
+
+
+def test_deploy_agent_receipt_failure_retries_without_reexecuting_shim(
+    monkeypatch, tmp_path
+):
+    """A successful activation is not repeated while its receipt is retried."""
+    from blueprint_api import APIError
+
+    promoted = {
+        "version_number": 7,
+        "status": "promoted",
+        "promoted_sha": _DEPLOY_PROMOTED_SHA,
+        "serving_status": "unconfirmed",
+        "activation_requested_at": "2026-06-15T00:00:00Z",
+    }
+    calls = []
+    post_attempts = 0
+
+    def fake_api(method, path, body=None, timeout=30):
+        nonlocal post_attempts
+        calls.append((method, path, body))
+        if method == "GET" and "release-versions" in path:
+            return {"versions": [promoted], "total": 1}
+        if method == "POST" and path.endswith("/activation-receipt"):
+            post_attempts += 1
+            if post_attempts == 1:
+                raise APIError("HTTP 503: unavailable")
+            return {
+                "version_number": 7,
+                "serving_status": "serving_confirmed",
+                "served_sha": _DEPLOY_PROMOTED_SHA,
+            }
+        return {}
+
+    _deploy_env(monkeypatch, fake_api, revision=_DEPLOY_PROMOTED_SHA)
+    shim_calls = []
+    monkeypatch.setattr(
+        blueprint.subprocess,
+        "run",
+        lambda command, **kwargs: shim_calls.append(command)
+        or type("R", (), {"returncode": 0})(),
+    )
+    args = argparse.Namespace(project_id=None, state_path=str(tmp_path / "agent.state"))
+
+    with pytest.raises(APIError):
+        blueprint._deploy_agent_once(args)
+    assert len(shim_calls) == 1
+    assert (tmp_path / "agent.state").exists()
+
+    assert blueprint._deploy_agent_once(args) is True
+    assert len(shim_calls) == 1
+    assert post_attempts == 2
+    assert not (tmp_path / "agent.state").exists()
+
+
+def test_deploy_agent_noops_without_live_approval(monkeypatch):
+    """No approval (or a resolved approval) never reaches GitHub, the shim,
+    or the receipt endpoint."""
+    monkeypatch.setattr(blueprint, "_read_live_approved_activation", lambda args: None)
+    monkeypatch.setattr(
+        blueprint,
+        "_fetch_deploy_manifest",
+        lambda *args, **kwargs: pytest.fail("agent must not fetch a manifest"),
+    )
+    monkeypatch.setattr(
+        blueprint.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("agent must not invoke the shim"),
+    )
+
+    assert blueprint._deploy_agent_once(argparse.Namespace(project_id=None)) is False

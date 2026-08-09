@@ -272,6 +272,59 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
         self.assertEqual(marker, ("active", "", "406788235451"))
         self.assertNotIn("--property=MainPID", run_mock.call_args.args[0])
 
+    def test_deploy_agent_unit_uses_systemd_owned_runtime_lock_directory(self):
+        payload = bootstrap._deploy_agent_unit(
+            PurePosixPath("/trusted/bundle"), "henry_hamster"
+        ).decode()
+        self.assertIn("User=henry_hamster", payload)
+        self.assertIn("RuntimeDirectory=blueprint-deploy-agent", payload)
+        self.assertIn("RuntimeDirectoryMode=0750", payload)
+        self.assertIn(
+            "--lock-path /run/blueprint-deploy-agent/deploy-agent.lock", payload
+        )
+        self.assertIn("--poll-interval 30", payload)
+        self.assertNotIn("NoNewPrivileges=true", payload)
+
+    def test_deploy_agent_install_restarts_existing_service_after_update(self):
+        with tempfile.TemporaryDirectory() as raw_directory:
+            directory = Path(raw_directory)
+            unit = directory / "blueprint-deploy-agent.service"
+            shim = directory / "blueprint-release"
+            sudoers = directory / "blueprint-release sudoers"
+            commands = []
+
+            def run(argv):
+                commands.append(argv)
+                return bootstrap.subprocess.CompletedProcess(argv, 0, "", "")
+
+            with (
+                unittest.mock.patch.object(bootstrap, "_DEPLOY_AGENT_UNIT", unit),
+                unittest.mock.patch.object(bootstrap, "_RELEASE_SHIM", shim),
+                unittest.mock.patch.object(bootstrap, "_RELEASE_SUDOERS", sudoers),
+                unittest.mock.patch.object(
+                    bootstrap, "_atomic_write", self._test_atomic_write
+                ),
+                unittest.mock.patch.object(
+                    bootstrap, "_snapshot_optional",
+                    return_value=None,
+                ),
+                unittest.mock.patch.object(bootstrap, "_run", side_effect=run),
+            ):
+                bootstrap._install_deploy_agent(
+                    bundle=PurePosixPath("/trusted/new-bundle"),
+                    install_user="henry_hamster",
+                    release_shim=b"new shim\n",
+                )
+
+            self.assertEqual(commands[:2], [
+                ["/usr/bin/systemctl", "daemon-reload"],
+                ["/usr/bin/systemctl", "enable", "--now", "blueprint-deploy-agent.service"],
+            ])
+            self.assertEqual(
+                commands[-1],
+                ["/usr/bin/systemctl", "restart", "blueprint-deploy-agent.service"],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
