@@ -1954,6 +1954,7 @@ describe('fetchVmImageIdentity', () => {
 
 describe('readAgentSourceSha', () => {
   afterEach(() => {
+    delete process.env.AGENT_SOURCE_SHA;
     mockReadFileSync.mockReset();
   });
 
@@ -1982,6 +1983,44 @@ describe('readAgentSourceSha', () => {
       throw new Error('ENOENT');
     });
     expect(readAgentSourceSha()).toBeNull();
+  });
+
+  it('prefers a validated 40-hex AGENT_SOURCE_SHA env var over the marker', () => {
+    process.env.AGENT_SOURCE_SHA = 'abcdefabcdefabcdefabcdefabcdefabcdefabcd';
+    mockReadFileSync.mockReturnValue('AGENT_SOURCE_SHA=0123456789abcdef0123456789abcdef01234567\n');
+    expect(readAgentSourceSha()).toBe('abcdefabcdefabcdefabcdefabcdefabcdefabcd');
+  });
+
+  it('falls back to the marker when the env value is short/non-40-hex', () => {
+    process.env.AGENT_SOURCE_SHA = 'abc1234'; // abbreviated — rejected as not a full SHA
+    mockReadFileSync.mockReturnValue('AGENT_SOURCE_SHA=0123456789abcdef0123456789abcdef01234567\n');
+    expect(readAgentSourceSha()).toBe('0123456789abcdef0123456789abcdef01234567');
+  });
+
+  it('falls back to the marker for a malformed env value', () => {
+    process.env.AGENT_SOURCE_SHA = 'not-a-sha';
+    mockReadFileSync.mockReturnValue('AGENT_SOURCE_SHA=abc1234');
+    expect(readAgentSourceSha()).toBe('abc1234');
+  });
+
+  it('returns null when env is malformed and the marker is the unknown fallback', () => {
+    process.env.AGENT_SOURCE_SHA = 'not-a-sha';
+    mockReadFileSync.mockReturnValue('AGENT_SOURCE_SHA=unknown');
+    expect(readAgentSourceSha()).toBeNull();
+  });
+
+  it('returns null when env is malformed and the marker file is absent', () => {
+    process.env.AGENT_SOURCE_SHA = 'not-a-sha';
+    mockReadFileSync.mockImplementation(() => {
+      throw new Error('ENOENT');
+    });
+    expect(readAgentSourceSha()).toBeNull();
+  });
+
+  it('falls back to the marker when the env var is absent', () => {
+    delete process.env.AGENT_SOURCE_SHA;
+    mockReadFileSync.mockReturnValue('AGENT_SOURCE_SHA=abc1234');
+    expect(readAgentSourceSha()).toBe('abc1234');
   });
 });
 
@@ -2323,6 +2362,50 @@ describe('agent runtime fingerprint heartbeats', () => {
     expect(body.task_id).toBe('task-runtime-fp');
     expect(body.agent_runtime_fingerprint).toBe(runtimeFingerprint);
     expect(body.agent_source_sha).toBe(sourceSha);
+  });
+
+  it('omits agent_source_sha from task and VM heartbeats when identity absent', async () => {
+    // The additive contract: a missing source identity must OMIT the field
+    // rather than send a null/bogus value over the wire.
+    _setAgentSourceShaForTesting(null);
+    fetchMock.mockImplementation((input: unknown) => {
+      const url = String(input);
+      if (url.endsWith('/api/agent/vm-heartbeat')) {
+        return Promise.resolve({ status: 204, json: () => Promise.resolve({}) });
+      }
+      if (url.endsWith('/api/agent/heartbeat')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
+      }
+      return Promise.resolve({
+        status: 200,
+        json: () => Promise.resolve({ action: 'exit', reason: 'done' }),
+      });
+    });
+
+    _startHeartbeatForTesting('task-no-sha', () => 'heartbeat-ok');
+    const result = await pollForNextRole({
+      vmInstanceId: 'vm-no-sha',
+      priorTaskId: 'task-no-sha',
+      priorPrNumber: null,
+      apiBase: 'http://api.test',
+      agentJwt: 'jwt-no-sha',
+      pollIntervalMs: 10,
+      timeoutMs: 1000,
+      heartbeatIntervalMs: 60_000,
+    });
+
+    expect(result).toEqual({ action: 'exit', reason: 'done' });
+    for (const suffix of ['/api/agent/vm-heartbeat', '/api/agent/heartbeat']) {
+      const call = fetchMock.mock.calls.find(([url]) => String(url).endsWith(suffix));
+      expect(call).toBeDefined();
+      const bodyStr = call?.[1]?.body;
+      expect(typeof bodyStr).toBe('string');
+      const body = JSON.parse(
+        defined(typeof bodyStr === 'string' ? bodyStr : undefined),
+      ) as { agent_runtime_fingerprint?: string; agent_source_sha?: string };
+      expect(body.agent_runtime_fingerprint).toBe(runtimeFingerprint);
+      expect(body.agent_source_sha).toBeUndefined();
+    }
   });
 
   it('reclaims the in-flight slot when a heartbeat POST wedges past the deadline', async () => {

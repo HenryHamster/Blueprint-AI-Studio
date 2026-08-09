@@ -268,6 +268,56 @@ async def test_task_heartbeat_records_source_sha(client: AsyncClient, db_session
     assert _compute.get_vm_source_sha(vm_id) == source_sha
 
 
+@pytest.mark.asyncio
+async def test_task_heartbeat_persists_runner_agent_source_sha(
+    client: AsyncClient, db_session
+):
+    """/api/agent/heartbeat on a runner-pinned task persists agent_source_sha
+    onto the durable LocalRunner row (the checkout-runner fleet's serving
+    provenance), independent of the warm-pool flag."""
+    import app.compute as _compute
+    from app.models import LocalRunner
+
+    project = Project(name="Runner Heartbeat SHA", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash="a" * 64,
+        status="active",
+    )
+    db_session.add(runner)
+    await db_session.commit()
+    await db_session.refresh(runner)
+
+    vm_id = f"runner:{runner.id}"
+    source_sha = "9" * 40
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
+        vm_instance_id=vm_id,
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    _compute._vm_source_shas.pop(vm_id, None)
+    token = create_agent_token(str(task.id), vm_id)
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={"task_id": str(task.id), "agent_source_sha": source_sha},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    assert _compute.get_vm_source_sha(vm_id) == source_sha
+
+    await db_session.refresh(runner)
+    assert runner.agent_source_sha == source_sha
+
+
 def test_record_and_get_vm_source_sha_roundtrip():
     """compute.record_vm_source_sha / get_vm_source_sha round-trip and clear."""
     import app.compute as _compute
@@ -331,6 +381,70 @@ async def test_persist_pool_vm_image_state_updates_pool_member(db_session):
     assert member.agent_runtime_fingerprint == "f" * 64
     assert member.agent_source_sha == "0123456789abcdef0123456789abcdef01234567"
     assert member.last_heartbeat_at is not None
+
+
+@pytest.mark.asyncio
+async def test_persist_runner_agent_source_sha_updates_localrunner(db_session):
+    """Runner-pinned heartbeats durably mirror the agent source SHA onto the
+    LocalRunner row so the checkout-runner fleet survives orchestrator restarts."""
+    import app.compute as _compute
+    from app.models import LocalRunner
+
+    project = Project(name="Runner Durable SHA", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash="f" * 64,
+        status="active",
+    )
+    db_session.add(runner)
+    await db_session.commit()
+    await db_session.refresh(runner)
+
+    updated = await _compute.persist_runner_agent_source_sha(
+        db_session,
+        f"runner:{runner.id}",
+        "0123456789abcdef0123456789abcdef01234567",
+    )
+    await db_session.commit()
+    await db_session.refresh(runner)
+
+    assert updated is True
+    assert runner.agent_source_sha == "0123456789abcdef0123456789abcdef01234567"
+
+
+@pytest.mark.asyncio
+async def test_persist_runner_agent_source_sha_ignores_vm_ids(db_session):
+    """Non-runner vm ids, unresolvable runner ids, and absent SHAs are no-ops."""
+    import app.compute as _compute
+
+    assert (
+        await _compute.persist_runner_agent_source_sha(
+            db_session, "agent-vm-task-1", "c" * 40
+        )
+        is False
+    )
+    assert (
+        await _compute.persist_runner_agent_source_sha(
+            db_session, "runner:00000000-0000-0000-0000-000000000000", "c" * 40
+        )
+        is False
+    )
+    assert (
+        await _compute.persist_runner_agent_source_sha(
+            db_session, "runner:not-a-uuid", "c" * 40
+        )
+        is False
+    )
+    assert (
+        await _compute.persist_runner_agent_source_sha(
+            db_session, "runner:00000000-0000-0000-0000-000000000000", None
+        )
+        is False
+    )
 
 
 @pytest.mark.asyncio

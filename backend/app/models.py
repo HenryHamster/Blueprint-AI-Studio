@@ -7827,6 +7827,15 @@ class LocalRunner(SQLModel, table=True):
     source_sha: str | None = Field(
         default=None, sa_column=Column(String(64), nullable=True)
     )
+    # Durable FULL agent source git SHA the runner's agents are serving, observed
+    # from agent heartbeats (persist_runner_agent_source_sha). Mirrors
+    # PoolVm.agent_source_sha so fleet-serving release-artifact checks can reason
+    # about self-hosted checkout runners across orchestrator restarts. Distinct
+    # from ``source_sha`` above, which is derived from the runner's own
+    # ``git describe`` value and may be abbreviated.
+    agent_source_sha: str | None = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
     # "active" | "inactive" | "deleted"
     status: str = Field(
         default="active",

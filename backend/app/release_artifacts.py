@@ -27,6 +27,9 @@ logger = logging.getLogger(__name__)
 BACKEND_REVISION_ARTIFACT_KIND = "backend_revision"
 AGENT_IMAGE_ARTIFACT_KIND = "agent_image"
 PROMOTION_MERGE_ARTIFACT_KIND = "promotion_merge"
+AGENT_IMAGE_FLEET_SOURCE_UNOBSERVABLE_REASON = (
+    "agent_image_fleet_source_unobservable"
+)
 
 # Distinct reason for a serving_confirmed resolution where the OBSERVED live SHA
 # is a strict DESCENDANT of the promoted SHA: the target branch legitimately
@@ -940,6 +943,9 @@ async def _check_agent_image_serving(
         only once the fleet INDEPENDENTLY reports ``agent_source_sha`` matching
         ``version.promoted_sha``; until then return ``None`` (not-yet) so the
         version stays unconfirmed within the existing confirmation window.
+        An observed non-matching source gets ``agent_image_fleet_not_yet_serving``;
+        no observable source identity gets
+        ``agent_image_fleet_source_unobservable``.
       * Indeterminate (non-self-repo, no GitHub creds, the rebake lookup errored,
         the diff base is unobservable, or no fleet VM has reported a source SHA
         yet) — treat as NOT-YET-CONFIRMED (return ``None``) WITHIN the
@@ -1067,7 +1073,7 @@ async def _check_agent_image_serving(
 
     # Bake expected: confirm only once the fleet is independently observed
     # serving the promoted SHA (the freshly baked image is live and running).
-    if await compute.fleet_serving_source_sha(
+    fleet_serving = await compute.fleet_serving_source_sha(
         session,
         promoted_sha,
         allow_descendant=True,
@@ -1075,15 +1081,24 @@ async def _check_agent_image_serving(
         owner=owner,
         repo=repo,
         project_id=str(version.project_id),
-    ):
+    )
+    if fleet_serving is True:
         return ("serving_confirmed", promoted_sha, now)
+    fleet_reason = (
+        AGENT_IMAGE_FLEET_SOURCE_UNOBSERVABLE_REASON
+        if fleet_serving is None
+        else "agent_image_fleet_not_yet_serving"
+    )
     logger.info(
-        "agent_image_serving_indeterminate path=fleet_not_yet_serving"
+        "agent_image_serving_indeterminate path=%s"
         " version_id=%s promoted_sha=%s",
+        "fleet_source_unobservable"
+        if fleet_serving is None
+        else "fleet_not_yet_serving",
         version.id,
         promoted_sha,
     )
-    return _defer_or_timeout("agent_image_fleet_not_yet_serving")
+    return _defer_or_timeout(fleet_reason)
 
 
 # Self-repo agent VM image serving gate.  Registered REQUIRED so a bake-path

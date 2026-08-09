@@ -5168,6 +5168,73 @@ class TestFunctionalProbes(unittest.TestCase):
         with patch("subprocess.run", return_value=fake):
             self.assertIsNone(local_runner._runner_version())
 
+    def test_agent_binary_checkout_sha_returns_full_sha_from_entry_directory(self):
+        sha = "9" * 40
+        fake = MagicMock()
+        fake.returncode = 0
+        fake.stdout = sha + "\n"
+        entry = "/alternate-checkout/agent/dist/index.js"
+        with patch("os.path.isfile", return_value=True), \
+             patch("subprocess.run", return_value=fake) as run:
+            self.assertEqual(
+                local_runner._agent_binary_checkout_sha(["node", entry]), sha
+            )
+        self.assertEqual(run.call_args.kwargs["cwd"], "/alternate-checkout/agent/dist")
+
+    def test_agent_binary_checkout_sha_none_on_short_sha(self):
+        fake = MagicMock()
+        fake.returncode = 0
+        fake.stdout = "abc1234\n"  # abbreviated — not a full HEAD SHA
+        with patch("os.path.isfile", return_value=True), \
+             patch("subprocess.run", return_value=fake):
+            self.assertIsNone(
+                local_runner._agent_binary_checkout_sha(["node", "/agent/dist/index.js"])
+            )
+
+    def test_agent_binary_checkout_sha_none_on_describe_output(self):
+        fake = MagicMock()
+        fake.returncode = 0
+        fake.stdout = "v22-15-gabc1234-dirty\n"  # git describe/tag, not rev-parse
+        with patch("os.path.isfile", return_value=True), \
+             patch("subprocess.run", return_value=fake):
+            self.assertIsNone(
+                local_runner._agent_binary_checkout_sha(["node", "/agent/dist/index.js"])
+            )
+
+    def test_agent_binary_checkout_sha_none_on_nonzero_exit(self):
+        fake = MagicMock()
+        fake.returncode = 128  # not a git repo
+        fake.stdout = ""
+        with patch("os.path.isfile", return_value=True), \
+             patch("subprocess.run", return_value=fake):
+            self.assertIsNone(
+                local_runner._agent_binary_checkout_sha(["node", "/agent/dist/index.js"])
+            )
+
+    def test_agent_binary_checkout_sha_none_when_git_absent(self):
+        with patch("os.path.isfile", return_value=True), \
+             patch("subprocess.run", side_effect=FileNotFoundError):
+            self.assertIsNone(
+                local_runner._agent_binary_checkout_sha(["node", "/agent/dist/index.js"])
+            )
+
+    def test_agent_binary_checkout_sha_none_on_empty_output(self):
+        fake = MagicMock()
+        fake.returncode = 0
+        fake.stdout = "   \n"
+        with patch("os.path.isfile", return_value=True), \
+             patch("subprocess.run", return_value=fake):
+            self.assertIsNone(
+                local_runner._agent_binary_checkout_sha(["node", "/agent/dist/index.js"])
+            )
+
+    def test_agent_binary_checkout_sha_omits_missing_entry(self):
+        with patch("subprocess.run") as run:
+            self.assertIsNone(
+                local_runner._agent_binary_checkout_sha(["node", "/missing/index.js"])
+            )
+        run.assert_not_called()
+
 
 class TestAgentWallClockDeadline(unittest.TestCase):
     def setUp(self):
@@ -6376,7 +6443,7 @@ class TestDockerAgentBackend(unittest.TestCase):
 
     def _spawn(self, *, backend, container_name, agent_image, agent_binary, caps,
                task_type="research", llm_env=None, project_id="project-123",
-               resident_session=False):
+               resident_session=False, checkout_sha=None):
         active_tasks: dict = {}
         agent_started_at: dict = {}
         agent_teardown: dict = {}
@@ -6398,6 +6465,7 @@ class TestDockerAgentBackend(unittest.TestCase):
 
         with patch.object(local_runner.iso, "decide_agent_backend", decide_mock), \
              patch.object(local_runner.iso, "plan_agent_execution", plan_mock), \
+             patch.object(local_runner, "_agent_binary_checkout_sha", return_value=checkout_sha) as checkout_sha_mock, \
              patch.object(local_runner.subprocess, "Popen", return_value=fake_proc):
             spawned = local_runner._spawn_agent_task(
                 task_id="task-xyz",
@@ -6420,7 +6488,7 @@ class TestDockerAgentBackend(unittest.TestCase):
         return {
             "spawned": spawned, "active": active_tasks, "started": agent_started_at,
             "teardown": agent_teardown, "decide": decide_mock, "plan": plan_mock,
-            "proc": fake_proc,
+            "proc": fake_proc, "checkout_sha": checkout_sha_mock,
         }
 
     def test_docker_image_plans_spawns_and_tracks_container(self):
@@ -6583,6 +6651,55 @@ class TestDockerAgentBackend(unittest.TestCase):
         _, pkw = r["plan"].call_args
         self.assertIsNone(pkw["agent_image"])
         self.assertEqual(pkw["injected_env"]["PROJECT_ID"], "project-123")
+
+    def test_agent_source_sha_passed_from_explicit_agent_checkout(self):
+        """A bwrap runner resolves identity from the explicit agent entry, not
+        local_runner.py's checkout, when BLUEPRINT_AGENT_BINARY selects another
+        checkout."""
+        sha = "9" * 40
+        explicit_entry = "/older-agent-checkout/agent/dist/index.js"
+        r = self._spawn(
+            backend=iso.BACKEND_BWRAP,
+            container_name=None,
+            agent_image=None,
+            agent_binary=["node", explicit_entry],
+            caps=_bwrap_caps(),
+            checkout_sha=sha,
+        )
+        self.assertTrue(r["spawned"])
+        _, pkw = r["plan"].call_args
+        self.assertEqual(pkw["injected_env"]["AGENT_SOURCE_SHA"], sha)
+        r["checkout_sha"].assert_called_once_with(["node", explicit_entry])
+
+    def test_docker_spawn_does_not_inject_agent_source_checkout_sha(self):
+        """The docker agent image carries its own baked /opt/agent/AGENT_SOURCE_SHA
+        marker; a host checkout value must never overwrite that baked provenance."""
+        r = self._spawn(
+            backend=iso.BACKEND_DOCKER,
+            container_name="bp-agent-abcd1234",
+            agent_image="registry/agent:prod",
+            agent_binary=None,
+            caps=_docker_caps(),
+            checkout_sha="9" * 40,
+        )
+        self.assertTrue(r["spawned"])
+        _, pkw = r["plan"].call_args
+        self.assertNotIn("AGENT_SOURCE_SHA", pkw["injected_env"])
+
+    def test_bwrap_spawn_omits_agent_source_sha_when_checkout_unavailable(self):
+        """When the checkout SHA cannot be resolved the bwrap spawn still succeeds
+        and simply omits the identity — the additive heartbeat contract."""
+        r = self._spawn(
+            backend=iso.BACKEND_BWRAP,
+            container_name=None,
+            agent_image=None,
+            agent_binary=["node", "/agent/dist/index.js"],
+            caps=_bwrap_caps(),
+            checkout_sha=None,
+        )
+        self.assertTrue(r["spawned"])
+        _, pkw = r["plan"].call_args
+        self.assertNotIn("AGENT_SOURCE_SHA", pkw["injected_env"])
 
     def test_declined_task_type_not_spawned(self):
         """A write task type on a docker-only (read-only image) box declines before
@@ -6842,6 +6959,7 @@ class TestDockerAgentBackend(unittest.TestCase):
 
                 with patch.object(local_runner.iso, "decide_agent_backend", decide_mock), \
                      patch.object(local_runner.iso, "plan_agent_execution", plan_mock), \
+                     patch.object(local_runner, "_agent_binary_checkout_sha", return_value=None), \
                      patch.object(local_runner.subprocess, "Popen",
                                  return_value=fake_proc):
                     spawned = local_runner._spawn_agent_task(
@@ -8630,6 +8748,7 @@ class TestCredentialFileTraversalGuard(unittest.TestCase):
                           return_value=iso.BACKEND_BWRAP), \
              patch.object(local_runner.iso, "plan_agent_execution",
                           return_value=plan), \
+             patch.object(local_runner, "_agent_binary_checkout_sha", return_value=None), \
              patch.object(local_runner.subprocess, "Popen",
                           return_value=fake_proc):
             buf = io.StringIO()

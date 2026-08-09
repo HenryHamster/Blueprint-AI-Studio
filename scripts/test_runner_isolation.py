@@ -639,6 +639,22 @@ class TestEnvAllowlist(unittest.TestCase):
         self.assertNotIn("CALL_DEEPGRAM_API_KEY", env)
         self.assertNotIn("ARBITRARY_INJECTION", env)
 
+    def test_agent_source_sha_passes_through_injected_identity_filter(self):
+        # Runner-derived checkout provenance is a trusted identity value (bwrap
+        # path). It must pass the injected filter, but NEVER flow from source_env
+        # (a host env var must not masquerade as image provenance on the docker
+        # path, which forwards only AGENT_ENV_ALLOWLIST).
+        env = iso.build_agent_env(
+            {},
+            {"AGENT_SOURCE_SHA": "9" * 40},
+            [],
+        )
+        self.assertEqual(env["AGENT_SOURCE_SHA"], "9" * 40)
+        # Not forwarded from the host environment under its allowlisted name.
+        self.assertNotIn("AGENT_SOURCE_SHA", iso.build_agent_env(
+            {"AGENT_SOURCE_SHA": "9" * 40}, {}, [],
+        ))
+
 
 # ── bwrap argv builder ────────────────────────────────────────────────────────
 

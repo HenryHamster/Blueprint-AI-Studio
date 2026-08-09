@@ -189,6 +189,11 @@ _AGENT_IDENTITY_ENV_KEYS: frozenset[str] = frozenset(
         # Non-secret; tells the agent WHERE the runner writes the supervisor
         # marker so its probe and the runner's write are one contract.
         "WALKTHROUGH_STACK_DIR",
+        # Host-checkout provenance for bwrap runners: the full HEAD SHA of the
+        # checkout the runner serves, derived by the runner (never from
+        # source_env — deliberately NOT in AGENT_ENV_ALLOWLIST) so a docker
+        # agent image's baked marker stays authoritative.
+        "AGENT_SOURCE_SHA",
     }
 )
 _AGENT_INJECTED_ENV_ALLOWLIST: frozenset[str] = frozenset(

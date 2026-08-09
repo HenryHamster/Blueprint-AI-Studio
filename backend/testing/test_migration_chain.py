@@ -1396,7 +1396,7 @@ def test_backfill_0707_chains_from_0702_and_declares_kv_keys():
         )
 
 
-def test_schema_head_chains_through_0739_localrunner_source_sha():
+def test_schema_head_chains_through_0740_localrunner_agent_source_sha():
     """Service-credential migrations follow admission removal as one linear chain.
 
     Historical contracts preserved:
@@ -1410,7 +1410,8 @@ def test_schema_head_chains_through_0739_localrunner_source_sha():
     - 0736 (direction-scoped category verdicts) revises 0735
     - 0737 (cross-project perf indexes) revises 0736
     - 0738 (approved-activation control columns) revises 0737
-    - 0739 (LocalRunner source identity) revises 0738 — current schema head
+    - 0739 (LocalRunner source identity) revises 0738
+    - 0740 (LocalRunner agent_source_sha) revises 0739 — current schema head
     """
     versions_dir = Path(__file__).resolve().parents[1] / "alembic" / "versions"
     operability = (
@@ -1486,6 +1487,9 @@ def test_schema_head_chains_through_0739_localrunner_source_sha():
     localrunner_source = (
         versions_dir / "0739_localrunner_source_sha.py"
     ).read_text()
+    localrunner_source_sha = (
+        versions_dir / "0740_localrunner_agent_source_sha.py"
+    ).read_text()
     assert parse_revision_identifiers(operability) == ("0708", "0707")
     assert parse_revision_identifiers(claims) == ("0709", "0708")
     assert parse_revision_identifiers(incarnation) == ("0710", "0709")
@@ -1528,13 +1532,17 @@ def test_schema_head_chains_through_0739_localrunner_source_sha():
     assert parse_revision_identifiers(activation_approval) == ("0738", "0737")
     assert "activation_requested_at" in activation_approval
     assert "activation_requested_by" in activation_approval
+    # 0739 chains from 0738: the runner's own clean source identity.
     assert parse_revision_identifiers(localrunner_source) == ("0739", "0738")
     assert '"localrunner"' in localrunner_source
     assert '"source_sha"' in localrunner_source
+    # 0740 chains from 0739: durable LocalRunner agent_source_sha provenance.
+    assert parse_revision_identifiers(localrunner_source_sha) == ("0740", "0739")
+    assert '"agent_source_sha"' in localrunner_source_sha
 
     from app.main import EXPECTED_SCHEMA_REVISION
 
-    assert EXPECTED_SCHEMA_REVISION == "0739", (
-        f"Expected EXPECTED_SCHEMA_REVISION == '0739', got {EXPECTED_SCHEMA_REVISION!r}. "
+    assert EXPECTED_SCHEMA_REVISION == "0740", (
+        f"Expected EXPECTED_SCHEMA_REVISION == '0740', got {EXPECTED_SCHEMA_REVISION!r}. "
         "Bump EXPECTED_SCHEMA_REVISION in backend/app/main.py."
     )

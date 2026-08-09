@@ -5515,6 +5515,21 @@ async def agent_heartbeat(
                 session, token.get("vm_instance_id"), **_img_kwargs
             )
 
+    # Mirror the heartbeat-reported source SHA onto the durable LocalRunner row
+    # when this heartbeat came from a task running on a self-hosted fleet runner
+    # (vm_instance_id="runner:<id>"). Runners are a first-class fleet member
+    # class with no warm-pool flag, so unlike the PoolVm mirror above this is NOT
+    # gated on is_warm_pool_enabled(). The runner's own liveness (last_seen_at)
+    # is refreshed by /api/runner/heartbeat; this only persists the agent commit
+    # the runner is currently serving so fleet-serving release-artifact checks
+    # survive an orchestrator restart.
+    if req.agent_source_sha is not None:
+        from app.compute import persist_runner_agent_source_sha
+
+        await persist_runner_agent_source_sha(
+            session, token.get("vm_instance_id"), req.agent_source_sha
+        )
+
     session.add(task)
     await session.commit()
 

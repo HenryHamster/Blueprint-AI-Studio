@@ -31,6 +31,11 @@ function runSmoke(): void {
     );
   }
   const baked = m[1];
+  // The reader prefers an AGENT_SOURCE_SHA env var (runner-provided host-checkout
+  // provenance). A bake host that happens to inherit one must not let the smoke
+  // pass off a runner override as proof of the baked marker — clear it so the
+  // smoke exercises the marker fallback this image actually carries.
+  delete process.env.AGENT_SOURCE_SHA;
   const parsed = readAgentSourceSha();
   if (baked === '' || baked === 'unknown') {
     // Acceptable dev/local fallback — reader must report null, never a bogus SHA.

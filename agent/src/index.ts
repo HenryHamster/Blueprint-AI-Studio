@@ -340,13 +340,25 @@ export function readAgentRuntimeFingerprint(): string | null {
   }
 }
 
-/** Read the baked source git SHA from the well-known marker written by the
- *  packer provisioner (/opt/agent/AGENT_SOURCE_SHA). Returns the commit SHA, or
- *  null when the file is absent (local dev / pre-marker image) or carries an
- *  empty/'unknown' value (a build with no commit in the environment) — so the
- *  agent never reports a bogus SHA over the wire. The permissive 7-40 hex match
- *  also rejects the literal 'unknown' fallback. */
+/** Read the git commit the running agent was built from.
+ *
+ *  Precedence: an ``AGENT_SOURCE_SHA`` env var injected by a host-checkout (bwrap)
+ *  runner carries the full validated HEAD SHA of the checkout the runner serves —
+ *  the immutable commit actually executing this agent. The Packer-baked marker
+ *  (/opt/agent/AGENT_SOURCE_SHA) is the fallback for baked images and for local
+ *  dev / pre-marker environments where the file is absent or carries an
+ *  empty/'unknown' value (a build with no commit in the environment).
+ *
+ *  Returns the commit SHA, or null when neither source yields one — so the agent
+ *  never reports a bogus SHA over the wire. The env value is accepted only as a
+ *  full 40-hex SHA (a short/dirty/tag value is rejected, matching the serving
+ *  gate's full-SHA comparison); the marker's permissive 7-40 hex match also
+ *  rejects the literal 'unknown' fallback. */
 export function readAgentSourceSha(): string | null {
+  const fromEnv = process.env.AGENT_SOURCE_SHA;
+  if (fromEnv && /^[0-9a-f]{40}$/.test(fromEnv)) {
+    return fromEnv;
+  }
   try {
     const raw = fs.readFileSync('/opt/agent/AGENT_SOURCE_SHA', 'utf-8').trim();
     const m = /^AGENT_SOURCE_SHA=([0-9a-f]{7,40})$/.exec(raw);

@@ -16,15 +16,18 @@ All pure / mocked — no DB.
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
+from unittest.mock import AsyncMock
 
 import pytest
 
 from app import release_artifacts as artifact_registry
 from app.release_artifacts import (
     AGENT_IMAGE_ARTIFACT_KIND,
+    AGENT_IMAGE_FLEET_SOURCE_UNOBSERVABLE_REASON,
     BACKEND_REVISION_ARTIFACT_KIND,
     PROMOTION_MERGE_ARTIFACT_KIND,
+    _check_agent_image_serving,
     _check_promotion_merge_serving,
     observable_release_artifact_providers,
     summarize_release_artifacts,
@@ -137,6 +140,61 @@ def test_observable_providers_none_without_github_repo():
     so the promotion is never armed and never stranded waiting on a signal."""
     project = _Proj(github_owner=None, github_repo=None)
     assert observable_release_artifact_providers(project, ("acme", "widget")) == ()
+
+
+@pytest.mark.asyncio
+async def test_agent_image_unobservable_fleet_reason_distinct_from_not_yet_serving(
+    mocker,
+):
+    """No source identity is distinct from an observed, lagging fleet."""
+    now = datetime(2026, 1, 1, 12, 0, 0)
+    project = _Proj(github_owner="acme", github_repo="widget")
+    version = _Version(
+        promoted_at=now - timedelta(hours=2),
+        deploy_confirm_deadline=now - timedelta(minutes=1),
+    )
+    version.id = 1
+    deployment_state = _DeployState(
+        status="stable",
+        current_sha="b" * 40,
+        deployed_at=now - timedelta(hours=1),
+    )
+    session = _DispatchSession(project, deployment_state)
+    artifact = _Artifact(AGENT_IMAGE_ARTIFACT_KIND, "unconfirmed")
+
+    mocker.patch(
+        "app.release_artifacts.project_matches_deploy_identity", return_value=True
+    )
+    mocker.patch(
+        "app.release_promotion._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "acme", "widget")),
+    )
+    mocker.patch(
+        "app.github_refs.agent_image_rebake_expected",
+        new=AsyncMock(return_value=True),
+    )
+    fleet = mocker.patch(
+        "app.compute.fleet_serving_source_sha",
+        new=AsyncMock(return_value=None),
+    )
+
+    decision = await _check_agent_image_serving(session, version, artifact, now)
+
+    assert decision == (
+        "confirmation_timed_out",
+        AGENT_IMAGE_FLEET_SOURCE_UNOBSERVABLE_REASON,
+        None,
+    )
+
+    fleet.return_value = False
+    lagging_decision = await _check_agent_image_serving(
+        session, version, artifact, now
+    )
+    assert lagging_decision == (
+        "confirmation_timed_out",
+        "agent_image_fleet_not_yet_serving",
+        None,
+    )
 
 
 # ---------------------------------------------------------------------------

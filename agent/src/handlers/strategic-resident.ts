@@ -5140,6 +5140,11 @@ export async function handleStrategicResident(
       // mutation accounting / last_progress_at stay exact; the backend advances
       // freshness on this only when no strategic op was applied. Requires
       // authorityHeld so a lease that lapsed mid-turn is not re-armed.
+      // authorityHeld is mutated inside the heartbeat/stop closures above (~2248/2284/2435),
+      // which TS control-flow analysis cannot see, so it narrows the captured `let` to its
+      // `true` initializer here. The check is load-bearing: a lease that lapsed mid-turn must
+      // not re-arm the continuation freshness signal — hence the rule suppression, not a removal.
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
       const autonomousTurnWorked = authorityHeld
         && !turnInterrupted
         && (r.sawToolUse
