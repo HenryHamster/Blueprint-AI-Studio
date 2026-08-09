@@ -836,7 +836,7 @@ async def complete_call_turn(
             raise HTTPException(status_code=400, detail="Invalid display block content")
         normalized_blocks.append({"type": block["type"], "content": content})
 
-    project = await _resolve_agent_project(project_id, token, session)
+    await _resolve_agent_project(project_id, token, session)
     task = await session.get(Task, payload.task_id)
     if task is None or (task.context or {}).get("_resident_session") is not True:
         raise HTTPException(status_code=409, detail="Call completion requires a Resident task")
@@ -1018,7 +1018,7 @@ async def claim_public_conversation_turn(
             status_code=409,
             detail="Standard fallback is disabled until it has a server-provisioned lease",
         )
-    task_context = _require_current_fast_task_identity(
+    _require_current_fast_task_identity(
         task=task,
         project=project,
         worker_generation=payload.worker_generation,
@@ -2049,10 +2049,13 @@ def _is_agent_compatible_signed_image_url(value: str) -> bool:
     """Mirror the resident agent's signed-GCS attachment transport allowlist."""
     try:
         parsed = urlparse(value)
+        hostname = str(parsed.hostname or "").lower()
+        port = parsed.port
     except ValueError:
         return False
-    hostname = str(parsed.hostname or "").lower()
     if parsed.scheme != "https":
+        return False
+    if parsed.username or parsed.password or port is not None:
         return False
     if hostname != "storage.googleapis.com" and not hostname.endswith(
         ".storage.googleapis.com"
@@ -2061,7 +2064,7 @@ def _is_agent_compatible_signed_image_url(value: str) -> bool:
     signatures = parse_qs(parsed.query, keep_blank_values=True).get(
         "X-Goog-Signature", []
     )
-    return any(bool(signature) for signature in signatures)
+    return len(signatures) == 1 and bool(signatures[0].strip())
 
 
 

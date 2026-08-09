@@ -854,6 +854,7 @@
         "test_materializes_exact_notes_snapshot",
         "test_notes_snapshot_surfaces_bounded_truncation_to_the_model",
         "test_materializes_whiteboard_as_short_lived_signed_image",
+        "test_signed_whiteboard_url_matches_resident_allowlist",
         "test_fails_closed_when_promised_revision_is_missing",
         "test_rejects_non_hex_revision_checksum",
         "test_poll_quarantines_missing_grant_and_delivers_valid_neighbors_once",

@@ -18,12 +18,46 @@ from app.models import (
 )
 from app.routers.agent_strategic_messages import (
     PermanentWorkdayArtifactError,
+    _is_agent_compatible_signed_image_url,
     _materialize_workday_artifact_attachments,
 )
 from app.storage import (
     StorageUriError,
     artifact_ref_render_uri,
 )
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        (
+            "https://storage.googleapis.com/bucket/board.png?X-Goog-Signature=sig",
+            True,
+        ),
+        (
+            "https://bucket.storage.googleapis.com/board.png?X-Goog-Signature=sig",
+            True,
+        ),
+        (
+            "https://attacker@storage.googleapis.com/board.png?X-Goog-Signature=sig",
+            False,
+        ),
+        (
+            "https://storage.googleapis.com:444/bucket/board.png?X-Goog-Signature=sig",
+            False,
+        ),
+        (
+            "https://storage.googleapis.com/bucket/board.png?X-Goog-Signature=&X-Goog-Signature=sig",
+            False,
+        ),
+        (
+            "https://storage.googleapis.com/bucket/board.png?X-Goog-Signature=%20",
+            False,
+        ),
+    ],
+)
+def test_signed_whiteboard_url_matches_resident_allowlist(url, expected):
+    assert _is_agent_compatible_signed_image_url(url) is expected
 
 
 async def _project(db_session):
