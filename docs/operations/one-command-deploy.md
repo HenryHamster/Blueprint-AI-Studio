@@ -52,9 +52,17 @@ The trust chain never depends on the caller:
    which the revision receipts record), but cannot replace the root-owned shim
    or deploy non-CI code. The socket ACL is the execution boundary.
 
-Migrations remain deliberately outside this path: a release whose code expects
-a newer schema fails closed at worker startup and rolls back. Run migrations
-first (see `docs/local-control-plane.md`), then deploy.
+Migrations are part of this path. The release tool compares the candidate
+image's baked schema revision with the live database head. Matching revisions
+use the normal hot-swap; when they differ, the tool stops both managed app
+units, waits for their containers to stop, runs the canonical migration
+transaction with the candidate image, verifies the resulting schema head, and
+starts the worker before the API. This is a bounded downtime window. If the
+migration choreography fails after the window begins, the app units remain
+stopped and the release must be fixed forward; the tool does not roll older
+code back across a possibly advanced schema. Operators do not run migrations
+separately, but must treat the deploy as a maintenance window and investigate
+or fix forward if it fails during migration.
 
 ## Host-side deploy agent (one-time install)
 
