@@ -339,10 +339,11 @@ async def run_request_changes(
 
     # Stale/unproven-target guard: REQUEST_CHANGES can launch a
     # code-writing fix only when the reviewer proved the exact
-    # immutable base/head it inspected. Missing provenance is no
-    # safer than a mismatch. If GitHub cannot provide the live
-    # target, fail closed for operator attention rather than
-    # expanding to an unpinned review or using stale guidance.
+    # immutable head it inspected. The base branch tip is ambient while
+    # the PR is in flight, so base-only drift does not invalidate head-bound
+    # review guidance; the live base is still required for downstream merge
+    # authority. If GitHub cannot provide the live target, fail closed for
+    # operator attention rather than expanding to an unpinned review.
     if not head_sha or not base_sha:
         task.status = TaskStatus.COMPLETED
         task.requires_approval = True
@@ -361,9 +362,7 @@ async def run_request_changes(
 
     review_target_unproven = (
         not reviewed_head_sha
-        or not reviewed_base_sha
         or reviewed_head_sha != head_sha
-        or reviewed_base_sha != base_sha
     )
     if review_target_unproven:
         # A stale finding can waste a fix iteration just as a
@@ -479,12 +478,9 @@ async def run_request_changes(
         await session.commit()
         return True, {"status": "accepted"}
 
-    # A cached verdict must have evaluated this exact head.
-    # Only exact-target verdicts are reusable on a later dispatch.
-    if (
-        reviewed_head_sha == head_sha
-        and reviewed_base_sha == base_sha
-    ):
+    # A cached verdict must have evaluated this exact head. Base drift is
+    # handled by the final merge-authority gate, not review admission.
+    if reviewed_head_sha == head_sha:
         _record_structured_review_result(
             {
                 "project_id": str(task.project_id),

@@ -3889,6 +3889,71 @@ async def test_migration_guard_moved_pr_replaces_queued_stale_fix(db_session, mo
 
 
 @pytest.mark.asyncio
+async def test_migration_guard_base_advance_reuses_same_head_fix(db_session, mocker):
+    """Base-only movement does not supersede a queued same-head fix."""
+    from app.migration_guard_recovery import spawn_migration_guard_fix_task
+
+    project = Project(name="migration fix ambient base", user_id="test-user")
+    db_session.add(project)
+    await db_session.flush()
+    old_target = {
+        "project_id": str(project.id),
+        "pr_number": 43,
+        "base_sha": "old-base",
+        "head_sha": "same-head",
+    }
+    source = _make_task(
+        db_session,
+        project,
+        pr_number=43,
+        ci_loop_extra={"review_target": old_target},
+    )
+    active_fix = Task(
+        project_id=project.id,
+        title="existing same-head migration fix",
+        payloads=[{"type": "fix", "pr_number": 43}],
+        status=TaskStatus.QUEUED,
+        context={"review_loop": {"fix_target": old_target}},
+    )
+    db_session.add(active_fix)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.github.get_pull_request",
+        AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "base": {"sha": "new-base", "ref": "automain"},
+                "head": {"sha": "same-head", "ref": "blueprint/test-branch"},
+            }
+        ),
+    )
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task", new_callable=AsyncMock
+    )
+
+    existing, created = await spawn_migration_guard_fix_task(
+        source,
+        db_session,
+        pr_number=43,
+        branch="blueprint/test-branch",
+        base_branch="automain",
+        guard_reason="duplicate revision",
+        review_loop=(source.context or {}).get("review_loop"),
+        gh_token="fake-token",
+        owner="owner",
+        repo="repo",
+    )
+
+    assert existing is active_fix
+    assert created is False
+    spawn_mock.assert_not_awaited()
+    await db_session.refresh(active_fix)
+    assert active_fix.status == TaskStatus.QUEUED
+
+
+@pytest.mark.asyncio
 async def test_migration_guard_moved_pr_retries_after_running_stale_fix_finishes(
     db_session, mocker
 ):

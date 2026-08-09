@@ -3143,20 +3143,17 @@ async def _process_post_commit(
                     and _assigned_pr_number == int(pr_number)
                     and reviewed_head_sha
                     == str(_assigned_review_target.get("head_sha") or "")
-                    and reviewed_base_sha
-                    == str(_assigned_review_target.get("base_sha") or "")
                 )
                 if (
                     _assigned_target_matches
                     and _completion_review_target is not None
                     and reviewed_head_sha
                     == str(_completion_review_target.get("head_sha") or "")
-                    and reviewed_base_sha
-                    == str(_completion_review_target.get("base_sha") or "")
                 ):
-                    # Only the backend may grant closure provenance.  Agent-
-                    # supplied SHAs are compared first, then overwritten from
-                    # the server target and bound to this durable review row.
+                    # Only the backend may grant closure provenance. The
+                    # agent-supplied head is compared first; the ambient base
+                    # is overwritten from the server target and both are bound
+                    # to this durable review row.
                     _current_review_entry.update(
                         {
                             "reviewed_head_sha": str(
@@ -3410,8 +3407,9 @@ async def _process_post_commit(
                         "issues": issues,
                         "resolutions": resolutions,
                         "investigated_files": investigated_files,
-                        # Cache only a verdict whose agent-stamped SHAs matched
-                        # the live target; preserve both for replay validation.
+                        # Cache only a verdict whose agent-stamped head matched
+                        # the live target; preserve both SHAs for audit and the
+                        # final merge-authority validation.
                         "reviewed_head_sha": target["head_sha"],
                         "reviewed_base_sha": target["base_sha"],
                     }
@@ -3467,9 +3465,7 @@ async def _process_post_commit(
                         return {"status": "accepted"}
                     if (
                         not reviewed_head_sha
-                        or not reviewed_base_sha
                         or reviewed_head_sha != _live_approve_target["head_sha"]
-                        or reviewed_base_sha != _live_approve_target["base_sha"]
                     ):
                         task.status = TaskStatus.COMPLETED
                         task.latest_status_message = (
@@ -3987,13 +3983,11 @@ async def _process_post_commit(
                         live_base_sha = str(pr_data.get("base", {}).get("sha", ""))
                         approve_target_is_stale = (
                             not reviewed_head_sha
-                            or not reviewed_base_sha
                             or reviewed_head_sha != head_sha
-                            or reviewed_base_sha != live_base_sha
                         )
                         if approve_target_is_stale:
                             # Do not let an APPROVE issued for a different
-                            # comparison range enter CI/merge lifecycle. There
+                            # reviewed head enter CI/merge lifecycle. There
                             # is deliberately no discard-count escape hatch:
                             # repeated branch motion can cost another bounded
                             # delta review, but it can never make a stale
@@ -4048,11 +4042,7 @@ async def _process_post_commit(
                                     )
                             await session.commit()
                             return {"status": "accepted"}
-                        if (
-                            reviewed_head_sha == head_sha
-                            and reviewed_base_sha
-                            == live_base_sha
-                        ):
+                        if reviewed_head_sha == head_sha:
                             _record_structured_review_result(
                                 {
                                     "project_id": str(task.project_id),

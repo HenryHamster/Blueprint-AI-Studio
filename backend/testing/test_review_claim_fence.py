@@ -156,7 +156,7 @@ async def test_claim_fence_collapses_duplicate_across_sibling_projects(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("task_type", ["review", "fix"])
-async def test_base_drift_retargets_instead_of_cancelling(
+async def test_base_only_advance_does_not_invalidate_review_claim(
     db_session, mocker, task_type
 ):
     project = Project(

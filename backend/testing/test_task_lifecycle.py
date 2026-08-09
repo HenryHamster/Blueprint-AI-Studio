@@ -10566,16 +10566,8 @@ async def test_stale_head_verdict_discards_fix_and_respawns_review(tl_db, mocker
 
 
 @pytest.mark.asyncio
-async def test_base_drift_only_request_changes_respawns_full_review(tl_db, mocker):
-    """Base-only drift must respawn a FULL review, never an empty delta.
-
-    When only ``reviewed_base_sha`` goes stale the head is unchanged, so a
-    ``delta_base_sha`` equal to the prior reviewed head would make the
-    replacement reviewer run ``git diff <live head>..HEAD`` — an empty range,
-    with the broad-review context suppressed. It would inspect nothing, and
-    the REQUEST_CHANGES finding this respawn exists to re-prove would be
-    silently dropped.
-    """
+async def test_base_only_request_changes_keeps_review_admitted(tl_db, mocker):
+    """Base-only drift keeps the head-bound REQUEST_CHANGES result usable."""
     calls, review_task = await _run_stale_head_branch(
         tl_db,
         mocker,
@@ -10585,11 +10577,10 @@ async def test_base_drift_only_request_changes_respawns_full_review(tl_db, mocke
         live_base_sha="newbase111111",
     )
 
-    review_calls = [c for c in calls if c[0][1] == "review"]
-    assert len(review_calls) == 1
-    assert not any(c[0][1] == "fix" for c in calls)
-    assert review_calls[0][1]["delta_base_sha"] == ""
-    assert (review_task.context or {}).get("_review_stale_head") is True
+    assert not any(c[0][1] == "review" for c in calls)
+    fix_calls = [c for c in calls if c[0][1] == "fix"]
+    assert len(fix_calls) == 1
+    assert (review_task.context or {}).get("_review_stale_head") is not True
 
 
 @pytest.mark.asyncio

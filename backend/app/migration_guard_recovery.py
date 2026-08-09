@@ -303,8 +303,6 @@ async def spawn_migration_guard_fix_task(
             str(candidate_target.get("project_id") or "")
             == str(fix_target["project_id"])
             and candidate_pr == int(fix_target["pr_number"])
-            and str(candidate_target.get("base_sha") or "")
-            == str(fix_target["base_sha"])
             and str(candidate_target.get("head_sha") or "")
             == str(fix_target["head_sha"])
         )

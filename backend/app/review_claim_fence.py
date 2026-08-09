@@ -112,10 +112,15 @@ def _target_matches_live(
         assigned_pr = int(assigned.get("pr_number") or 0)
     except (TypeError, ValueError):
         return False
+    assigned_head = str(assigned.get("head_sha") or "")
+    # Base SHA is deliberately not part of admission identity: it is the
+    # ambient integration-branch tip and may advance under an unchanged PR.
+    # The final merge-authority boundary is responsible for the strict
+    # base+head comparison immediately before submission.
     return bool(
         assigned_pr == pr_number
-        and str(assigned.get("base_sha") or "")
-        and str(assigned.get("head_sha") or "") == live_target["head_sha"]
+        and assigned_head
+        and assigned_head == live_target["head_sha"]
     )
 
 
