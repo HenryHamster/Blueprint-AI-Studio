@@ -1,6 +1,58 @@
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 import fs from 'fs';
 
+describe('tracked root check receipt contract', () => {
+  it('uses one runtime-derived receipt path for cleanup and publication', async () => {
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realPath = await vi.importActual<typeof import('node:path')>('node:path');
+    const script = realFs.readFileSync(realPath.resolve(process.cwd(), '..', 'check'), 'utf8');
+
+    expect(script.match(/_VERIFY_TASK_ID="\$\{TASK_ID:-/g)).toHaveLength(1);
+    expect(script.match(/_VERIFY_RECEIPT="\/tmp\/project_verification_receipt_\$\{_VERIFY_TASK_ID\}\.json"/g)).toHaveLength(1);
+    expect(script).toContain('if ! rm -f "$_VERIFY_RECEIPT" "$_VERIFY_HARNESS_RECEIPT"; then');
+    expect(script).toContain('mv -f "$_verification_tmp" "$_VERIFY_RECEIPT"');
+    expect(script).not.toContain('project_verification_receipt_6867e9ef-f0d6-41cb-8b9d-1be50b02c806.json');
+    expect(script).not.toContain('_VERIFICATION_RECEIPT');
+  });
+
+  it('removes a current-run receipt before an early failure', async () => {
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const realOs = await vi.importActual<typeof import('node:os')>('node:os');
+    const realPath = await vi.importActual<typeof import('node:path')>('node:path');
+    const repo = realFs.mkdtempSync(realPath.join(realOs.tmpdir(), 'root-check-receipt-'));
+    const taskId = `root-check-receipt-${realPath.basename(repo)}`;
+    const receipt = realPath.join('/tmp', `project_verification_receipt_${taskId}.json`);
+    const run = (args: string[]) => realCp.execFileSync('git', ['-C', repo, ...args], { stdio: 'ignore' });
+    try {
+      run(['init', '-q']);
+      run(['config', 'user.email', 'receipt-test@example.com']);
+      run(['config', 'user.name', 'receipt test']);
+      realFs.writeFileSync(realPath.join(repo, 'file.txt'), 'hello\n');
+      run(['add', 'file.txt']);
+      run(['commit', '-qm', 'initial']);
+      realFs.writeFileSync(receipt, '{"task_id":"previous-run","pytest":{"exit_code":0}}\n');
+
+      const checkPath = realPath.resolve(process.cwd(), '..', 'check');
+      let status = 0;
+      try {
+        realCp.execFileSync('bash', [checkPath], {
+          cwd: repo,
+          env: { ...process.env, WORKSPACE: repo, TASK_ID: taskId },
+          stdio: 'ignore',
+        });
+      } catch (error) {
+        status = (error as { status?: number }).status ?? -1;
+      }
+      expect(status).not.toBe(0);
+      expect(realFs.existsSync(receipt)).toBe(false);
+    } finally {
+      realFs.rmSync(repo, { recursive: true, force: true });
+      try { realFs.unlinkSync(receipt); } catch { /* absent */ }
+    }
+  });
+});
+
 // ── Module mocks ──────────────────────────────────────────────────────────────
 vi.mock('../index.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../index.js')>();
@@ -924,7 +976,10 @@ describe('writeCheckHelper — required backend-authoring verification', () => {
     expect(script).toContain('USE_TEST_POSTGRES=true bash "$_VERIFICATION_HARNESS" "$_verification_postgres_flag"');
     expect(script).toContain('source scripts/backend-test-route.sh');
     expect(script).toContain('select_backend_test_route');
-    expect(script).toContain('/tmp/project_verification_receipt_verify-authoring-1.json');
+    expect(script).toContain(
+      '_VERIFY_RECEIPT="/tmp/project_verification_receipt_${_VERIFY_TASK_ID}.json"',
+    );
+    expect(script).toContain('mv -f "$_verification_tmp" "$_VERIFY_RECEIPT"');
     expect(script).toContain('"skipped":runtime["skipped"],"exit_code":0');
     expect(script).toContain('no impacted pytest file/node was resolved');
     expect(script).toContain("grep -E '^backend/(testing|tests)/test_.*\\.py$'");
