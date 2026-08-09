@@ -59,50 +59,31 @@ first (see `docs/local-control-plane.md`), then deploy.
 ## Host-side deploy agent (one-time install)
 
 An operator can also activate an approved promotion in-product instead of
-hand-running `blueprint deploy`: the backend stamps an approval
-(`POST .../approve-activation`), and a durable host-side poller
-(`scripts/blueprint_deploy_agent.py`) — running on the control-plane host as the
-operator account — detects the pending binding, submits it to the same
+hand-running `blueprint deploy`: the backend stamps an approval, and the
+durable host-side poller detects the pending binding, submits it to the same
 root-owned release socket, and posts the activation receipt. The agent adds
 reachability, not privilege: it is bounded by the ACL-limited socket and
 `/usr/local/sbin/blueprint-release` execution boundary above, and it refuses
 (waits conservatively) on any binding that does not resolve to exactly the
 approved version's immutable `promoted_sha`.
 
-### Install (as the operator, `henry_hamster`)
+The `bootstrap_local_app_release.py` command in the preceding section is the
+sole installer for this agent and for
+`/etc/systemd/system/blueprint-deploy-agent.service`. It renders the unit from
+the reviewed programmatic renderer, installs the immutable bundle that the
+unit executes, verifies the units with `systemd-analyze`, and enables the
+service. Do not copy a unit template or install a second standalone agent.
+To install or refresh the agent, run that bootstrap command again with the
+full reviewed revision; its output identifies the installed bundle directory.
+
+After bootstrap, run the preflight from that bundle as `henry_hamster` (replace
+`<bundle>` with the directory printed by bootstrap):
 
 ```bash
-# 1. The root-owned release service + socket from the section above must already be installed.
-# 2. Install the self-contained agent bundle and its systemd unit template.
-#    The agent imports blueprint.py, which imports blueprint_api.py, so install
-#    all three together; do not rely on a checkout or PYTHONPATH at service time.
-sudo install -d -o henry_hamster -g henry_hamster -m 0755 \
-  /usr/local/lib/blueprint-node/deploy-agent
-sudo install -o henry_hamster -g henry_hamster -m 0755 \
-  scripts/blueprint_deploy_agent.py \
-  /usr/local/lib/blueprint-node/deploy-agent/blueprint_deploy_agent.py
-sudo install -o henry_hamster -g henry_hamster -m 0644 \
-  scripts/blueprint.py scripts/blueprint_api.py \
-  /usr/local/lib/blueprint-node/deploy-agent/
-
-# 3. Render and install the unit (substitute real values), then enable it:
-sed -e 's/@USER@/henry_hamster/g' \
-    -e 's|@PYTHON@|/usr/bin/python3|g' \
-    -e 's|@AGENT@|/usr/local/lib/blueprint-node/deploy-agent/blueprint_deploy_agent.py|g' \
-    -e 's|@ENV_FILE@|/etc/blueprint/deploy-agent.env|g' \
-    -e 's|@WANTED_BY@|multi-user.target|g' \
-  scripts/blueprint-deploy-agent.service | sudo tee /etc/systemd/system/blueprint-deploy-agent.service >/dev/null
-sudo systemctl daemon-reload
-sudo systemctl enable --now blueprint-deploy-agent.service
-
-# 4. Preflight the install (exit 0 = config present, project resolvable, shim present):
-/usr/bin/python3 /usr/local/lib/blueprint-node/deploy-agent/blueprint_deploy_agent.py --check
+/usr/bin/python3.12 \
+  /usr/local/lib/blueprint-node/<bundle>/blueprint.py \
+  deploy-agent --preflight
 ```
-
-`@ENV_FILE@` is optional: the agent reads the operator's
-`~/.blueprint-config.json` (or `BLUEPRINT_API_URL`/`BLUEPRINT_API_KEY`) exactly
-like `blueprint deploy`. Set `BLUEPRINT_DEPLOY_AGENT_QUIET=1` in the env file to
-silence the agent's own logging (systemd journaling remains).
 
 ### How the agent works
 
@@ -127,15 +108,12 @@ Each poll cycle the agent:
    and no sudo — the agent runs ON the control-plane host), then posts the
    activation receipt.
 
-Serialization is an `flock` on the agent's default lockfile,
-`~/.blueprint/deploy-agent.lock` — under the operator's home (the same
-`~/.blueprint` state directory `blueprint_runner` uses), so the unprivileged
-`User=henry_hamster` account can create it out of the box, without a
-root-owned `/run` directory or a `RuntimeDirectory=` line. Override with
-`--lockfile`. Overlapping agent restarts never run two deploys at once.
-Transient control-plane failures are logged and retried at the poll cadence
-with a 10× backoff after a failed cycle; the agent never crashes a poll cycle
-into the service.
+Serialization is an `flock` on `/run/blueprint-deploy-agent/deploy-agent.lock`
+and receipt-retry state is stored at
+`/var/lib/blueprint-deploy-agent/deploy-agent.state`; both directories are
+owned by systemd for `henry_hamster`. Overlapping agent restarts never run two
+deploys at once. Transient control-plane failures are logged and retried at the
+poll cadence; the agent never crashes a poll cycle into the service.
 
 ### Observability
 
@@ -145,14 +123,15 @@ into the service.
 - **Serving confirmation:** the in-product version history reflects the receipt
   (`serving_status=serving_confirmed` + `served_sha`).
 - **One-shot cycle (debug):**
-  `/usr/local/lib/blueprint-node/deploy-agent/blueprint_deploy_agent.py --once --project-id <id>`
+  `/usr/local/lib/blueprint-node/<bundle>/blueprint.py deploy-agent --once --project-id <id>`
 
 ### Recovery and manual rollback
 
-- **Agent is dead / won't start:** run `--check` for the preflight verdict
-  (missing config → create `~/.blueprint-config.json`; missing shim → re-run
-  the shim install above). Then `sudo systemctl reset-failed
-  blueprint-deploy-agent.service` (clears the StartLimitBurst cap) and
+- **Agent is dead / won't start:** run `deploy-agent --preflight` from the
+  installed bundle for the preflight verdict (missing config → create
+  `~/.blueprint-config.json`; missing shim → re-run the bootstrap above). Then
+  `sudo systemctl reset-failed blueprint-deploy-agent.service` (clears the
+  StartLimitBurst cap) and
   `sudo systemctl restart blueprint-deploy-agent.service`.
 - **A cycle fails conservatively:** the agent logs the reason and backs off; it
   never posts a receipt for a failed activation. If the release succeeds but

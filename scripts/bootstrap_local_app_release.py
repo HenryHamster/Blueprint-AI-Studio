@@ -345,7 +345,9 @@ def _install_deploy_agent(
     )
     previous = {path: _snapshot_optional(path) for path in managed}
     try:
-        _atomic_write(_DEPLOY_AGENT_UNIT, _deploy_agent_unit(bundle, install_user), 0o644)
+        # This renderer is the sole owner of blueprint-deploy-agent.service.
+        deploy_agent_unit = _deploy_agent_unit(bundle, install_user)
+        _atomic_write(_DEPLOY_AGENT_UNIT, deploy_agent_unit, 0o644)
         _atomic_write(_RELEASE_SERVICE, _release_service_unit(), 0o644)
         _atomic_write(_RELEASE_SOCKET_UNIT, _release_socket_unit(install_user), 0o644)
         _atomic_write(_RELEASE_SHIM, release_shim, 0o755)

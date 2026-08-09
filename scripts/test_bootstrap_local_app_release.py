@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ast
 import os
+import re
 import socket
 import stat
 import subprocess
@@ -292,6 +294,38 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
             "--lock-path /run/blueprint-deploy-agent/deploy-agent.lock", payload
         )
         self.assertIn("--poll-interval 30", payload)
+
+    def test_deploy_agent_unit_has_one_repository_writer(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        canonical_script = repo_root / "scripts" / "bootstrap_local_app_release.py"
+        writer_locations = []
+        for path in sorted((repo_root / "scripts").glob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+                    continue
+                if node.func.id != "_atomic_write" or not node.args:
+                    continue
+                target = node.args[0]
+                if isinstance(target, ast.Name) and target.id == "_DEPLOY_AGENT_UNIT":
+                    writer_locations.append(path)
+
+        self.assertEqual(writer_locations, [canonical_script])
+        self.assertFalse(
+            (repo_root / "scripts" / "blueprint-deploy-agent.service").exists(),
+            "the removed template must not become a second unit source",
+        )
+
+        direct_documented_writers = []
+        target = "/etc/systemd/system/blueprint-deploy-agent.service"
+        write_markers = re.compile(r"\b(?:tee|install|cp|mv)\b|write_(?:text|bytes)")
+        for path in sorted((repo_root / "docs").rglob("*.md")):
+            for line_number, line in enumerate(
+                path.read_text(encoding="utf-8").splitlines(), 1
+            ):
+                if target in line and write_markers.search(line):
+                    direct_documented_writers.append(f"{path}:{line_number}")
+        self.assertEqual(direct_documented_writers, [])
 
     def test_release_execution_is_root_owned_and_socket_activated(self):
         service = bootstrap._release_service_unit().decode()
