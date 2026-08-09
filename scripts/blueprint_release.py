@@ -52,6 +52,7 @@ _REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
 _SUDO_USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 _DEFAULT_SUDO_USER = "henry_hamster"
 _SOCKET_FD = 3
+_MAX_REQUEST_BYTES = 256
 
 
 def _fail(message: str) -> NoReturn:
@@ -118,6 +119,14 @@ def _run_release(digest: str, revision: str) -> int:
     return subprocess.run(_release_command(digest, revision), check=False).returncode
 
 
+def _request_args(payload: bytes) -> list[str]:
+    try:
+        text = payload.decode("ascii")
+    except UnicodeDecodeError:
+        _fail("request must contain ASCII arguments")
+    return text.strip().split()
+
+
 def _serve_one_request() -> None:
     if os.geteuid() != 0:
         _fail("release socket service must run as root")
@@ -125,8 +134,8 @@ def _serve_one_request() -> None:
     try:
         connection, _ = listener.accept()
         with connection:
-            payload = connection.recv(256).decode("ascii")
-            digest, revision = _validated_args(payload.strip().split())
+            payload = connection.recv(_MAX_REQUEST_BYTES)
+            digest, revision = _validated_args(_request_args(payload))
             return_code = _run_release(digest, revision)
             if return_code == 0:
                 connection.sendall(b"OK\n")

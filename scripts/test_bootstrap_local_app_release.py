@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import os
+import socket
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import unittest.mock
 from pathlib import Path, PurePosixPath
@@ -11,6 +14,7 @@ from pathlib import Path, PurePosixPath
 sys.path.insert(0, str(Path(__file__).parent))
 
 import bootstrap_local_app_release as bootstrap
+import blueprint_release as release
 
 
 class BootstrapLocalAppReleaseTests(unittest.TestCase):
@@ -437,6 +441,7 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
             }
 
         with (
+            unittest.mock.patch.object(deploy_blueprint, "_require_write_config"),
             unittest.mock.patch.object(
                 deploy_blueprint, "_read_live_approved_activation", return_value=promoted
             ),
@@ -473,6 +478,112 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
             next(body for method, path, body in calls if method == "POST"),
             {"version_number": 7, "revision": revision, "host": "control-plane"},
         )
+
+    def test_release_serve_accepts_the_exact_agent_wire_payload(self):
+        digest = "sha256:" + "0" * 64
+        revision = "a" * 40
+        payload = f"{digest} {revision}\n".encode("ascii")
+        release_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+
+        with tempfile.TemporaryDirectory() as raw_directory:
+            socket_path = str(Path(raw_directory) / "blueprint-release.sock")
+            release_socket.bind(socket_path)
+            release_socket.listen(1)
+            try:
+                original_fd = os.dup(release._SOCKET_FD)
+            except OSError:
+                original_fd = None
+            os.dup2(release_socket.fileno(), release._SOCKET_FD)
+            try:
+                with unittest.mock.patch.object(
+                    release.os, "geteuid", return_value=0
+                ), unittest.mock.patch.object(
+                    release, "_run_release", return_value=0
+                ) as run_release:
+                    server = threading.Thread(target=release._serve_one_request)
+                    server.start()
+                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                        client.connect(socket_path)
+                        client.sendall(payload)
+                        self.assertEqual(client.recv(256), b"OK\n")
+                    server.join(timeout=2)
+                    self.assertFalse(server.is_alive())
+
+                run_release.assert_called_once_with(digest, revision)
+            finally:
+                if original_fd is None:
+                    os.close(release._SOCKET_FD)
+                else:
+                    os.dup2(original_fd, release._SOCKET_FD)
+                    os.close(original_fd)
+                release_socket.close()
+
+    def test_release_serve_reports_nonzero_release(self):
+        digest = "sha256:" + "1" * 64
+        revision = "b" * 40
+        payload = f"{digest} {revision}\n".encode("ascii")
+        release_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+
+        with tempfile.TemporaryDirectory() as raw_directory:
+            socket_path = str(Path(raw_directory) / "blueprint-release.sock")
+            release_socket.bind(socket_path)
+            release_socket.listen(1)
+            try:
+                original_fd = os.dup(release._SOCKET_FD)
+            except OSError:
+                original_fd = None
+            os.dup2(release_socket.fileno(), release._SOCKET_FD)
+            try:
+                with unittest.mock.patch.object(
+                    release.os, "geteuid", return_value=0
+                ), unittest.mock.patch.object(
+                    release, "_run_release", return_value=17
+                ) as run_release:
+                    server = threading.Thread(target=release._serve_one_request)
+                    server.start()
+                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                        client.connect(socket_path)
+                        client.sendall(payload)
+                        self.assertEqual(
+                            client.recv(256), b"ERROR release exited 17\n"
+                        )
+                    server.join(timeout=2)
+                    self.assertFalse(server.is_alive())
+
+                run_release.assert_called_once_with(digest, revision)
+            finally:
+                if original_fd is None:
+                    os.close(release._SOCKET_FD)
+                else:
+                    os.dup2(original_fd, release._SOCKET_FD)
+                    os.close(original_fd)
+                release_socket.close()
+
+    def test_release_validator_rejects_malformed_payloads_before_release(self):
+        digest = "sha256:" + "0" * 64
+        revision = "a" * 40
+        malformed = (
+            (),
+            (digest,),
+            (digest, revision, "extra"),
+            (digest + "x", revision),
+            (digest, revision + "a"),
+            ("é", revision),
+            ("x" * 257,),
+        )
+
+        for args in malformed:
+            with self.subTest(args=args):
+                with (
+                    unittest.mock.patch.object(
+                        release, "_fail", side_effect=SystemExit(2)
+                    ) as fail,
+                    unittest.mock.patch.object(release, "_run_release") as run_release,
+                ):
+                    with self.assertRaises(SystemExit):
+                        release._validated_args(list(args))
+                fail.assert_called_once()
+                run_release.assert_not_called()
 
     def test_deploy_agent_install_restarts_existing_service_after_update(self):
         with tempfile.TemporaryDirectory() as raw_directory:
