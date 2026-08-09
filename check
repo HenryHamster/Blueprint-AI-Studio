@@ -304,67 +304,123 @@ if touches "backend/"; then
   fi
 
   if [ -n "$(printf '%s\n' "$CHANGED" | while IFS= read -r f; do case "$f" in backend/*.py) [ -f "$f" ] && printf x && break ;; esac; done)" ]; then
-    # Only real Ruff plus impacted Postgres pytest can mint this receipt.
-    _VERIFY_CHANGED=$(mktemp /tmp/check_verify_changed.XXXXXX)
-    : >"$_VERIFY_CHANGED"
+    # required backend-authoring verification. No skip can mint this receipt.
+    source scripts/backend-test-route.sh
+    _VERIFICATION_RECEIPT=/tmp/project_verification_receipt_6867e9ef-f0d6-41cb-8b9d-1be50b02c806.json
+    _VERIFICATION_DIR='backend'
+    _VERIFICATION_HARNESS='scripts/test-backend.sh'
+    _VERIFICATION_CHANGED=$(mktemp /tmp/check_verification_changed.XXXXXX)
+    : >"$_VERIFICATION_CHANGED"
     printf '%s\n' "$CHANGED" | grep -E '^backend/.*\.py$' | while IFS= read -r f; do
-      [ -f "$f" ] && printf '%s\0' "$f" >>"$_VERIFY_CHANGED"
+      [ -f "$f" ] && printf '%s\0' "$f" >>"$_VERIFICATION_CHANGED"
     done
-    _VERIFY_RUFF_OK=0
-    if [ -s "$_VERIFY_CHANGED" ] && xargs -0 -a "$_VERIFY_CHANGED" python3 -m ruff check --select E,F,W --ignore E501 2>&1; then
-      _VERIFY_RUFF_OK=1
+    _VERIFICATION_RUFF_OK=0
+    if [ ! -s "$_VERIFICATION_CHANGED" ]; then
+      echo "[check] required backend verification FAILED — no changed Python file in $_VERIFICATION_DIR"
+      FAILED+=("$_VERIFICATION_DIR verification: no Python target")
     else
-      echo "[check] required backend verification FAILED — Ruff missing, failed, or had no changed Python target"
-      FAILED+=("backend required ruff")
-    fi
-    if [ "$_VERIFY_RUFF_OK" = "1" ]; then
-      _VERIFY_CANDIDATES=$(mktemp /tmp/check_verify_selectors.XXXXXX)
-      printf '%s\n' "$CHANGED" | grep -E '^backend/testing/test_.*\.py$' | while IFS= read -r f; do
-        [ -f "${f%%::*}" ] && printf '%s\n' "$f"
-      done >"$_VERIFY_CANDIDATES" || true
-      printf '%s\n' "$CHANGED" | python3 backend/testing/impacted_tests.py >>"$_VERIFY_CANDIDATES"
-      _VERIFY_RESOLVER_RC=$?
-      _VERIFY_SELECTORS=$(while IFS= read -r f; do [ -f "${f%%::*}" ] && printf '%s\n' "$f"; done <"$_VERIFY_CANDIDATES" | awk '!seen[$0]++')
-      rm -f "$_VERIFY_CANDIDATES"
-      if [ "$_VERIFY_RESOLVER_RC" -ne 0 ]; then
-        echo "[check] required backend verification resolver FAILED (exit $_VERIFY_RESOLVER_RC)"
-        FAILED+=("backend verification resolver")
-      elif [ -z "$_VERIFY_SELECTORS" ]; then
-        echo "[check] required backend verification FAILED — no impacted pytest file/node resolved"
-        FAILED+=("backend verification no impacted pytest")
+      echo "[check] $_VERIFICATION_DIR required ruff..."
+      if xargs -0 -a "$_VERIFICATION_CHANGED" python3 -m ruff check --select E,F,W --ignore E501 2>&1; then
+        echo "[check] $_VERIFICATION_DIR required ruff OK"
+        _VERIFICATION_RUFF_OK=1
       else
-        _VERIFY_POSTGRES_FLAG=""
-        if _VERIFY_POSTGRES_FLAG="$(select_backend_test_route)"; then
+        echo "[check] $_VERIFICATION_DIR required ruff FAILED"
+        FAILED+=("$_VERIFICATION_DIR required ruff")
+      fi
+    fi
+    _VERIFICATION_SELECTORS=""
+    if [ "$_VERIFICATION_RUFF_OK" = "1" ]; then
+      _verification_stderr=$(mktemp /tmp/check_verification_resolver.XXXXXX)
+      _verification_candidates=$(mktemp /tmp/check_verification_selectors.XXXXXX)
+      : >"$_verification_candidates"
+      printf '%s\n' "$CHANGED" | grep -E '^backend/(testing|tests)/test_.*\.py$' | while IFS= read -r test_path; do
+        [ -f "${test_path%%::*}" ] && printf '%s\n' "$test_path"
+      done >>"$_verification_candidates" || true
+      if [ "$_VERIFICATION_DIR" = "backend" ] && [ -f backend/testing/impacted_tests.py ]; then
+        printf '%s\n' "$CHANGED" | python3 backend/testing/impacted_tests.py \
+          >>"$_verification_candidates" 2>"$_verification_stderr"
+        _verification_resolver_rc=$?
+      else
+        _verification_resolver_rc=0
+        while IFS= read -r changed_file; do
+          [ -n "$changed_file" ] || continue
+          case "$changed_file" in
+            */test_*.py|*/tests.py) printf '%s\n' "${changed_file#$_VERIFICATION_DIR/}" ;;
+            *.py)
+              _verification_base=$(basename "$changed_file" .py)
+              for candidate in \
+                "$_VERIFICATION_DIR/testing/test_${_verification_base}.py" \
+                "$_VERIFICATION_DIR/tests/test_${_verification_base}.py"; do
+                [ -f "$candidate" ] && printf '%s\n' "${candidate#$_VERIFICATION_DIR/}"
+              done
+              ;;
+          esac
+        done < <(printf '%s\n' "$CHANGED" | grep -E '^backend/.*\.py$') \
+          >>"$_verification_candidates"
+      fi
+      if [ "$_verification_resolver_rc" -ne 0 ]; then
+        echo "[check] required backend verification resolver FAILED (exit $_verification_resolver_rc)" >&2
+        cat "$_verification_stderr" >&2
+        FAILED+=("$_VERIFICATION_DIR verification resolver")
+      fi
+      _VERIFICATION_SELECTORS=$(
+        sed 's|^backend/||' "$_verification_candidates" \
+          | while IFS= read -r selector; do
+              [ -n "$selector" ] || continue
+              [ -f "$_VERIFICATION_DIR/${selector%%::*}" ] && printf '%s\n' "$selector"
+            done \
+          | awk '!seen[$0]++'
+      )
+      rm -f "$_verification_candidates"
+      rm -f "$_verification_stderr"
+    fi
+    if [ "$_VERIFICATION_RUFF_OK" = "1" ] && [ -z "$_VERIFICATION_SELECTORS" ]; then
+      echo "[check] required backend verification FAILED — no impacted pytest file/node was resolved"
+      FAILED+=("$_VERIFICATION_DIR verification: no impacted pytest")
+    elif [ "$_VERIFICATION_RUFF_OK" = "1" ]; then
+      _verification_count=$(printf '%s\n' "$_VERIFICATION_SELECTORS" | grep -c '^' || true)
+      if [ "$_verification_count" -gt 8 ]; then
+        echo "[check] required backend verification: $_verification_count impacted files; running the 8 most diff-relevant (the remainder are not run here)"
+      fi
+      mapfile -t _verification_selector_args < <(printf '%s\n' "$_VERIFICATION_SELECTORS" | head -n 8)
+      if [ -z "$_VERIFICATION_HARNESS" ] || [ ! -f "$_VERIFICATION_HARNESS" ]; then
+        echo "[check] required backend verification FAILED — sanctioned harness missing: $_VERIFICATION_HARNESS"
+        FAILED+=("$_VERIFICATION_DIR verification: harness missing")
+      else
+        _verification_postgres_flag=""
+        if _verification_postgres_flag="$(select_backend_test_route)"; then
           :
         else
-          echo "[check] GATE-ENVIRONMENT: required backend verification skipped — PostgreSQL runtime unavailable"
-          printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "backend: required targeted verification skipped — no sanctioned PostgreSQL runtime" >> "/tmp/check_gate_env_${_VERIFY_TASK_ID}.txt"
+          echo "[check] required backend verification FAILED — PostgreSQL runtime unavailable"
+          FAILED+=("$_VERIFICATION_DIR verification: PostgreSQL unavailable")
         fi
       fi
-      if [ -n "${_VERIFY_POSTGRES_FLAG:-}" ]; then
-        mapfile -t _VERIFY_ARGS < <(printf '%s\n' "$_VERIFY_SELECTORS" | head -n 8 | sed 's|^backend/||')
-        _VERIFY_HARNESS_RECEIPT="/tmp/backend_verification_harness_${_VERIFY_TASK_ID}.json"
-        rm -f "$_VERIFY_HARNESS_RECEIPT"
-        if ( set -o pipefail; BLUEPRINT_VERIFICATION_RESULT_FILE="$_VERIFY_HARNESS_RECEIPT" USE_TEST_POSTGRES=true bash scripts/test-backend.sh "$_VERIFY_POSTGRES_FLAG" "${_VERIFY_ARGS[@]}" 2>&1 | tail -200 ) \
-          && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d.get("exit_code")==0 and d.get("targeted") is True and d.get("use_test_postgres") is True and d.get("postgres_sidecar") is True and int(d.get("tests",0))>int(d.get("skipped",0)) and d.get("selectors")' "$_VERIFY_HARNESS_RECEIPT"; then
-          _VERIFY_SELECTORS_JSON=$(printf '%s\n' "${_VERIFY_ARGS[@]}" | python3 -c 'import json,sys; print(json.dumps([x.rstrip("\n") for x in sys.stdin if x.rstrip("\n")]))')
-          _VERIFY_RECEIPT="/tmp/project_verification_receipt_${_VERIFY_TASK_ID}.json"
-          _VERIFY_TMP="${_VERIFY_RECEIPT}.$$"
-          if python3 -c 'import datetime,json,sys; out,task,selectors,runtime_path,postgres_flag=sys.argv[1:]; runtime=json.load(open(runtime_path,encoding="utf-8")); payload={"version":1,"task_id":task,"directory":"backend","created_at":datetime.datetime.now(datetime.timezone.utc).isoformat(),"ruff":{"command":"python3 -m ruff check --select E,F,W --ignore E501 <changed-python-files>","exit_code":0},"pytest":{"command":"USE_TEST_POSTGRES=true bash scripts/test-backend.sh "+postgres_flag+" <impacted-selectors>","harness":"scripts/test-backend.sh","selectors":json.loads(selectors),"targeted":True,"use_test_postgres":True,"postgres_sidecar":True,"tests":runtime["tests"],"skipped":runtime["skipped"],"exit_code":0}}; open(out,"w",encoding="utf-8").write(json.dumps(payload,sort_keys=True)+"\n")' "$_VERIFY_TMP" "$_VERIFY_TASK_ID" "$_VERIFY_SELECTORS_JSON" "$_VERIFY_HARNESS_RECEIPT" "$_VERIFY_POSTGRES_FLAG" \
-            && mv -f "$_VERIFY_TMP" "$_VERIFY_RECEIPT"; then
-            echo "[check] required backend verification receipt: $_VERIFY_RECEIPT"
+      if [ -n "${_verification_postgres_flag:-}" ]; then
+        echo "[check] $_VERIFICATION_DIR required targeted Postgres pytest..."
+        _verification_harness_receipt=/tmp/backend_verification_harness_6867e9ef-f0d6-41cb-8b9d-1be50b02c806.json
+        rm -f "$_verification_harness_receipt"
+        if ( set -o pipefail; BLUEPRINT_VERIFICATION_RESULT_FILE="$_verification_harness_receipt" USE_TEST_POSTGRES=true bash "$_VERIFICATION_HARNESS" "$_verification_postgres_flag" "${_verification_selector_args[@]}" 2>&1 | tail -200 ) \
+          && python3 -c 'import json,sys; d=json.load(open(sys.argv[1],encoding="utf-8")); assert d.get("exit_code")==0 and d.get("targeted") is True and d.get("use_test_postgres") is True and d.get("postgres_sidecar") is True and int(d.get("tests",0))>int(d.get("skipped",0)) and d.get("selectors")' "$_verification_harness_receipt"; then
+          _verification_selectors_json=$(printf '%s\n' "${_verification_selector_args[@]}" | python3 -c 'import json,sys; print(json.dumps([line.rstrip("\n") for line in sys.stdin if line.rstrip("\n")]))')
+          _verification_tmp="${_VERIFICATION_RECEIPT}.$$"
+          if python3 -c 'import datetime,json,sys; out,task,directory,harness,selectors,harness_receipt,postgres_flag=sys.argv[1:]; runtime=json.load(open(harness_receipt,encoding="utf-8")); payload={"version":1,"task_id":task,"directory":directory,"created_at":datetime.datetime.now(datetime.timezone.utc).isoformat(),"ruff":{"command":"python3 -m ruff check --select E,F,W --ignore E501 <changed-python-files>","exit_code":0},"pytest":{"command":"USE_TEST_POSTGRES=true bash "+harness+" "+postgres_flag+" <impacted-selectors>","harness":harness,"selectors":json.loads(selectors),"targeted":True,"use_test_postgres":True,"postgres_sidecar":True,"tests":runtime["tests"],"skipped":runtime["skipped"],"exit_code":0}}; open(out,"w",encoding="utf-8").write(json.dumps(payload,sort_keys=True)+"\n")' "$_verification_tmp" '6867e9ef-f0d6-41cb-8b9d-1be50b02c806' "$_VERIFICATION_DIR" "$_VERIFICATION_HARNESS" "$_verification_selectors_json" "$_verification_harness_receipt" "$_verification_postgres_flag" \
+            && mv -f "$_verification_tmp" "$_VERIFICATION_RECEIPT"; then
+            echo "[check] $_VERIFICATION_DIR required targeted Postgres pytest OK"
+            echo "[check] verification receipt: $_VERIFICATION_RECEIPT"
           else
-            rm -f "$_VERIFY_TMP" "$_VERIFY_RECEIPT"
-            FAILED+=("backend verification receipt")
+            echo "[check] required backend verification FAILED — could not write receipt"
+            rm -f "$_verification_tmp" "$_VERIFICATION_RECEIPT"
+            FAILED+=("$_VERIFICATION_DIR verification receipt")
           fi
         else
-          echo "[check] required targeted Postgres pytest FAILED or produced no non-skipped evidence"
-          FAILED+=("backend required targeted Postgres pytest")
+          echo "[check] $_VERIFICATION_DIR required targeted Postgres pytest FAILED"
+          rm -f "$_VERIFICATION_RECEIPT"
+          FAILED+=("$_VERIFICATION_DIR required targeted Postgres pytest")
         fi
-        rm -f "$_VERIFY_HARNESS_RECEIPT"
+        rm -f "$_verification_harness_receipt"
       fi
     fi
-    rm -f "$_VERIFY_CHANGED"
+    rm -f "$_VERIFICATION_CHANGED"
   fi
 fi
 

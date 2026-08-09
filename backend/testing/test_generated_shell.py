@@ -2083,6 +2083,24 @@ class TestProjectVerificationRuntimeContract:
     def test_generated_fragment_and_tracked_check_share_fail_closed_contract(self):
         fragment = _BACKEND_VERIFICATION_FRAGMENT.read_text(encoding="utf-8")
         tracked = _TRACKED_CHECK.read_text(encoding="utf-8")
+        rendered_fragment = (
+            fragment.replace("@TASK_ID@", "6867e9ef-f0d6-41cb-8b9d-1be50b02c806")
+            .replace("@DIR@", "backend")
+            .replace("@HARNESS@", "scripts/test-backend.sh")
+            .replace("@PYTHON_PATH_RE@", r"^backend/.*\.py$")
+            .replace("@TEST_PATH_RE@", r"^backend/(testing|tests)/test_.*\.py$")
+            .replace("@SELECTOR_PREFIX_RE@", "backend/")
+            .rstrip("\n")
+        )
+        start = tracked.index("    # required backend-authoring verification")
+        end = tracked.index(
+            '\n  fi\nfi\n\nif touches "golden_tasks/"',
+            start,
+        )
+        assert tracked[start:end] == rendered_fragment, (
+            "the tracked root gate must be rendered from the canonical "
+            "backend verification fragment"
+        )
         helper = (_BLUEPRINT_ROOT / "scripts" / "backend-test-route.sh").read_text(
             encoding="utf-8"
         )
