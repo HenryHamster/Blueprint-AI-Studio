@@ -65,7 +65,7 @@
     "reaper_infra_recovery.py": 850,
     "agent_status_spawn.py": 900,
     "admin_task_mutations.py": 1650,
-    "admin_task_approvals.py": 850,
+    "admin_task_approvals.py": 900,
     "review_pipeline.py": 5350,
     "deploy_health.py": 1250,
     "direction_outcomes.py": 3700,

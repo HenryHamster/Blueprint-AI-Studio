@@ -2080,6 +2080,60 @@ def test_agent_status_decomposition_resolves_size_breach():
     )
 
 
+def test_acceptance_gate_decomposition_resolves_size_breach():
+    """The chronic acceptance gate keeps its cap while moving pure invariants.
+
+    Automain b48e4cee reported ``acceptance_gate.py`` at 3218 lines over its
+    unchanged 3150 cap.  The acceptance-window sub-score invariant guard is a
+    cohesive pure cluster, so it must live in a sibling module while remaining
+    available through ``app.acceptance_gate`` for existing callers.
+    """
+    json_path = os.path.join(os.path.dirname(__file__), "module_size_limits.json")
+    data = csl.load_limits(json_path)
+    backend_caps = data.get("backend", {})
+
+    target_rel = "acceptance_gate.py"
+    assert backend_caps.get(target_rel) == 3150, (
+        f"{target_rel} cap must remain the chronic-offender cap 3150; "
+        f"got {backend_caps.get(target_rel)}. Decompose instead of bumping."
+    )
+
+    backend_app_root = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "app")
+    )
+    target_path = os.path.join(backend_app_root, target_rel)
+    assert os.path.isfile(target_path), f"{target_path} must exist on disk"
+    actual_count = csl.count_lines(target_path)
+    assert actual_count <= backend_caps[target_rel], (
+        f"{target_rel} has {actual_count} lines over its unchanged cap 3150; "
+        "extract a cohesive cluster instead of raising the cap"
+    )
+
+    sibling_path = os.path.join(backend_app_root, "acceptance_window_invariants.py")
+    assert os.path.isfile(sibling_path), (
+        "the acceptance-window invariant cluster must live in the sibling module"
+    )
+
+    from app import acceptance_gate as gate
+    from app import acceptance_window_invariants as invariants
+
+    assert (
+        gate.acceptance_window_sub_scores_violations
+        is invariants.acceptance_window_sub_scores_violations
+    )
+    violations = gate.acceptance_window_sub_scores_violations(
+        {
+            "acceptance_window_verified": 2,
+            "acceptance_window_write_total": 1,
+            "acceptance_window_total_all_merges": 3,
+            "acceptance_window_fraction": 2.0,
+        }
+    )
+    assert violations == [
+        "acceptance_window_verified (2) exceeds acceptance_window_write_total (1)"
+    ]
+
+
 def test_release_reconciliation_decomposition_resolves_size_breach():
     """The serving-confirmation extraction must keep release_reconciliation ≤ 3700.
 

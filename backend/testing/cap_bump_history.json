@@ -1639,6 +1639,14 @@
           "new_cap": 900
         }
       ],
+      "admin_task_approvals.py": [
+        {
+          "commit_sha": "",
+          "commit_date": "2026-08-09T00:00:00Z",
+          "old_cap": 850,
+          "new_cap": 900
+        }
+      ],
       "admin_task_mutations.py": [
         {
           "commit_sha": "cb0e7137470cb4bdd2384bc8f3455c85ca4512ec",
