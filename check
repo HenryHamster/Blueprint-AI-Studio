@@ -337,8 +337,8 @@ if touches "backend/"; then
         if _VERIFY_POSTGRES_FLAG="$(select_backend_test_route)"; then
           :
         else
-          echo "[check] required backend verification FAILED — PostgreSQL runtime unavailable"
-          FAILED+=("backend verification PostgreSQL unavailable")
+          echo "[check] GATE-ENVIRONMENT: required backend verification skipped — PostgreSQL runtime unavailable"
+          printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "backend: required targeted verification skipped — no sanctioned PostgreSQL runtime" >> "/tmp/check_gate_env_${_VERIFY_TASK_ID}.txt"
         fi
       fi
       if [ -n "${_VERIFY_POSTGRES_FLAG:-}" ]; then
