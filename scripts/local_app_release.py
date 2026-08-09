@@ -36,6 +36,10 @@ _IMAGE_PREFIX = (
 _IMAGE_REF_RE = re.compile(rf"^{re.escape(_IMAGE_PREFIX)}@sha256:[0-9a-f]{{64}}$")
 _IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
+_SCHEMA_REVISION_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_EXPECTED_SCHEMA_REVISION_LINE_RE = re.compile(
+    r"^EXPECTED_SCHEMA_REVISION\s*=\s*(['\"])(?P<revision>[A-Za-z0-9_.-]+)\1$"
+)
 _SYSTEM_USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 _SERVICES = ("blueprint-api.service", "blueprint-worker.service")
 _ACTIVATION_ORDER = ("blueprint-worker.service", "blueprint-api.service")
@@ -1081,6 +1085,77 @@ def _retain_prior_image(image_id: str) -> str:
     return tag
 
 
+def _image_schema_revision(image_id: str) -> str:
+    result = _run(
+        [
+            "/usr/bin/docker",
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--entrypoint",
+            "/bin/sh",
+            image_id,
+            "-c",
+            "grep -E '^EXPECTED_SCHEMA_REVISION[[:space:]]*=' "
+            "/app/app/main.py",
+        ],
+        timeout=60,
+    )
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if len(lines) != 1:
+        raise RuntimeError(
+            f"prior image {image_id} does not expose one schema revision"
+        )
+    match = _EXPECTED_SCHEMA_REVISION_LINE_RE.fullmatch(lines[0])
+    if match is None:
+        raise RuntimeError(
+            f"prior image {image_id} exposes an invalid schema revision"
+        )
+    return match.group("revision")
+
+
+def _database_schema_revision() -> str:
+    result = _run(
+        [
+            "/usr/bin/docker",
+            "exec",
+            "--user=postgres",
+            _DATABASE_CONTAINER,
+            "psql",
+            "--username=blueprint",
+            "--dbname=blueprint",
+            "--tuples-only",
+            "--no-align",
+            "--command",
+            "SELECT version_num FROM alembic_version ORDER BY version_num;",
+        ],
+        timeout=30,
+    )
+    revisions = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if len(revisions) != 1 or not _SCHEMA_REVISION_RE.fullmatch(revisions[0]):
+        raise RuntimeError("live database does not expose one schema head")
+    return revisions[0]
+
+
+def _code_rollback_refusal(prior_image_id: str) -> str | None:
+    try:
+        prior_revision = _image_schema_revision(prior_image_id)
+        database_revision = _database_schema_revision()
+    except Exception as exc:
+        return (
+            "code-rollback refused: could not verify schema compatibility for "
+            f"prior image {prior_image_id}: {exc}; fix forward"
+        )
+    if prior_revision == database_revision:
+        return None
+    return (
+        f"code-rollback refused: prior image {prior_image_id} expects schema "
+        f"{prior_revision} but DB is at {database_revision}; a forward migration "
+        "cannot be undone by restoring the old image -- fix forward"
+    )
+
+
 def _prepare_evidence_root(directory: Path) -> None:
     _trusted_root_directory(Path("/var/lib"))
     _trusted_root_directory(Path("/var/lib/blueprint"))
@@ -1263,6 +1338,21 @@ def release(image_ref: str, revision: str) -> Path:
         )
     except Exception as exc:
         error = str(exc)
+        rollback_refusal = _code_rollback_refusal(prior_api)
+        if rollback_refusal is not None:
+            try:
+                evidence = _write_evidence(
+                    _EVIDENCE_ROOT,
+                    receipt("rollback_refused", rollback_refusal, False),
+                )
+            except Exception as evidence_exc:
+                raise RuntimeError(
+                    f"release failed ({error}); {rollback_refusal}; "
+                    f"EVIDENCE_WRITE_FAILED: {evidence_exc}"
+                ) from exc
+            raise RuntimeError(
+                f"release failed ({error}); {rollback_refusal}; evidence={evidence}"
+            ) from exc
         rollback_errors: list[str] = []
         for path, payload in snapshots.items():
             try:

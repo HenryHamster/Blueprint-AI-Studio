@@ -856,6 +856,12 @@ class LocalAppReleaseTests(unittest.TestCase):
                     release, "_retain_prior_image", return_value="retained:old"
                 )
             )
+            mocks["image_schema"] = stack.enter_context(
+                patch.object(release, "_image_schema_revision", return_value="0742")
+            )
+            mocks["database_schema"] = stack.enter_context(
+                patch.object(release, "_database_schema_revision", return_value="0742")
+            )
             stack.enter_context(patch.object(release, "_verify_services_stable"))
             stack.enter_context(patch.object(release, "_verify_worker_ready"))
             stack.enter_context(
@@ -1009,6 +1015,66 @@ class LocalAppReleaseTests(unittest.TestCase):
                         NEW_IMAGE,
                         allowed_images=frozenset({OLD_IMAGE, NEW_IMAGE}),
                     ),
+                    call(
+                        "blueprint-worker.service",
+                        OLD_IMAGE,
+                        allowed_images=frozenset({OLD_IMAGE, NEW_IMAGE}),
+                    ),
+                    call(
+                        "blueprint-api.service",
+                        OLD_IMAGE,
+                        allowed_images=frozenset({OLD_IMAGE, NEW_IMAGE}),
+                    ),
+                ],
+            )
+
+    def test_rollback_refused_when_prior_image_schema_behind_db(self):
+        with self._release_patches(
+            health_error=RuntimeError("candidate health failed")
+        ) as mocks:
+            mocks["image_schema"].return_value = "0742"
+            mocks["database_schema"].return_value = "0743"
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "code-rollback refused: prior image .* expects schema 0742 "
+                "but DB is at 0743.*fix forward",
+            ):
+                release.release(IMAGE_REF, REVISION)
+
+            self.assertEqual(mocks["atomic"].call_count, 2)
+            self.assertEqual(
+                mocks["restart"].call_args_list,
+                [
+                    call(
+                        "blueprint-worker.service",
+                        NEW_IMAGE,
+                        allowed_images=frozenset({OLD_IMAGE, NEW_IMAGE}),
+                    ),
+                    call(
+                        "blueprint-api.service",
+                        NEW_IMAGE,
+                        allowed_images=frozenset({OLD_IMAGE, NEW_IMAGE}),
+                    ),
+                ],
+            )
+            mocks["container"].assert_not_called()
+            self.assertEqual(
+                mocks["evidence"].call_args.args[1]["outcome"],
+                "rollback_refused",
+            )
+
+    def test_rollback_proceeds_when_prior_image_schema_matches_db(self):
+        with self._release_patches(
+            health_error=RuntimeError("candidate health failed")
+        ) as mocks:
+            mocks["image_schema"].return_value = "0743"
+            mocks["database_schema"].return_value = "0743"
+            with self.assertRaisesRegex(RuntimeError, "rolled back"):
+                release.release(IMAGE_REF, REVISION)
+
+            self.assertEqual(
+                mocks["restart"].call_args_list[-2:],
+                [
                     call(
                         "blueprint-worker.service",
                         OLD_IMAGE,
