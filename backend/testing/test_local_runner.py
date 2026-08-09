@@ -9,6 +9,7 @@ Covers the four new surfaces:
 
 import asyncio
 import os
+import sys
 import uuid
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -12570,6 +12571,27 @@ async def test_capability_proof_trial_flag_off_records_nothing(db_session):
     assert cap not in (project.capability_proof_records or {})
 
 
+def test_local_runner_receipt_requires_bootstrapped_toolchain_and_probe_legs():
+    scripts_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "scripts"))
+    sys.path.insert(0, scripts_root)
+    import local_runner as runner
+    import runner_isolation as isolation
+
+    unavailable = runner._earn_project_verification(
+        isolation.Capabilities(), None, None, None
+    )
+    assert unavailable["ready"] is False
+
+    toolchain = isolation.VerificationToolchain("/runner/venv/bin/python", "/runner/pg/bin")
+    expected = {"ready": True, "probes": {"ruff": {"ok": True, "exit_code": 0},
+        "docker_postgres": {"ok": True, "exit_code": 0}}}
+    with patch.object(isolation, "plan_agent_execution", return_value=isolation.ExecutionPlan("bwrap")), \
+         patch.object(isolation, "probe_project_verification", return_value=expected), \
+         patch.object(runner.shutil, "copy2"):
+        ready = runner._earn_project_verification(
+            isolation.Capabilities(), ["node", "/agent/index.js"], None, toolchain
+        )
+    assert ready["ready"] is True
 @pytest.mark.asyncio
 async def test_capability_proof_trial_skipped_suite_records_nothing(db_session):
     """A green-but-all-skipped (non-verifying) trial records no proof."""

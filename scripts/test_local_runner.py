@@ -68,6 +68,33 @@ class TestGpuPassthroughRetry(unittest.TestCase):
         self.assertEqual(retry_at, local_runner._GPU_PASSTHROUGH_RETRY_SECONDS)
         refresh.assert_called_once_with(transient)
 
+
+class TestVerificationToolchain(unittest.TestCase):
+    def test_bootstrap_failure_is_not_a_verification_claim(self):
+        with patch.object(local_runner, "_verification_toolchain_root", return_value=tempfile.mkdtemp()), \
+             patch.object(local_runner.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "pip failed")):
+            self.assertIsNone(local_runner._bootstrap_verification_toolchain())
+
+    def test_bootstrap_success_returns_exact_private_paths(self):
+        with tempfile.TemporaryDirectory() as root:
+            def fake_run(argv, **_kwargs):
+                if argv[1:3] == ["-m", "venv"]:
+                    os.makedirs(os.path.join(root, "venv", "bin"))
+                    Path(root, "venv", "bin", "python").touch()
+                if len(argv) > 2 and argv[1] == "-c":
+                    bindir = Path(root, "venv", "lib", "pgserver", "bin")
+                    bindir.mkdir(parents=True, exist_ok=True)
+                    for name in ("pg_config", "initdb", "pg_ctl", "pg_isready", "psql"):
+                        path = bindir / name
+                        path.touch()
+                        path.chmod(0o755)
+                    return subprocess.CompletedProcess(argv, 0, str(bindir) + "\n", "")
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            with patch.dict(os.environ, {"BLUEPRINT_RUNNER_VERIFICATION_TOOLCHAIN": root}), \
+                 patch.object(local_runner.subprocess, "run", side_effect=fake_run):
+                toolchain = local_runner._bootstrap_verification_toolchain()
+            self.assertEqual(toolchain.python_path, os.path.join(root, "venv", "bin", "python"))
+
         no_host_gpu = iso.replace(
             _docker_caps(),
             container_gpu_passthrough={
@@ -4035,11 +4062,12 @@ class TestGpuDetection(unittest.TestCase):
     def test_verification_plan_uses_write_agent_boundary(self):
         fake_plan = iso.ExecutionPlan(backend=iso.BACKEND_BWRAP, argv=["bwrap"])
         expected = {"version": 1, "ready": False}
+        toolchain = iso.VerificationToolchain("/runner/venv/bin/python", "/runner/pg/bin")
         with patch.object(iso, "plan_agent_execution", return_value=fake_plan) as planner, \
              patch.object(iso, "probe_project_verification", return_value=expected), \
              patch.object(local_runner.shutil, "copy2") as copy_probe:
             report = local_runner._earn_project_verification(
-                _bwrap_caps(), ["node", "/agent/dist/index.js"], None
+                _bwrap_caps(), ["node", "/agent/dist/index.js"], None, toolchain
             )
 
         self.assertEqual(report, expected)
