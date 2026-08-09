@@ -4,6 +4,7 @@ import json
 import ast
 import os
 import re
+import shutil
 import socket
 import stat
 import subprocess
@@ -389,6 +390,9 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                 "systemd-analyze is unavailable at /usr/bin/systemd-analyze; "
                 "runtime unit verification cannot run"
             )
+        true_path = shutil.which("true")
+        if true_path is None:
+            self.skipTest("an executable true command is required for unit verification")
         with tempfile.TemporaryDirectory() as raw_directory:
             root = Path(raw_directory)
             deploy_agent_unit = bootstrap._deploy_agent_unit(
@@ -401,11 +405,13 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                 if line.startswith("ExecStart=")
             ]
             (root / "blueprint-deploy-agent.service").write_bytes(
-                deploy_agent_unit.replace(b"/usr/bin/python3.12", b"/usr/bin/true")
+                deploy_agent_unit.replace(
+                    b"/usr/bin/python3.12", true_path.encode()
+                )
             )
             (root / "blueprint-release.service").write_bytes(
                 bootstrap._release_service_unit().replace(
-                    b"/usr/local/sbin/blueprint-release", b"/usr/bin/true"
+                    b"/usr/local/sbin/blueprint-release", true_path.encode()
                 )
             )
             (root / "blueprint-release.socket").write_bytes(
@@ -497,6 +503,9 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
             def settimeout(self, timeout):
                 self.timeout = timeout
 
+            def setsockopt(self, *_args):
+                pass
+
             def connect(self, path):
                 self.path = path
 
@@ -504,6 +513,9 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                 self.sent += payload
 
             def shutdown(self, _how):
+                pass
+
+            def close(self):
                 pass
 
             def recv(self, _limit):
@@ -540,6 +552,9 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
             ),
             unittest.mock.patch.object(
                 deploy_blueprint, "get_project_id", return_value="project-1"
+            ),
+            unittest.mock.patch.object(
+                deploy_blueprint, "_local_served_sha", return_value=revision
             ),
             unittest.mock.patch.object(deploy_blueprint, "api", side_effect=fake_api),
         ):
@@ -614,6 +629,9 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                         return_value={"run": {}, "digest": digest, "revision": revision},
                     ) as fetch_manifest,
                     unittest.mock.patch.object(blueprint, "get_project_id", return_value="project-1"),
+                    unittest.mock.patch.object(
+                        blueprint, "_local_served_sha", return_value=revision
+                    ),
                     unittest.mock.patch.object(blueprint, "api", side_effect=fake_api),
                     unittest.mock.patch.object(
                         release,
@@ -682,6 +700,9 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                     },
                 ),
                 unittest.mock.patch.object(blueprint, "get_project_id", return_value="project-1"),
+                unittest.mock.patch.object(
+                    blueprint, "_local_served_sha", return_value=revision
+                ),
                 unittest.mock.patch.object(blueprint, "api", side_effect=fake_api),
                 unittest.mock.patch.object(
                     blueprint,
@@ -702,6 +723,187 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                     len([item for item in calls if item[0] == "POST"]), 1
                 )
                 self.assertFalse(state_path.exists())
+
+    def test_confirmation_pending_does_not_reinvoke_release_or_post_receipt(self):
+        """A not-yet-serving SHA remains pending without replaying activation."""
+        revision = "e" * 40
+        promoted = {
+            "version_number": 10,
+            "status": "promoted",
+            "promoted_sha": revision,
+            "serving_status": "unconfirmed",
+            "activation_requested_at": "2026-08-09T00:00:00Z",
+        }
+        calls = []
+        release_calls = []
+
+        def fake_api(method, path, body=None, timeout=30):
+            calls.append((method, path, body))
+            return {"serving_status": "serving_confirmed", "served_sha": revision}
+
+        now = blueprint.datetime(2026, 8, 9, 0, 1, tzinfo=blueprint.timezone.utc)
+        with tempfile.TemporaryDirectory() as raw_directory:
+            state_path = Path(raw_directory) / "agent.state"
+            args = type("Args", (), {"project_id": None, "state_path": str(state_path)})()
+            with (
+                unittest.mock.patch.object(blueprint, "_require_write_config"),
+                unittest.mock.patch.object(
+                    blueprint, "_read_live_approved_activation", return_value=promoted
+                ),
+                unittest.mock.patch.object(
+                    blueprint,
+                    "_fetch_deploy_manifest",
+                    return_value={
+                        "run": {},
+                        "digest": "sha256:" + "2" * 64,
+                        "revision": revision,
+                    },
+                ),
+                unittest.mock.patch.object(blueprint, "get_project_id", return_value="project-1"),
+                unittest.mock.patch.object(
+                    blueprint,
+                    "_invoke_release_shim",
+                    side_effect=lambda *args, **kwargs: (
+                        release_calls.append(args),
+                        True,
+                    )[1],
+                ),
+                unittest.mock.patch.object(
+                    blueprint, "_local_served_sha", return_value="f" * 40
+                ),
+                unittest.mock.patch.object(
+                    blueprint, "_activation_confirmation_now", return_value=now
+                ),
+                unittest.mock.patch.object(blueprint, "api", side_effect=fake_api),
+            ):
+                self.assertFalse(blueprint._deploy_agent_once(args))
+                self.assertFalse(blueprint._deploy_agent_once(args))
+
+            self.assertEqual(len(release_calls), 1)
+            self.assertEqual([item for item in calls if item[0] == "POST"], [])
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(state["phase"], "completed")
+            self.assertIn("confirmation_deadline_at", state)
+
+    def test_confirmation_deadline_latches_failed_without_receipt(self):
+        """A missed serving deadline fails durably and never posts a receipt."""
+        revision = "1" * 40
+        promoted = {
+            "version_number": 11,
+            "status": "promoted",
+            "promoted_sha": revision,
+            "serving_status": "unconfirmed",
+            "activation_requested_at": "2026-08-09T00:00:00Z",
+        }
+        calls = []
+        deadline = blueprint.datetime(2026, 8, 9, tzinfo=blueprint.timezone.utc)
+
+        def fake_api(method, path, body=None, timeout=30):
+            calls.append((method, path, body))
+            return {"serving_status": "serving_confirmed", "served_sha": revision}
+
+        with tempfile.TemporaryDirectory() as raw_directory:
+            state_path = Path(raw_directory) / "agent.state"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "version_number": 11,
+                        "promoted_sha": revision,
+                        "revision": revision,
+                        "phase": "completed",
+                        "confirmation_deadline_at": deadline.isoformat(),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = type("Args", (), {"project_id": None, "state_path": str(state_path)})()
+            with (
+                unittest.mock.patch.object(blueprint, "_require_write_config"),
+                unittest.mock.patch.object(
+                    blueprint, "_read_live_approved_activation", return_value=promoted
+                ),
+                unittest.mock.patch.object(
+                    blueprint, "_local_served_sha", return_value="2" * 40
+                ),
+                unittest.mock.patch.object(
+                    blueprint,
+                    "_activation_confirmation_now",
+                    return_value=blueprint.datetime(
+                        2026, 8, 9, 0, 15, tzinfo=blueprint.timezone.utc
+                    ),
+                ),
+                unittest.mock.patch.object(blueprint, "api", side_effect=fake_api),
+                unittest.mock.patch.object(
+                    blueprint, "_invoke_release_shim"
+                ) as invoke_release,
+            ):
+                self.assertFalse(blueprint._deploy_agent_once(args))
+                self.assertFalse(blueprint._deploy_agent_once(args))
+
+            self.assertEqual(invoke_release.call_count, 0)
+            self.assertEqual([item for item in calls if item[0] == "POST"], [])
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(state["phase"], "failed")
+            self.assertEqual(
+                state["failure_reason"],
+                "served_sha_not_confirmed_before_deadline",
+            )
+
+    def test_local_serving_probe_accepts_full_sha_and_normalizes_case(self):
+        revision = "A" * 40
+
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps(
+                    {"sha": "A" * 40, "revision": "backend-revision"}
+                ).encode()
+
+        with unittest.mock.patch.object(blueprint, "urlopen", return_value=Response()):
+            self.assertEqual(blueprint._local_served_sha(), revision.lower())
+
+    def test_version_endpoint_exposes_full_sha_to_serving_probe(self):
+        """Pin the backend endpoint to the full-SHA activation contract."""
+        main_path = Path(__file__).parents[1] / "backend" / "app" / "main.py"
+        tree = ast.parse(main_path.read_text(encoding="utf-8"), filename=str(main_path))
+        version_route = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
+            and node.name == "get_version"
+        )
+        self.assertIn(
+            "/api/version",
+            [
+                decorator.args[0].value
+                for decorator in version_route.decorator_list
+                if isinstance(decorator, ast.Call)
+                and isinstance(decorator.func, ast.Attribute)
+                and decorator.func.attr == "get"
+                and decorator.args
+                and isinstance(decorator.args[0], ast.Constant)
+            ],
+        )
+        return_node = next(
+            node for node in version_route.body if isinstance(node, ast.Return)
+        )
+        self.assertIsInstance(return_node.value, ast.Dict)
+        fields = {
+            key.value: value
+            for key, value in zip(return_node.value.keys, return_node.value.values)
+            if isinstance(key, ast.Constant) and isinstance(key.value, str)
+        }
+        self.assertIsInstance(fields["sha"], ast.Name)
+        self.assertEqual(fields["sha"].id, "_current_sha")
+        self.assertIsInstance(fields["revision"], ast.Name)
+        self.assertEqual(fields["revision"].id, "_current_revision")
 
     def test_manual_lock_path_creates_missing_parent(self):
         with tempfile.TemporaryDirectory() as raw_directory:

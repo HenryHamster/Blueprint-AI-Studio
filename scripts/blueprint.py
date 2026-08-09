@@ -6530,7 +6530,9 @@ def _local_served_sha() -> str | None:
     ``local_app_release.py`` verifies this same loopback API endpoint as part of
     a successful release.  The deploy agent deliberately needs a fresh read
     after an accepted socket handoff: a rollback can occur after that handoff.
-    Transport, HTTP, JSON, and malformed-payload failures are all unconfirmed.
+    Transport, HTTP, JSON, malformed-payload, and abbreviated-SHA failures are
+    all unconfirmed.  The endpoint's ``sha`` is the full promoted Git SHA;
+    deployment-status views may abbreviate it independently.
     """
     try:
         with urlopen(_LOCAL_SERVING_VERSION_URL, timeout=5) as response:
@@ -6540,7 +6542,10 @@ def _local_served_sha() -> str | None:
     except (OSError, ValueError):
         return None
     sha = payload.get("sha") if isinstance(payload, dict) else None
-    return sha.lower() if isinstance(sha, str) else None
+    if not isinstance(sha, str):
+        return None
+    normalized_sha = sha.lower()
+    return normalized_sha if _DEPLOY_REVISION_RE.fullmatch(normalized_sha) else None
 
 
 def _pending_activation_confirmation(state: dict, expected_sha: str) -> str:
@@ -6551,6 +6556,7 @@ def _pending_activation_confirmation(state: dict, expected_sha: str) -> str:
     receipt; an old SHA, unavailable API, or malformed response remains pending
     until that deadline, then latches the local activation as failed.
     """
+    expected_sha = expected_sha.lower()
     now = _activation_confirmation_now()
     raw_deadline = state.get("confirmation_deadline_at")
     try:
