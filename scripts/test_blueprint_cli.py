@@ -6393,10 +6393,19 @@ def test_deploy_agent_does_not_post_receipt_when_shim_raises(
         ),
         encoding="utf-8",
     )
-    with pytest.raises(APIError, match="release"):
-        blueprint._deploy_agent_once(args)
+    release_calls = []
+    monkeypatch.setattr(blueprint, "_local_served_sha", lambda: None)
+    monkeypatch.setattr(
+        blueprint,
+        "_invoke_release_shim",
+        lambda *args, **kwargs: release_calls.append((args, kwargs)),
+    )
+    assert blueprint._deploy_agent_once(args) is False
+    assert release_calls == []
     assert not any(path.endswith("/activation-receipt") for _, path, _ in calls)
-    assert not state_path.exists()
+    resumed = json.loads(state_path.read_text(encoding="utf-8"))
+    assert resumed["phase"] == "started"
+    assert resumed["confirmation_deadline_at"]
 
 
 @pytest.mark.parametrize(

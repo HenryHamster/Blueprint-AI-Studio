@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import json
 import ast
+import io
+import json
 import os
 import re
 import shutil
@@ -18,8 +19,8 @@ from pathlib import Path, PurePosixPath
 sys.path.insert(0, str(Path(__file__).parent))
 
 import blueprint
-import bootstrap_local_app_release as bootstrap
 import blueprint_release as release
+import bootstrap_local_app_release as bootstrap
 
 
 class BootstrapLocalAppReleaseTests(unittest.TestCase):
@@ -664,6 +665,107 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                 os.dup2(original_fd, release._SOCKET_FD)
                 os.close(original_fd)
                 release_socket.close()
+
+    def test_resume_after_started_phase_does_not_re_release(self):
+        """A restarted agent reconciles its release fence into one receipt."""
+        revision = "f" * 40
+        promoted = {
+            "version_number": 12,
+            "status": "promoted",
+            "promoted_sha": revision,
+            "serving_status": "unconfirmed",
+            "activation_requested_at": "2026-08-09T00:00:00Z",
+        }
+        calls = []
+
+        def fake_api(method, path, body=None, timeout=30):
+            calls.append((method, path, body))
+            return {"serving_status": "serving_confirmed", "served_sha": revision}
+
+        with tempfile.TemporaryDirectory() as raw_directory:
+            state_path = Path(raw_directory) / "deploy-agent.state"
+            state_path.write_text(
+                json.dumps({
+                    "version_number": promoted["version_number"],
+                    "promoted_sha": revision,
+                    "revision": revision,
+                    "phase": "started",
+                }),
+                encoding="utf-8",
+            )
+            args = type(
+                "Args",
+                (),
+                {"project_id": None, "state_path": str(state_path)},
+            )()
+            with (
+                unittest.mock.patch.object(blueprint, "_require_write_config"),
+                unittest.mock.patch.object(
+                    blueprint, "_read_live_approved_activation", return_value=promoted
+                ),
+                unittest.mock.patch.object(
+                    blueprint, "_local_served_sha", return_value=revision
+                ),
+                unittest.mock.patch.object(
+                    blueprint, "_invoke_release_shim"
+                ) as invoke_release,
+                unittest.mock.patch.object(
+                    blueprint, "get_project_id", return_value="project-1"
+                ),
+                unittest.mock.patch.object(blueprint, "api", side_effect=fake_api),
+            ):
+                self.assertTrue(blueprint._deploy_agent_once(args))
+
+            invoke_release.assert_not_called()
+            receipts = [item for item in calls if item[0] == "POST"]
+            self.assertEqual(len(receipts), 1)
+            self.assertEqual(
+                receipts[0][2],
+                {
+                    "version_number": promoted["version_number"],
+                    "revision": revision,
+                    "host": "control-plane",
+                },
+            )
+            self.assertFalse(state_path.exists())
+
+    def test_deploy_agent_poll_survives_non_api_error(self):
+        """Transient poll parsing errors do not terminate the long-running unit."""
+        args = type(
+            "Args",
+            (),
+            {"poll_interval": 1, "once": False, "lock_path": "/tmp/unused-lock"},
+        )()
+        lock = unittest.mock.Mock()
+        attempts = []
+        sleep_calls = []
+
+        def poll_once(_args):
+            attempts.append(True)
+            if len(attempts) == 1:
+                raise json.JSONDecodeError("invalid approval", "{", 1)
+            return False
+
+        def sleep(interval):
+            sleep_calls.append(interval)
+            args.once = True
+
+        stderr = io.StringIO()
+        with (
+            unittest.mock.patch.object(blueprint, "_require_write_config"),
+            unittest.mock.patch.object(
+                blueprint, "_acquire_deploy_agent_lock", return_value=lock
+            ),
+            unittest.mock.patch.object(blueprint, "_deploy_agent_once", side_effect=poll_once),
+            unittest.mock.patch.object(blueprint.time, "sleep", side_effect=sleep),
+            unittest.mock.patch.object(blueprint.sys, "stderr", stderr),
+        ):
+            self.assertIsNone(blueprint.cmd_deploy_agent(args))
+
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(sleep_calls, [1])
+        self.assertIn("invalid approval", stderr.getvalue())
+        lock.close.assert_called_once_with()
 
     def test_send_timeout_after_release_handoff_retries_receipt_without_second_release(self):
         """An in-flight release parks the receipt without replaying the release."""

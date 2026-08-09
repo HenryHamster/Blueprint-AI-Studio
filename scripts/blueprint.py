@@ -6429,6 +6429,35 @@ def _deploy_agent_once(args: argparse.Namespace) -> bool:
                 file=sys.stderr,
             )
             return False
+        if matches_approval and pending_receipt.get("phase") == "started":
+            # The started marker is the at-most-once fence. A restart after
+            # this point cannot distinguish an in-flight release from one
+            # that completed before the agent died, so reconcile through the
+            # same serving probe used after an accepted socket handoff.
+            confirmation = _pending_activation_confirmation(pending_receipt, promoted_sha)
+            _write_deploy_agent_state(state_path, pending_receipt)
+            if confirmation == "failed":
+                print(
+                    f"Approved activation for v{approved.get('version_number')} failed: "
+                    "the promoted SHA was not observed serving before the deadline.",
+                    file=sys.stderr,
+                )
+                return False
+            if confirmation == "pending":
+                return False
+            pending_receipt["phase"] = "completed"
+            _write_deploy_agent_state(state_path, pending_receipt)
+            _post_activation_receipt(
+                argparse.Namespace(
+                    project_id=getattr(args, "project_id", None),
+                    host=getattr(args, "host", "control-plane"),
+                ),
+                approved,
+                promoted_sha,
+            )
+            _clear_deploy_agent_state(state_path)
+            print(f"Approved activation for v{approved.get('version_number')} completed.")
+            return True
         if matches_approval and pending_receipt.get("phase") in {"accepted", "completed"}:
             confirmation = _pending_activation_confirmation(pending_receipt, promoted_sha)
             _write_deploy_agent_state(state_path, pending_receipt)
@@ -6947,9 +6976,9 @@ def cmd_deploy_agent(args: argparse.Namespace) -> int | None:
         while True:
             try:
                 _deploy_agent_once(args)
-            except APIError as exc:
-                print(f"deploy-agent: {exc}", file=sys.stderr)
-                if args.once:
+            except (APIError, OSError, json.JSONDecodeError) as exc:
+                print(f"deploy-agent: transient poll failure: {exc}", file=sys.stderr)
+                if args.once and isinstance(exc, APIError):
                     raise
             if args.once:
                 return
