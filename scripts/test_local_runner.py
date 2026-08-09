@@ -24,6 +24,46 @@ import local_runner
 import runner_isolation as iso
 
 
+def _reset_local_runner_test_state():
+    """Stop runner-owned background work before restoring process globals.
+
+    Several tests exercise ``main()`` in-process.  Keep those tests from
+    leaking the verification-toolchain cache or reviving a maintenance thread
+    when the shutdown event is cleared for the next test.
+    """
+    local_runner._shutdown_event.set()
+    for thread in threading.enumerate():
+        if thread.name == "blueprint-cli-maintenance":
+            thread.join(timeout=1.0)
+    local_runner._verification_toolchain = None
+    local_runner._shutdown_event.clear()
+
+
+class _LocalRunnerTestCase(unittest.TestCase):
+    """Provide process-state isolation for every local-runner test case."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.addCleanup(_reset_local_runner_test_state)
+
+
+class TestLocalRunnerTestIsolation(unittest.TestCase):
+    def test_cleanup_stops_maintenance_and_restores_globals(self):
+        local_runner._verification_toolchain = object()
+        local_runner._shutdown_event.clear()
+        thread = threading.Thread(
+            target=local_runner._shutdown_event.wait,
+            name="blueprint-cli-maintenance",
+        )
+        thread.start()
+
+        _reset_local_runner_test_state()
+
+        self.assertFalse(thread.is_alive())
+        self.assertIsNone(local_runner._verification_toolchain)
+        self.assertFalse(local_runner._shutdown_event.is_set())
+
+
 # ── Capability factories (isolation core) ─────────────────────────────────────
 
 def _bwrap_caps(gpu_indices=()):
@@ -888,7 +928,7 @@ class TestEnvVarValidation(unittest.TestCase):
     # the main loop's _locate_agent_binary re-resolution.
 
 
-class TestCheckModeAggregatesFailures(unittest.TestCase):
+class TestCheckModeAggregatesFailures(_LocalRunnerTestCase):
     """`--check` reports ALL missing prerequisites in one pass (not first-fail)."""
 
     def _run_check(self, env_overrides=None, strip_vars=None):
@@ -938,7 +978,7 @@ class TestCheckModeAggregatesFailures(unittest.TestCase):
 
 # ── Agent binary detection ─────────────────────────────────────────────────────
 
-class TestAgentBinaryDetection(unittest.TestCase):
+class TestAgentBinaryDetection(_LocalRunnerTestCase):
     def test_explicit_existing_path_accepted(self):
         import tempfile
         with tempfile.NamedTemporaryFile(suffix=".js", delete=False) as f:
@@ -1102,7 +1142,7 @@ class TestAgentBinaryDetection(unittest.TestCase):
         self.assertTrue(result[1].endswith("dist/index.js"))
 
 
-class TestAgentWorkspace(unittest.TestCase):
+class TestAgentWorkspace(_LocalRunnerTestCase):
     def test_agent_workspace_for_task_uses_configured_root_and_sanitizes_task_id(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1161,7 +1201,7 @@ class TestAgentWorkspace(unittest.TestCase):
                 local_runner._cleanup_agent_workspace("never-made")  # no raise
 
 
-class TestContainerImageStore(unittest.TestCase):
+class TestContainerImageStore(_LocalRunnerTestCase):
     def test_docker_store_reports_its_own_filesystem_capacity(self):
         result = MagicMock(returncode=0, stdout="/var/lib/docker\n")
         # Unit tests execute on Windows while production Docker runners are
@@ -1191,7 +1231,7 @@ class TestContainerImageStore(unittest.TestCase):
         )
 
 
-class TestContainerImagesPresent(unittest.TestCase):
+class TestContainerImagesPresent(_LocalRunnerTestCase):
     def test_docker_images_reported_skipping_dangling(self):
         """Present images are listed by full ref; <none> dangling rows are skipped."""
         result = MagicMock(
@@ -1987,7 +2027,7 @@ class TestLiveRunnerConfig(unittest.TestCase):
         )
 
 
-class TestComputePollLoopLiveConfig(unittest.TestCase):
+class TestComputePollLoopLiveConfig(_LocalRunnerTestCase):
     """_compute_poll_loop gates on the LIVE compute limit, not the static arg."""
 
     def setUp(self):
@@ -2893,7 +2933,7 @@ class TestGracefulShutdown(unittest.TestCase):
 
 # ── Compute job report helper ─────────────────────────────────────────────────
 
-class TestComputeJobReport(unittest.TestCase):
+class TestComputeJobReport(_LocalRunnerTestCase):
     def test_sends_correct_fields_and_returns_cancel_flag(self):
         """_report_compute_job POSTs exec_status/exit_code and returns cancel_requested."""
         captured = {}
@@ -3505,7 +3545,7 @@ class TestRunComputeJob(unittest.TestCase):
 
 # ── Compute poll loop ─────────────────────────────────────────────────────────
 
-class TestComputePollLoop(unittest.TestCase):
+class TestComputePollLoop(_LocalRunnerTestCase):
     def setUp(self):
         local_runner._shutdown_event.clear()
 
@@ -4568,7 +4608,7 @@ class TestDockerLogin(unittest.TestCase):
 
 # ── Compute working-directory resolution ──────────────────────────────────────
 
-class TestComputeCwdResolution(unittest.TestCase):
+class TestComputeCwdResolution(_LocalRunnerTestCase):
     def test_relative_cwd_resolves_from_clone_root(self):
         clone_dir = os.path.join(os.getcwd(), "repo")
         nested = os.path.join(clone_dir, "DEN")
@@ -4705,7 +4745,7 @@ class TestRegistryHostDerivation(unittest.TestCase):
 
 # ── Durable artifact upload (FIX M1, runner side) ──────────────────────────────
 
-class TestArtifactUpload(unittest.TestCase):
+class TestArtifactUpload(_LocalRunnerTestCase):
     def _write(self, root, rel, data: bytes):
         path = os.path.join(root, rel)
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -4955,7 +4995,7 @@ class TestArtifactUpload(unittest.TestCase):
         self.assertTrue(all(status == "running" for status in reports))
 
 
-class TestBoundedDedupLog(unittest.TestCase):
+class TestBoundedDedupLog(_LocalRunnerTestCase):
     """Command-log capture: consecutive-duplicate collapsing + head/tail budget."""
 
     def _feed(self, log, data: bytes, chunk: int = 8192):
@@ -5265,7 +5305,7 @@ class TestFunctionalProbes(unittest.TestCase):
         run.assert_not_called()
 
 
-class TestAgentWallClockDeadline(unittest.TestCase):
+class TestAgentWallClockDeadline(_LocalRunnerTestCase):
     def setUp(self):
         local_runner._shutdown_event.clear()
 
@@ -5332,7 +5372,7 @@ class TestAgentWallClockDeadline(unittest.TestCase):
         self.assertIn("t1", active_tasks)
 
 
-class TestComputeJobTelemetry(unittest.TestCase):
+class TestComputeJobTelemetry(_LocalRunnerTestCase):
     def setUp(self):
         local_runner._shutdown_event.clear()
 
@@ -5691,7 +5731,7 @@ class TestHeartbeat401Streak(unittest.TestCase):
         )
 
 
-class TestDescribeSha(unittest.TestCase):
+class TestDescribeSha(_LocalRunnerTestCase):
     """Unit tests for _describe_sha, which extracts abbreviated SHAs from
     ``git describe`` output."""
 
@@ -6361,7 +6401,7 @@ class TestHeartbeatJitterAndNetworkFailureEscalation(unittest.TestCase):
             self.assertEqual(args, (-6, 6), f"jitter window wrong: got {args}, want (-6, 6)")
 
 
-class TestComputePollRetryAfter(unittest.TestCase):
+class TestComputePollRetryAfter(_LocalRunnerTestCase):
     def setUp(self):
         local_runner._shutdown_event.clear()
 
@@ -6453,7 +6493,7 @@ class TestPostRetryAfterHeader(unittest.TestCase):
 
 # ── Docker agent backend (BLUEPRINT_AGENT_IMAGE) ──────────────────────────────
 
-class TestDockerAgentBackend(unittest.TestCase):
+class TestDockerAgentBackend(_LocalRunnerTestCase):
     """Agent tasks routed to the prod agent container image instead of bwrap.
 
     Everything here mocks ``iso`` (decide_agent_backend / plan_agent_execution /
@@ -7021,7 +7061,7 @@ class TestDockerAgentBackend(unittest.TestCase):
                 self.assertIn(b"task output line 2", content)
 
 
-class TestAgentImagePresence(unittest.TestCase):
+class TestAgentImagePresence(_LocalRunnerTestCase):
     """Fail-closed image check (Fix 3): a docker box with BLUEPRINT_AGENT_IMAGE set
     but the image ABSENT must NOT advertise the docker agent backend — it would
     claim-and-crash-loop. ``_agent_image_present`` gates main()'s startup enablement;
@@ -7113,7 +7153,7 @@ class TestAgentImagePresence(unittest.TestCase):
         self.assertFalse(self._advertised_after_image_gate(inspect_rc=1))
 
 
-class TestAgentBackendPreference(unittest.TestCase):
+class TestAgentBackendPreference(_LocalRunnerTestCase):
     """The default agent backend is bwrap-first; docker requires an explicit opt-in.
 
     These tests drive the preference logic in main() (agent_backend_pref) and the
@@ -7331,7 +7371,7 @@ class TestSafeCredentialPath(unittest.TestCase):
         self.assertIn("_safe_credential_path", src)
 
 
-class TestCredentialPersistence(unittest.TestCase):
+class TestCredentialPersistence(_LocalRunnerTestCase):
     """Token persistence: save/load round-trip, file permissions, fallback behaviour."""
 
     def setUp(self):
@@ -7646,7 +7686,7 @@ class TestInitialOrchestratorRetry(unittest.TestCase):
         retry_mock.assert_not_called()
 
 
-class TestConcurrencyPresetMismatch(unittest.TestCase):
+class TestConcurrencyPresetMismatch(_LocalRunnerTestCase):
     """_preflight still surfaces the backward-compat enrolled_max_concurrent field,
     but main() no longer emits a warn-only mismatch warning — a server config block
     delivered on the heartbeat RESPONSE now OVERRIDES the env default live (see
@@ -7821,7 +7861,7 @@ class TestConcurrencyPresetMismatch(unittest.TestCase):
         )
 
 
-class BlueprintRunnerInstallTests(unittest.TestCase):
+class BlueprintRunnerInstallTests(_LocalRunnerTestCase):
     """Acceptance-evidence tests: the install path operators rely on for onboarding
     a new device renders a valid systemd unit with real host paths and the crash-loop
     burst cap. These tests import and exercise ``blueprint_runner`` (not local_runner)
@@ -8448,7 +8488,7 @@ class TestProviderCredentials(unittest.TestCase):
 # ── Agent deps bootstrap (blueprint-runner install) ──────────────────────────
 
 
-class TestBootstrapAgentDeps(unittest.TestCase):
+class TestBootstrapAgentDeps(_LocalRunnerTestCase):
     """_bootstrap_agent_deps in blueprint_runner: agent npm ci at install time."""
 
     def setUp(self):
@@ -8544,7 +8584,7 @@ class TestBootstrapAgentDeps(unittest.TestCase):
 # ── Agent deps missing detection (preflight) ────────────────────────────────
 
 
-class TestAgentDepsMissing(unittest.TestCase):
+class TestAgentDepsMissing(_LocalRunnerTestCase):
     """_agent_deps_missing in local_runner: preflight detection."""
 
     def setUp(self):
@@ -8746,7 +8786,7 @@ class TestTaskLogPersistence(unittest.TestCase):
 
 # ── Credential file path-traversal guard ──────────────────────────────────────
 
-class TestCredentialFileTraversalGuard(unittest.TestCase):
+class TestCredentialFileTraversalGuard(_LocalRunnerTestCase):
     """Path-traversal guard in _spawn_agent_task rejects credential-file paths
     that would escape the per-task workspace directory."""
 
@@ -9452,7 +9492,7 @@ def _make_bundle(members):
     return buf.getvalue()
 
 
-class DownloadInputArtifactTests(unittest.TestCase):
+class DownloadInputArtifactTests(_LocalRunnerTestCase):
     """Cross-job checkpoint resume: runner-side bundle hydration."""
 
     def setUp(self):
@@ -9589,7 +9629,7 @@ class DownloadInputArtifactTests(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.artifact_dir, "checkpoint", "new.pt")))
 
 
-class SupervisorDetectionTests(unittest.TestCase):
+class SupervisorDetectionTests(_LocalRunnerTestCase):
     """FINDING 3: supervision must be a claim about THIS PROCESS, not the host.
 
     The old detector returned "systemd" whenever /proc/1/comm was systemd — true
@@ -9700,7 +9740,7 @@ def _fake_host(pid1="", cgroup="", ancestry=True, env=None):
         yield
 
 
-class SelfUpdateSurvivalTests(unittest.TestCase):
+class SelfUpdateSurvivalTests(_LocalRunnerTestCase):
     """The self-update survival path must not exit into the void on a systemd
     host where nothing is actually supervising the runner (the dgx-1 outage).
 
@@ -9735,7 +9775,7 @@ class SelfUpdateSurvivalTests(unittest.TestCase):
         execv.assert_not_called()
 
 
-class PreflightSupervisorReportTests(unittest.TestCase):
+class PreflightSupervisorReportTests(_LocalRunnerTestCase):
     """--check must report the REAL supervision state — the concealment half of
     FINDING 3 (a hand-launched runner on a systemd host read as healthy)."""
 
@@ -9775,7 +9815,7 @@ class PreflightSupervisorReportTests(unittest.TestCase):
         self.assertIn("blueprint-runner.service", out)
 
 
-class GpuSandboxSmokeTests(unittest.TestCase):
+class GpuSandboxSmokeTests(_LocalRunnerTestCase):
     """FINDING 6: the preflight GPU smoke must probe against a LIVE workspace.
 
     The plan's bwrap argv binds workspace_host into the sandbox, and bwrap fails
@@ -9852,7 +9892,7 @@ class GpuSandboxSmokeTests(unittest.TestCase):
         self.assertFalse(os.path.isdir(captured["workspace"]))
 
 
-class TestCrossProjectGpuLedger(unittest.TestCase):
+class TestCrossProjectGpuLedger(_LocalRunnerTestCase):
     """No-double-booking on the unified single-daemon GPU ledger.
 
     The multi-project local-runner runs ONE daemon per physical box that serves
@@ -10116,7 +10156,7 @@ class TestParseResultMetrics(unittest.TestCase):
         self.assertEqual(result["zero"], 0.0)
 
 
-class TestClassifyViewable(unittest.TestCase):
+class TestClassifyViewable(_LocalRunnerTestCase):
     """_classify_viewable: extension → (content_type, kind) or None."""
 
     def test_png_classified_as_image(self):
@@ -10249,7 +10289,7 @@ class TestParseProgressRecord(unittest.TestCase):
         self.assertEqual(len(r["ts"]), 64)
 
 
-class TestCrc32c(unittest.TestCase):
+class TestCrc32c(_LocalRunnerTestCase):
     """_crc32c_update / _crc32c_b64: custom CRC32C implementation."""
 
     def test_crc32c_update_empty_data_unchanged(self):
@@ -10295,7 +10335,7 @@ class TestCrc32c(unittest.TestCase):
         self.assertNotEqual(local_runner._crc32c_b64(state_empty), local_runner._crc32c_b64(state_data))
 
 
-class TestBuildArtifactArchive(unittest.TestCase):
+class TestBuildArtifactArchive(_LocalRunnerTestCase):
     """_build_artifact_archive: build a .tar.gz of an artifact directory."""
 
     def setUp(self):
@@ -10514,7 +10554,7 @@ class TestLlmCliIsEligible(unittest.TestCase):
         self.assertFalse(local_runner._llm_cli_is_eligible({"healthy": None, "present": False}))
 
 
-class TestComputeBackendSummary(unittest.TestCase):
+class TestComputeBackendSummary(_LocalRunnerTestCase):
     """_compute_backend_summary: human string for available compute backends."""
 
     def test_no_backends_returns_none_string(self):
@@ -10544,7 +10584,7 @@ class TestComputeBackendSummary(unittest.TestCase):
         self.assertIn("docker", result)
 
 
-class TestArtifactDeliveryFailure(unittest.TestCase):
+class TestArtifactDeliveryFailure(_LocalRunnerTestCase):
     """_artifact_delivery_failure: creates a standardized failure dict."""
 
     def test_basic_failure_dict(self):
@@ -10567,7 +10607,7 @@ class TestArtifactDeliveryFailure(unittest.TestCase):
         self.assertEqual(result["reason"], "42")
 
 
-class TestCpuLoadAvgAndMemoryFree(unittest.TestCase):
+class TestCpuLoadAvgAndMemoryFree(_LocalRunnerTestCase):
     """_cpu_load_avg / _memory_free_bytes: system probes, tested with mocks."""
 
     def test_cpu_load_avg_returns_float(self):
