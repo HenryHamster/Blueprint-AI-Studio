@@ -565,53 +565,69 @@ async def github_webhook(
                     mutated_tasks = False
                     for art in pr_artifacts:
                         pr_task = task_map.get(art.task_id)
-                        if pr_task and not (pr_task.context or {}).get("pr_merged"):
-                            (
-                                record_pr_merged,
-                                terminal_rollup_merge,
-                                landed_branch,
-                            ) = await classify_rollup_merge_outcome(
-                                pr_task,
-                                project,
-                                session,
-                                pr_number=pr_number,
-                                merged_base_branch=pr_base_branch,
-                                source="github.pull_request.closed",
-                            )
-                            if record_pr_merged:
+                        if not pr_task:
+                            continue
+
+                        # Backend merge paths persist pr_merged before GitHub's
+                        # closed webhook arrives. Still fetch the authoritative
+                        # diff once, but do not replay landing or rollup work.
+                        if (pr_task.context or {}).get("pr_merged"):
+                            if not (pr_task.context or {}).get(
+                                "_pr_changed_files_github_verified"
+                            ):
                                 await _stamp_github_verified_changed_files(
                                     pr_task, owner, repo, pr_number, project.id
                                 )
-                                await corroborate_and_apply_merged_landed_signal(
-                                    pr_task,
-                                    project,
-                                    session,
-                                    base_branch=landed_branch,
-                                    hotfix_lane=bool(
-                                        (pr_task.first_payload or {}).get("hotfix")
-                                        or (pr_task.context or {}).get("hotfix")
-                                    ),
-                                    non_merge_reason="merged_pr_non_integration_branch",
-                                    # Pin the acceptance corroboration read to
-                                    # the webhook's own merge commit — the
-                                    # branch-tip cache can still serve the
-                                    # PRE-merge tip this soon after the merge.
-                                    merge_commit_sha=pr_merge_commit_sha,
-                                )
-                                affected_tasks.append(pr_task)
-                                logger.info(
-                                    f"[WEBHOOK] Set pr_merged on task {pr_task.id} (PR #{pr_number})"
-                                )
-                            elif (
-                                not terminal_rollup_merge
-                                and pr_task.status == TaskStatus.EVALUATING
-                            ):
-                                pr_task.latest_status_message = (
-                                    f"Rollup PR merged into {landed_branch}; "
-                                    "awaiting downstream landing"
-                                )
-                            session.add(pr_task)
-                            mutated_tasks = True
+                                session.add(pr_task)
+                                mutated_tasks = True
+                            continue
+
+                        (
+                            record_pr_merged,
+                            terminal_rollup_merge,
+                            landed_branch,
+                        ) = await classify_rollup_merge_outcome(
+                            pr_task,
+                            project,
+                            session,
+                            pr_number=pr_number,
+                            merged_base_branch=pr_base_branch,
+                            source="github.pull_request.closed",
+                        )
+                        if record_pr_merged:
+                            await _stamp_github_verified_changed_files(
+                                pr_task, owner, repo, pr_number, project.id
+                            )
+                            await corroborate_and_apply_merged_landed_signal(
+                                pr_task,
+                                project,
+                                session,
+                                base_branch=landed_branch,
+                                hotfix_lane=bool(
+                                    (pr_task.first_payload or {}).get("hotfix")
+                                    or (pr_task.context or {}).get("hotfix")
+                                ),
+                                non_merge_reason="merged_pr_non_integration_branch",
+                                # Pin the acceptance corroboration read to
+                                # the webhook's own merge commit — the
+                                # branch-tip cache can still serve the
+                                # PRE-merge tip this soon after the merge.
+                                merge_commit_sha=pr_merge_commit_sha,
+                            )
+                            affected_tasks.append(pr_task)
+                            logger.info(
+                                f"[WEBHOOK] Set pr_merged on task {pr_task.id} (PR #{pr_number})"
+                            )
+                        elif (
+                            not terminal_rollup_merge
+                            and pr_task.status == TaskStatus.EVALUATING
+                        ):
+                            pr_task.latest_status_message = (
+                                f"Rollup PR merged into {landed_branch}; "
+                                "awaiting downstream landing"
+                            )
+                        session.add(pr_task)
+                        mutated_tasks = True
                     if mutated_tasks:
                         await session.commit()
                     # Once a bootstrapped repo gains a project structure on its

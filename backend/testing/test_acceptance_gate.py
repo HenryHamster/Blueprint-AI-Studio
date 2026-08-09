@@ -26,6 +26,7 @@ from app.acceptance_gate import (
     REDERIVED_BY_QUALIFIER,
     TEST_COVERAGE_RESULT_KEY,
     acceptance_blocks_success,
+    acceptance_input_fingerprint,
     acceptance_is_proven,
     acceptance_counts_as_verified_context,
     acceptance_was_declared,
@@ -47,6 +48,7 @@ from app.acceptance_gate import (
     stamp_premerge_acceptance_finding,
     summarize_version_acceptance_aggregate,
     _evaluate_coverage_delta,
+    _paths_match,
 )
 from app.artifact_prerequisites import ARTIFACT_PREREQUISITES_KEY
 from app.landed_signal import REVIEW_LOOP_KEY, UNVERIFIED_MERGE_REASON_KEY
@@ -452,6 +454,9 @@ def test_effective_acceptance_verdict_current_rule_returns_frozen_verbatim():
         "reason": "stamped under the current rule",
         "rule_version": ACCEPTANCE_RULE_VERSION,
     }
+    frozen["input_fingerprint"] = acceptance_input_fingerprint(
+        task.first_payload, task.context, task.project_id
+    )
     task.context[CODE_ACCEPTANCE_VERDICT_KEY] = frozen
     # A current-rule stamp is trusted verbatim — no re-derivation, no rewrite.
     assert effective_acceptance_verdict(task) is frozen
@@ -636,6 +641,25 @@ def test_named_test_present_verified_touches_seam_passes_and_records():
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.parametrize(
+    ("changed", "declared", "expected"),
+    [
+        ("backend/testing/test_widget.py", "backend/testing/test_widget.py", True),
+        ("backend/testing/test_widget.py", "testing/test_widget.py", True),
+        ("testing/test_widget.py", "test_widget.py", True),
+        (r"backend\\testing\\test_widget.py", "testing/test_widget.py", True),
+        ("backend/testing/test_other.py", "testing/test_widget.py", False),
+        ("", "testing/test_widget.py", False),
+        ("backend/testing/test_widget.py", "", False),
+        (None, "testing/test_widget.py", False),
+        ("backend/testing/test_widget.py", None, False),
+    ],
+)
+def test_named_test_path_matching_contract(changed, declared, expected):
+    """Path matching tolerates repository-root conventions but fails closed."""
+    assert _paths_match(changed, declared) is expected
+
+
 def test_named_test_missing_from_changed_files_fails_closed():
     # The claimed test is not among the PR's changed files — never added here.
     task = _make_code_task(
@@ -653,6 +677,28 @@ def test_named_test_missing_from_changed_files_fails_closed():
 
     record_code_acceptance_verdict(task)
     assert acceptance_blocks_success(task.context[CODE_ACCEPTANCE_VERDICT_KEY]) is True
+
+
+def test_named_test_without_changed_file_provenance_has_distinct_reason():
+    """A missing diff signal is not proof that the declared test was omitted."""
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+        },
+        changed_files=None,
+        unverified_reason=None,
+    )
+
+    verdict = evaluate_code_acceptance(task)
+
+    assert verdict.satisfied is False
+    assert "changed-file provenance was unavailable" in verdict.reason
+    recorded = record_code_acceptance_verdict(task)
+    assert recorded is not None
+    assert classify_unsatisfied_reason(
+        task.context[CODE_ACCEPTANCE_VERDICT_KEY]
+    ) == "named_test_diff_provenance_unavailable"
 
 
 def test_named_test_test_only_diff_fails_closed():
@@ -1883,6 +1929,9 @@ async def test_consumed_downstream_artifact_upgrades_to_proven(db_session):
         # the rule version that produced it so a later qualification can tell
         # which rows were judged by a retired rule and re-derive them.
         "rule_version": ACCEPTANCE_RULE_VERSION,
+        "input_fingerprint": acceptance_input_fingerprint(
+            producer.first_payload, producer.context, producer.project_id
+        ),
         # Audit honesty (design doc c50453ef §5): a direct recording is an
         # ORIGINAL land-time stamp, never a re-derivation.
         "stamped_at_land_time": True,
@@ -2413,6 +2462,12 @@ def test_classify_undeclared_reason_partitions_undeclared_bucket():
 # gate formats) so the classifier is tested against what actually lands in
 # task.context[CODE_ACCEPTANCE_VERDICT_KEY], not a hand-rolled reimplementation.
 _REASONED_UNSATISFIED_SAMPLES = {
+    "named_test_diff_provenance_unavailable": (
+        "named_test",
+        "declared named_test 'backend/testing/test_widget.py' could not be "
+        "evaluated because PR changed-file provenance was unavailable — "
+        "_pr_changed_files was never recorded",
+    ),
     "named_test_missing_from_diff": (
         "named_test",
         "declared named_test 'backend/testing/test_widget.py' is not among the "
@@ -4288,9 +4343,9 @@ async def test_backfill_verdicts_advances_past_unprovable(db_session):
 
 
 @pytest.mark.asyncio
-async def test_backfill_missing_from_diff_failure_stays_re_examinable(db_session):
-    """A missing-from-diff named_test verdict that STILL cannot be proven (no
-    changed-file provenance has arrived) is stamped with the ordinary one-shot
+async def test_backfill_missing_diff_provenance_stays_re_examinable(db_session):
+    """An unavailable-provenance named_test verdict that STILL cannot be proven
+    (no changed-file provenance has arrived) is stamped with the ordinary one-shot
     ``_backfill_checked_at`` marker — freeing the LIMIT-200 window — but NOT
     the terminal marker: the candidate query re-admits the class as soon as
     provenance arrives, so marking never freezes the verdict. (Pre-fix the
@@ -4319,8 +4374,9 @@ async def test_backfill_missing_from_diff_failure_stays_re_examinable(db_session
         "proven": False,
         "kind": "named_test",
         "reason": (
-            "declared named_test 'backend/testing/test_widget.py' is not among the "
-            "PR's changed files — the claimed test was not added or modified here"
+            "declared named_test 'backend/testing/test_widget.py' could not be "
+            "evaluated because PR changed-file provenance was unavailable — "
+            "_pr_changed_files was never recorded"
         ),
     }
     task.context = ctx
@@ -4784,7 +4840,7 @@ async def test_landed_rollup_child_regrades_after_parent_changed_files_arrive(db
     await db_session.flush()
 
     # First propagation: parent has NO changed files → child lands but its verdict
-    # is frozen at declared_unsatisfied (missing-from-diff).
+    # is frozen at declared_unsatisfied with unavailable provenance.
     stamped = await _propagate_landed_to_staging_merged_descendants(
         parent.id, db_session
     )
@@ -4796,7 +4852,7 @@ async def test_landed_rollup_child_regrades_after_parent_changed_files_arrive(db
     recorded = (child.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
     assert recorded is not None
     assert recorded.get("satisfied") is False
-    assert "is not among the PR's changed files" in (recorded.get("reason") or "")
+    assert "changed-file provenance was unavailable" in (recorded.get("reason") or "")
 
     # ── Late arrival: the parent's GitHub-verified changed files land. ─────
     parent_ctx = dict(parent.context or {})
