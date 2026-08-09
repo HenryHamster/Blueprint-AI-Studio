@@ -9967,6 +9967,155 @@ async def test_rollup_child_own_changed_files_not_clobbered_by_parent(db_session
 
 
 @pytest.mark.asyncio
+async def test_stamp_clears_stale_parent_derived_marker(db_session, mocker):
+    """An exact child range replaces stale parent-derived provenance at merge."""
+    from app.acceptance_gate import (
+        CODE_ACCEPTANCE_VERDICT_KEY,
+        COMMIT_RANGE_DERIVED_CHANGED_FILES_KEY,
+        PARENT_DERIVED_CHANGED_FILES_KEY,
+        record_code_acceptance_verdict,
+    )
+
+    project = await _make_project(db_session, name="ExactRangeReplacesParent")
+    declared_test = "backend/testing/test_acceptance_criteria.py"
+    exact_files = ["backend/app/acceptance_criteria.py", declared_test]
+    task = Task(
+        project_id=project.id,
+        title="rollup child",
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "child",
+                "acceptance_evidence": {
+                    "kind": "named_test",
+                    "test_path": declared_test,
+                },
+            }
+        ],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={
+            "pr_merged": True,
+            "landed_on_integration": True,
+            "_pr_changed_files": exact_files,
+            PARENT_DERIVED_CHANGED_FILES_KEY: True,
+            "_pr_changed_files_truncated": True,
+            "review_loop": {
+                "review_target": {
+                    "base_sha": "base-sha",
+                    "head_sha": "child-head-sha",
+                },
+                "verify_tests_acceptance_block": {
+                    "present": True,
+                    "ran": True,
+                    "status": "ran",
+                    "passed": True,
+                    "selector": declared_test,
+                },
+            },
+        },
+    )
+    db_session.add(task)
+    await db_session.flush()
+
+    # Before the exact range arrives, the stale parent marker caps the verdict
+    # even though the merge-test block is a real green verdict.
+    initial = record_code_acceptance_verdict(task)
+    assert initial is not None
+    assert initial.proven is False
+
+    mocker.patch(
+        "app.github_refs.get_files_changed_between_refs",
+        new_callable=AsyncMock,
+        return_value=exact_files,
+    )
+    assert await ac.stamp_rollup_child_commit_range(
+        task,
+        gh_token="token",
+        owner="owner",
+        repo="repo",
+    ) is True
+
+    context = task.context or {}
+    assert context.get("_pr_changed_files") == exact_files
+    assert PARENT_DERIVED_CHANGED_FILES_KEY not in context
+    assert "_pr_changed_files_truncated" not in context
+    assert context.get(COMMIT_RANGE_DERIVED_CHANGED_FILES_KEY) is True
+    assert context.get("_pr_changed_files_github_verified") is True
+    assert context[CODE_ACCEPTANCE_VERDICT_KEY]["satisfied"] is True
+    assert context[CODE_ACCEPTANCE_VERDICT_KEY]["proven"] is True
+
+
+@pytest.mark.asyncio
+async def test_backfill_exact_child_range_is_idempotent(db_session, mocker):
+    """Repeating exact-range backfill is a no-op with an identical context."""
+    from app.acceptance_gate import (
+        COMMIT_RANGE_DERIVED_CHANGED_FILES_KEY,
+        PARENT_DERIVED_CHANGED_FILES_KEY,
+    )
+
+    project = await _make_project(db_session, name="ExactRangeBackfillIdempotent")
+    parent = Task(
+        project_id=project.id,
+        title="rollup parent",
+        payloads=[{"type": "research", "prompt": "rollup"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True, "landed_on_integration": True},
+    )
+    db_session.add(parent)
+    await db_session.flush()
+    child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        title="rollup child",
+        payloads=[{"type": "create", "prompt": "child"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={
+            "pr_merged": True,
+            "landed_on_integration": True,
+            "_pr_changed_files": ["backend/app/stale_parent_slice.py"],
+            PARENT_DERIVED_CHANGED_FILES_KEY: True,
+            COMMIT_RANGE_DERIVED_CHANGED_FILES_KEY: True,
+            "review_loop": {
+                "review_target": {
+                    "base_sha": "base-sha",
+                    "head_sha": "child-head-sha",
+                }
+            },
+        },
+    )
+    db_session.add(child)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    compare = mocker.patch(
+        "app.github_refs.get_files_changed_between_refs",
+        new_callable=AsyncMock,
+        return_value=[
+            "backend/app/acceptance_criteria.py",
+            "backend/testing/test_acceptance_criteria.py",
+        ],
+    )
+
+    assert await ac.backfill_rollup_child_changed_files(db_session, project.id) == 1
+    await db_session.refresh(child)
+    first_context = dict(child.context or {})
+    assert first_context.get(COMMIT_RANGE_DERIVED_CHANGED_FILES_KEY) is True
+    assert PARENT_DERIVED_CHANGED_FILES_KEY not in first_context
+
+    assert await ac.backfill_rollup_child_changed_files(db_session, project.id) == 0
+    await db_session.refresh(child)
+    assert child.context == first_context
+    assert compare.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_reconcile_backfill_stamps_landed_child_changed_files_from_parent(
     db_session,
 ):

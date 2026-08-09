@@ -2429,6 +2429,7 @@ async def stamp_rollup_child_commit_range(
     if commit_range is None:
         return False
     from app.acceptance_gate import (
+        PARENT_DERIVED_CHANGED_FILES_KEY,
         record_code_acceptance_verdict,
         stamp_commit_range_derived_changed_files_signal,
     )
@@ -2455,6 +2456,11 @@ async def stamp_rollup_child_commit_range(
         return False
 
     context = dict(task.context or {})
+    # ``dict.update`` cannot remove provenance from the previous stamp.  Clear
+    # the legacy parent-derived sentinels on the task before applying the exact
+    # child range, so the old union diff cannot continue to cap this verdict.
+    context.pop(PARENT_DERIVED_CHANGED_FILES_KEY, None)
+    context.pop("_pr_changed_files_truncated", None)
     context.update(stamp_commit_range_derived_changed_files_signal(changed))
     task.context = context
     record_code_acceptance_verdict(task)
@@ -2481,8 +2487,10 @@ async def backfill_rollup_child_changed_files(
 
     The canonical path now compares each child's backend-persisted immutable
     ``base_sha...head_sha`` range and stamps
-    :func:`stamp_commit_range_derived_changed_files_signal`, overwriting any
-    self-report or legacy parent-derived list.  The parent-union path remains
+    :func:`stamp_commit_range_derived_changed_files_signal`, replacing any
+    self-report and clearing legacy parent-derived sentinels.  Once exact
+    provenance is stamped, later backfill runs skip the child. The parent-union
+    path remains
     only as a compatibility fallback for old rows that have no usable child
     range; it is deliberately never used when the exact compare succeeds.
 
@@ -2493,10 +2501,11 @@ async def backfill_rollup_child_changed_files(
     ``direction_key``, when provided, scopes the search to tasks whose context
     carries that ``direction_id`` (matching the sibling backfills).
 
-    Idempotent (``setdefault`` — a re-run stamps nothing new) and best-effort
-    (errors are logged and swallowed so a failure never blocks the caller).  A
-    caller may provide ``diagnostic`` to retain a stable error code and exception
-    class when the swallowed failure must remain auditable.
+    Idempotent (clean exact-range stamps are skipped; legacy stamps with stale
+    sentinels get one repair pass) and best-effort (errors are logged and
+    swallowed so a failure never blocks the caller). A caller may provide
+    ``diagnostic`` to retain a stable error code and exception class when the
+    swallowed failure must remain auditable.
 
     Returns the count of children newly stamped by this call.
     """
@@ -2629,6 +2638,25 @@ async def backfill_rollup_child_changed_files(
                 if not is_merged_completion(task):
                     continue
                 if task.parent_task_id is None:
+                    continue
+
+                # The exact range is immutable and already authoritative.  Do
+                # not re-fetch or re-stamp it on every reconcile invocation. A
+                # legacy exact stamp may still carry the old parent-derived or
+                # truncation sentinel, so let that shape run once more through
+                # the merge-site cleanup above.
+                task_context = task.context or {}
+                if (
+                    task_context.get(
+                        _acceptance_gate.COMMIT_RANGE_DERIVED_CHANGED_FILES_KEY
+                    )
+                    is True
+                    and task_context.get(
+                        _acceptance_gate.PARENT_DERIVED_CHANGED_FILES_KEY
+                    )
+                    is not True
+                    and "_pr_changed_files_truncated" not in task_context
+                ):
                     continue
 
                 # Exact child provenance supersedes both self-reported and
