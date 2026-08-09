@@ -142,5 +142,7 @@ poll cadence; the agent never crashes a poll cycle into the service.
 - **Manual rollback (unchanged):** `blueprint deploy` / the release tool's
   rollback behavior is untouched. To roll back to an earlier revision, run
   `python scripts/blueprint.py deploy --sha <earlier-main-sha> --force` (the
-  receipt records it), or revoke `/etc/sudoers.d/blueprint-release` to restore
-  interactive-sudo ceremony while you investigate.
+  receipt records it). The bootstrap removes the legacy
+  `/etc/sudoers.d/blueprint-release` grant during installation; no manual
+  sudoers revocation is needed. The active release executor is the root-owned
+  socket service described above.

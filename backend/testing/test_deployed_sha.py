@@ -3,7 +3,9 @@
 All network calls are mocked — these tests never reach the real Cloud Run API.
 """
 
+import ast
 import importlib.util
+import re
 import sys
 from pathlib import Path
 from typing import ClassVar
@@ -13,6 +15,7 @@ import pytest
 from app import deployed_sha
 
 _SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "scripts"
+_REPO_ROOT = _SCRIPTS_DIR.parent
 
 
 def _load_blueprint_script():
@@ -41,6 +44,67 @@ def _load_blueprint_script():
 
 
 deploy_blueprint = _load_blueprint_script()
+
+
+def test_operator_docs_do_not_revoke_bootstrap_removed_sudoers_grant():
+    """Keep operator guidance aligned with the bootstrap's privilege end state."""
+    bootstrap_path = _SCRIPTS_DIR / "bootstrap_local_app_release.py"
+    bootstrap_tree = ast.parse(
+        bootstrap_path.read_text(encoding="utf-8"), filename=str(bootstrap_path)
+    )
+
+    legacy_paths = [
+        node.value.args[0].value
+        for node in ast.walk(bootstrap_tree)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id == "_LEGACY_RELEASE_SUDOERS"
+            for target in node.targets
+        )
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Name)
+        and node.value.func.id == "Path"
+        and len(node.value.args) == 1
+        and isinstance(node.value.args[0], ast.Constant)
+        and isinstance(node.value.args[0].value, str)
+    ]
+    assert legacy_paths == ["/etc/sudoers.d/blueprint-release"]
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "unlink"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "_LEGACY_RELEASE_SUDOERS"
+        for node in ast.walk(bootstrap_tree)
+    ), "bootstrap must remove the legacy sudoers grant"
+
+    legacy_path = legacy_paths[0]
+    operator_files = [
+        *(_REPO_ROOT / "docs").rglob("*.md"),
+        *(_REPO_ROOT / "admin-ui").rglob("*.ts"),
+        *(_REPO_ROOT / "admin-ui").rglob("*.tsx"),
+    ]
+    stale_instruction = re.compile(
+        rf"\brevoke\b[^.\n]*{re.escape(legacy_path)}", re.IGNORECASE
+    )
+    stale_lines = [
+        f"{path}:{line_number}: {line}"
+        for path in operator_files
+        for line_number, line in enumerate(
+            path.read_text(encoding="utf-8").splitlines(), 1
+        )
+        if stale_instruction.search(line)
+    ]
+    assert stale_lines == []
+
+    deploy_doc = (_REPO_ROOT / "docs/operations/one-command-deploy.md").read_text(
+        encoding="utf-8"
+    )
+    assert (
+        f"bootstrap removes the legacy\n  `{legacy_path}` grant during installation"
+        in deploy_doc
+    )
 
 # A real 64-hex container image digest (sha256). It is all-hex, so a naive
 # git-SHA check would WRONGLY accept it — the resolver must reject it.
@@ -252,6 +316,7 @@ class TestApprovedActivationExecutor:
 
     def test_records_receipt_with_deployed_sha(self, monkeypatch):
         calls = []
+        monkeypatch.setattr(deploy_blueprint, "_require_write_config", lambda _role: None)
         monkeypatch.setattr(
             deploy_blueprint,
             "_read_live_approved_activation",
@@ -273,6 +338,7 @@ class TestApprovedActivationExecutor:
                 ("shim", digest, revision, host)
             ),
         )
+        monkeypatch.setattr(deploy_blueprint, "_local_served_sha", lambda: _GIT_SHA)
         monkeypatch.setattr(
             deploy_blueprint,
             "get_project_id",
@@ -308,6 +374,7 @@ class TestApprovedActivationExecutor:
     def test_failed_activation_is_reported_not_timeout(self, monkeypatch):
         APIError = deploy_blueprint.APIError
 
+        monkeypatch.setattr(deploy_blueprint, "_require_write_config", lambda _role: None)
         monkeypatch.setattr(
             deploy_blueprint,
             "_read_live_approved_activation",
