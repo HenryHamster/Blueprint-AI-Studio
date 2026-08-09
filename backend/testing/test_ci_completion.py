@@ -7387,3 +7387,176 @@ async def test_latest_exact_approval_with_empty_ledger_can_merge(db_session, moc
     assert authoritative_loop["review_target"] == live_target
     assert "review_not_required" not in authoritative_loop
     assert "review_policy_reason" not in authoritative_loop
+
+
+# ---------------------------------------------------------------------------
+# Merge-time GitHub-verified changed-files provenance
+#
+# Root-cause regression guards for the acceptance-window-never-covered bug:
+# this pipeline merges PRs PROGRAMMATICALLY here, so GitHub's
+# ``pull_request.closed`` webhook — the only OTHER writer of
+# ``_pr_changed_files_github_verified`` — never fires. Without the merge-time
+# stamp the named_test acceptance gate evaluates every declared test against an
+# EMPTY diff, classifies it ``declared_unsatisfied``, and the release
+# acceptance window stays permanently 0-proven.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_merge_success_stamps_github_verified_changed_files_on_orig(
+    db_session, mocker
+):
+    """A successful programmatic merge stamps the merged PR's GitHub-verified
+    changed-file list onto the original task before the acceptance verdict runs.
+
+    The stamp must (a) override any untrusted agent self-report, (b) carry the
+    authoritative ``_pr_changed_files_github_verified`` sentinel, and (c)
+    summarize test/prod co-change computed from the REAL merged diff.
+    """
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch(
+        "app.github.merge_pull_request",
+        AsyncMock(return_value={"merged": True}),
+    )
+    # The REAL merged diff: a production module co-changed with its test.
+    real_files = ["backend/app/widget.py", "backend/testing/test_widget.py"]
+    mocker.patch(
+        "app.github.get_pr_files",
+        AsyncMock(return_value=[{"filename": p} for p in real_files]),
+    )
+
+    project = Project(
+        name="Merge provenance stamp test",
+        user_id="test-user",
+        github_owner="acme",
+        github_repo="widgets",
+        integration_branch="main",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # orig carries a STALE, untrusted agent self-report (no github_verified
+    # sentinel) that the merge-time stamp must override.
+    orig_task = Task(
+        project_id=project.id,
+        title="Original create task",
+        payloads=[{"type": "create", "prompt": "add widget"}],
+        context={"_pr_changed_files": ["backend/app/stale_self_report.py"]},
+        vm_instance_id=f"agent-vm-orig-{uuid.uuid4().hex[:8]}",
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(orig_task)
+    await db_session.commit()
+    await db_session.refresh(orig_task)
+
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={"original_task_id": str(orig_task.id)},
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True
+    # Re-read the committed row written by the dedicated _orig_session.
+    await db_session.refresh(orig_task)
+    ctx = orig_task.context or {}
+    assert ctx.get("_pr_changed_files_github_verified") is True, (
+        "merge-time stamp must mark the changed-file list as GitHub-verified"
+    )
+    assert set(ctx.get("_pr_changed_files") or []) == set(real_files), (
+        "stamp must REPLACE the stale agent self-report with the real PR diff"
+    )
+    assert ctx.get("_pr_changed_files_has_test") is True
+    assert ctx.get("_pr_changed_files_has_prod") is True
+
+
+@pytest.mark.asyncio
+async def test_merge_success_changed_files_stamp_is_fail_silent(db_session, mocker):
+    """A GitHub failure while fetching the merged PR's changed files must NEVER
+    block the merge. The merge completes and the acceptance gate falls back to
+    the agent self-report (no ``_pr_changed_files_github_verified`` sentinel).
+    """
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch(
+        "app.github.merge_pull_request",
+        AsyncMock(return_value={"merged": True}),
+    )
+
+    # get_pr_files must succeed for the PRE-merge migration guard but fail for
+    # the POST-merge provenance stamp. The reachability gate
+    # (verify_rollup_merge_landed) is the last step before the stamp; mock it to
+    # the test-env "indeterminate" verdict (keeps record_pr_merged True) and use
+    # its invocation to arm the changed-files fetch failure — deterministically
+    # separating the two get_pr_files phases without depending on the gate's own
+    # internal GitHub I/O.
+    phase = {"arm_failure": False}
+
+    async def _verify_landed(*_a, **_k):
+        phase["arm_failure"] = True
+        return "indeterminate"
+
+    async def _get_pr_files(*_a, **_k):
+        if phase["arm_failure"]:
+            raise RuntimeError("simulated GitHub outage during changed-files fetch")
+        return [{"filename": "README.md"}]
+
+    mocker.patch(
+        "app.rollup_pr_verification.verify_rollup_merge_landed",
+        side_effect=_verify_landed,
+    )
+    mocker.patch("app.github.get_pr_files", side_effect=_get_pr_files)
+
+    project = Project(
+        name="Merge provenance fail-silent test",
+        user_id="test-user",
+        github_owner="acme",
+        github_repo="widgets",
+        integration_branch="main",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    orig_task = Task(
+        project_id=project.id,
+        title="Original create task",
+        payloads=[{"type": "create", "prompt": "add widget"}],
+        context={},
+        vm_instance_id=f"agent-vm-orig-{uuid.uuid4().hex[:8]}",
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(orig_task)
+    await db_session.commit()
+    await db_session.refresh(orig_task)
+
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={"original_task_id": str(orig_task.id)},
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    # The merge is NOT blocked by the changed-files fetch failure.
+    assert result is True
+    await db_session.refresh(orig_task)
+    ctx = orig_task.context or {}
+    assert ctx.get("_pr_changed_files_github_verified") is not True, (
+        "a failed changed-files fetch must not leave a github_verified stamp"
+    )

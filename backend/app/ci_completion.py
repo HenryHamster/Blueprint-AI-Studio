@@ -862,6 +862,76 @@ async def _attempt_merge_with_retry_and_escalation(
                                 _orig_ctx = dict(orig.context or {})
                                 _orig_ctx["test_coverage_result"] = _tcov
                                 orig.context = _orig_ctx
+                            # Stamp the merged PR's GitHub-verified changed-file list
+                            # onto the original task BEFORE the acceptance verdict is
+                            # recorded (record_code_acceptance_verdict runs inside
+                            # apply_merged_landed_signal, below). This pipeline merges
+                            # PRs programmatically here, so GitHub's
+                            # ``pull_request.closed`` webhook — the only OTHER writer of
+                            # ``_pr_changed_files_github_verified`` — never fires. Without
+                            # this stamp the named_test gate evaluates every declared
+                            # acceptance test against an EMPTY diff, classifies it
+                            # ``named_test_missing_from_diff`` -> ``declared_unsatisfied``,
+                            # and the acceptance window stays permanently 0-proven no
+                            # matter how much real, co-changed test evidence landed. We
+                            # reuse the already-authenticated ``gh_token`` and mirror the
+                            # webhook helper's fail-silent contract: a transient GitHub
+                            # error must never block the merged-landed signal, so the gate
+                            # simply falls back to the agent self-report on failure. Skip
+                            # if an authoritative list is already present (idempotent
+                            # re-processing / a real webhook delivery).
+                            if ci_pr_number and not (orig.context or {}).get(
+                                "_pr_changed_files_github_verified"
+                            ):
+                                try:
+                                    from app.acceptance_gate import (
+                                        stamp_changed_files_signal,
+                                    )
+                                    from app.github import get_pr_files
+
+                                    _raw_files = await get_pr_files(
+                                        gh_token,
+                                        owner,
+                                        repo,
+                                        ci_pr_number,
+                                        str(orig.project_id),
+                                    )
+                                    _file_paths = [
+                                        f["filename"]
+                                        for f in (_raw_files or [])
+                                        if isinstance(f, dict)
+                                        and isinstance(f.get("filename"), str)
+                                    ]
+                                    if _file_paths:
+                                        _gv_ctx = dict(orig.context or {})
+                                        _gv_ctx.update(
+                                            stamp_changed_files_signal(
+                                                _file_paths, github_verified=True
+                                            )
+                                        )
+                                        # Fresh authoritative provenance re-admits the
+                                        # task to the acceptance backfill sweep.
+                                        _gv_ctx.pop("_backfill_checked_at", None)
+                                        _gv_ctx.pop(
+                                            "_backfill_missing_diff_terminal_at", None
+                                        )
+                                        orig.context = _gv_ctx
+                                        logger.info(
+                                            "[CI-MERGE] Stamped %d GitHub-verified "
+                                            "changed files for orig task %s (PR #%s)",
+                                            len(_file_paths),
+                                            orig.id,
+                                            ci_pr_number,
+                                        )
+                                except Exception:
+                                    logger.warning(
+                                        "[CI-MERGE] get_pr_files failed for orig task "
+                                        "%s (PR #%s); acceptance gate falls back to the "
+                                        "agent self-reported diff",
+                                        getattr(orig, "id", "?"),
+                                        ci_pr_number,
+                                        exc_info=True,
+                                    )
                             _orig_landed_on_integration = await corroborate_and_apply_merged_landed_signal(
                                 orig,
                                 orig_project,
