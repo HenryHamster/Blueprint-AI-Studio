@@ -741,7 +741,7 @@ def _paths_require_browser(paths: object) -> bool:
     )
 
 
-def _payload_requires_browser(payload: dict, context: dict | None = None) -> bool:
+def _payload_requires_browser(payload: dict, context: dict) -> bool:
     """Read the browser contract from payload and task path provenance.
 
     ``related_files`` is available before an agent starts (the dispatch-time
@@ -761,6 +761,16 @@ def _payload_requires_browser(payload: dict, context: dict | None = None) -> boo
     if not isinstance(evidence, dict):
         return False
     return str(evidence.get("kind") or "").strip().lower() in _BROWSER_EVIDENCE_KINDS
+
+
+def _task_requires_browser(task: Task) -> bool:
+    """Evaluate the browser contract using the task's complete provenance."""
+    return _payload_requires_browser(task.first_payload or {}, task.context or {})
+
+
+def _runner_lacks_required_browser(runner: LocalRunner, task: Task) -> bool:
+    """Return whether ``runner`` must refuse this task's browser contract."""
+    return not _runner_chromium_usable(runner) and _task_requires_browser(task)
 
 async def _try_runner_dispatch(
     session: AsyncSession,
@@ -871,7 +881,7 @@ async def _try_runner_dispatch(
         # declines still look transient, re-pick the decliner instead.
         declined_exclusion_advisory=decline_exclusion_is_advisory(task, task_type),
         requires_project_verification=requires_project_verification,
-        requires_browser=_payload_requires_browser(payload, ctx),
+        requires_browser=_task_requires_browser(task),
     )
     if runner is None:
         return False

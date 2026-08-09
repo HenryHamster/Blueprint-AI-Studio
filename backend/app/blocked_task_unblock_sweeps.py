@@ -249,12 +249,10 @@ async def _blocked_precondition_state(task, session, verify_pr_merged) -> str:
                 # unrelated deterministic blockers retain their permanent hold.
                 from app.orchestrator_runner_dispatch import (
                     _load_active_runners_cache,
-                    _payload_requires_browser,
+                    _task_requires_browser,
                 )
 
-                if _payload_requires_browser(
-                    task.first_payload or {}, task.context or {}
-                ):
+                if _task_requires_browser(task):
                     active_runners = await _load_active_runners_cache(session)
                     from app.runner_eligibility import _runner_chromium_usable
 

@@ -24,8 +24,9 @@ import json
 import uuid
 from datetime import datetime, timezone, timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
+from httpx import AsyncClient
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -1853,6 +1854,69 @@ async def test_admin_ui_task_dispatch_requires_viewport_capable_runner(db_sessio
     await db_session.refresh(task)
     assert task.status == TaskStatus.PROVISIONING
     assert task.vm_instance_id == f"runner:{capable.id}"
+
+
+@pytest.mark.asyncio
+async def test_pull_time_browser_backstop_uses_context_only_requirement(
+    client: AsyncClient, db_session
+):
+    """Pull-time routing must reject context-only browser requirements."""
+    from app import auth as auth_mod
+    from app.models import LocalRunner
+
+    project = Project(name="Pull Browser Backstop", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    token = auth_mod.create_runner_token(uuid.uuid4())
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash=auth_mod.hash_runner_token(token),
+        capabilities={"task_types": "all"},
+    )
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "refactor"}],
+        context={
+            "runner_target_id": str(runner.id),
+            "_pr_changed_files": ["admin-ui/src/components/Widget.tsx"],
+        },
+        status=TaskStatus.PROVISIONING,
+        vm_instance_id=f"runner:{runner.id}",
+    )
+    db_session.add_all([runner, task])
+    await db_session.commit()
+
+    # Let the test isolate the browser backstop from credential-pool policy. If
+    # the backstop drops context, this resolver succeeds and the task is handed
+    # to the incapable runner instead of being released to QUEUED.
+    with patch(
+        "app.routers.runner._resolve_pool_credentials_for_dispatch",
+        new=AsyncMock(
+            return_value=(
+                True,
+                SimpleNamespace(account_id=None, credentials=None),
+                None,
+                None,
+            )
+        ),
+    ) as resolve_credentials:
+        response = await client.post(
+            "/api/runner/next-task",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    assert response.status_code == 503
+    body = response.json()
+    assert body["skipped"][0]["code"] == "runner_capability_mismatch"
+    assert resolve_credentials.await_count == 0
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.QUEUED
+    assert task.vm_instance_id is None
+    assert task.started_at is None
+    assert "runner_target_id" not in (task.context or {})
 
 
 @pytest.mark.asyncio
