@@ -5,6 +5,7 @@ module imports cleanly, and that --json emits valid JSON for a read command —
 all with blueprint_api.api mocked so no network/credentials are needed.
 """
 import argparse
+import contextlib
 import hashlib
 import io
 import json
@@ -283,6 +284,7 @@ HELP_INVOCATIONS = [
     ["compute", "analyze"],
     ["compute", "run"],
     ["compute", "launch"],
+    ["migrate"],
     ["tasks", "create"],
 ]
 
@@ -5721,6 +5723,124 @@ def test_deploy_defaults_to_promoted_version(monkeypatch, capsys):
     assert body["version_number"] == 7
     assert body["revision"] == _DEPLOY_REV
     assert body["host"] == "hamsterwheel"
+
+
+def test_migrate_local_runs_alembic_upgrade_against_local_db(monkeypatch, tmp_path, capsys):
+    """The local migration is a repeatable worker-image container transaction."""
+    image = (
+        "us-central1-docker.pkg.dev/blueprint-orchestrator/blueprint-repo/"
+        "blueprint-orchestrator@sha256:" + "a" * 64
+    )
+    secrets = tmp_path / "worker-secrets.json"
+    secrets.write_text(
+        json.dumps(
+            {
+                "DATABASE_URL": "postgresql+asyncpg://worker:p%40ss@ignored:5432/blueprint",
+                "GITHUB_PAT_ENCRYPTION_KEY": "x" * 43,
+            }
+        ),
+        encoding="utf-8",
+    )
+    secrets.chmod(0o600)
+    credential = tmp_path / "worker-gcp.json"
+    credential.write_text(
+        json.dumps(
+            {
+                "type": "service_account",
+                "project_id": "blueprint-orchestrator",
+                "client_email": (
+                    "blueprint-local-worker-runtime@blueprint-orchestrator.iam.gserviceaccount.com"
+                ),
+                "private_key": "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----",
+            }
+        ),
+        encoding="utf-8",
+    )
+    credential.chmod(0o600)
+    role_env = tmp_path / "worker.role.env"
+    role_env.write_text(
+        "\n".join(
+            [
+                f"BLUEPRINT_WORKER_SECRETS_FILE={secrets}",
+                f"BLUEPRINT_WORKER_GOOGLE_CREDENTIALS_FILE={credential}",
+                "BLUEPRINT_CONTROL_PLANE_NETWORK=blueprint-control-plane",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    role_env.chmod(0o600)
+
+    registry_inputs = []
+
+    @contextlib.contextmanager
+    def fake_registry_config(path):
+        registry_inputs.append(path)
+        yield tmp_path / "docker-config"
+
+    monkeypatch.setattr(blueprint, "_migration_registry_config", fake_registry_config)
+    docker_calls = []
+    fail_upgrade = False
+
+    def fake_run(command, **kwargs):
+        nonlocal fail_upgrade
+        docker_calls.append((command, kwargs))
+        if command[-2:] == ["pull", image]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if command[-2:] == ["alembic", "current"]:
+            return SimpleNamespace(
+                returncode=0, stdout="Current revision(s): 0739\n", stderr=""
+            )
+        if command[-3:] == ["alembic", "upgrade", "head"]:
+            return SimpleNamespace(
+                returncode=17 if fail_upgrade else 0,
+                stdout="",
+                stderr="migration failed\n" if fail_upgrade else "",
+            )
+        raise AssertionError(f"unexpected docker command: {command}")
+
+    monkeypatch.setattr(blueprint.subprocess, "run", fake_run)
+    argv = [
+        "migrate", "--local", "--image", image,
+        "--worker-env-file", str(role_env),
+    ]
+
+    assert blueprint.main(argv) == 0
+    assert registry_inputs == [credential]
+    pull = next(command for command, _ in docker_calls if "pull" in command)
+    assert pull[-2:] == ["pull", image]
+    container_calls = [
+        (command, kwargs)
+        for command, kwargs in docker_calls
+        if "run" in command
+    ]
+    assert [command[command.index("alembic"):] for command, _ in container_calls] == [
+        ["alembic", "current"],
+        ["alembic", "upgrade", "head"],
+        ["alembic", "current"],
+    ]
+    for command, kwargs in container_calls:
+        assert image in command
+        assert "--network" in command
+        assert command[command.index("--network") + 1] == "blueprint-control-plane"
+        assert "--env" in command and "DATABASE_URL" in command
+        assert kwargs["env"]["DATABASE_URL"] == (
+            "postgresql+asyncpg://worker:p%40ss@blueprint-postgres:5432/blueprint?ssl=disable"
+        )
+    assert "Current revision(s): 0739" in capsys.readouterr().out
+
+    # Re-running the same command issues the normal idempotent `upgrade head`;
+    # Alembic makes it a no-op when the database is already current.
+    assert blueprint.main(argv) == 0
+    assert sum(
+        command[command.index("alembic"):] == ["alembic", "upgrade", "head"]
+        for command, _ in docker_calls
+        if "alembic" in command
+    ) == 2
+
+    fail_upgrade = True
+    assert blueprint.main(argv) == 17
+    assert "migration container exited 17" in capsys.readouterr().err
 
 
 def test_deploy_refuses_without_promoted_version(monkeypatch, capsys):

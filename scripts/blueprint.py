@@ -42,6 +42,7 @@ See also:
     subcommands.
 """
 import argparse
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -56,6 +57,8 @@ import tempfile
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 from blueprint_api import (
     APIError,
@@ -5522,6 +5525,44 @@ def build_parser() -> argparse.ArgumentParser:
         help="Deploy even when no promoted release version exists or the built "
         "revision does not contain the promoted SHA (emergency override).",
     )
+
+    # migrate
+    p_migrate = sub.add_parser(
+        "migrate", parents=[common],
+        help="Run Alembic against the local serving PostgreSQL in the deployed image.",
+        description=(
+            "Apply local serving-database migrations in a one-off container. "
+            "The --local acknowledgement is required because this command never "
+            "targets the cloud database."
+        ),
+    )
+    p_migrate.add_argument(
+        "--local", action="store_true", required=True,
+        help="Acknowledge that the target is the local blueprint PostgreSQL.",
+    )
+    p_migrate.add_argument(
+        "--sha", help="Migration image revision (prefix ok); defaults to the newest successful main build.",
+    )
+    p_migrate.add_argument(
+        "--image", "--worker-image", dest="image",
+        help="Full immutable worker/app image reference; overrides --sha manifest lookup.",
+    )
+    p_migrate.add_argument(
+        "--worker-env-file",
+        help="Worker role EnvironmentFile (defaults to the installed local worker role).",
+    )
+    p_migrate.add_argument(
+        "--worker-secrets-file",
+        help="Worker secrets JSON (defaults to the worker role configuration).",
+    )
+    p_migrate.add_argument(
+        "--registry-credential-file",
+        help="Worker Artifact Registry credential JSON (defaults to the worker role configuration).",
+    )
+    p_migrate.add_argument(
+        "--network",
+        help="Private Docker network (defaults to BLUEPRINT_CONTROL_PLANE_NETWORK).",
+    )
     p_deploy_agent = sub.add_parser(
         "deploy-agent", parents=[common],
         help="Run the trusted local executor for approved activations.")
@@ -5823,6 +5864,297 @@ _DEPLOY_REPO = "HenryHamster/BlueprintAIStudio"
 _DEPLOY_WORKFLOW = "Deploy Blueprint"
 _DEPLOY_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _DEPLOY_REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
+_MIGRATION_IMAGE_PREFIX = (
+    "us-central1-docker.pkg.dev/blueprint-orchestrator/"
+    "blueprint-repo/blueprint-orchestrator"
+)
+_MIGRATION_IMAGE_RE = re.compile(
+    rf"^{re.escape(_MIGRATION_IMAGE_PREFIX)}@sha256:[0-9a-f]{{64}}$"
+)
+_MIGRATION_REGISTRY = "us-central1-docker.pkg.dev"
+_MIGRATION_DOCKER = "/usr/bin/docker"
+_MIGRATION_NETWORK_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
+
+
+def _migration_secure_file(path_text: str, label: str) -> Path:
+    """Resolve a worker-owned input without following a replacement symlink."""
+    path = Path(path_text)
+    if not path.is_absolute():
+        raise ValueError(f"{label} must be an absolute path")
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise ValueError(f"{label} must be a regular, non-symlink file")
+    if stat.S_IMODE(info.st_mode) & 0o077:
+        raise ValueError(f"{label} must be mode 0600 or stricter")
+    return path
+
+
+def _migration_role_env(path: Path) -> dict[str, str]:
+    """Parse the literal systemd EnvironmentFile used by the worker unit."""
+    values: dict[str, str] = {}
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, separator, value = line.partition("=")
+        if not separator or not re.fullmatch(r"[A-Z][A-Z0-9_]*", key):
+            raise ValueError(f"invalid worker EnvironmentFile entry at line {line_number}")
+        if any(ord(char) < 32 or ord(char) == 127 for char in value):
+            raise ValueError(f"worker EnvironmentFile value for {key} contains control characters")
+        if key in values:
+            raise ValueError(f"worker EnvironmentFile repeats {key}")
+        values[key] = value
+    return values
+
+
+def _migration_worker_values(args: argparse.Namespace) -> tuple[dict[str, str], Path, Path, str]:
+    """Load the exact worker runtime inputs needed by the migration container."""
+    role_path_text = getattr(args, "worker_env_file", None) or os.environ.get(
+        "BLUEPRINT_WORKER_ENV_FILE", ""
+    )
+    if not role_path_text:
+        candidates = sorted(Path("/etc/blueprint/nodes").glob("*/roles/worker/role.env"))
+        if len(candidates) != 1:
+            raise ValueError(
+                "could not identify one installed worker role; pass --worker-env-file"
+            )
+        role_path = _migration_secure_file(
+            str(candidates[0]), "worker EnvironmentFile"
+        )
+    else:
+        role_path = _migration_secure_file(role_path_text, "worker EnvironmentFile")
+    role = _migration_role_env(role_path)
+
+    def configured(name: str, argument: str | None = None) -> str:
+        value = argument or role.get(name) or os.environ.get(name, "")
+        if not value:
+            raise ValueError(f"{name} is required by the worker migration contract")
+        return value
+
+    secrets_path = _migration_secure_file(
+        configured("BLUEPRINT_WORKER_SECRETS_FILE", getattr(args, "worker_secrets_file", None)),
+        "worker secrets file",
+    )
+    credential_path = _migration_secure_file(
+        configured(
+            "BLUEPRINT_WORKER_GOOGLE_CREDENTIALS_FILE",
+            getattr(args, "registry_credential_file", None),
+        ),
+        "worker registry credential file",
+    )
+    network = configured("BLUEPRINT_CONTROL_PLANE_NETWORK", getattr(args, "network", None))
+    if not _MIGRATION_NETWORK_RE.fullmatch(network):
+        raise ValueError("worker control-plane network is not a safe Docker network name")
+    try:
+        secrets = json.loads(secrets_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("worker secrets file is not valid JSON") from exc
+    if not isinstance(secrets, dict) or not secrets:
+        raise ValueError("worker secrets file must contain a non-empty JSON object")
+    if any(
+        not isinstance(key, str)
+        or not isinstance(value, str)
+        or not key
+        or any(ord(char) < 32 or ord(char) == 127 for char in value)
+        for key, value in secrets.items()
+    ):
+        raise ValueError("worker secrets must contain only string values without control characters")
+    database_url = secrets.get("DATABASE_URL")
+    if not database_url:
+        raise ValueError("worker secrets are missing DATABASE_URL")
+    secrets["DATABASE_URL"] = _migration_local_database_url(database_url)
+    return secrets, credential_path, secrets_path, network
+
+
+def _migration_local_database_url(value: str) -> str:
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"postgresql", "postgresql+asyncpg"}:
+        raise ValueError("worker DATABASE_URL must use PostgreSQL")
+    if not parsed.username or parsed.password is None or not parsed.path.strip("/"):
+        raise ValueError("worker DATABASE_URL must include user, password, and database")
+    userinfo = parsed.netloc.rsplit("@", 1)[0]
+    query = [
+        pair for pair in parsed.query.split("&")
+        if pair and pair.partition("=")[0].lower() not in {"ssl", "sslmode"}
+    ]
+    query.append("ssl=disable")
+    return urlunsplit(
+        SplitResult(
+            parsed.scheme,
+            f"{userinfo}@blueprint-postgres:5432",
+            parsed.path,
+            "&".join(query),
+            parsed.fragment,
+        )
+    )
+
+
+def _migration_credential_text(path: Path) -> str:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("worker registry credential is not valid JSON") from exc
+    expected_email = (
+        "blueprint-local-worker-runtime@blueprint-orchestrator.iam.gserviceaccount.com"
+    )
+    if (
+        not isinstance(payload, dict)
+        or payload.get("type") != "service_account"
+        or payload.get("project_id") != "blueprint-orchestrator"
+        or payload.get("client_email") != expected_email
+        or not isinstance(payload.get("private_key"), str)
+    ):
+        raise ValueError("worker registry credential has the wrong identity")
+    return path.read_text(encoding="utf-8")
+
+
+@contextlib.contextmanager
+def _migration_registry_config(credential_path: Path):
+    """Create the same ephemeral Docker login used by local_app_release."""
+    credential_text = _migration_credential_text(credential_path)
+    directory = Path(tempfile.mkdtemp(prefix="blueprint-registry-auth-", dir="/run"))
+    os.chmod(directory, 0o700)
+    cleanup_error: str | None = None
+    try:
+        login = subprocess.run(
+            [
+                _MIGRATION_DOCKER, "--config", str(directory), "login",
+                "--username", "_json_key", "--password-stdin",
+                f"https://{_MIGRATION_REGISTRY}",
+            ],
+            input=credential_text,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if login.returncode != 0:
+            detail = (login.stderr or login.stdout or "").strip()
+            raise RuntimeError(f"registry login failed{': ' + detail if detail else ''}")
+        credential_text = ""
+        yield directory
+    finally:
+        logout = subprocess.run(
+            [_MIGRATION_DOCKER, "--config", str(directory), "logout", _MIGRATION_REGISTRY],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if logout.returncode != 0:
+            cleanup_error = "docker logout failed"
+        try:
+            for entry in directory.iterdir():
+                entry.unlink()
+            directory.rmdir()
+        except OSError as exc:
+            cleanup_error = f"registry credential cleanup failed: {exc}"
+        if cleanup_error:
+            raise RuntimeError(cleanup_error)
+
+
+def _migration_image(args: argparse.Namespace) -> tuple[str, str | None]:
+    image = getattr(args, "image", None)
+    if image:
+        if not _MIGRATION_IMAGE_RE.fullmatch(image):
+            raise ValueError("--image must be the approved immutable Artifact Registry worker image")
+        return image, None
+    release = _fetch_deploy_manifest(getattr(args, "sha", None))
+    return f"{_MIGRATION_IMAGE_PREFIX}@{release['digest']}", release["revision"]
+
+
+def _migration_container_command(
+    config: Path,
+    image: str,
+    network: str,
+    credential_path: Path,
+    environment: dict[str, str],
+    action: tuple[str, ...],
+) -> list[str]:
+    forwarded = sorted(
+        set(environment)
+        | {
+            "BLUEPRINT_PROCESS_ROLE",
+            "BLUEPRINT_DEPLOYMENT_MODE",
+            "PYTHONDONTWRITEBYTECODE",
+            "HOME",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+        }
+    )
+    return [
+        _MIGRATION_DOCKER, "--config", str(config), "run", "--rm",
+        "--network", network, "--pull", "never", "--read-only",
+        "--tmpfs", "/tmp:rw,noexec,nosuid,size=512m", "--cap-drop", "ALL",
+        "--security-opt", "no-new-privileges",
+        "--mount", f"type=bind,src={credential_path},dst=/var/run/blueprint/gcp.json,readonly",
+        *(item for name in forwarded for item in ("--env", name)),
+        image, *action,
+    ]
+
+
+def _run_migration_container(command: list[str], environment: dict[str, str]) -> int:
+    result = subprocess.run(
+        command, capture_output=True, text=True, check=False,
+        timeout=600, env=environment,
+    )
+    if result.stdout:
+        print(result.stdout, end="")
+    if result.stderr:
+        print(result.stderr, end="", file=sys.stderr)
+    if result.returncode != 0:
+        print(f"ERROR: migration container exited {result.returncode}", file=sys.stderr)
+    return result.returncode
+
+
+def cmd_migrate(args: argparse.Namespace) -> int:
+    """Apply local migrations with the selected immutable worker image."""
+    if not args.local:  # argparse requires this; retain the guard for direct callers.
+        print("ERROR: migrate requires --local", file=sys.stderr)
+        return 2
+    try:
+        image, revision = _migration_image(args)
+        secrets, credential_path, _secrets_path, network = _migration_worker_values(args)
+        environment = dict(secrets)
+        environment.update(
+            {
+                "BLUEPRINT_PROCESS_ROLE": "worker",
+                "BLUEPRINT_DEPLOYMENT_MODE": "local-production",
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "HOME": "/tmp",
+                "GOOGLE_APPLICATION_CREDENTIALS": "/var/run/blueprint/gcp.json",
+            }
+        )
+        print("=== LOCAL DATABASE MIGRATION ===")
+        print(f"  Image:     {image}")
+        if revision:
+            print(f"  Revision:  {revision}")
+        with _migration_registry_config(credential_path) as config:
+            pull = subprocess.run(
+                [_MIGRATION_DOCKER, "--config", str(config), "pull", image],
+                capture_output=True, text=True, check=False, timeout=600,
+            )
+            if pull.stdout:
+                print(pull.stdout, end="")
+            if pull.stderr:
+                print(pull.stderr, end="", file=sys.stderr)
+            if pull.returncode != 0:
+                print(f"ERROR: migration image pull exited {pull.returncode}", file=sys.stderr)
+                return pull.returncode
+            base = lambda action: _migration_container_command(
+                config, image, network, credential_path, environment, action
+            )
+            print("  Before:")
+            before = _run_migration_container(base(("alembic", "current")), environment)
+            if before != 0:
+                return before
+            upgrade = _run_migration_container(
+                base(("alembic", "upgrade", "head")), environment
+            )
+            if upgrade != 0:
+                return upgrade
+            print("  After:")
+            return _run_migration_container(base(("alembic", "current")), environment)
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"ERROR: local migration failed: {exc}", file=sys.stderr)
+        return 1
 
 
 def _gh(*gh_args: str) -> str:
@@ -6630,6 +6962,7 @@ _DISPATCH = {
     "knowledge": cmd_knowledge,
     "compute": cmd_compute,
     "deploy": cmd_deploy,
+    "migrate": cmd_migrate,
     "deploy-agent": cmd_deploy_agent,
 }
 
