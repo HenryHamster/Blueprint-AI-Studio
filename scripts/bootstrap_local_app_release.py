@@ -258,7 +258,7 @@ def _deploy_agent_unit(bundle: Path, install_user: str) -> bytes:
         "Environment=PYTHONUNBUFFERED=1\n"
         f"ExecStart=/usr/bin/python3.12 {executable} deploy-agent "
         "--poll-interval 30 "
-        "--lock-path /run/blueprint-deploy-agent/deploy-agent.lock\n"
+        "--lock-path /run/blueprint-deploy-agent/deploy-agent.lock "
         "--state-path /var/lib/blueprint-deploy-agent/deploy-agent.state\n"
         "Restart=always\n"
         "RestartSec=30\n"

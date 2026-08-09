@@ -301,12 +301,23 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
 
     def test_systemd_verify_parses_the_rendered_execution_units(self):
         if not Path("/usr/bin/systemd-analyze").is_file():
-            self.skipTest("systemd-analyze is unavailable; runtime unit verification is deferred")
+            self.skipTest(
+                "systemd-analyze is unavailable at /usr/bin/systemd-analyze; "
+                "runtime unit verification cannot run"
+            )
         with tempfile.TemporaryDirectory() as raw_directory:
             root = Path(raw_directory)
+            deploy_agent_unit = bootstrap._deploy_agent_unit(
+                PurePosixPath("/usr/local/lib/bundle"), "henry_hamster"
+            )
+            deploy_agent_text = deploy_agent_unit.decode()
+            exec_start_lines = [
+                line
+                for line in deploy_agent_text.splitlines()
+                if line.startswith("ExecStart=")
+            ]
             (root / "blueprint-deploy-agent.service").write_bytes(
-                bootstrap._deploy_agent_unit(PurePosixPath("/usr/local/lib/bundle"), "henry_hamster")
-                .replace(b"/usr/bin/python3.12", b"/usr/bin/true")
+                deploy_agent_unit.replace(b"/usr/bin/python3.12", b"/usr/bin/true")
             )
             (root / "blueprint-release.service").write_bytes(
                 bootstrap._release_service_unit().replace(
@@ -329,6 +340,37 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+            diagnostics = "\n".join(
+                output for output in (result.stdout, result.stderr) if output
+            )
+            parse_defect_markers = (
+                "missing '='",
+                "ignoring line",
+                "unknown lvalue",
+                "unknown section",
+                "unknown key name",
+                "unknown directive",
+                "ignoring",
+            )
+            parse_defects = [
+                line
+                for line in diagnostics.splitlines()
+                if any(marker in line.lower() for marker in parse_defect_markers)
+            ]
+            self.assertFalse(
+                parse_defects,
+                "systemd-analyze reported unit parse defects:\n"
+                + (diagnostics or "<no diagnostics>"),
+            )
+            self.assertEqual(
+                len(exec_start_lines),
+                1,
+                deploy_agent_text,
+            )
+            self.assertIn(
+                "--state-path /var/lib/blueprint-deploy-agent/deploy-agent.state",
+                exec_start_lines[0],
+            )
 
     def test_effective_properties_keep_agent_hardened_and_release_root(self):
         outputs = iter(
