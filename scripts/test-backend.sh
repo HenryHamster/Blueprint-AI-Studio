@@ -44,7 +44,12 @@ for arg in "$@"; do
     --no-postgres) USE_POSTGRES=0 ;;
     --no-testmon) USE_TESTMON=0 ;;
     --require-testmon) REQUIRE_TESTMON=1 ;;
-    *) ARGS+=("$arg") ;;
+    *)
+      case "$arg" in
+        backend/*) ARGS+=("${arg#backend/}") ;;
+        *) ARGS+=("$arg") ;;
+      esac
+      ;;
   esac
 done
 if [ "${#ARGS[@]}" -gt 0 ]; then set -- "${ARGS[@]}"; else set --; fi
@@ -492,6 +497,12 @@ if [ "$USE_POSTGRES" = "1" ]; then
       if docker exec "$PG_CONTAINER" pg_isready -U test &>/dev/null; then break; fi
       sleep 0.5
     done
+  fi
+  echo "=== Checking migration-required PostgreSQL extensions ==="
+  if [ "$SANDBOX_POSTGRES" = "1" ]; then
+    verify_required_postgres_extensions "$PG_BIN/psql" -h "$PG_SOCKET" -U test -d test_blueprint
+  else
+    verify_required_postgres_extensions docker exec "$PG_CONTAINER" psql -U test -d test_blueprint
   fi
   echo "=== Running alembic migrations ==="
   _run python3 -m alembic upgrade head

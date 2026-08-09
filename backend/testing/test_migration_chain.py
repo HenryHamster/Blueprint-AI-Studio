@@ -2,7 +2,10 @@
 auto-merge guard that consumes them."""
 
 import ast
+import os
 from pathlib import Path
+import re
+import subprocess
 from unittest.mock import patch
 
 from app.migration_chain import (
@@ -82,6 +85,64 @@ def test_migration_files_do_not_import_app_modules():
         "resolve against the serving tree rather than the candidate. "
         f"Offenders: {offenders}"
     )
+
+
+def test_sandbox_bridge_covers_every_migration_required_extension(tmp_path: Path):
+    """The off-image bridge must fail diagnostically before Alembic runs.
+
+    This exercises the production shell helper with a narrow fake psql command
+    and derives the extension inventory from the immutable migration sources,
+    so a future contrib requirement cannot silently become another opaque
+    migration failure.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    versions_dir = repo_root / "backend" / "alembic" / "versions"
+    required: dict[str, list[str]] = {}
+    extension_pattern = re.compile(
+        r"CREATE EXTENSION IF NOT EXISTS ([A-Za-z0-9_]+)"
+    )
+    for path in sorted(versions_dir.glob("*.py")):
+        for extension in extension_pattern.findall(path.read_text()):
+            required.setdefault(extension, []).append(
+                path.relative_to(repo_root).as_posix()
+            )
+
+    helper = (repo_root / "scripts" / "backend-test-route.sh").read_text()
+    probe = (repo_root / "scripts" / "project-verification-probe.sh").read_text()
+    assert required == {"pg_trgm": [
+        "backend/alembic/versions/0122_artifact_pr_url_trgm_index.py",
+        "backend/alembic/versions/0145_knowledge_documents.py",
+        "backend/alembic/versions/0529_add_task_search_trgm_indexes.py",
+        "backend/alembic/versions/0714_repair_strategic_conversation_correctness.py",
+    ]}
+    for extension, migrations in required.items():
+        for migration in migrations:
+            assert f"'{extension}|{migration}'" in helper
+    assert "extension=\"pg_trgm\"" in probe
+    assert "0122_artifact_pr_url_trgm_index.py" in probe
+
+    fake_psql = tmp_path / "psql"
+    fake_psql.write_text("#!/bin/sh\nprintf '%s\\n' \"$PSQL_RESULT\"\n")
+    fake_psql.chmod(0o755)
+    check = (
+        "source scripts/backend-test-route.sh; "
+        "verify_required_postgres_extensions \"$FAKE_PSQL\""
+    )
+    env = os.environ.copy()
+    env["FAKE_PSQL"] = str(fake_psql)
+    env["PSQL_RESULT"] = "1"
+    passed = subprocess.run(
+        ["bash", "-c", check], cwd=repo_root, env=env, capture_output=True, text=True
+    )
+    assert passed.returncode == 0, passed.stderr
+
+    env["PSQL_RESULT"] = ""
+    missing = subprocess.run(
+        ["bash", "-c", check], cwd=repo_root, env=env, capture_output=True, text=True
+    )
+    assert missing.returncode != 0
+    assert "pg_trgm" in missing.stderr
+    assert "0122_artifact_pr_url_trgm_index.py" in missing.stderr
 # ── Pure helper ─────────────────────────────────────────────────────────────
 
 

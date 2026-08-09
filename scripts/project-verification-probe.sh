@@ -115,6 +115,25 @@ if [ "$PROBE_MODE" = "all" ] || [ "$PROBE_MODE" = "docker-postgres" ]; then
     echo "Sandbox PostgreSQL verification failed: SELECT 1 returned an unexpected result" >&2
     exit 1
   fi
+
+  # The v1 receipt must prove the same contrib surface that the immutable
+  # migration chain requires. pgserver's base wheel starts PostgreSQL but does
+  # not install pg_trgm; fail here with the migration that first needs it,
+  # before a runner can advertise a misleading verification capability.
+  extension="pg_trgm"
+  migration="backend/alembic/versions/0122_artifact_pr_url_trgm_index.py"
+  extension_result="$(
+    timeout "$COMMAND_TIMEOUT_SECONDS" "$POSTGRES_BIN/psql" \
+      -h "$POSTGRES_SOCKET" -U postgres -d postgres -tAc \
+      "SELECT 1 FROM pg_available_extensions WHERE name = '$extension'" 2>&1
+  )" || {
+    echo "Sandbox PostgreSQL verification failed: extension '$extension' required by $migration is unavailable: $extension_result" >&2
+    exit 1
+  }
+  if [ "$(printf '%s' "$extension_result" | tr -d '[:space:]')" != "1" ]; then
+    echo "Sandbox PostgreSQL verification failed: extension '$extension' required by $migration is missing (pg_available_extensions returned: $extension_result)" >&2
+    exit 1
+  fi
 fi
 
 echo "PROJECT_VERIFICATION_V1_OK"
