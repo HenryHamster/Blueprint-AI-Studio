@@ -468,3 +468,138 @@ class TestResolveDeployedShaRemainder:
         )
         result = await deployed_sha.resolve_deployed_sha()
         assert result == _GIT_SHA
+
+
+class TestAtMostOnceReleaseFence:
+    """The deploy agent must invoke the release shim exactly once even when the
+    root executor outlives the client socket timeout.
+
+    Drives _request_release_socket over a real Unix socket with a genuine
+    timeout — the sleep outlives the patched 1-second timeout so the fence
+    fires exactly as it does in production.  Cost-only side effects (real
+    deploys, network egress) are stubbed; the elapsed-time relationship is not.
+    """
+
+    _PROMOTED: ClassVar[dict] = {
+        "version_number": 30,
+        "status": "promoted",
+        "promoted_sha": _GIT_SHA,
+        "serving_status": "unconfirmed",
+        "activation_requested_at": "2026-08-09T00:00:00Z",
+    }
+
+    def test_slow_release_is_accepted_exactly_once(self, monkeypatch, tmp_path):
+        import socket as _sock
+        import threading
+        import time as _time
+
+        socket_path = str(tmp_path / "release.sock")
+        state_path = str(tmp_path / "deploy-agent.state")
+        digest = "sha256:" + "0" * 64
+
+        # Real Unix socket server: accepts the client request, then sleeps past
+        # the patched 1-second client timeout before responding.
+        server_ready = threading.Event()
+        requests_received: list[str] = []
+
+        def _slow_server() -> None:
+            srv = _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM)
+            try:
+                srv.bind(socket_path)
+                srv.listen(1)
+                server_ready.set()
+                conn, _ = srv.accept()
+                try:
+                    data = b""
+                    while b"\n" not in data:
+                        chunk = conn.recv(256)
+                        if not chunk:
+                            break
+                        data += chunk
+                    requests_received.append(data.decode("ascii").strip())
+                    _time.sleep(3.0)  # outlives the patched 1-second client timeout
+                    conn.sendall(b"OK\n")
+                finally:
+                    conn.close()
+            finally:
+                srv.close()
+
+        server_thread = threading.Thread(target=_slow_server, daemon=True)
+        server_thread.start()
+        assert server_ready.wait(timeout=3), "socket server failed to start"
+
+        # Patch elapsed-time parameters so the test completes in ~1 second.
+        monkeypatch.setattr(deploy_blueprint, "_RELEASE_SOCKET_PATH", socket_path)
+        monkeypatch.setattr(deploy_blueprint, "_RELEASE_SOCKET_TIMEOUT_SECONDS", 1)
+
+        # Stub expensive side effects — never the elapsed-time relationship.
+        monkeypatch.setattr(deploy_blueprint, "_require_write_config", lambda _a: None)
+        monkeypatch.setattr(
+            deploy_blueprint,
+            "_read_live_approved_activation",
+            lambda _a: dict(self._PROMOTED),
+        )
+        monkeypatch.setattr(
+            deploy_blueprint,
+            "_fetch_deploy_manifest",
+            lambda _sha: {
+                "run": {"databaseId": 1234},
+                "digest": digest,
+                "revision": _GIT_SHA,
+            },
+        )
+        monkeypatch.setattr(
+            deploy_blueprint,
+            "_validate_deploy_binding",
+            lambda _rev, _approved: None,
+        )
+        monkeypatch.setattr(
+            deploy_blueprint, "get_project_id", lambda _project_id=None: "project-1"
+        )
+        # Second-invocation confirmation: pretend the promoted revision is serving.
+        monkeypatch.setattr(deploy_blueprint, "_local_served_sha", lambda: _GIT_SHA)
+
+        receipt_calls: list[tuple] = []
+
+        def _fake_api(method, path, body=None, timeout=30):
+            receipt_calls.append((method, path, body))
+            return {
+                "version_number": 30,
+                "serving_status": "serving_confirmed",
+                "served_sha": _GIT_SHA,
+            }
+
+        monkeypatch.setattr(deploy_blueprint, "api", _fake_api)
+
+        args = type("Args", (), {
+            "project_id": None,
+            "host": "control-plane",
+            "state_path": state_path,
+            "poll_state_path": None,
+        })()
+
+        # --- First invocation: shim fires, timeout fires mid-recv ---
+        result1 = deploy_blueprint._deploy_agent_once(args)
+
+        # 1. Client returns False — must not raise.
+        assert result1 is False
+
+        # 2. State persisted at phase='accepted', not 'failed' or stuck at 'started'.
+        persisted = deploy_blueprint._read_deploy_agent_state(state_path)
+        assert persisted is not None
+        assert persisted.get("phase") == "accepted"
+
+        # --- Second invocation: must not re-invoke the shim ---
+        deploy_blueprint._deploy_agent_once(args)
+
+        # 3. The socket received exactly one request across both invocations.
+        assert len(requests_received) == 1
+
+        # 4. Exactly one receipt was posted.
+        receipt_posts = [
+            c for c in receipt_calls
+            if c[0] == "POST" and "activation-receipt" in (c[1] or "")
+        ]
+        assert len(receipt_posts) == 1
+
+        server_thread.join(timeout=5)
