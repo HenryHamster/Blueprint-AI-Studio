@@ -4981,6 +4981,21 @@ async def orchestrator_worker():
                 # app.orchestrator_ci_monitor._monitor_evaluating_tasks
                 # (re-exported above). Behaviour-preserving.
                 await _monitor_evaluating_tasks(session)
+                # Terminal rollup PR reconciliation has a different candidate
+                # population and cadence from the active CI monitor. Keep it on
+                # this leader loop, but let its own five-minute gate avoid adding
+                # latency to every orchestrator cycle.
+                try:
+                    from app.terminal_rollup_pr_sweep import (
+                        maybe_sweep_terminal_rollup_prs,
+                    )
+
+                    await maybe_sweep_terminal_rollup_prs(session)
+                except Exception:
+                    logger.exception(
+                        "[ORCHESTRATOR] Terminal rollup PR sweep failed"
+                    )
+                    await session.rollback()
                 # Post-commit recovery is handled by `_sweep_post_commit_pending`
                 # in services.py — it calls `_process_post_commit` (which knows
                 # how to spawn the right follow-up for every task type, including
