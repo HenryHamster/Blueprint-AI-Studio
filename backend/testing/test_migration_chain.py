@@ -96,6 +96,14 @@ def test_sandbox_bridge_covers_every_migration_required_extension(tmp_path: Path
     migration failure.
     """
     repo_root = Path(__file__).resolve().parents[2]
+    # In CI the backend/ tree is the Docker build context, so parents[2]
+    # resolves to a mount root without the repo-root scripts/ dir; the full
+    # repo is mounted at /repo there (mirrors the _REPO_ROOT fallback in
+    # test_check_gate_fail_closed.py).
+    if not (repo_root / "scripts" / "backend-test-route.sh").exists() and (
+        Path("/repo") / "scripts" / "backend-test-route.sh"
+    ).exists():
+        repo_root = Path("/repo")
     versions_dir = repo_root / "backend" / "alembic" / "versions"
     required: dict[str, list[str]] = {}
     extension_pattern = re.compile(

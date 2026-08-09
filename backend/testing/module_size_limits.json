@@ -335,6 +335,7 @@
     "test_reaper_sweeps_compute_image.py": 3500,
     "test_acceptance_gate.py": 5700,
     "test_migration_apply_gate.py": 3350,
+    "test_migration_chain.py": 1650,
     "test_warm_vm_integration.py": 3350,
     "test_auto_remediation.py": 3300,
     "test_admin_pool_accounts.py": 3200,
