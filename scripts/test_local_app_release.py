@@ -1063,6 +1063,47 @@ class LocalAppReleaseTests(unittest.TestCase):
                 "rollback_refused",
             )
 
+    def test_image_schema_revision_parses_one_expected_revision_and_fails_closed(self):
+        with patch.object(
+            release.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess(
+                ["docker", "run"],
+                0,
+                'EXPECTED_SCHEMA_REVISION = "0740"\n',
+                "",
+            ),
+        ) as run_mock:
+            self.assertEqual(release._image_schema_revision(OLD_IMAGE), "0740")
+        self.assertEqual(run_mock.call_args.kwargs["timeout"], 60)
+
+        for stdout in ("", 'EXPECTED_SCHEMA_REVISION = "0740"\n' * 2):
+            with self.subTest(stdout=stdout), patch.object(
+                release.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess([], 0, stdout, ""),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "one schema revision"):
+                    release._image_schema_revision(OLD_IMAGE)
+
+    def test_database_schema_revision_parses_one_head_and_fails_closed(self):
+        with patch.object(
+            release.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, "0740\n", ""),
+        ) as run_mock:
+            self.assertEqual(release._database_schema_revision(), "0740")
+        self.assertEqual(run_mock.call_args.kwargs["timeout"], 30)
+
+        for stdout in ("", "0740\n0741\n"):
+            with self.subTest(stdout=stdout), patch.object(
+                release.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess([], 0, stdout, ""),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "one schema head"):
+                    release._database_schema_revision()
+
     def test_rollback_proceeds_when_prior_image_schema_matches_db(self):
         with self._release_patches(
             health_error=RuntimeError("candidate health failed")

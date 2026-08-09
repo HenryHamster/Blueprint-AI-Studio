@@ -5874,6 +5874,12 @@ _MIGRATION_IMAGE_RE = re.compile(
 _MIGRATION_REGISTRY = "us-central1-docker.pkg.dev"
 _MIGRATION_DOCKER = "/usr/bin/docker"
 _MIGRATION_NETWORK_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
+_MIGRATION_HARDENING_ARGS = (
+    "--pull", "never", "--read-only",
+    "--tmpfs", "/tmp:rw,noexec,nosuid,size=512m",
+    "--cap-drop", "ALL",
+    "--security-opt", "no-new-privileges",
+)
 
 
 def _migration_secure_file(path_text: str, label: str) -> Path:
@@ -6081,9 +6087,7 @@ def _migration_container_command(
     )
     return [
         _MIGRATION_DOCKER, "--config", str(config), "run", "--rm",
-        "--network", network, "--pull", "never", "--read-only",
-        "--tmpfs", "/tmp:rw,noexec,nosuid,size=512m", "--cap-drop", "ALL",
-        "--security-opt", "no-new-privileges",
+        "--network", network, *_MIGRATION_HARDENING_ARGS,
         "--mount", f"type=bind,src={credential_path},dst=/var/run/blueprint/gcp.json,readonly",
         *(item for name in forwarded for item in ("--env", name)),
         image, *action,

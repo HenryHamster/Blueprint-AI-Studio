@@ -5823,6 +5823,15 @@ def test_migrate_local_runs_alembic_upgrade_against_local_db(monkeypatch, tmp_pa
         assert image in command
         assert "--network" in command
         assert command[command.index("--network") + 1] == "blueprint-control-plane"
+        assert command[command.index("--pull") + 1] == "never"
+        assert "--read-only" in command
+        assert command[command.index("--cap-drop") + 1] == "ALL"
+        assert command[command.index("--security-opt") + 1] == "no-new-privileges"
+        assert command[command.index("--tmpfs") + 1] == "/tmp:rw,noexec,nosuid,size=512m"
+        assert (
+            f"type=bind,src={credential},dst=/var/run/blueprint/gcp.json,readonly"
+            in command
+        )
         assert "--env" in command and "DATABASE_URL" in command
         assert kwargs["env"]["DATABASE_URL"] == (
             "postgresql+asyncpg://worker:p%40ss@blueprint-postgres:5432/blueprint?ssl=disable"
@@ -5841,6 +5850,111 @@ def test_migrate_local_runs_alembic_upgrade_against_local_db(monkeypatch, tmp_pa
     fail_upgrade = True
     assert blueprint.main(argv) == 17
     assert "migration container exited 17" in capsys.readouterr().err
+
+
+def test_migration_credential_text_pins_worker_service_account_identity(tmp_path):
+    credential = {
+        "type": "service_account",
+        "project_id": "blueprint-orchestrator",
+        "client_email": (
+            "blueprint-local-worker-runtime@blueprint-orchestrator.iam.gserviceaccount.com"
+        ),
+        "private_key": "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----",
+    }
+    path = tmp_path / "credential.json"
+    text = json.dumps(credential)
+    path.write_text(text, encoding="utf-8")
+
+    assert blueprint._migration_credential_text(path) == text
+
+    for field, value in (
+        ("type", "authorized_user"),
+        ("project_id", "another-project"),
+        ("client_email", "other@blueprint-orchestrator.iam.gserviceaccount.com"),
+    ):
+        invalid = dict(credential, **{field: value})
+        path.write_text(json.dumps(invalid), encoding="utf-8")
+        with pytest.raises(ValueError, match="wrong identity"):
+            blueprint._migration_credential_text(path)
+
+    path.write_text("{not valid json", encoding="utf-8")
+    with pytest.raises(ValueError, match="not valid JSON"):
+        blueprint._migration_credential_text(path)
+
+
+def test_migration_secure_file_rejects_links_and_insecure_modes(tmp_path):
+    regular = tmp_path / "regular"
+    regular.write_text("safe", encoding="utf-8")
+    regular.chmod(0o600)
+    assert blueprint._migration_secure_file(str(regular), "input") == regular
+
+    insecure = tmp_path / "insecure"
+    insecure.write_text("unsafe", encoding="utf-8")
+    insecure.chmod(0o640)
+    with pytest.raises(ValueError, match="0600"):
+        blueprint._migration_secure_file(str(insecure), "input")
+
+    link = tmp_path / "link"
+    link.symlink_to(regular)
+    with pytest.raises(ValueError, match="non-symlink"):
+        blueprint._migration_secure_file(str(link), "input")
+
+
+def test_migration_worker_values_rejects_untrusted_secret_shapes_and_accepts_valid_input(
+    tmp_path,
+):
+    credential = tmp_path / "credential.json"
+    credential.write_text("{}", encoding="utf-8")
+    credential.chmod(0o600)
+    role = tmp_path / "role.env"
+    role.write_text(
+        f"BLUEPRINT_WORKER_SECRETS_FILE={tmp_path / 'secrets.json'}\n"
+        f"BLUEPRINT_WORKER_GOOGLE_CREDENTIALS_FILE={credential}\n"
+        "BLUEPRINT_CONTROL_PLANE_NETWORK=blueprint-control-plane\n",
+        encoding="utf-8",
+    )
+    role.chmod(0o600)
+    secrets = tmp_path / "secrets.json"
+
+    args = argparse.Namespace(worker_env_file=str(role))
+    valid = {
+        "DATABASE_URL": "postgresql+asyncpg://worker:p%40ss@ignored:5432/blueprint",
+        "GITHUB_PAT_ENCRYPTION_KEY": "x" * 43,
+    }
+    secrets.write_text(json.dumps(valid), encoding="utf-8")
+    secrets.chmod(0o600)
+    values, credential_path, secrets_path, network = blueprint._migration_worker_values(args)
+    assert values["DATABASE_URL"] == (
+        "postgresql+asyncpg://worker:p%40ss@blueprint-postgres:5432/blueprint?ssl=disable"
+    )
+    assert credential_path == credential
+    assert secrets_path == secrets
+    assert network == "blueprint-control-plane"
+
+    for invalid in (
+        ["not", "an", "object"],
+        {"DATABASE_URL": ["not a string"]},
+        {"DATABASE_URL": "postgresql://worker:password@db:5432/blueprint\x1f"},
+    ):
+        secrets.write_text(json.dumps(invalid), encoding="utf-8")
+        with pytest.raises(ValueError, match="worker secrets"):
+            blueprint._migration_worker_values(args)
+
+
+def test_migration_image_requires_approved_immutable_artifact_registry_reference():
+    valid = (
+        "us-central1-docker.pkg.dev/blueprint-orchestrator/blueprint-repo/"
+        "blueprint-orchestrator@sha256:" + "a" * 64
+    )
+    assert blueprint._migration_image(argparse.Namespace(image=valid)) == (valid, None)
+
+    for invalid in (
+        "docker.io/library/worker:latest",
+        valid.replace("blueprint-repo", "other-repo"),
+        valid[:-1] + "g",
+    ):
+        with pytest.raises(ValueError, match="approved immutable"):
+            blueprint._migration_image(argparse.Namespace(image=invalid))
 
 
 def test_deploy_refuses_without_promoted_version(monkeypatch, capsys):
