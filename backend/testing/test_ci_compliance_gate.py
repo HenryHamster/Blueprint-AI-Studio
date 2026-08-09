@@ -2081,21 +2081,19 @@ def test_agent_status_decomposition_resolves_size_breach():
 
 
 def test_acceptance_gate_decomposition_resolves_size_breach():
-    """The chronic acceptance gate keeps its cap while moving pure invariants.
+    """The acceptance gate stays within its current committed cap.
 
-    Automain b48e4cee reported ``acceptance_gate.py`` at 3218 lines over its
-    unchanged 3150 cap.  The acceptance-window sub-score invariant guard is a
-    cohesive pure cluster, so it must live in a sibling module while remaining
-    available through ``app.acceptance_gate`` for existing callers.
+    Mainline later raised the cap to 3650 in e6bd88cf while retaining the
+    acceptance-window invariant extraction and compatibility exports.
     """
     json_path = os.path.join(os.path.dirname(__file__), "module_size_limits.json")
     data = csl.load_limits(json_path)
     backend_caps = data.get("backend", {})
 
     target_rel = "acceptance_gate.py"
-    assert backend_caps.get(target_rel) == 3150, (
-        f"{target_rel} cap must remain the chronic-offender cap 3150; "
-        f"got {backend_caps.get(target_rel)}. Decompose instead of bumping."
+    assert backend_caps.get(target_rel) == 3650, (
+        f"{target_rel} cap must match mainline's committed cap 3650; "
+        f"got {backend_caps.get(target_rel)}."
     )
 
     backend_app_root = os.path.normpath(
@@ -2105,8 +2103,7 @@ def test_acceptance_gate_decomposition_resolves_size_breach():
     assert os.path.isfile(target_path), f"{target_path} must exist on disk"
     actual_count = csl.count_lines(target_path)
     assert actual_count <= backend_caps[target_rel], (
-        f"{target_rel} has {actual_count} lines over its unchanged cap 3150; "
-        "extract a cohesive cluster instead of raising the cap"
+        f"{target_rel} has {actual_count} lines over its committed cap 3650"
     )
 
     sibling_path = os.path.join(backend_app_root, "acceptance_window_invariants.py")
@@ -2473,6 +2470,11 @@ def test_test_files_within_size_limits():
         "module_size_limits.json must define a non-empty 'testing' section. "
         "Run `python3 backend/testing/check_size_limits.py --fix --sections testing` "
         "and commit the updated JSON."
+    )
+    acceptance_criteria_cap = testing_caps.get("test_acceptance_criteria.py")
+    assert acceptance_criteria_cap == 15750, (
+        "test_acceptance_criteria.py must use the canonical 13663-line breach "
+        f"cap bump to 15750; got {acceptance_criteria_cap}"
     )
 
     testing_root = os.path.normpath(os.path.dirname(__file__))
