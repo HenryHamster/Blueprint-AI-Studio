@@ -59,6 +59,18 @@ def _git_fixture(
     return repo, base_sha, head_sha, integration_sha
 
 
+def _non_integration_merge_fixture(tmp_path: Path) -> tuple[Path, str, str, str]:
+    """Create an approved commit merged to research but absent from main."""
+    repo, base_sha, head_sha, _ = _git_fixture(tmp_path)
+    _run("git", "checkout", "-b", "research/staging", cwd=repo)
+    (repo / "staging.txt").write_text("research staging\n", encoding="utf-8")
+    _run("git", "add", ".", cwd=repo)
+    _run("git", "commit", "-m", "research staging", cwd=repo)
+    _run("git", "merge", "--no-ff", "approved-work", "-m", "merge approved work", cwd=repo)
+    merge_commit_sha = _run("git", "rev-parse", "HEAD", cwd=repo)
+    return repo, base_sha, head_sha, merge_commit_sha
+
+
 def test_inspect_flags_clean_strand_and_ignores_ancestor(tmp_path: Path):
     repo, base_sha, head_sha, integration_sha = _git_fixture(tmp_path)
 
@@ -167,6 +179,71 @@ async def test_sweep_alerts_after_two_qualification_cycles(db_session, tmp_path:
     ).scalar_one()
     assert "PR #17048" in alert.message
     assert "merge-tree classification: clean" in alert.message
+
+
+@pytest.mark.asyncio
+async def test_sweep_detects_strand_on_non_integration_branch(
+    db_session, tmp_path: Path
+):
+    repo, base_sha, head_sha, merge_commit_sha = _non_integration_merge_fixture(tmp_path)
+    project = Project(
+        name="Non-integration strand project",
+        user_id="test-user",
+        integration_branch="main",
+    )
+    db_session.add(project)
+    await db_session.flush()
+    task = Task(
+        project_id=project.id,
+        title="research branch merge",
+        status=TaskStatus.COMPLETED,
+        archived=True,
+        created_by="TEST",
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "merge_commit_sha": merge_commit_sha,
+            "review_loop": {
+                "review_approved": False,
+                "review_target": {
+                    "project_id": str(project.id),
+                    "pr_number": 17141,
+                    "base_sha": base_sha,
+                    "head_sha": head_sha,
+                },
+            },
+        },
+    )
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        active_qualification_attempt_id=uuid.uuid4(),
+    )
+    db_session.add(task)
+    db_session.add(version)
+    await db_session.commit()
+
+    first = await sweep_approved_pr_stranding(db_session, repo_root=str(repo))
+    assert first["stranded"] == 1
+    assert first["alerts_created"] == 0
+    assert task.context["approved_pr_stranding"]["checked_commit_sha"] == merge_commit_sha
+
+    version.active_qualification_attempt_id = uuid.uuid4()
+    db_session.add(version)
+    await db_session.commit()
+    second = await sweep_approved_pr_stranding(db_session, repo_root=str(repo))
+    assert second["alerts_created"] == 1
+    alert = (
+        await db_session.execute(
+            select(Alert).where(
+                Alert.event_type == "release.approved_pr_stranded",
+                Alert.project_id == project.id,
+            )
+        )
+    ).scalar_one()
+    assert "PR #17141" in alert.message
+    assert merge_commit_sha in alert.message
 
 
 @pytest.mark.asyncio

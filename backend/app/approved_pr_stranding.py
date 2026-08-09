@@ -17,10 +17,17 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
 
+from sqlalchemy import and_, or_
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.branch_resolution import get_project_integration_branch
+from app.landed_signal import (
+    LANDED_MERGE_SHA_KEY,
+    LANDED_ON_INTEGRATION_KEY,
+    LANDED_SIGNAL_KEY,
+    STRANDED_LANDING_REASON_KEY,
+)
 from app.models import Alert, AlertSeverity, Project, ReleaseVersion, Task
 from app.time_utils import _utcnow
 
@@ -56,6 +63,7 @@ class _ApprovedPrCandidate:
     pr_number: int | None
     base_sha: str | None
     head_sha: str | None
+    commit_sha: str | None
     target_valid: bool
     target_reason: str | None = None
 
@@ -164,6 +172,36 @@ def inspect_approved_pr(
             merge_base_sha,
             "git merge-tree check failed",
         )
+    if (
+        merge_tree.returncode != 0
+        and "unknown rev --write-tree" in merge_tree.stderr
+    ):
+        # Git 2.34 (still present on some self-hosted workers) has the older
+        # three-revision interface but not --write-tree.  Its exit status has
+        # the same conflict contract, while the output remains intentionally
+        # ignored so conflict-marker text in a clean file cannot false-positive.
+        merge_tree = _git(
+            ["merge-tree", merge_base_sha, integration_head_sha, head_sha],
+            repo_root=repo_root,
+        )
+        if merge_tree is None:
+            return ApprovedPrEvidence(
+                "unknown",
+                "unknown",
+                integration_head_sha,
+                merge_base_sha,
+                "legacy git merge-tree check failed",
+            )
+        if any(
+            marker in f"{merge_tree.stdout}\n{merge_tree.stderr}"
+            for marker in ("changed in both", "removed in both", "added in both", "CONFLICT")
+        ):
+            merge_tree = subprocess.CompletedProcess(
+                merge_tree.args,
+                1,
+                merge_tree.stdout,
+                merge_tree.stderr,
+            )
     # The --write-tree interface uses its exit status as the conflict signal.
     # Do not scan stdout/stderr: that stream includes merged file content,
     # which may legitimately document conflict markers.
@@ -190,24 +228,61 @@ def inspect_approved_pr(
 def _candidate_from_task(task: Task, project: Project) -> _ApprovedPrCandidate | None:
     context = task.context or {}
     review_loop = context.get("review_loop") or {}
-    if review_loop.get("review_approved") is not True:
+    merged_without_integration_landing = (
+        context.get(LANDED_SIGNAL_KEY) is True
+        and context.get(LANDED_ON_INTEGRATION_KEY) is False
+    )
+    if (
+        review_loop.get("review_approved") is not True
+        and not merged_without_integration_landing
+        and not context.get(STRANDED_LANDING_REASON_KEY)
+    ):
         return None
     target = review_loop.get("review_target")
-    if not isinstance(target, dict):
-        return _ApprovedPrCandidate(
-            task, project, None, None, None, False, "approved review has no review_target"
+    merge_commit_sha = context.get(LANDED_MERGE_SHA_KEY)
+    if not isinstance(merge_commit_sha, str) or not merge_commit_sha.strip():
+        merge_commit_sha = None
+    merged_evidence = bool(
+        merge_commit_sha
+        and (
+            merged_without_integration_landing
+            or context.get(STRANDED_LANDING_REASON_KEY)
         )
-    pr_number = target.get("pr_number")
-    base_sha = target.get("base_sha")
-    head_sha = target.get("head_sha")
+    )
+    if not isinstance(target, dict) and not merged_evidence:
+        return _ApprovedPrCandidate(
+            task,
+            project,
+            None,
+            None,
+            merge_commit_sha,
+            merge_commit_sha,
+            False,
+            "approved or merged review has no review_target",
+        )
+    target = target if isinstance(target, dict) else {}
+    pr_number = (
+        target.get("pr_number")
+        or review_loop.get("pr_number")
+        or context.get("rollup_pr_number")
+        or context.get("pr_number")
+    )
+    base_sha = (
+        target.get("base_sha")
+        or review_loop.get("base_sha")
+        or context.get("base_sha")
+        or ("merged-commit" if merged_evidence else None)
+    )
+    head_sha = target.get("head_sha") or review_loop.get("head_sha")
+    commit_sha = merge_commit_sha or head_sha
     if (
         isinstance(pr_number, bool)
         or not isinstance(pr_number, int)
         or pr_number <= 0
         or not isinstance(base_sha, str)
         or not base_sha.strip()
-        or not isinstance(head_sha, str)
-        or not head_sha.strip()
+        or not isinstance(commit_sha, str)
+        or not commit_sha.strip()
     ):
         return _ApprovedPrCandidate(
             task,
@@ -215,11 +290,18 @@ def _candidate_from_task(task: Task, project: Project) -> _ApprovedPrCandidate |
             pr_number if isinstance(pr_number, int) and not isinstance(pr_number, bool) else None,
             base_sha if isinstance(base_sha, str) and base_sha.strip() else None,
             head_sha if isinstance(head_sha, str) and head_sha.strip() else None,
+            commit_sha if isinstance(commit_sha, str) and commit_sha.strip() else None,
             False,
             "approved review target is incomplete or malformed",
         )
     return _ApprovedPrCandidate(
-        task, project, pr_number, base_sha.strip(), head_sha.strip(), True
+        task,
+        project,
+        pr_number,
+        base_sha.strip(),
+        head_sha.strip() if isinstance(head_sha, str) and head_sha.strip() else None,
+        commit_sha.strip(),
+        True,
     )
 
 
@@ -243,7 +325,7 @@ def _observation_for(
 ) -> tuple[dict[str, Any], bool]:
     task = candidate.task
     old = (task.context or {}).get(_OBSERVATION_KEY) or {}
-    identity = f"{candidate.pr_number}:{candidate.head_sha or 'unknown'}"
+    identity = f"{candidate.pr_number}:{candidate.commit_sha or 'unknown'}"
     if old.get("identity") != identity:
         old = {}
     cycle_ids = list(old.get("qualification_cycle_ids") or [])
@@ -255,6 +337,7 @@ def _observation_for(
         "pr_number": candidate.pr_number,
         "base_sha": candidate.base_sha,
         "head_sha": candidate.head_sha,
+        "checked_commit_sha": candidate.commit_sha,
         "state": evidence.state,
         "mergeability": evidence.mergeability,
         "integration_branch": get_project_integration_branch(candidate.project),
@@ -276,7 +359,7 @@ def _observation_for(
 
 
 async def sweep_approved_pr_stranding(session, *, repo_root: str = _REPO_ROOT) -> dict[str, int]:
-    """Scan approved review targets and alert only after one cycle of grace.
+    """Scan approved targets and durable merged records for non-landed work.
 
     Task observations are committed before alerts.  That ordering makes the
     detector's evidence durable even if alert creation or notification later
@@ -287,8 +370,32 @@ async def sweep_approved_pr_stranding(session, *, repo_root: str = _REPO_ROOT) -
             select(Task, Project)
             .join(Project, Project.id == Task.project_id)
             .where(
-                Task.archived.is_(False),
-                Task.context["review_loop"]["review_approved"].as_boolean().is_(True),
+                or_(
+                    and_(
+                        Task.archived.is_(False),
+                        Task.context["review_loop"]["review_approved"]
+                        .as_boolean()
+                        .is_(True),
+                    ),
+                    and_(
+                        Task.context[LANDED_MERGE_SHA_KEY]
+                        .as_string()
+                        .is_not(None),
+                        or_(
+                            and_(
+                                Task.context[LANDED_ON_INTEGRATION_KEY]
+                                .as_boolean()
+                                .is_(False),
+                                Task.context[LANDED_SIGNAL_KEY]
+                                .as_boolean()
+                                .is_(True),
+                            ),
+                            Task.context[STRANDED_LANDING_REASON_KEY]
+                            .as_string()
+                            .is_not(None),
+                        ),
+                    ),
+                )
             )
             .order_by(Task.updated_at.asc())
             .limit(_APPROVED_PR_BATCH_SIZE)
@@ -325,7 +432,7 @@ async def sweep_approved_pr_stranding(session, *, repo_root: str = _REPO_ROOT) -
         candidate_key = (
             project.id,
             candidate.pr_number or 0,
-            candidate.head_sha or str(task.id),
+            candidate.commit_sha or str(task.id),
         )
         candidates.setdefault(candidate_key, candidate)
 
@@ -341,7 +448,7 @@ async def sweep_approved_pr_stranding(session, *, repo_root: str = _REPO_ROOT) -
             else await asyncio.to_thread(
                 inspect_approved_pr,
                 base_sha=candidate.base_sha,
-                head_sha=candidate.head_sha,
+                head_sha=candidate.commit_sha,
                 integration_branch=branch,
                 repo_root=repo_root,
             )
@@ -366,12 +473,12 @@ async def sweep_approved_pr_stranding(session, *, repo_root: str = _REPO_ROOT) -
         await session.commit()
 
     all_alert_keys = {
-        f"approved_pr_stranding:{candidate.project.id}:{candidate.pr_number}:{candidate.head_sha}"
+        f"approved_pr_stranding:{candidate.project.id}:{candidate.pr_number}:{candidate.commit_sha}"
         for candidate, observation in observations
-        if candidate.pr_number is not None and candidate.head_sha
+        if candidate.pr_number is not None and candidate.commit_sha
     }
     alert_keys = {
-        f"approved_pr_stranding:{candidate.project.id}:{candidate.pr_number}:{candidate.head_sha}"
+        f"approved_pr_stranding:{candidate.project.id}:{candidate.pr_number}:{candidate.commit_sha}"
         for candidate, observation in observations
         if observation.get("state") == "stranded"
         and observation.get("qualification_cycles_seen", 0) >= 2
@@ -390,7 +497,7 @@ async def sweep_approved_pr_stranding(session, *, repo_root: str = _REPO_ROOT) -
     for candidate, observation in observations:
         alert_key = (
             f"approved_pr_stranding:{candidate.project.id}:{candidate.pr_number}:"
-            f"{candidate.head_sha}"
+            f"{candidate.commit_sha}"
         )
         alert = existing.get(alert_key)
         if observation.get("state") == "landed" and alert is not None:
@@ -403,8 +510,8 @@ async def sweep_approved_pr_stranding(session, *, repo_root: str = _REPO_ROOT) -
         ):
             continue
         message = (
-            f"PR #{candidate.pr_number} has an approving review, but head commit "
-            f"{candidate.head_sha} is not an ancestor of "
+            f"PR #{candidate.pr_number} has a recorded merge/review target, but checked commit "
+            f"{candidate.commit_sha} is not an ancestor of "
             f"{observation.get('integration_branch')} HEAD "
             f"{observation.get('integration_head_sha') or 'unknown'}. "
             f"Local merge-tree classification: {observation.get('mergeability')}. "
