@@ -11304,7 +11304,9 @@ def _referenced_symbol_names(
             collect_table_references(child)
 
     for root in roots:
-        for py_file in sorted(root.rglob("*.py")):
+        # A root may be a single module (an in-process-driven production script that
+        # lives outside the production package trees) or a directory to walk.
+        for py_file in [root] if root.is_file() else sorted(root.rglob("*.py")):
             try:
                 source = py_file.read_text(encoding="utf-8")
             except (UnicodeDecodeError, OSError):
@@ -11410,6 +11412,12 @@ def _production_reference_roots(backend_dir: Path) -> "tuple[Path, ...]":
     ``0472_encrypt_oauth_token.upgrade()`` calls ``app.field_encryption.encrypt_field``),
     so a patch on a symbol they call IS live and must not be reported as vacuous.
 
+    ``testing/check_size_limits.py`` is named FILE-BY-FILE (not by adding ``testing/``
+    as a tree — that would let any test's own reference suppress a finding and gut this
+    guard). It is the CI size-cap gate: production code that happens to live beside the
+    suite, and ``test_size_limits_checker.py`` drives it in-process via ``csl.main(...)``,
+    so a patch on a symbol it calls IS live.
+
     NOT here, deliberately: ``agent/`` and the repo-root runner scripts. Those execute in
     a SEPARATE process, so an in-process pytest patch on a symbol only they call is still
     inert — exactly the finding this guard should surface.
@@ -11420,8 +11428,9 @@ def _production_reference_roots(backend_dir: Path) -> "tuple[Path, ...]":
             backend_dir / "app",
             backend_dir / "alembic",
             backend_dir / "scripts",
+            backend_dir / "testing" / "check_size_limits.py",
         )
-        if d.is_dir()
+        if d.exists()
     )
 
 # app.* FUNCTIONS that are patched in backend/testing/ but have NO call site in any
@@ -12300,21 +12309,24 @@ def test_orchestrator_health_task_type_vocab_is_registry_known():
     _CODE_PRODUCING_TASK_TYPES and _OUTPUT_TRANSFORMING_TASK_TYPES).  This guard
     catches that at PR time rather than silently at runtime.
 
-    The empty-string sentinel in _CODE_PRODUCING_TASK_TYPES is intentional — it
-    is the normalized form for a default-create task whose payload carries no
-    explicit type — and is therefore excluded from the registry check.
+    The code-producing membership now lives canonically in
+    ``task_capabilities.CODE_PRODUCING_TASK_TYPES`` (imported by orchestrator_health
+    rather than duplicated); the empty-string default-create sentinel was absorbed
+    into orchestrator_health._task_type normalization (missing/empty payload type
+    resolves to "create", which is a member), so no empty-string member remains to
+    exclude from the registry check.
     """
-    from app.task_capabilities import ALL_TASK_TYPES
+    from app.task_capabilities import ALL_TASK_TYPES, CODE_PRODUCING_TASK_TYPES
     import app.orchestrator_health as _oh
 
     covered_sets = {
-        "_CODE_PRODUCING_TASK_TYPES": _oh._CODE_PRODUCING_TASK_TYPES,
+        "CODE_PRODUCING_TASK_TYPES": CODE_PRODUCING_TASK_TYPES,
         "_OUTPUT_TRANSFORMING_TASK_TYPES": _oh._OUTPUT_TRANSFORMING_TASK_TYPES,
     }
     for set_name, type_set in covered_sets.items():
         unknown = {t for t in type_set if t and t not in ALL_TASK_TYPES}
         assert not unknown, (
-            f"orchestrator_health.{set_name} contains unregistered task type(s): "
+            f"{set_name} contains unregistered task type(s): "
             f"{sorted(unknown)}.  Either add the type to TaskType in task_capabilities.py "
             "or remove the stale literal from the frozenset."
         )
@@ -12896,15 +12908,15 @@ class TestProblemModelWritePathInvariants:
         # lifecycle.py: sanitize_problem_model_raw -> startup healing write-back
         ("lifecycle.py", 505): "sanitize_problem_model_raw(...) strips packer markers before startup healing write-back",
         # direction_lifecycle.py: sanitize_problem_model_raw -> reconcile_gaps_for_retired_directions
-        ("direction_lifecycle.py", 844): "sanitize_problem_model_raw input -> reconcile_gaps_for_retired_directions mutates raw dict in place",
+        ("direction_lifecycle.py", 846): "sanitize_problem_model_raw input -> reconcile_gaps_for_retired_directions mutates raw dict in place",
         # direction_lifecycle.py: reconcile_gap_staffing_raw_result (parses through ProblemModel)
-        ("direction_lifecycle.py", 872): "reconcile_gap_staffing_raw_result calls parse_problem_model internally",
+        ("direction_lifecycle.py", 874): "reconcile_gap_staffing_raw_result calls parse_problem_model internally",
         # strategic_completion.py: apply_agent_update (write-back)
-        ("strategic_completion.py", 5084): "apply_agent_update inline-sanitizes both current and proposed",
+        ("strategic_completion.py", 5360): "apply_agent_update inline-sanitizes both current and proposed",
         # strategic_completion.py: apply_agent_update (re-normalized)
-        ("strategic_completion.py", 5121): "apply_agent_update result, then _normalize_active_moves_writeback",
+        ("strategic_completion.py", 5397): "apply_agent_update result, then _normalize_active_moves_writeback",
         # strategic_completion.py: parse_problem_model -> model_dump (fallback gap reconciliation)
-        ("strategic_completion.py", 6804): "parse_problem_model(…) validated pydantic model_dump",
+        ("strategic_completion.py", 7080): "parse_problem_model(…) validated pydantic model_dump",
         # reaper_sweeps.py: parse_problem_model -> model_dump (moot-confirmation sweep)
         ("reaper_sweeps.py", 1253): "parse_problem_model(…) validated pydantic model_dump",
         # reaper_sweeps.py: parse_problem_model -> model_dump (stale-decay sweep)
@@ -12918,19 +12930,19 @@ class TestProblemModelWritePathInvariants:
         # admin_onboard.py: pm.model_dump() from parsed ProblemModel
         ("routers/admin_onboard.py", 915): "pm parsed from ProblemModel, model_dump",
         # admin_agent_ops.py: reconcile_gap_staffing_raw_result -> problem_model key (5 sites)
-        ("routers/admin_agent_ops.py", 1832): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 2258): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 2705): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 2818): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
-        ("routers/admin_agent_ops.py", 3073): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 1993): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 2419): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 2866): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 2979): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
+        ("routers/admin_agent_ops.py", 3234): "reconcile_gap_staffing_raw_result -> problem_model key -> parse_problem_model internally",
         # admin_agent_ops.py: apply_agent_update (op endpoint write-back)
-        ("routers/admin_agent_ops.py", 4732): "apply_agent_update result",
+        ("routers/admin_agent_ops.py", 4860): "apply_agent_update result",
         # admin_agent_ops.py: apply_agent_update (re-normalized after write-back)
-        ("routers/admin_agent_ops.py", 4760): "apply_agent_update result, then _normalize_active_moves_writeback",
+        ("routers/admin_agent_ops.py", 4888): "apply_agent_update result, then _normalize_active_moves_writeback",
         # admin_agent_ops.py: current_model.model_dump() (pending_confirm op)
-        ("routers/admin_agent_ops.py", 5291): "validated current_model pydantic model_dump",
+        ("routers/admin_agent_ops.py", 5419): "validated current_model pydantic model_dump",
         # admin_agent_ops.py: current_model.model_dump() (resolve_pending_confirm op)
-        ("routers/admin_agent_ops.py", 5373): "validated current_model pydantic model_dump",
+        ("routers/admin_agent_ops.py", 5501): "validated current_model pydantic model_dump",
     }
 
     def test_all_problem_model_write_paths_are_sanitized(self):

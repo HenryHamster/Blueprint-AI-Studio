@@ -808,6 +808,27 @@ async def test_finalize_infra_shaped_probe_failure_is_infra_failure_not_quality(
                 "assertion_delta": 5,
                 "test_count_delta": 2,
             },
+            # The fixed audits.ts emits the acceptance-category contract whenever
+            # an active rubric exists — independent of a version goal string — so
+            # a goal-less version's report still carries per-category verdicts.
+            "category_verdicts": [
+                {
+                    "category_key": "c-dfdc9d82",
+                    "status": "met",
+                    "citations": [{"kind": "diff", "ref": "ui.tsx:10"}],
+                },
+                {
+                    "category_key": "c-f52fd975",
+                    "status": "met",
+                    "citations": [{"kind": "diff", "ref": "ui.tsx:20"}],
+                },
+                {
+                    "category_key": "c-5214996f",
+                    "status": "met",
+                    "citations": [{"kind": "diff", "ref": "ui.tsx:30"}],
+                },
+            ],
+            "residual_uncaptured_gap": None,
         },
         smoke_logs={
             "passed": True,
@@ -895,6 +916,27 @@ async def test_finalize_failed_walkthrough_probe_blocks_promotion_and_preserves_
                 "assertion_delta": 5,
                 "test_count_delta": 2,
             },
+            # The fixed audits.ts emits the acceptance-category contract whenever
+            # an active rubric exists — independent of a version goal string — so
+            # a goal-less version's report still carries per-category verdicts.
+            "category_verdicts": [
+                {
+                    "category_key": "c-dfdc9d82",
+                    "status": "met",
+                    "citations": [{"kind": "diff", "ref": "ui.tsx:10"}],
+                },
+                {
+                    "category_key": "c-f52fd975",
+                    "status": "met",
+                    "citations": [{"kind": "diff", "ref": "ui.tsx:20"}],
+                },
+                {
+                    "category_key": "c-5214996f",
+                    "status": "met",
+                    "citations": [{"kind": "diff", "ref": "ui.tsx:30"}],
+                },
+            ],
+            "residual_uncaptured_gap": None,
         },
         smoke_logs={
             "passed": True,
@@ -1016,6 +1058,37 @@ async def test_finalize_unknown_criteria_probe_is_contract_blocker_preserves_ver
                 "assertion_delta": 5,
                 "test_count_delta": 2,
             },
+            # The fixed audits.ts emits the acceptance-category contract whenever
+            # an active rubric exists — independent of a version goal string — so
+            # a goal-less version's report still carries per-category verdicts.
+            "category_verdicts": [
+                {
+                    "category_key": "c-28e29fc5",
+                    "status": "met",
+                    "citations": [{"kind": "diff", "ref": "ui.tsx:10"}],
+                },
+                {
+                    "category_key": "c-09e29209",
+                    "status": "met",
+                    "citations": [{"kind": "diff", "ref": "ui.tsx:20"}],
+                },
+                {
+                    "category_key": "c-13867029",
+                    "status": "met",
+                    "citations": [{"kind": "diff", "ref": "ui.tsx:30"}],
+                },
+                {
+                    "category_key": "c-635ee093",
+                    "status": "met",
+                    "citations": [{"kind": "diff", "ref": "ui.tsx:40"}],
+                },
+                {
+                    "category_key": "c-280480cf",
+                    "status": "met",
+                    "citations": [{"kind": "diff", "ref": "ui.tsx:50"}],
+                },
+            ],
+            "residual_uncaptured_gap": None,
         },
         smoke_logs={
             "passed": True,
@@ -2333,3 +2406,354 @@ async def test_goal_category_grading_uses_full_version_delta_while_audit_stays_i
     full_range = f"main...{candidate}"
     assert payload.get("diff_range") == full_range
     assert payload.get("goal_category_diff_range") == full_range
+
+
+@pytest.mark.asyncio
+async def test_finalize_holds_when_audit_graded_a_narrowed_goal_category_range(
+    db_session,
+):
+    """Finalize HOLDS when the audit report's echoed goal_category_diff_range
+    disagrees with the full version delta the promotion would carry.
+
+    ``goal_category_diff_range`` is pinned at spawn to ``base_branch...candidate``
+    so goal/acceptance-category grading spans the full version delta (goal
+    verdicts have no scoped carry-forward).  The agent echoes the range it
+    actually graded into ``audit_scope.goal_category_diff_range``, but the
+    backend previously never read that echo — a grader could report the full
+    range while grading a narrowed incremental window and every gate would
+    pass.  The finalize-time read site closes that gap by holding the
+    qualification via _handle_infra_failure."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    candidate = "abcd" * 10
+    await _seed_audit_only_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        audit_logs={
+            "audit_score": 1.0,
+            "findings": [],
+            "test_erosion": {"deleted_test_files": []},
+            "audit_scope": {
+                "mode": "full",
+                # A narrowed echo — the grader claims a SMALLER window than the
+                # full version delta the promotion PR would carry.
+                "goal_category_diff_range": "main...0000111122223333",
+            },
+        },
+    )
+    _pre_gates = {
+        "ci_green": True,
+        "ci_resolution": {"state": "success", "resolved_sha": candidate},
+        "migration_verdict": "ok",
+        "migration_detail": None,
+        "apply_verdict": "ok",
+        "apply_detail": None,
+    }
+
+    result = await rq._finalize_qualification(
+        db_session, version, _pre_gates=_pre_gates
+    )
+    await db_session.commit()
+
+    assert result["status"] == "infra_failure"
+    assert result["error"] == "audit_goal_category_range_narrowed"
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "infra_failure"
+    assert version.last_qualification["error"] == "audit_goal_category_range_narrowed"
+
+
+@pytest.mark.asyncio
+async def test_finalize_accepts_audit_that_graded_the_full_goal_category_range(
+    db_session,
+):
+    """A report whose echoed goal_category_diff_range IS the full version delta
+    finalizes normally — proving the read-site check is not an always-true
+    hold."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    candidate = "abcd" * 10
+    await _seed_audit_only_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        audit_logs={
+            "audit_score": 1.0,
+            "findings": [],
+            "test_erosion": {"deleted_test_files": []},
+            "audit_scope": {
+                "mode": "full",
+                "goal_category_diff_range": f"main...{candidate}",
+            },
+        },
+    )
+    _pre_gates = {
+        "ci_green": True,
+        "ci_resolution": {"state": "success", "resolved_sha": candidate},
+        "migration_verdict": "ok",
+        "migration_detail": None,
+        "apply_verdict": "ok",
+        "apply_detail": None,
+    }
+
+    result = await rq._finalize_qualification(
+        db_session, version, _pre_gates=_pre_gates
+    )
+    await db_session.commit()
+
+    assert result["status"] == "dry_run"
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "dry_run"
+
+
+# ---------------------------------------------------------------------------
+# Walkthrough evidence-contract re-driver
+# (_redrive_walkthrough_contract_qualification)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_walkthrough_contract_failed_is_redriven_within_cap(
+    db_session, mocker, monkeypatch
+):
+    """Acceptance evidence for the walkthrough-contract re-drive path: a version
+    blocked on ``walkthrough_e2e_contract_failed`` — a REAL ``not_promoted``
+    verdict produced by ``_finalize_qualification`` from a walkthrough report
+    whose keys do not resolve to the active rubric (a deployed-side contract
+    defect) — is automatically re-driven by the sweep re-driver within a bounded
+    cap.
+
+    Below the cap the re-driver re-enters ``run_qualification`` through the
+    sweep's sanctioned path (``auto_trigger=True``, never ``explicit_request``)
+    and a fresh qualification spawns.  The re-drive is bounded: once
+    ``walkthrough_contract_redrive_count`` reaches the cap the re-driver halts
+    (no spawn) and raises exactly one operator Alert, deduped on
+    ``walkthrough_contract_redrive_loop_escalated`` across subsequent sweeps —
+    a deployed site that keeps rejecting reports surfaces to a human instead of
+    spinning fresh qualification attempts forever.
+    """
+    from app import shared_state
+    from app.release_qualifier_redrive import (
+        _MAX_WALKTHROUGH_CONTRACT_REDRIVE_ATTEMPTS,
+        _redrive_walkthrough_contract_qualification,
+    )
+
+    shared_state.runtime_config["promotion_enabled"] = True
+    # The serving engine sha the DEPLOYED validator stamps on the contract
+    # failure record (monkeypatched like the other engine-sha tests).
+    monkeypatch.setenv("DEPLOY_SHA", "abc1234def5678")
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    # A rubric whose ACTIVE keys do NOT include the walkthrough report's keys —
+    # the report is a REPORT-CONTRACT defect (unknown criteria) resolved by the
+    # deployed qualifier, recorded as a durable not_promoted verdict.
+    for _rubric_key in (
+        "c-28e29fc5",
+        "c-09e29209",
+        "c-13867029",
+        "c-635ee093",
+        "c-280480cf",
+    ):
+        await _add_version_criterion(
+            db_session,
+            project,
+            version,
+            key=_rubric_key,
+            text=f"criterion {_rubric_key}",
+        )
+
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+            # The fixed audits.ts emits the acceptance-category contract whenever
+            # an active rubric exists — independent of a version goal string — so
+            # a goal-less version's report still carries per-category verdicts.
+            # Without this section the merge-grade gate HOLDs on
+            # merge_grade_grader_lacks_category_verdicts before the walkthrough
+            # contract check can run.
+            "category_verdicts": [
+                {
+                    "category_key": "c-28e29fc5",
+                    "status": "met",
+                    "citations": [{"kind": "diff", "ref": "ui.tsx:10"}],
+                },
+                {
+                    "category_key": "c-09e29209",
+                    "status": "met",
+                    "citations": [{"kind": "diff", "ref": "ui.tsx:20"}],
+                },
+                {
+                    "category_key": "c-13867029",
+                    "status": "met",
+                    "citations": [{"kind": "diff", "ref": "ui.tsx:30"}],
+                },
+                {
+                    "category_key": "c-635ee093",
+                    "status": "met",
+                    "citations": [{"kind": "diff", "ref": "ui.tsx:40"}],
+                },
+                {
+                    "category_key": "c-280480cf",
+                    "status": "met",
+                    "citations": [{"kind": "diff", "ref": "ui.tsx:50"}],
+                },
+            ],
+            "residual_uncaptured_gap": None,
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    candidate_sha = version.last_qualification["candidate_sha"]
+    walk_task = Task(
+        project_id=project.id,
+        title="walkthrough",
+        payloads=[{"type": "walkthrough_e2e", "base_branch": "automain"}],
+        vm_instance_id="vm-walkthrough",
+        status=TaskStatus.COMPLETED,
+        context={"candidate_sha": candidate_sha},
+    )
+    db_session.add(walk_task)
+    await db_session.flush()
+    db_session.add(
+        Artifact(
+            task_id=walk_task.id,
+            artifact_type=ArtifactType.WALKTHROUGH_E2E_REPORT,
+            logs=json.dumps(
+                {
+                    "git_sha": candidate_sha,
+                    "exercised_engine_sha": candidate_sha,
+                    "results": [
+                        {"criterion_key": "c-dfdc9d82", "passed": True},
+                        {"criterion_key": "c-f52fd975", "passed": True},
+                        {
+                            "criterion_key": "c-workday-session-lifecycle",
+                            "passed": True,
+                        },
+                        {"criterion_key": "c-5214996f", "passed": True},
+                    ],
+                }
+            ),
+        )
+    )
+    await db_session.commit()
+    await db_session.refresh(walk_task)
+
+    qual = {
+        **(version.last_qualification or {}),
+        "requested_probes": ["walkthrough_e2e"],
+        "walkthrough_e2e_task_id": str(walk_task.id),
+    }
+    version.last_qualification = _with_current_qualification_contract(
+        project, version, qual
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Produce the REAL not_promoted / walkthrough_e2e_contract_failed verdict.
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+    assert result["status"] == "not_promoted"
+    assert result["blocker"] == "walkthrough_e2e_contract_failed"
+
+    await db_session.refresh(version)
+    lq = version.last_qualification
+    assert lq["status"] == "not_promoted"
+    assert lq["blocker"] == "walkthrough_e2e_contract_failed"
+    assert lq["execution_site"] == rs.EXECUTION_SITE_DEPLOYED
+    assert lq["walkthrough_contract_redrive_count"] is None
+    # Observability: the record stamps the serving engine sha that produced it.
+    assert lq["engine_sha"] == "abc1234def5678"
+
+    # Below the cap: the re-driver re-enters the qualifier and a fresh
+    # qualification spawns.
+    mock_run_qual = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=mocker.AsyncMock(return_value={"status": "spawned"}),
+    )
+    redriven = await _redrive_walkthrough_contract_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert redriven is True, (
+        "a walkthrough contract-failed version below the cap must be re-driven"
+    )
+    mock_run_qual.assert_called_once()
+    call_kwargs = mock_run_qual.await_args.kwargs
+    assert call_kwargs.get("auto_trigger") is True, (
+        "the walkthrough-contract re-drive is the sweep's sanctioned "
+        "attempt-scoped recovery path, never a claim of explicit_request"
+    )
+    assert call_kwargs.get("explicit_request") is not True
+
+    await db_session.refresh(version)
+    assert version.last_qualification["walkthrough_contract_redrive_count"] == 1, (
+        "a successful re-drive must advance the per-episode counter so the cap "
+        "holds under repeated contract failures"
+    )
+
+    # At the cap: the re-driver halts (no spawn) and raises exactly one
+    # operator Alert, deduped across subsequent sweep cycles.
+    version.last_qualification = {
+        **version.last_qualification,
+        "walkthrough_contract_redrive_count": _MAX_WALKTHROUGH_CONTRACT_REDRIVE_ATTEMPTS,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    halted = await _redrive_walkthrough_contract_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert halted is False, "a contract-failed version AT the cap must halt"
+    mock_run_qual.assert_called_once()  # no additional spawn
+
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(Alert.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1, "reaching the re-drive cap raises exactly one Alert"
+    assert "walkthrough" in alerts[0].title.lower()
+    await db_session.refresh(version)
+    assert (
+        version.last_qualification.get("walkthrough_contract_redrive_loop_escalated")
+        is True
+    )
+
+    # Deduped: a second sweep cycle at the cap does not spam another Alert.
+    await _redrive_walkthrough_contract_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    alerts_again = (
+        (
+            await db_session.execute(
+                select(Alert).where(Alert.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts_again) == 1

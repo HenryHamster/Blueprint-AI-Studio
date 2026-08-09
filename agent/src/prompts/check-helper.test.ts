@@ -922,7 +922,8 @@ describe('writeCheckHelper — required backend-authoring verification', () => {
     expect(script).toContain('required backend-authoring verification');
     expect(script).toContain('python3 -m ruff check --select E,F,W --ignore E501');
     expect(script).toContain('USE_TEST_POSTGRES=true bash "$_VERIFICATION_HARNESS" "$_verification_postgres_flag"');
-    expect(script).toContain('pg_config --bindir');
+    expect(script).toContain('source scripts/backend-test-route.sh');
+    expect(script).toContain('select_backend_test_route');
     expect(script).toContain('/tmp/project_verification_receipt_verify-authoring-1.json');
     expect(script).toContain('"skipped":runtime["skipped"],"exit_code":0');
     expect(script).toContain('no impacted pytest file/node was resolved');
@@ -1143,6 +1144,14 @@ describe('writeCheckHelper — required backend-authoring verification', () => {
       realFs.mkdirSync(bin, { recursive: true });
       realFs.mkdirSync(realPath.join(dir, 'backend', 'testing'), { recursive: true });
       realFs.mkdirSync(realPath.join(dir, 'scripts'), { recursive: true });
+      // The generated checker sources this committed helper at runtime. Copy
+      // it into the isolated fixture so these tests exercise the same route
+      // selection contract as a real checkout.
+      const routeHelper = realPath.resolve(process.cwd(), '..', 'scripts', 'backend-test-route.sh');
+      realFs.copyFileSync(
+        routeHelper,
+        realPath.join(dir, 'scripts', 'backend-test-route.sh'),
+      );
       realFs.writeFileSync(realPath.join(dir, 'backend', 'x.py'), 'value = 1\n');
       realFs.writeFileSync(realPath.join(dir, 'backend', 'testing', 'test_x.py'), 'def test_x(): assert True\n');
       realFs.writeFileSync(realPath.join(dir, 'backend', 'testing', 'impacted_tests.py'), '# shimmed by python3\n');

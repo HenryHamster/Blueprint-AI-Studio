@@ -44,6 +44,7 @@ vi.mock('../api', () => ({
   setVersionGoal: vi.fn(),
   patchAdminSettings: vi.fn(),
   setProjectPromotionEnabled: vi.fn(),
+  approveActivation: vi.fn(),
   clearDeployFailed: vi.fn(),
   // VersionLifecyclePanel statically imports the acceptance-criteria actions;
   // browser-mode ESM requires the mock factory to expose every named export the

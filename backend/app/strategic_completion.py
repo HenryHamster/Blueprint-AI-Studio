@@ -3129,6 +3129,270 @@ def already_built_completion_suggestion(direction: dict) -> str | None:
     )
 
 
+# ── Direction objective completion (campaign path) ────────────────────────────
+# A direction (multi-task campaign) no longer 'completes' merely when its child
+# PRs merge: once its integrated merged diff has been graded against its
+# DECLARED OBJECTIVE, the graded verdict is authoritative for the completion
+# signal.  The trigger lives in
+# ``rollup_management._maybe_spawn_direction_merge_grade`` (spawn) and the
+# lifecycle consumes the completed grade via
+# :func:`consume_direction_merge_grade_if_ready`; these helpers read the
+# DIRECTION-scoped category-verdict ledger so the lifecycle gate and the digest
+# surface reflect the OBJECTIVE, not child-merge counts.  Directions with no
+# declared rubric or no graded verdict return ``None`` and keep today's
+# merge-count heuristic behaviour (backward compatible).
+
+
+async def _direction_active_category_keys(
+    session: AsyncSession,
+    project: Project | None,
+    direction: dict,
+    direction_id: str,
+) -> set[str]:
+    """Resolve a direction's ACTIVE acceptance-criterion keys.
+
+    Reads the in-memory direction dict's ``criterion_keys`` first; when the
+    dict does not carry them (legacy/synthetic directions) it falls back to the
+    first-class ``Direction.criterion_keys`` column via ``get_direction_row``
+    (the in-memory dicts do not reliably carry the promoted column — see
+    ``acceptance_criteria._direction_owns_blocking_uncovered_criteria``).
+    """
+    keys = direction.get("criterion_keys")
+    if not isinstance(keys, list):
+        keys = None
+    if not keys and project is not None:
+        from app.directions_repo import get_direction_row  # noqa: PLC0415
+
+        try:
+            row = await get_direction_row(session, project.id, direction_id)
+        except Exception:  # noqa: BLE001 — best-effort fallback
+            row = None
+        if row is not None:
+            keys = list(getattr(row, "criterion_keys", None) or [])
+    if not isinstance(keys, list):
+        return set()
+    return {str(k).strip() for k in keys if str(k).strip()}
+
+
+async def _direction_active_categories(
+    session: AsyncSession,
+    project: Project | None,
+    direction: dict,
+    active_keys: set[str],
+) -> list[dict[str, str]]:
+    """Resolve active criterion keys to grader-facing rubric categories.
+
+    The blind merge-grade rubric must carry the human-readable criterion TEXT:
+    the version path passes ``VersionAcceptanceCriterion.text`` and a key-only
+    rubric (``c-1a2b3c4d: c-1a2b3c4d``) is ungradeable.  A key whose row cannot
+    be resolved falls back to the key itself so the category degrades rather
+    than silently dropping out of the rubric.
+    """
+    text_by_key: dict[str, str] = {}
+    if project is not None and active_keys:
+        from app.acceptance_criteria import (  # noqa: PLC0415
+            direction_criterion_release_version_id,
+            get_criteria_by_keys,
+        )
+
+        try:
+            rows = await get_criteria_by_keys(
+                session,
+                project.id,
+                sorted(active_keys),
+                release_version_id=direction_criterion_release_version_id(direction),
+            )
+        except Exception:  # noqa: BLE001 — best-effort resolution
+            rows = []
+        for row in rows:
+            text = str(getattr(row, "text", "") or "").strip()
+            if text:
+                text_by_key[row.criterion_key] = text
+    return [
+        {"category_key": k, "text": text_by_key.get(k, k)}
+        for k in sorted(active_keys)
+    ]
+
+
+async def direction_objective_completion_verdict(
+    session: AsyncSession,
+    project: Project | None,
+    direction: dict,
+) -> bool | None:
+    """Return the direction's graded objective-completion verdict, or None.
+
+    ``None`` means there is no graded verdict to consult (no declared rubric,
+    or no grade has landed yet) — the caller keeps today's heuristic behavior.
+    ``True``/``False`` are authoritative: a graded fully-met objective marks the
+    direction complete; a graded not-met objective suppresses completion no
+    matter what the merge-count heuristic says.
+
+    Mirrors the version path's gate: the rubric-gated ledger oracle
+    (:func:`app.category_verdict_ledger.is_candidate_fully_met`) is consulted
+    only when the direction declares acceptance criteria (``criterion_keys``).
+    """
+    if project is None:
+        return None
+    did = str(direction.get("id") or direction.get("direction_id") or "").strip()
+    if not did:
+        return None
+    active_keys = await _direction_active_category_keys(
+        session, project, direction, did
+    )
+    if not active_keys:
+        # No rubric to grade against — the ledger oracle fails closed on an
+        # EMPTY acceptance set, and an unrubricated direction has nothing to
+        # certify.  Mirror the version path (which only gates when active
+        # categories exist) and defer to the heuristic.
+        return None
+    from app import category_verdict_ledger as _ledger  # noqa: PLC0415
+
+    candidate_sha = await _ledger.get_latest_direction_candidate_sha(session, did)
+    if not candidate_sha:
+        return None
+    try:
+        return await _ledger.is_candidate_fully_met(
+            session,
+            direction_id=did,
+            candidate_sha=candidate_sha,
+            active_category_keys=active_keys,
+        )
+    except Exception:  # noqa: BLE001 — a ledger hiccup must not break lifecycle
+        logger.warning(
+            "[STRATEGIC] failed to read direction objective verdict for %s",
+            did,
+            exc_info=True,
+        )
+        return None
+
+
+async def consume_direction_merge_grade_if_ready(
+    session: AsyncSession,
+    project: Project | None,
+    direction: dict,
+) -> bool:
+    """Record a completed direction-scoped merge grade into the ledger, if any.
+
+    Finds the direction's most recent COMPLETED ``release_merge_grade`` task;
+    when its candidate has not been recorded yet, reads the
+    ``RELEASE_MERGE_GRADE`` artifact and persists the verdicts + objective_gap
+    debt via ``record_direction_merge_grade`` (the direction-scoped RESULT side
+    of the blind objective grade).  Returns True when a grade was newly
+    recorded, False otherwise.  Best-effort: never raises — a ledger hiccup
+    must not break the lifecycle tick.
+    """
+    if project is None:
+        return False
+    did = str(direction.get("id") or direction.get("direction_id") or "").strip()
+    if not did:
+        return False
+    from app import category_verdict_ledger as _ledger  # noqa: PLC0415
+    from app.database import resolve_dialect_name  # noqa: PLC0415
+    from app.models import ArtifactType  # noqa: PLC0415
+    from app.release_qualifier_audit import (  # noqa: PLC0415
+        _latest_artifact_logs,
+        _resolve_direction_objective,
+        record_direction_merge_grade,
+    )
+    from sqlalchemy import cast as _cast  # noqa: PLC0415
+    from sqlalchemy import func as _func  # noqa: PLC0415
+    from sqlalchemy.dialects.postgresql import JSONB as _JSONB  # noqa: PLC0415
+
+    try:
+        dialect_name = resolve_dialect_name(session)
+        if dialect_name == "sqlite":
+            direction_filter = _func.json_extract(
+                Task.context, "$.direction_id"
+            ) == did
+            type_filter = (
+                _func.json_extract(Task.payloads, "$[0].type")
+                == "release_merge_grade"
+            )
+        else:
+            direction_filter = Task.context.op("@>")(
+                _cast({"direction_id": did}, _JSONB)
+            )
+            type_filter = (
+                Task.payloads[0]["type"].as_string() == "release_merge_grade"
+            )
+        task = (
+            (
+                await session.execute(
+                    select(Task)
+                    .where(
+                        Task.project_id == project.id,
+                        Task.status == TaskStatus.COMPLETED,
+                        type_filter,
+                        direction_filter,
+                    )
+                    .order_by(Task.created_at.desc())
+                    .limit(1)
+                )
+            )
+            .scalars()
+            .first()
+        )
+    except Exception:  # noqa: BLE001 — best-effort consumption
+        logger.warning(
+            "[STRATEGIC] failed to look up direction merge grade for %s",
+            did,
+            exc_info=True,
+        )
+        return False
+    if task is None:
+        return False
+    ctx = task.context or {}
+    candidate_sha = str(ctx.get("candidate_sha") or "").strip() or None
+    if not candidate_sha:
+        return False
+    if await _ledger.get_category_verdicts(
+        session, None, candidate_sha, direction_id=did
+    ):
+        return False  # already recorded
+    artifact = await _latest_artifact_logs(
+        session, task.id, ArtifactType.RELEASE_MERGE_GRADE
+    )
+    if not artifact:
+        return False
+    objective = _resolve_direction_objective(direction)
+    if not objective:
+        return False
+    active_keys = await _direction_active_category_keys(
+        session, project, direction, did
+    )
+    active_categories = await _direction_active_categories(
+        session, project, direction, active_keys
+    )
+    _attempt_id = ctx.get("qualification_attempt_id")
+    try:
+        _attempt_uuid = uuid.UUID(str(_attempt_id)) if _attempt_id else None
+    except (ValueError, TypeError):
+        _attempt_uuid = None
+    try:
+        _result = await record_direction_merge_grade(
+            session,
+            direction_id=did,
+            project_id=project.id,
+            goal=objective,
+            artifact=artifact,
+            active_categories=active_categories or None,
+            qualification_attempt_id=_attempt_uuid,
+            grader_run_id=str(task.id),
+        )
+    except Exception:  # noqa: BLE001 — best-effort
+        logger.warning(
+            "[STRATEGIC] failed to record direction merge grade for %s",
+            did,
+            exc_info=True,
+        )
+        return False
+    # True ONLY when at least one verdict/debt row was actually persisted — an
+    # artifact with no gradable content (missing graded_candidate_sha, no
+    # per-category verdicts) records nothing, and re-stamping the direction row
+    # every cycle just because the grade task is COMPLETED is write amplification.
+    return bool(_result and _result.get("ledger_writes"))
+
+
 # ── Outcome-progress (scaffolding) detector ──────────────────────────────────
 # Advisory axis catching the INVERSE of every existing health rule: a direction
 # with a HEALTHY merge rate that keeps shipping refactor/scaffolding PRs while
@@ -4915,15 +5179,27 @@ async def _handle_strategic_completion(
         from app.vision_merge import append_rejected_edits, merge_vision
 
         current_vision = dict(project.vision or {})
-        payload_vision_rev = (task.first_payload.get("vision") or {}).get("revision", 0)
+        # The legacy vision body is no longer shipped in the strategic payload
+        # (see the spawned_vision_rev resolution above), so the payload fallback
+        # is empty for every modern task. Bind the merge baseline to the
+        # cycle's durable baseline_vision snapshot; legacy tasks that still
+        # carry the payload key keep the old read; tasks with no cycle row fall
+        # back to the CURRENT agent-visible vision so the 3-way merge never runs
+        # against an empty baseline (which makes every agent-supplied field read
+        # as a fresh edit and logs spurious rejections for legit updates).
+        payload_vision_rev = spawned_vision_rev
         db_vision_rev = current_vision.get("revision", 0)
         # Baseline: prefer the snapshot the cycle row captured at spawn time
         # (StrategicCycle.cycle_metadata.baseline_vision). Falls back to the
-        # payload vision if the cycle row is unavailable (legacy task).
+        # payload vision (legacy task) and then the current agent-visible vision.
         cycle_id = task.strategic_cycle_id or (task.context or {}).get(
             "strategic_cycle_id"
         )
         baseline_vision = task.first_payload.get("vision") or {}
+        if not baseline_vision:
+            from app.strategic_local_runner import _agent_visible_vision
+
+            baseline_vision = _agent_visible_vision(project.vision)
         if cycle_id:
             cycle_row = await strategic_cycle.get(session, cycle_id)
             if cycle_row is not None:

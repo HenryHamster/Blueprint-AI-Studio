@@ -525,6 +525,18 @@ describe('buildThinkerPrompt', () => {
     expect(prompt).not.toContain('Recovery caveat');
   });
 
+  it('Section 6 documents the compact-digest default and the _agent_view_lean echo-back contract', () => {
+    const prompt = buildThinkerPrompt({ ...base, problemModelRecovery: 'present' });
+    // The digest is the default shipping shape and must steer the agent to echo
+    // the `_agent_view_lean` marker so stripped durable fields are preserved.
+    expect(prompt).toContain('compact digest');
+    expect(prompt).toContain('_agent_view_lean');
+    expect(prompt).toContain('echo the `_agent_view_lean` marker back verbatim');
+    expect(prompt).toContain('Without that marker echoed, a blank field is treated as a deliberate clear');
+    // Recoverable detail is still advertised for when the digest omits it.
+    expect(prompt).toContain('./fetch problem-model');
+  });
+
   it('vision section rendered only when visionJson is non-empty', () => {
     const withVision = buildThinkerPrompt({ ...base, visionJson: '{"systems":[]}' });
     expect(withVision).toContain('## Vision (legacy artifact');

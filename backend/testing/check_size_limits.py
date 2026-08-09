@@ -17,7 +17,15 @@ Two modes:
   entry. When the mainline baseline cannot be established (not a git checkout, no
   mainline branch, unreadable file at the ref — e.g. a shallow CI clone that never
   fetched the integration branch) the guard degrades to a clear skip, never a
-  crash or a spurious failure.
+  crash or a spurious failure. Check mode ALSO verifies the reverse direction of
+  the ledger contract: every cap_bump_history.json record must be justified by
+  the MAINLINE git history (a real increase of the exact old -> new caps, made by
+  a commit in the mainline ancestry). A ledger record with a wrong old_cap, a
+  decrease mis-filed as a bump, a commit outside the mainline ancestry, or an
+  unresolvable SHA is a PHANTOM record and fails the check as ``[ledger-phantom]``.
+  Unlike the cap-raise baseline this runs on truncated/shallow checkouts too —
+  every CI shard and agent VM — so phantom drift is caught where it accrues. When
+  git history is unavailable the guard degrades to a clear skip.
 * ``--fix`` mode: for every breached file, rewrite *only* that file's cap in the
   tracked JSON to the canonical ``bump_size_limit`` policy value; AND for every
   uncapped source file over ``_COVERAGE_THRESHOLD`` lines (the complementary
@@ -27,7 +35,9 @@ Two modes:
   is the justification a follow-up check accepts. Both paths preserve key order
   and the leading ``_doc`` field so the diff stays minimal. After ``--fix``
   re-running check mode passes. The bump stays policy-consistent so the guardrail
-  still catches genuine runaway growth.
+  still catches genuine runaway growth. ``--fix`` ALSO self-heals the ledger: any
+  record the mainline git history cannot justify is pruned by rebuilding
+  cap_bump_history.json from git, even when no cap breach exists to bump.
 
 Usage (from the repo root, no install step)::
 
@@ -642,7 +652,19 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     if args.fix:
-        if not breaches and not uncapped:
+        # Ledger-phantom self-heal: even with no cap breach to bump, a
+        # cap-bump-history ledger holding records the mainline git history
+        # cannot justify must be pruned so the check (and the deployed
+        # chronic-offender classification) stops trusting phantom records.
+        from app.size_limit_policy import phantom_ledger_records
+
+        ledger_path = os.path.join(
+            os.path.dirname(args.json_path), "cap_bump_history.json"
+        )
+        phantoms = phantom_ledger_records(
+            repo_root=args.repo_root, ledger_path=ledger_path
+        )
+        if not breaches and not uncapped and not phantoms:
             print("No breaches to fix — all scoped files within cap.")
             return 0
         chronic_skipped: list[tuple[str, dict, str]] = []
@@ -690,39 +712,46 @@ def main(argv: list[str] | None = None) -> int:
             added.append((section, rec, new_cap))
         if bumped or added:
             write_limits(args.json_path, data)
-            if bumped:
-                # Keep the committed cap-bump-history ledger (the deployed
-                # backend's history source) in sync with the bumps just applied.
-                # Rebuilding from git + the pending bumps is idempotent and
-                # self-heals any drift (including manual cap edits already in
-                # git). A ledger-maintenance failure must not roll back the cap
-                # bumps, but it must be loud — a stale ledger would change
-                # chronic-offender classification in production; the CI guard
-                # test would also catch it.
-                try:
-                    from app.size_limit_policy import rebuild_cap_bump_history_ledger
+        if bumped or phantoms:
+            # Keep the committed cap-bump-history ledger (the deployed
+            # backend's history source) in sync with the bumps just applied AND
+            # self-heal it: rebuild_cap_bump_history_ledger prunes any record
+            # the mainline git history cannot justify (a phantom), on truncated
+            # checkouts too — every CI shard and agent VM — so the phantom guard
+            # never survives a --fix run. Rebuilding from git + the pending
+            # bumps is idempotent and self-heals any drift (including manual cap
+            # edits already in git). A ledger-maintenance failure must not roll
+            # back the cap bumps, but it must be loud — a stale ledger would
+            # change chronic-offender classification in production; the CI guard
+            # test would also catch it.
+            try:
+                from app.size_limit_policy import rebuild_cap_bump_history_ledger
 
-                    ledger_path = os.path.join(
-                        os.path.dirname(args.json_path), "cap_bump_history.json"
-                    )
-                    rebuild_cap_bump_history_ledger(
-                        caps_json_path=args.json_path,
-                        ledger_path=ledger_path,
-                        pending=[
-                            (section, rec["rel"], rec["cap"], new_cap)
-                            for section, rec, new_cap in bumped
-                        ],
-                    )
-                    print(f"Updated {os.path.basename(ledger_path)}.")
-                except Exception as exc:  # noqa: BLE001 — cap bumps already written
+                rebuild_cap_bump_history_ledger(
+                    caps_json_path=args.json_path,
+                    ledger_path=ledger_path,
+                    pending=[
+                        (section, rec["rel"], rec["cap"], new_cap)
+                        for section, rec, new_cap in bumped
+                    ],
+                )
+                if phantoms:
                     print(
-                        f"[warn] could not update cap-bump-history ledger: {exc}"
+                        f"Pruned {len(phantoms)} phantom record(s) from "
+                        f"{os.path.basename(ledger_path)}."
                     )
-            actions = []
-            if bumped:
-                actions.append(f"Bumped {len(bumped)} cap(s)")
-            if added:
-                actions.append(f"Added {len(added)} cap(s)")
+                if bumped:
+                    print(f"Updated {os.path.basename(ledger_path)}.")
+            except Exception as exc:  # noqa: BLE001 — cap bumps already written
+                print(
+                    f"[warn] could not update cap-bump-history ledger: {exc}"
+                )
+        actions = []
+        if bumped:
+            actions.append(f"Bumped {len(bumped)} cap(s)")
+        if added:
+            actions.append(f"Added {len(added)} cap(s)")
+        if actions:
             print(f"{'; '.join(actions)} in {args.json_path}.")
         if chronic_skipped:
             print(
@@ -842,6 +871,40 @@ def main(argv: list[str] | None = None) -> int:
                 f"({old_cap} -> {new_cap}) raise."
             )
             exit_code = 1
+
+    # Ledger-phantom guard: the cap-bump-history ledger must not hold records
+    # the MAINLINE git history cannot justify — the reverse direction of the
+    # [cap-raise] guard above. Where [cap-raise] proves git is recorded in the
+    # ledger, this proves the ledger is recorded in git: every ledger record
+    # must correspond to a real increase actually made by the named commit on
+    # the mainline ancestry. A record with a wrong old_cap, a decrease mis-filed
+    # as a bump, a commit outside the mainline ancestry, or an unresolvable SHA
+    # is a phantom. This check runs on truncated/shallow checkouts too — every
+    # CI shard and agent VM — so phantom drift is caught where the legacy
+    # truncated-checkout skip let it hide. When git history is unavailable (not
+    # a git checkout, no mainline ref) the guard degrades to a clear skip, never
+    # a crash or a spurious failure.
+    from app.size_limit_policy import phantom_ledger_records
+
+    ledger_path = os.path.join(
+        os.path.dirname(args.json_path), "cap_bump_history.json"
+    )
+    phantoms = phantom_ledger_records(
+        repo_root=args.repo_root, ledger_path=ledger_path
+    )
+    if phantoms:
+        for section, key, old_cap, new_cap, commit_sha, reason in phantoms:
+            print(
+                f"[ledger-phantom] {section}/{key}: ledger records "
+                f"{old_cap} -> {new_cap} at {commit_sha[:12]} — {reason}"
+            )
+        print(
+            f"\n{len(phantoms)} phantom cap-bump-history record(s) — records the "
+            "mainline git history cannot justify. Run this checker with --fix to "
+            f"rebuild {os.path.basename(ledger_path)} from git (pruning phantoms), "
+            "or remove the listed records from the ledger."
+        )
+        exit_code = 1
 
     if exit_code == 0 and not preexisting:
         print("All scoped files within their size caps.")

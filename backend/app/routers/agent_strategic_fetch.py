@@ -2266,7 +2266,15 @@ async def agent_fetch_efficiency_snapshot(
     origination split, window metadata, and cohort coverage (cohort_task_count /
     cohort_capped flag plus the cohort_effective_window_start/end span actually
     covered by the loaded cohort, so a truncated sample is distinguishable from
-    a complete window and the window a reading covers is recorded).
+    a complete window and the window a reading covers is recorded). Also returns
+    ``history`` — the persisted project_efficiency_snapshot time series (each
+    capture's axis values plus its captured_at / metric_def_version provenance),
+    oldest-first, so the stored cost-over-time artifact is readable by agents.
+    window_days reports the requested _AXIS_WINDOW_DAYS when the cohort is
+    complete, but the effective span actually covered by the loaded rows when
+    cohort_capped truncates it, so a capped reading is never labelled with the
+    full requested window (cohort_requested_window_days always carries the
+    requested value).
     Reuses the same compute path as the operator dashboard so numbers are consistent.
     Read-only; cross-project access returns 404."""
     from app.efficiency_snapshot import (  # noqa: PLC0415
@@ -2280,11 +2288,13 @@ async def agent_fetch_efficiency_snapshot(
         _AXIS_WINDOW_DAYS,
         _COHORT_CAP,
         _cohort_effective_window,
+        build_merged_work_origination_reading,
         _compute_cost_per_merged_pr,
         _compute_cost_per_verified_task,
         _compute_llm_cache_hit_rate,
         _compute_vm_reuse_rate,
         _load_recent_tasks,
+        _load_serving_sha_timeline,
     )
     from app.llm_cost_attribution import (  # noqa: PLC0415
         _compact_llm_cost_attribution,
@@ -2293,27 +2303,82 @@ async def agent_fetch_efficiency_snapshot(
     )
     from app.digest_metrics import compute_format_compliance_metrics  # noqa: PLC0415
     from app.research_completion import (  # noqa: PLC0415
-        merged_work_origination_reading,
         merged_work_origination_split,
+    )
+    from app.project_telemetry import (  # noqa: PLC0415
+        read_recent_efficiency_snapshots,
     )
     from app.time_utils import _utcnow  # noqa: PLC0415
 
     await _resolve_agent_project(project_id, token, session)
     tasks = await _load_recent_tasks(session, project_id)
+    # Serving-sha boundaries for the strategic-cycle cost slices: which serving
+    # revision was live when each cycle ran, so a reading can separate cycles
+    # that ran before a lever reached serving from cycles that ran after.
+    serving_sha_timeline = await _load_serving_sha_timeline(session, project_id)
     cohort_window = _cohort_effective_window(tasks)
+    cohort_capped = len(tasks) >= _COHORT_CAP
+    # When the row cap truncates the cohort, the requested 7-day window is NOT
+    # what the aggregates above measure — they describe only the span actually
+    # covered by the loaded rows (as narrow as ~1.6 days under heavy volume).
+    # Emit the effective span as the headline window_days so a capped reading is
+    # never labelled with the full requested window; cohort_requested_window_days
+    # preserves the requested value for provenance (mirrors compute_current_axes).
+    if (
+        cohort_capped
+        and cohort_window["start"] is not None
+        and cohort_window["end"] is not None
+    ):
+        window_days = round(
+            (
+                datetime.fromisoformat(cohort_window["end"])
+                - datetime.fromisoformat(cohort_window["start"])
+            ).total_seconds()
+            / 86400,
+            1,
+        )
+    else:
+        window_days = _AXIS_WINDOW_DAYS
     format_compliance = compute_format_compliance_metrics(tasks)
-    llm_cost_attribution = _compact_llm_cost_attribution(tasks)
+    llm_cost_attribution = _compact_llm_cost_attribution(
+        tasks, serving_sha_timeline=serving_sha_timeline
+    )
     # Research-vs-strategist attribution of work that LANDED in the window
     # (direction d-197325ef, criterion c-09d49820). Computed by its own
     # GROUP BY over the landing timestamp rather than from the created_at-ordered,
     # 5000-row-capped `tasks` cohort, which would answer a biased question.
-    merged_work_origination = merged_work_origination_reading(
+    origination_window_end = _utcnow()
+    origination_window_start = origination_window_end - timedelta(
+        days=_AXIS_WINDOW_DAYS
+    )
+    merged_work_origination = build_merged_work_origination_reading(
         await merged_work_origination_split(
             session,
             project_id,
-            since=_utcnow() - timedelta(days=_AXIS_WINDOW_DAYS),
-        )
+            since=origination_window_start,
+        ),
+        window_start=origination_window_start,
+        window_end=origination_window_end,
     )
+
+    # The persisted append-only efficiency snapshot time series
+    # (project_efficiency_snapshot) — the stored artifact that shows the axes
+    # moving over time. captured_at and metric_def_version are read from the row
+    # columns (the durable source of truth after migration 0694 repaired the
+    # table); the blob carries the axis values (ALL_AXES + nested blocks) and the
+    # serving_sha that recorded them, so each capture carries its provenance.
+    # Table rows come back newest-first; reverse to oldest-first to match the
+    # admin trend-surface ordering.
+    history = [
+        {
+            **(row.blob or {}),
+            "captured_at": row.captured_at.isoformat(),
+            "metric_def_version": row.metric_def_version,
+        }
+        for row in reversed(
+            await read_recent_efficiency_snapshots(session, project_id)
+        )
+    ]
 
     return {
         "status": "success",
@@ -2327,11 +2392,13 @@ async def agent_fetch_efficiency_snapshot(
             FORMAT_COMPLIANCE_KEY: format_compliance,
             "llm_cost_attribution": llm_cost_attribution,
             "merged_work_origination": merged_work_origination,
-            "window_days": _AXIS_WINDOW_DAYS,
+            "window_days": window_days,
             "cohort_task_count": len(tasks),
-            "cohort_capped": len(tasks) >= _COHORT_CAP,
+            "cohort_capped": cohort_capped,
+            "cohort_requested_window_days": _AXIS_WINDOW_DAYS,
             "cohort_effective_window_start": cohort_window["start"],
             "cohort_effective_window_end": cohort_window["end"],
+            "history": history,
         },
     }
 

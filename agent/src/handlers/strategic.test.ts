@@ -334,7 +334,7 @@ vi.mock('../index.js', () => ({
   persistAndPostStatus: vi.fn().mockResolvedValue(undefined),
   runClaudeCode: vi.fn().mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' }),
   apiPost: vi.fn().mockResolvedValue({}),
-  resolveBaseBranch: () => 'main',
+  resolveBaseBranch: vi.fn(() => 'main'),
   setCurrentPromptFingerprint: vi.fn(),
   sendHeartbeatSync: vi.fn(),
 }));
@@ -1103,6 +1103,34 @@ describe('handleStrategic problem_model recovery framing', () => {
     expect(section).not.toContain('this is the first cycle');
     expect(section).not.toContain('EXISTS but was not shipped in full');
   });
+
+  it('present as compact digest: `_agent_view_lean` marker → present framing with digest note and echo-back steering', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      problem_model: {
+        intent: { purpose: 'real' },
+        capabilities: [{ name: 'ci', status: 'working' }],
+        gaps: [{ id: 'g-1', name: 'a gap', status: 'open' }],
+        _agent_view_lean: {
+          stripped_gap_fields: ['description', 'evidence', 'active_moves'],
+          summarized_capabilities: 1,
+        },
+      },
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-dg', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    const params = capturedThinkerParams;
+    expect(params?.problemModelRecovery).toBe('present');
+    const section = String(params?.problemModelSection);
+    expect(section).toContain('compact digest');
+    expect(section).toContain('_agent_view_lean');
+    expect(section).toContain('echo the `_agent_view_lean` marker back');
+    expect(section).toContain('./fetch problem-model');
+    // Digest is the full live model shipped — NOT the packer-drop recovery path.
+    expect(section).not.toContain('EXISTS but was not shipped in full');
+    expect(section).not.toContain('this is the first cycle');
+  });
 });
 
 describe('handleStrategic self-repo prompt framing', () => {
@@ -1340,6 +1368,48 @@ describe('handleStrategic executor prompt: criterion_keys direction guidance', (
     // Guidance explains why: directions without criterion_keys write no CriterionEvidence
     expect(executorPrompt).toContain('CriterionEvidence');
     expect(executorPrompt).toContain('never invent keys');
+  });
+});
+
+describe('handleStrategic executor prompt: sequenced landing gates', () => {
+  beforeEach(() => {
+    vi.mocked(runClaudeCode).mockClear();
+    vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
+      ok: true,
+      analysisText: 'analysis',
+    });
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: '',
+    });
+  });
+
+  it('teaches the foundation-first ordered spawn workflow with the landing-gate fields', async () => {
+    vi.mocked(mockedIndexModule.resolveBaseBranch).mockReturnValueOnce('project-integration');
+    const statusRef = { value: '' };
+    await handleStrategic(
+      'task-sequenced-landing-gates',
+      { project_name: 'Blueprint' },
+      {},
+      'tok',
+      'owner',
+      'repo',
+      null,
+      statusRef,
+    );
+
+    const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0]?.[0];
+    expect(executorPrompt).toBeDefined();
+    // Foundation-first ordering: spawn the foundation, then reference its task_id.
+    expect(executorPrompt).toContain('spawn the FOUNDATION first');
+    expect(executorPrompt).toContain('"depends_on": ["<foundation task_id>"]');
+    // Both fields use the resolved project integration branch, so the re-cut
+    // base is the exact branch whose landing status releases the successor.
+    expect(executorPrompt).toContain('"require_deps_landed_on": "project-integration", "release_base_branch": "project-integration"');
+    expect(executorPrompt).toContain('every depends_on dependency must have LANDED on');
+    // Independent work stays parallel (no depends_on) so it is not held by the chain.
+    expect(executorPrompt).toContain('work parallel (no depends_on)');
   });
 });
 

@@ -2512,7 +2512,7 @@ async def test_propagate_skips_force_dropped_children(cleanup_db, mocker):
         )
         children.append(child)
 
-    _propagate_landed_to_rollup_children(children, cleanup_db)
+    await _propagate_landed_to_rollup_children(children, cleanup_db)
 
     for child, reason in zip(children, force_drop_reasons):
         assert not has_landed_signal(child), (
@@ -2524,6 +2524,116 @@ async def test_propagate_skips_force_dropped_children(cleanup_db, mocker):
         assert (child.context or {}).get("_non_merge_unblock_reason") == reason, (
             f"force-dropped child ({reason}) must retain _non_merge_unblock_reason"
         )
+
+
+@pytest.mark.asyncio
+async def test_propagate_rollup_children_carries_merge_sha(cleanup_db):
+    """_propagate_landed_to_rollup_children must forward the landed parent's
+    merge commit SHA onto every child it newly lands, so rollup children (which
+    land via the parent's single PR with no PR fetch of their own) carry exact
+    commit identity for the discovery-review receipt.  When no SHA is supplied,
+    the child is still landed but carries no merge_commit_sha key.
+    """
+    from app.rollup_management import _propagate_landed_to_rollup_children
+    from app.landed_signal import LANDED_MERGE_SHA_KEY, has_landed_signal
+
+    project = await _make_project(cleanup_db)
+
+    child = await _make_task(
+        cleanup_db,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+        },
+    )
+    await _propagate_landed_to_rollup_children(
+        [child], cleanup_db, merge_commit_sha="a" * 40
+    )
+
+    assert has_landed_signal(child)
+    assert (child.context or {}).get(LANDED_MERGE_SHA_KEY) == "a" * 40
+    assert "_non_merge_unblock_reason" not in (child.context or {})
+
+    # No SHA supplied → landed but without commit identity key.
+    no_sha_child = await _make_task(
+        cleanup_db,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+        },
+    )
+    await _propagate_landed_to_rollup_children([no_sha_child], cleanup_db)
+
+    assert has_landed_signal(no_sha_child)
+    assert LANDED_MERGE_SHA_KEY not in (no_sha_child.context or {})
+
+
+@pytest.mark.asyncio
+async def test_propagate_bfs_descendants_carry_parent_merge_sha(cleanup_db):
+    """The BFS staging-merged descendant sweep must forward the landed parent's
+    merge commit SHA onto every descendant it newly stamps, so deep rollup
+    descendants resolve exact commit identity for the discovery-review receipt.
+    """
+    from app.rollup_management import _propagate_landed_to_staging_merged_descendants
+    from app.landed_signal import LANDED_MERGE_SHA_KEY, has_landed_signal
+
+    project = await _make_project(cleanup_db, integration_branch="main")
+
+    outer_parent = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="research",
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": True,
+            LANDED_MERGE_SHA_KEY: "f" * 40,
+        },
+    )
+    sub_rollup = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="plan",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=outer_parent.id,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+        },
+    )
+    grandchild = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="create",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=sub_rollup.id,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+        },
+    )
+
+    stamped = await _propagate_landed_to_staging_merged_descendants(
+        outer_parent.id, cleanup_db
+    )
+    await cleanup_db.commit()
+
+    await cleanup_db.refresh(sub_rollup)
+    await cleanup_db.refresh(grandchild)
+
+    assert {t.id for t in stamped} == {sub_rollup.id, grandchild.id}
+    assert has_landed_signal(sub_rollup)
+    assert has_landed_signal(grandchild)
+    assert (sub_rollup.context or {}).get(LANDED_MERGE_SHA_KEY) == "f" * 40
+    assert (grandchild.context or {}).get(LANDED_MERGE_SHA_KEY) == "f" * 40
 
 
 def _mock_repoll_resolves_to_dirty(mocker, *, initial_state):
@@ -3343,6 +3453,144 @@ async def test_propagate_landed_descendants_inherits_changed_files(cleanup_db):
         "a child's own self-reported changed files must not be clobbered"
     )
     assert PARENT_DERIVED_CHANGED_FILES_KEY not in own_ctx
+
+
+@pytest.mark.asyncio
+async def test_propagate_landed_descendants_inherits_acceptance_block(cleanup_db):
+    """Rung 6 of design doc c50453ef (closes U1): a rollup child whose DECLARED
+    named_test the parent's single-PR acceptance-test block describes inherits that
+    block under ``_inherited_acceptance_block``, so the child's existence-at-merge
+    / ran-green readers see the parent's genuinely-run test instead of failing
+    closed on an absent ``review_loop``. A child whose declaration the block does
+    NOT describe inherits nothing (a green run of some OTHER test is never credited
+    for this declaration), and an already-inherited block is never clobbered.
+    """
+    from app.rollup_management import _propagate_landed_to_staging_merged_descendants
+    from app.acceptance_gate import (
+        INHERITED_ACCEPTANCE_BLOCK_KEY,
+        MERGE_ACCEPTANCE_BLOCK_KEY,
+        REVIEW_LOOP_KEY,
+        _acceptance_test_ran_green_at_merge,
+        _declared_named_test_path,
+    )
+
+    project = await _make_project(cleanup_db, integration_branch="main")
+
+    block = {
+        "declared": True,
+        "descriptor": "test_widget.py",
+        "selector": "backend/testing/test_widget.py::test_x",
+        "present": True,
+        "ran": True,
+        "status": "ran",
+        "passed": True,
+    }
+    parent = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="research",
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": True,
+            REVIEW_LOOP_KEY: {MERGE_ACCEPTANCE_BLOCK_KEY: block},
+        },
+    )
+
+    # CASE 1: child declares the SAME test the parent's block describes.
+    matching_child = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="create",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=parent.id,
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "make widget",
+                "acceptance_evidence": {
+                    "kind": "named_test",
+                    "test_path": "backend/testing/test_widget.py",
+                },
+            }
+        ],
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+        },
+    )
+    # CASE 2: child declares a DIFFERENT test — no inheritance.
+    other_child = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="create",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=parent.id,
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "make other",
+                "acceptance_evidence": {
+                    "kind": "named_test",
+                    "test_path": "backend/testing/test_other.py",
+                },
+            }
+        ],
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+        },
+    )
+    # CASE 3: child already carries an inherited block — never clobbered.
+    existing_block = dict(block)
+    existing_block["descriptor"] = "older inherited block"
+    already = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="create",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=parent.id,
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "make widget too",
+                "acceptance_evidence": {
+                    "kind": "named_test",
+                    "test_path": "backend/testing/test_widget.py",
+                },
+            }
+        ],
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+            INHERITED_ACCEPTANCE_BLOCK_KEY: existing_block,
+        },
+    )
+
+    await _propagate_landed_to_staging_merged_descendants(parent.id, cleanup_db)
+    await cleanup_db.commit()
+    await cleanup_db.refresh(matching_child)
+    await cleanup_db.refresh(other_child)
+    await cleanup_db.refresh(already)
+
+    match_ctx = matching_child.context or {}
+    assert match_ctx.get(INHERITED_ACCEPTANCE_BLOCK_KEY) == block
+    declared = _declared_named_test_path(matching_child.first_payload)
+    assert declared == "backend/testing/test_widget.py"
+    # The reader side now sees the parent's genuinely-run test via the inherited
+    # block — the child's ran-green evidence is no longer invisible.
+    assert _acceptance_test_ran_green_at_merge(match_ctx, declared) is True
+
+    other_ctx = other_child.context or {}
+    assert INHERITED_ACCEPTANCE_BLOCK_KEY not in other_ctx
+    other_declared = _declared_named_test_path(other_child.first_payload)
+    assert _acceptance_test_ran_green_at_merge(other_ctx, other_declared) is False
+
+    # An already-inherited block is untouched (setdefault-style, never clobbered).
+    assert (already.context or {}).get(INHERITED_ACCEPTANCE_BLOCK_KEY) == existing_block
 
 
 @pytest.mark.asyncio
@@ -4893,3 +5141,404 @@ async def test_alembic_stale_inflight_stake_does_not_wedge_the_reconcile(
     await _check_and_trigger_rollup(child, cleanup_db)
 
     mock_commit.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Campaign objective completion: a direction's completion signal waits on its
+# GRADED objective, not child-merge counts.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_direction_campaign_completion_waits_on_scoped_objective(
+    cleanup_db, mocker
+):
+    """A campaign direction's completion reflects its graded OBJECTIVE once a
+    direction-scoped merge grade lands — not the merge-count heuristic alone.
+
+    End-to-end through the real production chain:
+
+    1. TRIGGER — a landed rollup whose parent carries ``direction_id`` and whose
+       direction declares a gradeable objective spawns a direction-scoped
+       ``release_merge_grade`` task against the integrated merged diff.
+    2. BACKWARD COMPAT — before any grade completes, the merge-count heuristic
+       still marks the direction possibly_complete (no graded verdict yet).
+    3. WAITS — once the grade completes NOT-met, the lifecycle consumes it and
+       the graded verdict AUTHORITATIVELY suppresses possibly_complete — the
+       campaign does not 'complete' while its objective remains unmet.
+    4. FULFILLS — after the rubric is graded fully met, the lifecycle marks the
+       direction complete with the graded-objective message.
+    """
+    import json
+    from datetime import timedelta
+
+    from sqlalchemy import select as _select
+
+    from app import category_verdict_ledger as _ledger
+    from app.direction_lifecycle import _process_direction_lifecycle_locked
+    from app.models import Artifact, ArtifactType, Project, Task as _Task
+    from app.models import TaskStatus
+    from app.rollup_management import _do_rollup_post_merge_housekeeping
+    from app.time_utils import _utcnow
+
+    direction_id = "d-campaign-7c69e418"
+    objective = "Ship the scoped objective-completion grade end-to-end"
+    candidate_sha = "1a2b3c4d" * 5
+
+    now = _utcnow()
+    # 5 cycles: the two most recent are no-op low-yield (trips the completion
+    # heuristic), the older three merged real PRs (so the still-productive pause
+    # shield holds and no merge-rate auto-pause fires before the completion gate).
+    def _cycle(days_ago, *, created, merged):
+        return {
+            "timestamp": (now - timedelta(days=days_ago)).isoformat(),
+            "tasks_created": created,
+            "tasks_completed": created,
+            "tasks_completed_no_pr": created if merged == 0 else 0,
+            "tasks_failed": 0,
+            "tasks_failed_infra": 0,
+            "prs_merged": merged,
+            "verified_prs_merged": merged,
+            "merged_prs_any_base": merged,
+            "autonomous_prs_merged": merged,
+        }
+
+    history = [
+        _cycle(4, created=3, merged=2),
+        _cycle(3, created=3, merged=2),
+        _cycle(2, created=3, merged=2),
+        _cycle(1, created=1, merged=0),
+        _cycle(0, created=1, merged=0),
+    ]
+    direction = {
+        "id": direction_id,
+        "text": "Scope objective-completion grading to campaign directions",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "completion_criteria": objective,
+        "criterion_keys": ["c-campaign-1"],
+        "last_cycle_productive": True,
+        "consecutive_unproductive_cycles": 0,
+        "research_history": history,
+    }
+    project = Project(
+        name="Campaign Completion Test",
+        user_id="u-campaign",
+        github_owner="acme",
+        github_repo="repo",
+        integration_branch="automain",
+        promotion_target="main",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    cleanup_db.add(project)
+    await cleanup_db.commit()
+    await cleanup_db.refresh(project)
+
+    # The direction's criterion key resolves to a real VersionAcceptanceCriterion
+    # row — the grader rubric must carry its human-readable TEXT, not the key.
+    from app.release_models import ReleaseVersion, VersionAcceptanceCriterion
+
+    release_version = ReleaseVersion(
+        project_id=project.id, version_number=1, status="open"
+    )
+    cleanup_db.add(release_version)
+    await cleanup_db.commit()
+    criterion_text = "The campaign ships the scoped objective grade end-to-end"
+    cleanup_db.add(
+        VersionAcceptanceCriterion(
+            project_id=project.id,
+            release_version_id=release_version.id,
+            criterion_key="c-campaign-1",
+            text=criterion_text,
+        )
+    )
+    await cleanup_db.commit()
+
+    parent = await _make_rollup_parent_with_pr(
+        cleanup_db, project.id, extra_context={"direction_id": direction_id}
+    )
+    child_a = _Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "implement campaign piece A"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "direction_id": direction_id,
+            "research_task_id": "r-campaign-a",
+            "pr_number": 701,
+            "landed_on_integration": True,
+            "pr_merged": True,
+        },
+    )
+    child_b = _Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "implement campaign piece B"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "direction_id": direction_id,
+            "research_task_id": "r-campaign-b",
+            "pr_number": 702,
+            "landed_on_integration": True,
+            "pr_merged": True,
+        },
+    )
+    cleanup_db.add(child_a)
+    cleanup_db.add(child_b)
+    await cleanup_db.commit()
+    await cleanup_db.refresh(child_a)
+    await cleanup_db.refresh(child_b)
+
+    # Mock only the unrelated housekeeping side-effects; the spawn trigger
+    # (_maybe_spawn_direction_merge_grade) and the lifecycle gate run REAL.
+    mocker.patch(
+        "app.direction_outcomes.refresh_direction_outcomes_after_merge",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.acceptance_criteria.record_task_merge_evidence",
+        new_callable=AsyncMock,
+        return_value=1,
+    )
+    mocker.patch("app.github.delete_branch", new_callable=AsyncMock)
+    mocker.patch(
+        "app.github.get_pull_request_diff", new_callable=AsyncMock, return_value=""
+    )
+    mocker.patch(
+        "app.notification_dispatch.post_pr_merged_message", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.viewport_coverage.update_viewport_coverage_snapshot_from_diff",
+        new_callable=AsyncMock,
+    )
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.rollup_management._nudge_sibling_rollup_prs", new_callable=AsyncMock
+    )
+    mocker.patch("app.rollup_management._cleanup_branches", new_callable=AsyncMock)
+    mocker.patch(
+        "app.github_refs.get_branch_sha", new_callable=AsyncMock, return_value=candidate_sha
+    )
+    mocker.patch(
+        "app.direction_lifecycle._compute_direction_error_fingerprint",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+
+    # ---- 1. TRIGGER: the landed rollup spawns the direction-scoped grade ----
+    await _do_rollup_post_merge_housekeeping(
+        parent=parent,
+        project=project,
+        session=cleanup_db,
+        gh_token="tok",
+        owner="acme",
+        repo="repo",
+        rollup_pr_number=4242,
+        staging_branch="research/conflict-stg",
+        target_branch="automain",
+        completed_children=[child_a, child_b],
+        completed_count=2,
+        landed=True,
+        terminal=False,
+    )
+    await cleanup_db.refresh(parent)
+    assert parent.context.get("_direction_merge_grade_candidate_sha") == candidate_sha, (
+        "housekeeping must stamp the graded candidate sha on the parent context"
+    )
+    grade_task = (
+        await cleanup_db.execute(
+            _select(_Task).where(
+                _Task.id == uuid.UUID(parent.context["_direction_merge_grade_task_id"])
+            )
+        )
+    ).scalar_one()
+    assert grade_task.first_payload["type"] == "release_merge_grade"
+    assert grade_task.first_payload["direction_id"] == direction_id
+    assert grade_task.first_payload["candidate_sha"] == candidate_sha
+    assert grade_task.first_payload["merged_prs"] == [701, 702]
+    assert grade_task.first_payload["categories"] == [
+        {"category_key": "c-campaign-1", "text": criterion_text}
+    ], (
+        "the grader rubric must carry the criterion's human-readable text — "
+        "a key-only rubric is ungradeable"
+    )
+
+    # ---- 2. BACKWARD COMPAT: no verdict yet → heuristic sets possibly_complete ----
+    await _process_direction_lifecycle_locked(project, cleanup_db, set(), now)
+    await cleanup_db.refresh(project)
+    d = project.directions[0]
+    assert d.get("possibly_complete") is True, (
+        "before any grade, the merge-count heuristic must still mark the "
+        "direction possibly_complete"
+    )
+    assert "graded fully met" not in (d.get("completion_suggestion") or "")
+
+    # ---- 3. WAITS: a NOT-met grade authoritatively suppresses completion ----
+    grade_task.status = TaskStatus.COMPLETED
+    cleanup_db.add(grade_task)
+    not_met_artifact = {
+        "graded_candidate_sha": candidate_sha,
+        "covers_goal": False,
+        "coverage_score": 0.3,
+        "biggest_gap": "Objective still not implemented.",
+        "rationale": "Read the merged diff.",
+        "category_verdicts": [
+            {
+                "category_key": "c-campaign-1",
+                "status": "not_met",
+                "tier": "judged",
+                "blocked_by": "unbuilt",
+                "gap": "The campaign objective is not yet delivered.",
+                "citations": [{"kind": "diff", "ref": "backend/app/x.py"}],
+            }
+        ],
+        "residual_uncaptured_gap": (
+            "The objective's acceptance criteria are not fully captured."
+        ),
+    }
+    cleanup_db.add(
+        Artifact(
+            task_id=grade_task.id,
+            artifact_type=ArtifactType.RELEASE_MERGE_GRADE,
+            logs=json.dumps(not_met_artifact),
+        )
+    )
+    await cleanup_db.commit()
+    await cleanup_db.refresh(grade_task)
+
+    await _process_direction_lifecycle_locked(project, cleanup_db, set(), now)
+    await cleanup_db.refresh(project)
+    d = project.directions[0]
+    assert d.get("possibly_complete") is not True, (
+        "a graded NOT-met objective must suppress the completion signal — the "
+        "campaign waits on its objective, not merge counts"
+    )
+    verdicts = await _ledger.get_category_verdicts(
+        cleanup_db, None, candidate_sha, direction_id=direction_id
+    )
+    assert len(verdicts) == 1 and verdicts[0].status == "not_met"
+    assert await _ledger.get_latest_direction_candidate_sha(
+        cleanup_db, direction_id
+    ) == candidate_sha
+
+    # ---- 4. FULFILLS: a fully-met grade marks the direction complete ----
+    attempt_id = uuid.UUID(grade_task.context["qualification_attempt_id"])
+    await _ledger.upsert_category_verdict(
+        cleanup_db,
+        direction_id=direction_id,
+        candidate_sha=candidate_sha,
+        category_key="c-campaign-1",
+        status="met",
+        tier="judged",
+        gap=None,
+        citations=[],
+        grader_run_id=str(grade_task.id),
+        qualification_attempt_id=attempt_id,
+        project_id=project.id,
+    )
+    await _ledger.upsert_residual(
+        cleanup_db,
+        direction_id=direction_id,
+        candidate_sha=candidate_sha,
+        uncaptured_gap=None,
+        qualification_attempt_id=attempt_id,
+        project_id=project.id,
+    )
+    await cleanup_db.commit()
+
+    await _process_direction_lifecycle_locked(project, cleanup_db, set(), now)
+    await cleanup_db.refresh(project)
+    d = project.directions[0]
+    assert d.get("possibly_complete") is True, (
+        "a graded fully-met objective must mark the direction complete"
+    )
+    assert "graded fully met" in (d.get("completion_suggestion") or ""), (
+        "the completion suggestion must cite the graded objective verdict"
+    )
+
+
+@pytest.mark.asyncio
+async def test_direction_merge_grade_skipped_when_no_active_criterion_keys(
+    cleanup_db, mocker
+):
+    """A direction with a gradeable objective but NO active criterion_keys must
+    not spawn a direction-scoped merge grade.
+
+    The legacy/synthetic case that ``_direction_active_category_keys`` exists for
+    yields an empty active set: ``direction_objective_completion_verdict`` returns
+    None for it and ``record_direction_merge_grade`` writes no ledger rows (no
+    category verdicts), so ``consume_direction_merge_grade_if_ready`` never
+    records the grade and the completion gate would never consult it.  Each
+    landed campaign rollup for such a direction would otherwise waste a full Opus
+    LLM grade + VM slot + task row.
+    """
+    from app.models import Project
+    from app.rollup_management import _maybe_spawn_direction_merge_grade
+
+    direction_id = "d-empty-rubric"
+    direction = {
+        "id": direction_id,
+        "text": "A direction with a gradeable objective but no rubric",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "completion_criteria": "Ship the scoped objective-completion grade",
+        # NOTE: NO criterion_keys — the legacy/synthetic case where the in-memory
+        # dict carries no rubric and no first-class Direction row exists either.
+    }
+    project = Project(
+        name="Empty Rubric Grade Test",
+        user_id="u-empty-rubric",
+        github_owner="acme",
+        github_repo="repo",
+        integration_branch="automain",
+        promotion_target="main",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    cleanup_db.add(project)
+    await cleanup_db.commit()
+    await cleanup_db.refresh(project)
+
+    parent = await _make_rollup_parent_with_pr(
+        cleanup_db, project.id, extra_context={"direction_id": direction_id}
+    )
+
+    mocker.patch(
+        "app.github_refs.get_branch_sha",
+        new_callable=AsyncMock,
+        return_value="1a2b3c4d" * 5,
+    )
+    mocker.patch(
+        "app.release_qualifier_audit._collect_direction_merged_pr_numbers",
+        new_callable=AsyncMock,
+        return_value=[701],
+    )
+    spawn = mocker.patch(
+        "app.release_qualifier_audit._spawn_direction_merge_grade_task",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+
+    await _maybe_spawn_direction_merge_grade(
+        parent=parent,
+        project=project,
+        session=cleanup_db,
+        gh_token="tok",
+        owner="acme",
+        repo="repo",
+        target_branch="automain",
+    )
+    await cleanup_db.refresh(parent)
+
+    spawn.assert_not_called()
+    assert parent.context.get("_direction_merge_grade_task_id") is None, (
+        "no grade task may be stamped on the parent context when the direction "
+        "has no active criterion keys"
+    )

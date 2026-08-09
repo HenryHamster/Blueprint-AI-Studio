@@ -443,6 +443,64 @@ async def test_fleet_serving_source_sha_preserves_exact_match_without_ancestry(
 
 
 @pytest.mark.asyncio
+async def test_fleet_serving_source_sha_accepts_live_local_runner(db_session):
+    """A live checkout runner can independently prove the promoted source SHA."""
+    promoted_sha = "a" * 40
+    project = Project(name="Local serving identity", user_id="test-user")
+    db_session.add(project)
+    await db_session.flush()
+    db_session.add(
+        LocalRunner(
+            project_id=project.id,
+            token_hash="0" * 64,
+            status="active",
+            last_seen_at=_utcnow(),
+            source_sha=promoted_sha,
+        )
+    )
+    await db_session.commit()
+
+    assert (
+        await compute.fleet_serving_source_sha(
+            db_session,
+            promoted_sha,
+            project_id=project.id,
+        )
+        is True
+    )
+
+
+@pytest.mark.asyncio
+async def test_fleet_serving_source_sha_rejects_local_runner_on_different_sha(
+    db_session,
+):
+    """A checkout runner reporting another commit must not satisfy the gate."""
+    promoted_sha = "a" * 40
+    project = Project(name="Wrong local serving identity", user_id="test-user")
+    db_session.add(project)
+    await db_session.flush()
+    db_session.add(
+        LocalRunner(
+            project_id=project.id,
+            token_hash="1" * 64,
+            status="active",
+            last_seen_at=_utcnow(),
+            source_sha="b" * 40,
+        )
+    )
+    await db_session.commit()
+
+    assert (
+        await compute.fleet_serving_source_sha(
+            db_session,
+            promoted_sha,
+            project_id=project.id,
+        )
+        is False
+    )
+
+
+@pytest.mark.asyncio
 async def test_fleet_serving_source_sha_accepts_descendant_when_enabled(
     monkeypatch, mocker
 ):
@@ -490,6 +548,148 @@ async def test_fleet_serving_source_sha_indeterminate_descendant_is_not_confirme
         )
         is False
     )
+
+
+@pytest.mark.asyncio
+async def test_fleet_serving_source_sha_confirms_from_live_local_runner(
+    gcp_cleanup_db,
+):
+    """A self-hosted checkout runner with a durable agent_source_sha confirms
+    fleet serving.
+
+    The fleet-serving predicate behind the agent_image release artifact only
+    inspected warm-pool PoolVm rows and a task-bound in-memory cache, so a fleet
+    made entirely of durable operator-hardware runners could never satisfy it.
+    This exercises the real DB path (no in-memory heartbeat cache populated) for
+    a fleet that is entirely LocalRunner rows — exactly the release gate's
+    project-scoped call shape.
+    """
+    from app.models import LocalRunner
+    from app.time_utils import _utcnow
+
+    promoted_sha = "c" * 40
+    project = Project(name="Runner Fleet Serving", user_id="user-1")
+    gcp_cleanup_db.add(project)
+    await gcp_cleanup_db.commit()
+    await gcp_cleanup_db.refresh(project)
+
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash="a" * 64,
+        hostname="operator-box-1",
+        version="v1.2.3-5-g" + promoted_sha[:7],
+        agent_source_sha=promoted_sha,
+        status="active",
+        last_seen_at=_utcnow(),
+    )
+    gcp_cleanup_db.add(runner)
+    await gcp_cleanup_db.commit()
+
+    assert (
+        await compute.fleet_serving_source_sha(
+            gcp_cleanup_db,
+            promoted_sha,
+            allow_descendant=True,
+            token="tok",
+            owner="acme",
+            repo="widget",
+            project_id=str(project.id),
+        )
+        is True
+    )
+
+
+@pytest.mark.asyncio
+async def test_fleet_serving_source_sha_ignores_inactive_and_other_project_runner(
+    gcp_cleanup_db,
+):
+    """Only active, live, project-scoped runners with a reported SHA confirm."""
+    from app.models import LocalRunner
+    from app.time_utils import _utcnow
+
+    promoted_sha = "c" * 40
+    project = Project(name="Runner Fleet Scoped", user_id="user-1")
+    gcp_cleanup_db.add(project)
+    await gcp_cleanup_db.commit()
+    await gcp_cleanup_db.refresh(project)
+    other_project = Project(name="Other Project", user_id="user-2")
+    gcp_cleanup_db.add(other_project)
+    await gcp_cleanup_db.commit()
+    await gcp_cleanup_db.refresh(other_project)
+
+    gcp_cleanup_db.add_all(
+        [
+            # Inactive runner on the right project.
+            LocalRunner(
+                project_id=project.id,
+                token_hash="b" * 64,
+                status="inactive",
+                agent_source_sha=promoted_sha,
+                last_seen_at=_utcnow(),
+            ),
+            # Active but stale (missed liveness window) runner on the right project.
+            LocalRunner(
+                project_id=project.id,
+                token_hash="c" * 64,
+                status="active",
+                agent_source_sha=promoted_sha,
+                last_seen_at=_utcnow() - timedelta(seconds=10000),
+            ),
+            # Active + live runner on a DIFFERENT project (tenant isolation).
+            LocalRunner(
+                project_id=other_project.id,
+                token_hash="d" * 64,
+                status="active",
+                agent_source_sha=promoted_sha,
+                last_seen_at=_utcnow(),
+            ),
+        ]
+    )
+    await gcp_cleanup_db.commit()
+
+    assert (
+        await compute.fleet_serving_source_sha(
+            gcp_cleanup_db,
+            promoted_sha,
+            project_id=str(project.id),
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_fleet_source_sha_snapshot_includes_runner_kind(gcp_cleanup_db):
+    """Live LocalRunner rows appear as runner-kind buckets in the snapshot."""
+    from app.models import LocalRunner
+    from app.time_utils import _utcnow
+
+    project = Project(name="Runner Snapshot", user_id="user-1")
+    gcp_cleanup_db.add(project)
+    await gcp_cleanup_db.commit()
+    await gcp_cleanup_db.refresh(project)
+
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash="e" * 64,
+        status="active",
+        agent_source_sha="f" * 40,
+        last_seen_at=_utcnow(),
+    )
+    gcp_cleanup_db.add(runner)
+    await gcp_cleanup_db.commit()
+
+    snapshot = await compute.agent_fleet_source_sha_snapshot(
+        gcp_cleanup_db, project.id
+    )
+    assert snapshot["total_observed"] == 1
+    assert snapshot["mixed"] is False
+    assert snapshot["unknown_count"] == 0
+    bucket = snapshot["buckets"][0]
+    assert bucket["source_sha"] == "f" * 40
+    assert bucket["runner_count"] == 1
+    assert bucket["count"] == 1
+    assert bucket["warm_pool_count"] == 0
+    assert bucket["task_vm_count"] == 0
 
 
 async def test_local_compute_backend_recovers_running_pid_after_restart():
@@ -8138,5 +8338,4 @@ async def test_build_launch_spec_declared_metric_none_when_absent(db_session, mo
 
     spec = compute_jobs._build_launch_spec(job)
     assert spec.declared_metric is None
-
 

@@ -416,6 +416,18 @@ async def _alert_promotion_deploy_failed(
         "no_new_revision": (
             "no new healthy production revision booted within the confirmation window"
         ),
+        "deploy_workflow_never_dispatched": (
+            "the deploy workflow was never dispatched for the promoted SHA"
+        ),
+        "deploy_workflow_failed": (
+            "the deploy workflow ran for the promoted SHA but concluded failed"
+        ),
+        "deploy_workflow_succeeded_stale_revision": (
+            "the deploy workflow succeeded but the promoted revision never served"
+        ),
+        "deploy_workflow_in_progress": (
+            "the deploy workflow is still running past the confirmation deadline"
+        ),
         "rolled_back": "the deploy was ROLLED BACK after the promotion",
         "halted": "the deploy was HALTED after the promotion",
         "sha_mismatch": ("the live serving SHA does not match the promoted SHA"),

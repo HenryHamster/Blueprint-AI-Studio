@@ -396,11 +396,9 @@ def _validate_spec(data: dict[str, Any]) -> list[str]:
 
 
 # Task types that ship a code-producing PR and therefore must carry an
-# acceptance_evidence declaration to pass validate_task_payload (mirrors
-# payload_schemas._CODE_PRODUCING_TASK_TYPES).
-_CODE_PRODUCING_TYPES = frozenset(
-    {"create", "fix", "refactor", "qa", "migrate", "deps", "docs"}
-)
+# acceptance_evidence declaration to pass validate_task_payload. The canonical
+# membership is task_capabilities.CODE_PRODUCING_TASK_TYPES — imported inline at
+# the usage site (matching the module's bare-pytest inline-import pattern).
 
 
 def _to_task_payload(data: dict[str, Any]) -> dict[str, Any]:
@@ -409,7 +407,9 @@ def _to_task_payload(data: dict[str, Any]) -> dict[str, Any]:
         "prompt": str(data.get("prompt", "")),
         "title": str(data.get("name", "")),
     }
-    if payload["type"] in _CODE_PRODUCING_TYPES:
+    from app.task_capabilities import CODE_PRODUCING_TASK_TYPES  # noqa: PLC0415
+
+    if payload["type"] in CODE_PRODUCING_TASK_TYPES:
         payload["acceptance_evidence"] = {
             "kind": "observable_behavior",
             "description": "golden spec task ships a real, testable change",

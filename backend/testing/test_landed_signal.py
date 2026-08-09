@@ -23,6 +23,8 @@ from app.branch_resolution import get_project_integration_branch
 from app.landed_signal import (
     apply_merged_landed_signal,
     mark_landed_on_integration,
+    LANDED_MERGE_SHA_KEY,
+    LANDED_SIGNAL_KEY,
     NON_MERGE_UNBLOCK_REASON_KEY,
 )
 from app.models import Project, Task, TaskStatus
@@ -137,6 +139,111 @@ def test_acceptance_verdict_failure_does_not_block_landing(monkeypatch):
     # The landing bit must be written regardless.
     from app.landed_signal import LANDED_ON_INTEGRATION_KEY
     assert task.context.get(LANDED_ON_INTEGRATION_KEY) is True
+
+
+# ---------------------------------------------------------------------------
+# Merge commit identity recording
+# ---------------------------------------------------------------------------
+
+
+def test_mark_landed_on_integration_records_merge_sha():
+    """The canonical landing write records the exact merge commit SHA.
+
+    This is the named acceptance-evidence test required by the task plan: a
+    landed write task stamped through ``mark_landed_on_integration`` with a
+    merge commit carries ``merge_commit_sha`` in context so the
+    discovery-review receipt's ``_merge_sha`` reader can resolve exact commit
+    identity instead of reporting "lacks exact commit identity".
+    """
+    task = _make_code_task_with_evidence(
+        acceptance_evidence=None,
+        changed_files=["backend/app/widget.py"],
+    )
+
+    mark_landed_on_integration(task, merge_commit_sha="a" * 40)
+
+    assert task.context.get(LANDED_SIGNAL_KEY) is True
+    assert task.context.get(LANDED_ON_INTEGRATION_KEY) is True
+    assert task.context.get(LANDED_MERGE_SHA_KEY) == "a" * 40
+
+
+def test_mark_landed_on_integration_truncates_long_merge_sha():
+    """A merge SHA longer than 64 chars is truncated to the reader's bound."""
+    task = _make_code_task_with_evidence(
+        acceptance_evidence=None,
+        changed_files=["backend/app/widget.py"],
+    )
+
+    mark_landed_on_integration(task, merge_commit_sha="b" * 80)
+
+    recorded = task.context.get(LANDED_MERGE_SHA_KEY)
+    assert recorded == "b" * 64
+    assert len(recorded) == 64
+
+
+def test_mark_landed_on_integration_preserves_existing_merge_sha_when_none():
+    """Re-stamping a landing without a SHA must not erase a recorded SHA."""
+    task = _make_code_task_with_evidence(
+        acceptance_evidence=None,
+        changed_files=["backend/app/widget.py"],
+    )
+    task.context = {
+        **(task.context or {}),
+        LANDED_MERGE_SHA_KEY: "c" * 40,
+    }
+
+    mark_landed_on_integration(task)
+
+    assert task.context.get(LANDED_MERGE_SHA_KEY) == "c" * 40
+
+
+def test_apply_merged_landed_signal_stamps_merge_sha_only_on_integration():
+    """apply_merged_landed_signal forwards the SHA on an integration landing."""
+    task = _make_code_task_with_evidence(
+        acceptance_evidence=None,
+        changed_files=["backend/app/widget.py"],
+    )
+    project = Project(
+        name="sha integration", user_id="test-user", integration_branch="automain"
+    )
+    integration = get_project_integration_branch(project)
+
+    landed = apply_merged_landed_signal(
+        task,
+        project,
+        base_branch=integration,
+        hotfix_lane=False,
+        merge_commit_sha="d" * 40,
+    )
+
+    assert landed is True
+    assert task.context.get(LANDED_MERGE_SHA_KEY) == "d" * 40
+
+
+def test_apply_merged_landed_signal_omits_sha_on_non_integration_landing():
+    """A merge onto a staging branch records the unblock marker but no SHA."""
+    task = _make_code_task_with_evidence(
+        acceptance_evidence=None,
+        changed_files=["backend/app/widget.py"],
+    )
+    project = Project(
+        name="sha staging", user_id="test-user", integration_branch="automain"
+    )
+
+    landed = apply_merged_landed_signal(
+        task,
+        project,
+        base_branch="research/def01234",
+        hotfix_lane=False,
+        non_merge_reason="merged_pr_non_integration_branch",
+        merge_commit_sha="e" * 40,
+    )
+
+    assert landed is False
+    assert task.context.get(LANDED_MERGE_SHA_KEY) is None
+    assert task.context.get(NON_MERGE_UNBLOCK_REASON_KEY) == (
+        "merged_pr_non_integration_branch"
+    )
 
 
 @pytest.mark.asyncio
@@ -500,3 +607,301 @@ def test_unverified_merge_reason_preserved_on_direct_landing():
     assert verdict["kind"] == "named_test"
     bucket = classify_merged_acceptance_context(task.context)
     assert bucket == "declared_unsatisfied", f"expected 'declared_unsatisfied', got {bucket!r}"
+
+
+# ---------------------------------------------------------------------------
+# Corroboration twin: corroborate-and-mark_landed_on_integration
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_corroborate_and_mark_landed_corroborates_before_landing_write():
+    """The async twin corroborates the declared acceptance test at the merge
+    commit BEFORE the landing write runs — the marker is already stamped on
+    task.context at the moment the sync landing write executes, so a not-in-diff
+    declared test that exists in the merged tree mints machine-proven credit.
+
+    Previously only the orchestrator CI monitor's already-merged recheck branch
+    corroborated before recording; every other landing path left the marker
+    absent and the gate fell back to agent self-report.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from app.acceptance_gate import ACCEPTANCE_TEST_CORROBORATED_KEY
+    from app.landed_signal import (
+        LANDED_ON_INTEGRATION_KEY,
+        corroborate_and_mark_landed_on_integration,
+        mark_landed_on_integration,
+    )
+
+    task = _make_code_task_with_evidence(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+            "test_id": "test_widget_handles_empty",
+        },
+        changed_files=["backend/app/widget.py"],  # declared test NOT in the diff
+    )
+    ctx = {
+        "token": "tok",
+        "owner": "owner",
+        "repo": "repo",
+        "branch": "integration",
+        "project_id": "proj-1",
+    }
+    seen_marker_at_landing: dict = {}
+
+    def _landing_snapshot(task_arg, project=None, *, merge_commit_sha=None):
+        seen_marker_at_landing["present"] = (
+            ACCEPTANCE_TEST_CORROBORATED_KEY in (task_arg.context or {})
+        )
+        seen_marker_at_landing["value"] = (task_arg.context or {}).get(
+            ACCEPTANCE_TEST_CORROBORATED_KEY
+        )
+        # Delegate to the real sync writer so the landed signal + verdict still
+        # record exactly as the production landing write would.
+        mark_landed_on_integration(
+            task_arg, project, merge_commit_sha=merge_commit_sha
+        )
+
+    with (
+        patch(
+            "app.source_ref_validation.resolve_branch_verification_context",
+            new=AsyncMock(return_value=dict(ctx)),
+        ),
+        patch(
+            "app.github_repo_snapshot.file_text_at_commit",
+            new=AsyncMock(
+                return_value=(
+                    True,
+                    "def test_widget_handles_empty():\n    assert 1",
+                )
+            ),
+        ),
+        patch(
+            "app.landed_signal.mark_landed_on_integration",
+            side_effect=_landing_snapshot,
+        ),
+    ):
+        await corroborate_and_mark_landed_on_integration(
+            task, None, merge_commit_sha="a" * 40
+        )
+
+    assert seen_marker_at_landing["present"] is True
+    assert seen_marker_at_landing["value"] is True
+    # The sync write still ran and recorded the landed signal.
+    assert task.context.get(LANDED_ON_INTEGRATION_KEY) is True
+
+
+@pytest.mark.asyncio
+async def test_corroborate_and_mark_landed_survives_indeterminate_corroboration():
+    """An indeterminate corroboration (resolver failure) never aborts the
+    landing: the sync write still stamps the landed signal and records a soft
+    verdict with no marker, preserving the fail-safe contract of the sync
+    function."""
+    from unittest.mock import AsyncMock, patch
+
+    from app.acceptance_gate import (
+        ACCEPTANCE_TEST_CORROBORATED_KEY,
+        CODE_ACCEPTANCE_VERDICT_KEY,
+    )
+    from app.landed_signal import (
+        LANDED_ON_INTEGRATION_KEY,
+        corroborate_and_mark_landed_on_integration,
+    )
+
+    task = _make_code_task_with_evidence(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+            "test_id": "test_widget_handles_empty",
+        },
+        changed_files=["backend/app/widget.py"],
+    )
+    # Targeted-green evidence so a marker-less landing records a SOFT verdict
+    # (satisfied, unproven) rather than failing closed on missing data.
+    rl = dict((task.context or {}).get(REVIEW_LOOP_KEY) or {})
+    rl["acceptance_test_targeted_green"] = True
+    rl["acceptance_test_targeted_descriptor"] = (
+        "backend/testing/test_widget.py"
+    )
+    task.context = {**(task.context or {}), REVIEW_LOOP_KEY: rl}
+
+    with patch(
+        "app.source_ref_validation.resolve_branch_verification_context",
+        new=AsyncMock(side_effect=RuntimeError("boom")),
+    ):
+        await corroborate_and_mark_landed_on_integration(
+            task, None, merge_commit_sha="a" * 40
+        )
+
+    assert task.context.get(LANDED_ON_INTEGRATION_KEY) is True
+    assert ACCEPTANCE_TEST_CORROBORATED_KEY not in (task.context or {})
+    verdict = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+    assert isinstance(verdict, dict)
+    assert verdict.get("satisfied") is True
+    assert verdict.get("proven") is False
+
+
+# ---------------------------------------------------------------------------
+# Corroboration twin: corroborate_and_apply_merged_landed_signal
+# ---------------------------------------------------------------------------
+
+
+def _make_project_for_landing() -> Project:
+    return Project(
+        name="proj",
+        github_repo="repo",
+        github_owner="owner",
+        integration_branch="integration",
+        promotion_target="release/main",
+    )
+
+
+@pytest.mark.asyncio
+async def test_corroborate_and_apply_merged_corroborates_before_guarded_write():
+    """The guarded-write twin stamps the backend corroboration marker BEFORE the
+    sync guarded write records the verdict, so a not-in-diff declared test that
+    exists at the merge commit mints machine-proven credit on every async
+    landing path (CI completion, task lifecycle, rollups, routers, recovery)."""
+    from unittest.mock import AsyncMock, patch
+
+    from app.acceptance_gate import ACCEPTANCE_TEST_CORROBORATED_KEY
+    from app.landed_signal import corroborate_and_apply_merged_landed_signal
+
+    task = _make_code_task_with_evidence(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+            "test_id": "test_widget_handles_empty",
+        },
+        changed_files=["backend/app/widget.py"],  # declared test NOT in the diff
+    )
+    # Targeted-green agent evidence: necessary but NOT sufficient for a
+    # not-in-diff test — the proven mint additionally requires the backend's own
+    # corroboration, which is exactly what the twin supplies.
+    _rl = dict((task.context or {}).get(REVIEW_LOOP_KEY) or {})
+    _rl["acceptance_test_targeted_green"] = True
+    _rl["acceptance_test_targeted_descriptor"] = "backend/testing/test_widget.py"
+    task.context = {**(task.context or {}), REVIEW_LOOP_KEY: _rl}
+    project = _make_project_for_landing()
+    resolved = {
+        "token": "tok",
+        "owner": "owner",
+        "repo": "repo",
+        "branch": "integration",
+        "project_id": str(uuid.uuid4()),
+    }
+
+    with (
+        patch(
+            "app.source_ref_validation.resolve_branch_verification_context",
+            new=AsyncMock(return_value=dict(resolved)),
+        ),
+        patch(
+            "app.github_repo_snapshot.file_text_at_commit",
+            new=AsyncMock(
+                return_value=(
+                    True,
+                    "def test_widget_handles_empty():\n    assert 1",
+                )
+            ),
+        ),
+    ):
+        landed = await corroborate_and_apply_merged_landed_signal(
+            task,
+            project,
+            object(),  # session — only forwarded to the (patched) resolver
+            base_branch="integration",
+            hotfix_lane=False,
+            merge_commit_sha="a" * 40,
+        )
+
+    # Same guarded-write contract as the sync function.
+    assert landed is True
+    assert task.context.get(LANDED_ON_INTEGRATION_KEY) is True
+    assert task.context.get(LANDED_MERGE_SHA_KEY) == "a" * 40
+    # ...plus the corroboration marker, which mints proven credit for the
+    # not-in-diff declared test.
+    assert task.context.get(ACCEPTANCE_TEST_CORROBORATED_KEY) is True
+    verdict = task.context.get(CODE_ACCEPTANCE_VERDICT_KEY)
+    assert verdict["satisfied"] is True
+    assert verdict["proven"] is True
+
+
+@pytest.mark.asyncio
+async def test_corroborate_and_apply_merged_preserves_non_landing_guard():
+    """A merge onto the promotion target is still NOT a landing: the twin must
+    preserve the sync guard (returns False, no landed signal) and must never
+    turn a corroboration into a landing."""
+    from unittest.mock import AsyncMock, patch
+
+    from app.landed_signal import (
+        corroborate_and_apply_merged_landed_signal,
+    )
+
+    task = _make_code_task_with_evidence(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+        },
+        changed_files=["backend/app/widget.py"],
+    )
+    project = _make_project_for_landing()
+
+    with patch(
+        "app.source_ref_validation.resolve_branch_verification_context",
+        new=AsyncMock(side_effect=RuntimeError("no creds")),
+    ):
+        landed = await corroborate_and_apply_merged_landed_signal(
+            task,
+            project,
+            object(),
+            base_branch="release/main",
+            hotfix_lane=True,
+            non_merge_reason="merged_pr_non_integration_branch",
+        )
+
+    assert landed is False
+    assert task.context.get(LANDED_ON_INTEGRATION_KEY) is False
+    # The hotfix promotion merge is still recorded as a merge-equivalent unblock
+    # (pr_merged stays True — merge-equivalent — but the LANDING is withheld).
+    assert (
+        task.context.get(NON_MERGE_UNBLOCK_REASON_KEY)
+        == "merged_pr_non_integration_branch"
+    )
+
+
+@pytest.mark.asyncio
+async def test_corroborate_and_apply_merged_never_aborts_on_corroboration_failure():
+    """A corroboration blow-up must never abort a real merge landing."""
+    from unittest.mock import AsyncMock, patch
+
+    from app.acceptance_gate import ACCEPTANCE_TEST_CORROBORATED_KEY
+    from app.landed_signal import corroborate_and_apply_merged_landed_signal
+
+    task = _make_code_task_with_evidence(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+        },
+        changed_files=["backend/app/widget.py"],
+    )
+    project = _make_project_for_landing()
+
+    with patch(
+        "app.acceptance_gate.corroborate_acceptance_test_at_merge",
+        new=AsyncMock(side_effect=RuntimeError("boom")),
+    ):
+        landed = await corroborate_and_apply_merged_landed_signal(
+            task,
+            project,
+            object(),
+            base_branch="integration",
+            hotfix_lane=False,
+            merge_commit_sha="b" * 40,
+        )
+
+    assert landed is True
+    assert task.context.get(LANDED_ON_INTEGRATION_KEY) is True
+    assert ACCEPTANCE_TEST_CORROBORATED_KEY not in (task.context or {})

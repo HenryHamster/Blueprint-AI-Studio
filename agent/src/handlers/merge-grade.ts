@@ -75,6 +75,12 @@ export interface MergeGradeArtifact {
   // The single goal aspect NO category captures, or null when the categories
   // fully decompose the goal. A non-empty string hard-blocks promotion.
   residual_uncaptured_gap: string | null;
+  // Direction scope discriminator (campaign-objective path, dir d-4f944896):
+  // echoed verbatim from the payload so the backend can key results into the
+  // direction-scoped category-verdict ledger. Empty string on the legacy
+  // version-scoped path. It is an identifier, NOT a strategist narrative, so it
+  // does not weaken the blindness contract.
+  direction_id: string;
 }
 
 /**
@@ -201,7 +207,9 @@ export function normalizeCategoryVerdicts(raw: unknown): CategoryVerdict[] {
  * verdicts and residual are carried verbatim (coerced) — the backend enforces
  * the citation/rubric rules.
  */
-export function normalizeMergeGradeOutput(raw: unknown, candidateSha: string): MergeGradeArtifact {
+export function normalizeMergeGradeOutput(
+  raw: unknown, candidateSha: string, directionId?: string,
+): MergeGradeArtifact {
   const obj = (raw && typeof raw === 'object' && !Array.isArray(raw))
     ? raw as Record<string, unknown>
     : {};
@@ -230,6 +238,7 @@ export function normalizeMergeGradeOutput(raw: unknown, candidateSha: string): M
     rationale: strVal(obj.rationale || obj.reason).trim(),
     category_verdicts: normalizeCategoryVerdicts(obj.category_verdicts),
     residual_uncaptured_gap: residualRaw !== '' ? residualRaw : null,
+    direction_id: (directionId ?? '').trim(),
   };
 }
 
@@ -240,6 +249,16 @@ export function normalizeMergeGradeOutput(raw: unknown, candidateSha: string): M
  */
 function resolveVersionGoal(payload: Record<string, unknown>): string {
   return strVal(payload.version_goal).trim() || strVal(payload.goal).trim();
+}
+
+/**
+ * Resolve the direction scope discriminator for the artifact. Returns the raw
+ * `direction_id` payload key (empty string on the version-scoped path where the
+ * key is absent). An identifier only — never a narrative — so echoing it does
+ * not violate the blindness contract.
+ */
+function resolveDirectionId(payload: Record<string, unknown>): string {
+  return strVal(payload.direction_id).trim();
 }
 
 /**
@@ -546,8 +565,9 @@ Rules:
 
   let logs = '';
   let mergeGradeUnparseable = false;
+  const directionId = resolveDirectionId(payload);
   if (handlerOutput !== null && validateMergeGradeShape(handlerOutput).ok) {
-    logs = sanitize(JSON.stringify(normalizeMergeGradeOutput(handlerOutput, candidateSha)));
+    logs = sanitize(JSON.stringify(normalizeMergeGradeOutput(handlerOutput, candidateSha, directionId)));
   } else {
     // Infer coverage state from the invalid output to determine whether biggest_gap is required during repair.
     const handlerObj = (handlerOutput && typeof handlerOutput === 'object' && !Array.isArray(handlerOutput))
@@ -581,7 +601,7 @@ Output ONLY the JSON object now — with top-level "graded_candidate_sha" (use "
       validateParsedValue: validateMergeGradeShape,
     });
     if (repaired.value !== null) {
-      logs = sanitize(JSON.stringify(normalizeMergeGradeOutput(repaired.value, candidateSha)));
+      logs = sanitize(JSON.stringify(normalizeMergeGradeOutput(repaired.value, candidateSha, directionId)));
     } else {
       mergeGradeUnparseable = exitCode === 0;
       logs = sanitize(lastResultText || allOutput.slice(-50_000));

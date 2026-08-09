@@ -77,6 +77,10 @@ RUNTIME_SECTIONS = frozenset(
         "provider-settings",
         "notifications",
         "advanced",
+        # RuntimeWorkspace renders VersionLifecyclePanel under this section id
+        # (admin-ui/src/components/RuntimeWorkspace.tsx) — attention items that
+        # deep-link to the promotion/activation panel target it.
+        "version-lifecycle",
     )
 )
 

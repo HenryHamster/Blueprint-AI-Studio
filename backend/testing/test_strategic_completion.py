@@ -2141,6 +2141,93 @@ async def test_no_vision_produced_increments_failures_under_held_lock(
     )
 
 
+@pytest.mark.asyncio
+async def test_legacy_vision_merge_uses_real_baseline_when_no_cycle_row(
+    db_session, mocker
+):
+    """The log-parse 3-way vision merge must NOT run against an empty baseline.
+
+    The vision-key cut (#16973) stopped shipping the legacy `vision` body in the
+    strategic payload, so ``task.first_payload.get("vision")`` is empty for every
+    modern task. When the task also has no StrategicCycle row, the old code merged
+    against ``{}`` — which makes every agent-supplied field read as a fresh edit
+    against the persisted vision. Legitimate agent edits to existing fields were
+    then rejected as ``value_conflict`` and the user's stale value won. The fix
+    binds the baseline to the current agent-visible vision, so the merge sees the
+    agent as the only editor and lets the edit land.
+    """
+    from unittest.mock import AsyncMock
+
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.strategic_completion._check_direction_starvation", new_callable=AsyncMock
+    )
+
+    project = Project(
+        name="P",
+        user_id="u1",
+        vision={
+            "purpose": "original purpose",
+            "revision": 0,
+            "systems": [{"id": "s1", "name": "Auth", "status": "planned"}],
+        },
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Modern task shape after the vision-key cut: NO `vision` key in the payload
+    # and NO StrategicCycle row (no cycle_id in context). The only baseline the
+    # merge can bind to is the current agent-visible vision.
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review"}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {
+                "purpose": "agent updated purpose",
+                "revision": 1,
+                "systems": [{"id": "s1", "name": "Auth", "status": "active"}],
+            },
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    vision = project.vision or {}
+    # The agent's edit to an existing field must land (the user never touched it).
+    assert vision.get("purpose") == "agent updated purpose", (
+        f"Agent purpose edit must survive the merge with a real baseline; "
+        f"got {vision.get('purpose')!r}"
+    )
+    sys_by_id = {s["id"]: s for s in vision.get("systems", [])}
+    assert sys_by_id["s1"]["status"] == "active", (
+        f"Agent systems edit must survive the merge; got {sys_by_id['s1']['status']!r}"
+    )
+    # No spurious rejected-edit ledger entries for agent-only edits.
+    assert (
+        vision.get("_rejected_agent_edits") is None
+        or vision["_rejected_agent_edits"] == []
+    ), (
+        "A real baseline must not log value_conflict rejections for agent-only edits; "
+        f"got {vision.get('_rejected_agent_edits')!r}"
+    )
+    # The merge still bumps the revision off the persisted value.
+    assert vision.get("revision") == 1, (
+        f"Expected revision bumped to 1, got {vision.get('revision')!r}"
+    )
+
+
 # ── _check_direction_starvation ──────────────────────────────────────────────
 
 

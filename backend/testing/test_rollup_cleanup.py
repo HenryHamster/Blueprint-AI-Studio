@@ -1010,6 +1010,42 @@ async def test_verify_pr_merged_api_confirms_merged(cleanup_db, mocker):
 
 
 @pytest.mark.asyncio
+async def test_verify_pr_merged_records_exact_merge_sha(cleanup_db, mocker):
+    """When the verified PR payload carries merge_commit_sha, _verify_pr_merged
+    records it on the task so the discovery-review receipt can resolve exact
+    commit identity (previously the landed signal was stamped without it)."""
+    from app.landed_signal import LANDED_MERGE_SHA_KEY
+
+    project = await _make_project(cleanup_db)
+    task = await _make_task(cleanup_db, project.id, context={})
+    await _make_artifact(cleanup_db, task.id, "https://github.com/owner/repo/pull/42")
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "merged": True,
+            "state": "closed",
+            "merge_commit_sha": "d" * 40,
+        },
+    )
+    ctx, _ = _make_write_session_mock(db_task=None)
+    mocker.patch("app.rollup_pr_verification.AsyncSessionLocal", return_value=ctx)
+
+    result = await _verify_pr_merged(task, cleanup_db)
+
+    assert result is True
+    assert task.context.get(LANDED_MERGE_SHA_KEY) == "d" * 40
+    assert task.context.get("landed_on_integration") is True
+    assert "_non_merge_unblock_reason" not in task.context
+
+
+@pytest.mark.asyncio
 async def test_verify_pr_merged_on_distinct_promotion_target_alerts_without_pr_merged(
     cleanup_db, mocker
 ):

@@ -4845,6 +4845,50 @@ async def test_acceptance_window_rederives_stale_rule_version_verdicts(db_sessio
     assert agg["acceptance_window_buckets"]["proven"] == 1
     assert agg["acceptance_window_buckets"]["declared_unsatisfied"] == 1
 
+    # Durability: the re-derived verdict must not stay a per-drive throwaway —
+    # the aggregate writes it back onto the session-bound task so every OTHER
+    # reader (task_outcomes, direction_outcomes, acceptance_criteria,
+    # metrics_integrity_sweep) sees the corrected row instead of the stale one.
+    stale_ctx = stale_task.context or {}
+    assert stale_ctx[CODE_ACCEPTANCE_VERDICT_KEY]["rule_version"] == (
+        ACCEPTANCE_RULE_VERSION
+    )
+    assert stale_ctx[CODE_ACCEPTANCE_VERDICT_KEY]["satisfied"] is True
+    assert stale_ctx[CODE_ACCEPTANCE_VERDICT_KEY]["proven"] is True
+    # A current-rule stamp is untouched — the frozen dict stays verbatim.
+    assert (
+        effective_acceptance_verdict(control_task)
+        is control_task.context[CODE_ACCEPTANCE_VERDICT_KEY]
+    )
+
+    # Re-derivation audit (design doc c50453ef §5): the drive reports how much
+    # already-merged work was re-scored, in which direction, and under which
+    # retired rule version the stale population was stamped — so score movement
+    # is inspectable instead of a silently-shifting aggregate. The stale task was
+    # re-derived (upgrade: unsatisfied → proven); the control was stamped under
+    # the current rule and never counted.
+    assert agg["acceptance_window_rederived_count"] == 1
+    assert agg["acceptance_window_rederived_upgrades"] == 1
+    assert agg["acceptance_window_rederived_downgrades"] == 0
+    assert agg["acceptance_window_rule_version"] == ACCEPTANCE_RULE_VERSION
+    assert agg["acceptance_window_stale_version_counts"] == {
+        ACCEPTANCE_RULE_VERSION - 1: 1
+    }
+    assert agg["acceptance_window_rederived_task_ids"] == [str(stale_task.id)]
+
+    # The durable re-derived stamp is auditable too: it is marked as a
+    # re-derivation and nests the ORIGINAL land-time (unsatisfied) verdict — the
+    # retired rule's judgment is never destroyed by the correction.
+    stale_verdict = stale_ctx[CODE_ACCEPTANCE_VERDICT_KEY]
+    assert stale_verdict["stamped_at_land_time"] is False
+    assert isinstance(stale_verdict["rederived_at"], str)
+    assert stale_verdict["rederived_by"] == f"qualifier:v{ACCEPTANCE_RULE_VERSION}"
+    assert stale_verdict["land_time_verdict"]["satisfied"] is False
+    assert (
+        stale_verdict["land_time_verdict"]["rule_version"]
+        == ACCEPTANCE_RULE_VERSION - 1
+    )
+
 
 @pytest.mark.asyncio
 async def test_acceptance_window_aggregate_ignores_post_terminal_updates(
@@ -6114,3 +6158,269 @@ async def test_readiness_excludes_rubric_holds_from_failed_attempts(db_session):
     )
     assert "rubric_changed" not in result["blocker_counts"]
     assert result["ready"] is True
+
+
+@pytest.mark.asyncio
+async def test_acceptance_window_corroboration_upgrades_soft_to_proven(db_session):
+    """The acceptance-window aggregate corroborates soft named_test verdicts
+    recorded on a non-CI-monitor landing path against the stored merge commit,
+    upgrading them to machine-proven — the fix for "the acceptance window mints
+    ~0 proven coverage".
+
+    A landed write task whose declared test is NOT in its PR diff was capped at
+    soft/unproven credit because every non-CI-monitor landing path recorded the
+    verdict without a corroboration marker. The window pass re-runs the backend's
+    own tree check at the stored merge commit; a confirmed presence stamps the
+    marker and re-records the verdict, moving the task into the proven bucket.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from app.acceptance_gate import (
+        ACCEPTANCE_RULE_VERSION,
+        ACCEPTANCE_TEST_CORROBORATED_KEY,
+        CODE_ACCEPTANCE_VERDICT_KEY,
+    )
+    from app.landed_signal import LANDED_MERGE_SHA_KEY, LANDED_SIGNAL_KEY
+
+    project, version = await _make_project_and_version(db_session)
+    task = Task(
+        project_id=project.id,
+        title="soft-named-test",
+        payloads=[
+            {
+                "type": "create",
+                "acceptance_evidence": {
+                    "kind": "named_test",
+                    "test_path": "backend/testing/test_seam.py",
+                    "test_id": "test_x",
+                },
+            }
+        ],
+        status=TaskStatus.COMPLETED,
+        context={
+            LANDED_SIGNAL_KEY: True,
+            "_pr_changed_files": ["app/seam.py"],  # declared test NOT in diff
+            "review_loop": {
+                "acceptance_test_targeted_green": True,
+                "acceptance_test_targeted_descriptor": (
+                    "backend/testing/test_seam.py"
+                ),
+            },
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": True,
+                "proven": False,
+                "kind": "named_test",
+                "reason": "credited soft without machine proof",
+                "rule_version": ACCEPTANCE_RULE_VERSION,
+            },
+            LANDED_MERGE_SHA_KEY: "a" * 40,
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    with patch(
+        "app.acceptance_gate.corroborate_acceptance_test_at_merge",
+        new=AsyncMock(return_value=True),
+    ):
+        agg = await rq._compute_acceptance_window_aggregate(db_session, version)
+
+    assert agg["acceptance_window_total"] == 1
+    assert agg["acceptance_window_verified"] == 1
+    assert agg["acceptance_window_fraction"] == pytest.approx(1.0)
+    assert agg["acceptance_window_buckets"]["proven"] == 1
+    # The aggregate mutated the session-bound task in place; the enclosing
+    # qualifier flow's commit persists the upgrade. Commit here to mirror that
+    # contract, then verify the marker and re-recorded verdict are durable.
+    await db_session.commit()
+    await db_session.refresh(task)
+    ctx = task.context or {}
+    assert ctx.get(ACCEPTANCE_TEST_CORROBORATED_KEY) is True
+    verdict = ctx.get(CODE_ACCEPTANCE_VERDICT_KEY)
+    assert isinstance(verdict, dict)
+    assert verdict.get("proven") is True
+
+
+@pytest.mark.asyncio
+async def test_acceptance_window_corroboration_cap_bounds_attempts_not_successes(
+    db_session,
+):
+    """The per-drive corroboration cap must bound GitHub ATTEMPTS, not successes.
+
+    Previously the counter advanced only on a confirmed presence, so a window
+    where every candidate corroborated indeterminate issued one round-trip per
+    task with no bound at all. And because a non-True result stamps no marker,
+    the same tasks were re-read in full on every later drive, forever.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from app.acceptance_gate import (
+        ACCEPTANCE_RULE_VERSION,
+        ACCEPTANCE_TEST_CORROBORATED_KEY,
+        CODE_ACCEPTANCE_VERDICT_KEY,
+        WINDOW_CORROBORATION_ATTEMPTED_SHA_KEY,
+    )
+    from app.landed_signal import LANDED_MERGE_SHA_KEY, LANDED_SIGNAL_KEY
+
+    project, version = await _make_project_and_version(db_session)
+    candidates = 55  # > the 50-attempt cap
+    for i in range(candidates):
+        db_session.add(
+            Task(
+                project_id=project.id,
+                title=f"soft-named-test-{i}",
+                payloads=[
+                    {
+                        "type": "create",
+                        "acceptance_evidence": {
+                            "kind": "named_test",
+                            "test_path": "backend/testing/test_seam.py",
+                            "test_id": "test_x",
+                        },
+                    }
+                ],
+                status=TaskStatus.COMPLETED,
+                context={
+                    LANDED_SIGNAL_KEY: True,
+                    "_pr_changed_files": ["app/seam.py"],
+                    "review_loop": {
+                        "acceptance_test_targeted_green": True,
+                        "acceptance_test_targeted_descriptor": (
+                            "backend/testing/test_seam.py"
+                        ),
+                    },
+                    CODE_ACCEPTANCE_VERDICT_KEY: {
+                        "satisfied": True,
+                        "proven": False,
+                        "kind": "named_test",
+                        "reason": "credited soft without machine proof",
+                        "rule_version": ACCEPTANCE_RULE_VERSION,
+                    },
+                    LANDED_MERGE_SHA_KEY: f"{i:040d}",
+                },
+            )
+        )
+    await db_session.commit()
+
+    # Every corroboration is indeterminate (e.g. tree unavailable / no creds).
+    indeterminate = AsyncMock(return_value=None)
+    with patch(
+        "app.acceptance_gate.corroborate_acceptance_test_at_merge", new=indeterminate
+    ):
+        agg = await rq._compute_acceptance_window_aggregate(db_session, version)
+
+    assert agg["acceptance_window_total"] == candidates
+    assert indeterminate.await_count == 50, (
+        "the cap must bound ATTEMPTS: every candidate returned an indeterminate "
+        f"result, so the loop must stop at 50 round-trips, got "
+        f"{indeterminate.await_count}"
+    )
+    await db_session.commit()
+
+    # Second drive: the 50 attempted tasks carry a durable per-sha attempt
+    # marker, so only the 5 never-attempted tasks are re-read. Without the
+    # marker every one of the 55 would be re-attempted forever.
+    second = AsyncMock(return_value=None)
+    with patch("app.acceptance_gate.corroborate_acceptance_test_at_merge", new=second):
+        await rq._compute_acceptance_window_aggregate(db_session, version)
+    assert second.await_count == candidates - 50, (
+        "already-attempted tasks must not be re-read at the same merge sha; "
+        f"got {second.await_count} re-attempts"
+    )
+    await db_session.commit()
+
+    # An indeterminate result never stamps the corroboration marker (which would
+    # be a fabricated verdict input) — only the attempt record.
+    rows = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    attempted = [
+        t for t in rows if WINDOW_CORROBORATION_ATTEMPTED_SHA_KEY in (t.context or {})
+    ]
+    assert len(attempted) == candidates
+    for t in attempted:
+        ctx = t.context or {}
+        assert ctx[WINDOW_CORROBORATION_ATTEMPTED_SHA_KEY] == ctx[LANDED_MERGE_SHA_KEY]
+        assert ACCEPTANCE_TEST_CORROBORATED_KEY not in ctx
+        assert ctx[CODE_ACCEPTANCE_VERDICT_KEY]["proven"] is False
+
+
+@pytest.mark.asyncio
+async def test_acceptance_window_corroboration_retries_on_a_new_merge_sha(db_session):
+    """The attempt marker is keyed by merge sha, so a task that later records a
+    NEW merge commit is eligible for a fresh corroboration attempt."""
+    from unittest.mock import AsyncMock, patch
+
+    from app.acceptance_gate import (
+        ACCEPTANCE_RULE_VERSION,
+        ACCEPTANCE_TEST_CORROBORATED_KEY,
+        CODE_ACCEPTANCE_VERDICT_KEY,
+        WINDOW_CORROBORATION_ATTEMPTED_SHA_KEY,
+    )
+    from app.landed_signal import LANDED_MERGE_SHA_KEY, LANDED_SIGNAL_KEY
+
+    project, version = await _make_project_and_version(db_session)
+    task = Task(
+        project_id=project.id,
+        title="soft-named-test",
+        payloads=[
+            {
+                "type": "create",
+                "acceptance_evidence": {
+                    "kind": "named_test",
+                    "test_path": "backend/testing/test_seam.py",
+                    "test_id": "test_x",
+                },
+            }
+        ],
+        status=TaskStatus.COMPLETED,
+        context={
+            LANDED_SIGNAL_KEY: True,
+            "_pr_changed_files": ["app/seam.py"],
+            "review_loop": {
+                "acceptance_test_targeted_green": True,
+                "acceptance_test_targeted_descriptor": (
+                    "backend/testing/test_seam.py"
+                ),
+            },
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": True,
+                "proven": False,
+                "kind": "named_test",
+                "reason": "credited soft without machine proof",
+                "rule_version": ACCEPTANCE_RULE_VERSION,
+            },
+            LANDED_MERGE_SHA_KEY: "a" * 40,
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    with patch(
+        "app.acceptance_gate.corroborate_acceptance_test_at_merge",
+        new=AsyncMock(return_value=None),
+    ):
+        await rq._compute_acceptance_window_aggregate(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(task)
+    assert (task.context or {}).get(WINDOW_CORROBORATION_ATTEMPTED_SHA_KEY) == "a" * 40
+
+    # The task re-lands on a different merge commit — corroboration is now a
+    # genuinely different read, so it must run again (and can upgrade).
+    task.context = {**(task.context or {}), LANDED_MERGE_SHA_KEY: "b" * 40}
+    db_session.add(task)
+    await db_session.commit()
+
+    retried = AsyncMock(return_value=True)
+    with patch("app.acceptance_gate.corroborate_acceptance_test_at_merge", new=retried):
+        agg = await rq._compute_acceptance_window_aggregate(db_session, version)
+    assert retried.await_count == 1
+    assert agg["acceptance_window_buckets"]["proven"] == 1
+    await db_session.commit()
+    await db_session.refresh(task)
+    ctx = task.context or {}
+    assert ctx.get(ACCEPTANCE_TEST_CORROBORATED_KEY) is True
+    assert ctx[CODE_ACCEPTANCE_VERDICT_KEY]["proven"] is True
+    assert ctx[WINDOW_CORROBORATION_ATTEMPTED_SHA_KEY] == "b" * 40

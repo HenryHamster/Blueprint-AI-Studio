@@ -40,6 +40,9 @@ from app.efficiency_snapshot import (
     LLM_TOKEN_PRICING,
     METRIC_DEF_VERSION,
     NESTED_METRIC_CONSUMERS,
+    ORIGINATION_CAPTURED_AT,
+    ORIGINATION_MIN_QUOTABLE_COHORT,
+    build_merged_work_origination_reading,
     PROMPT_STATIC_BYTES_THRESHOLD,
     PROVIDER_ROUTING_ADOPT,
     PROVIDER_ROUTING_INSUFFICIENT_DATA,
@@ -86,6 +89,8 @@ from app.models import (
     ImprovementLane,
     ImprovementLaneStatus,
     TaskStatus,
+    TASK_ORIGINATION_RESEARCH,
+    TASK_ORIGINATION_STRATEGIST,
     bank_task_current_attempt,
 )
 from app.llm_cost_attribution import (
@@ -909,6 +914,7 @@ async def test_read_baseline_with_drift_returns_drift_pct(db_session):
     assert cpm_axis["baseline"] == base_cpm
     assert cpm_axis["drift_pct"] == 50.0
     assert result["baseline_captured_at"] is not None
+    assert "merged_work_origination" in result
 
 
 @pytest.mark.asyncio
@@ -11639,6 +11645,10 @@ async def test_agent_efficiency_snapshot_exposes_cohort_provenance(
     assert isinstance(data["cohort_capped"], bool)
     assert data["cohort_task_count"] == 2
     assert data["cohort_capped"] is False
+    # Uncapped cohort: the headline window is the full requested 7-day window and
+    # the provenance field carries the same requested value.
+    assert data["window_days"] == 7
+    assert data["cohort_requested_window_days"] == 7
 
 
 @pytest.mark.asyncio
@@ -11731,6 +11741,320 @@ async def test_agent_efficiency_snapshot_cohort_capped_flag(
         "cap of 2 must limit the loaded cohort to the 2 most-recently-updated tasks"
     )
     assert data["cohort_capped"] is True
+
+
+@pytest.mark.asyncio
+async def test_capped_cohort_reports_effective_window_as_authoritative(
+    client: AsyncClient, db_session, monkeypatch
+):
+    """A cohort truncated by the row cap must not be labelled with the full
+    requested window: window_days must report the span the loaded rows actually
+    cover (the effective window), not 7, with cohort_requested_window_days
+    preserving the requested 7 for provenance."""
+    import app.efficiency_snapshot as efficiency_snapshot_module
+
+    from app.auth import create_agent_token
+
+    # Shrink the cap so three terminal tasks trip it without seeding 5000 rows.
+    monkeypatch.setattr(efficiency_snapshot_module, "_COHORT_CAP", 2)
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    token_task = make_task(project_id=project.id)
+    db_session.add(token_task)
+    now = _utcnow()
+    db_session.add(_make_efficient_task(project.id, updated_at=now - timedelta(days=6)))
+    db_session.add(_make_efficient_task(project.id, updated_at=now - timedelta(days=3)))
+    db_session.add(_make_efficient_task(project.id, updated_at=now))
+    await db_session.commit()
+    await db_session.refresh(token_task)
+
+    token = create_agent_token(str(token_task.id), "agent-vm-capped-window")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/efficiency-snapshot",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+
+    # The cap truncates the cohort to the 2 most-recently-updated tasks.
+    assert data["cohort_capped"] is True
+    assert data["cohort_task_count"] == 2
+
+    # The requested window is preserved for provenance...
+    assert data["cohort_requested_window_days"] == 7
+
+    # ...but the headline window must describe the span actually loaded, which
+    # with cap=2 and rows at -6d/-3d/now is exactly 3.0 days — NOT the 7-day
+    # request a capped cohort could otherwise be mistaken for.
+    effective_start = datetime.fromisoformat(data["cohort_effective_window_start"])
+    effective_end = datetime.fromisoformat(data["cohort_effective_window_end"])
+    expected_days = round(
+        (effective_end - effective_start).total_seconds() / 86400, 1
+    )
+    assert data["window_days"] == expected_days
+    assert data["window_days"] < 7
+    assert data["window_days"] == 3.0
+
+
+def test_origination_reading_quotes_a_fully_covered_window():
+    """A complete, sufficiently sized classified window yields real shares."""
+    window_start = ORIGINATION_CAPTURED_AT + timedelta(days=1)
+    window_end = window_start + timedelta(days=7)
+    split = {
+        TASK_ORIGINATION_RESEARCH: ORIGINATION_MIN_QUOTABLE_COHORT // 2,
+        TASK_ORIGINATION_STRATEGIST: ORIGINATION_MIN_QUOTABLE_COHORT // 2,
+    }
+
+    reading = build_merged_work_origination_reading(
+        split, window_start=window_start, window_end=window_end
+    )
+
+    assert reading["status"] == "QUOTABLE"
+    assert reading["research_share_of_commissioned"] == pytest.approx(0.5)
+    assert reading["window_start"] == window_start.isoformat()
+    assert reading["window_end"] == window_end.isoformat()
+    assert reading["unquotable_reason"] is None
+
+
+def test_origination_reading_refuses_a_window_before_capture():
+    """A pre-capture window is explicitly unquotable, never a zero share."""
+    window_start = ORIGINATION_CAPTURED_AT - timedelta(days=1)
+    window_end = ORIGINATION_CAPTURED_AT + timedelta(days=6)
+    split = {
+        TASK_ORIGINATION_RESEARCH: ORIGINATION_MIN_QUOTABLE_COHORT // 2,
+        TASK_ORIGINATION_STRATEGIST: ORIGINATION_MIN_QUOTABLE_COHORT // 2,
+    }
+
+    reading = build_merged_work_origination_reading(
+        split, window_start=window_start, window_end=window_end
+    )
+
+    assert reading["status"] == "UNQUOTABLE"
+    assert reading["unquotable_reason"] == "window_predates_origination_capture"
+    assert reading["research_share_of_commissioned"] is None
+
+
+def test_origination_reading_refuses_an_undersized_cohort():
+    """A small classified cohort cannot support a directional share claim."""
+    window_start = ORIGINATION_CAPTURED_AT + timedelta(days=1)
+    window_end = window_start + timedelta(days=7)
+    reading = build_merged_work_origination_reading(
+        {TASK_ORIGINATION_RESEARCH: 1, TASK_ORIGINATION_STRATEGIST: 1},
+        window_start=window_start,
+        window_end=window_end,
+    )
+
+    assert reading["status"] == "UNQUOTABLE"
+    assert reading["unquotable_reason"] == "cohort_too_small"
+    assert reading["research_share_of_commissioned"] is None
+
+
+def test_origination_reading_distinguishes_no_data_from_a_valid_zero():
+    """No rows are not the same fact as a measured zero research share."""
+    window_start = ORIGINATION_CAPTURED_AT + timedelta(days=1)
+    window_end = window_start + timedelta(days=7)
+
+    no_data = build_merged_work_origination_reading(
+        {}, window_start=window_start, window_end=window_end
+    )
+    zero = build_merged_work_origination_reading(
+        {TASK_ORIGINATION_STRATEGIST: ORIGINATION_MIN_QUOTABLE_COHORT},
+        window_start=window_start,
+        window_end=window_end,
+    )
+
+    assert no_data["status"] == "UNQUOTABLE"
+    assert no_data["unquotable_reason"] == "no_origination_data"
+    assert no_data["research_share_of_commissioned"] is None
+    assert zero["status"] == "QUOTABLE"
+    assert zero["research_share_of_commissioned"] == 0.0
+    contaminated = build_merged_work_origination_reading(
+        {
+            TASK_ORIGINATION_RESEARCH: ORIGINATION_MIN_QUOTABLE_COHORT,
+            TASK_ORIGINATION_STRATEGIST: ORIGINATION_MIN_QUOTABLE_COHORT,
+            "SYSTEM": ORIGINATION_MIN_QUOTABLE_COHORT,
+        },
+        window_start=window_start,
+        window_end=window_end,
+    )
+    assert contaminated["status"] == "UNQUOTABLE"
+    assert contaminated["unquotable_reason"] == "cohort_too_contaminated"
+    assert contaminated["research_share_of_commissioned"] is None
+
+
+@pytest.mark.asyncio
+async def test_efficiency_snapshot_history_surface_returns_captures_with_provenance(
+    client: AsyncClient, db_session
+):
+    """GET /api/agent/projects/{id}/efficiency-snapshot must expose the
+    persisted ``project_efficiency_snapshot`` time series under ``history``,
+    oldest-first, each capture carrying its captured_at / metric_def_version
+    provenance alongside the recorded axis values."""
+    from sqlalchemy import select as _select
+
+    from app.auth import create_agent_token
+    from app.models import ProjectEfficiencySnapshot
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # A QUEUED (non-terminal) task provides a valid agent token without joining
+    # the terminal cohort itself.
+    token_task = make_task(project_id=project.id)
+    db_session.add(token_task)
+    db_session.add(_make_efficient_task(project.id))
+    await db_session.commit()
+
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+    # Add a warm-start task so the second capture records different axes.
+    db_session.add(
+        _make_efficient_task(
+            project.id,
+            vm_warm_start=True,
+            context={
+                "pr_merged": True,
+                "review_loop": {"iteration": 2},
+                "_timing": {"warm_start": True},
+            },
+        )
+    )
+    await db_session.commit()
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+    await db_session.refresh(token_task)
+
+    rows = list(
+        (
+            await db_session.execute(
+                _select(ProjectEfficiencySnapshot)
+                .where(ProjectEfficiencySnapshot.project_id == project.id)
+                .order_by(ProjectEfficiencySnapshot.captured_at.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 2, "two write_snapshot calls must persist two table rows"
+
+    token = create_agent_token(str(token_task.id), "agent-vm-history-read")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/efficiency-snapshot",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+    assert "history" in data, (
+        "agent efficiency-snapshot must expose the persisted history series"
+    )
+    history = data["history"]
+    assert len(history) == 2, f"expected 2 history entries, got {len(history)}"
+
+    captured_ats = [entry["captured_at"] for entry in history]
+    assert captured_ats == sorted(captured_ats), "history must be oldest-first"
+
+    for i, entry in enumerate(history):
+        row = rows[i]
+        # captured_at / metric_def_version come from the durable row columns.
+        assert entry["captured_at"] == row.captured_at.isoformat(), (
+            f"history entry {i} captured_at must come from the row column"
+        )
+        assert entry["metric_def_version"] == METRIC_DEF_VERSION, (
+            f"history entry {i} must carry metric_def_version provenance; "
+            f"got {entry.get('metric_def_version')!r}"
+        )
+        # Axis values and serving_sha come from the recorded blob.
+        assert (
+            entry[AXIS_COST_PER_MERGED_PR]
+            == row.blob[AXIS_COST_PER_MERGED_PR]
+        ), f"history entry {i} must carry the recorded axis value"
+        assert entry["serving_sha"] == row.blob["serving_sha"], (
+            f"history entry {i} must carry the recorded serving_sha"
+        )
+    # The two captures record genuinely different readings: the second snapshot
+    # added a warm-start task, moving vm_reuse_rate from 0.0 to 0.5.
+    assert history[0][AXIS_VM_REUSE_RATE] != history[1][AXIS_VM_REUSE_RATE], (
+        "the two captures should record distinct axis values"
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_efficiency_snapshot_history_empty_before_first_snapshot(
+    client: AsyncClient, db_session
+):
+    """Before any write_snapshot the persisted series is empty: history == []."""
+    from app.auth import create_agent_token
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    token_task = make_task(project_id=project.id)
+    db_session.add(token_task)
+    db_session.add(_make_efficient_task(project.id))
+    await db_session.commit()
+    await db_session.refresh(token_task)
+
+    token = create_agent_token(str(token_task.id), "agent-vm-history-empty")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/efficiency-snapshot",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    assert res.json()["data"]["history"] == []
+
+
+@pytest.mark.asyncio
+async def test_agent_efficiency_snapshot_history_sourced_from_table(
+    client: AsyncClient, db_session
+):
+    """The agent history surface must come from the persisted table, not the
+    design_doc container's ``snapshots`` list (stripping them still returns the row)."""
+    from app.auth import create_agent_token
+    from app.project_telemetry import set_project_telemetry
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    token_task = make_task(project_id=project.id)
+    db_session.add(token_task)
+    db_session.add(_make_efficient_task(project.id))
+    await db_session.commit()
+
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+
+    # Strip the dual-written design_doc-side snapshots so only the table row
+    # remains as a source.
+    container = await _require_container(db_session, project)
+    assert container.get("snapshots"), "write_snapshot must dual-write snapshots"
+    container_without_snapshots = dict(container)
+    container_without_snapshots.pop("snapshots", None)
+    await set_project_telemetry(
+        db_session, project.id, DESIGN_DOC_KEY, container_without_snapshots
+    )
+    await db_session.commit()
+
+    token = create_agent_token(str(token_task.id), "agent-vm-history-table")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/efficiency-snapshot",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    history = res.json()["data"]["history"]
+    assert len(history) == 1, (
+        "history must come from the persisted table even when the design_doc "
+        "snapshots list is stripped"
+    )
 
 
 @pytest.mark.asyncio

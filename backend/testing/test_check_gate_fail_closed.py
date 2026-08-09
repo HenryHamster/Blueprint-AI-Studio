@@ -8,25 +8,17 @@ nothing to check, and the run printed ``PASS`` with zero checks actually
 executed. The empty set is indistinguishable in that code path from a genuine
 no-op diff, so the gate reported green exactly when it was least entitled to.
 
-This module drives the real ``./check`` script against throwaway git repos:
-
-  * ``test_uncomputable_base_diff_fails_closed`` — a repo with no base ref and
-    no remote must exit non-zero with a diagnostic naming the base ref it tried
-    to resolve, never a green run.
-  * ``test_genuine_noop_diff_still_exits_zero`` — a repo whose base ref
-    resolves and whose committed diff is genuinely empty must still exit 0, so
-    the fail-closed change does not break legitimate empty diffs.
-
-The tests invoke the script as ``bash <repo>/check`` with ``WORKSPACE`` pointed
-at the throwaway repo, so they exercise the exact production code path (the
-``_try_base_diff`` / fetch-repair / fail-closed block), not a reimplementation.
+The route tests below also pin the backend PostgreSQL capability selection used
+by the gate and harness.
 """
 
 from __future__ import annotations
 
 import os
 import shutil
+import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -35,6 +27,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 if not (_REPO_ROOT / "check").exists() and Path("/repo/check").exists():
     _REPO_ROOT = Path("/repo")
 _CHECK = _REPO_ROOT / "check"
+_ROUTE_HELPER = _REPO_ROOT / "scripts" / "backend-test-route.sh"
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -126,7 +119,6 @@ def test_genuine_noop_diff_still_exits_zero(tmp_path: Path) -> None:
     _init_repo(repo)
     # Local base ref at HEAD -> the committed diff computes and is empty.
     _git(repo, "branch", "automain")
-
     result = _run_check(repo)
 
     combined = f"{result.stdout}\n{result.stderr}"
@@ -135,3 +127,64 @@ def test_genuine_noop_diff_still_exits_zero(tmp_path: Path) -> None:
         f"exit {result.returncode} with output:\n{combined}"
     )
     assert "PASS" in combined, f"expected the green PASS marker, got:\n{combined}"
+
+
+def test_off_image_pgserver_route_wins_without_baked_paths(tmp_path: Path) -> None:
+    """An importable pgserver package is a real route, not a Docker fallback."""
+    pg_bin = tmp_path / "pg-bin"
+    pg_bin.mkdir()
+    for name in ("initdb", "pg_ctl"):
+        binary = pg_bin / name
+        binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        binary.chmod(binary.stat().st_mode | stat.S_IXUSR)
+    pgserver = tmp_path / "pgserver"
+    pgserver.mkdir()
+    (pgserver / "__init__.py").write_text("", encoding="utf-8")
+    (pgserver / "_commands.py").write_text(
+        f"POSTGRES_BIN_PATH = {str(pg_bin)!r}\n", encoding="utf-8"
+    )
+    (tmp_path / "pytest.py").write_text("", encoding="utf-8")
+
+    env = os.environ.copy()
+    # Use the running interpreter as the sandbox Python: it is guaranteed to
+    # exist on every host (the CI backend-test-deps image installs it at
+    # /usr/local/bin/python, not /usr/bin/python3), and the fake ``pgserver``
+    # package on PYTHONPATH shadows any real wheel, so the route still resolves
+    # the fabricated bindir. A hardcoded /usr/bin/python3 silently fails closed
+    # on any image without a system python3 there.
+    env["BLUEPRINT_SANDBOX_PYTHON"] = sys.executable
+    env["PYTHONPATH"] = str(tmp_path)
+    env["PATH"] = f"{tmp_path}:/usr/bin:/bin"
+    result = subprocess.run(
+        ["bash", "-c", f"source {_ROUTE_HELPER}; select_backend_test_route"],
+        cwd=_REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.strip() == "--sandbox-postgres"
+
+
+def test_backend_route_stays_fail_closed_without_a_runtime(tmp_path: Path) -> None:
+    """A missing sandbox and Docker daemon cannot silently select SQLite."""
+    fake_pg_config = tmp_path / "pg_config"
+    fake_pg_config.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    fake_pg_config.chmod(fake_pg_config.stat().st_mode | stat.S_IXUSR)
+    env = os.environ.copy()
+    env["BLUEPRINT_SANDBOX_PYTHON"] = "/usr/bin/python3"
+    env["PYTHONPATH"] = str(tmp_path / "empty-python-path")
+    env["PATH"] = str(tmp_path)
+    result = subprocess.run(
+        ["/bin/bash", "-c", f"source {_ROUTE_HELPER}; select_backend_test_route"],
+        cwd=_REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert result.stdout == ""

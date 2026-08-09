@@ -17,7 +17,7 @@ from __future__ import annotations
 import contextlib
 from datetime import timedelta
 from uuid import uuid4
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, call
 
 import pytest
 
@@ -2011,8 +2011,13 @@ async def test_confirm_no_new_revision_times_out_scenario(db_session, mocker):
         db_session, promoted_at=promoted_at, deadline=deadline
     )
     # Stale revision predating the promotion; STABLE but never advanced, and
-    # determinately NOT a descendant of the promoted commit.
+    # determinately NOT a descendant of the promoted commit.  No deploy.yml run
+    # exists for the promoted SHA, so the timeout is substantiated as
+    # never-dispatched rather than the bare no_new_revision backstop.
     mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    mocker.patch(
+        "app.github.get_workflow_run_for_sha", new=AsyncMock(return_value=None)
+    )
     await _set_deploy_state(
         db_session,
         status=DeploymentStatus.STABLE,
@@ -2026,7 +2031,7 @@ async def test_confirm_no_new_revision_times_out_scenario(db_session, mocker):
     assert resolved is True
     await db_session.refresh(version)
     assert version.serving_status == "confirmation_timed_out"
-    assert version.deploy_failure_reason == "no_new_revision"
+    assert version.deploy_failure_reason == "deploy_workflow_never_dispatched"
     # No loud deploy-failed alert → no dedup stamp.
     assert version.deploy_confirm_alerted_at is None
 
@@ -3212,6 +3217,11 @@ async def test_confirm_pre_promotion_diverged_sha_waits_then_times_out(
         deployed_at=promoted_at - timedelta(hours=2),  # predates promotion
     )
     mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    # No deploy.yml run for the promoted SHA — the past-deadline timeout is
+    # substantiated as never-dispatched, never deploy_failed / never confirmed.
+    mocker.patch(
+        "app.github.get_workflow_run_for_sha", new=AsyncMock(return_value=None)
+    )
 
     # Within the confirmation window: no decision, version stays unconfirmed.
     resolved = await _confirm_serving_or_fail(
@@ -3234,7 +3244,7 @@ async def test_confirm_pre_promotion_diverged_sha_waits_then_times_out(
     assert resolved is True
     await db_session.refresh(version)
     assert version.serving_status == "confirmation_timed_out"
-    assert version.deploy_failure_reason == "no_new_revision"
+    assert version.deploy_failure_reason == "deploy_workflow_never_dispatched"
     assert version.served_sha is None
 
 
@@ -7700,6 +7710,351 @@ async def test_harvest_flake_budget_tristate(db_session, mocker):
     assert await _harvest_promotion_ci_failures(**kwargs) == "flake_handoff"
     assert rerun_mock.await_count == 1
     assert handle_mock.await_count == 1
+
+
+# ===========================================================================
+# Activation receipt: blueprint deploy → _record_activation_receipt
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_record_activation_receipt_resolves_unconfirmed_to_serving_confirmed(
+    db_session,
+):
+    """An activation receipt for an unconfirmed promoted version confirms the
+    backend artifact with the reported revision and resolves the whole version
+    to serving_confirmed through the shared recovery machinery: scalar flip,
+    served_sha/served_at, verdict outcome, receipt provenance."""
+    from app.release_reconciliation import _record_activation_receipt
+
+    now = _utcnow()
+    promoted_at = now - timedelta(hours=1)
+    deadline = promoted_at + timedelta(hours=1)
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+
+    receipt = await _record_activation_receipt(
+        db_session,
+        version,
+        revision=_SHA_B,
+        host="hamsterwheel",
+        operator_id="op@example.com",
+        now=now,
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert receipt["serving_status"] == "serving_confirmed"
+    assert version.serving_status == "serving_confirmed"
+    assert version.served_sha == _SHA_B
+    assert version.served_at is not None
+    assert version.deploy_failure_reason is None
+
+    # The receipt provenance is stamped on the version audit trail.
+    receipt_block = (version.last_qualification or {}).get("activation_receipt") or {}
+    assert receipt_block.get("revision") == _SHA_B
+    assert receipt_block.get("host") == "hamsterwheel"
+    assert receipt_block.get("operator") == "op@example.com"
+
+    # The backend artifact is confirmed with the served identifier.
+    backend = (
+        (
+            await db_session.execute(
+                _select(ReleaseDeployArtifact).where(
+                    ReleaseDeployArtifact.version_id == version.id,
+                    ReleaseDeployArtifact.artifact_kind
+                    == BACKEND_REVISION_ARTIFACT_KIND,
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert backend is not None
+    assert backend.serving_status == "serving_confirmed"
+    assert backend.served_identifier == _SHA_B
+
+    # The verdict outcome flipped to serving_confirmed.
+    verdict = (
+        (
+            await db_session.execute(
+                _select(QualificationVerdict).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert verdict.post_promotion_outcome == "serving_confirmed"
+
+
+@pytest.mark.asyncio
+async def test_record_activation_receipt_leaves_aggregate_unconfirmed_when_required_pending(
+    db_session, mocker
+):
+    """A required non-backend artifact that stays pending keeps the whole
+    version unconfirmed — only the backend artifact is confirmed by the
+    receipt, and the confirm-sweep finishes the remaining gate."""
+    from app.release_reconciliation import _record_activation_receipt
+
+    async def _never_resolve(_session, _version, _artifact, _now):
+        return None
+
+    backend_provider = artifact_registry._ARTIFACT_PROVIDERS[
+        BACKEND_REVISION_ARTIFACT_KIND
+    ]
+    mocker.patch.dict(
+        artifact_registry._ARTIFACT_PROVIDERS,
+        {
+            BACKEND_REVISION_ARTIFACT_KIND: backend_provider,
+            "synthetic_pending": ReleaseArtifactProvider(
+                artifact_kind="synthetic_pending",
+                check=_never_resolve,
+                required=True,
+            ),
+        },
+        clear=True,
+    )
+    now = _utcnow()
+    promoted_at = now - timedelta(hours=1)
+    deadline = promoted_at + timedelta(hours=1)
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline
+    )
+
+    receipt = await _record_activation_receipt(
+        db_session,
+        version,
+        revision=_SHA_B,
+        host="hamsterwheel",
+        operator_id="op@example.com",
+        now=now,
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # The whole-release aggregate stays unconfirmed.
+    assert receipt["serving_status"] == "unconfirmed"
+
+    # The backend artifact is confirmed with the served identifier.
+    backend = (
+        (
+            await db_session.execute(
+                _select(ReleaseDeployArtifact).where(
+                    ReleaseDeployArtifact.version_id == version.id,
+                    ReleaseDeployArtifact.artifact_kind
+                    == BACKEND_REVISION_ARTIFACT_KIND,
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert backend is not None
+    assert backend.serving_status == "serving_confirmed"
+    assert backend.served_identifier == _SHA_B
+
+    # The synthetic required artifact is still pending, keeping the aggregate
+    # unconfirmed until the sweep resolves it.
+    pending = (
+        (
+            await db_session.execute(
+                _select(ReleaseDeployArtifact).where(
+                    ReleaseDeployArtifact.version_id == version.id,
+                    ReleaseDeployArtifact.artifact_kind == "synthetic_pending",
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert pending is not None
+    assert (pending.serving_status or "unconfirmed") == "unconfirmed"
+
+
+# ===========================================================================
+# Approved activation control: _approved_activation_mismatch /
+# _approved_activation_superseded / approved-mode receipt provenance
+# ===========================================================================
+
+
+def test_approved_activation_mismatch_only_guards_live_approved_receipts():
+    """``_approved_activation_mismatch`` rejects ONLY the case an in-product
+    approval intends to close: an active approval (still unconfirmed) reporting
+    a revision other than the approved promoted SHA.  No approval (the legacy
+    CLI path), a matching SHA, or an already-resolved version all pass through
+    unchanged."""
+    from app.release_activation import _approved_activation_mismatch
+
+    version = rv.ReleaseVersion(
+        project_id=uuid4(),
+        version_number=1,
+        status="promoted",
+        serving_status="unconfirmed",
+        promoted_sha=_SHA_A,
+    )
+
+    # No approval → the legacy CLI path is unchanged even for a differing
+    # revision (the built revision may legitimately be a descendant).
+    assert _approved_activation_mismatch(version, _SHA_B) is None
+
+    # Active approval + the EXACT approved SHA → no rejection.
+    version.activation_requested_at = _utcnow()
+    version.activation_requested_by = "op@example.com"
+    assert _approved_activation_mismatch(version, _SHA_A) is None
+
+    # Active approval + a DIFFERENT revision → mismatch rejection naming the
+    # approved SHA prefix so the operator can see which artifact is authorized.
+    detail = _approved_activation_mismatch(version, "9" * 40)
+    assert detail is not None
+    assert "does not match" in detail
+    assert _SHA_A[:12] in detail
+
+    # Already-resolved → the existing idempotency / recovery machinery governs.
+    version.serving_status = "serving_confirmed"
+    assert _approved_activation_mismatch(version, _SHA_B) is None
+
+
+@pytest.mark.asyncio
+async def test_approved_activation_superseded_detects_newer_promotion(db_session):
+    """An approved version is superseded once a NEWER promotion exists; the
+    current promoted version is never superseded by itself."""
+    from app.release_activation import _approved_activation_superseded
+
+    now = _utcnow()
+    promoted_at = now - timedelta(hours=2)
+    deadline = promoted_at + timedelta(hours=1)
+    project, v1 = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline, promoted_sha=_SHA_A
+    )
+    v1.activation_requested_at = now
+    v1.activation_requested_by = "op@example.com"
+    db_session.add(v1)
+    await db_session.commit()
+
+    assert await _approved_activation_superseded(db_session, v1) is False
+
+    # A newer promotion supersedes the approved v1.
+    v2 = await rv.open_version(db_session, project.id, version_number=2)
+    v2.status = "promoted"
+    v2.promoted_at = now
+    v2.promoted_sha = _SHA_B
+    v2.serving_status = "unconfirmed"
+    v2.deploy_confirm_deadline = now + timedelta(hours=1)
+    db_session.add(v2)
+    await db_session.commit()
+
+    assert await _approved_activation_superseded(db_session, v1) is True
+    assert await _approved_activation_superseded(db_session, v2) is False
+
+
+@pytest.mark.asyncio
+async def test_record_activation_receipt_approved_mode_stamps_provenance(db_session):
+    """A receipt under an in-product approval records mode=approved_activation
+    and the approval binding it fulfilled, alongside the standard provenance."""
+    from app.release_reconciliation import _record_activation_receipt
+
+    now = _utcnow()
+    promoted_at = now - timedelta(hours=1)
+    deadline = promoted_at + timedelta(hours=1)
+    _project, version = await _make_promoted_unconfirmed_version(
+        db_session,
+        promoted_at=promoted_at,
+        deadline=deadline,
+        promoted_sha=_SHA_A,
+    )
+    version.activation_requested_at = promoted_at + timedelta(minutes=30)
+    version.activation_requested_by = "op@example.com"
+    db_session.add(version)
+    await db_session.commit()
+
+    receipt = await _record_activation_receipt(
+        db_session,
+        version,
+        revision=_SHA_A,
+        host="hamsterwheel",
+        operator_id="op@example.com",
+        now=now,
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert receipt["mode"] == "approved_activation"
+    assert version.serving_status == "serving_confirmed"
+
+    receipt_block = (version.last_qualification or {}).get("activation_receipt") or {}
+    assert receipt_block["mode"] == "approved_activation"
+    assert receipt_block["revision"] == _SHA_A
+    assert receipt_block["activation_requested_by"] == "op@example.com"
+    assert receipt_block["activation_requested_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_cli_activation_with_outstanding_approval_allows_promoted_descendant(
+    db_session, mocker
+):
+    """The working CLI deploy path may receipt a descendant of promoted_sha.
+
+    ``blueprint deploy`` performs the same ancestry check before activation.
+    An outstanding approval for the current promotion must not turn that valid
+    CLI receipt into a 409, and the receipt must still close serving
+    confirmation with the observed descendant SHA.
+    """
+    from app.release_activation import reject_stale_or_mismatched_approved_receipt
+    from app.release_reconciliation import _record_activation_receipt
+
+    ancestry = mocker.patch(
+        "app.github.is_ancestor_of", new=AsyncMock(return_value=True)
+    )
+    now = _utcnow()
+    promoted_at = now - timedelta(hours=1)
+    deadline = promoted_at + timedelta(hours=1)
+    project, version = await _make_promoted_unconfirmed_version(
+        db_session, promoted_at=promoted_at, deadline=deadline, promoted_sha=_SHA_A
+    )
+    version.activation_requested_at = promoted_at + timedelta(minutes=30)
+    version.activation_requested_by = "op@example.com"
+    db_session.add(version)
+    await db_session.commit()
+
+    rejection_detail = await reject_stale_or_mismatched_approved_receipt(
+        db_session, version, _SHA_B
+    )
+    assert rejection_detail is None
+
+    ancestry.return_value = False
+    rejection_detail = await reject_stale_or_mismatched_approved_receipt(
+        db_session, version, _SHA_B
+    )
+    assert rejection_detail is not None
+    assert "does not match" in rejection_detail
+    ancestry.return_value = True
+
+    receipt = await _record_activation_receipt(
+        db_session,
+        version,
+        revision=_SHA_B,
+        host="hamsterwheel",
+        operator_id="op@example.com",
+        now=now,
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert receipt["serving_status"] == "serving_confirmed"
+    assert version.serving_status == "serving_confirmed"
+    assert version.served_sha == _SHA_B
+    expected_ancestry_call = call(
+        "tok",
+        "acme",
+        "widget",
+        _SHA_A,
+        _SHA_B,
+        project_id=str(project.id),
+    )
+    assert ancestry.await_args_list == [expected_ancestry_call, expected_ancestry_call]
 
 
 # ===========================================================================

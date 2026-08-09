@@ -23,6 +23,7 @@ from app.acceptance_gate import (
     CODE_ACCEPTANCE_VERDICT_KEY,
     CRITERION_OPS,
     PREMERGE_ACCEPTANCE_FINDING_KEY,
+    REDERIVED_BY_QUALIFIER,
     TEST_COVERAGE_RESULT_KEY,
     acceptance_blocks_success,
     acceptance_is_proven,
@@ -416,6 +417,10 @@ def test_record_code_acceptance_verdict_stamps_rule_version():
     stamped = task.context[CODE_ACCEPTANCE_VERDICT_KEY]
     assert stamped["rule_version"] == ACCEPTANCE_RULE_VERSION
     assert isinstance(ACCEPTANCE_RULE_VERSION, int) and ACCEPTANCE_RULE_VERSION >= 1
+    # A direct recording is an ORIGINAL land-time stamp, never a re-derivation —
+    # so a later rule-version bump can tell the two apart (design doc c50453ef §5).
+    assert stamped["stamped_at_land_time"] is True
+    assert "land_time_verdict" not in stamped
     # Legacy verdicts (no rule_version) are still readable by every consumer —
     # the field is additive.
     assert acceptance_is_proven({"proven": True, "satisfied": True}) is True
@@ -467,13 +472,14 @@ def test_effective_acceptance_verdict_retired_rule_rederives():
     # Simulate a stale stamp: the retired rule judged the same evidence
     # unsatisfied (e.g. it never granted the existence-at-merge credit the
     # current rule does), so re-derivation must flip it to proven.
-    task.context[CODE_ACCEPTANCE_VERDICT_KEY] = {
+    frozen = {
         "satisfied": False,
         "proven": False,
         "kind": "named_test",
         "reason": "declared test not among the PR's changed files (retired rule)",
         "rule_version": ACCEPTANCE_RULE_VERSION - 1,
     }
+    task.context[CODE_ACCEPTANCE_VERDICT_KEY] = frozen
     effective = effective_acceptance_verdict(task)
     assert effective["satisfied"] is True
     assert effective["proven"] is True
@@ -481,6 +487,17 @@ def test_effective_acceptance_verdict_retired_rule_rederives():
     assert effective["rule_version"] == ACCEPTANCE_RULE_VERSION
     assert acceptance_blocks_success(effective) is False
     assert acceptance_is_proven(effective) is True
+    # Audit honesty (design doc c50453ef §5): the re-derived dict is marked as a
+    # re-derivation, timed, and nests the ORIGINAL land-time verdict — the
+    # retired rule's judgment is never destroyed by re-scoring.
+    assert effective["stamped_at_land_time"] is False
+    assert isinstance(effective["rederived_at"], str) and effective["rederived_at"]
+    assert effective["rederived_by"] == REDERIVED_BY_QUALIFIER
+    assert effective["land_time_verdict"] == frozen
+    # The nested land-time verdict is the ORIGINAL, not another re-derived chain
+    # (a legacy stamp with no marker counts as original — absent is not False).
+    assert effective["land_time_verdict"].get("stamped_at_land_time") is not False
+    assert effective["land_time_verdict"]["rule_version"] == ACCEPTANCE_RULE_VERSION - 1
 
 
 def test_effective_acceptance_verdict_rederivation_declared_false_keeps_frozen():
@@ -514,7 +531,7 @@ def test_effective_acceptance_verdict_preserves_consumed_upgrade():
     )
     consumed_by = str(uuid.uuid4())
     consumed_artifact = str(uuid.uuid4())
-    task.context[CODE_ACCEPTANCE_VERDICT_KEY] = {
+    frozen = {
         "satisfied": True,
         "proven": True,
         "consumed": True,
@@ -524,6 +541,7 @@ def test_effective_acceptance_verdict_preserves_consumed_upgrade():
         "reason": "delivered",
         "rule_version": ACCEPTANCE_RULE_VERSION - 1,
     }
+    task.context[CODE_ACCEPTANCE_VERDICT_KEY] = frozen
     effective = effective_acceptance_verdict(task)
     assert effective["satisfied"] is True
     assert effective["proven"] is True
@@ -532,6 +550,48 @@ def test_effective_acceptance_verdict_preserves_consumed_upgrade():
     assert effective["consumed_artifact_id"] == consumed_artifact
     assert effective["rule_version"] == ACCEPTANCE_RULE_VERSION
     assert acceptance_is_proven(effective) is True
+    # The consumption upgrade is preserved WITHOUT erasing audit honesty: the
+    # original consumed verdict is nested as the land-time verdict.
+    assert effective["stamped_at_land_time"] is False
+    assert effective["rederived_by"] == REDERIVED_BY_QUALIFIER
+    assert effective["land_time_verdict"] == frozen
+    assert effective["land_time_verdict"]["consumed"] is True
+
+
+def test_effective_acceptance_verdict_rederivation_chain_nests_original():
+    """Re-deriving an ALREADY-re-derived verdict must nest the ORIGINAL land-time
+    verdict — never the previous re-derived dict — so the land-time judgment is
+    not replaced by a chain of re-scorings."""
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+        },
+        changed_files=["backend/app/widget.py", "backend/testing/test_widget.py"],
+    )
+    original = {
+        "satisfied": False,
+        "proven": False,
+        "kind": "named_test",
+        "reason": "declared test not among the PR's changed files (retired rule)",
+        "rule_version": ACCEPTANCE_RULE_VERSION - 2,
+        "stamped_at_land_time": True,
+    }
+    # First re-derivation (v-2 -> v-1): nests the original.
+    task.context[CODE_ACCEPTANCE_VERDICT_KEY] = dict(original)
+    once = effective_acceptance_verdict(task)
+    assert once["land_time_verdict"] == original
+    assert once["stamped_at_land_time"] is False
+    assert once["rederived_by"] == REDERIVED_BY_QUALIFIER
+    # Second re-derivation (v-1 -> v): the recorded row is the previous
+    # re-derived dict; the nested land-time verdict must still be the ORIGINAL.
+    task.context[CODE_ACCEPTANCE_VERDICT_KEY] = once
+    twice = effective_acceptance_verdict(task)
+    assert twice["stamped_at_land_time"] is False
+    assert twice["rederived_by"] == REDERIVED_BY_QUALIFIER
+    assert twice["land_time_verdict"] == original
+    assert twice["land_time_verdict"]["satisfied"] is False
+    assert twice["land_time_verdict"]["rule_version"] == ACCEPTANCE_RULE_VERSION - 2
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -882,27 +942,28 @@ def test_existing_green_test_only_diff_still_fails_closed():
 
 
 def test_premerge_acceptance_failure_reaches_review_loop():
-    # A PR whose declared named_test is NOT among its changed files is
-    # structurally unsatisfiable BEFORE the merge: the test was never added to
-    # the diff, so no merge-time green run can ever satisfy the declaration.
-    # The pre-merge gate must route that failure into the review/fix loop (a
-    # durable, readable finding) so the task can correct the code or the
-    # declaration while the PR is still open — instead of discovering it only
-    # at merge-landing, when nothing can be done.
+    # A PR whose declared named_test exercises a production seam that does not
+    # semantically correspond to the test module is structurally unsatisfiable
+    # BEFORE the merge: no production change this PR ships is related to the
+    # declared test, so no merge-time green run can ever satisfy the
+    # declaration. The pre-merge gate must route that failure into the
+    # review/fix loop (a durable, readable finding) so the task can correct the
+    # code or the declaration while the PR is still open — instead of
+    # discovering it only at merge-landing, when nothing can be done.
     task = _make_code_task(
         acceptance_evidence={
             "kind": "named_test",
             "test_path": "backend/testing/test_widget.py",
             "test_id": "test_widget_handles_empty",
         },
-        changed_files=["backend/app/widget.py"],  # declared test absent
+        changed_files=["backend/app/other.py"],  # unrelated production seam
         unverified_reason=None,
     )
     verdict = evaluate_premerge_acceptance(task)
     assert verdict is not None
     assert verdict.declared is True
     assert verdict.satisfied is False
-    assert "not among" in verdict.reason
+    assert "does not semantically correspond" in verdict.reason
     assert verdict.proven is False
 
     # The structural failure is stamped as a durable finding and read back by
@@ -911,7 +972,7 @@ def test_premerge_acceptance_failure_reaches_review_loop():
     assert finding is not None
     assert finding["satisfied"] is False
     assert finding["kind"] == "named_test"
-    assert finding["cause"] == "named_test_missing_from_diff"
+    assert finding["cause"] == "named_test_ungrounded_seam"
     assert finding["reason"] == verdict.reason
     assert premerge_acceptance_finding(task) == finding
     assert (task.context or {}).get(PREMERGE_ACCEPTANCE_FINDING_KEY) == finding
@@ -920,13 +981,13 @@ def test_premerge_acceptance_failure_reaches_review_loop():
     # a fix agent corrects it in the same pass as the review feedback.
     block = format_premerge_acceptance_finding(finding)
     assert "PRE-MERGE ACCEPTANCE FAILURE" in block
-    assert "not among" in block
-    assert "named_test_missing_from_diff" in block
+    assert "does not semantically correspond" in block
+    assert "named_test_ungrounded_seam" in block
     assert format_premerge_acceptance_finding(None) == ""
     assert format_premerge_acceptance_finding({"satisfied": True}) == ""
 
-    # Self-healing: once the agent adds the declared test to the diff (a new
-    # status POST with corrected changed files), re-stamping clears the finding.
+    # Self-healing: once the agent makes the seam grounded (a change related to
+    # the declared test), re-stamping clears the finding.
     task.context = {
         **(task.context or {}),
         "_pr_changed_files": [
@@ -965,6 +1026,74 @@ def test_premerge_acceptance_failure_reaches_review_loop():
     assert evaluate_premerge_acceptance(undeclared) is None
     assert stamp_premerge_acceptance_finding(undeclared) is None
     assert premerge_acceptance_finding(undeclared) is None
+
+
+def test_premerge_named_test_not_in_diff_is_not_a_hard_fail():
+    """A declared named_test ABSENT from the PR's diff is not a pre-merge
+    structural defect.
+
+    The merge-time gate credits a test that exists at the merge commit and ran
+    green even when the PR never modified it (behaviour-preserving work
+    re-verifies a pre-existing test). Pre-merge we cannot know whether that
+    holds, so absence from the diff alone must credit soft (satisfied/unproven)
+    instead of hard-failing the open PR — the anti-fraud existence check is
+    deferred to merge. The gate must not steer agents into churning a test the
+    merge gate would credit untouched.
+    """
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+            "test_id": "test_widget_handles_empty",
+        },
+        changed_files=["backend/app/widget.py"],  # production seam, test absent
+        unverified_reason=None,
+    )
+    verdict = evaluate_premerge_acceptance(task)
+    assert verdict is not None
+    assert verdict.declared is True
+    assert verdict.satisfied is True
+    assert verdict.proven is False
+    assert "not among the PR's changed files" in verdict.reason
+    assert "exists at the merge commit" in verdict.reason
+
+    # No durable finding is stamped — the review/fix pipeline is not told to
+    # correct anything while the PR is still open.
+    assert stamp_premerge_acceptance_finding(task) is None
+    assert premerge_acceptance_finding(task) is None
+    assert PREMERGE_ACCEPTANCE_FINDING_KEY not in (task.context or {})
+
+    # The truncated variant keeps its existing soft-credit behavior.
+    truncated = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+        },
+        changed_files=["backend/app/widget.py"],
+        unverified_reason=None,
+    )
+    truncated.context = {
+        **(truncated.context or {}),
+        "_pr_changed_files_truncated": True,
+    }
+    trunc_verdict = evaluate_premerge_acceptance(truncated)
+    assert trunc_verdict is not None
+    assert trunc_verdict.satisfied is True
+    assert trunc_verdict.proven is False
+
+    # An absent-from-diff test with an UNRELATED production seam is still a
+    # structural defect (the merge gate enforces the same grounding), so the
+    # hard-fail survives for that shape.
+    ungrounded = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+        },
+        changed_files=["backend/app/other.py"],  # unrelated production seam
+        unverified_reason=None,
+    )
+    assert evaluate_premerge_acceptance(ungrounded).satisfied is False
+    assert stamp_premerge_acceptance_finding(ungrounded) is not None
 
 
 def test_premerge_acceptance_other_kinds_structural_only():
@@ -1754,6 +1883,9 @@ async def test_consumed_downstream_artifact_upgrades_to_proven(db_session):
         # the rule version that produced it so a later qualification can tell
         # which rows were judged by a retired rule and re-derive them.
         "rule_version": ACCEPTANCE_RULE_VERSION,
+        # Audit honesty (design doc c50453ef §5): a direct recording is an
+        # ORIGINAL land-time stamp, never a re-derivation.
+        "stamped_at_land_time": True,
     }
     consumer = _make_code_task(changed_files=["backend/app/consumer.py"])
     consumer.project_id = project_id
@@ -4759,6 +4891,77 @@ def test_merge_acceptance_block_reads_the_key_the_monitor_writes():
     assert _merge_acceptance_test_block(task.context) is None
 
 
+def test_merge_acceptance_block_reads_inherited_block_for_rollup_child():
+    """A rollup child (which merges via the parent's single PR and never owns a
+    review_loop) reads its PARENT-INHERITED acceptance-test block — rung 6 of
+    design doc c50453ef, closing U1. The inherited block lives at the TOP level
+    under ``_inherited_acceptance_block`` (never inside review_loop, which a
+    child legitimately lacks), and the reader falls back to it only when the
+    child carries no own block. A mismatched inherited block fails closed — a
+    green run of some OTHER test is never credited for this declaration."""
+    from app.acceptance_gate import (
+        INHERITED_ACCEPTANCE_BLOCK_KEY,
+        MERGE_ACCEPTANCE_BLOCK_KEY,
+        _acceptance_test_exists_at_merge,
+        _acceptance_test_ran_green_at_merge,
+        _declared_named_test_path,
+        _merge_acceptance_test_block,
+    )
+
+    block = {
+        "declared": True,
+        "descriptor": "the seam test",
+        "selector": "testing/test_seam.py::test_x",
+        "present": True,
+        "ran": True,
+        "status": "ran",
+        "passed": True,
+    }
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "testing/test_seam.py",
+            "test_id": "test_x",
+        },
+        changed_files=["app/seam.py"],
+    )
+    # Rollup child shape: NO review_loop at all, only the parent's inherited
+    # block stamped by _propagate_landed_to_staging_merged_descendants.
+    task.context.pop(REVIEW_LOOP_KEY, None)
+    task.context[INHERITED_ACCEPTANCE_BLOCK_KEY] = block
+    assert _merge_acceptance_test_block(task.context) == block
+    declared = _declared_named_test_path(task.first_payload)
+    assert _acceptance_test_exists_at_merge(task.context, declared) is True
+    assert _acceptance_test_ran_green_at_merge(task.context, declared) is True
+
+    # A child that somehow DOES carry its own review_loop block: the own block
+    # wins, and a non-green own block is not rescued by the inherited one.
+    own = dict(block)
+    own["passed"] = False
+    task.context[REVIEW_LOOP_KEY] = {MERGE_ACCEPTANCE_BLOCK_KEY: own}
+    assert _merge_acceptance_test_block(task.context) == own
+    assert _acceptance_test_ran_green_at_merge(task.context, declared) is False
+
+    # A mismatched inherited block (names a DIFFERENT test — descriptor AND
+    # selector both point elsewhere) fails closed.
+    mismatched = dict(block)
+    mismatched["descriptor"] = "some_other_test.py"
+    mismatched["selector"] = "backend/testing/test_other.py::test_other"
+    task2 = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "testing/test_seam.py",
+            "test_id": "test_x",
+        },
+        changed_files=["app/seam.py"],
+    )
+    task2.context.pop(REVIEW_LOOP_KEY, None)
+    task2.context[INHERITED_ACCEPTANCE_BLOCK_KEY] = mismatched
+    declared2 = _declared_named_test_path(task2.first_payload)
+    assert _acceptance_test_exists_at_merge(task2.context, declared2) is False
+    assert _acceptance_test_ran_green_at_merge(task2.context, declared2) is False
+
+
 def test_not_in_diff_green_run_flows_writer_to_gate_as_proven():
     """End-to-end: a pre-existing test run green with in_diff=False now earns
     proven — the exact behaviour-preserving-refactor case the gate must credit.
@@ -5076,518 +5279,3 @@ def test_name_dropped_test_with_no_existence_evidence_still_hard_fails():
     )
     assert verdict_out.proven is False
     assert "not among the PR's changed files" in verdict_out.reason
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Backend-side corroboration of declared test existence at the merge commit
-# (PR #16956 regression: the gate previously trusted the agent's ``present``
-# word; the backend must independently verify the declared path/test-id in the
-# merged tree and fail closed on a corroborated absence)
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def test_corroborated_absence_overrides_agent_present_word():
-    """A backend-refuted declared test is a non-existence verdict even when the
-    agent reported the test present AND green. The gate must fail closed rather
-    than silently credit a test the backend can prove exists nowhere."""
-    from app.acceptance_gate import (
-        ACCEPTANCE_TEST_CORROBORATED_KEY,
-        _acceptance_test_exists_at_merge,
-        _acceptance_test_ran_green_at_merge,
-        _declared_named_test_path,
-    )
-
-    task = _make_code_task(
-        acceptance_evidence={
-            "kind": "named_test",
-            "test_path": "testing/test_nowhere.py",
-            "test_id": "test_x",
-        },
-        changed_files=["app/seam.py"],
-        targeted_green=True,  # agent claims it ran the declared test
-        merge_test_block={
-            "present": True,
-            "ran": True,
-            "status": "ran",
-            "passed": True,
-        },
-    )
-    # Backend corroboration ran against the merged tree and refuted the path.
-    task.context = {
-        **(task.context or {}),
-        ACCEPTANCE_TEST_CORROBORATED_KEY: False,
-    }
-    declared = _declared_named_test_path(task.first_payload)
-    assert _acceptance_test_exists_at_merge(task.context, declared) is False
-    assert _acceptance_test_ran_green_at_merge(task.context, declared) is False
-
-
-def test_corroborated_absence_is_a_non_existence_verdict_end_to_end():
-    """End-to-end through the real writer: a backend-refuted declared test must
-    not be credited — ``evaluate_code_acceptance`` must mint a non-existence
-    (unproven) verdict even when the agent reported a targeted green run, exactly
-    the PR #16956 fail-open the fix closes."""
-    from app.acceptance_gate import (
-        ACCEPTANCE_TEST_CORROBORATED_KEY,
-        evaluate_code_acceptance,
-    )
-
-    task = _make_code_task(
-        acceptance_evidence={
-            "kind": "named_test",
-            "test_path": "testing/test_nowhere.py",
-            "test_id": "test_x",
-        },
-        changed_files=["app/seam.py"],  # production change, test NOT in diff
-        targeted_green=True,  # agent claims it ran the declared test green
-        merge_test_block={
-            # The block NAMES the declared test, so the block-corroboration
-            # guard has nothing to withdraw — the only thing standing between
-            # this task and a credit is the backend's refuted corroboration.
-            "selector": "testing/test_nowhere.py::test_x",
-            "descriptor": "testing/test_nowhere.py",
-            "present": True,
-            "ran": True,
-            "status": "ran",
-            "passed": True,
-        },
-    )
-    # Backend corroboration refuted the declared path in the merged tree.
-    task.context = {
-        **(task.context or {}),
-        ACCEPTANCE_TEST_CORROBORATED_KEY: False,
-    }
-    verdict = evaluate_code_acceptance(task)
-    assert verdict.proven is False, (
-        f"corroborated-absent test must not be credited: {verdict.reason}"
-    )
-    assert "not among the PR's changed files" in verdict.reason
-
-
-def test_corroborated_presence_preserves_existing_verdict():
-    """A genuinely-corroborated declared test (backend confirmed the path and
-    node id in the merged tree) must still mint the same existing verdict — the
-    marker only overrides on a refuted absence, never on a confirmed presence."""
-    from app.acceptance_gate import (
-        ACCEPTANCE_TEST_CORROBORATED_KEY,
-        _acceptance_test_exists_at_merge,
-        _acceptance_test_ran_green_at_merge,
-        _declared_named_test_path,
-    )
-
-    task = _make_code_task(
-        acceptance_evidence={
-            "kind": "named_test",
-            "test_path": "testing/test_seam.py",
-            "test_id": "test_x",
-        },
-        changed_files=["app/seam.py"],
-        targeted_green=True,
-    )
-    task.context = {
-        **(task.context or {}),
-        ACCEPTANCE_TEST_CORROBORATED_KEY: True,
-    }
-    declared = _declared_named_test_path(task.first_payload)
-    assert _acceptance_test_exists_at_merge(task.context, declared) is True
-    assert _acceptance_test_ran_green_at_merge(task.context, declared) is True
-
-
-def test_missing_corroboration_marker_falls_back_to_agent_evidence():
-    """When the backend has not yet computed corroboration (marker absent — e.g.
-    the task landed before this fix, or the tree snapshot was unavailable) the
-    predicate keeps today's behavior: a genuinely-existing test is not suppressed
-    on missing data."""
-    from app.acceptance_gate import (
-        ACCEPTANCE_TEST_CORROBORATED_KEY,
-        _acceptance_test_exists_at_merge,
-        _acceptance_test_ran_green_at_merge,
-        _declared_named_test_path,
-    )
-
-    task = _make_code_task(
-        acceptance_evidence={
-            "kind": "named_test",
-            "test_path": "testing/test_seam.py",
-            "test_id": "test_x",
-        },
-        changed_files=["app/seam.py"],
-        targeted_green=True,
-    )
-    assert ACCEPTANCE_TEST_CORROBORATED_KEY not in (task.context or {})
-    declared = _declared_named_test_path(task.first_payload)
-    assert _acceptance_test_exists_at_merge(task.context, declared) is True
-    assert _acceptance_test_ran_green_at_merge(task.context, declared) is True
-
-
-def _corroboration_task(test_path: str, test_id: str | None = None) -> Task:
-    """Task whose first payload declares a ``named_test`` at *test_path*."""
-    evidence: dict = {"kind": "named_test", "test_path": test_path}
-    if test_id is not None:
-        evidence["test_id"] = test_id
-    return _make_code_task(
-        acceptance_evidence=evidence,
-        changed_files=["app/seam.py"],
-    )
-
-
-@pytest.mark.asyncio
-async def test_corroboration_confirms_declared_path_and_node():
-    """A declared test whose path and node id are present in the merged tree is
-    corroborated as True — the genuinely-corroborated case keeps its verdict."""
-    from unittest.mock import AsyncMock, patch
-
-    from app.acceptance_gate import corroborate_acceptance_test_at_merge
-
-    task = _corroboration_task(
-        "backend/testing/test_seam.py", test_id="test_x"
-    )
-    ctx = {
-        "token": "tok",
-        "owner": "owner",
-        "repo": "repo",
-        "branch": "integration",
-        "project_id": "proj-1",
-    }
-    with (
-        patch(
-            "app.source_ref_validation.resolve_branch_verification_context",
-            new=AsyncMock(return_value=dict(ctx)),
-        ),
-        patch(
-            "app.github_repo_snapshot.file_text_on_branch",
-            new=AsyncMock(return_value=(True, "def test_x():\n    assert 1")),
-        ),
-    ):
-        assert (
-            await corroborate_acceptance_test_at_merge(task, None) is True
-        )
-
-
-@pytest.mark.asyncio
-async def test_corroboration_refutes_declared_but_absent_path():
-    """A declared test path that is ABSENT from the merged tree is a backend
-    non-existence verdict (False) — never fail-open."""
-    from unittest.mock import AsyncMock, patch
-
-    from app.acceptance_gate import corroborate_acceptance_test_at_merge
-
-    task = _corroboration_task(
-        "backend/testing/test_nowhere.py", test_id="test_x"
-    )
-    ctx = {
-        "token": "tok",
-        "owner": "owner",
-        "repo": "repo",
-        "branch": "integration",
-        "project_id": "proj-1",
-    }
-    with (
-        patch(
-            "app.source_ref_validation.resolve_branch_verification_context",
-            new=AsyncMock(return_value=dict(ctx)),
-        ),
-        patch(
-            "app.github_repo_snapshot.file_text_on_branch",
-            new=AsyncMock(return_value=(False, None)),
-        ),
-    ):
-        assert (
-            await corroborate_acceptance_test_at_merge(task, None) is False
-        )
-
-
-@pytest.mark.asyncio
-async def test_corroboration_refutes_absent_test_id_in_present_file():
-    """A declared test path that EXISTS but does not contain the declared test id
-    is a backend non-existence verdict (False) — a fabricated id inside a real
-    file must not pass."""
-    from unittest.mock import AsyncMock, patch
-
-    from app.acceptance_gate import corroborate_acceptance_test_at_merge
-
-    task = _corroboration_task(
-        "backend/testing/test_seam.py", test_id="test_fabricated"
-    )
-    ctx = {
-        "token": "tok",
-        "owner": "owner",
-        "repo": "repo",
-        "branch": "integration",
-        "project_id": "proj-1",
-    }
-    with (
-        patch(
-            "app.source_ref_validation.resolve_branch_verification_context",
-            new=AsyncMock(return_value=dict(ctx)),
-        ),
-        patch(
-            "app.github_repo_snapshot.file_text_on_branch",
-            new=AsyncMock(
-                return_value=(True, "def test_real():\n    assert 1")
-            ),
-        ),
-    ):
-        assert (
-            await corroborate_acceptance_test_at_merge(task, None) is False
-        )
-
-
-@pytest.mark.asyncio
-async def test_corroboration_tries_backend_prefixed_variant():
-    """A declaration that drops the monorepo ``backend/`` prefix still
-    corroborates against the real tree via the prefixed candidate path."""
-    from unittest.mock import AsyncMock, patch
-
-    from app.acceptance_gate import corroborate_acceptance_test_at_merge
-
-    task = _corroboration_task(
-        "testing/test_seam.py", test_id="test_x"
-    )
-    ctx = {
-        "token": "tok",
-        "owner": "owner",
-        "repo": "repo",
-        "branch": "integration",
-        "project_id": "proj-1",
-    }
-    # First candidate (unprefixed) is absent; the backend-prefixed variant
-    # exists and contains the declared id.
-    with (
-        patch(
-            "app.source_ref_validation.resolve_branch_verification_context",
-            new=AsyncMock(return_value=dict(ctx)),
-        ),
-        patch(
-            "app.github_repo_snapshot.file_text_on_branch",
-            new=AsyncMock(
-                side_effect=[(False, None), (True, "def test_x():\n    assert 1")]
-            ),
-        ),
-    ):
-        assert (
-            await corroborate_acceptance_test_at_merge(task, None) is True
-        )
-
-
-@pytest.mark.asyncio
-async def test_corroboration_indeterminate_when_snapshot_unavailable():
-    """An unavailable tree snapshot (tri-state None) is indeterminate — not an
-    absence — so a genuinely-existing test is not suppressed on missing data."""
-    from unittest.mock import AsyncMock, patch
-
-    from app.acceptance_gate import corroborate_acceptance_test_at_merge
-
-    task = _corroboration_task(
-        "backend/testing/test_seam.py", test_id="test_x"
-    )
-    ctx = {
-        "token": "tok",
-        "owner": "owner",
-        "repo": "repo",
-        "branch": "integration",
-        "project_id": "proj-1",
-    }
-    with (
-        patch(
-            "app.source_ref_validation.resolve_branch_verification_context",
-            new=AsyncMock(return_value=dict(ctx)),
-        ),
-        patch(
-            "app.github_repo_snapshot.file_text_on_branch",
-            new=AsyncMock(return_value=(None, None)),
-        ),
-    ):
-        assert (
-            await corroborate_acceptance_test_at_merge(task, None) is None
-        )
-
-
-@pytest.mark.asyncio
-async def test_corroboration_no_named_test_is_none():
-    """A task that declares no ``named_test`` cannot be corroborated one way or
-    the other — indeterminate, not absent."""
-    from unittest.mock import AsyncMock, patch
-
-    from app.acceptance_gate import corroborate_acceptance_test_at_merge
-
-    task = _make_code_task(
-        acceptance_evidence={"kind": "coverage_delta", "threshold": 5},
-        changed_files=["app/seam.py"],
-    )
-    with patch(
-        "app.source_ref_validation.resolve_branch_verification_context",
-        new=AsyncMock(),
-    ) as _resolve:
-        assert await corroborate_acceptance_test_at_merge(task, None) is None
-    _resolve.assert_not_awaited()
-
-
-def test_declared_test_id_present_uses_word_boundaries():
-    """The declared node-id check is a standalone-identifier match: a full
-    pytest node reduces to its leaf, and a substring/prefix collision does not
-    false-positive."""
-    from app.acceptance_gate import _declared_test_id_present
-
-    assert _declared_test_id_present("test_x", "def test_x():\n    pass") is True
-    # Full pytest node id reduces to its leaf segment.
-    assert (
-        _declared_test_id_present(
-            "testing/test_seam.py::TestSeam::test_x",
-            "def test_x():\n    pass",
-        )
-        is True
-    )
-    # Prefix / substring-only matches must not be credited.
-    assert _declared_test_id_present("test_x", "def test_xy():\n    pass") is False
-    assert _declared_test_id_present("test_x", "# a comment about test_xz") is False
-    assert _declared_test_id_present("", "def test_x():\n    pass") is False
-
-
-def test_candidate_paths_cover_all_monorepo_roots_and_dedupe():
-    """A declaration that drops its monorepo prefix yields a candidate under
-    EVERY root (backend, admin-ui, agent) — a prefix-dropped admin-ui/agent test
-    must never corroborate as a definite absence because only the backend
-    variant was probed. Already-prefixed declarations are used as-is, and the
-    result is deduplicated with order preserved."""
-    from app.acceptance_gate import _candidate_test_paths
-
-    assert _candidate_test_paths("src/components/X.viewport.test.tsx") == [
-        "src/components/X.viewport.test.tsx",
-        "backend/src/components/X.viewport.test.tsx",
-        "admin-ui/src/components/X.viewport.test.tsx",
-        "agent/src/components/X.viewport.test.tsx",
-    ]
-    # Already-prefixed declarations probe exactly one path.
-    assert _candidate_test_paths("backend/testing/test_seam.py") == [
-        "backend/testing/test_seam.py"
-    ]
-    assert _candidate_test_paths("admin-ui/src/X.test.tsx") == [
-        "admin-ui/src/X.test.tsx"
-    ]
-    assert _candidate_test_paths("agent/src/handlers/x.test.ts") == [
-        "agent/src/handlers/x.test.ts"
-    ]
-    # Leading ./ is stripped and never duplicates.
-    assert _candidate_test_paths("./backend/testing/test_seam.py") == [
-        "backend/testing/test_seam.py"
-    ]
-
-
-@pytest.mark.asyncio
-async def test_corroboration_finds_prefix_dropped_agent_test():
-    """A prefix-dropped agent-side declaration corroborates True via the
-    ``agent/`` candidate instead of reading as a definite absence."""
-    from unittest.mock import AsyncMock, patch
-
-    from app.acceptance_gate import corroborate_acceptance_test_at_merge
-
-    task = _corroboration_task("src/handlers/seam.test.ts", test_id="handles seam")
-    ctx = {
-        "token": "tok",
-        "owner": "owner",
-        "repo": "repo",
-        "branch": "integration",
-        "project_id": "proj-1",
-    }
-    with (
-        patch(
-            "app.source_ref_validation.resolve_branch_verification_context",
-            new=AsyncMock(return_value=dict(ctx)),
-        ),
-        patch(
-            "app.github_repo_snapshot.file_text_on_branch",
-            new=AsyncMock(
-                side_effect=[
-                    (False, None),  # src/handlers/seam.test.ts
-                    (False, None),  # backend/src/handlers/seam.test.ts
-                    (False, None),  # admin-ui/src/handlers/seam.test.ts
-                    (True, "it('handles seam', () => {})"),  # agent/…
-                ]
-            ),
-        ),
-    ):
-        assert await corroborate_acceptance_test_at_merge(task, None) is True
-
-
-@pytest.mark.asyncio
-async def test_corroboration_pins_to_merge_commit_when_sha_provided():
-    """When the caller knows the merge commit, the tree read is pinned to that
-    exact immutable SHA — never routed through the branch-tip cache, whose TTL
-    can still serve the PRE-merge tip moments after a merge and stamp a durable
-    false "test absent" for a test the PR itself just added."""
-    from unittest.mock import AsyncMock, patch
-
-    from app.acceptance_gate import corroborate_acceptance_test_at_merge
-
-    task = _corroboration_task("backend/testing/test_seam.py", test_id="test_x")
-    ctx = {
-        "token": "tok",
-        "owner": "owner",
-        "repo": "repo",
-        "branch": "integration",
-        "project_id": "proj-1",
-    }
-    commit_reader = AsyncMock(return_value=(True, "def test_x():\n    assert 1"))
-    branch_reader = AsyncMock(return_value=(False, None))
-    with (
-        patch(
-            "app.source_ref_validation.resolve_branch_verification_context",
-            new=AsyncMock(return_value=dict(ctx)),
-        ),
-        patch("app.github_repo_snapshot.file_text_at_commit", new=commit_reader),
-        patch("app.github_repo_snapshot.file_text_on_branch", new=branch_reader),
-    ):
-        assert (
-            await corroborate_acceptance_test_at_merge(
-                task, None, commit_sha="a" * 40
-            )
-            is True
-        )
-    branch_reader.assert_not_awaited()
-    assert commit_reader.await_args.kwargs["commit_sha"] == "a" * 40
-
-
-def test_not_in_diff_proven_requires_positive_corroboration():
-    """For a declared test ABSENT from the PR's diff, every input behind the
-    existence/green-run credit is agent-reported — so machine ``proven``
-    additionally requires the backend's OWN tree check to have confirmed
-    existence. Indeterminate corroboration credits soft (satisfied, unproven);
-    positive corroboration keeps the proven mint; an in-diff test is unaffected
-    because presence in the GitHub-sourced diff is already backend-grounded."""
-    from app.acceptance_gate import _evaluate_named_test
-
-    evidence = AcceptanceEvidence(
-        kind="named_test", test_path="testing/test_seam.py", test_id="test_x"
-    )
-    # Indeterminate (None / never computed): soft credit, never proven.
-    soft = _evaluate_named_test(
-        evidence,
-        ["app/seam.py"],
-        verified=True,
-        test_exists=True,
-        ran_green=True,
-    )
-    assert soft.satisfied is True
-    assert soft.proven is False
-    assert "corroboration" in (soft.reason or "")
-    # Positive backend corroboration: the proven mint is preserved.
-    proven = _evaluate_named_test(
-        evidence,
-        ["app/seam.py"],
-        verified=True,
-        test_exists=True,
-        ran_green=True,
-        corroborated=True,
-    )
-    assert proven.satisfied is True
-    assert proven.proven is True
-    # In-diff: the declared test is among the PR's own changed files — proven
-    # without any corroboration marker, exactly as before.
-    in_diff = _evaluate_named_test(
-        evidence,
-        ["app/seam.py", "testing/test_seam.py"],
-        verified=True,
-    )
-    assert in_diff.satisfied is True
-    assert in_diff.proven is True

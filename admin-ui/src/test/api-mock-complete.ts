@@ -59,6 +59,7 @@ export function createApiMock(overrides: Record<string, unknown> = {}) {
     setVersionPhase: vi.fn(),
     setVersionGoal: vi.fn(),
     cutVersion: vi.fn(),
+    approveActivation: vi.fn(),
     clearDeployFailed: vi.fn(),
     createAcceptanceCriterion: vi.fn(),
     deleteAcceptanceCriterion: vi.fn(),

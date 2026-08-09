@@ -30,7 +30,7 @@ instead of the base input rate:
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -524,4 +524,189 @@ def test_unpriced_coverage_is_spend_weighted_and_retains_unpriced_token_volume()
     assert totals2["unpriced_coverage_fraction"] != round(1 / 2, 4)
     assert totals2["unpriced_input_tokens"] == 1_000
     assert totals2["unpriced_output_tokens"] == 100
+
+
+# ── 9. Strategic-cycle cost sliced by time and serving sha ──────────────────
+
+
+def test_strategic_cycle_cost_series_partitions_at_boundary():
+    """strategic_cycle_cost_per_event is sliceable by time and serving sha.
+
+    The decision-loop cost is a single aggregate over a cap-truncated recency
+    cohort, so it structurally cannot separate cycles that ran before a lever
+    reached serving from cycles that ran after. This test pins the slicing that
+    fixes that: ``by_cycle`` carries each cycle's first/last task timestamps
+    (a per-cycle TIME SERIES that can be partitioned at any timestamp), and
+    ``by_serving_sha`` attributes every cycle to the serving revision live when
+    its first task was last updated — cycles before the boundary land in the
+    old-sha bucket, cycles at-or-after the boundary in the new-sha bucket, and
+    the buckets reconcile to the aggregate total_usd. A cycle predating the
+    oldest timeline boundary lands in a None-sha bucket rather than being
+    dropped or mis-attributed.
+    """
+    import uuid
+
+    project_id = uuid.uuid4()
+    now = _utcnow()
+    boundary = now - timedelta(days=3)
+    old_sha = "a" * 40
+    new_sha = "b" * 40
+
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+
+    def _cost(in_tok: int, out_tok: int) -> float:
+        return in_tok * input_rate + out_tok * output_rate
+
+    def _cycle_task(cycle_id: str, ts: datetime, in_tok: int, out_tok: int) -> object:
+        return make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={},
+            payloads=[{"type": "strategic_review"}],
+            strategic_cycle_id=cycle_id,
+            created_at=ts,
+            updated_at=ts,
+            api_call_summary={
+                "total_input_tokens": in_tok,
+                "total_output_tokens": out_tok,
+                "llm_call_count": 2,
+            },
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+        )
+
+    early_a = now - timedelta(days=5)
+    early_b = now - timedelta(days=4)
+    late_a = now - timedelta(days=1)
+    late_b = now - timedelta(hours=20)
+
+    tasks = [
+        _cycle_task("cycle-old-1", early_a, 1000, 200),
+        _cycle_task("cycle-old-2", early_b, 500, 100),
+        _cycle_task("cycle-new-1", late_a, 800, 160),
+        _cycle_task("cycle-new-2", late_b, 300, 60),
+        # Unrelated create task must NOT appear in any strategic slice.
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            payloads=[{"type": "create"}],
+            api_call_summary={
+                "total_input_tokens": 9999,
+                "total_output_tokens": 999,
+                "llm_call_count": 8,
+            },
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+        ),
+    ]
+
+    timeline = [
+        {"since": (now - timedelta(days=7)).isoformat(), "sha": old_sha},
+        {"since": boundary.isoformat(), "sha": new_sha},
+    ]
+
+    result = _compact_llm_cost_attribution(tasks, serving_sha_timeline=timeline)
+    sc = result["strategic_cycle_cost_per_event"]
+    assert sc is not None
+    assert sc["by_cycle_capped"] is False
+
+    old_cost = round(_cost(1000, 200) + _cost(500, 100), 6)
+    new_cost = round(_cost(800, 160) + _cost(300, 60), 6)
+    expected_total = round(old_cost + new_cost, 6)
+
+    # Aggregate unchanged by the additive slices.
+    assert sc["cycle_count"] == 4
+    assert sc["total_usd"] == pytest.approx(expected_total)
+    assert sc["per_event_usd"] == pytest.approx(expected_total / 4)
+
+    # by_cycle is a per-cycle TIME SERIES, oldest-first, with the updated_at
+    # span of each cycle's tasks so a reading partitions at any timestamp.
+    by_cycle = sc["by_cycle"]
+    assert len(by_cycle) == 4
+    assert [c["cycle_id"] for c in by_cycle] == [
+        "cycle-old-1", "cycle-old-2", "cycle-new-1", "cycle-new-2",
+    ]
+    assert by_cycle[0]["first_task_at"] == early_a.isoformat()
+    assert by_cycle[0]["last_task_at"] == early_a.isoformat()
+    assert by_cycle[0]["task_count"] == 1
+    assert by_cycle[0]["total_usd"] == pytest.approx(_cost(1000, 200))
+    assert by_cycle[-1]["first_task_at"] == late_b.isoformat()
+
+    # Serving-sha partition at the boundary: before -> old_sha, at/after -> new_sha.
+    by_sha = {r["serving_sha"]: r for r in sc["by_serving_sha"]}
+    assert set(by_sha) == {old_sha, new_sha}
+    assert by_sha[old_sha]["cycle_count"] == 2
+    assert by_sha[old_sha]["total_usd"] == pytest.approx(old_cost)
+    assert by_sha[old_sha]["per_event_usd"] == pytest.approx(old_cost / 2)
+    assert by_sha[old_sha]["first_cycle_at"] == early_a.isoformat()
+    assert by_sha[old_sha]["last_cycle_at"] == early_b.isoformat()
+    assert by_sha[new_sha]["cycle_count"] == 2
+    assert by_sha[new_sha]["total_usd"] == pytest.approx(new_cost)
+    assert by_sha[new_sha]["per_event_usd"] == pytest.approx(new_cost / 2)
+    assert by_sha[new_sha]["first_cycle_at"] == late_a.isoformat()
+    assert by_sha[new_sha]["last_cycle_at"] == late_b.isoformat()
+
+    # Buckets reconcile to the aggregate total.
+    assert sum(r["total_usd"] for r in sc["by_serving_sha"]) == pytest.approx(
+        sc["total_usd"]
+    )
+
+    # A cycle whose first task predates the oldest boundary has no attributing
+    # sha — it lands in a None-sha bucket, not dropped, not mis-attributed.
+    pre = _compact_llm_cost_attribution(
+        [_cycle_task("cycle-pre", now - timedelta(days=10), 100, 20)],
+        serving_sha_timeline=timeline,
+    )["strategic_cycle_cost_per_event"]
+    by_sha_pre = {r["serving_sha"]: r for r in pre["by_serving_sha"]}
+    assert set(by_sha_pre) == {None}
+    assert by_sha_pre[None]["cycle_count"] == 1
+    assert by_sha_pre[None]["total_usd"] == pytest.approx(_cost(100, 20))
+
+
+def test_serving_sha_timeline_from_snapshots_builds_boundaries():
+    """The serving-sha timeline built from snapshot history is sorted,
+    deduplicated across back-to-back snapshots of an unchanged revision, and
+    extended with the current serving sha at ``now`` so cycles active after the
+    newest snapshot still attribute to the serving revision."""
+    from app.efficiency_snapshot import _serving_sha_timeline_from_snapshots
+
+    now = _utcnow()
+    d1 = (now - timedelta(days=6)).isoformat()
+    d2 = (now - timedelta(days=3)).isoformat()
+    d3 = (now - timedelta(days=1)).isoformat()
+
+    snapshots = [
+        {"captured_at": d1, "serving_sha": "shaX"},
+        # Back-to-back snapshot of an unchanged revision collapses into shaX@d1.
+        {"captured_at": d2, "serving_sha": "shaX"},
+        {"captured_at": d3, "serving_sha": "shaY"},
+        # Pre-stamp snapshot carries no sha and is skipped.
+        {"captured_at": (now - timedelta(days=2)).isoformat(), "serving_sha": None},
+    ]
+    tl = _serving_sha_timeline_from_snapshots(snapshots, "shaY", now)
+    assert tl is not None
+    assert tl[0] == {"since": d1, "sha": "shaX"}
+    # The current serving sha at now collapses into the existing shaY boundary.
+    assert tl[1] == {"since": d3, "sha": "shaY"}
+    assert len(tl) == 2
+
+    # No snapshots and no current sha -> None (pre-stamp deployments).
+    assert _serving_sha_timeline_from_snapshots([], None, now) is None
+    # Only the current sha -> a single boundary at now.
+    assert _serving_sha_timeline_from_snapshots([], "shaZ", now) == [
+        {"since": now.isoformat(), "sha": "shaZ"}
+    ]
+    # A rollback to a previously-serving sha keeps BOTH boundaries (the later
+    # stamp means that revision started serving again then).
+    rollback = _serving_sha_timeline_from_snapshots(
+        [
+            {"captured_at": (now - timedelta(days=9)).isoformat(), "serving_sha": "shaX"},
+            {"captured_at": (now - timedelta(days=6)).isoformat(), "serving_sha": "shaY"},
+            {"captured_at": (now - timedelta(days=3)).isoformat(), "serving_sha": "shaX"},
+        ],
+        None,
+        now,
+    )
+    assert [b["sha"] for b in rollback] == ["shaX", "shaY", "shaX"]
 

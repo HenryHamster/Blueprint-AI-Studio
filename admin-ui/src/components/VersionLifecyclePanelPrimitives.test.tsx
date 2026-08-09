@@ -14,6 +14,7 @@ import {
   DurableQualificationEvidenceRow,
   PromotionReadinessSummary,
   PinnedServingVersionCallout,
+  PromotedAwaitingActivationCallout,
   StagedDirectionsSummary,
   CutConsequences,
   ChallengedVsUnchallengedSummary,
@@ -598,6 +599,43 @@ describe('PinnedServingVersionCallout', () => {
     expect(host.textContent).toContain('v5');
     expect(host.textContent).toContain('12 merged');
     expect(host.textContent).toContain('Stable release');
+  });
+});
+
+describe('PromotedAwaitingActivationCallout', () => {
+  test('renders nothing when the version is not promoted', () => {
+    const version: RecentVersion = {
+      version_number: 4,
+      status: 'open',
+      serving: { status: 'unconfirmed' },
+    } as RecentVersion;
+    const host = render(<PromotedAwaitingActivationCallout version={version} />);
+    expect(host.textContent).toBe('');
+  });
+
+  test('renders nothing when serving has already resolved', () => {
+    const version: RecentVersion = {
+      version_number: 4,
+      status: 'promoted',
+      serving: { status: 'serving_confirmed', confirmed_at: '2026-07-01T12:00:00Z' },
+    } as RecentVersion;
+    const host = render(<PromotedAwaitingActivationCallout version={version} />);
+    expect(host.textContent).toBe('');
+  });
+
+  test('renders awaiting-activation guidance for promoted-unconfirmed', () => {
+    const version: RecentVersion = {
+      version_number: 4,
+      status: 'promoted',
+      promoted_at: '2026-07-01T12:00:00Z',
+      serving: { status: 'unconfirmed' },
+      deploy_confirm_deadline: '2026-07-08T12:00:00Z',
+    } as RecentVersion;
+    const host = render(<PromotedAwaitingActivationCallout version={version} />);
+    expect(host.textContent).toContain('awaiting activation');
+    expect(host.textContent).toContain('v4');
+    expect(host.textContent).toContain('blueprint deploy');
+    expect(host.textContent).toContain('confirm by');
   });
 });
 

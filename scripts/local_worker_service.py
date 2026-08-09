@@ -361,6 +361,55 @@ def _wait_for_proxy(gateway: str, *, timeout: float = 30.0) -> None:
     raise RuntimeError("Cloud SQL proxy did not accept connections within 30 seconds")
 
 
+def _oci_revision_label(image: str) -> str | None:
+    """Read the pinned image's ``org.opencontainers.image.revision`` label.
+
+    Every released image carries this label (local_app_release._inspect_candidate
+    verifies it), so a launcher invoked without an explicit deploy SHA can still
+    identify the revision it is about to run — first-boot and rollback role
+    environments predate the deploy-SHA wiring. Returns None when the image is
+    not local, the label is missing, or the inspect output is malformed.
+    """
+    result = subprocess.run(
+        ["docker", "image", "inspect", image],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        record = json.loads(result.stdout)[0]
+        labels = (record.get("Config") or {}).get("Labels") or {}
+    except (IndexError, KeyError, TypeError, json.JSONDecodeError):
+        return None
+    return labels.get("org.opencontainers.image.revision")
+
+
+def _resolve_deploy_sha(env_name: str, image: str) -> str:
+    """Resolve the deploy identity for a role launcher, fail-closed.
+
+    Resolution order: the role-specific env var (authoritative, stamped by
+    local_app_release), then the pinned image's OCI revision label (covers
+    first-boot/rollback where the role env predates the deploy-SHA wiring).
+    Raises ValueError when neither yields a full 40-hex git SHA so a role never
+    starts with an unknown deploy identity.
+    """
+    deploy_sha = os.environ.get(env_name, "").strip()
+    if deploy_sha:
+        if not _DEPLOY_SHA_RE.fullmatch(deploy_sha):
+            raise ValueError(f"{env_name} must be a full git SHA")
+        return deploy_sha
+    label_sha = _oci_revision_label(image)
+    if label_sha and _DEPLOY_SHA_RE.fullmatch(label_sha):
+        return label_sha
+    raise ValueError(
+        f"{env_name} is absent and image {image} carries no "
+        "org.opencontainers.image.revision label; refusing to start with an "
+        "unknown deploy identity"
+    )
+
+
 def _assert_proxy_reachable_from_network(
     image: str, network: str, gateway: str
 ) -> None:
@@ -455,14 +504,15 @@ def command() -> tuple[list[str], dict[str, str]]:
     )
     # The worker is the leader for singleton background services, including the
     # deploy-state health tick that reconciles DeploymentState.current_sha from
-    # DEPLOY_SHA. Off Cloud Run there is no image-lookup fallback, so without
-    # this the singleton stays "unknown" and post-promotion serving
-    # confirmation reads a stale row forever.
-    deploy_sha = os.environ.get("BLUEPRINT_WORKER_DEPLOY_SHA", "").strip()
-    if deploy_sha:
-        if not _DEPLOY_SHA_RE.fullmatch(deploy_sha):
-            raise ValueError("BLUEPRINT_WORKER_DEPLOY_SHA must be a full git SHA")
-        environment["DEPLOY_SHA"] = deploy_sha
+    # DEPLOY_SHA. Off Cloud Run there is no image-lookup fallback, so a role
+    # must never start without a deploy identity — otherwise the singleton
+    # stays "unknown" and post-promotion serving confirmation reads a stale row
+    # forever. local_app_release stamps BLUEPRINT_WORKER_DEPLOY_SHA; the pinned
+    # image's OCI revision label covers first-boot/rollback where the role env
+    # predates the deploy-SHA wiring.
+    environment["DEPLOY_SHA"] = _resolve_deploy_sha(
+        "BLUEPRINT_WORKER_DEPLOY_SHA", image
+    )
     runtime_environment = {
         "BLUEPRINT_PROCESS_ROLE",
         "BLUEPRINT_DEPLOYMENT_MODE",
@@ -470,9 +520,8 @@ def command() -> tuple[list[str], dict[str, str]]:
         "HOME",
         "PORT",
         "GOOGLE_APPLICATION_CREDENTIALS",
+        "DEPLOY_SHA",
     }
-    if deploy_sha:
-        runtime_environment.add("DEPLOY_SHA")
     forwarded = sorted(_ALLOWED_SECRETS | runtime_environment)
     argv = [
         "docker",

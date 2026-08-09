@@ -5505,6 +5505,12 @@ def build_parser() -> argparse.ArgumentParser:
                           help="Show what would be deployed without deploying.")
     p_deploy.add_argument("--yes", action="store_true",
                           help="Skip the confirmation prompt (for scripting).")
+    p_deploy.add_argument(
+        "--force",
+        action="store_true",
+        help="Deploy even when no promoted release version exists or the built "
+             "revision does not contain the promoted SHA (emergency override).",
+    )
 
     # envelope
     p_envelope = sub.add_parser(
@@ -5798,13 +5804,114 @@ def _gh(*gh_args: str) -> str:
     return proc.stdout
 
 
+def _resolve_deploy_binding(args: argparse.Namespace, revision: str) -> dict | None:
+    """Resolve the promoted release version this deploy binds to (or ``None``).
+
+    Bind the built revision to the project's latest promoted release version:
+    query the backend for the newest ``status=promoted`` version and, when the
+    built revision differs from the promoted SHA, verify via the GitHub compare
+    API that the build CONTAINS the promoted commit (status ``identical`` or
+    ``ahead``).  Refuse ``behind``/``diverged`` revisions — a build that does not
+    include the promoted commit must not be surfaced as the promoted version
+    serving.  ``--force`` bypasses every refusal (emergency override); with no
+    promoted version at all, ``--force`` returns ``None`` and the deploy proceeds
+    unbound (legacy behavior, no receipt).
+    """
+    pid = get_project_id(getattr(args, "project_id", None))
+    versions_data, err = _safe_read(
+        f"/api/admin/projects/{pid}/release-versions?status=promoted&limit=1"
+    )
+    if err:
+        print(f"ERROR: could not read promoted release versions: {err}")
+        raise APIError(1, "promoted version lookup failed")
+    versions = (versions_data or {}).get("versions") or []
+    promoted = versions[0] if versions else None
+    if promoted is None:
+        if getattr(args, "force", False):
+            print("  WARNING: no promoted release version found — deploying "
+                  "unbound (--force).")
+            return None
+        print("ERROR: no promoted release version found for this project; "
+              "refusing to activate a revision that is not bound to a "
+              "promotion. Use --force to deploy anyway.")
+        raise APIError(1, "no promoted release version")
+
+    promoted_sha = (promoted.get("promoted_sha") or "").lower()
+    version_number = promoted.get("version_number")
+    status = "identical"
+    if promoted_sha and promoted_sha != revision:
+        compare = json.loads(_gh(
+            "api", f"repos/{_DEPLOY_REPO}/compare/{promoted_sha}...{revision}",
+        ))
+        status = (compare.get("status") or "unknown")
+        if status not in ("identical", "ahead"):
+            if getattr(args, "force", False):
+                print(f"  WARNING: built revision {revision[:12]} is {status} "
+                      f"the promoted SHA {promoted_sha[:12]} — binding check "
+                      "bypassed (--force).")
+            else:
+                print(f"ERROR: built revision {revision[:12]} is {status} the "
+                      f"promoted SHA {promoted_sha[:12]}; refusing to activate a "
+                      "revision that does not contain the promoted commit. Use "
+                      "--force to deploy anyway.")
+                raise APIError(1, "revision not descendant of promoted sha")
+    print(f"  Binding:   v{version_number} (promoted {promoted_sha[:12]}, "
+          f"build {status})")
+    return promoted
+
+
+def _post_activation_receipt(
+    args: argparse.Namespace,
+    promoted: dict | None,
+    revision: str,
+) -> None:
+    """POST the activation receipt so the backend confirms the promoted version.
+
+    Called only AFTER the SSH activation succeeds.  The receipt carries the
+    promoted ``version_number``, the activated ``revision``, and the SSH host;
+    the backend stamps it on ``last_qualification`` and resolves the version's
+    serving state.  A failed POST exits non-zero: the release IS activated, but
+    the backend was not told, so the serving-confirmation loop would otherwise
+    keep waiting on a stale signal.
+    """
+    if promoted is None:
+        return
+    try:
+        result = api("POST", (
+            f"/api/admin/projects/{get_project_id(getattr(args, 'project_id', None))}"
+            "/activation-receipt"
+        ), {
+            "version_number": promoted.get("version_number"),
+            "revision": revision,
+            "host": args.host,
+        })
+    except APIError:
+        print("ERROR: release activated, but the activation receipt could not "
+              "be recorded — the promoted version's serving confirmation will "
+              "not reflect this activation. Investigate the backend and re-post "
+              "the receipt (or re-run deploy) to close the loop.", file=sys.stderr)
+        raise
+    if isinstance(result, dict):
+        serving = result.get("serving_status")
+        served = result.get("served_sha") or ""
+        print(f"  Receipt:   v{promoted.get('version_number')} "
+              f"serving_status={serving} (served_sha={served[:12] or '?'})")
+    else:
+        print(f"  Receipt:   recorded for v{promoted.get('version_number')}")
+
+
 def cmd_deploy(args: argparse.Namespace) -> None:
     """Activate the newest CI-built main release on the local control plane.
 
     Chain: find the newest successful "Deploy Blueprint" run on main (or the
     run for --sha), download its integrity-checked local-app-release manifest,
-    then invoke the root-owned zero-argument-trust shim on the control-plane
-    host over SSH. The shim (scripts/blueprint_release.py, installed as
+    bind the built revision to the project's latest promoted release version
+    (SHA-or-descendant via the GitHub compare API; --force bypasses), then
+    invoke the root-owned zero-argument-trust shim on the control-plane host
+    over SSH. After activation, POST an activation receipt so the backend
+    records the served revision and closes the serving-confirmation loop.
+
+    The shim (scripts/blueprint_release.py, installed as
     /usr/local/sbin/blueprint-release) re-validates both values against strict
     regexes, pins the registry/repository, and the immutable release tool
     re-verifies digest, revision label, and health with automatic rollback —
@@ -5857,9 +5964,11 @@ def cmd_deploy(args: argparse.Namespace) -> None:
     print(f"  Revision:  {revision}")
     print(f"  Image:     ...@{digest[:19]}...")
     print(f"  Built:     {run.get('createdAt', '?')} (run {run['databaseId']})")
+    promoted = _resolve_deploy_binding(args, revision)
     if args.dry_run:
         print("  (dry run — nothing deployed)")
         return
+    _require_write_config("deploy")
     if not args.yes:
         answer = input("Activate this release? [y/N] ").strip().lower()
         if answer not in ("y", "yes"):
@@ -5874,6 +5983,7 @@ def cmd_deploy(args: argparse.Namespace) -> None:
               "rolls back failed activations; inspect its receipt on the host.")
         raise APIError(proc.returncode, "release failed")
     print("Release activated. Runners self-update on their next heartbeat.")
+    _post_activation_receipt(args, promoted, revision)
 
 
 _DISPATCH = {

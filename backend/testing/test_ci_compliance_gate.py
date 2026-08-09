@@ -2080,6 +2080,88 @@ def test_agent_status_decomposition_resolves_size_breach():
     )
 
 
+def test_release_reconciliation_decomposition_resolves_size_breach():
+    """The serving-confirmation extraction must keep release_reconciliation ≤ 3700.
+
+    Automain 5b97819a reported backend/release_reconciliation.py at 3787 lines,
+    above its 3700 cap and classified as a chronic offender — such modules are
+    DECOMPOSED, never cap-bumped again. The post-promotion serving-confirmation
+    cluster moved to the sibling module ``app.release_serving_confirmation``.
+    This test pins the cap UNCHANGED at 3700 and verifies the re-exported
+    helpers still resolve through the canonical ``app.release_reconciliation``
+    module (the import surface callers such as ``app.release_qualifier_sweep``
+    and ``app.routers.admin_release_version`` rely on).
+    """
+    json_path = os.path.join(os.path.dirname(__file__), "module_size_limits.json")
+    data = csl.load_limits(json_path)
+    backend_caps = data.get("backend", {})
+
+    target_rel = "release_reconciliation.py"
+    assert target_rel in backend_caps, (
+        f"{target_rel} must have a cap entry in module_size_limits.json"
+    )
+    # Chronic offenders are decomposed, not bumped: the existing cap stays as-is.
+    assert backend_caps[target_rel] == 3700, (
+        f"{target_rel} cap must remain 3700 after decomposition; "
+        f"got {backend_caps[target_rel]}. Chronic offenders are decomposed, "
+        "never cap-bumped."
+    )
+
+    backend_app_root = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "app")
+    )
+    assert os.path.isdir(backend_app_root), "backend app/ must exist next to testing/"
+
+    target_path = os.path.join(backend_app_root, target_rel)
+    assert os.path.isfile(target_path), f"{target_path} must exist on disk"
+
+    actual_count = csl.count_lines(target_path)
+    cap = backend_caps[target_rel]
+    assert actual_count <= cap, (
+        f"{target_rel} has {actual_count} lines which exceeds its cap of {cap}. "
+        "Extract the serving-confirmation cluster into the sibling module "
+        "app.release_serving_confirmation instead of raising the cap."
+    )
+    result = csl.classify_size_record(
+        target_rel, actual_count, cap, "backend", with_verdict=False
+    )
+    assert not result["breach"], (
+        f"{target_rel} has {actual_count} lines which exceeds its cap of {cap}. "
+        "Run `python3 backend/testing/check_size_limits.py --fix` and commit "
+        "the updated module_size_limits.json."
+    )
+
+    # The cohesive serving-confirmation cluster now lives in the sibling module —
+    # the extraction that bought release_reconciliation back under its cap.
+    sibling_path = os.path.join(backend_app_root, "release_serving_confirmation.py")
+    assert os.path.isfile(sibling_path), (
+        "the serving-confirmation cluster must be extracted to "
+        "app/release_serving_confirmation.py for release_reconciliation to fit "
+        "its existing 3700 cap without raising it"
+    )
+
+    # Back-compat: helpers moved to the sibling must still resolve through the
+    # canonical app.release_reconciliation module (callers import them from
+    # there — e.g. app.release_qualifier_sweep, admin_release_version, tests).
+    from app import release_reconciliation as rr
+
+    for name in (
+        "_DEPLOY_FAILED_RECOVERY_WINDOW_SECONDS_DEFAULT",
+        "_classify_serving_outcome",
+        "_confirm_serving_or_fail",
+        "_reconcile_if_deploy_failed_recovered",
+        "_record_activation_receipt",
+        "_record_post_promotion_outcome",
+        "_recover_serving_confirmed",
+        "_refresh_release_artifact_rows",
+        "_to_naive_utc",
+    ):
+        assert hasattr(rr, name), (
+            f"{name} must remain importable from app.release_reconciliation "
+            "after the serving-confirmation cluster moved to the sibling module"
+        )
+
+
 def test_cap_bump_resolves_strategic_resident_session_breach():
     """After bumping caps via check_size_limits --fix,
     strategic_resident_session.py must be within its new cap on the real file
@@ -2471,6 +2553,57 @@ def test_cap_bump_resolves_acceptance_gate_breach():
     )
     assert backend_caps[target_rel] >= 3150, (
         f"{target_rel} cap must be at least 3150 (bumped from old 2650 cap); "
+        f"got {backend_caps[target_rel]}"
+    )
+
+    # Resolve app/ as testing/'s sibling, matching the Docker harness layout
+    # (see test_cap_bump_resolves_orchestrator_runner_dispatch_breach above).
+    backend_root = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "app")
+    )
+    assert os.path.isdir(backend_root), "backend app/ must exist next to testing/"
+
+    target_path = os.path.join(backend_root, target_rel)
+    assert os.path.isfile(target_path), f"{target_path} must exist on disk"
+
+    actual_count = csl.count_lines(target_path)
+    cap = backend_caps[target_rel]
+    result = csl.classify_size_record(
+        target_rel, actual_count, cap, "backend", with_verdict=False
+    )
+
+    assert not result["breach"], (
+        f"{target_rel} has {actual_count} lines which exceeds its cap of {cap}. "
+        "Run `python3 backend/testing/check_size_limits.py --fix` and commit "
+        "the updated module_size_limits.json."
+    )
+
+
+def test_cap_bump_resolves_llm_cost_attribution_breach():
+    """After bumping caps via check_size_limits --fix, llm_cost_attribution.py
+    must be within its new cap on the real file tree.
+
+    This is the breach the 2026-08-08 ci-compliance remediation targets: automain
+    HEAD 3c585c45 reported backend/llm_cost_attribution.py at 1926 lines over its
+    old cap of 1850. The fix bumps that cap to 2250 in module_size_limits.json —
+    the canonical bump_size_limit(1926) policy value; this merge-test gate proves
+    the bumped JSON is consistent with the actual file size on disk, so the test
+    fails if the cap is reverted (or the file grows past the new cap) before the
+    CI invariant suite runs. The breach classification itself is delegated to the
+    production predicate ``app.size_limit_policy.is_breach`` (via
+    ``classify_size_record``), so the gate exercises the shipped policy rather
+    than re-deriving the comparison.
+    """
+    json_path = os.path.join(os.path.dirname(__file__), "module_size_limits.json")
+    data = csl.load_limits(json_path)
+    backend_caps = data.get("backend", {})
+
+    target_rel = "llm_cost_attribution.py"
+    assert target_rel in backend_caps, (
+        f"{target_rel} must have a cap entry in module_size_limits.json"
+    )
+    assert backend_caps[target_rel] >= 2250, (
+        f"{target_rel} cap must be at least 2250 (bumped from old 1850 cap); "
         f"got {backend_caps[target_rel]}"
     )
 

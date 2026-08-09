@@ -2,7 +2,10 @@
 auto-merge guard that consumes them."""
 
 import ast
+import os
 from pathlib import Path
+import re
+import subprocess
 from unittest.mock import patch
 
 from app.migration_chain import (
@@ -82,6 +85,72 @@ def test_migration_files_do_not_import_app_modules():
         "resolve against the serving tree rather than the candidate. "
         f"Offenders: {offenders}"
     )
+
+
+def test_sandbox_bridge_covers_every_migration_required_extension(tmp_path: Path):
+    """The off-image bridge must fail diagnostically before Alembic runs.
+
+    This exercises the production shell helper with a narrow fake psql command
+    and derives the extension inventory from the immutable migration sources,
+    so a future contrib requirement cannot silently become another opaque
+    migration failure.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    # In CI the backend/ tree is the Docker build context, so parents[2]
+    # resolves to a mount root without the repo-root scripts/ dir; the full
+    # repo is mounted at /repo there (mirrors the _REPO_ROOT fallback in
+    # test_check_gate_fail_closed.py).
+    if not (repo_root / "scripts" / "backend-test-route.sh").exists() and (
+        Path("/repo") / "scripts" / "backend-test-route.sh"
+    ).exists():
+        repo_root = Path("/repo")
+    versions_dir = repo_root / "backend" / "alembic" / "versions"
+    required: dict[str, list[str]] = {}
+    extension_pattern = re.compile(
+        r"CREATE EXTENSION IF NOT EXISTS ([A-Za-z0-9_]+)"
+    )
+    for path in sorted(versions_dir.glob("*.py")):
+        for extension in extension_pattern.findall(path.read_text()):
+            required.setdefault(extension, []).append(
+                path.relative_to(repo_root).as_posix()
+            )
+
+    helper = (repo_root / "scripts" / "backend-test-route.sh").read_text()
+    probe = (repo_root / "scripts" / "project-verification-probe.sh").read_text()
+    assert required == {"pg_trgm": [
+        "backend/alembic/versions/0122_artifact_pr_url_trgm_index.py",
+        "backend/alembic/versions/0145_knowledge_documents.py",
+        "backend/alembic/versions/0529_add_task_search_trgm_indexes.py",
+        "backend/alembic/versions/0714_repair_strategic_conversation_correctness.py",
+    ]}
+    for extension, migrations in required.items():
+        for migration in migrations:
+            assert f"'{extension}|{migration}'" in helper
+    assert "extension=\"pg_trgm\"" in probe
+    assert "0122_artifact_pr_url_trgm_index.py" in probe
+
+    fake_psql = tmp_path / "psql"
+    fake_psql.write_text("#!/bin/sh\nprintf '%s\\n' \"$PSQL_RESULT\"\n")
+    fake_psql.chmod(0o755)
+    check = (
+        "source scripts/backend-test-route.sh; "
+        "verify_required_postgres_extensions \"$FAKE_PSQL\""
+    )
+    env = os.environ.copy()
+    env["FAKE_PSQL"] = str(fake_psql)
+    env["PSQL_RESULT"] = "1"
+    passed = subprocess.run(
+        ["bash", "-c", check], cwd=repo_root, env=env, capture_output=True, text=True
+    )
+    assert passed.returncode == 0, passed.stderr
+
+    env["PSQL_RESULT"] = ""
+    missing = subprocess.run(
+        ["bash", "-c", check], cwd=repo_root, env=env, capture_output=True, text=True
+    )
+    assert missing.returncode != 0
+    assert "pg_trgm" in missing.stderr
+    assert "0122_artifact_pr_url_trgm_index.py" in missing.stderr
 # ── Pure helper ─────────────────────────────────────────────────────────────
 
 
@@ -1335,7 +1404,7 @@ def test_backfill_0707_chains_from_0702_and_declares_kv_keys():
         )
 
 
-def test_schema_head_chains_through_0735_task_origination():
+def test_schema_head_chains_through_0740_localrunner_agent_source_sha():
     """Service-credential migrations follow admission removal as one linear chain.
 
     Historical contracts preserved:
@@ -1345,7 +1414,12 @@ def test_schema_head_chains_through_0735_task_origination():
     - 0725 (fleet-sizing reading) revises 0724
     - 0727 (inline LLM spend log) revises 0725
     - 0728 (inline LLM spend pricing status) revises 0727
-    - 0735 (task origination) revises 0728 — current schema head
+    - 0735 (task origination) revises 0728
+    - 0736 (direction-scoped category verdicts) revises 0735
+    - 0737 (cross-project perf indexes) revises 0736
+    - 0738 (approved-activation control columns) revises 0737
+    - 0739 (LocalRunner source identity) revises 0738
+    - 0740 (LocalRunner agent_source_sha) revises 0739 — current schema head
     """
     versions_dir = Path(__file__).resolve().parents[1] / "alembic" / "versions"
     operability = (
@@ -1409,6 +1483,21 @@ def test_schema_head_chains_through_0735_task_origination():
     task_origination = (
         versions_dir / "0735_task_origination.py"
     ).read_text()
+    direction_scoped_verdicts = (
+        versions_dir / "0736_scope_category_verdict_to_direction.py"
+    ).read_text()
+    perf_indexes = (
+        versions_dir / "0737_cross_project_scan_indexes.py"
+    ).read_text()
+    activation_approval = (
+        versions_dir / "0738_activation_request_approval.py"
+    ).read_text()
+    localrunner_source = (
+        versions_dir / "0739_localrunner_source_sha.py"
+    ).read_text()
+    localrunner_source_sha = (
+        versions_dir / "0740_localrunner_agent_source_sha.py"
+    ).read_text()
     assert parse_revision_identifiers(operability) == ("0708", "0707")
     assert parse_revision_identifiers(claims) == ("0709", "0708")
     assert parse_revision_identifiers(incarnation) == ("0710", "0709")
@@ -1443,10 +1532,25 @@ def test_schema_head_chains_through_0735_task_origination():
     assert parse_revision_identifiers(inline_llm_pricing_status) == ("0728", "0727")
     # 0735 chains from 0728: durable task-origination class.
     assert parse_revision_identifiers(task_origination) == ("0735", "0728")
+    # 0736 chains from 0735: exactly-one-of direction/version verdict scope.
+    assert parse_revision_identifiers(direction_scoped_verdicts) == ("0736", "0735")
+    # 0737 chains from 0736: additive cross-project perf indexes.
+    assert parse_revision_identifiers(perf_indexes) == ("0737", "0736")
+    # 0738 chains from 0737: approved-activation control columns.
+    assert parse_revision_identifiers(activation_approval) == ("0738", "0737")
+    assert "activation_requested_at" in activation_approval
+    assert "activation_requested_by" in activation_approval
+    # 0739 chains from 0738: the runner's own clean source identity.
+    assert parse_revision_identifiers(localrunner_source) == ("0739", "0738")
+    assert '"localrunner"' in localrunner_source
+    assert '"source_sha"' in localrunner_source
+    # 0740 chains from 0739: durable LocalRunner agent_source_sha provenance.
+    assert parse_revision_identifiers(localrunner_source_sha) == ("0740", "0739")
+    assert '"agent_source_sha"' in localrunner_source_sha
 
     from app.main import EXPECTED_SCHEMA_REVISION
 
-    assert EXPECTED_SCHEMA_REVISION == "0735", (
-        f"Expected EXPECTED_SCHEMA_REVISION == '0735', got {EXPECTED_SCHEMA_REVISION!r}. "
+    assert EXPECTED_SCHEMA_REVISION == "0740", (
+        f"Expected EXPECTED_SCHEMA_REVISION == '0740', got {EXPECTED_SCHEMA_REVISION!r}. "
         "Bump EXPECTED_SCHEMA_REVISION in backend/app/main.py."
     )

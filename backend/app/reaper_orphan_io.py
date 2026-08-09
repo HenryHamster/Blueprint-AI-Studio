@@ -60,6 +60,11 @@ class OrphanIoSnapshot:
     gh_pr_state: str | None
     gh_pr_merged: bool
     gh_pr_base_branch: str | None
+    # The merged PR's own merge commit. Carried through so the mutation phase
+    # can pin its acceptance-test corroboration to that immutable tree instead
+    # of the 60s-TTL branch-tip cache, which right after a merge can still serve
+    # the PRE-merge tip and report a just-added test absent.
+    gh_pr_merge_commit_sha: str | None = None
 
 
 async def _run_orphan_io(
@@ -288,6 +293,7 @@ async def _run_orphan_io(
     gh_pr_state: str | None = None
     gh_pr_merged: bool = False
     gh_pr_base_branch: str | None = None
+    gh_pr_merge_commit_sha: str | None = None
     if has_pr_artifact and pr_num:
         try:
             from app.routers.agent import get_github_token_for_task
@@ -302,6 +308,7 @@ async def _run_orphan_io(
             gh_pr_state = _pr_data.get("state")
             gh_pr_merged = bool(_pr_data.get("merged"))
             gh_pr_base_branch = (_pr_data.get("base") or {}).get("ref")
+            gh_pr_merge_commit_sha = _pr_data.get("merge_commit_sha")
         except Exception as _gh_exc:  # noqa: BLE001
             # GH API unreachable: fall back to "open" — handing off
             # to review pipeline is the safer default.
@@ -328,4 +335,5 @@ async def _run_orphan_io(
         gh_pr_state=gh_pr_state,
         gh_pr_merged=gh_pr_merged,
         gh_pr_base_branch=gh_pr_base_branch,
+        gh_pr_merge_commit_sha=gh_pr_merge_commit_sha,
     )

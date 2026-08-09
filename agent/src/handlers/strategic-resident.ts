@@ -44,6 +44,7 @@ import {
   MESSAGE_POLL_LIMIT, MAX_POLL_PAGES, OPERATOR_MESSAGE_BATCH_CAP, MAX_IMAGES_PER_TURN,
   buildPriorDecisionsText, buildRetiredContextText, buildStagedDirectionsText,
   buildSurfaceCatalog, nextFocus, classifyTickOutcome, openFoundLeads, parseTickVerdict,
+  buildDirectionChangeSignals, hasDueSurface, REEXAM_COOLDOWN_MS,
   classifyOperatorDecisionReview, mergePendingOperatorDecisionReview,
   retainPendingOperatorDecisionReview, advancePendingOperatorDecisionReview, MAX_REVIEW_ATTEMPTS,
   shouldRunAutonomousTurn, actionableFiredWatchRevision, wakeBarrierRevision,
@@ -54,6 +55,7 @@ import {
   decisionsRegisterText, DECISIONS_REGISTER_CAP, isSettledDecisionVerdict, admitDecisionEntry,
   serializeDecisionsReg, restoreDecisionsReg, parseOperatorDecision, OPERATOR_DECISION_VERDICT,
   formatStrategicMemoryNotes, formatCheckpointState, resolveCheckpointGrounding,
+  resolveResidentPurposeText,
   type ConversationClaimResponse, type MessagesPollResponse,
   type SessionHeartbeatResponse, type ResidentInboundMessage,
   type StreamFrameKind, type StreamFrameStatus, type ExamRecord, type ContentBlock,
@@ -879,8 +881,15 @@ export async function handleStrategicResident(
   provisionAmbientHelpers(taskId, WORKSPACE);
 
   // ── Bootstrap context (delivered on the FIRST turn, retained in-session) ────
-  const vision = payload.vision as Record<string, unknown> | undefined;
-  const visionJson = vision && Object.keys(vision).length > 0 ? JSON.stringify(vision, null, 2) : '';
+  // The legacy `vision` body is no longer emitted by the backend (cut in #16973);
+  // the single live intent field is `effective_purpose`. Bind the Vision
+  // grounding section to that key — never to payload.vision, which would render
+  // silently empty. A missing/blank purpose is logged (observable to operators)
+  // and the prompt renders an explicit "no project purpose on record" marker.
+  const purposeText = resolveResidentPurposeText(payload);
+  if (!purposeText) {
+    sendLog(ws, '[resident] WARNING: payload.effective_purpose is empty — grounding the session without a project purpose\n');
+  }
   const problemModel = payload.problem_model as Record<string, unknown> | undefined;
   const problemModelJson = problemModel && Object.keys(problemModel).length > 0
     ? JSON.stringify(problemModel, null, 2) : '';
@@ -991,7 +1000,7 @@ export async function handleStrategicResident(
     retiredDirectionsText,
     previousDecisionOutcomesText,
     strategicMemoryNotesText,
-    visionJson,
+    purposeText,
     openMessagesText: buildOpenMessagesText(openMessages),
     recentHandledConversationText: formatRecentHandledConversation(recentHandledConversation),
     sessionId,
@@ -1194,6 +1203,13 @@ export async function handleStrategicResident(
   // TICK-VERDICT records what was examined so an idle claim can never be a global
   // "nothing to do" and can never rest on unexamined surfaces. No quotas exist.
   let surfaceCatalog = buildSurfaceCatalog(payload, listWorkspaceTopDirs(WORKSPACE));
+  // Per-direction change-fingerprints for the re-exam change-gate, keyed
+  // direction:<id>. Derived from the session-start payload's directions_summary
+  // (the source of the outcome/cycle/PR/churn counters); the heartbeat does not
+  // refresh those counters mid-session, so within a session this map is stable
+  // and the cooldown drives re-exam, while counter deltas surface across a
+  // restart/bootstrap versus the exam ledger's persisted baseline signal.
+  const directionChangeSignals = buildDirectionChangeSignals(payload);
   // Restore the exam ledger from the persisted context (written by the heartbeat
   // note round-trip). A clean restart continues rotation rather than wiping it.
   const restoredLedger = restoreLedger(
@@ -1275,7 +1291,7 @@ export async function handleStrategicResident(
     const grounding = resolveCheckpointGrounding(
       {
         problemModelJson,
-        visionJson,
+        purposeText,
         strategicMemoryNotesText,
         runningUpdate: strVal(payload.running_update),
         openMessagesText: buildOpenMessagesText(openMessages),
@@ -1286,7 +1302,7 @@ export async function handleStrategicResident(
     return {
       examLedgerJson, recentInteractions, autonomousState,
       problemModelJson: grounding.problemModelJson,
-      visionJson: grounding.visionJson,
+      purposeText: grounding.purposeText,
       strategicMemoryNotesText: grounding.strategicMemoryNotesText,
       openMessagesText: grounding.openMessagesText,
       recentHandledConversationText: grounding.recentHandledConversationText,
@@ -2270,6 +2286,7 @@ export async function handleStrategicResident(
       currentWorkStateRev = resp.work_state_rev;
     }
     if (
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- the backend contract emits a dict or omits the key; a defensive wire-level null guard is kept deliberately.
       resp.work_state_summary !== null
       && typeof resp.work_state_summary === 'object'
       && !Array.isArray(resp.work_state_summary)
@@ -2305,6 +2322,7 @@ export async function handleStrategicResident(
   const heartbeat = async (
     progress: boolean,
     handledIds?: string[],
+    autonomousTurnWorked?: boolean,
   ): Promise<SessionHeartbeatResponse | null> => {
     // A heartbeat is proof the loop is alive — reset the warm session's idle
     // ceiling so a chat-only / monitor session (which issues no turns to reset
@@ -2322,6 +2340,13 @@ export async function handleStrategicResident(
     );
     const body: Record<string, unknown> = {
       session_id: sessionId, task_id: taskId, progress, note,
+      // Autonomous examination progress: a completed autonomous WORKING turn
+      // (tool calls / TICK-VERDICT) that applied no strategic op still renews
+      // the continuation lease for an unattended review (examination IS the
+      // work). Only ever set true from the autonomous turn-loop below; operator
+      // and liveness heartbeats leave it false, so the operator-chat mutation
+      // gate is unchanged.
+      autonomous_turn: autonomousTurnWorked === true,
       worker_generation: workerGeneration,
       resident_incarnation_id: residentProcessIncarnation,
       repo_head: lastDeliveredRepoHead,
@@ -2510,7 +2535,7 @@ export async function handleStrategicResident(
       foregroundTyped = warmingController;
       await warmingController.ensureReady();
       const warmingStillCurrent = foregroundTyped === warmingController
-        && typedFastLease?.leaseId === acquiredLease.leaseId
+        && typedFastLease.leaseId === acquiredLease.leaseId
         && typedFastLease.generation === acquiredLease.generation;
       if (!warmingStillCurrent) {
         warmingController.close();
@@ -4065,7 +4090,7 @@ export async function handleStrategicResident(
         content: turn.completion.content,
         idempotency_key: receipt.idempotency_key,
         envelope: claimed.envelope,
-        ...(workdayRequest ? {
+        ...(turn.workdayRequests.length > 0 ? {
           workday_request: {
             delivery_key: workdayRequest.delivery_key,
             question: workdayRequest.prompt,
@@ -4664,6 +4689,7 @@ export async function handleStrategicResident(
       // operator reply is streamed and its lease-renewing heartbeat lands BEFORE
       // any context compaction (handleOperatorTurn enforces that ordering), so a
       // compaction never sits on the critical path ahead of the reply.
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- preemptedTypedContinuationMessages is set by the watchContinuation closure while this loop is suspended; TS narrows it to null here.
       const msgs = preemptedTypedContinuationMessages ?? await pollMessages();
       preemptedTypedContinuationMessages = null;
       if (msgs.length > 0) {
@@ -4769,6 +4795,17 @@ export async function handleStrategicResident(
         wakeBarrierRevision(firedResidentBarriers),
       ].join('#');
       const ownedWorkPending = hasPendingOwnedWork(currentWorkStateSummary);
+      // Re-exam change-gate: is ANY surface due for a real look this tick? Only
+      // consulted on the unchanged-state exploration path (operator/agenda/
+      // followup/watch/world-change wakes short-circuit ahead of it). When the
+      // exploration interval elapses but every surface is settled-clear-and-
+      // unchanged within its cooldown, the exploration turn is suppressed and the
+      // loop idles cheaply below instead of deep-re-reading a settled surface.
+      const anyDue = hasDueSurface(surfaceCatalog, examRecords, {
+        currentSignals: directionChangeSignals,
+        nowMs: Date.now(),
+        cooldownMs: REEXAM_COOLDOWN_MS,
+      });
       if (!shouldRunAutonomousTurn({
         currentWorkStateRev,
         lastTurnWorkStateRev: lastAutonomousWorkStateRev,
@@ -4781,6 +4818,12 @@ export async function handleStrategicResident(
         msSinceLastAutonomousTurn: lastAutonomousTurnAt === 0
           ? Number.POSITIVE_INFINITY : Date.now() - lastAutonomousTurnAt,
         explorationIntervalMs: cfg.explorationIntervalMs,
+        anyDue,
+        // Empty-session guard: this session has run an autonomous turn iff
+        // lastAutonomousTurnAt has been stamped (set to Date.now() only after a
+        // turn completes; 0 at session start). Ensures the all-quiet suppression
+        // never fires before the session makes any strategic API activity.
+        hasRunAutonomousTurnThisSession: lastAutonomousTurnAt !== 0,
       })) {
         const wakeProjection = explorationWakeProjection(
           lastAutonomousTurnAt,
@@ -4818,7 +4861,15 @@ export async function handleStrategicResident(
       // somewhere new/deeper, open FOUND leads to restate, and a corrective flag
       // set after an unevidenced idle claim.
       operatorTurnJustCompleted = false;
-      const focus = nextFocus(surfaceCatalog, examRecords, FOCUS_LIST_SIZE);
+      // Change-gated rotation: never-examined first, then DUE surfaces (changed
+      // since their clear, unsettled, or cooldown-elapsed) ahead of settled-
+      // clear-and-unchanged ones — so a due surface is examined before an
+      // already-cleared, unchanged one is re-read.
+      const focus = nextFocus(surfaceCatalog, examRecords, FOCUS_LIST_SIZE, {
+        currentSignals: directionChangeSignals,
+        nowMs: Date.now(),
+        cooldownMs: REEXAM_COOLDOWN_MS,
+      });
       const recentRecords = examRecords.slice(-6);
       const openFound = openFoundLeads(examRecords);
       const corrective = correctiveNextTick;
@@ -4946,6 +4997,12 @@ export async function handleStrategicResident(
         at: new Date().toISOString(),
         interrupted: turnInterrupted,
       });
+      // Stamp the surface's live change-fingerprint onto the record so a future
+      // tick can tell whether the surface moved since THIS exam. Only direction
+      // surfaces expose a signal (undefined otherwise) — this is the baseline the
+      // re-exam change-gate diffs the next live fingerprint against.
+      const examinedSignal = directionChangeSignals.get(upd.record.surfaceKey);
+      if (examinedSignal !== undefined) upd.record.signal = examinedSignal;
       examRecords.push(upd.record);
       if (examRecords.length > EXAM_RECORDS_CAP) {
         examRecords.splice(0, examRecords.length - EXAM_RECORDS_CAP);
@@ -5074,9 +5131,29 @@ export async function handleStrategicResident(
       const consumedBarrierIds = turnInterrupted
         ? undefined
         : firedResidentBarriers.map((barrier) => barrier.id);
+      // Autonomous-freshness signal: for an unattended review, examination IS
+      // the work, so a completed working turn renews the continuation lease even
+      // when it applied no strategic op. "Worked" = the turn actually EXECUTED
+      // (ran tool calls or emitted a TICK-VERDICT) and was not an interrupt /
+      // timeout / dead-subprocess — a hung child never reaches here (the stall
+      // detector breaks the loop first). Distinct from appliedStrategicOp so
+      // mutation accounting / last_progress_at stay exact; the backend advances
+      // freshness on this only when no strategic op was applied. Requires
+      // authorityHeld so a lease that lapsed mid-turn is not re-armed.
+      // authorityHeld is mutated inside the heartbeat/stop closures above (~2248/2284/2435),
+      // which TS control-flow analysis cannot see, so it narrows the captured `let` to its
+      // `true` initializer here. The check is load-bearing: a lease that lapsed mid-turn must
+      // not re-arm the continuation freshness signal — hence the rule suppression, not a removal.
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+      const autonomousTurnWorked = authorityHeld
+        && !turnInterrupted
+        && (r.sawToolUse
+          || parseTickVerdict(r.resultText) !== null
+          || parseTickVerdict(r.accumulatedTurnText) !== null);
       const hb = await heartbeat(
         r.appliedStrategicOp && authorityHeld,
         consumedBarrierIds,
+        autonomousTurnWorked,
       );
       // Record the pacing baseline AFTER the post-turn heartbeat so the loop's own
       // writes are already folded into the rev we compare against next iteration.
@@ -5152,7 +5229,9 @@ export async function handleStrategicResident(
     // controller after the first snapshot above.  Its provider probe is
     // bounded; join it during teardown, then close/release the final state so a
     // quick stop cannot leak a pooled slot or restricted child.
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- typedFastProvisionAttempt is set to a real Promise by the kickTypedFastProvisioning closure; TS narrows it to null in this scope.
     if (typedFastProvisionAttempt !== null) {
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- same closure assignment makes this a genuine Promise at teardown time.
       await typedFastProvisionAttempt;
     }
     typedForegroundToClose = foregroundTyped;

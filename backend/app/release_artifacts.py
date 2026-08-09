@@ -27,6 +27,9 @@ logger = logging.getLogger(__name__)
 BACKEND_REVISION_ARTIFACT_KIND = "backend_revision"
 AGENT_IMAGE_ARTIFACT_KIND = "agent_image"
 PROMOTION_MERGE_ARTIFACT_KIND = "promotion_merge"
+AGENT_IMAGE_FLEET_SOURCE_UNOBSERVABLE_REASON = (
+    "agent_image_fleet_source_unobservable"
+)
 
 # Distinct reason for a serving_confirmed resolution where the OBSERVED live SHA
 # is a strict DESCENDANT of the promoted SHA: the target branch legitimately
@@ -214,6 +217,20 @@ def artifact_is_unconfirmed(artifact: ReleaseDeployArtifact | None) -> bool:
 # ``no_new_revision`` cannot mask a concrete gate like a fleet that never
 # served the promoted SHA.
 _TIMED_OUT_BACKSTOP_REASONS = frozenset({"no_new_revision"})
+
+# ``no_new_revision`` substantiation reasons: when the backend-revision provider
+# times out without ever observing a new revision serving the promoted SHA, it
+# consults the deploy workflow (``deploy.yml``) runs for that SHA and names the
+# specific gate that kept the promotion from shipping.  These are CONCRETE gates
+# (never-dispatched / workflow-failed / succeeded-but-stale / still-running), so
+# they are deliberately NOT in ``_TIMED_OUT_BACKSTOP_REASONS`` and surface over
+# the low-information backstop in the aggregate.
+DEPLOY_WORKFLOW_NEVER_DISPATCHED_REASON = "deploy_workflow_never_dispatched"
+DEPLOY_WORKFLOW_FAILED_REASON = "deploy_workflow_failed"
+DEPLOY_WORKFLOW_SUCCEEDED_STALE_REVISION_REASON = (
+    "deploy_workflow_succeeded_stale_revision"
+)
+DEPLOY_WORKFLOW_IN_PROGRESS_REASON = "deploy_workflow_in_progress"
 
 
 def aggregate_required_artifact_status(
@@ -740,7 +757,11 @@ async def _reclassify_sha_mismatch_if_superseded(
                 "resolving confirmation_timed_out",
                 getattr(version, "version_number", "?"),
             )
-            return ("confirmation_timed_out", "no_new_revision", None)
+            # Substantiate the timeout: consult the deploy workflow runs for the
+            # promoted SHA so the operator sees whether the deploy was never
+            # dispatched, ran and failed, or ran and left a stale revision —
+            # instead of the low-information no_new_revision backstop.
+            return await _substantiate_no_new_revision(session, version, now)
         return decision
 
     served_at = _to_naive_utc(ds.deployed_at) if ds is not None else None
@@ -759,6 +780,85 @@ async def _reclassify_sha_mismatch_if_superseded(
         served_at,
         SUPERSEDED_BY_DESCENDANT_REASON,
     )
+
+
+async def _substantiate_no_new_revision(
+    session: AsyncSession,
+    version: ReleaseVersion,
+    now: datetime,
+) -> ServingDecision:
+    """Name the deploy-workflow gate behind a bare ``no_new_revision`` timeout.
+
+    ``no_new_revision`` ("the serving SHA just couldn't be confirmed in time")
+    cannot distinguish the real causes of a promotion whose deploy never
+    shipped: the deploy workflow was never dispatched, it ran and failed, or it
+    ran and the revision is stale.  The run-listing helper
+    (:func:`app.github.get_workflow_run_for_sha`) already exists and is used by
+    the agent-image bake gate; here it is pointed at the deploy workflow for the
+    promoted SHA to substantiate the cause:
+
+      * no deploy.yml run for the promoted SHA → ``deploy_workflow_never_dispatched``
+      * a run concluded non-success → ``deploy_workflow_failed``
+      * a run concluded success → ``deploy_workflow_succeeded_stale_revision``
+      * a run still queued/in_progress past the deadline → ``deploy_workflow_in_progress``
+
+    Any credential/API failure keeps the honest ``no_new_revision`` backstop —
+    never fabricate a specific gate from a failed lookup.  The outcome stays a
+    ``confirmation_timed_out`` (a report, never a silent confirm), matching the
+    conservative wait → honest-timeout contract of the supersession reclassifier.
+    """
+    promoted_sha = version.promoted_sha
+    if not promoted_sha:
+        return ("confirmation_timed_out", "no_new_revision", None)
+    project = await session.get(Project, version.project_id)
+    if project is None:
+        return ("confirmation_timed_out", "no_new_revision", None)
+    try:
+        from app import github
+        from app.github_checks import DEPLOY_WORKFLOW_FILE
+        from app.release_promotion import _resolve_github_with_session
+
+        resolved = await _resolve_github_with_session(session, project)
+        if resolved is None:
+            return ("confirmation_timed_out", "no_new_revision", None)
+        token, owner, repo = resolved
+        run = await github.get_workflow_run_for_sha(
+            token,
+            owner,
+            repo,
+            promoted_sha,
+            workflow_file=DEPLOY_WORKFLOW_FILE,
+            project_id=str(version.project_id),
+        )
+    except Exception as exc:  # noqa: BLE001 — fall back to the honest backstop
+        logger.warning(
+            "[RELEASE_ARTIFACTS] no_new_revision substantiation for v%s raised "
+            "(%s) — keeping no_new_revision",
+            getattr(version, "version_number", "?"),
+            exc,
+        )
+        return ("confirmation_timed_out", "no_new_revision", None)
+    if run is None:
+        # No deploy.yml run exists for the promoted SHA — the deploy workflow
+        # was NEVER dispatched.  (A run-listing API failure also surfaces as
+        # None; the outcome stays confirmation_timed_out — a report, never a
+        # silent confirm, and the upstream helper logs the API failure.)
+        return (
+            "confirmation_timed_out",
+            DEPLOY_WORKFLOW_NEVER_DISPATCHED_REASON,
+            None,
+        )
+    status = run.get("status")
+    conclusion = run.get("conclusion")
+    if status == "completed":
+        if conclusion == "success":
+            return (
+                "confirmation_timed_out",
+                DEPLOY_WORKFLOW_SUCCEEDED_STALE_REVISION_REASON,
+                None,
+            )
+        return ("confirmation_timed_out", DEPLOY_WORKFLOW_FAILED_REASON, None)
+    return ("confirmation_timed_out", DEPLOY_WORKFLOW_IN_PROGRESS_REASON, None)
 
 
 async def _check_backend_revision_serving(
@@ -843,6 +943,9 @@ async def _check_agent_image_serving(
         only once the fleet INDEPENDENTLY reports ``agent_source_sha`` matching
         ``version.promoted_sha``; until then return ``None`` (not-yet) so the
         version stays unconfirmed within the existing confirmation window.
+        An observed non-matching source gets ``agent_image_fleet_not_yet_serving``;
+        no observable source identity gets
+        ``agent_image_fleet_source_unobservable``.
       * Indeterminate (non-self-repo, no GitHub creds, the rebake lookup errored,
         the diff base is unobservable, or no fleet VM has reported a source SHA
         yet) — treat as NOT-YET-CONFIRMED (return ``None``) WITHIN the
@@ -970,7 +1073,7 @@ async def _check_agent_image_serving(
 
     # Bake expected: confirm only once the fleet is independently observed
     # serving the promoted SHA (the freshly baked image is live and running).
-    if await compute.fleet_serving_source_sha(
+    fleet_serving = await compute.fleet_serving_source_sha(
         session,
         promoted_sha,
         allow_descendant=True,
@@ -978,15 +1081,24 @@ async def _check_agent_image_serving(
         owner=owner,
         repo=repo,
         project_id=str(version.project_id),
-    ):
+    )
+    if fleet_serving is True:
         return ("serving_confirmed", promoted_sha, now)
+    fleet_reason = (
+        AGENT_IMAGE_FLEET_SOURCE_UNOBSERVABLE_REASON
+        if fleet_serving is None
+        else "agent_image_fleet_not_yet_serving"
+    )
     logger.info(
-        "agent_image_serving_indeterminate path=fleet_not_yet_serving"
+        "agent_image_serving_indeterminate path=%s"
         " version_id=%s promoted_sha=%s",
+        "fleet_source_unobservable"
+        if fleet_serving is None
+        else "fleet_not_yet_serving",
         version.id,
         promoted_sha,
     )
-    return _defer_or_timeout("agent_image_fleet_not_yet_serving")
+    return _defer_or_timeout(fleet_reason)
 
 
 # Self-repo agent VM image serving gate.  Registered REQUIRED so a bake-path

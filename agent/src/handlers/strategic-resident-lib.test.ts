@@ -6,12 +6,15 @@ import {
   materializeContentBlocks, isAllowedAttachmentDownloadUrl,
   rollbackMessageBatchAdmission, RetryableArtifactAttachmentError,
   buildBootstrapPrompt, buildAutonomousPrompt,
+  resolveResidentPurposeText,
   resolveTerminalStatus, nextAuthorityHeld, autonomousActive, FrameCoalescer,
   buildPriorDecisionsText,
   buildRetiredContextText,
   buildStagedDirectionsText, formatDirectionGroundingText,
   MESSAGE_POLL_LIMIT, OPERATOR_MESSAGE_BATCH_CAP, RESIDENT_REPLY_RECEIPT_MAX_BYTES,
   buildSurfaceCatalog, nextFocus, parseTickVerdict, parseAgendaContinue,
+  directionChangeSignal, buildDirectionChangeSignals, hasDueSurface, surfaceDue,
+  REEXAM_COOLDOWN_MS,
   parseOperatorDecision, OPERATOR_DECISION_VERDICT,
   mergePendingOperatorDecisionReview, advancePendingOperatorDecisionReview,
   retainPendingOperatorDecisionReview, MAX_REVIEW_ATTEMPTS,
@@ -1132,7 +1135,7 @@ describe('buildBootstrapPrompt', () => {
     stagedDirectionsText: '',
     retiredDirectionsText: '',
     previousDecisionOutcomesText: '',
-    visionJson: '{"v":1}',
+    purposeText: 'Ship a coherent strategic v2 pipeline.',
     openMessagesText: 'msg1',
     sessionId: 'ss-1',
     fetchGuidanceText: '',
@@ -1204,14 +1207,25 @@ describe('buildBootstrapPrompt', () => {
 
   it('omits optional sections that are blank', () => {
     const p = buildBootstrapPrompt({
-      ...base, runningUpdate: '', directionsText: '', visionJson: '', openMessagesText: '',
+      ...base, runningUpdate: '', directionsText: '', purposeText: '', openMessagesText: '',
     });
     expect(p).not.toContain('Active directions');
     expect(p).not.toContain('Open operator messages');
-    expect(p).not.toContain('## Vision');
     expect(p).not.toContain('Recently retired / completed directions');
     expect(p).not.toContain('Prior-cycle decision outcomes');
     expect(p).not.toContain('Already-staged (next-version) directions');
+  });
+
+  it('renders an explicit no-purpose marker instead of a silently-empty Vision section', () => {
+    // Absence of project purpose must be OBSERVABLE — a blank effective_purpose
+    // renders the "no project purpose on record" marker rather than dropping the
+    // section (which would be indistinguishable from the payload never carrying it).
+    const p = buildBootstrapPrompt({ ...base, purposeText: '' });
+    expect(p).toContain('## Vision (project purpose)');
+    expect(p).toContain('no project purpose on record');
+    expect(p).not.toContain('Ship a coherent strategic v2 pipeline.');
+    // A whitespace-only purpose renders the same observable marker.
+    expect(buildBootstrapPrompt({ ...base, purposeText: '   ' })).toContain('no project purpose on record');
   });
 
   it('renders the recently-answered operator conversation as a read-only section', () => {
@@ -1324,6 +1338,59 @@ describe('buildBootstrapPrompt', () => {
   });
 });
 
+describe('resolveResidentPurposeText (payload grounding key binding)', () => {
+  // Regression: the vision-key cut (#16973) removed the legacy `vision` dict
+  // from every resident payload; the backend now ships `effective_purpose`.
+  // These tests fail if the resident surface ever re-binds its grounding section
+  // to a payload key the backend does NOT emit, because a vision-bound read would
+  // render a silently-empty section on current backends.
+  it('does NOT bind to the removed payload.vision key', () => {
+    // The legacy vision body is no longer emitted; a payload carrying only
+    // `vision` must resolve to NO purpose text, never to the stale JSON blob.
+    expect(resolveResidentPurposeText({ vision: { future: 'testable code' } })).toBe('');
+    expect(resolveResidentPurposeText({ vision: { future: 'x' }, effective_purpose: '' })).toBe('');
+    // An absent key behaves the same as an empty string (observable absence).
+    expect(resolveResidentPurposeText({})).toBe('');
+  });
+
+  it('reads the live effective_purpose key the backend emits', () => {
+    expect(resolveResidentPurposeText({ effective_purpose: 'Ship the v2 pipeline' })).toBe('Ship the v2 pipeline');
+    expect(resolveResidentPurposeText({ effective_purpose: '  padded purpose  ' })).toBe('padded purpose');
+    // Non-string values degrade to '' (no throw).
+    expect(resolveResidentPurposeText({ effective_purpose: { future: 'x' } })).toBe('');
+    expect(resolveResidentPurposeText({ effective_purpose: 42 })).toBe('');
+  });
+
+  it('renders the grounding section only from effective_purpose, with an observable empty marker', () => {
+    const baseCtx = {
+      contextPrefix: '', projectName: 'Acme', problemModelJson: '{"gaps":[]}',
+      runningUpdate: '', directionsText: '', stagedDirectionsText: '',
+      retiredDirectionsText: '', previousDecisionOutcomesText: '',
+      strategicMemoryNotesText: '', openMessagesText: '', sessionId: 's-1',
+      fetchGuidanceText: '',
+    };
+    // A payload that only carries the removed `vision` key → the section renders
+    // the "no project purpose on record" marker and NEVER the vision JSON blob.
+    const visionOnly = buildBootstrapPrompt({
+      ...baseCtx,
+      purposeText: resolveResidentPurposeText({ vision: { future: 'testable code' } }),
+    });
+    expect(visionOnly).toContain('## Vision (project purpose)');
+    expect(visionOnly).toContain('no project purpose on record');
+    expect(visionOnly).not.toContain('testable code');
+    expect(visionOnly).not.toContain('"future"');
+
+    // The live key drives the section content end-to-end.
+    const withPurpose = buildBootstrapPrompt({
+      ...baseCtx,
+      purposeText: resolveResidentPurposeText({ effective_purpose: 'Ground on the product mission' }),
+    });
+    expect(withPurpose).toContain('## Vision (project purpose)');
+    expect(withPurpose).toContain('Ground on the product mission');
+    expect(withPurpose).not.toContain('no project purpose on record');
+  });
+});
+
 describe('retired/prior-context renderers', () => {
   it('renders compact staged-direction lines and omits empty input', () => {
     expect(buildStagedDirectionsText([])).toBe('');
@@ -1424,7 +1491,7 @@ describe('retired/prior-context renderers', () => {
       ]),
       retiredDirectionsText: retiredText,
       previousDecisionOutcomesText: priorText,
-      visionJson: '',
+      purposeText: '',
       openMessagesText: '',
       fetchGuidanceText: '',
       sessionId: 'ss-x',
@@ -1467,8 +1534,13 @@ describe('buildAutonomousPrompt (dynamic, evidence-gated)', () => {
     // Rotating focus surfaces are listed.
     expect(p).toContain('direction:d-1');
     expect(p).toContain('code:backend');
-    // Delta signals can never justify CLEAR.
-    expect(p).toContain('can NEVER justify a CLEAR');
+    // First-time-CLEAR guard preserved: a not-yet-examined surface cannot be
+    // declared CLEAR on cheap delta signals alone.
+    expect(p).toContain('cannot be declared CLEAR on cheap delta');
+    expect(p).toContain('a first-time CLEAR must rest on what you actually opened and read');
+    // ...but an already-clear, unchanged surface may be SKIPPED (trust prior verdict).
+    expect(p).toContain('SKIPPED this tick');
+    expect(p).toContain('trust the prior verdict');
     // No unsolicited durable operator messages; status → set-running-update.
     expect(p).toContain('do NOT send unsolicited durable messages');
     expect(p).toContain('set-running-update');
@@ -2037,7 +2109,7 @@ describe('buildBootstrapPrompt operator-decision instruction', () => {
     contextPrefix: '', projectName: 'Blueprint', problemModelJson: '{}',
     runningUpdate: '', directionsText: '', stagedDirectionsText: '',
     retiredDirectionsText: '', previousDecisionOutcomesText: '',
-    strategicMemoryNotesText: '', visionJson: '', openMessagesText: '',
+    strategicMemoryNotesText: '', purposeText: '', openMessagesText: '',
     sessionId: 's-1', fetchGuidanceText: '', priorSessionContextText: '',
     skillsText: '', decisionsRegisterText: '',
   };
@@ -2311,6 +2383,205 @@ describe('nextFocus (never-examined first, then LRU)', () => {
     ];
     // Every catalog surface is still never-examined despite the stale record.
     expect(nextFocus(catalog, records, 4).map(s => s.key)).toEqual(['a', 'b', 'c', 'd']);
+  });
+
+  it('without a change-gate (no opts), cleared+unchanged surfaces are NOT skipped (legacy LRU)', () => {
+    const records: ExamRecord[] = [
+      { surfaceKey: 'a', atTick: 1, at: 't', verdict: 'clear', note: '' },
+      { surfaceKey: 'b', atTick: 2, at: 't', verdict: 'clear', note: '' },
+      { surfaceKey: 'c', atTick: 3, at: 't', verdict: 'clear', note: '' },
+      { surfaceKey: 'd', atTick: 4, at: 't', verdict: 'clear', note: '' },
+    ];
+    // Legacy path: all examined and clear → pure LRU (stalest first), no skip tier.
+    expect(nextFocus(catalog, records, 4).map(s => s.key)).toEqual(['a', 'b', 'c', 'd']);
+  });
+});
+
+describe('re-exam change-gate (skip settled-clear, unchanged surfaces)', () => {
+  const NOW = 1_700_000_000_000;
+  const iso = (ms: number): string => new Date(ms).toISOString();
+  const dir = (key: string): ExamSurface => ({ key, kind: 'direction', label: key, hint: `h:${key}` });
+  const clearRec = (key: string, atTick: number, atMs: number, signal?: string): ExamRecord =>
+    ({ surfaceKey: key, atTick, at: iso(atMs), verdict: 'clear', note: 'nothing actionable', ...(signal ? { signal } : {}) });
+  const gate = (currentSignals: Map<string, string>, nowMs: number) =>
+    ({ currentSignals, nowMs, cooldownMs: REEXAM_COOLDOWN_MS });
+
+  it('directionChangeSignal folds status + outcome/cycle/PR/churn counters, and is delta-sensitive', () => {
+    const baseFields = { id: 'd-1', status: 'active', total_cycles: 3, prs_merged: 2, prs_rejected: 1, tasks_failed: 0, confirmed_finding_count: 4 };
+    const s = directionChangeSignal(baseFields);
+    // Deterministic for identical fields.
+    expect(directionChangeSignal({ ...baseFields })).toBe(s);
+    // Every tracked delta changes the fingerprint: cycle, merge, reject, churn, outcome, status.
+    expect(directionChangeSignal({ ...baseFields, total_cycles: 4 })).not.toBe(s);
+    expect(directionChangeSignal({ ...baseFields, prs_merged: 3 })).not.toBe(s);
+    expect(directionChangeSignal({ ...baseFields, prs_rejected: 2 })).not.toBe(s);
+    expect(directionChangeSignal({ ...baseFields, tasks_failed: 1 })).not.toBe(s);
+    expect(directionChangeSignal({ ...baseFields, confirmed_finding_count: 5 })).not.toBe(s);
+    expect(directionChangeSignal({ ...baseFields, status: 'paused' })).not.toBe(s);
+    // Missing fields fold to a defined fingerprint (0/'' defaults).
+    expect(directionChangeSignal({})).toBe('|0|0|0|0|0');
+  });
+
+  it('buildDirectionChangeSignals keys direction:<id> and skips entries without an id', () => {
+    const m = buildDirectionChangeSignals({ directions_summary: [
+      { id: 'd-1', status: 'active', total_cycles: 1 },
+      { status: 'active', total_cycles: 9 }, // no id → skipped
+    ] });
+    expect(m.size).toBe(1);
+    expect(m.get('direction:d-1')).toBe(directionChangeSignal({ id: 'd-1', status: 'active', total_cycles: 1 }));
+    // Non-array / absent directions_summary → empty map.
+    expect(buildDirectionChangeSignals({}).size).toBe(0);
+  });
+
+  it('1. skips a recently-cleared direction with NO change signal since that clear', () => {
+    const sig = directionChangeSignal({ id: 'd-1', status: 'active', total_cycles: 2, prs_merged: 1 });
+    const cat = [dir('direction:d-1')];
+    const records = [clearRec('direction:d-1', 5, NOW - 60_000, sig)];
+    const opts = gate(new Map([['direction:d-1', sig]]), NOW); // live signal identical
+    expect(surfaceDue(cat[0], records[0], opts)).toBe(false);
+    expect(hasDueSurface(cat, records, opts)).toBe(false); // all-quiet
+    // Never dropped — a forced turn still has a surface to name — but deprioritized.
+    expect(nextFocus(cat, records, 3, opts).map(s => s.key)).toEqual(['direction:d-1']);
+  });
+
+  it('2. re-examines a direction with a NEW outcome/cycle/PR delta since its last clear', () => {
+    const oldSig = directionChangeSignal({ id: 'd-1', status: 'active', total_cycles: 2, prs_merged: 1 });
+    const newSig = directionChangeSignal({ id: 'd-1', status: 'active', total_cycles: 3, prs_merged: 2 });
+    const cat = [dir('direction:d-1')];
+    const records = [clearRec('direction:d-1', 5, NOW - 60_000, oldSig)];
+    const opts = gate(new Map([['direction:d-1', newSig]]), NOW); // moved since clear
+    expect(surfaceDue(cat[0], records[0], opts)).toBe(true);
+    expect(hasDueSurface(cat, records, opts)).toBe(true);
+  });
+
+  it('2b. prioritizes a CHANGED direction ahead of a settled-clear, unchanged one (even if less recent)', () => {
+    const s1 = directionChangeSignal({ id: 'd-1', total_cycles: 1 });
+    const s2old = directionChangeSignal({ id: 'd-2', total_cycles: 1 });
+    const s2new = directionChangeSignal({ id: 'd-2', total_cycles: 2 });
+    const cat = [dir('direction:d-1'), dir('direction:d-2')];
+    const records = [
+      clearRec('direction:d-1', 9, NOW - 60_000, s1),   // most-recent, unchanged → skip
+      clearRec('direction:d-2', 1, NOW - 60_000, s2old), // least-recent, changed → due
+    ];
+    const opts = gate(new Map([['direction:d-1', s1], ['direction:d-2', s2new]]), NOW);
+    // Due (d-2) leads despite its lower atTick; skip (d-1) is deprioritized to the end.
+    expect(nextFocus(cat, records, 2, opts).map(s => s.key)).toEqual(['direction:d-2', 'direction:d-1']);
+  });
+
+  it('3. cooldown eventually makes a long-unchanged cleared surface due again (nothing starved forever)', () => {
+    const sig = directionChangeSignal({ id: 'd-1', total_cycles: 2 });
+    const clearedAt = NOW;
+    const cat = [dir('direction:d-1')];
+    const records = [clearRec('direction:d-1', 1, clearedAt, sig)];
+    const unchanged = new Map([['direction:d-1', sig]]);
+    // Just under the cooldown, unchanged → still skipped.
+    expect(surfaceDue(cat[0], records[0], gate(unchanged, clearedAt + REEXAM_COOLDOWN_MS - 1))).toBe(false);
+    // At/over the cooldown → due again despite NO change signal (the escape hatch).
+    expect(surfaceDue(cat[0], records[0], gate(unchanged, clearedAt + REEXAM_COOLDOWN_MS))).toBe(true);
+    expect(hasDueSurface(cat, records, gate(unchanged, clearedAt + REEXAM_COOLDOWN_MS + 1))).toBe(true);
+  });
+
+  it('4. always selects a never-examined surface first (first examination is not gated)', () => {
+    const sig = directionChangeSignal({ id: 'd-1', total_cycles: 1 });
+    const cat = [dir('direction:d-1'), dir('direction:d-2')];
+    const records = [clearRec('direction:d-1', 5, NOW - 60_000, sig)]; // d-1 cleared+unchanged; d-2 never examined
+    const opts = gate(new Map([['direction:d-1', sig]]), NOW);
+    expect(surfaceDue(cat[1], undefined, opts)).toBe(true); // never-examined is due
+    expect(hasDueSurface(cat, records, opts)).toBe(true);
+    // Never-examined d-2 leads; the cleared+unchanged d-1 is deprioritized last.
+    expect(nextFocus(cat, records, 2, opts).map(s => s.key)).toEqual(['direction:d-2', 'direction:d-1']);
+  });
+
+  it('treats an unsettled last verdict (found/unevidenced) as due regardless of change signal', () => {
+    const sig = directionChangeSignal({ id: 'd-1', total_cycles: 1 });
+    const cat = [dir('direction:d-1')];
+    const foundRec: ExamRecord = { surfaceKey: 'direction:d-1', atTick: 5, at: iso(NOW - 60_000), verdict: 'found', note: 'open lead', signal: sig };
+    // Same live signal (unchanged), well within cooldown — but a non-clear verdict still wants work.
+    expect(surfaceDue(cat[0], foundRec, gate(new Map([['direction:d-1', sig]]), NOW))).toBe(true);
+  });
+
+  it('re-examines a legacy clear record with no stored signal (seeds a baseline once)', () => {
+    const cat = [dir('direction:d-1')];
+    const legacy = clearRec('direction:d-1', 5, NOW - 60_000); // no signal field
+    const opts = gate(new Map([['direction:d-1', directionChangeSignal({ id: 'd-1', total_cycles: 1 })]]), NOW);
+    expect(surfaceDue(cat[0], legacy, opts)).toBe(true);
+  });
+
+  it('gates a non-direction cleared surface by cooldown alone (no derivable change signal)', () => {
+    const cat: ExamSurface[] = [{ key: 'qualification', kind: 'fetch', label: 'q', hint: 'h' }];
+    const clearedAt = NOW;
+    const records = [{ surfaceKey: 'qualification', atTick: 5, at: iso(clearedAt), verdict: 'clear' as const, note: '' }];
+    // No signal for a fetch surface → within cooldown skips, past cooldown re-examines.
+    expect(surfaceDue(cat[0], records[0], gate(new Map(), clearedAt + REEXAM_COOLDOWN_MS - 1))).toBe(false);
+    expect(surfaceDue(cat[0], records[0], gate(new Map(), clearedAt + REEXAM_COOLDOWN_MS))).toBe(true);
+  });
+
+  it('persists the change-gate signal across serialize → restore (baseline survives restart)', () => {
+    const sig = directionChangeSignal({ id: 'd-1', total_cycles: 2, prs_merged: 1 });
+    const records: ExamRecord[] = [clearRec('direction:d-1', 5, NOW, sig)];
+    const restored = restoreLedger(serializeLedger(records, 5, false));
+    expect(restored?.records[0].signal).toBe(sig);
+  });
+
+  it('exploration turn is suppressed when nothing is due, runs when a surface is due, and never overrides a real wake', () => {
+    const base = {
+      currentWorkStateRev: 'r1',
+      lastTurnWorkStateRev: 'r1',
+      previousTurnAgendaContinue: false,
+      operatorTurnJustCompleted: false,
+      msSinceLastAutonomousTurn: AUTONOMOUS_EXPLORATION_INTERVAL_MS,
+      explorationIntervalMs: AUTONOMOUS_EXPLORATION_INTERVAL_MS,
+    };
+    // Exploration interval elapsed + nothing due → idle cheaply (no deep re-read).
+    expect(shouldRunAutonomousTurn({ ...base, anyDue: false })).toBe(false);
+    // Exploration interval elapsed + a surface due → run.
+    expect(shouldRunAutonomousTurn({ ...base, anyDue: true })).toBe(true);
+    // anyDue never overrides a real wake: an operator turn runs even when nothing's due.
+    expect(shouldRunAutonomousTurn({ ...base, anyDue: false, operatorTurnJustCompleted: true })).toBe(true);
+    // Backward compat: omitting anyDue preserves legacy exploration pacing (runs).
+    expect(shouldRunAutonomousTurn({ ...base })).toBe(true);
+  });
+
+  it('never suppresses the FIRST autonomous turn of a session (empty-session guard)', () => {
+    // All-quiet gate state: an all-clear, within-cooldown carried ledger (anyDue
+    // false) is exactly what a freshly-spawned session can inherit.
+    const base = {
+      currentWorkStateRev: 'r1',
+      lastTurnWorkStateRev: 'r1',
+      previousTurnAgendaContinue: false,
+      operatorTurnJustCompleted: false,
+      explorationIntervalMs: AUTONOMOUS_EXPLORATION_INTERVAL_MS,
+      anyDue: false,
+    };
+    // Fresh session, first tick (no autonomous turn run yet) → runs regardless of
+    // anyDue, so the session makes strategic API activity and is never scored an
+    // empty-session strategic failure.
+    expect(shouldRunAutonomousTurn({
+      ...base,
+      msSinceLastAutonomousTurn: Number.POSITIVE_INFINITY,
+      hasRunAutonomousTurnThisSession: false,
+    })).toBe(true);
+    // The guard is independent of the Infinity pacing sentinel: even with a
+    // finite elapsed time, a session that has NOT yet run a turn still runs.
+    expect(shouldRunAutonomousTurn({
+      ...base,
+      msSinceLastAutonomousTurn: AUTONOMOUS_EXPLORATION_INTERVAL_MS,
+      hasRunAutonomousTurnThisSession: false,
+    })).toBe(true);
+    // AFTER the session has run >=1 autonomous turn, the same all-quiet state
+    // suppresses — the session already made API activity, so idling is safe.
+    expect(shouldRunAutonomousTurn({
+      ...base,
+      msSinceLastAutonomousTurn: AUTONOMOUS_EXPLORATION_INTERVAL_MS,
+      hasRunAutonomousTurnThisSession: true,
+    })).toBe(false);
+    // A due surface still runs after the first turn.
+    expect(shouldRunAutonomousTurn({
+      ...base,
+      anyDue: true,
+      msSinceLastAutonomousTurn: AUTONOMOUS_EXPLORATION_INTERVAL_MS,
+      hasRunAutonomousTurnThisSession: true,
+    })).toBe(true);
   });
 });
 
@@ -3067,7 +3338,7 @@ describe('buildCompactionCheckpoint', () => {
       recentInteractions: '',
       autonomousState: 'Examination tick: 0',
       problemModelJson: JSON.stringify({ goals: ['improve testing'] }),
-      visionJson: JSON.stringify({ future: 'testable code' }),
+      purposeText: 'testable code',
       strategicMemoryNotesText: '- Prefer concrete action over abstract discussion\n- Verify findings before escalating',
       openMessagesText: 'msg: improve test coverage',
       priorSessionContextText: 'Prior session explored auth flows.',
@@ -3082,7 +3353,7 @@ describe('buildCompactionCheckpoint', () => {
     // Every grounding field that was present renders as a sub-section.
     expect(result).toContain('### Problem model');
     expect(result).toContain('improve testing');
-    expect(result).toContain('### Vision');
+    expect(result).toContain('### Vision (project purpose)');
     expect(result).toContain('testable code');
     expect(result).toContain('### Standing behavioral lessons');
     expect(result).toContain('Prefer concrete action');
@@ -3137,7 +3408,7 @@ describe('buildCompactionCheckpoint', () => {
       autonomousState: 'Examination tick: 0',
       problemModelJson: JSON.stringify({ goals: ['improve testing'] }),
       directionsText: '- d-1 active',
-      visionJson: JSON.stringify({ future: 'testable code' }),
+      purposeText: 'testable code',
       openMessagesText: 'msg: improve test coverage',
     };
     const result = buildCompactionCheckpoint(ctx);
@@ -3222,20 +3493,20 @@ describe('buildCompactionCheckpoint', () => {
     expect(withoutStatic).not.toContain('## Prior-cycle decision outcomes');
 
     // PROBLEM 2 — field-level grounding fallback. A successful refetch that
-    // returns an empty STRUCTURAL field (problemModelJson / visionJson) is a
+    // returns an empty STRUCTURAL field (problemModelJson / purposeText) is a
     // transient degraded read: fall back to the snapshot rather than dropping
     // the section. An empty refreshed openMessagesText still WINS (messages the
     // operator's turn just handled must disappear).
     const snapshot: CheckpointGrounding = {
       problemModelJson: JSON.stringify({ goals: ['SNAPSHOT goal'] }, null, 2),
-      visionJson: JSON.stringify({ future: 'SNAPSHOT vision' }, null, 2),
+      purposeText: 'SNAPSHOT purpose',
       strategicMemoryNotesText: '- SNAPSHOT lesson',
       runningUpdate: 'SNAPSHOT running update',
       openMessagesText: 'SNAPSHOT open message',
     };
     const refreshedDegraded: CheckpointGrounding = {
       problemModelJson: '',
-      visionJson: '',
+      purposeText: '',
       strategicMemoryNotesText: '',
       runningUpdate: '',
       openMessagesText: '',
@@ -3243,7 +3514,7 @@ describe('buildCompactionCheckpoint', () => {
     const resolved = resolveCheckpointGrounding(snapshot, refreshedDegraded);
     // Structural fields fall back to the snapshot on an empty refetch.
     expect(resolved.problemModelJson).toContain('SNAPSHOT goal');
-    expect(resolved.visionJson).toContain('SNAPSHOT vision');
+    expect(resolved.purposeText).toContain('SNAPSHOT purpose');
     expect(resolved.strategicMemoryNotesText).toBe('- SNAPSHOT lesson');
     expect(resolved.runningUpdate).toBe('SNAPSHOT running update');
     // openMessagesText is the deliberate exception — empty refreshed wins.
@@ -3391,13 +3662,13 @@ describe('formatCheckpointState', () => {
   it('maps a populated response into pretty-printed JSON + formatted notes + string', () => {
     const resp: CheckpointStateResponse = {
       problem_model: { goals: ['ship refresh'] },
-      vision: { future: 'coherent strategist' },
+      effective_purpose: 'coherent strategist purpose',
       strategic_memory_notes: [{ note: 'do not re-derive', set_at: '2026-07-01T00:00:00Z' }],
       running_update: 'refresh landed',
     };
     const g = formatCheckpointState(resp);
     expect(g.problemModelJson).toBe(JSON.stringify({ goals: ['ship refresh'] }, null, 2));
-    expect(g.visionJson).toBe(JSON.stringify({ future: 'coherent strategist' }, null, 2));
+    expect(g.purposeText).toBe('coherent strategist purpose');
     expect(g.strategicMemoryNotesText).toBe('- [2026-07-01T00:00:00Z] do not re-derive');
     expect(g.runningUpdate).toBe('refresh landed');
   });
@@ -3405,12 +3676,12 @@ describe('formatCheckpointState', () => {
   it('coerces empty {} / missing / mistyped fields to empty strings (no throw)', () => {
     const g = formatCheckpointState({
       problem_model: {},
-      vision: undefined,
+      effective_purpose: undefined,
       strategic_memory_notes: 'not-an-array',
       running_update: 42,
     });
     expect(g.problemModelJson).toBe('');
-    expect(g.visionJson).toBe('');
+    expect(g.purposeText).toBe('');
     expect(g.strategicMemoryNotesText).toBe('');
     expect(g.runningUpdate).toBe('');
     // A fully empty response object must not throw.
@@ -3421,7 +3692,7 @@ describe('formatCheckpointState', () => {
 describe('resolveCheckpointGrounding', () => {
   const snapshot: CheckpointGrounding = {
     problemModelJson: JSON.stringify({ goals: ['STALE goal'] }, null, 2),
-    visionJson: JSON.stringify({ future: 'STALE vision' }, null, 2),
+    purposeText: 'STALE purpose',
     strategicMemoryNotesText: '- STALE lesson',
     runningUpdate: 'STALE running update',
   };
@@ -3431,15 +3702,15 @@ describe('resolveCheckpointGrounding', () => {
     // operator updated mid-session; every field must win over the snapshot.
     const refreshed = formatCheckpointState({
       problem_model: { goals: ['FRESH goal'] },
-      vision: { future: 'FRESH vision' },
+      effective_purpose: 'FRESH purpose',
       strategic_memory_notes: [{ note: 'FRESH lesson', set_at: '2026-07-11T00:00:00Z' }],
       running_update: 'FRESH running update',
     });
     const resolved = resolveCheckpointGrounding(snapshot, refreshed);
     expect(resolved.problemModelJson).toContain('FRESH goal');
     expect(resolved.problemModelJson).not.toContain('STALE');
-    expect(resolved.visionJson).toContain('FRESH vision');
-    expect(resolved.visionJson).not.toContain('STALE');
+    expect(resolved.purposeText).toContain('FRESH purpose');
+    expect(resolved.purposeText).not.toContain('STALE');
     expect(resolved.strategicMemoryNotesText).toBe('- [2026-07-11T00:00:00Z] FRESH lesson');
     expect(resolved.runningUpdate).toBe('FRESH running update');
 
@@ -3462,7 +3733,7 @@ describe('resolveCheckpointGrounding', () => {
   it('falls back to the snapshot when no refresh occurred (refreshed null/undefined)', () => {
     expect(resolveCheckpointGrounding(snapshot, null)).toEqual({
       problemModelJson: snapshot.problemModelJson,
-      visionJson: snapshot.visionJson,
+      purposeText: snapshot.purposeText,
       strategicMemoryNotesText: snapshot.strategicMemoryNotesText,
       runningUpdate: snapshot.runningUpdate,
     });
@@ -3471,7 +3742,7 @@ describe('resolveCheckpointGrounding', () => {
   });
 
   it('an empty refreshed STRUCTURAL field falls back to the snapshot (transient degraded read)', () => {
-    // A successful refetch that returns empty problem-model/vision/memory/running
+    // A successful refetch that returns empty problem-model/purpose/memory/running
     // fields is treated as a transient degraded server read — NOT a mid-session
     // clear — so the checkpoint must fall back to the session-start snapshot
     // field-by-field rather than dropping structural grounding entirely. Only a
@@ -3479,7 +3750,7 @@ describe('resolveCheckpointGrounding', () => {
     // covered in the 'resolveCheckpointGrounding open_messages' suite.)
     const refreshed: CheckpointGrounding = {
       problemModelJson: JSON.stringify({ goals: ['FRESH goal'] }, null, 2),
-      visionJson: '',
+      purposeText: '',
       strategicMemoryNotesText: '',
       runningUpdate: '',
     };
@@ -3488,8 +3759,8 @@ describe('resolveCheckpointGrounding', () => {
     expect(resolved.problemModelJson).toContain('FRESH goal');
     expect(resolved.problemModelJson).not.toContain('STALE');
     // Empty refreshed structural fields fall back to the snapshot, not undefined.
-    expect(resolved.visionJson).toBe(snapshot.visionJson);
-    expect(resolved.visionJson).toContain('STALE vision');
+    expect(resolved.purposeText).toBe(snapshot.purposeText);
+    expect(resolved.purposeText).toContain('STALE purpose');
     expect(resolved.strategicMemoryNotesText).toBe(snapshot.strategicMemoryNotesText);
     expect(resolved.runningUpdate).toBe(snapshot.runningUpdate);
   });
@@ -3519,7 +3790,7 @@ describe('formatCheckpointState open_messages field', () => {
 describe('resolveCheckpointGrounding open_messages', () => {
   const snapshot: CheckpointGrounding = {
     problemModelJson: '{}',
-    visionJson: '{}',
+    purposeText: '',
     strategicMemoryNotesText: '',
     runningUpdate: '',
     openMessagesText: 'STALE open message',
@@ -3528,7 +3799,7 @@ describe('resolveCheckpointGrounding open_messages', () => {
   it('refreshed openMessagesText wins over the snapshot', () => {
     const refreshed: CheckpointGrounding = {
       problemModelJson: '{}',
-      visionJson: '{}',
+      purposeText: '',
       strategicMemoryNotesText: '',
       runningUpdate: '',
       openMessagesText: 'FRESH open message',
@@ -3542,7 +3813,7 @@ describe('resolveCheckpointGrounding open_messages', () => {
     // must WIN so the checkpoint omits the section rather than re-showing stale text.
     const refreshed: CheckpointGrounding = {
       problemModelJson: '{}',
-      visionJson: '{}',
+      purposeText: '',
       strategicMemoryNotesText: '',
       runningUpdate: '',
       openMessagesText: '',
@@ -3559,7 +3830,7 @@ describe('resolveCheckpointGrounding open_messages', () => {
   it('snapshot with no openMessagesText falls back to undefined when refresh is null', () => {
     const snapshotNoMsgs: CheckpointGrounding = {
       problemModelJson: '{}',
-      visionJson: '{}',
+      purposeText: '',
       strategicMemoryNotesText: '',
       runningUpdate: '',
     };
@@ -3585,7 +3856,7 @@ describe('formatCheckpointState recent_handled_conversation field', () => {
 describe('resolveCheckpointGrounding recent_handled_conversation', () => {
   const snapshot: CheckpointGrounding = {
     problemModelJson: '{}',
-    visionJson: '{}',
+    purposeText: '',
     strategicMemoryNotesText: '',
     runningUpdate: '',
     recentHandledConversationText: 'STALE handled tail',
@@ -3594,7 +3865,7 @@ describe('resolveCheckpointGrounding recent_handled_conversation', () => {
   it('refreshed recentHandledConversationText wins over the snapshot', () => {
     const refreshed: CheckpointGrounding = {
       problemModelJson: '{}',
-      visionJson: '{}',
+      purposeText: '',
       strategicMemoryNotesText: '',
       runningUpdate: '',
       recentHandledConversationText: 'FRESH handled tail',
@@ -3606,7 +3877,7 @@ describe('resolveCheckpointGrounding recent_handled_conversation', () => {
   it('empty refreshed recentHandledConversationText collapses to undefined (fresh wins over stale)', () => {
     const refreshed: CheckpointGrounding = {
       problemModelJson: '{}',
-      visionJson: '{}',
+      purposeText: '',
       strategicMemoryNotesText: '',
       runningUpdate: '',
       recentHandledConversationText: '',

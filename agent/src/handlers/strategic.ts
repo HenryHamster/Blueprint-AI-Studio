@@ -685,6 +685,16 @@ export async function handleStrategic(
     const problemModelJson = problemModel && Object.keys(problemModel).length > 0
       ? JSON.stringify(problemModel, null, 2)
       : '';
+    // A shipped model stamped `_agent_view_lean` is the compact per-entry digest —
+    // the DEFAULT strategic-cycle shipping shape (see backend's
+    // strategic_problem_view._agent_view_problem_model_lean). It is the FULL live
+    // model — every capability/gap/friction entry present, each reduced to its
+    // decision-relevant scalars — so it still resolves to 'present' (edit it
+    // directly), distinct from the packer's exceptional floor-skeletonized case
+    // (`_agent_view_floor_applied` → 'fetch') and the compacted-provenance case
+    // (`_agent_view_compacted` → still 'present'). Descriptions/evidence/notes/
+    // history/provenance are NOT inline but the durable model is intact.
+    const problemModelLean = !!problemModel?._agent_view_lean;
     // Use the backend-resolved value first, with legacy payload fallbacks.
     const currentPurpose = resolveStrategicPurpose(payload, problemModel);
 
@@ -876,7 +886,10 @@ export async function handleStrategic(
 
     let problemModelSection: string;
     if (problemModelRecovery === 'present') {
-      problemModelSection = `## Your current understanding (problem_model)\n\`\`\`json\n${problemModelJson}\n\`\`\``;
+      const digestNote = problemModelLean
+        ? `\n\n_Shipment form: **compact digest** (\`_agent_view_lean\`). Every capability, gap, and friction entry is listed — reduced to its decision-relevant scalars (capabilities: name/status/proof_exempt; gaps: id/name/status/priority/size/opened/tag/deferral/closed; friction: id/name/status). Descriptions, evidence, capability notes/backing_paths/absorbs, friction seen_in/mitigations_tried/promoted_to_gap_id, provenance (source/evidence_refs), and per-gap history/past_moves are **not** inline — the durable model is intact and any detail you actually need is recoverable via \`./fetch problem-model\` (or \`./fetch gap <gap_id>\`). Edit the digest directly and **echo the \`_agent_view_lean\` marker back** in your update so the backend preserves the stripped durable fields (see Section 6 of the thinker guidance)._`
+        : '';
+      problemModelSection = `## Your current understanding (problem_model)${digestNote}\n\`\`\`json\n${problemModelJson}\n\`\`\``;
     } else if (problemModelRecovery === 'fetch') {
       const partialView = problemModelJson
         ? `\n\nA partial/summarized view was shipped below, but it is NOT the full model — do not treat it as complete or submit it as a replacement:\n\`\`\`json\n${problemModelJson}\n\`\`\``
@@ -1435,6 +1448,25 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 ./strategic spawn-task '{"type": "research", "title": "...", "prompt": "...", "criterion_ids": ["c-key-1", "c-key-2"], "acceptance_evidence": {"kind": "named_test", "test_path": "testing/test_foo.py", "test_id": "test_bar"}}'
 # Direction spawn with explicit extra criterion coverage (merged with direction's own keys):
 ./strategic spawn-task '{"type": "research", "title": "...", "prompt": "...", "direction_id": "d-xxx", "criterion_ids": ["c-key-extra"], "acceptance_evidence": {"kind": "named_test", "test_path": "testing/test_foo.py"}}'
+
+# Sequenced build-on-top work (landing gates): to author an ORDERED chain instead
+# of independent parallel siblings, spawn the FOUNDATION first, then on each
+# successor pass the foundation's RETURNED task_id in depends_on and declare the
+# named landing branch. Dispatch then holds until EVERY dependency has LANDED on
+# that branch before the successor's base is re-cut. Keep genuinely independent
+# work parallel (no depends_on) so it is not held by the chain.
+./strategic spawn-task '{"type": "create", "title": "Implement foundation", "prompt": "...", "direction_id": "d-xxx"}'
+#   → response returns a task_id; the successor references it and declares the gate:
+./strategic spawn-task '{"type": "create", "title": "Build on the foundation", "prompt": "...", "direction_id": "d-xxx", "depends_on": ["<foundation task_id>"], "require_deps_landed_on": "${baseBranch}", "release_base_branch": "${baseBranch}"}'
+# require_deps_landed_on — branch every depends_on dependency must have LANDED on
+#   before this task dispatches: hold until each dep is COMPLETED with its merged
+#   work on that branch, bypassing the file-overlap heuristic.
+# release_base_branch — branch this task's base_branch is repointed to at
+#   dependency-release time; it starts from that branch's tip including the
+#   dependencies' merged code.
+# BOTH fields MUST be the project integration branch (the base this spawn builds
+#   from): a direct spawn never creates a shared/campaign branch, so any other
+#   name is rejected with a 400 that names the allowed integration branch.
 
 # Implementation-ready bounded work uses the same command and needs no direction.
 ./strategic spawn-task '{"type": "create|refactor|qa", "title": "...", "prompt": "Full implementation prompt...", "idempotency_key": "stable-logical-request"}'

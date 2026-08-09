@@ -17,7 +17,7 @@ CI" — it is NOT permission to merge. A legacy scalar
 durable review history (or an explicit no-review policy marker) is required.
 """
 
-import asyncio
+import asyncio  # noqa: F401  # test mock target (app.ci_completion.asyncio.sleep)
 import contextlib
 import logging
 import uuid
@@ -199,7 +199,7 @@ async def _attempt_merge_with_retry_and_escalation(
         is_custom_staged_rollup_root,
         merged_pr_counts_as_integration_landing,
     )
-    from app.landed_signal import apply_merged_landed_signal
+    from app.landed_signal import corroborate_and_apply_merged_landed_signal
     from app.models import Project
     from app.shared_state import (
         get_project_integration_branch,
@@ -862,15 +862,17 @@ async def _attempt_merge_with_retry_and_escalation(
                                 _orig_ctx = dict(orig.context or {})
                                 _orig_ctx["test_coverage_result"] = _tcov
                                 orig.context = _orig_ctx
-                            _orig_landed_on_integration = apply_merged_landed_signal(
+                            _orig_landed_on_integration = await corroborate_and_apply_merged_landed_signal(
                                 orig,
                                 orig_project,
+                                session,
                                 base_branch=ci_base,
                                 hotfix_lane=bool(
                                     (orig.first_payload or {}).get("hotfix")
                                     or (orig.context or {}).get("hotfix")
                                 ),
                                 non_merge_reason="merged_pr_non_integration_branch",
+                                merge_commit_sha=merge_result.get("sha"),
                             )
                             # Membership-based merge-credit propagation across the
                             # nested-rollup + squash boundary. apply_merged_landed_signal

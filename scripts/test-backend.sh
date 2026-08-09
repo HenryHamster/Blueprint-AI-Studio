@@ -19,6 +19,7 @@
 #   scripts/test-backend.sh --sandbox-postgres           # private local Postgres; no Docker socket required
 set -euo pipefail
 cd "$(dirname "$0")/../backend"
+source ../scripts/backend-test-route.sh
 
 # The real upgrade chain contains fail-closed encrypted-data migrations. Keep a
 # deterministic non-production Fernet key in the repo-owned harness so Alembic
@@ -43,7 +44,12 @@ for arg in "$@"; do
     --no-postgres) USE_POSTGRES=0 ;;
     --no-testmon) USE_TESTMON=0 ;;
     --require-testmon) REQUIRE_TESTMON=1 ;;
-    *) ARGS+=("$arg") ;;
+    *)
+      case "$arg" in
+        backend/*) ARGS+=("${arg#backend/}") ;;
+        *) ARGS+=("$arg") ;;
+      esac
+      ;;
   esac
 done
 if [ "${#ARGS[@]}" -gt 0 ]; then set -- "${ARGS[@]}"; else set --; fi
@@ -147,6 +153,11 @@ if [ "$SANDBOX_POSTGRES" = "1" ]; then
     echo "ERROR: --sandbox-postgres requires $PYTHON" >&2
     exit 2
   }
+elif [ "$USE_POSTGRES" = "1" ] && _AUTO_POSTGRES_FLAG="$(select_backend_test_route 2>/dev/null)" && [ "$_AUTO_POSTGRES_FLAG" = "--sandbox-postgres" ]; then
+  SANDBOX_POSTGRES=1
+  USE_DOCKER=0
+  PYTHON="${BLUEPRINT_SANDBOX_PYTHON:-/opt/blueprint-backend-venv/bin/python}"
+  echo "=== Using off-image pgserver PostgreSQL sandbox ==="
 elif command -v docker &>/dev/null; then
   USE_DOCKER=1
 else
@@ -344,36 +355,6 @@ resolve_deps_image() {
   return 1
 }
 
-# --- PostgreSQL bindir resolution for --sandbox-postgres ---
-# Resolve a usable PostgreSQL server bindir. Prefers `pg_config --bindir` when
-# it is on PATH and points at a real server (images with libpq-dev /
-# postgresql-client install pg_config on PATH). When pg_config is absent from
-# PATH, falls back to the highest-versioned /usr/lib/postgresql/*/bin that
-# actually holds initdb (an image with only the server packages still has the
-# server binaries there). Prints the bindir and returns 0; returns 1 when
-# neither exists — a pg_config that exists but points at a non-server dir stays
-# fail-closed rather than scanning. Keep this helper byte-identical across
-# check, scripts/test-backend.sh and the generated check_backend_verification.sh
-# fragment — mirrored paths must not diverge again.
-resolve_pg_bindir() {
-  local bindir cand
-  if command -v pg_config >/dev/null 2>&1; then
-    bindir="$(pg_config --bindir 2>/dev/null || true)"
-    if [ -n "$bindir" ] && [ -x "$bindir/initdb" ]; then
-      printf '%s\n' "$bindir"
-      return 0
-    fi
-    return 1
-  fi
-  for cand in $(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -V | tail -n 1); do
-    if [ -x "$cand/initdb" ]; then
-      printf '%s\n' "$cand"
-      return 0
-    fi
-  done
-  return 1
-}
-
 # --- Configure DATABASE_URL / ENV_ARGS based on --postgres ---
 if [ "$USE_POSTGRES" = "1" ] && [ "$SANDBOX_POSTGRES" = "1" ]; then
   PG_BIN="$(resolve_pg_bindir)" || {
@@ -516,6 +497,12 @@ if [ "$USE_POSTGRES" = "1" ]; then
       if docker exec "$PG_CONTAINER" pg_isready -U test &>/dev/null; then break; fi
       sleep 0.5
     done
+  fi
+  echo "=== Checking migration-required PostgreSQL extensions ==="
+  if [ "$SANDBOX_POSTGRES" = "1" ]; then
+    verify_required_postgres_extensions "$PG_BIN/psql" -h "$PG_SOCKET" -U test -d test_blueprint
+  else
+    verify_required_postgres_extensions docker exec "$PG_CONTAINER" psql -U test -d test_blueprint
   fi
   echo "=== Running alembic migrations ==="
   _run python3 -m alembic upgrade head

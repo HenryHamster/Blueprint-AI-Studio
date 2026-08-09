@@ -908,11 +908,13 @@ async function attachAcceptanceTestProbe(
       ? diff.changedFiles.some(cf => acceptanceTestPathMatches(cf, declaredPath))
       : undefined;
   const inDiffField = inDiff !== undefined ? { in_diff: inDiff } : {};
-  // A green/present run that is NOT among the PR's changed files can never earn
-  // machine-proven coverage — the gate hard-fails proven=False. Warn PRE-merge.
+  // A green/present run that is NOT among the PR's changed files is still
+  // creditable: the merge gate proves an unmodified test that EXISTS at the
+  // merge commit and RAN GREEN (backend-corroborated) — presence in the diff is
+  // not required. Inform PRE-merge so the agent does not churn the test.
   const notInDiffNote =
     inDiff === false
-      ? ` NOTE: the declared test \`${declaredPath}\` is NOT among this PR's changed files — a green run of an unmodified test cannot earn machine-proven coverage (the merge gate requires the declared test be added/modified by this PR); add or modify it here to earn proven credit.`
+      ? ` NOTE: the declared test \`${declaredPath}\` is NOT among this PR's changed files — that is not a hard fail: the merge gate credits an unmodified test that exists at the merge commit and ran green (backend-corroborated), so do not churn the test to force it into the diff.`
       : '';
 
   let runner: TestRunner | null = null;
@@ -963,7 +965,7 @@ async function attachAcceptanceTestProbe(
   const passed = acceptanceTestRunPassed(cleanExit, status);
   const present = status !== 'absent';
   if (inDiff === false) {
-    sendLog(ws, `Declared acceptance test [${label}]: not among the PR's changed files — a green run cannot earn machine-proven coverage.\n`);
+    sendLog(ws, `Declared acceptance test [${label}]: not among the PR's changed files — the merge gate still credits an unmodified test that exists at the merge commit and ran green (no diff churn needed).\n`);
   }
   sendLog(ws, `Declared acceptance test [${label}]: ${status}\n`);
   let note: string;

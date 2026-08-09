@@ -209,6 +209,23 @@ _RUBRIC_REDRIVE_STATUSES: frozenset[str] = frozenset(
 # RUBRIC_REDRIVE_ATTEMPTS`` (the resolver's cap for the read surfaces).
 _MAX_RUBRIC_REDRIVE_ATTEMPTS = 2
 
+# Maximum number of sweep-driven re-entries for a ``status=not_promoted``
+# version blocked on ``walkthrough_e2e_contract_failed``.
+#
+# The walkthrough evidence-contract blocker is EXECUTION_SITE_DEPLOYED: the
+# report-key validation was performed by the DEPLOYED qualifier against the
+# DEPLOYED rubric, so a fix on automain is inert until a conforming change
+# lands and the version's next candidate carries it.  The recovery signal is a
+# change in the qualification inputs — an automain advance (the conforming fix)
+# or a rubric/goal change (the contract_fingerprint drifts) — which is exactly
+# when ``run_qualification``'s cached-verdict guard releases the blocked
+# candidate for a fresh qualification.  The cap bounds how many such automatic
+# re-entries the sweep performs before it halts and raises an operator Alert: a
+# deployed site that keeps rejecting the candidate's reports (or a team that
+# keeps shipping reports that violate the contract) must surface to a human
+# instead of spinning fresh qualification attempts forever.
+_MAX_WALKTHROUGH_CONTRACT_REDRIVE_ATTEMPTS = 3
+
 # Transient error codes the sweep is allowed to re-drive.  Permanent errors
 # (e.g. project misconfiguration) should not be blindly retried.
 #
@@ -860,6 +877,195 @@ async def _redrive_rubric_changed_qualification(
                 version.last_qualification = {
                     **new_qual,
                     "rubric_redrive_count": rubric_redrive_count + 1,
+                }
+                flag_modified(version, "last_qualification")
+                await redrive_session.commit()
+        return bool(result and result.get("status") == "spawned")
+
+
+async def _redrive_walkthrough_contract_qualification(
+    version_id,
+    *,
+    session_factory=None,
+) -> bool:
+    """Re-enter the qualifier for a ``not_promoted`` version blocked on a
+    walkthrough evidence-contract failure.
+
+    ``_handle_walkthrough_contract_failure`` records
+    ``last_qualification.status == "not_promoted"`` with
+    ``blocker == "walkthrough_e2e_contract_failed"`` — a DURABLE verdict
+    (unlike the transient ``infra_failure`` / ``error`` holds) whose blocker is
+    EXECUTION_SITE_DEPLOYED: the report-key validation ran in the serving
+    process against the serving rubric.  Until now nothing scheduled a
+    re-entry: the sweep re-drives only criterion-coverage ``not_promoted``
+    blockers, reconciliation covers only ``ci_unresolved``, and the auto-trigger
+    executor explicitly excludes ``not_promoted`` blockers other than the
+    acceptance grade — so a version whose walkthrough report violated the
+    deployed contract stranded until a human or the strategist manually
+    re-requested qualification.  This re-driver is the missing scheduled path.
+
+    It re-enters ``run_qualification`` (with ``auto_trigger=True``, the sweep's
+    sanctioned path for attempt-scoped recovery) for each open, stabilize-phase
+    version whose ``last_qualification.status == "not_promoted"`` AND
+    ``blocker == "walkthrough_e2e_contract_failed"``, subject to a bounded
+    re-drive cap (``_MAX_WALKTHROUGH_CONTRACT_REDRIVE_ATTEMPTS``).
+
+    The re-drive does NOT spawn on an unchanged candidate: a contract-failure
+    record is deterministic (the deployed validator would reject the identical
+    report again), so ``_qualification_probe_contract_is_reusable`` treats it
+    as reusable and ``run_qualification``'s cached-verdict guard returns
+    ``{"status": "cached_verdict"}`` cheaply — no new qualification spawns, no
+    VMs burn, and the cap does not advance.  A fresh qualification spawns only
+    when the qualification inputs actually changed — the integration HEAD
+    advanced (a conforming fix landing on automain) or the goal/rubric drifted
+    (``contract_fingerprint`` mismatch) — which is precisely the recovery the
+    deployed-side blocker needs.
+
+    The cap counts re-drives PERFORMED, tracked in
+    ``last_qualification["walkthrough_contract_redrive_count"]`` (a
+    per-contract-episode counter): ``run_qualification`` carries it forward
+    into the pending record and ``_handle_walkthrough_contract_failure``
+    carries it into the next contract-failure record, so the cap advances
+    across the spawn→finalize→re-drive cycle.  The counter resets to 0
+    naturally when a NON-contract-failure verdict lands (that record carries no
+    counter).  A deployed site that keeps rejecting reports cannot spin
+    attempts forever: when the cap is hit the re-driver raises an operator
+    Alert (once, deduped on ``walkthrough_contract_redrive_loop_escalated``)
+    and halts — the explicit operator-actionable state instead of silence.
+
+    Commit behavior: COMMIT on every outcome, same as the error/infra/rubric
+    re-drivers.  ``run_qualification`` writes a new ``last_qualification`` (and
+    bumps ``qualification_attempts``) on every path it takes; rolling back
+    would discard those writes.  The re-drive counter is incremented POST-commit
+    so a failed spawn is NOT counted as a performed re-drive.
+
+    Returns True only when the re-entry actually STARTED a new qualification
+    (``status == "spawned"``).  Any guard no-op, cap hit, or cached-verdict
+    deferral returns False.
+    """
+    from app import release_qualifier
+
+    factory = session_factory or AsyncSessionLocal
+    async with factory() as redrive_session:
+        # Row-lock the version (same as the infra/rubric re-drivers) so this
+        # autonomous re-drive serializes against a concurrently-committing
+        # explicit qualification instead of reading a stale contract-failure
+        # marker mid-flight.
+        version = (
+            await redrive_session.execute(
+                select(release_version.ReleaseVersion)
+                .where(release_version.ReleaseVersion.id == version_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if version is None:
+            return False
+        qual = version.last_qualification
+        if (
+            not isinstance(qual, dict)
+            or qual.get("status") != "not_promoted"
+            or qual.get("blocker") != "walkthrough_e2e_contract_failed"
+            or version.phase != "stabilize"
+        ):
+            return False
+        # Bounded attempts: a deployed site that keeps rejecting reports must
+        # not spin fresh qualification attempts (and their heavy VMs) forever.
+        # Use the per-contract-episode counter carried on last_qualification —
+        # NOT the lifetime qualification_attempts column, which accrues across
+        # ALL episodes and would silently block re-drives for long-lived
+        # versions.
+        redrive_count = int(qual.get("walkthrough_contract_redrive_count") or 0)
+        if redrive_count >= _MAX_WALKTHROUGH_CONTRACT_REDRIVE_ATTEMPTS:
+            # Raise an operator Alert (once) so the cap is visible.  Guard
+            # against duplicate alerts with a flag on last_qualification.
+            if not qual.get("walkthrough_contract_redrive_loop_escalated"):
+                _error = str(qual.get("error") or "unavailable")
+                alert = Alert(
+                    project_id=version.project_id,
+                    severity=AlertSeverity.ERROR,
+                    title=(
+                        f"Release v{version.version_number} walkthrough "
+                        f"contract redrive loop halted"
+                    ),
+                    message=(
+                        f"Release v{version.version_number} has had "
+                        f"{redrive_count} walkthrough evidence-contract "
+                        f"re-drive(s) while the DEPLOYED qualifier kept "
+                        f"rejecting the candidate's walkthrough report "
+                        f"(last error: {_error}) — autonomous re-qualification "
+                        f"halted. A conforming fix on automain (or a rubric/"
+                        f"goal change) is required before a fresh "
+                        f"qualification can pass the evidence contract."
+                    ),
+                    event_type="release.qualification_crash_loop",
+                )
+                redrive_session.add(alert)
+                version.last_qualification = {
+                    **qual,
+                    "walkthrough_contract_redrive_loop_escalated": True,
+                }
+                flag_modified(version, "last_qualification")
+                redrive_session.add(version)
+                await redrive_session.commit()
+                logger.warning(
+                    "[RELEASE_QUALIFIER] sweep: v%d "
+                    "walkthrough_contract_redrive_count=%d reached cap=%d — "
+                    "raised operator Alert and halted auto re-drive",
+                    version.version_number,
+                    redrive_count,
+                    _MAX_WALKTHROUGH_CONTRACT_REDRIVE_ATTEMPTS,
+                )
+            return False
+        # The CI-compliance qualify gate must not be bypassed by a re-drive.  If
+        # the integration HEAD currently breaches the guardrails (per the latest
+        # stored evaluation), defer until a repair lands — the sweep's
+        # ``_recheck_ci_compliance_blocked_version`` keeps re-evaluating.  Uses
+        # the stored record (no fresh GitHub scan under the sweep session).
+        from app.strategic_spawning import ci_compliance_qualify_gate
+
+        project = await redrive_session.get(Project, version.project_id)
+        if project is not None and ci_compliance_qualify_gate(project).get("blocked"):
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep: deferring walkthrough contract "
+                "re-drive for v%d — integration HEAD breaches CI-compliance "
+                "guardrails",
+                version.version_number,
+            )
+            return False
+        # Re-enter the qualifier with auto_trigger=True (the sweep's sanctioned
+        # attempt-scoped recovery path — NEVER a claim of explicit_request).
+        # run_qualification's cached-verdict guard makes an unchanged-candidate
+        # call a cheap no-op (no spawn, no cap advance), so this re-drive costs
+        # real qualification work only when the inputs changed.
+        result = await release_qualifier.run_qualification(
+            redrive_session,
+            version.project_id,
+            version,
+            retry_episode=int(qual.get("retry_episode") or 0) + 1,
+            retry_episode_cap=_MAX_WALKTHROUGH_CONTRACT_REDRIVE_ATTEMPTS,
+            requested_probes=qual.get("requested_probes"),
+            auto_trigger=True,
+        )
+        # COMMIT on every outcome — do NOT roll back the non-spawned paths.
+        # run_qualification writes a new last_qualification (and bumps
+        # qualification_attempts) on every path it takes; rolling back would
+        # discard those writes and leave the version in the old contract-failure
+        # state.
+        await redrive_session.commit()
+        # If the re-entry actually STARTED a fresh qualification, persist the
+        # per-episode re-drive counter so the cap advances across sweeps.  A
+        # non-spawned result (cached_verdict / no_credentials / sha_error / ...)
+        # is NOT counted as a performed re-drive.  The pending record already
+        # carries the prior counter (run_qualification stamps it from the prior
+        # record), so the increment survives even if this post-commit write is
+        # lost to a crash.
+        if result and result.get("status") == "spawned":
+            await redrive_session.refresh(version)
+            new_qual = version.last_qualification
+            if isinstance(new_qual, dict):
+                version.last_qualification = {
+                    **new_qual,
+                    "walkthrough_contract_redrive_count": redrive_count + 1,
                 }
                 flag_modified(version, "last_qualification")
                 await redrive_session.commit()

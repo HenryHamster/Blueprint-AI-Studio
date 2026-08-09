@@ -81,7 +81,7 @@ export interface StrategicWatchReceipt {
   target_kind?: 'task';
   target_task_id?: string;
   purpose?: string;
-  state?: 'fired' | 'expired' | string;
+  state?: string;
   terminal_status?: string | null;
   receipt?: {
     title?: string;
@@ -525,7 +525,7 @@ export interface CheckpointStateResponse {
   problem_model?: unknown;
   strategic_memory_notes?: unknown;
   running_update?: unknown;
-  vision?: unknown;
+  effective_purpose?: unknown;
   /** Current open operator messages (same shape as the bootstrap payload's
    *  open_messages). Present on backends that have shipped this field; absent
    *  on older responses — caller degrades gracefully. */
@@ -536,10 +536,25 @@ export interface CheckpointStateResponse {
   recent_handled_conversation?: unknown;
 }
 
+/**
+ * Resolve the resident's project-purpose grounding from the bootstrap payload.
+ *
+ * Binds to `effective_purpose` — the single intent field the backend actually
+ * emits (the legacy `vision` body was removed in #16973). Never read
+ * `payload.vision` here: the backend no longer ships it, so a vision-bound read
+ * would render a silently-empty grounding section that only activates when a
+ * stale backend still carries the old key. Returns a trimmed string, or '' when
+ * the payload carries no purpose (callers log + render an explicit marker).
+ */
+export function resolveResidentPurposeText(payload: Record<string, unknown>): string {
+  return typeof payload.effective_purpose === 'string' ? payload.effective_purpose.trim() : '';
+}
+
 /** The self-model grounding fields the compaction checkpoint carries. */
 export interface CheckpointGrounding {
   problemModelJson: string;
-  visionJson: string;
+  /** Current project purpose text (payload.effective_purpose). */
+  purposeText: string;
   strategicMemoryNotesText: string;
   runningUpdate: string;
   /** Formatted open operator messages text (from open_messages). Absent when
@@ -553,9 +568,10 @@ export interface CheckpointGrounding {
 
 /**
  * Map a checkpoint-state endpoint response into the refreshed grounding fields,
- * formatted identically to the session-start bootstrap (problem_model / vision
- * → pretty JSON, notes → shared formatter, running_update → string). Tolerant
- * of missing / mistyped keys so a partial response never throws.
+ * formatted identically to the session-start bootstrap (problem_model → pretty
+ * JSON, effective_purpose → trimmed text, notes → shared formatter,
+ * running_update → string). Tolerant of missing / mistyped keys so a partial
+ * response never throws.
  *
  * Note: `openMessagesText` is left empty here because the formatting function
  * (`buildOpenMessagesText`) lives in strategic-sections.ts which imports the
@@ -565,7 +581,7 @@ export interface CheckpointGrounding {
 export function formatCheckpointState(resp: CheckpointStateResponse): CheckpointGrounding {
   return {
     problemModelJson: formatRecordJson(resp.problem_model),
-    visionJson: formatRecordJson(resp.vision),
+    purposeText: typeof resp.effective_purpose === 'string' ? resp.effective_purpose.trim() : '',
     strategicMemoryNotesText: formatStrategicMemoryNotes(resp.strategic_memory_notes),
     runningUpdate: typeof resp.running_update === 'string' ? resp.running_update : '',
     openMessagesText: '',
@@ -582,14 +598,13 @@ export function formatCheckpointState(resp: CheckpointStateResponse): Checkpoint
  * DELIBERATE ASYMMETRY — do NOT "simplify" this back into a whole-object
  * `refreshed ?? snapshot` switch:
  *
- *  - STRUCTURAL fields (problemModelJson, visionJson, strategicMemoryNotesText,
+ *  - STRUCTURAL fields (problemModelJson, purposeText, strategicMemoryNotesText,
  *    runningUpdate) fall back FIELD-BY-FIELD: a refreshed value that is
  *    empty/blank is treated as a transient degraded server read (e.g.
- *    _agent_view_problem_model / _agent_visible_vision formatting to empty) and
- *    the session-start snapshot value is used instead. Losing the problem model
- *    or vision to a momentary empty refetch is a coherence loss we refuse to
- *    take; a genuine mid-session edit still refreshes because it returns a
- *    non-empty value.
+ *    _agent_view_problem_model formatting to empty) and the session-start
+ *    snapshot value is used instead. Losing the problem model or purpose to a
+ *    momentary empty refetch is a coherence loss we refuse to take; a genuine
+ *    mid-session edit still refreshes because it returns a non-empty value.
  *  - openMessagesText and recentHandledConversationText are the EXCEPTION: a
  *    refreshed EMPTY value must WIN over the stale bootstrap snapshot. Messages
  *    the operator's turn just handled should DISAPPEAR from the open feed (and
@@ -604,7 +619,7 @@ export function resolveCheckpointGrounding(
   refreshed: CheckpointGrounding | null | undefined,
 ): {
   problemModelJson?: string;
-  visionJson?: string;
+  purposeText?: string;
   strategicMemoryNotesText?: string;
   runningUpdate?: string;
   openMessagesText?: string;
@@ -614,7 +629,7 @@ export function resolveCheckpointGrounding(
   if (refreshed == null) {
     return {
       problemModelJson: snapshot.problemModelJson || undefined,
-      visionJson: snapshot.visionJson || undefined,
+      purposeText: snapshot.purposeText || undefined,
       strategicMemoryNotesText: snapshot.strategicMemoryNotesText || undefined,
       runningUpdate: snapshot.runningUpdate || undefined,
       openMessagesText: snapshot.openMessagesText || undefined,
@@ -628,7 +643,7 @@ export function resolveCheckpointGrounding(
     (refreshedVal && refreshedVal.trim() ? refreshedVal : snapshotVal) || undefined;
   return {
     problemModelJson: structural(refreshed.problemModelJson, snapshot.problemModelJson),
-    visionJson: structural(refreshed.visionJson, snapshot.visionJson),
+    purposeText: structural(refreshed.purposeText, snapshot.purposeText),
     strategicMemoryNotesText: structural(refreshed.strategicMemoryNotesText, snapshot.strategicMemoryNotesText),
     runningUpdate: structural(refreshed.runningUpdate, snapshot.runningUpdate),
     openMessagesText: refreshed.openMessagesText || undefined,
@@ -654,8 +669,8 @@ export interface CompactionCheckpointContext {
   // settled directions, or re-propose corrections the operator already made.
   /** Current problem model JSON (payload.problem_model). */
   problemModelJson?: string;
-  /** Current vision JSON (payload.vision). */
-  visionJson?: string;
+  /** Current project purpose text (payload.effective_purpose). */
+  purposeText?: string;
   /** Formatted standing behavioral lessons (payload.strategic_memory_notes). */
   strategicMemoryNotesText?: string;
   /** Formatted open operator messages text (payload.open_messages). */
@@ -756,8 +771,10 @@ ${ctx.autonomousState.trim()}`);
   if (ctx.directionsText?.trim()) {
     grounding.push(`### Active directions\n${ctx.directionsText.trim()}`);
   }
-  if (ctx.visionJson?.trim()) {
-    grounding.push(`### Vision\n\`\`\`json\n${ctx.visionJson.trim()}\n\`\`\``);
+  if (ctx.purposeText?.trim()) {
+    grounding.push(`### Vision (project purpose)\n${ctx.purposeText.trim()}`);
+  } else if (ctx.purposeText !== undefined) {
+    grounding.push(`### Vision (project purpose)\n_(no project purpose on record — the operator has not seeded intent.purpose / user_purpose. Ground decisions on the problem model and directions above instead.)_`);
   }
   if (ctx.openMessagesText?.trim()) {
     grounding.push(`### Open operator messages\n${ctx.openMessagesText.trim()}`);
@@ -1512,7 +1529,11 @@ export interface BootstrapContext {
   /** Formatted strategic memory notes text (one line per entry, e.g. "- [ts] note").
    *  Empty string or whitespace → section omitted. Absent or omitted defaults to ''. */
   strategicMemoryNotesText?: string;
-  visionJson: string;
+  /** Current project purpose text (payload.effective_purpose). Rendered as the
+   *  `## Vision (project purpose)` grounding section. Empty string renders an
+   *  explicit "no project purpose on record" marker so an absent purpose is
+   *  observable, never silently indistinguishable from a dropped section. */
+  purposeText: string;
   openMessagesText: string;
   /** Formatted recently-answered operator conversation tail
    *  (payload.recent_handled_conversation). Rendered as a read-only,
@@ -1603,8 +1624,10 @@ ${ctx.strategicMemoryNotesText.trim()}`);
 
 ${ctx.toolContentText.trim()}`);
   }
-  if (ctx.visionJson.trim()) {
-    sections.push(`## Vision\n\`\`\`json\n${ctx.visionJson.trim()}\n\`\`\``);
+  if (ctx.purposeText.trim()) {
+    sections.push(`## Vision (project purpose)\n${ctx.purposeText.trim()}`);
+  } else {
+    sections.push(`## Vision (project purpose)\n_(no project purpose on record — the operator has not seeded intent.purpose / user_purpose. Ground decisions on the problem model, directions, and open operator messages below.)_`);
   }
   if (ctx.priorSessionContextText?.trim()) {
     sections.push(`## Prior session context\n${ctx.priorSessionContextText.trim()}`);
@@ -1788,10 +1811,28 @@ export interface ExamRecord {
   at: string;
   verdict: 'clear' | 'found' | 'advanced' | 'unevidenced' | 'interrupted';
   note: string;
+  /** Compact change-fingerprint of the surface AT the moment of this exam, used
+   *  by the re-exam change-gate (see directionChangeSignal / nextFocus). Present
+   *  only for surfaces that expose a cheap change signal (currently directions,
+   *  from directions_summary counters); undefined for surfaces with no derivable
+   *  signal. A later tick compares the live fingerprint against this baseline: an
+   *  unchanged fingerprint on a settled `clear` surface means "nothing moved
+   *  since I cleared it", so the surface is skipped until its cooldown elapses. */
+  signal?: string;
 }
 
 /** Cap on retained exam records (bounds a multi-hour session's memory). */
 export const EXAM_RECORDS_CAP = 200;
+
+/** Re-exam cooldown (ms): the max staleness after which a settled-`clear`,
+ *  unchanged surface becomes due for a fresh look again even with NO change
+ *  signal — the escape hatch that stops the change-gate from starving any
+ *  surface forever. Measured against the exam record's wall-clock `at` (not a
+ *  tick count) so it keeps advancing during all-quiet stretches where no tick
+ *  runs. 4h is ~24 floor ticks (AUTONOMOUS_FLOOR_TICK_MS = 10min): a settled
+ *  surface that would otherwise be re-read every floor tick is now re-read at
+ *  most ~once per 4h absent real movement, while staleness stays bounded. */
+export const REEXAM_COOLDOWN_MS = 4 * 60 * 60 * 1000;
 
 export interface DecisionsRegisterEntry {
   atTick: number;
@@ -2085,9 +2126,140 @@ export function buildSurfaceCatalog(
 }
 
 /**
- * The next focus surfaces for this tick: never-examined surfaces first (in
- * catalog order, so freshly-added directions are auto-prioritized), then
- * least-recently-examined (LRU by the max tick a record touched the surface).
+ * Compact change-fingerprint of one direction's `directions_summary` entry: a
+ * stable string over the fields that MOVE when the direction does real work or
+ * churns — its status plus the monotonic outcome/cycle/PR/churn counters. Used
+ * as the per-surface change signal by the re-exam gate: an unchanged fingerprint
+ * on a surface already found CLEAR means "nothing moved since I cleared it", so
+ * re-reading it re-derives a settled fact. Pure over the fields it reads; a
+ * missing field folds to 0/'' so the fingerprint is defined for any shape.
+ *
+ * NOTE on freshness: these counters ship in the session-start payload's
+ * `directions_summary` and refresh only at the next bootstrap — the mid-session
+ * heartbeat carries `work_state_rev`, `active_direction_ids`, and
+ * `direction_grounding` (id/text/status) but NOT the counters. So within one
+ * session a direction's fingerprint is stable (the cooldown drives re-exam) and
+ * counter deltas surface across a restart/bootstrap, where the persisted exam
+ * ledger's stored signal becomes the baseline to diff against. This is a
+ * conservative, no-false-positive signal aligned with "don't re-read every tick".
+ */
+export function directionChangeSignal(dir: Record<string, unknown>): string {
+  const n = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+  return [
+    str(dir.status),
+    n(dir.total_cycles),
+    n(dir.prs_merged),
+    n(dir.prs_rejected),
+    n(dir.tasks_failed),
+    n(dir.confirmed_finding_count),
+  ].join('|');
+}
+
+/**
+ * Build the live per-surface change-signal map (`direction:<id>` → fingerprint)
+ * from a payload's `directions_summary`. Only direction surfaces expose a cheap
+ * signal; a surface absent from the map has no derivable signal and is gated by
+ * the cooldown alone. Pure.
+ */
+export function buildDirectionChangeSignals(
+  payload: Record<string, unknown>,
+): Map<string, string> {
+  const out = new Map<string, string>();
+  const dirs = Array.isArray(payload.directions_summary)
+    ? payload.directions_summary as Array<Record<string, unknown>> : [];
+  for (const d of dirs) {
+    const id = str(d.id);
+    if (id) out.set(`direction:${id}`, directionChangeSignal(d));
+  }
+  return out;
+}
+
+/** Inputs to the re-exam change-gate. All optional: with none supplied,
+ *  `nextFocus` degrades to the legacy never-first-then-LRU rotation and every
+ *  examined surface is treated as due. */
+export interface ReexamGateOptions {
+  /** Live per-surface change signals (`direction:<id>` → fingerprint) from the
+   *  current payload's directions_summary (see buildDirectionChangeSignals). An
+   *  absent entry means "no derivable signal" → the surface is cooldown-gated. */
+  currentSignals?: Map<string, string>;
+  /** Wall-clock now (ms) for the cooldown escape hatch; omit to disable it. */
+  nowMs?: number;
+  /** Max staleness (ms) before a settled-clear, unchanged surface is due again
+   *  regardless of change signal. Default REEXAM_COOLDOWN_MS. */
+  cooldownMs?: number;
+}
+
+/** Most-recent exam record per surface key (highest atTick wins; array order
+ *  breaks ties). */
+function latestRecordBySurface(records: ExamRecord[]): Map<string, ExamRecord> {
+  const latest = new Map<string, ExamRecord>();
+  for (const r of records) {
+    const prev = latest.get(r.surfaceKey);
+    if (prev === undefined || r.atTick >= prev.atTick) latest.set(r.surfaceKey, r);
+  }
+  return latest;
+}
+
+/**
+ * Whether a surface is DUE for (re-)examination under the change-gate. A surface
+ * is due when it has NEVER been examined, when its most-recent verdict is not a
+ * settled `clear` (found/advanced/unevidenced/interrupted all still want a
+ * look), or when — being settled clear — it has a change signal since that clear
+ * OR its cooldown has elapsed. A settled-clear surface with no change signal and
+ * an un-elapsed cooldown is NOT due (skipped this tick). Pure.
+ */
+export function surfaceDue(
+  surface: ExamSurface,
+  latest: ExamRecord | undefined,
+  opts: ReexamGateOptions,
+): boolean {
+  if (latest === undefined) return true;      // never examined → always due
+  if (latest.verdict !== 'clear') return true; // unsettled → keep working it
+  // Settled clear: due only if the surface moved or the cooldown elapsed.
+  const current = opts.currentSignals?.get(surface.key);
+  // A comparable live signal that differs from the baseline recorded at the
+  // clear exam ⇒ real movement ⇒ due. `current === undefined` (no derivable
+  // signal for this surface) skips this check and falls through to the cooldown.
+  // A legacy clear record with no stored `signal` (baseline undefined) but a
+  // live signal present ⇒ differs ⇒ due (re-examined once to seed a baseline).
+  if (current !== undefined && current !== latest.signal) return true;
+  // Cooldown escape hatch so nothing is starved forever.
+  const cooldownMs = opts.cooldownMs ?? REEXAM_COOLDOWN_MS;
+  if (typeof opts.nowMs === 'number' && latest.at) {
+    const at = Date.parse(latest.at);
+    if (Number.isFinite(at) && opts.nowMs - at >= cooldownMs) return true;
+  }
+  return false;
+}
+
+/**
+ * Whether ANY catalog surface is due for examination under the change-gate.
+ * When this is false, every surface is settled-clear-and-unchanged within its
+ * cooldown — the "all-quiet" case, where the caller should idle cheaply rather
+ * than deep-re-read an arbitrary already-settled surface. Pure.
+ */
+export function hasDueSurface(
+  catalog: ExamSurface[],
+  records: ExamRecord[],
+  opts: ReexamGateOptions,
+): boolean {
+  const latest = latestRecordBySurface(records);
+  for (const s of catalog) {
+    if (surfaceDue(s, latest.get(s.key), opts)) return true;
+  }
+  return false;
+}
+
+/**
+ * The next focus surfaces for this tick. Never-examined surfaces come first (in
+ * catalog order, so freshly-added directions are auto-prioritized); then, when a
+ * change-gate `opts` is supplied, surfaces that are DUE (a change signal since
+ * their last clear, an unsettled last verdict, or an elapsed cooldown) ahead of
+ * surfaces that are settled-clear-and-unchanged ("skip" tier) — both ordered
+ * least-recently-examined. Skip-tier surfaces are still returned (never dropped)
+ * so a forced turn always has a surface to name, just deprioritized so an
+ * unchanged, recently-cleared surface is not re-read while anything real is due.
+ * Without `opts`, this degrades to the legacy never-first-then-LRU rotation.
  * Records whose surface is no longer in the catalog are ignored (pruned).
  * Returns at most `n` surfaces.
  */
@@ -2095,20 +2267,23 @@ export function nextFocus(
   catalog: ExamSurface[],
   records: ExamRecord[],
   n: number = FOCUS_LIST_SIZE,
+  opts?: ReexamGateOptions,
 ): ExamSurface[] {
-  const lastTick = new Map<string, number>();
-  for (const r of records) {
-    const prev = lastTick.get(r.surfaceKey);
-    if (prev === undefined || r.atTick > prev) lastTick.set(r.surfaceKey, r.atTick);
-  }
+  const latest = latestRecordBySurface(records);
   const never: ExamSurface[] = [];
-  const examined: ExamSurface[] = [];
+  const due: ExamSurface[] = [];
+  const skip: ExamSurface[] = [];
   for (const s of catalog) {
-    if (lastTick.has(s.key)) examined.push(s);
-    else never.push(s);
+    const rec = latest.get(s.key);
+    if (rec === undefined) { never.push(s); continue; }
+    // Legacy path (no opts): every examined surface is "due" → preserves the
+    // exact never-first-then-LRU ordering the gate-free rotation produced.
+    if (opts && !surfaceDue(s, rec, opts)) skip.push(s);
+    else due.push(s);
   }
-  examined.sort((a, b) => (lastTick.get(a.key) ?? 0) - (lastTick.get(b.key) ?? 0));
-  return [...never, ...examined].slice(0, Math.max(0, n));
+  const lru = (arr: ExamSurface[]): ExamSurface[] =>
+    arr.sort((a, b) => (latest.get(a.key)?.atTick ?? 0) - (latest.get(b.key)?.atTick ?? 0));
+  return [...never, ...lru(due), ...lru(skip)].slice(0, Math.max(0, n));
 }
 
 /**
@@ -2416,6 +2591,25 @@ export interface AutonomousTurnGateState {
   msSinceLastAutonomousTurn: number;
   /** unchanged-state exploration interval; default AUTONOMOUS_EXPLORATION_INTERVAL_MS */
   explorationIntervalMs?: number;
+  /** re-exam change-gate verdict: is ANY surface due for a real look this tick
+   *  (never-examined, unsettled, changed since its clear, or cooldown elapsed)?
+   *  Consulted ONLY on the unchanged-state exploration path — when the interval
+   *  has elapsed but every surface is settled-clear-and-unchanged within its
+   *  cooldown (`false`), the exploration turn is suppressed so the caller idles
+   *  cheaply instead of deep-re-reading a settled surface. `undefined` (gate not
+   *  wired) preserves legacy exploration pacing. Never gates operator/agenda/
+   *  followup/watch/world-change wakes — those always run. */
+  anyDue?: boolean;
+  /** has THIS session already completed at least one autonomous examination turn
+   *  (→ it has made strategic API activity)? Empty-session guard: the all-quiet
+   *  `anyDue === false` suppression must NEVER fire before the session's first
+   *  autonomous turn, or a freshly-spawned session that inherits an all-clear,
+   *  within-cooldown carried ledger would make ZERO API calls and then lapse at
+   *  its TTL — which the backend scores as an empty-session strategic failure
+   *  (3 consecutive → the strategic_failures_high freeze). `false` forces the
+   *  first turn to run regardless of `anyDue`; `true` allows all-quiet
+   *  suppression; `undefined` (gate not wired) preserves legacy pacing. */
+  hasRunAutonomousTurnThisSession?: boolean;
 }
 
 /**
@@ -2440,7 +2634,25 @@ export function shouldRunAutonomousTurn(state: AutonomousTurnGateState): boolean
   const explorationInterval = state.explorationIntervalMs
     ?? AUTONOMOUS_EXPLORATION_INTERVAL_MS;
   if (explorationInterval <= 0) return false;
-  return state.msSinceLastAutonomousTurn >= explorationInterval;
+  if (state.msSinceLastAutonomousTurn < explorationInterval) return false;
+  // Empty-session guard: the all-quiet suppression below must never keep a
+  // session that has NOT yet run an autonomous turn from running one — a
+  // freshly-spawned session inheriting an all-clear, within-cooldown carried
+  // ledger would otherwise make zero strategic API calls and lapse at its TTL,
+  // which the backend scores as an empty-session strategic failure. The first
+  // autonomous turn always runs (→ API activity). The `msSinceLastAutonomousTurn
+  // === Infinity` short-circuit above already covers the current caller wiring
+  // (lastAutonomousTurnAt is per-session), but this makes the invariant explicit
+  // and independent of that sentinel. Only an explicit `false` forces the run;
+  // `undefined` (not wired) preserves legacy pacing.
+  if (state.hasRunAutonomousTurnThisSession === false) return true;
+  // Exploration interval elapsed. Spend a real (expensive) turn only when a
+  // surface is actually due under the re-exam change-gate. When everything is
+  // settled-clear-and-unchanged within its cooldown (anyDue === false), suppress
+  // the exploration turn so the caller idles cheaply rather than deep-re-reading
+  // an already-settled surface. `undefined` (gate not wired) preserves legacy
+  // exploration pacing by running.
+  return state.anyDue !== false;
 }
 
 /** Operator-facing projection for the next unchanged-state exploration wake. */
@@ -2679,9 +2891,15 @@ export function buildAutonomousPrompt(
     'The helper reads the file and wraps it as JSON; passing markdown as argv fails silently.',
     'Idle is stated here in the stream, never in the inbox.',
     '',
-    'Cheap delta signals — revision numbers, attempt counts, `git fetch`, unchanged',
-    'payload fields — may be checked but can NEVER justify a CLEAR: "no change since',
-    'the last tick" is the expected steady state, not evidence a surface is clear.',
+    'A surface you have NOT yet examined cannot be declared CLEAR on cheap delta',
+    'signals alone — revision numbers, attempt counts, `git fetch`, unchanged payload',
+    'fields: a first-time CLEAR must rest on what you actually opened and read.',
+    'But a surface you ALREADY examined and found CLEAR, with no change signal since',
+    '(no new outcome/cycle/PR/churn on a direction; no update elsewhere), may be',
+    'SKIPPED this tick — trust the prior verdict, do not re-derive it. Re-examine it',
+    'only when a change signal appears or its re-exam cooldown elapses; the rotation',
+    'already deprioritizes settled-clear, unchanged surfaces so you can spend the',
+    'turn where something actually moved.',
     '',
     'Proactive memory ops: call `./strategic set-memory <note>` when you discover a',
     'durable behavioral lesson, operator preference, project-specific pitfall, or',
@@ -2843,6 +3061,11 @@ export function restoreLedger(
         verdict: (['clear', 'found', 'advanced', 'unevidenced', 'interrupted'].includes(String(r.verdict))
           ? r.verdict : 'unevidenced') as ExamRecord['verdict'],
         note: typeof r.note === 'string' ? r.note.slice(0, EXAM_NOTE_CAP) : '',
+        // Preserve the change-gate baseline fingerprint across restart so a
+        // settled surface stays skippable (and its cross-restart delta stays
+        // detectable) rather than restoring to a signal-less record that would
+        // force one redundant re-read. Omitted when absent (legacy blobs).
+        ...(typeof r.signal === 'string' && r.signal ? { signal: r.signal } : {}),
       }));
     const tick = typeof p.tick === 'number' && Number.isFinite(p.tick) ? p.tick : 0;
     const corrective = typeof p.corrective === 'boolean' ? p.corrective : false;

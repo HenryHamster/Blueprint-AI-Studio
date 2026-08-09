@@ -791,6 +791,8 @@ async def _process_direction_lifecycle_locked(
         _evidence_progress_suppresses_scaffolding,
         _outcome_progress_config,
         already_built_completion_suggestion,
+        consume_direction_merge_grade_if_ready,
+        direction_objective_completion_verdict,
     )
 
     directions_modified = False
@@ -1943,27 +1945,65 @@ async def _process_direction_lifecycle_locked(
             # signal; the strategic agent / operator decides any follow-up.
             continue
         # Positive completion detection — mark for user review but don't pause.
-        # Two signals feed possibly_complete: the merge-based heuristic
-        # (_check_direction_completion) and the Fix #3 "already-built" signature
-        # (no-op-dominated completions). The already-built signal is the reason a
-        # churn/zero-merge pause was just suppressed above, so it must set the flag
-        # here; otherwise the else-branch below would immediately pop it.
-        completion_suggestion = _check_direction_completion(
-            d
-        ) or already_built_completion_suggestion(d)
-        if completion_suggestion:
+        # Scoped objective verdict (campaign path): when the
+        # direction's integrated merged diff has been graded against its declared
+        # objective, the graded verdict is AUTHORITATIVE over the merge-count
+        # heuristic below — a graded not-met objective must not let the campaign
+        # 'complete' on child-merge counts, and a graded fully-met objective marks
+        # it complete regardless of recent cycle yield.
+        try:
+            if await consume_direction_merge_grade_if_ready(session, project, d):
+                directions_modified = True
+        except Exception:  # noqa: BLE001 — best-effort consumption
+            logger.warning(
+                f"[AUTONOMOUS] Failed to consume direction merge grade for {did}",
+                exc_info=True,
+            )
+        _objective_verdict = await direction_objective_completion_verdict(
+            session, project, d
+        )
+        if _objective_verdict is True:
             if not d.get("possibly_complete"):
                 d["possibly_complete"] = True
-                d["completion_suggestion"] = completion_suggestion
+                d["completion_suggestion"] = (
+                    "Direction objective graded fully met on the integrated "
+                    "merged diff."
+                )
                 logger.info(
-                    f"[AUTONOMOUS] Direction {did} possibly complete: {completion_suggestion}"
+                    f"[AUTONOMOUS] Direction {did} objective graded fully met — "
+                    "marking possibly_complete"
                 )
                 directions_modified = True
-        else:
+        elif _objective_verdict is False:
+            # A graded not-met objective is authoritative: suppress any heuristic
+            # completion signal so the campaign does not 'complete' while its
+            # objective remains unmet.
             if d.get("possibly_complete"):
                 d.pop("possibly_complete", None)
                 d.pop("completion_suggestion", None)
                 directions_modified = True
+        else:
+            # Two signals feed possibly_complete: the merge-based heuristic
+            # (_check_direction_completion) and the Fix #3 "already-built" signature
+            # (no-op-dominated completions). The already-built signal is the reason a
+            # churn/zero-merge pause was just suppressed above, so it must set the flag
+            # here; otherwise the else-branch below would immediately pop it.
+            completion_suggestion = _check_direction_completion(
+                d
+            ) or already_built_completion_suggestion(d)
+            if completion_suggestion:
+                if not d.get("possibly_complete"):
+                    d["possibly_complete"] = True
+                    d["completion_suggestion"] = completion_suggestion
+                    logger.info(
+                        f"[AUTONOMOUS] Direction {did} possibly complete: {completion_suggestion}"
+                    )
+                    directions_modified = True
+            else:
+                if d.get("possibly_complete"):
+                    d.pop("possibly_complete", None)
+                    d.pop("completion_suggestion", None)
+                    directions_modified = True
         # Outcome-progress (scaffolding) detection — advisory signal.
         # Flags a long-running healthy-merge direction whose outcome signal has
         # stalled. It records evidence and notifies on entry/escalation, but it

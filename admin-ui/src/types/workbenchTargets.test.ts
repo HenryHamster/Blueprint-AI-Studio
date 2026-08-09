@@ -44,6 +44,21 @@ describe('workbench target helpers', () => {
     });
   });
 
+  it('keeps the runtime version-lifecycle section so activation attention can deep-link', () => {
+    // The "promoted, awaiting activation" attention item targets the panel
+    // that activates a promoted version; dropping the section would silently
+    // land the operator on Runtime health instead.
+    expect(normalizeWorkbenchTarget({
+      surface: 'runtime',
+      section: 'version-lifecycle',
+      project_id: 'p1',
+    })).toEqual({
+      surface: 'runtime',
+      section: 'version-lifecycle',
+      project_id: 'p1',
+    });
+  });
+
   it('dedupes refetch surfaces and filters unsupported values', () => {
     expect(normalizeWorkbenchRefetchSurfaces([
       'runtime',

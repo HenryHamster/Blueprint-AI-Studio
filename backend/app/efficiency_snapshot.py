@@ -25,7 +25,7 @@ import statistics
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Mapping, Sequence
+from typing import Any, Dict, Mapping, Sequence, cast
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from sqlalchemy import func, or_
@@ -346,6 +346,14 @@ UNPRICED_ALERT_MIN_TASKS = 3
 # Window over which "current" axes are computed for each daily snapshot.
 _AXIS_WINDOW_DAYS = 7
 
+# Migration 0735 added Task.origination with a SYSTEM server default, which
+# backfilled every pre-existing task. Origination shares are therefore only
+# evidence-bearing after the migration's capture boundary; older rows are a
+# residual, not proof of direct/system work.
+ORIGINATION_CAPTURED_AT = datetime(2026, 8, 7)
+ORIGINATION_MIN_QUOTABLE_COHORT = 20
+ORIGINATION_MAX_UNATTRIBUTED_SHARE = 0.20
+
 # Row cap applied to _load_recent_tasks. Past this many terminal tasks in the
 # requested window, the loaded cohort is a recency SAMPLE (most-recently-
 # updated first) rather than the full window — every aggregate computed from
@@ -404,7 +412,77 @@ _SNAPSHOT_HISTORY_MAX = 7
 #      cohort_capped (bool: True when 5000-row limit was reached), and
 #      blocked_provisioned_vm_spend_usd (VM spend by BLOCKED tasks in the window),
 #      making silent sampling and BLOCKED exclusion explicit.
-METRIC_DEF_VERSION = "v16"
+# v17: strategic_cycle_cost_per_event gains by_cycle (per-cycle TIME SERIES with
+#      first/last task timestamps, capped at _STRATEGIC_CYCLE_SLICE_CAP newest
+#      cycles), by_serving_sha (per-serving-revision rollup over ALL cycles so it
+#      reconciles with the aggregate total_usd), and by_cycle_capped — so a
+#      decision-loop reading can separate cycles that ran before a lever reached
+#      serving from cycles that ran after.
+METRIC_DEF_VERSION = "v18"
+
+
+def build_merged_work_origination_reading(
+    split: Mapping[str, int],
+    *,
+    window_start: datetime,
+    window_end: datetime,
+) -> dict[str, Any]:
+    """Attach evidence provenance to the merged-work origination split.
+
+    Suppress shares unless the window is post-0735, sufficiently sized, and not
+    mostly residual-contaminated; retain counts for diagnosis when unquotable.
+    """
+    from app.research_completion import merged_work_origination_reading
+
+    reading = cast(dict[str, Any], merged_work_origination_reading(dict(split)))
+    merged_total = reading["merged_total"]
+    commissioned_total = reading["commissioned_total"]
+    unattributed = reading["unattributed_merged"]
+    contamination_rate = (
+        round(unattributed / merged_total, 4) if merged_total else None
+    )
+
+    reason: str | None = None
+    if window_start < ORIGINATION_CAPTURED_AT:
+        reason = "window_predates_origination_capture"
+    elif merged_total == 0:
+        reason = "no_origination_data"
+    elif commissioned_total == 0:
+        reason = "no_commissioned_origination_data"
+    elif commissioned_total < ORIGINATION_MIN_QUOTABLE_COHORT:
+        reason = "cohort_too_small"
+    elif (
+        contamination_rate is not None
+        and contamination_rate > ORIGINATION_MAX_UNATTRIBUTED_SHARE
+    ):
+        reason = "cohort_too_contaminated"
+
+    quotable = reason is None
+    if not quotable:
+        for key in (
+            "research_share_of_commissioned",
+            "strategist_share_of_commissioned",
+            "research_share_of_merged",
+            "strategist_share_of_merged",
+        ):
+            reading[key] = None
+
+    reading.update(
+        {
+            "window_start": window_start.isoformat(),
+            "window_end": window_end.isoformat(),
+            "window_days": round(
+                (window_end - window_start).total_seconds() / 86400, 1
+            ),
+            "origination_capture_start": ORIGINATION_CAPTURED_AT.isoformat(),
+            "window_fully_captured": window_start >= ORIGINATION_CAPTURED_AT,
+            "cohort_size": commissioned_total,
+            "contamination_rate": contamination_rate,
+            "status": "QUOTABLE" if quotable else "UNQUOTABLE",
+            "unquotable_reason": reason,
+        }
+    )
+    return reading
 
 
 async def _read_snapshot_history(
@@ -464,6 +542,78 @@ async def _read_snapshot_history(
     if len(merged) > _SNAPSHOT_HISTORY_MAX:
         merged = merged[-_SNAPSHOT_HISTORY_MAX:]
     return merged
+
+
+def _serving_sha_timeline_from_snapshots(
+    snapshots: Sequence[Mapping[str, Any]],
+    current_sha: str | None,
+    now: datetime,
+) -> list[Dict[str, Any]] | None:
+    """Build the sorted serving-sha boundary list a cycle-cost slice needs.
+
+    Each snapshot that carries a ``serving_sha`` contributes a boundary: from
+    its ``captured_at`` onward that revision was serving until a later snapshot
+    superseded it. ``current_sha`` (the live ``DEPLOY_SHA``) is appended at
+    ``now`` so cycles active after the newest snapshot still attribute to the
+    revision serving right now. Consecutive boundaries with the same sha are
+    collapsed to the earliest stamp (that is when the sha's serving period
+    began), which keeps the timeline minimal and the attribution correct across
+    back-to-back snapshots of an unchanged revision.
+
+    Returns a sorted oldest-first list of ``{"since": iso8601, "sha": str}``
+    boundaries, or None when neither any snapshot nor ``current_sha`` can name
+    a serving revision (pre-stamp deployments).
+    """
+    boundaries: list[tuple[datetime, str]] = []
+    for snap in snapshots or []:
+        sha = snap.get("serving_sha")
+        captured = snap.get("captured_at")
+        if not sha or not captured:
+            continue
+        try:
+            since = datetime.fromisoformat(captured)
+        except (TypeError, ValueError):
+            continue
+        if since.tzinfo is not None:
+            # Snapshot timestamps are naive UTC; normalize an aware stamp so it
+            # compares cleanly against Task.updated_at in the cost slicer.
+            since = since.replace(tzinfo=None)
+        boundaries.append((since, sha))
+    if current_sha:
+        boundaries.append((now, current_sha))
+    if not boundaries:
+        return None
+    boundaries.sort(key=lambda pair: pair[0])
+    collapsed: list[tuple[datetime, str]] = []
+    for since, sha in boundaries:
+        if collapsed and collapsed[-1][1] == sha:
+            continue
+        collapsed.append((since, sha))
+    return [{"since": since.isoformat(), "sha": sha} for since, sha in collapsed]
+
+
+async def _load_serving_sha_timeline(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> list[Dict[str, Any]] | None:
+    """Load the serving-sha timeline a project's cycle-cost slices need.
+
+    Merges the design_doc container and ``project_efficiency_snapshot`` table
+    history (via :func:`_read_snapshot_history`) and appends the current
+    ``DEPLOY_SHA`` at now, so both the daily snapshot write path and the live
+    agent endpoint can slice strategic-cycle cost by serving revision. Returns
+    None when no snapshot carries a serving_sha and no DEPLOY_SHA is stamped.
+    """
+    project = await session.get(Project, project_id, populate_existing=True)
+    if project is None:
+        return None
+    container = (project.design_doc or {}).get(DESIGN_DOC_KEY) or {}
+    snapshots = await _read_snapshot_history(session, project_id, container)
+    from app.deployed_sha import get_serving_sha
+
+    return _serving_sha_timeline_from_snapshots(
+        snapshots, get_serving_sha(), _utcnow()
+    )
 
 
 async def _batch_read_snapshot_histories(
@@ -2869,6 +3019,10 @@ async def compute_current_axes(
     tasks = await _load_recent_tasks(session, project_id)
     cohort_task_count = len(tasks)
     cohort_capped = cohort_task_count >= _COHORT_CAP
+    # Serving-sha boundaries for the strategic-cycle cost slices: which serving
+    # revision was live when each cycle ran, so a reading can separate cycles
+    # that ran before a lever reached serving from cycles that ran after.
+    serving_sha_timeline = await _load_serving_sha_timeline(session, project_id)
     cohort_window = _cohort_effective_window(tasks)
     blocked_vm_spend = await _compute_blocked_vm_spend(session, project_id)
     lanes = await _load_project_lanes(session, project_id)
@@ -2889,18 +3043,22 @@ async def compute_current_axes(
     # derived from the 5000-row `tasks` cohort above, which is created_at-ordered
     # and capped, so it would answer a different (and biased) question.
     from app.research_completion import (  # noqa: PLC0415 — avoids an import cycle
-        merged_work_origination_reading,
         merged_work_origination_split,
     )
 
-    merged_work_origination = merged_work_origination_reading(
+    origination_window_end = _utcnow()
+    origination_window_start = origination_window_end - timedelta(
+        days=_AXIS_WINDOW_DAYS
+    )
+    merged_work_origination = build_merged_work_origination_reading(
         await merged_work_origination_split(
             session,
             project_id,
-            since=_utcnow() - timedelta(days=_AXIS_WINDOW_DAYS),
-        )
+            since=origination_window_start,
+        ),
+        window_start=origination_window_start,
+        window_end=origination_window_end,
     )
-    merged_work_origination["window_days"] = _AXIS_WINDOW_DAYS
 
     # Provider routing A/B verdict (direction d-cf39cb40): derive from the
     # per-model efficiency breakdown so the verdict carries BOTH cost ratio AND
@@ -3021,7 +3179,9 @@ async def compute_current_axes(
         # drove the change — without relying on the on-demand live endpoint
         # (which only covers the current window). Reconciles with the scalar
         # llm_cost_per_merged_pr axis via the shared _task_llm_attempts path.
-        "llm_cost_attribution": _compact_llm_cost_attribution(tasks),
+        "llm_cost_attribution": _compact_llm_cost_attribution(
+            tasks, serving_sha_timeline=serving_sha_timeline
+        ),
         # VM cost by-task-type attribution: compact breakdown of total VM dollars
         # by task type so operators can see how much of cost_per_merged_pr drift
         # comes from primary tasks (review, create) vs quality-gate side-cars.
@@ -3942,6 +4102,9 @@ async def read_baseline_with_drift(
         },
         "baseline_captured_at": baseline.get("captured_at"),
         "last_snapshot_at": container.get("last_run_at") or latest.get("captured_at"),
+        # Merged-work origination is a persisted sibling reading, including its
+        # capture-window and quotability provenance rather than a bare share.
+        "merged_work_origination": latest.get("merged_work_origination"),
         "vm_cold_start_breakdown": latest.get("vm_cold_start_breakdown"),
         "reuse_funnel": get_reuse_funnel_snapshot(),
         # Durable (restart-surviving) warm-reuse drop-out ranking from the latest

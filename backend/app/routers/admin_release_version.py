@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import re
 import uuid
 from datetime import datetime
 from typing import Any, Dict, Optional
@@ -295,6 +296,7 @@ async def _serialize_version_history_entry(
         "phase": version.phase,
         "opened_at": version.opened_at.isoformat(),
         "promoted_at": version.promoted_at.isoformat() if version.promoted_at else None,
+        "promoted_sha": version.promoted_sha,
         "qualification_attempts": version.qualification_attempts,
         "qualification_retry_episode": getattr(version, "qualification_retry_episode", 0),
         "active_qualification_attempt_id": (
@@ -314,6 +316,13 @@ async def _serialize_version_history_entry(
         "deploy_confirm_deadline": version.deploy_confirm_deadline.isoformat()
         if version.deploy_confirm_deadline
         else None,
+        # Approved-activation control state (additive; NULL until an operator
+        # approves activation).  activation_requested_at NULL + unconfirmed is
+        # "awaiting approval"; set + unconfirmed is "approved-but-not-yet-executed".
+        "activation_requested_at": version.activation_requested_at.isoformat()
+        if version.activation_requested_at
+        else None,
+        "activation_requested_by": version.activation_requested_by,
         "aggregate_serving_status": aggregate["serving_status"],
         "aggregate_deploy_failure_reason": aggregate["reason_code"],
         "artifacts": artifacts,
@@ -845,6 +854,13 @@ async def get_version_lifecycle(
                 if open_row.served_at
                 else None,
                 "deploy_failure_reason": open_row.deploy_failure_reason,
+                # Approved-activation control state (additive; normally NULL for a
+                # still-open version — populated once an operator approves activation
+                # of the promoted row this version becomes).
+                "activation_requested_at": open_row.activation_requested_at.isoformat()
+                if open_row.activation_requested_at
+                else None,
+                "activation_requested_by": open_row.activation_requested_by,
                 "aggregate_serving_status": aggregate_serving["serving_status"],
                 "aggregate_deploy_failure_reason": aggregate_serving["reason_code"],
                 "artifacts": artifact_evidence,
@@ -1784,6 +1800,254 @@ async def clear_deploy_failed(
         "clear_mode": clear_mode,
         "operator_attested": clear_mode == "operator_attested",
         "attestation_reason": attestation_reason,
+    }
+
+
+@router.post("/projects/{project_id}/approve-activation")
+async def approve_activation(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+) -> Dict[str, Any]:
+    """Approve activation of the latest promoted, still-unconfirmed version.
+
+    Admin-gated (matching the deploy operator levers).  Targets the latest
+    ``promoted`` version under a ``with_for_update`` row lock, with no request
+    body: the approval always aims at the current promoted version, so it can
+    never be aimed at a different or historical artifact.  The approval binds
+    EXACTLY this version's immutable ``promoted_sha`` — the activation-receipt
+    path refuses any reported revision that differs, or a receipt once a newer
+    promotion supersedes this version.
+
+    Requires ``serving_status == "unconfirmed"`` — the exact predicate the
+    attention item and callout use, so the in-product surface is one unambiguous
+    action.  Already ``serving_confirmed`` / ``deploy_failed`` /
+    ``confirmation_timed_out`` (or a never-armed ``serving_status`` NULL) -> 409.
+    Idempotent: re-approving a still-unconfirmed version returns the existing
+    approval without re-stamping.
+    """
+    from app.time_utils import _utcnow  # noqa: PLC0415
+
+    project_row = await session.get(Project, project_id)
+    if project_row is None:
+        raise HTTPException(status_code=404, detail="Project not found.")
+
+    version = (
+        (
+            await session.execute(
+                select(ReleaseVersion)
+                .options(selectinload(ReleaseVersion.deploy_artifacts))
+                .where(
+                    ReleaseVersion.project_id == project_id,
+                    ReleaseVersion.status == "promoted",
+                )
+                .order_by(ReleaseVersion.version_number.desc())
+                .limit(1)
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if version is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No promoted version awaiting activation for this project.",
+        )
+
+    aggregate, _ = _version_serving_summary(version, project_row)
+    aggregate_status = aggregate["serving_status"]
+
+    if version.serving_status == "serving_confirmed" or aggregate_status == "serving_confirmed":
+        raise HTTPException(
+            status_code=409,
+            detail=f"v{version.version_number} is already serving (serving_status={version.serving_status}); nothing left to approve.",
+        )
+    if version.serving_status == "deploy_failed" or aggregate_status == "deploy_failed":
+        raise HTTPException(
+            status_code=409,
+            detail=f"v{version.version_number} deploy failed; clear the deploy failure before approving activation.",
+        )
+    if version.serving_status == "confirmation_timed_out":
+        raise HTTPException(
+            status_code=409,
+            detail=f"v{version.version_number} confirmation window timed out; a fresh promotion is required before activation can be approved.",
+        )
+    if version.serving_status != "unconfirmed":
+        raise HTTPException(
+            status_code=409,
+            detail=f"v{version.version_number} is not awaiting activation (serving_status={version.serving_status}).",
+        )
+
+    operator_id = current_user.get("email") or current_user["user_id"]
+    now = _utcnow()
+
+    if version.activation_requested_at is not None:
+        # Idempotent re-approval while still unconfirmed — return the existing
+        # durable approval without re-stamping it.
+        return {
+            "version_number": version.version_number,
+            "project_id": str(project_id),
+            "promoted_sha": version.promoted_sha,
+            "activation_requested_at": version.activation_requested_at.isoformat(),
+            "activation_requested_by": version.activation_requested_by,
+            "serving_status": version.serving_status,
+        }
+
+    # Durable, immutable audit provenance (WHO approved and WHEN); the binding to
+    # project / version / promoted SHA is inherent in this row.
+    qual = dict(version.last_qualification or {})
+    qual["activation_approval"] = {
+        "mode": "in_product_approval",
+        "operator": operator_id,
+        "approved_at": now.isoformat(),
+        "approved_sha": version.promoted_sha,
+    }
+    version.last_qualification = qual
+    version.activation_requested_at = now
+    version.activation_requested_by = operator_id
+    session.add(version)
+    await session.commit()
+    await session.refresh(version)
+    return {
+        "version_number": version.version_number,
+        "project_id": str(project_id),
+        "promoted_sha": version.promoted_sha,
+        "activation_requested_at": version.activation_requested_at.isoformat(),
+        "activation_requested_by": version.activation_requested_by,
+        "serving_status": version.serving_status,
+    }
+
+
+_SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+class _ActivationReceiptBody(BaseModel):
+    # The promoted version_number this activation bound to.
+    version_number: int
+    # The activated revision (40-hex SHA). Defaults to the version's promoted_sha.
+    revision: str | None = _Field(default=None, max_length=40)
+    # SSH host that performed the activation (provenance, informational).
+    host: str | None = _Field(default=None, max_length=200)
+
+
+@router.post("/projects/{project_id}/activation-receipt")
+async def record_activation_receipt(
+    project_id: uuid.UUID,
+    payload: _ActivationReceiptBody,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+) -> Dict[str, Any]:
+    """Record an operator activation of a promoted version and close the loop.
+
+    The one-command activation path (``blueprint deploy``) binds the built
+    revision to the project's latest promoted version, activates it on the
+    control-plane host, then POSTs this receipt.  The backend stamps the receipt
+    provenance on the version's ``last_qualification``, confirms the
+    ``backend_revision`` artifact with the served identifier, and — when every
+    required artifact now confirms — resolves the version to
+    ``serving_confirmed`` through the shared recovery machinery.
+
+    Idempotent: re-POSTing an identical receipt for an already
+    ``serving_confirmed`` version with a matching ``served_sha`` returns the
+    current state without error.
+    """
+    from app.release_reconciliation import (  # noqa: PLC0415
+        _record_activation_receipt,
+    )
+    from app.time_utils import _utcnow  # noqa: PLC0415
+
+    if payload.revision is not None and not _SHA40_RE.fullmatch(payload.revision):
+        raise HTTPException(
+            status_code=400,
+            detail="revision must be a 40-character lowercase hex SHA.",
+        )
+
+    version = (
+        (
+            await session.execute(
+                select(ReleaseVersion)
+                .where(
+                    ReleaseVersion.project_id == project_id,
+                    ReleaseVersion.version_number == payload.version_number,
+                )
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if version is None:
+        raise HTTPException(status_code=404, detail="Release version not found.")
+    if version.status != "promoted":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Release version {version.version_number} is not promoted "
+                f"(status={version.status}). Only promoted versions can be "
+                "confirmed serving by an activation receipt."
+            ),
+        )
+
+    effective_sha = (payload.revision or version.promoted_sha or "").strip()
+
+    # Approved-activation guard: an in-product approval authorizes EXACTLY the
+    # approved version's promoted SHA, so a receipt under that approval must
+    # never confirm a different or historical artifact.  Applied whenever an
+    # approval exists and the version is not yet resolved (including a
+    # never-armed promotion with serving_status NULL); the legacy CLI receipt
+    # path (no approval) and already-resolved versions are unchanged.
+    if version.activation_requested_at is not None:
+        from app.release_activation import (  # noqa: PLC0415
+            reject_stale_or_mismatched_approved_receipt,
+        )
+
+        rejection_detail = await reject_stale_or_mismatched_approved_receipt(
+            session, version, effective_sha
+        )
+        if rejection_detail:
+            raise HTTPException(status_code=409, detail=rejection_detail)
+
+    receipt_mode = (
+        "approved_activation" if version.activation_requested_at else "cli_activation"
+    )
+    if (
+        version.serving_status == "serving_confirmed"
+        and version.served_sha == effective_sha
+    ):
+        # Idempotent re-POST: the version already serves the bound revision.
+        return {
+            "version_number": version.version_number,
+            "serving_status": version.serving_status,
+            "served_sha": version.served_sha,
+            "served_at": version.served_at.isoformat() if version.served_at else None,
+            "deploy_failure_reason": version.deploy_failure_reason,
+            "receipt": {
+                "mode": receipt_mode,
+                "serving_status": "serving_confirmed",
+                "served_sha": effective_sha,
+            },
+        }
+
+    operator_id = current_user.get("email") or current_user["user_id"]
+    now = _utcnow()
+    receipt = await _record_activation_receipt(
+        session,
+        version,
+        revision=payload.revision,
+        host=payload.host,
+        operator_id=operator_id,
+        now=now,
+    )
+    await session.commit()
+    await session.refresh(version)
+    return {
+        "version_number": version.version_number,
+        "serving_status": version.serving_status,
+        "served_sha": version.served_sha,
+        "served_at": version.served_at.isoformat() if version.served_at else None,
+        "deploy_failure_reason": version.deploy_failure_reason,
+        "receipt": receipt,
     }
 
 

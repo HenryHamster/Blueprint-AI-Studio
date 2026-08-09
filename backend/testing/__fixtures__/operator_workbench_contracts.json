@@ -990,7 +990,8 @@
       "orchestrator",
       "provider-routing",
       "provider-settings",
-      "settings"
+      "settings",
+      "version-lifecycle"
     ],
     "surfaces": [
       "external",

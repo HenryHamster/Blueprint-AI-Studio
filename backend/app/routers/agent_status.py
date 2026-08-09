@@ -22,7 +22,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 from app.database import get_session, resolve_async_engine
 from app.branch_resolution import classify_rollup_merge_outcome
-from app.landed_signal import apply_merged_landed_signal
+from app.landed_signal import corroborate_and_apply_merged_landed_signal
 from app.models import (
     Alert,
     AlertSeverity,
@@ -3247,6 +3247,7 @@ async def update_agent_status(
                 _gh_pr_state: str | None = None
                 _gh_pr_merged: bool = False
                 _gh_pr_base_branch: str | None = None
+                _gh_pr_merge_sha: str | None = None
                 try:
                     from app.routers.agent import get_github_token_for_task
                     from app.github import get_pull_request
@@ -3260,6 +3261,7 @@ async def update_agent_status(
                     _gh_pr_state = _pr_data.get("state")
                     _gh_pr_merged = bool(_pr_data.get("merged"))
                     _gh_pr_base_branch = (_pr_data.get("base") or {}).get("ref")
+                    _gh_pr_merge_sha = _pr_data.get("merge_commit_sha")
                 except Exception as _gh_exc:
                     # Mirror reaper behavior: assume open on transient GH failure
                     # so a brief outage doesn't strand the task as FAILED-forever.
@@ -3382,15 +3384,20 @@ async def update_agent_status(
                             f"{_landed_branch}; awaiting downstream landing"
                         )
                     if _record_pr_merged:
-                        apply_merged_landed_signal(
+                        await corroborate_and_apply_merged_landed_signal(
                             task,
                             _proj,
+                            session,
                             base_branch=_landed_branch,
                             hotfix_lane=bool(
                                 (task.first_payload or {}).get("hotfix")
                                 or (task.context or {}).get("hotfix")
                             ),
                             non_merge_reason="merged_pr_non_integration_branch",
+                            # Pin acceptance corroboration to the PR's own merge
+                            # commit; the branch-tip cache may still hold the
+                            # pre-merge tip for this out-of-band landing.
+                            merge_commit_sha=_gh_pr_merge_sha,
                         )
                     session.add(task)
                     await session.commit()

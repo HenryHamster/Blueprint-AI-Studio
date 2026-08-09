@@ -22,7 +22,10 @@ from app.broadcast import broadcast_to_project  # noqa: F401
 from app.branch_resolution import (
     _signal_blocking_project_branch_configuration,
 )
-from app.landed_signal import apply_merged_landed_signal, mark_unblocked_non_merge
+from app.landed_signal import (
+    corroborate_and_apply_merged_landed_signal,
+    mark_unblocked_non_merge,
+)
 from app.models import (
     Project,
     Task,
@@ -137,25 +140,42 @@ def _promotion_target_merge_allowed(task: Task, target_branch: str) -> bool:
     return bool(payload.get("hotfix") or ctx.get("hotfix"))
 
 
-def _merge_context_with_hotfix_non_landing(
+async def _merge_context_with_hotfix_non_landing(
     task: Task,
     project: Project | None,
+    session: AsyncSession,
     *,
     base_context: Dict[str, Any],
     landed_branch: str,
     record_pr_merged: bool,
     preserve_hotfix_non_landing: bool = True,
+    merge_commit_sha: str | None = None,
 ) -> Dict[str, Any]:
-    """Preserve merge-equivalent unblock semantics for hotfix promotion merges."""
+    """Preserve merge-equivalent unblock semantics for hotfix promotion merges.
+
+    Async because the landing write routes through the corroborating twin
+    :func:`app.landed_signal.corroborate_and_apply_merged_landed_signal`, which
+    stamps the backend's own acceptance-test corroboration BEFORE the
+    code-acceptance verdict is recorded — so an operator-approved merge mints
+    machine-proven credit for a declared test that exists in the merged tree but
+    not in the PR's diff. ``session`` is used only for that corroboration read.
+
+    ``merge_commit_sha`` is the sha the merge API just returned. Callers pass it
+    so that corroboration read is pinned to the immutable merge commit instead
+    of the branch-tip cache, whose 60s TTL can still hold the PRE-merge tip and
+    would report a test the PR itself added as absent.
+    """
     task.context = dict(base_context)
 
     if record_pr_merged:
-        apply_merged_landed_signal(
+        await corroborate_and_apply_merged_landed_signal(
             task,
             project,
+            session,
             base_branch=landed_branch,
             hotfix_lane=_promotion_target_merge_allowed(task, landed_branch),
             non_merge_reason="merged_pr_non_integration_branch",
+            merge_commit_sha=merge_commit_sha,
         )
         return dict(task.context or {})
 

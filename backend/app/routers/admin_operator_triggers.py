@@ -30,7 +30,7 @@ import time
 from app.database import get_session
 from app.depends_on_provenance import has_structural_depends_on
 from app.branch_resolution import classify_rollup_merge_outcome
-from app.landed_signal import apply_merged_landed_signal
+from app.landed_signal import corroborate_and_apply_merged_landed_signal
 from app.shared_state import (
     get_project_integration_branch,
     get_project_pr_title_prefix as _get_project_pr_title_prefix,
@@ -1011,15 +1011,20 @@ async def trigger_rollup(
                 "rollup_pr_url": rollup_pr_url,
             }
             if record_pr_merged:
-                apply_merged_landed_signal(
+                await corroborate_and_apply_merged_landed_signal(
                     task,
                     _project,
+                    session,
                     base_branch=landed_branch,
                     hotfix_lane=bool(
                         (task.first_payload or {}).get("hotfix")
                         or (task.context or {}).get("hotfix")
                     ),
                     non_merge_reason="merged_pr_non_integration_branch",
+                    # The merge API's own commit sha — pins acceptance
+                    # corroboration to the immutable merge tree instead of the
+                    # 60s-TTL branch-tip cache.
+                    merge_commit_sha=merge_result.get("sha"),
                 )
             if terminal_rollup_merge:
                 task.latest_status_message = (
@@ -1089,15 +1094,42 @@ async def trigger_rollup(
                     **(task.context or {}),
                 }
                 if record_pr_merged:
-                    apply_merged_landed_signal(
+                    # This branch learned the PR was ALREADY merged (no merge
+                    # API result to read a sha from), so resolve the merge
+                    # commit explicitly: acceptance corroboration must read the
+                    # immutable merge tree rather than the 60s-TTL branch tip.
+                    # Best-effort — a lookup failure leaves the sha unknown and
+                    # corroboration simply declines to stamp.
+                    _already_merged_sha = None
+                    try:
+                        _already_merged_detail = await get_pull_request(
+                            gh_token,
+                            owner,
+                            repo,
+                            rollup_pr_number,
+                            project_id=str(task.project_id),
+                        )
+                        _already_merged_sha = _already_merged_detail.get(
+                            "merge_commit_sha"
+                        )
+                    except Exception:  # noqa: BLE001 — never block the landing
+                        logger.warning(
+                            "[OPERATOR_ROLLUP] merge-commit lookup failed for "
+                            "already-merged PR #%s",
+                            rollup_pr_number,
+                            exc_info=True,
+                        )
+                    await corroborate_and_apply_merged_landed_signal(
                         task,
                         _project,
+                        session,
                         base_branch=landed_branch,
                         hotfix_lane=bool(
                             (task.first_payload or {}).get("hotfix")
                             or (task.context or {}).get("hotfix")
                         ),
                         non_merge_reason="merged_pr_non_integration_branch",
+                        merge_commit_sha=_already_merged_sha,
                     )
                 if terminal_rollup_merge:
                     task.latest_status_message = (

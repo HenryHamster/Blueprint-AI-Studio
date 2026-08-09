@@ -81,7 +81,11 @@ from app.branch_resolution import (
     is_custom_staged_rollup_root,
     merged_pr_counts_as_integration_landing,
 )
-from app.landed_signal import apply_merged_landed_signal, mark_unblocked_non_merge
+from app.landed_signal import (
+    LANDED_MERGE_SHA_KEY,
+    corroborate_and_apply_merged_landed_signal,
+    mark_unblocked_non_merge,
+)
 from app.shared_state import (
     runtime_config as _runtime_config,
     get_project_integration_branch as _get_project_integration_branch,
@@ -422,8 +426,11 @@ _FORCE_DROP_REASONS = frozenset(
 )
 
 
-def _propagate_landed_to_rollup_children(
-    completed_children: list[Task], session: AsyncSession
+async def _propagate_landed_to_rollup_children(
+    completed_children: list[Task],
+    session: AsyncSession,
+    *,
+    merge_commit_sha: str | None = None,
 ) -> None:
     """Stamp landed_on_integration on children carried by a landed rollup.
 
@@ -438,20 +445,40 @@ def _propagate_landed_to_rollup_children(
     review_respawn_cap) carry pr_merged=True but were never genuinely merged;
     they must retain landed_on_integration=False so they are not falsely
     credited as landed.
+
+    *merge_commit_sha* is the landed parent's merge commit, forwarded to each
+    newly-landed child so rollup children (which land via the parent's single
+    PR with no PR fetch of their own) carry exact commit identity for the
+    discovery-review receipt.
+
+    Unlike the sync predecessor, this landing path corroborates each child's
+    declared acceptance test at the merge commit BEFORE recording the verdict,
+    so a child with its OWN (GitHub-verified) changed files whose declared test
+    is absent from the diff mints machine-proven credit instead of soft.
     """
     from app.landed_signal import (
         NON_MERGE_UNBLOCK_REASON_KEY,
+        corroborate_and_mark_landed_on_integration,
         has_landed_signal,
         has_merge_unblock_signal,
-        mark_landed_on_integration,
     )
 
+    _project = (
+        await session.get(Project, completed_children[0].project_id)
+        if completed_children and completed_children[0].project_id is not None
+        else None
+    )
     for child in completed_children:
         ctx = child.context or {}
         if ctx.get(NON_MERGE_UNBLOCK_REASON_KEY) in _FORCE_DROP_REASONS:
             continue
         if has_merge_unblock_signal(child) and not has_landed_signal(child):
-            mark_landed_on_integration(child)
+            await corroborate_and_mark_landed_on_integration(
+                child,
+                session,
+                _project,
+                merge_commit_sha=merge_commit_sha,
+            )
             session.add(child)
 
 
@@ -486,9 +513,9 @@ async def _propagate_landed_to_staging_merged_descendants(
     from app import acceptance_gate as _acceptance_gate
     from app.landed_signal import (
         NON_MERGE_UNBLOCK_REASON_KEY,
+        corroborate_and_mark_landed_on_integration,
         has_landed_signal,
         has_merge_unblock_signal,
-        mark_landed_on_integration,
     )
 
     visited: set = {parent_task_id}
@@ -501,6 +528,16 @@ async def _propagate_landed_to_staging_merged_descendants(
     _parent = await session.get(Task, parent_task_id)
     _parent_ctx: dict = (_parent.context or {}) if _parent is not None else {}
     _parent_coverage: dict | None = _parent_ctx.get("test_coverage_result")
+    # The rollup's own project, loaded once so the corroboration twin can
+    # resolve GitHub credentials when it stamps a descendant's landed signal.
+    _desc_project = (
+        await session.get(Project, _parent.project_id)
+        if _parent is not None and _parent.project_id is not None
+        else None
+    )
+    # The landed parent's exact merge commit, forwarded to every descendant
+    # stamped in this walk (rollup descendants land via the parent's single PR).
+    _parent_merge_sha: str | None = _parent_ctx.get(LANDED_MERGE_SHA_KEY)
 
     # Read the landed PR-owning parent's GitHub-verified changed-file list so it
     # can be propagated DOWN to every landed descendant that lacks its own
@@ -515,6 +552,28 @@ async def _propagate_landed_to_staging_merged_descendants(
         for p in (_parent_ctx.get("_pr_changed_files") or [])
         if isinstance(p, str) and p.strip()
     ]
+
+    # Rung 6 of design doc c50453ef (closes U1): the parent's normalized
+    # acceptance-test block — the no-CI merge monitor's record of which declared
+    # test the parent's single PR genuinely ran, and how it exited — is inherited
+    # by a descendant ONLY when the block's selector/descriptor names THAT
+    # descendant's declared test path. Rollup children merge via the parent's
+    # single PR and never own a ``review_loop``, so without this a child whose
+    # declared test the parent's CI genuinely ran green would read as "did not
+    # run green" and fail closed forever. The inherited block is stored under
+    # :data:`acceptance_gate.INHERITED_ACCEPTANCE_BLOCK_KEY` at the TOP level of
+    # the child's context — never inside review_loop, which a child legitimately
+    # lacks — so the reader side (``acceptance_gate._merge_acceptance_test_block``)
+    # can find it without mistaking it for the child's own merge evidence. The
+    # per-descendant selector match is checked in the walk below; an unmatched
+    # selector propagates nothing, because a green run of some OTHER test is
+    # never credible proof of this declaration.
+    _parent_block: dict | None = (
+        _parent_ctx.get(_acceptance_gate.REVIEW_LOOP_KEY) or {}
+    ).get(_acceptance_gate.MERGE_ACCEPTANCE_BLOCK_KEY)
+    if not isinstance(_parent_block, dict):
+        _parent_block = _parent_ctx.get(_acceptance_gate.MERGE_ACCEPTANCE_BLOCK_KEY)
+    _parent_block = _parent_block if isinstance(_parent_block, dict) else None
 
     while queue:
         rows = (
@@ -581,8 +640,39 @@ async def _propagate_landed_to_staging_merged_descendants(
                     _acceptance_gate.record_code_acceptance_verdict(row)
                     _propagated = True
 
+                # Rung 6 (design doc c50453ef, closes U1): inherit the parent's
+                # acceptance-test block onto a descendant whose DECLARED named_test
+                # the block actually describes. The child's declared test ran as
+                # part of the parent's single PR; the block is the durable record
+                # that it ran (green or not — the reader fails closed on a block
+                # that did not run green). Stamped once, under the top-level
+                # inherited key, and only for a matching declaration. After
+                # stamping, re-evaluate the verdict so a stale
+                # declared_unsatisfied flips to proven.
+                if _parent_block is not None and not (row.context or {}).get(
+                    _acceptance_gate.INHERITED_ACCEPTANCE_BLOCK_KEY
+                ):
+                    _declared_path = _acceptance_gate._declared_named_test_path(
+                        row.first_payload
+                    )
+                    if _declared_path and _acceptance_gate.acceptance_test_block_matches_declared(
+                        _parent_block, _declared_path
+                    ):
+                        _inh_ctx = dict(row.context or {})
+                        _inh_ctx[
+                            _acceptance_gate.INHERITED_ACCEPTANCE_BLOCK_KEY
+                        ] = _parent_block
+                        row.context = _inh_ctx
+                        _acceptance_gate.record_code_acceptance_verdict(row)
+                        _propagated = True
+
                 if not has_landed_signal(row):
-                    mark_landed_on_integration(row)
+                    await corroborate_and_mark_landed_on_integration(
+                        row,
+                        session,
+                        _desc_project,
+                        merge_commit_sha=_parent_merge_sha,
+                    )
                     session.add(row)
                     stamped.append(row)
                 elif _propagated:
@@ -1182,6 +1272,21 @@ async def _do_rollup_post_merge_housekeeping(
         for _rep in _dir_representatives.values():
             await refresh_direction_outcomes_after_merge(_rep, session)
         await _record_completed_children_merge_evidence(completed_children, session)
+        if project is not None:
+            try:
+                await _maybe_spawn_direction_merge_grade(
+                    parent,
+                    project,
+                    session,
+                    gh_token,
+                    owner,
+                    repo,
+                    target_branch,
+                )
+            except Exception as _mg_exc:  # noqa: BLE001 — best-effort post-merge grade
+                logger.warning(
+                    f"[ROLLUP] Failed to spawn direction merge grade: {_mg_exc}"
+                )
     try:
         await delete_branch(gh_token, owner, repo, staging_branch)
     except Exception as del_err:
@@ -1250,6 +1355,127 @@ async def _do_rollup_post_merge_housekeeping(
             f"[MERGE-QUEUE] Sibling nudge after rollup PR "
             f"#{rollup_pr_number} failed: {_queue_exc}"
         )
+
+
+async def _maybe_spawn_direction_merge_grade(
+    parent: Task,
+    project: "Project",
+    session: "AsyncSession",
+    gh_token: str,
+    owner: str,
+    repo: str,
+    target_branch: str,
+) -> None:
+    """Spawn a direction-scoped blind objective grade after a landed rollup.
+
+    The parent rollup's context carries the campaign's ``direction_id`` when the
+    rollup is a multi-task campaign.  When that direction declares a gradeable
+    objective, its integrated merged diff (the integration-branch tip the rollup
+    just landed on) is graded against it via the direction-scoped spawner
+    (``release_qualifier_audit._spawn_direction_merge_grade_task``).  The
+    completed grade's verdicts are later consumed by the direction lifecycle
+    (``strategic_completion.consume_direction_merge_grade_if_ready``) into the
+    direction-scoped category-verdict ledger, and the direction's completion
+    gate then reflects the objective verdict instead of child-merge counts.
+
+    Duplicate-spawn guard: the spawned task id + candidate sha are stamped on
+    the parent context; a re-poll of the same landed merge reuses the existing
+    spawn instead of minting another grade.
+    """
+    ctx = dict(parent.context or {})
+    direction_id = str(ctx.get("direction_id") or "").strip()
+    if not direction_id:
+        return
+    direction = next(
+        (
+            d
+            for d in (project.directions or [])
+            if str(d.get("id") or "") == direction_id
+        ),
+        None,
+    )
+    if direction is None:
+        return
+    from app.release_qualifier_audit import (  # noqa: PLC0415
+        _collect_direction_merged_pr_numbers,
+        _resolve_direction_objective,
+        _spawn_direction_merge_grade_task,
+    )
+    from app.release_scoring import is_contentless_goal  # noqa: PLC0415
+
+    objective = _resolve_direction_objective(direction)
+    if not objective or is_contentless_goal(objective):
+        return
+    try:
+        from app.github_refs import get_branch_sha  # noqa: PLC0415
+
+        candidate_sha = await get_branch_sha(gh_token, owner, repo, target_branch)
+    except Exception as _sha_exc:  # noqa: BLE001 — best-effort post-merge grade
+        logger.warning(
+            f"[ROLLUP] Failed to resolve {target_branch} tip for direction "
+            f"merge grade: {_sha_exc}"
+        )
+        return
+    if not candidate_sha:
+        return
+    if ctx.get("_direction_merge_grade_candidate_sha") == candidate_sha:
+        return  # already spawned for this merged diff
+    import uuid  # noqa: PLC0415
+
+    merged_prs = await _collect_direction_merged_pr_numbers(
+        session, project.id, direction_id
+    )
+    from app.strategic_completion import (  # noqa: PLC0415
+        _direction_active_categories,
+        _direction_active_category_keys,
+    )
+
+    active_keys = await _direction_active_category_keys(
+        session, project, direction, direction_id
+    )
+    if not active_keys:
+        # No rubric to grade against — an empty active set is un-consumable:
+        # direction_objective_completion_verdict returns None for it and
+        # record_direction_merge_grade writes no ledger rows (no category
+        # verdicts), so consume_direction_merge_grade_if_ready never records the
+        # grade and the completion gate would never consult it. Skip spawning
+        # (mirrors the is_contentless_goal early-return above).
+        return
+    active_categories = await _direction_active_categories(
+        session, project, direction, active_keys
+    )
+    # The diff base is the STABLE promotion target, NOT the target_branch the
+    # candidate was resolved from: on a terminal rollup target_branch IS the
+    # integration branch, so an integration-branch base would yield an EMPTY
+    # three-dot range and the objective could never be graded.
+    from app.branch_resolution import get_project_promotion_target  # noqa: PLC0415
+
+    grade_base = get_project_promotion_target(project)
+    grade_task = await _spawn_direction_merge_grade_task(
+        session,
+        project.id,
+        direction=direction,
+        candidate_sha=candidate_sha,
+        qualification_attempt_id=uuid.uuid4(),
+        base_branch=grade_base,
+        merged_pr_numbers=merged_prs,
+        categories=active_categories or None,
+    )
+    if grade_task is None:
+        return
+    parent.context = {
+        **ctx,
+        "_direction_merge_grade_task_id": str(grade_task.id),
+        "_direction_merge_grade_candidate_sha": candidate_sha,
+    }
+    from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+
+    flag_modified(parent, "context")
+    session.add(parent)
+    logger.info(
+        f"[ROLLUP] Spawned direction merge grade {grade_task.id} for "
+        f"{direction_id} ({grade_base}...{candidate_sha[:8]}) vs objective"
+    )
 
 
 async def _record_completed_children_merge_evidence(
@@ -2874,17 +3100,28 @@ async def _check_and_trigger_rollup(
                                 **_clear_rollup_transient_state(parent.context),
                             }
                             if _landed:
-                                apply_merged_landed_signal(
+                                await corroborate_and_apply_merged_landed_signal(
                                     parent,
                                     project,
+                                    session,
                                     base_branch=target_branch,
                                     hotfix_lane=_promotion_target_rollup_allowed(
                                         parent, target_branch
                                     ),
                                     non_merge_reason="merged_pr_non_integration_branch",
+                                    # The already-merged PR payload carries its
+                                    # merge commit — pin corroboration to that
+                                    # immutable tree, not the 60s-TTL tip cache.
+                                    merge_commit_sha=pr_state.get(
+                                        "merge_commit_sha"
+                                    ),
                                 )
-                                _propagate_landed_to_rollup_children(
-                                    completed_children, session
+                                await _propagate_landed_to_rollup_children(
+                                    completed_children,
+                                    session,
+                                    merge_commit_sha=(
+                                        parent.context or {}
+                                    ).get(LANDED_MERGE_SHA_KEY),
                                 )
                                 await _propagate_landed_to_staging_merged_descendants(
                                     parent.id, session
@@ -3298,17 +3535,27 @@ async def _check_and_trigger_rollup(
                         },
                     }
                     if _landed:
-                        apply_merged_landed_signal(
+                        # No merge commit exists on this path: the zero-diff PR
+                        # was CLOSED (its branch was already equivalent to the
+                        # target) and credited as a merge-equivalent landing.
+                        # Corroboration runs unpinned and, per its own contract,
+                        # will not stamp a durable absence from a cached tip.
+                        await corroborate_and_apply_merged_landed_signal(
                             parent,
                             project,
+                            session,
                             base_branch=target_branch,
                             hotfix_lane=_promotion_target_rollup_allowed(
                                 parent, target_branch
                             ),
                             non_merge_reason="merged_pr_non_integration_branch",
                         )
-                        _propagate_landed_to_rollup_children(
-                            completed_children, session
+                        await _propagate_landed_to_rollup_children(
+                            completed_children,
+                            session,
+                            merge_commit_sha=(
+                                parent.context or {}
+                            ).get(LANDED_MERGE_SHA_KEY),
                         )
                         await _propagate_landed_to_staging_merged_descendants(
                             parent.id, session
@@ -4146,17 +4393,26 @@ async def _check_and_trigger_rollup(
                             "rollup_pr_url": rollup_pr_url,
                         }
                         if _landed:
-                            apply_merged_landed_signal(
+                            await corroborate_and_apply_merged_landed_signal(
                                 parent,
                                 project,
+                                session,
                                 base_branch=target_branch,
                                 hotfix_lane=_promotion_target_rollup_allowed(
                                     parent, target_branch
                                 ),
                                 non_merge_reason="merged_pr_non_integration_branch",
+                                # merge_pull_request returns the exact merge
+                                # commit; record it even if the ancestry gate
+                                # degraded and could not fetch the PR.
+                                merge_commit_sha=merge_result.get("sha"),
                             )
-                            _propagate_landed_to_rollup_children(
-                                completed_children, session
+                            await _propagate_landed_to_rollup_children(
+                                completed_children,
+                                session,
+                                merge_commit_sha=(
+                                    parent.context or {}
+                                ).get(LANDED_MERGE_SHA_KEY),
                             )
                             await _propagate_landed_to_staging_merged_descendants(
                                 parent.id, session
@@ -4537,6 +4793,7 @@ async def _check_and_trigger_rollup(
                                     )
                                 )
                                 _repoll_merged = False
+                                _repoll_merge_sha: str | None = None
                                 _repoll_success_ri: int | None = None
                                 _repoll_merge_fail_msg: str | None = None
                                 _repoll_authority_held = False
@@ -4640,6 +4897,7 @@ async def _check_and_trigger_rollup(
                                             )
                                         elif _rp_merge.get("merged"):
                                             _repoll_merged = True
+                                            _repoll_merge_sha = _rp_merge.get("sha")
                                             _repoll_success_ri = _ri
                                         else:
                                             _repoll_merge_fail_msg = _rp_merge.get(
@@ -4704,16 +4962,25 @@ async def _check_and_trigger_rollup(
                                         "rollup_pr_url": rollup_pr_url,
                                     }
                                     if _rp_landed:
-                                        apply_merged_landed_signal(
+                                        await corroborate_and_apply_merged_landed_signal(
                                             parent,
                                             project,
+                                            session,
                                             base_branch=target_branch,
                                             hotfix_lane=_promotion_target_rollup_allowed(
                                                 parent, target_branch
                                             ),
+                                            # Merge sha from the repoll merge —
+                                            # pins corroboration to the merge
+                                            # tree, not the cached branch tip.
+                                            merge_commit_sha=_repoll_merge_sha,
                                         )
-                                        _propagate_landed_to_rollup_children(
-                                            completed_children, session
+                                        await _propagate_landed_to_rollup_children(
+                                            completed_children,
+                                            session,
+                                            merge_commit_sha=(
+                                                parent.context or {}
+                                            ).get(LANDED_MERGE_SHA_KEY),
                                         )
                                         await _propagate_landed_to_staging_merged_descendants(
                                             parent.id, session
@@ -4997,16 +5264,27 @@ async def _check_and_trigger_rollup(
                                             "rollup_pr_url": rollup_pr_url,
                                         }
                                         if _esc_landed:
-                                            apply_merged_landed_signal(
+                                            await corroborate_and_apply_merged_landed_signal(
                                                 parent,
                                                 project,
+                                                session,
                                                 base_branch=target_branch,
                                                 hotfix_lane=_promotion_target_rollup_allowed(
                                                     parent, target_branch
                                                 ),
+                                                # Merge sha from the escalation
+                                                # merge — pins corroboration to
+                                                # the immutable merge tree.
+                                                merge_commit_sha=_esc_result.get(
+                                                    "sha"
+                                                ),
                                             )
-                                            _propagate_landed_to_rollup_children(
-                                                completed_children, session
+                                            await _propagate_landed_to_rollup_children(
+                                                completed_children,
+                                                session,
+                                                merge_commit_sha=(
+                                                    parent.context or {}
+                                                ).get(LANDED_MERGE_SHA_KEY),
                                             )
                                             await _propagate_landed_to_staging_merged_descendants(
                                                 parent.id, session

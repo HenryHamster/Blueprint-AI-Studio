@@ -5,7 +5,7 @@
 reproducible projection; this doc is the narrative form of the same model).
 
 v28's headline goal promises a **median strategist cycle under $1.50**, down from a
-measured **$4.41/cycle**. Nothing in the repo computed that number — this artifact does.
+measured **$7.52/cycle** baseline. Nothing in the repo computed that number — this artifact does.
 It derives the projected median from stated inputs, cites each input to its source,
 prices the two caching regimes separately, states every assumption, shows sensitivity,
 and reports the number honestly: **the projected median is above $1.50, and the
@@ -17,8 +17,8 @@ The same script also projects **monthly spend** (§7, criterion c-3fd62b9d): the
 monthly TOTAL is the decision-loop term (per-cycle cost × a cited cycle-volume anchor)
 plus the task-execution term (per-task cost × a cited task-volume anchor), both sourced
 from measured data and shown separately so the split is auditable. At the R=0.70
-sensitivity point and the measured realized volume the total lands at **~$837/month**
-($735 decision loop + $102 task execution) — comfortably within the $3,000/month
+sensitivity point and the measured realized volume the total lands at **~$1,355/month**
+($1,253 decision loop + $102 task execution) — comfortably within the $3,000/month
 envelope, so the envelope is not the binding constraint at today's cadence.
 
 ---
@@ -27,7 +27,7 @@ envelope, so the envelope is not the binding constraint at today's cadence.
 
 | Input | Value | Source |
 |---|---|---|
-| Baseline per-cycle cost | **$4.41/cycle** | Task-provided measurement. Corroborated at $4.43/cycle by design doc `d6c4d7fb-…` and by the `strategic_review_effort.py` docstring ("~$4.43 per cycle"). |
+| Baseline per-cycle cost | **$7.52/cycle** | The **mean of the recorded baseline readings' `cost_per_cycle`** (`docs/strategic-cycle-cost-baseline.md`, `BASELINE_READINGS` / `baseline_record()` in the script): 7.5947, 7.6329, 7.3183 → mean 7.5153, median 7.5947. Derived at module load so the anchor can never drift from the instrument. The earlier task-provided **$4.41/cycle** constant (design doc `d6c4d7fb-…` cites $4.43; the `strategic_review_effort.py` docstring cites "~$4.43 per cycle") is superseded by the recorded baseline. |
 | Mean input tokens per call | **741,992** | Task-provided measurement. Design doc cites 737,568. Inclusive per-call total = fresh input + cache read + cache creation (`mean_input_tokens_per_call`, `backend/app/llm_cost_attribution.py:1174-1178`). |
 | Baseline cache read share | **0.55** | Design doc (strategic_review vs 0.87 elsewhere; target ≥ 0.80). |
 | Stable prefix rendered | **42,073 bytes ≈ 10,518 tokens** | Measured statically: `buildStrategicStablePrefix` in `agent/src/prompts/thinker.ts` with representative params (`projectName='Blueprint AI Studio'`, `isSelfRepo=true`, 355-byte `selfImprovementBlock` from `agent/src/handlers/strategic.ts`, `PLAYBOOK_GUIDANCE`/`DEFAULT_TOOL_GUIDANCE`/`READ_ONLY_BASH_WRITE_NOTE` from `agent/src/prompt.ts`). |
@@ -38,7 +38,14 @@ envelope, so the envelope is not the binding constraint at today's cadence.
 
 **Tokens are estimated from measured bytes at 4 bytes/token** (standard English-text
 approximation). The byte counts are exact; the cost model is anchored on the measured
-$4.41/cycle, so the estimate only affects the tiny cross-cycle term (§4).
+$7.52/cycle baseline, so the estimate only affects the tiny cross-cycle term (§4).
+
+**Statistic label — mean vs median.** Each recorded `cost_per_cycle` is a **mean**
+over its cohort's cycles (`per_event_usd = total_usd / cycle_count`), while the
+projection's headline claim is about a **median** per-cycle cost. The projection
+anchors on the mean of the recorded per-reading means ($7.5153) and reports the
+recorded median ($7.5947, 1.1% higher) alongside it, so the mean-anchor is *not*
+conservative relative to this sample's median — the gap is stated, not conflated.
 
 ---
 
@@ -74,7 +81,7 @@ Within one cycle, the prompt is rendered **once** and passed to the Claude Code
 session; every later turn re-sends the fixed prompt + accumulated conversation. The
 automatic prefix cache matches the whole fixed payload (TTL 5 min, extended to 1 h
 for a frequently re-sent prefix), so the cache-read share of the cycle's input is
-large. **This regime is already priced into the measured $4.41.** The v28 stable-prefix
+large. **This regime is already priced into the measured $7.52 baseline.** The v28 stable-prefix
 reorder does **not** change it: the prompt is byte-identical across turns whether the
 stable block leads or trails.
 
@@ -104,16 +111,17 @@ Terra is exactly **0.5×** sol on every rate, so the fleet price multiplier is
 `1 − 0.5R`.
 
 ```
-projected cost = $4.41 · (1 − 0.5R) · [ φ_in · m(ρ_after)/m(ρ_before) + (1 − φ_in) ]
+projected cost = $7.52 · (1 − 0.5R) · [ φ_in · m(ρ_after)/m(ρ_before) + (1 − φ_in) ]
                 − cross_cycle_saving(R, survival)
 ```
 
-Base assumptions: `φ_in = 0.90`, `survival = 0`. Routine share `R` is **not assumed** —
-it is read from the effort-tier split (`backend/scripts/measured_effort_tier_split.json`):
-a **measured** realised share, or the **replayed fail-closed LOWER BOUND** (`--replay`).
-When neither is available R is UNMEASURED and the headline is reported **UNVERIFIED**;
-the R = 0.70 figure that previously anchored the "honest base" is now a sensitivity
-scenario, not an input.
+Base assumptions: `φ_in = 0.90`, `survival = 0`. The baseline is **$7.5153** — the mean
+of the recorded baseline readings' `cost_per_cycle` (see §1), never a constant.
+Routine share `R` is **not assumed** — it is read from the effort-tier split
+(`backend/scripts/measured_effort_tier_split.json`): a **measured** realised share, or
+the **replayed fail-closed LOWER BOUND** (`--replay`). When neither is available R is
+UNMEASURED and the headline is reported **UNVERIFIED**; the R = 0.70 figure that
+previously anchored the "honest base" is now a sensitivity scenario, not an input.
 
 ### Scenario — tier mix at R = 0.70 (the old assumed base, for reference)
 
@@ -121,7 +129,7 @@ The reorder does not move the intra-cycle share (`ρ` stays 0.55), and cross-cyc
 survival is 0:
 
 ```
-$4.41 · (1 − 0.35) = $2.87/cycle
+$7.52 · (1 − 0.35) = $4.88/cycle
 ```
 
 This is a **scenario label, not the headline**: the >=30%-below-baseline claim built
@@ -131,9 +139,9 @@ on it is UNVERIFIED until a measured routine share is checked in.
 
 ```
 m(0.80)/m(0.55) = 0.28/0.505 = 0.5545
-R = 0.70:  $4.41 · 0.65 · (0.90·0.5545 + 0.10) = $1.72/cycle
-R = 0.85:  $4.41 · 0.575 · 0.5991           = $1.52/cycle
-R = 0.90:  $4.41 · 0.55 · 0.5991            = $1.45/cycle
+R = 0.70:  $7.52 · 0.65 · (0.90·0.5545 + 0.10) = $2.93/cycle
+R = 0.85:  $7.52 · 0.575 · 0.5991           = $2.59/cycle
+R = 0.90:  $7.52 · 0.55 · 0.5991            = $2.48/cycle
 ```
 
 ---
@@ -144,26 +152,26 @@ R = 0.90:  $4.41 · 0.55 · 0.5991            = $1.45/cycle
 
 | Routine share R | Tier-only | + cache share 0.80 |
 |---|---|---|
-| 0.30 | $3.75 | $2.25 |
-| 0.50 | $3.31 | $1.98 |
-| 0.70 | $2.87 | $1.72 |
-| 0.85 | $2.54 | $1.52 |
-| 0.90 | $2.43 | $1.45 |
-| 1.00 | $2.21 | $1.32 |
+| 0.30 | $6.39 | $3.83 |
+| 0.50 | $5.64 | $3.38 |
+| 0.70 | $4.88 | $2.93 |
+| 0.85 | $4.32 | $2.59 |
+| 0.90 | $4.13 | $2.48 |
+| 1.00 | $3.76 | $2.25 |
 
-Cache-share sensitivity at R = 0.70: share 0.55 → $2.87, 0.60 → $2.64,
-0.70 → $2.18, 0.80 → $1.72.
+Cache-share sensitivity at R = 0.70: share 0.55 → $4.88, 0.60 → $4.49,
+0.70 → $3.71, 0.80 → $2.93.
 
-Cross-cycle survival at R = 0.70, share 0.55: 0.00 → $2.87, 0.10 → $2.86,
-1.00 → $2.84 (the term is negligible by construction).
+Cross-cycle survival at R = 0.70, share 0.55: 0.00 → $4.88, 0.10 → $4.88,
+1.00 → $4.85 (the term is negligible by construction).
 
 Input-cost share (φ_in) shifts everything proportionally on the input side; the
-0.80-2.87 spread in the table is driven far more by `R` and `ρ` than by `φ_in` in the
+$2.25-$6.39 spread in the table is driven far more by `R` and `ρ` than by `φ_in` in the
 plausible 0.80-0.95 range.
 
 **Routine share R is the swing factor.** The >=30%-below-baseline headline requires
-R ≥ 0.60 (tier-only `$4.41·(1 − 0.5R) ≤ $3.087 ⇔ R ≥ 0.60`). The table shows why R
-matters: at R = 0.30 the tier-only cost is $3.75 — only ~15% below baseline — so the
+R ≥ 0.60 (tier-only `$7.52·(1 − 0.5R) ≤ $5.26 ⇔ R ≥ 0.60`). The table shows why R
+matters: at R = 0.30 the tier-only cost is $6.39 — only ~15% below baseline — so the
 claim flips within the assumption's range. The fail-closed classifier
 (`strategic_review_effort.py`) routes any open message, version decision pending,
 integrity conflict, prior-dirty cycle, or recent failure to consequential — so
@@ -201,10 +209,10 @@ python3 backend/scripts/strategic_effort_tier_evidence.py --replay --days 7 \
   --write-json backend/scripts/measured_effort_tier_split.json
 ```
 
-At the measured-R boundary, the tier-only cost is $3.09/cycle at R = 0.60 (exactly 30%
-below baseline) — the claim needs R ≥ 0.60. The full tier-only range across
-R = 0.3-0.9 is $2.43-$3.75, and the projected median stays above the $1.50 headline
-across the entire range (even R = 1.0 is $2.21/cycle tier-only).
+At the measured-R boundary, the tier-only cost is $5.26/cycle at R = 0.60 (exactly 30%
+below the $7.52 baseline) — the claim needs R ≥ 0.60. The full tier-only range across
+R = 0.3-0.9 is $4.13-$6.39, and the projected median stays above the $1.50 headline
+across the entire range (even R = 1.0 is $3.76/cycle tier-only).
 
 Reaching $1.50 requires **both** of these to hold simultaneously:
 
@@ -215,11 +223,11 @@ Reaching $1.50 requires **both** of these to hold simultaneously:
 2. A routine share of ~85%+ — near the classifier's ceiling and contradicted by
    the current recovering-period signals.
 
-At the direction's own target inputs the number lands at $1.52-1.72 (R = 0.70-0.85),
+At the direction's own target inputs the number lands at $2.59-2.93 (R = 0.70-0.85),
 so the target is on the edge of the model's optimistically-parameterized range — but
 the mechanism analysis says the share lever is not available at the claimed size. The
 tier-mix lever (PR #16730) is the one reliable cost reduction, and its ceiling alone
-(R = 1) is $2.21/cycle.
+(R = 1) is $3.76/cycle.
 
 ---
 
@@ -269,18 +277,18 @@ this measurement).
 
 ```
 Scenario R=0.70 (sensitivity point), share 0.55:
-  decision loop : $2.87/cycle × 256.6 (measured) = $  735.45/month
+  decision loop : $4.88/cycle × 256.6 (measured) = $1,253.31/month
   task execution: $0.3128/task × 326.1 tasks     = $  102.02/month
-  TOTAL                                        = $  837.47/month
+  TOTAL                                        = $1,355.33/month
 Direction-target (R=0.85, share 0.80):
-  decision loop : $1.52/cycle × 256.6 (measured) = $  389.71/month
+  decision loop : $2.59/cycle × 256.6 (measured) = $  664.12/month
   task execution: $0.3128/task × 326.1 tasks     = $  102.02/month
-  TOTAL                                        = $  491.73/month
+  TOTAL                                        = $  766.14/month
 ```
 
 **Envelope verdict:** at the R=0.70 sensitivity point the TOTAL at the measured volume is
-**~$837/month** — **27.9%** of the $3,000/month envelope, comfortably within it. The
-decision-loop-only half binds at **~1,047 cycles/month** (~4.1× the measured volume);
+**~$1,355/month** — **45.2%** of the $3,000/month envelope, comfortably within it. The
+decision-loop-only half binds at **~614 cycles/month** (~2.4× the measured volume);
 the combined envelope binds at a lower volume, but task volume does not scale with
 cycle volume at the measured basis, so the script asserts no combined binds-at figure
 (rather than fabricating a scaling assumption). The envelope is therefore *not* the

@@ -1118,17 +1118,21 @@ describe('handleVerifyTests — declared acceptance-test probe', () => {
   });
 
   it('declared test RAN but NOT among the PR changed files → in_diff=false (visible pre-merge)', async () => {
-    // The declared test passes green, but the PR did not add/modify it — the
-    // backend gate will hard-fail proven=False. Surface it PRE-merge.
+    // The declared test passes green and the PR did not add/modify it — that is
+    // NOT a hard fail: the merge gate credits an unmodified test that exists at
+    // the merge commit and ran green. Surface it PRE-merge so the agent does not
+    // churn the test to force it into the diff.
     mockDiffAndRun(['app/seam.py', 'app/other.py'], 'collected 1 item\n1 passed in 0.10s');
     await handleVerifyTests('atd2', payload, declaredTask('testing/test_seam.py::test_x'), 'tok', 'o', 'r', null, { value: '' });
     const block = acceptanceBlock();
     expect(block?.status).toBe('ran');
     expect(block?.passed).toBe(true);
     expect(block?.in_diff).toBe(false);
-    // The operator-facing note carries the pre-merge warning.
+    // The operator-facing note carries the merge-time rule, not a churn order.
     const logs = lastPostedPayload().logs as string;
     expect(logs).toContain('is NOT among');
+    expect(logs).toContain('exists at the merge commit and ran green');
+    expect(logs).not.toContain('cannot earn machine-proven coverage');
   });
 
   it('basename-only changed path still matches the declared test (tolerant match)', async () => {

@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -202,6 +203,7 @@ class WorkerServiceTests(unittest.TestCase):
             "BLUEPRINT_WORKER_SECRETS_FILE": str(self.secrets),
             "BLUEPRINT_WORKER_GOOGLE_CREDENTIALS_FILE": str(self.google_credentials),
             "BLUEPRINT_DATABASE_MODE": "cloudsql-proxy",
+            "BLUEPRINT_WORKER_DEPLOY_SHA": "b" * 40,
         }
         with patch.dict(os.environ, env, clear=True):
             argv, child_env = worker.command()
@@ -239,13 +241,14 @@ class WorkerServiceTests(unittest.TestCase):
         self.assertNotIn(self.payload["GITHUB_PRIVATE_KEY"], " ".join(argv))
         self.assertNotIn(self.payload["DATABASE_URL"], " ".join(argv))
 
+    @patch.object(worker, "_oci_revision_label")
     @patch.object(worker, "_network_gateway", return_value="172.20.0.1")
     @patch.object(worker, "_assert_proxy_reachable_from_network")
     @patch.object(worker, "_wait_for_proxy")
     @patch.object(worker, "_assert_no_active_user_worker_service")
     @patch.object(worker, "_assert_no_host_ci_runner")
     def test_worker_forwards_deploy_sha_to_container(
-        self, _ci_guard, _user_worker_guard, _wait, _network_probe, _gateway
+        self, _ci_guard, _user_worker_guard, _wait, _network_probe, _gateway, _oci_label
     ):
         env = {
             "BLUEPRINT_WORKER_IMAGE_ID": f"sha256:{'a' * 64}",
@@ -254,11 +257,6 @@ class WorkerServiceTests(unittest.TestCase):
             "BLUEPRINT_WORKER_GOOGLE_CREDENTIALS_FILE": str(self.google_credentials),
             "BLUEPRINT_DATABASE_MODE": "local-postgres",
         }
-        # Absent: DEPLOY_SHA is neither set nor forwarded.
-        with patch.dict(os.environ, env, clear=True):
-            argv, child_env = worker.command()
-        self.assertNotIn("DEPLOY_SHA", child_env)
-        self.assertNotIn("DEPLOY_SHA", argv)
 
         # Present and valid: exported to the container so the leader's
         # deploy-state health tick can reconcile DeploymentState.current_sha.
@@ -270,6 +268,16 @@ class WorkerServiceTests(unittest.TestCase):
             argv, child_env = worker.command()
         self.assertEqual(child_env["DEPLOY_SHA"], "b" * 40)
         self.assertIn("DEPLOY_SHA", argv)
+        _oci_label.assert_not_called()
+
+        # Absent env var: the pinned image's OCI revision label is the
+        # fallback identity source for first-boot/rollback role environments.
+        _oci_label.return_value = "c" * 40
+        with patch.dict(os.environ, env, clear=True):
+            argv, child_env = worker.command()
+        self.assertEqual(child_env["DEPLOY_SHA"], "c" * 40)
+        self.assertIn("DEPLOY_SHA", argv)
+        _oci_label.assert_called_once_with(f"sha256:{'a' * 64}")
 
         # Malformed values fail closed rather than stamping a bogus SHA.
         with patch.dict(
@@ -279,6 +287,97 @@ class WorkerServiceTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(ValueError, "full git SHA"):
                 worker.command()
+
+    @patch.object(worker, "_oci_revision_label", return_value=None)
+    @patch.object(worker, "_network_gateway", return_value="172.20.0.1")
+    @patch.object(worker, "_assert_proxy_reachable_from_network")
+    @patch.object(worker, "_wait_for_proxy")
+    @patch.object(worker, "_assert_no_active_user_worker_service")
+    @patch.object(worker, "_assert_no_host_ci_runner")
+    def test_missing_deploy_sha_does_not_silently_start(
+        self, _ci_guard, _user_worker_guard, _wait, _network_probe, _gateway, _oci_label
+    ):
+        """A role must never start with an unknown deploy identity.
+
+        With no explicit BLUEPRINT_WORKER_DEPLOY_SHA and no OCI revision label
+        on the pinned image, ``command()`` must fail closed instead of booting
+        a container that reports serving SHA 'unknown' forever — which would
+        time out every promoted version's serving confirmation against a stale
+        singleton.
+        """
+        env = {
+            "BLUEPRINT_WORKER_IMAGE_ID": f"sha256:{'a' * 64}",
+            "BLUEPRINT_CONTROL_PLANE_NETWORK": "blueprint-control-plane",
+            "BLUEPRINT_WORKER_SECRETS_FILE": str(self.secrets),
+            "BLUEPRINT_WORKER_GOOGLE_CREDENTIALS_FILE": str(self.google_credentials),
+            "BLUEPRINT_DATABASE_MODE": "local-postgres",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaisesRegex(ValueError, "unknown deploy identity"):
+                worker.command()
+        _oci_label.assert_called_once_with(f"sha256:{'a' * 64}")
+
+    @patch.object(worker, "_oci_revision_label")
+    def test_resolve_deploy_sha_prefers_env_then_image_label_then_fails_closed(
+        self, _label
+    ):
+        image = f"sha256:{'a' * 64}"
+        # The role-specific env var is authoritative when present and valid.
+        with patch.dict(
+            os.environ, {"BLUEPRINT_WORKER_DEPLOY_SHA": "d" * 40}, clear=True
+        ):
+            self.assertEqual(
+                worker._resolve_deploy_sha("BLUEPRINT_WORKER_DEPLOY_SHA", image),
+                "d" * 40,
+            )
+        _label.assert_not_called()
+
+        # Absent env var falls back to the pinned image's OCI revision label.
+        _label.return_value = "e" * 40
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                worker._resolve_deploy_sha("BLUEPRINT_WORKER_DEPLOY_SHA", image),
+                "e" * 40,
+            )
+        _label.assert_called_once_with(image)
+
+        # A label that is not a full 40-hex SHA is not a valid identity.
+        _label.return_value = "not-a-sha"
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(ValueError, "unknown deploy identity"):
+                worker._resolve_deploy_sha("BLUEPRINT_WORKER_DEPLOY_SHA", image)
+
+        # A malformed env value fails closed before any image lookup.
+        with patch.dict(
+            os.environ, {"BLUEPRINT_WORKER_DEPLOY_SHA": "short"}, clear=True
+        ):
+            with self.assertRaisesRegex(ValueError, "full git SHA"):
+                worker._resolve_deploy_sha("BLUEPRINT_WORKER_DEPLOY_SHA", image)
+
+    @patch.object(worker.subprocess, "run")
+    def test_oci_revision_label_parses_image_inspect(self, run):
+        image = f"sha256:{'a' * 64}"
+        run.return_value = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                [{"Config": {"Labels": {"org.opencontainers.image.revision": "c" * 40}}}]
+            ),
+            stderr="",
+        )
+        self.assertEqual(worker._oci_revision_label(image), "c" * 40)
+        self.assertEqual(run.call_args.args[0], ["docker", "image", "inspect", image])
+
+        # Missing label degrades to None; the caller decides fail-closed.
+        run.return_value = SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps([{"Config": {"Labels": {}}}]),
+            stderr="",
+        )
+        self.assertIsNone(worker._oci_revision_label(image))
+
+        # Docker failure also degrades to None.
+        run.return_value = SimpleNamespace(returncode=1, stdout="", stderr="error")
+        self.assertIsNone(worker._oci_revision_label(image))
 
     @patch.object(worker, "_network_gateway", return_value="172.20.0.1")
     @patch.object(worker, "_assert_proxy_reachable_from_network")
@@ -294,6 +393,7 @@ class WorkerServiceTests(unittest.TestCase):
             "BLUEPRINT_WORKER_SECRETS_FILE": str(self.secrets),
             "BLUEPRINT_WORKER_GOOGLE_CREDENTIALS_FILE": str(self.google_credentials),
             "BLUEPRINT_DATABASE_MODE": "local-postgres",
+            "BLUEPRINT_WORKER_DEPLOY_SHA": "b" * 40,
         }
         with patch.dict(os.environ, env, clear=True):
             argv, child_env = worker.command()

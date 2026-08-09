@@ -220,7 +220,20 @@ describe('normalizeMergeGradeOutput — stable contract shape', () => {
       // Goal-verification redesign: per-category grade defaults to empty / null.
       category_verdicts: [],
       residual_uncaptured_gap: null,
+      // Direction scope discriminator defaults to '' (version-scoped path).
+      direction_id: '',
     });
+  });
+
+  it('echoes the direction scope discriminator when supplied', () => {
+    const out = normalizeMergeGradeOutput(
+      { covers_goal: false, biggest_gap: 'objective not yet met' },
+      CANDIDATE_SHA,
+      'd-1a2b3c4d5e6f',
+    );
+    expect(out.direction_id).toBe('d-1a2b3c4d5e6f');
+    // The version-scoped path (no direction) leaves it empty.
+    expect(normalizeMergeGradeOutput({ covers_goal: true }, CANDIDATE_SHA).direction_id).toBe('');
   });
 
   it('coerces per-category verdicts + residual (goal-verification redesign)', () => {
@@ -355,6 +368,27 @@ describe('handleReleaseMergeGrade — pinned candidate + diff-range pre-flight',
     const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('FAILED');
     expect(call.failure_category).toBe('diff_range_unresolvable');
+  });
+
+  it('FAILS LOUD with diff_range_unresolvable when the range is EMPTY (0 commits)', async () => {
+    // `git rev-list --count main...<sha>` prints "0" and exits 0 when base and
+    // candidate resolve to the same commit (the direction-grade terminal-rollup
+    // path IF the spawner had pinned the integration branch as base). The
+    // pre-flight must treat a zero-count range as unresolvable and FAIL the
+    // grade rather than grading a blank surface as not-met.
+    vi.mocked(git).mockImplementation((args: string[]) => {
+      if (args[0] === 'rev-parse') return CANDIDATE_SHA;
+      if (args[0] === 'rev-list') return '0'; // EMPTY symmetric difference
+      return '';
+    });
+    await handleReleaseMergeGrade(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
+    expect(call.failure_category).toBe('diff_range_unresolvable');
+    expect(call.logs).toContain(DIFF_RANGE);
+    expect(call.logs).toContain('EMPTY');
   });
 
   it('FAILS LOUD with diff_range_unresolvable when the candidate fetch fails', async () => {

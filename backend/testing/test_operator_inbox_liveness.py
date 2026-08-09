@@ -2424,3 +2424,82 @@ async def test_null_audience_reply_healed_to_operator_fyi(db_session):
     )
 
     _liveness_mod._reset_liveness_for_tests()
+
+
+class _RowCountingSession:
+    """Wraps an async session and records how many rows each ProjectMessage
+    entity SELECT actually hydrates, plus the SQL it emitted."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.entity_scans: list[tuple[str, int]] = []
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    async def execute(self, statement, *args, **kwargs):
+        result = await self._inner.execute(statement, *args, **kwargs)
+        sql = str(statement).lower()
+        is_entity_scan = (
+            "projectmessage" in sql
+            and sql.lstrip().startswith("select")
+            and "count(" not in sql
+            and "projectmessage.content" in sql
+            # A statement that carries its own LIMIT is already bounded — the
+            # escalation/alert dedupe probes are `.limit(1)` single-row lookups.
+            # Everything else that hydrates entities must carry a per-project
+            # window bound instead.
+            and " limit " not in sql
+        )
+        if not is_entity_scan:
+            return result
+        frozen = result.freeze()
+        self.entity_scans.append((sql, len(frozen().all())))
+        return frozen()
+
+
+@pytest.mark.asyncio
+async def test_message_scans_are_bounded_per_project(db_session):
+    """Batching must not drop the per-project row bound.
+
+    ``projectmessage`` is durable and ever-growing, and a leaking inbox is
+    exactly the population these predicates select.  Both entity scans (the
+    sample scan and the quarantined heal scan) must stay bounded to
+    ``sample_limit`` rows per project via a window rank, not slice an
+    unbounded SELECT in Python.
+    """
+    import app.operator_inbox_liveness as _liveness_mod
+
+    _liveness_mod._reset_liveness_for_tests()
+
+    project_id = await _create_test_project(db_session, "bounded-scan-test")
+    for _ in range(6):
+        # Operator-visible open messages — feed the sample scan.
+        await _create_forward_leaked_message(
+            db_session, project_id, audience="operator-action-needed"
+        )
+        # Quarantined replies — feed the heal scan.
+        await _create_forward_leaked_message(db_session, project_id)
+    await db_session.commit()
+
+    recording = _RowCountingSession(db_session)
+    results = await _liveness_mod.run_operator_inbox_liveness_check(
+        recording, _force=True, sample_limit=2
+    )
+    assert results is not None
+
+    assert recording.entity_scans, (
+        "expected at least one ProjectMessage entity SELECT to be recorded"
+    )
+    for sql, row_count in recording.entity_scans:
+        assert row_count <= 2, (
+            f"ProjectMessage entity scan hydrated {row_count} rows with "
+            f"sample_limit=2 — the per-project bound was lost by batching. "
+            f"SQL: {sql}"
+        )
+        assert "row_number" in sql, (
+            f"expected a row_number() per-project rank to bound the scan, "
+            f"got SQL: {sql}"
+        )
+
+    _liveness_mod._reset_liveness_for_tests()

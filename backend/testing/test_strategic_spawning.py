@@ -5281,6 +5281,7 @@ def test_agent_view_problem_model_cluster_reexported_from_sibling_module():
         "_agent_view_problem_model",
         "_agent_view_problem_model_packed",
         "_agent_view_problem_model_floor",
+        "_agent_view_problem_model_lean",
         "_compute_model_health",
         "_shrink_pm_to_floor",
         "_skeletonize_caps_friction",

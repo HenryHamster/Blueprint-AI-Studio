@@ -67,6 +67,8 @@ CHRONIC_GROWTH_PCT: float = 0.30
 
 
 class BumpRecord(TypedDict):
+    # A real commit SHA, or ``UNATTRIBUTED_COMMIT_SHA`` for a cap bump staged
+    # before the commit that will contain it exists.
     commit_sha: str
     commit_date: str  # ISO-8601
     old_cap: int
@@ -86,6 +88,12 @@ class BumpHistoryUnavailableError(Exception):
     chronic-offender verdict must treat this state as fail-closed (refuse the
     bump) rather than as "no bump history".
     """
+
+
+# A cap file and its ledger are sometimes committed together, so the commit SHA
+# cannot be known while the tree is being assembled.  This explicit marker
+# replaces the old empty-string record and is never eligible for pruning.
+UNATTRIBUTED_COMMIT_SHA = "unattributed"
 
 
 # Module-level TTL cache: (module_key, section) -> (outcome, monotonic_time)
@@ -437,9 +445,12 @@ def ledger_with_pending_bumps(
 
     ``pending`` entries are ``(section, key, old_cap, new_cap)`` — cap bumps
     not yet in the committed history (an uncommitted ``--fix`` bump, or a rollup
-    auto-bump about to be committed).  Records already present for the same
-    (key, old_cap, new_cap) are not duplicated, so a retried rollup cycle (or a
-    regenerated ``--fix``) is idempotent.
+    auto-bump about to be committed).  They are recorded with the explicit
+    ``UNATTRIBUTED_COMMIT_SHA`` marker; an empty ``commit_sha`` is never
+    appended.  Records already present for the same (key, old_cap, new_cap) are
+    not duplicated, so a retried rollup cycle (or a regenerated ``--fix``) is
+    idempotent. A later complete-history regeneration can replace the marker
+    with the actual commit SHA.
     """
     result = dict(ledger_data) if isinstance(ledger_data, dict) else {}
     history: dict = {}
@@ -453,7 +464,7 @@ def ledger_with_pending_bumps(
         if (old_cap, new_cap) not in known:
             records.append(
                 {
-                    "commit_sha": "",
+                    "commit_sha": UNATTRIBUTED_COMMIT_SHA,
                     "commit_date": now_iso,
                     "old_cap": old_cap,
                     "new_cap": new_cap,
@@ -490,7 +501,12 @@ def rebuild_cap_bump_history_ledger(
     rebuilt from the mainline ancestry, and only if that would not drop a
     record the existing ledger already holds for a current key is the mirror
     replaced outright (the merge path keeps both).  ``git log`` itself never
-    runs on a truncated checkout.  ``caps_json_path`` / ``ledger_path``
+    runs on a truncated checkout.  On ANY checkout where git is available —
+    including truncated ones — the mirror is then self-healed by pruning only
+    records that positive git evidence proves fabricated
+    (:func:`phantom_ledger_records`). Missing or otherwise unverifiable evidence
+    is preserved, never treated as proof of fabrication. ``caps_json_path`` /
+    ``ledger_path``
     default to the shipped files (under ``backend/testing/``); callers with a
     hermetic fixture repo pass the fixture paths.
     """
@@ -507,7 +523,8 @@ def rebuild_cap_bump_history_ledger(
     )
 
     git_output = None
-    if _git_reads_history_here() and not _git_history_is_truncated():
+    git_available = _git_reads_history_here()
+    if git_available and not _git_history_is_truncated():
         try:
             result = subprocess.run(
                 [
@@ -557,8 +574,29 @@ def rebuild_cap_bump_history_ledger(
         else:
             base_history = git_histories
     else:
-        # git entirely unavailable — preserve the existing mirror.
+        # git entirely unavailable, or the checkout is truncated — preserve the
+        # existing mirror (a truncated ``git log`` must never truncate it).
         base_history = existing_history
+
+    if git_available:
+        # Self-heal: prune ledger records positive mainline evidence proves
+        # fabricated (a wrong old_cap, a decrease mis-filed as a bump, or a
+        # non-ancestor commit). Without this the
+        # _git_would_drop_ledger_records merge safety net would preserve them
+        # FOREVER — a phantom pair is by definition absent from git's bump set,
+        # so regeneration would "drop" it and the merge path would merge it
+        # straight back in.  Unlike the full-history regeneration above, this
+        # runs on truncated checkouts too (every CI shard and agent VM is
+        # shallow). phantom_ledger_records skips every record whose provenance
+        # cannot be corroborated; only positive contradictory evidence is
+        # returned for pruning.
+        phantoms = phantom_ledger_records(
+            repo_root=_REPO_ROOT,
+            ledger_path=out_path,
+            history=existing,
+        )
+        if phantoms:
+            base_history = _prune_phantom_records(base_history, phantoms)
 
     ledger = {
         "_doc": (
@@ -614,6 +652,49 @@ def _git_would_drop_ledger_records(
     return False
 
 
+def _prune_phantom_records(
+    base_history: dict,
+    phantoms: "list[tuple[str, str, int, int, str, str]]",
+) -> dict[str, dict[str, list[BumpRecord]]]:
+    """Remove from ``base_history`` every record ``phantoms`` flags.
+
+    ``phantoms`` is the output of :func:`phantom_ledger_records` — each entry
+    ``(section, key, old_cap, new_cap, commit_sha, reason)`` identifies a
+    record the mainline git history cannot justify.  Records are matched on all
+    five identifying fields so a real bump sharing a pair with a phantom (same
+    key/pair at a different commit) is never dropped.
+    """
+    phantom_keys = {
+        (section, key, old_cap, new_cap, sha)
+        for (section, key, old_cap, new_cap, sha, _reason) in phantoms
+    }
+    pruned: dict[str, dict[str, list[BumpRecord]]] = {}
+    for section, keys in base_history.items():
+        if not isinstance(keys, dict):
+            continue
+        section_out: dict[str, list[BumpRecord]] = {}
+        for key, records in keys.items():
+            if not isinstance(records, list):
+                continue
+            kept = [
+                r
+                for r in records
+                if (
+                    section,
+                    key,
+                    r.get("old_cap"),
+                    r.get("new_cap"),
+                    r.get("commit_sha"),
+                )
+                not in phantom_keys
+            ]
+            if kept:
+                section_out[key] = kept
+        if section_out:
+            pruned[section] = section_out
+    return pruned
+
+
 def _merge_bump_histories(
     existing_history: dict, git_histories: dict[str, dict[str, list[BumpRecord]]]
 ) -> dict[str, dict[str, list[BumpRecord]]]:
@@ -646,13 +727,44 @@ def _merge_bump_histories(
     return {s: sec for s, sec in merged.items() if sec}
 
 
+def _split_git_log_chunks(output: str) -> list[tuple[str, str, str]]:
+    """Split ``git log -p`` output into ``(commit_sha, commit_date, diff_text)`` chunks.
+
+    Extracted from :func:`_parse_git_diff_output` so callers that need every
+    commit's raw diff — the phantom-ledger check, which verifies each ledger
+    record against its own commit — share the same commit-splitting instead of
+    re-deriving it.  A commit header is ``COMMIT <sha> <date>``; everything
+    after it until the next header is that commit's diff text.
+    """
+    chunks: list[tuple[str, str, str]] = []
+    current_sha = ""
+    current_date = ""
+    current_lines: list[str] = []
+
+    for line in output.split("\n"):
+        if line.startswith("COMMIT "):
+            if current_sha:
+                chunks.append((current_sha, current_date, "\n".join(current_lines)))
+            parts = line.split(" ", 2)
+            current_sha = parts[1] if len(parts) > 1 else ""
+            current_date = parts[2].strip() if len(parts) > 2 else ""
+            current_lines = []
+        else:
+            current_lines.append(line)
+
+    if current_sha:
+        chunks.append((current_sha, current_date, "\n".join(current_lines)))
+    return chunks
+
+
 def _parse_git_diff_output(output: str, module_key: str) -> list[BumpRecord]:
     """Parse ``git log -p`` output for cap increases of ``module_key``.
 
-    Splits the output on "COMMIT <sha> <date>" header lines, then within each
-    commit's diff looks for ``-    "<key>": <int>`` (removed) and
-    ``+    "<key>": <int>`` (added) lines.  Records only increases
-    (new_cap > old_cap) — a decrease or reset is not a bump.
+    Splits the output on "COMMIT <sha> <date>" header lines (via
+    :func:`_split_git_log_chunks`), then within each commit's diff looks for
+    ``-    "<key>": <int>`` (removed) and ``+    "<key>": <int>`` (added)
+    lines.  Records only increases (new_cap > old_cap) — a decrease or reset
+    is not a bump.
 
     Merge-duplicated bump pairs are collapsed: the same cap change
     (old_cap -> new_cap) is frequently recorded twice in ``git log --all`` —
@@ -673,27 +785,7 @@ def _parse_git_diff_output(output: str, module_key: str) -> list[BumpRecord]:
     # Matches +/- diff lines containing the key and a numeric cap value.
     cap_re = re.compile(rf'^([+-])\s+"{re.escape(module_key)}":\s*(\d+)', re.MULTILINE)
 
-    # Accumulate (sha, date, diff_text) for each commit.
-    chunks: list[tuple[str, str, str]] = []
-    current_sha = ""
-    current_date = ""
-    current_lines: list[str] = []
-
-    for line in output.split("\n"):
-        if line.startswith("COMMIT "):
-            if current_sha:
-                chunks.append((current_sha, current_date, "\n".join(current_lines)))
-            parts = line.split(" ", 2)
-            current_sha = parts[1] if len(parts) > 1 else ""
-            current_date = parts[2].strip() if len(parts) > 2 else ""
-            current_lines = []
-        else:
-            current_lines.append(line)
-
-    if current_sha:
-        chunks.append((current_sha, current_date, "\n".join(current_lines)))
-
-    for sha, date, diff_text in chunks:
+    for sha, date, diff_text in _split_git_log_chunks(output):
         old_cap: int | None = None
         new_cap: int | None = None
         for m in cap_re.finditer(diff_text):
@@ -731,6 +823,337 @@ def _parse_git_diff_output(output: str, module_key: str) -> list[BumpRecord]:
     )
 
 
+def _diff_bump_pairs(diff_text: str) -> dict[str, set[tuple[int, int]]]:
+    """Map every key a diff touches to its bump pairs.
+
+    For one commit's diff text, collect each ``-    "<key>": <old>`` /
+    ``+    "<key>": <new>`` pair and record the pair ONLY when it is an
+    increase (new > old).  A decrease or reset is not a bump and cannot
+    justify a ledger record — which is exactly why a decrease mis-filed in the
+    ledger is a phantom.  Unlike :func:`_parse_git_diff_output` (one key,
+    deduped across commits), this maps EVERY key in the diff, the per-commit
+    source of truth the phantom-ledger check compares ledger records against.
+    """
+    cap_re = re.compile(r'^([+-])\s+"([^"]+)":\s*(\d+)', re.MULTILINE)
+    by_key: dict[str, tuple[int | None, int | None]] = {}
+    for m in cap_re.finditer(diff_text):
+        sign, key, val_str = m.group(1), m.group(2), m.group(3)
+        val = int(val_str)
+        old_cap, new_cap = by_key.get(key, (None, None))
+        if sign == "-":
+            by_key[key] = (val, new_cap)
+        elif sign == "+":
+            by_key[key] = (old_cap, val)
+    out: dict[str, set[tuple[int, int]]] = {}
+    for key, (old_cap, new_cap) in by_key.items():
+        if old_cap is not None and new_cap is not None and new_cap > old_cap:
+            out.setdefault(key, set()).add((old_cap, new_cap))
+    return out
+
+
+def _git_log_bump_map(output: str) -> dict[str, dict[str, set[tuple[int, int]]]]:
+    """Build ``commit_sha -> {key: {(old_cap, new_cap)}}`` from ``git log -p`` output.
+
+    The per-commit bump map the phantom-ledger check verifies ledger records
+    against.  Merge-duplicated pairs are NOT collapsed here (unlike
+    :func:`_parse_git_diff_output`): each commit is verified on its own merits,
+    and the same pair legitimately appearing in two commits justifies a ledger
+    record pointing at either one.
+    """
+    result: dict[str, dict[str, set[tuple[int, int]]]] = {}
+    for sha, _date, diff_text in _split_git_log_chunks(output):
+        pairs = _diff_bump_pairs(diff_text)
+        if pairs:
+            result[sha] = pairs
+    return result
+
+
+def _resolve_shas(shas: set[str], repo_root: str) -> dict[str, bool]:
+    """Return ``{sha: is_resolvable}`` for a set of SHAs via ONE batch call.
+
+    ``git cat-file --batch-check`` answers every SHA in a single subprocess
+    instead of one ``git cat-file`` per record — the ledger holds hundreds of
+    records and per-SHA probing would shell hundreds of times.
+    """
+    if not shas:
+        return {}
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-c",
+                f"safe.directory={repo_root}",
+                "cat-file",
+                "--batch-check=%(objectname) %(objecttype)",
+            ],
+            input="\n".join(sorted(shas)) + "\n",
+            capture_output=True,
+            text=True,
+            timeout=30,
+            cwd=repo_root,
+        )
+    except Exception:  # noqa: BLE001 — a probe; treat as unresolvable below
+        return {}
+    resolved: dict[str, bool] = {}
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        resolved[parts[0]] = len(parts) >= 2 and parts[1] != "missing"
+    return resolved
+
+
+def _commit_in_mainline_ancestry(sha: str, repo_root: str) -> bool | None:
+    """True when ``sha`` is in the mainline ancestry, False when provably not.
+
+    ``None`` means the probe could not answer (git error / unreadable ref) —
+    the caller must then fail closed on a complete checkout and skip on a
+    truncated one.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-c",
+                f"safe.directory={repo_root}",
+                "merge-base",
+                "--is-ancestor",
+                sha,
+                _mainline_git_ref(repo_root),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            cwd=repo_root,
+        )
+    except Exception:  # noqa: BLE001 — a probe; caller decides the fallback
+        return None
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    return None
+
+
+def _git_show_file_diff(sha: str, repo_root: str) -> str | None:
+    """Return the commit's diff of ``module_size_limits.json``, or ``None``.
+
+    Used to verify a ledger record whose commit does not appear in the partial
+    mainline ``git log`` (a beyond-boundary ancestor whose objects happen to be
+    present in a shallow clone).  ``git show`` can render that commit's diff
+    directly even though the log traversal stops at the shallow boundary.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-c",
+                f"safe.directory={repo_root}",
+                "show",
+                sha,
+                "--",
+                _MODULE_SIZE_LIMITS_RELPATH,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            cwd=repo_root,
+        )
+    except Exception:  # noqa: BLE001 — a probe; caller decides the fallback
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
+def phantom_ledger_records(
+    *,
+    repo_root: str | None = None,
+    ledger_path: str | None = None,
+    history: dict | None = None,
+) -> list[tuple[str, str, int, int, str, str]]:
+    """Return ledger records the mainline git history cannot justify.
+
+    Each returned entry is ``(section, key, old_cap, new_cap, commit_sha,
+    reason)`` — a record in the cap-bump-history ledger that positive git
+    evidence proves contradictory to the named commit. This is the REVERSE
+    direction of the ``git ⊆ ledger`` guard: while that guard proves the mirror
+    is not missing a git-recorded bump, this proves no record the mirror holds
+    is fabricated — a wrong ``old_cap``, a decrease mis-filed as a bump, or a
+    non-ancestor commit. Empty and explicitly unattributed records are always
+    preserved because absent or unverifiable evidence cannot justify deletion.
+
+    Runs on a truncated/shallow checkout too — every CI shard and agent VM — so
+    the phantom check is not skipped exactly where the ledger most often
+    drifts.  Records whose SHA resolves in the partial history ARE verified;
+    only records the partial history cannot adjudicate are skipped:
+
+    * a SHA that does not resolve on a shallow checkout (the object was never
+      fetched) — skipping is provably safe there, because a fabricated SHA is
+      indistinguishable from a genuine beyond-boundary bump when the object is
+      gone; and
+    * a beyond-boundary ancestor whose ancestry probe cannot answer.
+
+    Even on a complete checkout, an unresolved or unreadable provenance check is
+    preserved. A record is prunable only when the available diff or ancestry
+    result positively contradicts it.
+
+    ``history`` (the full ledger dict) defaults to the shipped ledger at
+    ``ledger_path``; ``repo_root`` defaults to ``_REPO_ROOT``.
+    """
+    root = repo_root or _REPO_ROOT
+    if not _git_reads_history_here():
+        # No git checkout — nothing to verify the ledger against.  The ledger
+        # is the only history source in the deployed layout by design.
+        return []
+    if history is None:
+        out_path = ledger_path or _CAP_BUMP_HISTORY_LEDGER_PATH
+        try:
+            with open(out_path, encoding="utf-8") as f:
+                ledger = json.load(f)
+        except (OSError, ValueError):
+            return []
+    else:
+        ledger = history
+        out_path = ledger_path or _CAP_BUMP_HISTORY_LEDGER_PATH
+
+    ref = _mainline_git_ref(root)
+    if ref == "HEAD":
+        # No mainline branch present (a feature-branch-only clone): the ref
+        # helper fell back to HEAD, whose ancestry is not the ledger's source of
+        # truth.  Same clear-skip the cap-raise guard uses — a phantom verdict
+        # needs the mainline ancestry to compare against.
+        return []
+
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-c",
+                f"safe.directory={root}",
+                "log",
+                ref,
+                "--format=COMMIT %H %aI",
+                "-p",
+                "--",
+                _MODULE_SIZE_LIMITS_RELPATH,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            cwd=root,
+        )
+    except Exception:  # noqa: BLE001 — unreadable git: nothing verifiable
+        return []
+    if result.returncode != 0:
+        return []
+    bump_map = _git_log_bump_map(result.stdout)
+
+    # Collect records and the SHAs they cite, then resolve all SHAs in one batch.
+    records: list[tuple[str, str, int, int, str]] = []
+    shas: set[str] = set()
+    ledger_history = ledger.get("history") if isinstance(ledger, dict) else None
+    for section, keys in (ledger_history or {}).items():
+        if not isinstance(keys, dict):
+            continue
+        for key, recs in keys.items():
+            if not isinstance(recs, list):
+                continue
+            for rec in recs:
+                if not isinstance(rec, dict):
+                    continue
+                sha = str(rec.get("commit_sha") or "")
+                try:
+                    old_cap = int(rec["old_cap"])
+                    new_cap = int(rec["new_cap"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if sha and sha != UNATTRIBUTED_COMMIT_SHA:
+                    shas.add(sha)
+                records.append((section, key, old_cap, new_cap, sha))
+    resolved = _resolve_shas(shas, root) if shas else {}
+
+    phantoms: list[tuple[str, str, int, int, str, str]] = []
+    for section, key, old_cap, new_cap, sha in records:
+        if not sha or sha == UNATTRIBUTED_COMMIT_SHA:
+            # Rollup-pending or legacy unattributed bump: written before the
+            # commit that bumps the cap exists; nothing to verify against yet.
+            continue
+        pair = (old_cap, new_cap)
+        commit_pairs = bump_map.get(sha, {}).get(key, set())
+        if sha in bump_map:
+            # The commit is in the (partial) mainline log — we have its diff.
+            if pair not in commit_pairs:
+                phantoms.append(
+                    (
+                        section,
+                        key,
+                        old_cap,
+                        new_cap,
+                        sha,
+                        "commit's diff shows no recorded bump for this key/pair",
+                    )
+                )
+            continue
+        # SHA not in the mainline log: resolve it and pin down why.
+        if not resolved.get(sha, False):
+            # Evidence is absent, not positive proof of fabrication.
+            continue
+        ancestry = _commit_in_mainline_ancestry(sha, root)
+        if ancestry is False:
+            phantoms.append(
+                (
+                    section,
+                    key,
+                    old_cap,
+                    new_cap,
+                    sha,
+                    "commit is not in the mainline ancestry",
+                )
+            )
+            continue
+        if ancestry is None:
+            # An ancestry probe failure is evidence loss, not proof of a fake
+            # record. Never delete on this polarity.
+            continue
+        # A beyond-boundary ancestor whose objects are present in this (possibly
+        # shallow) checkout: render its diff directly and verify the pair.
+        diff_text = _git_show_file_diff(sha, root)
+        if diff_text is None:
+            # An unreadable diff cannot establish fabrication.
+            continue
+        shown_pairs = _diff_bump_pairs(diff_text).get(key, set())
+        if pair not in shown_pairs:
+            phantoms.append(
+                (
+                    section,
+                    key,
+                    old_cap,
+                    new_cap,
+                    sha,
+                    "commit's diff shows no recorded bump for this key/pair",
+                )
+            )
+    return phantoms
+
+
+def cap_history_chain_breaks(history: list[BumpRecord]) -> list[tuple[int, int]]:
+    """Return upward breaks in a module's ordered cap-bump history.
+
+    Consecutive records should form a chain: the next record's ``old_cap``
+    equals the previous record's ``new_cap``. A lower next ``old_cap`` is a
+    legitimate cap decrease and is intentionally ignored; only an upward gap
+    can represent a deleted cap-raise record. The returned pairs are
+    ``(previous_new_cap, next_old_cap)``.
+    """
+    ordered = sorted(history, key=lambda r: _parse_iso(r["commit_date"]))
+    return [
+        (previous["new_cap"], current["old_cap"])
+        for previous, current in zip(ordered, ordered[1:])
+        if current["old_cap"] > previous["new_cap"]
+    ]
+
+
 def _is_chronic_offender(history: list[BumpRecord]) -> bool:
     """Return True when ``history`` meets the chronic-offender threshold.
 
@@ -743,18 +1166,28 @@ def _is_chronic_offender(history: list[BumpRecord]) -> bool:
        AND there are at least ``CHRONIC_BUMP_THRESHOLD`` bumps on record
        (avoids false-positives from a single jump on a fresh file).
     """
+    # A missing record is evidence loss, not permission to grant a routine
+    # bump. An upward chain break is the observable residue of a deleted cap
+    # raise; classify it as chronic so self-heal cannot loosen governance while
+    # the ledger is incomplete. Downward breaks are legal cap decreases and are
+    # deliberately excluded by cap_history_chain_breaks().
+    if cap_history_chain_breaks(history):
+        return True
+
     if len(history) < CHRONIC_BUMP_THRESHOLD:
         return False
 
+    ordered = sorted(history, key=lambda r: _parse_iso(r["commit_date"]))
+
     # Trigger 1 — window check.
     cutoff = datetime.now(timezone.utc) - timedelta(days=CHRONIC_WINDOW_DAYS)
-    recent_count = sum(1 for r in history if _parse_iso(r["commit_date"]) >= cutoff)
+    recent_count = sum(1 for r in ordered if _parse_iso(r["commit_date"]) >= cutoff)
     if recent_count >= CHRONIC_BUMP_THRESHOLD:
         return True
 
     # Trigger 2 — cumulative growth check.
-    first_cap = history[0]["old_cap"]
-    current_cap = history[-1]["new_cap"]
+    first_cap = ordered[0]["old_cap"]
+    current_cap = ordered[-1]["new_cap"]
     return first_cap > 0 and (current_cap - first_cap) / first_cap >= CHRONIC_GROWTH_PCT
 
 

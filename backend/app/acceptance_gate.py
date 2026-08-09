@@ -43,6 +43,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Mapping
 
 from app.ci_resolution import is_degraded_unverified_reason
+from app.landed_signal import LANDED_MERGE_SHA_KEY
 from app.landed_signal import REVIEW_LOOP_KEY, UNVERIFIED_MERGE_REASON_KEY
 from app.landed_signal import merge_verification_status
 from sqlalchemy import String, and_, cast, exists, not_, or_
@@ -129,9 +130,23 @@ CODE_ACCEPTANCE_VERDICT_KEY = "code_acceptance_verdict"
 # 1-2 of design doc c50453ef). A later qualification reads this field to tell
 # which recorded rows were judged by a now-retired rule and re-derive them via
 # the pure :func:`evaluate_acceptance` core instead of trusting a stale verdict.
-# Bumped whenever the acceptance evaluation rules change. Nothing consumes the
-# field yet — this rung only stamps it, behaviour-preservingly.
-ACCEPTANCE_RULE_VERSION = 1
+# Bumped whenever the acceptance evaluation rules change. Consumed by
+# :func:`effective_acceptance_verdict` (rung 3), which re-derives any recorded
+# row whose stamp predates the current rule.
+#
+# v2: the evaluation rules changed this version — :func:`_merge_acceptance_test_block`
+# now also reads the inherited rollup-child block (:data:`INHERITED_ACCEPTANCE_BLOCK_KEY`)
+# and the window-corroboration marker semantics changed, so a row stamped under v1
+# can score differently under the current core. Bumping retires those v1 stamps so
+# rung 3 re-derives them instead of trusting a verdict the retired rule produced.
+ACCEPTANCE_RULE_VERSION = 2
+
+# ``rederived_by`` stamped on a re-derived verdict (design doc c50453ef §5).
+# Identifies the actor that re-scored already-merged work so an auditor can tell
+# a land-time stamp from a qualification-time correction. Every re-derivation
+# goes through :func:`effective_acceptance_verdict`, which runs at qualification
+# time inside the qualifier's acceptance-window tally — hence the qualifier label.
+REDERIVED_BY_QUALIFIER = f"qualifier:v{ACCEPTANCE_RULE_VERSION}"
 
 # Durable top-level context key where a PRE-MERGE structural acceptance finding
 # is stamped while a PR is still open. Lives at the TOP level (not inside
@@ -587,6 +602,19 @@ def _acceptance_test_targeted_green(
 # STRING ("pass"/"fail"/"undetected") and therefore can never carry the block.
 MERGE_ACCEPTANCE_BLOCK_KEY = "verify_tests_acceptance_block"
 
+# Durable top-level context key where a ROLLUP CHILD receives its parent's
+# normalized acceptance-test block when the parent's block names the CHILD's
+# declared test path (rung 6 of design doc c50453ef, closing U1). Rollup
+# children merge via the parent's single PR and never own a ``review_loop``, so
+# without this a child's declared test that the parent's CI genuinely ran green
+# reads as "did not run green" and fails closed forever. Lives at the TOP level
+# (like ``_pr_changed_files``) because the child's ``review_loop`` is
+# deliberately absent — an inherited block must never be mistaken for the
+# child's own merge evidence. The propagation site (``rollup_management``)
+# copies the parent's block ONLY when its ``selector``/``descriptor`` matches
+# the child's declared test path; an unmatched selector propagates nothing.
+INHERITED_ACCEPTANCE_BLOCK_KEY = "_inherited_acceptance_block"
+
 
 def _merge_acceptance_test_block(context: Mapping[str, Any] | None) -> dict | None:
     """Read the declared acceptance test's normalized merge-test block, defensively.
@@ -599,15 +627,26 @@ def _merge_acceptance_test_block(context: Mapping[str, Any] | None) -> dict | No
     persisted the block, yields ``None`` — so every caller MUST still fall back to
     :func:`_acceptance_test_targeted_green`, which those tasks do carry.
 
+    For a ROLLUP CHILD (which never owns a ``review_loop``), the reader falls
+    back to the top-level :data:`INHERITED_ACCEPTANCE_BLOCK_KEY` block the rollup
+    propagation stamped from its parent — the block describes the child's
+    declared test (the propagation site matches the selector), so ``test_exists``
+    / ``ran_green`` for an unmodified declared test on a rollup child are
+    readable from the same normalized shape. ``_acceptance_test_targeted_green``
+    deliberately does NOT read the inherited block: the targeted-green signal is
+    per-PR evidence and is never propagated to a child.
+
     Context-shaped (a bare ``context`` dict, not a ``Task``) so the pure
     evaluation core (:func:`evaluate_acceptance`) can re-derive verdicts from
     persisted merge records.
     """
     review_loop = (context or {}).get(REVIEW_LOOP_KEY)
-    if not isinstance(review_loop, dict):
-        return None
-    block = review_loop.get(MERGE_ACCEPTANCE_BLOCK_KEY)
-    return block if isinstance(block, dict) else None
+    if isinstance(review_loop, dict):
+        block = review_loop.get(MERGE_ACCEPTANCE_BLOCK_KEY)
+        if isinstance(block, dict):
+            return block
+    inherited = (context or {}).get(INHERITED_ACCEPTANCE_BLOCK_KEY)
+    return inherited if isinstance(inherited, dict) else None
 
 
 # Internal, BACKEND-computed marker recording whether the declared acceptance
@@ -621,6 +660,15 @@ def _merge_acceptance_test_block(context: Mapping[str, Any] | None) -> dict | No
 # agent-reported evidence rather than suppress a genuinely-existing test on
 # missing data).
 ACCEPTANCE_TEST_CORROBORATED_KEY = "_acceptance_test_corroborated"
+
+# Durable "corroboration was already attempted at this merge commit" marker,
+# written by the release qualifier's acceptance-window backfill pass. A
+# corroboration that returns False/None stamps NO
+# :data:`ACCEPTANCE_TEST_CORROBORATED_KEY`, so without this marker the same
+# tasks would be re-read from GitHub on every subsequent qualifier drive
+# forever. The value is the merge sha that was read (not a bare boolean), so a
+# task that later lands on a NEW merge commit is eligible for a fresh attempt.
+WINDOW_CORROBORATION_ATTEMPTED_SHA_KEY = "_acceptance_corroboration_attempted_sha"
 
 
 def _declared_test_reference(
@@ -783,6 +831,73 @@ async def corroborate_acceptance_test_at_merge(
     return False
 
 
+async def corroborate_acceptance_for_landing(
+    task: Task,
+    session: Any,
+    project: Any = None,
+    *,
+    branch: str | None = None,
+    commit_sha: str | None = None,
+) -> bool | None:
+    """Run :func:`corroborate_acceptance_test_at_merge` and stamp its marker.
+
+    This is the reusable "corroborate + stamp" wrapper every integration-landing
+    path calls BEFORE it records the code-acceptance verdict, so a declared test
+    that is ABSENT from the PR's diff but PRESENT in the merged tree can mint
+    machine-proven coverage (see :func:`_evaluate_named_test` — the proven mint
+    for a not-in-diff test requires the backend's own
+    :data:`ACCEPTANCE_TEST_CORROBORATED_KEY` to be ``True``). Previously only the
+    orchestrator CI monitor stamped the marker; every other landing path
+    (:func:`app.landed_signal.mark_landed_on_integration` callers) left it
+    absent and the gate fell back to agent self-report, capping a genuinely
+    existing not-in-diff test at soft/unproven credit forever.
+
+    Stamps the marker onto ``task.context`` ONLY when corroboration produced a
+    definitive tri-state (``True``/``False``); an indeterminate ``None`` leaves
+    the marker absent so the evaluation core falls back to agent-reported
+    evidence. Best-effort — never raises, so a corroboration failure can never
+    abort a real merge landing. The caller is responsible for committing.
+
+    ONE EXTRA GUARD on the durable ``False``: a corroborated ABSENCE is only
+    stamped when the read was PINNED to an immutable *commit_sha*. Without it
+    the read goes through the branch-tip cache
+    (:data:`app.github_repo_snapshot._BRANCH_SHA_TTL_S`, 60s), which moments
+    after a merge can still serve the PRE-merge tip and report a test the PR
+    itself just added as absent — and that ``False`` is durable and overrides
+    the agent's targeted-green evidence in
+    :func:`_acceptance_test_exists_at_merge` forever. An unpinned absence
+    therefore leaves the marker unstamped (today's fallback behaviour) rather
+    than recording a verdict the cache cannot support. A ``True`` needs no such
+    guard: a stale tip proves the test existed even BEFORE the merge.
+
+    Returns the corroboration result (``True``/``False``/``None``) so a caller
+    that needs a CONSERVATIVE backfill (only upgrade, never downgrade — see
+    ``_compute_acceptance_window_aggregate``) can decide not to re-record on a
+    corroborated absence.
+    """
+    try:
+        result = await corroborate_acceptance_test_at_merge(
+            task,
+            session,
+            project=project,
+            branch=branch,
+            commit_sha=commit_sha,
+        )
+        if result is True or (result is False and commit_sha):
+            task.context = {
+                **(task.context or {}),
+                ACCEPTANCE_TEST_CORROBORATED_KEY: result,
+            }
+        return result
+    except Exception:  # noqa: BLE001 — corroboration must never abort a landing
+        logger.warning(
+            "corroborate_acceptance_for_landing failed for task %s",
+            getattr(task, "id", None),
+            exc_info=True,
+        )
+        return None
+
+
 def _acceptance_test_exists_at_merge(
     context: Mapping[str, Any] | None, declared_path: str | None = None
 ) -> bool:
@@ -937,9 +1052,14 @@ def _evaluate_named_test(
     files still drops every path beyond index 50. A legitimately declared test
     lying beyond that stored prefix would read as absent and unsoundly hard-fail a
     truthful declaration. So truncation always yields the soft (inconclusive)
-    credit above; nothing overrides it. Where the list is complete
-    (``truncated=False``), the plain hard-fail below already applies and is
-    genuinely authoritative because every changed path is stored.
+    credit above; nothing overrides it — EXCEPT a backend-refuted
+    :data:`ACCEPTANCE_TEST_CORROBORATED_KEY` (``corroborated is False``). That is
+    not a data artifact: the backend checked the EXACT merge-commit tree and
+    confirmed the declared test exists nowhere, so the truncation premise ("may
+    ship beyond the stored prefix") is provably defeated and the hard fail below
+    applies. Where the list is complete (``truncated=False``), the plain
+    hard-fail below already applies and is genuinely authoritative because every
+    changed path is stored.
 
     ``parent_derived`` marks that the changed-file list was INHERITED from a
     rollup parent's combined diff (the union of all siblings' changes) rather than
@@ -972,6 +1092,9 @@ def _evaluate_named_test(
     (``None``: never computed / credentials missing / snapshot unavailable) caps
     the credit at ``satisfied=True, proven=False``: honest missing data never
     penalizes the merge, but the agent's word alone never mints machine proof.
+    A corroborated ABSENCE (``False``) is stronger still: it overrides even the
+    truncation soft credit — a >50-file PR whose declared test the backend proves
+    exists nowhere cannot claim the "may ship beyond the stored prefix" excuse.
     An in-diff test is unaffected — presence in the GitHub-sourced diff is
     already backend-grounded evidence.
     """
@@ -1000,6 +1123,25 @@ def _evaluate_named_test(
             "test does not prove this declaration",
         )
     if not test_present:
+        if truncated and corroborated is False:
+            # The truncation soft credit rests on the premise that the declared
+            # test "may ship beyond the stored 50-path prefix". A backend-REFUTED
+            # corroboration defeats that premise: the backend checked the exact
+            # merge-commit tree and confirmed the declared test exists NOWHERE, so
+            # its absence is proven rather than inconclusive. This closes the
+            # large-rollup name-drop shape — a >50-file PR whose declared test
+            # never shipped must not earn the truncation credit.
+            return AcceptanceGateVerdict(
+                True,
+                False,
+                evidence.kind,
+                f"declared named_test {declared_path!r} is not among the PR's "
+                "changed files — the changed-file list was truncated (>50 files, "
+                "only the first 50 paths are stored), but the backend "
+                "corroborated at the merge commit that the declared test does "
+                "not exist in the repo tree, so absence is proven rather than "
+                "inconclusive",
+            )
         if truncated:
             return AcceptanceGateVerdict(
                 True,
@@ -1155,31 +1297,29 @@ def _evaluate_named_test_premerge(
     """Pre-merge structural gate for a ``named_test`` acceptance declaration.
 
     Mirrors :func:`_evaluate_named_test`'s structurally-checkable requirements
-    (test present, non-test seam, semantic grounding) while skipping the
-    merge-time green-run requirement. Same fail-closed reason strings, so
+    (non-test seam, semantic grounding) while skipping the merge-time
+    green-run requirement. A declared test ABSENT from the PR's diff is NOT a
+    structural defect: the merge-time gate credits a test that exists at the
+    merge commit and ran green (backend-corroborated), and pre-merge we cannot
+    know whether that holds — so absence from the diff alone is
+    satisfied/unproven, with the anti-fraud existence check deferred to merge.
+    The test-only-diff and ungrounded-seam hard-fails survive because the merge
+    gate enforces them identically. Same fail-closed reason strings, so
     :func:`classify_unsatisfied_reason` maps them identically. Truncated /
     parent-derived input stays inconclusive (satisfied/unproven), as at merge.
     """
     declared_path = (evidence.test_path or "").partition("::")[0].strip()
     test_present = any(_paths_match(cf, declared_path) for cf in changed)
-    if not test_present:
-        if truncated:
-            return AcceptanceGateVerdict(
-                True,
-                True,
-                evidence.kind,
-                f"declared named_test {declared_path!r} could not be confirmed "
-                "among the PR's changed files because the changed-file list was "
-                "truncated (>50 files, only the first 50 paths are stored) — the "
-                "test may ship beyond the stored prefix, so absence is "
-                "inconclusive before merge",
-            )
+    if not test_present and truncated:
         return AcceptanceGateVerdict(
             True,
-            False,
+            True,
             evidence.kind,
-            f"declared named_test {declared_path!r} is not among the PR's "
-            "changed files — the claimed test was not added or modified here",
+            f"declared named_test {declared_path!r} could not be confirmed "
+            "among the PR's changed files because the changed-file list was "
+            "truncated (>50 files, only the first 50 paths are stored) — the "
+            "test may ship beyond the stored prefix, so absence is "
+            "inconclusive before merge",
         )
     seam_files = [cf for cf in changed if not _is_test_path(cf)]
     if not seam_files:
@@ -1207,6 +1347,22 @@ def _evaluate_named_test_premerge(
             f"declared named_test {declared_path!r} matches the rollup parent's "
             "combined changed-file diff (inherited, not the child's own PR) — "
             "credited soft without machine proof before merge",
+        )
+    if not test_present:
+        # Absent from the diff but structurally sound: the merge gate credits an
+        # unmodified test that exists at the merge commit and ran green (see
+        # _evaluate_named_test), so absence alone must not hard-fail the open PR.
+        # Existence-at-merge and the green run are merge-time checks; pre-merge
+        # we can only credit soft and let the merge gate mint proof or fail.
+        return AcceptanceGateVerdict(
+            True,
+            True,
+            evidence.kind,
+            f"declared named_test {declared_path!r} is not among the PR's changed "
+            "files, but the merge gate credits an unmodified test that exists at "
+            "the merge commit and ran green — absence from the diff is not a "
+            "structural defect, so this is credited soft without machine proof "
+            "before merge",
         )
     return AcceptanceGateVerdict(
         True,
@@ -1577,14 +1733,17 @@ def evaluate_premerge_acceptance(task: Task) -> AcceptanceGateVerdict | None:
 
     Mirrors :func:`evaluate_code_acceptance` but only judges what is decidable
     from the declaration + the PR's changed files before merge: named_test is
-    present with a non-test, semantically-grounded seam (the green run is
-    verified at merge); downstream_artifact is delivered by the diff; visual /
-    coverage_delta declarations are guaranteed well-formed by the schema (the
-    screenshot / measurement is verified at merge); observable_behavior ships a
-    real diff. A structural defect returns ``satisfied=False`` with the same
-    actionable reason string the merge-time gate uses
-    (:func:`classify_unsatisfied_reason` maps it identically); a task with no
-    declaration returns ``None``.
+    satisfied when the diff ships a non-test, semantically-grounded seam for it
+    to exercise — a declared test absent from the diff is NOT a defect, because
+    the merge gate credits an unmodified test that exists at the merge commit
+    and ran green (existence-at-merge and the green run are verified at merge);
+    downstream_artifact is delivered by the diff; visual / coverage_delta
+    declarations are guaranteed well-formed by the schema (the screenshot /
+    measurement is verified at merge); observable_behavior ships a real diff. A
+    structural defect (test-only diff, ungrounded seam, undelivered artifact)
+    returns ``satisfied=False`` with the same actionable reason string the
+    merge-time gate uses (:func:`classify_unsatisfied_reason` maps it
+    identically); a task with no declaration returns ``None``.
     """
     evidence = read_acceptance_evidence(task.first_payload)
     if evidence is None:
@@ -1670,8 +1829,16 @@ def record_code_acceptance_verdict(task: Task) -> AcceptanceGateVerdict | None:
         "proof_ref": verdict.proof_ref,
         # Stamps the rule version that produced this verdict so a later
         # qualification can tell which recorded rows were judged by a retired
-        # rule and re-derive them (design doc c50453ef). Nothing consumes it yet.
+        # rule and re-derive them (design doc c50453ef). Consumed by
+        # :func:`effective_acceptance_verdict`.
         "rule_version": ACCEPTANCE_RULE_VERSION,
+        # Audit honesty (design doc c50453ef §5): this is the ORIGINAL recording
+        # of the verdict at land time, not a re-derivation. A re-derivation
+        # (rule-version bump) sets this to False and nests the original verdict
+        # under ``land_time_verdict`` so the land-time judgment is never
+        # destroyed. Rollup propagation records a child's verdict here too — the
+        # child's own first recording, stamped against its merge record.
+        "stamped_at_land_time": True,
     }
     # A re-recorded verdict means new provenance arrived (parent-derived changed
     # files, a GitHub-verified diff, etc.) AFTER the one-shot backfill sweep had
@@ -1728,6 +1895,17 @@ def effective_acceptance_verdict(task: Task) -> dict | None:
         # row stable rather than erasing it into the undeclared bucket.
         return frozen
     effective = dict(frozen)
+    # Audit honesty (design doc c50453ef §5): the land-time verdict is NEVER
+    # destroyed by re-derivation. Nest the ORIGINAL land-time recording — the
+    # frozen dict itself when it is the original stamp, else the already-nested
+    # original from a prior re-derivation (never a re-derived chain). A reviewer
+    # can always read what the retiring rule judged, side by side with what the
+    # current rule re-derives.
+    original_land_time = (
+        frozen
+        if frozen.get("stamped_at_land_time") is not False
+        else frozen.get("land_time_verdict") or frozen
+    )
     effective.update(
         {
             "satisfied": rederived.satisfied,
@@ -1736,6 +1914,10 @@ def effective_acceptance_verdict(task: Task) -> dict | None:
             "reason": rederived.reason,
             "proof_ref": rederived.proof_ref,
             "rule_version": ACCEPTANCE_RULE_VERSION,
+            "stamped_at_land_time": False,
+            "rederived_at": _utcnow().isoformat(),
+            "rederived_by": REDERIVED_BY_QUALIFIER,
+            "land_time_verdict": original_land_time,
         }
     )
     if frozen.get("consumed") is True:
@@ -1743,6 +1925,20 @@ def effective_acceptance_verdict(task: Task) -> dict | None:
         # verdict stays proven even though the pure core cannot see consumption.
         effective["proven"] = True
     return effective
+
+
+def verdict_rule_version(recorded: Mapping[str, Any] | None) -> int:
+    """The rule version a recorded verdict was stamped under, ``0`` when absent.
+
+    Used by the qualifier's window audit (:data:`ACCEPTANCE_AGGREGATE_BUCKETS`)
+    to count how many recorded rows were judged by each RETIRED version before
+    re-derivation. ``0`` means the row predates the version stamp — a legacy
+    verdict recorded before design doc c50453ef landed.
+    """
+    if not isinstance(recorded, dict):
+        return 0
+    version = recorded.get("rule_version")
+    return version if isinstance(version, int) else 0
 
 
 def premerge_acceptance_finding(task: Task) -> dict | None:
@@ -2344,6 +2540,54 @@ def summarize_version_acceptance_aggregate(
 # ---------------------------------------------------------------------------
 
 
+async def _corroborate_soft_named_test(task: Task, session: Any) -> bool:
+    """Corroborate a soft named_test verdict that lacks a corroboration marker.
+
+    Soft (``satisfied=True, proven=False``) named_test verdicts recorded on a
+    non-CI-monitor landing path (rollup propagation, PR verification, recovery
+    strands) never had :data:`ACCEPTANCE_TEST_CORROBORATED_KEY` stamped, so a
+    not-in-diff declared test is capped at soft/unproven credit forever — the
+    mechanical reason the acceptance window mints ~0 proven coverage. This runs
+    the backend's own tree check against the task's stored merge commit and
+    stamps a confirmed-PRESENCE marker so the caller's re-evaluation can mint
+    machine-proven credit.
+
+    Conservative: only a corroborated ``True`` stamps the marker; a corroborated
+    ABSENCE or an indeterminate result leaves the marker absent so the recorded
+    soft verdict is never downgraded (matching the backfill's upgrade-only
+    contract). Best-effort — never raises.
+
+    Returns True iff a confirmed-presence marker was newly stamped.
+    """
+    ctx = task.context or {}
+    sha = ctx.get(LANDED_MERGE_SHA_KEY)
+    if not isinstance(sha, str) or not sha:
+        return False
+    project = (
+        await session.get(Project, task.project_id)
+        if task.project_id is not None
+        else None
+    )
+    try:
+        result = await corroborate_acceptance_test_at_merge(
+            task, session, project=project, commit_sha=sha[:64]
+        )
+    except Exception:  # noqa: BLE001 — backfill corroboration must never raise
+        logger.warning(
+            "backfill corroboration failed for task %s",
+            getattr(task, "id", None),
+            exc_info=True,
+        )
+        return False
+    if result is True:
+        task.context = {
+            **(task.context or {}),
+            ACCEPTANCE_TEST_CORROBORATED_KEY: True,
+        }
+        return True
+    return False
+
+
 async def backfill_acceptance_verdicts(session) -> int:
     """Re-evaluate pre-fix named_test acceptance verdicts that may have been
     false-negatives. Three historical failure classes are healed:
@@ -2548,7 +2792,17 @@ async def backfill_acceptance_verdicts(session) -> int:
             satisfied = verdict_data.get("satisfied")
             missing_from_diff = False
             if satisfied is True:
-                pass
+                # Soft named_test verdicts (satisfied, unproven) recorded on a
+                # non-CI-monitor landing path carry no corroboration marker, so a
+                # not-in-diff declared test is credited soft forever. Corroborate
+                # it against the stored merge commit before re-evaluating — a
+                # test the backend confirms EXISTS at the merge commit then mints
+                # machine-proven credit. Conservative: only a confirmed presence
+                # stamps the marker; a corroborated absence / indeterminate
+                # result leaves the soft credit untouched (backfill never
+                # downgrades a recorded verdict).
+                if ACCEPTANCE_TEST_CORROBORATED_KEY not in (task.context or {}):
+                    await _corroborate_soft_named_test(task, session)
             elif satisfied is False:
                 # Two re-evaluable unsatisfied classes:
                 #   (a) Pre-fix verified-merge mis-scoring: the old

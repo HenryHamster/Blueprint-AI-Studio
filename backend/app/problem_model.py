@@ -640,6 +640,7 @@ PACKER_MARKER_KEYS: frozenset[str] = frozenset(
     {
         "truncated",
         "_agent_view_floor_applied",
+        "_agent_view_lean",
         "_gap_memory_trimmed",
         "_agent_view_compacted",
     }
@@ -2915,6 +2916,35 @@ def apply_agent_update(
     # byte-budget packer when a value is truncated — strip it here so an agent
     # that echoes back a truncated view does not produce a permanent 400.
     floor_applied = proposed_raw.pop("_agent_view_floor_applied", None)
+    # The lean digest (the DEFAULT problem_model shape shipped each cycle — see
+    # strategic_problem_view._agent_view_problem_model_lean) records in
+    # ``_agent_view_lean`` exactly which fields/sections it reduced before the
+    # agent saw them. Merge that record into the floor-applied restoration set
+    # so the same floor-aware preservation machinery restores the stripped
+    # detail on write-back: gap ``description``/``evidence``/``active_moves``,
+    # capability ``notes``/``backing_paths``/``source``/``absorbs``, and
+    # friction ``description``/``seen_in``/``mitigations_tried``/``source``/
+    # ``promoted_to_gap_id``. An agent that edits the digest and echoes it back
+    # (marker included) cannot wipe durable detail it never saw. Like the floor
+    # marker, the echo is the agent's signal of what it actually saw — a full
+    # model submitted after ``./fetch problem-model`` omits it, so a blank there
+    # remains a genuine clear (see test
+    # ``test_apply_agent_update_blank_gap_field_clears_without_floor_marker``).
+    lean_view = proposed_raw.pop("_agent_view_lean", None)
+    if isinstance(lean_view, dict):
+        _lean_floor = dict(floor_applied) if isinstance(floor_applied, dict) else {}
+        _stripped = list(_lean_floor.get("stripped_gap_fields") or [])
+        for _field in ("description", "evidence", "active_moves"):
+            if _field not in _stripped:
+                _stripped.append(_field)
+        _lean_floor["stripped_gap_fields"] = _stripped
+        for _count_key in ("summarized_capabilities", "summarized_friction"):
+            if lean_view.get(_count_key):
+                _lean_floor[_count_key] = max(
+                    int(_lean_floor.get(_count_key) or 0),
+                    int(lean_view[_count_key]),
+                )
+        floor_applied = _lean_floor
     proposed_raw.pop("_gap_memory_trimmed", None)
     # The compaction marker is informational at write time — restore of the
     # compacted fields is unconditional (see _COMPACT_*_FIELDS), so the echoed

@@ -1383,6 +1383,48 @@ def _describe_sha(version_str: str) -> str | None:
     return None
 
 
+def _agent_binary_checkout_sha(agent_binary: list[str] | None) -> str | None:
+    """Full HEAD SHA for the checkout containing the executing agent entry.
+
+    The final argv element is the bwrap agent entry point. In particular,
+    ``BLUEPRINT_AGENT_BINARY`` may select an entry from a checkout other than
+    the one containing this runner, so provenance must be resolved from that
+    entry's real directory rather than ``local_runner.py``'s directory. The
+    value is validated as a full 40-hex SHA so a short/dirty/tag value can never
+    be mistaken for the executing commit (the agent_image serving gate compares
+    full SHAs). Returns None on ANY failure — an absent entry, git absent,
+    non-checkout path, timeout, or a non-40-hex value — so a probe failure never
+    breaks a spawn (the agent then simply omits the identity from heartbeats).
+    """
+    if not agent_binary:
+        return None
+    entry_path = agent_binary[-1]
+    if not isinstance(entry_path, str) or not os.path.isfile(entry_path):
+        return None
+    entry_dir = os.path.dirname(os.path.realpath(entry_path))
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=entry_dir,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    sha = result.stdout.strip()
+    return sha if re.fullmatch(r"[0-9a-f]{40}", sha) else None
+
+
+def _clean_source_sha(version_str: str | None) -> str | None:
+    """Return a commit identity only for a clean, parseable checkout."""
+    if not version_str or "-dirty" in version_str:
+        return None
+    return _describe_sha(version_str)
+
+
 def _actionable_version_hint(value: object) -> str | None:
     """Return a deploy identity only when the server supplied a real hint.
 
@@ -4071,6 +4113,7 @@ def _heartbeat_loop(
                 "supported_agent_task_types": supported_agent_task_types,
                 "hostname": hostname,
                 "version": version,
+                "git_sha": _clean_source_sha(version),
                 "isolation_backends": isolation_backends,
                 "container_gpu_passthrough": (
                     caps.container_gpu_passthrough if caps is not None else None
@@ -7594,6 +7637,7 @@ def _preflight(
         compute_reason = "no bwrap sandbox and no usable container runtime"
 
     gpu_caps = _detect_gpu()
+    preflight_version = _runner_version()
 
     # Orchestrator / token ping (the token validation).
     heartbeat_body = {
@@ -7609,7 +7653,8 @@ def _preflight(
         "agent_available": claimable[iso.CLASS_AGENT],
         "supported_agent_task_types": supported_agent_task_types,
         "hostname": hostname,
-        "version": _runner_version(),
+        "version": preflight_version,
+        "git_sha": _clean_source_sha(preflight_version),
         # Isolation-backend inventory + selected backends so `--check`
         # populates the fleet view the same way the running heartbeat does.
         "isolation_backends": iso.capabilities_inventory(caps),
@@ -8148,6 +8193,15 @@ def _spawn_agent_task(
     if task_type == "walkthrough_e2e" and caps.docker_usable:
         stack_protocol_dir_sandbox = wts.sandbox_proto_dir(iso.SANDBOX_WORKSPACE)
         injected_env["WALKTHROUGH_STACK_DIR"] = stack_protocol_dir_sandbox
+    # Host-checkout provenance for bwrap runners only: the immutable commit
+    # executing the agent (validated full HEAD SHA) rides through the injected
+    # env so the agent can report it. The docker agent backend is deliberately
+    # excluded — the image carries its own baked /opt/agent/AGENT_SOURCE_SHA
+    # marker, and a host value must never overwrite that baked provenance.
+    if backend == iso.BACKEND_BWRAP:
+        checkout_sha = _agent_binary_checkout_sha(agent_binary)
+        if checkout_sha:
+            injected_env["AGENT_SOURCE_SHA"] = checkout_sha
     plan = iso.plan_agent_execution(
         caps=caps,
         agent_binary=agent_binary,

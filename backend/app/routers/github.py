@@ -29,7 +29,7 @@ from app.github import (
     get_user_installations,
     validate_fine_grained_pat,
 )
-from app.landed_signal import apply_merged_landed_signal
+from app.landed_signal import corroborate_and_apply_merged_landed_signal
 from app.models import (
     Artifact,
     ArtifactType,
@@ -536,6 +536,9 @@ async def github_webhook(
                 pr_base_branch = (data.get("pull_request", {}).get("base") or {}).get(
                     "ref"
                 )
+                pr_merge_commit_sha = (data.get("pull_request") or {}).get(
+                    "merge_commit_sha"
+                )
                 if pr_number:
                     pr_url_suffix = f"/{owner}/{repo}/pull/{pr_number}"
                     art_result = await session.execute(
@@ -579,15 +582,21 @@ async def github_webhook(
                                 await _stamp_github_verified_changed_files(
                                     pr_task, owner, repo, pr_number, project.id
                                 )
-                                apply_merged_landed_signal(
+                                await corroborate_and_apply_merged_landed_signal(
                                     pr_task,
                                     project,
+                                    session,
                                     base_branch=landed_branch,
                                     hotfix_lane=bool(
                                         (pr_task.first_payload or {}).get("hotfix")
                                         or (pr_task.context or {}).get("hotfix")
                                     ),
                                     non_merge_reason="merged_pr_non_integration_branch",
+                                    # Pin the acceptance corroboration read to
+                                    # the webhook's own merge commit — the
+                                    # branch-tip cache can still serve the
+                                    # PRE-merge tip this soon after the merge.
+                                    merge_commit_sha=pr_merge_commit_sha,
                                 )
                                 affected_tasks.append(pr_task)
                                 logger.info(
@@ -942,7 +951,7 @@ async def github_webhook(
         for task in matching:
             try:
                 gh_token, gh_owner, gh_repo = await get_github_token_for_task(
-                    task.id, session
+                    task.id, session, task=task
                 )
                 ci_result = await get_check_runs_cached(
                     gh_token,

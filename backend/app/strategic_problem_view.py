@@ -222,6 +222,127 @@ def _compact_low_value_detail(trimmed: dict) -> dict:
     return trimmed
 
 
+def _agent_view_problem_model_lean(pm: dict | None) -> dict:
+    """Compact per-entry digest of the durable problem_model, shipped by DEFAULT
+    in strategic-cycle payloads instead of the full agent-view trim.
+
+    The full agent-view model (:func:`_agent_view_problem_model`) was the
+    largest single block in the strategic prompt (~48 KB of a ~173 KB mean
+    render — ~28% of the prompt driving ~48% of fleet LLM spend), shipped whole
+    every cycle. This digest keeps every LIVE region the strategist reasons
+    over — intent, context, constraints, pending confirmations, and EVERY
+    capability/gap/friction entry — but reduces each entry to its
+    decision-relevant scalars:
+
+      - capabilities → ``{name, status, proof_exempt}``
+      - gaps → ``{id, name, status, priority, size, opened, tag, deferral, closed}``
+      - friction → ``{id, name, status}``
+
+    Descriptions, evidence, provenance (``source``/``evidence_refs``),
+    capability ``notes``/``backing_paths``/``absorbs``, friction
+    ``seen_in``/``mitigations_tried``/``promoted_to_gap_id``, and per-gap
+    ``history``/``past_moves`` are NOT inline. The cut is non-destructive: the
+    ``_agent_view_lean`` marker records exactly what was reduced, and
+    ``apply_agent_update`` merges it into the floor-applied restoration set so
+    an agent echoing the digest back cannot wipe durable detail it never saw
+    (the write-back merge additionally restores the always-compacted provenance
+    fields unconditionally and unions per-gap append-only logs). The full model
+    remains recoverable via ``./fetch problem-model``.
+
+    The intent auto-heal (restore a blank/placeholder ``purpose`` from the
+    operator's durable ``user_purpose``) is preserved so the strategist never
+    sees a deadlocked blank purpose on a mature model. Operates on a shallow
+    copy — the durable ``project.problem_model`` is never mutated.
+    """
+    if not pm:
+        return {}
+    trimmed = dict(pm)
+    trimmed.pop("archived_gaps", None)
+    # The rejected-agent-edits ledger is surfaced via the dedicated
+    # ``operator_overrides`` payload key — strip it here (see
+    # :func:`_agent_view_problem_model`).
+    trimmed.pop("rejected_agent_edits", None)
+    # The revision_log is durable model-write history, not prompt input (see
+    # :func:`_agent_view_problem_model`) — never shipped inside the digest.
+    trimmed.pop("revision_log", None)
+
+    intent = trimmed.get("intent")
+    if isinstance(intent, dict):
+        purpose = (intent.get("purpose") or "").strip()
+        user_purpose = (intent.get("user_purpose") or "").strip()
+        if (not purpose or purpose == "..." or bool(re.match(r"^<[^>]+>$", purpose))) and user_purpose:
+            intent["purpose"] = user_purpose
+            logger.info(
+                "[STRATEGIC] Auto-healed blank intent.purpose from user_purpose "
+                "in lean problem-model digest"
+            )
+
+    counts: dict[str, int] = {}
+
+    caps = trimmed.get("capabilities")
+    if isinstance(caps, list):
+        reduced: list[Any] = []
+        for cap in caps:
+            if not isinstance(cap, dict):
+                reduced.append(cap)
+                continue
+            reduced.append(
+                {k: cap[k] for k in ("name", "status", "proof_exempt") if k in cap}
+            )
+        trimmed["capabilities"] = reduced
+        counts["summarized_capabilities"] = len(reduced)
+
+    gaps = trimmed.get("gaps")
+    if isinstance(gaps, list):
+        reduced = []
+        for gap in gaps:
+            if not isinstance(gap, dict):
+                reduced.append(gap)
+                continue
+            reduced.append(
+                {
+                    k: gap[k]
+                    for k in (
+                        "id",
+                        "name",
+                        "status",
+                        "priority",
+                        "size",
+                        "opened",
+                        "tag",
+                        "deferral",
+                        "closed",
+                    )
+                    if k in gap
+                }
+            )
+        trimmed["gaps"] = reduced
+
+    fric = trimmed.get("friction")
+    if isinstance(fric, list):
+        reduced = []
+        for f in fric:
+            if not isinstance(f, dict):
+                reduced.append(f)
+                continue
+            reduced.append({k: f[k] for k in ("id", "name", "status") if k in f})
+        trimmed["friction"] = reduced
+        counts["summarized_friction"] = len(reduced)
+
+    # The digest is the DEFAULT shipping shape, so the marker is always
+    # stamped. It drives floor-aware field preservation on write-back: gap
+    # ``description``/``evidence``/``active_moves`` and capability/friction
+    # detail were stripped before the agent saw them, so a blank resubmit must
+    # preserve the durable values (see problem_model.apply_agent_update, which
+    # merges this marker into the ``_agent_view_floor_applied`` restoration set
+    # when the agent echoes it back).
+    trimmed["_agent_view_lean"] = {
+        "stripped_gap_fields": ["description", "evidence", "active_moves"],
+        **counts,
+    }
+    return trimmed
+
+
 # Guaranteed-small floor for the agent-view problem_model when it is packed
 # under genuine byte-budget pressure. The byte-budget packer registers
 # ``_agent_view_problem_model_packed`` as problem_model's summarize_fn at

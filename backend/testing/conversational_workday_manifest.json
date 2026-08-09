@@ -280,7 +280,12 @@
         "test_typed_fast_capacity_denial_persists_no_lease_for_workday_fallback",
         "test_typed_fast_lease_is_fenced_renewed_and_released",
         "test_explicit_runner_change_rejects_active_session",
-        "test_explicit_runner_replaces_a_genuinely_stale_active_worker"
+        "test_explicit_runner_replaces_a_genuinely_stale_active_worker",
+        "test_first_agent_heartbeat_reanchors_born_stale_session",
+        "test_post_claim_idle_still_lapses",
+        "test_autonomous_turn_does_not_bypass_unattended_cap",
+        "test_autonomous_turn_flag_does_not_rescue_operator_chat_idle_lapse",
+        "test_autonomous_working_turn_renews_freshness_without_mutation"
       ]
     },
     {
@@ -709,7 +714,25 @@
         "caps aggregate ordinary images while preserving required images across a combined batch",
         "bounds a required ArtifactRef download when %s never resolves",
         "degrades an ordinary image to an unavailable block when %s never resolves",
-        "uses a conservative context limit for routed DeepSeek residents"
+        "uses a conservative context limit for routed DeepSeek residents",
+        "reads the live effective_purpose key the backend emits",
+        "renders an explicit no-purpose marker instead of a silently-empty Vision section",
+        "renders the grounding section only from effective_purpose, with an observable empty marker",
+        "without a change-gate (no opts), cleared+unchanged surfaces are NOT skipped (legacy LRU)",
+        "buildDirectionChangeSignals keys direction:<id> and skips entries without an id",
+        "directionChangeSignal folds status + outcome/cycle/PR/churn counters, and is delta-sensitive",
+        "does NOT bind to the removed payload.vision key",
+        "1. skips a recently-cleared direction with NO change signal since that clear",
+        "2. re-examines a direction with a NEW outcome/cycle/PR delta since its last clear",
+        "2b. prioritizes a CHANGED direction ahead of a settled-clear, unchanged one (even if less recent)",
+        "3. cooldown eventually makes a long-unchanged cleared surface due again (nothing starved forever)",
+        "4. always selects a never-examined surface first (first examination is not gated)",
+        "gates a non-direction cleared surface by cooldown alone (no derivable change signal)",
+        "treats an unsettled last verdict (found/unevidenced) as due regardless of change signal",
+        "exploration turn is suppressed when nothing is due, runs when a surface is due, and never overrides a real wake",
+        "never suppresses the FIRST autonomous turn of a session (empty-session guard)",
+        "persists the change-gate signal across serialize → restore (baseline survives restart)",
+        "re-examines a legacy clear record with no stored signal (seeds a baseline once)"
       ]
     },
     {

@@ -32,12 +32,19 @@ the per-cycle projection:
     $3,000/month envelope — an honest result, not a tuned one.
 
 A number tuned backwards from $1.50 would fail these tests.
+
+The baseline-anchor tests pin the fix that replaced the task-provided
+$4.41/cycle constant: ``BASELINE_COST_PER_CYCLE_USD`` is derived from the
+recorded baseline readings (mean of their ``cost_per_cycle``),
+``baseline_per_cycle_stats()`` reconciles mean vs median, and
+``headline_claim()`` labels both statistics instead of silently conflating them.
 """
 import contextlib
 import importlib.util
 import io
 import json
 import math
+import statistics
 from itertools import pairwise
 from pathlib import Path
 
@@ -70,6 +77,7 @@ def test_script_is_importable_and_exposes_the_model_functions():
         "target_concurrency_status",
         "cohort_capped",
         "baseline_record",
+        "baseline_per_cycle_stats",
         "project_monthly_spend",
         "project_monthly_spend_with_tasks",
         "load_measured_split",
@@ -128,14 +136,14 @@ def test_cache_share_lever_only_helps_when_the_share_rises():
 
 
 def test_direction_target_case_lands_at_the_documented_boundary():
-    """At the direction's own target inputs (share 0.80, R=0.85) cost ~$1.52.
+    """At the direction's own target inputs (share 0.80, R=0.85) cost ~$2.59.
 
-    The doc reports $1.52; the target is on the edge of the optimistically
+    The doc reports $2.59; the target is on the edge of the optimistically
     parameterized range, not comfortably under it.
     """
     mod = _load_module()
     target_case = mod.project_cycle_cost(0.85, 0.80, 0.0)
-    assert 1.40 < target_case < 1.60, f"unexpected boundary value: {target_case:.2f}"
+    assert 2.40 < target_case < 2.80, f"unexpected boundary value: {target_case:.2f}"
 
 
 def test_cross_cycle_term_is_bounded_small():
@@ -583,7 +591,9 @@ def test_main_output_includes_the_monthly_arithmetic():
     out = buf.getvalue()
     assert "[7] Projected monthly spend" in out
     assert "Target-concurrency input: NOT AVAILABLE" in out
-    assert str(monthly["monthly_spend_usd"]) in out
+    # The CLI prints the monthly figure comma-grouped (e.g. "1,253.31"), which
+    # matches the formatted projection value.
+    assert f"{monthly['monthly_spend_usd']:,.2f}" in out
 
 
 def test_mean_task_execution_cost_matches_documented_basis():
@@ -654,8 +664,8 @@ def test_monthly_spend_with_tasks_preserves_cycle_volume_refusal():
 # --- Baseline measurement record (fc135ee2) ------------------------------
 
 def test_baseline_record_carries_cohort_provenance_for_both_readings():
-    """Both 2026-08-07 baseline readings surface verbatim with cohort
-    provenance: a 5000-task cohort at _COHORT_CAP, capped=True.
+    """All three baseline readings surface verbatim with cohort provenance:
+    a 5000-task cohort at _COHORT_CAP, capped=True.
 
     docs/strategic-cycle-cost-baseline.md is the narrative form of this exact
     record; the field mapping against the agent efficiency-snapshot read
@@ -667,9 +677,9 @@ def test_baseline_record_carries_cohort_provenance_for_both_readings():
     assert record["cohort_cap"] == mod.COHORT_CAP == 5000
     assert record["requested_window_days"] == mod.AXIS_WINDOW_DAYS == 7
     assert record["cost_arithmetic_consistent"] is True
-    assert len(record["readings"]) == 2
+    assert len(record["readings"]) == 3
 
-    reading_1, reading_2 = record["readings"]
+    reading_1, reading_2, reading_3 = record["readings"]
     assert reading_1["reading"] == 1
     assert reading_1["date"] == "2026-08-07"
     assert reading_1["integration_head"] == "9e25341c"
@@ -705,6 +715,68 @@ def test_baseline_record_carries_cohort_provenance_for_both_readings():
     assert reading_2["cost_per_cycle_consistent"] is True
     assert reading_2["cohort_effective_window_start"] == "2026-07-31T00:00:00+00:00"
     assert reading_2["cohort_effective_window_end"] == "2026-08-07T00:00:00+00:00"
+
+    # Reading 3: first post-promotion reading (2026-08-08).
+    assert reading_3["reading"] == 3
+    assert reading_3["date"] == "2026-08-08"
+    assert reading_3["integration_head"] == "5b97819"
+    assert reading_3["cycle_count"] == 230
+    assert reading_3["strategic_cycle_cost_usd"] == pytest.approx(1683.2)
+    assert reading_3["cost_per_cycle"] == pytest.approx(7.318261)
+    assert reading_3["total_llm_usd"] == pytest.approx(3390.42)
+    # unpriced_coverage dropped to 0.72 from 0.9752: 72% of spend still predates
+    # v29 serving; attribution will improve as the cohort ages out pre-promotion tasks.
+    assert reading_3["unpriced_coverage"] == pytest.approx(0.72)
+    assert reading_3["cohort_task_count"] == 5000
+    assert reading_3["cohort_capped"] is True
+    assert reading_3["requested_window_days"] == 7
+    assert reading_3["cohort_cap"] == 5000
+    assert reading_3["cost_per_cycle_consistent"] is True
+    # Reading 3 postdates the endpoint change: effective window is the true span.
+    assert reading_3["cohort_effective_window_start"] == "2026-08-01T00:00:00+00:00"
+    assert reading_3["cohort_effective_window_end"] == "2026-08-08T00:00:00+00:00"
+
+
+def test_baseline_record_includes_post_promotion_reading():
+    """Reading 3 (2026-08-08, integration HEAD 5b97819) is the first
+    post-promotion reading: unpriced_coverage 0.72 vs 0.9752 on the earlier
+    readings, and effective window captured from the true endpoint span.
+
+    The named acceptance test: verifies that baseline_record() carries the
+    post-promotion reading with consistent cost arithmetic and correct
+    cohort-capped provenance.
+    """
+    mod = _load_module()
+    record = mod.baseline_record()
+    assert len(record["readings"]) >= 3, "Reading 3 (post-promotion) must be present"
+
+    reading_3 = record["readings"][2]
+    assert reading_3["reading"] == 3
+    assert reading_3["date"] == "2026-08-08"
+    assert reading_3["integration_head"] == "5b97819"
+    assert reading_3["cycle_count"] == 230
+
+    # Cost arithmetic must be self-consistent (total / count within tolerance).
+    assert reading_3["cost_per_cycle_consistent"] is True
+    assert reading_3["cost_per_cycle"] == pytest.approx(
+        reading_3["strategic_cycle_cost_usd"] / reading_3["cycle_count"], abs=0.0005
+    )
+
+    # unpriced_coverage dropped vs the two 2026-08-07 readings — reflects v29
+    # promotion: 72% of spend still predates serving, not 97.52%.
+    assert reading_3["unpriced_coverage"] == pytest.approx(0.72)
+    earlier_coverages = [r["unpriced_coverage"] for r in record["readings"][:2]]
+    assert all(c > reading_3["unpriced_coverage"] for c in earlier_coverages), (
+        "Reading 3 unpriced_coverage should be lower than pre-promotion readings"
+    )
+
+    # Cohort provenance: still capped (5000 rows).
+    assert reading_3["cohort_capped"] is True
+    assert reading_3["cohort_task_count"] == 5000
+
+    # Effective window is the true span from the endpoint (not the query-window bounds).
+    assert reading_3["cohort_effective_window_start"] == "2026-08-01T00:00:00+00:00"
+    assert reading_3["cohort_effective_window_end"] == "2026-08-08T00:00:00+00:00"
 
 
 def test_cohort_capped_flag_matches_the_task_count_cap():
@@ -803,7 +875,7 @@ def test_baseline_record_fails_closed_on_missing_cohort_count():
 
 
 def test_main_output_includes_the_baseline_record():
-    """Section [8] prints both dated readings and the flat-cohort caveat."""
+    """Section [8] prints all three dated readings and the provenance caveat."""
     mod = _load_module()
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
@@ -812,5 +884,124 @@ def test_main_output_includes_the_baseline_record():
     assert "[8] Baseline measurement record" in out
     assert "integration HEAD 9e25341c" in out
     assert "integration HEAD 83813e87" in out
-    assert "both readings share cycle_count 212" in out
+    assert "integration HEAD 5b97819" in out
     assert "not evidence about the levers" in out
+
+
+# --- Baseline-anchored projection (the $4.41 constant fix) ---------------
+
+def test_projection_anchor_sourced_from_baseline_record_and_labels_statistic(
+    tmp_path, monkeypatch
+):
+    """The projection's per-cycle baseline anchor is DERIVED from the recorded
+    baseline record (mean of the recorded cost_per_cycle values), not a
+    task-provided constant — and the mean-vs-median statistic is labelled.
+
+    This is the acceptance test for "anchor the cost projection on the recorded
+    baseline, not a constant":
+
+    (a) BASELINE_COST_PER_CYCLE_USD equals the mean of the validated baseline
+        record's cost_per_cycle values and is strictly above the old $4.41
+        constant;
+    (b) the projection uses that derived anchor — a cycle with routine share 0
+        and the baseline cache share projects at exactly the derived baseline;
+    (c) baseline_per_cycle_stats() labels the statistic: mean AND median both
+        reported, with a note naming the MEAN-vs-MEDIAN gap (per_event_usd is
+        a mean while the projection claims a median);
+    (d) headline_claim() carries the baseline keys (baseline_mean_usd,
+        baseline_median_usd, mean_median_note).
+    """
+    mod = _load_module()
+    record = mod.baseline_record()
+    recorded = [r["cost_per_cycle"] for r in record["readings"]]
+    expected_mean = sum(recorded) / len(recorded)
+
+    # (a) anchor sourced from the record, not a 4.41 constant.
+    assert pytest.approx(expected_mean) == mod.BASELINE_COST_PER_CYCLE_USD
+    assert mod.BASELINE_COST_PER_CYCLE_USD > 4.41
+
+    # (b) the projection uses the derived anchor.
+    assert mod.project_cycle_cost(
+        0.0, mod.BASELINE_CACHE_READ_SHARE, 0.0
+    ) == pytest.approx(mod.BASELINE_COST_PER_CYCLE_USD)
+
+    # (c) statistic labelled.
+    stats = mod.baseline_per_cycle_stats()
+    assert stats["available"] is True
+    assert stats["mean_usd"] == pytest.approx(expected_mean)
+    assert stats["median_usd"] == pytest.approx(statistics.median(recorded))
+    assert stats["reading_count"] == len(recorded)
+    note = stats["statistic_note"].lower()
+    assert "mean" in note and "median" in note
+    assert "per_event_usd" in stats["statistic_note"]
+
+    # (d) headline carries the baseline keys (a measured split drives it).
+    split_path = tmp_path / "measured_effort_tier_split.json"
+    monkeypatch.setattr(mod, "MEASURED_SPLIT_PATH", split_path)
+    split_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "measurement_status": "measured",
+                "routine_share": 0.85,
+                "split": {"routine": 0.85, "consequential": 0.15, "pinned": 0.0, "other": 0.0},
+                "counts": {"routine": 17, "consequential": 3},
+                "denominator_cycles": 20,
+                "measured_denominator_cycles": 20,
+            }
+        )
+    )
+    claim = mod.headline_claim()
+    assert claim["available"] is True
+    assert claim["baseline_mean_usd"] == pytest.approx(expected_mean)
+    assert claim["baseline_median_usd"] == pytest.approx(stats["median_usd"])
+    assert "median" in claim["mean_median_note"].lower()
+
+
+def test_baseline_per_cycle_stats_reconciles_mean_and_median():
+    """Mean/median of the three recorded readings, plus the reading count.
+
+    This sample is slightly left-skewed: the recorded median (7.5947) is above
+    the mean (7.5153), so the note must call out that the mean anchor is NOT
+    conservative relative to the recorded median — never silently conflated.
+    """
+    mod = _load_module()
+    stats = mod.baseline_per_cycle_stats()
+    recorded = [r["cost_per_cycle"] for r in mod.baseline_record()["readings"]]
+    assert stats["available"] is True
+    assert stats["reading_count"] == 3 == len(recorded)
+    assert stats["mean_usd"] == pytest.approx(sum(recorded) / 3)
+    assert stats["median_usd"] == pytest.approx(statistics.median(recorded))
+    assert stats["median_usd"] > stats["mean_usd"]
+    assert "per_event_usd = total_usd / cycle_count" in stats["statistic_note"]
+    assert "NOT conservative" in stats["statistic_note"]
+
+
+def test_baseline_per_cycle_stats_empty_readings_fails_closed():
+    """No readings -> available=False, no fabricated statistics."""
+    mod = _load_module()
+    stats = mod.baseline_per_cycle_stats([])
+    assert stats["available"] is False
+    assert stats["mean_usd"] is None
+    assert stats["median_usd"] is None
+    assert stats["reading_count"] == 0
+    assert stats["statistic_note"]
+
+
+def test_main_output_uses_the_derived_baseline():
+    """The CLI anchors on the derived baseline and no longer cites $4.41.
+
+    The mean/median reconciliation is printed in section [0]; section [1] names
+    the baseline as the mean of the recorded readings; the old $4.41 constant
+    is gone from the printed output entirely.
+    """
+    mod = _load_module()
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        mod.main()
+    out = buf.getvalue()
+    assert "$4.41" not in out
+    assert f"${mod.BASELINE_COST_PER_CYCLE_USD:.2f}" in out
+    assert "recorded baseline readings" in out
+    assert "median" in out and "MEAN" in out
+    assert f"{mod.BASELINE_COST_PER_CYCLE_USD:.4f}" in out

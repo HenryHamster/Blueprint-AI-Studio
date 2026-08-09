@@ -121,6 +121,7 @@ from app.strategic_problem_view import (  # noqa: F401 — re-exported for calle
     _GAP_PRIORITY_RANK,
     _agent_view_problem_model,
     _agent_view_problem_model_floor,
+    _agent_view_problem_model_lean,
     _agent_view_problem_model_packed,
     _compute_model_health,
     _gap_floor_keep_rank,
@@ -2214,9 +2215,9 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     "open_message_count": {"priority": "critical"},
     "prompt_suffix": {"priority": "high", "exempt": True},
     # Effective purpose — the single live intent field shipped to the agent
-    # (the legacy vision body is no longer shipped: at critical priority it
-    # measured ~37 KB and evicted lower-tier sections; problem_model carries
-    # the durable intent).
+    # (the legacy vision body is no longer shipped). A compact resolved-purpose
+    # string (tens to hundreds of bytes), so it ships at critical priority with
+    # negligible byte cost; problem_model carries the durable intent.
     "effective_purpose": {"priority": "critical"},
     # User-facing state the agent must respond to. Core section: the open-message
     # inbox has BOTH a summarize fallback AND a floor callback, so at least its
@@ -2280,16 +2281,18 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     "problem_model": {
         "priority": "high",
         "summarize": _agent_view_problem_model_packed,
-        # Floor reservation = the WHOLE agent-view model. The packer reserves the
-        # full model's bytes off the top of the budget so every other recoverable
+        # Floor reservation = the WHOLE shipped problem_model (now the compact
+        # LEAN digest — see _agent_view_problem_model_lean — so the reservation
+        # is ~1/4 of the old agent-view model). The packer reserves the shipped
+        # model's bytes off the top of the budget so every other recoverable
         # sibling degrades or drops BEFORE the problem_model is ever reduced —
-        # under normal cycle sizes the whole model ships intact and the
-        # skeletonizing summarize path never fires. Only when the full model
-        # cannot fit at all does the reservation exceed budget; the packer then
-        # drops the floor guarantee and the summarize callback degrades the model
-        # loudly (marker + _packer_meta record). The floor callback is a simple,
-        # independent function that cannot fail, so the reservation is honored
-        # even if the summarize callback raises an exception.
+        # under normal cycle sizes the digest ships intact and the skeletonizing
+        # summarize path never fires. Only when the digest cannot fit at all does
+        # the reservation exceed budget; the packer then drops the floor
+        # guarantee and the summarize callback degrades the model loudly (marker
+        # + _packer_meta record). The floor callback is a simple, independent
+        # function that cannot fail, so the reservation is honored even if the
+        # summarize callback raises an exception.
         "floor": _agent_view_problem_model_floor,
         "fetch_verb": "problem-model",
     },
@@ -2538,16 +2541,18 @@ _DESIGN_DOC_UPDATE_SCHEMA: dict[str, dict] = {
     "problem_model": {
         "priority": "high",
         "summarize": _agent_view_problem_model_packed,
-        # Floor reservation = the WHOLE agent-view model. The packer reserves the
-        # full model's bytes off the top of the budget so every other recoverable
+        # Floor reservation = the WHOLE shipped problem_model (now the compact
+        # LEAN digest — see _agent_view_problem_model_lean — so the reservation
+        # is ~1/4 of the old agent-view model). The packer reserves the shipped
+        # model's bytes off the top of the budget so every other recoverable
         # sibling degrades or drops BEFORE the problem_model is ever reduced —
-        # under normal cycle sizes the whole model ships intact and the
-        # skeletonizing summarize path never fires. Only when the full model
-        # cannot fit at all does the reservation exceed budget; the packer then
-        # drops the floor guarantee and the summarize callback degrades the model
-        # loudly (marker + _packer_meta record). The floor callback is a simple,
-        # independent function that cannot fail, so the reservation is honored
-        # even if the summarize callback raises an exception.
+        # under normal cycle sizes the digest ships intact and the skeletonizing
+        # summarize path never fires. Only when the digest cannot fit at all does
+        # the reservation exceed budget; the packer then drops the floor
+        # guarantee and the summarize callback degrades the model loudly (marker
+        # + _packer_meta record). The floor callback is a simple, independent
+        # function that cannot fail, so the reservation is honored even if the
+        # summarize callback raises an exception.
         "floor": _agent_view_problem_model_floor,
         "fetch_verb": "problem-model",
     },
@@ -4326,10 +4331,7 @@ async def _spawn_design_doc_update(
                 if _dd_available_capabilities
                 else {}
             ),
-            "problem_model": await _verify_capability_backing_paths(
-                _agent_view_problem_model(project.problem_model),
-                **verification_kwargs,
-            ),
+            "problem_model": _agent_view_problem_model_lean(project.problem_model),
             # Soft size/health signal from the DURABLE pre-trim model so counts
             # are honest (the agent view above is trimmed). Fail-open: omitted
             # when the durable model fails strict validation.
@@ -7836,6 +7838,13 @@ async def _spawn_strategic_review(
         _agent_view_problem_model(project.problem_model),
         **verification_kwargs,
     )
+    # The payload's problem_model ships as the compact LEAN digest by default
+    # (the perf cut — see strategic_problem_view._agent_view_problem_model_lean).
+    # The full verified view above still backs cycle_start_reconciliation and
+    # prune-candidates, which need per-entry detail (verification blocks,
+    # active_moves) the digest intentionally omits, so reconciliation stays
+    # accurate while the shipped model shrinks to its decision-relevant scalars.
+    _lean_problem_model = _agent_view_problem_model_lean(project.problem_model)
     # Stamp per-direction in-flight counts onto direction_stats from the SAME
     # active_by_direction mapping the reconciliation reads, so the (droppable)
     # directions_summary floor and cycle_start_reconciliation.direction_pipeline
@@ -8049,7 +8058,7 @@ async def _spawn_strategic_review(
                 )
             ),
             "effective_purpose": resolve_project_purpose(project),
-            "problem_model": _verified_problem_model,
+            "problem_model": _lean_problem_model,
             **(
                 {"cycle_start_reconciliation": _cycle_start_reconciliation}
                 if _cycle_start_reconciliation

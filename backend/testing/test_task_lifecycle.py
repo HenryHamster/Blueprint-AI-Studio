@@ -4947,7 +4947,8 @@ async def test_request_changes_empty_pr_terminal_merge_unblocks_dependents(
         return_value=(True, True, "main"),
     )
     landed_mock = mocker.patch(
-        "app.review_request_changes.apply_merged_landed_signal"
+        "app.review_request_changes.corroborate_and_apply_merged_landed_signal",
+        new_callable=AsyncMock,
     )
     refresh_mock = mocker.patch(
         "app.direction_outcomes.refresh_direction_outcomes_after_merge",
@@ -4973,7 +4974,7 @@ async def test_request_changes_empty_pr_terminal_merge_unblocks_dependents(
     merge_mock.assert_not_awaited()
     close_mock.assert_awaited_once()
     classify_mock.assert_awaited_once()
-    landed_mock.assert_called_once()
+    landed_mock.assert_awaited_once()
     refresh_mock.assert_awaited_once()
     unblock_mock.assert_awaited_once()
 

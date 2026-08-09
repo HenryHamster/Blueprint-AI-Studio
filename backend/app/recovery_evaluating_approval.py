@@ -272,6 +272,7 @@ async def _handle_approval_gate_timeout(
                         f"merged into {{landed}}; awaiting downstream landing"
                     ),
                     hotfix_lane=None,
+                    merge_commit_sha=_merged_pr_data.get("merge_commit_sha"),
                 )
                 flag_modified(task, "context")
                 session.add(task)

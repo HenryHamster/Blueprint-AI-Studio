@@ -17,7 +17,6 @@ import local_worker_service as worker
 _CONTAINER_NAME = "blueprint-local-api"
 _ROLE_LABEL = "com.blueprint.role"
 _ROLE = "api"
-_DEPLOY_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _REQUIRED_API_SECRETS = frozenset(
     {
         "DATABASE_URL",
@@ -48,6 +47,10 @@ _OPTIONAL_API_CONFIG = frozenset(
         "ADMIN_JWT_SECRET",
         "ADMIN_JWT_EXPIRE_MINUTES",
         "ADMIN_API_KEY_ALLOWED_IPS",
+        # Typed-Fast attestation for the Resident conversation lane. The backend
+        # fail-closes unless this exactly matches its pinned qualification
+        # string, so forwarding an arbitrary value cannot activate anything.
+        "CALL_FOREGROUND_QUALIFICATION",
     }
 )
 _ALLOWED_API_ENV = _REQUIRED_API_SECRETS | _REQUIRED_API_CONFIG | _OPTIONAL_API_CONFIG
@@ -220,11 +223,15 @@ def command() -> tuple[list[str], dict[str, str]]:
             "GOOGLE_APPLICATION_CREDENTIALS": "/var/run/blueprint/gcp.json",
         }
     )
-    deploy_sha = os.environ.get("BLUEPRINT_API_DEPLOY_SHA", "").strip()
-    if deploy_sha:
-        if not _DEPLOY_SHA_RE.fullmatch(deploy_sha):
-            raise ValueError("BLUEPRINT_API_DEPLOY_SHA must be a full git SHA")
-        environment["DEPLOY_SHA"] = deploy_sha
+    # The API role records its serving identity for the deployment-state row
+    # even though it is categorically ineligible for the leader path. Off Cloud
+    # Run there is no image-lookup fallback, so a role must never start without
+    # a deploy identity — local_app_release stamps BLUEPRINT_API_DEPLOY_SHA, and
+    # the pinned image's OCI revision label covers first-boot/rollback where the
+    # role env predates the deploy-SHA wiring.
+    environment["DEPLOY_SHA"] = worker._resolve_deploy_sha(
+        "BLUEPRINT_API_DEPLOY_SHA", image
+    )
     runtime_environment = {
         "BLUEPRINT_PROCESS_ROLE",
         "BLUEPRINT_DEPLOYMENT_MODE",
@@ -232,9 +239,8 @@ def command() -> tuple[list[str], dict[str, str]]:
         "HOME",
         "PORT",
         "GOOGLE_APPLICATION_CREDENTIALS",
+        "DEPLOY_SHA",
     }
-    if deploy_sha:
-        runtime_environment.add("DEPLOY_SHA")
     forwarded = sorted(_ALLOWED_API_ENV | runtime_environment)
     argv = [
         "docker",

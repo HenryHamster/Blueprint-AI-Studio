@@ -167,6 +167,7 @@ async def _handle_pr_state_check_pending(
                 ),
                 ctx_override=_ctx2,
                 non_merge_reason="merged_pr_non_integration_branch",
+                merge_commit_sha=pr_data.get("merge_commit_sha"),
             )
             if record_pr_merged:
                 _ctx2 = dict(task.context or {})

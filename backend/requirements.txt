@@ -38,3 +38,9 @@ mypy==1.20.2
 # Suite sharding for parallel CI (matrix shards run `--splits N --group K`).
 # Deterministic split by collection order (no pytest-randomly installed).
 pytest-split==0.11.0
+# This distribution exposes the ``pgserver`` import and includes the matching
+# PostgreSQL server plus contrib binaries. Do not install the upstream
+# ``pgserver`` distribution alongside it: both own the same import namespace,
+# and pip can otherwise mix an upstream server with this wheel's pg_trgm.so.
+pgserver-search==0.1.6
+ruff==0.12.9

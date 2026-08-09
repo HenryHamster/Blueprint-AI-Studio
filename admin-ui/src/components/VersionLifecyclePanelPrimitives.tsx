@@ -990,6 +990,73 @@ export function PinnedServingVersionCallout({ version }: { version: RecentVersio
   );
 }
 
+export function PromotedAwaitingActivationCallout({
+  version,
+  canApprove = false,
+  approving = false,
+  approvalError = null,
+  onApprove,
+  optimisticApproval = null,
+}: {
+  version: RecentVersion;
+  canApprove?: boolean;
+  approving?: boolean;
+  approvalError?: string | null;
+  onApprove?: () => void;
+  optimisticApproval?: { activation_requested_at: string; activation_requested_by: string } | null;
+}) {
+  const servingStatus = version.serving?.status ?? version.serving_status;
+  // Only the "promoted, still unconfirmed" state is awaiting the operator's
+  // single activation approval — serving_confirmed and deploy_failed have their
+  // own surfaces, and an un-armed promotion reads as NULL/NA, not pending.
+  if (version.status !== 'promoted' || servingStatus !== 'unconfirmed') return null;
+  const promotedAt = version.promoted_at ?? version.serving?.confirmed_at ?? version.served_at;
+  const deadline = version.deploy_confirm_deadline;
+  const deadlineText = deadline
+    ? ` · confirm by ${new Date(deadline).toLocaleString()}`
+    : '';
+  const activationRequestedAt = version.activation_requested_at ?? optimisticApproval?.activation_requested_at;
+  const activationRequestedBy = version.activation_requested_by ?? optimisticApproval?.activation_requested_by;
+  const approved = !!activationRequestedAt;
+  return (
+    <div
+      data-testid="promoted-awaiting-activation"
+      className="flex flex-col gap-0.5 px-2 py-1.5 rounded border bg-amber-500/10 border-amber-500/30"
+    >
+      <div className="flex flex-wrap items-center gap-1.5">
+        <span className="text-ui-sm font-semibold text-amber-400">
+          {approved ? 'approved — awaiting activation' : 'promoted, awaiting activation'}
+        </span>
+        <span className="text-ui-sm font-mono text-amber-300">v{version.version_number}</span>
+        {promotedAt && (
+          <span className="text-ui-sm text-amber-600">promoted {timeAgo(promotedAt)}</span>
+        )}
+      </div>
+      <p className="text-ui-sm text-amber-300/80">
+        {approved
+          ? <>Approved by {activationRequestedBy || 'an administrator'}; awaiting the activation receipt{deadlineText}.</>
+          : <>Approve activation to have the host-side deploy agent perform the bound release, or run <span className="font-mono">blueprint deploy</span> for an emergency override{deadlineText}.</>}
+      </p>
+      {canApprove && !approved && onApprove && (
+        <button
+          type="button"
+          data-testid="approve-activation"
+          onClick={onApprove}
+          disabled={approving}
+          className="self-start text-ui-sm px-2 py-1 min-h-[44px] sm:min-h-0 rounded border border-amber-500/40 text-amber-300 hover:bg-amber-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+          {approving ? 'Approving…' : 'Approve activation'}
+        </button>
+      )}
+      {approvalError && (
+        <p role="alert" data-testid="approve-activation-error" className="text-ui-sm text-red-400">
+          {approvalError}
+        </p>
+      )}
+    </div>
+  );
+}
+
 export function StagedDirectionsSummary({ staged }: { staged: StagedDirection[] }) {
   if (!staged.length) return null;
   return (

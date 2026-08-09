@@ -1112,20 +1112,34 @@ async def fleet_serving_source_sha(
     owner: str | None = None,
     repo: str | None = None,
     project_id: str | None = None,
-) -> bool:
-    """True iff the running agent fleet is observed serving ``promoted_sha``.
+) -> bool | None:
+    """Return whether the running agent fleet is observed serving ``promoted_sha``.
 
     Default fleet-serving definition for the agent VM image release artifact: at
-    least one currently-active (LIVE: PROVISIONING / IDLE / LEASED) warm-pool VM
-    reports ``agent_source_sha == promoted_sha`` — i.e. the freshly baked image
-    is live and running on the fleet.  DB-backed so the read survives an
-    orchestrator restart (the durable ``PoolVm.agent_source_sha`` is populated by
-    heartbeats via :func:`persist_pool_vm_image_state`); the in-memory heartbeat
-    map is consulted as a warm fallback before a row is persisted (and for
-    task-bound VMs that have no PoolVm registry row).
+    least one currently-active fleet member reports a source identity equal to
+    ``promoted_sha`` (or an ancestor when ``allow_descendant``). Every live fleet
+    class feeds one union before the match/ancestry check:
 
-    A read-only observation: returns ``False`` (not-yet-serving) rather than
-    raising on any error so it can never abort the serving-confirmation sweep.
+    * LIVE (PROVISIONING / IDLE / LEASED) warm-pool ``PoolVm`` rows — the freshly
+      baked image is live and running on the fleet;
+    * self-hosted checkout runners (``LocalRunner``) with a live ``last_seen_at``
+      and a durable ``agent_source_sha`` (the FULL SHA an agent reports over its
+      heartbeat) or ``source_sha`` (the runner's own clean ``git describe``
+      identity) — operator hardware serving the commit from a git checkout;
+    * the in-memory heartbeat map as a warm fallback before a row is persisted
+      (and for task-bound VMs that have no PoolVm registry row).
+
+    DB-backed so the read survives an orchestrator restart (the durable
+    ``PoolVm.agent_source_sha`` is populated by heartbeats via
+    :func:`persist_pool_vm_image_state`; ``LocalRunner.agent_source_sha`` via
+    :func:`persist_runner_agent_source_sha`; ``LocalRunner.source_sha`` by the
+    runner's own registration/heartbeat report).
+
+    A read-only observation: returns ``True`` for a matching observation,
+    ``False`` when at least one source identity is observable but none matches,
+    and ``None`` when no eligible live fleet member reports any source identity.
+    It returns an indeterminate result rather than raising on any error so it
+    can never abort the serving-confirmation sweep.
     """
     if not promoted_sha:
         return False
@@ -1133,7 +1147,9 @@ async def fleet_serving_source_sha(
     try:
         from sqlalchemy import select
 
-        from app.models import PoolVm, Task, TaskStatus
+        from app.models import LocalRunner, PoolVm, Task, TaskStatus
+        from app.runner_health_monitors import _get_liveness_seconds
+        from app.time_utils import _utcnow
         from app.warm_pool import LIVE_POOL_STATES
 
         stmt = select(PoolVm.agent_source_sha).where(
@@ -1144,6 +1160,39 @@ async def fleet_serving_source_sha(
             stmt = stmt.where(PoolVm.project_id == project_id)
         rows = (await session.execute(stmt)).all()
         observed_shas.update(str(row[0]) for row in rows if row[0])
+
+        # Self-hosted checkout runners (LocalRunner) are a first-class fleet
+        # member class. Their durable agent_source_sha is written by
+        # persist_runner_agent_source_sha on agent heartbeat; the liveness
+        # window here matches the fleet panel's own runner-liveness definition
+        # (_runner_liveness_health) rather than inventing a second staleness rule.
+        stale_cutoff = _utcnow() - timedelta(seconds=_get_liveness_seconds())
+        runner_stmt = select(LocalRunner.agent_source_sha).where(
+            LocalRunner.agent_source_sha.is_not(None),
+            LocalRunner.status == "active",
+            LocalRunner.last_seen_at.is_not(None),
+            LocalRunner.last_seen_at >= stale_cutoff,
+        )
+        if project_id is not None:
+            runner_stmt = runner_stmt.where(LocalRunner.project_id == project_id)
+        runner_rows = (await session.execute(runner_stmt)).all()
+        observed_shas.update(str(row[0]) for row in runner_rows if row[0])
+        if promoted_sha in observed_shas:
+            return True
+
+        # The runner's own clean ``git describe`` identity (LocalRunner.source_sha)
+        # is a second, independent observation of the same fleet class; it folds
+        # into the same union under the same liveness window.
+        runner_stmt = select(LocalRunner.source_sha).where(
+            LocalRunner.last_seen_at >= stale_cutoff,
+            LocalRunner.source_sha.is_not(None),
+            LocalRunner.status == "active",
+            LocalRunner.last_seen_at.is_not(None),
+        )
+        if project_id is not None:
+            runner_stmt = runner_stmt.where(LocalRunner.project_id == project_id)
+        runner_rows = (await session.execute(runner_stmt)).all()
+        observed_shas.update(str(row[0]) for row in runner_rows if row[0])
         if promoted_sha in observed_shas:
             return True
     except Exception as e:
@@ -1181,6 +1230,8 @@ async def fleet_serving_source_sha(
             )
     if promoted_sha in observed_shas:
         return True
+    if not observed_shas:
+        return None
     if not (allow_descendant and token and owner and repo):
         return False
     try:
@@ -1206,9 +1257,11 @@ async def agent_fleet_source_sha_snapshot(session, project_id=None) -> dict:
     """Return a read-only source-SHA distribution for live agent VMs.
 
     Durable ``PoolVm`` rows are the restart-safe source for warm-pool members.
-    The in-memory heartbeat caches add short-lived task VMs that have no pool
-    registry row. Missing ``agent_source_sha`` is preserved as an explicit
-    unknown bucket so older/pre-marker images do not look healthy by omission.
+    Durable ``LocalRunner`` rows cover self-hosted checkout runners (keyed by
+    their ``runner:<id>`` vm identity, ``kind="runner"``). The in-memory
+    heartbeat caches add short-lived task VMs that have no pool registry row.
+    Missing ``agent_source_sha`` is preserved as an explicit unknown bucket so
+    older/pre-marker images do not look healthy by omission.
     """
     observations: dict[str, dict] = {}
     try:
@@ -1257,6 +1310,38 @@ async def agent_fleet_source_sha_snapshot(session, project_id=None) -> dict:
                     "last_heartbeat_at": None,
                     "kind": "task_vm",
                 }
+
+        # Self-hosted checkout runners are first-class fleet members: fold live
+        # runners into the same source-SHA distribution, keyed by their
+        # runner:<id> vm identity. Liveness matches the fleet panel's runner
+        # definition (status + last_seen_at recency), same as fleet_serving_source_sha.
+        from app.models import LocalRunner
+        from app.runner_health_monitors import _get_liveness_seconds
+        from app.time_utils import _utcnow
+
+        stale_cutoff = _utcnow() - timedelta(seconds=_get_liveness_seconds())
+        runner_stmt = select(LocalRunner).where(
+            LocalRunner.status == "active",
+            LocalRunner.last_seen_at.is_not(None),
+            LocalRunner.last_seen_at >= stale_cutoff,
+        )
+        if project_id is not None:
+            runner_stmt = runner_stmt.where(LocalRunner.project_id == project_id)
+        runners = (await session.execute(runner_stmt)).scalars().all()
+        for runner in runners:
+            rid = f"runner:{runner.id}"
+            if rid in observations:
+                continue
+            observations[rid] = {
+                "vm_id": rid,
+                "source_sha": runner.agent_source_sha,
+                "image_name": None,
+                "build_ts": None,
+                "last_heartbeat_at": runner.last_seen_at.isoformat()
+                if runner.last_seen_at
+                else None,
+                "kind": "runner",
+            }
     except Exception as e:
         logger.debug(f"[COMPUTE] agent_fleet_source_sha_snapshot failed: {e}")
 
@@ -1270,6 +1355,7 @@ async def agent_fleet_source_sha_snapshot(session, project_id=None) -> dict:
                 "count": 0,
                 "warm_pool_count": 0,
                 "task_vm_count": 0,
+                "runner_count": 0,
                 "image_names": [],
                 "latest_build_ts": None,
                 "last_heartbeat_at": None,
@@ -1278,6 +1364,8 @@ async def agent_fleet_source_sha_snapshot(session, project_id=None) -> dict:
         bucket["count"] += 1
         if obs.get("kind") == "warm_pool":
             bucket["warm_pool_count"] += 1
+        elif obs.get("kind") == "runner":
+            bucket["runner_count"] += 1
         else:
             bucket["task_vm_count"] += 1
         image_name = obs.get("image_name")
@@ -1313,7 +1401,8 @@ async def expected_serving_source_sha(session, project_id=None) -> str | None:
     """Best-effort: the source git SHA the live agent fleet is currently serving.
 
     Returns the dominant (most-observed) ``agent_source_sha`` across live agent
-    VMs from :func:`agent_fleet_source_sha_snapshot`, or ``None`` when no live VM
+    fleet members (warm-pool VMs, task VMs, and self-hosted runners) from
+    :func:`agent_fleet_source_sha_snapshot`, or ``None`` when no live member
     has reported a source SHA yet. The snapshot already sorts buckets so the
     first non-null bucket is the most-observed served SHA. Read-only and never
     raises — callers that compare a grader VM's recorded SHA against this for a
@@ -1369,6 +1458,46 @@ async def persist_pool_vm_image_state(
         member.agent_source_sha = source_sha
     member.last_heartbeat_at = heartbeat_at or _utcnow()
     session.add(member)
+    return True
+
+
+async def persist_runner_agent_source_sha(
+    session,
+    vm_instance_id: str,
+    source_sha: str | None,
+) -> bool:
+    """Persist heartbeat-derived agent source SHA onto a LocalRunner row.
+
+    Self-hosted fleet runners (``scripts/local_runner.py``) multiplex tasks onto
+    a ``runner:<id>`` vm id, so every agent heartbeat for a runner-pinned task
+    carries that id. The agent already reports the exact commit it is serving via
+    ``agent_source_sha`` (a host-checkout SHA injected by the runner, or the
+    baked image marker); mirroring it onto the durable ``LocalRunner`` row makes
+    the checkout-runner fleet visible to release-artifact serving checks across
+    orchestrator restarts, exactly like :func:`persist_pool_vm_image_state` does
+    for warm-pool VMs.
+
+    Returns ``True`` when a matching LocalRunner row was updated, ``False`` when
+    the vm id is not a runner (task-bound chain/backlog VMs have no runner row)
+    or the runner id is not resolvable.
+    """
+    if not vm_instance_id or not source_sha:
+        return False
+    if not isinstance(vm_instance_id, str) or not vm_instance_id.startswith("runner:"):
+        return False
+    runner_id = vm_instance_id.removeprefix("runner:").strip()
+    try:
+        from uuid import UUID
+
+        from app.models import LocalRunner
+
+        runner = await session.get(LocalRunner, UUID(runner_id))
+    except (ValueError, TypeError):
+        return False
+    if runner is None:
+        return False
+    runner.agent_source_sha = source_sha
+    session.add(runner)
     return True
 
 

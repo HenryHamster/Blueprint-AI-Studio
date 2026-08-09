@@ -45,7 +45,10 @@ from app.failure_classification import (
 )
 from app.acceptance_gate import (
     ACCEPTANCE_AGGREGATE_BUCKETS,
+    ACCEPTANCE_RULE_VERSION,
+    ACCEPTANCE_TEST_CORROBORATED_KEY,
     CODE_ACCEPTANCE_VERDICT_KEY,
+    WINDOW_CORROBORATION_ATTEMPTED_SHA_KEY,
     _UNDECLARED_REASON_KEYS,
     _UNSATISFIED_REASON_KEYS,
     _is_test_path,
@@ -53,6 +56,8 @@ from app.acceptance_gate import (
     classify_undeclared_reason,
     classify_unsatisfied_reason,
     effective_acceptance_verdict,
+    record_code_acceptance_verdict,
+    verdict_rule_version,
 )
 from app.acceptance_criteria import (
     WALKTHROUGH_E2E_FLOW_MARKERS,
@@ -72,6 +77,7 @@ try:  # pragma: no cover - exercised once the sibling ledger module lands
 except Exception:  # noqa: BLE001 - sibling module not yet landed in this checkout
     _category_ledger = None  # type: ignore[assignment]
 
+from app.landed_signal import LANDED_MERGE_SHA_KEY
 from app.landed_signal import is_verified_merge, landed_signal_predicate
 from app.models import (
     ArtifactType,
@@ -129,7 +135,9 @@ from app.release_qualifier_audit import (
     _spawn_release_audit_challenge_task,
     _spawn_release_audit_task,
     _spawn_release_merge_grade_task,
+    _spawn_direction_merge_grade_task,  # noqa: F401 — re-exported for callers/tests
     _spawn_qualifier_walkthrough_task,
+    record_direction_merge_grade,  # noqa: F401 — re-exported for callers/tests
     get_infra_failure_stats,  # noqa: F401 — re-exported for callers/tests
     get_latest_qualification_audit_findings,  # noqa: F401 — re-exported for callers/tests
     get_latest_release_audit_challenge,  # noqa: F401 — re-exported for callers/tests
@@ -274,6 +282,7 @@ from app.release_qualifier_audit_surface import (
     _audit_dimension_detail,  # noqa: F401 — re-exported for callers/tests
     _audit_finding_identity,  # noqa: F401 — re-exported for callers/tests
     _audit_finding_path,  # noqa: F401 — re-exported for callers/tests
+    _audit_report_confirms_goal_category_range,  # noqa: F401 — re-exported for callers/tests
     _audit_report_confirms_incremental_base,  # noqa: F401 — re-exported for callers/tests
     _audit_report_raw_findings,  # noqa: F401 — re-exported for callers/tests
     _audited_surface_hash_from_map,  # noqa: F401 — re-exported for callers/tests
@@ -509,12 +518,28 @@ def _qualification_probe_contract_is_reusable(
         return True
     result = prior_qual.get("walkthrough_e2e_result")
     candidate_sha = str(prior_qual.get("candidate_sha") or "").strip()
-    return bool(
+    if (
         isinstance(result, dict)
         and result.get("status") in {"passed", "failed"}
         and candidate_sha
         and result.get("candidate_sha") == candidate_sha
         and result.get("exercised_engine_sha") == candidate_sha
+    ):
+        return True
+    # A walkthrough evidence-CONTRACT failure
+    # (blocker="walkthrough_e2e_contract_failed") records a DETERMINISTIC
+    # deployed-side verdict: the serving validator rejected the report's
+    # structure or key resolution, and re-running the SAME candidate would
+    # reproduce the same rejection (the validator is deployed, not re-rolled).
+    # Treating the record as reusable lets run_qualification's cached-verdict
+    # guard make a same-candidate re-drive a cheap no-op (no VM spawn, no
+    # cap advance) while a candidate advance — a conforming fix landing on
+    # automain — or a goal/rubric change (contract_fingerprint drift) still
+    # spawns a fresh qualification.  The walkthrough-contract sweep re-driver
+    # depends on this no-op for its unchanged-candidate sweep passes.
+    return bool(
+        prior_qual.get("status") == "not_promoted"
+        and prior_qual.get("blocker") == "walkthrough_e2e_contract_failed"
     )
 
 # Explicit enumeration of every dimension written by _dual_write_dimension_results.
@@ -3481,6 +3506,17 @@ async def run_qualification(
         # pending record carrying the accumulated count even if that post-commit
         # write is lost to a crash.
         "rubric_redrive_count": int(prior_qual.get("rubric_redrive_count") or 0),
+        # Per-contract-episode re-drive counter, carried forward from the prior
+        # walkthrough contract-failure verdict (0 when the prior outcome was not
+        # a contract failure).  The walkthrough-contract re-driver
+        # (_redrive_walkthrough_contract_qualification) increments this
+        # POST-commit after each successful re-entry so the cap advances across
+        # the spawn→finalize→re-drive cycle; stamping it here keeps the pending
+        # record carrying the accumulated count even if that post-commit write
+        # is lost to a crash.
+        "walkthrough_contract_redrive_count": int(
+            prior_qual.get("walkthrough_contract_redrive_count") or 0
+        ),
         "keyless_requalification_consumed_at": prior_qual.get(
             "keyless_requalification_consumed_at"
         ),
@@ -3782,6 +3818,13 @@ async def _handle_walkthrough_contract_failure(
     finalized_at = _utcnow().isoformat()
     candidate_sha = qual.get("candidate_sha")
     sub_scores: dict[str, Any] = {"walkthrough_e2e": 0.0}
+    # Stamp the serving engine sha on the record so observability (and any
+    # future site-change detection) can see WHICH deployed validator produced
+    # this contract failure — a new serving sha means the validator may have
+    # changed.  Lazy import mirrors the spawn_failed record's idiom
+    # (app.deployed_sha is a lightweight env-reader; no load-order coupling).
+    from app.deployed_sha import get_serving_sha  # noqa: PLC0415
+
     record: dict[str, Any] = {
         "qualification_attempt_id": qual.get("qualification_attempt_id"),
         "retry_episode": qual.get("retry_episode", 0),
@@ -3791,6 +3834,7 @@ async def _handle_walkthrough_contract_failure(
         "ci_green": qual.get("ci_green"),
         "ci_resolution": qual.get("ci_resolution"),
         "smoketest_enabled": bool(qual.get("smoketest_enabled", False)),
+        "engine_sha": get_serving_sha(),
         "status": "not_promoted",
         "blocker": "walkthrough_e2e_contract_failed",
         # Persist the execution site directly so every downstream surface
@@ -3815,6 +3859,13 @@ async def _handle_walkthrough_contract_failure(
         # sweep's exactly-once bound survives the overwrite of last_qualification.
         "keyless_requalification_consumed_at": qual.get(
             "keyless_requalification_consumed_at"
+        ),
+        # Carry the per-contract-episode re-drive counter forward so the
+        # sweep's walkthrough-contract re-driver cap
+        # (_redrive_walkthrough_contract_qualification) survives the
+        # spawn→finalize→re-drive overwrite of last_qualification.
+        "walkthrough_contract_redrive_count": qual.get(
+            "walkthrough_contract_redrive_count"
         ),
     }
     version.last_qualification = record
@@ -4396,6 +4447,12 @@ async def _compute_acceptance_window_aggregate(
         "acceptance_window_undeclared_reasons": dict, # split of the undeclared bucket by reason (sums to buckets["undeclared"])
         "acceptance_window_declared_unsatisfied_reasons": dict, # split of the declared_unsatisfied bucket by reason (sums to buckets["declared_unsatisfied"])
         "acceptance_window_inferred_test_cochange": int,  # verified merges credited via inferred_test_cochange
+        "acceptance_window_rederived_count": int,  # write-task verdicts re-derived under the current rule this drive (each task counted once)
+        "acceptance_window_rederived_upgrades": int,  # re-derived verdicts that strictly improved (satisfied/proven minted)
+        "acceptance_window_rederived_downgrades": int,  # re-derived verdicts that strictly worsened
+        "acceptance_window_rule_version": int,  # the acceptance rule version this drive judged under
+        "acceptance_window_stale_version_counts": dict,  # retired rule version -> recorded rows stamped under it (legacy pre-stamp rows counted under 0)
+        "acceptance_window_rederived_task_ids": list,  # task ids actually re-derived this drive (capped)
       }
 
     The nested breakdowns are purely additive: ``acceptance_window_buckets``
@@ -4444,13 +4501,169 @@ async def _compute_acceptance_window_aggregate(
     # mid-version re-scores already-merged work. Current-rule stamps and the
     # declared-fail-safe rows pass through verbatim (see
     # ``acceptance_gate.effective_acceptance_verdict``); undeclared rows keep no
-    # verdict key so the inferred-test-cochange path still applies.
+    # verdict key so the inferred-test-cochange path still applies. The re-derived
+    # verdict is written back onto the session-bound task so the correction is
+    # DURABLE for every reader, not a per-drive throwaway.
+    # Re-derivation audit (design doc c50453ef §5): the window reports how much
+    # already-merged work was re-scored by the current rule THIS drive, in which
+    # direction, and which retired rule versions produced the stale population —
+    # so score movement is inspectable instead of a silently-shifting aggregate.
+    # A task is counted exactly ONCE per drive even though the corroboration pass
+    # and the classification pass both walk every write-task row.
+    _REDERIVED_TASK_ID_CAP = 100
+    _rederived_seen: set[str] = set()
+    _stale_seen: set[str] = set()
+    _rederived_task_ids: list[str] = []
+    _stale_version_counts: dict[int, int] = {}
+    _rederived_upgrades = 0
+    _rederived_downgrades = 0
+
+    def _verdict_rank(verdict: dict) -> int:
+        """Ordinal rank of a verdict for upgrade/downgrade direction: 0
+        unsatisfied, 1 satisfied-unproven, 2 proven."""
+        if verdict.get("proven") is True:
+            return 2
+        if verdict.get("satisfied") is True:
+            return 1
+        return 0
+
     def _effective_context(task: Task) -> dict:
+        nonlocal _rederived_upgrades, _rederived_downgrades
         ctx = dict(task.context or {})
+        frozen = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+        if frozen is not None and not isinstance(frozen, dict):
+            frozen = None
+        # Audit the RETIRED-version population BEFORE re-derivation: every
+        # recorded row stamped under a rule other than the current one is counted
+        # once under its own version, so the stale population's size and vintage
+        # are visible even when a row cannot be re-derived (its payload no longer
+        # declares evidence, so ``effective_acceptance_verdict`` returns the
+        # frozen row verbatim).
+        if isinstance(frozen, dict):
+            _version = verdict_rule_version(frozen)
+            if _version != ACCEPTANCE_RULE_VERSION:
+                _task_id = str(task.id)
+                if _task_id not in _stale_seen:
+                    _stale_seen.add(_task_id)
+                    _stale_version_counts[_version] = (
+                        _stale_version_counts.get(_version, 0) + 1
+                    )
         effective = effective_acceptance_verdict(task)
         if effective is not None:
             ctx[CODE_ACCEPTANCE_VERDICT_KEY] = effective
+            # Durability: re-derivation recomputes the corrected verdict on every
+            # drive and every other reader (task_outcomes, direction_outcomes,
+            # acceptance_criteria, metrics_integrity_sweep, capability_proof)
+            # reads the RECORDED row — so a non-frozen re-derivation is stamped
+            # back onto ``task.context`` and made durable by the enclosing flow's
+            # next commit. Idempotent: once re-stamped under the CURRENT rule,
+            # later drives return the frozen dict verbatim and skip this write.
+            if effective is not frozen:
+                task.context = ctx
+                session.add(task)
+                # Count the re-derivation exactly once per task per drive. The
+                # direction is the strict rank movement between the retired-rule
+                # verdict and the current-rule verdict, so upgrades AND downgrades
+                # are both visible — re-derivation is honest, not monotonic.
+                _task_id = str(task.id)
+                if _task_id not in _rederived_seen:
+                    _rederived_seen.add(_task_id)
+                    _rederived_task_ids.append(_task_id)
+                    _frozen_rank = (
+                        _verdict_rank(frozen) if isinstance(frozen, dict) else 0
+                    )
+                    _effective_rank = _verdict_rank(effective)
+                    if _effective_rank > _frozen_rank:
+                        _rederived_upgrades += 1
+                    elif _effective_rank < _frozen_rank:
+                        _rederived_downgrades += 1
         return ctx
+
+    # Corroboration pass (the fix for "the acceptance window mints ~0 proven
+    # coverage"): soft named_test verdicts (satisfied, unproven) recorded on a
+    # non-CI-monitor landing path carry no corroboration marker, so a declared
+    # test ABSENT from the PR's diff but PRESENT in the merged tree is capped at
+    # soft credit forever. Corroborate each such verdict against the stored
+    # merge commit and re-record — a test the backend confirms exists at the
+    # merge commit then mints machine-proven coverage. CONSERVATIVE: only a
+    # confirmed presence (True) stamps the marker and re-records; a corroborated
+    # absence or indeterminate result leaves the recorded soft verdict untouched,
+    # so this additive observability pass never downgrades a previous
+    # qualification. Best-effort and bounded per drive — corroboration is GitHub
+    # I/O, so the pass never blocks the aggregation on a slow/absent tree.
+    #
+    # The cap bounds ATTEMPTS, not successes: a window where every candidate
+    # corroborates indeterminate (no GitHub creds, unavailable tree) must still
+    # issue at most ``_WINDOW_CORROBORATION_CAP`` round-trips per drive. And
+    # because a non-True result stamps no corroboration marker, the attempt is
+    # additionally recorded DURABLY under
+    # :data:`WINDOW_CORROBORATION_ATTEMPTED_SHA_KEY` keyed by the merge sha that
+    # was read — otherwise the same tasks would be re-read in full on every
+    # subsequent qualifier drive, forever. Keying by sha (not a bare boolean)
+    # keeps a later landing on a NEW merge commit eligible for a fresh attempt.
+    _window_project = await session.get(Project, version.project_id)
+    _WINDOW_CORROBORATION_CAP = 50
+    _corroboration_attempts = 0
+    for task in rows_write:
+        if _corroboration_attempts >= _WINDOW_CORROBORATION_CAP:
+            break
+        _ctx = _effective_context(task)
+        _verdict = _ctx.get(CODE_ACCEPTANCE_VERDICT_KEY)
+        if not (
+            isinstance(_verdict, dict)
+            and _verdict.get("kind") == "named_test"
+            and _verdict.get("satisfied") is True
+            and _verdict.get("proven") is not True
+            and ACCEPTANCE_TEST_CORROBORATED_KEY not in _ctx
+        ):
+            continue
+        _sha = (task.context or {}).get(LANDED_MERGE_SHA_KEY)
+        if not isinstance(_sha, str) or not _sha:
+            continue
+        _sha = _sha[:64]
+        if (task.context or {}).get(WINDOW_CORROBORATION_ATTEMPTED_SHA_KEY) == _sha:
+            # Already attempted against this exact merge commit on an earlier
+            # drive and it did not produce a definitive result. The read is
+            # deterministic for an immutable commit, so retrying spends I/O for
+            # no new information.
+            continue
+        from app.acceptance_gate import corroborate_acceptance_test_at_merge
+
+        _corroboration_attempts += 1
+        try:
+            _result = await corroborate_acceptance_test_at_merge(
+                task,
+                session,
+                project=_window_project,
+                commit_sha=_sha,
+            )
+        except Exception:  # noqa: BLE001 — window corroboration must never abort
+            logger.warning(
+                "[RELEASE_QUALIFIER] acceptance-window corroboration failed for "
+                "task %s",
+                getattr(task, "id", None),
+                exc_info=True,
+            )
+            # An UNEXPECTED raise (the helper swallows its own I/O failures) is
+            # not durably marked: leave the task eligible so a transient fault
+            # cannot permanently deny it proven credit. The per-drive cap above
+            # already bounds the cost.
+            continue
+        _new_ctx = {
+            **(task.context or {}),
+            WINDOW_CORROBORATION_ATTEMPTED_SHA_KEY: _sha,
+        }
+        if _result is True:
+            # CONSERVATIVE: only a confirmed presence stamps the corroboration
+            # marker and re-records. A corroborated absence (False) or an
+            # indeterminate result (None) leaves the recorded soft verdict
+            # untouched — it is only marked as attempted.
+            _new_ctx[ACCEPTANCE_TEST_CORROBORATED_KEY] = True
+            task.context = _new_ctx
+            record_code_acceptance_verdict(task)
+        else:
+            task.context = _new_ctx
+        session.add(task)
 
     for task in rows_write:
         ctx = _effective_context(task)
@@ -4500,6 +4713,24 @@ async def _compute_acceptance_window_aggregate(
         # Per-merge audit trail: task IDs of the inferred_test_cochange merges so
         # operators can trace which specific merges were counted without SQL.
         "acceptance_window_inferred_test_cochange_task_ids": inferred_task_ids,
+        # Re-derivation audit (design doc c50453ef §5): how much already-merged
+        # work was re-scored by the CURRENT rule this drive, in which direction,
+        # and which retired rule versions produced the stale population. All keys
+        # are additive observability — the scalar ``verified`` and the bucket
+        # counts above are unchanged. ``rederived_count`` == len(rederived_task_ids)
+        # before the cap; upgrades + downgrades can be less than the count because
+        # a re-derivation that preserves the rank (e.g. a satisfied->satisfied
+        # reason change) is still a re-derivation.
+        "acceptance_window_rederived_count": len(_rederived_seen),
+        "acceptance_window_rederived_upgrades": _rederived_upgrades,
+        "acceptance_window_rederived_downgrades": _rederived_downgrades,
+        "acceptance_window_rule_version": ACCEPTANCE_RULE_VERSION,
+        "acceptance_window_stale_version_counts": dict(
+            sorted(_stale_version_counts.items())
+        ),
+        "acceptance_window_rederived_task_ids": _rederived_task_ids[
+            :_REDERIVED_TASK_ID_CAP
+        ],
     }
 
 async def _collect_verified_merge_test_evidence(
@@ -6567,6 +6798,35 @@ async def _finalize_qualification(
                     session, version, qual, "audit_report_findings_wrong_type"
                 )
 
+    # Goal and acceptance-category grading has no scoped carry-forward, so the
+    # release_audit report MUST have graded the full version delta the
+    # promotion would carry.  The agent echoes the range it actually graded
+    # into audit_scope.goal_category_diff_range (pinned at spawn to
+    # base_branch...candidate_sha); a present echo that disagrees means a
+    # narrowed goal/category window — hold rather than score a narrowed grade.
+    if isinstance(audit_report, dict) and candidate_sha:
+        _expected_goal_category_range = (
+            f"{_lts_branch_names(_policy_project)[1]}...{candidate_sha}"
+        )
+        if not _audit_report_confirms_goal_category_range(
+            audit_report, _expected_goal_category_range
+        ):
+            _echoed_goal_category_range = (audit_report.get("audit_scope") or {}).get(
+                "goal_category_diff_range"
+            )
+            logger.warning(
+                "[RELEASE_QUALIFIER] v%d candidate %s: release_audit report "
+                "echoed goal_category_diff_range %r but expected the full "
+                "version delta %r — holding",
+                version.version_number,
+                str(candidate_sha)[:8],
+                _echoed_goal_category_range,
+                _expected_goal_category_range,
+            )
+            return await _handle_infra_failure(
+                session, version, qual, "audit_goal_category_range_narrowed"
+            )
+
     # Persist audit and test_erosion to the per-dimension ledger immediately
     # since both have now been resolved (from the ledger or live).  An infra
     # failure in a later gate must not discard them — otherwise the re-drive
@@ -7627,10 +7887,15 @@ async def _finalize_qualification(
             "blocked": False,
             "detail": None,
         }
-    if _merge_grade_goal_usable and "merge_grade" not in resolved_dims:
+    if (_merge_grade_goal_usable or bool(active_categories)) and "merge_grade" not in resolved_dims:
         # The primary release review is holistic.  It supplies both defect/test
         # evidence and the formerly separate blind merge-grade contract, so one
         # candidate decision consumes one LLM task rather than a fixed fan-out.
+        # ``evaluate_merge_grade`` is also reached when the goal is empty/
+        # contentless but an ACTIVE acceptance-criteria rubric exists: the rubric
+        # is a gradeable contract on its own (the audit ships ``categories`` even
+        # without a goal string), and its per-category verdicts must be graded and
+        # gated instead of fail-closing the whole contract as never-graded.
         merge_grade_artifact: dict[str, Any] | None = (
             audit_report
             if isinstance(audit_report, dict)
@@ -7684,12 +7949,13 @@ async def _finalize_qualification(
         # that supports the protocol reaches the fleet.
         if merge_grade_cert["status"] == "category_grade_unsupported":
             logger.warning(
-                "[RELEASE_QUALIFIER] v%d candidate %s: the merge-grade agent "
-                "returned no `category_verdicts` section while %d acceptance "
+                "[RELEASE_QUALIFIER] v%d candidate %s: the release-audit/merge-grade "
+                "agent returned no `category_verdicts` section while %d acceptance "
                 "criteria are ACTIVE — the grader predates the per-category "
-                "protocol. HOLDING (not fabricating not_met verdicts). Rebake the "
-                "agent image from a ref carrying agent/src/handlers/merge-grade.ts "
-                "per-category output.",
+                "protocol (or the goal-less rubric contract). HOLDING (not "
+                "fabricating not_met verdicts). Rebake the agent image from a ref "
+                "carrying agent/src/handlers/audits.ts / merge-grade.ts per-category "
+                "output.",
                 version.version_number,
                 (candidate_sha or "")[:8],
                 len(active_categories or []),

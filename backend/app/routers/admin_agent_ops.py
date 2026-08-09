@@ -1129,6 +1129,167 @@ async def _has_exact_live_fast_public_claim(
     )
 
 
+async def _resolve_spawn_task_dependencies(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    calling_task_id: uuid.UUID,
+    raw_depends_on: Any,
+    new_task_base: str | None,
+    declared_landing_gate: str | None,
+) -> list[Task]:
+    """Validate a spawn_task ``depends_on`` declaration and resolve it to rows.
+
+    Reuses the same persisted representation the PLAN spawner writes to
+    ``Task.depends_on`` (a flat list of prerequisite task id strings) rather
+    than inventing a parallel one — see app.plan_completion. Unknown,
+    cross-project, terminal-failed, self-referential, duplicate, and cyclic
+    prerequisite ids are rejected at authoring time so a bad edge never
+    silently drops or wedges the dependent in the dispatch gate.
+    """
+    if raw_depends_on is None:
+        return []
+    if not isinstance(raw_depends_on, list) or not raw_depends_on:
+        raise HTTPException(
+            status_code=400,
+            detail="depends_on must be a non-empty list of task UUIDs",
+        )
+    # This spawn always cuts from the project integration branch (see
+    # spawn_payload below). Reject a dependency whose own base branch differs:
+    # the dispatch loop only waits on a dependency matching _same_base_branch
+    # (orchestrator_health.py), so a cross-base edge would be silently skipped
+    # and the dependent would dispatch against a base missing the dependency's
+    # landed code. Mirrors the operator-facing depends_on gate in
+    # admin_task_mutations.py.
+    from app.orchestrator_health import (
+        _same_base_branch_value as _same_base_value,
+    )
+
+    seen: set[str] = set()
+    foundations: list[Task] = []
+    for raw_id in raw_depends_on:
+        dep_text = str(raw_id).strip()
+        try:
+            dep_uuid = uuid.UUID(dep_text)
+        except (ValueError, AttributeError):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "depends_on entries must be task UUIDs; got "
+                    f"{raw_id!r}"
+                ),
+            ) from None
+        dep_text = str(dep_uuid)
+        if dep_text == str(calling_task_id):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "depends_on cannot reference the calling strategic task "
+                    f"itself: {dep_text}"
+                ),
+            )
+        if dep_text in seen:
+            raise HTTPException(
+                status_code=400,
+                detail=f"depends_on lists {dep_text} more than once",
+            )
+        seen.add(dep_text)
+        dep_task = await session.get(Task, dep_uuid)
+        if dep_task is None or dep_task.project_id != project_id:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "depends_on references a task outside this "
+                    f"project: {dep_text}"
+                ),
+            )
+        if dep_task.status == TaskStatus.FAILED:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"depends_on task {dep_text} is terminal-failed and cannot "
+                    "be a prerequisite"
+                ),
+            )
+        dep_base = (dep_task.first_payload or {}).get("base_branch")
+        # A declared landing gate replaces the base-branch heuristic for this
+        # task's edges: dispatch holds until the dep has LANDED on the named
+        # branch (sequenced_spawn.landing_gate), and a declared
+        # release_base_branch re-cuts the base at release — so a cross-base
+        # edge is neither silently skipped nor dispatched against a base
+        # missing the dep's code.
+        if declared_landing_gate is None and not _same_base_value(
+            new_task_base, dep_base
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Cross-base dependency rejected: this spawn's base "
+                    f"branch '{new_task_base or '(default)'}' differs "
+                    f"from dependency {dep_text}'s base "
+                    f"'{dep_base or '(default)'}'. A dependency only "
+                    f"propagates its landed code when both share a base "
+                    f"branch; otherwise the dependent would dispatch "
+                    f"without the prerequisite's changes. Align the base "
+                    f"branches or re-point the dependency."
+                ),
+            )
+        foundations.append(dep_task)
+    await _reject_dependency_cycles(session, foundations)
+    return foundations
+
+
+async def _reject_dependency_cycles(
+    session: AsyncSession,
+    foundations: list[Task],
+) -> None:
+    """Reject a declared prerequisite set whose dependency graph is cyclic.
+
+    The dispatch gate (orchestrator_health._check_candidate_task_deps) walks
+    ``depends_on`` edges to decide whether to hold a dependent, so attaching a
+    new task to an already-cyclic prerequisite set would deadlock the gate.
+    The new task is always a sink (nothing references it yet), so the only
+    cycle detectable at authoring time is a pre-existing one among the declared
+    foundations.
+    """
+    if not foundations:
+        return
+    cache: dict[str, Task] = {str(t.id): t for t in foundations}
+
+    async def _has_cycle(start: Task, path: set[str]) -> bool:
+        key = str(start.id)
+        if key in path:
+            return True
+        path.add(key)
+        for dep in start.depends_on or []:
+            dep_key = str(dep).strip()
+            if not dep_key:
+                continue
+            try:
+                uuid.UUID(dep_key)
+            except ValueError:
+                continue
+            if dep_key not in cache:
+                row = await session.get(Task, uuid.UUID(dep_key))
+                if row is None:
+                    continue
+                cache[dep_key] = row
+            if await _has_cycle(cache[dep_key], path):
+                return True
+        path.discard(key)
+        return False
+
+    for foundation in foundations:
+        if await _has_cycle(foundation, set()):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "depends_on declares a cyclic prerequisite set (a "
+                    "prerequisite transitively depends on itself); the dispatch "
+                    "gate would deadlock — remove the cyclic edges"
+                ),
+            )
+
 
 class StrategicOp(BaseModel):
     """Incremental strategic review operation from an agent."""
@@ -4140,9 +4301,17 @@ async def strategic_operation(
         # gated deterministically by sequenced_spawn.landing_gate instead of the
         # base-branch heuristics, and release_base_branch repoints the task's
         # base at dependency-release time. Mirrored verbatim into payloads[0];
-        # branch-name shape is enforced by the payload schema below.
+        # branch-name shape is enforced by the payload schema below. This API
+        # always cuts the spawned task from the project integration branch and
+        # nothing anywhere creates a shared/campaign branch for a strategist, so
+        # a sequencing field is only usable when it names that integration
+        # branch — any other ref would later be consumed as a literal branch
+        # that does not exist. Reject such a declaration here, before dependency
+        # resolution or payload persistence, so a bad campaign declaration never
+        # reaches admission.
         declared_landing_gate: str | None = None
         declared_release_base: str | None = None
+        integration_branch = _get_project_integration_branch(project)
         for _seq_key in ("require_deps_landed_on", "release_base_branch"):
             _seq_raw = data.get(_seq_key)
             if _seq_raw is None:
@@ -4152,76 +4321,35 @@ async def strategic_operation(
                     status_code=400,
                     detail=f"{_seq_key} must be a non-empty branch name",
                 )
+            _seq_value = _seq_raw.strip()
+            if _seq_value != integration_branch:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"{_seq_key} names branch {_seq_value!r}, but direct "
+                        f"strategist spawns build only from the project "
+                        f"integration branch {integration_branch!r} — no "
+                        f"shared/campaign branch is ever created for a "
+                        f"strategist, so the declared ref would not exist. "
+                        f"Declare {integration_branch!r} (or omit the field)."
+                    ),
+                )
             if _seq_key == "require_deps_landed_on":
-                declared_landing_gate = _seq_raw.strip()
+                declared_landing_gate = _seq_value
             else:
-                declared_release_base = _seq_raw.strip()
+                declared_release_base = _seq_value
         raw_depends_on = data.get("depends_on")
         depends_on_ids: list[str] = []
         if raw_depends_on is not None:
-            if not isinstance(raw_depends_on, list) or not raw_depends_on:
-                raise HTTPException(
-                    status_code=400,
-                    detail="depends_on must be a non-empty list of task UUIDs",
-                )
-            # This spawn always cuts from the project integration branch (see
-            # spawn_payload below). Reject a dependency whose own base branch
-            # differs: the dispatch loop only waits on a dependency matching
-            # _same_base_branch (orchestrator_health.py), so a cross-base edge
-            # would be silently skipped and the dependent would dispatch against
-            # a base missing the dependency's landed code. Mirrors the
-            # operator-facing depends_on gate in admin_task_mutations.py.
-            from app.orchestrator_health import (
-                _same_base_branch_value as _same_base_value,
+            foundation_tasks = await _resolve_spawn_task_dependencies(
+                session,
+                project_id=project.id,
+                calling_task_id=task.id,
+                raw_depends_on=raw_depends_on,
+                new_task_base=_get_project_integration_branch(project),
+                declared_landing_gate=declared_landing_gate,
             )
-
-            _new_task_base = _get_project_integration_branch(project)
-            for _dep in raw_depends_on:
-                _dep_text = str(_dep).strip()
-                try:
-                    _dep_uuid = uuid.UUID(_dep_text)
-                except (ValueError, AttributeError):
-                    raise HTTPException(
-                        status_code=400,
-                        detail=(
-                            "depends_on entries must be task UUIDs; got "
-                            f"{_dep!r}"
-                        ),
-                    ) from None
-                _dep_task = await session.get(Task, _dep_uuid)
-                if _dep_task is None or _dep_task.project_id != project.id:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=(
-                            "depends_on references a task outside this "
-                            f"project: {_dep_text}"
-                        ),
-                    )
-                _dep_base = (_dep_task.first_payload or {}).get("base_branch")
-                # A declared landing gate replaces the base-branch heuristic for
-                # this task's edges: dispatch holds until the dep has LANDED on
-                # the named branch (sequenced_spawn.landing_gate), and a declared
-                # release_base_branch re-cuts the base at release — so a
-                # cross-base edge is neither silently skipped nor dispatched
-                # against a base missing the dep's code.
-                if declared_landing_gate is None and not _same_base_value(
-                    _new_task_base, _dep_base
-                ):
-                    raise HTTPException(
-                        status_code=400,
-                        detail=(
-                            "Cross-base dependency rejected: this spawn's base "
-                            f"branch '{_new_task_base or '(default)'}' differs "
-                            f"from dependency {_dep_text}'s base "
-                            f"'{_dep_base or '(default)'}'. A dependency only "
-                            f"propagates its landed code when both share a base "
-                            f"branch; otherwise the dependent would dispatch "
-                            f"without the prerequisite's changes. Align the base "
-                            f"branches or re-point the dependency."
-                        ),
-                    )
-                if _dep_text not in depends_on_ids:
-                    depends_on_ids.append(_dep_text)
+            depends_on_ids = [str(t.id) for t in foundation_tasks]
         direction_id = data.get("direction_id")
         direction_entry = next(
             (

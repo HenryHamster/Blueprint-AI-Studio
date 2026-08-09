@@ -686,98 +686,160 @@ async def run_operator_inbox_liveness_check(
         return []
 
     results: List[LivenessResult] = []
-    for (project_id,) in project_ids:
-        pid = str(project_id)
 
-        messages = (
+    # ── Batched measurement ─────────────────────────────────────────────────
+    # The per-project loop used to issue 4-5 individual SELECTs per project
+    # (a sample-message scan, an INFO-alert count, a quarantined-reply count,
+    # an undelivered-reply count, and a conditional quarantined-message scan).
+    # On a 25-50 project tick that is ~100-250 DB round-trips per liveness
+    # interval.  Collapse them into a constant handful of grouped / batched
+    # queries and partition the rows per project in memory, preserving the
+    # exact per-project predicates and ordering.
+    project_id_list = [pid for (pid,) in project_ids]
+
+    def _bounded_message_select(pids: List[Any], *predicates: Any) -> Any:
+        """Batched newest-first message scan bounded to ``sample_limit`` per project.
+
+        Batching must not trade N round-trips for an unbounded result set:
+        ``projectmessage`` is a durable, ever-growing table and the predicates
+        below describe exactly the population a leaking inbox inflates.  A
+        ``row_number() OVER (PARTITION BY project_id ORDER BY created_at DESC)``
+        rank keeps the per-project TOP-N bound the old per-project
+        ``.limit(sample_limit)`` provided, so a tick still loads at most
+        ``max_projects * sample_limit`` rows.
+        """
+        ranked = (
+            select(
+                ProjectMessage.id.label("message_id"),
+                func.row_number()
+                .over(
+                    partition_by=ProjectMessage.project_id,
+                    order_by=ProjectMessage.created_at.desc(),
+                )
+                .label("rn"),
+            )
+            .where(ProjectMessage.project_id.in_(pids), *predicates)
+            .subquery()
+        )
+        return (
+            select(ProjectMessage)
+            .join(ranked, ProjectMessage.id == ranked.c.message_id)
+            .where(ranked.c.rn <= sample_limit)
+            .order_by(ProjectMessage.created_at.desc())
+        )
+
+    # Sample messages: newest-first per project, bounded to sample_limit rows
+    # per project by the window rank — reproduces the per-project TOP-N exactly.
+    messages_by_project: Dict[Any, List[ProjectMessage]] = {}
+    if project_id_list:
+        for _m in (
             await session.execute(
-                select(ProjectMessage)
-                .where(
-                    ProjectMessage.project_id == project_id,
+                _bounded_message_select(
+                    project_id_list,
                     ProjectMessage.status.in_([OPEN_STATUS, LINKED_STATUS]),
                     ProjectMessage.from_type != "user",
                     operator_visible_message_audience_filter(ProjectMessage.context),
                 )
-                .order_by(ProjectMessage.created_at.desc())
-                .limit(sample_limit)
             )
-        ).scalars().all()
+        ).scalars().all():
+            messages_by_project.setdefault(_m.project_id, []).append(_m)
 
-        info_alert_count = int(
-            (
-                await session.execute(
-                    select(func.count())
-                    .select_from(Alert)
-                    .where(
-                        Alert.project_id == project_id,
-                        Alert.dismissed_at.is_(None),
-                        Alert.severity == AlertSeverity.INFO,
-                        operator_visible_alert_filter(Alert.event_type),
-                    )
+    info_alert_counts = dict(
+        (
+            await session.execute(
+                select(Alert.project_id, func.count())
+                .select_from(Alert)
+                .where(
+                    Alert.project_id.in_(project_id_list),
+                    Alert.dismissed_at.is_(None),
+                    Alert.severity == AlertSeverity.INFO,
+                    operator_visible_alert_filter(Alert.event_type),
                 )
-            ).scalar()
-            or 0
-        )
+                .group_by(Alert.project_id)
+            )
+        ).all()
+    )
 
-        # Reverse-audience detector: reply-bearing messages that are invisible to
-        # the operator — either explicitly quarantined (audience IN non-operator)
-        # OR with a NULL audience (un-stamped rows that are also excluded by the
-        # fail-closed operator_visible_message_audience_filter).  NULL-audience
-        # replies are a silent dead-letter path: the backfill sweep would stamp
-        # them STRATEGIST_INTERNAL if their event_type is absent or unregistered,
-        # making the reply permanently invisible.  Detecting both classes here
-        # lets the heal pass surface them before the backfill can bury them.
-        # Covers both reply_to-threaded messages and cover-style messages
-        # (with _resident_reply_covered_message_ids but no reply_to).
-        quarantined_reply_count = int(
-            (
-                await session.execute(
-                    select(func.count())
-                    .select_from(ProjectMessage)
-                    .where(
-                        ProjectMessage.project_id == project_id,
-                        or_(
-                            ProjectMessage.reply_to_message_id.isnot(None),
-                            ProjectMessage.context["_resident_reply_covered_message_ids"].isnot(None),
+    quarantined_counts = dict(
+        (
+            await session.execute(
+                select(ProjectMessage.project_id, func.count())
+                .select_from(ProjectMessage)
+                .where(
+                    ProjectMessage.project_id.in_(project_id_list),
+                    or_(
+                        ProjectMessage.reply_to_message_id.isnot(None),
+                        ProjectMessage.context["_resident_reply_covered_message_ids"].isnot(None),
+                    ),
+                    ProjectMessage.status.in_([OPEN_STATUS, LINKED_STATUS]),
+                    or_(
+                        ProjectMessage.context["audience"].as_string().in_(
+                            _NON_OPERATOR_AUDIENCES
                         ),
-                        ProjectMessage.status.in_([OPEN_STATUS, LINKED_STATUS]),
-                        or_(
-                            ProjectMessage.context["audience"].as_string().in_(
-                                _NON_OPERATOR_AUDIENCES
-                            ),
-                            ProjectMessage.context["audience"].as_string().is_(None),
-                        ),
-                    )
+                        ProjectMessage.context["audience"].as_string().is_(None),
+                    ),
                 )
-            ).scalar()
-            or 0
-        )
+                .group_by(ProjectMessage.project_id)
+            )
+        ).all()
+    )
 
-        # Undelivered strategist-reply detector: operator-visible strategist replies
-        # that were created but never delivered (delivered_at IS NULL) past the
-        # staleness threshold.  These are messages that SHOULD have been delivered
-        # but the transport ack was never received — a provable delivery gap.
-        staleness_cutoff = now - timedelta(minutes=_UNDELIVERED_STALENESS_MINUTES)
-        undelivered_reply_count = int(
-            (
-                await session.execute(
-                    select(func.count())
-                    .select_from(ProjectMessage)
-                    .where(
-                        ProjectMessage.project_id == project_id,
-                        ProjectMessage.from_type != "user",
-                        ProjectMessage.delivered_at.is_(None),
-                        ProjectMessage.created_at < staleness_cutoff,
-                        or_(
-                            ProjectMessage.reply_to_message_id.isnot(None),
-                            ProjectMessage.context["_resident_reply_covered_message_ids"].as_string().isnot(None),
-                        ),
-                        operator_visible_message_audience_filter(ProjectMessage.context),
-                    )
+    staleness_cutoff = now - timedelta(minutes=_UNDELIVERED_STALENESS_MINUTES)
+    undelivered_counts = dict(
+        (
+            await session.execute(
+                select(ProjectMessage.project_id, func.count())
+                .select_from(ProjectMessage)
+                .where(
+                    ProjectMessage.project_id.in_(project_id_list),
+                    ProjectMessage.from_type != "user",
+                    ProjectMessage.delivered_at.is_(None),
+                    ProjectMessage.created_at < staleness_cutoff,
+                    or_(
+                        ProjectMessage.reply_to_message_id.isnot(None),
+                        ProjectMessage.context["_resident_reply_covered_message_ids"].as_string().isnot(None),
+                    ),
+                    operator_visible_message_audience_filter(ProjectMessage.context),
                 )
-            ).scalar()
-            or 0
-        )
+                .group_by(ProjectMessage.project_id)
+            )
+        ).all()
+    )
+
+    # Quarantined reply rows for the heal pass — fetched once for exactly the
+    # projects that have at least one quarantined reply.
+    quarantined_project_ids = [
+        pid for pid in project_id_list if quarantined_counts.get(pid, 0) > 0
+    ]
+    quarantined_msgs_by_project: Dict[Any, List[ProjectMessage]] = {}
+    if quarantined_project_ids:
+        for _m in (
+            await session.execute(
+                _bounded_message_select(
+                    quarantined_project_ids,
+                    or_(
+                        ProjectMessage.reply_to_message_id.isnot(None),
+                        ProjectMessage.context["_resident_reply_covered_message_ids"].isnot(None),
+                    ),
+                    ProjectMessage.status.in_([OPEN_STATUS, LINKED_STATUS]),
+                    or_(
+                        ProjectMessage.context["audience"].as_string().in_(
+                            _NON_OPERATOR_AUDIENCES
+                        ),
+                        ProjectMessage.context["audience"].as_string().is_(None),
+                    ),
+                )
+            )
+        ).scalars().all():
+            quarantined_msgs_by_project.setdefault(_m.project_id, []).append(_m)
+
+    for (project_id,) in project_ids:
+        pid = str(project_id)
+
+        messages = messages_by_project.get(project_id, [])[:sample_limit]
+        info_alert_count = int(info_alert_counts.get(project_id, 0) or 0)
+        quarantined_reply_count = int(quarantined_counts.get(project_id, 0) or 0)
+        undelivered_reply_count = int(undelivered_counts.get(project_id, 0) or 0)
 
         if not messages and info_alert_count == 0 and quarantined_reply_count == 0 and undelivered_reply_count == 0:
             results.append(
@@ -840,25 +902,8 @@ async def run_operator_inbox_liveness_check(
         healed_count = 0
         if quarantined_reply_count > 0:
             quarantined_msgs = (
-                await session.execute(
-                    select(ProjectMessage)
-                    .where(
-                        ProjectMessage.project_id == project_id,
-                        or_(
-                            ProjectMessage.reply_to_message_id.isnot(None),
-                            ProjectMessage.context["_resident_reply_covered_message_ids"].isnot(None),
-                        ),
-                        ProjectMessage.status.in_([OPEN_STATUS, LINKED_STATUS]),
-                        or_(
-                            ProjectMessage.context["audience"].as_string().in_(
-                                _NON_OPERATOR_AUDIENCES
-                            ),
-                            ProjectMessage.context["audience"].as_string().is_(None),
-                        ),
-                    )
-                    .limit(sample_limit)
-                )
-            ).scalars().all()
+                quarantined_msgs_by_project.get(project_id, [])[:sample_limit]
+            )
             healed_count = await _heal_quarantined_replies(
                 session, quarantined_msgs, pid
             )
