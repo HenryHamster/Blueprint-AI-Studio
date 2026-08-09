@@ -342,6 +342,37 @@ class BootstrapLocalAppReleaseTests(unittest.TestCase):
                     direct_documented_writers.append(f"{path}:{line_number}")
         self.assertEqual(direct_documented_writers, [])
 
+    def test_single_deploy_executor_ships(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        scripts_root = repo_root / "scripts"
+        self.assertFalse(
+            (scripts_root / "blueprint_deploy_agent.py").exists(),
+            "the orphaned second deploy executor must not ship",
+        )
+
+        canonical_script = scripts_root / "bootstrap_local_app_release.py"
+        writer_locations = []
+        for path in sorted(scripts_root.glob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+                    continue
+                if node.func.id != "_atomic_write" or not node.args:
+                    continue
+                target = node.args[0]
+                if isinstance(target, ast.Name) and target.id == "_DEPLOY_AGENT_UNIT":
+                    writer_locations.append(path)
+        self.assertEqual(writer_locations, [canonical_script])
+
+        orphan_lockfile_defaults = []
+        for path in sorted(scripts_root.glob("*.py")):
+            for line_number, line in enumerate(
+                path.read_text(encoding="utf-8").splitlines(), 1
+            ):
+                if "~/.blueprint/" + "deploy-agent.lock" in line:
+                    orphan_lockfile_defaults.append(f"{path}:{line_number}")
+        self.assertEqual(orphan_lockfile_defaults, [])
+
     def test_release_execution_is_root_owned_and_socket_activated(self):
         service = bootstrap._release_service_unit().decode()
         socket = bootstrap._release_socket_unit("henry_hamster").decode()

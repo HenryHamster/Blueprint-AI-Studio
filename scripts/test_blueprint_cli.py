@@ -19,7 +19,6 @@ from types import SimpleNamespace
 
 import blueprint
 import blueprint_api
-import blueprint_deploy_agent
 import local_app_release as local_release
 import pytest
 
@@ -6339,49 +6338,6 @@ def test_deploy_agent_confirms_when_served_sha_matches(monkeypatch, tmp_path):
     assert not state_path.exists()
 
 
-def _standalone_pending_activation_setup(monkeypatch, state_path):
-    """Stub binding resolution so the standalone tests exercise its persisted receipt path."""
-    promoted = _approved_activation() | {"id": "uuid-promo"}
-    monkeypatch.setattr(blueprint, "load_config", dict)
-    monkeypatch.setattr(blueprint_deploy_agent, "get_project_id", lambda _value=None: "proj-1")
-    monkeypatch.setattr(blueprint_deploy_agent, "_latest_promoted_version", lambda _id: promoted)
-    monkeypatch.setattr(
-        blueprint_deploy_agent,
-        "_resolve_deploy_manifest",
-        lambda _args: (_DEPLOY_PROMOTED_SHA, f"sha256:{'0' * 64}", {}),
-    )
-    monkeypatch.setattr(blueprint_deploy_agent, "_resolve_deploy_binding", lambda *_args: promoted)
-    return promoted, argparse.Namespace(
-        project_id="proj-1",
-        host="control-plane",
-        dry_run=False,
-        state_path=str(state_path),
-    )
-
-
-@pytest.mark.parametrize(("served_sha", "expected_rc"), [("b" * 40, 1), (_DEPLOY_PROMOTED_SHA, 0)])
-def test_standalone_deploy_agent_served_sha_gate(monkeypatch, tmp_path, served_sha, expected_rc):
-    """The standalone agent fails old serving images and retro-confirms matching ones."""
-    posted = []
-    now = [datetime(2026, 6, 15, tzinfo=timezone.utc)]
-    state_path = tmp_path / "deploy-agent.state"
-    _write_accepted_activation_state(state_path)
-    _promoted, args = _standalone_pending_activation_setup(monkeypatch, state_path)
-    monkeypatch.setattr(blueprint, "_local_served_sha", lambda: served_sha)
-    monkeypatch.setattr(blueprint, "_activation_confirmation_now", lambda: now[0])
-    monkeypatch.setattr(
-        blueprint_deploy_agent, "_post_activation_receipt", lambda *items: posted.append(items)
-    )
-
-    assert blueprint_deploy_agent._execute_pending_activation(args) == expected_rc
-    assert len(posted) == (1 if expected_rc == 0 else 0)
-    assert state_path.exists() is (expected_rc == 1)
-    if expected_rc == 1:
-        now[0] += timedelta(seconds=blueprint._DEPLOY_AGENT_CONFIRMATION_TIMEOUT_SECONDS)
-        assert blueprint_deploy_agent._execute_pending_activation(args) == 1
-        assert json.loads(state_path.read_text(encoding="utf-8"))["phase"] == "failed"
-
-
 @pytest.mark.parametrize(
     "failure",
     [
@@ -6443,67 +6399,6 @@ def test_deploy_agent_does_not_post_receipt_when_shim_raises(
     assert not state_path.exists()
 
 
-def test_standalone_deploy_agent_does_not_post_receipt_when_shim_raises(
-    monkeypatch, tmp_path
-):
-    """The standalone agent clears a failed handoff before its next cycle."""
-    from blueprint_api import APIError
-
-    promoted = {
-        "id": "uuid-promo",
-        "version_number": 7,
-        "status": "promoted",
-        "promoted_sha": _DEPLOY_PROMOTED_SHA,
-        "serving_status": "unconfirmed",
-        "activation_requested_at": "2026-06-15T00:00:00Z",
-    }
-    calls = []
-    _deploy_env(
-        monkeypatch,
-        _deploy_api_fake(calls, promoted=promoted),
-        revision=_DEPLOY_PROMOTED_SHA,
-    )
-    monkeypatch.setattr(
-        blueprint_deploy_agent,
-        "get_project_id",
-        lambda _project_id=None: "proj-1",
-    )
-    monkeypatch.setattr(
-        blueprint,
-        "_invoke_release_shim",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            APIError("release executor failed: rollback completed")
-        ),
-    )
-    state_path = tmp_path / "deploy-agent.state"
-    args = argparse.Namespace(
-        project_id="proj-1",
-        host="control-plane",
-        dry_run=False,
-        lockfile=str(tmp_path / "deploy-agent.lock"),
-        state_path=str(state_path),
-    )
-
-    assert blueprint_deploy_agent._execute_pending_activation(args) == 1
-    assert not any(path.endswith("/activation-receipt") for _, path, _ in calls)
-    assert not state_path.exists()
-
-    state_path.write_text(
-        json.dumps(
-            {
-                "version_number": promoted["version_number"],
-                "promoted_sha": _DEPLOY_PROMOTED_SHA,
-                "revision": _DEPLOY_PROMOTED_SHA,
-                "phase": "started",
-            }
-        ),
-        encoding="utf-8",
-    )
-    assert blueprint_deploy_agent._execute_pending_activation(args) == 1
-    assert not any(path.endswith("/activation-receipt") for _, path, _ in calls)
-    assert not state_path.exists()
-
-
 @pytest.mark.parametrize(
     ("error", "status"),
     [
@@ -6532,70 +6427,6 @@ def test_deploy_agent_preflight_classifies_control_plane_failures(
     assert "remediation" in control
 
 
-def test_deploy_agent_receipt_failure_does_not_rerun_shim(
-    monkeypatch, tmp_path
-):
-    """A successful activation is not repeated while its receipt is retried."""
-    from blueprint_api import APIError
-
-    promoted = {
-        "version_number": 7,
-        "status": "promoted",
-        "promoted_sha": _DEPLOY_PROMOTED_SHA,
-        "serving_status": "unconfirmed",
-        "activation_requested_at": "2026-06-15T00:00:00Z",
-    }
-    calls = []
-    post_attempts = 0
-
-    def fake_api(method, path, body=None, timeout=30):
-        nonlocal post_attempts
-        calls.append((method, path, body))
-        if method == "GET" and "release-versions" in path:
-            return {"versions": [promoted], "total": 1}
-        if method == "POST" and path.endswith("/activation-receipt"):
-            post_attempts += 1
-            if post_attempts == 1:
-                raise APIError("HTTP 503: unavailable")
-            return {
-                "version_number": 7,
-                "serving_status": "serving_confirmed",
-                "served_sha": _DEPLOY_PROMOTED_SHA,
-            }
-        return {}
-
-    real_write_guard = blueprint._require_write_config
-    _deploy_env(monkeypatch, fake_api, revision=_DEPLOY_PROMOTED_SHA)
-    monkeypatch.setattr(blueprint, "_require_write_config", real_write_guard)
-    monkeypatch.setattr(
-        blueprint_deploy_agent, "get_project_id", lambda _project_id=None: "proj-1"
-    )
-    socket_calls = []
-    monkeypatch.setattr(
-        blueprint,
-        "_request_release_socket",
-        lambda digest, revision: socket_calls.append((digest, revision)),
-    )
-    monkeypatch.setattr(blueprint, "_local_served_sha", lambda: _DEPLOY_PROMOTED_SHA)
-    args = argparse.Namespace(
-        project_id=None,
-        host="control-plane",
-        interval=30,
-        dry_run=False,
-        lockfile=str(tmp_path / "agent.lock"),
-        state_path=str(tmp_path / "agent.state"),
-    )
-
-    assert blueprint_deploy_agent._run_cycle(args) == 1
-    assert len(socket_calls) == 1
-    assert (tmp_path / "agent.state").exists()
-
-    assert blueprint_deploy_agent._run_cycle(args) == 0
-    assert len(socket_calls) == 1
-    assert post_attempts == 2
-    assert not (tmp_path / "agent.state").exists()
-
-
 def test_deploy_agent_read_only_config_refuses_before_shim(monkeypatch, tmp_path):
     """A read-only agent credential is rejected before any activation lookup or shim call."""
     shim_calls = []
@@ -6619,24 +6450,6 @@ def test_deploy_agent_read_only_config_refuses_before_shim(monkeypatch, tmp_path
             )
         )
     assert not shim_calls
-
-
-def test_standalone_deploy_agent_read_only_refuses_before_shim(monkeypatch, tmp_path):
-    """The installed wrapper repeats the write guard inside every cycle."""
-    monkeypatch.setattr(blueprint, "load_config", lambda: {"read_only": True})
-    monkeypatch.setattr(
-        blueprint,
-        "_read_live_approved_activation",
-        lambda _args: pytest.fail("read-only config must stop before polling"),
-    )
-    args = argparse.Namespace(
-        project_id="proj-1",
-        host="control-plane",
-        lockfile=str(tmp_path / "agent.lock"),
-        state_path=str(tmp_path / "agent.state"),
-        poll_state_path=str(tmp_path / "agent.poll"),
-    )
-    assert blueprint_deploy_agent._run_cycle(args) == 1
 
 
 def test_deploy_agent_noops_without_live_approval(monkeypatch):
